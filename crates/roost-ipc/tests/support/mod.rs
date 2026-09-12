@@ -50,13 +50,19 @@ pub enum Reply {
     Err(ResponseError),
 }
 
+/// The incarnation this stub names on every subscribe ack. Protocol 5
+/// requires the field, and a client compares it against the one
+/// `session.identify` gave it.
+pub const STUB_SESSION_ID: &str = "01K3S8TQ4F0Q9YB2K6WZ5D7XN";
+
 /// How `events.subscribe` is answered.
 #[derive(Debug, Clone)]
 pub enum Subscribe {
     /// Ack at this fence revision, then push.
     Ack(u64),
-    /// Refuse — `connect-required` and `taken-over` are the two the
-    /// wire defines, and they instruct differently.
+    /// Refuse — `replay-expired`, `revision-ahead` and
+    /// `session-mismatch` are what the wire defines, and they instruct
+    /// differently.
     Reject(ResponseError),
 }
 
@@ -413,8 +419,11 @@ async fn serve_conn(stream: UnixStream, plan: Plan, recorded: Arc<Recorded>) {
                     continue;
                 }
                 Subscribe::Ack(revision) => {
-                    let ack = serde_json::to_value(EventsSubscribeResult { revision })
-                        .expect("encode the subscribe ack");
+                    let ack = serde_json::to_value(EventsSubscribeResult {
+                        revision,
+                        session_id: STUB_SESSION_ID.to_string(),
+                    })
+                    .expect("encode the subscribe ack");
                     reply(&mut write, Response::ok(request.id, ack)).await;
                     serve_push(write, plan).await;
                     return;

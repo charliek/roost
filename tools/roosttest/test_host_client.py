@@ -18,13 +18,12 @@ Three parties, none of them simulated:
 * the **client** — the ordinary harness UI (`--roost-target iced`),
   driven over its own socket. `host.add` + `host.connect` are the only
   setup it needs; there are no keystrokes in this file.
-* occasionally a **second client** — a scripted wire client (a
-  `session.connect` on a plain socket plus `eventstream.py`), which is
-  what a takeover and the lease-holder-only effects rule need. The wire
-  cannot tell a second Roost window from a Python socket, which is
-  exactly why the scripted one is the honest stand-in, and why plan 037
-  §9 makes a real second window the stretch variant rather than the
-  default.
+* occasionally a **second client** — a scripted wire client
+  (`eventstream.py` on a plain socket), which is what the every-subscriber
+  effects rule needs. The wire cannot tell a second Roost window from a
+  Python socket, which is exactly why the scripted one is the honest
+  stand-in, and why plan 037 §9 makes a real second window the stretch
+  variant rather than the default.
 
 # How a host tab is observed
 
@@ -41,9 +40,9 @@ answers, which is both the discovery and the attach.
 
 # What is deliberately not here
 
-The upgrade dialog's "Restart session" button and the takeover banner
-are view state with no op behind them; their logic is unit-tested in
-`roost-iced`. What this lane proves is the *state* the button acts on
+The upgrade dialog's "Restart session" button and the frozen-frame
+banner are view state with no op behind them; their logic is unit-tested
+in `roost-iced`. What this lane proves is the *state* the button acts on
 (a host really does reach `needs-restart` against a mismatched build)
 and the *composition* the button runs (stop → gone → relaunch really
 does bring the layout back). See [`test_a_build_mismatch_reaches_needs_restart_and_a_restart_restores_the_layout`].
@@ -64,7 +63,6 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-import dataplane
 import pytest
 import session as sessionlib
 import ui
@@ -102,7 +100,6 @@ FAKE_BUILD = "ghostty-0000000000000000+fake.plan037"
 # over IPC, so a wording change that silently broke that read is exactly
 # what these tests must catch.
 SUBTITLE_NEEDS_RESTART = "build mismatch — offers a restart"
-SUBTITLE_TAKEN_OVER = "take the session back"
 
 
 # ---------------------------------------------------------------------------
@@ -121,12 +118,17 @@ def session_env():
         made.teardown()
 
 
-def start_session(env, **overrides) -> None:
-    """Daemonize a session in test mode and prove it is answering."""
+def start_session(env, **overrides):
+    """Daemonize a session in test mode and prove it is answering.
+
+    The `Launch` comes back for the one caller that needs the pid the
+    launcher reported — a case that kills the daemon outright.
+    """
     launch = env.start_daemonized(ROOST_TEST_MODE="1", **overrides)
     assert launch.returncode == 0, f"start failed: {launch.stdout!r} / {launch.stderr!r}"
     assert launch.verdict.kind == "ready", launch.verdict
     env.wait_answering()
+    return launch
 
 
 def require_test_mode(roost: Roost) -> None:
@@ -188,7 +190,7 @@ class HostUnderTest:
     def connect_and_wait(self, timeout: float = 30.0) -> None:
         result = self.connect()
         # The op reports what was asked for, never the far end's verdict:
-        # waiting for a dial, an identify and a lease before replying
+        # waiting for a dial, an identify and a subscribe before replying
         # would block the caller on a round trip it can watch instead.
         assert result["state"] in ("connecting", "connected"), result
         self.wait_connected(timeout)
@@ -212,8 +214,8 @@ class HostUnderTest:
         """Wait for the Connect verb to describe a specific state.
 
         `connect_subtitle` is per-state (`host_verbs.rs`), so this is the
-        one read that distinguishes `needs-restart` from `taken-over`
-        from a plain drop without a state-reporting op."""
+        one read that distinguishes `needs-restart` from a plain drop
+        without a state-reporting op."""
 
         def settled() -> bool:
             row = host_row(self.roost, f"host:connect:{self.saved_id}")
@@ -224,18 +226,6 @@ class HostUnderTest:
     # -- the session behind it ------------------------------------------
     def client(self, timeout: float = 30.0) -> Roost:
         return self.env.client(timeout=timeout)
-
-    @staticmethod
-    def lease(client: Roost, takeover: bool = False, label: str | None = None) -> str:
-        """A `session.connect` lease. A bearer credential: returned,
-        never logged, never interpolated into an assertion message.
-
-        `label` is what the claimant reports itself as, which is the
-        only thing a deposed stream is told about it."""
-        params: dict = {"takeover": takeover}
-        if label is not None:
-            params["client_label"] = label
-        return client.call("session.connect", params)["lease"]
 
 
 @contextlib.contextmanager
@@ -572,9 +562,9 @@ def test_a_reconnect_resumes_the_stream_from_the_fence_it_left_at(host, roost):
     """Plan 056 R11: coming back is a *resume*, not a re-list.
 
     `host.disconnect` + `host.connect` is the only drop this lane can
-    force — a takeover of the client's own connection rather than a wire
-    that died — and that is exactly enough, because the fact being
-    resumed on is a fact about the **session**: the same `session_id`,
+    force — the client hanging up on itself rather than a wire that died
+    — and that is exactly enough, because the fact being resumed on is a
+    fact about the **session**: the same `session_id`,
     the same replay ring, the same fence. Which side hung up decides
     nothing (§3.2), which is why the checkpoint lives on the host entry
     and is seeded into every attempt whatever its cause.
@@ -994,324 +984,23 @@ def test_a_build_skew_is_named_before_any_attach_and_a_socket_host_is_offered_no
         assert attached["connect"]["reduced_fidelity"] is True, attached
 
 
-def watched_tab_ids(roost: Roost, saved_id: str) -> set[int]:
-    """Every tab id this client's sidebar mirror holds for `saved_id`.
-
-    Read through `app.sidebar_dump` rather than through a tab op: a
-    deposed client cannot attach, and the point of the read is that its
-    *mirror* is still live even when its terminals are frozen.
-    """
-    section = roost.sidebar_host(saved_id)
-    if section is None:
-        return set()
-    return {
-        bare(tab["key"])
-        for project in section.get("projects", [])
-        for tab in project.get("tabs", [])
-    }
-
-
 # ---------------------------------------------------------------------------
-# 6. AC3 — takeover, and what the displaced window keeps
+# 7. AC8 — every subscriber receives every effect
 # ---------------------------------------------------------------------------
 
 
-# The geometry the scripted phone drives the shared tab to before it
-# hands the foreground back. Deliberately not the UI's own grid: after
-# the takeback the tab must still be this size, because a reattach would
-# have negotiated `tab.attach{focus: true}` and resized it to the
-# window's.
-PHONE_COLS, PHONE_ROWS = 60, 20
+def test_a_bell_reaches_the_attached_client_and_a_second_subscriber_too(host, roost):
+    """Effects are addressed to a **tab**, and every subscriber gets
+    them.
 
-
-def test_a_takeover_keeps_the_frame_live_and_connect_takes_the_foreground_back(host, roost):
-    """A takeover moves the **foreground**, and nothing else (plan 057
-    §3.5).
-
-    Under R1 a takeover revoked the lease and the session closed every
-    connection under it, so the displaced window went blind and its frame
-    froze. R15 reverses that half: raw input is open to every same-UID
-    client, and the lease survives only as the foreground. The session
-    closes nothing, so the displaced window keeps its control connection,
-    its event stream and its attach — what it loses is who gets effects,
-    whose focus mutes notifications, and which ops need the lease.
-
-    So this asserts the whole of that: the frame is live and owns the
-    keyboard, `host.status` names the state and the taker, the band says
-    the same thing, an upload is refused as *not the foreground* rather
-    than as a dead host, and the deposed stream still delivers. The
-    status strip that says all this is an overlay, which the unchanged
-    PTY geometry across the takeover is the proof of — a strip that took
-    a row would have shrunk the grid and resized the shared tab.
-
-    Then the takeback, and its pinned observable: the phone sizes the tab
-    to 60x20 from its own data connection, and after `host.connect` the
-    tab is **still** 60x20. A reattach would have run `tab.attach` with
-    `focus: true` at this window's own grid and resized the shared PTY to
-    it; the size standing still is what proves the takeback happened in
-    place, with no reattach and no snapshot.
-    """
-    takeback_in_place(host, roost)
-
-
-def takeback_in_place(host, roost) -> None:
-    """A takeover moves only the foreground, and `host.connect` takes it
-    back on the connection already there.
-
-    Driven against whichever `host` the lane hands it, so every transport
-    asserts the same sequence rather than a copy of it.
-    """
-    host.connect_and_wait()
-    with host.client() as session:
-        tab = quiet_tab(session, first_project(session), host.env.launch_cwd)
-        key = host_key(roost, tab)
-        line = marker("LIVE")
-        session.tab_feed_pty_bytes(tab, f"{line}\r\n".encode())
-        wait_dump_contains(roost, key, line)
-        before = session.dump(tab)
-        assert (before["cols"], before["rows"]) != (PHONE_COLS, PHONE_ROWS), (
-            "the phone's geometry has to differ from this window's, or the "
-            f"no-reattach assertion below proves nothing: {before}"
-        )
-
-        # The second party. A scripted wire client, because the wire
-        # cannot tell one from a second Roost window — which is exactly
-        # the property under test.
-        with host.client() as interloper:
-            lease = host.lease(interloper, takeover=True, label="a phone")
-            with EventStream(host.env.socket, lease=lease) as stream:
-                stream.subscribe()
-                host.wait_connect_subtitle(SUBTITLE_TAKEN_OVER)
-
-                # 1. The frame is live, and it still owns the keyboard.
-                # The direct inverse of the frozen-frame gate this
-                # replaces: `app.active_terminal_focused` is
-                # `keyboard_route()` reduced to a bool, and a frozen
-                # frame answered `false` there.
-                frozen = try_dump_text(roost, key)
-                assert frozen is not None and line in frozen, (
-                    "a taken-over host must keep its frame — it is still being served"
-                )
-                assert roost.app_active_terminal_focused() is True, (
-                    "a deposed window still types into its terminal"
-                )
-
-                # And nothing about saying so touched the grid: the
-                # status strip is an overlay, so the takeover did not
-                # resize the shared PTY.
-                during = session.dump(tab)
-                assert (during["cols"], during["rows"]) == (
-                    before["cols"],
-                    before["rows"],
-                ), f"the takeover resized the tab: {before} -> {during}"
-
-                # 2. The state, and who has the foreground.
-                row = host_status_row(roost, host.saved_id)
-                assert row["state"] == "taken-over", row
-                assert row["taken_by"] == "a phone", row
-                assert row["rollup"] == "taken over by a phone", (
-                    "the band names the taker, not just the state"
-                )
-
-                # 3. An upload is refused as *not the foreground*. The
-                # session is right there, so "unavailable" would describe
-                # a connection that is fine. The wire code stays
-                # `host-unavailable` — a UI socket speaks a closed set of
-                # them — and the sentence is what carries the difference.
-                refusal = wait_until(
-                    lambda: not_foreground(roost, key),
-                    30.0,
-                    "the upload lane to answer not-foreground",
-                )
-                assert "is driven by a phone" in refusal, refusal
-                assert "take the foreground" in refusal, refusal
-
-                # 4. Still watching: a tab the new foreground opens
-                # reaches the deposed client's sidebar.
-                watched = quiet_tab(interloper, first_project(interloper), host.env.launch_cwd)
-                wait_until(
-                    lambda: watched in watched_tab_ids(roost, host.saved_id),
-                    30.0,
-                    "a tab opened by the new foreground to reach the deposed client",
-                )
-
-                # 5. The phone sizes the tab from its own data
-                # connection — the last geometry-bearing interaction, and
-                # the fact the takeback must not disturb.
-                with attached(interloper, host.env.socket, lease, tab) as phone:
-                    phone.read_until_finish()
-                    phone.send_resize(PHONE_COLS, PHONE_ROWS)
-                    wait_until(
-                        lambda: session_geometry(session, tab) == (PHONE_COLS, PHONE_ROWS),
-                        30.0,
-                        f"the phone's RESIZE to size the tab {PHONE_COLS}x{PHONE_ROWS}",
-                    )
-
-                    # 6. Take the foreground back. The interloper is
-                    # *told*, not cut: its stream survives, and so does
-                    # its data connection.
-                    host.connect_and_wait()
-                    assert stream.recv_driver_changed(timeout=30.0), stream.driver_changes
-                    assert stream.stopping_reason is None, (
-                        "a takeover must demote a stream, never end it"
-                    )
-
-                    # Same incarnation: the takeback ran on the
-                    # connection that was already there rather than
-                    # replacing it. And focusing the tab again — the call
-                    # that *would* attach, if anything had come loose —
-                    # leaves the phone's size standing, which is what
-                    # "no reattach" means where a user can see it: a
-                    # `tab.attach` negotiates `focus: true` and resizes
-                    # the shared PTY to this window's own grid.
-                    retaken = host_key(roost, tab)
-                    assert retaken == key, (
-                        f"the takeback minted a new incarnation ({key} -> "
-                        f"{retaken}), so it was a reconnect, not a takeback"
-                    )
-                    # Held rather than sampled: an attach is
-                    # asynchronous, so a size read once could be read
-                    # before the reattach this is looking for got there.
-                    deadline = time.monotonic() + scaled_timeout(3.0)
-                    while time.monotonic() < deadline:
-                        assert session_geometry(session, tab) == (
-                            PHONE_COLS,
-                            PHONE_ROWS,
-                        ), (
-                            "the takeback resized the shared PTY, so it ran a "
-                            "`tab.attach` of its own instead of taking the "
-                            "foreground in place"
-                        )
-                        time.sleep(0.05)
-
-        back = host_key(roost, tab)
-        wait_dump_contains(roost, back, line)
-
-        # And the client drives again: the takeback re-entered the
-        # Connected edge, so nobody else is named and the upload lane is
-        # open (plan 047 + 049).
-        settled = host_status_row(roost, host.saved_id)
-        assert settled["state"] == "connected", settled
-        assert "taken_by" not in settled, settled
-        landed = roost.tab_send_file(back, [FIXTURE_FILES / "note.txt"])
-        assert landed["uploads"], landed
-
-        # It did not depose *itself*: the `session.driver_changed` its
-        # own takeback produced must never reach a pump this client is
-        # still running.
-        deadline = time.monotonic() + scaled_timeout(2.0)
-        while time.monotonic() < deadline:
-            assert f"host:disconnect:{host.saved_id}" in host_row_ids(roost), (
-                "the client took the session back and then deposed itself"
-            )
-
-
-def session_geometry(session: Roost, tab: int) -> tuple[int, int]:
-    dumped = session.dump(tab)
-    return dumped["cols"], dumped["rows"]
-
-
-def not_foreground(roost: Roost, key: str) -> str | None:
-    """`tab.send_file`'s refusal sentence, once it names the foreground.
-
-    A wait rather than a read: the task publishes `taken-over` to the UI
-    a moment before it tells the upload lane *why* it has no lane, and
-    until then the honest answer there is still "disconnected".
-    """
-    message = refused(roost.tab_send_file, key, [FIXTURE_FILES / "note.txt"]).message
-    return message if "foreground" in message else None
-
-
-@contextlib.contextmanager
-def attached(client: Roost, socket, lease: str, tab: int):
-    """One data connection on `tab`, at the phone's own geometry.
-
-    A focused attach, which is what any ordinary client makes: it claims
-    the grid at attach time, and the RESIZE the caller sends afterwards
-    is what this test actually pins.
-    """
-    ticket = client.call(
-        "tab.attach",
-        {
-            "lease": lease,
-            "tab_id": str(tab),
-            "kinds": [dataplane.GHOSTTY_SNAPSHOT],
-            "cols": PHONE_COLS,
-            "rows": PHONE_ROWS,
-            "cell_w_px": 0,
-            "cell_h_px": 0,
-            "libghostty_build": client.call("session.identify")["libghostty_build"],
-        },
-    )
-    with dataplane.DataPlane(socket) as conn:
-        reply = conn.handshake(ticket["attach_token"])
-        assert reply.ok, reply.raw
-        yield conn
-
-
-def test_a_deposed_client_never_takes_the_session_back_on_its_own(host, roost):
-    """The steal-back guard (plan 049 §3.11), watched rather than argued.
-
-    Reconnecting *is* a takeover on this wire, so a client that has been
-    deposed and then reconnects for any reason takes the session away
-    from whoever has it — takeover ping-pong between two windows,
-    neither of which the user asked for. The client's answer is that a
-    non-current lease is terminal for its automation: only the explicit
-    "take the session back" affordance reclaims.
-
-    Asserted as a *window* rather than a single read, and from both
-    ends: the client keeps offering Connect (so it never reached
-    connected), and the interloper's lease keeps working (so nothing
-    displaced it).
-    """
-    host.connect_and_wait()
-    with host.client() as session:
-        tab = quiet_tab(session, first_project(session), host.env.launch_cwd)
-    host_key(roost, tab)
-
-    with host.client() as interloper:
-        lease = host.lease(interloper, takeover=True, label="a phone")
-        with EventStream(host.env.socket, lease=lease) as stream:
-            stream.subscribe()
-            host.wait_connect_subtitle(SUBTITLE_TAKEN_OVER)
-
-            deadline = time.monotonic() + scaled_timeout(5.0)
-            while time.monotonic() < deadline:
-                assert f"host:connect:{host.saved_id}" in host_row_ids(roost), (
-                    "the deposed client reconnected on its own, which is a takeover"
-                )
-                # Still the interloper's, from the session's own mouth.
-                interloper.call(
-                    "session.set_focus", {"lease": lease, "focused_tab_id": None}
-                )
-                time.sleep(0.1)
-
-            assert stream.stopping_reason is None, (
-                "the interloper's stream was cut by something"
-            )
-            assert stream.driver_changes == [], (
-                f"somebody took the lease back: {stream.driver_changes}"
-            )
-
-        interloper.call("session.stop")
-
-
-# ---------------------------------------------------------------------------
-# 7. AC8 — effects reach the lease holder and nobody else
-# ---------------------------------------------------------------------------
-
-
-def test_a_bell_reaches_the_attached_client_and_a_stranger_gets_no_effects(host, roost):
-    """Effects are addressed to whoever is driving the session.
-
-    A session has no view of its own, so a bell and an OSC 52 write only
-    mean anything to an attached client — and only to the one holding
-    the lease, or a second window would silently steal the first's
-    clipboard. Since R1 the stranger's half is proven by the
-    **projection** rather than at the gate: it gets a real stream (state,
-    titles, `notification.fired`), and the effect commit reaches it as an
-    empty batch. That is what makes the rule true for every effect
-    rather than for the two tested here.
+    A session has no view of its own, so it cannot decide whose bell a
+    bell is — it publishes the fact, and each client applies it to the
+    tab it is showing. The scripted stream here is the second client: it
+    presents no credential of any kind and still receives the same
+    `tab.effect` envelope the UI does, which is what makes the rule true
+    for every effect rather than for the two tested here. (Which client
+    a *clipboard* write lands on is the client's own viewed-tab rule,
+    unit-tested in `servicing.rs`; a bell marks whatever tab rang.)
 
     The bell's row has to **persist**, not merely appear. The inbox is
     derived on every reconcile from what the mirrors report as pending,
@@ -1332,25 +1021,29 @@ def test_a_bell_reaches_the_attached_client_and_a_stranger_gets_no_effects(host,
         focus(roost, parked_key)
         key = sibling_key(parked_key, tab)
 
-        # A stranger may watch, and watching is all it may do: the
-        # effect commit arrives with its events filtered away.
-        with EventStream(host.env.socket) as stranger:
-            fence = stranger.subscribe()
+        # A second subscriber, presenting nothing.
+        with EventStream(host.env.socket) as second:
+            fence = second.subscribe()
 
             session.tab_feed_pty_bytes(tab, b"\x07")
             # Read past the commit the bell produced. A title change
             # afterwards is the sentinel: reaching it proves the effect
-            # commit was delivered and carried nothing, rather than
-            # proving only that nothing arrived yet.
+            # commit was delivered in full, rather than proving only
+            # that nothing has arrived yet.
             sentinel = marker("SENTINEL")
             session.set_title(tab, sentinel)
-            batches, _title = stranger.recv_until("tab.title_changed", timeout=30.0)
-            stranger.expect_contiguous(batches, fence)
-            assert all(
-                envelope["event"] != "tab.effect"
+            batches, _title = second.recv_until("tab.title_changed", timeout=30.0)
+            second.expect_contiguous(batches, fence)
+            effects = [
+                envelope
                 for batch in batches
                 for envelope in batch["events"]
-            ), f"a stranger must never see a tab.effect: {batches}"
+                if envelope["event"] == "tab.effect"
+            ]
+            assert [e["data"]["effect"] for e in effects] == ["bell"], (
+                f"a second subscriber must receive the same effect: {batches}"
+            )
+            assert effects[0]["data"]["tab_id"] == str(tab), effects
 
         wait_until(
             lambda: f"notif:{key}" in inbox_ids(roost),
@@ -1405,6 +1098,14 @@ def test_an_osc52_write_in_a_host_tab_reaches_the_clients_clipboard(host, roost)
     clipboard — the machine with the user on it, not the one with the
     shell.
 
+    The tab is **focused first**, and that is not incidental setup: every
+    subscriber receives every effect, so each client applies a clipboard
+    write only for the tab it is viewing — otherwise a copy in a tab
+    somebody else is driving would silently take this window's clipboard.
+    The background case is deterministic only inside the process, so it is
+    pinned in `servicing.rs`'s unit test; this lane asserts the half a
+    user sees.
+
     Seeded with a baseline first: a clipboard that already held the
     payload would pass this without the effect ever arriving. Skipped
     where the platform has no usable clipboard, which is the same
@@ -1415,7 +1116,11 @@ def test_an_osc52_write_in_a_host_tab_reaches_the_clients_clipboard(host, roost)
     host.connect_and_wait()
     with host.client() as session:
         tab = quiet_tab(session, first_project(session), host.env.launch_cwd)
-        host_key(roost, tab)
+        key = host_key(roost, tab)
+        # `tab.focus` moves the selection inside the op, on the UI
+        # thread, so the client is already viewing this tab by the time
+        # the effect below is published.
+        focus(roost, key)
         payload = marker("HOSTCLIP")
         session.tab_feed_pty_bytes(tab, osc52(payload.encode()))
         wait_until(
@@ -2226,8 +1931,8 @@ def test_a_client_wires_a_hosts_agent_hooks_and_off_takes_them_back(jailed_host)
     side reports what a host answered. The **real** one is the harness UI,
     which runs on `agent-hooks = off` and connects afterwards — so the
     unwiring is not something this test asks for, it is what the client
-    does on its own after `session.connect`, which is the whole claim of
-    §3.4 ("off is off everywhere") and the only way to see that the client
+    does on its own once connected, which is the whole claim of §3.4
+    ("off is off everywhere") and the only way to see that the client
     really queues the op.
     """
     host, jail = jailed_host
@@ -2235,11 +1940,9 @@ def test_a_client_wires_a_hosts_agent_hooks_and_off_takes_them_back(jailed_host)
     assert not jail.record.exists(), "the session wired something before a client asked"
 
     with host.client() as scripted:
-        lease = HostUnderTest.lease(scripted)
         reply = scripted.call(
             "session.set_agent_hooks",
             {
-                "lease": lease,
                 "mode": "auto",
                 "skip": ["cursor", "gemini"],
                 "client": "roosttest",
@@ -2268,12 +1971,13 @@ def test_a_client_wires_a_hosts_agent_hooks_and_off_takes_them_back(jailed_host)
 
     # A second client asking the same thing is told nothing new: the
     # session flipped `noticed` for what it reported, so the toast is at
-    # most once per agent per host.
+    # most once per agent per host. It needs no standing of any kind —
+    # every same-UID connection may state this host's policy, and the
+    # last one to reach the install lock wins.
     with host.client() as second:
         again = second.call(
             "session.set_agent_hooks",
             {
-                "lease": HostUnderTest.lease(second, takeover=True),
                 "mode": "auto",
                 "skip": ["cursor"],
                 "client": "roosttest",
@@ -2283,8 +1987,8 @@ def test_a_client_wires_a_hosts_agent_hooks_and_off_takes_them_back(jailed_host)
     assert again["removed"] == [], again
 
     # Now the real client. Nothing below asks for an unwiring — the UI
-    # reads `agent-hooks = off` out of the harness config and sends it
-    # after its own `session.connect`.
+    # reads `agent-hooks = off` out of the harness config and sends it on
+    # connecting.
     host.connect_and_wait()
     wait_until(
         lambda: wired_agents(jail) == set(),
@@ -2596,45 +2300,6 @@ def test_send_file_on_a_local_tab_pastes_the_escaped_local_path(roost, project, 
     assert result["skipped"] == [], result
     assert result["pasted"] == str(source).replace(" ", r"\ "), result
     drain_until_match(roost, tab, re.escape(result["pasted"].encode()))
-
-
-def test_send_file_into_a_taken_over_host_is_refused_as_not_foreground(host, roost):
-    """The #376 rule, applied to the newest way of putting bytes in a tab
-    — and to what a takeover means since plan 057 §3.5.
-
-    A taken-over host is *live*: it keeps its frame, takes keys, and
-    lists its tabs, because the session closes nothing. What it does not
-    have is the foreground, and `session.put_file` is one of the ops the
-    lease still owns. So the refusal has to come before anything is
-    uploaded, and it has to say which of the two things happened — a host
-    that cannot be reached and a host somebody else is driving are
-    different problems with different remedies.
-
-    The wire *code* stays `host-unavailable` either way (a UI socket
-    speaks a closed set of them, and everything that is not a session
-    refusal folds onto that one), so the sentence is the assertion.
-    """
-    host.connect_and_wait()
-    with host.client() as session:
-        tab = quiet_tab(session, first_project(session), host.env.launch_cwd)
-    key = host_key(roost, tab)
-
-    with host.client() as interloper:
-        lease = HostUnderTest.lease(interloper, takeover=True, label="a phone")
-        with EventStream(host.env.socket, lease=lease) as stream:
-            # Subscribing is what makes the takeover *land*: the lease
-            # alone does not displace the connected client until the
-            # interloper is actually listening, so without this the wait
-            # below races and times out on a loaded runner.
-            stream.subscribe()
-            host.wait_connect_subtitle(SUBTITLE_TAKEN_OVER)
-            message = wait_until(
-                lambda: not_foreground(roost, key),
-                30.0,
-                "the upload lane to answer not-foreground",
-            )
-            assert "is driven by a phone" in message, message
-            assert "take the foreground" in message, message
 
 
 def test_roostctl_tab_send_file_prints_the_host_path_it_pasted(

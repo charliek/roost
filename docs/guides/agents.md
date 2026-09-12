@@ -296,7 +296,7 @@ A host session (`roost-session`) has no `config.conf` of its own — the
 connecting client's config is the only authority a session has for what
 "wired" should mean there. So the client sends its `agent-hooks` /
 `agent-hooks-skip` values to the host as the `session.set_agent_hooks`
-op right after every `session.connect`
+op right after every connect
 ([`ipc.md`](../reference/ipc.md#sessionset_agent_hooks)):
 
 - **Connecting wires the host.** With `agent-hooks = auto` (the

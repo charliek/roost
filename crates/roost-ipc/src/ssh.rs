@@ -1363,7 +1363,7 @@ impl TunnelState {
     /// recency. `Transport` is [`classify_ssh_failure`]'s fallthrough —
     /// "no rule matched" — so it never displaces a classified family,
     /// whichever order the two arrive in. One client runs several execs
-    /// at once (control, events, a lease probe) and they die together:
+    /// at once (control, events, an upload) and they die together:
     /// an events exec's `Transport` would otherwise erase a control
     /// exec's `ChangedHostKey` before anyone had read it. Between two
     /// families of equal specificity, the newer exec wins, and a
@@ -2071,8 +2071,8 @@ async fn identify_over<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
 /// The refusal is *not* flattened into the error here, because two
 /// callers disagree about what a refusal means: a verify wants
 /// `session.identify` failing to be a failure, while the bootstrap job's
-/// lease-free `session.stop` (plan 039 §3.4) reads "the session is
-/// already shutting down" as the outcome it wanted. Only a transport or
+/// `session.stop` (plan 039 §3.4) reads "the session is already shutting
+/// down" as the outcome it wanted. Only a transport or
 /// protocol fault is an `Err`.
 pub(crate) async fn call_over<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     stdin: &mut W,
@@ -2946,8 +2946,8 @@ mod tests {
         }
     }
 
-    /// One client runs several execs at once — control, events, a lease
-    /// probe — and a dying link kills them together. The fallthrough
+    /// One client runs several execs at once — control, events, an
+    /// upload — and a dying link kills them together. The fallthrough
     /// family must not erase a first-match hit inside one unseen window:
     /// a changed host key read as a bare `Transport` is a retry against
     /// a possible machine-in-the-middle. The generation still advances,

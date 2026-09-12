@@ -1960,7 +1960,7 @@ async fn the_stop_accepts_only_the_shutting_down_code() {
             "the session is already shutting down",
             true,
         ),
-        ("connect-required", "connect first", false),
+        ("not-found", "no such session", false),
         ("internal", "the dispatcher fell over", false),
         ("a-code-from-the-future", "who knows", false),
     ] {

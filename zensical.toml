@@ -57,6 +57,9 @@ nav = [
     { "Architecture" = "reference/architecture.md" },
   ] },
   { "Changelog" = "changelog.md" },
+  { "Archive" = [
+    { "Legacy protocol" = "archive/ipc-legacy-proto.md" },
+  ] },
   { "Development" = [
     { "Architecture & principles" = "development/vision.md" },
     { "Iced migration" = "development/iced-migration.md" },

@@ -1791,7 +1791,7 @@ const CURL_MAX_TIME_SECS: u64 = 300;
 /// process that prints one line; anything slower is not answering.
 const LOCAL_IDENTIFY_BUDGET: Duration = Duration::from_secs(10);
 
-/// The lease-free wire stop.
+/// The wire stop, on a bare connection.
 const STOP_BUDGET: Duration = Duration::from_secs(30);
 
 /// How long the stopped session gets to unlink its socket and release
@@ -2158,7 +2158,7 @@ enum BridgeAnswer {
     /// separately from the rendered message because one caller routes on
     /// it: [`BootstrapJob::stop_over_the_wire`] treats *only*
     /// `shutting-down` as "the stop it asked for is already happening",
-    /// and everything else — `connect-required`, `internal`, a code this
+    /// and everything else — `not-implemented`, `internal`, a code this
     /// build has never heard of — as the refusal it is.
     Refused { code: String, detail: String },
     /// The bridge ran and found no session to talk to.
@@ -2671,13 +2671,12 @@ impl BootstrapJob {
     // Stop, wait, start, check
     // --------------------------------------------------------------
 
-    /// Stop the running session over the wire, lease-free.
+    /// Stop the running session over the wire.
     ///
-    /// `session.stop` is dispatched *before* the lease gate, so this
-    /// sends it raw: no `session.connect`, no takeover, none of the
-    /// eviction side-effects a client attach would have. The in-repo
-    /// precedent is `roost-session`'s own signal handler, which
-    /// self-dials exactly this.
+    /// One op on a bare connection: no subscribe, and none of the attach
+    /// machinery a client would bring. The in-repo precedent is
+    /// `roost-session`'s own signal handler, which self-dials exactly
+    /// this.
     ///
     /// **`client-bridge: no session` is success**, not a failure: the
     /// job asked for the session to be gone, and it is. So is one
@@ -2687,9 +2686,9 @@ impl BootstrapJob {
     /// actually went, and it does not care who asked it to.
     ///
     /// **Every other refusal is a failed stop.** Flattening them all into
-    /// "it is shutting down" would read `connect-required`,
-    /// `not-implemented`, `internal` and a code this build has never
-    /// heard of as consent to carry on, and the job would then wait out
+    /// "it is shutting down" would read `not-found`, `not-implemented`,
+    /// `internal` and a code this build has never heard of as consent to
+    /// carry on, and the job would then wait out
     /// the whole await-gone budget before reporting a timeout instead of
     /// the reason the session gave in the first sentence.
     pub async fn stop_over_the_wire(&self) -> Result<(), BootstrapError> {

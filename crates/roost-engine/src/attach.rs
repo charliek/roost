@@ -188,9 +188,9 @@ pub(crate) async fn serve_attach(
 
     let tab_id = admitted.tab_id;
     let outcome = attach_tab(h, &admitted, &handshake, reader, writer, close);
-    // Registered under the lease by the admission; deregistered here
-    // however the forwarder ended, so a tab that is attached and
-    // detached repeatedly does not accumulate entries.
+    // Registered by the admission; deregistered here however the
+    // forwarder ended, so a tab that is attached and detached repeatedly
+    // does not accumulate entries.
     outcome.await;
     h.release_data_conn(tab_id, ctx.conn_id);
 }
@@ -243,8 +243,7 @@ async fn attach_tab(
     // The fence is a round trip through the tab task, and a stop during
     // it means there is no session left to stream from. Answering
     // `accepted` now would hand this client a stream nothing will ever
-    // write to. (A takeover cannot land here: since R15 it closes no
-    // data connection.)
+    // write to.
     if close.reason().is_some() {
         debug!(
             tab_id,

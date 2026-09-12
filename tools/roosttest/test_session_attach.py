@@ -1,10 +1,10 @@
 """The attach data plane, end to end against a real `roost-session`.
 
 `test_session.py` proves the daemon serves the control plane headlessly.
-This module proves the other half: that a client with no UI can take a
-lease, negotiate an attach, and receive one tab's terminal over the
-binary data plane — snapshot, live PTY frames, exit — with the fence,
-lease, and resume rules the protocol promises.
+This module proves the other half: that a client with no UI can negotiate
+an attach and receive one tab's terminal over the binary data plane —
+snapshot, live PTY frames, exit — with the fence and resume rules the
+protocol promises.
 
 Everything here drives a REAL daemon over a real Unix socket (see
 `session.py` for the per-test profile isolation) and speaks the wire
@@ -27,6 +27,7 @@ are both *durations under test*, not synchronization.
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import signal
@@ -41,6 +42,7 @@ import session as sessionlib
 from client import Roost, RoostError, scaled_timeout
 from dataplane import DataPlane
 from eventstream import EventStream
+from test_session_effects import set_focus, theme
 
 pytestmark = pytest.mark.session_daemon
 
@@ -107,34 +109,19 @@ def first_project(client: Roost) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Lease + ticket helpers
+# Ticket helpers
 # ---------------------------------------------------------------------------
-
-
-def connect_lease(client: Roost, takeover: bool = False, label: str | None = None) -> str:
-    """`session.connect` — the lease every lease-gated op presents.
-
-    The lease is a bearer credential: it is returned, never logged, and
-    never interpolated into an assertion message. `label` is what the
-    claimant reports itself as, which is the only thing a deposed stream
-    is told about it.
-    """
-    params: dict = {"takeover": takeover}
-    if label is not None:
-        params["client_label"] = label
-    return client.call("session.connect", params)["lease"]
 
 
 def attach_ticket(
     client: Roost,
-    lease: str | None,
     tab_id: int,
     cols: int = COLS,
     rows: int = ROWS,
     *,
     kinds: list[str] | None = None,
     libghostty_build: str | None = None,
-    focus: bool | None = None,
+    focus: bool = True,
 ) -> dict:
     """`tab.attach` — a single-use ticket for one data connection.
 
@@ -143,17 +130,9 @@ def attach_ticket(
     have to be updated every time `third_party/ghostty` moves. The
     mismatch case mutates this value on purpose.
 
-    `focus` rides the wire **only when a caller asks for it**, so the
-    default here is the default on the wire: a focused attach sends no
-    `focus` key at all, which is the compatibility guarantee a session
-    predating `open_input` depends on (it decodes strictly and would
-    refuse the key). Every other case in this module goes on exercising
-    that shape by saying nothing.
-
-    `lease=None` **omits the key**, which is a different wire shape from
-    `lease=""` and the one the compatibility story turns on: since R15
-    the field is optional, so a client written against an `open_input`
-    session never sends it at all.
+    `focus` is always sent. Protocol 5 requires it — the omit-when-true
+    shim that let a caller say nothing is gone — so the default here is
+    the claim an ordinary attach makes rather than the wire's.
     """
     if libghostty_build is None:
         libghostty_build = client.call("session.identify")["libghostty_build"]
@@ -165,11 +144,8 @@ def attach_ticket(
         "cell_w_px": 0,
         "cell_h_px": 0,
         "libghostty_build": libghostty_build,
+        "focus": focus,
     }
-    if lease is not None:
-        params["lease"] = lease
-    if focus is not None:
-        params["focus"] = focus
     return client.call("tab.attach", params)
 
 
@@ -187,22 +163,21 @@ def dial(
 
 
 def attached(
-    env, client: Roost, lease: str, tab_id: int
+    env, client: Roost, tab_id: int
 ) -> tuple[DataPlane, dataplane.Reply, dict]:
     """The whole happy prologue: ticket, dial, accepted handshake."""
-    return attached_as(env, client, lease, tab_id, dataplane.GHOSTTY_SNAPSHOT)
+    return attached_as(env, client, tab_id, dataplane.GHOSTTY_SNAPSHOT)
 
 
 def attached_as(
     env,
     client: Roost,
-    lease: str,
     tab_id: int,
     kind: str,
     cols: int = COLS,
     rows: int = ROWS,
     *,
-    focus: bool | None = None,
+    focus: bool = True,
 ) -> tuple[DataPlane, dataplane.Reply, dict]:
     """The same prologue, offering exactly one kind.
 
@@ -210,7 +185,7 @@ def attached_as(
     between, so the stream under test is the one the case names.
     """
     ticket = attach_ticket(
-        client, lease, tab_id, cols=cols, rows=rows, kinds=[kind], focus=focus
+        client, tab_id, cols=cols, rows=rows, kinds=[kind], focus=focus
     )
     assert ticket["kind"] == kind, ticket
     conn, reply = dial(env, ticket, kind=kind)
@@ -379,95 +354,58 @@ def wait_for_bytes(
 
 
 # ---------------------------------------------------------------------------
-# 1. Leases: a takeover moves the foreground and closes nothing
+# 1. Every connection is symmetric
 # ---------------------------------------------------------------------------
 
 
-def test_a_takeover_moves_the_foreground_and_closes_nothing(env):
-    """One takeover, and the only thing it moves is the foreground.
+def test_a_second_client_changes_nothing_for_the_first(env):
+    """A second client arriving takes nothing away from the first.
 
-    Raw input is open to every same-UID client (plan 057, R15), so the
-    displaced client loses nothing it was using to work: its control
-    connection still answers, and its data connection still streams the
-    tab's output. What it loses is the foreground — the settings ops, the
-    focus, and its stream's driver classification.
+    Every op that touches the session's settings, its files or its
+    terminal is run by client A *after* client B has connected, and every
+    one of them succeeds. That is symmetry read from outside.
 
-    The **stream is demoted, not cut** (plan 049 §3.8): it gets one
-    non-terminal `session.driver_changed` naming whoever claimed the
-    lease, and it keeps delivering after it. A deposed window that lost
-    its stream would go blind about the session it is still showing.
-
-    The tombstone is the last: a *foreground* op presenting the dead
-    lease is told `taken-over` (someone else has it) rather than
-    `connect-required` (you never connected), because those instruct
-    differently.
+    Run in one case rather than six, because the failure mode being
+    guarded is shared: a single surviving gate would make some arbitrary
+    subset of a working window read-only, and which subset is exactly
+    what a user cannot diagnose. The agent jail is what keeps the
+    `set_agent_hooks` leg honest — it writes real files, inside this
+    session's own root.
     """
-    started(env)
+    jail = env.jail_agents()
+    started(env, ROOST_AGENT_HOOKS_FORCE="1")
 
-    old = env.client()
-    old_lease = connect_lease(old)
-    project = first_project(old)
-    tab = quiet_tab(old, project, env.launch_cwd)
+    with env.client() as first, env.client() as second:
+        project = first_project(first)
+        tab = quiet_tab(first, project, env.launch_cwd)
 
-    stream = EventStream(env.socket, lease=old_lease)
-    stream.subscribe()
+        # Client B, doing the loudest thing the wire still carries: it
+        # reads the session and states a focus of its own.
+        second.tabs()
+        set_focus(second, tab)
 
-    conn, reply, _ticket = attached(env, old, old_lease, tab)
-    conn.read_until_ready()
+        first.call("session.set_theme", {"osc_colors": theme()})
+        wired = first.call(
+            "session.set_agent_hooks",
+            {"mode": "auto", "skip": [], "client": "roosttest"},
+        )
+        assert wired["errors"] == [], wired
+        assert set(jail.read_record()) == set(wired["wired"]), wired
 
-    new = env.client()
-    new_lease = connect_lease(new, takeover=True, label="  a phone\n  ")
-    assert len(new_lease) == 32
+        landed = first.call(
+            "session.put_file",
+            {"name": "note.txt", "data": base64.b64encode(b"hi").decode()},
+        )
+        assert landed["bytes"] == 2, landed
 
-    # The data connection is untouched: it is still on the tab's tee, so
-    # output produced after the takeover reaches it.
-    marker = b"ROOST_AFTER_THE_TAKEOVER"
-    new.tab_feed_pty_bytes(tab, marker + b"\r\n")
-    seen = bytearray()
+        set_focus(first, tab)
 
-    def landed(frame) -> bool:
-        if frame.frame_type == dataplane.FRAME_PTY:
-            seen.extend(frame.pty()[1])
-        return marker in bytes(seen)
+        conn, reply, _ticket = attached(env, first, tab)
+        assert reply.ok, reply.raw
+        conn.read_until_ready()
+        conn.close()
 
-    conn.read_frames_until(landed, timeout=30.0, what="the post-takeover PTY bytes")
-    conn.close()
-
-    # The event stream is told, not cut — and the label the claimant
-    # reported arrives normalized (trimmed, control characters gone).
-    assert stream.recv_driver_changed(timeout=30.0) == "a phone"
-    assert stream.stopping_reason is None, "a driver_changed must not end the stream"
-
-    # And it keeps delivering: a commit after the takeover still lands,
-    # with no hole in the revision sequence.
-    watched = quiet_tab(new, project, env.launch_cwd)
-    _batches, opened = stream.recv_until("tab.opened", timeout=30.0)
-    assert int(opened["data"]["tab"]["id"]) == watched
-    stream.close()
-
-    # And the connection that ran the original `session.connect` is still
-    # there, still serving everything that is not the foreground.
-    assert old.call("tab.list")["projects"]
-    old.close()
-
-    # The dead lease is tombstoned, not forgotten. Read through a
-    # foreground op: `tab.attach` takes no lease any more, so it is no
-    # longer the place a stale one is noticed.
-    with env.client() as stale:
-        with pytest.raises(RoostError) as refused:
-            stale.call(
-                "session.set_focus", {"lease": old_lease, "focused_tab_id": None}
-            )
-        assert refused.value.code == "taken-over", refused.value
-
-    # A lease outlives its holder's connection: dropping `new` releases
-    # nothing, so the next client still has to say it means it.
-    new.close()
-    with env.client() as polite:
-        with pytest.raises(RoostError) as busy:
-            connect_lease(polite, takeover=False)
-        assert busy.value.code == "already-connected", busy.value
-        assert len(connect_lease(polite, takeover=True)) == 32
+        first.send(tab, b"\n")
 
     env.stop_over_the_wire()
 
@@ -481,27 +419,21 @@ def test_two_clients_attached_to_one_tab_both_see_output_and_both_type(env):
     """A tab serves every same-UID client that asks for it (plan 057, R15).
 
     This is the shape the product is for — started on the desktop,
-    picked up on the phone, both left open — and before R15 it was the
-    one shape the protocol refused: a second admitted handshake
-    superseded the first, so the desktop's stream ended the moment the
-    phone attached.
+    picked up on the phone, both left open.
 
     Three things at once, because they are one behaviour: both
     connections are still live after the second attach, output fans out
-    to both, and input from either reaches the child. The second client
-    presents an **empty** lease — it never ran `session.connect` at all,
-    which is the whole point of raw input being open.
+    to both, and input from either reaches the child.
     """
     started(env)
 
     with env.client() as desktop, env.client() as phone:
-        lease = connect_lease(desktop)
         project = first_project(desktop)
         tab = echoing_tab(desktop, project, env.launch_cwd)
 
-        first, _reply, _ticket = attached(env, desktop, lease, tab)
+        first, _reply, _ticket = attached(env, desktop, tab)
         first.read_until_ready()
-        second, _reply, _ticket = attached(env, phone, "", tab)
+        second, _reply, _ticket = attached(env, phone, tab)
         second.read_until_ready()
 
         # One child, so one announcement — and it goes to both.
@@ -522,39 +454,6 @@ def test_two_clients_attached_to_one_tab_both_see_output_and_both_type(env):
 
     env.stop_over_the_wire()
 
-
-def test_an_attach_that_omits_the_lease_entirely_is_admitted(env):
-    """The `lease` key is optional on `tab.attach` since R15, and the
-    *omitted* shape is the one the compatibility story turns on.
-
-    A client written against an `open_input` session has no lease to
-    send and no reason to invent one, so it sends no key — which is a
-    different wire shape from `"lease": ""` and the one a strict decoder
-    would refuse. This case sends it while another client holds the
-    foreground, so nothing about the answer can be "there was no lease to
-    be wrong about".
-    """
-    started(env)
-
-    with env.client() as driver, env.client() as bare:
-        connect_lease(driver)
-        project = first_project(driver)
-        tab = echoing_tab(driver, project, env.launch_cwd)
-
-        ticket = attach_ticket(bare, None, tab)
-        conn, reply = dial(env, ticket)
-        assert reply.ok, (reply.code, reply.message)
-        conn.read_until_ready()
-
-        # A real stream, not just an accepted handshake.
-        seen = bytearray()
-        conn.send_input(b"\n")
-        wait_for_bytes(conn, seen, CHILD_UP)
-        conn.send_input(b"BARE_TYPED\n")
-        wait_for_bytes(conn, seen, b"BARE_TYPED")
-        conn.close()
-
-    env.stop_over_the_wire()
 
 
 def test_geometry_follows_the_last_client_that_interacted(env):
@@ -578,7 +477,6 @@ def test_geometry_follows_the_last_client_that_interacted(env):
     resized_cols, resized_rows = 70, 22
 
     with env.client() as desktop, env.client() as phone:
-        lease = connect_lease(desktop)
         project = first_project(desktop)
         tab = quiet_tab(desktop, project, env.launch_cwd)
 
@@ -597,7 +495,6 @@ def test_geometry_follows_the_last_client_that_interacted(env):
         big, big_reply, _ticket = attached_as(
             env,
             desktop,
-            lease,
             tab,
             dataplane.GHOSTTY_SNAPSHOT,
             cols=desktop_cols,
@@ -617,7 +514,6 @@ def test_geometry_follows_the_last_client_that_interacted(env):
         small, small_reply, _ticket = attached_as(
             env,
             phone,
-            "",
             tab,
             dataplane.VT,
             cols=phone_cols,
@@ -688,7 +584,6 @@ def test_a_refused_handshake_is_one_json_line_and_a_close(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
 
@@ -701,7 +596,7 @@ def test_a_refused_handshake_is_one_json_line_and_a_close(env):
 
         # A token that was already spent. Single-use is what keeps a
         # ticket from being a standing invitation.
-        ticket = attach_ticket(client, lease, tab)
+        ticket = attach_ticket(client, tab)
         with DataPlane(env.socket) as first:
             assert first.handshake(ticket["attach_token"]).ok
             first.read_until_ready()
@@ -713,7 +608,7 @@ def test_a_refused_handshake_is_one_json_line_and_a_close(env):
 
         # Checked BEFORE the token: two ends that disagree about the
         # protocol disagree about what a token even is.
-        fresh = attach_ticket(client, lease, tab)
+        fresh = attach_ticket(client, tab)
         with DataPlane(env.socket) as ancient:
             reply = ancient.handshake(fresh["attach_token"], protocol_version=1)
             assert reply.ok is False, reply
@@ -738,10 +633,9 @@ def test_an_expired_token_is_refused(env):
     started(env, ROOST_SESSION_ATTACH_TTL_MS="50")
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
-        ticket = attach_ticket(client, lease, tab)
+        ticket = attach_ticket(client, tab)
 
         time.sleep(scaled_timeout(0.4))
 
@@ -764,20 +658,19 @@ def test_tab_attach_refuses_what_it_cannot_serve(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
         build = client.call("session.identify")["libghostty_build"]
 
         with pytest.raises(RoostError) as unknown:
-            attach_ticket(client, lease, tab, kinds=["hologram", "sixel-mosaic"])
+            attach_ticket(client, tab, kinds=["hologram", "sixel-mosaic"])
         assert unknown.value.code == "unsupported-kind", unknown.value
 
         # A list that MIXES an unknown kind with a servable one is fine:
         # the client states a preference order and the first servable
         # entry wins.
         mixed = attach_ticket(
-            client, lease, tab, kinds=["sixel-mosaic", dataplane.GHOSTTY_SNAPSHOT]
+            client, tab, kinds=["sixel-mosaic", dataplane.GHOSTTY_SNAPSHOT]
         )
         assert mixed["kind"] == dataplane.GHOSTTY_SNAPSHOT
 
@@ -785,14 +678,14 @@ def test_tab_attach_refuses_what_it_cannot_serve(env):
         # depends on the build, so a skew has nothing left to fall back
         # to. (Offer `vt` beside it and it does — the case below.)
         with pytest.raises(RoostError) as mismatch:
-            attach_ticket(client, lease, tab, libghostty_build=SKEWED_BUILD)
+            attach_ticket(client, tab, libghostty_build=SKEWED_BUILD)
         assert mismatch.value.code == "build-mismatch", mismatch.value
         # Both strings are named so a client can tell which side to move.
         assert build in mismatch.value.message
         assert SKEWED_BUILD in mismatch.value.message
 
         with pytest.raises(RoostError) as zero:
-            attach_ticket(client, lease, tab, cols=0, rows=ROWS)
+            attach_ticket(client, tab, cols=0, rows=ROWS)
         assert zero.value.code == "invalid-param", zero.value
 
         client.close_tab(tab)
@@ -800,7 +693,7 @@ def test_tab_attach_refuses_what_it_cannot_serve(env):
             lambda: tab not in tab_ids(client), 20.0, f"tab {tab} to close"
         )
         with pytest.raises(RoostError) as gone:
-            attach_ticket(client, lease, tab)
+            attach_ticket(client, tab)
         assert gone.value.code == "not-found", gone.value
 
     env.stop_over_the_wire()
@@ -827,29 +720,24 @@ def test_a_matching_client_still_gets_ghostsnp_and_can_ask_for_vt(env):
         assert identity["payload_kinds"] == [dataplane.GHOSTTY_SNAPSHOT, dataplane.VT], (
             identity["payload_kinds"]
         )
-        # R4's op parameter is feature-detected, not probed for with an
-        # `unknown-field` — same channel, asserted where the kinds are.
-        assert "tab_dump_scrollback" in identity["features"], identity["features"]
-
-        lease = connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
 
         # Fidelity first: an unskewed client is served the snapshot,
         # which `vt` never displaces.
         both = attach_ticket(
-            client, lease, tab, kinds=[dataplane.GHOSTTY_SNAPSHOT, dataplane.VT]
+            client, tab, kinds=[dataplane.GHOSTTY_SNAPSHOT, dataplane.VT]
         )
         assert both["kind"] == dataplane.GHOSTTY_SNAPSHOT, both
 
         # And a client that asks for `vt` alone gets it whatever its
         # build says — the kind has no build requirement, so the string
         # is not consulted at all.
-        assert attach_ticket(client, lease, tab, kinds=[dataplane.VT])["kind"] == (
+        assert attach_ticket(client, tab, kinds=[dataplane.VT])["kind"] == (
             dataplane.VT
         )
         skewed = attach_ticket(
-            client, lease, tab, kinds=[dataplane.VT], libghostty_build=SKEWED_BUILD
+            client, tab, kinds=[dataplane.VT], libghostty_build=SKEWED_BUILD
         )
         assert skewed["kind"] == dataplane.VT, skewed
 
@@ -873,7 +761,6 @@ def test_a_build_skew_lands_on_vt_unless_the_client_offers_nothing_else(env):
 
     with env.client() as client:
         assert client.call("session.identify")["libghostty_build"] == SKEWED_BUILD
-        lease = connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
         # This client's own pin, which the session no longer matches.
@@ -881,7 +768,6 @@ def test_a_build_skew_lands_on_vt_unless_the_client_offers_nothing_else(env):
 
         fallback = attach_ticket(
             client,
-            lease,
             tab,
             kinds=[dataplane.GHOSTTY_SNAPSHOT, dataplane.VT],
             libghostty_build=mine,
@@ -891,7 +777,6 @@ def test_a_build_skew_lands_on_vt_unless_the_client_offers_nothing_else(env):
         with pytest.raises(RoostError) as refused:
             attach_ticket(
                 client,
-                lease,
                 tab,
                 kinds=[dataplane.GHOSTTY_SNAPSHOT],
                 libghostty_build=mine,
@@ -903,7 +788,7 @@ def test_a_build_skew_lands_on_vt_unless_the_client_offers_nothing_else(env):
         # "I have never heard of that one".
         with pytest.raises(RoostError) as unknown:
             attach_ticket(
-                client, lease, tab, kinds=["sixel-mosaic"], libghostty_build=mine
+                client, tab, kinds=["sixel-mosaic"], libghostty_build=mine
             )
         assert unknown.value.code == "unsupported-kind", unknown.value
 
@@ -927,25 +812,23 @@ def test_the_legacy_kinds_knob_restores_the_pre_vt_session(env):
             identity["payload_kinds"]
         )
 
-        lease = connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
 
         # Not advertised is not servable: `vt` is refused as a kind this
         # session has never heard of, not as one it declined to serve.
         with pytest.raises(RoostError) as unknown:
-            attach_ticket(client, lease, tab, kinds=[dataplane.VT])
+            attach_ticket(client, tab, kinds=[dataplane.VT])
         assert unknown.value.code == "unsupported-kind", unknown.value
 
         assert attach_ticket(
-            client, lease, tab, kinds=[dataplane.GHOSTTY_SNAPSHOT, dataplane.VT]
+            client, tab, kinds=[dataplane.GHOSTTY_SNAPSHOT, dataplane.VT]
         )["kind"] == dataplane.GHOSTTY_SNAPSHOT
 
         # And the refusal the UI's restart prompt is raised from.
         with pytest.raises(RoostError) as mismatch:
             attach_ticket(
                 client,
-                lease,
                 tab,
                 kinds=[dataplane.GHOSTTY_SNAPSHOT, dataplane.VT],
                 libghostty_build=SKEWED_BUILD,
@@ -976,13 +859,12 @@ def test_ready_leads_the_snapshot_and_the_seqs_are_contiguous(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
         seed(client, tab, seed_bytes(400))
         wait_dump_contains(client, tab, "seed-0399")
 
-        conn, reply, _ticket = attached(env, client, lease, tab)
+        conn, reply, _ticket = attached(env, client, tab)
         assert reply.mode == "snapshot", reply
         conn.read_until_finish()
 
@@ -1032,14 +914,13 @@ def test_finish_arrives_under_a_flooding_producer(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         tab = flooding_tab(client, project, env.launch_cwd)
         # The producer is running before the attach, so the snapshot is
         # taken against a tab that is already spewing.
         wait_dump_contains(client, tab, "spam")
 
-        conn, reply, _ticket = attached(env, client, lease, tab)
+        conn, reply, _ticket = attached(env, client, tab)
         assert reply.mode == "snapshot", reply
         conn.read_frames_until(
             lambda f: conn.snap.finish_seen or f.frame_type == dataplane.FRAME_ERROR,
@@ -1125,14 +1006,13 @@ def test_a_vt_payload_always_ends_in_one_empty_snap(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         flooded = wide_tab_seeded(
             client, project, env.launch_cwd, ["/bin/sh", "-c", "exec sleep 300"]
         )
 
         conn, reply, _ticket = attached_as(
-            env, client, lease, flooded, dataplane.VT, cols=WIDE_COLS
+            env, client, flooded, dataplane.VT, cols=WIDE_COLS
         )
         assert reply.mode == "snapshot", reply
         # Seeded and confirmed landed before a single frame is read.
@@ -1167,7 +1047,7 @@ def test_a_vt_payload_always_ends_in_one_empty_snap(env):
         client.close_tab(flooded)
 
         fresh = quiet_tab(client, project, env.launch_cwd)
-        conn, _reply, _ticket = attached_as(env, client, lease, fresh, dataplane.VT)
+        conn, _reply, _ticket = attached_as(env, client, fresh, dataplane.VT)
         conn.read_until_finish()
         assert conn.snap.terminator_frames == 1, conn.snap.terminator_frames
         assert conn.snap_frames == 2, (
@@ -1196,16 +1076,15 @@ def test_a_child_dying_inside_a_vt_payload_still_gets_exit_last(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         dying = wide_tab_seeded(
             client, project, env.launch_cwd, ["/bin/sh", "-c", "read _"]
         )
 
         conn, _reply, _ticket = attached_as(
-            env, client, lease, dying, dataplane.VT, cols=WIDE_COLS
+            env, client, dying, dataplane.VT, cols=WIDE_COLS
         )
-        client.send(dying, b"\n", lease=lease)
+        client.send(dying, b"\n")
         sessionlib.wait_until(
             lambda: dying not in tab_ids(client),
             30.0,
@@ -1241,13 +1120,12 @@ def test_the_vt_payload_carries_a_row_for_every_row_the_dump_reports(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
         seed(client, tab, seed_bytes(400))
         wait_dump_contains(client, tab, "seed-0399")
 
-        conn, _reply, _ticket = attached_as(env, client, lease, tab, dataplane.VT)
+        conn, _reply, _ticket = attached_as(env, client, tab, dataplane.VT)
         conn.read_until_finish()
         conn.close()
 
@@ -1292,13 +1170,12 @@ def test_resume_replays_the_ring_with_no_snapshot(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
         seed(client, tab, seed_bytes(100))
         wait_dump_contains(client, tab, "seed-0099")
 
-        first, reply, ticket = attached(env, client, lease, tab)
+        first, _reply, ticket = attached(env, client, tab)
         first.read_until_finish()
         resume_from = first.next_seq
         first.close()
@@ -1308,7 +1185,7 @@ def test_resume_replays_the_ring_with_no_snapshot(env):
         client.tab_feed_pty_bytes(tab, b"MISSED-WHILE-AWAY\r\n")
         wait_dump_contains(client, tab, "MISSED-WHILE-AWAY")
 
-        again = attach_ticket(client, lease, tab)
+        again = attach_ticket(client, tab)
         conn, resumed = dial(
             env,
             again,
@@ -1366,13 +1243,12 @@ def test_a_restarted_daemon_never_resumes_a_stale_stream(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
         seed(client, tab, seed_bytes(50))
         wait_dump_contains(client, tab, "seed-0049")
 
-        conn, _reply, old_ticket = attached(env, client, lease, tab)
+        conn, _reply, old_ticket = attached(env, client, tab)
         conn.read_until_finish()
         conn.close()
 
@@ -1381,14 +1257,13 @@ def test_a_restarted_daemon_never_resumes_a_stale_stream(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         # The layout rehydrates as fresh shells, so the ids are new: the
         # tab is found by the cwd it was restored into.
         restored = [t for t in client.tabs() if t["cwd"] == str(env.launch_cwd)]
         assert restored, client.tabs()
         tab = int(restored[0]["id"])
 
-        first, reply, fresh_ticket = attached(env, client, lease, tab)
+        first, _reply, fresh_ticket = attached(env, client, tab)
         first.read_until_finish()
         assert fresh_ticket["server_epoch"] != old_ticket["server_epoch"], (
             "a restarted session reused its predecessor's epoch"
@@ -1405,7 +1280,7 @@ def test_a_restarted_daemon_never_resumes_a_stale_stream(env):
         # consume the ring, so the same seq is still covered below.
         honest, honest_reply = dial(
             env,
-            attach_ticket(client, lease, tab),
+            attach_ticket(client, tab),
             resume_from_seq=resume_from,
             server_epoch=fresh_ticket["server_epoch"],
             tab_generation=fresh_ticket["tab_generation"],
@@ -1418,7 +1293,7 @@ def test_a_restarted_daemon_never_resumes_a_stale_stream(env):
         # the dead process's, and that alone forces the full snapshot.
         stale, stale_reply = dial(
             env,
-            attach_ticket(client, lease, tab),
+            attach_ticket(client, tab),
             resume_from_seq=resume_from,
             server_epoch=old_ticket["server_epoch"],
             tab_generation=old_ticket["tab_generation"],
@@ -1448,7 +1323,6 @@ def test_exit_is_the_final_frame_on_a_natural_child_exit(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         tab = open_tab(
             client,
@@ -1457,7 +1331,7 @@ def test_exit_is_the_final_frame_on_a_natural_child_exit(env):
             ["/bin/sh", "-c", "read line; echo done; exit 0"],
         )
 
-        conn, reply, _ticket = attached(env, client, lease, tab)
+        conn, _reply, _ticket = attached(env, client, tab)
         conn.read_until_finish()
 
         conn.send_input(b"go\n")
@@ -1489,11 +1363,10 @@ def test_a_disconnect_leaves_the_tab_running_but_a_stop_labels_it(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
 
-        conn, _reply, _ticket = attached(env, client, lease, tab)
+        conn, _reply, _ticket = attached(env, client, tab)
         conn.read_until_ready()
         conn.close()
 
@@ -1502,7 +1375,7 @@ def test_a_disconnect_leaves_the_tab_running_but_a_stop_labels_it(env):
 
         # And the tab is still attachable, so nothing about the detach
         # left the pipeline in a half state.
-        conn, _reply, _ticket = attached(env, client, lease, tab)
+        conn, _reply, _ticket = attached(env, client, tab)
         conn.read_until_ready()
 
         # Mid-attach, from another connection: the stop runs while this
@@ -1534,10 +1407,9 @@ def test_a_sigkilled_daemon_drops_the_attach_and_a_restart_recovers(env):
     launch = started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
-        conn, _reply, _ticket = attached(env, client, lease, tab)
+        conn, _reply, _ticket = attached(env, client, tab)
         conn.read_until_ready()
 
     os.kill(launch.verdict.pid, signal.SIGKILL)
@@ -1691,14 +1563,14 @@ def test_tab_dump_serves_history_above_the_viewport(env):
 # ---------------------------------------------------------------------------
 
 
-def measure_ready(env, client: Roost, lease: str, tab: int) -> float:
+def measure_ready(env, client: Roost, tab: int) -> float:
     """Seconds from handshake-send to the READY tag landing.
 
     The ticket is minted outside the window on purpose: what a user waits
     for is the stream, and the control round trip that precedes it is
     already covered by every other case here.
     """
-    ticket = attach_ticket(client, lease, tab)
+    ticket = attach_ticket(client, tab)
     conn = DataPlane(env.socket)
     try:
         started_at = time.monotonic()
@@ -1720,13 +1592,12 @@ def test_attaching_to_a_2000_line_tab_reaches_ready_fast(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
         seed(client, tab, seed_bytes(2000))
         wait_dump_contains(client, tab, "seed-1999", timeout=60.0)
 
-        samples = [measure_ready(env, client, lease, tab) for _ in range(3)]
+        samples = [measure_ready(env, client, tab) for _ in range(3)]
 
     median = statistics.median(samples)
     budget = scaled_timeout(READY_BUDGET)
@@ -1753,7 +1624,6 @@ def test_eight_concurrent_attaches_to_distinct_tabs_reach_ready(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         tabs = []
         for index in range(8):
@@ -1767,7 +1637,7 @@ def test_eight_concurrent_attaches_to_distinct_tabs_reach_ready(env):
         # and eight threads do not contend on one control connection.
         # The connection stays open across the dials: a ticket is
         # reclaimed when the connection that minted it closes.
-        tickets = [attach_ticket(client, lease, tab) for tab in tabs]
+        tickets = [attach_ticket(client, tab) for tab in tabs]
 
         elapsed: dict[int, float] = {}
         failures: list[Exception] = []
@@ -1824,10 +1694,9 @@ def test_input_latency_holds_up_under_dump_load(env):
     started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         tab = open_tab(client, project, env.launch_cwd, ["/bin/sh", "-c", "exec cat"])
-        conn, _reply, _ticket = attached(env, client, lease, tab)
+        conn, _reply, _ticket = attached(env, client, tab)
         conn.read_until_finish()
         drain_pending(conn)
 
@@ -1947,12 +1816,11 @@ def test_a_slow_reader_is_cut_off_and_a_re_attach_succeeds(env):
     launch = started(env)
 
     with env.client() as client:
-        lease = connect_lease(client)
         project = first_project(client)
         tab = flooding_tab(client, project, env.launch_cwd)
         wait_dump_contains(client, tab, "spam")
 
-        conn, reply, _ticket = attached(env, client, lease, tab)
+        conn, reply, _ticket = attached(env, client, tab)
         assert reply.ok
 
         # Read nothing while the producer runs. Sampling every 250 ms
@@ -1970,7 +1838,7 @@ def test_a_slow_reader_is_cut_off_and_a_re_attach_succeeds(env):
         conn.close()
 
         # No thrash loop: the very next attach is served normally.
-        again, reply, _ticket = attached(env, client, lease, tab)
+        again, reply, _ticket = attached(env, client, tab)
         assert reply.ok
         again.read_until_ready(timeout=60.0)
         again.close()

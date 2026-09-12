@@ -28,10 +28,10 @@ use roost_ipc::dataframe::{
 use roost_ipc::framing::{write_frame, FrameReader};
 use roost_ipc::messages::{
     ops, AttachAccepted, AttachHandshakeReply, AttachMode, AttachPayloadKind, ResponseError,
-    SessionConnectParams, SessionConnectResult, SessionStopParams, SessionStopResult,
-    TabAttachParams, TabAttachResult, TabCapturePtyInputParams, TabCapturePtyInputResult,
-    TabCloseParams, TabDumpParams, TabDumpResult, TabFeedPtyBytesParams, TabOpenParams,
-    TabOpenResult, TabResizeParams, WireTabRef, SESSION_PROTOCOL_VERSION,
+    SessionStopParams, SessionStopResult, TabAttachParams, TabAttachResult,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabCloseParams, TabDumpParams,
+    TabDumpResult, TabFeedPtyBytesParams, TabOpenParams, TabOpenResult, TabResizeParams,
+    WireTabRef, SESSION_PROTOCOL_VERSION,
 };
 use roost_ipc::{IpcClient, IpcServer};
 use tempfile::TempDir;
@@ -133,28 +133,18 @@ impl Harness {
         IpcClient::connect(&self.socket).await.expect("connect")
     }
 
-    /// A connected client holding the lease, plus a live tab parked on
-    /// `cat` — a child that keeps its PTY open and echoes nothing on its
-    /// own, so every byte on the wire is one the test caused.
-    async fn leased_tab(&self) -> (IpcClient, String, i64) {
-        self.leased_tab_sized(0, 0).await
+    /// A control connection plus a live tab parked on `cat` — a child
+    /// that keeps its PTY open and echoes nothing on its own, so every
+    /// byte on the wire is one the test caused.
+    async fn live_tab(&self) -> (IpcClient, i64) {
+        self.live_tab_sized(0, 0).await
     }
 
     /// The same, at an explicit geometry. Width is what a snapshot's
     /// size follows, so the one test that needs a multi-frame snapshot
     /// asks for a wide tab rather than trying to type its way there.
-    async fn leased_tab_sized(&self, cols: u32, rows: u32) -> (IpcClient, String, i64) {
+    async fn live_tab_sized(&self, cols: u32, rows: u32) -> (IpcClient, i64) {
         let mut client = self.control().await;
-        let lease: SessionConnectResult = client
-            .call(
-                ops::SESSION_CONNECT,
-                SessionConnectParams {
-                    takeover: false,
-                    client_label: None,
-                },
-            )
-            .await
-            .expect("session.connect");
         let project = self
             .workspace
             .create_project("p", "/tmp")
@@ -173,16 +163,17 @@ impl Harness {
             )
             .await
             .expect("tab.open");
-        (client, lease.lease, opened.tab.id)
+        (client, opened.tab.id)
     }
 
     /// The preamble every "what happens on a live connection" test
-    /// shares: a leased client, a tab attached at the default geometry,
-    /// and a data connection that has already read its snapshot through
-    /// FINISH — so the next frame is whatever the test causes.
+    /// shares: a control connection, a tab attached at the default
+    /// geometry, and a data connection that has already read its
+    /// snapshot through FINISH — so the next frame is whatever the test
+    /// causes.
     async fn attached(&self) -> (IpcClient, i64, DataClient) {
-        let (mut client, lease, tab_id) = self.leased_tab().await;
-        let ticket = attach(&mut client, &lease, tab_id).await;
+        let (mut client, tab_id) = self.live_tab().await;
+        let ticket = attach(&mut client, tab_id).await;
         let (_accepted, mut data) = dial(&self.socket, handshake(&ticket.attach_token))
             .await
             .expect("accepted");
@@ -196,18 +187,14 @@ impl Harness {
     async fn attached_at(
         &self,
         client: &mut IpcClient,
-        lease: &str,
         tab_id: i64,
         grid: (u16, u16),
         cell: (u16, u16),
         focus: bool,
     ) -> (AttachAccepted, DataClient) {
-        let ticket = attach_with(
-            client,
-            sized_attach_params(lease, tab_id, grid, cell, focus),
-        )
-        .await
-        .expect("tab.attach");
+        let ticket = attach_with(client, sized_attach_params(tab_id, grid, cell, focus))
+            .await
+            .expect("tab.attach");
         let (accepted, mut data) = dial(&self.socket, handshake(&ticket.attach_token))
             .await
             .expect("accepted");
@@ -219,9 +206,9 @@ impl Harness {
     /// the data connection dropped the way a client's would be. The seq
     /// is the last record that client applied — what it would carry into
     /// `resume_from_seq + 1`.
-    async fn caught_up(&self) -> (IpcClient, String, i64, u64) {
-        let (mut client, lease, tab_id) = self.leased_tab().await;
-        let ticket = attach(&mut client, &lease, tab_id).await;
+    async fn caught_up(&self) -> (IpcClient, i64, u64) {
+        let (mut client, tab_id) = self.live_tab().await;
+        let ticket = attach(&mut client, tab_id).await;
         let (accepted, mut data) = dial(&self.socket, handshake(&ticket.attach_token))
             .await
             .expect("accepted");
@@ -233,19 +220,18 @@ impl Harness {
         feed(&mut client, tab_id, b"ROOST_CAUGHT_UP\r\n".to_vec()).await;
         let (applied, _) = data.read_pty_until(after, b"ROOST_CAUGHT_UP").await;
         drop(data);
-        (client, lease, tab_id, applied)
+        (client, tab_id, applied)
     }
 }
 
-async fn attach(client: &mut IpcClient, lease: &str, tab_id: i64) -> TabAttachResult {
-    attach_with(client, attach_params(lease, tab_id))
+async fn attach(client: &mut IpcClient, tab_id: i64) -> TabAttachResult {
+    attach_with(client, attach_params(tab_id))
         .await
         .expect("tab.attach")
 }
 
-fn attach_params(lease: &str, tab_id: i64) -> TabAttachParams {
+fn attach_params(tab_id: i64) -> TabAttachParams {
     TabAttachParams {
-        lease: Some(lease.to_string()),
         tab_id,
         kinds: vec![
             AttachPayloadKind::from("sixel-mosaic-v9"),
@@ -264,7 +250,6 @@ fn attach_params(lease: &str, tab_id: i64) -> TabAttachParams {
 /// geometry claim: `true` resizes the tab, `false` attaches at whatever
 /// size it already is.
 fn sized_attach_params(
-    lease: &str,
     tab_id: i64,
     (cols, rows): (u16, u16),
     (cell_w_px, cell_h_px): (u16, u16),
@@ -276,7 +261,7 @@ fn sized_attach_params(
         cell_w_px,
         cell_h_px,
         focus,
-        ..attach_params(lease, tab_id)
+        ..attach_params(tab_id)
     }
 }
 
@@ -553,8 +538,8 @@ async fn wait_for_dump(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_snapshot_attach_streams_ready_then_finish_then_live_frames() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
-    let ticket = attach(&mut client, &lease, tab_id).await;
+    let (mut client, tab_id) = h.live_tab().await;
+    let ticket = attach(&mut client, tab_id).await;
     assert_eq!(
         ticket.kind.as_str(),
         AttachPayloadKind::GHOSTTY_SNAPSHOT,
@@ -604,11 +589,11 @@ async fn a_snapshot_attach_streams_ready_then_finish_then_live_frames() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resize_frame_reaches_the_tabs_terminal() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (mut client, tab_id) = h.live_tab().await;
 
     // `tab.attach` resizes to the geometry the client asked for before
     // it ever mints a token.
-    let mut params = attach_params(&lease, tab_id);
+    let mut params = attach_params(tab_id);
     params.cols = 100;
     params.rows = 30;
     let ticket = attach_with(&mut client, params).await.expect("tab.attach");
@@ -670,8 +655,8 @@ async fn an_input_frame_reaches_the_pty() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exit_is_the_final_frame() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
-    let ticket = attach(&mut client, &lease, tab_id).await;
+    let (mut client, tab_id) = h.live_tab().await;
+    let ticket = attach(&mut client, tab_id).await;
     let (accepted, mut data) = dial(&h.socket, handshake(&ticket.attach_token))
         .await
         .expect("accepted");
@@ -722,8 +707,8 @@ async fn an_unknown_token_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_token_is_consumed_by_its_first_use() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
-    let ticket = attach(&mut client, &lease, tab_id).await;
+    let (mut client, tab_id) = h.live_tab().await;
+    let ticket = attach(&mut client, tab_id).await;
 
     let (_accepted, _data) = dial(&h.socket, handshake(&ticket.attach_token))
         .await
@@ -778,10 +763,10 @@ async fn a_malformed_handshake_is_answered_as_a_rejection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_first_servable_and_eligible_kind_wins() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (mut client, tab_id) = h.live_tab().await;
     let skewed = "ghostty-0000000000000000+snapshot.v1";
 
-    let mut both = attach_params(&lease, tab_id);
+    let mut both = attach_params(tab_id);
     both.kinds = vec![
         AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT),
         AttachPayloadKind::from(AttachPayloadKind::VT),
@@ -809,7 +794,7 @@ async fn the_first_servable_and_eligible_kind_wins() {
     );
 
     for build in [roost_vt::libghostty_build(), skewed.to_string()] {
-        let mut vt_only = attach_params(&lease, tab_id);
+        let mut vt_only = attach_params(tab_id);
         vt_only.kinds = vec![AttachPayloadKind::from(AttachPayloadKind::VT)];
         vt_only.libghostty_build = build.clone();
         assert_eq!(
@@ -829,9 +814,9 @@ async fn the_first_servable_and_eligible_kind_wins() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_ghostsnp_only_client_is_unaffected_by_vt() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (mut client, tab_id) = h.live_tab().await;
 
-    let mut only = attach_params(&lease, tab_id);
+    let mut only = attach_params(tab_id);
     only.kinds = vec![AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT)];
     assert_eq!(
         attach_with(&mut client, only.clone())
@@ -857,9 +842,9 @@ async fn a_ghostsnp_only_client_is_unaffected_by_vt() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unadvertised_kind_is_not_servable() {
     let h = harness_advertising(&[AttachPayloadKind::GHOSTTY_SNAPSHOT]).await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (mut client, tab_id) = h.live_tab().await;
 
-    let mut vt_only = attach_params(&lease, tab_id);
+    let mut vt_only = attach_params(tab_id);
     vt_only.kinds = vec![AttachPayloadKind::from(AttachPayloadKind::VT)];
     assert_eq!(
         attach_with(&mut client, vt_only).await.unwrap_err(),
@@ -876,9 +861,9 @@ async fn an_unadvertised_kind_is_not_servable() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_advertised_kind_with_no_rule_is_refused() {
     let h = harness_advertising(&["sixel-mosaic-v9"]).await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (mut client, tab_id) = h.live_tab().await;
 
-    let mut mystery = attach_params(&lease, tab_id);
+    let mut mystery = attach_params(tab_id);
     mystery.kinds = vec![AttachPayloadKind::from("sixel-mosaic-v9")];
     assert_eq!(
         attach_with(&mut client, mystery).await.unwrap_err(),
@@ -892,30 +877,30 @@ async fn an_advertised_kind_with_no_rule_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_control_op_refuses_what_cannot_be_served() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (mut client, tab_id) = h.live_tab().await;
 
-    let mut unknown_kind = attach_params(&lease, tab_id);
+    let mut unknown_kind = attach_params(tab_id);
     unknown_kind.kinds = vec![AttachPayloadKind::from("sixel-mosaic-v9")];
     assert_eq!(
         attach_with(&mut client, unknown_kind).await.unwrap_err(),
         "unsupported-kind"
     );
 
-    let mut wrong_build = attach_params(&lease, tab_id);
+    let mut wrong_build = attach_params(tab_id);
     wrong_build.libghostty_build = "ghostty-0000000000000000+snapshot.v1".into();
     assert_eq!(
         attach_with(&mut client, wrong_build).await.unwrap_err(),
         "build-mismatch"
     );
 
-    let mut zero_grid = attach_params(&lease, tab_id);
+    let mut zero_grid = attach_params(tab_id);
     zero_grid.rows = 0;
     assert_eq!(
         attach_with(&mut client, zero_grid).await.unwrap_err(),
         "invalid-param"
     );
 
-    let mut missing_tab = attach_params(&lease, tab_id + 9_999);
+    let mut missing_tab = attach_params(tab_id + 9_999);
     missing_tab.kinds = vec![AttachPayloadKind::from("sixel-mosaic-v9")];
     assert_eq!(
         attach_with(&mut client, missing_tab).await.unwrap_err(),
@@ -966,16 +951,16 @@ async fn an_oversized_frame_ends_the_connection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_attaches_to_one_tab_both_stream_and_both_type() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (mut client, tab_id) = h.live_tab().await;
 
-    let first = attach(&mut client, &lease, tab_id).await;
+    let first = attach(&mut client, tab_id).await;
     let (a_accepted, mut a) = dial(&h.socket, handshake(&first.attach_token))
         .await
         .expect("accepted");
     let (_snapshot, pty) = a.read_snapshot().await;
     let a_at = pty.last().map_or(a_accepted.seq, |(seq, _)| *seq);
 
-    let second = attach(&mut client, &lease, tab_id).await;
+    let second = attach(&mut client, tab_id).await;
     let (b_accepted, mut b) = dial(&h.socket, handshake(&second.attach_token))
         .await
         .expect("the first attach is untouched and a second is admitted");
@@ -1001,15 +986,15 @@ async fn two_attaches_to_one_tab_both_stream_and_both_type() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropping_one_of_several_data_connections_removes_only_its_entry() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (mut client, tab_id) = h.live_tab().await;
 
-    let leaving = attach(&mut client, &lease, tab_id).await;
+    let leaving = attach(&mut client, tab_id).await;
     let (_accepted, mut going) = dial(&h.socket, handshake(&leaving.attach_token))
         .await
         .expect("accepted");
     going.read_snapshot().await;
 
-    let staying = attach(&mut client, &lease, tab_id).await;
+    let staying = attach(&mut client, tab_id).await;
     let (accepted, mut data) = dial(&h.socket, handshake(&staying.attach_token))
         .await
         .expect("accepted");
@@ -1031,12 +1016,11 @@ async fn dropping_one_of_several_data_connections_removes_only_its_entry() {
     assert_eq!(error_of(&data.frame().await).code, "shutting-down");
 }
 
-/// An attach takes no lease, so a session can be serving a data
-/// connection having never minted one — and a stop owes that connection
-/// the same labeled close as any other. The registry's own walk is what
-/// pins this: the closer used to be reachable only through the lease.
+/// A stop owes a data connection the same labeled close as a control
+/// one. The registry's own walk is what pins it: this connection ran
+/// nothing but `tab.open` and `tab.attach`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_stop_labels_a_data_connection_on_a_session_that_never_minted_a_lease() {
+async fn a_stop_labels_a_data_connection_that_only_ever_attached() {
     let h = harness().await;
     let mut client = h.control().await;
     let project = h
@@ -1058,15 +1042,9 @@ async fn a_stop_labels_a_data_connection_on_a_session_that_never_minted_a_lease(
         .await
         .expect("tab.open");
 
-    let ticket = attach_with(
-        &mut client,
-        TabAttachParams {
-            lease: None,
-            ..attach_params("", opened.tab.id)
-        },
-    )
-    .await
-    .expect("an attach on a session with no lease at all");
+    let ticket = attach_with(&mut client, attach_params(opened.tab.id))
+        .await
+        .expect("tab.attach");
     let (_accepted, mut data) = dial(&h.socket, handshake(&ticket.attach_token))
         .await
         .expect("accepted");
@@ -1079,41 +1057,6 @@ async fn a_stop_labels_a_data_connection_on_a_session_that_never_minted_a_lease(
 
     assert_eq!(error_of(&data.frame().await).code, "shutting-down");
     assert!(data.next().await.is_none());
-}
-
-/// The lease is accepted and ignored on an attach: absent, empty, and a
-/// token this session has already displaced all negotiate a ticket.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn tab_attach_accepts_no_lease_an_empty_lease_and_a_stale_one() {
-    let h = harness().await;
-    let (mut client, stale, tab_id) = h.leased_tab().await;
-    let mut taker = h.control().await;
-    let _taken: SessionConnectResult = taker
-        .call(
-            ops::SESSION_CONNECT,
-            SessionConnectParams {
-                takeover: true,
-                client_label: None,
-            },
-        )
-        .await
-        .expect("session.connect with takeover");
-
-    for lease in [None, Some(String::new()), Some(stale.clone())] {
-        let ticket = attach_with(
-            &mut client,
-            TabAttachParams {
-                lease: lease.clone(),
-                ..attach_params("", tab_id)
-            },
-        )
-        .await
-        .unwrap_or_else(|code| panic!("attach refused {code} for lease={lease:?}"));
-        let (_accepted, mut data) = dial(&h.socket, handshake(&ticket.attach_token))
-            .await
-            .expect("accepted");
-        data.read_snapshot().await;
-    }
 }
 
 // ---------------------------------------------------------------------
@@ -1174,13 +1117,13 @@ fn index_of(captured: &[u8], needle: &[u8]) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_input_frame_applies_its_connections_geometry_first() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (mut client, tab_id) = h.live_tab().await;
 
     let (_desktop, _a) = h
-        .attached_at(&mut client, &lease, tab_id, (100, 30), (8, 16), true)
+        .attached_at(&mut client, tab_id, (100, 30), (8, 16), true)
         .await;
     let (_phone, mut b) = h
-        .attached_at(&mut client, &lease, tab_id, (60, 20), (8, 16), false)
+        .attached_at(&mut client, tab_id, (60, 20), (8, 16), false)
         .await;
     wait_for_dump(&mut client, tab_id, "the focused attach's geometry", |d| {
         (d.cols, d.rows) == (100, 30)
@@ -1215,13 +1158,13 @@ async fn an_input_frame_applies_its_connections_geometry_first() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn same_grid_different_cell_metrics_still_counts_as_a_change() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (mut client, tab_id) = h.live_tab().await;
 
     let (_accepted, mut same) = h
-        .attached_at(&mut client, &lease, tab_id, (100, 30), (8, 16), true)
+        .attached_at(&mut client, tab_id, (100, 30), (8, 16), true)
         .await;
     let (_accepted, mut wider_cells) = h
-        .attached_at(&mut client, &lease, tab_id, (100, 30), (9, 16), false)
+        .attached_at(&mut client, tab_id, (100, 30), (9, 16), false)
         .await;
 
     watch_size_reports(&mut client, tab_id).await;
@@ -1250,10 +1193,10 @@ async fn same_grid_different_cell_metrics_still_counts_as_a_change() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_grid_resize_keeps_the_cell_metrics_a_client_declared() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (mut client, tab_id) = h.live_tab().await;
 
     let (_accepted, _data) = h
-        .attached_at(&mut client, &lease, tab_id, (100, 30), (9, 18), true)
+        .attached_at(&mut client, tab_id, (100, 30), (9, 18), true)
         .await;
     watch_size_reports(&mut client, tab_id).await;
 
@@ -1276,10 +1219,10 @@ async fn a_grid_resize_keeps_the_cell_metrics_a_client_declared() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_grid_resize_to_the_size_the_tab_already_has_reports_nothing() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (mut client, tab_id) = h.live_tab().await;
 
     let (_accepted, _data) = h
-        .attached_at(&mut client, &lease, tab_id, (100, 30), (9, 18), true)
+        .attached_at(&mut client, tab_id, (100, 30), (9, 18), true)
         .await;
     watch_size_reports(&mut client, tab_id).await;
 
@@ -1305,13 +1248,13 @@ async fn a_grid_resize_to_the_size_the_tab_already_has_reports_nothing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_senders_linearize_in_receive_order() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (mut client, tab_id) = h.live_tab().await;
 
     let (_accepted, mut desktop) = h
-        .attached_at(&mut client, &lease, tab_id, (100, 30), (8, 16), true)
+        .attached_at(&mut client, tab_id, (100, 30), (8, 16), true)
         .await;
     let (_accepted, mut phone) = h
-        .attached_at(&mut client, &lease, tab_id, (60, 20), (8, 16), false)
+        .attached_at(&mut client, tab_id, (60, 20), (8, 16), false)
         .await;
 
     // Sequenced, not raced: each marker is read back before the next
@@ -1334,9 +1277,9 @@ async fn two_senders_linearize_in_receive_order() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_zero_sized_resize_frame_is_ignored() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (mut client, tab_id) = h.live_tab().await;
     let (_accepted, mut data) = h
-        .attached_at(&mut client, &lease, tab_id, (100, 30), (8, 16), true)
+        .attached_at(&mut client, tab_id, (100, 30), (8, 16), true)
         .await;
 
     let mut payload = Vec::new();
@@ -1370,10 +1313,10 @@ async fn a_zero_sized_resize_frame_is_ignored() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unfocused_attach_never_resizes_and_reports_the_snapshot_geometry() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (mut client, tab_id) = h.live_tab().await;
 
     let (desktop, _a) = h
-        .attached_at(&mut client, &lease, tab_id, (100, 30), (8, 16), true)
+        .attached_at(&mut client, tab_id, (100, 30), (8, 16), true)
         .await;
     assert_eq!(
         (desktop.snapshot_cols, desktop.snapshot_rows),
@@ -1382,7 +1325,7 @@ async fn an_unfocused_attach_never_resizes_and_reports_the_snapshot_geometry() {
     );
 
     let (phone, _b) = h
-        .attached_at(&mut client, &lease, tab_id, (60, 20), (8, 16), false)
+        .attached_at(&mut client, tab_id, (60, 20), (8, 16), false)
         .await;
     assert_eq!(
         (phone.snapshot_cols, phone.snapshot_rows),
@@ -1412,13 +1355,13 @@ async fn an_unfocused_attach_never_resizes_and_reports_the_snapshot_geometry() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_focused_attach_reports_the_size_it_was_actually_encoded_at() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (mut client, tab_id) = h.live_tab().await;
 
     // The attach negotiates 100x30 and mints a ticket. Nothing has been
     // dialed yet, so nothing has been encoded yet either.
     let ticket = attach_with(
         &mut client,
-        sized_attach_params(&lease, tab_id, (100, 30), (8, 16), true),
+        sized_attach_params(tab_id, (100, 30), (8, 16), true),
     )
     .await
     .expect("tab.attach");
@@ -1449,9 +1392,9 @@ async fn a_focused_attach_reports_the_size_it_was_actually_encoded_at() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dump_never_resizes() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
+    let (mut client, tab_id) = h.live_tab().await;
     let (_accepted, mut data) = h
-        .attached_at(&mut client, &lease, tab_id, (100, 30), (8, 16), true)
+        .attached_at(&mut client, tab_id, (100, 30), (8, 16), true)
         .await;
 
     let d = dump(&mut client, tab_id).await;
@@ -1542,58 +1485,42 @@ async fn a_session_stop_labels_a_live_data_connection() {
     assert!(data.next().await.is_none());
 }
 
-/// A ticket belongs to the connection that minted it, not to a lease
-/// (plan 057, R15): a takeover leaves every outstanding one usable, and
-/// what reclaims the quota is the minting connection going away.
+/// A ticket belongs to the connection that minted it, and what reclaims
+/// the quota is that connection going away.
 ///
 /// The quota is the registry's bound, so it has to be reclaimable
 /// without waiting out a TTL — a client that mints its whole share and
 /// vanishes must not lock everyone else out for a minute.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_takeover_keeps_tokens_and_a_departing_connection_purges_its_own() {
+async fn a_second_client_keeps_tokens_and_a_departing_connection_purges_its_own() {
     let h = harness().await;
-    let (mut old_client, old_lease, tab_id) = h.leased_tab().await;
-    let survivor = attach(&mut old_client, &old_lease, tab_id).await;
+    let (mut old_client, tab_id) = h.live_tab().await;
+    let survivor = attach(&mut old_client, tab_id).await;
 
     let mut new_client = h.control().await;
-    let _taken: SessionConnectResult = new_client
-        .call(
-            ops::SESSION_CONNECT,
-            SessionConnectParams {
-                takeover: true,
-                client_label: None,
-            },
-        )
-        .await
-        .expect("session.connect with takeover");
 
-    // The takeover took the foreground and nothing else: a ticket minted
-    // under the displaced lease still admits a data connection.
+    // A second client changes nothing: a ticket the first minted still
+    // admits a data connection.
     let (_accepted, mut data) = dial(&h.socket, handshake(&survivor.attach_token))
         .await
-        .expect("a ticket minted before the takeover is still admissible");
+        .expect("a ticket minted before the second client is still admissible");
     data.read_snapshot().await;
 
-    // The quota is per session, and the displaced client — still
-    // attaching on its stale lease, which is accepted and ignored —
-    // takes its full share of it. Filling the rest takes a second
-    // connection, because no single one may hold the whole pool.
+    // The quota is per session, and one connection takes its full share
+    // of it. Filling the rest takes a second connection, because no
+    // single one may hold the whole pool.
     let mut minted = Vec::new();
     for _ in 0..MAX_TOKENS_PER_CONNECTION {
-        minted.push(
-            attach(&mut old_client, &old_lease, tab_id)
-                .await
-                .attach_token,
-        );
+        minted.push(attach(&mut old_client, tab_id).await.attach_token);
     }
     let mut filler = h.control().await;
     for _ in 0..(MAX_OUTSTANDING_TOKENS - MAX_TOKENS_PER_CONNECTION) {
-        attach_with(&mut filler, attach_params("", tab_id))
+        attach_with(&mut filler, attach_params(tab_id))
             .await
             .expect("a second connection fills the rest of the pool");
     }
     assert_eq!(
-        attach_with(&mut new_client, attach_params("", tab_id))
+        attach_with(&mut new_client, attach_params(tab_id))
             .await
             .unwrap_err(),
         "too-many-tokens",
@@ -1605,7 +1532,7 @@ async fn a_takeover_keeps_tokens_and_a_departing_connection_purges_its_own() {
     drop(old_client);
     let deadline = Instant::now() + BUDGET;
     let ticket = loop {
-        match attach_with(&mut new_client, attach_params("", tab_id)).await {
+        match attach_with(&mut new_client, attach_params(tab_id)).await {
             Ok(ticket) => break ticket,
             Err(code) => {
                 assert_eq!(code, "too-many-tokens");
@@ -1630,31 +1557,29 @@ async fn a_takeover_keeps_tokens_and_a_departing_connection_purges_its_own() {
 
 /// One connection cannot hold the whole ticket pool (review F2).
 ///
-/// Before R15 minting required the lease, so only the foreground could
-/// reach the session-wide quota at all. Raw input is open now: any
-/// same-UID process can loop `tab.attach` without ever dialing, and
+/// Any same-UID process can loop `tab.attach` without ever dialing, and
 /// without a per-connection share one buggy script would answer the real
 /// UI's attach with `too-many-tokens` for a whole TTL.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_connection_cannot_mint_away_everybody_elses_attach() {
     let h = harness().await;
-    let (mut hog, lease, tab_id) = h.leased_tab().await;
+    let (mut hog, tab_id) = h.live_tab().await;
 
     for _ in 0..MAX_TOKENS_PER_CONNECTION {
-        attach(&mut hog, &lease, tab_id).await;
+        attach(&mut hog, tab_id).await;
     }
     assert_eq!(
-        attach_with(&mut hog, attach_params(&lease, tab_id))
+        attach_with(&mut hog, attach_params(tab_id))
             .await
             .unwrap_err(),
         "too-many-tokens",
         "its own share is spent"
     );
 
-    // And the session is not: another client — leaseless, as R15 allows
-    // — still gets a ticket, and a usable one.
+    // And the session is not: another client still gets a ticket, and a
+    // usable one.
     let mut other = h.control().await;
-    let ticket = attach_with(&mut other, attach_params("", tab_id))
+    let ticket = attach_with(&mut other, attach_params(tab_id))
         .await
         .expect("a second connection still has room in the pool");
     let (_accepted, mut data) = dial(&h.socket, handshake(&ticket.attach_token))
@@ -1668,8 +1593,8 @@ async fn one_connection_cannot_mint_away_everybody_elses_attach() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attach_after_the_stop_latch_is_refused() {
     let h = harness().await;
-    let (mut client, lease, tab_id) = h.leased_tab().await;
-    let ticket = attach(&mut client, &lease, tab_id).await;
+    let (mut client, tab_id) = h.live_tab().await;
+    let ticket = attach(&mut client, tab_id).await;
 
     let _report: SessionStopResult = client
         .call(ops::SESSION_STOP, SessionStopParams {})
@@ -1677,11 +1602,11 @@ async fn an_attach_after_the_stop_latch_is_refused() {
         .expect("session.stop");
 
     // Both halves: the control op, and a token minted before the stop.
-    // On a fresh connection because the stop closed every one the lease
-    // holder had — which is itself the point of registering them.
+    // On a fresh connection because the stop closed every one it had
+    // registered — which is itself the point of registering them.
     let mut after = h.control().await;
     assert_eq!(
-        attach_with(&mut after, attach_params(&lease, tab_id))
+        attach_with(&mut after, attach_params(tab_id))
             .await
             .unwrap_err(),
         "shutting-down"
@@ -1711,7 +1636,7 @@ async fn an_attach_after_the_stop_latch_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resume_replays_the_ring_and_sends_no_snapshot() {
     let h = harness().await;
-    let (mut client, lease, tab_id, applied) = h.caught_up().await;
+    let (mut client, tab_id, applied) = h.caught_up().await;
 
     // What the client misses while it is away. Dumped first so the ring
     // provably holds it before the handoff runs.
@@ -1724,7 +1649,7 @@ async fn a_resume_replays_the_ring_and_sends_no_snapshot() {
     })
     .await;
 
-    let ticket = attach(&mut client, &lease, tab_id).await;
+    let ticket = attach(&mut client, tab_id).await;
     let (accepted, mut data) = dial(
         &h.socket,
         resume_handshake(
@@ -1793,11 +1718,11 @@ async fn a_resume_replays_the_ring_and_sends_no_snapshot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resume_reports_the_geometry_the_ring_was_written_at() {
     let h = harness().await;
-    let (mut client, lease, tab_id, applied) = h.caught_up().await;
+    let (mut client, tab_id, applied) = h.caught_up().await;
 
     let ticket = attach_with(
         &mut client,
-        sized_attach_params(&lease, tab_id, (100, 30), (8, 16), true),
+        sized_attach_params(tab_id, (100, 30), (8, 16), true),
     )
     .await
     .expect("tab.attach");
@@ -1836,9 +1761,9 @@ async fn a_resume_reports_the_geometry_the_ring_was_written_at() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_empty_slice_resume_is_a_hit() {
     let h = harness().await;
-    let (mut client, lease, tab_id, applied) = h.caught_up().await;
+    let (mut client, tab_id, applied) = h.caught_up().await;
 
-    let ticket = attach(&mut client, &lease, tab_id).await;
+    let ticket = attach(&mut client, tab_id).await;
     let (accepted, mut data) = dial(
         &h.socket,
         resume_handshake(
@@ -1875,10 +1800,10 @@ async fn an_empty_slice_resume_is_a_hit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unhonorable_resume_triple_falls_back_to_a_snapshot() {
     let h = harness().await;
-    let (mut client, lease, tab_id, applied) = h.caught_up().await;
+    let (mut client, tab_id, applied) = h.caught_up().await;
 
     // Seq 0: a client holding nothing is asking for everything.
-    let ticket = attach(&mut client, &lease, tab_id).await;
+    let ticket = attach(&mut client, tab_id).await;
     falls_back(
         &h.socket,
         resume_handshake(
@@ -1893,7 +1818,7 @@ async fn an_unhonorable_resume_triple_falls_back_to_a_snapshot() {
 
     // The triple is all-or-nothing: a seq with no identity beside it
     // names a stream on no particular server.
-    let ticket = attach(&mut client, &lease, tab_id).await;
+    let ticket = attach(&mut client, tab_id).await;
     falls_back(
         &h.socket,
         serde_json::json!({
@@ -1908,7 +1833,7 @@ async fn an_unhonorable_resume_triple_falls_back_to_a_snapshot() {
     // A seq the tab has not reached yet: the client claims to hold
     // records that do not exist, which is the one direction a replay
     // could never fix.
-    let ticket = attach(&mut client, &lease, tab_id).await;
+    let ticket = attach(&mut client, tab_id).await;
     falls_back(
         &h.socket,
         resume_handshake(
@@ -1943,9 +1868,9 @@ async fn falls_back(socket: &Path, handshake: serde_json::Value, what: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_generation_mismatch_falls_back_to_a_snapshot() {
     let h = harness().await;
-    let (mut client, lease, tab_id, applied) = h.caught_up().await;
+    let (mut client, tab_id, applied) = h.caught_up().await;
 
-    let ticket = attach(&mut client, &lease, tab_id).await;
+    let ticket = attach(&mut client, tab_id).await;
     let (accepted, mut data) = dial(
         &h.socket,
         resume_handshake(
@@ -1973,9 +1898,9 @@ async fn a_generation_mismatch_falls_back_to_a_snapshot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_epoch_mismatch_falls_back_to_a_snapshot() {
     let h = harness().await;
-    let (mut client, lease, tab_id, applied) = h.caught_up().await;
+    let (mut client, tab_id, applied) = h.caught_up().await;
 
-    let ticket = attach(&mut client, &lease, tab_id).await;
+    let ticket = attach(&mut client, tab_id).await;
     let (accepted, mut data) = dial(
         &h.socket,
         resume_handshake(
@@ -1998,7 +1923,7 @@ async fn an_epoch_mismatch_falls_back_to_a_snapshot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_seq_the_ring_no_longer_covers_falls_back_to_a_snapshot() {
     let h = harness().await;
-    let (mut client, lease, tab_id, applied) = h.caught_up().await;
+    let (mut client, tab_id, applied) = h.caught_up().await;
 
     let mut flood = vec![b'.'; 3 * 1024 * 1024];
     flood.extend_from_slice(b"\r\nROOST_FLOOD_DONE\r\n");
@@ -2010,7 +1935,7 @@ async fn a_seq_the_ring_no_longer_covers_falls_back_to_a_snapshot() {
     })
     .await;
 
-    let ticket = attach(&mut client, &lease, tab_id).await;
+    let ticket = attach(&mut client, tab_id).await;
     let (accepted, mut data) = dial(
         &h.socket,
         resume_handshake(
@@ -2050,7 +1975,7 @@ async fn a_seq_the_ring_no_longer_covers_falls_back_to_a_snapshot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resumed_connection_replays_its_slice_then_exits() {
     let h = harness().await;
-    let (mut client, lease, tab_id, applied) = h.caught_up().await;
+    let (mut client, tab_id, applied) = h.caught_up().await;
 
     let missed = b"ROOST_LAST_WORDS\r\n";
     feed(&mut client, tab_id, missed.to_vec()).await;
@@ -2061,7 +1986,7 @@ async fn a_resumed_connection_replays_its_slice_then_exits() {
     })
     .await;
 
-    let ticket = attach(&mut client, &lease, tab_id).await;
+    let ticket = attach(&mut client, tab_id).await;
     let (accepted, mut data) = dial(
         &h.socket,
         resume_handshake(

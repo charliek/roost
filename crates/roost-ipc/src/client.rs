@@ -44,8 +44,7 @@ use crate::framing::{write_frame, FrameReader};
 use crate::messages::{
     ops, AttachAccepted, AttachHandshake, AttachHandshakeReply, EventBatch, EventsSubscribeParams,
     EventsSubscribeResult, IdentifyParams, IdentifyResult, RawRequest, Response, ResponseError,
-    SessionDriverChangedEvent, SessionStoppingEvent, SESSION_DRIVER_CHANGED_EVENT,
-    SESSION_STOPPING_EVENT,
+    SessionStoppingEvent, SESSION_STOPPING_EVENT,
 };
 use crate::Error;
 
@@ -172,12 +171,8 @@ impl IpcClient {
     /// a callable handle would be holding one that can only ever return
     /// an event-shaped frame to the wrong caller.
     ///
-    /// The lease is the one [`ops::SESSION_CONNECT`] handed out; without
-    /// a live one the server answers `connect-required`, and with one
-    /// another client has since taken, `taken-over` — see
-    /// [`ServerCode`].
-    pub async fn subscribe_events(self, lease: &str) -> Result<EventStream, ClientError> {
-        self.subscribe(lease, None, None).await
+    pub async fn subscribe_events(self) -> Result<EventStream, ClientError> {
+        self.subscribe(None, None).await
     }
 
     /// Resume a stream instead of starting one: `from_revision` is what
@@ -193,17 +188,15 @@ impl IpcClient {
     /// `tab.list` snapshot.
     pub async fn resume_events(
         self,
-        lease: &str,
         from_revision: u64,
         session_id: &str,
     ) -> Result<EventStream, ClientError> {
-        self.subscribe(lease, Some(from_revision), Some(session_id.to_string()))
+        self.subscribe(Some(from_revision), Some(session_id.to_string()))
             .await
     }
 
     async fn subscribe(
         mut self,
-        lease: &str,
         from_revision: Option<u64>,
         session_id: Option<String>,
     ) -> Result<EventStream, ClientError> {
@@ -211,7 +204,6 @@ impl IpcClient {
             .call(
                 ops::EVENTS_SUBSCRIBE,
                 EventsSubscribeParams {
-                    lease: lease.to_string(),
                     // HS-2 scope: subscribe unfiltered and filter
                     // client-side. A non-zero value is refused.
                     tab_id_filter: 0,
@@ -224,6 +216,7 @@ impl IpcClient {
             reader: self.reader,
             writer: self.writer,
             revision: ack.revision,
+            session_id: ack.session_id,
             next_revision: ack.revision.saturating_add(1),
             stopping: None,
         })
@@ -248,9 +241,6 @@ pub enum EventFrame {
     /// The stream is over and says why. Always the last frame before
     /// the close.
     Stopping(SessionStoppingEvent),
-    /// Another client took the driver lease. **Not terminal**: the
-    /// stream keeps delivering after it, as an observer.
-    DriverChanged(SessionDriverChangedEvent),
 }
 
 /// A subscribed connection, reading the server's push stream.
@@ -269,17 +259,15 @@ pub struct EventStream {
     #[allow(dead_code)]
     writer: OwnedWriteHalf,
     revision: u64,
+    session_id: String,
     next_revision: u64,
     stopping: Option<SessionStoppingEvent>,
 }
 
 impl EventStream {
     /// Dial `path` and subscribe on the connection in one step.
-    pub async fn connect(path: impl AsRef<Path>, lease: &str) -> Result<Self, ClientError> {
-        IpcClient::connect(path)
-            .await?
-            .subscribe_events(lease)
-            .await
+    pub async fn connect(path: impl AsRef<Path>) -> Result<Self, ClientError> {
+        IpcClient::connect(path).await?.subscribe_events().await
     }
 
     /// The ack's fence: the commit this subscription starts from.
@@ -291,9 +279,15 @@ impl EventStream {
         self.revision
     }
 
+    /// The incarnation that answered the subscribe —
+    /// [`EventsSubscribeResult::session_id`], which says why a client
+    /// compares it with the one `session.identify` returned.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     /// Why the stream ended, once the terminal envelope has arrived.
-    /// `"stop"` — the session is shutting down; `"taken-over"` —
-    /// another client took the lease.
+    /// `"stop"` — the session is shutting down.
     pub fn stopping_reason(&self) -> Option<&str> {
         self.stopping.as_ref().map(|s| s.reason.as_str())
     }
@@ -343,19 +337,6 @@ impl EventStream {
                     }
                     self.stopping = Some(stopping.clone());
                     return Ok(Some(EventFrame::Stopping(stopping)));
-                }
-                if name == SESSION_DRIVER_CHANGED_EVENT {
-                    // Deliberately not latched: the stopping latch
-                    // exists because that envelope is defined as the
-                    // last frame, and this one is defined as not.
-                    let changed: SessionDriverChangedEvent = value
-                        .get("data")
-                        .cloned()
-                        .map(serde_json::from_value)
-                        .transpose()
-                        .map_err(Error::from)?
-                        .unwrap_or_default();
-                    return Ok(Some(EventFrame::DriverChanged(changed)));
                 }
                 tracing::debug!(event = %name, "ignoring an unrecognized push envelope");
                 continue;
@@ -630,14 +611,7 @@ impl<W: AsyncWrite + Unpin> DataWriter<W> {
 /// newer server's, and losing it would make the log useless.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerCode {
-    // -- lease / session lifecycle ---------------------------------------
-    /// No live lease. Run `session.connect` and retry.
-    ConnectRequired,
-    /// Another client took the lease. Stop driving this session; a
-    /// deliberate reconnect is a takeover back.
-    TakenOver,
-    /// A lease is live and `takeover` was not set.
-    AlreadyConnected,
+    // -- session lifecycle -----------------------------------------------
     /// `session.stop` has latched.
     ShuttingDown,
     // -- events resume ---------------------------------------------------
@@ -663,7 +637,7 @@ pub enum ServerCode {
     InvalidParam,
     /// The handshake's `protocol_version` is not this session's.
     ProtocolMismatch,
-    /// Unknown, expired, already-used, or takeover-purged attach token.
+    /// Unknown, expired, or already-used attach token.
     InvalidToken,
     /// The terminal could not be encoded right now. Re-attach.
     SnapshotFailed,
@@ -685,11 +659,6 @@ pub enum ServerCode {
     Desync,
     /// The client is not reading fast enough.
     Overflow,
-    /// A newer data connection took this tab. Only a **pre-R15** session
-    /// emits it — a tab admits any number of data connections now — and
-    /// the decode stays so a current client still maps an older
-    /// session's supersede onto a clean detach.
-    Superseded,
     /// The client sent something the framing forbids.
     ProtocolError,
     // -- host routing (UI socket only) -----------------------------------
@@ -714,9 +683,6 @@ impl ServerCode {
     /// Map a wire code onto a variant.
     pub fn from_wire(code: &str) -> ServerCode {
         match code {
-            "connect-required" => ServerCode::ConnectRequired,
-            "taken-over" => ServerCode::TakenOver,
-            "already-connected" => ServerCode::AlreadyConnected,
             "shutting-down" => ServerCode::ShuttingDown,
             "replay-expired" => ServerCode::ReplayExpired,
             "revision-ahead" => ServerCode::RevisionAhead,
@@ -734,7 +700,6 @@ impl ServerCode {
             "store-full" => ServerCode::StoreFull,
             "desync" => ServerCode::Desync,
             "overflow" => ServerCode::Overflow,
-            "superseded" => ServerCode::Superseded,
             "protocol-error" => ServerCode::ProtocolError,
             "host-unavailable" => ServerCode::HostUnavailable,
             "unknown-op" => ServerCode::UnknownOp,
@@ -749,9 +714,6 @@ impl ServerCode {
     /// The wire spelling, round-tripping [`Self::from_wire`].
     pub fn as_str(&self) -> &str {
         match self {
-            ServerCode::ConnectRequired => "connect-required",
-            ServerCode::TakenOver => "taken-over",
-            ServerCode::AlreadyConnected => "already-connected",
             ServerCode::ShuttingDown => "shutting-down",
             ServerCode::ReplayExpired => "replay-expired",
             ServerCode::RevisionAhead => "revision-ahead",
@@ -769,7 +731,6 @@ impl ServerCode {
             ServerCode::StoreFull => "store-full",
             ServerCode::Desync => "desync",
             ServerCode::Overflow => "overflow",
-            ServerCode::Superseded => "superseded",
             ServerCode::ProtocolError => "protocol-error",
             ServerCode::HostUnavailable => "host-unavailable",
             ServerCode::UnknownOp => "unknown-op",
@@ -849,9 +810,6 @@ mod tests {
         // The catalogues in `ipc.md`: the response envelope's, the
         // handshake rejection's, and the data-plane ERROR frame's.
         for code in [
-            "connect-required",
-            "taken-over",
-            "already-connected",
             "shutting-down",
             "build-mismatch",
             "unsupported-kind",
@@ -866,7 +824,6 @@ mod tests {
             "store-full",
             "desync",
             "overflow",
-            "superseded",
             "protocol-error",
             "unknown-op",
             "not-implemented",
@@ -964,11 +921,11 @@ mod tests {
     fn an_error_frame_decodes_to_a_typed_code() {
         let frame = DataFrame {
             frame_type: FRAME_ERROR,
-            payload: br#"{"code":"superseded","message":"another connection"}"#.to_vec(),
+            payload: br#"{"code":"desync","message":"a gap in the seq"}"#.to_vec(),
         };
         match ServerFrame::decode(frame).unwrap() {
             ServerFrame::Error(error) => {
-                assert_eq!(ServerCode::from(&error), ServerCode::Superseded)
+                assert_eq!(ServerCode::from(&error), ServerCode::Desync)
             }
             other => panic!("expected an ERROR frame, got {other:?}"),
         }

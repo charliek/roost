@@ -7,8 +7,7 @@
 //! frame timing out there would drop the host. So the lane is its own
 //! task with its own bounded channel, its own connections and its own
 //! budget: a timeout or a dial failure fails that upload alone, and the
-//! host stays `Connected`. A takeover mid-upload arrives the same way,
-//! as that upload's refusal; the main connection alone decides host
+//! host stays `Connected` — the main connection alone decides host
 //! state.
 //!
 //! What ties the lane to the connection it belongs to is cancellation.
@@ -117,14 +116,6 @@ struct Upload {
 #[derive(Debug, Clone)]
 pub(crate) struct Uploads {
     lane: Arc<Mutex<Option<mpsc::Sender<Upload>>>>,
-    /// Why the lane is closed, when it is closed because another client
-    /// took the foreground rather than because the host went away (plan
-    /// 057 §3.5).
-    ///
-    /// An empty lane cannot tell the two apart on its own, and the two
-    /// are not the same sentence: one says the session is gone, the other
-    /// says it is right there and somebody else is driving it.
-    deposed: Arc<Mutex<Option<Deposed>>>,
     budget: Budget,
 }
 
@@ -138,49 +129,22 @@ impl Uploads {
     pub(crate) fn with_budget(budget: Budget) -> Uploads {
         Uploads {
             lane: Arc::new(Mutex::new(None)),
-            deposed: Arc::new(Mutex::new(None)),
             budget,
         }
-    }
-
-    /// Another client is the foreground: an upload asked from here is
-    /// refused as [`HostOpError::NotForeground`] until the foreground
-    /// comes back.
-    ///
-    /// The task calls it on the deposition edge, *after* the lane guard
-    /// has closed the lane — the guard is what stops a dispatcher dialing
-    /// `session.put_file` with a lease this client no longer holds, and
-    /// this only decides which sentence the refusal carries.
-    pub(crate) fn deposed(&self, label: &str, taken_by: Option<&str>) {
-        *self.locked_deposed() = Some(Deposed {
-            label: label.to_string(),
-            taken_by: taken_by.map(str::to_string),
-        });
-    }
-
-    /// This client drives again, or has stopped watching altogether:
-    /// whatever the lane answers from here on, it is not "somebody else
-    /// is driving".
-    pub(crate) fn foreground(&self) {
-        *self.locked_deposed() = None;
     }
 
     /// Open the lane for one incarnation and start its dispatcher.
     ///
     /// The returned guard is the incarnation's lifetime: dropping it
     /// empties the slot and cancels every upload, in flight or queued.
-    pub(crate) fn open(&self, socket: PathBuf, lease: String) -> Lane {
+    pub(crate) fn open(&self, socket: PathBuf) -> Lane {
         let (tx, rx) = mpsc::channel(QUEUE_DEPTH);
         let cancel = Arc::new(Shutdown::default());
-        // A lane exists only where the lease does, so opening one is the
-        // one edge that proves this client is the foreground again.
-        self.foreground();
         *self.locked() = Some(tx.clone());
         tokio::spawn(dispatch(
             rx,
             Wire {
                 socket,
-                lease,
                 budget: self.budget,
             },
             Arc::clone(&cancel),
@@ -205,10 +169,9 @@ impl Uploads {
         source: UploadSource,
     ) -> Result<oneshot::Receiver<UploadResult>, HostOpError> {
         let Some(lane) = self.locked().clone() else {
-            // No dispatcher means no lease. Which of the two reasons for
-            // that it is decides the sentence: a host that went away, or
-            // one that is right there under another client's foreground.
-            return Err(self.no_lane());
+            // No dispatcher: the lane exists only while an incarnation is
+            // connected, so there is nothing to carry this upload.
+            return Err(HostOpError::Disconnected);
         };
         let (tx, rx) = oneshot::channel();
         let upload = Upload {
@@ -241,32 +204,11 @@ impl Uploads {
         }
     }
 
-    /// Why there is no lane to enqueue onto.
-    fn no_lane(&self) -> HostOpError {
-        match self.locked_deposed().clone() {
-            Some(Deposed { label, taken_by }) => HostOpError::NotForeground { label, taken_by },
-            None => HostOpError::Disconnected,
-        }
-    }
-
     fn locked(&self) -> std::sync::MutexGuard<'_, Option<mpsc::Sender<Upload>>> {
         self.lane
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
-
-    fn locked_deposed(&self) -> std::sync::MutexGuard<'_, Option<Deposed>> {
-        self.deposed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
-
-/// Who holds the foreground this lane's host is not holding.
-#[derive(Debug, Clone)]
-struct Deposed {
-    label: String,
-    taken_by: Option<String>,
 }
 
 /// One incarnation's hold on its lane. See [`Uploads::open`].
@@ -293,7 +235,6 @@ impl Drop for Lane {
 #[derive(Clone)]
 struct Wire {
     socket: PathBuf,
-    lease: String,
     budget: Budget,
 }
 
@@ -369,8 +310,8 @@ async fn put_file(wire: Wire, name: String, source: UploadSource) -> UploadResul
     // 10 MiB file on an NFS `$HOME` must not park a runtime worker, and
     // neither may ever run where the winit thread could see it.
     let encoding = {
-        let (name, lease) = (name.clone(), wire.lease.clone());
-        tokio::task::spawn_blocking(move || encode(lease, name, source))
+        let name = name.clone();
+        tokio::task::spawn_blocking(move || encode(name, source))
     };
     let (bytes, params) = encoding
         .await
@@ -391,9 +332,9 @@ async fn put_file(wire: Wire, name: String, source: UploadSource) -> UploadResul
 /// Dial the host's socket afresh and send the one op.
 ///
 /// A connection per upload, the `tab.attach` precedent: the control
-/// client is serial and busy, and `require_lease` registers this
-/// connection under the same lease, so a takeover or a `session.stop`
-/// closes it too — as a per-upload failure.
+/// client is serial and busy, and the session registers every connection
+/// that sends an op, so a `session.stop` closes this one too — as a
+/// per-upload failure.
 async fn send(socket: &Path, params: serde_json::Value) -> Result<serde_json::Value, HostOpError> {
     let mut client = IpcClient::connect(socket)
         .await
@@ -408,11 +349,7 @@ async fn send(socket: &Path, params: serde_json::Value) -> Result<serde_json::Va
 }
 
 /// Read the source and build the frame's params. Blocking.
-fn encode(
-    lease: String,
-    name: String,
-    source: UploadSource,
-) -> Result<(u64, serde_json::Value), HostOpError> {
+fn encode(name: String, source: UploadSource) -> Result<(u64, serde_json::Value), HostOpError> {
     let data = match source {
         UploadSource::Path(path) => read_capped(&path, &name)?,
         UploadSource::Bytes(bytes) => bytes,
@@ -421,7 +358,7 @@ fn encode(
     if bytes > MAX_PUT_FILE_BYTES {
         return Err(too_large(&name, bytes));
     }
-    let params = serde_json::to_value(SessionPutFileParams { lease, name, data })
+    let params = serde_json::to_value(SessionPutFileParams { name, data })
         .map_err(|error| HostOpError::Local(format!("encoding the upload failed: {error}")))?;
     Ok((bytes, params))
 }
@@ -632,53 +569,6 @@ mod tests {
     #[tokio::test]
     async fn a_closed_lane_refuses_immediately() {
         let uploads = Uploads::default();
-        assert_eq!(
-            uploads
-                .enqueue("shot.png".into(), UploadSource::Bytes(vec![1]))
-                .err(),
-            Some(HostOpError::Disconnected)
-        );
-    }
-
-    /// The two reasons a lane can be closed are not the same sentence
-    /// (plan 057 §3.5): a deposed client's host is *right there* and
-    /// still serving its grid, and telling the user it disconnected
-    /// would be a lie about a session they can watch updating.
-    #[tokio::test]
-    async fn an_upload_while_deposed_is_refused_not_foreground_not_disconnected() {
-        let uploads = Uploads::default();
-        uploads.deposed("workbox", Some("a phone"));
-
-        let refusal = uploads
-            .enqueue("shot.png".into(), UploadSource::Bytes(vec![1]))
-            .expect_err("a deposed client has no lane");
-        assert_eq!(
-            refusal,
-            HostOpError::NotForeground {
-                label: "workbox".into(),
-                taken_by: Some("a phone".into()),
-            }
-        );
-        assert_eq!(
-            refusal.to_string(),
-            "workbox is driven by a phone; take the foreground first"
-        );
-
-        // A takeover this client only inferred names nobody, and the
-        // sentence still has to read.
-        uploads.deposed("workbox", None);
-        assert_eq!(
-            uploads
-                .enqueue("shot.png".into(), UploadSource::Bytes(vec![1]))
-                .expect_err("still no lane")
-                .to_string(),
-            "workbox is driven by another client; take the foreground first"
-        );
-
-        // Opening a lane is what proves the foreground came back, so a
-        // stale label can never outlive it.
-        let _lane = uploads.open(PathBuf::from("/nonexistent.sock"), "the-lease".into());
-        drop(_lane);
         assert_eq!(
             uploads
                 .enqueue("shot.png".into(), UploadSource::Bytes(vec![1]))

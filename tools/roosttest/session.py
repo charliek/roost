@@ -110,11 +110,6 @@ _SANITIZE = (
     "ROOST_SHELL_INTEGRATION",
     "ROOST_SOCKET",
     "ROOST_TAB_ID",
-    # The driver lease `roostctl tab send` presents against a session
-    # socket. A developer who exported one would make "an unleased write
-    # is accepted" a statement about their shell rather than about the
-    # session, so the unset case is the fixture's to guarantee.
-    "ROOST_LEASE",
     "ROOST_SESSION_BIN",
     "ROOST_SESSION_LAUNCH_CWD",
     # The test-mode build-string override (plan 037 §3.7). A stray value

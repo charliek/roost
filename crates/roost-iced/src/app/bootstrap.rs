@@ -166,8 +166,8 @@ pub(crate) enum LiveState {
     /// which is the Add Host entry's normal shape rather than a host
     /// that moved.
     Cold { qualifies: Option<bool> },
-    /// Connecting, connected at full fidelity, taken over, stopped —
-    /// anything the card was not planned against.
+    /// Connecting, connected at full fidelity, stopped — anything the
+    /// card was not planned against.
     Other,
 }
 
@@ -178,14 +178,11 @@ impl LiveState {
     /// Exactly one state does, and it is why both confirm paths
     /// disconnect the host before they start their job. From every
     /// other state there is nothing to tear down; from this one a live
-    /// driver stream races the reconnect ladder. If the bridge EOFs
-    /// before `session.stopping` arrives, `serve` returns `Dropped`,
-    /// the ladder dials a session mid-restart, the `held_lease` probe
-    /// answers `NotCurrent` against the new one, and the band says
-    /// `taken over` by nobody until the job's own reconnect. Handing
-    /// the session's lifecycle to the job for its duration is what
-    /// stops that; the retained rows keep drawing (plan 056 §3.3) and
-    /// the reconnect the job finishes with is unconditional.
+    /// stream races the reconnect ladder, which would dial the session
+    /// the job is in the middle of replacing. Handing the session's
+    /// lifecycle to the job for its duration is what stops that; the
+    /// retained rows keep drawing (plan 056 §3.3) and the reconnect the
+    /// job finishes with is unconditional.
     pub(crate) fn holds_a_live_stream(&self) -> bool {
         match self {
             Self::ConnectedReduced { .. } => true,
@@ -1104,9 +1101,9 @@ mod tests {
     ///
     /// Exhaustive on purpose: every other state is one where nothing is
     /// attached, and a variant added later must be decided rather than
-    /// defaulted. Getting this wrong is not cosmetic — a driver stream
-    /// left up under a restart races the reconnect ladder into a
-    /// `taken over` the band cannot explain.
+    /// defaulted. Getting this wrong is not cosmetic — a stream left up
+    /// under a restart races the reconnect ladder into the session the
+    /// job is replacing.
     #[test]
     fn only_a_live_connection_is_disconnected_before_the_job() {
         assert!(LiveState::ConnectedReduced {

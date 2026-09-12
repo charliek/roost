@@ -208,6 +208,49 @@ fn agent_report_vector_decodes_into_its_typed_params() {
     assert_eq!(result.tab.hook_active, roost_ipc::agent::is_live(&agent));
 }
 
+/// `tab.attach`'s request vectors, decoded into the typed params rather
+/// than round-tripped as a `Value`.
+///
+/// `focus` is why this exists. At protocol 4 it carried a serde default,
+/// so a vector could omit it and still decode — which is exactly what
+/// both vectors did, and generic round-tripping cannot see a struct field
+/// that is not there. At 5 it is required and always serialized, so an
+/// omission is a malformed request; this is what refuses one.
+#[test]
+fn the_attach_request_vectors_decode_into_their_typed_params() {
+    use roost_ipc::messages::{ops, AttachPayloadKind, RawRequest, TabAttachParams};
+
+    for name in ["tab.attach.request.json", "tab.attach.vt.request.json"] {
+        let mut path = vectors_dir();
+        path.push(name);
+        let raw = fs::read_to_string(&path).expect("read attach request vector");
+        let req: RawRequest = serde_json::from_str(&raw).expect("decode envelope");
+        assert_eq!(req.op, ops::TAB_ATTACH, "{name}");
+        let params: TabAttachParams = serde_json::from_value(req.params.clone())
+            .unwrap_or_else(|error| panic!("{name} must decode as TabAttachParams: {error}"));
+        assert!(
+            params.focus,
+            "{name}: an attach vector must state its geometry claim, not lean on a default",
+        );
+        assert!(
+            req.params
+                .get("focus")
+                .is_some_and(serde_json::Value::is_boolean),
+            "{name}: `focus` must be present on the wire, spelled as a bool",
+        );
+        assert_eq!(
+            params.kinds.first().map(AttachPayloadKind::as_str),
+            Some(AttachPayloadKind::GHOSTTY_SNAPSHOT),
+            "{name}: the snapshot kind stays first in every preference list, got {:?}",
+            params.kinds,
+        );
+        assert!(
+            params.cols > 0 && params.rows > 0,
+            "{name}: the grid is non-zero"
+        );
+    }
+}
+
 /// `app.sidebar_dump` is the newest read-only UI-state op; generic
 /// vector round-tripping (above) only proves the fixture is valid
 /// JSON, not that it matches `SidebarDumpResult`'s field names/types

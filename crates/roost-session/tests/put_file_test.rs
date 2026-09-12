@@ -23,7 +23,6 @@ const PNG: &[u8] = b"\x89PNG\r\n\x1a\n-- not really a png, but bytes are bytes -
 
 async fn put_file(
     client: &mut IpcClient,
-    lease: &str,
     name: &str,
     data: &[u8],
 ) -> Result<SessionPutFileResult, ClientError> {
@@ -31,7 +30,6 @@ async fn put_file(
         .call(
             ops::SESSION_PUT_FILE,
             SessionPutFileParams {
-                lease: lease.to_string(),
                 name: name.to_string(),
                 data: data.to_vec(),
             },
@@ -68,9 +66,8 @@ async fn an_uploaded_file_lands_private_under_a_pasteable_path() {
     let launch_cwd = layout.launch_cwd.clone();
     let served = layout.spawn(&launch_cwd);
     let mut client = support::connect(&layout.socket_path()).await;
-    let lease = support::session_connect(&mut client).await.lease;
 
-    let result = put_file(&mut client, &lease, "roost-image-1757083567-8f3a.png", PNG)
+    let result = put_file(&mut client, "roost-image-1757083567-8f3a.png", PNG)
         .await
         .expect("session.put_file");
 
@@ -113,8 +110,7 @@ async fn a_clean_stop_sweeps_the_store_and_so_does_the_next_start() {
 
     let served = layout.spawn(&launch_cwd);
     let mut client = support::connect(&layout.socket_path()).await;
-    let lease = support::session_connect(&mut client).await.lease;
-    let landed = put_file(&mut client, &lease, "design.pdf", PNG)
+    let landed = put_file(&mut client, "design.pdf", PNG)
         .await
         .expect("session.put_file")
         .path;
@@ -162,9 +158,8 @@ async fn an_unpasteable_root_falls_back_to_tmp() {
 
     let served = layout.spawn_config(config);
     let mut client = support::connect(&layout.socket_path()).await;
-    let lease = support::session_connect(&mut client).await.lease;
 
-    let result = put_file(&mut client, &lease, "shot.png", PNG)
+    let result = put_file(&mut client, "shot.png", PNG)
         .await
         .expect("session.put_file");
 
@@ -199,9 +194,8 @@ async fn a_store_that_cannot_be_created_answers_not_supported() {
 
     let served = layout.spawn_config(config);
     let mut client = support::connect(&layout.socket_path()).await;
-    let lease = support::session_connect(&mut client).await.lease;
 
-    let error = put_file(&mut client, &lease, "shot.png", PNG)
+    let error = put_file(&mut client, "shot.png", PNG)
         .await
         .expect_err("a session with no store cannot land a file");
     assert_eq!(code(&error), "not-supported");

@@ -170,8 +170,8 @@ impl VerbItem {
 }
 
 /// Whether a host is attached right now. `Connecting` is deliberately
-/// not connected: an attempt in flight holds no lease, so Stop and
-/// Disconnect have nothing to act on yet.
+/// not connected: an attempt in flight has reached no session yet, so
+/// Stop and Disconnect have nothing to act on.
 fn is_connected(state: SectionState) -> bool {
     matches!(state, SectionState::Connected)
 }
@@ -278,7 +278,6 @@ pub fn verbs(hosts: &[HostRow<'_>], policy: VerbPolicy) -> Vec<VerbItem> {
 fn connect_subtitle(state: SectionState) -> &'static str {
     match state {
         SectionState::NeedsRestart => "build mismatch — offers a restart",
-        SectionState::TakenOver => "take the session back",
         SectionState::Stopped => "starts a fresh session",
         _ => "starts it if needed",
     }
@@ -376,10 +375,6 @@ mod tests {
                 vec![ADD_ID, "host:connect:h", "host:remove:h"],
             ),
             (
-                SectionState::TakenOver,
-                vec![ADD_ID, "host:connect:h", "host:remove:h"],
-            ),
-            (
                 SectionState::Stopped,
                 vec![ADD_ID, "host:connect:h", "host:remove:h"],
             ),
@@ -400,7 +395,7 @@ mod tests {
     /// Stop is connected-only and Remove is not-connected-only, stated
     /// as the invariant rather than as a row list: the two must never be
     /// offered together, or the palette would let a user remove the
-    /// registry entry for a session it is holding a lease on.
+    /// registry entry for a session it is still connected to.
     #[test]
     fn stop_and_remove_are_never_offered_at_the_same_time() {
         for state in [
@@ -408,7 +403,6 @@ mod tests {
             SectionState::Connecting,
             SectionState::Disconnected,
             SectionState::NeedsRestart,
-            SectionState::TakenOver,
             SectionState::Stopped,
         ] {
             let items = verbs(&[host("h", state)], FULL);
@@ -552,12 +546,6 @@ mod tests {
                 vec![ADD_ID, "host:connect:h", "host:remove:h"],
             ),
             (
-                Localhost,
-                SectionState::TakenOver,
-                true,
-                vec![ADD_ID, "host:connect:h", "host:remove:h"],
-            ),
-            (
                 Socket,
                 SectionState::Connecting,
                 true,
@@ -588,7 +576,6 @@ mod tests {
             SectionState::Connecting,
             SectionState::Disconnected,
             SectionState::NeedsRestart,
-            SectionState::TakenOver,
             SectionState::Stopped,
         ] {
             for action in [

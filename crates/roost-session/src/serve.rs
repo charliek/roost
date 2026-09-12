@@ -320,8 +320,8 @@ pub async fn serve(
     )
     .with_session(session, stop_handle(&stop, files_root))
     // The install engine lives on this side of the seam and only this
-    // side: `roost-engine` decodes and lease-gates the op, the daemon
-    // owns the `$HOME` it writes (plan 046 §3.4).
+    // side: `roost-engine` decodes and admits the op, the daemon owns
+    // the `$HOME` it writes (plan 046 §3.4).
     .with_agent_hooks(crate::agent_hooks::handle());
     if let Some(store) = file_store {
         handler = handler.with_file_store(store);

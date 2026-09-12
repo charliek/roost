@@ -175,8 +175,8 @@ pub(crate) enum FailReason {
     /// `build-mismatch` — retrying cannot help; the host needs a restart
     /// (the C8 dialog drives that; the tab just stops).
     BuildMismatch(String),
-    /// The lease moved or the session is stopping — the host connection
-    /// owns the recovery; the tab detaches passively.
+    /// The session is going away — the host connection owns the
+    /// recovery; the tab detaches passively.
     HostGone(String),
     /// Anything transient: transport errors, `snapshot-failed`,
     /// `not-found` after a respawn race. Re-attach with backoff.
@@ -194,7 +194,7 @@ pub(super) enum AttachStep {
         delay: Duration,
     },
     /// Detach passively and stay detached: another window took the tab
-    /// (`superseded`), the lease moved, or the build mismatches. The
+    /// (`superseded`), the session is going, or the build mismatches. The
     /// host-level state (banner, NeedsRestart) is the connection's to
     /// publish, not this tab's.
     Detach,
@@ -368,13 +368,12 @@ impl HostAttach {
         self.kind
     }
 
-    /// Whether input queued here still has a reader (plan 057 §3.5).
+    /// Whether input queued here still has a reader.
     ///
     /// True for every phase but [`Phase::Ended`]. `Requesting` and
     /// `Hydrating` queue rather than drop — the input queue outlives an
     /// attempt, which is the whole reason it lives on the attach and not
-    /// on the attempt's task — and a *deposed* attach is `Live` like any
-    /// other, because a takeover closes nothing.
+    /// on the attempt's task.
     pub(super) fn live(&self) -> bool {
         !matches!(self.phase, Phase::Ended)
     }
@@ -408,15 +407,12 @@ impl HostAttach {
                 "cell_w_px": geometry.cell_w,
                 "cell_h_px": geometry.cell_h,
                 "libghostty_build": libghostty_build,
+                // Attach is on-focus in this client, so the claim is
+                // always true. Stated rather than omitted: protocol 5
+                // requires the field, and the omit-when-true shim that
+                // used to cover this is gone.
+                "focus": true,
             }),
-            // Lease **if available**, never required (plan 057 §3.5):
-            // an `open_input` session ignores the field, and one release
-            // older decodes `TabAttachParams::lease` as a required
-            // `String` — so a client that stopped presenting the lease it
-            // holds would fail every attach against it. A deposed
-            // connection presents none, which only such a session cares
-            // about and it is not one of them.
-            crate::host_conn::LeasePolicy::IfAvailable,
         );
         let input_rx = Arc::clone(&self.input_rx);
         let task = tokio::spawn(run_attempt(
@@ -623,12 +619,7 @@ impl HostAttach {
             HostTabFrame::Error { code, message, .. } => {
                 let mapped = ServerCode::from_wire(&code);
                 match mapped {
-                    ServerCode::Superseded => {
-                        // Another window took the tab: this one lets go.
-                        self.phase = Phase::Ended;
-                        AttachStep::Detach
-                    }
-                    ServerCode::TakenOver | ServerCode::ShuttingDown => {
+                    ServerCode::ShuttingDown => {
                         // Host-level: the events connection sees the
                         // same fate and the connection state machine
                         // owns the banner. The tab detaches passively.
@@ -1033,9 +1024,7 @@ fn negotiated_kind(
 fn reason_for(code: Option<&ServerCode>, message: String) -> FailReason {
     match code {
         Some(ServerCode::BuildMismatch) => FailReason::BuildMismatch(message),
-        Some(ServerCode::TakenOver | ServerCode::ConnectRequired | ServerCode::ShuttingDown) => {
-            FailReason::HostGone(message)
-        }
+        Some(ServerCode::ShuttingDown) => FailReason::HostGone(message),
         _ => FailReason::Retryable(message),
     }
 }
@@ -1049,13 +1038,9 @@ fn classify_op_failure(error: &crate::host_conn::queue::HostOpError) -> FailReas
         // token mint at all; grouped with the two that do not retry
         // because an unexplained client-side refusal is not something a
         // second attach attempt would fix either.
-        // `NotForeground` cannot reach a token mint either — `tab.attach`
-        // is `LeasePolicy::IfAvailable` and a deposed task serves it —
-        // and it is grouped here for the same reason `Local` is.
-        HostOpError::Disconnected
-        | HostOpError::Unavailable
-        | HostOpError::Local(_)
-        | HostOpError::NotForeground { .. } => FailReason::HostGone(error.to_string()),
+        HostOpError::Disconnected | HostOpError::Unavailable | HostOpError::Local(_) => {
+            FailReason::HostGone(error.to_string())
+        }
         HostOpError::Transport(_) => FailReason::Retryable(error.to_string()),
     }
 }
@@ -1157,7 +1142,7 @@ async fn run_attempt(
     let mut rx = input_rx.lock().await;
     // ONE loop over both halves, and only the READER decides when the
     // attempt is over. A write error just parks the writer branch: the
-    // server labels its closes (`superseded`, `taken-over`, `ERROR`
+    // server labels its closes (`superseded`, `ERROR`
     // desync…), and cancelling the reader on a write failure would lose
     // the label already queued behind it — turning a passive detach
     // into a re-attach loop. The queue keeps buffering for the retry.
@@ -1277,43 +1262,6 @@ mod tests {
             attach.input_tx(),
         );
         (attach, tab, feed_tx, feed_rx)
-    }
-
-    /// `tab.attach` is lease-**if-available**, and both halves of that
-    /// are load-bearing (plan 057 §3.5).
-    ///
-    /// A session advertising `open_input` ignores the field, so a deposed
-    /// client attaching without one is admitted — which is what keeps its
-    /// tabs switchable after a takeover. A session one release older
-    /// decodes `TabAttachParams::lease` as a required `String` and
-    /// refuses a missing key and a `null` alike, so a client that stopped
-    /// presenting the lease it holds would fail *every* attach against
-    /// it.
-    #[tokio::test]
-    async fn the_attach_intent_presents_a_lease_when_one_is_held_and_none_when_deposed() {
-        let (mut attach, _tab, feed_tx, _feed_rx) = rig();
-        let (ops, mut ops_rx) = crate::host_conn::HostOps::channel();
-
-        attach.begin(
-            &ops,
-            std::path::PathBuf::from("/nonexistent/roost-attach-lease.sock"),
-            "gb",
-            &feed_tx,
-        );
-
-        let intent = ops_rx.try_recv().expect("the attach intent is enqueued");
-        assert_eq!(intent.op, ops::TAB_ATTACH);
-        assert_eq!(intent.lease, crate::host_conn::LeasePolicy::IfAvailable);
-        assert_eq!(
-            intent.lease.present("the-lease"),
-            Some("the-lease"),
-            "the foreground presents what it holds, because an older session needs it"
-        );
-        assert_eq!(
-            intent.lease.present(""),
-            None,
-            "and a deposed client presents nothing rather than an empty claim"
-        );
     }
 
     fn accepted(resumed: bool, fence: u64) -> HostTabFrame {
@@ -1570,13 +1518,11 @@ mod tests {
         assert!(matches!(attach.phase, Phase::Requesting));
     }
 
-    /// The ERROR-code table: `superseded` and `taken-over` detach
-    /// passively (someone else drives now), `overflow`/`desync` rebuild.
+    /// The ERROR-code table: `shutting-down` detaches passively (the
+    /// host connection owns the recovery), `overflow`/`desync` rebuild.
     #[tokio::test]
     async fn error_codes_map_to_their_recoveries() {
         for (code, detaches) in [
-            ("superseded", true),
-            ("taken-over", true),
             ("shutting-down", true),
             ("overflow", false),
             ("desync", false),

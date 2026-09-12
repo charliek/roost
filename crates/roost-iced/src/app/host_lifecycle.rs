@@ -163,7 +163,6 @@ pub(super) fn dial_saved_host(
             socket,
             HostTransport::LocalSession,
             mode,
-            cause,
         ),
         ResolvedTransport::UnixSocket(socket) => hosts.connect(
             &host.id,
@@ -171,7 +170,6 @@ pub(super) fn dial_saved_host(
             socket,
             HostTransport::UnixSocket,
             mode,
-            cause,
         ),
         ResolvedTransport::Ssh(target) => {
             hosts.open_ssh(&host.id, &host.label, target, mode, origin, cause)

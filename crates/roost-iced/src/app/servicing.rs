@@ -49,8 +49,8 @@ const CODES_A_UI_SOCKET_ALSO_SPEAKS: [&str; 12] = [
 /// `message` is the session's own, not `Display` (which prefixes the
 /// code and would double it).
 ///
-/// Everything else folds onto `host-unavailable`: a lease or lifecycle
-/// code, and any code a newer or older session invents. That matters
+/// Everything else folds onto `host-unavailable`: a lifecycle code, and
+/// any code a newer or older session invents. That matters
 /// because `ipc.md` tells a client to treat an unlisted code as fatal
 /// for the request, so passing an unbounded set through would put codes
 /// on the UI socket that its own contract says cannot appear there.
@@ -516,12 +516,9 @@ fn notification_activation(
 /// backlog.
 ///
 /// A session's own workspace has no window, so what it suppresses is
-/// decided by what this client tells it: `session.set_focus` (plan 038
-/// §C6) pushes the selection + window-focus truth down at every edge
-/// that moves it, and the session's `attention_suppressed_by_focus`
-/// then reads the same focus the user has. A session too old to serve
-/// that op refuses it harmlessly and keeps HS-2's behavior — its
-/// attached tab suppresses its own `notification.fired`.
+/// decided by what its clients tell it: `session.set_focus` (plan 038
+/// §C6) states the tab this client is looking at, at every edge that
+/// moves it, and the session mutes a tab while any client says so.
 #[derive(Debug)]
 enum HostEnvelopeAction {
     Effect(roost_ipc::messages::TabEffectEvent),
@@ -532,13 +529,6 @@ enum HostEnvelopeAction {
     TabClosed(i64),
     /// The project is gone: retire every row under it.
     ProjectDeleted(i64),
-    /// The session's active row moved. Only interesting when it moved
-    /// *away* from this client's focus claim — a lease-less third party
-    /// (`tab.focus`, `tab.open`) can park the session's selection on a
-    /// tab nobody is watching, which the suppression predicate would
-    /// then mute at the source until this client's next natural edge.
-    /// Re-asserting the claim closes that window.
-    ActiveMoved(i64),
     /// A workspace fact the mirror already folded in, or an event from a
     /// newer session this client does not know. Both are silent by
     /// contract (`ipc.md` #versioning: old clients ignore new events).
@@ -581,12 +571,63 @@ fn host_envelope_action(envelope: &roost_ipc::messages::EventEnvelope) -> HostEn
             .map_or_else(HostEnvelopeAction::Undecodable, |event| {
                 HostEnvelopeAction::ProjectDeleted(event.project_id)
             }),
-        ops::EVENT_ACTIVE_CHANGED => decode::<roost_ipc::messages::ActiveChangedEvent>(envelope)
-            .map_or_else(HostEnvelopeAction::Undecodable, |event| {
-                HostEnvelopeAction::ActiveMoved(event.tab_id)
-            }),
         _ => HostEnvelopeAction::Ignore,
     }
+}
+
+/// Queue a host tab's OSC 52 write, if it is addressed to the tab this
+/// client is looking at. Split out from the `App` so the rule can be
+/// driven without one.
+///
+/// **A clipboard write lands only on the viewed tab.** A session-wide
+/// effect reaching every subscriber means a copy in a tab someone else is
+/// driving would otherwise overwrite the clipboard of a phone parked on a
+/// different tab. `viewed` is this client's own selection, never the
+/// mirror's session-wide `active_tab_id`, and it is deliberately not
+/// ANDed with window focus: a copy in the tab you are looking at lands
+/// whether or not the window has focus, as it does in tmux. Attach phase
+/// is not consulted either — a copy in the selected tab lands while that
+/// tab is still hydrating.
+fn apply_host_clipboard_effect(
+    clipboard: &mut ClipboardQueue,
+    policy: config::ClipboardWrite,
+    viewed: TabKey,
+    key: TabKey,
+    effect: &roost_ipc::messages::TabEffectEvent,
+) -> bool {
+    if key != viewed {
+        return false;
+    }
+    let Some(data) = effect.data.as_deref() else {
+        return false;
+    };
+    let Ok(bytes) = roost_ipc::messages::bytes_base64::decode(data) else {
+        tracing::debug!(%key, "clipboard effect with undecodable payload");
+        return false;
+    };
+    let target = match effect.target.unwrap_or_default() {
+        roost_ipc::messages::ClipboardEffectTarget::System => {
+            roost_engine::osc::ClipboardTarget::System
+        }
+        roost_ipc::messages::ClipboardEffectTarget::Selection => {
+            roost_engine::osc::ClipboardTarget::Selection
+        }
+    };
+    // Reject rather than repair: the local OSC 52 parser refuses
+    // non-UTF-8 payloads, and a peer that sends one must not get
+    // replacement-altered text onto the clipboard here either.
+    let Ok(text) = String::from_utf8(bytes) else {
+        tracing::debug!(%key, "clipboard effect payload is not UTF-8; dropped");
+        return false;
+    };
+    if !enqueue_osc_clipboard_write(clipboard, policy, target, text) {
+        tracing::info!(
+            %key,
+            "host OSC 52 clipboard write dropped — clipboard-write = deny"
+        );
+        return false;
+    }
+    true
 }
 
 /// The inbox rows one instance's project list currently owes, in
@@ -1195,13 +1236,6 @@ impl App {
                 HostEnvelopeAction::ProjectDeleted(project_id) => {
                     self.retire_project_notifications(ProjectKey::new(host, project_id));
                 }
-                HostEnvelopeAction::ActiveMoved(tab_id) => {
-                    // Our own set_focus echoes back as a move that
-                    // matches the claim, so this cannot ping-pong.
-                    if self.hosts.focus_claim_disagrees(host, tab_id) {
-                        self.push_host_focus();
-                    }
-                }
                 HostEnvelopeAction::Undecodable(error) => tracing::debug!(
                     ?host, event = %envelope.event, %error,
                     "a host event envelope did not decode"
@@ -1246,13 +1280,22 @@ impl App {
         self.desktop_notifications.fire(key, title, body);
     }
 
-    /// Apply one `tab.effect` envelope from a connected host: bell rings
-    /// the notification inbox (the app's attention surface — local tabs
-    /// have no bell path, so this is the closest existing one), and an
-    /// OSC 52 write lands on this client's clipboard under the same
-    /// config policy a local tab's write obeys. The caller chains the
-    /// returned task — it is the queue pump, exactly as
+    /// Apply one `tab.effect` envelope from a connected host. The caller
+    /// chains the returned task — it is the queue pump, exactly as
     /// `apply_osc_actions`'s tail is for a local write.
+    ///
+    /// **A bell marks whatever tab rang**, ungated: every subscriber
+    /// receives every effect now, and a mark on a background tab is what
+    /// a bell is for — the attention surface is where the user goes
+    /// looking. It clears where every attention marker clears, on focus
+    /// (`app.rs`'s focus edge). Recording it rather than upserting the
+    /// row is deliberate: the reconcile derives rows from the mirror and
+    /// prunes anything it did not declare, so an upsert here would be
+    /// erased microseconds later. That is also why a key the mirror does
+    /// not carry yet is recorded rather than refused — an effect can beat
+    /// the snapshot that first names its tab, and gating on membership
+    /// would drop that bell for good instead of showing it one reconcile
+    /// later.
     fn apply_host_effect(
         &mut self,
         host: HostId,
@@ -1261,56 +1304,24 @@ impl App {
         let key = TabKey::new(host, effect.tab_id);
         match effect.effect {
             roost_ipc::messages::TabEffect::Bell => {
-                // Record that this tab rang, then let the ordinary
-                // reconcile derive the row from it. Upserting the row
-                // here instead would put an undeclared row in a set the
-                // reconcile prunes against the mirror, and the next
-                // reconcile would erase it — which is exactly what a
-                // bell used to do: arrive, and vanish before anyone saw
-                // it. It clears where every attention marker clears, on
-                // focus.
                 if self.host_bells.insert(key) {
                     self.reconcile_notification_inbox();
                 }
                 UiTask::None
             }
             roost_ipc::messages::TabEffect::ClipboardWrite => {
-                let Some(data) = effect.data.as_deref() else {
-                    return UiTask::None;
-                };
-                let Ok(bytes) = roost_ipc::messages::bytes_base64::decode(data) else {
-                    tracing::debug!(%key, "clipboard effect with undecodable payload");
-                    return UiTask::None;
-                };
-                let target = match effect.target.unwrap_or_default() {
-                    roost_ipc::messages::ClipboardEffectTarget::System => {
-                        roost_engine::osc::ClipboardTarget::System
-                    }
-                    roost_ipc::messages::ClipboardEffectTarget::Selection => {
-                        roost_engine::osc::ClipboardTarget::Selection
-                    }
-                };
-                // Reject rather than repair: the local OSC 52 parser
-                // refuses non-UTF-8 payloads, and a peer that sends one
-                // must not get replacement-altered text onto the
-                // clipboard here either.
-                let Ok(text) = String::from_utf8(bytes) else {
-                    tracing::debug!(%key, "clipboard effect payload is not UTF-8; dropped");
-                    return UiTask::None;
-                };
-                if !enqueue_osc_clipboard_write(
+                let viewed = self.active_tab_key();
+                if apply_host_clipboard_effect(
                     &mut self.clipboard,
                     self.config.clipboard_write,
-                    target,
-                    text,
+                    viewed,
+                    key,
+                    effect,
                 ) {
-                    tracing::info!(
-                        %key,
-                        "host OSC 52 clipboard write dropped — clipboard-write = deny"
-                    );
-                    return UiTask::None;
+                    self.clipboard.start_next()
+                } else {
+                    UiTask::None
                 }
-                self.clipboard.start_next()
             }
         }
     }
@@ -1560,10 +1571,10 @@ impl App {
                     }
                     // Effects ride the batch verbatim and are applied
                     // here, before the mirror folds the commit away.
-                    // Lease-holder-only is structural: this stream only
-                    // flows while our connection holds the lease — a
-                    // displaced client's events connection is closed at
-                    // takeover before the new holder can generate any.
+                    // Nothing is filtered on the way in: the session
+                    // publishes every effect to every subscriber, and
+                    // which of them this client acts on is decided
+                    // below — see `apply_host_clipboard_effect`.
                     if let crate::host_conn::HostWorkspaceEvent::Applied { events, .. } = &event {
                         task = task.then(self.apply_host_envelopes(host, events));
                     }
@@ -1600,16 +1611,14 @@ impl App {
                             if let Err(error) = self.workspace.touch_host_connected(host) {
                                 tracing::debug!(%host, %error, "could not stamp last_connected");
                             }
-                            // A session that just came up believes it is
-                            // focused on its own restored tab, and the
-                            // connect task cannot know better — the
-                            // selection is the UI's. Told here, on the
-                            // edge where the lease exists and the queue
-                            // is draining.
+                            // A session mutes nothing until a client
+                            // says what it is looking at, and the
+                            // connect task cannot say — the selection is
+                            // the UI's. Told here, on the edge where the
+                            // queue is draining.
                             self.push_host_focus();
-                            // Same edge, same reason: the lease exists
-                            // and the queue is draining. Every connect,
-                            // with this client's current config — see
+                            // Same edge, same reason. Every connect, with
+                            // this client's current config — see
                             // `HostConnSet::wire_agent_hooks`.
                             self.wire_host_agent_hooks(host);
                         }
@@ -1629,9 +1638,6 @@ impl App {
                     // a state change moves both, and `try_next` marked
                     // the batch for the reconcile that rebuilds them.
                 }
-                // Nothing renders off it — it is kept for the outage a
-                // later drop opens (plan 040 §3.7).
-                EngineFeed::HostLease(host, lease) => self.hosts.apply_lease(host, lease),
                 EngineFeed::HostConnectFacts(host, facts) => {
                     self.hosts.note_connect_facts(host, facts)
                 }
@@ -2150,10 +2156,8 @@ impl App {
                     }
                     None => (host_sidebar::SectionState::Disconnected, None, None),
                 };
-                // Taken before `host.id` is moved into the view. The
-                // band's reason, not `host.status`'s: a taken-over host's
-                // is the taker's name.
-                let reason = self.hosts.band_reason(&host.id).map(str::to_string);
+                // Taken before `host.id` is moved into the view.
+                let reason = self.hosts.section_reason(&host.id).map(str::to_string);
                 let reduced_fidelity = self.hosts.reduced_fidelity(&host.id);
                 super::HostView {
                     saved_id: host.id,
@@ -2963,9 +2967,9 @@ impl App {
     /// report the state it left the host in.
     ///
     /// `connecting` rather than `connected` is the honest answer — the
-    /// dial, the identify and the lease are a round trip this reply does
-    /// not wait for, and a client that wants the settled verdict watches
-    /// the section (or asks again).
+    /// dial, the identify and the prologue are a round trip this reply
+    /// does not wait for, and a client that wants the settled verdict
+    /// watches the section (or asks again).
     ///
     /// `test_user_origin` is `HostConnectParams::test_user_origin`,
     /// already gated in `roost-engine` on nothing — the test-mode check
@@ -3086,14 +3090,6 @@ impl App {
                 last_connected: host.last_connected,
                 generation: self.hosts.generation(&host.id),
                 state: band.state.wire().to_string(),
-                // Beside the state it explains, and from the connection
-                // rather than the band: the band's vocabulary has one
-                // `taken-over` and no room for who took it.
-                taken_by: self
-                    .hosts
-                    .state(&host.id)
-                    .and_then(crate::host_conn::HostConnState::taken_by)
-                    .map(str::to_string),
                 // The band's input, untruncated — the ssh failure
                 // families are written as sentences and the rollup
                 // beside them is capped at 60 characters.
@@ -3144,19 +3140,7 @@ impl App {
         &self,
         host: roost_engine::persistence::HostSnapshot,
     ) -> HostConnectionResult {
-        // A takeback asked of a deposed-but-serving task is an attempt in
-        // flight, and this op reports the ask (plan 057 §3.5). Nothing
-        // about the band moved for it — the grid is still live and the
-        // facts still stand — so the divergence is deliberate: a caller
-        // that wants the settled answer polls `host.status`, which is
-        // what that split has always meant.
-        if self.hosts.taking_foreground(&host.id) {
-            return HostConnectionResult {
-                host: host.into(),
-                state: host_sidebar::SectionState::Connecting.wire().to_string(),
-            };
-        }
-        // Otherwise through the section state the sidebar itself reads,
+        // Through the section state the sidebar itself reads,
         // so the reply and the dot drawn beside it can never disagree. A
         // host this app is not driving at all reads as disconnected,
         // which is exactly what its section shows.
@@ -3224,6 +3208,62 @@ mod tests {
     use super::file_transfer::LostReason;
     use super::*;
 
+    /// Under fan-out every client receives every effect, so the
+    /// clipboard asks *this* client's own question: is the tab the copy
+    /// came from the one I am showing?
+    #[test]
+    fn a_clipboard_effect_lands_only_on_the_viewed_tab() {
+        let host = HostId::new(7);
+        let viewed = TabKey::new(host, 1);
+        let copy = |tab: TabKey| roost_ipc::messages::TabEffectEvent {
+            tab_id: tab.tab,
+            effect: roost_ipc::messages::TabEffect::ClipboardWrite,
+            data: Some(roost_ipc::messages::bytes_base64::encode(b"copied")),
+            target: Some(roost_ipc::messages::ClipboardEffectTarget::System),
+        };
+
+        for (policy, key, lands, why) in [
+            (
+                config::ClipboardWrite::Allow,
+                viewed,
+                true,
+                "the viewed tab",
+            ),
+            (
+                config::ClipboardWrite::Allow,
+                TabKey::new(host, 2),
+                false,
+                "a copy in a tab this client is not showing must not take its clipboard",
+            ),
+            (
+                config::ClipboardWrite::Deny,
+                viewed,
+                false,
+                "the viewed-tab rule composes with the config policy; it does not replace it",
+            ),
+            (
+                config::ClipboardWrite::Allow,
+                TabKey::new(host, 909),
+                false,
+                "a tab this client has never heard of",
+            ),
+        ] {
+            let mut clipboard = ClipboardQueue::default();
+            assert_eq!(
+                apply_host_clipboard_effect(&mut clipboard, policy, viewed, key, &copy(key)),
+                lands,
+                "{why}"
+            );
+            match clipboard.start_next() {
+                UiTask::ClipboardWrite { text, .. } => {
+                    assert!(lands, "{why}");
+                    assert_eq!(text, "copied");
+                }
+                _ => assert!(!lands, "{why}"),
+            }
+        }
+    }
+
     /// The image seam's one gate: the env it was launched with, and
     /// nothing about the box it is running on — see
     /// [`image_write_refusal`] for why that is the whole policy.
@@ -3267,9 +3307,8 @@ mod tests {
 
         for code in [
             "shutting-down",
-            "connect-required",
-            "taken-over",
-            "already-connected",
+            "replay-expired",
+            "session-mismatch",
             "too-many-tokens",
             "a-code-from-a-newer-session",
         ] {

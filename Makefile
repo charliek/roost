@@ -333,7 +333,7 @@ e2e-host-local-spawn-ci: $(GHOSTTY_LIB)  ## Plan 044 W2 local-daemon-spawn E2E a
 # restart it drives relaunches that daemon out of the UI's environment, so
 # a stale `roost-session` is the binary under test twice over. Never
 # beside another host lane: see LOCALHOST_E2E_TESTS.
-e2e-host-localhost: $(GHOSTTY_LIB)  ## Plan 058 localhost-sentinel E2E (#460: `host.add localhost`, its ↻ Restart verb, and R15's takeback)
+e2e-host-localhost: $(GHOSTTY_LIB)  ## Plan 058 localhost-sentinel E2E (#460: `host.add localhost`, its ↻ Restart verb, and a killed session restarted on it)
 	cargo build -p roost-iced -p roost-cli -p roost-session
 	ROOST_TEST_MODE=1 uv run --group test pytest $(LOCALHOST_E2E_TESTS) --roost-target iced
 

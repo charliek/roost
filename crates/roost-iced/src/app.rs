@@ -450,33 +450,7 @@ fn frozen_frame<'a>(
         .into()
 }
 
-/// A host tab's **live** grid with a one-line status strip over its top
-/// edge: another client holds the foreground (plan 057 §3.5).
-///
-/// The one thing this must not do is take a row. `App::resize` derives
-/// the grid from the window and the chrome around it, so a strip that
-/// participated in terminal layout would shrink the grid — and since a
-/// client's geometry is what sizes the shared PTY, the takeover itself
-/// would resize the session out from under whoever took it. Hence the
-/// stack: the same overlay the frozen banner uses, minus the scrim,
-/// because these pixels are still being updated.
-fn foreground_strip<'a>(
-    content: Element<'a, Message>,
-    saved_id: &str,
-    banner: host_notice::HostBanner,
-) -> Element<'a, Message> {
-    // An ordinary Connect, which on a deposed-but-serving host is a
-    // takeback in place — no reattach, no snapshot, no blink.
-    let press = Message::HostReconnect(saved_id.to_string());
-    stack![content, host_strip(banner, press)]
-        .width(Fill)
-        .height(Fill)
-        .into()
-}
-
 /// The strip itself: a sentence, a button, and the hairline under it.
-/// Shared so the two lines a host tab can carry cannot drift apart in
-/// padding, type size or colour.
 fn host_strip<'a>(banner: host_notice::HostBanner, press: Message) -> Column<'a, Message> {
     let strip = container(
         row![
@@ -910,7 +884,7 @@ async fn host_call<T: serde::de::DeserializeOwned>(
     params: serde_json::Value,
 ) -> Result<T, String> {
     let value = ops
-        .call(op, params, crate::host_conn::LeasePolicy::None)
+        .call(op, params)
         .await
         .map_err(|error| format!("{op}: {error}"))?;
     serde_json::from_value(value).map_err(|error| format!("{op} answered unexpectedly: {error}"))
@@ -958,10 +932,7 @@ async fn host_remove_call<T>(
     removed: T,
     already_gone: T,
 ) -> Result<T, String> {
-    match ops
-        .call(op, params, crate::host_conn::LeasePolicy::None)
-        .await
-    {
+    match ops.call(op, params).await {
         Ok(_) => Ok(removed),
         Err(crate::host_conn::HostOpError::Rejected {
             code: roost_ipc::client::ServerCode::NotFound,
@@ -1448,14 +1419,11 @@ fn terminal_cursor_focused(route: KeyboardRoute, window_focused: bool) -> bool {
 /// has a session, and something on the other end will read what is
 /// queued for it.
 ///
-/// `attach_live` is the *attach's* answer, not the host connection's
-/// (plan 057 §3.5). A takeover moves the foreground and closes nothing,
-/// so a deposed window is still attached, still streaming and still
-/// typing — asking its `HostConnState` would take the keyboard away from
-/// a terminal that works. What genuinely has no reader is a host tab
-/// whose attach ended: the session stopped, the build gate refused, the
-/// shell exited. Routing keys there swallows them silently, which reads
-/// to a user as a hung terminal.
+/// `attach_live` is the *attach's* answer, not the host connection's.
+/// What genuinely has no reader is a host tab whose attach ended: the
+/// session stopped, the build gate refused, the shell exited. Routing
+/// keys there swallows them silently, which reads to a user as a hung
+/// terminal.
 ///
 /// Answering `false` sends the route to [`KeyboardRoute::None`], where
 /// accelerators still fire and the modal routes above still win.
@@ -2332,6 +2300,7 @@ impl App {
             .build()
             .context("build Iced engine runtime")?;
         let workspace = Arc::new(Workspace::open(profile.state_json_path()));
+        workspace.set_window_focused(true);
         let supervisor = Arc::new(PtySupervisor::new());
         let client = LocalClient::new(
             Arc::clone(&workspace),
@@ -4509,16 +4478,11 @@ impl App {
             }
         };
         // A frozen host frame keeps its pixels and says why (plan 037
-        // §3.1); a live one somebody else is driving keeps them *and*
-        // keeps updating, and says who has the foreground (plan 057
-        // §3.5). With no host selection both are `None` and the terminal
+        // §3.1). With no host selection this is `None` and the terminal
         // element goes through untouched.
         let terminal = match self.host_frame_banner() {
             Some((saved_id, frame, banner)) => frozen_frame(terminal, saved_id, frame, banner),
-            None => match self.host_foreground_strip() {
-                Some((saved_id, strip)) => foreground_strip(terminal, saved_id, strip),
-                None => terminal,
-            },
+            None => terminal,
         };
         let main = column![tab_bar, terminal].width(Fill).height(Fill);
         let content: Element<'_, Message> = if collapsed {
@@ -5341,7 +5305,7 @@ impl App {
         let selection = self.host_selection?;
         let view = self.host_view(selection.tab.host)?;
         let section = self.hosts.section(&view.saved_id)?;
-        let frozen = host_notice::frozen_frame(section.state, section.serving_in_place)?;
+        let frozen = host_notice::frozen_frame(section.state)?;
         Some((view, frozen))
     }
 
@@ -5358,7 +5322,7 @@ impl App {
         }
         let view = self.host_view(tab.host)?;
         let section = self.hosts.section(&view.saved_id)?;
-        host_notice::frozen_frame(section.state, section.serving_in_place)
+        host_notice::frozen_frame(section.state)
     }
 
     /// The banner the window owes the frame it is showing, the host its
@@ -5371,26 +5335,9 @@ impl App {
         let selection = self.host_selection?;
         let view = self.host_view(selection.tab.host)?;
         let section = self.hosts.section(&view.saved_id)?;
-        let frozen = host_notice::frozen_frame(section.state, section.serving_in_place)?;
-        let banner = frozen.banner(&view.label, section.state.taken_by());
+        let frozen = host_notice::frozen_frame(section.state)?;
+        let banner = frozen.banner(&view.label);
         Some((view.saved_id.as_str(), frozen, banner))
-    }
-
-    /// The status strip the window owes a live host grid whose
-    /// foreground another client holds (plan 057 §3.5), and the host its
-    /// button takes it back from.
-    ///
-    /// Composed here, at the draw, for [`Self::host_frame_banner`]'s
-    /// reason — and mutually exclusive with it by construction, because
-    /// [`host_notice::frozen_frame`] and
-    /// [`host_notice::foreground_strip`] answer on disjoint states.
-    fn host_foreground_strip(&self) -> Option<(&str, host_notice::HostBanner)> {
-        let selection = self.host_selection?;
-        let view = self.host_view(selection.tab.host)?;
-        let section = self.hosts.section(&view.saved_id)?;
-        let strip =
-            host_notice::foreground_strip(section.state, &view.label, section.serving_in_place)?;
-        Some((view.saved_id.as_str(), strip))
     }
 
     /// The frozen-frame banner's button (plan 037 §3.1).
@@ -5406,7 +5353,7 @@ impl App {
         let current = self
             .hosts
             .section(saved_id)
-            .and_then(|section| host_notice::frozen_frame(section.state, section.serving_in_place));
+            .and_then(|section| host_notice::frozen_frame(section.state));
         if !host_notice::click_still_lands(frame, current) {
             tracing::debug!(
                 host = %saved_id,
@@ -5424,9 +5371,9 @@ impl App {
     ///
     /// [`Self::host_project_of`]'s twin for the one question that is not
     /// about acting on a row: is the window still showing something this
-    /// host told us about? A taken-over or stopped session answers yes —
-    /// its rows are still listed, dimmed — which is what lets the frozen
-    /// frame stay up instead of snapping back to a local tab.
+    /// host told us about? A stopped session answers yes — its rows are
+    /// still listed, dimmed — which is what lets the frozen frame stay
+    /// up instead of snapping back to a local tab.
     fn host_listed_project_of(&self, tab: TabKey) -> Option<ProjectKey> {
         listed_project_of(self.host_view(tab.host)?, tab)
     }
@@ -5475,9 +5422,9 @@ impl App {
         if self.host_project_of(selection.tab) == Some(selection.project) {
             return;
         }
-        // A takeover or a stop leaves a frame nothing will ever update
-        // again — and that frame is the last true thing this window
-        // knows about that session, so it stays (plan 037 §3.1's
+        // A stop leaves a frame nothing will ever update again — and
+        // that frame is the last true thing this window knows about that
+        // session, so it stays (plan 037 §3.1's
         // "keeps its last frame dimmed") with the banner over it. The
         // row must still be listed: a tab the mirror dropped before the
         // connection died has nothing left to show.
@@ -5525,16 +5472,16 @@ impl App {
     /// assembled at each edge.
     ///
     /// Called at the three edges that can move it: a host reaching
-    /// `Connected` (a fresh session believes its own headless default
-    /// until told), the selection moving, and the window gaining or
-    /// losing focus. The set dedups, so calling it on a change that
-    /// turns out not to move anything costs nothing.
+    /// `Connected` (this connection has stated nothing yet), the
+    /// selection moving, and the window gaining or losing focus. The set
+    /// dedups, so calling it on a change that turns out not to move
+    /// anything costs nothing.
     fn push_host_focus(&mut self) {
         self.hosts
             .set_focus(host_focus_claim(self.window_focused, self.host_selection));
     }
 
-    /// The gated Connect: the sidebar's ↻ row, the takeover banner's
+    /// The gated Connect: the sidebar's ↻ row, the stopped banner's
     /// button, and the `Connect Host` palette verb — which
     /// `palette.activate` also reaches over the IPC socket, hence the
     /// `origin`.
@@ -5593,9 +5540,8 @@ impl App {
 
     /// Connect a saved host again, from the sidebar's inline ↻ row.
     ///
-    /// An explicit connect is unconditional takeover and may spawn a
-    /// localhost session that is not running (§3.2's explicit-connect
-    /// rule) — the launch-time probe is the only connect that does
+    /// An explicit connect may spawn a localhost session that is not
+    /// running (§3.2's explicit-connect rule) — the launch-time probe is the only connect that does
     /// neither. C7's `Connect Host` verb and the Add Host dialog land on
     /// this same entry.
     ///
@@ -5953,9 +5899,8 @@ impl App {
     ///
     /// **The state is re-read here, and that is the load-bearing part.**
     /// The dialog is modal to the pointer, not to the world: an IPC
-    /// `host connect`, a launch-time retry, or another window's takeover
-    /// can move this host out from under either prompt while it is still
-    /// on screen. Acting then would reap a session that is healthy and
+    /// `host connect` or a launch-time retry can move this host out from
+    /// under either prompt while it is still on screen. Acting then would reap a session that is healthy and
     /// attached — every shell on it — for a question that no longer
     /// applies. So it is asked again at the moment the answer is acted
     /// on, by [`host_awaits_restart`], and a host that moved on is told
@@ -9114,8 +9059,6 @@ mod tests {
             session_id: session_id.to_string(),
             skew: skew(),
             reduced_fidelity,
-            supports_resume: true,
-            supports_open_input: true,
             resumed: None,
         }
     }
@@ -9202,7 +9145,6 @@ mod tests {
         // And no other state answers either arm, however the facts read.
         for state in [
             HostConnState::Connecting { previous: None },
-            HostConnState::TakenOver { taken_by: None },
             HostConnState::Stopped,
             HostConnState::Disconnected(Disconnected {
                 reason: "session ended".into(),

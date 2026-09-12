@@ -47,8 +47,8 @@ const SSH_BACKOFF_CAP: Duration = Duration::from_secs(30);
 ///
 /// The sleeps alone are 75–150s, but a full give-up at these values is
 /// nearer **6–8 minutes**: every attempt also pays the establish's
-/// `ConnectTimeout 15`, the previous tunnel's teardown, the lease probe
-/// and the dial. That cost is why the two overrides below exist.
+/// `ConnectTimeout 15`, the previous tunnel's teardown and the dial.
+/// That cost is why the two overrides below exist.
 const SSH_ATTEMPT_BUDGET: u32 = 10;
 
 /// Test seam: the attempt budget, so a lane can reach the give-up in

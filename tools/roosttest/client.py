@@ -236,19 +236,11 @@ class Roost:
     def clear_notification(self, tab_id: int) -> None:
         self.call("tab.clear_notification", {"tab_id": str(tab_id)})
 
-    def send(self, tab_id: int, data: bytes | str, lease: str | None = None) -> None:
-        """Write bytes into a tab's PTY input.
-
-        `lease` is accepted and ignored on every socket (plan 057, R15):
-        raw input takes no lease. Omitted rather than sent empty when
-        absent — that is the shape a lease-less client has always put on
-        the wire, and the shape a pre-`open_input` session needs.
-        """
+    def send(self, tab_id: int, data: bytes | str) -> None:
+        """Write bytes into a tab's PTY input."""
         if isinstance(data, str):
             data = data.encode()
         params = {"tab_id": str(tab_id), "data": base64.b64encode(data).decode()}
-        if lease is not None:
-            params["lease"] = lease
         self.call("tab.write", params)
 
     def run(self, tab_id: int, command: str, ready_timeout: float = 5.0) -> None:

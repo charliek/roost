@@ -2,8 +2,8 @@
 //!
 //! Everything here runs against a live `serve()` — the same session a
 //! `roostctl session start` produces, minus the fork — and dials it the
-//! way a host client will: `session.connect`, `tab.attach`, a second
-//! connection carrying the JSON handshake, the preamble, and then binary
+//! way a host client will: `tab.attach`, a second connection carrying
+//! the JSON handshake, the preamble, and then binary
 //! frames. The SNAP payload goes into plan 034's [`SnapshotDecoder`] and
 //! the decoded terminal is walked through the same densifier the session
 //! itself dumps from, so a passing assertion means the client and the
@@ -75,16 +75,15 @@ fn budget() -> Duration {
 }
 
 // ---------------------------------------------------------------------
-// A session, leased, with tabs a test can drive
+// A session with tabs a test can drive
 // ---------------------------------------------------------------------
 
-/// One running session plus the control connection that holds its lease
-/// — `tab.attach` is lease-gated, so no test gets anywhere without it.
+/// One running session plus the control connection a test drives it
+/// through.
 struct Session {
     layout: support::Layout,
     served: tokio::task::JoinHandle<anyhow::Result<()>>,
     control: IpcClient,
-    lease: String,
     project_id: i64,
 }
 
@@ -94,13 +93,11 @@ impl Session {
         let launch_cwd = layout.launch_cwd.clone();
         let served = layout.spawn(&launch_cwd);
         let mut control = support::connect(&layout.socket_path()).await;
-        let lease = support::session_connect(&mut control).await.lease;
         let project_id = support::tabs(&mut control).await[0].project_id;
         Self {
             layout,
             served,
             control,
-            lease,
             project_id,
         }
     }
@@ -177,8 +174,7 @@ impl Session {
     }
 
     /// Bytes toward the child, not into the terminal — the seam
-    /// [`Self::feed`] deliberately bypasses. The lease rides along
-    /// because a session socket refuses an unleased write.
+    /// [`Self::feed`] deliberately bypasses.
     async fn write_tab(&mut self, tab_id: i64, data: &[u8]) {
         self.control
             .call::<_, serde_json::Value>(
@@ -186,7 +182,6 @@ impl Session {
                 TabWriteParams {
                     tab_id,
                     data: data.to_vec(),
-                    lease: Some(self.lease.clone()),
                 },
             )
             .await
@@ -221,7 +216,6 @@ impl Session {
             .call(
                 ops::TAB_ATTACH,
                 TabAttachParams {
-                    lease: Some(self.lease.clone()),
                     tab_id,
                     kinds: vec![AttachPayloadKind::from(kind)],
                     cols,

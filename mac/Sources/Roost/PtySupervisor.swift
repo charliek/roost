@@ -607,9 +607,6 @@ func childEnvironment(
     // xterm-256color entry), so strict $TERMINFO readers would find no
     // entry for the TERM Roost advertises.
     env.removeValue(forKey: "TERMINFO")
-    // A driver lease (plan 049 §3.12) is one session's authority; an
-    // exporting shell that launched Roost must not hand it to every tab.
-    env.removeValue(forKey: "ROOST_LEASE")
     // Advertise OSC 8 hyperlink support. Roost renders + opens OSC 8
     // links (Cmd-click), but the `supports-hyperlinks` library many
     // CLIs gate on — Claude Code, anything on chalk/terminal-link —

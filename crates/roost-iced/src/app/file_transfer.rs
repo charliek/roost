@@ -1165,10 +1165,8 @@ impl super::App {
     /// Why a paste or a drop into `tab` is refused, if it is (issue
     /// #376) — `None` when it lands.
     ///
-    /// Gated on the **attach**, not on the host's connection state (plan
-    /// 057 §3.5): a takeover closes nothing, so a deposed host tab is
-    /// still streaming and still takes keys, and a paste belongs with
-    /// them. What has no reader is a host tab whose attach ended, and the
+    /// Gated on the **attach**, not on the host's connection state: what
+    /// has no reader is a host tab whose attach ended, and the
     /// sentence names the state wherever the state names itself — a
     /// session that *ended* says so, and everything else (a drop, a
     /// build gate, a shell that exited) gets the sentence the rest of the
@@ -1187,13 +1185,7 @@ impl super::App {
     ///
     /// `connected` comes from the connection's own state rather than the
     /// reconciled view cache: the view is what the window is showing, and
-    /// a gesture is about what the wire can carry. It asks
-    /// `reached_session` rather than `is_foreground` because a deposed
-    /// connection *can* carry one — the upload lane refuses it as
-    /// [`crate::host_conn::HostOpError::NotForeground`], with a sentence
-    /// naming who is driving and what to do about it, and answering
-    /// `Target::Unavailable` here would pre-empt that with "the host is
-    /// not accepting operations", which is not what happened.
+    /// a gesture is about what the wire can carry.
     fn transfer_facts(&self, tab: TabKey) -> TransferFacts {
         let saved = self.host_view(tab.host).map(|view| view.saved_id.as_str());
         TransferFacts {
@@ -1203,7 +1195,7 @@ impl super::App {
             connected: saved.is_some_and(|saved| {
                 self.hosts
                     .state(saved)
-                    .is_some_and(crate::host_conn::HostConnState::reached_session)
+                    .is_some_and(crate::host_conn::HostConnState::is_connected)
             }),
             live: saved.and_then(|saved| self.hosts.incarnation(saved)),
             tab_host: tab.host,

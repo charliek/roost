@@ -1,6 +1,6 @@
 # Host Sessions
 
-Host sessions (HS-1a/HS-1b/HS-2 in the [roadmap](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md)) let a `roost-session` daemon own a workspace + PTY supervisor that outlives any UI attached to it, and let the iced UI attach to one as a client. This page is the shipped architecture: the component topology, the attach sequence, and the lease/takeover lifecycle. [`reference/ipc.md`](../reference/ipc.md#session-sockets) is the **normative wire spec** — this page explains the shape, that page is the contract. The design rationale and the full decision history live in [`discovery/host-sessions-architecture.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-architecture.md) and [`discovery/host-sessions-roadmap.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md).
+Host sessions (HS-1a/HS-1b/HS-2 in the [roadmap](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md)) let a `roost-session` daemon own a workspace + PTY supervisor that outlives any UI attached to it, and let the iced UI attach to one as a client. This page is the shipped architecture: the component topology, the attach sequence, and how multiple clients share one session. [`reference/ipc.md`](../reference/ipc.md#session-sockets) is the **normative wire spec** — this page explains the shape, that page is the contract. The design rationale and the full decision history live in [`discovery/host-sessions-architecture.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-architecture.md) and [`discovery/host-sessions-roadmap.md`](https://github.com/charliek/roost/blob/main/discovery/host-sessions-roadmap.md).
 
 Scope: iced-only (`crates/roost-iced`); the server crate (`crates/roost-session`) now builds and ships for both Linux and macOS. The Swift Mac app has none of this. See [DL-17](vision.md#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28) and [DL-18](vision.md#dl-18-hosts-ux-attach-on-focus-effects-theme-reseed-and-the-mac-gate-2026-08-29) in the decision log for why the shape is what it is, and the [user guide](../guides/host-sessions.md) for how it looks from the outside.
 
@@ -36,7 +36,7 @@ flowchart LR
     TabTask --- PTY
   end
 
-  Control -- "session.identify, session.connect,<br/>session.set_theme, tab.attach,<br/>workspace mutations" --> SessionIPC
+  Control -- "session.identify, session.set_theme,<br/>tab.attach, workspace mutations" --> SessionIPC
   EventsConn -- "events.subscribe →<br/>EventBatch stream" --> SessionIPC
   Data -- "ROOSTDP2 handshake →<br/>SNAP / PTY / EXIT frames" --> TabTask
 ```
@@ -69,163 +69,77 @@ flowchart LR
 
 **Resize is withheld, not sent live, until the hydration settles.** A user resize between attach and FINISH is queued (latest-wins) and sent once — at FINISH, or after a 2s timeout, whichever comes first — because resizing a decoder that hasn't finished producing a terminal would forfeit the history pages still in flight. Once live, `seq` must be exactly `last + 1`; a gap, duplicate, wrong epoch/generation, or an `EOF` before `FINISH` all mean the same thing — the stream can no longer be trusted — and the client drops the attach and re-attaches with capped backoff, which resets only once the connection reaches `Live` again.
 
-## The lease/takeover lifecycle
+## Multiple clients {: #the-leasetakeover-lifecycle }
 
-A session has one **interactive lease** at a time, but as of plan 057
-(R15, [#453](https://github.com/charliek/roost/issues/453)) the lease
-is not authority to write — it never was going to hold up against
-"start on the desktop, pick it up on the phone, sit back down," and R1
-(plan 049) had it backwards anyway (reads gated, writes open). What the
-lease is now is authority to be the **foreground**: whichever
-connection holds it gets `tab.effect` (bells, OSC 52 clipboard writes)
-on its event stream, its `session.set_focus` is the one that mutes
-notifications, `session.driver_changed` names it, and it is the only
-connection the session-wide settings ops (`session.set_theme`,
-`session.set_agent_hooks`, `session.put_file`, `session.set_focus`)
-will accept. It never gates input: `tab.write` and `tab.attach` take no
-lease, from any same-UID client, at any time. Reconnecting is always a
-takeover on this wire (there is no separate "steal" op): the same
-`session.connect{takeover: true}` a fresh connect uses is what
-displaces a stale one. **Reading was already ungated by R1** —
-`events.subscribe` takes no lease; the lease it is *handed* only
-classifies which of two feeds the resulting stream gets. The lease is
-interactive-ownership coordination, not a security boundary: any
-same-UID client can take over on purpose, same as always.
+A session has no owner. R1 (plan 049) opened reads; R15 (plan 057,
+[#453](https://github.com/charliek/roost/issues/453)) opened writes;
+what remained after both was "the foreground" — an interactive lease
+that decided whose event stream got `tab.effect`, whose focus muted
+notifications, and which connection the session-wide settings ops would
+accept. Plan 061 retired it (protocol `5`, [DL-26](vision.md#dl-26-there-is-no-lease-2026-09-12)):
+there is no `session.connect`, no `lease` field on any op, and no
+`session.driver_changed` event. Every same-UID connection is symmetric,
+and reconnecting is just a reconnect — never a claim on anything
+another connection holds.
 
 ```mermaid
 flowchart LR
-  Sub(("events.subscribe<br/>(no lease required)")) -- "lease absent/stale/unknown" --> Observer["observer stream:<br/>state batches +<br/>notification.fired<br/>(no tab.effect)"]
-  Sub -- "lease present + current" --> Driver["driver stream:<br/>state batches +<br/>tab.effect"]
-  NoLease(("no lease held")) -- "session.connect" --> Held["lease held<br/>(this connection is the foreground)"]
-  AnyClient(("any same-UID client,<br/>lease or none")) -- "tab.attach + tab.write" --> Live["reads + writes flow either way —<br/>never lease-gated"]
-  Held -- "another client:<br/>session.connect{takeover: true}" --> Takeover["takeover<br/>(old lease invalidated + tombstoned;<br/>every control + data connection<br/>stays open)"]
-  Takeover -- "every registered<br/>event stream" --> DriverChanged["session.driver_changed<br/>{taken_by}<br/>(non-terminal — stream survives)"]
-  DriverChanged --> Observer
-  DriverChanged --> UIObs["iced: still live —<br/>band names the new foreground,<br/>grid keeps typing + resizing,<br/>bells/clipboard/notif-mute move away"]
-  Held -- "session.stop<br/>(any client)" --> Stopping["latches stopping;<br/>every control/data conn<br/>labeled + closed"]
-  Stopping -- "every event stream<br/>(driver or observer)" --> StoppingS["session.stopping<br/>{reason: stop}<br/>(terminal)"]
-  Stopping -- "data connection" --> ErrorS["ERROR<br/>{code: shutting-down}"]
+  AnyClient(("any same-UID<br/>connection")) -- "tab.write, tab.attach,<br/>tab.list, tab.open, ..." --> Live["reads + writes flow —<br/>no gate, ever"]
+  Commit(("a workspace commit")) -- "events.subscribe" --> Batch["every subscriber's<br/>stream gets the<br/>same EventBatch"]
+  Effect(("tab.effect<br/>(bell / OSC 52)")) -- "fanned out<br/>unfiltered" --> EachClient["each client applies it<br/>by its own policy:<br/>bell → mark the tab;<br/>clipboard → only if viewed"]
+  Focus(("session.set_focus<br/>(per connection)")) -- "unions into" --> Mute["a tab is muted while<br/>ANY connection views it"]
+  Size(("tab.attach / tab.write /<br/>INPUT / RESIZE")) -- "last one wins" --> PtySize["the tab's PTY size"]
+  Stop(("session.stop<br/>(any client)")) --> Stopping["latches stopping;<br/>every control/data/event<br/>connection labeled + closed"]
+  Stopping --> StoppingS["session.stopping<br/>{reason: stop}<br/>(terminal, on every stream)"]
   StoppingS --> UIS["iced: Stopped state —<br/>frozen frame + banner,<br/>Start a new session"]
 ```
 
-**One tombstone.** The session remembers only the *most recently*
-displaced lease, so its holder is told `taken-over` (someone else has
-it now) rather than the less informative `connect-required` (you were
-never connected) — a second takeover forgets the first tombstone in
-favor of the newest one, since the first holder has already been told.
-That tombstone answers `require_lease` on the foreground-only ops
-(`session.set_theme`, `session.set_agent_hooks`, `session.put_file`,
-`session.set_focus`); it says nothing about `tab.write` or
-`tab.attach`, which never ask for a lease at all, and nothing about
-event streams, which are never closed by a takeover either (below).
+**Effects fan out; the viewing client applies them.** Every subscriber
+receives every `tab.effect` — there is no per-connection classification
+of the stream, and no client is anybody else's side-channel. What each
+client does with one is its own policy: a bell is worth marking on any
+tab it owns (there is no ring seam to gate — marking a background tab
+is what a bell should do), while an OSC 52 clipboard write is applied
+only to the tab that client is actually *viewing* — its own selection,
+never a mirrored "active tab" that some other client's connection
+happens to be looking at — and independent of window focus, so a copy
+in the viewed tab lands even while the window is unfocused, the way
+tmux behaves. A client attached to a different tab, or not attached at
+all, simply never sees its own clipboard touched by somebody else's
+paste.
 
-**Takeover closes nothing — control or data.** Before R15 a takeover
-closed every connection registered under the displaced lease; now the
-registry tracks control connections independently of who holds the
-lease (a `controls` map keyed by connection, not by `Lease::conns`), so
-invalidating and tombstoning the lease touches only who is admitted to
-the foreground-only ops. The displaced client's control connection
-stays open and keeps answering everything that was never lease-gated;
-its data connections (its tab attaches) stay open and keep streaming
-and accepting input exactly as before the takeover. What *does* die
-with the takeover is its focus — clearing `focus_conn` at takeover is
-preserved from before R15, so the displaced client's notifications
-un-mute the moment it stops being the foreground, same as always.
+**Focus is a union, not an election.** `session.set_focus` is a plain
+per-connection statement — "this connection is looking at tab N" — and
+moves nothing else: the session's active selection and persisted
+selection move only through `tab.focus`. A tab is muted while **any**
+connection says it is looking at that tab
+(`tab_is_being_watched(tab) = (window_focused && active_tab_id
+== tab) || viewing.values().any(|t| *t == tab)`); a connection's
+statement is forgotten the moment it restates `null` or the connection
+closes, and nothing else clears it. Two clients on two different tabs
+therefore both get muted correctly, with zero further coordination
+traffic once each has said its own tab once — there is no re-push to
+answer, because nothing about one connection's statement can disagree
+with another's.
 
-**Event streams were already non-terminal on takeover, before R15.**
-An event stream is registered in a separate observer registry,
-structurally so a takeover cannot close the stream it needs to
-reclassify. It gets one non-terminal `session.driver_changed{taken_by}`
-envelope, injected into its existing push queue, and **keeps delivering
-afterward** — reclassified from driver to observer if it was the
-deposed lease's own stream, unchanged if it was already an observer.
-`taken_by` is the new holder's normalized `client_label` (`"unknown
-client"` if none was given) — display metadata a UI renders as what the
-client *reports itself as*, never a verified identity. A stream whose
-queue is already full when the envelope would land never sees it: its
-relay ends and the peer gets a bare EOF, the same resync semantics
-event backpressure has always had, rather than the takeover blocking on
-a slow reader. `session.stopping` is the only *terminal* envelope on
-this wire; `session.driver_changed` is deliberately its non-terminal
-sibling and a client must not latch on it.
+**Geometry is last-interactor** ([DL-25](vision.md#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08)),
+unchanged by this plan: whichever connection last sent a geometry-
+bearing frame (`tab.attach` with `focus: true`, `tab.resize`, or a
+data-plane `INPUT`/`RESIZE`) sizes the tab. Nothing elects a size
+holder; the PTY simply has the size the last such frame asked for.
 
-**The observer stream is a first-class state, not a degraded one.**
-`events.subscribe` with no lease, a stale one, or one that was just
-taken over all land on the same feed: every workspace batch plus
-`notification.fired`, never `tab.effect` (that stays the foreground's
-own side-channel — bells, OSC 52 clipboard writes belong to whoever
-currently holds the lease, not to whoever is actually typing, since
-typing gates on nothing). A revision whose only events were filtered
-out still arrives as an empty batch, so the strictly-consecutive
-revision fence a client relies on never sees a gap that isn't real
-loss. This is what lets a second Roost window, or a phone, watch a
-session's tab list, titles, and notifications live without ever
-claiming the lease — and, since R15, it no longer has to give up
-typing to do so.
+**`session.stop` still closes everything, from any client.** It labels
+and closes every control connection, every data connection, and every
+event stream this session ever admitted, regardless of who opened it —
+the same behavior as before this plan, because stopping the session was
+never part of the lease.
 
-**The displaced window keeps everything, including its terminal
-frame.** Before R15, `TakenOver` froze only the terminal *grid*,
-because attach input died with the lease; since attach input is no
-longer lease-gated at all, nothing freezes on a takeover. The iced
-client keeps its attach, keeps typing, keeps resizing, keeps switching
-tabs; what it loses is being the foreground — bells/clipboard stop
-arriving, its focus no longer mutes notifications, and the session-wide
-settings ops are refused locally until it takes the foreground back. A
-status strip overlaid on the grid names the new foreground and offers
-**"Take the foreground"**, which retakes it *in place* — one
-`session.connect{takeover: true}` on the existing control connection,
-a `session.set_theme` reseed, and a re-dial of only the event stream
-resuming from its checkpoint — no reattach, no new snapshot, no blink.
-`Stopped` is still the one state that freezes everything, because the
-shells themselves are gone, and it keeps its own scrim + "Start a new
-session" banner unchanged. A deposed connection to a session that
-predates R15 (no `open_input` in its `session.identify.features`) sees
-the old behavior instead: the server closes its data connections and
-its control connection, its attach ends, keys stop routing, and "Take
-the foreground" falls back to a full reconnect because there is no
-surviving control leg to retake in place.
-
-**The in-place retake runs on every transport.** Both doors raise the
-ask through `HostConnSet::request_foreground_in_place`, which is why
-they cannot drift: `connect` when the request names the endpoint the
-deposed task is already on, and over ssh `open_ssh` against the
-**live** tunnel's `bridge.sock` *before* it tears anything down. So a
-takeback over ssh reuses the tunnel, its mux, its per-connection execs
-and the deposed task's control leg: no second handshake, no new request
-number, no new generation, no fresh `SshState` — and therefore
-`reached_connected` still standing, which is what makes the ladder
-eligible if the takeback itself fails. The exception over ssh is a host
-with no live tunnel to ask on: one whose tunnel has already been
-replaced under the task — its endpoint is not the live tunnel's, and a
-reconnect is the only endpoint it could come back on — and one whose
-establish is still in flight. Both take the full reconnect.
-
-**The reconnect probe never authorizes a silent steal-back.** A client
-whose connection merely dropped — the wire, not a takeover — has to
-find out which happened before it reconnects as the foreground, because
-`session.connect{takeover: true}` always displaces whoever currently
-holds the lease. It re-presents its held lease as a `session.set_theme`
-resend (lease-checked before mutation, so the reply is the verdict)
-rather than through `events.subscribe`, which no longer proves anything
-since it takes no lease at all. Exactly one outcome resumes as
-foreground: the lease is still current. **Any non-current verdict —
-`taken-over` *or* `connect-required` — enters observer-of-foreground
-mode**, not just `taken-over`; a client displaced two takeovers ago
-sees the tombstone's fallback `connect-required`, and treating that as
-permission to retake would be exactly the steal-back this policy exists
-to prevent. A timeout or any other transport uncertainty **never**
-authorizes a takeover either — the client retries the probe under its
-normal backoff instead, because proving nothing is not the same as
-proving the lease moved. Only an explicit affordance — the user
-pressing "Take the foreground" — promotes an observer back to
-foreground, on the existing control connection (or a fresh one, for the
-pre-R15 fallback path); auto-retry never does it on its own.
-`ROOST_LEASE` still exists for `roostctl tab send` against a session
-socket, but as of R15 it is vestigial for the write itself — a write
-needs no credential, same-UID is the boundary — and is accepted and
-ignored if set; it remains the way a one-shot CLI could *also* present
-a lease without becoming the foreground, since presenting one on a
-write was never how the foreground changed hands.
+**A reconnect is a reconnect.** There is no takeover to detect, no
+tombstone to fall back to, no "observer of the foreground" mode, and no
+"take the foreground" affordance — a client that lost its connection
+simply reconnects through the ordinary ladder below and is admitted
+exactly like any other connection, symmetric with whatever else is
+already attached.
 
 **Auto-reconnect never auto-spawns.** Launch-time reconnect — on both platforms — is *connect-if-present* and **localhost-only**: it probes that socket, and if nothing answers, the section shows disconnected with a manual ↻ rather than silently starting a daemon. A saved SSH host is not dialed at launch at all — `reconnect_saved_hosts` declines every non-localhost transport before resolving it, so an SSH host is skipped rather than probed and found wanting. Connecting to a remote machine is an outbound decision, and at launch nobody has asked for it. A *mid-session* drop is different. A `localhost` session that was running and *went away* is retried with jittered, capped backoff (`Backoff` in `host_conn/state.rs`, 250ms base up to a 30s ceiling); a saved SSH host runs the same kind of ladder once two gates hold at the moment of the drop — the host resolves to `ResolvedTransport::Ssh` (a plain `UnixSocket` target stays manual, unchanged) and the connection had actually reached `Connected` at least once, so a host that never worked in the first place doesn't grow a ladder off its own first failure. The SSH ladder runs its own schedule — 1s base, doubling, jittered `[0.5, 1.0]×`, capped at 30s — and gives up after 10 attempts, settling to `disconnected` with copy that says so; ↻ Reconnect never leaves the screen and is the recovery either way. Not every drop is retried: a changed or unknown host key, a refused login, and a session that is actually gone all settle immediately instead of looping, because each has a different correct next step (see the [user guide's troubleshooting table](../guides/host-sessions.md#troubleshooting) for the full set). Either way, if the session itself died, the host settles on "session ended" (or "no session," for SSH) and only an explicit Connect starts a fresh one — auto-reconnect never starts one for you.
 
@@ -235,12 +149,12 @@ write was never how the foreground changed hands.
 
 Two small additions ride the existing events stream as new event types — additive, and of the kind that does not move `SESSION_PROTOCOL_VERSION` (an older client simply ignores an event name it doesn't recognize), so it stayed at `2` for HS-2. Plan 047 later moved it to `3` for `session.put_file`, which a pre-047 session could only answer `unknown-op` — see the versioning rule in [`ipc.md`](../reference/ipc.md#session-sockets):
 
-- **`tab.effect` events** — a session's per-tab OSC scan now emits `bell` and OSC 52 `clipboard-write` as client-directed effects on the events stream (`crates/roost-engine/src/tab_task.rs`), for the session's foreground (the lease holder) to apply — not for whoever is actually typing, since as of R15 anyone same-UID may type. Everything else the scanner sees (pointer shape, today) stays dropped and debug-logged in the tab task, by design — the envelope is scoped to these two effects rather than left open to "just one more."
-- **`session.set_theme`** — closes the reseed gap the architecture doc left open: a connecting client seeds every tab's server `Terminal` with its own palette (sent right after `session.connect`, before the first `tab.attach`), so a program that queries a color from a session gets back what the attached client is actually rendering, not the server's factory default.
+- **`tab.effect` events** — a session's per-tab OSC scan now emits `bell` and OSC 52 `clipboard-write` as client-directed effects on the events stream (`crates/roost-engine/src/tab_task.rs`), fanned out to every subscriber for each to apply by its own rule (see [Multiple clients](#the-leasetakeover-lifecycle)) — not to a single owner, and not gated on who is actually typing. Everything else the scanner sees (pointer shape, today) stays dropped and debug-logged in the tab task, by design — the envelope is scoped to these two effects rather than left open to "just one more."
+- **`session.set_theme`** — closes the reseed gap the architecture doc left open: a connecting client seeds every tab's server `Terminal` with its own palette (sent right after `session.identify`, before the first `tab.attach`), so a program that queries a color from a session gets back what the attached client is actually rendering, not the server's factory default.
 
 See [`reference/ipc.md`](../reference/ipc.md#events) for the full event catalog and [`session.set_theme`](../reference/ipc.md#sessionset_theme)'s wire shape.
 
-HS-3 adds one more in the same spirit — [`session.set_focus`](../reference/ipc.md#sessionset_focus), the client's real focus (window focus + which tab is selected), pushed down so the session suppresses notifications for the tab the user is actually looking at rather than for whichever tab its headless workspace defaulted to. It is lease-gated like `set_theme`, and deliberately short-lived: a new lease, the connection that reported it closing, or the live lease's last connection closing all revert the session to "nobody is looking", because a focus is a statement about a window that may no longer exist. An older session answers `unknown-op` and keeps the HS-2 behavior described under [Known limitations](#known-limitations).
+HS-3 adds one more in the same spirit — [`session.set_focus`](../reference/ipc.md#sessionset_focus), the client's real focus (window focus + which tab is selected), pushed down so the session suppresses notifications for the tab the user is actually looking at rather than for whichever tab its headless workspace defaulted to. Any same-UID connection may send it, and it is deliberately short-lived: the connection that reported it closing, or that same connection restating `null`, reverts *that connection's* slot in the union to "nobody is looking" — because a focus is a statement about a window that may no longer exist, and it is scoped to the connection that made it (see [Multiple clients](#the-leasetakeover-lifecycle)). An older session answers `unknown-op` and keeps the HS-2 behavior described under [Known limitations](#known-limitations).
 
 ## Reordering a host's sidebar section
 
@@ -336,7 +250,7 @@ For an upgrade (`Mismatch` + running), the job runs **install → stop → await
 - The atomic rename in phase 4 never disturbs the running process; installing first means a failed install leaves the old session running and untouched, rather than the host with neither an old session nor a working new one.
 - `session.stop` replies **before** the process actually finalizes (unlink + lock release happen post-reply), so the job polls a bridge dial — bounded, scaled — until it reports "no session" before starting. Skipping this "await-gone" step lets a blind `start` lose the race to the dying old process, print `already-running pid=<old>`, and exit 0: a masked failure on the happy path.
 
-`session.stop` is answered before the lease gate, so this needs no `session.connect{takeover: true}` and has no eviction side effects; a `client-bridge: no session` reply on the stop step reads as already-stopped, i.e. success. The post-start identify step then asserts the running session's protocol + build actually match the client — catching "started the right binary and it immediately crashed" — before the job reports success and hands off to the normal `connect_saved_host` reconnect. That post-start check runs the full triple (`app_version` included) only when this job just wrote the bytes; a start-only flow (`Compatible{path}`, no install) instead checks the same protocol+build pair the ordinary runtime attach gate checks, because a `Compatible` probe already means that gate was going to pass.
+`session.stop` needs no prior connection setup and has no eviction side effects — any same-UID socket can send it; a `client-bridge: no session` reply on the stop step reads as already-stopped, i.e. success. The post-start identify step then asserts the running session's protocol + build actually match the client — catching "started the right binary and it immediately crashed" — before the job reports success and hands off to the normal `connect_saved_host` reconnect. That post-start check runs the full triple (`app_version` included) only when this job just wrote the bytes; a start-only flow (`Compatible{path}`, no install) instead checks the same protocol+build pair the ordinary runtime attach gate checks, because a `Compatible` probe already means that gate was going to pass.
 
 ### Compatibility: install rule vs. runtime gate
 
@@ -463,7 +377,7 @@ throughout, because the socket never moves with this variable:
 
 | Lane | What it drives | What it holds up |
 |---|---|---|
-| `test_host_client.py` (`make e2e-host-client`) | a UI beside a real `roost-session` | HS-2's client half: attach fidelity, disconnect-vs-stop, takeover, `needs-restart` and the restart composition, the attention surfaces, and (#398) that a host-qualified `tab.reorder`/`project.reorder` reaches the session and the local workspace stays untouched |
+| `test_host_client.py` (`make e2e-host-client`) | a UI beside a real `roost-session` | HS-2's client half: attach fidelity, disconnect-vs-stop, a second client changing nothing for the first, `needs-restart` and the restart composition, the attention surfaces, and (#398) that a host-qualified `tab.reorder`/`project.reorder` reaches the session and the local workspace stays untouched |
 | `test_host_ssh.py` (`make e2e-host-ssh`) | the same, with only `ssh` faked (`fixtures/fake-ssh.sh`) | the transport and the reconnect ladder — the armed band's format agreement against the same row's `retry` numbers, a give-up with `retry` gone, the classified failures |
 | `test_host_bootstrap.py` (`make e2e-host-bootstrap`) | the same fixture in `run-remote` mode, jailed, so the generated remote scripts really execute | the install/upgrade job end to end; its verdicts are read out of `reason` and `generation` |
 | `test_host_local_missing_daemon.py` (`make e2e-host-missing-daemon`) | a UI whose `ROOST_SESSION_BIN` points at nothing | the settle-once rule above: `generation` reaching 1 and staying there, `retry` absent, the rollup and `detail` held flat for 3s |
@@ -475,7 +389,7 @@ Each of the five pytest lanes needs a UI **and** a daemon, so none of them rides
 
 ## Known limitations
 
-- **A host tab's own attention doesn't reach a client on an older session.** Closed for current sessions by HS-3's [`session.set_focus`](../reference/ipc.md#sessionset_focus): the client pushes its real focus (window focus + selection) down at every edge that moves it, so the session's suppression rule reads the same focus the user has, and the reported focus is forgotten when the lease turns over or its last connection closes. It remains true against a session too old to serve the op — that refusal is harmless (`unknown-op`, logged once per connection) and leaves HS-2's behavior: `notification.fired` never fires for whichever tab that session considers active.
+- **A host tab's own attention doesn't reach a client on an older session.** Closed for current sessions by HS-3's [`session.set_focus`](../reference/ipc.md#sessionset_focus): the client pushes its real focus (window focus + selection) down at every edge that moves it, so the session's suppression rule reads the same focus the user has, and the reported focus is forgotten the moment that connection closes. There is no longer an older-session case beneath it: protocol 5's compatibility gate tests exact equality, so a session too old to serve the op never reaches a connected state to exhibit HS-2's behaviour — it lands in `NeedsRestart` with the update or restart offer instead.
 - **Kitty images render blank after attach.** The snapshot payload doesn't currently carry Kitty graphics protocol state (architecture §5).
 - **Missed-while-detached effects still are not replayed; notifications within the replay window now are.** A `tab.effect` (bell, clipboard write) that fired while nobody was attached is still gone, by design (non-goal, not a bug). But a reconnect to the same `session_id` that lands inside the session's bounded replay ring (`ROOST_SESSION_REPLAY_WINDOW`) now *resumes* `events.subscribe` from the last-applied revision instead of re-snapshotting, so any `notification.fired` committed during the gap replays onto the carried mirror and its inbox row appears — the once-only replay and the no-effect rule are the server's existing contract (R5, #440), inherited here rather than changed. A reconnect that falls outside the window, or that the session refuses for any other reason (`replay-expired`, `revision-ahead`, `session-mismatch`), falls back to the ordinary fresh subscribe + `tab.list` snapshot — never fatal, just back to *current* state, exactly as before R11.
 - **One attached tab per host at a time from this client — a client policy, not a server limit.** As of R15 (plan 057) the server itself admits any number of data connections to one tab (bounded only by the outstanding-token quota per TTL plus the concurrent-snapshot cap, both named in [`ipc.md`](../reference/ipc.md)); a second window or a phone can attach to the same tab this client has open and both type, with neither displacing the other. What is unchanged is this client's own attach-on-focus policy: it dials a tab's data connection only while that tab is focused and detaches on blur, so it never itself holds more than one live data connection at a time. Multi-attach *from one client* (a warm pool of several tabs' connections at once) is still explicit future work.

@@ -93,12 +93,9 @@ async fn the_ack_fences_the_stream_and_every_commit_arrives() {
     )
     .await;
 
-    let mut stream = within(
-        "the subscribe",
-        EventStream::connect(stub.path(), "9f2c1d7a"),
-    )
-    .await
-    .expect("the stub acks the subscribe");
+    let mut stream = within("the subscribe", EventStream::connect(stub.path()))
+        .await
+        .expect("the stub acks the subscribe");
     assert_eq!(
         stream.revision(),
         42,
@@ -129,11 +126,9 @@ async fn the_ack_fences_the_stream_and_every_commit_arrives() {
         .is_none());
     assert_eq!(stream.stopping_reason(), None, "nothing labeled this close");
 
-    // The lease really went out — the ack is lease-gated on the wire.
     let requests = stub.recorded().requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].op, ops::EVENTS_SUBSCRIBE);
-    assert_eq!(requests[0].params["lease"], "9f2c1d7a");
     assert_eq!(
         requests[0].params["tab_id_filter"], "0",
         "HS-2 subscribes unfiltered and filters client-side"
@@ -178,11 +173,7 @@ async fn a_resume_sends_its_fence_and_its_session_and_is_acked_with_the_fence() 
         .expect("connect");
     let mut stream = within(
         "the resume",
-        client.resume_events(
-            "9f2c1d7a4b6e08315c0d9a72e4f16b83",
-            1180,
-            "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
-        ),
+        client.resume_events(1180, "01K3S8TQ4F0Q9YB2K6WZ5D7XN"),
     )
     .await
     .expect("the stub acks the resume");
@@ -211,9 +202,7 @@ async fn a_skipped_revision_is_reported_as_loss() {
     )
     .await;
 
-    let mut stream = EventStream::connect(stub.path(), "lease")
-        .await
-        .expect("subscribed");
+    let mut stream = EventStream::connect(stub.path()).await.expect("subscribed");
     within("the first batch", stream.next())
         .await
         .expect("a frame")
@@ -230,7 +219,7 @@ async fn a_skipped_revision_is_reported_as_loss() {
 /// exempt from the gap check, and is the last frame before the close.
 #[tokio::test]
 async fn the_stopping_envelope_names_why_the_stream_ended() {
-    for reason in ["stop", "taken-over"] {
+    for reason in ["stop"] {
         let stub = Stub::start(
             Plan::new()
                 .subscribe(Subscribe::Ack(1))
@@ -239,9 +228,7 @@ async fn the_stopping_envelope_names_why_the_stream_ended() {
         )
         .await;
 
-        let mut stream = EventStream::connect(stub.path(), "lease")
-            .await
-            .expect("subscribed");
+        let mut stream = EventStream::connect(stub.path()).await.expect("subscribed");
         within("the batch", stream.next())
             .await
             .expect("a frame")
@@ -264,56 +251,6 @@ async fn the_stopping_envelope_names_why_the_stream_ended() {
     }
 }
 
-/// The driver-changed envelope is the deliberate counterexample to the
-/// stopping latch: same non-commit shape, but the stream keeps going —
-/// the subscriber is now an observer, not gone.
-#[tokio::test]
-async fn the_driver_changed_envelope_does_not_end_the_stream() {
-    let stub = Stub::start(
-        Plan::new()
-            .subscribe(Subscribe::Ack(4))
-            .push(Push::empty(5))
-            .push(Push::Raw(serde_json::json!({
-                "event": "session.driver_changed",
-                "data": {"taken_by": "kestrel.local"},
-            })))
-            .push(Push::empty(6)),
-    )
-    .await;
-
-    let mut stream = EventStream::connect(stub.path(), "lease")
-        .await
-        .expect("subscribed");
-    match within("the first batch", stream.next())
-        .await
-        .expect("a frame")
-    {
-        Some(EventFrame::Batch(batch)) => assert_eq!(batch.revision, 5),
-        other => panic!("expected batch 5, got {other:?}"),
-    }
-    match within("the envelope", stream.next())
-        .await
-        .expect("a frame")
-    {
-        Some(EventFrame::DriverChanged(changed)) => {
-            assert_eq!(changed.taken_by, "kestrel.local");
-        }
-        other => panic!("expected the driver-changed envelope, got {other:?}"),
-    }
-    assert_eq!(
-        stream.stopping_reason(),
-        None,
-        "a non-terminal envelope must not latch the stream"
-    );
-    match within("the batch after it", stream.next())
-        .await
-        .expect("a frame")
-    {
-        Some(EventFrame::Batch(batch)) => assert_eq!(batch.revision, 6),
-        other => panic!("expected batch 6, got {other:?}"),
-    }
-}
-
 /// Additive control frames from a newer session must not break a client
 /// that predates them — the versioning policy's whole point. The gap
 /// check must not see them either: they are not commits.
@@ -330,9 +267,7 @@ async fn an_unrecognized_control_envelope_is_ignored() {
     )
     .await;
 
-    let mut stream = EventStream::connect(stub.path(), "lease")
-        .await
-        .expect("subscribed");
+    let mut stream = EventStream::connect(stub.path()).await.expect("subscribed");
     for want in [5, 6] {
         match within("a batch", stream.next()).await.expect("a frame") {
             Some(EventFrame::Batch(batch)) => assert_eq!(batch.revision, want),
@@ -358,9 +293,7 @@ async fn a_revision_bearing_non_batch_does_not_advance_the_fence() {
     )
     .await;
 
-    let mut stream = EventStream::connect(stub.path(), "lease")
-        .await
-        .expect("subscribed");
+    let mut stream = EventStream::connect(stub.path()).await.expect("subscribed");
     match within("the real commit", stream.next())
         .await
         .expect("a frame")
@@ -384,9 +317,7 @@ async fn the_stream_latches_closed_after_the_stopping_envelope() {
     )
     .await;
 
-    let mut stream = EventStream::connect(stub.path(), "lease")
-        .await
-        .expect("subscribed");
+    let mut stream = EventStream::connect(stub.path()).await.expect("subscribed");
     match within("the stopping envelope", stream.next())
         .await
         .expect("a frame")
@@ -415,9 +346,7 @@ async fn a_reasonless_stopping_envelope_falls_back_to_bare_eof() {
     )
     .await;
 
-    let mut stream = EventStream::connect(stub.path(), "lease")
-        .await
-        .expect("subscribed");
+    let mut stream = EventStream::connect(stub.path()).await.expect("subscribed");
     assert!(
         within("the close", stream.next())
             .await
@@ -428,18 +357,18 @@ async fn a_reasonless_stopping_envelope_falls_back_to_bare_eof() {
     assert_eq!(stream.stopping_reason(), None);
 }
 
-/// The two refusals instruct differently on purpose — go get a lease,
-/// versus stop, somebody else drives this session now — so the client
-/// state machine has to be able to tell them apart without reading
-/// strings.
+/// The resume refusals instruct differently on purpose — snapshot
+/// afresh, versus this is not the session you fenced against — so the
+/// client state machine has to be able to tell them apart without
+/// reading strings.
 #[tokio::test]
 async fn a_refused_subscribe_is_a_typed_refusal() {
     for (code, want) in [
-        ("connect-required", ServerCode::ConnectRequired),
-        ("taken-over", ServerCode::TakenOver),
+        ("replay-expired", ServerCode::ReplayExpired),
+        ("session-mismatch", ServerCode::SessionMismatch),
     ] {
         let stub = Stub::start(Plan::new().subscribe(Subscribe::Reject(rejected(code)))).await;
-        let error = EventStream::connect(stub.path(), "stale")
+        let error = EventStream::connect(stub.path())
             .await
             .err()
             .expect("the subscribe is refused");
@@ -534,7 +463,6 @@ async fn a_refused_handshake_is_typed_and_never_turns_binary() {
     for (code, want) in [
         ("protocol-mismatch", ServerCode::ProtocolMismatch),
         ("invalid-token", ServerCode::InvalidToken),
-        ("taken-over", ServerCode::TakenOver),
         ("not-found", ServerCode::NotFound),
         ("snapshot-failed", ServerCode::SnapshotFailed),
         ("shutting-down", ServerCode::ShuttingDown),
@@ -716,15 +644,13 @@ async fn an_eof_inside_a_frame_is_a_fault() {
     }
 }
 
-/// `ERROR` carries the stable codes a client branches on: re-attach,
-/// passive detach, or the host's takeover state.
+/// `ERROR` carries the stable codes a client branches on: re-attach or
+/// passive detach.
 #[tokio::test]
 async fn error_frames_map_to_the_codes_the_state_machine_branches_on() {
     for (code, want) in [
         ("desync", ServerCode::Desync),
         ("overflow", ServerCode::Overflow),
-        ("superseded", ServerCode::Superseded),
-        ("taken-over", ServerCode::TakenOver),
         ("shutting-down", ServerCode::ShuttingDown),
         ("protocol-error", ServerCode::ProtocolError),
     ] {

@@ -219,31 +219,11 @@ pub const SESSION_STOPPING_EVENT: &str = "session.stopping";
 
 /// `data` of the [`SESSION_STOPPING_EVENT`] envelope.
 ///
-/// `"stop"` — the session is shutting down; `"taken-over"` — another
-/// client took the lease. Either way the connection is over; the
-/// difference is whether reconnecting is worth trying.
+/// `reason` is `"stop"`: the session is shutting down and the
+/// connection is over.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionStoppingEvent {
     pub reason: String,
-}
-
-/// The other envelope that rides outside an [`EventBatch`]: another
-/// client took the driver lease.
-///
-/// Unlike [`SESSION_STOPPING_EVENT`] this one is **not terminal** — the
-/// stream keeps delivering after it; what changed is that this
-/// subscriber is no longer the driver. Like the stopping envelope it
-/// carries no revision and is exempt from the client's gap check.
-pub const SESSION_DRIVER_CHANGED_EVENT: &str = "session.driver_changed";
-
-/// `data` of the [`SESSION_DRIVER_CHANGED_EVENT`] envelope.
-///
-/// `taken_by` is the new holder's label as *it reported itself* on
-/// [`ops::SESSION_CONNECT`] — display metadata, never identity — and
-/// falls back to `"unknown client"` when the claimant sent none.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionDriverChangedEvent {
-    pub taken_by: String,
 }
 
 // ============================================================================
@@ -329,20 +309,6 @@ pub struct TabWriteParams {
     /// Raw bytes encoded as base64. See `bytes_base64`.
     #[serde(with = "bytes_base64")]
     pub data: Vec<u8>,
-    /// The driver lease minted by [`ops::SESSION_CONNECT`].
-    ///
-    /// **Accepted and ignored on every socket.** Raw input is open to
-    /// every same-UID client (plan 057, R15): the lease is the session's
-    /// *foreground*, not a write fence. The key stays on the wire so a
-    /// client that holds a lease sends byte-identical bytes to what it
-    /// always has — and so a session that predates `open_input` still
-    /// accepts them.
-    ///
-    /// Omitted when unset so a lease-less client's request is
-    /// byte-identical to what it has always sent — an older server
-    /// `deny_unknown_fields`-rejects a key it has never heard of.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lease: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1328,31 +1294,6 @@ pub struct NotificationCreateParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventsSubscribeParams {
-    /// The lease [`ops::SESSION_CONNECT`] handed out — a **classifier,
-    /// not a gate** (plan 049 §3.7).
-    ///
-    /// Reading a session is not interactive authority, so a subscribe is
-    /// never refused for want of one. What the lease decides is *what
-    /// arrives*:
-    ///
-    /// * present and current → the **driver** stream: every workspace
-    ///   batch plus [`ops::EVENT_TAB_EFFECT`], which is the driving
-    ///   client's side-channel (bells, OSC 52 clipboard writes) and
-    ///   nobody else's;
-    /// * absent, stale, or unknown → an **observer** stream: every
-    ///   workspace batch plus [`ops::EVENT_NOTIFICATION_FIRED`], with
-    ///   `tab.effect` filtered out. A revision whose every event was
-    ///   filtered still arrives, as an empty [`EventBatch`], because the
-    ///   client's whole loss check is the revision sequence.
-    ///
-    /// A driver stream whose lease is taken over is reclassified in
-    /// place and told once, with [`SESSION_DRIVER_CHANGED_EVENT`].
-    ///
-    /// Defaulted rather than required by serde so a client that holds no
-    /// lease may omit the key entirely. A credential: never logged,
-    /// never echoed in an error.
-    #[serde(default)]
-    pub lease: String,
     /// Restrict to a single tab. `"0"` (or absent) means all events.
     ///
     /// Not implemented: a non-zero value is rejected rather than
@@ -1407,6 +1348,13 @@ pub struct EventsSubscribeParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventsSubscribeResult {
     pub revision: u64,
+    /// The incarnation answering — [`SessionIdentify::session_id`].
+    ///
+    /// Required: a subscribe's two legs can be two dials, and a client
+    /// that identified one incarnation and subscribed to another would
+    /// fence a fresh history against a stale revision. Naming it on the
+    /// ack is what lets the client refuse that pair.
+    pub session_id: String,
 }
 
 /// `app.activate` carries no params. Declared (empty + strict) so the
@@ -1767,13 +1715,7 @@ pub struct AgentReportChangedEvent {
 }
 
 // ============================================================================
-// Host sessions (plan 033 §D4, plan 036 §D4/D6/D11)
-//
-// The server speaks part of this today: the attach handshake and the
-// stopping envelope. The lease + attach *ops* land in HS-1b, and their
-// param/result types live here ahead of them on purpose — the golden
-// vectors and the Swift mirror pin the wire before an implementation
-// exists to drift from it.
+// Host sessions
 // ============================================================================
 
 /// Version of the host-session protocol: the `session.*` handshake, the
@@ -1784,91 +1726,31 @@ pub struct AgentReportChangedEvent {
 /// speaks. A host-session change must not force every `roostctl` build
 /// to be re-gated, and vice versa.
 ///
+/// # The contract at `5`
+///
+/// Every same-UID connection to a session is **symmetric**. There is no
+/// owner, no lease and no foreground: reading, typing, attaching and
+/// every `session.set_*` op are open to all of them, last writer wins.
+/// [`ops::EVENT_TAB_EFFECT`] fans out to every subscriber, and each
+/// client decides what to do with it. [`ops::SESSION_SET_FOCUS`] is a
+/// per-connection statement about what that client is looking at — a
+/// tab is muted while *any* connection views it — and the PTY is sized
+/// by whoever interacted with it last.
+///
 /// # The versioning rule
 ///
-/// **An additive *session-socket* op bumps this when a pre-bump peer
-/// could not refuse it meaningfully.** Two qualifiers, both learned
-/// after the fact: the rule is scoped to this protocol's own sockets
-/// (a UI-socket op like [`ops::TAB_SEND_FILE`] moves
-/// [`crate::PROTOCOL_VERSION`]'s story, not this one, and that wire has
-/// no handshake gate to move), and it is now the **fallback** —
-/// [`SessionIdentify::features`] advertises additive session ops so a
-/// client feature-detects them instead of a whole generation being
-/// spent on one op. Not every addition bumped even before that: a new
-/// *event* name inside an existing batch is ignored by a client that
-/// has no name for it, and a new lease-gated op a client never sends
-/// costs an old session nothing.
+/// **A session-socket change bumps this when a pre-bump peer could not
+/// refuse it meaningfully**, in either direction. The rule is scoped to
+/// this protocol's own sockets: a UI-socket op like
+/// [`ops::TAB_SEND_FILE`] moves [`crate::PROTOCOL_VERSION`]'s story,
+/// not this one. A new *event* name inside an existing batch does not
+/// bump — a client with no name for it ignores it.
 ///
-/// `session.put_file` (plan 047) is the other kind. A pre-047 session
-/// answers `unknown-op` to a paste the user just performed, and the
-/// only honest client response is a per-paste special case ("this
-/// host's session is too old to receive files") carried forever.
-/// Charlie's call was the clean break instead: bump, and let the
-/// existing `NeedsRestart` dialog offer the update. The cost is stated
-/// plainly — the bump disables **every** host session against an
-/// un-updated far side, not just uploads, and a Unix-socket host gets
-/// no offer at all (its user updates the far side by hand).
-///
-/// `4` (plan 049, R1) re-cuts what the lease owns, which is
-/// **breaking in both directions**. [`ops::EVENTS_SUBSCRIBE`] no longer
-/// requires a lease — it *classifies* on one (driver stream vs.
-/// observer stream), so a `3` session refuses the leaseless subscribe a
-/// `4` client makes; [`ops::TAB_WRITE`] on a session socket now
-/// requires one, so a `3` client's leaseless write is refused by a `4`
-/// session. Takeover stopped being terminal for event streams: they
-/// survive it and receive [`SESSION_DRIVER_CHANGED_EVENT`] instead of
-/// [`SESSION_STOPPING_EVENT`], which a `3` client skips as an unknown
-/// envelope and then waits forever for a goodbye that never comes.
-/// [`SessionConnectParams::client_label`] and
-/// [`SessionIdentify::features`] ride along additively.
-///
-/// R15 (plan 057) re-opened the write half **within** this generation:
-/// [`ops::TAB_WRITE`] and [`ops::TAB_ATTACH`] take no lease again. That
-/// is additive — a gate that stops refusing breaks no client — so the
-/// number stays `4` and the reversal is advertised as `open_input` in
-/// [`SESSION_FEATURES`]. A `4` session without that entry still answers
-/// `connect-required` to a leaseless write, which is why a client
-/// feature-detects instead of reading this number.
-///
-/// `3` (plan 047) adds [`ops::SESSION_PUT_FILE`] under that rule.
-///
-/// `2` (plan 036, HS-1b) was a **breaking** bump from HS-1a's `1`:
-/// `events.subscribe` and `tab.attach` require the lease minted by
-/// [`ops::SESSION_CONNECT`], so a client written against `1` — which
-/// subscribed with no lease at all — is rejected with
-/// `connect-required`. The attach handshake carries this same number in
-/// its `protocol_version` field and a mismatch is refused before the
-/// token is even looked at.
-pub const SESSION_PROTOCOL_VERSION: u32 = 4;
-
-/// What this build advertises in [`SessionIdentify::features`] — the
-/// one source both the docs and the tests read.
-///
-/// Additive within a generation and **monotonic**: a capability is never
-/// removed without a [`SESSION_PROTOCOL_VERSION`] bump, which is when
-/// the next generation of vectors is cut. That is what lets an older
-/// generation's frozen vector stay valid — its list is a subset of this
-/// one, never an equal.
-///
-/// An entry need not be a whole op. `events_resume` is
-/// [`EventsSubscribeParams::from_revision`] and `tab_dump_scrollback` is
-/// [`TabDumpParams::scrollback`]: both are additive *parameters* on ops
-/// every generation already serves, listed so a client can
-/// feature-detect them instead of probing for the `unknown-field` an
-/// older server answers.
-///
-/// `open_input` is the third kind — a *rule* this session serves that a
-/// same-generation session may not. It promises three things:
-/// [`ops::TAB_WRITE`] and [`ops::TAB_ATTACH`] take no lease; a takeover
-/// preserves every control and data connection, moving only the
-/// foreground; and [`ops::TAB_ATTACH`] accepts a `focus` parameter (a
-/// client sends `focus: false` only to a session advertising this).
-pub const SESSION_FEATURES: &[&str] = &[
-    "put_file",
-    "events_resume",
-    "tab_dump_scrollback",
-    "open_input",
-];
+/// A client compares this number against the session's
+/// [`SessionIdentify::session_protocol`] for **equality** and refuses
+/// anything else, so the integer is the whole negotiation. What each
+/// generation changed is `CHANGELOG.md`'s to tell.
+pub const SESSION_PROTOCOL_VERSION: u32 = 5;
 
 /// What a host session can encode a tab's attach payload as.
 ///
@@ -1950,16 +1832,6 @@ pub struct SessionIdentify {
     pub app_version: String,
     pub session_protocol: u32,
     pub payload_kinds: Vec<AttachPayloadKind>,
-    /// Optional additive session ops this build serves, as an open
-    /// string list — same preserve-unknown contract as
-    /// `payload_kinds`, and the channel that keeps a single new op from
-    /// spending a whole [`SESSION_PROTOCOL_VERSION`] generation. Never
-    /// generations: what a bump covers is not listed here.
-    ///
-    /// `#[serde(default)]` because a `3` session sends no such key and
-    /// must still decode — the values are [`SESSION_FEATURES`].
-    #[serde(default)]
-    pub features: Vec<String>,
     pub libghostty_build: String,
     pub session_id: String,
     pub started_at: String,
@@ -2017,47 +1889,6 @@ pub struct EventBatch {
     pub events: Vec<EventEnvelope>,
 }
 
-/// [`ops::SESSION_CONNECT`] params. `takeover: false` (the default)
-/// fails with `already-connected` when a lease is live — *including*
-/// when the caller is the current holder, because a client that lost
-/// track of its own lease is exactly the one that must re-establish it
-/// deliberately.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SessionConnectParams {
-    #[serde(default)]
-    pub takeover: bool,
-    /// Who the claimant says it is — a hostname for a desktop, an app
-    /// name for a phone — stated at the moment it claims authority, and
-    /// echoed to the deposed streams as
-    /// [`SessionDriverChangedEvent::taken_by`].
-    ///
-    /// **Display metadata, never identity**: nothing is authenticated,
-    /// so a UI renders it as what the client *reports itself as*.
-    /// Normalized server-side (trim, strip control characters, cap at
-    /// 128 bytes, empty → absent) rather than here, so a hand-written
-    /// request gets the same treatment as a typed one.
-    ///
-    /// Omitted when unset: an older session `deny_unknown_fields`-
-    /// rejects the key, so an unlabeled connect must stay byte-
-    /// identical to what it has always sent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_label: Option<String>,
-}
-
-/// [`ops::SESSION_CONNECT`] result: the bearer lease every lease-gated
-/// op must present, plus the workspace revision it was minted at so a
-/// client can fence its first `tab.list` against the event stream
-/// without a second round trip.
-///
-/// The lease is a credential: never log it, never print it in a test
-/// failure dump.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionConnectResult {
-    pub lease: String,
-    pub revision: u64,
-}
-
 /// [`ops::TAB_ATTACH`] params — the control-plane half of an attach.
 ///
 /// `kinds` is the client's preference order; the server serves the
@@ -2069,24 +1900,6 @@ pub struct SessionConnectResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabAttachParams {
-    /// The driver lease minted by [`ops::SESSION_CONNECT`], accepted and
-    /// ignored — an attach is raw input and takes no lease (plan 057,
-    /// R15). It stays on the wire because a session that predates
-    /// `open_input` **requires** it, and a client that holds one has no
-    /// reason to strip it.
-    ///
-    /// Omitted when unset rather than sent as `null`, so that a client
-    /// which *does* hold a lease puts byte-identical bytes on the wire
-    /// to what it has always sent. That is the case compatibility turns
-    /// on. A client holding **no** lease cannot attach to a
-    /// pre-`open_input` session at all — that session decodes this key
-    /// as a required `String` and refuses both the missing key and a
-    /// `null` — which is correct, because such a session really does
-    /// gate attach on the lease. Present a lease whenever you have one:
-    /// it costs nothing here and is the difference between working and
-    /// not against an older peer.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lease: Option<String>,
     #[serde(with = "string_int64")]
     pub tab_id: i64,
     pub kinds: Vec<AttachPayloadKind>,
@@ -2099,38 +1912,26 @@ pub struct TabAttachParams {
     pub libghostty_build: String,
     /// Whether this attach claims the tab's geometry.
     ///
-    /// `true` (the default) resizes the tab to `cols`/`rows` during
-    /// negotiation, which is what an attach has always done. `false`
-    /// attaches at whatever size the tab already is, so a client that is
-    /// only watching cannot shrink the one that is typing; its geometry
-    /// still applies the moment it sends an `INPUT` or `RESIZE` frame,
-    /// which is why the grid must be non-zero either way.
+    /// `true` resizes the tab to `cols`/`rows` during negotiation, which
+    /// is what an attach has always done. `false` attaches at whatever
+    /// size the tab already is, so a client that is only watching cannot
+    /// shrink the one that is typing; its geometry still applies the
+    /// moment it sends an `INPUT` or `RESIZE` frame, which is why the
+    /// grid must be non-zero either way.
     ///
-    /// **Omitted from the wire when true**, and that is not a size
-    /// optimization: this struct is `deny_unknown_fields`, so a session
-    /// that predates `open_input` would refuse *every* attach carrying
-    /// the key — not just the ones that meant something by it. A client
-    /// sends `focus: false` only to a session advertising `open_input`.
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    /// Required and always serialized. Protocol 4 let it be omitted to
+    /// mean `true`, so a client could address a peer that predated the
+    /// field; at 5 there is no such peer, and an omitted `focus` is a
+    /// malformed request rather than a claim.
     pub focus: bool,
 }
 
-fn default_true() -> bool {
-    true
-}
-
-fn is_true(value: &bool) -> bool {
-    *value
-}
-
-/// Hand-written so the Rust default and the serde default agree: a
-/// derived `Default` would make `focus` false, and a caller filling the
-/// rest of the struct with `..Default::default()` would silently ask for
-/// an unfocused attach.
+/// Hand-written because a derived `Default` would make `focus` false, and
+/// a caller filling the rest of the struct with `..Default::default()`
+/// would silently ask for an unfocused attach.
 impl Default for TabAttachParams {
     fn default() -> Self {
         TabAttachParams {
-            lease: None,
             tab_id: 0,
             kinds: Vec::new(),
             cols: 0,
@@ -2151,7 +1952,8 @@ impl Default for TabAttachParams {
 /// back, which is what makes a stale stream from a restarted server
 /// unresumable by construction rather than by luck.
 ///
-/// `attach_token` is a credential — same no-logging rule as the lease.
+/// `attach_token` is a credential: never log it, never print it in a
+/// test failure dump.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabAttachResult {
     pub attach_token: String,
@@ -2276,8 +2078,7 @@ pub struct AttachAccepted {
 pub enum AttachHandshakeReply {
     Accepted(AttachAccepted),
     /// Written, then the connection closes. Codes: `invalid-token`,
-    /// `protocol-mismatch`, `taken-over`, `snapshot-failed`,
-    /// `shutting-down`.
+    /// `protocol-mismatch`, `snapshot-failed`, `shutting-down`.
     Rejected(ResponseError),
 }
 
@@ -2448,7 +2249,7 @@ pub struct HostDisconnectParams {
 ///
 /// The state is what the client asked *for*, not the far end's verdict:
 /// `host.connect` starts an attempt and answers `connecting`, because
-/// waiting for a dial, an identify and a lease before replying would
+/// waiting for a dial, an identify and a subscribe before replying would
 /// block the caller on a remote round trip it can watch on the events
 /// stream instead. A caller that wants the settled answer polls
 /// [`host.status`](HostStatus) — which reports the connection state the
@@ -2501,16 +2302,6 @@ pub struct HostStatus {
     /// `host.connect` answers with, produced by the same classifier the
     /// band's dot reads.
     pub state: String,
-    /// Who this session says is driving it, when this client has been
-    /// told (plan 057 §3.5).
-    ///
-    /// Only a `taken-over` host carries it, and only when the
-    /// `session.driver_changed` envelope named the claimant — a takeover
-    /// this client merely *inferred* from a non-current lease probe knows
-    /// no name. Self-reported display metadata, never identity: the
-    /// session authenticates nobody.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub taken_by: Option<String>,
     /// The connection's own one-line reason, untruncated. This is the
     /// band's *input*; [`Self::rollup`] is what it renders.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2631,12 +2422,11 @@ pub struct RetrySchedule {
 /// `host.connect`, `host.disconnect`, and anything that reports one.
 ///
 /// Kebab-case to match the error codes beside them on this wire
-/// (`taken-over`, `build-mismatch`).
+/// (`build-mismatch`).
 pub mod host_state {
     pub const DISCONNECTED: &str = "disconnected";
     pub const CONNECTING: &str = "connecting";
     pub const CONNECTED: &str = "connected";
-    pub const TAKEN_OVER: &str = "taken-over";
     pub const STOPPED: &str = "stopped";
     pub const NEEDS_RESTART: &str = "needs-restart";
 }
@@ -2731,16 +2521,13 @@ pub struct OscColorsParams {
 /// [`ops::SESSION_SET_THEME`] params: seed every tab's server terminal
 /// with the attached client's palette.
 ///
-/// Lease-gated, like every other interactive session op — a client that
-/// does not drive the session does not get to recolor it. Applies to
-/// the tabs that exist now **and** is remembered for tabs the session
-/// opens later, so a client sends it once after `session.connect`
-/// (before the first `tab.attach`) and again whenever its theme
-/// changes. Concurrent callers are last-writer-wins.
+/// Open to every same-UID connection, last writer wins. Applies to the
+/// tabs that exist now **and** is remembered for tabs the session opens
+/// later, so a client sends it once on connecting (before the first
+/// `tab.attach`) and again whenever its theme changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSetThemeParams {
-    pub lease: String,
     pub osc_colors: OscColorsParams,
 }
 
@@ -2752,24 +2539,19 @@ pub struct SessionSetThemeResult {
     pub tabs: u32,
 }
 
-/// [`ops::SESSION_SET_FOCUS`] params: what the attached client is
+/// [`ops::SESSION_SET_FOCUS`] params: what the connected client is
 /// actually looking at.
 ///
-/// A session's own workspace has no window, so its `window_focused`
-/// defaults to true and its active tab is whatever its restored layout
-/// selected — which makes the notification-suppression predicate
-/// (`window focused AND this is the active tab`) permanently true for
-/// one tab per session, muting exactly the tab an agent is most likely
-/// to be working in. This op is how the client that *does* have a window
-/// states the truth.
+/// A session's own workspace has no window, so nothing it can see tells
+/// it which tab a user has on screen and every agent would raise into a
+/// surface nobody is reading. This op is how a client that *does* have a
+/// window states it. Per connection and unioned: a tab is muted while
+/// any client says it is looking at it, and the statement moves nothing
+/// else — not the session's selection, which only `tab.focus` moves.
 ///
-/// Lease-gated, like every other interactive session op: focus is a
-/// property of the client driving the session, so a client that does not
-/// drive it does not get to state one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSetFocusParams {
-    pub lease: String,
     /// The session tab the client is looking at, or `null` for "nothing
     /// on this session is being looked at" (the window lost focus, or
     /// the selection moved to another host or to a local tab).
@@ -2797,14 +2579,12 @@ pub enum AgentHooksMode {
 /// [`ops::SESSION_SET_AGENT_HOOKS`] params: bring the host's agent hook
 /// entries in line with the connected client's configuration.
 ///
-/// Lease-gated, like every other interactive session op — and for a
-/// sharper reason than most: this one writes files under the session
-/// user's `$HOME`.
+/// Open to every same-UID connection, last writer wins — and this one
+/// writes files under the session user's `$HOME`.
 ///
-/// The client sends it after **every** `session.connect`, with its own
-/// `agent-hooks` / `agent-hooks-skip` values, because the op is
-/// idempotent and a config change made since the last connect has to
-/// reach the host. That is also why [`AgentHooksMode::Off`] *removes*
+/// The client sends it on **every** connect, with its own `agent-hooks` /
+/// `agent-hooks-skip` values, because the op is idempotent and a config
+/// change made since the last connect has to reach the host. That is also why [`AgentHooksMode::Off`] *removes*
 /// Roost's entries here rather than meaning "do nothing": on the client's
 /// own machine `off` is an opt-out of future wiring, but a host has no
 /// config of its own to consult — the client is the authority, so `off`
@@ -2812,7 +2592,6 @@ pub enum AgentHooksMode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSetAgentHooksParams {
-    pub lease: String,
     pub mode: AgentHooksMode,
     /// Agent names never wired, from the client's `agent-hooks-skip`. A
     /// name the host does not recognise is reported as a skip and
@@ -2891,12 +2670,12 @@ pub const MAX_PUT_FILE_BYTES: u64 = 10 * 1024 * 1024;
 /// pasteable **bare**, which is the one spelling every agent unquotes
 /// the same way. `data` is over [`MAX_PUT_FILE_BYTES`] → `too-large`.
 ///
-/// Lease-gated, and in the session's mutating set: a `session.stop`
-/// racing an upload waits for it.
+/// Open to every same-UID connection — each one's uploads land in their
+/// own private directory — and in the session's mutating set: a
+/// `session.stop` racing an upload waits for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionPutFileParams {
-    pub lease: String,
     pub name: String,
     /// Raw bytes encoded as base64. See `bytes_base64`.
     #[serde(with = "bytes_base64")]
@@ -3032,40 +2811,28 @@ pub mod ops {
     /// workspace, tear every PTY down, reply with the reap report, and
     /// only then run the process-level shutdown tail.
     pub const SESSION_STOP: &str = "session.stop";
-    /// Take the session's single interactive lease — the session's
-    /// *foreground*. Its holder is the one whose `session.set_focus`,
-    /// `session.set_theme`, `session.set_agent_hooks` and
-    /// `session.put_file` are accepted, and the one whose
-    /// `events.subscribe` stream is classified driver (so it receives
-    /// `tab.effect`) and named by `session.driver_changed`. Input is
-    /// not the lease's: `tab.write` and `tab.attach` take none. A lease
-    /// lives until it is
-    /// replaced or the session stops — losing the connection does not
-    /// release it, so a reconnecting client always arrives as a
-    /// takeover.
-    pub const SESSION_CONNECT: &str = "session.connect";
     /// Seed every tab's server terminal with the attached client's
-    /// theme palette, and remember it for the tabs opened next. Lease-
-    /// gated; last-writer-wins between concurrent clients.
+    /// theme palette, and remember it for the tabs opened next.
+    /// Last-writer-wins between concurrent clients.
     pub const SESSION_SET_THEME: &str = "session.set_theme";
-    /// Push the attached client's real focus — which of this session's
-    /// tabs it is looking at, or none — so the session's own
-    /// notification-suppression predicate reads the client's window
-    /// instead of a headless default. Lease-gated, and forgotten when
-    /// the lease is (a new lease, or the last connection under it
-    /// closing, reverts the session to "nobody is looking").
+    /// Push this connection's real focus — which of this session's tabs
+    /// it is looking at, or none — so the session's own
+    /// notification-suppression predicate reads a client's window
+    /// instead of a headless default. Per connection and unioned: a tab
+    /// is muted while any connection views it, and a connection's
+    /// statement dies with it.
     pub const SESSION_SET_FOCUS: &str = "session.set_focus";
     /// Bring the host's agent hook entries in line with the connected
     /// client's `agent-hooks` configuration — wiring them, refreshing
-    /// them, or taking them back out. Lease-gated, and served only by a
-    /// session that was built with an install callback: the engine
-    /// decodes and gates it, `roost-session` does the work.
+    /// them, or taking them back out. Served only by a session that was
+    /// built with an install callback: the engine decodes it,
+    /// `roost-session` does the work.
     pub const SESSION_SET_AGENT_HOOKS: &str = "session.set_agent_hooks";
     /// Take one file's bytes and land them somewhere the session's own
     /// shells can read, answering with a paste-safe absolute host path.
-    /// Lease-gated and mutating; a session built without a file store
-    /// answers `not-supported`, and a UI socket `unknown-op` like every
-    /// other session op. The leg underneath [`TAB_SEND_FILE`].
+    /// Mutating; a session built without a file store answers
+    /// `not-supported`, and a UI socket `unknown-op` like every other
+    /// session op. The leg underneath [`TAB_SEND_FILE`].
     pub const SESSION_PUT_FILE: &str = "session.put_file";
     /// Ask for a ticket to open a data connection for one tab. The
     /// control-plane half of an attach: it negotiates payload kind,
@@ -3263,8 +3030,8 @@ pub mod ops {
     pub const HOST_REMOVE: &str = "host.remove";
     pub const HOST_LIST: &str = "host.list";
     /// Start a connection to a saved host — the palette's
-    /// `Connect Host: <label>` and the sidebar's ↻ Reconnect. An
-    /// explicit connect is unconditional takeover, and may start a
+    /// `Connect Host: <label>` and the sidebar's ↻ Reconnect. It
+    /// reconnects whatever the host's current state, and may start a
     /// localhost session that is not running.
     pub const HOST_CONNECT: &str = "host.connect";
     /// Drop a saved host's connection. Never Stop: the session keeps
@@ -3846,7 +3613,6 @@ mod tests {
         let p = TabWriteParams {
             tab_id: 5,
             data: b"hello\n".to_vec(),
-            lease: None,
         };
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains("\"data\":\"aGVsbG8K\""), "got: {json}");
@@ -4561,7 +4327,6 @@ mod tests {
             last_connected: Some("2026-09-01T17:40:02Z".into()),
             generation: 3,
             state: host_state::DISCONNECTED.into(),
-            taken_by: None,
             reason: Some("reconnecting in 8s (3/10)".into()),
             detail: None,
             rollup: Some("disconnected — reconnecting in 8s (3/10)".into()),
@@ -4653,27 +4418,6 @@ mod tests {
                 "from_revision": 4_312,
             })
         );
-
-        // `taken_by` rides beside the state and is additive: a host
-        // nobody took over omits the key, and one whose takeover this
-        // client only inferred omits it too — there is no name to give.
-        let deposed = HostStatus {
-            state: host_state::TAKEN_OVER.into(),
-            taken_by: Some("a phone".into()),
-            ..never.clone()
-        };
-        round_trip(&deposed);
-        assert_eq!(
-            serde_json::to_value(&deposed).unwrap()["taken_by"],
-            serde_json::json!("a phone")
-        );
-        assert!(serde_json::to_value(HostStatus {
-            state: host_state::TAKEN_OVER.into(),
-            ..never.clone()
-        })
-        .unwrap()
-        .get("taken_by")
-        .is_none());
 
         // A fresh snapshot resumed from nothing, so the fence is omitted
         // rather than reported as a revision the session never attested.

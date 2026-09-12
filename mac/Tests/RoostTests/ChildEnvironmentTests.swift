@@ -29,9 +29,13 @@ import Testing
         #expect(out["TERMINFO"] == nil)
     }
 
-    @Test func stripsAnInheritedDriverLease() {
+    /// `ROOST_LEASE` was stripped while a session had a driver lease to
+    /// leak. Nothing mints one at protocol 5, so the strip is gone and
+    /// the variable is just another one Roost passes through — which is
+    /// what this pins, so the removal cannot quietly come back.
+    @Test func passesThroughRoostLeaseNowThatNothingMintsOne() {
         let out = env(base: ["ROOST_LEASE": "9f2c1d7a4b6e08315c0d9a72e4f16b83", "HOME": "/Users/u"])
-        #expect(out["ROOST_LEASE"] == nil)
+        #expect(out["ROOST_LEASE"] == "9f2c1d7a4b6e08315c0d9a72e4f16b83")
     }
 
     @Test func forcesTerminalIdentityAndRoostContract() {

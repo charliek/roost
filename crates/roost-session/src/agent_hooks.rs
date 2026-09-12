@@ -1,10 +1,10 @@
 //! The host half of `session.set_agent_hooks` (plan 046 §3.4).
 //!
-//! `roost-engine` decodes the op and gates it on the interactive lease;
-//! the work lands here, in the one process that has both the install
-//! engine linked and the `$HOME` being written. The engine never depends
-//! on `roost-agent-install` — it is linked into the UI processes too, and
-//! a UI has no business carrying a dotfile writer.
+//! `roost-engine` decodes the op; the work lands here, in the one
+//! process that has both the install engine linked and the `$HOME` being
+//! written. The engine never depends on `roost-agent-install` — it is
+//! linked into the UI processes too, and a UI has no business carrying a
+//! dotfile writer.
 //!
 //! **The client's config is the authority, and it is re-sent on every
 //! connect.** `mode = off` therefore *removes* Roost's entries here,
@@ -26,7 +26,7 @@
 //! diagnosable from `roostctl agent status` on the host. Reconciling the
 //! two is filed as future work (§9), not solved here.
 
-use roost_agent_install::{Guard, Home, InstallError, Mode, Outcome};
+use roost_agent_install::{Guard, Home, Mode, Outcome};
 use roost_engine::ipc::{AgentHooksError, AgentHooksHandle, AgentHooksRequest};
 use roost_ipc::messages::{
     AgentHooksFailed, AgentHooksMode, AgentHooksSkipped, SessionSetAgentHooksResult,
@@ -55,21 +55,19 @@ pub fn handle() -> AgentHooksHandle {
 
 /// One ensure, against an explicit [`Home`] — the seam the tests drive.
 ///
-/// Only an [`InstallError`] (no `$HOME`, an unwritable record, a lock
-/// another writer held past the deadline) becomes an `Err` here, and the
-/// engine turns that into one error frame. A *per-agent* failure is not
+/// Only a whole-run install failure (no `$HOME`, an unwritable record, a
+/// lock another writer held past the deadline) becomes an `Err` here, and
+/// the engine turns that into one error frame. A *per-agent* failure is not
 /// that: it rides back in [`SessionSetAgentHooksResult::errors`], because
 /// a codex file Roost could not parse must not cost the client the
 /// session it just attached to.
 ///
-/// `ensure_on_behalf` rather than `ensure`, for the two things that are
-/// only true remotely: the asking client's authority is re-checked once
-/// the install holds its lock (the door check it passed can be seconds
-/// stale by then — see `session_set_agent_hooks`), and the record's
-/// `noticed` flag is flipped in that same locked write. The flip belongs
-/// there because this reply *is* the announcement: there is no second
-/// step to defer it to, and doing it afterwards under a re-taken lock let
-/// two clients connecting at once both be told about the same agent.
+/// `ensure_on_behalf` rather than `ensure`, for the one thing that is
+/// only true remotely: the record's `noticed` flag is flipped in the
+/// install's own locked write. The flip belongs there because this reply
+/// *is* the announcement: there is no second step to defer it to, and
+/// doing it afterwards under a re-taken lock let two clients connecting
+/// at once both be told about the same agent.
 fn ensure_in(
     home: &Home,
     request: &AgentHooksRequest,
@@ -80,14 +78,8 @@ fn ensure_in(
         AgentHooksMode::Auto => Mode::Auto,
         AgentHooksMode::Off => Mode::Off,
     };
-    let outcome =
-        roost_agent_install::ensure_on_behalf(home, mode, &skip, &request.client, guard, &|| {
-            request.authority.holds()
-        })
-        .map_err(|error| match error {
-            InstallError::Unauthorized => AgentHooksError::Unauthorized,
-            other => AgentHooksError::Failed(other.to_string()),
-        })?;
+    let outcome = roost_agent_install::ensure_on_behalf(home, mode, &skip, &request.client, guard)
+        .map_err(|error| AgentHooksError::Failed(error.to_string()))?;
 
     info!(
         client = %request.client,
@@ -151,29 +143,11 @@ fn reply(outcome: &Outcome, unknown_skip_names: &[String]) -> SessionSetAgentHoo
 mod tests {
     use super::*;
 
-    use roost_engine::ipc::AgentHooksAuthority;
-
     fn request(mode: AgentHooksMode, skip: &[&str]) -> AgentHooksRequest {
-        with_authority(mode, skip, AgentHooksAuthority::always())
-    }
-
-    fn with_authority(
-        mode: AgentHooksMode,
-        skip: &[&str],
-        authority: AgentHooksAuthority,
-    ) -> AgentHooksRequest {
         AgentHooksRequest {
             mode,
             skip: skip.iter().map(|s| (*s).to_string()).collect(),
             client: "charlie-mbp".into(),
-            authority,
-        }
-    }
-
-    fn failure(error: AgentHooksError) -> String {
-        match error {
-            AgentHooksError::Failed(message) => message,
-            other => panic!("expected a whole-run failure, got {other:?}"),
         }
     }
 
@@ -219,38 +193,6 @@ mod tests {
         let record = std::fs::read_to_string(dir.path().join(".config/roost/agent-hooks.json"))
             .expect("state record");
         assert!(record.contains("charlie-mbp"), "{record}");
-    }
-
-    /// A request whose lease was taken over while it waited writes
-    /// nothing at all — not the agents' files, and not the state record
-    /// that says who wired them.
-    ///
-    /// The window is real: the install engine blocks on a per-home lock,
-    /// and neither dropping the client's connection nor its own 15 s
-    /// timeout cancels a handler already running. So an `auto` request
-    /// stuck behind another writer could land *after* the client that
-    /// displaced it had already told the host `off`.
-    #[test]
-    fn a_displaced_lease_writes_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = a_home(dir.path());
-
-        let lost = ensure_in(
-            &home,
-            &with_authority(
-                AgentHooksMode::Auto,
-                &[],
-                AgentHooksAuthority::new(|| false),
-            ),
-            Guard::PERMITTED,
-        )
-        .expect_err("a request that lost the lease must not write");
-        assert!(
-            matches!(lost, AgentHooksError::Unauthorized),
-            "and it says so as a takeover, not as an internal fault: {lost:?}"
-        );
-        assert!(!dir.path().join(".claude/settings.json").exists());
-        assert!(!dir.path().join(".config/roost/agent-hooks.json").exists());
     }
 
     /// The toast is a property of the host, not of the call: the session
@@ -327,10 +269,9 @@ mod tests {
             forced: false,
         };
 
-        let refused = failure(
-            ensure_in(&home, &request(AgentHooksMode::Auto, &[]), guard)
-                .expect_err("test mode must stop the install engine dead"),
-        );
+        let refused = ensure_in(&home, &request(AgentHooksMode::Auto, &[]), guard)
+            .expect_err("test mode must stop the install engine dead")
+            .to_string();
         assert!(refused.contains("ROOST_TEST_MODE"), "{refused}");
         assert!(!dir.path().join(".claude/settings.json").exists());
     }

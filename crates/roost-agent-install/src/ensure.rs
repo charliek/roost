@@ -211,35 +211,23 @@ pub fn ensure(
     by: &str,
     guard: Guard,
 ) -> Result<Outcome, InstallError> {
-    ensure_with(home, mode, skip, by, guard, Notice::Caller, None)
+    ensure_with(home, mode, skip, by, guard, Notice::Caller)
 }
 
 /// [`ensure`] run for somebody who is not this machine — a host session
 /// acting on a connected client's config (plan 046 §3.4).
 ///
-/// Two things differ, and both follow from the caller being remote.
-///
-/// `authority` is re-asked **once the lock is in hand**, and a `false`
-/// answer is [`InstallError::Unauthorized`] with nothing written. The
-/// caller's permission was checked at the door, but the door can be a
-/// long way from the effect: this call can sit behind another writer's
-/// lock for the whole of [`crate::write::LOCK_DEADLINE`], and the client
-/// that asked may have lost the session's lease to somebody else in the
-/// meantime. The lock is the serialization point for every Roost writer,
-/// so it is the last moment at which "may I still write?" is a question
-/// whose answer still holds when the rename lands.
-///
-/// And the run flips `noticed` itself, in the same record write —
-/// see [`Notice::Here`].
+/// One thing differs, and it follows from the caller being remote: the
+/// run flips `noticed` itself, in the same record write — see
+/// [`Notice::Here`].
 pub fn ensure_on_behalf(
     home: &Home,
     mode: Mode,
     skip: &[Agent],
     by: &str,
     guard: Guard,
-    authority: &dyn Fn() -> bool,
 ) -> Result<Outcome, InstallError> {
-    ensure_with(home, mode, skip, by, guard, Notice::Here, Some(authority))
+    ensure_with(home, mode, skip, by, guard, Notice::Here)
 }
 
 fn ensure_with(
@@ -249,14 +237,9 @@ fn ensure_with(
     by: &str,
     guard: Guard,
     notice: Notice,
-    authority: Option<&dyn Fn() -> bool>,
 ) -> Result<Outcome, InstallError> {
     guard.check()?;
     let _lock = crate::write::lock(&home.lock_path())?;
-    // Under the lock and before the first read: see `ensure_on_behalf`.
-    if authority.is_some_and(|still| !still()) {
-        return Err(InstallError::Unauthorized);
-    }
     let (mut record, warning) = state::load(home)?;
     let mut outcome = Outcome::default();
     if let Some(warning) = warning {
@@ -561,56 +544,15 @@ mod tests {
         Home::rooted(root)
     }
 
-    /// The authority is asked **while the lock is held**, and that is the
-    /// whole of the fix.
-    ///
-    /// A caller can wait the length of [`crate::write::LOCK_DEADLINE`]
-    /// behind another writer, and a remote caller's permission can expire
-    /// inside that wait (its session lease taken over by a client that
-    /// asked for the opposite). Asked at the door, the answer is stale by
-    /// the time it matters; asked under the lock, no other Roost writer
-    /// can slip between the answer and the write.
+    /// A delegated run wires, records, and reports exactly as a local
+    /// `ensure` does.
     #[test]
-    fn the_authority_is_asked_under_the_lock_not_at_the_door() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = a_home(dir.path());
-        let asked = std::cell::Cell::new(0u32);
-        let held_while_asked = std::cell::Cell::new(false);
-
-        let refused = ensure_on_behalf(&home, Mode::Auto, &[], "remote", Guard::PERMITTED, &|| {
-            asked.set(asked.get() + 1);
-            held_while_asked.set(
-                crate::write::lock_within(&home.lock_path(), std::time::Duration::ZERO).is_err(),
-            );
-            false
-        })
-        .expect_err("a caller without authority must not write");
-
-        assert_eq!(asked.get(), 1);
-        assert!(
-            held_while_asked.get(),
-            "the authority was asked before the run took its lock"
-        );
-        assert!(matches!(refused, InstallError::Unauthorized), "{refused:?}");
-        assert!(
-            !dir.path().join(".claude/settings.json").exists(),
-            "an unauthorised run wrote an agent's file"
-        );
-        assert!(
-            !dir.path().join(".config/roost/agent-hooks.json").exists(),
-            "an unauthorised run wrote the state record"
-        );
-    }
-
-    /// A caller that still holds its authority is not slowed down by
-    /// having one: the same run wires, records, and reports.
-    #[test]
-    fn an_authorised_delegate_wires_exactly_as_ensure_does() {
+    fn a_delegate_wires_exactly_as_ensure_does() {
         let dir = tempfile::tempdir().unwrap();
         let home = a_home(dir.path());
 
-        let done = ensure_on_behalf(&home, Mode::Auto, &[], "remote", Guard::PERMITTED, &|| true)
-            .expect("ensure");
+        let done =
+            ensure_on_behalf(&home, Mode::Auto, &[], "remote", Guard::PERMITTED).expect("ensure");
         assert_eq!(done.wired, vec![Agent::Claude]);
         assert_eq!(done.unnoticed, vec![Agent::Claude]);
     }
@@ -629,8 +571,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = a_home(dir.path());
 
-        let first = ensure_on_behalf(&home, Mode::Auto, &[], "remote", Guard::PERMITTED, &|| true)
-            .expect("ensure");
+        let first =
+            ensure_on_behalf(&home, Mode::Auto, &[], "remote", Guard::PERMITTED).expect("ensure");
         assert_eq!(first.unnoticed, vec![Agent::Claude]);
         // Read straight off the record: no `mark_noticed` ran in between,
         // which is exactly the point.
@@ -638,7 +580,7 @@ mod tests {
             .expect("state record");
         assert!(recorded.contains("\"noticed\": true"), "{recorded}");
 
-        let second = ensure_on_behalf(&home, Mode::Auto, &[], "remote", Guard::PERMITTED, &|| true)
+        let second = ensure_on_behalf(&home, Mode::Auto, &[], "remote", Guard::PERMITTED)
             .expect("ensure again");
         assert!(second.unnoticed.is_empty(), "{second:?}");
     }

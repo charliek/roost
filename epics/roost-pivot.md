@@ -18,13 +18,17 @@ amendments only as far as §10 and §11. Two of its answers have since
 been overtaken, so read them against the rules below rather than as they
 stand:
 
-* **§04 Q12's "write is three things"** is half wrong now. "Semantic
-  writes go through the agent's API" stands. "**Attach** is one client at
-  a time, switched by takeover" and "**raw `tab.write`** follows attach"
-  were both reversed by R15 (#453, landed): a tab admits as many data
-  connections as clients dial, `tab.write` and `tab.attach` take no lease
-  at all, and a takeover closes neither — it moves the *foreground*. See
-  the "Write is two things" rule below, and `vision.md` DL-25.
+* **§04 Q12's "write is three things"** is wholly overtaken now.
+  "Semantic writes go through the agent's API" stands. "**Attach** is
+  one client at a time, switched by takeover" and "**raw `tab.write`**
+  follows attach" were reversed by R15 (#453, landed): a tab admits as
+  many data connections as clients dial, `tab.write` and `tab.attach`
+  take no lease at all. R20 (#468, landed) then removed the lease
+  itself — there is no "foreground" and no takeover left to switch:
+  every same-UID connection is symmetric, effects fan out to every
+  subscriber and the viewing client applies them, and a tab is muted
+  while any client views it. See the "Write is two things" rule below,
+  and `vision.md` DL-25 and DL-26.
 * **§04 Q7's "no network listener"** is narrower than it reads. It
   governs roost's own transport; an agent's own server on `127.0.0.1`,
   exposed by that agent's plugin, is the agent's lane (R10, landed). See
@@ -67,6 +71,7 @@ gh issue list -R charliek/roost --state open --search "in:title [R"
 | R17 | [#462](https://github.com/charliek/roost/issues/462) | RP/M5 | R15's in-place foreground retake never runs over SSH — a reconnect rebuilds the bridge socket, so the remote case falls back to the reattach R15 exists to avoid |
 | R18 | [#463](https://github.com/charliek/roost/issues/463) | RP/M5 | `tab.resize` zeroes libghostty's cell metrics; R15's whole-tuple geometry compare made that reachable, so in-band size reports read `0x0` |
 | R19 | [#461](https://github.com/charliek/roost/issues/461) | — | CI/dev: `runtime_dir_test` fails 9/12 under umask 0002 — its own tempdir fixture is group-writable, and `roost-session start` refuses the same way |
+| R20 | [#468](https://github.com/charliek/roost/issues/468) | RP/M5 | retire the lease: session protocol 5, no `session.connect`, no `driver_changed`; every same-UID client is symmetric — closes #458 and #466 |
 
 **Sequencing.** R6 went first, as the XS item that shook down the
 issue → PR → `Closes` → board chain; R2 and R1 followed, then R8, then
@@ -102,9 +107,13 @@ moved and the protocol did not.
 **R15 reverses one of R1's two halves, on purpose.** R1 made reads free
 and writes owned. Measured against tmux and herdr (2026-09-08), owned
 input is stricter than either substrate for no product gain: tmux lets
-every attached client type, herdr's multi-client attach has no owner at
-all, and both put bells, clipboard and sizing on one foreground client
-without ever gating input on it. Roost follows. Every same-UID client
+every attached client type, and herdr's ordinary multi-pane client mode
+gates no input either — its foreground client is derived from the newest
+activity stamp rather than claimed, and carries bells, title and sizing
+without ever deciding who may type. (herdr does keep a single writable
+owner with an explicit `--takeover`, but only for a raw direct attach to
+one terminal; see DL-26, which corrects an earlier overstatement that
+herdr had no owner at all.) Roost follows. Every same-UID client
 may type into and attach to any tab; the lease survives as the
 foreground. The wire change is additive at protocol 4 — shed pins one
 identify vector per generation and must not need a re-pin. Geometry is
@@ -140,13 +149,29 @@ people develop on, which is how a real failure gets waved through — and
 it earns its row because the same check refuses a `roost-session start`,
 so it is not only a test.
 
-Two already on the board are worth reading beside these rather than
-below them: **#460** (no roosttest fixture for a daemon in the UI's own
+One already on the board is worth reading beside these rather than
+below it: **#460** (no roosttest fixture for a daemon in the UI's own
 localhost profile) is named in its own body as work to do *before* R9,
 since R9 turns localhost from a minority case into the path every session
-takes; and **#458** (a subscribe's control and event legs can name
-different sessions) is a narrow race today whose odds R9 raises, for the
-same reason.
+takes. **#458** (a subscribe's control and event legs can name
+different sessions) landed with R20: the ack now carries `session_id`
+and a mismatched pair is refused before the pump starts.
+
+**R20 removes the residue R15 left standing.** R1 made reads free; R15
+made input free; what remained was "the foreground" — four things a
+lease decided (which stream got `tab.effect`, whose focus muted
+notifications, who `session.driver_changed` named, and which
+connection the settings ops accepted). Measured against tmux and
+herdr, that residue bought nothing: neither substrate gates anything on
+an owner. R20 (#468) retires `session.connect`, the `lease` field on
+every op, and `session.driver_changed` — a breaking bump to session
+protocol `5`, since nothing built on this wire had shipped past
+v0.0.19's protocol `2`. Effects now fan out to every subscriber and the
+viewing client applies them; focus is a union over connections, not an
+election; geometry stays last-interactor (R15/DL-25, unchanged). It
+also closes #466 (a lease published by a diff at a distance) by
+deleting every lease carrier the bug depended on, and #458 by requiring
+`session_id` on the subscribe ack.
 
 ## Rules that apply in this repo
 
@@ -167,13 +192,14 @@ same reason.
 - **Sessions live in `roost-session`, never in the app's own process**
   (R9). Until R9 lands, work that needs a subscribable session must use a
   host session, not the app window.
-- **Write is two things, and reads are free.** Semantic writes go
-  through the agent's API (many writers, the agent serializes). Raw
-  input — `tab.write` and attach — is open to every same-UID client, the
-  tmux/herdr rule (R15, amending R1's "writes owned"). The lease is the
-  *foreground*: it decides who gets `tab.effect`, whose focus
-  suppresses notifications, and who sizes the PTY last; it never gates
-  input. Reads are free to everyone.
+- **Every same-UID client is symmetric.** Reads, input, attach and
+  settings are free — semantic writes still go through the agent's API
+  (many writers, the agent serializes), but nothing else asks who is
+  driving, because there is no lease and nothing left to ask (R20,
+  #468, landed; amends R1's "writes owned" and R15's "the lease is the
+  foreground"). Effects reach every subscriber and the viewing client
+  applies them; a tab is muted while any client views it; the last
+  interactor sizes the PTY.
 - **No supervisor artifact.** A session comes up on demand from the
   client that connects (R16). Do not add a unit, a plist, or a doctor
   probe for one without a case that needs a session before any client.

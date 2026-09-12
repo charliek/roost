@@ -199,53 +199,18 @@ that logic mentions a version number, which is why adding a payload kind
 costs nothing — plan 053 spent that budget for real, adding the `vt`
 kind and its whole fallback path with no protocol bump.
 
-**`session.identify.features` is the same pattern applied to *ops and
-op parameters alike*.** An open string list, decode-when-absent like
-`payload_kinds`, naming the additive session capabilities this build
-serves — seeded with `"put_file"` (plan 049, R1) and joined by
-`"events_resume"` (plan 052) for `events.subscribe`'s
-`from_revision`/`session_id` pair, `"tab_dump_scrollback"` (plan
-053) for `tab.dump`'s `scrollback` count, and `"open_input"` (plan 057,
-R15) for three things a client may rely on together — the reopened
-`tab.write`/`tab.attach` gate, `tab.attach`'s `focus` parameter, and
-that a takeover **preserves every control and data connection** rather
-than closing them — the first three add a capability,
-the fourth *removes* a restriction the same generation had imposed, and
-`features` carries both kinds. It exists because the
-alternative, bumping `SESSION_PROTOCOL_VERSION` for every additive
-capability, conflates two different questions: "can this peer speak my
-generation of the wire at all" (the exact gate above) and "does this
-peer happen to also support one more optional thing" (a capability).
-Before `features`, `session.put_file` had only the generation gate to
-answer the second question with, which is what set the now-superseded
-exception described under [Version bumps](#version-bumps) below. A
-client checks `features` the same way it checks `payload_kinds`: read
-the list, look for the name it cares about, degrade gracefully if it's
-missing. The line between the two channels is not "capability vs.
-restriction" but assumption vs. reliance: a generation pins what a
-client may *assume* about the wire — a `4` client assumes leaseless
-subscribe and a lease-gated write, full stop — and a feature entry
-names what it may *additionally* rely on beyond that, including a
-reversal of what the generation otherwise implies. `open_input` is the
-case that makes this concrete: a `4` session without it still answers
-`connect-required` to a leaseless write, so a client feature-detects
-the reversal instead of assuming it from the number alone.
-
-**`features` is monotonic within a generation.** A capability already
-listed is never removed without a `SESSION_PROTOCOL_VERSION` bump —
-that bump is *when* the next generation's vector is cut, so a capability
-can only disappear at exactly the moment a client is already forced to
-renegotiate everything else. That is what lets a frozen generation's
-identify vector stay meaningful after the build that serves it grows
-new features: the vector pins the **floor** — the capabilities that
-generation is guaranteed to have — and the current build's `features`
-is checked against it as a **superset**, never an equality. The
-`session.identify.response.v<N>.json` vector for the running generation
-is compared field-by-field except `features`, which is asserted
-duplicate-free and a **subset** of what the current build advertises;
-older generations' vectors are unaffected, since they are exercised only
-by decode-only tests that never compare against the live `features`
-list.
+**There is no intra-generation capability channel today.** `session.identify`
+carried a `features` list — an open string channel for an additive
+session capability that did not warrant a whole generation bump —
+through protocol `4`. It answered a real question (has this build also
+grown one more optional thing, short of "can it speak my generation at
+all") and is not gone because the question stopped mattering; it is
+gone because `4` → `5` retired it along with the lease it mostly
+existed to soften, and no second real consumer has needed the channel
+back since. See the `4` → `5` entry under [Version bumps](#version-bumps)
+for what moved. If a capability needs feature-detecting again before
+the next generation exists to carry it, that channel is the thing to
+resurrect — not something to route around with version sniffing.
 
 **Absence of a mandatory capability is a legitimate refusal.** Capability
 detection governs optional features; it does not mean every negotiation
@@ -295,17 +260,17 @@ bump anything, with one deliberate exception, now **re-qualified twice**
 since it was first written:
 
 **An additive *session-socket* op bumps the session integer when a
-pre-bump peer could not refuse it meaningfully — and only as a
-fallback, now that `features` exists.** Two qualifiers, both learned
+pre-bump peer could not refuse it meaningfully.** Two qualifiers, both learned
 after the fact. First, *session-socket only*: a UI-socket op like
 `tab.send_file` correctly does not move `PROTOCOL_VERSION` — that wire
 has no handshake gate for a bump to protect, so the exception never
 applied there in the first place; `tab.send_file` shipped as a pure
-addition, no bump, exactly as the matrix predicts. Second, *fallback,
-not first resort*: [`session.identify.features`](#capability-negotiation-over-version-sniffing)
-(plan 049, R1) is now the preferred channel for "this build also does
-one more optional thing" — a client feature-detects an entry instead of
-a whole generation being spent on one op.
+addition, no bump, exactly as the matrix predicts. Second, at protocol 5 this is again the
+*only* route: `session.identify.features` was the preferred channel for
+"this build also does one more optional thing" through generation 4, and
+5 deleted it — the integer now carries the whole contract, so an
+additive session-socket op spends a generation rather than a feature
+entry. A capability channel returns only with a second real consumer.
 
 Plan 047's `session.put_file` is the case that set the rule in the
 first place (documented on `SESSION_PROTOCOL_VERSION` and in [ipc.md's
@@ -320,24 +285,20 @@ R1's leaseless-classified `events.subscribe` and lease-gated
 `tab.write` are genuinely breaking in both directions (an old peer's
 request is refused or misunderstood, not merely a feature it lacks),
 which is the ordinary rule above, not the additive-op fallback. A new
-*event* a client can ignore, or a lease-gated op a client never sends,
-stays additive.
+*event* a client can ignore stays additive.
 
-**Plan 057 (R15) reopened `tab.write`'s and `tab.attach`'s gate, and
-that half is not the mirror of R1's.** Closing a gate is breaking —
-that is R1, above. Opening one back up is additive: an old (post-R1,
-pre-R15) client that still presents a `lease` on every write gets
-exactly the reply it always got, because a lease that is offered is
-now simply accepted and ignored rather than checked. Nothing about its
-request stops decoding or gets refused, so R15 needed no new
-generation — `SESSION_PROTOCOL_VERSION` stays `4` and the frozen `v4`
-identify vector is untouched. A client detects the reopened gate the
-ordinary capability-negotiation way, `open_input` in
-[`session.identify.features`](ipc.md#sessionidentify), not by
-generation: a `4` session that predates R15 carries no `open_input`
-entry and still answers a leaseless write with `connect-required`,
-which is the feature-detectable form of "this peer doesn't do that
-yet," not a decode failure.
+**`4` → `5` retired the lease, and it is the ordinary rule again, in
+both directions at once.** `session.connect` is gone (a pre-bump client
+gets `unknown-op`), so is the `lease` field on every op that carried one
+(`unknown-field`, because each of those params is `deny_unknown_fields`),
+so is `session.driver_changed` and the `connect-required` /
+`taken-over` / `already-connected` / `superseded` codes, and
+`events.subscribe`'s ack gained a **required** `session_id` a pre-bump
+session does not send. `session.identify.features` went with them: at
+`5` the integer is the whole negotiation, and a channel for
+intra-generation capabilities comes back when there is a second real
+consumer for one. No shim was left behind in either direction — that is
+the point of a generation.
 
 ## Fixtures are the contract
 
@@ -367,6 +328,19 @@ change.** Reformatting is fine; changing a value, adding a key, or
 removing one is not. The point of a golden file is that it records what
 the wire looked like at a moment; editing it in place erases exactly the
 evidence a compatibility question needs.
+
+*Except at a breaking generation bump.* A `SESSION_PROTOCOL_VERSION`
+bump may retire request and event vectors for ops that no longer exist
+and re-cut the ones whose shape changed, in the same commit as the bump.
+The corpus is the **current** contract, for consumers pinning `roost-ipc`
+by rev; carrying a generation-qualified copy of every retired shape would
+turn it into an archive nobody replays. The evidence is not lost: the
+prior generation's shapes survive at the previous tag, and its identify
+response survives on disk as the frozen `session.identify.response.v<N>.json`
+the rule below versions. `4` → `5` is the worked example — it deleted the
+four `session.connect` / `session.driver_changed` vectors, dropped the
+retired `lease` key from ten, and re-cut `events.subscribe.response.json`
+for the ack's new `session_id`.
 
 **Additive changes add vectors.** A new op, a new event, or an
 interesting new optional-field combination gets its own file. The loader

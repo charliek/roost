@@ -111,7 +111,7 @@ FRAME_NAMES = {
     FRAME_RESIZE: "RESIZE",
 }
 
-SESSION_PROTOCOL_VERSION = 4
+SESSION_PROTOCOL_VERSION = 5
 GHOSTTY_SNAPSHOT = "ghostty-snapshot"
 VT = "vt"
 #: `roost_engine::attach::VT_SNAP_FRAME_BYTES`. Not the wire's 1 MiB

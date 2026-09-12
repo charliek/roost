@@ -92,22 +92,12 @@ pub(crate) enum EngineFeed {
     /// shared one in place, so this is a wake plus the envelopes that
     /// have to be exact per commit.
     HostWorkspace(HostId, crate::host_conn::HostWorkspaceEvent),
-    /// One host's connection lifecycle, for the sidebar headers,
-    /// takeover banner and upgrade dialog.
+    /// One host's connection lifecycle, for the sidebar headers, the
+    /// frozen-frame banner and the upgrade dialog.
     HostState(HostId, crate::host_conn::HostConnState),
-    /// The lease a host connection was granted, published once as it
-    /// reaches `Connected` (plan 040 §3.7).
-    ///
-    /// It rides the feed rather than sitting on [`Self::HostState`]
-    /// because that state is what the UI *renders*, and a lease is not
-    /// something to render — it is a fact the app keeps so that the next
-    /// attempt over a dead ssh transport, which is a fresh task, can ask
-    /// whether the session is still ours before taking it back.
-    HostLease(HostId, String),
     /// What one connection attempt learned about the session it reached
     /// ([`crate::host_conn::ConnectFacts`], plan 056 §3.1), published
-    /// once per incarnation right behind the `Connected`/`TakenOver` it
-    /// belongs to — for an observer as much as for a driver.
+    /// once per incarnation right behind the `Connected` it belongs to.
     HostConnectFacts(HostId, crate::host_conn::ConnectFacts),
     /// An ssh host's armed auto-reconnect came due (plan 040 §3.4).
     ///
@@ -215,11 +205,6 @@ impl EngineFeedReceiver {
             EngineFeed::Workspace(_)
                 | EngineFeed::HostWorkspace(..)
                 | EngineFeed::HostState(..)
-                // Host-connection state like the two above, and it
-                // arrives between them: classified with them so a
-                // reconcile pulled forward mid-drain lands after one
-                // connection's arrival rather than inside it.
-                | EngineFeed::HostLease(..)
                 // Published in the same breath as the state above, and
                 // read by the same band and the same `host.status`:
                 // classified with it so a reconcile pulled forward
@@ -645,8 +630,6 @@ mod tests {
                         client_build: "gb-new".into(),
                     },
                     reduced_fidelity: true,
-                    supports_resume: true,
-                    supports_open_input: true,
                     resumed: None,
                 },
             ),

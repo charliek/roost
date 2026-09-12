@@ -875,6 +875,8 @@ for the shipped mechanics.
 
 *Amended by [DL-25](#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08) — the "attach input + `tab.write` owned" half is reversed; reads-free stands.*
 
+*Superseded by [DL-26](#dl-26-there-is-no-lease-2026-09-12) — the lease itself, and everything it gated, is retired at protocol 5.*
+
 ### DL-24: no supervisor artifact — a session comes up on demand (2026-09-08)
 
 A session comes up exactly three ways: a client's own localhost
@@ -968,6 +970,85 @@ See [`reference/ipc.md`](../reference/ipc.md#sessionconnect),
 [`reference/ipc-compatibility.md`](../reference/ipc-compatibility.md#version-bumps),
 and
 [`development/host-sessions.md`'s lease/takeover lifecycle](host-sessions.md#the-leasetakeover-lifecycle)
+for the shipped mechanics.
+
+*Superseded by [DL-26](#dl-26-there-is-no-lease-2026-09-12) — the lease itself is retired at protocol 5; geometry stays last-interactor, unchanged.*
+
+### DL-26: there is no lease (2026-09-12)
+
+[DL-23](#dl-23-the-interactive-lease-is-re-cut-reads-free-attach-input-tabwrite-owned-2026-09-07)
+and [DL-25](#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08)
+kept narrowing what the interactive lease gated until what was left —
+"the foreground" — was four things: which stream got `tab.effect`,
+whose focus muted notifications, who `session.driver_changed` named,
+and which connection the session-wide settings ops would accept.
+Measured against the two substrates roost keeps comparing itself to,
+that residue bought nothing *for roost's requirement* — though the
+measurement deserves stating precisely, because an earlier draft of this
+entry overstated it. **tmux** is the clean case: bells and OSC 52 go to
+every attached client, sizing follows the latest, and none of it is
+gated on an owner. **herdr is not an owner-free design**, and citing it
+as one was wrong. It keeps a `foreground_client_id` — "the client
+currently driving session-wide host presentation and side effects"
+(`src/server/headless.rs:210`) — and its bells, window title and PTY
+sizing (`effective_size`) all key off that one client. Its *direct*
+terminal attach goes further still, with a single writable owner per
+terminal (`terminal_attach_owners`) that a second client must pass
+`--takeover` to seize.
+
+Two things distinguish it from what roost retired, and they are the
+whole of the argument. herdr's foreground is **derived, not claimed**:
+`latest_shell_client` is simply the connection with the newest activity
+stamp, promoted automatically, never a token a client holds and another
+must take. And its ordinary multi-pane client mode gates **no input** on
+any of it — the owner exists only for the raw single-terminal attach.
+Roost's lease was the other shape: an explicitly minted token, held
+across reconnects, seized by an announced takeover. Roost also goes
+further than herdr rather than copying it — effects reach every
+subscriber and the viewing client decides what to apply, and muting is a
+union rather than one elected client's property. What
+the residue *cost* was most of the host-session client's complexity —
+the reconnect probe, observer mode, deposed-but-serving, the in-place
+retake, the carried lease through an outage, the takeover banner — for
+a coordination problem that turned out not to need a single answer.
+
+**Charlie's product requirement is simpler than a lease:** the client
+you are viewing from gets the notifications; other connected clients
+may get them too. That is "deliver to every subscriber, and each
+client applies an effect to the tab it is viewing" — not an election.
+The one thing that genuinely needs a single answer — which tab is
+muted because someone is looking at it — is a **union** over
+connections, not a claim.
+
+**Two rules replace the lease, in full:**
+
+1. **Effects fan out; the viewing client applies them.** Every
+   subscriber receives every `tab.effect`. A bell is worth marking on
+   any tab a client owns; an OSC 52 clipboard write is applied only to
+   the tab that client is actually viewing, independent of window
+   focus. There is no "driver" stream and no `session.driver_changed`
+   — every stream is the same stream.
+2. **Focus is a union.** `session.set_focus` is a per-connection
+   viewing statement that moves nothing else; a tab is muted while
+   **any** connection says it is looking at it. Two clients on two
+   different tabs both get muted correctly, with no re-election and no
+   ping-pong between them.
+
+Session protocol `5` retires `session.connect`, the `lease` field on
+every op, `session.driver_changed`, and the four retired refusal codes
+(`connect-required`, `already-connected`, `taken-over`, `superseded`) —
+a hard,
+breaking bump with no compatibility shim in either direction, because
+nothing built on this wire had shipped past v0.0.19's protocol `2`
+(see CHANGELOG). Geometry stays last-interactor
+([DL-25](#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08)) —
+that rule never depended on the lease and needed no change. `roostctl`,
+same-UID access, and the attach ticket are unchanged; only the
+authority layer on top of them is gone.
+
+See [`reference/ipc.md`](../reference/ipc.md#sessionconnect) for the
+wire contract at `5` and
+[`development/host-sessions.md`'s multiple-clients section](host-sessions.md#the-leasetakeover-lifecycle)
 for the shipped mechanics.
 
 ## Direction (under evaluation)
