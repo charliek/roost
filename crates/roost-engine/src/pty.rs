@@ -1521,12 +1521,17 @@ fn terminate_child(
     tab_id: i64,
 ) {
     // The `killer` lock is taken inside the closure, so the order is
-    // latch → killer, and only here.
+    // latch → killer, and only here. Poison-tolerant for the same reason
+    // the latch is: a panic that poisoned this mutex would otherwise
+    // turn every later hangup into a silent no-op, leaving the watchdog
+    // to SIGKILL a child that never got the chance to run its traps.
     let mut failure = None;
     let signalled = latch.signal(|| {
-        if let Ok(mut killer) = killer.lock() {
-            failure = killer.kill().err();
-        }
+        failure = killer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .kill()
+            .err();
     });
     if let Some(err) = failure {
         // ESRCH (raw 3) / NotFound: child already gone — the wait task
