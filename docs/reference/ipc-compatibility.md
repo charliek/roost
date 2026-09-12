@@ -199,41 +199,18 @@ that logic mentions a version number, which is why adding a payload kind
 costs nothing — plan 053 spent that budget for real, adding the `vt`
 kind and its whole fallback path with no protocol bump.
 
-**`session.identify.features` is the same pattern applied to *ops and
-op parameters alike*.** An open string list, decode-when-absent like
-`payload_kinds`, naming the additive session capabilities this build
-serves — seeded with `"put_file"` (plan 049, R1) and joined by
-`"events_resume"` (plan 052) for `events.subscribe`'s
-`from_revision`/`session_id` pair and `"tab_dump_scrollback"` (plan
-053) for `tab.dump`'s `scrollback` count. It exists because the
-alternative, bumping `SESSION_PROTOCOL_VERSION` for every additive
-capability, conflates two different questions: "can this peer speak my
-generation of the wire at all" (the exact gate above) and "does this
-peer happen to also support one more optional thing" (a capability).
-Before `features`, `session.put_file` had only the generation gate to
-answer the second question with, which is what set the now-superseded
-exception described under [Version bumps](#version-bumps) below. A
-client checks `features` the same way it checks `payload_kinds`: read
-the list, look for the name it cares about, degrade gracefully if it's
-missing. The line between the two channels is assumption vs. reliance: a
-generation pins what a client may *assume* about the wire, and a feature
-entry names what it may *additionally* rely on beyond that.
-
-**`features` is monotonic within a generation.** A capability already
-listed is never removed without a `SESSION_PROTOCOL_VERSION` bump —
-that bump is *when* the next generation's vector is cut, so a capability
-can only disappear at exactly the moment a client is already forced to
-renegotiate everything else. That is what lets a frozen generation's
-identify vector stay meaningful after the build that serves it grows
-new features: the vector pins the **floor** — the capabilities that
-generation is guaranteed to have — and the current build's `features`
-is checked against it as a **superset**, never an equality. The
-`session.identify.response.v<N>.json` vector for the running generation
-is compared field-by-field except `features`, which is asserted
-duplicate-free and a **subset** of what the current build advertises;
-older generations' vectors are unaffected, since they are exercised only
-by decode-only tests that never compare against the live `features`
-list.
+**There is no intra-generation capability channel today.** `session.identify`
+carried a `features` list — an open string channel for an additive
+session capability that did not warrant a whole generation bump —
+through protocol `4`. It answered a real question (has this build also
+grown one more optional thing, short of "can it speak my generation at
+all") and is not gone because the question stopped mattering; it is
+gone because `4` → `5` retired it along with the lease it mostly
+existed to soften, and no second real consumer has needed the channel
+back since. See the `4` → `5` entry under [Version bumps](#version-bumps)
+for what moved. If a capability needs feature-detecting again before
+the next generation exists to carry it, that channel is the thing to
+resurrect — not something to route around with version sniffing.
 
 **Absence of a mandatory capability is a legitimate refusal.** Capability
 detection governs optional features; it does not mean every negotiation

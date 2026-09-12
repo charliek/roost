@@ -97,7 +97,7 @@ Every host action lives in the command palette (`Cmd-Shift-P` / `Alt-Shift-P`) �
 | Palette row | What it does |
 |---|---|
 | **Add Host…** | Opens the Name + Target dialog described above. Always offered, on every platform. |
-| **Connect Host: `<label>`** | Dials the host, starting it first if it's `localhost` and nothing answers. Reconnecting to an already-connected host is a deliberate takeover (see below). |
+| **Connect Host: `<label>`** | Dials the host, starting it first if it's `localhost` and nothing answers. A second connect to an already-connected host is just another connection, alongside any this window or another already has open (see below). |
 | **Disconnect Host: `<label>`** | Drops the connection. The session's shells keep running. |
 | **Stop Session: `<label>`** | Ends every shell on that host and flushes its layout. Offered only while connected — you can't stop what you're not attached to. Confirms first. |
 | **Remove Host: `<label>`** | Forgets the saved host. Offered only while disconnected (removing a live connection would race it). Never touches the session itself. |
@@ -230,32 +230,20 @@ This feature moved the session protocol version, which means a Roost with it **c
 - **A host reached over SSH** offers to install the matching `roost-session` and restart it, with the usual consent card first.
 - **A host reached over a plain [`ssh -L` forward](#scripted-fallback-forwarding-with-ssh-n-l) (a Unix-socket target)** gets no in-app offer — Roost cannot reach in over a bare forwarded socket. SSH into that machine yourself, update `roost-session`, then `roostctl session stop` and `roostctl session start` there, and Connect again from here.
 
-## Takeover
+## Several windows on one session
 
-**Two windows can type into the same tab at the same time.** A second Roost window, a script, a phone over an SSH forward — any client that can open the session's socket **as the user running it** may attach to a tab and put bytes in it. Same-UID access to that socket is the whole boundary, and always was: another person logged into the same box cannot open it. What admits a client is not being on the machine, it is being you. Nothing has to be taken from anybody first, and nothing is closed when somebody else joins.
+**Two windows can type into the same tab at the same time.** A second Roost window, a script, a phone over an SSH forward — any client that can open the session's socket **as the user running it** may attach to a tab and put bytes in it. Same-UID access to that socket is the whole boundary, and always was: another person logged into the same box cannot open it. There is no ownership to claim first, and nothing is ever closed when somebody else joins — connecting from a second place is just another connection, symmetric with the one you already have.
 
-What a session does hold one of is the **foreground**. Connecting to a host claims it, and connecting from somewhere else moves it. The foreground is a short list:
+So when another client connects to a host you have open, **nothing freezes and nothing changes about your window**. Your terminal keeps redrawing, your keystrokes keep landing, your tabs keep switching, your sidebar keeps listing, and there is no banner, no strip, and no button naming who else is connected.
 
-- **effects** — a bell, an OSC 52 clipboard write, an agent notification — go to the foreground client, so a copy from a shell lands on the machine you are sitting at rather than on all of them;
-- **focus** — which tab your window has open, and therefore which notifications are muted, is the foreground client's to declare;
-- **who sized the PTY last** — every client that types or resizes sets the tab's size, and taking the foreground does not by itself resize anything;
-- and the session-wide settings: the theme, the agent-hook mode, and file uploads (`tab.send_file`, drag-and-drop, a pasted image).
+What you get from two Roosts, or a Roost and a phone, on one session:
 
-So when another client connects to a host you have open, **nothing freezes**. Your terminal keeps redrawing, your keystrokes keep landing, your tabs keep switching, your sidebar keeps listing. A line appears over the top of the grid saying who has the foreground:
+- **A bell or a copy reaches every connected client**, and each applies it by its own rule — a bell marks whichever of its tabs owns one; an OSC 52 clipboard write lands only on the tab **that client** is actually viewing, so a phone attached to a different tab never has its clipboard overwritten by a desktop's paste, and a client looking at the *same* tab as you gets the same copy you do.
+- **A tab is muted while any connected client is looking at it.** Each window states its own focus; the session mutes a tab's notifications the moment any one of them says it is watching, and un-mutes it only once none of them are. Two windows on two different tabs both get muted, correctly, with nothing to coordinate between them.
+- **The PTY is sized by whoever typed or resized last.** Every client that interacts sets the tab's size; connecting from somewhere else does not by itself resize anything. A client that only watches (never typing) never shrinks the one that is working.
+- **The session-wide settings — theme, agent-hook mode, file uploads — are last-writer-wins**, from whichever client sent them most recently. Two clients that disagree flip them on every reconnect; that is by design, not a bug (see [Agent Hooks](agents.md#remote-hosts) for the file side of it).
 
-> **‹label› is driven by a client reporting itself as ‹taken_by›.** [Take the foreground]
-
-(or, when the new connection gave no name: "‹label› is driven by another client.") "Reporting itself as" is deliberate wording, not a hedge you can ignore: the name is whatever the connecting client typed for itself — a hostname, an app name — and nothing here verifies it. Treat it as a hint, not an identity. The sidebar band says the same thing more briefly — *taken over by ‹taken_by›* — beside a dot that stays green, because the host really is connected.
-
-While another client has the foreground, an upload is refused with *"‹label› is driven by ‹taken_by›; take the foreground first"* rather than attempted, and effects for that host go to them instead of you.
-
-**"Take the foreground"** — the line's button, the sidebar's ↻ row, and the palette's Connect verb are all the same action — takes it back **in place**, on a `localhost` session and on one reached over SSH alike: no reconnect, no reattach, no fresh snapshot, the connection you already have claims the foreground again and the grid does not blink. Over SSH that means the tunnel you are already on is reused rather than rebuilt — the whole point, since it is the phone-picks-up-the-desktop case that reaches a real machine that way. It does not resize the tab either, so whatever size the other client left it at is the size it stays until somebody types.
-
-**Reading a session never needs the foreground at all** — and since this change, neither does typing into one. A client that dials a host and asks only to watch — a script, a monitoring tool, a future phone client — sees the same live tab list, titles and notifications with no risk of moving the foreground, because it never asks for it. Watching is not degraded driving; it is the normal way to look at a session you don't hold.
-
-### Against an older session
-
-A `roost-session` from before this change closes the displaced client's connections on a takeover, exactly as it always did. Against one of those you get the old behaviour: the terminal frame stops updating, the band reads *taken over*, and ↻ is a **full reconnect** — a new connection, a fresh attach, and a takeover of its own. Nothing is lost either way; you just watch it come back rather than never seeing it go. Update the session (see [the upgrade / restart flow](#the-upgrade-restart-flow)) and the in-place behaviour above is what you get.
+**Nothing stops anyone from typing.** There was never a "steal" step and there still isn't — every same-UID client could always attach and type, and reading a session never required anything either. What changed with this release is that there is no longer a single client whose window the effects and focus route through by default: they route to everyone, and each client decides for itself what to do with what it gets.
 
 ## The upgrade / restart flow
 
@@ -453,7 +441,7 @@ Two things that look like a hang but aren't: a biometric-gated SSH agent (Touch 
 
 **"The session on ‹label› ended."** This is the honest reading of a session that told Roost it was shutting down cleanly (an explicit `session.stop`, from any client — including a palette Stop from a different window). The banner's button is **Start a new session**, not a reconnect — the previous session's shells are genuinely gone, and this starts a fresh one. If you didn't stop it yourself, check whether another client or script did (`roostctl session stop` from anywhere reaches the same daemon).
 
-**A host tab's own attention doesn't reach you (older sessions only).** Roost now tells a host session what you are actually looking at — which tab is selected, and whether the window has focus — so the same-tab suppression rule ([Notifications → Focus policy](notifications.md#focus-policy)) applies to the tab you are really watching, exactly as it does locally. Against a `roost-session` older than this release there is nothing to tell: that session runs headless and always considers itself "focused" on whichever tab it thinks is active, so notifications for that one tab are silently suppressed (every *other* tab on the host is unaffected). Upgrading `roost-session` on the host and reconnecting fixes it.
+**A host tab's own attention doesn't reach you (older sessions only).** Roost tells a host session what you are actually looking at — which tab is selected, and whether the window has focus — so the same-tab suppression rule ([Notifications → Focus policy](notifications.md#focus-policy)) applies to the tab you are really watching, exactly as it does locally; if another window or a phone is also connected, a tab is muted while any of them is watching it (see [Several windows on one session](#several-windows-on-one-session)). Against a `roost-session` older than this release there is nothing to tell: that session runs headless and always considers itself "focused" on whichever tab it thinks is active, so notifications for that one tab are silently suppressed (every *other* tab on the host is unaffected). Upgrading `roost-session` on the host and reconnecting fixes it.
 
 **A host also gets your agent hooks, on every connect.** Right after connecting, Roost sends the host your `agent-hooks` / `agent-hooks-skip` config, and the session wires (or, with `agent-hooks = off`, unwires) its own Claude Code / Codex / grok / cursor-agent / OpenCode config files to match — the same mechanism [Agent Hooks](agents.md) describes for a local machine, just aimed at the host's `$HOME` instead of yours. A `claude` (or any other agent) already running in a host tab when you first connect picks the hooks up on its *next* launch, not retroactively. Connecting from a second machine with a different `agent-hooks` value flips the host's files again on that connect — last writer wins, and `roostctl agent status` run on the host names which client did it and when. Against a `roost-session` that predates this op, connecting still succeeds; nothing is wired, and Roost logs one line rather than a toast per connection. See [Agent Hooks → Remote hosts](agents.md#remote-hosts) for the full behavior, including why `off` means something slightly different here than it does locally.
 
@@ -462,5 +450,5 @@ Two things that look like a hang but aren't: a biometric-gated SSH agent (Touch 
 - [`reference/ipc.md`](../reference/ipc.md#session-sockets) — the wire contract this feature drives, including the `host.*` ops and the attach data plane.
 - [`reference/cli.md`](../reference/cli.md#session-subcommands) — `roostctl session` and `roostctl host` in full.
 - [Agent Hooks](agents.md) — how Claude Code / Codex / grok / cursor-agent / OpenCode get wired, locally and on a host.
-- [Host sessions (development)](../development/host-sessions.md) — the architecture: how `HostConn` is put together, the attach sequence, and the lease/takeover lifecycle.
+- [Host sessions (development)](../development/host-sessions.md) — the architecture: how `HostConn` is put together, the attach sequence, and how multiple clients share one session.
 - [Keybindings](../getting-started/keybindings.md) — the full shortcut table, including the host-context notes on `Cmd-N`/`Cmd-T`.
