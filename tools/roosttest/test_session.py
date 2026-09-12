@@ -665,28 +665,21 @@ def test_events_push_reaches_a_python_subscriber(env):
     started(env)
 
     with env.client() as client:
-        # Reading a session is not authority (plan 049 §3.7): a client
-        # that never connected gets an *observer* stream rather than a
-        # refusal, and it is a real stream — acked with a fence, and
+        # Reading a session is not authority: a subscriber that asked for
+        # nothing else gets a real stream — acked with a fence, and
         # delivering the session's commits.
-        with EventStream(env.socket) as leaseless:
-            observer_fence = leaseless.subscribe()
-            assert observer_fence > 0
+        with EventStream(env.socket) as second:
+            second_fence = second.subscribe()
+            assert second_fence > 0
 
-            lease = client.call("session.connect", {"takeover": False})["lease"]
             snapshot = client.call("tab.list")
             project = int(snapshot["projects"][0]["id"])
             watched = client.open_tab(project, cwd=str(env.launch_cwd), title="watched")
-            batches, envelope = leaseless.recv_until("tab.opened", timeout=20.0)
-            leaseless.expect_contiguous(batches, observer_fence)
+            batches, envelope = second.recv_until("tab.opened", timeout=20.0)
+            second.expect_contiguous(batches, second_fence)
             assert int(envelope["data"]["tab"]["id"]) == watched
 
-        # Bind the length before asserting so a failure dump prints the
-        # number, never the bearer token itself.
-        lease_len = len(lease)
-        assert lease_len == 32
-
-        with EventStream(env.socket, lease=lease) as stream:
+        with EventStream(env.socket) as stream:
             fence = stream.subscribe()
             # The snapshot's revision is the same fence the ack names,
             # which is what makes "discard everything <= this" a usable
@@ -1002,78 +995,17 @@ def test_a_fence_from_a_previous_incarnation_is_refused(env):
     env.stop_over_the_wire()
 
 
-def test_a_resume_across_a_takeover_replays_the_facts_and_none_of_the_effects(env):
-    """A deposed driver catches up as an observer, and learns it late.
+def test_a_resume_never_re_lives_the_effects_in_its_gap(env):
+    """Effects are live-only: the **ring** strips them.
 
-    Three things at once. The workspace facts from the takeover era are
-    replayed — a demoted client is still watching the session, which is
-    the whole of plan 049 §3.8. The effects are not: they are the *live*
-    driver's side-channel (DL-18), and this stream's lease is dead twice
-    over. And `session.driver_changed` is not replayable either — it is
-    per-stream state, not a commit — so the resumed stream never sees
-    one and finds out the way any client that missed the envelope does:
-    from its next *foreground* op, which answers `taken-over`.
-    """
-    started(env, ROOST_TEST_MODE="1")
-
-    with env.client() as deposed:
-        session_id = deposed.call("session.identify")["session_id"]
-        lease = connect_lease(deposed)
-        project = first_project(deposed)
-        tab = quiet_tab(deposed, project, env.launch_cwd)
-
-        with EventStream(env.socket, lease=lease) as stream:
-            fence = stream.subscribe()
-            # It really was a driver stream before the gap: an effect
-            # arrived on it.
-            deposed.tab_feed_pty_bytes(tab, osc52(b"the driver's clipboard"))
-            data, fence = next_effect(stream, fence)
-            assert data["effect"] == "clipboard-write", data
-
-    # The gap: somebody else takes the lease and drives.
-    with env.client() as phone:
-        connect_lease(phone, takeover=True, label="a phone")
-        phone.tab_feed_pty_bytes(tab, osc52(b"the phone's clipboard"))
-        gap_tab = quiet_tab(phone, project, env.launch_cwd)
-        gap_end = revision_beyond(phone, fence, "the takeover-era commits")
-
-        with EventStream(env.socket, lease=lease) as resumed:
-            assert resumed.subscribe(from_revision=fence, session_id=session_id) == fence
-
-            replayed = batches_through(resumed, gap_end)
-            resumed.expect_contiguous(replayed, fence)
-            opened = [
-                int(envelope["data"]["tab"]["id"])
-                for batch in replayed
-                for envelope in batch["events"]
-                if envelope["event"] == "tab.opened"
-            ]
-            assert gap_tab in opened, replayed
-            assert "tab.effect" not in event_names(replayed), replayed
-            assert resumed.driver_changes == [], resumed.driver_changes
-
-        # A *foreground* op, because that is the only kind a stale lease
-        # is still noticed on: `tab.write` takes no lease at all now
-        # (plan 057, R15).
-        with env.client() as stale:
-            with pytest.raises(RoostError) as refused:
-                stale.call("session.set_focus", {"lease": lease, "focused_tab_id": None})
-            assert refused.value.code == "taken-over", refused.value
-
-        phone.call("session.stop")
-
-
-def test_a_driver_that_resumes_is_still_the_driver_but_never_re_lives_its_gap(env):
-    """The case that proves the *ring* strips effects, not the lease.
-
-    This stream's lease is current the whole way through, so nothing
-    downstream would filter anything: if the effect committed during the
-    gap comes back, it came back out of the ring. It does not — the
+    Nothing downstream filters anything any more — every subscriber
+    receives every effect — so if the effect committed during the gap
+    came back, it came back out of the replay ring. It does not: the
     revision arrives as an empty batch, which is how a commit whose only
-    event was an effect is kept visible without being re-enacted — while
-    the ordinary workspace fact beside it replays in full. And the
-    driver is still the driver: the effect fired *after* the resume
-    lands.
+    event was an effect stays visible without being re-enacted, while
+    the ordinary workspace fact beside it replays in full. An effect
+    fired *after* the resume still lands, which is what tells "stripped
+    on replay" apart from "not delivered".
     """
     started(env, ROOST_TEST_MODE="1")
 
@@ -1110,7 +1042,7 @@ def test_a_driver_that_resumes_is_still_the_driver_but_never_re_lives_its_gap(en
             )
             assert "renamed-in-the-gap" in titles_in(replayed), replayed
 
-            # Still the driver, so a live effect is delivered.
+            # Live effects still arrive.
             client.tab_feed_pty_bytes(tab, osc52(b"live, after the resume"))
             data, _ = next_effect(resumed, gap_end)
             assert base64.b64decode(data["data"]) == b"live, after the resume", data

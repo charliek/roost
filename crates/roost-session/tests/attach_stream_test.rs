@@ -75,11 +75,11 @@ fn budget() -> Duration {
 }
 
 // ---------------------------------------------------------------------
-// A session, leased, with tabs a test can drive
+// A session with tabs a test can drive
 // ---------------------------------------------------------------------
 
-/// One running session plus the control connection that holds its lease
-/// — `tab.attach` is lease-gated, so no test gets anywhere without it.
+/// One running session plus the control connection a test drives it
+/// through.
 struct Session {
     layout: support::Layout,
     served: tokio::task::JoinHandle<anyhow::Result<()>>,
@@ -177,8 +177,7 @@ impl Session {
     }
 
     /// Bytes toward the child, not into the terminal — the seam
-    /// [`Self::feed`] deliberately bypasses. The lease rides along
-    /// because a session socket refuses an unleased write.
+    /// [`Self::feed`] deliberately bypasses.
     async fn write_tab(&mut self, tab_id: i64, data: &[u8]) {
         self.control
             .call::<_, serde_json::Value>(

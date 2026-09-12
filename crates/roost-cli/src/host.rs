@@ -84,10 +84,10 @@ pub enum HostCmd {
         #[arg(long)]
         id: String,
     },
-    /// Connect a saved host by id. Unconditional takeover (reconnect IS
-    /// takeover on this wire), and on localhost it starts the session if
-    /// it is not already running. Returns once the attempt is under way
-    /// — watch the sidebar or poll `host status` for the settled state.
+    /// Connect a saved host by id. It displaces nobody, and on localhost
+    /// it starts the session if it is not already running. Returns once
+    /// the attempt is under way — watch the sidebar or poll `host status`
+    /// for the settled state.
     Connect {
         #[arg(long)]
         id: String,

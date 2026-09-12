@@ -75,9 +75,6 @@
 //! wait for that lock is bounded ([`write::LOCK_DEADLINE`]): a caller
 //! that cannot get it hears [`InstallError::LockBusy`], because the one
 //! thing worse than two writers is a daemon that can never shut down.
-//! A run made on somebody else's behalf ([`ensure_on_behalf`]) re-asks
-//! their authority *inside* that lock, which is the only place the
-//! answer stays true until the write.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 

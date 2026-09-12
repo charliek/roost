@@ -27,6 +27,7 @@ are both *durations under test*, not synchronization.
 
 from __future__ import annotations
 
+import base64
 import os
 import re
 import signal
@@ -41,6 +42,7 @@ import session as sessionlib
 from client import Roost, RoostError, scaled_timeout
 from dataplane import DataPlane
 from eventstream import EventStream
+from test_session_effects import connect_lease, set_focus, theme
 
 pytestmark = pytest.mark.session_daemon
 
@@ -107,22 +109,8 @@ def first_project(client: Roost) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Lease + ticket helpers
+# Ticket helpers
 # ---------------------------------------------------------------------------
-
-
-def connect_lease(client: Roost, takeover: bool = False, label: str | None = None) -> str:
-    """`session.connect` — the lease every lease-gated op presents.
-
-    The lease is a bearer credential: it is returned, never logged, and
-    never interpolated into an assertion message. `label` is what the
-    claimant reports itself as, which is the only thing a deposed stream
-    is told about it.
-    """
-    params: dict = {"takeover": takeover}
-    if label is not None:
-        params["client_label"] = label
-    return client.call("session.connect", params)["lease"]
 
 
 def attach_ticket(
@@ -379,95 +367,60 @@ def wait_for_bytes(
 
 
 # ---------------------------------------------------------------------------
-# 1. Leases: a takeover moves the foreground and closes nothing
+# 1. Every connection is symmetric
 # ---------------------------------------------------------------------------
 
 
-def test_a_takeover_moves_the_foreground_and_closes_nothing(env):
-    """One takeover, and the only thing it moves is the foreground.
+def test_a_second_client_changes_nothing_for_the_first(env):
+    """A second client arriving takes nothing away from the first.
 
-    Raw input is open to every same-UID client (plan 057, R15), so the
-    displaced client loses nothing it was using to work: its control
-    connection still answers, and its data connection still streams the
-    tab's output. What it loses is the foreground — the settings ops, the
-    focus, and its stream's driver classification.
+    This is the whole of retiring the lease, read from outside: every op
+    that used to answer `taken-over` or `connect-required` to a client
+    that had been displaced is run by client A *after* client B has
+    announced itself the loudest way the wire still allows
+    (`session.connect{takeover: true}`), and every one of them succeeds.
 
-    The **stream is demoted, not cut** (plan 049 §3.8): it gets one
-    non-terminal `session.driver_changed` naming whoever claimed the
-    lease, and it keeps delivering after it. A deposed window that lost
-    its stream would go blind about the session it is still showing.
-
-    The tombstone is the last: a *foreground* op presenting the dead
-    lease is told `taken-over` (someone else has it) rather than
-    `connect-required` (you never connected), because those instruct
-    differently.
+    Run in one case rather than six, because the failure mode being
+    guarded is shared: a single surviving gate would make some arbitrary
+    subset of a working window read-only, and which subset is exactly
+    what a user cannot diagnose. The agent jail is what keeps the
+    `set_agent_hooks` leg honest — it writes real files, inside this
+    session's own root.
     """
-    started(env)
+    jail = env.jail_agents()
+    started(env, ROOST_AGENT_HOOKS_FORCE="1")
 
-    old = env.client()
-    old_lease = connect_lease(old)
-    project = first_project(old)
-    tab = quiet_tab(old, project, env.launch_cwd)
+    with env.client() as first, env.client() as second:
+        project = first_project(first)
+        tab = quiet_tab(first, project, env.launch_cwd)
+        connect_lease(first)
 
-    stream = EventStream(env.socket, lease=old_lease)
-    stream.subscribe()
+        # The loudest announcement the wire still carries. It mints a
+        # token that gates nothing and tombstones nobody.
+        connect_lease(second, takeover=True, label="a phone")
 
-    conn, reply, _ticket = attached(env, old, old_lease, tab)
-    conn.read_until_ready()
+        first.call("session.set_theme", {"lease": "", "osc_colors": theme()})
+        wired = first.call(
+            "session.set_agent_hooks",
+            {"lease": "", "mode": "auto", "skip": [], "client": "roosttest"},
+        )
+        assert wired["errors"] == [], wired
+        assert set(jail.read_record()) == set(wired["wired"]), wired
 
-    new = env.client()
-    new_lease = connect_lease(new, takeover=True, label="  a phone\n  ")
-    assert len(new_lease) == 32
+        landed = first.call(
+            "session.put_file",
+            {"lease": "", "name": "note.txt", "data": base64.b64encode(b"hi").decode()},
+        )
+        assert landed["bytes"] == 2, landed
 
-    # The data connection is untouched: it is still on the tab's tee, so
-    # output produced after the takeover reaches it.
-    marker = b"ROOST_AFTER_THE_TAKEOVER"
-    new.tab_feed_pty_bytes(tab, marker + b"\r\n")
-    seen = bytearray()
+        set_focus(first, "", tab)
 
-    def landed(frame) -> bool:
-        if frame.frame_type == dataplane.FRAME_PTY:
-            seen.extend(frame.pty()[1])
-        return marker in bytes(seen)
+        conn, reply, _ticket = attached(env, first, "", tab)
+        assert reply.ok, reply.raw
+        conn.read_until_ready()
+        conn.close()
 
-    conn.read_frames_until(landed, timeout=30.0, what="the post-takeover PTY bytes")
-    conn.close()
-
-    # The event stream is told, not cut — and the label the claimant
-    # reported arrives normalized (trimmed, control characters gone).
-    assert stream.recv_driver_changed(timeout=30.0) == "a phone"
-    assert stream.stopping_reason is None, "a driver_changed must not end the stream"
-
-    # And it keeps delivering: a commit after the takeover still lands,
-    # with no hole in the revision sequence.
-    watched = quiet_tab(new, project, env.launch_cwd)
-    _batches, opened = stream.recv_until("tab.opened", timeout=30.0)
-    assert int(opened["data"]["tab"]["id"]) == watched
-    stream.close()
-
-    # And the connection that ran the original `session.connect` is still
-    # there, still serving everything that is not the foreground.
-    assert old.call("tab.list")["projects"]
-    old.close()
-
-    # The dead lease is tombstoned, not forgotten. Read through a
-    # foreground op: `tab.attach` takes no lease any more, so it is no
-    # longer the place a stale one is noticed.
-    with env.client() as stale:
-        with pytest.raises(RoostError) as refused:
-            stale.call(
-                "session.set_focus", {"lease": old_lease, "focused_tab_id": None}
-            )
-        assert refused.value.code == "taken-over", refused.value
-
-    # A lease outlives its holder's connection: dropping `new` releases
-    # nothing, so the next client still has to say it means it.
-    new.close()
-    with env.client() as polite:
-        with pytest.raises(RoostError) as busy:
-            connect_lease(polite, takeover=False)
-        assert busy.value.code == "already-connected", busy.value
-        assert len(connect_lease(polite, takeover=True)) == 32
+        first.send(tab, b"\n")
 
     env.stop_over_the_wire()
 

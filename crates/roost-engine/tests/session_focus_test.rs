@@ -11,7 +11,7 @@ use roost_engine::ipc::{
     AgentHooksError, AgentHooksHandle, AgentHooksRequest, IpcHandler, SessionInfo, StopHandle,
 };
 use roost_engine::{AttentionSource, PtySupervisor, Workspace};
-use roost_ipc::messages::{ops, SessionConnectResult, SessionSetAgentHooksResult};
+use roost_ipc::messages::{ops, SessionSetAgentHooksResult};
 use roost_ipc::{ConnAction, ConnCloseWatch, ConnCtx, Handler, HandlerOutcome, PushSource};
 use tempfile::TempDir;
 
@@ -78,28 +78,13 @@ fn reply(outcome: HandlerOutcome) -> serde_json::Value {
     }
 }
 
-async fn connect(f: &Fixture, c: &Conn) -> Result<SessionConnectResult, String> {
-    match f
-        .handler
-        .handle(&c.ctx, ops::SESSION_CONNECT, serde_json::json!({}))
-        .await
-    {
-        Ok(outcome) => Ok(serde_json::from_value(reply(outcome)).expect("typed connect result")),
-        Err(e) => Err(e.code),
-    }
-}
-
 /// Subscribe and keep the push source alive: dropping it would end the
 /// relay, and a dead connection is pruned out of the registry — which is
 /// the opposite of what the cases below are checking.
-async fn subscribe(f: &Fixture, c: &Conn, lease: &str) -> PushSource {
+async fn subscribe(f: &Fixture, c: &Conn) -> PushSource {
     match f
         .handler
-        .handle(
-            &c.ctx,
-            ops::EVENTS_SUBSCRIBE,
-            serde_json::json!({"lease": lease}),
-        )
+        .handle(&c.ctx, ops::EVENTS_SUBSCRIBE, serde_json::json!({}))
         .await
     {
         Ok(HandlerOutcome::ReplyThen {
@@ -123,9 +108,11 @@ fn sibling_tab(f: &Fixture, tab: i64) -> i64 {
     f.workspace.open_tab(project, "/tmp", "sh").unwrap().id
 }
 
-async fn set_focus(f: &Fixture, c: &Conn, lease: &str, tab: Option<i64>) -> Result<(), String> {
+async fn set_focus(f: &Fixture, c: &Conn, tab: Option<i64>) -> Result<(), String> {
+    // `lease` is still a required field on the wire; it is read by
+    // nothing and retired at protocol 5.
     let params = serde_json::json!({
-        "lease": lease,
+        "lease": "",
         "focused_tab_id": tab.map(|id| id.to_string()),
     });
     match f
@@ -137,14 +124,7 @@ async fn set_focus(f: &Fixture, c: &Conn, lease: &str, tab: Option<i64>) -> Resu
             assert_eq!(reply(outcome), serde_json::json!({}));
             Ok(())
         }
-        Err(e) => {
-            assert!(
-                !e.message.contains(lease) || lease.is_empty(),
-                "a lease is a credential and must not be echoed back: {}",
-                e.message
-            );
-            Err(e.code)
-        }
+        Err(e) => Err(e.code),
     }
 }
 
@@ -156,30 +136,29 @@ fn attention_fires(f: &Fixture, tab: i64) -> bool {
         .expect("the tab exists")
 }
 
+/// Any connection may state what it is looking at — the op's only
+/// refusal is a tab this session does not have.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn set_focus_needs_the_lease_and_a_tab_that_exists() {
+async fn set_focus_needs_a_tab_that_exists_and_nothing_else() {
     let f = fixture();
     let tab = a_tab(&f);
-    let holder = conn(1);
+    let viewer = conn(1);
 
     assert_eq!(
-        set_focus(&f, &conn(2), &"0".repeat(32), Some(tab))
-            .await
-            .unwrap_err(),
-        "connect-required",
-    );
-
-    let lease = connect(&f, &holder).await.expect("connect").lease;
-    assert_eq!(
-        set_focus(&f, &holder, &lease, Some(tab + 999))
-            .await
-            .unwrap_err(),
+        set_focus(&f, &viewer, Some(tab + 999)).await.unwrap_err(),
         "not-found"
     );
-    set_focus(&f, &holder, &lease, Some(tab))
+    set_focus(&f, &viewer, Some(tab))
         .await
         .expect("the client states what it is looking at");
     assert!(!attention_fires(&f, tab), "the viewed tab is suppressed");
+
+    // A connection that never ran another op on this socket is no
+    // different: reporting a view is not a privilege.
+    let stranger = conn(2);
+    set_focus(&f, &stranger, Some(tab))
+        .await
+        .expect("any same-UID connection may say what it is viewing");
 }
 
 /// Two clients looking at two tabs mute both. Symmetry's load-bearing
@@ -193,12 +172,9 @@ async fn two_connections_viewing_different_tabs_mute_both() {
     let loud = sibling_tab(&f, first);
     let a = conn(1);
     let b = conn(2);
-    let lease = connect(&f, &a).await.expect("connect").lease;
 
-    set_focus(&f, &a, &lease, Some(first)).await.expect("focus");
-    set_focus(&f, &b, &lease, Some(second))
-        .await
-        .expect("focus");
+    set_focus(&f, &a, Some(first)).await.expect("focus");
+    set_focus(&f, &b, Some(second)).await.expect("focus");
     assert!(!attention_fires(&f, first));
     assert!(!attention_fires(&f, second));
     assert!(
@@ -207,12 +183,12 @@ async fn two_connections_viewing_different_tabs_mute_both() {
     );
 
     // A withdrawal is only the withdrawing connection's.
-    set_focus(&f, &a, &lease, None).await.expect("nothing here");
+    set_focus(&f, &a, None).await.expect("nothing here");
     assert!(attention_fires(&f, first));
     assert!(!attention_fires(&f, second));
 
     // As is a close.
-    set_focus(&f, &a, &lease, Some(first)).await.expect("focus");
+    set_focus(&f, &a, Some(first)).await.expect("focus");
     assert!(!attention_fires(&f, first));
     f.handler.connection_ended(a.ctx.conn_id);
     assert!(attention_fires(&f, first));
@@ -221,9 +197,7 @@ async fn two_connections_viewing_different_tabs_mute_both() {
     // And a refused claim applies nothing at all.
     let c = conn(3);
     assert_eq!(
-        set_focus(&f, &c, &lease, Some(second + 999))
-            .await
-            .unwrap_err(),
+        set_focus(&f, &c, Some(second + 999)).await.unwrap_err(),
         "not-found"
     );
     assert!(attention_fires(&f, first));
@@ -241,12 +215,9 @@ async fn a_focus_ends_with_its_connection_and_the_selection_never_moves() {
     let second = sibling_tab(&f, first);
     f.workspace.focus_tab(first).unwrap();
     let control = conn(1);
-    let lease = connect(&f, &control).await.expect("connect").lease;
     let stream = conn(2);
-    let _push = subscribe(&f, &stream, &lease).await;
-    set_focus(&f, &control, &lease, Some(second))
-        .await
-        .expect("focus");
+    let _push = subscribe(&f, &stream).await;
+    set_focus(&f, &control, Some(second)).await.expect("focus");
     assert_eq!(
         f.workspace.active().1,
         first,
@@ -269,9 +240,9 @@ async fn a_focus_ends_with_its_connection_and_the_selection_never_moves() {
     // And a client coming back re-states it, which is what a
     // reconnecting UI does the moment it reaches Connected.
     let back = conn(3);
-    set_focus(&f, &back, &lease, Some(second))
+    set_focus(&f, &back, Some(second))
         .await
-        .expect("the same lease still works");
+        .expect("a returning client re-states what it is viewing");
     assert!(!attention_fires(&f, second));
 }
 
@@ -285,14 +256,11 @@ async fn a_focus_dies_with_its_author_even_when_someone_registered_first() {
     let f = fixture();
     let tab = a_tab(&f);
     let author = conn(1);
-    let lease = connect(&f, &author).await.expect("connect").lease;
-    set_focus(&f, &author, &lease, Some(tab))
-        .await
-        .expect("focus");
+    set_focus(&f, &author, Some(tab)).await.expect("focus");
     assert!(!attention_fires(&f, tab));
 
     let late = conn(2);
-    let _push = subscribe(&f, &late, &lease).await;
+    let _push = subscribe(&f, &late).await;
     f.handler.connection_ended(author.ctx.conn_id);
 
     assert!(
@@ -308,16 +276,13 @@ async fn a_null_focus_leaves_no_claim_behind() {
     let f = fixture();
     let tab = a_tab(&f);
     let holder = conn(1);
-    let lease = connect(&f, &holder).await.expect("connect").lease;
-    set_focus(&f, &holder, &lease, Some(tab))
-        .await
-        .expect("focus");
-    set_focus(&f, &holder, &lease, None)
+    set_focus(&f, &holder, Some(tab)).await.expect("focus");
+    set_focus(&f, &holder, None)
         .await
         .expect("and then nothing");
 
     let other = conn(2);
-    let _push = subscribe(&f, &other, &lease).await;
+    let _push = subscribe(&f, &other).await;
     f.handler.connection_ended(holder.ctx.conn_id);
     assert!(attention_fires(&f, tab));
 }
@@ -358,11 +323,10 @@ async fn a_ui_sockets_connection_ending_changes_nothing() {
 async fn set_agent_hooks(
     f: &Fixture,
     c: &Conn,
-    lease: &str,
     mode: &str,
 ) -> Result<SessionSetAgentHooksResult, String> {
     let params = serde_json::json!({
-        "lease": lease,
+        "lease": "",
         "mode": mode,
         "skip": ["cursor"],
         "client": "charlie-mbp",
@@ -373,14 +337,7 @@ async fn set_agent_hooks(
         .await
     {
         Ok(outcome) => Ok(serde_json::from_value(reply(outcome)).expect("typed result")),
-        Err(e) => {
-            assert!(
-                !e.message.contains(lease) || lease.is_empty(),
-                "a lease is a credential and must not be echoed back: {}",
-                e.message
-            );
-            Err(e.code)
-        }
+        Err(e) => Err(e.code),
     }
 }
 
@@ -390,10 +347,9 @@ async fn set_agent_hooks(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_without_an_install_backend_says_not_supported() {
     let f = fixture();
-    let holder = conn(1);
-    let lease = connect(&f, &holder).await.expect("connect").lease;
+    let asking = conn(1);
     assert_eq!(
-        set_agent_hooks(&f, &holder, &lease, "auto").await,
+        set_agent_hooks(&f, &asking, "auto").await,
         Err("not-supported".into())
     );
 }
@@ -408,10 +364,9 @@ async fn a_failing_install_backend_surfaces_as_internal() {
         ))
     });
     let f = fixture_with(Some(handle));
-    let holder = conn(1);
-    let lease = connect(&f, &holder).await.expect("connect").lease;
+    let asking = conn(1);
     assert_eq!(
-        set_agent_hooks(&f, &holder, &lease, "auto").await,
+        set_agent_hooks(&f, &asking, "auto").await,
         Err("internal".into())
     );
 }

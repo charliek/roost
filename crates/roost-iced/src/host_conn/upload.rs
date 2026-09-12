@@ -391,9 +391,9 @@ async fn put_file(wire: Wire, name: String, source: UploadSource) -> UploadResul
 /// Dial the host's socket afresh and send the one op.
 ///
 /// A connection per upload, the `tab.attach` precedent: the control
-/// client is serial and busy, and `require_lease` registers this
-/// connection under the same lease, so a takeover or a `session.stop`
-/// closes it too — as a per-upload failure.
+/// client is serial and busy, and the session registers every connection
+/// that sends an op, so a `session.stop` closes this one too — as a
+/// per-upload failure.
 async fn send(socket: &Path, params: serde_json::Value) -> Result<serde_json::Value, HostOpError> {
     let mut client = IpcClient::connect(socket)
         .await

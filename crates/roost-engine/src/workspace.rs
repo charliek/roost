@@ -1985,10 +1985,10 @@ impl Workspace {
             Persist::Write => Some(inner.snapshot_for_persist()),
         };
         if let Some(bounds) = self.replay_bounds {
-            // Effects are the driving client's live side-channel
-            // (DL-18): replaying a clipboard write from thirty seconds
-            // ago is wrong in itself, and a 256 KiB one would burn the
-            // byte budget for nothing. A batch whose events were all
+            // Effects are live-only: replaying a clipboard write from
+            // thirty seconds ago is wrong in itself, and a 256 KiB one
+            // would burn the byte budget for nothing. A batch whose
+            // events were all
             // effects is still retained — empty — because the revision
             // is what the client's gap check reads. A clone and a
             // `VecDeque` push are non-blocking, which is what this lock

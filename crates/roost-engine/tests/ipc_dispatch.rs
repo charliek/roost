@@ -11,8 +11,8 @@ use roost_engine::ipc::{FileStore, IpcHandler, SessionInfo, StopHandle};
 use roost_engine::{PtySupervisor, Workspace};
 use roost_ipc::messages::{
     ops, IdentifyParams, IdentifyResult, ProjectCreateParams, ProjectCreateResult,
-    SessionConnectParams, SessionConnectResult, SessionPutFileParams, SessionPutFileResult,
-    TabListResult, TabOpenParams, TabOpenResult, MAX_PUT_FILE_BYTES,
+    SessionPutFileParams, SessionPutFileResult, TabListResult, TabOpenParams, TabOpenResult,
+    MAX_PUT_FILE_BYTES,
 };
 use roost_ipc::IpcClient;
 use roost_ipc::IpcServer;
@@ -691,8 +691,8 @@ async fn app_keybind_dispatch_rejects_non_paste_action() {
 ///
 /// Dialed over a real socket rather than driven through the `Handler`
 /// trait, because half of what this op promises is about two
-/// *connections*: two uploads racing for the same room, and a second
-/// connection presenting a lease the first one minted.
+/// *connections*: two uploads racing for the same room, and every
+/// same-UID connection being able to make one.
 struct SessionFixture {
     socket: PathBuf,
     root: PathBuf,
@@ -748,22 +748,6 @@ impl SessionFixture {
         connect_with_retry(&self.socket).await
     }
 
-    /// A connection holding the session's interactive lease.
-    async fn leased(&self) -> (IpcClient, String) {
-        let mut client = self.client().await;
-        let lease: SessionConnectResult = client
-            .call(
-                ops::SESSION_CONNECT,
-                SessionConnectParams {
-                    takeover: true,
-                    client_label: None,
-                },
-            )
-            .await
-            .expect("session.connect");
-        (client, lease.lease)
-    }
-
     /// Every upload directory the store currently holds.
     fn uploads(&self) -> Vec<PathBuf> {
         let mut dirs: Vec<_> = std::fs::read_dir(&self.root)
@@ -777,7 +761,6 @@ impl SessionFixture {
 
 async fn put_file(
     client: &mut IpcClient,
-    lease: &str,
     name: &str,
     data: Vec<u8>,
 ) -> Result<SessionPutFileResult, roost_ipc::ClientError> {
@@ -785,12 +768,21 @@ async fn put_file(
         .call(
             ops::SESSION_PUT_FILE,
             SessionPutFileParams {
-                lease: lease.to_string(),
+                lease: String::new(),
                 name: name.to_string(),
                 data,
             },
         )
         .await
+}
+
+/// The server's message beside [`code`], for the cases where two
+/// different refusals share one code and only the text tells them apart.
+fn message(error: &roost_ipc::ClientError) -> &str {
+    match error {
+        roost_ipc::ClientError::Server { message, .. } => message,
+        other => panic!("expected a server error, got {other:?}"),
+    }
 }
 
 fn code(error: &roost_ipc::ClientError) -> &str {
@@ -805,7 +797,7 @@ fn code(error: &roost_ipc::ClientError) -> &str {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn put_file_refuses_every_name_it_cannot_paste_bare() {
     let f = SessionFixture::new(Some(1 << 20)).await;
-    let (mut client, lease) = f.leased().await;
+    let mut client = f.client().await;
 
     let long = "a".repeat(129);
     for name in [
@@ -822,7 +814,7 @@ async fn put_file_refuses_every_name_it_cannot_paste_bare() {
         "$HOME.png",
         "shot\npng",
     ] {
-        let error = put_file(&mut client, &lease, name, b"x".to_vec())
+        let error = put_file(&mut client, name, b"x".to_vec())
             .await
             .expect_err("a name outside the grammar must be refused");
         assert_eq!(code(&error), "invalid-param", "{name:?}");
@@ -835,7 +827,7 @@ async fn put_file_refuses_every_name_it_cannot_paste_bare() {
     // The boundary on the good side: 128 bytes is a name.
     let name = format!("{}.png", "b".repeat(124));
     assert_eq!(name.len(), 128);
-    let landed = put_file(&mut client, &lease, &name, b"x".to_vec())
+    let landed = put_file(&mut client, &name, b"x".to_vec())
         .await
         .expect("a 128-byte name is inside the rule");
     assert!(landed.path.ends_with(&name));
@@ -846,10 +838,10 @@ async fn put_file_refuses_every_name_it_cannot_paste_bare() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn exactly_the_cap_lands_and_one_more_byte_does_not() {
     let f = SessionFixture::new(Some(64 * 1024 * 1024)).await;
-    let (mut client, lease) = f.leased().await;
+    let mut client = f.client().await;
 
     let cap = usize::try_from(MAX_PUT_FILE_BYTES).unwrap();
-    let landed = put_file(&mut client, &lease, "exact.bin", vec![0xAB; cap])
+    let landed = put_file(&mut client, "exact.bin", vec![0xAB; cap])
         .await
         .expect("exactly the cap must land");
     assert_eq!(landed.bytes, MAX_PUT_FILE_BYTES);
@@ -858,7 +850,7 @@ async fn exactly_the_cap_lands_and_one_more_byte_does_not() {
         MAX_PUT_FILE_BYTES
     );
 
-    let error = put_file(&mut client, &lease, "over.bin", vec![0xAB; cap + 1])
+    let error = put_file(&mut client, "over.bin", vec![0xAB; cap + 1])
         .await
         .expect_err("one byte over the cap must be refused");
     assert_eq!(code(&error), "too-large");
@@ -871,14 +863,13 @@ async fn exactly_the_cap_lands_and_one_more_byte_does_not() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_oversized_payload_is_refused_before_it_is_decoded() {
     let f = SessionFixture::new(Some(64 * 1024 * 1024)).await;
-    let (mut client, lease) = f.leased().await;
+    let mut client = f.client().await;
 
     let encoded_cap = usize::try_from(MAX_PUT_FILE_BYTES).unwrap().div_ceil(3) * 4;
     let error = client
         .call_raw(
             ops::SESSION_PUT_FILE,
             serde_json::json!({
-                "lease": lease,
                 "name": "over.bin",
                 "data": "!".repeat(encoded_cap + 1),
             }),
@@ -892,83 +883,69 @@ async fn an_oversized_payload_is_refused_before_it_is_decoded() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn malformed_base64_is_invalid_param() {
     let f = SessionFixture::new(Some(1 << 20)).await;
-    let (mut client, lease) = f.leased().await;
+    let mut client = f.client().await;
 
     let error = client
         .call_raw(
             ops::SESSION_PUT_FILE,
-            serde_json::json!({"lease": lease, "name": "shot.png", "data": "not base64!!"}),
+            serde_json::json!({"name": "shot.png", "data": "not base64!!"}),
         )
         .await
         .expect_err("malformed base64 must be refused");
     assert_eq!(code(&error), "invalid-param");
+    // `invalid-param` is also what a frame missing a required field answers,
+    // and this payload omits the (still-required) `lease`. The code alone
+    // would therefore pass without the base64 check ever running; serde
+    // happens to reach `data` first, so it does. Assert on the text as well
+    // so a future field reordering cannot quietly make this vacuous.
+    assert!(
+        message(&error).contains("base64"),
+        "the refusal must be the malformed payload, not a missing field: {error:?}"
+    );
     assert!(f.uploads().is_empty());
 }
 
-/// The op writes into the session user's home and its answer is about
-/// to be typed into one of the session's tabs, so it is lease-gated
-/// like every other op that carries authority.
+/// Every same-UID connection may upload: uploads land in separate
+/// private directories and coexist, so nothing about one client's
+/// upload is a claim against another's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn put_file_needs_a_lease_and_loses_it_to_a_takeover() {
+async fn put_file_is_open_to_every_connection() {
     let f = SessionFixture::new(Some(1 << 20)).await;
 
-    let mut stranger = f.client().await;
-    let error = put_file(
-        &mut stranger,
-        "0".repeat(32).as_str(),
-        "shot.png",
-        b"x".to_vec(),
-    )
-    .await
-    .expect_err("no lease, no upload");
-    assert_eq!(code(&error), "connect-required");
-
-    let (mut first, lease) = f.leased().await;
-    put_file(&mut first, &lease, "before.png", b"x".to_vec())
+    let mut first = f.client().await;
+    put_file(&mut first, "before.png", b"x".to_vec())
         .await
-        .expect("the lease holder may upload");
+        .expect("the first connection may upload");
 
     // One client, several connections, is the shape a host client
-    // actually has — §3.3 gives uploads a connection of their own — so a
-    // second connection presenting the same lease is admitted under it.
+    // actually has — §3.3 gives uploads a connection of their own.
     let mut sibling = f.client().await;
-    put_file(&mut sibling, &lease, "sibling.png", b"x".to_vec())
+    put_file(&mut sibling, "sibling.png", b"x".to_vec())
         .await
-        .expect("a second connection under one lease may upload too");
+        .expect("a second connection may upload too");
 
-    // A connection that holds the lease token but has not yet presented
-    // it: the takeover below closes the *registered* connections, so
-    // this is the one that lives to hear the refusal.
-    let mut displaced = f.client().await;
-
-    let (_second, new_lease) = f.leased().await;
-    assert_ne!(new_lease, lease);
-    let error = put_file(&mut displaced, &lease, "after.png", b"x".to_vec())
+    // And an unrelated one, which under the retired lease answered
+    // `connect-required` here.
+    let mut stranger = f.client().await;
+    put_file(&mut stranger, "after.png", b"x".to_vec())
         .await
-        .expect_err("a displaced lease cannot upload");
-    assert_eq!(code(&error), "taken-over");
-    assert_eq!(
-        f.uploads().len(),
-        2,
-        "and nothing landed after the takeover"
-    );
+        .expect("a connection that never connected may upload");
+
+    assert_eq!(f.uploads().len(), 3, "each upload got its own directory");
 }
 
-/// Two connections under one lease, racing for the last room in the
-/// store. Admission is one serialized decision, so exactly one of them
-/// can win — and the loser hearing `store-full` rather than a lease
-/// error is also what proves the second connection was admitted under
-/// the first one's lease.
+/// Two connections racing for the last room in the store. Admission is
+/// one serialized decision, so exactly one of them can win.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_connections_racing_for_the_last_room_cannot_over_admit() {
     const BYTES: usize = 4096;
     let f = SessionFixture::new(Some(2 * BYTES as u64 - 1)).await;
-    let (mut first, lease) = f.leased().await;
+    let mut first = f.client().await;
     let mut second = f.client().await;
 
     let (a, b) = tokio::join!(
-        put_file(&mut first, &lease, "a.bin", vec![0xA; BYTES]),
-        put_file(&mut second, &lease, "b.bin", vec![0xB; BYTES]),
+        put_file(&mut first, "a.bin", vec![0xA; BYTES]),
+        put_file(&mut second, "b.bin", vec![0xB; BYTES]),
     );
 
     let winners = [&a, &b].into_iter().filter(|r| r.is_ok()).count();
@@ -988,14 +965,14 @@ async fn two_connections_racing_for_the_last_room_cannot_over_admit() {
 async fn a_full_store_refuses_and_deletes_nothing() {
     const BYTES: usize = 4096;
     let f = SessionFixture::new(Some(BYTES as u64)).await;
-    let (mut client, lease) = f.leased().await;
+    let mut client = f.client().await;
 
-    let landed = put_file(&mut client, &lease, "kept.bin", vec![0xA; BYTES])
+    let landed = put_file(&mut client, "kept.bin", vec![0xA; BYTES])
         .await
         .expect("the first file fills the store exactly");
 
     for (name, size) in [("second.bin", BYTES), ("tiny.bin", 1)] {
-        let error = put_file(&mut client, &lease, name, vec![0xB; size])
+        let error = put_file(&mut client, name, vec![0xB; size])
             .await
             .expect_err("nothing else fits");
         assert_eq!(code(&error), "store-full", "{name}");
@@ -1013,9 +990,9 @@ async fn a_full_store_refuses_and_deletes_nothing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_without_a_store_answers_not_supported() {
     let f = SessionFixture::new(None).await;
-    let (mut client, lease) = f.leased().await;
+    let mut client = f.client().await;
 
-    let error = put_file(&mut client, &lease, "shot.png", b"x".to_vec())
+    let error = put_file(&mut client, "shot.png", b"x".to_vec())
         .await
         .expect_err("no store, no upload");
     assert_eq!(code(&error), "not-supported");

@@ -73,9 +73,8 @@ async fn a_session_pushes_its_commits_and_cuts_the_stream_on_stop() {
     let seeded = support::tabs(&mut client).await;
     let project_id = seeded[0].project_id;
 
-    // No lease needed: reading a session is not authority (plan 049
-    // §3.7), so a client that never connected still gets a stream — an
-    // observer one, which for a workspace commit is the same feed.
+    // A client that never ran `session.connect` still gets a stream,
+    // and the same one every other subscriber gets.
     let (mut watching, _watch_w, watch_fence) = subscribe(&socket_path, "").await;
     let lease = support::session_connect(&mut client).await.lease;
 

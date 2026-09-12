@@ -118,30 +118,11 @@ fn tab_write_params(tab_id: i64, data: &[u8], lease: Option<&str>) -> serde_json
     params
 }
 
-/// One client's connection. The lease gate registers the presenting
-/// connection, so a takeover test needs two distinct identities — which
-/// [`call`]'s per-call context cannot express.
+/// One client's connection. Two distinct identities are what a
+/// two-connection case needs, which [`call`]'s per-call context cannot
+/// express.
 fn conn(id: u64) -> ConnCtx {
     ConnCtx::new(id).0
-}
-
-/// Mint the interactive lease on a fresh connection.
-async fn connect(f: &Fixture, ctx: &ConnCtx) -> String {
-    connect_with(f, ctx, false).await
-}
-
-async fn connect_with(f: &Fixture, ctx: &ConnCtx, takeover: bool) -> String {
-    let value = reply(
-        f.handler
-            .handle(
-                ctx,
-                ops::SESSION_CONNECT,
-                serde_json::json!({"takeover": takeover}),
-            )
-            .await
-            .expect("session.connect"),
-    );
-    value["lease"].as_str().expect("lease token").to_string()
 }
 
 /// Every tab the report accounts for, in bucket order. The three lists
@@ -284,14 +265,10 @@ async fn session_identify_reports_the_installed_identity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tab_open_without_a_size_uses_the_session_default() {
     let f = fixture(true);
-    let lease = connect(&f, &conn(1)).await;
-    assert_eq!(
-        open_tab_reporting_size(&f, None, Some(&lease)).await,
-        (120, 40)
-    );
+    assert_eq!(open_tab_reporting_size(&f, None, None).await, (120, 40));
     // An explicit size still wins.
     assert_eq!(
-        open_tab_reporting_size(&f, Some((72, 19)), Some(&lease)).await,
+        open_tab_reporting_size(&f, Some((72, 19)), None).await,
         (72, 19)
     );
 }
@@ -345,9 +322,6 @@ async fn session_stop_reaps_latches_and_finalizes() {
     .expect_err("project.create after stop");
     assert_eq!(err.code, "shutting-down");
 
-    // The latch is checked before the lease gate, so a stopping session
-    // says what is actually wrong rather than sending a client off to
-    // re-`session.connect` into a session that is going away.
     let err = call(
         &f.handler,
         ops::SESSION_SET_FOCUS,
@@ -528,20 +502,18 @@ async fn open_tab_reporting_size(
 }
 
 /// Raw input is open to every same-UID client (plan 057, R15): a write
-/// on a session socket takes no lease, and a presented one is accepted
-/// and ignored the way a UI socket has always accepted it.
+/// on a session socket takes no lease, and the field is accepted and
+/// ignored whatever it carries — the way a UI socket has always
+/// accepted it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_socket_accepts_an_unleased_tab_write() {
     let f = fixture(true);
-    let stale = connect(&f, &conn(1)).await;
-    // Displaced, so the third variant below is a lease this session
-    // actively remembers as dead rather than one it never issued.
-    connect_with(&f, &conn(2), true).await;
 
     // Each variant gets its own tab and its own six-byte sink: `dd`
     // exits after the first delivery, so one shared sink could only ever
     // prove the first write landed.
-    for lease in [None, Some(""), Some(stale.as_str())] {
+    let unknown = "0".repeat(32);
+    for lease in [None, Some(""), Some(unknown.as_str())] {
         let (tab_id, mut output) = a_tab_reading_six_bytes(&f).await;
         call(
             &f.handler,
@@ -554,49 +526,36 @@ async fn a_session_socket_accepts_an_unleased_tab_write() {
     }
 }
 
-/// The lease is the **foreground**, not a write fence: after a takeover
-/// both leases still write, and what tells them apart is a foreground
-/// op — `session.set_focus`, which only the live lease may state.
+/// Two connections, and neither one is privileged: both write, and both
+/// may state what they are looking at. A second connection arriving is
+/// not an event the first one has to survive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_taken_over_lease_still_writes_and_only_the_new_one_is_the_foreground() {
+async fn two_connections_both_write_and_both_report_a_focus() {
     let f = fixture(true);
     let first = conn(1);
     let second = conn(2);
-    let old = connect(&f, &first).await;
 
-    let new = connect_with(&f, &second, true).await;
-    assert_ne!(old, new);
-
-    for lease in [&old, &new] {
+    for ctx in [&first, &second] {
         let (tab_id, mut output) = a_tab_reading_six_bytes(&f).await;
-        call(
-            &f.handler,
-            ops::TAB_WRITE,
-            tab_write_params(tab_id, b"TYPED!", Some(lease)),
-        )
-        .await
-        .expect("both leases write");
-        read_until(&mut output, b"TYPED!", "a write on either lease").await;
-    }
+        f.handler
+            .handle(
+                ctx,
+                ops::TAB_WRITE,
+                tab_write_params(tab_id, b"TYPED!", None),
+            )
+            .await
+            .expect("every connection writes");
+        read_until(&mut output, b"TYPED!", "a write on either connection").await;
 
-    let err = f
-        .handler
-        .handle(
-            &first,
-            ops::SESSION_SET_FOCUS,
-            serde_json::json!({"lease": old, "focused_tab_id": null}),
-        )
-        .await
-        .expect_err("the displaced lease is not the foreground");
-    assert_eq!(err.code, "taken-over");
-    f.handler
-        .handle(
-            &second,
-            ops::SESSION_SET_FOCUS,
-            serde_json::json!({"lease": new, "focused_tab_id": null}),
-        )
-        .await
-        .expect("the live lease is");
+        f.handler
+            .handle(
+                ctx,
+                ops::SESSION_SET_FOCUS,
+                serde_json::json!({"lease": "", "focused_tab_id": null}),
+            )
+            .await
+            .expect("either connection may report what it is viewing");
+    }
 }
 
 /// A tab parked on `dd`, which copies exactly six bytes back out and

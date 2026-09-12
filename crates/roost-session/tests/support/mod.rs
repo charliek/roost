@@ -218,9 +218,9 @@ pub async fn session_identify(client: &mut IpcClient) -> SessionIdentify {
         .expect("session.identify")
 }
 
-/// Take the session's interactive lease. Every lease-gated op needs one,
-/// and a test that only wants the lease does not care who held it, so
-/// this always takes over.
+/// Run `session.connect`. It gates nothing and displaces nobody — the
+/// op is inert and retired at protocol 5; the token it answers with is
+/// echoed back only because the field is still on the wire.
 pub async fn session_connect(client: &mut IpcClient) -> SessionConnectResult {
     client
         .call(

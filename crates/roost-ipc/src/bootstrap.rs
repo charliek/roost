@@ -2671,13 +2671,12 @@ impl BootstrapJob {
     // Stop, wait, start, check
     // --------------------------------------------------------------
 
-    /// Stop the running session over the wire, lease-free.
+    /// Stop the running session over the wire.
     ///
-    /// `session.stop` is dispatched *before* the lease gate, so this
-    /// sends it raw: no `session.connect`, no takeover, none of the
-    /// eviction side-effects a client attach would have. The in-repo
-    /// precedent is `roost-session`'s own signal handler, which
-    /// self-dials exactly this.
+    /// One op on a bare connection: no `session.connect`, and none of
+    /// the attach machinery a client would bring. The in-repo precedent
+    /// is `roost-session`'s own signal handler, which self-dials exactly
+    /// this.
     ///
     /// **`client-bridge: no session` is success**, not a failure: the
     /// job asked for the session to be gone, and it is. So is one

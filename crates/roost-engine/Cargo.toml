@@ -23,9 +23,9 @@ server-vt = ["dep:roost-vt", "roost-vt/ffi"]
 roost-ipc = { path = "../roost-ipc" }
 roost-osc = { path = "../roost-osc" }
 roost-vt = { path = "../roost-vt", optional = true }
-# Not optional: `session.connect`'s lease is minted here, and a lease is
-# not a server-vt concern — a session hands one out whether or not it
-# serves attach data.
+# Not optional: host ids and attach tickets are minted here, and neither
+# is a server-vt concern — a UI build mints both without serving attach
+# data.
 getrandom = { workspace = true }
 
 portable-pty = { workspace = true }

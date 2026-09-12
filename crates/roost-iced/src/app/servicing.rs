@@ -575,6 +575,61 @@ fn host_envelope_action(envelope: &roost_ipc::messages::EventEnvelope) -> HostEn
     }
 }
 
+/// Queue a host tab's OSC 52 write, if it is addressed to the tab this
+/// client is looking at. Split out from the `App` so the rule can be
+/// driven without one.
+///
+/// **A clipboard write lands only on the viewed tab.** A session-wide
+/// effect reaching every subscriber means a copy in a tab someone else is
+/// driving would otherwise overwrite the clipboard of a phone parked on a
+/// different tab. `viewed` is this client's own selection, never the
+/// mirror's session-wide `active_tab_id`, and it is deliberately not
+/// ANDed with window focus: a copy in the tab you are looking at lands
+/// whether or not the window has focus, as it does in tmux. Attach phase
+/// is not consulted either — a copy in the selected tab lands while that
+/// tab is still hydrating.
+fn apply_host_clipboard_effect(
+    clipboard: &mut ClipboardQueue,
+    policy: config::ClipboardWrite,
+    viewed: TabKey,
+    key: TabKey,
+    effect: &roost_ipc::messages::TabEffectEvent,
+) -> bool {
+    if key != viewed {
+        return false;
+    }
+    let Some(data) = effect.data.as_deref() else {
+        return false;
+    };
+    let Ok(bytes) = roost_ipc::messages::bytes_base64::decode(data) else {
+        tracing::debug!(%key, "clipboard effect with undecodable payload");
+        return false;
+    };
+    let target = match effect.target.unwrap_or_default() {
+        roost_ipc::messages::ClipboardEffectTarget::System => {
+            roost_engine::osc::ClipboardTarget::System
+        }
+        roost_ipc::messages::ClipboardEffectTarget::Selection => {
+            roost_engine::osc::ClipboardTarget::Selection
+        }
+    };
+    // Reject rather than repair: the local OSC 52 parser refuses
+    // non-UTF-8 payloads, and a peer that sends one must not get
+    // replacement-altered text onto the clipboard here either.
+    let Ok(text) = String::from_utf8(bytes) else {
+        tracing::debug!(%key, "clipboard effect payload is not UTF-8; dropped");
+        return false;
+    };
+    if !enqueue_osc_clipboard_write(clipboard, policy, target, text) {
+        tracing::info!(
+            %key,
+            "host OSC 52 clipboard write dropped — clipboard-write = deny"
+        );
+        return false;
+    }
+    true
+}
+
 /// The inbox rows one instance's project list currently owes, in
 /// snapshot order.
 ///
@@ -1225,13 +1280,22 @@ impl App {
         self.desktop_notifications.fire(key, title, body);
     }
 
-    /// Apply one `tab.effect` envelope from a connected host: bell rings
-    /// the notification inbox (the app's attention surface — local tabs
-    /// have no bell path, so this is the closest existing one), and an
-    /// OSC 52 write lands on this client's clipboard under the same
-    /// config policy a local tab's write obeys. The caller chains the
-    /// returned task — it is the queue pump, exactly as
+    /// Apply one `tab.effect` envelope from a connected host. The caller
+    /// chains the returned task — it is the queue pump, exactly as
     /// `apply_osc_actions`'s tail is for a local write.
+    ///
+    /// **A bell marks whatever tab rang**, ungated: every subscriber
+    /// receives every effect now, and a mark on a background tab is what
+    /// a bell is for — the attention surface is where the user goes
+    /// looking. It clears where every attention marker clears, on focus
+    /// (`app.rs`'s focus edge). Recording it rather than upserting the
+    /// row is deliberate: the reconcile derives rows from the mirror and
+    /// prunes anything it did not declare, so an upsert here would be
+    /// erased microseconds later. That is also why a key the mirror does
+    /// not carry yet is recorded rather than refused — an effect can beat
+    /// the snapshot that first names its tab, and gating on membership
+    /// would drop that bell for good instead of showing it one reconcile
+    /// later.
     fn apply_host_effect(
         &mut self,
         host: HostId,
@@ -1240,56 +1304,24 @@ impl App {
         let key = TabKey::new(host, effect.tab_id);
         match effect.effect {
             roost_ipc::messages::TabEffect::Bell => {
-                // Record that this tab rang, then let the ordinary
-                // reconcile derive the row from it. Upserting the row
-                // here instead would put an undeclared row in a set the
-                // reconcile prunes against the mirror, and the next
-                // reconcile would erase it — which is exactly what a
-                // bell used to do: arrive, and vanish before anyone saw
-                // it. It clears where every attention marker clears, on
-                // focus.
                 if self.host_bells.insert(key) {
                     self.reconcile_notification_inbox();
                 }
                 UiTask::None
             }
             roost_ipc::messages::TabEffect::ClipboardWrite => {
-                let Some(data) = effect.data.as_deref() else {
-                    return UiTask::None;
-                };
-                let Ok(bytes) = roost_ipc::messages::bytes_base64::decode(data) else {
-                    tracing::debug!(%key, "clipboard effect with undecodable payload");
-                    return UiTask::None;
-                };
-                let target = match effect.target.unwrap_or_default() {
-                    roost_ipc::messages::ClipboardEffectTarget::System => {
-                        roost_engine::osc::ClipboardTarget::System
-                    }
-                    roost_ipc::messages::ClipboardEffectTarget::Selection => {
-                        roost_engine::osc::ClipboardTarget::Selection
-                    }
-                };
-                // Reject rather than repair: the local OSC 52 parser
-                // refuses non-UTF-8 payloads, and a peer that sends one
-                // must not get replacement-altered text onto the
-                // clipboard here either.
-                let Ok(text) = String::from_utf8(bytes) else {
-                    tracing::debug!(%key, "clipboard effect payload is not UTF-8; dropped");
-                    return UiTask::None;
-                };
-                if !enqueue_osc_clipboard_write(
+                let viewed = self.active_tab_key();
+                if apply_host_clipboard_effect(
                     &mut self.clipboard,
                     self.config.clipboard_write,
-                    target,
-                    text,
+                    viewed,
+                    key,
+                    effect,
                 ) {
-                    tracing::info!(
-                        %key,
-                        "host OSC 52 clipboard write dropped — clipboard-write = deny"
-                    );
-                    return UiTask::None;
+                    self.clipboard.start_next()
+                } else {
+                    UiTask::None
                 }
-                self.clipboard.start_next()
             }
         }
     }
@@ -1539,10 +1571,10 @@ impl App {
                     }
                     // Effects ride the batch verbatim and are applied
                     // here, before the mirror folds the commit away.
-                    // Lease-holder-only is structural: this stream only
-                    // flows while our connection holds the lease — a
-                    // displaced client's events connection is closed at
-                    // takeover before the new holder can generate any.
+                    // Nothing is filtered on the way in: the session
+                    // publishes every effect to every subscriber, and
+                    // which of them this client acts on is decided
+                    // below — see `apply_host_clipboard_effect`.
                     if let crate::host_conn::HostWorkspaceEvent::Applied { events, .. } = &event {
                         task = task.then(self.apply_host_envelopes(host, events));
                     }
@@ -3201,6 +3233,62 @@ mod tests {
 
     use super::file_transfer::LostReason;
     use super::*;
+
+    /// Under fan-out every client receives every effect, so the
+    /// clipboard asks *this* client's own question: is the tab the copy
+    /// came from the one I am showing?
+    #[test]
+    fn a_clipboard_effect_lands_only_on_the_viewed_tab() {
+        let host = HostId::new(7);
+        let viewed = TabKey::new(host, 1);
+        let copy = |tab: TabKey| roost_ipc::messages::TabEffectEvent {
+            tab_id: tab.tab,
+            effect: roost_ipc::messages::TabEffect::ClipboardWrite,
+            data: Some(roost_ipc::messages::bytes_base64::encode(b"copied")),
+            target: Some(roost_ipc::messages::ClipboardEffectTarget::System),
+        };
+
+        for (policy, key, lands, why) in [
+            (
+                config::ClipboardWrite::Allow,
+                viewed,
+                true,
+                "the viewed tab",
+            ),
+            (
+                config::ClipboardWrite::Allow,
+                TabKey::new(host, 2),
+                false,
+                "a copy in a tab this client is not showing must not take its clipboard",
+            ),
+            (
+                config::ClipboardWrite::Deny,
+                viewed,
+                false,
+                "the viewed-tab rule composes with the config policy; it does not replace it",
+            ),
+            (
+                config::ClipboardWrite::Allow,
+                TabKey::new(host, 909),
+                false,
+                "a tab this client has never heard of",
+            ),
+        ] {
+            let mut clipboard = ClipboardQueue::default();
+            assert_eq!(
+                apply_host_clipboard_effect(&mut clipboard, policy, viewed, key, &copy(key)),
+                lands,
+                "{why}"
+            );
+            match clipboard.start_next() {
+                UiTask::ClipboardWrite { text, .. } => {
+                    assert!(lands, "{why}");
+                    assert_eq!(text, "copied");
+                }
+                _ => assert!(!lands, "{why}"),
+            }
+        }
+    }
 
     /// The image seam's one gate: the env it was launched with, and
     /// nothing about the box it is running on — see

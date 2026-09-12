@@ -21,9 +21,8 @@ use roost_engine::{PtySupervisor, ReplayBounds, Workspace, WorkspaceEvent};
 use roost_ipc::agent::{AgentLifecycle, AgentTabState, Ownership, ShellState};
 use roost_ipc::framing::{write_frame, FrameReader};
 use roost_ipc::messages::{
-    ops, EventBatch, EventsSubscribeResult, Project, Response, SessionConnectResult,
-    SessionStopResult, Tab, TabListResult, TabState, SESSION_DRIVER_CHANGED_EVENT,
-    SESSION_STOPPING_EVENT,
+    ops, EventBatch, EventsSubscribeResult, Project, Response, SessionStopResult, Tab,
+    TabListResult, TabState, SESSION_STOPPING_EVENT,
 };
 use roost_ipc::{IpcClient, IpcServer};
 use tempfile::TempDir;
@@ -110,50 +109,10 @@ impl Harness {
         panic!("server never came up at {}", self.socket.display());
     }
 
-    /// Take the session lease on a throwaway control connection.
-    ///
-    /// Takeover on purpose: these tests connect freely and the lease
-    /// survives the connection that took it, so the second caller in a
-    /// test would otherwise get `already-connected`.
-    async fn lease(&self) -> String {
-        self.lease_as(None).await
-    }
-
-    /// The same, with the claimant naming itself — what a deposed
-    /// stream is told in `session.driver_changed`.
-    async fn lease_as(&self, label: Option<&str>) -> String {
-        let mut client = IpcClient::connect(&self.socket).await.expect("connect");
-        let mut params = serde_json::json!({"takeover": true});
-        if let Some(label) = label {
-            params["client_label"] = serde_json::json!(label);
-        }
-        let result: SessionConnectResult = client
-            .call(ops::SESSION_CONNECT, params)
-            .await
-            .expect("session.connect");
-        result.lease
-    }
-
-    /// Subscribe with no lease at all: an observer stream.
-    async fn watch(&self) -> (Reader, Writer, u64) {
-        self.subscribe_with("").await
-    }
-
     /// Dial, subscribe, and return the connection plus the acked fence.
     async fn subscribe(&self) -> (Reader, Writer, u64) {
-        let lease = self.lease().await;
-        self.subscribe_with(&lease).await
-    }
-
-    async fn subscribe_with(&self, lease: &str) -> (Reader, Writer, u64) {
         let (mut reader, mut w) = self.dial().await;
-        request(
-            &mut w,
-            1,
-            ops::EVENTS_SUBSCRIBE,
-            serde_json::json!({"lease": lease}),
-        )
-        .await;
+        request(&mut w, 1, ops::EVENTS_SUBSCRIBE, serde_json::json!({})).await;
         let ack = read_frame(&mut reader).await;
         assert_eq!(ack["ok"], serde_json::json!(true), "ack: {ack}");
         let result: EventsSubscribeResult =
@@ -380,7 +339,6 @@ async fn the_relay_gives_up_on_a_source_nobody_polls() {
             capacity: 1,
             stall: Duration::from_millis(100),
         },
-        Arc::new(event_push::FullFeed),
     );
     let source = &mut subscription.source;
     for i in 0..8 {
@@ -500,55 +458,12 @@ async fn session_stop_labels_and_closes_a_live_push_connection() {
     // And a subscribe after the latch is refused rather than handed a
     // stream nothing will ever end.
     let (mut reader, mut w) = h.dial().await;
-    request(
-        &mut w,
-        1,
-        ops::EVENTS_SUBSCRIBE,
-        serde_json::json!({"lease": "whatever"}),
-    )
-    .await;
+    request(&mut w, 1, ops::EVENTS_SUBSCRIBE, serde_json::json!({})).await;
     let reply = read_frame(&mut reader).await;
-    // The lease gate runs first, and a session that already stopped has
-    // no lease to present — either answer tells the client to stop
-    // retrying on this connection.
-    assert!(
-        ["shutting-down", "connect-required"].contains(&reply["error"]["code"].as_str().unwrap()),
+    assert_eq!(
+        reply["error"]["code"], "shutting-down",
         "unexpected refusal: {reply}"
     );
-}
-
-/// A takeover **demotes** the previous holder's stream rather than
-/// closing it (plan 049 §3.8): one non-terminal `session.driver_changed`
-/// naming the claimant, and the stream keeps delivering after it.
-///
-/// This is the wire-visible half of the inversion. A client that lost
-/// its stream here would go blind about a session it is still showing —
-/// which is exactly what the frozen-frame banner exists to avoid.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_takeover_tells_the_previous_holders_stream_and_keeps_it_open() {
-    let h = harness(true, None).await;
-    let (mut reader, _w, fence) = h.subscribe().await;
-
-    // A second client takes the lease. Its own connection is untouched;
-    // the first holder's control connection is cut, its stream is not.
-    let _second = h.lease_as(Some("a phone")).await;
-
-    let envelope = read_frame(&mut reader).await;
-    assert_eq!(
-        envelope["event"], SESSION_DRIVER_CHANGED_EVENT,
-        "frame: {envelope}"
-    );
-    assert_eq!(envelope["data"]["taken_by"], "a phone");
-    assert!(
-        envelope.get("revision").is_none(),
-        "the control envelope is not a batch and carries no revision: {envelope}"
-    );
-
-    // Still delivering, and still contiguous: the demotion is not a gap.
-    h.workspace.create_project("after", "/tmp").unwrap();
-    let batch = read_batch(&mut reader).await;
-    assert_eq!(batch.revision, fence + 1);
-    assert_eq!(names(&batch), vec![ops::EVENT_PROJECT_CREATED]);
 }
 
 /// Three concurrent streams, one commit, three deliveries. The registry
@@ -558,20 +473,15 @@ async fn a_takeover_tells_the_previous_holders_stream_and_keeps_it_open() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_concurrent_streams_are_each_delivered_in_full() {
     let h = harness(true, None).await;
-    let lease = h.lease().await;
-    let (mut driver, _dw, driver_fence) = h.subscribe_with(&lease).await;
-    let (mut first, _fw, first_fence) = h.watch().await;
-    let (mut second, _sw, second_fence) = h.watch().await;
+    let (mut a, _aw, a_fence) = h.subscribe().await;
+    let (mut b, _bw, b_fence) = h.subscribe().await;
+    let (mut c, _cw, c_fence) = h.subscribe().await;
 
     for name in ["one", "two", "three"] {
         h.workspace.create_project(name, "/tmp").unwrap();
     }
 
-    for (reader, fence) in [
-        (&mut driver, driver_fence),
-        (&mut first, first_fence),
-        (&mut second, second_fence),
-    ] {
+    for (reader, fence) in [(&mut a, a_fence), (&mut b, b_fence), (&mut c, c_fence)] {
         for step in 1..=3 {
             let batch = read_batch(reader).await;
             assert_eq!(batch.revision, fence + step, "a stream skipped a revision");
@@ -580,11 +490,67 @@ async fn three_concurrent_streams_are_each_delivered_in_full() {
     }
 }
 
-/// `notification.fired` is not an effect. It is transient like one, but
-/// routing notifications is the point of watching a session at all, so
-/// it crosses to observers (plan 049 §3.7).
+/// **Every subscriber receives every effect.** One bell, two streams,
+/// the same envelope on both — same tab, same revision, same commit.
+///
+/// The two streams are deliberately asymmetric in the one way that used
+/// to decide this: the first presents the token `session.connect` mints
+/// and the second presents nothing at all. Under the retired lease that
+/// made the second an *observer* and stripped `tab.effect` out of its
+/// batch; a session has no view of its own, so which client a bell or an
+/// OSC 52 write is for is now the viewing client's question, answered
+/// where the tab is on screen.
+#[cfg(feature = "server-vt")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_notification_reaches_an_observer() {
+async fn every_stream_receives_the_same_effect() {
+    use roost_engine::tab_task::ServerVtWorkspace;
+
+    let h = harness(true, None).await;
+    let project = h.workspace.create_project("p", "/tmp").unwrap();
+    let tab = h.workspace.open_tab(project.id, "/tmp", "sh").unwrap();
+
+    let mut client = IpcClient::connect(&h.socket).await.expect("connect");
+    let connected: roost_ipc::messages::SessionConnectResult = client
+        .call(ops::SESSION_CONNECT, serde_json::json!({"takeover": true}))
+        .await
+        .expect("session.connect");
+
+    let (mut holder, mut hw) = h.dial().await;
+    request(
+        &mut hw,
+        1,
+        ops::EVENTS_SUBSCRIBE,
+        serde_json::json!({"lease": connected.lease}),
+    )
+    .await;
+    let ack = read_frame(&mut holder).await;
+    assert_eq!(ack["ok"], serde_json::json!(true), "ack: {ack}");
+
+    let (mut stranger, _sw, _fence) = h.subscribe().await;
+
+    h.workspace
+        .tab_effect(tab.id, roost_engine::TabEffectKind::Bell);
+
+    let first = read_batch(&mut holder).await;
+    let second = read_batch(&mut stranger).await;
+    assert_eq!(names(&first), vec![ops::EVENT_TAB_EFFECT], "{first:?}");
+    assert_eq!(
+        names(&second),
+        vec![ops::EVENT_TAB_EFFECT],
+        "a subscriber that presented nothing gets the bell too: {second:?}"
+    );
+    assert_eq!(first.revision, second.revision);
+    assert_eq!(
+        first.events[0].data["tab_id"],
+        serde_json::json!(tab.id.to_string())
+    );
+    assert_eq!(first.events[0].data, second.events[0].data);
+}
+
+/// `notification.fired` reaches a subscriber that is doing nothing else
+/// with the session: routing notifications is the point of watching one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notification_reaches_a_subscriber() {
     let h = harness(true, None).await;
     let project = h.workspace.create_project("p", "/tmp").unwrap();
     let tab = h.workspace.open_tab(project.id, "/tmp", "t").unwrap();
@@ -592,7 +558,7 @@ async fn a_notification_reaches_an_observer() {
     // suppresses its own notification, which would make this pass or
     // fail on which tab happened to be selected rather than on routing.
     h.workspace.open_tab(project.id, "/tmp", "other").unwrap();
-    let (mut watcher, _ww, _fence) = h.watch().await;
+    let (mut watcher, _ww, _fence) = h.subscribe().await;
 
     assert!(h
         .workspace
@@ -606,7 +572,7 @@ async fn a_notification_reaches_an_observer() {
     let batch = read_batch(&mut watcher).await;
     assert!(
         names(&batch).contains(&ops::EVENT_NOTIFICATION_FIRED),
-        "an observer must be told: {:?}",
+        "a subscriber must be told: {:?}",
         names(&batch)
     );
 }
@@ -940,15 +906,8 @@ async fn a_malformed_frame_after_the_flip_produces_no_reply() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_ack_is_an_ordinary_response_envelope() {
     let h = harness(true, None).await;
-    let lease = h.lease().await;
     let (mut reader, mut w) = h.dial().await;
-    request(
-        &mut w,
-        42,
-        ops::EVENTS_SUBSCRIBE,
-        serde_json::json!({"lease": lease}),
-    )
-    .await;
+    request(&mut w, 42, ops::EVENTS_SUBSCRIBE, serde_json::json!({})).await;
     let raw = read_frame(&mut reader).await;
     let response: Response = serde_json::from_value(raw).expect("response envelope");
     assert_eq!(response.id, 42);
@@ -973,8 +932,7 @@ async fn a_commit_between_the_cut_and_the_spawn_still_reaches_the_stream() {
     let cut = workspace.subscribe_live();
     workspace.create_project("raced", "/tmp").unwrap();
 
-    let mut subscription =
-        event_push::spawn(cut, PushLimits::default(), Arc::new(event_push::FullFeed));
+    let mut subscription = event_push::spawn(cut, PushLimits::default());
     assert_eq!(
         subscription.revision, 0,
         "the cut was taken before the commit"
@@ -995,8 +953,7 @@ async fn a_commit_between_the_cut_and_the_spawn_still_reaches_the_stream() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resume_replays_the_gap_and_then_goes_live() {
     let h = harness(true, None).await;
-    let lease = h.lease().await;
-    let (reader, w, fence) = h.subscribe_with(&lease).await;
+    let (reader, w, fence) = h.subscribe().await;
     // The phone's link drops.
     drop((reader, w));
 
@@ -1008,7 +965,7 @@ async fn a_resume_replays_the_gap_and_then_goes_live() {
         &mut w,
         1,
         ops::EVENTS_SUBSCRIBE,
-        serde_json::json!({"lease": lease, "from_revision": fence, "session_id": SESSION_ID}),
+        serde_json::json!({"from_revision": fence, "session_id": SESSION_ID}),
     )
     .await;
     let ack = read_frame(&mut reader).await;
@@ -1124,13 +1081,7 @@ async fn a_refused_resume_is_answered_on_the_ack_and_the_connection_survives() {
     );
 
     // The recovery, on the same connection: subscribe afresh.
-    request(
-        &mut w,
-        5,
-        ops::EVENTS_SUBSCRIBE,
-        serde_json::json!({"lease": ""}),
-    )
-    .await;
+    request(&mut w, 5, ops::EVENTS_SUBSCRIBE, serde_json::json!({})).await;
     let ack = read_frame(&mut reader).await;
     assert_eq!(ack["ok"], serde_json::json!(true), "ack: {ack}");
     let result: EventsSubscribeResult =

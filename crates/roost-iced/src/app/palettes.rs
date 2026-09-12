@@ -1847,7 +1847,7 @@ impl App {
         // On COMMIT only. `apply_theme_name` is also the preview path —
         // it runs on every selection move in the theme palette, and
         // again when the user backs out — so reseeding there would push
-        // a lease-gated op to every connected host on every arrow key,
+        // a `session.set_theme` to every connected host on every arrow key,
         // and a browse-then-cancel would leave hosts recoloured to a
         // theme the user rejected. A preview is local by nature: it
         // costs an in-process repaint here and nothing on the wire.

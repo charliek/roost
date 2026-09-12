@@ -32,28 +32,27 @@ use roost_ipc::messages::{
     AppNotificationStatusResult, AppRenderStatsParams, AppRenderStatsResult,
     AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams, AppUpdateCheckParams,
     AppUpdateStatusParams, AppUpdateStatusResult, AttachPayloadKind, ClipboardDumpParams,
-    ClipboardDumpResult, ClipboardWriteParams, EventEnvelope, EventsSubscribeParams,
-    EventsSubscribeResult, Host, HostAddParams, HostAddResult, HostConnectParams,
-    HostConnectionResult, HostDisconnectParams, HostListParams, HostListResult, HostRemoveParams,
-    HostStatusParams, HostStatusResult, IdentifyParams, IdentifyResult, NotificationCreateParams,
-    PaletteActivateParams, PaletteDismissParams, PaletteOpenParams, PalettePresentParams,
-    PalettePresentResult, PaletteQueryParams, PaletteStateParams, PaletteStateResult,
-    ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams,
-    ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams,
-    SelectionDumpParams, SelectionDumpResult, SelectionSetParams, SessionConnectParams,
-    SessionConnectResult, SessionDriverChangedEvent, SessionIdentify, SessionIdentifyParams,
-    SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams,
-    SessionSetAgentHooksResult, SessionSetFocusParams, SessionSetThemeParams, SessionStopParams,
-    SessionStopResult, SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams,
-    TabAgentReportResult, TabAttachParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
-    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
-    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
-    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
-    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams, TabSendFileResult,
-    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
-    WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef, WireTabRef,
-    MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES, SESSION_DRIVER_CHANGED_EVENT, SESSION_FEATURES,
+    ClipboardDumpResult, ClipboardWriteParams, EventsSubscribeParams, EventsSubscribeResult, Host,
+    HostAddParams, HostAddResult, HostConnectParams, HostConnectionResult, HostDisconnectParams,
+    HostListParams, HostListResult, HostRemoveParams, HostStatusParams, HostStatusResult,
+    IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
+    PaletteDismissParams, PaletteOpenParams, PalettePresentParams, PalettePresentResult,
+    PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
+    ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
+    ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
+    SelectionDumpResult, SelectionSetParams, SessionConnectParams, SessionConnectResult,
+    SessionIdentify, SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult,
+    SessionSetAgentHooksParams, SessionSetAgentHooksResult, SessionSetFocusParams,
+    SessionSetThemeParams, SessionStopParams, SessionStopResult, SidebarDumpParams,
+    SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult, TabAttachParams,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
+    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
+    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
+    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams,
+    TabSendFileResult, TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams,
+    TabWriteParams, WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef,
+    WireTabRef, MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES, SESSION_FEATURES,
     SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
@@ -595,7 +594,7 @@ pub enum UiRequest {
         reply: HostOpReply<()>,
     },
     /// `host.connect` — the palette's `Connect Host` and the sidebar's
-    /// ↻ Reconnect, as an op. Unconditional takeover, and it may start a
+    /// ↻ Reconnect, as an op. It displaces nobody, and it may start a
     /// localhost session that is not running.
     HostConnect {
         id: String,
@@ -712,94 +711,38 @@ impl std::fmt::Debug for StopHandle {
 /// What a session does when a client sends `session.set_agent_hooks`.
 ///
 /// The dependency direction is the point (plan 046 §3.4): this crate
-/// decodes the op and gates it on the lease, and the *daemon* — which is
-/// the process that links `roost-agent-install` and owns the `$HOME`
-/// being written — supplies the doing. `roost-engine` is linked into the
-/// UI processes too, and a UI has no business carrying a dotfile writer.
+/// decodes the op, and the *daemon* — which is the process that links
+/// `roost-agent-install` and owns the `$HOME` being written — supplies
+/// the doing. `roost-engine` is linked into the UI processes too, and a
+/// UI has no business carrying a dotfile writer.
 ///
 /// A handler built without one answers `not-supported`, which is the
 /// honest answer for any socket that is not a host session's.
 #[derive(Clone)]
 pub struct AgentHooksHandle(Arc<dyn Fn(AgentHooksRequest) -> AgentHooksFuture + Send + Sync>);
 
-/// The op's params minus the credential. The lease is this crate's to
-/// check and nobody else's to hold.
+/// The op's params, as the daemon receives them.
 #[derive(Debug, Clone)]
 pub struct AgentHooksRequest {
     pub mode: roost_ipc::messages::AgentHooksMode,
     pub skip: Vec<String>,
     /// How the asking client names itself, for the host's state record.
     pub client: String,
-    /// Whether the client that asked *still* holds the session — asked
-    /// again at the point of effect. See [`AgentHooksAuthority`].
-    pub authority: AgentHooksAuthority,
-}
-
-/// "Is the client that asked for this still the lease holder?", callable
-/// from the thread doing the work.
-///
-/// The lease gate at the door is not enough on its own. The install
-/// engine takes a per-home `flock` and can wait behind another writer
-/// for seconds; the client's own 15 s budget makes a *timed-out* client
-/// reconnect while the host work carries on. In that window another
-/// client can take the lease over and state the opposite policy — and
-/// the displaced request would then run afterwards and rewrite the files
-/// it was no longer allowed to touch. So the answer travels with the
-/// request and is re-asked where it counts (`roost-agent-install`'s
-/// `ensure_on_behalf` asks it under the lock).
-///
-/// It is a closure rather than a lease string because the registry that
-/// can answer lives in this module and nothing outside it should be able
-/// to read or forge a lease token.
-#[derive(Clone)]
-pub struct AgentHooksAuthority(Arc<dyn Fn() -> bool + Send + Sync>);
-
-impl AgentHooksAuthority {
-    pub fn new(f: impl Fn() -> bool + Send + Sync + 'static) -> Self {
-        Self(Arc::new(f))
-    }
-
-    /// For a caller with no authority to lose — the tests, and any
-    /// future backend that is not driven by a lease.
-    pub fn always() -> Self {
-        Self::new(|| true)
-    }
-
-    pub fn holds(&self) -> bool {
-        (self.0)()
-    }
-}
-
-impl std::fmt::Debug for AgentHooksAuthority {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("AgentHooksAuthority")
-    }
 }
 
 /// Why a session could not run an install at all.
 ///
-/// Typed rather than a string because the two answers instruct
-/// differently on the wire: `Unauthorized` is `taken-over` (stop driving
-/// this session), everything else is `internal` (the wiring failed, the
-/// session is fine). A *per-agent* failure is neither — it rides back in
-/// the reply's `errors`.
+/// A whole-run failure: no `$HOME`, an unwritable state record, a lock
+/// another writer never released. A *per-agent* failure is not one — it
+/// rides back in the reply's `errors`.
 #[derive(Debug)]
 pub enum AgentHooksError {
-    /// The lease that asked had been taken over by the time the install
-    /// could act. Nothing was written.
-    Unauthorized,
-    /// A whole-run failure: no `$HOME`, an unwritable state record, a
-    /// lock another writer never released.
     Failed(String),
 }
 
 impl std::fmt::Display for AgentHooksError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AgentHooksError::Unauthorized => f.write_str(
-                "the lease that asked for this was taken over before the install could run; \
-                 nothing was written",
-            ),
             AgentHooksError::Failed(error) => f.write_str(error),
         }
     }
@@ -841,11 +784,10 @@ const MAX_PUT_FILE_NAME_BYTES: usize = 128;
 /// the accounting that decides whether the next one fits.
 ///
 /// The dependency direction mirrors [`AgentHooksHandle`]: this crate
-/// decodes `session.put_file` and gates it on the lease, and the
-/// *daemon* — the process that owns the host's cache directory and
-/// sweeps it — supplies the root. A handler built without one answers
-/// `not-supported`, the honest answer for any socket that is not a host
-/// session's.
+/// decodes `session.put_file`, and the *daemon* — the process that owns
+/// the host's cache directory and sweeps it — supplies the root. A
+/// handler built without one answers `not-supported`, the honest answer
+/// for any socket that is not a host session's.
 ///
 /// **Nothing here ever evicts** (plan 047 §3.1). A path this store has
 /// handed out stays valid until the session stops cleanly or starts
@@ -1037,11 +979,9 @@ struct SessionState {
     /// latch completes, and its tab joins the reap set — while every
     /// later one is rejected.
     barrier: tokio::sync::RwLock<()>,
-    /// Who currently holds interactive authority, and which connections
-    /// they hold it on. The single linearization point for the whole
-    /// admission story: connect, takeover, and every lease-gated op
-    /// resolve against this one lock, so two clients racing a takeover
-    /// produce one winner rather than two live leases.
+    /// Every connection this session is tracking, and the attach
+    /// tickets it has handed out. One lock, so a stop's sweep and a
+    /// registration that raced it cannot both win.
     clients: std::sync::Mutex<ClientRegistry>,
 }
 
@@ -1071,12 +1011,10 @@ pub const MAX_OUTSTANDING_TOKENS: usize = 16;
 
 /// How many of those one control connection may hold at once.
 ///
-/// Half the pool, so no single connection can exhaust it: before R15
-/// minting required the lease, which meant only the foreground could
-/// reach [`MAX_OUTSTANDING_TOKENS`] at all. Raw input is open now, so
-/// any same-UID client can loop `tab.attach` without ever dialing — and
-/// without this sub-cap one buggy agent script would answer every other
-/// client's attach with `too-many-tokens` for a whole TTL.
+/// Half the pool, so no single connection can exhaust it: any same-UID
+/// client can loop `tab.attach`, and without this sub-cap one buggy
+/// agent script would answer every other client's attach with
+/// `too-many-tokens` for a whole TTL.
 ///
 /// Eight is far above anything healthy: a client consumes each ticket
 /// within a round trip, so even a UI attaching several tabs at once
@@ -1085,91 +1023,21 @@ pub const MAX_OUTSTANDING_TOKENS: usize = 16;
 /// room, and a low cap would start refusing legitimate bursts.
 pub const MAX_TOKENS_PER_CONNECTION: usize = MAX_OUTSTANDING_TOKENS / 2;
 
-/// What a takeover reports when the claimant stated no label.
-///
-/// Display copy, not a sentinel: `taken_by` is always a non-empty string
-/// on the wire so a client never has to render "took over by ".
-const UNKNOWN_CLIENT: &str = "unknown client";
-
-/// The longest client label a session will keep, in bytes.
-const MAX_CLIENT_LABEL: usize = 128;
-
-/// Trim, de-control, and cap a claimant's self-reported label.
-///
-/// Display metadata, never identity (§3.9) — which is exactly why it is
-/// normalized here rather than trusted: it is rendered in a banner, so a
-/// label carrying a newline or a kilobyte of text is a UI problem a
-/// client should not be able to hand us. Empty after normalization is
-/// absent: a label nobody stated must not render as one.
-fn normalize_client_label(raw: Option<String>) -> Option<String> {
-    let raw = raw?;
-    let mut label = String::new();
-    for c in raw.trim().chars().filter(|c| !is_layout_hostile(*c)) {
-        if label.len() + c.len_utf8() > MAX_CLIENT_LABEL {
-            break;
-        }
-        label.push(c);
-    }
-    let label = label.trim().to_string();
-    (!label.is_empty()).then_some(label)
-}
-
-/// Characters a banner must never receive, beyond `char::is_control`.
-///
-/// The line/paragraph separators break the banner onto a second line and
-/// the bidi overrides reorder everything after them — neither is a
-/// control character by Unicode's definition, so `is_control` alone
-/// lets both straight through into a string this session renders.
-fn is_layout_hostile(c: char) -> bool {
-    c.is_control()
-        || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-}
-
 /// One live `events.subscribe` stream.
 ///
 /// Streams are registered **here and never under [`ClientRegistry::controls`]**
-/// (plan 049 §3.7), because the two kinds are handled differently at
-/// both events that reach them: a stop closes a stream and only then
-/// aborts its relay, and a takeover demotes a stream and tells it who
-/// took over rather than touching it. Keeping them in separate lists is
-/// what makes that structural instead of a branch somebody has to
-/// remember. Since R15 (plan 057) a takeover touches no control or data
-/// connection either.
-struct Observer {
+/// (plan 049 §3.7), because a stop treats the two kinds differently: it
+/// closes a stream and only then aborts its relay. Keeping them in
+/// separate lists is what makes that structural instead of a branch
+/// somebody has to remember.
+struct Stream {
     conn_id: u64,
     closer: ConnCloser,
-    /// Writes one non-batch envelope into this stream's push queue,
-    /// behind whatever is already queued. Weak on purpose — see
-    /// [`event_push::Subscription::inject`].
-    inject: tokio::sync::mpsc::WeakSender<serde_json::Value>,
     /// Ends the relay; its dropped sender is what EOFs the peer.
     relay: tokio::task::AbortHandle,
-    /// The lease this stream presented, `None` for one that presented
-    /// none — and `None` again once a takeover demoted it. Delivery
-    /// classifies off the same `current` under this same lock, so this
-    /// view and that one cannot disagree.
-    presented: Option<String>,
-    /// A `session.driver_changed` the queue would not take, waiting for
-    /// this stream's own relay to send it (plan 049 §3.8).
-    ///
-    /// The slot exists because a full queue does not mean a stalled
-    /// peer. The relay reserves capacity *before* it takes the registry
-    /// lock, so a stream that is draining perfectly reports `Full` to
-    /// the injector for exactly as long as its relay is parked on that
-    /// lock — and cutting it there would turn a healthy reader into a
-    /// bare EOF. Left here instead, [`LeaseGate`] finds it under the
-    /// same lock and spends its reserved permit on the notice first.
-    /// A peer that genuinely stopped reading still dies, on the relay's
-    /// own stall budget.
-    ///
-    /// One slot, not a queue: a second takeover's envelope names the
-    /// current holder, which is the more useful answer than the one it
-    /// replaces, and a stream that has not been told once has no order
-    /// to preserve.
-    notice: Option<serde_json::Value>,
 }
 
-impl Observer {
+impl Stream {
     /// Still worth keeping a record for: the relay is running and the
     /// connection it writes to is open. A stream that ended on its own
     /// satisfies neither, which is what the prunes retain on.
@@ -1178,10 +1046,9 @@ impl Observer {
     }
 }
 
-/// The client registry: one live lease, one tombstone, one entry per
-/// live control connection, one entry per live event stream, at most
-/// [`MAX_OUTSTANDING_TOKENS`] unconsumed tokens, and **every** live data
-/// connection per tab.
+/// The client registry: one entry per live control connection, one per
+/// live event stream, at most [`MAX_OUTSTANDING_TOKENS`] unconsumed
+/// tokens, and **every** live data connection per tab.
 ///
 /// Data connections are not bounded by construction any more (plan 057,
 /// R15): a tab admits as many as clients dial. What bounds them is the
@@ -1194,28 +1061,13 @@ impl Observer {
 /// fence and budgets, so a reader that falls behind is cut on its own
 /// lag and takes nobody with it.
 struct ClientRegistry {
-    current: Option<Lease>,
-    /// The most recently invalidated lease token, kept only so its
-    /// holder gets `taken-over` instead of `connect-required` — a
-    /// materially different instruction (stop retrying vs. reconnect).
-    /// Exactly one: an older tombstone is a client that has already been
-    /// told twice over.
-    tombstone: Option<String>,
     /// Attach tickets handed out but not yet presented on a data
     /// connection.
     tokens: Vec<AttachToken>,
-    /// Every live control connection, keyed by conn id.
-    ///
-    /// **The authority for closing**, held independently of any lease.
-    /// A takeover closes nothing, so the connections a displaced lease
-    /// was held on outlive it — and a stop must still be able to hand
-    /// each of them the labeled `shutting-down` close. [`Lease::conns`]
-    /// is membership and nothing else.
-    ///
-    /// Every connection that sends a single op on this socket is in
-    /// here, not only the ones that present a lease: since R15 a client
-    /// that only attaches and writes never mints one, and it is owed the
-    /// same labeled goodbye as the foreground.
+    /// Every live control connection, keyed by conn id — **the
+    /// authority for closing**. Every connection that sends a single op
+    /// on this socket is in here, because a stop owes each of them the
+    /// labeled `shutting-down` close rather than a bare EOF.
     controls: std::collections::HashMap<u64, ConnCloser>,
     /// Every live data connection, by tab id. Kept so a stop can close
     /// them and so a forwarder unwinding can drop its own entry — no
@@ -1230,18 +1082,16 @@ struct ClientRegistry {
     /// — nothing on it is request-shaped any more — so a stop has to
     /// reach in, close it (which writes the terminal envelope) and only
     /// then abort its relay.
-    observers: Option<Vec<Observer>>,
+    streams: Option<Vec<Stream>>,
 }
 
 impl Default for ClientRegistry {
     fn default() -> Self {
         Self {
-            current: None,
-            tombstone: None,
             tokens: Vec::new(),
             controls: std::collections::HashMap::new(),
             data_conns: std::collections::HashMap::new(),
-            observers: Some(Vec::new()),
+            streams: Some(Vec::new()),
         }
     }
 }
@@ -1265,9 +1115,7 @@ struct AttachToken {
     /// [`MAX_TOKENS_PER_CONNECTION`], which is what bounds a **live**
     /// client that mints and never dials. `forget_connection` purges on
     /// it, which is what releases a **vanished** one's tickets instead
-    /// of leaving them to time out — the connection-scoped replacement
-    /// for the lease-scoped purge a takeover used to do, since takeovers
-    /// no longer invalidate tickets and an attach takes no lease.
+    /// of leaving them to time out.
     minted_by: u64,
     tab_id: i64,
     tab_generation: u64,
@@ -1301,202 +1149,23 @@ pub(crate) struct AdmittedAttach {
     pub(crate) terms: AttachTerms,
 }
 
-struct Lease {
-    token: String,
-    /// Which connections have presented this lease — membership only.
-    /// The closers live in [`ClientRegistry::controls`], which outlives
-    /// the lease.
-    conns: Vec<u64>,
-    /// What the claimant said it was, normalized. Never authenticated —
-    /// it exists so a deposed client's banner can name whoever took the
-    /// session, and it travels no further than
-    /// [`SessionDriverChangedEvent::taken_by`].
-    label: Option<String>,
-}
-
-/// What a presented lease turns out to be.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LeaseStatus {
-    /// The live lease. The presenting connection is now registered under
-    /// it.
-    Current,
-    /// The tombstone: this client held the lease and lost it.
-    TakenOver,
-    /// Absent, empty, or a token this session never issued.
-    Unknown,
-}
-
 impl ClientRegistry {
-    /// Mint a lease for `ctx`, or refuse.
-    ///
-    /// `takeover` moves the **foreground** and nothing else (plan 057,
-    /// R15): the previous lease is invalidated and tombstoned, so its
-    /// holder's foreground ops answer `taken-over`, but no connection is
-    /// closed and no attach ticket is revoked. The displaced client
-    /// keeps typing, keeps attaching, keeps reading.
-    ///
-    /// Event streams get the one thing a takeover does emit, which is
-    /// the whole of plan 049 §3.8: `session.driver_changed` naming the
-    /// claimant, plus a demotion of the displaced driver's stream. Both
-    /// happen here, under the registry lock delivery also classifies
-    /// under — which is what makes "no `tab.effect` after
-    /// `session.driver_changed` on one stream" an invariant rather than
-    /// a race.
-    fn connect(
-        &mut self,
-        takeover: bool,
-        label: Option<String>,
-        ctx: &ConnCtx,
-    ) -> Result<String, HandlerError> {
-        if self.current.is_some() && !takeover {
-            // Refused even when the caller already holds the lease on
-            // this very connection: a client that lost track of its own
-            // lease is exactly the one that must re-establish it
-            // deliberately.
-            return Err(HandlerError::new(
-                "already-connected",
-                "another client holds the session lease; retry with takeover: true",
-            ));
-        }
-        let mut displaced = None;
-        if let Some(previous) = self.current.take() {
-            self.tombstone = Some(previous.token.clone());
-            displaced = Some((previous.token, previous.label));
-        }
-        let token = random_hex_128();
-        let taken_by = label.clone().unwrap_or_else(|| UNKNOWN_CLIENT.to_string());
-        self.register_control(ctx);
-        self.current = Some(Lease {
-            token: token.clone(),
-            conns: vec![ctx.conn_id],
-            label,
-        });
-        if let Some((displaced, from)) = displaced {
-            // The one place both labels exist at once, and the only
-            // reason a session keeps the holder's: an operator reading
-            // the log wants "who lost it to whom", which no single
-            // event carries. Both are normalized display metadata —
-            // neither is a credential and neither is authenticated.
-            tracing::info!(
-                from = from.as_deref().unwrap_or(UNKNOWN_CLIENT),
-                to = taken_by,
-                "the session lease changed hands"
-            );
-            self.announce_takeover(&displaced, &taken_by);
-        }
-        Ok(token)
-    }
-
-    /// Demote the displaced lease's streams and tell **every** stream who
-    /// took over.
-    ///
-    /// Every one, not just the deposed driver's: an observer that was
-    /// already watching has the same question ("who drives this now?")
-    /// and the same reason to want the answer. Injection order is
-    /// registration order, and consecutive takeovers are serialized by
-    /// this lock, so a stream reads them in the order they happened.
-    ///
-    /// A stream whose queue is full at this instant is **not** cut: the
-    /// envelope is parked on its [`Observer::notice`] slot and its own
-    /// relay sends it, ahead of whatever batch that relay was holding a
-    /// permit for. Reserved capacity is not backpressure, and a takeover
-    /// still never waits on anybody — a peer that has really stopped
-    /// reading dies on the relay's stall budget instead, with the bare
-    /// EOF that has always been event backpressure's resync signal.
-    fn announce_takeover(&mut self, displaced: &str, taken_by: &str) {
-        let envelope = match serde_json::to_value(SessionDriverChangedEvent {
-            taken_by: taken_by.to_string(),
-        })
-        .and_then(|data| {
-            serde_json::to_value(EventEnvelope {
-                event: SESSION_DRIVER_CHANGED_EVENT.to_string(),
-                data,
-            })
-        }) {
-            Ok(value) => value,
-            // Not reachable: the payload is one owned String. Ending
-            // every stream over it would be a worse answer than leaving
-            // them un-notified, since the client converges through the
-            // prologue either way.
-            Err(error) => {
-                tracing::warn!(%error, "the driver-changed envelope could not be serialized");
-                return;
-            }
-        };
-        let Some(observers) = self.observers.as_mut() else {
-            return;
-        };
-        for observer in observers.iter_mut() {
-            if observer.presented.as_deref() == Some(displaced) {
-                observer.presented = None;
-            }
-            let Some(queue) = observer.inject.upgrade() else {
-                // The relay is already gone; its EOF is the signal.
-                continue;
-            };
-            match queue.try_send(envelope.clone()) {
-                Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(envelope)) => {
-                    tracing::debug!(
-                        conn_id = observer.conn_id,
-                        "an events subscriber's queue was full; its relay delivers the takeover"
-                    );
-                    observer.notice = Some(envelope);
-                }
-                // The receiver is gone: this connection is already on
-                // its way down and the relay's own `tx.closed()` arm
-                // ends it.
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
-            }
-        }
-    }
-
-    /// The takeover envelope this stream's relay owes its peer, if one
-    /// was parked on it. See [`Observer::notice`].
-    fn take_notice(&mut self, conn_id: u64) -> Option<serde_json::Value> {
-        self.observers
-            .as_mut()?
-            .iter_mut()
-            .find(|observer| observer.conn_id == conn_id)?
-            .notice
-            .take()
-    }
-
     /// Register one event stream. `false` once a stop has swept.
-    fn register_stream(
-        &mut self,
-        lease: &str,
-        ctx: &ConnCtx,
-        inject: tokio::sync::mpsc::WeakSender<serde_json::Value>,
-        relay: tokio::task::AbortHandle,
-    ) -> bool {
-        let Some(observers) = self.observers.as_mut() else {
+    fn register_stream(&mut self, ctx: &ConnCtx, relay: tokio::task::AbortHandle) -> bool {
+        let Some(streams) = self.streams.as_mut() else {
             return false;
         };
-        // Pruned here, as `present` and `forget_connection` prune the
-        // lease's own connections: this list is only ever walked here
-        // and at a takeover or a stop, so a subscriber that finished on
-        // its own goes away on somebody else's subscribe.
-        observers.retain(Observer::is_live);
-        observers.push(Observer {
+        // Pruned here, as `forget_connection` prunes the controls: this
+        // list is only ever walked here and at a stop, so a subscriber
+        // that finished on its own goes away on somebody else's
+        // subscribe.
+        streams.retain(Stream::is_live);
+        streams.push(Stream {
             conn_id: ctx.conn_id,
             closer: ctx.closer.clone(),
-            inject,
             relay,
-            presented: (!lease.is_empty()).then(|| lease.to_string()),
-            notice: None,
         });
         true
-    }
-
-    /// Is `lease` the live one? The read a stream's delivery classifies
-    /// on — no registration, no error, just the fact.
-    fn is_driver(&self, lease: &str) -> bool {
-        !lease.is_empty()
-            && self
-                .current
-                .as_ref()
-                .is_some_and(|current| current.token == lease)
     }
 
     /// End every live relay and refuse further ones. Called *after*
@@ -1504,48 +1173,12 @@ impl ClientRegistry {
     /// drop its sender, the push loop's source would end, and the peer
     /// would get an unlabeled EOF instead of `session.stopping`.
     fn abort_streams(&mut self) {
-        for observer in self.observers.take().into_iter().flatten() {
-            observer.relay.abort();
+        for stream in self.streams.take().into_iter().flatten() {
+            stream.relay.abort();
         }
     }
 
-    /// Resolve a presented lease, registering the presenting connection
-    /// when it is the live one.
-    fn present(&mut self, lease: &str, ctx: &ConnCtx) -> LeaseStatus {
-        if self
-            .current
-            .as_ref()
-            .is_some_and(|current| !lease.is_empty() && current.token == lease)
-        {
-            self.register_control(ctx);
-            let controls = &self.controls;
-            let current = self
-                .current
-                .as_mut()
-                .expect("the live lease was just matched under this lock");
-            // Pruned here, as in `forget_connection`: a client that
-            // reconnects repeatedly on the same lease would otherwise
-            // accumulate a member id per dead connection.
-            current.conns.retain(|id| controls.contains_key(id));
-            if !current.conns.contains(&ctx.conn_id) {
-                current.conns.push(ctx.conn_id);
-            }
-            return LeaseStatus::Current;
-        }
-        if !lease.is_empty() && self.tombstone.as_deref() == Some(lease) {
-            return LeaseStatus::TakenOver;
-        }
-        LeaseStatus::Unknown
-    }
-
-    /// Track a control connection's closer, independently of whatever
-    /// authority it just presented — or never presented at all.
-    ///
-    /// [`ClientRegistry::controls`] is the authority for closing and
-    /// [`Lease::conns`] is membership, which is why the registration is
-    /// here and not on the lease: a connection admitted under a lease
-    /// that is later taken over keeps being closable, and a stop still
-    /// owes it a labeled goodbye.
+    /// Track a control connection's closer.
     ///
     /// Closed peers are pruned on the way in, the way this list is
     /// walked: only on a registration, a close, and a stop.
@@ -1556,16 +1189,11 @@ impl ClientRegistry {
 
     /// Forget one connection.
     ///
-    /// Closed peers are pruned on the way through, like [`Self::present`]
-    /// does: a client that dropped two connections at once must not
-    /// leave the second one standing in for a holder that is gone.
+    /// Closed peers are pruned on the way through: a client that dropped
+    /// two connections at once must not leave the second one standing.
     fn forget_connection(&mut self, conn_id: u64, reclaim_tokens: bool) {
-        // Ahead of the lease's own bookkeeping and outside it: a stream,
-        // a control connection or an attach ticket can exist on a
-        // session that never minted a lease at all, so none of these may
-        // sit under an early return that asks about one.
-        if let Some(observers) = self.observers.as_mut() {
-            observers.retain(|observer| observer.conn_id != conn_id && observer.is_live());
+        if let Some(streams) = self.streams.as_mut() {
+            streams.retain(|stream| stream.conn_id != conn_id && stream.is_live());
         }
         self.controls.remove(&conn_id);
         self.controls.retain(|_, closer| !closer.is_closed());
@@ -1575,41 +1203,24 @@ impl ClientRegistry {
         if reclaim_tokens {
             self.tokens.retain(|token| token.minted_by != conn_id);
         }
-        let controls = &self.controls;
-        if let Some(current) = self.current.as_mut() {
-            current
-                .conns
-                .retain(|id| *id != conn_id && controls.contains_key(id));
-        }
     }
 
-    /// Close every registered connection, and stop tracking them. The
-    /// lease itself stays: nothing after a stop is admissible anyway, and
-    /// keeping it means a late op is refused as `shutting-down` rather
-    /// than as a lease problem it cannot fix.
+    /// Close every registered connection, and stop tracking them.
     fn close_all(&mut self, reason: CloseReason) {
         for (_, closer) in self.controls.drain() {
             closer.close(reason);
         }
-        if let Some(current) = self.current.as_mut() {
-            // Membership only; the closers were in `controls` above.
-            current.conns.clear();
-        }
-        // Walked in its own right, not as a side effect of the lease's
-        // list: a data connection is admitted by a ticket, not by a
-        // lease, so a session that never minted one can still have
-        // several — and each is owed the same labeled close.
+        // Walked in its own right: a data connection is admitted by a
+        // ticket, so each list is owed the same labeled close.
         for (_, conns) in self.data_conns.drain() {
             for (_, closer) in conns {
                 closer.close(reason);
             }
         }
-        // Independent of the lease, for the same reason
-        // `forget_connection` is: a session can have observers and have
-        // never minted one. The records stay — [`Self::abort_streams`]
-        // takes them, after every closer above has fired.
-        for observer in self.observers.iter().flatten() {
-            observer.closer.close(reason);
+        // The records stay — [`Self::abort_streams`] takes them, after
+        // every closer above has fired.
+        for stream in self.streams.iter().flatten() {
+            stream.closer.close(reason);
         }
         // The tokens deliberately stay. `admit_attach`'s stop latch is
         // what refuses them, and it can only say `shutting-down` about a
@@ -1753,18 +1364,12 @@ impl SessionState {
     /// sweep takes, which is what makes them atomic: a stream handed out
     /// after the sweep would be one no closer can reach and no abort can
     /// end.
-    fn register_stream(
-        &self,
-        lease: &str,
-        ctx: &ConnCtx,
-        inject: tokio::sync::mpsc::WeakSender<serde_json::Value>,
-        relay: tokio::task::AbortHandle,
-    ) -> bool {
+    fn register_stream(&self, ctx: &ConnCtx, relay: tokio::task::AbortHandle) -> bool {
         let mut guard = lock(&self.clients);
         if self.stopping.load(Ordering::Acquire) {
             return false;
         }
-        guard.register_stream(lease, ctx, inject, relay)
+        guard.register_stream(ctx, relay)
     }
 
     /// End every live relay and refuse further ones.
@@ -1772,85 +1377,23 @@ impl SessionState {
         lock(&self.clients).abort_streams();
     }
 
-    /// Mint or take over the interactive lease for `ctx`'s connection.
-    fn connect(
-        &self,
-        takeover: bool,
-        label: Option<String>,
-        ctx: &ConnCtx,
-    ) -> Result<String, HandlerError> {
-        let mut guard = lock(&self.clients);
-        // Re-checked UNDER the registry lock: the stop latches first and
-        // sweeps this registry second, so a connect that was admitted
-        // past the latch but reaches the registry after the sweep must
-        // be refused here — a lease minted post-sweep would be authority
-        // no closer can ever revoke.
-        if self.stopping.load(Ordering::Acquire) {
-            return Err(shutting_down());
-        }
-        guard.connect(takeover, label, ctx)
-    }
-
-    /// The gate every lease-carrying op runs first. Registers `ctx` under
-    /// the lease on success; the error never echoes the presented token.
-    fn require_lease(&self, lease: &str, ctx: &ConnCtx) -> Result<(), HandlerError> {
-        let mut guard = lock(&self.clients);
-        // Same post-sweep refusal as `connect` — registration IS the
-        // resource, so the decision has to share the sweep's lock.
-        if self.stopping.load(Ordering::Acquire) {
-            return Err(shutting_down());
-        }
-        match guard.present(lease, ctx) {
-            LeaseStatus::Current => Ok(()),
-            LeaseStatus::TakenOver => Err(HandlerError::new(
-                "taken-over",
-                "this lease was taken over by another client",
-            )),
-            LeaseStatus::Unknown => Err(HandlerError::new(
-                "connect-required",
-                "run session.connect first: this op requires a session lease",
-            )),
-        }
-    }
-
     /// Note this connection as a live control connection, whatever it is
     /// about to ask for.
     ///
     /// The one choke point, called from [`Handler::handle`] before any
-    /// dispatch, because since plan 057 R15 a control connection that
-    /// never presents a lease is ordinary: a client that only attaches,
-    /// writes and lists is first-class and would otherwise appear in
-    /// none of `controls`, `data_conns` or `observers` — so a stop could
-    /// only give it a bare EOF, and a client that distinguishes "the
-    /// session stopped" from "the wire died" would re-dial a socket
-    /// being unlinked.
+    /// dispatch: a client that only attaches, writes and lists would
+    /// otherwise appear in none of `controls`, `data_conns` or
+    /// `streams` — so a stop could only give it a bare EOF, and a client
+    /// that distinguishes "the session stopped" from "the wire died"
+    /// would re-dial a socket being unlinked.
     ///
-    /// Registration is refused after the stop sweep for
-    /// [`Self::require_lease`]'s reason: an entry added past the sweep
-    /// is one no closer will ever reach.
+    /// Registration is refused after the stop sweep: an entry added past
+    /// it is one no closer will ever reach.
     fn register_control(&self, ctx: &ConnCtx) {
         if self.stopping.load(Ordering::Acquire) {
             return;
         }
         lock(&self.clients).register_control(ctx);
-    }
-
-    /// Is `lease` still the live one?
-    ///
-    /// A read, with none of [`Self::require_lease`]'s registration: it is
-    /// asked from the thread doing an op's *work*, where the question is
-    /// "may this still take effect", not "count me as a connection". A
-    /// stop counts as a loss of authority for the same reason it refuses
-    /// mutations — a session that has flushed and reaped must not gain
-    /// new entries pointing at the socket it is about to unlink.
-    fn holds_lease(&self, lease: &str) -> bool {
-        if lease.is_empty() || self.stopping.load(Ordering::Acquire) {
-            return false;
-        }
-        lock(&self.clients)
-            .current
-            .as_ref()
-            .is_some_and(|current| current.token == lease)
     }
 
     /// One connection has ended.
@@ -1864,7 +1407,7 @@ impl SessionState {
         lock(&self.clients).forget_connection(conn_id, !stopping);
     }
 
-    /// Tell every connection the lease holder owns why it is going away.
+    /// Tell every registered connection why it is going away.
     fn close_clients(&self, reason: CloseReason) {
         lock(&self.clients).close_all(reason);
     }
@@ -1934,10 +1477,9 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Ops that change workspace or PTY state — or hand out the authority to
 /// change it — and so must not run once a session has latched Stopping.
 ///
-/// `session.connect` and `tab.attach` are in the set for the second
-/// reason: neither touches the workspace, but a lease or an attach token
-/// minted after the latch is authority over a session that has already
-/// flushed and reaped.
+/// `tab.attach` is in the set for the second reason: it touches no
+/// workspace state, but a ticket minted after the latch is authority
+/// over a session that has already flushed and reaped.
 ///
 /// Reads (`identify`, `tab.list`, `tab.dump*`, `session.identify`) stay
 /// answerable throughout, so a client can still find out what happened.
@@ -1967,6 +1509,9 @@ fn is_mutating_op(op: &str) -> bool {
             | ops::PROJECT_DELETE
             | ops::PROJECT_REORDER
             | ops::NOTIFICATION_CREATE
+            // Inert, and listed anyway: a session that has flushed and
+            // reaped must answer `shutting-down` rather than hand back a
+            // fence for a socket it is about to unlink.
             | ops::SESSION_CONNECT
             | ops::SESSION_SET_THEME
             | ops::SESSION_SET_FOCUS
@@ -2163,8 +1708,8 @@ impl Handler for IpcHandler {
         Box::pin(async move {
             // Every op on a session socket passes through here, which is
             // why the registration is here: see
-            // [`SessionState::register_control`] for why a leaseless
-            // connection has to be tracked too.
+            // [`SessionState::register_control`] for why every
+            // connection has to be tracked.
             if let Some(session) = self.session.as_ref() {
                 session.register_control(ctx);
             }
@@ -2178,10 +1723,8 @@ impl Handler for IpcHandler {
     /// still looking at whatever they said they were. A UI socket has no
     /// session registry and does nothing here.
     ///
-    /// Streams are pruned here too, and independently of the lease: an
-    /// observer can exist on a session where no lease was ever minted —
-    /// as can a control connection holding attach tickets, which this is
-    /// also where the registry reclaims.
+    /// Streams are pruned here too, and so are the attach tickets this
+    /// connection minted.
     fn connection_ended(&self, conn_id: u64) {
         let Some(session) = self.session.as_ref() else {
             return;
@@ -2705,59 +2248,44 @@ async fn dispatch_outcome(
         return Err(shutting_down());
     }
 
-    // Served here rather than in `dispatch`, which has no connection
-    // identity — and a lease that nothing can be registered against is
-    // not a lease.
+    // Retained, and inert: the token it answers with grants nothing,
+    // registers nothing and displaces nobody. Every same-UID connection
+    // is already symmetric — the op itself is retired at protocol 5.
     if op == ops::SESSION_CONNECT {
-        let p: SessionConnectParams = decode(params)?;
-        let lease = session.connect(p.takeover, normalize_client_label(p.client_label), ctx)?;
-        // `snapshot_with_revision` rather than `revision`: one lock
-        // acquisition means the number a client fences its first
-        // `tab.list` against is a state-consistent read, not one that
-        // could have moved between two.
-        let (revision, _projects) = h.workspace.snapshot_with_revision();
-        return encode(&SessionConnectResult { lease, revision }).map(HandlerOutcome::Reply);
+        let _p: SessionConnectParams = decode(params)?;
+        let revision = h.workspace.revision();
+        return encode(&SessionConnectResult {
+            lease: random_hex_128(),
+            revision,
+        })
+        .map(HandlerOutcome::Reply);
     }
 
-    // Served here rather than in `dispatch` for the same reason
-    // `tab.attach` is: the lease it presents is bound to *this*
-    // connection, which `dispatch` cannot see. And it is lease-gated at
-    // all because it is the attached client's theme — only the client
-    // driving the session gets to state it.
     if op == ops::SESSION_SET_THEME {
         let p: SessionSetThemeParams = decode(params)?;
-        return session_set_theme(h, session, ctx, p)
-            .await
-            .map(HandlerOutcome::Reply);
+        return session_set_theme(h, p).await.map(HandlerOutcome::Reply);
     }
 
-    // Connection-scoped for the same reason as its two neighbours: the
-    // lease it presents is this connection's, and what the op states —
-    // "I am looking at this tab" — is only true for as long as the
-    // connection that said it holds the lease. `dispatch` can see
-    // neither.
+    // Connection-scoped, which `dispatch` cannot see: what the op states
+    // — "I am looking at this tab" — is true only for as long as the
+    // connection that said it is open.
     if op == ops::SESSION_SET_FOCUS {
         let p: SessionSetFocusParams = decode(params)?;
-        return session_set_focus(h, session, ctx, &p).map(HandlerOutcome::Reply);
+        return session_set_focus(h, ctx, &p).map(HandlerOutcome::Reply);
     }
 
-    // Connection-scoped like its neighbours, for the same reason: the
-    // lease rides in the params and belongs to *this* connection.
     if op == ops::SESSION_SET_AGENT_HOOKS {
         let p: SessionSetAgentHooksParams = decode(params)?;
-        return session_set_agent_hooks(h, session, ctx, p)
+        return session_set_agent_hooks(h, p)
             .await
             .map(HandlerOutcome::Reply);
     }
 
-    // Connection-scoped like its neighbours, and guarded before the
-    // decode: see [`put_file_size_guard`].
+    // Guarded before the decode: see [`put_file_size_guard`].
     if op == ops::SESSION_PUT_FILE {
         put_file_size_guard(&params)?;
         let p: SessionPutFileParams = decode(params)?;
-        return session_put_file(h, session, ctx, p)
-            .await
-            .map(HandlerOutcome::Reply);
+        return session_put_file(h, p).await.map(HandlerOutcome::Reply);
     }
 
     // Served here rather than in `dispatch` because the ticket it mints
@@ -2770,28 +2298,14 @@ async fn dispatch_outcome(
             .map(HandlerOutcome::Reply);
     }
 
-    // Raw input is open to every same-UID client (plan 057, R15): the
-    // presented lease is accepted and ignored here exactly as it is on a
-    // UI socket. What the lease still owns is the foreground — effects,
-    // focus, and the session-wide settings ops — never a keystroke.
-    if op == ops::TAB_WRITE {
-        let p: TabWriteParams = decode(params)?;
-        h.supervisor
-            .write(p.tab_id, p.data)
-            .await
-            .map_err(|e| pty_err(&e))?;
-        return Ok(HandlerOutcome::Reply(serde_json::json!({})));
-    }
-
     dispatch(h, op, params).await.map(HandlerOutcome::Reply)
 }
 
 /// `tab.attach`: negotiate a payload kind and hand back a single-use
 /// ticket for one data connection.
 ///
-/// An attach is raw input, so it takes no lease (plan 057, R15): any
-/// same-UID client may attach, and a tab serves as many data connections
-/// as are dialed. A presented `lease` is accepted and ignored.
+/// Any same-UID client may attach, and a tab serves as many data
+/// connections as are dialed.
 ///
 /// The validation order is pinned (D5) and each earlier failure wins,
 /// because the codes instruct differently: `not-found` means "that tab
@@ -2969,18 +2483,14 @@ async fn tab_attach(
 /// a host tab picks its colors against a theme nobody is looking at.
 ///
 /// Whole-theme, not a diff: the client states the palette it renders
-/// with and the server takes it. Two clients racing (a takeover during
-/// a theme change) are last-writer-wins by construction — there is one
-/// stored seed and the last `set_theme` to reach the tab task is the
-/// one its terminal ends on.
+/// with and the server takes it. Two clients racing are last-writer-wins
+/// by construction — there is one stored seed and the last `set_theme`
+/// to reach the tab task is the one its terminal ends on.
 #[cfg(feature = "server-vt")]
 async fn session_set_theme(
     h: &IpcHandler,
-    session: &Arc<SessionState>,
-    ctx: &ConnCtx,
     p: SessionSetThemeParams,
 ) -> Result<serde_json::Value, HandlerError> {
-    session.require_lease(&p.lease, ctx)?;
     let seed = decode_osc_colors(&p.osc_colors)?;
     // Storing the seed and reseeding the live tabs is one supervisor
     // call — see `PtySupervisor::set_theme` for why the pair cannot be
@@ -2999,11 +2509,8 @@ async fn session_set_theme(
 #[allow(clippy::unused_async)]
 async fn session_set_theme(
     _h: &IpcHandler,
-    session: &Arc<SessionState>,
-    ctx: &ConnCtx,
-    p: SessionSetThemeParams,
+    _p: SessionSetThemeParams,
 ) -> Result<serde_json::Value, HandlerError> {
-    session.require_lease(&p.lease, ctx)?;
     Err(no_server_vt())
 }
 
@@ -3020,11 +2527,9 @@ async fn session_set_theme(
 /// routing is the same routing.
 fn session_set_focus(
     h: &IpcHandler,
-    session: &Arc<SessionState>,
     ctx: &ConnCtx,
     p: &SessionSetFocusParams,
 ) -> Result<serde_json::Value, HandlerError> {
-    session.require_lease(&p.lease, ctx)?;
     h.workspace
         .set_client_focus(ctx.conn_id, p.focused_tab_id)
         .map_err(ws_err)?;
@@ -3039,82 +2544,51 @@ fn session_set_focus(
 /// — belongs to the daemon, which is the only process here that links
 /// the install engine; this crate only decides *whether* it may run.
 ///
-/// Lease-gated because it writes authority-bearing files on the host,
-/// and in [`is_mutating_op`] because a session that has latched
+/// In [`is_mutating_op`] because a session that has latched
 /// `session.stop` has already flushed and reaped: entries pointing at a
 /// socket about to be unlinked are worse than no entries at all.
+/// Otherwise every same-UID connection may state it, and the last one to
+/// reach the install lock wins (plan 046 §3.4).
 ///
 /// A per-agent install failure is a *reported* failure, never an error
 /// frame: the reply's `errors` list carries it, so a client hears which
 /// agent broke and still keeps the session it just attached to. Only a
 /// whole-run failure — no `$HOME`, an unwritable record, a lock another
 /// writer never released — is an error frame.
-///
-/// **The lease is checked twice, and the second one is the real one.**
-/// `require_lease` here is the door; the install engine can then sit
-/// behind another writer's `flock` for seconds, and neither closing the
-/// client's connection nor its own 15 s timeout cancels the handler that
-/// is already running. So the credential travels on as an
-/// [`AgentHooksAuthority`] the backend re-asks at the point of effect —
-/// once it owns the lock, before it plans. Without that, a client that
-/// had *lost* the lease could still rewrite the host's files and the
-/// state record afterwards, undoing the policy of whoever displaced it.
-/// Two clients that each legitimately hold the lease in turn are
-/// last-writer-wins by design (plan 046 §3.4); one acting after it lost
-/// the lease is not.
 async fn session_set_agent_hooks(
     h: &IpcHandler,
-    session: &Arc<SessionState>,
-    ctx: &ConnCtx,
     p: SessionSetAgentHooksParams,
 ) -> Result<serde_json::Value, HandlerError> {
-    session.require_lease(&p.lease, ctx)?;
     let handle = h.agent_hooks.as_ref().ok_or_else(|| {
         HandlerError::new(
             "not-supported",
             "this session cannot wire agent hooks: it was built without an install backend",
         )
     })?;
-    let authority = {
-        let session = Arc::clone(session);
-        let lease = p.lease.clone();
-        AgentHooksAuthority::new(move || session.holds_lease(&lease))
-    };
     let result = handle
         .run(AgentHooksRequest {
             mode: p.mode,
             skip: p.skip,
             client: p.client,
-            authority,
         })
         .await
-        .map_err(|error| match error {
-            // The same code any other lease-gated op would answer this
-            // client with now, so a client that hears it reacts the one
-            // documented way: stop driving this session.
-            AgentHooksError::Unauthorized => HandlerError::new("taken-over", error.to_string()),
-            AgentHooksError::Failed(_) => HandlerError::new("internal", error.to_string()),
-        })?;
+        .map_err(|AgentHooksError::Failed(message)| HandlerError::new("internal", message))?;
     encode(&result)
 }
 
 /// `session.put_file`: land one client-supplied file on the host and
 /// answer with the path a shell can be told to read (plan 047 §3.1).
 ///
-/// Lease-gated because the file is written under the session user's
-/// `$HOME` and its path is about to be typed into one of this session's
-/// tabs, and in [`is_mutating_op`] because a session that has latched
-/// `session.stop` is about to sweep the very directory this writes into.
-/// A slow write therefore holds the mutation barrier and a racing stop
-/// waits for it — the price of never handing back a path that is already
-/// gone.
+/// Available to every same-UID connection: uploads land in separate
+/// private directories and coexist. In [`is_mutating_op`] because a
+/// session that has latched `session.stop` is about to sweep the very
+/// directory this writes into — a slow write therefore holds the
+/// mutation barrier and a racing stop waits for it, the price of never
+/// handing back a path that is already gone.
 async fn session_put_file(
     h: &IpcHandler,
-    session: &Arc<SessionState>,
-    ctx: &ConnCtx,
     p: SessionPutFileParams,
 ) -> Result<serde_json::Value, HandlerError> {
-    session.require_lease(&p.lease, ctx)?;
     let store = h.files.clone().ok_or_else(|| {
         HandlerError::new(
             "not-supported",
@@ -3255,55 +2729,6 @@ fn parse_rgb_hex(raw: &str) -> Option<(u8, u8, u8)> {
     ))
 }
 
-/// One subscription's classifier (plan 049 §3.7).
-///
-/// It holds the lease the stream *presented* — an immutable fact for the
-/// life of the stream — and compares it against `current` at the instant
-/// each batch is enqueued. Reclassification therefore needs no write:
-/// a takeover replaces `current` with a freshly minted token, and this
-/// comparison stops matching in the same critical section.
-struct LeaseGate {
-    session: Arc<SessionState>,
-    presented: String,
-    /// Which stream this is, so the gate can pick up a takeover notice
-    /// the injector had to park — see [`Observer::notice`].
-    conn_id: u64,
-}
-
-impl event_push::StreamGate for LeaseGate {
-    fn deliver(
-        &self,
-        permit: tokio::sync::mpsc::Permit<'_, serde_json::Value>,
-        batch: &crate::VersionedWorkspaceEvent,
-    ) -> event_push::Delivery {
-        // The lock is the whole point. A takeover demotes this stream
-        // and injects `session.driver_changed` in this same critical
-        // section, so an effect batch is either enqueued *before* the
-        // envelope (correct — the reader was still the driver) or
-        // classified after it and filtered (correct — it no longer is).
-        // There is no third interleaving, which is what makes "no
-        // tab.effect after driver_changed" an invariant.
-        //
-        // Nothing is awaited here: the queue slot was reserved before
-        // this call, so the send cannot block.
-        let mut guard = lock(&self.session.clients);
-        // Ahead of the batch, always: the reservation this permit came
-        // from is what made the queue look full to the injector, and
-        // sending the batch first would put a driver-classified
-        // `tab.effect` after the announcement on the same stream.
-        if let Some(notice) = guard.take_notice(self.conn_id) {
-            permit.send(notice);
-            return event_push::Delivery::NoticeSentRetryBatch;
-        }
-        let driver = guard.is_driver(&self.presented);
-        let Some(value) = event_push::batch_value(batch, driver) else {
-            return event_push::Delivery::End;
-        };
-        permit.send(value);
-        event_push::Delivery::Delivered
-    }
-}
-
 /// Where this subscription starts: the current revision, or the replay
 /// a `from_revision` asked for.
 ///
@@ -3365,20 +2790,11 @@ fn resume_cut(
 
 /// `events.subscribe` on a session socket: ack with the fence, then push.
 ///
-/// **Leaseless, and lease-classified** (plan 049 §3.7). Reading a session
-/// is not authority, so the op no longer gates — but the lease still
-/// means something: it decides *what* this stream sees.
-///
-/// * `lease` present and current → the driver stream, today's full feed,
-///   `tab.effect` included (DL-18: effects belong to the client driving).
-/// * absent, stale, or unknown → an observer stream: every workspace
-///   batch plus `notification.fired`, with `tab.effect` filtered and its
-///   revision still delivered as an empty batch.
-///
-/// Classification is the ordinary one on a resume too, for replayed and
-/// live batches alike: a driver taken over during its gap comes back an
-/// observer, and since effects are never replayed, a replay cannot put a
-/// `tab.effect` after the `session.driver_changed` it missed.
+/// Every subscriber sees everything the session publishes — workspace
+/// facts, `notification.fired`, and `tab.effect` alike. There is no
+/// classification and no projection: which client a bell or an OSC 52
+/// write is *for* is the viewing client's question, answered where the
+/// tab is on screen, not here.
 ///
 /// Not a mutating op — it changes no workspace state — but it does
 /// establish a resource, so it is refused once the session has latched:
@@ -3403,18 +2819,8 @@ fn events_subscribe(
     // request/response connection it was and the client can simply
     // subscribe again on it.
     let cut = resume_cut(h, session, params)?;
-    let gate = Arc::new(LeaseGate {
-        session: Arc::clone(session),
-        presented: params.lease.clone(),
-        conn_id: ctx.conn_id,
-    });
-    let subscription = event_push::spawn(cut, h.push_limits, gate);
-    if !session.register_stream(
-        &params.lease,
-        ctx,
-        subscription.inject,
-        subscription.abort.clone(),
-    ) {
+    let subscription = event_push::spawn(cut, h.push_limits);
+    if !session.register_stream(ctx, subscription.abort.clone()) {
         // Lost the race with the stop's sweep. Abort what we just
         // started rather than leaking a relay the stop will never see.
         subscription.abort.abort();
@@ -4623,22 +4029,14 @@ mod tests {
     }
 
     fn live_streams(state: &SessionState) -> usize {
-        lock(&state.clients).observers.as_ref().map_or(0, Vec::len)
+        lock(&state.clients).streams.as_ref().map_or(0, Vec::len)
     }
 
-    /// A stream registration with a throwaway queue: what these cases
-    /// are about is the *registry*, not delivery, so the sender is
-    /// dropped immediately and only the weak handle is kept.
-    fn register(
-        state: &SessionState,
-        conn_id: u64,
-        lease: &str,
-        relay: tokio::task::AbortHandle,
-    ) -> bool {
+    /// A stream registration with a throwaway relay: what these cases
+    /// are about is the *registry*, not delivery.
+    fn register(state: &SessionState, conn_id: u64, relay: tokio::task::AbortHandle) -> bool {
         let (ctx, _watch) = ConnCtx::new(conn_id);
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let weak = tx.downgrade();
-        state.register_stream(lease, &ctx, weak, relay)
+        state.register_stream(&ctx, relay)
     }
 
     /// A relay that ended on its own — the normal close — must not stay
@@ -4651,10 +4049,10 @@ mod tests {
         let finished = tokio::spawn(async {});
         let stale = finished.abort_handle();
         finished.await.expect("the task completes");
-        assert!(register(&state, 1, "", stale));
+        assert!(register(&state, 1, stale));
 
         let parked = tokio::spawn(std::future::pending::<()>());
-        assert!(register(&state, 2, "", parked.abort_handle()));
+        assert!(register(&state, 2, parked.abort_handle()));
         assert_eq!(
             live_streams(&state),
             1,
@@ -4670,7 +4068,7 @@ mod tests {
     async fn the_stop_sweep_aborts_live_relays_and_then_refuses() {
         let state = session_state();
         let parked = tokio::spawn(std::future::pending::<()>());
-        assert!(register(&state, 1, "", parked.abort_handle()));
+        assert!(register(&state, 1, parked.abort_handle()));
 
         state.abort_streams();
         assert!(
@@ -4680,7 +4078,7 @@ mod tests {
 
         let late = tokio::spawn(std::future::pending::<()>());
         assert!(
-            !register(&state, 2, "", late.abort_handle()),
+            !register(&state, 2, late.abort_handle()),
             "a subscribe after the sweep must be refused"
         );
         late.abort();
@@ -4698,73 +4096,25 @@ mod tests {
 
         let late = tokio::spawn(std::future::pending::<()>());
         assert!(
-            !register(&state, 1, "", late.abort_handle()),
+            !register(&state, 1, late.abort_handle()),
             "the latch is checked under the sweep's own lock"
         );
         assert_eq!(live_streams(&state), 0);
         late.abort();
     }
 
-    /// Observers are pruned independently of the lease. A session that
-    /// never minted one still has to clean up after a subscriber that
-    /// went away, and the lease's own early return must not sit in
-    /// front of that.
+    /// A connection that ends takes its stream record with it, so a
+    /// subscriber that went away leaves nothing for the stop sweep to
+    /// walk.
     #[tokio::test]
-    async fn a_stream_is_pruned_with_no_lease_ever_minted() {
+    async fn a_stream_is_pruned_when_its_connection_ends() {
         let state = session_state();
         let parked = tokio::spawn(std::future::pending::<()>());
-        let (ctx, _watch) = ConnCtx::new(7);
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        assert!(state.register_stream("", &ctx, tx.downgrade(), parked.abort_handle()));
-        assert!(lock(&state.clients).current.is_none());
+        assert!(register(&state, 7, parked.abort_handle()));
 
         state.forget_connection(7);
         assert_eq!(live_streams(&state), 0);
         parked.abort();
-    }
-
-    /// Normalization is the whole of the label contract (§3.9): a
-    /// banner renders this, so a client cannot hand us a newline, a
-    /// kilobyte, or whitespace pretending to be a name.
-    #[test]
-    fn a_client_label_is_trimmed_capped_and_de_controlled() {
-        assert_eq!(normalize_client_label(None), None);
-        assert_eq!(normalize_client_label(Some("   ".into())), None);
-        assert_eq!(normalize_client_label(Some(String::new())), None);
-        assert_eq!(
-            normalize_client_label(Some("  pop-os  ".into())).as_deref(),
-            Some("pop-os")
-        );
-        assert_eq!(
-            normalize_client_label(Some("pop\nos\u{7}".into())).as_deref(),
-            Some("popos"),
-            "control characters are dropped, not escaped"
-        );
-        assert_eq!(
-            normalize_client_label(Some("\u{7}  pop-os".into())).as_deref(),
-            Some("pop-os"),
-            "whitespace uncovered by a dropped control character is trimmed too"
-        );
-        assert_eq!(
-            normalize_client_label(Some("pop\u{202e}o\u{2028}s".into())).as_deref(),
-            Some("popos"),
-            "a bidi override reorders the banner and a line separator splits it; \
-             neither is `is_control`, so both are dropped by name"
-        );
-        // A label that is nothing but control characters is no label.
-        assert_eq!(normalize_client_label(Some("\u{0}\u{1}".into())), None);
-
-        let long = normalize_client_label(Some("é".repeat(200))).expect("a capped label");
-        assert!(
-            long.len() <= MAX_CLIENT_LABEL,
-            "capped in bytes: {}",
-            long.len()
-        );
-        assert!(
-            std::str::from_utf8(long.as_bytes()).is_ok() && long.chars().all(|c| c == 'é'),
-            "the cap must land on a character boundary"
-        );
-        assert_eq!(long.chars().count(), MAX_CLIENT_LABEL / 2);
     }
 
     /// Admission is atomic, not merely capped: the check and the charge
