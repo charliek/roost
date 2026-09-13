@@ -388,11 +388,24 @@ fn dial_failure(mode: ConnectMode, socket: &Path, error: &roost_ipc::Error) -> A
     }
 }
 
+/// The pump task's lifetime. Dropping this aborts it — on the error
+/// path, on cancellation, on a panic, and on [`Live`] going away — so no
+/// exit from the prologue can leave a subscribed socket behind. Same
+/// footgun `host_conn.rs`'s displaced-establish handles document:
+/// dropping an `AbortHandle` on its own aborts nothing.
+struct EventPump(tokio::task::AbortHandle);
+
+impl Drop for EventPump {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// A live, subscribed connection.
 struct Live {
     control: IpcClient,
     events: EventRx,
-    pump: tokio::task::AbortHandle,
+    pump: EventPump,
     /// Shared with the UI: written here, read there. Never copied onto
     /// the feed.
     mirror: Arc<SharedMirror>,
@@ -484,12 +497,6 @@ impl Unsupported {
             _ => return None,
         };
         (!std::mem::replace(seen, true)).then_some(note)
-    }
-}
-
-impl Drop for Live {
-    fn drop(&mut self) {
-        self.pump.abort();
     }
 }
 
@@ -763,7 +770,7 @@ async fn subscribe_prologue(
     control: &mut IpcClient,
     facts: &mut ConnectFacts,
     resume: Option<&Resume>,
-) -> Result<(EventRx, tokio::task::AbortHandle, Arc<SharedMirror>), AttemptError> {
+) -> Result<(EventRx, EventPump, Arc<SharedMirror>), AttemptError> {
     let plan = SubscribePlan {
         resume,
         session_id: &facts.session_id,
@@ -966,7 +973,7 @@ async fn subscribe(
     socket: &Path,
     control: &mut IpcClient,
     plan: SubscribePlan<'_>,
-) -> Result<(EventRx, tokio::task::AbortHandle, Subscribed), AttemptError> {
+) -> Result<(EventRx, EventPump, Subscribed), AttemptError> {
     if let Some(resume) = plan.offered() {
         if let Some(resumed) = resume_stream(socket, resume, plan.session_id).await? {
             return Ok(resumed);
@@ -1009,7 +1016,7 @@ async fn resume_stream(
     socket: &Path,
     resume: &Resume,
     identified: &str,
-) -> Result<Option<(EventRx, tokio::task::AbortHandle, Subscribed)>, AttemptError> {
+) -> Result<Option<(EventRx, EventPump, Subscribed)>, AttemptError> {
     // Read here rather than carried on the checkpoint: this is the
     // moment the fence has to be true — see [`Resume`].
     let from_revision = resume.mirror.read().revision;
@@ -1070,7 +1077,7 @@ async fn subscribe_and_snapshot(
     socket: &Path,
     control: &mut IpcClient,
     identified: &str,
-) -> Result<(EventRx, tokio::task::AbortHandle, HostMirror), AttemptError> {
+) -> Result<(EventRx, EventPump, HostMirror), AttemptError> {
     // Bounded: this dials and handshakes, and a peer that accepts
     // without answering must not hold the connection in `Connecting`.
     let stream = tokio::time::timeout(leg(), EventStream::connect(socket))
@@ -1079,17 +1086,8 @@ async fn subscribe_and_snapshot(
     require_same_incarnation(&stream, identified)?;
     let ack = stream.revision();
     let (events, pump) = spawn_event_pump(stream);
-
-    match snapshot(control, ack).await {
-        Ok(mirror) => Ok((events, pump, mirror)),
-        // The pump is already reading its own socket, and nothing else
-        // holds it yet — an early return that merely dropped the abort
-        // handle would leave it detached and subscribed forever.
-        Err(error) => {
-            pump.abort();
-            Err(error)
-        }
-    }
+    let mirror = snapshot(control, ack).await?;
+    Ok((events, pump, mirror))
 }
 
 /// `tab.list`, fenced against the subscribe ack.
@@ -1126,7 +1124,7 @@ fn snapshot_fence(list: TabListResult, ack: u64) -> Result<HostMirror, AttemptEr
 /// `EventStream::next` is not cancel-safe — it buffers whole lines — so
 /// it must never be a `select!` branch. A pump gives the connection loop
 /// an `mpsc::Receiver` instead, which is.
-fn spawn_event_pump(mut stream: EventStream) -> (EventRx, tokio::task::AbortHandle) {
+fn spawn_event_pump(mut stream: EventStream) -> (EventRx, EventPump) {
     let (tx, rx) = mpsc::channel(EVENT_PUMP_DEPTH);
     let handle = tokio::spawn(async move {
         loop {
@@ -1143,7 +1141,7 @@ fn spawn_event_pump(mut stream: EventStream) -> (EventRx, tokio::task::AbortHand
             }
         }
     });
-    (rx, handle.abort_handle())
+    (rx, EventPump(handle.abort_handle()))
 }
 
 /// How one round — dial, then serve — ended. Both halves funnel into
@@ -1256,12 +1254,12 @@ async fn serve(
 /// that `Arc` and a resync is not a new connection. A resume replaces
 /// nothing at all: the fence it was granted is the one this very mirror
 /// is at, and the gap arrives behind it as ordinary batches.
-fn reseat(live: &mut Live, events: EventRx, pump: tokio::task::AbortHandle, what: Subscribed) {
-    // Before the field is overwritten, or the stale subscription's task
-    // keeps pushing onto a channel nobody drains.
-    live.pump.abort();
+fn reseat(live: &mut Live, events: EventRx, pump: EventPump, what: Subscribed) {
+    // Overwriting the guard is what retires the old pump — and it has
+    // to happen before `events` is overwritten, or the stale
+    // subscription's task keeps pushing onto a channel nobody drains.
+    drop(std::mem::replace(&mut live.pump, pump));
     live.events = events;
-    live.pump = pump;
     if let Subscribed::Fresh(mirror) = what {
         live.mirror.reset(mirror);
     }
@@ -3262,6 +3260,54 @@ mod tests {
 
         let states = host.stop().await;
         assert_eq!(states.connections(), 1, "one incarnation throughout");
+    }
+
+    /// Cancelling an attempt mid-snapshot retires its pump.
+    ///
+    /// The precondition below is what stops this test from passing by
+    /// never entering the window: the fake pushes onto `subscribes`
+    /// before writing the subscribe ack, and `tab.list` is only sent
+    /// after that ack lands, so a read stall on `tab.list` implies
+    /// exactly one subscribe with its pump already holding the
+    /// stream — `streams_ended` only moves at EOF.
+    #[tokio::test]
+    async fn cancelling_an_attempt_mid_snapshot_retires_its_pump() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("cancel-mid-snapshot.sock");
+        let fake = Fake::new(PutFile::Land).stalling(ops::TAB_LIST);
+        fake.serve(&socket);
+
+        // An assertion failure (or the negative control) must not leave
+        // the fake's control task wedged on `release.requested()`.
+        struct ReleaseOnDrop(Arc<Shutdown>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.request();
+            }
+        }
+        let _release = ReleaseOnDrop(Arc::clone(&fake.release));
+
+        // Not `Connected::start`: that waits for a `Connected` state
+        // this attempt never reaches while `tab.list` is stalled.
+        let host = Connected::spawn(socket, HostTransport::UnixSocket);
+        cued(&fake.stalled, "the session read tab.list").await;
+
+        assert_eq!(
+            fake.subscribes().len(),
+            1,
+            "the pump's subscribe reached the session before the stall"
+        );
+        assert_eq!(fake.held_streams(), 1, "and the pump is holding its stream");
+
+        host.stop().await;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while fake.held_streams() > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancelling the attempt retires its pump, releasing the stream");
     }
 
     /// An upload the session never answers spends its own budget and

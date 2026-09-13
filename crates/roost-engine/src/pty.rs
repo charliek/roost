@@ -48,6 +48,11 @@ const PTY_OUTPUT_CHUNK_SIZE: usize = 4096;
 /// Matches the Mac side's 20×10ms teardown window in
 /// `PtySupervisor.swift`.
 const KILL_GRACE: Duration = Duration::from_millis(200);
+/// How often the reap fallback polls when `waitid(WNOWAIT)` is
+/// unavailable. No supported target is expected to take that path; the
+/// interval exists so a surprise degrades to CPU, never to a `close()`
+/// blocked behind a reaper.
+const REAP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// How long each side of the exit handshake waits on the other before
 /// publishing `Exit` itself (#255). Long enough that the normal path —
 /// the reader hitting EOF within microseconds of the child being
@@ -190,8 +195,11 @@ pub enum SupervisorEvent {
 ///   it past the hangup: SIGHUP, or the per-tab SIGKILL watchdog, was
 ///   enough. A straggler that dies between the deadline and the
 ///   escalation belongs here too — the SIGKILL was never sent.
-/// * `killed` — still live at the deadline, so `shutdown_all` sent it a
-///   direct SIGKILL that landed, and it was reaped after that.
+/// * `killed` — still live at the deadline, so `shutdown_all` delivered
+///   a direct SIGKILL to it under its [`ReapLatch`], and it left the map
+///   after that. "Delivered under the latch" is the whole claim: the
+///   child had not been reaped when the signal went out, but it may
+///   already have been a zombie the signal did nothing to.
 /// * `abandoned` — still in the session map after the post-SIGKILL tail.
 ///   Its child may yet be reaped by its wait task; shutdown stopped
 ///   waiting.
@@ -200,6 +208,156 @@ pub struct ShutdownReport {
     pub reaped: Vec<i64>,
     pub killed: Vec<i64>,
     pub abandoned: Vec<i64>,
+}
+
+/// Serialises signalling a child against reaping it, so no signal can
+/// reach a recycled pid. The reap task observes the exit with
+/// `waitid(WNOWAIT)` — the zombie keeps the pid — then `reap`s under the
+/// lock; a signaller runs its `kill(2)` under the same lock and only
+/// while the child is unreaped. So the pid is released to the kernel
+/// with signalling already closed, rather than between a liveness check
+/// and the signal that follows it.
+///
+/// A leaf lock: never taken while `sessions`, `pending` or `killer` is
+/// held, and never held across anything that can block — a `kill(2)`, or
+/// a `wait()` that `WNOWAIT` has already proved immediate. Holding it
+/// across a blocking wait would park every `close()`, watchdog and
+/// shutdown escalation behind the reaper. That rules out logging under
+/// it too: Roost's log appender is synchronous, so a write inside a
+/// closure here queues the same three callers behind a file write. A
+/// signaller captures what it needs — `errno` included, read straight
+/// after the failing syscall, before a log macro's own callsite work can
+/// clobber it — and logs after the closure returns.
+///
+/// Prerequisite: this process is the child's only reaper. Nothing else
+/// waits on it, and the kernel does not auto-reap it — Roost sets no
+/// `SIGCHLD` disposition at all, neither `SIG_IGN` nor `SA_NOCLDWAIT`
+/// (there is no `SIGCHLD` handling anywhere in the Rust tree). Whoever
+/// else reaped it would release the pid with nobody's latch held, and no
+/// guarantee of this kind could hold; auto-reap is only one way that
+/// happens.
+struct ReapLatch(Mutex<bool>);
+
+impl ReapLatch {
+    fn new() -> Self {
+        Self(Mutex::new(false))
+    }
+
+    /// Run `signal` under the latch unless the child is already reaped.
+    /// Answers whether it ran.
+    fn signal(&self, signal: impl FnOnce()) -> bool {
+        // Poison-tolerant, here and below: a panic under the latch must
+        // not turn every later `close()` into a panic of its own.
+        let closed = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *closed {
+            return false;
+        }
+        signal();
+        true
+    }
+
+    /// Close signalling and run `reap` under the latch. Only for a body
+    /// that cannot block: a `wait()` that `WNOWAIT` has proved immediate,
+    /// or a call that never waits at all.
+    fn reap<T>(&self, reap: impl FnOnce() -> T) -> T {
+        let mut closed = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *closed = true;
+        reap()
+    }
+
+    /// Run a non-blocking `poll` under the latch and, unless it answers
+    /// "still running", close signalling in the same critical section —
+    /// so the pid that poll just released was already unreachable to
+    /// every signaller. A failed poll closes the latch as well: losing
+    /// ownership of the child (`ECHILD`) is as final as reaping it, and
+    /// reporting the failure with the latch reopened would let a
+    /// signaller reach a pid the kernel has already said is gone.
+    fn reap_if_exited<T>(
+        &self,
+        poll: impl FnOnce() -> std::io::Result<Option<T>>,
+    ) -> std::io::Result<Option<T>> {
+        let mut closed = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let polled = poll();
+        if !matches!(polled, Ok(None)) {
+            *closed = true;
+        }
+        polled
+    }
+}
+
+/// Wait for `pid` to exit without reaping it. Leaving the child a zombie
+/// is the point: the pid stays reserved until a later `wait()` releases
+/// it, which is the window [`ReapLatch`] closes signalling inside.
+///
+/// Darwin requires one of `WEXITED|WSTOPPED|WCONTINUED`; `WEXITED`
+/// satisfies that and is what we want on both targets. `si_code` is read
+/// because a successful `waitid` is not by itself a terminal status: a
+/// child that made itself traced (`PTRACE_TRACEME` names *us* as its
+/// tracer) reports its ptrace stops here too, and a `wait()` on a
+/// stopped child blocks — which the caller would run under the latch.
+/// So only `CLD_EXITED` / `CLD_KILLED` / `CLD_DUMPED` answer `Ok`, and
+/// anything else keeps waiting — which is what the name promises anyway.
+/// Returning on a stop would be worse than useless: it would hand the
+/// caller to a `try_wait` that reads that same stop as an exit.
+fn exited_without_reaping(pid: u32) -> std::io::Result<()> {
+    loop {
+        // SAFETY: `waitid` only writes the `siginfo_t` we hand it, and
+        // `WNOWAIT` leaves the child unreaped either way.
+        let (rc, si_code) = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let rc = libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            );
+            (rc, info.si_code)
+        };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if matches!(
+            si_code,
+            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+        ) {
+            return Ok(());
+        }
+        // Reported, but not dead: keep waiting rather than answering, and
+        // sleep so a stop that `WNOWAIT` leaves in place cannot spin. The
+        // poll fallback is no refuge here — `try_wait` reads a stop as an
+        // exit — so a non-terminal report must never leave this loop.
+        std::thread::sleep(REAP_POLL_INTERVAL);
+    }
+}
+
+/// Reap by polling, for when `waitid(WNOWAIT)` is unavailable and the
+/// zombie cannot be pinned across a `wait()`. The latch is held for each
+/// non-blocking poll and never across the sleep, so a signaller waits on
+/// a poll at worst — see [`ReapLatch`] for why a reaper must never be
+/// something a `close()` can queue behind.
+fn reap_by_polling<T>(
+    latch: &ReapLatch,
+    mut poll: impl FnMut() -> std::io::Result<Option<T>>,
+) -> std::io::Result<T> {
+    loop {
+        if let Some(status) = latch.reap_if_exited(&mut poll)? {
+            return Ok(status);
+        }
+        std::thread::sleep(REAP_POLL_INTERVAL);
+    }
 }
 
 /// One tab's teardown handles, snapshotted out of the session map so
@@ -211,7 +369,11 @@ struct Victim {
     /// session's own — rather than growing a second teardown path.
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     pid: Option<u32>,
-    reaped: Arc<AtomicBool>,
+    /// The child's reap latch, shared with its session and its reap
+    /// task. A victim snapshotted after the reap signals nothing,
+    /// because [`ReapLatch::signal`] refuses — which is why `snapshot`
+    /// needs no liveness rule of its own.
+    latch: Arc<ReapLatch>,
 }
 
 impl Victim {
@@ -223,12 +385,50 @@ impl Victim {
             tab_id,
             killer: Mutex::new(session.killer.lock().unwrap().clone_killer()),
             pid: session.pid,
-            reaped: session.reaped.clone(),
+            latch: session.latch.clone(),
         }
     }
 
+    /// SIGHUP plus the per-tab SIGKILL watchdog, exactly as `close()`
+    /// does it.
+    fn hangup(&self) {
+        terminate_child(&self.killer, self.pid, self.latch.clone(), self.tab_id);
+    }
+
     fn terminate(self) {
-        terminate_child(&self.killer, self.pid, self.reaped, self.tab_id);
+        self.hangup();
+    }
+
+    /// SIGKILL this victim under its latch. Answers whether the signal
+    /// both ran — the latch was still open — and was accepted by the
+    /// kernel.
+    fn sigkill(&self) -> bool {
+        let Some(pid) = self.pid else { return false };
+        // Written only inside the closure, so a `false` covers both "the
+        // latch was already closed" and "the kernel refused".
+        let mut landed = false;
+        let mut failure = None;
+        self.latch.signal(|| {
+            // SAFETY: a pid we spawned, held unreaped by the latch for
+            // the length of this closure.
+            let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+            if rc == 0 {
+                landed = true;
+            } else {
+                failure = Some(std::io::Error::last_os_error());
+            }
+        });
+        if let Some(err) = failure {
+            // ESRCH is the child winning the race; anything else is a
+            // real failure. Either way we did not kill it, so it is not
+            // reported as `killed`.
+            debug!(
+                tab_id = self.tab_id,
+                ?err,
+                "pty shutdown SIGKILL did not land"
+            );
+        }
+        landed
     }
 }
 
@@ -304,10 +504,10 @@ struct Session {
     /// task. `close()` uses it to SIGKILL-escalate if SIGHUP is
     /// ignored.
     pid: Option<u32>,
-    /// Set true by the wait task once `child.wait()` returns (the
-    /// child is reaped). `close()`'s SIGKILL watchdog reads this to
-    /// skip force-killing an already-dead child.
-    reaped: Arc<AtomicBool>,
+    /// Serialises this child's teardown signals against its reap; see
+    /// [`ReapLatch`]. Shared with the reap task, with the SIGKILL
+    /// watchdog, and with any `Victim` snapshotted off this session.
+    latch: Arc<ReapLatch>,
     /// A receiver subscribed before the reader task started, held for
     /// the UI's first attach. The attach can be arbitrarily late (a
     /// main-loop hop for in-process opens, a TabOpened event for IPC
@@ -542,6 +742,28 @@ impl PtySupervisor {
         rows: u16,
         socket_path: &std::path::Path,
     ) -> anyhow::Result<broadcast::Receiver<PtyOutputEvent>> {
+        self.spawn_with(tab_id, cwd, argv, cols, rows, socket_path, || {})
+    }
+
+    /// [`Self::spawn`], plus a seam for the one window nothing else can
+    /// reach: `before_promote` runs after the child exists and before
+    /// the promotion re-checks `pending`, so a test can land a `close()`
+    /// inside it deterministically. It is invoked **outside every
+    /// lock** — a hook holding `sessions` or `pending` would deadlock
+    /// the very `close()` it exists to let in.
+    // `spawn`'s own list is already at clippy's bar; the seam is the
+    // one over it.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_with(
+        &self,
+        tab_id: i64,
+        cwd: &str,
+        argv: &[String],
+        cols: u16,
+        rows: u16,
+        socket_path: &std::path::Path,
+        before_promote: impl FnOnce(),
+    ) -> anyhow::Result<broadcast::Receiver<PtyOutputEvent>> {
         // Reserve the slot atomically. Two concurrent
         // `spawn(tab_id, ...)` calls used to be racy: the first
         // would `contains_key` and the second would do the same
@@ -656,9 +878,9 @@ impl PtySupervisor {
         // Captured before the child moves into the wait task so
         // `close()` can SIGKILL-escalate by pid if SIGHUP is ignored.
         let pid = child.process_id();
-        // Shared with the wait task; flipped true once the child is
-        // reaped so the SIGKILL watchdog can stand down.
-        let reaped = Arc::new(AtomicBool::new(false));
+        // Shared with the wait task: the reap closes it, and every
+        // signaller for this child runs under it (see `ReapLatch`).
+        let latch = Arc::new(ReapLatch::new());
 
         // Drop the slave end now that the shell has it.
         drop(pair.slave);
@@ -784,7 +1006,7 @@ impl PtySupervisor {
         let output_for_exit = output.clone();
         let lifecycle_tx = self.lifecycle.clone();
         let sessions_for_reap = self.sessions.clone();
-        let reaped_for_wait = reaped.clone();
+        let latch_for_wait = latch.clone();
         let exit_published_for_wait = exit_published.clone();
 
         let session = Session {
@@ -792,13 +1014,14 @@ impl PtySupervisor {
             output,
             killer: Mutex::new(killer),
             pid,
-            reaped,
+            latch,
             initial_rx: Some(initial_rx),
             #[cfg(feature = "server-vt")]
             tab_task: tab_pipe
                 .as_ref()
                 .map(|pipe| (pipe.cmd_tx.clone(), pipe.tab_generation)),
         };
+        before_promote();
         // Promote the slot from pending → sessions atomically, BEFORE
         // the reap task exists (see below).
         //
@@ -870,34 +1093,52 @@ impl PtySupervisor {
         // the session is reachable: the reader only publishes once
         // this task hands it a status.
         tokio::task::spawn_blocking(move || {
-            let (status, exit) = match child.wait() {
+            // Two branches because only one of them can prove the
+            // `wait()` immediate (see `ReapLatch`): with a pid, `waitid`
+            // pins the exit as a zombie first; without one, or if
+            // `waitid` fails outright, polling is what keeps the latch
+            // off a blocking wait.
+            let waited = match pid.map(exited_without_reaping) {
+                Some(Ok(())) => latch_for_wait.reap(|| child.wait()),
+                other => {
+                    debug!(
+                        tab_id,
+                        ?other,
+                        "waitid(WNOWAIT) unavailable; reaping by poll"
+                    );
+                    reap_by_polling(&latch_for_wait, || child.try_wait())
+                }
+            };
+            let (status, exit) = match waited {
                 Ok(exit) => (exit.exit_code() as i32, Some(exit)),
                 Err(err) => {
                     error!(tab_id, ?err, "child.wait failed");
                     (-1, None)
                 }
             };
-            // Mark reaped first so a concurrent `close()` SIGKILL
-            // watchdog stands down, then drop the dead session so
-            // later writes get `NotFound` instead of silently
-            // succeeding against a closed PTY — and only then tell
-            // anyone the child exited. Removing ahead of both the
-            // status handoff and `TabExited` means the tab is already
-            // unreachable by the time either channel reports the exit,
-            // so a consumer reacting to `Exit` can never find a live
-            // session for a dead child.
-            reaped_for_wait.store(true, Ordering::SeqCst);
+            // The reap above closed the latch in the same critical
+            // section, so a concurrent `close()` SIGKILL watchdog has
+            // already stood down. Drop the dead session next, so later
+            // writes get `NotFound` instead of silently succeeding
+            // against a closed PTY — and only then tell anyone the
+            // child exited. Removing ahead of both the status handoff
+            // and `TabExited` means the tab is already unreachable by
+            // the time either channel reports the exit, so a consumer
+            // reacting to `Exit` can never find a live session for a
+            // dead child.
             {
                 // Only remove the session if THIS waiter still owns it.
                 // `close()` frees the slot synchronously, so the same
                 // tab_id can be re-spawned before a stale waiter fires;
-                // matching the per-spawn `reaped` identity prevents
-                // evicting a newer live session (#80). Scoped so the
-                // deadline wait below never holds the sessions lock.
+                // matching the per-spawn latch identity prevents
+                // evicting a newer live session (#80). Taken after the
+                // reap returned, never inside it — the latch is a leaf
+                // lock. Scoped so the deadline wait below never holds
+                // the sessions lock.
                 let mut sessions = sessions_for_reap.lock().unwrap();
                 let owns = sessions
                     .get(&tab_id)
-                    .map(|s| Arc::ptr_eq(&s.reaped, &reaped_for_wait))
+                    .map(|s| Arc::ptr_eq(&s.latch, &latch_for_wait))
                     .unwrap_or(false);
                 if owns {
                     sessions.remove(&tab_id);
@@ -955,7 +1196,7 @@ impl PtySupervisor {
             // and the reap task started above reaps whatever the signal
             // lands on. Dropping `session` drops the input/resize
             // channels, so the writer task exits too.
-            terminate_child(&session.killer, session.pid, session.reaped.clone(), tab_id);
+            terminate_child(&session.killer, session.pid, session.latch.clone(), tab_id);
             drop(session);
             return Err(err.into());
         }
@@ -1056,9 +1297,9 @@ impl PtySupervisor {
         // The one exception is a shutdown in progress. `shutdown_all`
         // reads "entry gone from the map" as "child reaped", so removing
         // a still-running child's entry here would have it counted as
-        // reaped. While the latch is set, close() sends the same hangup
-        // but leaves the entry for the waiter to remove — which is what
-        // shutdown's own sweep does.
+        // reaped. While `shutting_down` is set, close() sends the same
+        // hangup but leaves the entry for the waiter to remove — which
+        // is what shutdown's own sweep does.
         let (session, victim, was_pending) = {
             let mut sessions = self.sessions.lock().unwrap();
             let mut pending = self.pending.lock().unwrap();
@@ -1073,7 +1314,7 @@ impl PtySupervisor {
             }
         };
         if let Some(session) = session {
-            terminate_child(&session.killer, session.pid, session.reaped.clone(), tab_id);
+            terminate_child(&session.killer, session.pid, session.latch.clone(), tab_id);
         } else if let Some(victim) = victim {
             victim.terminate();
         } else if was_pending {
@@ -1149,7 +1390,7 @@ impl PtySupervisor {
         // `terminate_child` makes syscalls and spawns a watchdog thread
         // per tab, and the wait tasks it is about to wake need this same
         // lock to remove their sessions.
-        let victims: Vec<Victim> = {
+        let mut victims: Vec<Victim> = {
             let sessions = self.sessions.lock().unwrap();
             self.sweep_started.store(true, Ordering::SeqCst);
             sessions
@@ -1157,14 +1398,15 @@ impl PtySupervisor {
                 .map(|(tab_id, session)| Victim::snapshot(*tab_id, session))
                 .collect()
         };
-        let mut targets: Vec<i64> = victims.iter().map(|v| v.tab_id).collect();
-        targets.sort_unstable();
-        let pids: HashMap<i64, u32> = victims
-            .iter()
-            .filter_map(|v| v.pid.map(|pid| (v.tab_id, pid)))
-            .collect();
-        for victim in victims {
-            victim.terminate();
+        // Sorted once, out of the map's arbitrary order, so both the
+        // target list and the escalation walk below stay in id order —
+        // the report's vectors are documented sorted.
+        victims.sort_unstable_by_key(|victim| victim.tab_id);
+        let targets: Vec<i64> = victims.iter().map(|v| v.tab_id).collect();
+        // The victims outlive the cooperative phase: their latches are
+        // what the escalation below signals under.
+        for victim in &victims {
+            victim.hangup();
         }
 
         let mut remaining = targets.clone();
@@ -1173,34 +1415,20 @@ impl PtySupervisor {
         let stragglers = remaining.clone();
         let mut signalled: Vec<i64> = Vec::new();
         if !stragglers.is_empty() {
-            for tab_id in &stragglers {
-                let Some(&pid) = pids.get(tab_id) else {
-                    continue;
-                };
-                // Re-read the map immediately before signalling: an
-                // entry that has since gone means the waiter reaped that
-                // child, and its pid may already have been recycled onto
-                // an unrelated process. This narrows the window to the
-                // same inherent signal-after-reap race the per-tab
-                // watchdog in `terminate_child` already carries.
-                if !self.sessions.lock().unwrap().contains_key(tab_id) {
+            for victim in &victims {
+                if !stragglers.contains(&victim.tab_id) {
                     continue;
                 }
-                // SAFETY: a signal to a pid we spawned, checked live a
-                // moment ago. An exited-but-unreaped zombie takes it as
-                // a no-op; the wait task still reaps it.
-                let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-                if rc == 0 {
-                    signalled.push(*tab_id);
-                } else {
-                    // ESRCH is the child winning the race; anything else
-                    // is a real failure. Either way we did not kill it,
-                    // so it is not reported as `killed`.
-                    debug!(
-                        tab_id,
-                        err = ?std::io::Error::last_os_error(),
-                        "pty shutdown SIGKILL did not land"
-                    );
+                // Re-read the map immediately before signalling: an
+                // entry that has since gone means the waiter reaped that
+                // child, so it is not a straggler after all. This is the
+                // *reported* oracle only — what keeps the signal itself
+                // off a recycled pid is the latch `sigkill` runs under.
+                if !self.sessions.lock().unwrap().contains_key(&victim.tab_id) {
+                    continue;
+                }
+                if victim.sigkill() {
+                    signalled.push(victim.tab_id);
                 }
             }
             self.await_removals(
@@ -1289,20 +1517,36 @@ impl PtySupervisor {
 fn terminate_child(
     killer: &Mutex<Box<dyn ChildKiller + Send + Sync>>,
     pid: Option<u32>,
-    reaped: Arc<AtomicBool>,
+    latch: Arc<ReapLatch>,
     tab_id: i64,
 ) {
-    if let Ok(mut killer) = killer.lock() {
-        if let Err(err) = killer.kill() {
-            // ESRCH (raw 3) / NotFound: child already gone — the wait
-            // task has or will emit Exit. Anything else is a real
-            // failure worth logging.
-            let already_gone =
-                err.kind() == std::io::ErrorKind::NotFound || err.raw_os_error() == Some(3);
-            if !already_gone {
-                warn!(tab_id, ?err, "pty SIGHUP failed");
-            }
+    // The `killer` lock is taken inside the closure, so the order is
+    // latch → killer, and only here. Poison-tolerant for the same reason
+    // the latch is: a panic that poisoned this mutex would otherwise
+    // turn every later hangup into a silent no-op, leaving the watchdog
+    // to SIGKILL a child that never got the chance to run its traps.
+    let mut failure = None;
+    let signalled = latch.signal(|| {
+        failure = killer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .kill()
+            .err();
+    });
+    if let Some(err) = failure {
+        // ESRCH (raw 3) / NotFound: child already gone — the wait task
+        // has or will emit Exit. Anything else is a real failure worth
+        // logging.
+        let already_gone =
+            err.kind() == std::io::ErrorKind::NotFound || err.raw_os_error() == Some(3);
+        if !already_gone {
+            warn!(tab_id, ?err, "pty SIGHUP failed");
         }
+    }
+    if !signalled {
+        // Already reaped: the hangup was refused, and there is nothing
+        // left for a watchdog to escalate against either.
+        return;
     }
     let Some(pid) = pid else { return };
     // Detached watchdog: if the wait task hasn't reaped the child
@@ -1310,15 +1554,15 @@ fn terminate_child(
     // `std::thread` (not tokio) keeps `close()` callable from any
     // context regardless of runtime. SIGKILL against an
     // exited-but-unreaped zombie is harmless; the wait task reaps it.
-    // PID reuse inside the short window is negligible and gated by
-    // `reaped`.
     std::thread::spawn(move || {
         std::thread::sleep(KILL_GRACE);
-        if !reaped.load(Ordering::SeqCst) {
+        latch.signal(|| {
+            // SAFETY: a pid we spawned, held unreaped by the latch for
+            // the length of this closure.
             unsafe {
                 libc::kill(pid as libc::pid_t, libc::SIGKILL);
             }
-        }
+        });
     });
 }
 
@@ -1838,6 +2082,7 @@ pub enum PtyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     /// The hang-up branch of `write_all_nonblocking` (#409), fenced
     /// without a child or a runtime shutdown to hide behind: a write
@@ -2085,6 +2330,332 @@ mod tests {
         assert_eq!(
             std::path::Path::new(&got).canonicalize().unwrap(),
             std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+    }
+
+    /// Counts hangups instead of sending them. `clone_killer` hands out
+    /// another handle onto the same counter, matching portable-pty's
+    /// contract that a clone signals the same child.
+    #[derive(Debug, Clone)]
+    struct CountingKiller(Arc<AtomicUsize>);
+
+    impl ChildKiller for CountingKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[test]
+    fn a_close_after_the_reap_signals_nothing() {
+        // `pid: None` on purpose: with a real pid the production
+        // watchdog would SIGKILL a pid this test does not own once
+        // `KILL_GRACE` elapsed.
+        let kills = Arc::new(AtomicUsize::new(0));
+        let killer = || {
+            Mutex::new(Box::new(CountingKiller(kills.clone())) as Box<dyn ChildKiller + Send + Sync>)
+        };
+
+        let reaped = Arc::new(ReapLatch::new());
+        reaped.reap(|| {});
+        terminate_child(&killer(), None, reaped, 1);
+        assert_eq!(
+            kills.load(Ordering::SeqCst),
+            0,
+            "a reaped child must not be signalled"
+        );
+
+        terminate_child(&killer(), None, Arc::new(ReapLatch::new()), 2);
+        assert_eq!(
+            kills.load(Ordering::SeqCst),
+            1,
+            "an unreaped child still gets its hangup"
+        );
+    }
+
+    #[test]
+    fn the_latch_refuses_to_signal_once_the_child_is_reaped() {
+        let latch = ReapLatch::new();
+        let mut before = false;
+        assert!(latch.signal(|| before = true));
+        assert!(before);
+
+        latch.reap(|| {});
+        let mut after = false;
+        assert!(!latch.signal(|| after = true));
+        assert!(!after, "a closed latch must not run its signal");
+
+        // The fallback's poll closes signalling exactly when it reaps,
+        // and not before.
+        let polled = ReapLatch::new();
+        assert!(matches!(polled.reap_if_exited(|| Ok(None::<()>)), Ok(None)));
+        assert!(
+            polled.signal(|| {}),
+            "a poll that found the child alive leaves signalling open"
+        );
+        assert!(matches!(polled.reap_if_exited(|| Ok(Some(7))), Ok(Some(7))));
+        assert!(
+            !polled.signal(|| {}),
+            "a poll that reaped the child closes signalling"
+        );
+
+        let lost = ReapLatch::new();
+        let poll = || Err::<Option<()>, _>(std::io::Error::from_raw_os_error(libc::ECHILD));
+        assert!(lost.reap_if_exited(poll).is_err());
+        assert!(
+            !lost.signal(|| {}),
+            "a poll that lost the child closes signalling too"
+        );
+    }
+
+    #[test]
+    fn a_signal_in_flight_and_the_reap_serialise() {
+        let latch = Arc::new(ReapLatch::new());
+        // Flipped as the last act of the signal closure, still under the
+        // latch: a reap that observes it false ran while the signal was
+        // half-done.
+        let finished = Arc::new(AtomicBool::new(false));
+        let parked = Arc::new(std::sync::Barrier::new(2));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let signaller = std::thread::spawn({
+            let latch = latch.clone();
+            let finished = finished.clone();
+            let parked = parked.clone();
+            move || {
+                latch.signal(|| {
+                    parked.wait();
+                    release_rx.recv().expect("release");
+                    finished.store(true, Ordering::SeqCst);
+                });
+            }
+        });
+        parked.wait();
+
+        let (at_the_door_tx, at_the_door_rx) = std::sync::mpsc::channel::<()>();
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel::<bool>();
+        let reaper = std::thread::spawn({
+            let latch = latch.clone();
+            let finished = finished.clone();
+            move || {
+                at_the_door_tx.send(()).expect("the test is listening");
+                let _ = observed_tx.send(latch.reap(|| finished.load(Ordering::SeqCst)));
+            }
+        });
+        at_the_door_rx.recv().expect("reaper thread");
+        // Waiting, not synchronising: no channel can observe a thread
+        // parked on a mutex, and from the send above the reaper is
+        // microseconds from the latch. The wait only has to outlast
+        // that for the reap to be contending when we release.
+        std::thread::sleep(Duration::from_millis(50));
+
+        release_tx.send(()).expect("release the parked signal");
+        assert_eq!(
+            observed_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "a reap must not run while a signal is still in flight"
+        );
+        signaller.join().expect("signal thread");
+        reaper.join().expect("reap thread");
+    }
+
+    #[test]
+    fn waiting_without_reaping_leaves_the_status_for_wait() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 7")
+            .spawn()
+            .expect("spawn /bin/sh");
+        exited_without_reaping(child.id()).expect("waitid(WNOWAIT)");
+        // The zombie is still ours: the pid was never released, so the
+        // status is still there to collect.
+        let status = child.wait().expect("wait after waitid(WNOWAIT)");
+        assert_eq!(status.code(), Some(7));
+    }
+
+    #[test]
+    fn the_reap_fallback_never_blocks_a_signaller() {
+        /// Kills whatever child is still in the cell — after a failed
+        /// assertion, or a negative control that never reaps — so no
+        /// `sleep` outlives the test. Ownership is the whole design:
+        /// the poller takes the `Child` out of the cell the moment it
+        /// reports an exit, so a cleanup here can only ever signal a pid
+        /// nothing has reaped, with no disarm to get wrong. A `Mutex`
+        /// around a `Child` is safe only because every use of it here is
+        /// a `try_wait`; the production reaper waits, which is why
+        /// [`ReapLatch`] keeps the child outside the lock.
+        struct ChildGuard(Arc<Mutex<Option<std::process::Child>>>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let mut held = self.0.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(mut child) = held.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("100")
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let pid = child.id();
+        let child = Arc::new(Mutex::new(Some(child)));
+        let _guard = ChildGuard(child.clone());
+
+        let latch = Arc::new(ReapLatch::new());
+        let (polling_tx, polling_rx) = std::sync::mpsc::channel::<()>();
+        let (poll_tx, poll_rx) = std::sync::mpsc::channel();
+        let poller = std::thread::spawn({
+            let latch = latch.clone();
+            let child = child.clone();
+            move || {
+                // Announced from inside the first poll, so the latch is
+                // held when the test hears it: without that the signal
+                // below could pass simply by arriving before the reaper.
+                let mut announce = Some(polling_tx);
+                let _ = poll_tx.send(reap_by_polling(&latch, || {
+                    if let Some(tx) = announce.take() {
+                        let _ = tx.send(());
+                    }
+                    let mut held = child.lock().unwrap_or_else(|p| p.into_inner());
+                    let Some(alive) = held.as_mut() else {
+                        return Ok(None);
+                    };
+                    let status = alive.try_wait()?;
+                    if status.is_some() {
+                        held.take();
+                    }
+                    Ok(status)
+                }));
+            }
+        });
+        polling_rx
+            .recv()
+            .expect("the poller reaches its first poll");
+
+        // The SIGTERM is the only thing that will end this child, so a
+        // fallback that held the latch across its wait would deadlock
+        // the pair rather than merely delay the signal.
+        let (signal_tx, signal_rx) = std::sync::mpsc::channel();
+        let signaller = std::thread::spawn({
+            let latch = latch.clone();
+            move || {
+                let _ = signal_tx.send(latch.signal(|| {
+                    // SAFETY: a pid we spawned, held unreaped by the
+                    // latch for the length of this closure.
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                    }
+                }));
+            }
+        });
+        assert_eq!(
+            signal_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "a signaller must not wait on the reap fallback"
+        );
+
+        let status = poll_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the poller returns once the child exits")
+            .expect("try_wait");
+        assert!(
+            !status.success(),
+            "a SIGTERMed child is not a clean exit: {status:?}"
+        );
+        signaller.join().expect("signal thread");
+        poller.join().expect("poll thread");
+    }
+
+    /// A shell that dies on SIGHUP as one process, leaving no
+    /// descendant to hold the PTY open. The `COOPERATIVE` idiom of
+    /// `tests/pty_shutdown_test.rs`, restated because that file is a
+    /// separate crate target.
+    const COOPERATIVE: &str = "exec sleep 100";
+
+    /// Bounded wait for a tab's reap to reach the lifecycle channel.
+    async fn exited(lifecycle: &mut broadcast::Receiver<SupervisorEvent>, tab_id: i64) -> bool {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match lifecycle.recv().await {
+                    Ok(SupervisorEvent::TabExited { tab_id: id, .. }) if id == tab_id => return,
+                    Ok(_) => {}
+                    Err(err) => panic!("lifecycle recv: {err:?}"),
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_close_inside_the_promotion_window_cancels_the_spawn() {
+        let sup = Arc::new(PtySupervisor::new());
+        let mut lifecycle = sup.subscribe_lifecycle();
+        let tab_id = 469;
+        let socket = std::path::PathBuf::from("/tmp/roost-pty-promotion-window.sock");
+        let argv: Vec<String> = vec!["/bin/sh".into(), "-c".into(), COOPERATIVE.into()];
+
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let spawning = tokio::task::spawn_blocking({
+            let sup = sup.clone();
+            let (socket, argv) = (socket.clone(), argv.clone());
+            move || {
+                sup.spawn_with(tab_id, "/tmp", &argv, 80, 24, &socket, || {
+                    parked_tx.send(()).expect("the test is listening");
+                    // Bounded, so a seam that ever moved inside the
+                    // promotion locks fails this test on its named
+                    // assertion instead of wedging the run: the park
+                    // would release, the spawn would promote, and the
+                    // `close()` it deadlocked would return.
+                    release_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("the test releases the park");
+                })
+            }
+        });
+
+        parked_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the spawn reaches the promotion window");
+        sup.close(tab_id);
+        release_tx.send(()).expect("the spawn is parked");
+        let spawned = spawning.await.expect("the spawn task joins");
+
+        // A promotion that installed the session anyway leaves a live
+        // `sleep 100` behind, and tokio's shutdown waits out its reap
+        // task — so tear it down here rather than stall the whole test
+        // binary on the assertion below.
+        if spawned.is_ok() {
+            sup.close(tab_id);
+            exited(&mut lifecycle, tab_id).await;
+        }
+
+        let Err(err) = spawned else {
+            panic!("a close inside the promotion window cancels the spawn");
+        };
+        assert!(
+            matches!(err.downcast_ref::<PtyError>(), Some(PtyError::Cancelled(id)) if *id == tab_id),
+            "the cancellation names this tab: {err:?}"
+        );
+        assert!(!sup.has(tab_id), "the cancelled spawn installed no session");
+        assert!(
+            exited(&mut lifecycle, tab_id).await,
+            "the unwanted child was terminated and reaped"
+        );
+
+        sup.spawn(tab_id, "/tmp", &argv, 80, 24, &socket)
+            .expect("the freed slot leaked into neither pending nor sessions");
+        sup.close(tab_id);
+        assert!(
+            exited(&mut lifecycle, tab_id).await,
+            "the replacement child was reaped too"
         );
     }
 }

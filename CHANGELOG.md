@@ -325,6 +325,29 @@ release workflow asserts they agree).
 
 ### Fixed
 
+- **A tab's teardown could signal a recycled pid (#470)** —
+  `terminate_child`'s immediate SIGHUP was a raw `kill(2)` with no
+  liveness gate at all, while its own SIGKILL watchdog *was* gated on a
+  `reaped` flag and justified itself by that gate. The fix is a
+  per-child reap latch: the reap task observes the exit with
+  `waitid(WNOWAIT)`, which leaves the child a zombie so the kernel does
+  not release the pid, and only then reaps under the latch, while every
+  signaller runs its `kill(2)` under that same latch and only while the
+  child is unreaped. The window was narrow and reaching it needed a
+  specific race, so this is hardening ahead of R9 moving every local tab
+  onto the session path rather than a bug anyone was hitting daily. Two
+  details of the shape: a `waitid` that cannot answer degrades to a 20ms
+  poll rather than to a blocked `close()`, and only a terminal exit
+  status is accepted, because a traced child reports its ptrace stops
+  through the same call.
+- **Cancelling a host connection attempt mid-snapshot leaked its event
+  pump (#472)** — dropping a `tokio::task::AbortHandle` aborts nothing,
+  so the attempt future's cancellation left the pump running and the
+  session-side socket subscribed, with nothing left to ever drain it.
+  The pump is now owned by a guard that aborts on drop, covering every
+  exit from the prologue by construction. The symptom was a session
+  accumulating subscribed connections that nobody drains, across
+  repeated connect/cancel cycles.
 - **A subscribe that lands on a different incarnation than the one just
   identified is refused before it can mix the two sessions' state
   (#458)** — `session.identify` and `events.subscribe` are two separate
@@ -449,6 +472,16 @@ release workflow asserts they agree).
 
 ### Internal
 
+- **The close-cancels-a-pending-spawn branch is now under test, through a
+  promotion seam (#469)** — no user-visible change. `spawn`'s `Cancelled`
+  arm, hit when a `close()` lands between the `pending` reservation and
+  the promotion, had no test anywhere, and the existing race mirror in
+  `pty_shutdown_test.rs` cannot reach it: a round where every racer
+  promotes before the sweep passes without exercising the branch. A
+  private `spawn_with(..., before_promote)` gives a test a hook that
+  runs after the child exists and before the promotion re-checks
+  `pending`, outside every lock; production passes an empty closure, and
+  there is no `#[cfg(test)]` anywhere in the spawn path.
 - **`HostConnSet` keeps one `HostEntry` per saved host, and three `App`
   guards are now unit-tested (#383, #386)** — no user-visible change.
   `HostConnSet` used to carry six parallel `HashMap`s keyed on a saved

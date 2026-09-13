@@ -56,8 +56,9 @@ pub fn close_tab(
 /// once the waiter has taken the entry it finds nothing, but under a
 /// latched `shutting_down` the entry stays until the reap, so the
 /// hang-up is re-sent. That second SIGHUP is as narrow as every other
-/// double close in the tree and no narrower — `terminate_child` gates
-/// its watchdog on `reaped` but not its immediate `kill()` (#470).
+/// double close in the tree and no narrower, and it cannot reach a
+/// recycled pid: `terminate_child` signals under the child's reap
+/// latch, which refuses once the child has been reaped (#470).
 ///
 /// `pub` for the same reason [`close_tab`] is: the race test lives in
 /// `tests/` with a real PTY and a multi-thread runtime.
