@@ -1350,15 +1350,27 @@ fn apply_batch(
 ) -> bool {
     let revision = batch.revision;
     if !mirror.apply_batch(&batch) {
-        // Below the fence: the snapshot already has it.
+        // Below the fence: the snapshot already has it. Nothing is
+        // published at all, so a replayed delete the mirror was built
+        // from cannot claim to have emptied anything.
         return true;
     }
+    // Read after the apply and only for a batch that carried a delete:
+    // plan 063 §D6's claim is "*this* batch emptied the host", and the
+    // task is the mirror's only writer, so this pair is atomic in
+    // practice.
+    let became_empty_by_delete = batch
+        .events
+        .iter()
+        .any(|envelope| envelope.event == ops::EVENT_PROJECT_DELETED)
+        && mirror.read().projects.is_empty();
     publish_workspace(
         feed,
         incarnation,
         HostWorkspaceEvent::Applied {
             revision,
             events: batch.events,
+            became_empty_by_delete,
         },
     )
 }
@@ -1626,7 +1638,10 @@ mod tests {
             panic!("a mirror delta is a HostWorkspace item");
         };
         assert_eq!(*tagged, host);
-        let HostWorkspaceEvent::Applied { revision, events } = event else {
+        let HostWorkspaceEvent::Applied {
+            revision, events, ..
+        } = event
+        else {
             panic!("expected an applied batch");
         };
         assert_eq!(*revision, 5);
@@ -1636,6 +1651,154 @@ mod tests {
             5,
             "and the state moved on the shared mirror, not on the feed"
         );
+    }
+
+    /// Plan 063 §D6's per-batch claim: **this** batch deleted a project
+    /// and left the host with none.
+    ///
+    /// Three cases, and the middle one is the whole reason the claim is
+    /// per batch rather than a mirror flag — "the mirror is empty" is
+    /// equally true of a host nobody emptied, and auto-removing on that
+    /// would forget a host for having been quiet.
+    #[tokio::test]
+    async fn only_the_batch_that_deleted_the_last_project_claims_it() {
+        let deleted = |project: i64| EventEnvelope {
+            event: ops::EVENT_PROJECT_DELETED.into(),
+            data: serde_json::json!({ "project_id": project.to_string() }),
+        };
+        // 1. The delete that empties it.
+        let (feed, mut rx) = crate::engine_feed::channel();
+        let mirror = seeded_mirror(4);
+        assert!(apply_batch(
+            &mirror,
+            EventBatch {
+                revision: 5,
+                events: vec![deleted(1)],
+            },
+            HostId::new(9),
+            &feed,
+        ));
+        assert_eq!(emptied(&mut rx), Some(true));
+
+        // 2. A batch that carries no delete, on a mirror that is
+        // *already* empty. Every batch after the one above is this one,
+        // and none of them may re-raise the claim.
+        assert!(apply_batch(
+            &mirror,
+            EventBatch {
+                revision: 6,
+                events: vec![EventEnvelope {
+                    event: ops::EVENT_ACTIVE_CHANGED.into(),
+                    data: serde_json::json!({"project_id": "0", "tab_id": "0"}),
+                }],
+            },
+            HostId::new(9),
+            &feed,
+        ));
+        assert!(mirror.read().projects.is_empty(), "still empty");
+        assert_eq!(emptied(&mut rx), Some(false));
+
+        // 3. A delete that leaves something behind is not an emptying.
+        let two = SharedMirror::new(HostMirror::from_list(
+            TabListResult {
+                projects: vec![
+                    seeded_list(None).projects.remove(0),
+                    Project {
+                        id: 2,
+                        name: "second".into(),
+                        cwd: "/tmp".into(),
+                        position: 1,
+                        created_at: 0,
+                        tabs: Vec::new(),
+                    },
+                ],
+                revision: Some(4),
+            },
+            4,
+        ));
+        assert!(apply_batch(
+            &two,
+            EventBatch {
+                revision: 5,
+                events: vec![deleted(1)],
+            },
+            HostId::new(9),
+            &feed,
+        ));
+        assert_eq!(emptied(&mut rx), Some(false));
+    }
+
+    /// The other two ways a host can look empty, and neither is a live
+    /// delete (plan 063 §D6).
+    ///
+    /// **Empty at connect** is a `Reset` — a rebuild from a fenced
+    /// `tab.list`, which carries no such claim at all, by construction:
+    /// the variant has no field for one. That is what routes it to
+    /// §D12's seed instead of to the auto-remove.
+    ///
+    /// **Replayed history** is a batch the snapshot already contains.
+    /// The fence discards it, and a discarded batch publishes nothing —
+    /// so a `project.deleted` the mirror was *built from* can never be
+    /// mistaken for one that just happened.
+    #[tokio::test]
+    async fn an_empty_snapshot_and_a_replayed_delete_make_no_claim() {
+        let (feed, mut rx) = crate::engine_feed::channel();
+        let empty = Arc::new(SharedMirror::new(HostMirror::from_list(
+            TabListResult {
+                projects: Vec::new(),
+                revision: Some(4),
+            },
+            4,
+        )));
+
+        assert!(publish_workspace(
+            &feed,
+            HostId::new(9),
+            HostWorkspaceEvent::Reset(Arc::clone(&empty)),
+        ));
+        let items = feed_items(&mut rx);
+        assert!(
+            matches!(
+                &items[0],
+                EngineFeed::HostWorkspace(_, HostWorkspaceEvent::Reset(_))
+            ),
+            "a connect's snapshot is a Reset, which has nowhere to put a delete claim"
+        );
+
+        // And the replay: the very delete the snapshot above already
+        // reflects, arriving at a revision the fence covers.
+        assert!(apply_batch(
+            &empty,
+            EventBatch {
+                revision: 4,
+                events: vec![EventEnvelope {
+                    event: ops::EVENT_PROJECT_DELETED.into(),
+                    data: serde_json::json!({"project_id": "1"}),
+                }],
+            },
+            HostId::new(9),
+            &feed,
+        ));
+        assert!(
+            feed_items(&mut rx).is_empty(),
+            "history below the fence never reaches the UI at all, let alone as a claim"
+        );
+    }
+
+    /// The `became_empty_by_delete` of the one applied batch on `rx`.
+    fn emptied(rx: &mut crate::engine_feed::EngineFeedReceiver) -> Option<bool> {
+        let items = feed_items(rx);
+        assert_eq!(items.len(), 1, "one batch, one wake");
+        match &items[0] {
+            EngineFeed::HostWorkspace(
+                _,
+                HostWorkspaceEvent::Applied {
+                    became_empty_by_delete,
+                    ..
+                },
+            ) => Some(*became_empty_by_delete),
+            _ => None,
+        }
     }
 
     /// A batch at or below the fence is already in the snapshot, so it

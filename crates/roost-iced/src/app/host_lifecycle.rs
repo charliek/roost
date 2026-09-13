@@ -114,6 +114,13 @@ pub(super) fn tunnel_ready(
 /// `policy` is a parameter rather than a [`host_verbs::VerbPolicy::current`]
 /// read: it is state the decision turns on, and state a decision turns on
 /// is passed in.
+///
+/// Answers **whether an attempt actually started**. Three things refuse
+/// one — the shutdown gate, a `mode` that declines, an unresolvable
+/// target — and the caller has to know, because plan 063 §D12's connect
+/// purpose is parked against a landing that a refused dial will never
+/// have (a parked create would then fire on some later, unrelated
+/// connect).
 // Eight parameters is one over clippy's bar, and each is a cluster this
 // dial genuinely reads — bundling any of them into a struct would only
 // move the argument list somewhere less legible.
@@ -127,10 +134,10 @@ pub(super) fn dial_saved_host(
     mode: impl FnOnce(bool) -> Option<ConnectMode>,
     cause: AttemptCause,
     policy: host_verbs::VerbPolicy,
-) {
+) -> bool {
     if exit != ExitState::Running {
         tracing::debug!(host = %host.id, "not connecting a host during shutdown");
-        return;
+        return false;
     }
     // A new attempt replaces the origin and the failure an in-flight
     // probe's question was built on, so that probe is now asking about
@@ -143,12 +150,12 @@ pub(super) fn dial_saved_host(
         Ok(transport) => transport,
         Err(error) => {
             tracing::warn!(host = %host.id, ?error, "cannot resolve a saved host's target");
-            return;
+            return false;
         }
     };
     let localhost = transport.is_localhost();
     let Some(mode) = mode(localhost) else {
-        return;
+        return false;
     };
     let mode = spawn_gate(mode, policy);
     // The one place the transport becomes the connection set's own
@@ -175,6 +182,7 @@ pub(super) fn dial_saved_host(
             hosts.open_ssh(&host.id, &host.label, target, mode, origin, cause)
         }
     }
+    true
 }
 
 /// Drop an in-flight probe, and the band line it left. Answers whether

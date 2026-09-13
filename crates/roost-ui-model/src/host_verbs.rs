@@ -32,6 +32,17 @@ const REMOVE_PREFIX: &str = "host:remove:";
 const CREATE_ON_PREFIX: &str = "host:create_on:";
 const UPDATE_PREFIX: &str = "host:update:";
 const RESTART_PREFIX: &str = "host:restart:";
+/// A forgotten host offered back (plan 063 §D7). Keyed by **target**,
+/// not by a saved id: the row exists precisely because the host is no
+/// longer saved, and the target is what the recents list dedupes on, so
+/// it is the only key that is unique by construction. A target may
+/// contain colons; the whole remainder of the id is it.
+const RECENT_PREFIX: &str = "host:recent:";
+/// The same forgotten host in the creation picker, which also opens a
+/// project once it is up. A separate id rather than a flag on the wire:
+/// a palette row is addressed by its id, and the two rows do different
+/// things.
+const CREATE_ON_RECENT_PREFIX: &str = "host:create_on_recent:";
 
 /// The id of the seeded-localhost Connect row — the one verb addressed
 /// to a host that is not saved yet (plan 037 §3.5). Activating it saves
@@ -63,6 +74,11 @@ pub struct HostRow<'a> {
     /// `HostSnapshot.id` — what every verb is addressed to.
     pub saved_id: &'a str,
     pub label: &'a str,
+    /// The registry's target, verbatim — the key a *recent* is matched
+    /// against (plan 063 §D7's [`offerable_recents`]). Not a second
+    /// spelling of `transport`: that says how a host is reached, this
+    /// says which host it is.
+    pub target: &'a str,
     pub state: SectionState,
     /// How this host is reached. Only [`HostTransportKind::localhost`]
     /// rides the policy; a host reached over an `ssh -L` forward keeps
@@ -73,6 +89,16 @@ pub struct HostRow<'a> {
     /// that is connected at exact fidelity or is not connected at all,
     /// which is the ordinary case.
     pub fidelity: Option<FidelityAction>,
+}
+
+/// One forgotten host, as the recents rows read it (plan 063 §D7).
+///
+/// Carries no state: a recent is not a connection, it is a target and
+/// the name it last went by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecentRow<'a> {
+    pub label: &'a str,
+    pub target: &'a str,
 }
 
 /// The policy, as one value.
@@ -128,6 +154,14 @@ pub enum HostVerb {
     /// save it if it is not saved, start it if it is not running, then
     /// create (plan 063 §D3).
     CreateOnLocalhost,
+    /// A forgotten host, offered back by target (plan 063 §D7): save it
+    /// again and connect. `create` says whether the row was pressed in
+    /// the creation picker, which also opens a project on it once it is
+    /// up — the two rows differ only in that tail, so they are one verb.
+    AddRecent {
+        target: String,
+        create: bool,
+    },
 }
 
 /// Parse a palette row id back into the verb it names.
@@ -162,6 +196,20 @@ pub fn parse(id: &str) -> Option<HostVerb> {
     }
     if let Some(host) = saved(REMOVE_PREFIX) {
         return Some(HostVerb::Remove(host));
+    }
+    // Before `CREATE_ON_PREFIX` for legibility only — the two cannot
+    // collide (`host:create_on_recent:` has `_` where the other has `:`).
+    if let Some(target) = saved(CREATE_ON_RECENT_PREFIX) {
+        return Some(HostVerb::AddRecent {
+            target,
+            create: true,
+        });
+    }
+    if let Some(target) = saved(RECENT_PREFIX) {
+        return Some(HostVerb::AddRecent {
+            target,
+            create: false,
+        });
     }
     // Checked last: `host:create_on:local` is the local sentinel above,
     // and a saved id can never be the word "local" (labels can't be, and
@@ -219,14 +267,30 @@ fn is_connected(state: SectionState) -> bool {
 ///   localhost transport** (plan 063 §D3 — before R9 that could only be
 ///   an empty registry), and only where the policy offers the localhost
 ///   surface at all.
+/// * One row per **recent** — a host this client forgot — beside
+///   `Add Host…`, because that is the same gesture with the typing
+///   already done (plan 063 §D7).
 /// * `New Project on…` appears once the picker has more than one
 ///   destination, because with one it is exactly `new_project`.
-pub fn verbs(hosts: &[HostRow<'_>], local: LocalSlot<'_>, policy: VerbPolicy) -> Vec<VerbItem> {
+pub fn verbs(
+    hosts: &[HostRow<'_>],
+    recents: &[RecentRow<'_>],
+    local: LocalSlot<'_>,
+    policy: VerbPolicy,
+) -> Vec<VerbItem> {
     let mut items = vec![VerbItem::new(
         ADD_ID,
         "Add Host…",
         "point Roost at an SSH host or a session socket",
     )];
+
+    items.extend(offerable_recents(hosts, recents).map(|recent| {
+        VerbItem::new(
+            format!("{RECENT_PREFIX}{}", recent.target),
+            format!("Add Host: {}", recent.label),
+            "saves it again and connects",
+        )
+    }));
 
     if policy.localhost_surface && !hosts.iter().any(|host| host.transport.localhost()) {
         items.push(VerbItem::new(
@@ -296,7 +360,7 @@ pub fn verbs(hosts: &[HostRow<'_>], local: LocalSlot<'_>, policy: VerbPolicy) ->
     // Asked of the picker itself rather than recomputed: the row exists
     // exactly when pressing it would offer a choice, and two spellings
     // of that count would drift.
-    if create_targets(hosts, local, policy, LOCAL_LABEL).len() > 1 {
+    if create_targets(hosts, recents, local, policy, LOCAL_LABEL).len() > 1 {
         items.push(VerbItem::new(
             NEW_PROJECT_ON_ID,
             "New Project on…",
@@ -341,6 +405,7 @@ fn connect_subtitle(state: SectionState) -> &'static str {
 /// saving, starting or plain creating pressing it will do.
 pub fn create_targets(
     hosts: &[HostRow<'_>],
+    recents: &[RecentRow<'_>],
     local: LocalSlot<'_>,
     policy: VerbPolicy,
     local_label: &str,
@@ -372,7 +437,37 @@ pub fn create_targets(
                 subtitle: None,
             }),
     );
+    // Last, under the destinations that already exist: a recent is a
+    // place to create *after* two round trips (save, connect), so it
+    // belongs below every host that is one op away.
+    items.extend(offerable_recents(hosts, recents).map(|recent| {
+        VerbItem::new(
+            format!("{CREATE_ON_RECENT_PREFIX}{}", recent.target),
+            recent.label,
+            "saves it again, connects, then creates",
+        )
+    }));
     items
+}
+
+/// The recents worth offering: the ones that are not saved again
+/// already.
+///
+/// Nothing prunes the recents list when a host is re-added — a target
+/// can be forgotten and saved repeatedly, and a list that rewrote itself
+/// on every add would be a second place the registry lives. So the
+/// filter is here, where both surfaces read it: a row offering to save a
+/// host that is already in the sidebar would fail on the duplicate
+/// label, and it would name a band the user can already see.
+fn offerable_recents<'a, 'r>(
+    hosts: &'a [HostRow<'_>],
+    recents: &'a [RecentRow<'r>],
+) -> impl Iterator<Item = &'a RecentRow<'r>> {
+    recents.iter().filter(|recent| {
+        !hosts
+            .iter()
+            .any(|host| host.target.trim() == recent.target.trim())
+    })
 }
 
 /// The saved host holding the local-session slot, if one is saved. Read
@@ -418,10 +513,22 @@ mod tests {
         HostRow {
             saved_id,
             label: saved_id,
+            // Distinct per host and never a recent's target, so the
+            // recents filter neither hides a row by accident nor
+            // matches one it should not.
+            target: saved_id,
             state,
             transport: HostTransportKind::Ssh,
             fidelity: None,
         }
+    }
+
+    /// The registry with nothing forgotten — every pre-§D7 assertion in
+    /// this module.
+    const NO_RECENTS: &[RecentRow<'static>] = &[];
+
+    fn recent(label: &'static str, target: &'static str) -> RecentRow<'static> {
+        RecentRow { label, target }
     }
 
     fn ids(items: &[VerbItem]) -> Vec<&str> {
@@ -481,10 +588,13 @@ mod tests {
     #[test]
     fn a_fresh_registry_offers_add_always_and_the_seed_only_with_the_surface() {
         assert_eq!(
-            ids(&verbs(&[], IN_PROCESS, FULL)),
+            ids(&verbs(&[], NO_RECENTS, IN_PROCESS, FULL)),
             vec![ADD_ID, CONNECT_SEED_ID, NEW_PROJECT_ON_ID]
         );
-        assert_eq!(ids(&verbs(&[], IN_PROCESS, GATED)), vec![ADD_ID]);
+        assert_eq!(
+            ids(&verbs(&[], NO_RECENTS, IN_PROCESS, GATED)),
+            vec![ADD_ID]
+        );
     }
 
     /// The seed row's gate is the *transport*, not the count (plan 063
@@ -495,12 +605,14 @@ mod tests {
     fn the_seed_row_is_gated_on_a_localhost_host_rather_than_on_an_empty_registry() {
         assert!(ids(&verbs(
             &[host("ssh-only", SectionState::Connected)],
+            NO_RECENTS,
             IN_PROCESS,
             FULL
         ))
         .contains(&CONNECT_SEED_ID));
         assert!(!ids(&verbs(
             &[localhost_host("mine", SectionState::Disconnected)],
+            NO_RECENTS,
             IN_PROCESS,
             FULL
         ))
@@ -545,7 +657,7 @@ mod tests {
         for (state, mut expected) in cases {
             expected.push(NEW_PROJECT_ON_ID);
             assert_eq!(
-                ids(&verbs(&[host("h", state)], IN_PROCESS, FULL)),
+                ids(&verbs(&[host("h", state)], NO_RECENTS, IN_PROCESS, FULL)),
                 expected,
                 "{state:?}"
             );
@@ -569,7 +681,7 @@ mod tests {
             SectionState::NeedsRestart,
             SectionState::Stopped,
         ] {
-            let items = verbs(&[host("h", state)], IN_PROCESS, FULL);
+            let items = verbs(&[host("h", state)], NO_RECENTS, IN_PROCESS, FULL);
             let has = |prefix: &str| items.iter().any(|item| item.id.starts_with(prefix));
             assert_eq!(
                 has(REMOVE_PREFIX),
@@ -580,7 +692,12 @@ mod tests {
         }
         // The subtitle is the promise the reversal rests on, so it is
         // pinned rather than left to the row's presence.
-        let connected = verbs(&[host("h", SectionState::Connected)], IN_PROCESS, FULL);
+        let connected = verbs(
+            &[host("h", SectionState::Connected)],
+            NO_RECENTS,
+            IN_PROCESS,
+            FULL,
+        );
         assert_eq!(
             connected
                 .iter()
@@ -601,7 +718,7 @@ mod tests {
             localhost_host("slot", SectionState::Connected),
             host("box", SectionState::Connected),
         ];
-        let session_items = verbs(&hosts, session("slot"), FULL);
+        let session_items = verbs(&hosts, NO_RECENTS, session("slot"), FULL);
         let under_session = ids(&session_items);
         assert!(
             !under_session.contains(&"host:remove:slot"),
@@ -614,6 +731,7 @@ mod tests {
 
         let in_process_items = verbs(
             &hosts,
+            NO_RECENTS,
             LocalSlot {
                 mode: LocalBackendMode::InProcess,
                 slot_saved_id: Some("slot"),
@@ -636,13 +754,14 @@ mod tests {
         let local = HostRow {
             saved_id: "h1",
             label: "localhost",
+            target: "localhost",
             state: SectionState::Disconnected,
             transport: HostTransportKind::Localhost,
             fidelity: None,
         };
         let remote = host("h2", SectionState::Disconnected);
 
-        let gated = verbs(&[local, remote], IN_PROCESS, GATED);
+        let gated = verbs(&[local, remote], NO_RECENTS, IN_PROCESS, GATED);
         assert!(
             !ids(&gated).contains(&"host:connect:h1"),
             "a client without the surface must not offer a session it cannot reach"
@@ -659,7 +778,8 @@ mod tests {
 
         // Same inputs, the shipping answer: the localhost host is
         // ordinary.
-        assert!(ids(&verbs(&[local, remote], IN_PROCESS, FULL)).contains(&"host:connect:h1"));
+        assert!(ids(&verbs(&[local, remote], NO_RECENTS, IN_PROCESS, FULL))
+            .contains(&"host:connect:h1"));
     }
 
     /// A connected localhost host under a withholding policy: the gate
@@ -680,6 +800,7 @@ mod tests {
         let connected = HostRow {
             saved_id: "h1",
             label: "localhost",
+            target: "localhost",
             state: SectionState::Connected,
             transport: HostTransportKind::Localhost,
             // Reduced fidelity is a connection verb too: a build that
@@ -687,7 +808,7 @@ mod tests {
             // restart one either.
             fidelity: Some(FidelityAction::Restart),
         };
-        let offered = verbs(&[connected], IN_PROCESS, GATED);
+        let offered = verbs(&[connected], NO_RECENTS, IN_PROCESS, GATED);
         let items = ids(&offered);
         assert!(!items.contains(&"host:disconnect:h1"));
         assert!(!items.contains(&"host:stop:h1"));
@@ -703,19 +824,21 @@ mod tests {
     #[test]
     fn the_picker_row_appears_only_when_the_picker_offers_a_choice() {
         assert!(
-            ids(&verbs(&[], IN_PROCESS, FULL)).contains(&NEW_PROJECT_ON_ID),
+            ids(&verbs(&[], NO_RECENTS, IN_PROCESS, FULL)).contains(&NEW_PROJECT_ON_ID),
             "LOCAL plus localhost is already two destinations"
         );
         assert!(
-            !ids(&verbs(&[], IN_PROCESS, GATED)).contains(&NEW_PROJECT_ON_ID),
+            !ids(&verbs(&[], NO_RECENTS, IN_PROCESS, GATED)).contains(&NEW_PROJECT_ON_ID),
             "without the surface a fresh registry has LOCAL alone"
         );
         assert!(
-            !ids(&verbs(&[], session("nothing-saved"), FULL)).contains(&NEW_PROJECT_ON_ID),
+            !ids(&verbs(&[], NO_RECENTS, session("nothing-saved"), FULL))
+                .contains(&NEW_PROJECT_ON_ID),
             "session mode with only the localhost row is not a choice"
         );
         assert!(ids(&verbs(
             &[host("h", SectionState::Connected)],
+            NO_RECENTS,
             session("nothing-saved"),
             FULL
         ))
@@ -732,7 +855,7 @@ mod tests {
             host("down", SectionState::Disconnected),
             host("dialing", SectionState::Connecting),
         ];
-        let targets = create_targets(&hosts, IN_PROCESS, FULL, "Local");
+        let targets = create_targets(&hosts, NO_RECENTS, IN_PROCESS, FULL, "Local");
         assert_eq!(
             ids(&targets),
             vec![
@@ -755,7 +878,7 @@ mod tests {
         // `the_picker_lists_local_localhost_and_connected_hosts` pins as
         // the localhost one.
         let row = |hosts: &[HostRow<'_>], local: LocalSlot<'_>| {
-            create_targets(hosts, local, FULL, "Local")
+            create_targets(hosts, NO_RECENTS, local, FULL, "Local")
                 .into_iter()
                 .nth(1)
                 .expect("the localhost row is always offered")
@@ -801,7 +924,13 @@ mod tests {
             host("box", SectionState::Connected),
         ];
         assert_eq!(
-            ids(&create_targets(&hosts, session("slot"), FULL, "Local")),
+            ids(&create_targets(
+                &hosts,
+                NO_RECENTS,
+                session("slot"),
+                FULL,
+                "Local"
+            )),
             vec!["host:create_on:slot", "host:create_on:box"]
         );
     }
@@ -878,7 +1007,7 @@ mod tests {
                 ..host("h", state)
             };
             assert_eq!(
-                ids(&verbs(&[row], IN_PROCESS, FULL)),
+                ids(&verbs(&[row], NO_RECENTS, IN_PROCESS, FULL)),
                 expect(transport, rest),
                 "{transport:?} {state:?} reduced={reduced_fidelity}"
             );
@@ -905,7 +1034,7 @@ mod tests {
                     fidelity: Some(action),
                     ..host("h", state)
                 };
-                let offered = verbs(&[row], IN_PROCESS, FULL);
+                let offered = verbs(&[row], NO_RECENTS, IN_PROCESS, FULL);
                 let items = ids(&offered);
                 assert!(
                     !items
@@ -930,6 +1059,7 @@ mod tests {
                     fidelity: fidelity_action(true, transport, SectionState::Connected),
                     ..host("h", SectionState::Connected)
                 }],
+                NO_RECENTS,
                 IN_PROCESS,
                 FULL,
             )
@@ -946,6 +1076,111 @@ mod tests {
             Some("Restart session on pop-os")
         );
         assert_eq!(title(HostTransportKind::Socket), None);
+    }
+
+    /// Plan 063 §D7's recents, in both surfaces: beside `Add Host…` in
+    /// the command frame, and last in the creation picker.
+    #[test]
+    fn a_forgotten_host_is_offered_back_in_both_surfaces() {
+        let recents = [recent("old-box", "user@old-box")];
+        let items = verbs(&[], &recents, IN_PROCESS, FULL);
+        assert_eq!(
+            ids(&items),
+            vec![
+                ADD_ID,
+                "host:recent:user@old-box",
+                CONNECT_SEED_ID,
+                NEW_PROJECT_ON_ID
+            ],
+            "the recent sits with Add Host, which is the gesture it saves"
+        );
+        let row = items
+            .iter()
+            .find(|item| item.id.starts_with(RECENT_PREFIX))
+            .expect("the recent row");
+        assert_eq!(row.title, "Add Host: old-box");
+        assert_eq!(row.subtitle.as_deref(), Some("saves it again and connects"));
+
+        let targets = create_targets(
+            &[host("live", SectionState::Connected)],
+            &recents,
+            IN_PROCESS,
+            FULL,
+            "Local",
+        );
+        assert_eq!(
+            ids(&targets),
+            vec![
+                CREATE_ON_LOCAL_ID,
+                CREATE_ON_LOCALHOST_ID,
+                "host:create_on:live",
+                "host:create_on_recent:user@old-box"
+            ],
+            "and last in the picker: it is two round trips from being a destination"
+        );
+        assert_eq!(targets[3].title, "old-box");
+        assert_eq!(
+            targets[3].subtitle.as_deref(),
+            Some("saves it again, connects, then creates")
+        );
+    }
+
+    /// A recent whose target is saved again is not offered: the row
+    /// would fail on the duplicate label, and it would name a band that
+    /// is already on screen. Nothing prunes the recents list on an add,
+    /// so this filter is what keeps the two from disagreeing.
+    #[test]
+    fn a_recent_that_is_saved_again_is_not_offered_back() {
+        let recents = [recent("old-box", "user@old-box"), recent("shed", "shed")];
+        let saved = HostRow {
+            target: "user@old-box",
+            ..host("back", SectionState::Connected)
+        };
+
+        let offered_items = verbs(&[saved], &recents, IN_PROCESS, FULL);
+        let offered = ids(&offered_items);
+        assert!(
+            !offered.contains(&"host:recent:user@old-box"),
+            "the saved one is gone: {offered:?}"
+        );
+        assert!(
+            offered.contains(&"host:recent:shed"),
+            "the one still forgotten stays: {offered:?}"
+        );
+
+        let picker_items = create_targets(&[saved], &recents, IN_PROCESS, FULL, "Local");
+        let picker = ids(&picker_items);
+        assert!(!picker.contains(&"host:create_on_recent:user@old-box"));
+        assert!(picker.contains(&"host:create_on_recent:shed"));
+
+        // The control: with that host not saved, the row is there.
+        let control = verbs(&[], &recents, IN_PROCESS, FULL);
+        assert!(ids(&control).contains(&"host:recent:user@old-box"));
+    }
+
+    /// A target with colons in it — an `ssh -L` socket path, a
+    /// `host:port` — round-trips through the row id, which is why the
+    /// remainder of the id is taken whole rather than split.
+    #[test]
+    fn a_recents_row_id_round_trips_a_target_with_colons() {
+        let target = "/run/user/1000/roost:2/roost.sock";
+        let recents = [recent("forwarded", target)];
+        for item in verbs(&[], &recents, IN_PROCESS, FULL)
+            .into_iter()
+            .chain(create_targets(&[], &recents, IN_PROCESS, FULL, "Local"))
+            .filter(|item| item.id.contains("recent"))
+        {
+            let create = item.id.starts_with(CREATE_ON_RECENT_PREFIX);
+            assert_eq!(
+                parse(&item.id),
+                Some(HostVerb::AddRecent {
+                    target: target.to_string(),
+                    create
+                }),
+                "{}",
+                item.id
+            );
+        }
     }
 
     /// Every id the builders emit parses back to the verb that produced
@@ -966,13 +1201,18 @@ mod tests {
                 ..host("mine", SectionState::Connected)
             },
         ];
-        let mut items = verbs(&hosts, IN_PROCESS, FULL);
-        items.extend(verbs(&[], IN_PROCESS, FULL));
-        items.extend(verbs(&hosts, session("mine"), FULL));
-        items.extend(create_targets(&hosts, IN_PROCESS, FULL, "Local"));
+        let mut items = verbs(&hosts, NO_RECENTS, IN_PROCESS, FULL);
+        items.extend(verbs(&[], NO_RECENTS, IN_PROCESS, FULL));
+        items.extend(verbs(&hosts, NO_RECENTS, session("mine"), FULL));
+        items.extend(create_targets(
+            &hosts, NO_RECENTS, IN_PROCESS, FULL, "Local",
+        ));
         // The registry with no localhost host is what emits the picker's
         // not-yet-saved `localhost` row.
-        items.extend(create_targets(&[], IN_PROCESS, FULL, "Local"));
+        items.extend(create_targets(&[], NO_RECENTS, IN_PROCESS, FULL, "Local"));
+        let recents = [recent("old-box", "user@old-box")];
+        items.extend(verbs(&hosts, &recents, IN_PROCESS, FULL));
+        items.extend(create_targets(&hosts, &recents, IN_PROCESS, FULL, "Local"));
         for item in &items {
             assert!(parse(&item.id).is_some(), "{} does not parse", item.id);
         }
@@ -1004,6 +1244,20 @@ mod tests {
         assert_eq!(
             parse("host:create_on:abc"),
             Some(HostVerb::CreateOn(Some("abc".into())))
+        );
+        assert_eq!(
+            parse("host:recent:user@box"),
+            Some(HostVerb::AddRecent {
+                target: "user@box".into(),
+                create: false
+            })
+        );
+        assert_eq!(
+            parse("host:create_on_recent:user@box"),
+            Some(HostVerb::AddRecent {
+                target: "user@box".into(),
+                create: true
+            })
         );
         // Not a host row: the command frame's own ids must fall through
         // so `run_palette_row` keeps handling them.

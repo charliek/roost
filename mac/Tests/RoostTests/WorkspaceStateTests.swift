@@ -975,6 +975,37 @@ struct WorkspaceStatePersistenceTests {
         #expect(back.projects.count == 2, "the mutation still landed")
     }
 
+    /// The forgotten-hosts list the Rust UI writes (plan 063 §D7) is
+    /// carried for the same reason `hosts` is, and has the same failure
+    /// mode: a Mac write-through that rebuilt the snapshot without it
+    /// would erase the user's recents. Never read here — this UI is
+    /// in-process and has no host client — only carried.
+    @Test func recentHostsSurviveAnOrdinaryRewrite() async throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let seeded = """
+        {
+            "next_id": 3,
+            "projects": [],
+            "hosts": [{ "id": "h1", "label": "shed", "target": "test1@localhost" }],
+            "recent_hosts": [
+                { "id": "r1", "label": "old-box", "target": "user@old-box" }
+            ]
+        }
+        """
+        try seeded.write(toFile: path, atomically: true, encoding: .utf8)
+
+        let ws = await Workspace(statePath: path)
+        _ = await ws.createProject(name: "Roost", cwd: "/tmp")
+
+        let back = try #require(Self.decodeSnapshot(at: path))
+        #expect(back.recentHosts.count == 1, "recents must survive the rewrite")
+        #expect(back.recentHosts[0].id == "r1")
+        #expect(back.recentHosts[0].label == "old-box")
+        #expect(back.recentHosts[0].target == "user@old-box")
+        #expect(back.hosts.count == 1, "and the saved hosts beside them")
+    }
+
     @Test func legacyStateWithoutHostsLoadsAndRewritesEmpty() async throws {
         let path = tempPath()
         defer { try? FileManager.default.removeItem(atPath: path) }
@@ -989,6 +1020,7 @@ struct WorkspaceStatePersistenceTests {
 
         let back = try #require(Self.decodeSnapshot(at: path))
         #expect(back.hosts.isEmpty, "absent hosts key loads as none")
+        #expect(back.recentHosts.isEmpty, "and an absent recent_hosts key likewise")
     }
 
     @Test func freshWorkspacePersistsEmptyHosts() async throws {

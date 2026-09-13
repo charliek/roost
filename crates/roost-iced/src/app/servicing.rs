@@ -868,6 +868,57 @@ pub(super) fn view_incarnation(incarnation: Option<HostId>) -> HostId {
     incarnation.unwrap_or(HostId::LOCAL)
 }
 
+/// The host half of plan 063 §D9's exit inputs, read off the bands and
+/// the connection set together.
+///
+/// Together, because neither is the whole answer on its own. The band
+/// carries the rows; whether an attempt is in flight is the connection
+/// set's, and an ssh host that reached a session and dropped keeps its
+/// `HostConn` — so a fresh handshake over it still renders
+/// `Disconnected`. Reading only the band would let the last local
+/// project closing during that handshake look like "nothing left
+/// anywhere" and end the process mid-dial.
+pub(super) fn host_exit_rows(
+    views: &[super::HostView],
+    hosts: &crate::host_conn::HostConnSet,
+) -> Vec<local_backend::HostExitRow> {
+    views
+        .iter()
+        .map(|view| local_backend::HostExitRow {
+            // A disconnected section keeps the rows its last connection
+            // published (`HostConnSet::section` hands back the retained
+            // mirror), so this one read covers both halves of §D9's
+            // "live mirror or retained".
+            visible_rows: !view.projects.is_empty(),
+            connecting: view.state == host_sidebar::SectionState::Connecting
+                || hosts.ssh_establishing(&view.saved_id),
+        })
+        .collect()
+}
+
+/// Whether this client still has a connection attempt a host could land
+/// on: an ssh handshake out, or a connection in a state a landing can
+/// still come from.
+///
+/// True the instant an attempt starts, under both transports —
+/// [`HostConnSet::connect`] seats a `Connecting` entry synchronously and
+/// `open_ssh` seats the ssh state — so a purpose armed and read in the
+/// same reconcile is never mistaken for a stale one. False the moment
+/// there is nothing left to land: a failed handshake, a drop, a host
+/// that is no longer saved.
+///
+/// [`HostConnSet::connect`]: crate::host_conn::HostConnSet
+pub(super) fn attempt_alive(hosts: &crate::host_conn::HostConnSet, saved_id: &str) -> bool {
+    hosts.ssh_establishing(saved_id)
+        || matches!(
+            hosts.state(saved_id),
+            Some(
+                crate::host_conn::HostConnState::Connecting { .. }
+                    | crate::host_conn::HostConnState::Connected
+            )
+        )
+}
+
 /// A saved host's target as the sidebar model names it.
 ///
 /// [`host_sidebar::HostTransportKind`] mirrors
@@ -917,6 +968,15 @@ impl App {
         if self.window_id.is_some() {
             self.refresh_pill_labels();
         }
+        // Before the exit rule, and in the same reconcile it was
+        // scheduled by, because §D9's slot carve-out is satisfied by
+        // the removal this may perform: the last project on the slot
+        // closing takes the slot out of the registry, and *that* is
+        // what lets the window close (plan 063 §D6/§D9).
+        // Before both guards below read it: a purpose whose attempt is
+        // over owes nothing and must not hold the window open.
+        self.prune_connect_purposes();
+        self.run_pending_host_removals();
         self.request_exit_if_empty();
         self.reconcile_confirm_delete();
         self.reconcile_tab_drag_preview();
@@ -989,23 +1049,232 @@ impl App {
     /// closing the last tab (the engine cascades tab → project), the
     /// confirm dialog, the palette, and raw `project.delete` over IPC.
     ///
-    /// Boot is safe: `hydrate_workspace` seeds a default project before
-    /// the first reconcile, so the workspace is never observed empty
-    /// except after the user emptied it.
+    /// Boot is safe under `in-process`: `hydrate_workspace` seeds a
+    /// default project before the first reconcile. Under `session` it is
+    /// the *slot* being in the registry that holds the window open
+    /// before the first mirror arrives, which is the same clause that
+    /// keeps it open through a failed spawn.
     ///
-    /// **Except under `local-backend = session`** (plan 063 §D5), where
-    /// the in-process workspace is empty *by design* — nothing is seeded
-    /// into it and the window's content is the slot's. Observing it
-    /// would end the app on its own first reconcile. The full
-    /// every-host-empty predicate that replaces this one is §D9's; this
-    /// clause is the part that has to exist the moment the local band
-    /// can be a session.
+    /// The predicate itself is [`local_backend::exit_on_empty`] — every
+    /// clause of plan 063 §D9, unit-tested a column at a time. This is
+    /// the reading of the app's state that feeds it.
     fn request_exit_if_empty(&mut self) {
-        if self.local_backend == LocalBackendMode::Session {
+        let hosts = host_exit_rows(&self.host_views, &self.hosts);
+        let exit = local_backend::exit_on_empty(local_backend::ExitInput {
+            mode: self.local_backend,
+            local_projects_empty: self.projects.is_empty(),
+            hosts: &hosts,
+            creation_pending: self.host_creation_pending(),
+            // The switch state machine is plan 063 §D8a, which C6
+            // ships; until then nothing can be mid-switch, and the
+            // column is here because the predicate is where it belongs.
+            switch_in_flight: false,
+            slot_registered: self.local_slot_saved_id().is_some(),
+            slot_ever_registered: self.slot_ever_registered.ever(),
+        });
+        if self.exit_state.observe(exit) {
+            tracing::info!("last project closed; exiting");
+        }
+    }
+
+    /// Whether any host is owed a project this client has not delivered
+    /// yet (plan 063 §D6/§D12) — a seed or a create-after-connect,
+    /// either parked against a connect in flight or already dispatched.
+    ///
+    /// Both halves matter: between arming the purpose and the landing
+    /// there is no op to see, and between the dispatch and its reply
+    /// there is no purpose left.
+    ///
+    /// A parked purpose counts only while [`Self::attempt_alive`] says
+    /// there is still an attempt for it to land on. That is a read, not
+    /// a cleanup, deliberately: this guard blocks the exit, and an ssh
+    /// establish that fails permanently publishes **no** `HostState` at
+    /// all, so the one edge that clears a purpose never runs and a
+    /// cleanup living on it would strand the guard for the life of the
+    /// process. Anything that can end an attempt — a failed handshake,
+    /// a drop, a `host.remove` — makes this answer no by construction.
+    fn host_creation_pending(&self) -> bool {
+        self.host_ops.any_create()
+            || self.connect_purposes.iter().any(|(saved_id, purpose)| {
+                *purpose == local_backend::ConnectPurpose::CreateAfterConnect
+                    && attempt_alive(&self.hosts, saved_id)
+            })
+    }
+
+    /// Drop the parked connect purposes whose attempt is over (plan 063
+    /// §D12).
+    ///
+    /// Hygiene *and* correctness: a stale `CreateAfterConnect` left on a
+    /// host would be drained by `settle_connect_purpose` on some later,
+    /// unrelated connect and create a project nobody asked for. Done as
+    /// a sweep over live state rather than as a cleanup hung off each
+    /// way an attempt can end, because one of those ways — a permanent
+    /// ssh establish failure — publishes no `HostState` at all, so the
+    /// cleanup would never run.
+    fn prune_connect_purposes(&mut self) {
+        let Self {
+            connect_purposes,
+            hosts,
+            ..
+        } = self;
+        connect_purposes.retain(|saved_id, purpose| {
+            let alive = attempt_alive(hosts, saved_id);
+            if !alive {
+                tracing::debug!(host = %saved_id, ?purpose, "an attempt ended owing this");
+            }
+            alive
+        });
+    }
+
+    /// Plan 063 §D6: this batch deleted a project and left the host with
+    /// none. Schedule the removal; [`Self::run_pending_host_removal`]
+    /// decides when — and whether — it happens.
+    ///
+    /// One pending removal at a time. Two hosts emptying in the same
+    /// drain is not a case worth a queue: the second one's next batch,
+    /// state change or reconcile re-raises nothing, so it simply keeps
+    /// its band until the user acts. Overwriting rather than refusing
+    /// means the most recent claim is the one held, which is the one
+    /// whose mirror is most likely still empty.
+    fn schedule_host_auto_remove(&mut self, incarnation: HostId, revision: u64) {
+        let Some(saved_id) = self.hosts.owner_of(incarnation) else {
+            return;
+        };
+        tracing::info!(
+            host = %saved_id,
+            revision,
+            "the last project on a host was deleted; scheduling the auto-remove"
+        );
+        // Keyed by host, so two hosts emptying in one drain are two
+        // claims. Re-claiming the same host replaces its entry — and
+        // resets `confirming`, because a newer emptiness is a newer
+        // question than the one already out.
+        self.pending_auto_remove.insert(
+            saved_id,
+            local_backend::PendingAutoRemove {
+                incarnation,
+                revision,
+                confirming: false,
+            },
+        );
+    }
+
+    /// The gate on one scheduled auto-remove (plan 063 §D6), read off
+    /// live state.
+    fn removal_gate(
+        &self,
+        saved_id: &str,
+        pending: &local_backend::PendingAutoRemove,
+    ) -> local_backend::RemovalGate {
+        local_backend::RemovalGate {
+            owned: self.hosts.owns(pending.incarnation),
+            mirror_empty: self
+                .hosts
+                .mirror(pending.incarnation)
+                .is_some_and(|mirror| mirror.read().projects.is_empty()),
+            ops_settled: self.host_ops.settled(saved_id),
+            creation_pending: self.host_ops.creating(saved_id)
+                || (self.connect_purposes.contains_key(saved_id)
+                    && attempt_alive(&self.hosts, saved_id)),
+            // As in `request_exit_if_empty`: C6's latch (§D8a).
+            switch_in_flight: false,
+        }
+    }
+
+    /// Carry every scheduled auto-remove forward one reconcile (plan 063
+    /// §D6).
+    ///
+    /// Nothing is forgotten here. A claim that passes the gate asks the
+    /// **host** whether it is really empty
+    /// ([`crate::host_conn::HostConnSet::confirm_empty`]) and waits for
+    /// the answer; [`Self::host_emptiness_confirmed`] is where a host is
+    /// actually removed. The mirror cannot be the verdict — see that
+    /// method's doc for the two ordinary sequences in which it reads
+    /// empty while the session holds projects.
+    ///
+    /// Taken before it is walked, so the nested `reconcile` any of this
+    /// triggers finds nothing to redo.
+    fn run_pending_host_removals(&mut self) {
+        if self.pending_auto_remove.is_empty() {
             return;
         }
-        if self.exit_state.observe(self.projects.is_empty()) {
-            tracing::info!("last project closed; exiting");
+        let claims = std::mem::take(&mut self.pending_auto_remove);
+        let sweep = local_backend::sweep_removals(claims, |saved_id, pending| {
+            local_backend::removal_step(self.removal_gate(saved_id, pending))
+        });
+        for saved_id in &sweep.dropped {
+            tracing::debug!(
+                host = %saved_id,
+                "dropping an auto-remove whose host is no longer the one it described"
+            );
+        }
+        for (saved_id, incarnation) in &sweep.confirm {
+            tracing::debug!(
+                host = %saved_id,
+                "asking a host whether its last project really is gone"
+            );
+            self.hosts.confirm_empty(saved_id, *incarnation);
+        }
+        self.pending_auto_remove = sweep.keep;
+    }
+
+    /// A host answered the confirming `tab.list` (plan 063 §D6) — the
+    /// only place the auto-remove actually forgets one.
+    ///
+    /// **Why the mirror is not the verdict.** It is a projection that
+    /// lags its session by however long a broadcast takes, and two
+    /// ordinary sequences make it read empty while the session holds
+    /// projects. A creation whose control reply beat its
+    /// `project.created` event: the delete that emptied the band and
+    /// the create that refilled it are both answered, the mirror has
+    /// only the first, and forgetting here loses the replacement (and
+    /// under `session` ends the process over live work). A resumed
+    /// connection replaying a gap: the delete at revision N and the
+    /// create at N+1 are both history, but the mirror passes through
+    /// "empty" between them, and there is nothing on the wire that says
+    /// a replay burst has more to come. The session is the party doing
+    /// the committing, so its own answer cannot be mid-sequence.
+    ///
+    /// The gate is re-read rather than trusted from before the round
+    /// trip: anything may have moved while the question was out.
+    pub(super) fn host_emptiness_confirmed(&mut self, reply: crate::host_conn::HostEmptiness) {
+        let Some(pending) = self.pending_auto_remove.remove(&reply.saved_id) else {
+            return;
+        };
+        if pending.incarnation != reply.incarnation {
+            // A reconnect replaced the connection that was asked; put
+            // the live claim back and let it ask again.
+            self.pending_auto_remove.insert(reply.saved_id, pending);
+            return;
+        }
+        // The claim is no longer "confirming": whatever this answer
+        // says, the question it was waiting on is answered.
+        let mut pending = pending;
+        pending.confirming = false;
+        let step = local_backend::confirmed_step(
+            reply.empty.as_ref().ok().copied(),
+            true,
+            local_backend::removal_step(self.removal_gate(&reply.saved_id, &pending)),
+        );
+        match step {
+            local_backend::ConfirmedStep::Requeue => {
+                self.pending_auto_remove.insert(reply.saved_id, pending);
+            }
+            local_backend::ConfirmedStep::Drop => tracing::info!(
+                host = %reply.saved_id,
+                answered = ?reply.empty,
+                "not forgetting a host after all — its own answer, or the world, disagreed"
+            ),
+            local_backend::ConfirmedStep::Forget => {
+                tracing::info!(
+                    host = %reply.saved_id,
+                    revision = pending.revision,
+                    "forgetting a host whose last project was closed"
+                );
+                if let Err(error) = self.host_remove_requested(&reply.saved_id) {
+                    tracing::warn!(host = %reply.saved_id, %error, "the auto-remove failed");
+                }
+            }
         }
     }
 
@@ -1618,8 +1887,16 @@ impl App {
                     // publishes every effect to every subscriber, and
                     // which of them this client acts on is decided
                     // below — see `apply_host_clipboard_effect`.
-                    if let crate::host_conn::HostWorkspaceEvent::Applied { events, .. } = &event {
+                    if let crate::host_conn::HostWorkspaceEvent::Applied {
+                        events,
+                        revision,
+                        became_empty_by_delete,
+                    } = &event
+                    {
                         task = task.then(self.apply_host_envelopes(host, events));
+                        if *became_empty_by_delete {
+                            self.schedule_host_auto_remove(host, *revision);
+                        }
                     }
                     // The mirror moving leaves the view's copy of it
                     // behind — the tail reconcile is what rebuilds the
@@ -1664,15 +1941,25 @@ impl App {
                             // this client's current config — see
                             // `HostConnSet::wire_agent_hooks`.
                             self.wire_host_agent_hooks(host);
-                            // A picker row that asked to create on a
-                            // session that was not up yet (plan 063
-                            // §D3). Drained on the edge, so the create
-                            // happens exactly once per connect.
-                            if self.pending_create_on_connect.as_deref() == Some(host.as_str()) {
-                                self.pending_create_on_connect = None;
-                                if let Some(incarnation) = self.hosts.incarnation(host) {
-                                    task = task.then(self.create_project_on(incarnation).task);
-                                }
+                            // What this connect owed its landing (plan
+                            // 063 §D12). Drained on the edge, so it is
+                            // spent exactly once per connect.
+                            task = task.then(self.settle_connect_purpose(host));
+                        } else if !matches!(
+                            self.hosts.state(host),
+                            Some(crate::host_conn::HostConnState::Connecting { .. })
+                        ) {
+                            // The attempt ended somewhere other than
+                            // `Connected` and nothing is retrying: a
+                            // purpose parked against a landing that is
+                            // not going to happen would otherwise fire
+                            // on some later connect nobody asked it for.
+                            if let Some(purpose) = self.connect_purposes.remove(host) {
+                                tracing::debug!(
+                                    %host,
+                                    ?purpose,
+                                    "dropping what a failed connect was going to do"
+                                );
                             }
                         }
                         // Attributed (not a stale task's publication): the
@@ -1699,6 +1986,7 @@ impl App {
                 }
                 EngineFeed::HostTunnel(ready) => self.host_tunnel_ready(*ready),
                 EngineFeed::HostBootstrap(event) => self.host_bootstrap_event(*event),
+                EngineFeed::HostEmptiness(reply) => self.host_emptiness_confirmed(*reply),
                 // A signal reached the process (plan 039 §3.9). Same
                 // latch the macOS menu's Quit item uses — `take_exit_task`
                 // (called every `update()`) is what turns this into
@@ -2187,6 +2475,11 @@ impl App {
     /// one that has never connected lists none. With no saved hosts this
     /// clears to empty and the sidebar keeps exactly today's chrome.
     pub(super) fn refresh_host_views(&mut self) {
+        // Read together with the registry below, because the palette's
+        // recents rows are filtered against it (plan 063 §D7): a
+        // recents list taken at a different moment could offer back a
+        // host the sidebar is already showing.
+        self.recent_hosts = self.workspace.recent_hosts();
         self.host_views = self
             .workspace
             .hosts()
@@ -2219,6 +2512,7 @@ impl App {
                     // one that exists before a connection does.
                     label: host.label,
                     transport: transport_kind(&host.target),
+                    target: host.target,
                     reduced_fidelity,
                     reason,
                     host: view_incarnation(incarnation),
@@ -2232,6 +2526,51 @@ impl App {
                 }
             })
             .collect();
+        // One-way, and armed from the registry rather than from the
+        // launch path, so a slot a *user* adds by hand arms it too
+        // (plan 063 §D9). Read by the exit rule below, which cannot
+        // otherwise tell the slot the auto-remove just took out from
+        // one `ensure_local_slot` never managed to save.
+        self.slot_ever_registered
+            .observe(self.local_slot_view().is_some());
+    }
+
+    /// Spend what a connect owed its landing (plan 063 §D6/§D12).
+    ///
+    /// Two things can be owed, and both are creations, which is why one
+    /// place decides between them: a caller that parked
+    /// `CreateAfterConnect` gets its project unconditionally, and every
+    /// purpose that *seeds* gets one only if the host came up holding
+    /// nothing.
+    ///
+    /// The emptiness is read here rather than carried, and it is a
+    /// different question from §D6's `became_empty_by_delete`: a host
+    /// that is empty **at connect** is one nobody emptied — it may never
+    /// have held anything, or another client may have cleared it while
+    /// this one was away — so it is seeded, not forgotten. Only a batch
+    /// this client watched arrive can say a project was deleted.
+    ///
+    /// Safe to read on this edge because the connect publishes its
+    /// `Reset` before `Connected` and the feed preserves that order, so
+    /// the mirror below is the one the fenced `tab.list` built.
+    fn settle_connect_purpose(&mut self, saved_id: &str) -> UiTask {
+        let purpose = self.connect_purposes.remove(saved_id).unwrap_or_default();
+        let Some(incarnation) = self.hosts.incarnation(saved_id) else {
+            return UiTask::None;
+        };
+        let empty = self
+            .hosts
+            .mirror(incarnation)
+            .is_some_and(|mirror| mirror.read().projects.is_empty());
+        let create = match purpose {
+            local_backend::ConnectPurpose::CreateAfterConnect => true,
+            purpose => purpose.seeds() && empty,
+        };
+        if !create {
+            return UiTask::None;
+        }
+        tracing::info!(host = %saved_id, ?purpose, "creating a project on a host that just connected");
+        self.create_host_project_dispatch(incarnation).task
     }
 
     /// *The slot*: the saved host that holds the local band under
@@ -5248,6 +5587,133 @@ mod tests {
         );
 
         supervisor.close(84);
+    }
+
+    /// Plan 063 §D12's parked purposes are read through
+    /// `attempt_alive`, so what it answers is what releases that guard.
+    /// The case that matters is the one no `HostState` is published for:
+    /// a permanent establish failure, where a cleanup hung off the
+    /// state edge would never run and the guard would block the exit
+    /// for the life of the process.
+    #[tokio::test]
+    async fn an_attempt_is_alive_from_the_handshake_until_it_settles() {
+        use crate::host_conn::fixtures::{
+            a_connected_socket_host, a_set, abort_establishes, dropped, refuse, ssh_target,
+            unreachable,
+        };
+        use crate::host_conn::{AttemptCause, ConnectMode, RequestOrigin};
+
+        let (mut set, _feed) = a_set();
+        assert!(
+            !attempt_alive(&set, "h1"),
+            "a host nothing has dialed has no attempt to land on"
+        );
+
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+            AttemptCause::Explicit,
+        );
+        abort_establishes(&mut set);
+        assert!(
+            attempt_alive(&set, "h1"),
+            "alive from the instant the handshake starts, with no connection yet"
+        );
+
+        refuse(&mut set, unreachable());
+        assert!(
+            !attempt_alive(&set, "h1"),
+            "and dead when the handshake fails — the edge that publishes no HostState"
+        );
+
+        // A connection that lands is alive; one that drops is not.
+        // On a socket transport, which has no handshake of its own, so
+        // this half is the connection state alone.
+        let incarnation = a_connected_socket_host(&mut set, "h2", "/nonexistent/roost-alive.sock");
+        assert!(attempt_alive(&set, "h2"));
+        set.apply_state(incarnation, dropped("the connection closed"));
+        assert!(
+            !attempt_alive(&set, "h2"),
+            "a dropped connection is not something a landing can still come from"
+        );
+
+        // And a host that is not saved at all cannot be waiting on one.
+        set.remove("h2");
+        assert!(!attempt_alive(&set, "h2"));
+    }
+
+    /// Plan 063 §D9's `connecting` column, built from the band and the
+    /// connection set together.
+    ///
+    /// The row that matters is the one the band cannot describe: an ssh
+    /// host that reached a session, dropped, and is being dialed again
+    /// keeps its `HostConn`, so the section still renders
+    /// `Disconnected`. Reading only that would let the last local
+    /// project closing during the handshake end the process mid-dial.
+    #[tokio::test]
+    async fn a_band_that_reads_disconnected_mid_handshake_still_blocks_the_exit() {
+        use crate::host_conn::fixtures::{
+            a_dropped_ssh_host, a_set, abort_establishes, refuse, retry_once, unreachable,
+        };
+
+        let (mut hosts, _feed) = a_set();
+        a_dropped_ssh_host(&mut hosts, "/nonexistent/roost-exit-rows.sock");
+        abort_establishes(&mut hosts);
+        assert!(retry_once(&mut hosts), "the armed rung authorized a dial");
+
+        // The band as `refresh_host_views` builds it for this host: a
+        // dropped connection with no rows left to show.
+        let view = super::HostView {
+            saved_id: "h1".to_string(),
+            label: "one".to_string(),
+            target: "workbox".to_string(),
+            transport: host_sidebar::HostTransportKind::Ssh,
+            host: HostId::LOCAL,
+            state: host_sidebar::SectionState::Disconnected,
+            reduced_fidelity: false,
+            reason: None,
+            projects: Vec::new(),
+            active_tab_id: 0,
+            agents: 0,
+        };
+        let views = [view];
+
+        let rows = host_exit_rows(&views, &hosts);
+        assert!(
+            rows[0].connecting,
+            "a handshake in flight is an attempt, whatever the band says"
+        );
+        assert!(!rows[0].visible_rows);
+        assert!(
+            !local_backend::exit_on_empty(local_backend::ExitInput {
+                mode: roost_ipc::LocalBackendMode::InProcess,
+                local_projects_empty: true,
+                hosts: &rows,
+                creation_pending: false,
+                switch_in_flight: false,
+                slot_registered: false,
+                slot_ever_registered: false,
+            }),
+            "and the window stays open through it"
+        );
+
+        // The control the row is worth having: once the handshake
+        // settles, the same band exits.
+        refuse(&mut hosts, unreachable());
+        let settled = host_exit_rows(&views, &hosts);
+        assert!(!settled[0].connecting);
+        assert!(local_backend::exit_on_empty(local_backend::ExitInput {
+            mode: roost_ipc::LocalBackendMode::InProcess,
+            local_projects_empty: true,
+            hosts: &settled,
+            creation_pending: false,
+            switch_in_flight: false,
+            slot_registered: false,
+            slot_ever_registered: false,
+        }));
     }
 
     /// [`App::apply_host_tab_frame`]'s reduced-fidelity edge (plan 056

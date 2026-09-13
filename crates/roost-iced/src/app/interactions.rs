@@ -391,6 +391,14 @@ impl App {
     /// dropping it (`HostOps`' contract), so the completion always
     /// arrives and the editor never sticks open waiting on nothing.
     fn host_rename_dispatch(&mut self, target: RenameTarget, label: &str, op: u64) -> UiTask {
+        // The id was minted by the editor's own state machine, so the
+        // registration is here rather than at a `take_host_op_id`
+        // (plan 063 §D6 tracks every locally-initiated host mutation).
+        self.host_ops.begin(
+            op,
+            self.hosts.owner_of(target.host()),
+            local_backend::HostOpKind::Other,
+        );
         let Some(ops) = self.hosts.ops_for(target.host()).cloned() else {
             return self.engine_op(
                 async move { Err("that host is not accepting operations".to_string()) },
@@ -1211,6 +1219,13 @@ impl App {
         ordered_ids: Vec<i64>,
         op: u64,
     ) -> UiTask {
+        // Same reason as `host_rename_dispatch`: the drag's own state
+        // machine minted the id (plan 063 §D6).
+        self.host_ops.begin(
+            op,
+            self.hosts.owner_of(host),
+            local_backend::HostOpKind::Other,
+        );
         match host_reorder_call(&self.hosts, host, target, &ordered_ids) {
             Some(call) => self.engine_op(
                 async move { call.await.map_err(|error| error.to_string()) },

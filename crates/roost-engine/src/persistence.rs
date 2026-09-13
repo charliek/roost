@@ -78,6 +78,18 @@ pub struct SnapshotFile {
     /// UI) still loads.
     #[serde(default)]
     pub hosts: Vec<HostSnapshot>,
+    /// Hosts the user has *forgotten*, most recent first — what
+    /// `Add Host…` and the creation picker offer to put back (plan 063
+    /// §D7). Written when a host is removed, whether the user asked or
+    /// the last-project auto-remove did.
+    ///
+    /// SSH and socket targets only: this machine's own session is
+    /// implicit (there is always a `localhost` to save again), so
+    /// remembering it would be a row that says nothing. Defaulted like
+    /// `hosts` so a file from an older build — or from the Mac UI, which
+    /// carries this list without reading it — still loads.
+    #[serde(default)]
+    pub recent_hosts: Vec<HostSnapshot>,
 }
 
 fn default_sidebar_width() -> f64 {
@@ -97,6 +109,7 @@ impl Default for SnapshotFile {
             sidebar_collapsed: false,
             sidebar_width: default_sidebar_width(),
             hosts: Vec::new(),
+            recent_hosts: Vec::new(),
         }
     }
 }
@@ -294,6 +307,15 @@ mod tests {
                     last_connected: None,
                 },
             ],
+            // Plan 063 §D7's forgotten hosts: a separate list with the
+            // same shape, so a round trip that folded the two together
+            // would come back with the wrong `hosts`.
+            recent_hosts: vec![HostSnapshot {
+                id: "h3".into(),
+                label: "old-box".into(),
+                target: "user@old-box".into(),
+                last_connected: Some("2026-09-01T00:00:00Z".into()),
+            }],
             projects: vec![ProjectSnapshot {
                 id: 1,
                 name: "Roost".into(),

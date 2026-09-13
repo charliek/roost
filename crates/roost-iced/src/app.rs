@@ -715,7 +715,14 @@ pub enum EngineOpResult {
         tab: TabKey,
         result: Result<CloseTabOutcome, String>,
     },
+    /// `op` is **not** a palette-reply key — a delete reaches the
+    /// palette only through the confirm overlay, which answers
+    /// `palette.activate` the moment it opens. It is the id
+    /// [`local_backend::HostOpsInFlight`] tracks the dispatch by, which
+    /// is what makes plan 063 §D6's auto-remove wait for the very
+    /// deletion that triggered it to be answered first.
     ProjectDeleted {
+        op: u64,
         project: ProjectKey,
         result: Result<DeleteProjectOutcome, String>,
     },
@@ -849,7 +856,9 @@ fn engine_op_status(result: EngineOpResult) -> Option<String> {
                 Some(error)
             }
         },
-        EngineOpResult::ProjectDeleted { project, result } => match result {
+        EngineOpResult::ProjectDeleted {
+            project, result, ..
+        } => match result {
             Ok(DeleteProjectOutcome::Deleted) => None,
             Ok(DeleteProjectOutcome::AlreadyGone) => {
                 tracing::debug!(?project, "confirmed delete: project already gone");
@@ -902,6 +911,27 @@ fn engine_op_status(result: EngineOpResult) -> Option<String> {
 }
 
 impl EngineOpResult {
+    /// The dispatch id this completion carries, where it has one.
+    ///
+    /// Wider than [`Self::palette_op`] on purpose: this is what retires
+    /// a host op from [`local_backend::HostOpsInFlight`], and a delete
+    /// — the one completion that owes no palette reply — is exactly the
+    /// one plan 063 §D6 must not retire early.
+    fn op_id(&self) -> Option<u64> {
+        match self {
+            Self::TabClosed { op, .. }
+            | Self::ProjectDeleted { op, .. }
+            | Self::TabOpened { op, .. }
+            | Self::ProjectCreated { op, .. }
+            | Self::Renamed { op, .. }
+            | Self::TabsReordered { op, .. }
+            | Self::ProjectsReordered { op, .. } => Some(*op),
+            // Not workspace mutations: a verify dials a target that may
+            // not even be saved, and a restart is keyed by saved id.
+            Self::HostVerified { .. } | Self::HostRestarted { .. } => None,
+        }
+    }
+
     /// The id a deferred `palette.activate` reply would be stashed
     /// under. Only the completions whose rows became asynchronous carry
     /// one; the rest can owe no IPC reply, so they answer `None` rather
@@ -2378,11 +2408,37 @@ pub struct App {
     /// the first reconcile that can answer — either by selecting, or by
     /// finding a selection already held.
     pending_initial_local_selection: bool,
-    /// A saved host to create a project on as soon as it connects: the
-    /// picker's `localhost` row when this machine's session was not
-    /// ready (plan 063 §D3). At most one, because at most one picker row
-    /// can be pressed at a time and a second press supersedes.
-    pending_create_on_connect: Option<String>,
+    /// Why each connect this client started was started (plan 063
+    /// §D12), keyed by saved host and drained on the edge where it
+    /// lands. Sparse: [`local_backend::ConnectPurpose::OrdinaryConnect`] is the
+    /// default, so only a connect that owes something is recorded.
+    connect_purposes: HashMap<String, local_backend::ConnectPurpose>,
+    /// Locally-initiated host workspace mutations still awaiting their
+    /// reply (plan 063 §D6). Two clauses read it: the auto-remove waits
+    /// for the deletion that caused it to be answered, and the exit rule
+    /// waits for a creation that is about to fill a band.
+    host_ops: local_backend::HostOpsInFlight,
+    /// The hosts whose last project this client just watched be deleted,
+    /// waiting to be forgotten (plan 063 §D6), keyed by saved host.
+    /// Scheduled where the batch lands and settled by a later reconcile
+    /// — see [`local_backend::removal_step`] for why it is not done on
+    /// the spot.
+    ///
+    /// A **map**, not one slot: one feed drain can carry the last
+    /// deletion on two hosts (the slot's and another's), and a single
+    /// slot would leave whichever came first unscheduled — forgetting
+    /// the wrong host, and under `session` leaving an emptied slot
+    /// registered, which blocks the exit for the life of the process.
+    pending_auto_remove: HashMap<String, local_backend::PendingAutoRemove>,
+    /// The forgotten hosts the palette offers back (plan 063 §D7),
+    /// cached beside `host_views` for the same lifetime reason: the
+    /// rows borrow their strings.
+    recent_hosts: Vec<roost_engine::persistence::HostSnapshot>,
+    /// Whether a slot has ever been in the saved-host registry this run
+    /// (plan 063 §D9). Armed by `refresh_host_views`; read by the exit
+    /// rule, which needs it to tell a slot that *left* the registry
+    /// from one that never got into it.
+    slot_ever_registered: local_backend::SlotEverRegistered,
     /// One entry per saved host, in registry order — the sidebar's host
     /// sections, refreshed by `reconcile`. **Empty with no saved hosts**,
     /// and every host-aware branch in the view is gated on that, which is
@@ -2432,6 +2488,11 @@ struct HostView {
     /// `HostSnapshot.id`, which is what a reconnect verb is addressed to.
     saved_id: String,
     label: String,
+    /// The registry's target string, verbatim. Carried because it is
+    /// what a *recent* is keyed by (plan 063 §D7): the palette offers a
+    /// forgotten host back only while nothing saved reaches the same
+    /// place, and `transport` is a classification, not an identity.
+    target: String,
     /// How this host is reached. Read from the registry rather than from
     /// the connection, so it is known for a host that has never
     /// connected — which is exactly when the macOS gate has to decide
@@ -2682,7 +2743,11 @@ impl App {
             add_host_focus_requested: false,
             pending_host_selection: None,
             pending_initial_local_selection: backend_mode == LocalBackendMode::Session,
-            pending_create_on_connect: None,
+            connect_purposes: HashMap::new(),
+            host_ops: local_backend::HostOpsInFlight::default(),
+            pending_auto_remove: HashMap::new(),
+            recent_hosts: Vec::new(),
+            slot_ever_registered: local_backend::SlotEverRegistered::default(),
             host_views: Vec::new(),
             host_sections: Vec::new(),
             runtime_handle: runtime.handle().clone(),
@@ -2746,6 +2811,14 @@ impl App {
                 crate::host_conn::RequestOrigin::Ipc,
                 |localhost| reconnect_mode(host_verbs::VerbPolicy::current(), localhost, is_slot),
                 crate::host_conn::AttemptCause::AutoReconnect,
+                // The slot has to come up on something: under `session`
+                // it *is* the local band, and an empty one is a window
+                // with nothing in it (plan 063 §D5/§D12).
+                if is_slot {
+                    local_backend::ConnectPurpose::EnsureNonempty
+                } else {
+                    local_backend::ConnectPurpose::OrdinaryConnect
+                },
             );
         }
         if !self.hosts.is_empty() {
@@ -2765,8 +2838,9 @@ impl App {
         origin: crate::host_conn::RequestOrigin,
         mode: impl FnOnce(bool) -> Option<crate::host_conn::ConnectMode>,
         cause: crate::host_conn::AttemptCause,
+        purpose: local_backend::ConnectPurpose,
     ) {
-        host_lifecycle::dial_saved_host(
+        let dialed = host_lifecycle::dial_saved_host(
             self.exit_state,
             &mut self.hosts,
             &mut self.bootstraps,
@@ -2776,6 +2850,19 @@ impl App {
             cause,
             host_verbs::VerbPolicy::current(),
         );
+        // Only against an attempt that started, and only when there is
+        // something to say: the default purpose is what an absent entry
+        // means, so an ordinary connect stores nothing (plan 063 §D12).
+        // A refused dial parking a purpose would leave it to fire on
+        // some later connect nobody asked it for.
+        if !dialed {
+            return;
+        }
+        if purpose == local_backend::ConnectPurpose::default() {
+            self.connect_purposes.remove(&host.id);
+        } else {
+            self.connect_purposes.insert(host.id.clone(), purpose);
+        }
     }
 
     /// An ssh tunnel finished coming up, or failed to. Dialing is the
@@ -3066,6 +3153,19 @@ impl App {
         op
     }
 
+    /// [`Self::take_engine_op_id`] for a mutation addressed to a
+    /// *host*, which also records it as in flight (plan 063 §D6).
+    ///
+    /// Every dispatch that changes what a host holds mints its id here,
+    /// which is what lets the auto-remove wait for the deletion that
+    /// caused it to be answered before it disconnects the queue that
+    /// answer is coming down.
+    fn take_host_op_id(&mut self, host: HostId, kind: local_backend::HostOpKind) -> u64 {
+        let op = self.take_engine_op_id();
+        self.host_ops.begin(op, self.hosts.owner_of(host), kind);
+        op
+    }
+
     /// An engine mutation reported back — `Message::EngineOp`.
     ///
     /// Reconcile runs on every arm, success or failure — including the
@@ -3082,6 +3182,14 @@ impl App {
         // Before the match consumes it: a creation on a host owes the
         // selection the local path gets for free (plan 037 §3.9).
         self.arm_pending_host_selection(&result);
+        // And before the reconcile at the tail, which is where a
+        // scheduled auto-remove asks whether this host's ops have
+        // settled (plan 063 §D6). This completion IS the reply reaching
+        // the main thread, so retiring it here is what makes the answer
+        // "yes, after this one".
+        if let Some(op) = result.op_id() {
+            self.host_ops.finish(op);
+        }
         match result {
             simple @ (EngineOpResult::TabClosed { .. }
             | EngineOpResult::ProjectDeleted { .. }
@@ -5149,7 +5257,7 @@ impl App {
             .host_project_row(project)
             .map(|(_, row)| row.cwd.clone())
             .unwrap_or_default();
-        let op = self.take_engine_op_id();
+        let op = self.take_host_op_id(project.host, local_backend::HostOpKind::Other);
         let project_id = project.project;
         EngineDispatch {
             task: self.engine_op(
@@ -5171,7 +5279,7 @@ impl App {
             self.set_status("that host is not accepting operations".to_string());
             return EngineDispatch::default();
         };
-        let op = self.take_engine_op_id();
+        let op = self.take_host_op_id(host, local_backend::HostOpKind::Create);
         EngineDispatch {
             task: self.engine_op(
                 async move { create_host_project_flow(ops).await },
@@ -5380,15 +5488,25 @@ impl App {
                 return UiTask::None;
             };
             let host_project_id = project.project;
+            let op = self.take_host_op_id(project.host, local_backend::HostOpKind::Other);
             return self.engine_op(
                 async move { delete_host_project_flow(ops, host_project_id).await },
-                move |result| EngineOpResult::ProjectDeleted { project, result },
+                move |result| EngineOpResult::ProjectDeleted {
+                    op,
+                    project,
+                    result,
+                },
             );
         };
+        let op = self.take_engine_op_id();
         let client = self.client.clone();
         self.engine_op(
             async move { delete_project_flow(&client, project_id).await },
-            move |result| EngineOpResult::ProjectDeleted { project, result },
+            move |result| EngineOpResult::ProjectDeleted {
+                op,
+                project,
+                result,
+            },
         )
     }
 
@@ -5428,7 +5546,7 @@ impl App {
             self.set_status("that host is not accepting operations".to_string());
             return EngineDispatch::default();
         };
-        let op = self.take_engine_op_id();
+        let op = self.take_host_op_id(tab.host, local_backend::HostOpKind::Other);
         let tab_id = tab.tab;
         EngineDispatch {
             task: self.engine_op(
@@ -5916,6 +6034,25 @@ impl App {
         origin: crate::host_conn::RequestOrigin,
         cause: crate::host_conn::AttemptCause,
     ) {
+        self.host_reconnect_for(
+            saved_id,
+            origin,
+            cause,
+            local_backend::ConnectPurpose::OrdinaryConnect,
+        );
+    }
+
+    /// [`Self::host_reconnect_requested`] where the caller owes the
+    /// landing something (plan 063 §D12) — a creation of its own, or a
+    /// switch's replay. Every other route wants the ordinary purpose and
+    /// goes through the door above.
+    pub(crate) fn host_reconnect_for(
+        &mut self,
+        saved_id: &str,
+        origin: crate::host_conn::RequestOrigin,
+        cause: crate::host_conn::AttemptCause,
+        purpose: local_backend::ConnectPurpose,
+    ) {
         let Ok(host) = self.saved_host(saved_id) else {
             tracing::debug!(host = %saved_id, "reconnect requested for a host that is not saved");
             return;
@@ -5932,6 +6069,7 @@ impl App {
                 })
             },
             cause,
+            purpose,
         );
     }
 
@@ -5958,6 +6096,19 @@ impl App {
     // `roostctl host` verb, and (for reconnect) the sidebar's inline ↻ —
     // and all three land here rather than each doing its own thing.
 
+    /// The forgotten hosts as the palette's recents rows read them
+    /// (plan 063 §D7), in the order the registry remembers them —
+    /// most recent first.
+    fn host_recent_rows(&self) -> Vec<host_verbs::RecentRow<'_>> {
+        self.recent_hosts
+            .iter()
+            .map(|host| host_verbs::RecentRow {
+                label: host.label.as_str(),
+                target: host.target.as_str(),
+            })
+            .collect()
+    }
+
     /// The saved hosts as the verb policy reads them.
     fn host_verb_rows(&self) -> Vec<host_verbs::HostRow<'_>> {
         self.host_views
@@ -5965,6 +6116,7 @@ impl App {
             .map(|view| host_verbs::HostRow {
                 saved_id: view.saved_id.as_str(),
                 label: view.label.as_str(),
+                target: view.target.as_str(),
                 state: view.state,
                 transport: view.transport,
                 // The band's own derivation, from the band's own
@@ -8531,10 +8683,12 @@ mod tests {
                 result: Ok(CloseTabOutcome::Closed),
             },
             EngineOpResult::ProjectDeleted {
+                op: 0,
                 project: ProjectKey::local(3),
                 result: Ok(DeleteProjectOutcome::AlreadyGone),
             },
             EngineOpResult::ProjectDeleted {
+                op: 0,
                 project: ProjectKey::local(3),
                 result: Ok(DeleteProjectOutcome::Deleted),
             },
@@ -8559,6 +8713,7 @@ mod tests {
         );
         assert_eq!(
             engine_op_status(EngineOpResult::ProjectDeleted {
+                op: 0,
                 project: ProjectKey::local(3),
                 result: Err("delete exploded".into()),
             }),
@@ -8596,16 +8751,28 @@ mod tests {
             runtime.handle().clone(),
             async { panic!("engine op panicked") },
             |result: Result<DeleteProjectOutcome, String>| EngineOpResult::ProjectDeleted {
+                op: 0,
                 project: ProjectKey::local(3),
                 result,
             },
         ));
-        let EngineOpResult::ProjectDeleted { project, result } = panicked else {
+        let EngineOpResult::ProjectDeleted {
+            op,
+            project,
+            result,
+            ..
+        } = panicked
+        else {
             panic!("a delete's join failure must stay a delete completion")
         };
         assert_eq!(project, ProjectKey::local(3));
         assert!(result.is_err(), "a lost task is that op's own error");
-        assert!(engine_op_status(EngineOpResult::ProjectDeleted { project, result }).is_some());
+        assert!(engine_op_status(EngineOpResult::ProjectDeleted {
+            op,
+            project,
+            result
+        })
+        .is_some());
     }
 
     #[test]
@@ -8777,6 +8944,7 @@ mod tests {
             HostView {
                 saved_id: saved_id.to_string(),
                 label: saved_id.to_string(),
+                target: format!("{saved_id}.example"),
                 transport,
                 host: HostId::new(host),
                 state,
@@ -9263,6 +9431,7 @@ mod tests {
         );
         assert_eq!(
             EngineOpResult::ProjectDeleted {
+                op: 0,
                 project: ProjectKey::local(3),
                 result: Ok(DeleteProjectOutcome::Deleted),
             }
