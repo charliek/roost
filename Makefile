@@ -67,7 +67,7 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust test-iced test-mac test-harness test-linux-scripts e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-session e2e-host-client e2e-host-client-ci e2e-host-ssh e2e-host-ssh-ci e2e-host-missing-daemon e2e-host-missing-daemon-ci e2e-host-local-spawn e2e-host-local-spawn-ci e2e-host-localhost e2e-host-localhost-ci e2e-host-bootstrap e2e-host-bootstrap-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle smoke-iced smoke-mac visual-parity smoke-mac-launch test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
+.PHONY: test test-rust which-runner test-iced test-mac test-harness test-linux-scripts e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-session e2e-host-client e2e-host-client-ci e2e-host-ssh e2e-host-ssh-ci e2e-host-missing-daemon e2e-host-missing-daemon-ci e2e-host-local-spawn e2e-host-local-spawn-ci e2e-host-localhost e2e-host-localhost-ci e2e-host-bootstrap e2e-host-bootstrap-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle smoke-iced smoke-mac visual-parity smoke-mac-launch test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
 
 ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_agent_lifecycle.py tools/roosttest/test_agent_hooks.py tools/roosttest/test_agent_palette.py tools/roosttest/test_doctor.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_palette_256.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py tools/roosttest/test_tab_dump_scrollback.py tools/roosttest/test_dock_badge.py tools/roosttest/test_menu_bar.py tools/roosttest/test_sparkle.py tools/roosttest/test_view_perf.py
 # `test_tab_dump_scrollback.py` needs no lane entry for Mac: `e2e-mac`
@@ -216,6 +216,12 @@ test: test-rust test-mac test-harness test-linux-scripts test-mac-scripts  ## Al
 # Serialisation that process isolation would otherwise lose is restored in
 # `.config/nextest.toml`; read that before trusting a parallel run.
 RUST_TEST := $(if $(shell command -v cargo-nextest 2>/dev/null),cargo nextest run,cargo test)
+# Nextest cannot run doctests at all. There are none today, so this is a
+# no-op — but "none today" is not an invariant anyone enforces, and without
+# this line the first doctest anyone writes would pass locally by being
+# skipped and then run for real in CI. `cargo test` already covers them, so
+# the step is only added for the nextest path.
+RUST_DOCTEST := $(if $(shell command -v cargo-nextest 2>/dev/null),cargo test --workspace --doc,true)
 
 # roost-vt's tests/*.rs all start with `#![cfg(feature = "ffi")]`, so the
 # `--workspace` run compiles and then silently skips every one of them. The
@@ -223,6 +229,7 @@ RUST_TEST := $(if $(shell command -v cargo-nextest 2>/dev/null),cargo nextest ru
 # step (.github/workflows/ci.yml, rust job) so `make test` runs them too.
 test-rust:  ## Workspace tests (+ roost-vt ffi and roost-engine server-vt, cfg-gated out of the default run). Uses cargo-nextest when installed.
 	$(RUST_TEST) --workspace
+	$(RUST_DOCTEST)
 	$(RUST_TEST) -p roost-vt --features ffi
 	$(RUST_TEST) -p roost-engine --features server-vt
 

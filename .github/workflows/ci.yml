@@ -20,11 +20,15 @@ permissions:
 # and macOS for 21-54 minutes, so a superseded run burns a full matrix of
 # runner-minutes nobody will read.
 #
-# `cancel-in-progress` is deliberately PR-only: a push to `main` is the
-# post-merge gate a release keys off (release.yml's `ci-gate`), so those
-# runs must always finish even when the next merge lands behind them.
+# A push to `main` gets a group of its own (keyed on the SHA) rather than
+# sharing one with the next push. `cancel-in-progress: false` is not enough
+# on its own: GitHub keeps only ONE pending run per group, so three merges
+# landing while CI is busy silently drop the middle one — and that SHA then
+# has no `ci-success`, which is exactly what release.yml's `ci-gate` looks
+# for when a tag points at it. Per-SHA groups mean main runs never queue
+# behind each other and never displace one another.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

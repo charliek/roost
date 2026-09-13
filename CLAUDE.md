@@ -149,19 +149,13 @@ wrapper small.
   is for cross-crate integration tests, and is impossible in the binary
   crates (`roost-iced`, `roost-cli`) — no lib target to link against.
   Swift tests use `swift-testing` in `mac/Tests/RoostTests/`.
-- **Install [`cargo-nextest`](https://nexte.st)** — `make test-rust` picks it
-  up automatically and runs ~2.5× faster (158s → 63s here), because
-  `cargo test` runs this workspace's 78 test binaries strictly one after
-  another while the suite sits asleep on PTY children and timeout budgets.
-  It is optional, not required: a checkout without it falls back to
-  `cargo test` and runs the identical binaries. `make which-runner` says
-  which one you are getting. Two things to know before trusting a parallel
-  run: nextest gives **each test its own process**, so a test may not rely
-  on in-binary state set by another; and anything throttling a *system-wide*
-  resource needs a group in `.config/nextest.toml` (the PTY-heavy lanes are
-  there — two at once is #444, `openpty` ENXIO on macOS — while the
-  `HOME`/panic-hook mutexes need nothing, since process isolation is a
-  stronger guarantee than the lock they take).
+- **Install [`cargo-nextest`](https://nexte.st)** — optional, but `make
+  test-rust` picks it up and runs ~2.5× faster (158s → 63s). Without it the
+  same binaries run under `cargo test`; `make which-runner` says which you
+  are getting. The one rule it imposes: nextest gives **each test its own
+  process**, so a test may not rely on in-binary state another test set, and
+  anything throttling a *system-wide* resource needs a group in
+  `.config/nextest.toml` — which is where the why is written down.
 - Default to no comments. Add a comment only when the WHY is
   non-obvious — a hidden constraint, a workaround, a tricky
   invariant. Don't comment what well-named code already says.
