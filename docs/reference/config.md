@@ -40,6 +40,7 @@ the launcher with deterministic commands.
 | `link-modifier` | `ctrl \| alt \| super` | Cmd (Mac) / Alt (Linux) | Which held modifier reveals + opens a URL on hover/click. iced-only; the Swift Mac app is fixed to Cmd. See [the dedicated section below](#link-modifier). |
 | `agent-hooks` | `auto \| off` | `auto` | Whether Roost wires the supported coding agents' (Claude Code, Codex, grok/gx, cursor-agent, OpenCode) hook entries into their own config files at startup. See [the dedicated section below](#agent-hooks) and the [Agent Hooks](../guides/agents.md) guide. |
 | `agent-hooks-skip` | comma list | (empty) | Agent names (`claude`, `codex`, `grok`, `cursor`, `opencode`) never wired even when `agent-hooks = auto`. See [below](#agent-hooks). |
+| `local-backend` | `in-process \| session` | `in-process` | Where the tabs you start in the Roost window run: in the UI process (they end when Roost quits), or in a local [host session](../guides/host-sessions.md) (they keep running, and any of your own clients can attach). Linux/iced only; the Swift Mac app is always in-process. An unrecognized value logs a warning and reads as `in-process`. |
 
 ## `copy-on-select`
 

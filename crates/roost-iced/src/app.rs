@@ -39,7 +39,7 @@ use roost_ipc::messages::{
     WindowMetricsResult,
 };
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
-use roost_ipc::IpcServer;
+use roost_ipc::{IpcServer, LocalBackendCell, LocalBackendMode};
 use roost_ui_model::theme::Theme;
 use roost_ui_model::typography::{self, FamilyApply, TerminalTypography};
 use roost_ui_model::{
@@ -85,6 +85,7 @@ pub(crate) mod host_lifecycle;
 pub(crate) mod host_notice;
 pub(crate) mod host_tab;
 mod interactions;
+mod local_backend;
 mod palettes;
 mod servicing;
 mod tab_backend;
@@ -2028,6 +2029,12 @@ pub struct App {
     /// answers everything it still holds.
     gestures: file_transfer::Gestures,
     config: RoostConfig,
+    /// Where this UI's own tabs run (plan 063 §D1), read once from the
+    /// `local-backend` key at bootstrap.
+    local_backend: LocalBackendMode,
+    /// What the IPC handler answers `identify` from. Written only by
+    /// [`Self::publish_local_route`].
+    local_route: Arc<LocalBackendCell>,
     typography: TerminalTypography,
     font_registry: &'static FontRegistry,
     terminal_metrics: TerminalMetrics,
@@ -2319,6 +2326,13 @@ impl App {
         let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
         runtime.spawn(engine_feed::pump_ui_requests(ui_rx, feed_tx.clone()));
         spawn_quit_signals(&runtime, &feed_tx)?;
+        // Seeded before the socket is bound: a client that dials during
+        // the rest of bootstrap must never be told the wrong backend.
+        let backend_mode = LocalBackendMode::from(config.local_backend);
+        let local_route = Arc::new(LocalBackendCell::new(local_backend::route_snapshot(
+            backend_mode,
+            None,
+        )));
         let handler = IpcHandler::new(
             Arc::clone(&workspace),
             Arc::clone(&supervisor),
@@ -2326,7 +2340,8 @@ impl App {
             profile.app_label,
             profile.app_id,
         )
-        .with_ui(ui_tx);
+        .with_ui(ui_tx)
+        .with_local_route(Arc::clone(&local_route));
         let server = runtime
             .block_on(IpcServer::bind(&profile.socket_path, handler))
             .context("bind Iced IPC server")?;
@@ -2377,6 +2392,8 @@ impl App {
             file_drops: FileDropQueue::default(),
             gestures: file_transfer::Gestures::default(),
             config,
+            local_backend: backend_mode,
+            local_route,
             typography,
             font_registry,
             terminal_metrics,
@@ -2445,11 +2462,23 @@ impl App {
             runtime,
             _locks: locks,
         };
+        app.publish_local_route();
         app.reconcile();
         app.resize(app.window_size);
         app.reconnect_saved_hosts();
         tracing::info!(socket = %profile.socket_path.display(), "Iced walking skeleton ready");
         Ok(app)
+    }
+
+    /// Republish the local-backend route for the IPC handler to read.
+    ///
+    /// The single writer of the shared cell: every change to the mode
+    /// or to the slot's selection goes through here, so `identify` (and
+    /// what a bare id means over the UI socket) can never disagree with
+    /// what the UI is actually doing.
+    fn publish_local_route(&self) {
+        self.local_route
+            .store(local_backend::route_snapshot(self.local_backend, None));
     }
 
     /// Launch-time auto-reconnect for saved host sessions: **connect if

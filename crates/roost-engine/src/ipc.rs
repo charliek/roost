@@ -58,7 +58,7 @@ use roost_ipc::messages::{
 use roost_ipc::messages::{SessionSetThemeResult, TabAttachResult};
 use roost_ipc::{
     CloseReason, ConnAction, ConnCloser, ConnCtx, Handler, HandlerError, HandlerOutcome,
-    StopFinalizer,
+    LocalBackendCell, LocalBackendMode, LocalRoute, StopFinalizer,
 };
 
 /// Text snapshot of a tab's terminal viewport, produced on the UI
@@ -1566,6 +1566,11 @@ pub struct IpcHandler {
     /// `not-supported` — the daemon owns the directory because the
     /// daemon is what sweeps it.
     files: Option<FileStore>,
+    /// Set by the running UI: where its own local tabs live (plan 063
+    /// §D1). A session daemon never installs one — its tabs are the
+    /// session's — so `identify` on a session socket keeps answering
+    /// exactly what it always has.
+    local_route: Option<Arc<LocalBackendCell>>,
 }
 
 impl IpcHandler {
@@ -1587,6 +1592,7 @@ impl IpcHandler {
             push_limits: PushLimits::default(),
             agent_hooks: None,
             files: None,
+            local_route: None,
         }
     }
 
@@ -1623,6 +1629,24 @@ impl IpcHandler {
     pub fn with_ui(mut self, tx: tokio::sync::mpsc::UnboundedSender<UiRequest>) -> Self {
         self.ui_tx = Some(tx);
         self
+    }
+
+    /// Share the UI's local-backend route (plan 063 §D1). The UI writes
+    /// the cell on every mode/selection change; this handler only reads
+    /// it.
+    #[must_use]
+    pub fn with_local_route(mut self, cell: Arc<LocalBackendCell>) -> Self {
+        self.local_route = Some(cell);
+        self
+    }
+
+    /// The current local-backend snapshot, defaulted to in-process
+    /// wherever no UI installed a cell.
+    fn local_route(&self) -> Arc<LocalRoute> {
+        self.local_route
+            .as_ref()
+            .map(|cell| cell.load())
+            .unwrap_or_default()
     }
 
     /// Promote this handler to a host-session socket: `session.identify`
@@ -2865,6 +2889,13 @@ async fn session_stop(
     })
 }
 
+/// Where the local host session listens, for a client that wants the
+/// events a UI socket cannot serve. Only under `session` — in-process
+/// has no slot to point at.
+fn local_session_socket(mode: LocalBackendMode) -> Option<String> {
+    (mode == LocalBackendMode::Session).then(roost_ipc::session_socket_path)?
+}
+
 async fn dispatch(
     h: &IpcHandler,
     op: &str,
@@ -2873,7 +2904,15 @@ async fn dispatch(
     match op {
         ops::IDENTIFY => {
             let _p: IdentifyParams = decode(params)?;
-            let (active_project_id, active_tab_id) = h.workspace.active();
+            let route = h.local_route();
+            // Under `session` this socket's own workspace is empty, so
+            // `workspace.active()` would answer `0` and `roostctl` with
+            // no `--tab` would have nothing to act on. A bare id means
+            // the slot's id there (plan 063 §D10), and so does this.
+            let (active_project_id, active_tab_id) = match route.mode {
+                LocalBackendMode::Session => route.slot_active.unwrap_or((0, 0)),
+                LocalBackendMode::InProcess => h.workspace.active(),
+            };
             let result = IdentifyResult {
                 socket_path: h.socket_path.to_string_lossy().into(),
                 pid: std::process::id() as i32,
@@ -2883,6 +2922,8 @@ async fn dispatch(
                 app_id: h.app_id.clone(),
                 ui_version: env!("CARGO_PKG_VERSION").into(),
                 protocol_version: roost_ipc::PROTOCOL_VERSION,
+                local_backend: route.mode,
+                local_session_socket: local_session_socket(route.mode),
             };
             encode(&result)
         }
@@ -3992,6 +4033,7 @@ fn parse_clipboard_op(s: &str) -> Result<ClipboardOp, HandlerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roost_ipc::paths::BundleProfile;
 
     fn session_state() -> SessionState {
         SessionState {
@@ -4284,5 +4326,108 @@ mod tests {
     #[test]
     fn a_cancelled_spawn_is_not_found_on_the_wire() {
         assert_eq!(pty_err(&PtyError::Cancelled(7)).code, "not-found");
+    }
+
+    // ----- identify's local-backend fields (plan 063 §D1) ------------
+
+    /// A handler over a workspace holding one project and one tab, so
+    /// `workspace.active()` is something a slot override can differ
+    /// from.
+    fn identify_handler(dir: &std::path::Path) -> IpcHandler {
+        let workspace = Arc::new(Workspace::open(dir.join("state.json")));
+        let project = workspace.create_project("p", "/tmp").expect("project");
+        workspace
+            .open_tab(project.id, "/tmp", "t")
+            .expect("open a tab");
+        assert_ne!(workspace.active(), (0, 0), "the fixture needs a selection");
+        IpcHandler::new(
+            workspace,
+            Arc::new(PtySupervisor::new()),
+            dir.join("roost.sock"),
+            "Roost-test",
+            "ai.stridelabs.Roost.test",
+        )
+    }
+
+    async fn identify_of(h: &IpcHandler) -> IdentifyResult {
+        let value = dispatch(h, ops::IDENTIFY, serde_json::json!({}))
+            .await
+            .expect("identify");
+        serde_json::from_value(value).expect("decode identify")
+    }
+
+    #[tokio::test]
+    async fn identify_reports_the_in_process_backend_when_no_route_is_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path());
+        let id = identify_of(&h).await;
+
+        assert_eq!(id.local_backend, LocalBackendMode::InProcess);
+        assert_eq!(id.local_session_socket, None);
+        assert_eq!(
+            (id.active_project_id, id.active_tab_id),
+            h.workspace.active()
+        );
+    }
+
+    /// Under `session` the ids on the wire are the slot's UI-selected
+    /// ones, not this socket's own (empty) workspace — and the answer
+    /// tracks the cell, which is how a mode change reaches `identify`
+    /// at all.
+    #[tokio::test]
+    async fn identify_under_session_follows_the_route_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        let cell = Arc::new(LocalBackendCell::default());
+        let h = identify_handler(dir.path()).with_local_route(Arc::clone(&cell));
+        let local = h.workspace.active();
+
+        // Installed but still in-process: unchanged from above.
+        let id = identify_of(&h).await;
+        assert_eq!((id.active_project_id, id.active_tab_id), local);
+        assert_eq!(id.local_backend, LocalBackendMode::InProcess);
+
+        cell.store(LocalRoute {
+            mode: LocalBackendMode::Session,
+            slot_socket: Some("/ignored/by/identify.sock".into()),
+            slot_active: Some((41, 42)),
+        });
+        let id = identify_of(&h).await;
+        assert_eq!(id.local_backend, LocalBackendMode::Session);
+        assert_eq!((id.active_project_id, id.active_tab_id), (41, 42));
+        assert_ne!((id.active_project_id, id.active_tab_id), local);
+        // Profile-derived, not the cell's `slot_socket`.
+        let expected = BundleProfile::session().unwrap().socket_path;
+        assert_eq!(
+            id.local_session_socket.as_deref(),
+            Some(expected.to_string_lossy().as_ref())
+        );
+
+        // No slot selection yet reports the same "nothing selected" the
+        // local path does.
+        cell.store(LocalRoute {
+            mode: LocalBackendMode::Session,
+            slot_socket: None,
+            slot_active: None,
+        });
+        let id = identify_of(&h).await;
+        assert_eq!((id.active_project_id, id.active_tab_id), (0, 0));
+    }
+
+    /// A session daemon installs no route cell, so its `identify` is
+    /// byte-for-byte what it was before the fields existed: its own
+    /// workspace's selection, in-process, no session socket.
+    #[tokio::test]
+    async fn a_session_sockets_identify_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path())
+            .with_session(session_state().info, StopHandle::new(|| async {}));
+        let id = identify_of(&h).await;
+
+        assert_eq!(id.local_backend, LocalBackendMode::InProcess);
+        assert_eq!(id.local_session_socket, None);
+        assert_eq!(
+            (id.active_project_id, id.active_tab_id),
+            h.workspace.active()
+        );
     }
 }

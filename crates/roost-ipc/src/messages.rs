@@ -19,6 +19,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentLifecycle, AgentTabState, Ownership, ShellState};
+use crate::local_route::LocalBackendMode;
 
 // ============================================================================
 // Shared types
@@ -251,6 +252,16 @@ pub struct IdentifyResult {
     pub app_id: String,
     pub ui_version: String,
     pub protocol_version: u32,
+    /// Which local backend this UI runs its own tabs on (plan 063 §D1).
+    /// Absent from a Swift reply, which is always in-process — the
+    /// default this deserializes to.
+    #[serde(default)]
+    pub local_backend: LocalBackendMode,
+    /// The local host session's socket, present only under
+    /// `local_backend = session`. A client that wants the events a UI
+    /// socket cannot serve subscribes there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_session_socket: Option<String>,
 }
 
 // ============================================================================
@@ -4496,5 +4507,33 @@ mod tests {
         let extra = r#"{"event":"tab.opened","data":{},"extra":1}"#;
         let parsed: EventEnvelope = serde_json::from_str(extra).unwrap();
         assert_eq!(parsed.event, "tab.opened");
+    }
+
+    /// The Swift UI answers `identify` from its own struct and has never
+    /// heard of `local_backend`, which is correct of it — the Mac app is
+    /// always in-process. The Rust client has to read that reply anyway,
+    /// so both fields default rather than fail.
+    #[test]
+    fn an_identify_without_the_local_backend_fields_still_decodes() {
+        let swift = r#"{
+            "socket_path": "/Users/me/Library/Caches/Roost/roost.sock",
+            "pid": 12345,
+            "active_project_id": "1",
+            "active_tab_id": "3",
+            "app_label": "Roost",
+            "app_id": "ai.stridelabs.Roost",
+            "ui_version": "0.7.0",
+            "protocol_version": 1
+        }"#;
+        let parsed: IdentifyResult = serde_json::from_str(swift).expect("decode");
+        assert_eq!(parsed.local_backend, LocalBackendMode::InProcess);
+        assert_eq!(parsed.local_session_socket, None);
+        // Re-encoding adds `local_backend` but still omits the socket:
+        // a Rust in-process reply is the Swift shape plus one field a
+        // client ignores, which is the additive direction the matrix in
+        // `docs/reference/ipc-compatibility.md` allows for free.
+        let json = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(json["local_backend"], "in-process");
+        assert!(json.get("local_session_socket").is_none());
     }
 }

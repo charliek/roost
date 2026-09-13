@@ -13,6 +13,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use roost_ipc::LocalBackendMode;
+
 use crate::custom_command::{self, CustomCommand};
 use crate::keybind::{self, AccelMods};
 use crate::provider::{self, Provider};
@@ -80,6 +82,17 @@ pub struct RoostConfig {
     /// does (`roost-agent-install`) is also the one that can name the
     /// spellings it did not recognise.
     pub agent_hooks_skip: Vec<String>,
+
+    /// `local-backend` — where the UI's own tabs run (plan 063 §D1).
+    /// Defaults to [`LocalBackend::InProcess`], which an unparseable
+    /// value also resolves to.
+    pub local_backend: LocalBackend,
+
+    /// Whether a `local-backend` line was present at all — parseable or
+    /// not. The fresh-install default keys on the key never having been
+    /// written, so a typo must not read as "never configured" and
+    /// silently move a user's tabs to a session.
+    pub local_backend_key_present: bool,
 }
 
 impl Default for RoostConfig {
@@ -98,6 +111,51 @@ impl Default for RoostConfig {
             show_sidebar_agents: true,
             agent_hooks: AgentHooks::default(),
             agent_hooks_skip: Vec::new(),
+            local_backend: LocalBackend::default(),
+            local_backend_key_present: false,
+        }
+    }
+}
+
+/// Two-state `local-backend` policy (plan 063 §D1) — where the UI's own
+/// tabs run.
+///
+/// * `InProcess` (default) — PTYs in the UI process, as they have
+///   always been (DL-4). They die with the app and no other client can
+///   attach to them.
+/// * `Session` — the local tabs live in a `roost-session` daemon on
+///   this machine, so they survive quit and any same-UID client can
+///   subscribe, attach and type.
+///
+/// [`roost_ipc::LocalBackendMode`] is the same two states in a crate
+/// `roost-engine` can see; the `From` below is the only conversion.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum LocalBackend {
+    #[default]
+    InProcess,
+    Session,
+}
+
+impl LocalBackend {
+    /// Parse a config value. Unlike its switch-shaped neighbours this
+    /// takes only the two documented spellings — there is no
+    /// boolean-ish reading of "in-process" that a user would expect to
+    /// work. Any other value returns `None` so the caller can warn and
+    /// keep the default.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "in-process" => Some(Self::InProcess),
+            "session" => Some(Self::Session),
+            _ => None,
+        }
+    }
+}
+
+impl From<LocalBackend> for LocalBackendMode {
+    fn from(value: LocalBackend) -> Self {
+        match value {
+            LocalBackend::InProcess => Self::InProcess,
+            LocalBackend::Session => Self::Session,
         }
     }
 }
@@ -335,6 +393,24 @@ impl RoostConfig {
                                 "unknown agent-hooks value; falling back to default `auto`"
                             );
                             AgentHooks::default()
+                        }
+                    };
+                }
+                "local-backend" => {
+                    // Presence is recorded even when the value is
+                    // rubbish: it is what tells the launch ladder
+                    // "configured, badly" from "never configured", and
+                    // only the latter may pick a default of its own.
+                    cfg.local_backend_key_present = true;
+                    cfg.local_backend = match LocalBackend::parse(value) {
+                        Some(v) => v,
+                        None => {
+                            tracing::warn!(
+                                value,
+                                "unknown local-backend value; expected in-process|session, \
+                                 falling back to default `in-process`"
+                            );
+                            LocalBackend::default()
                         }
                     };
                 }
@@ -947,6 +1023,47 @@ mod tests {
     fn agent_hooks_skip_accepts_a_quoted_value() {
         let cfg = RoostConfig::parse("agent-hooks-skip = \"codex, grok\"");
         assert_eq!(cfg.agent_hooks_skip, vec!["codex", "grok"]);
+    }
+
+    // ----- local-backend (plan 063 §D1) ------------------------------
+
+    #[test]
+    fn local_backend_defaults_to_in_process_with_the_key_absent() {
+        let cfg = RoostConfig::parse("theme = Dracula\n");
+        assert_eq!(cfg.local_backend, LocalBackend::InProcess);
+        assert!(!cfg.local_backend_key_present);
+    }
+
+    #[test]
+    fn local_backend_accepts_its_two_documented_spellings() {
+        for (body, want) in [
+            ("local-backend = in-process", LocalBackend::InProcess),
+            ("local-backend = session", LocalBackend::Session),
+            ("local-backend = \"session\"", LocalBackend::Session),
+            ("local-backend = SESSION\r\n", LocalBackend::Session),
+        ] {
+            let cfg = RoostConfig::parse(body);
+            assert_eq!(cfg.local_backend, want, "{body:?}");
+            assert!(cfg.local_backend_key_present, "{body:?}");
+        }
+    }
+
+    /// A value nobody can parse still counts as *configured*. The
+    /// fresh-install default writes the key only when it was never
+    /// written, and a typo that read as "never configured" would move a
+    /// user's local tabs onto a session behind their back.
+    #[test]
+    fn local_backend_unknown_value_is_in_process_but_still_counts_as_configured() {
+        for body in [
+            "local-backend = pancakes",
+            "local-backend =",
+            "local-backend = in_process",
+            "local-backend = session\nlocal-backend = pancakes",
+        ] {
+            let cfg = RoostConfig::parse(body);
+            assert_eq!(cfg.local_backend, LocalBackend::InProcess, "{body:?}");
+            assert!(cfg.local_backend_key_present, "{body:?}");
+        }
     }
 
     // ----- unquote semantic (mirrors Config.swift's `unquote`) -------

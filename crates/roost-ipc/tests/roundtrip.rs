@@ -4,6 +4,7 @@
 
 use roost_ipc::agent::AgentLifecycle;
 use roost_ipc::messages::*;
+use roost_ipc::LocalBackendMode;
 
 fn round_trip_to_value<T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug>(
     v: &T,
@@ -434,4 +435,51 @@ fn file_transfer_vectors_decode_as_typed_params_and_results() {
     assert_eq!(result.skipped[0].path, params.paths[1]);
     assert_eq!(result.skipped[0].reason, "directory");
     assert_eq!(serde_json::to_value(&result).unwrap(), response["result"]);
+}
+
+/// The two `identify` vectors are the wire's record of plan 063's
+/// additive response fields, and the pair is the point: the pre-063 file
+/// is what a Swift UI still answers, the session one is what an iced UI
+/// answers under `local-backend = session`. Decoding both against the
+/// *current* struct is the old-server → new-client direction of the
+/// compatibility matrix, which is the direction `#[serde(default)]` on
+/// those two fields exists to satisfy.
+#[test]
+fn both_identify_vectors_decode_as_the_current_typed_result() {
+    fn vector(name: &str) -> serde_json::Value {
+        let path = format!(
+            "{}/../../tests/ipc-vectors/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {path}: {e}"))
+    }
+
+    let pre_063 = vector("identify.response.json");
+    let result: IdentifyResult =
+        serde_json::from_value(pre_063["result"].clone()).expect("pre-063 identify decodes");
+    assert_eq!(result.local_backend, LocalBackendMode::InProcess);
+    assert_eq!(result.local_session_socket, None);
+    // Re-encoding is deliberately NOT byte-compared: an in-process reply
+    // now carries `local_backend`, which is exactly the additive
+    // new-server → old-client change the vector predates. The vector
+    // stays as recorded (`docs/reference/ipc-compatibility.md`).
+    assert_eq!(result.active_tab_id, 3);
+
+    let session = vector("identify.session.response.json");
+    let result: IdentifyResult =
+        serde_json::from_value(session["result"].clone()).expect("session identify decodes");
+    assert_eq!(result.local_backend, LocalBackendMode::Session);
+    assert_eq!(
+        result.local_session_socket.as_deref(),
+        Some("/run/user/1000/roost-session/roost.sock")
+    );
+    // Under `session` the ids on the wire are the slot's selection, not
+    // this socket's own workspace — the reason the field pair exists.
+    assert_eq!((result.active_project_id, result.active_tab_id), (4, 9));
+    assert_eq!(
+        serde_json::to_value(&result).unwrap(),
+        session["result"],
+        "typed re-encode must match the vector"
+    );
 }

@@ -2056,13 +2056,18 @@ fn ui_checks(inputs: &Inputs, tab_list: &TabList, model: AgentModel) -> Vec<Chec
             Ok(id) => (
                 Status::Ok,
                 format!(
-                    "{} ({}) pid={} ui_version={} protocol_version={} active_tab={} socket={}",
+                    "{} ({}) pid={} ui_version={} protocol_version={} active_tab={} \
+                     local_backend={} local_session_socket={} socket={}",
                     redact(&id.app_label),
                     redact(&id.app_id),
                     id.pid,
                     redact(&id.ui_version),
                     id.protocol_version,
                     id.active_tab_id,
+                    id.local_backend,
+                    id.local_session_socket
+                        .as_deref()
+                        .map_or_else(|| "none".to_string(), redact),
                     redact(&id.socket_path)
                 ),
             ),
@@ -3738,6 +3743,7 @@ mod tests {
     use super::*;
     use roost_ipc::agent::{AgentLifecycle, Ownership, ShellState};
     use roost_ipc::messages::TabState;
+    use roost_ipc::LocalBackendMode;
 
     // ---------------------------------------------------------- fixtures
 
@@ -3751,6 +3757,8 @@ mod tests {
             app_id: "ai.stridelabs.Roost".into(),
             ui_version: ui_version.into(),
             protocol_version: 1,
+            local_backend: LocalBackendMode::InProcess,
+            local_session_socket: None,
         }
     }
 

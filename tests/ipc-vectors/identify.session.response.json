@@ -1,0 +1,16 @@
+{
+  "id": "1",
+  "ok": true,
+  "result": {
+    "socket_path": "/run/user/1000/roost/roost.sock",
+    "pid": 12345,
+    "active_project_id": "4",
+    "active_tab_id": "9",
+    "app_label": "Roost",
+    "app_id": "ai.stridelabs.Roost",
+    "ui_version": "0.7.0",
+    "protocol_version": 1,
+    "local_backend": "session",
+    "local_session_socket": "/run/user/1000/roost-session/roost.sock"
+  }
+}
