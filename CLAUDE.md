@@ -149,6 +149,13 @@ wrapper small.
   is for cross-crate integration tests, and is impossible in the binary
   crates (`roost-iced`, `roost-cli`) — no lib target to link against.
   Swift tests use `swift-testing` in `mac/Tests/RoostTests/`.
+- **Install [`cargo-nextest`](https://nexte.st)** — optional, but `make
+  test-rust` picks it up and runs ~2.5× faster (158s → 63s). Without it the
+  same binaries run under `cargo test`; `make which-runner` says which you
+  are getting. The one rule it imposes: nextest gives **each test its own
+  process**, so a test may not rely on in-binary state another test set, and
+  anything throttling a *system-wide* resource needs a group in
+  `.config/nextest.toml` — which is where the why is written down.
 - Default to no comments. Add a comment only when the WHY is
   non-obvious — a hidden constraint, a workaround, a tricky
   invariant. Don't comment what well-named code already says.
