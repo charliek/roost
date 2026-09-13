@@ -859,7 +859,7 @@ impl EngineOpResult {
 /// error is reported and the completion's reconcile shows the rollback,
 /// exactly as the blocking version behaved when its second call failed.
 async fn create_project_flow(client: &LocalClient) -> Result<(i64, i64), String> {
-    let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+    let cwd = roost_engine::home_dir();
     let project = client
         .create_project("", &cwd)
         .await
@@ -897,9 +897,28 @@ async fn host_call<T: serde::de::DeserializeOwned>(
 /// The cwd is deliberately left empty rather than filled with this
 /// machine's `$HOME`. A remote host's home directory is not ours, and a
 /// path that does not exist over there would spawn a shell in a
-/// directory nobody chose — the session falls back to its own launch cwd
-/// for an empty one, which is the closest thing to "wherever that
+/// directory nobody chose — the engine resolves an empty cwd to its own
+/// `$HOME` at create time, which is the closest thing to "wherever that
 /// machine starts things".
+///
+/// A tab-open failure after the create committed rolls the project back
+/// too, mirroring [`create_project_flow`]'s local twin: there the
+/// engine's own spawn-failure path closes the seed tab it opened, and
+/// closing a project's *last* tab deletes the project.
+///
+/// That word is the whole guard. Across the wire there is no cascade, so
+/// the rollback is an explicit `project.delete` — and an unconditional
+/// one would delete a project that is no longer empty. Two ways it can
+/// have stopped being empty: the `tab.open` reply was lost rather than
+/// refused (the tab exists on the host, we just never heard), or another
+/// client opened a tab in the brand-new project first — a session serves
+/// every client at once, which is the point of it. So the failure path
+/// re-reads the host's own tab list and deletes only a project that is
+/// still empty there.
+///
+/// A rollback that itself fails is logged, not surfaced: the caller
+/// already has the tab-open error to report, and a project the rollback
+/// declined or could not remove is visible for the user to delete.
 async fn create_host_project_flow(ops: crate::host_conn::HostOps) -> Result<(i64, i64), String> {
     use roost_ipc::messages::{ops as wire, ProjectCreateResult, TabOpenResult};
     let created: ProjectCreateResult = host_call(
@@ -909,13 +928,54 @@ async fn create_host_project_flow(ops: crate::host_conn::HostOps) -> Result<(i64
     )
     .await?;
     let project = created.project;
-    let opened: TabOpenResult = host_call(
+    let opened: Result<TabOpenResult, String> = host_call(
         &ops,
         wire::TAB_OPEN,
         host_tab_open_params(project.id, &project.cwd),
     )
-    .await?;
-    Ok((project.id, opened.tab.id))
+    .await;
+    match opened {
+        Ok(opened) => Ok((project.id, opened.tab.id)),
+        Err(error) => {
+            if let Err(rollback_error) = roll_back_empty_host_project(&ops, project.id).await {
+                tracing::warn!(
+                    project_id = project.id,
+                    %rollback_error,
+                    "rolling back a host project after a failed tab.open also failed"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Delete `project_id` on the host, but only while the host still says it
+/// holds no tabs. See [`create_host_project_flow`] for why the emptiness
+/// is re-read rather than assumed.
+async fn roll_back_empty_host_project(
+    ops: &crate::host_conn::HostOps,
+    project_id: i64,
+) -> Result<(), String> {
+    use roost_ipc::messages::{ops as wire, TabListResult};
+    let listed: TabListResult = host_call(ops, wire::TAB_LIST, serde_json::json!({})).await?;
+    match listed.projects.iter().find(|p| p.id == project_id) {
+        None => Ok(()),
+        Some(project) if !project.tabs.is_empty() => {
+            tracing::info!(
+                project_id,
+                tabs = project.tabs.len(),
+                "not rolling back a host project that is no longer empty"
+            );
+            Ok(())
+        }
+        Some(_) => host_call::<serde_json::Value>(
+            ops,
+            wire::PROJECT_DELETE,
+            serde_json::json!({ "project_id": project_id.to_string() }),
+        )
+        .await
+        .map(|_| ()),
+    }
 }
 
 /// A host op that removes something, where "it is already gone" is the
@@ -7243,8 +7303,8 @@ impl Drop for App {
 fn hydrate_workspace(runtime: &tokio::runtime::Runtime, client: &LocalClient) -> Result<()> {
     let mut projects = runtime.block_on(client.list_projects())?;
     if projects.is_empty() {
-        let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-        projects.push(runtime.block_on(client.create_project("Roost", &cwd))?);
+        let cwd = roost_engine::home_dir();
+        projects.push(runtime.block_on(client.create_project("", &cwd))?);
     }
     let restore = client.workspace.take_restore_layout();
     for project in &projects {
@@ -8149,6 +8209,228 @@ mod tests {
         );
 
         supervisor.close(doomed_tab_id);
+    }
+
+    /// A host project with no tabs, as `tab.list` would report the one
+    /// `project.create` just made.
+    fn empty_project(id: i64) -> Project {
+        Project {
+            id,
+            name: "Untitled 1".into(),
+            cwd: "/home/x".into(),
+            position: 0,
+            created_at: 0,
+            tabs: vec![],
+        }
+    }
+
+    /// [`create_host_project_flow`]'s twin to the mid-flow-failure test
+    /// above: there is no engine-side cascade across the wire, so a
+    /// failed `tab.open` must be followed by an explicit rollback
+    /// `project.delete` for the project the create just committed.
+    #[tokio::test]
+    async fn host_create_rolls_back_the_project_when_tab_open_fails() {
+        use roost_ipc::client::ServerCode;
+        use roost_ipc::messages::{ops as wire, ProjectCreateResult, TabListResult};
+
+        let (ops, mut rx) = crate::host_conn::HostOps::channel();
+        let worker = tokio::spawn(async move {
+            let create = rx.recv().await.expect("project.create sent");
+            assert_eq!(create.op, wire::PROJECT_CREATE);
+            let project = Project {
+                id: 42,
+                name: "Untitled 1".into(),
+                cwd: "/home/x".into(),
+                position: 0,
+                created_at: 0,
+                tabs: vec![],
+            };
+            create.answer(Ok(
+                serde_json::to_value(ProjectCreateResult { project }).unwrap()
+            ));
+
+            let open = rx.recv().await.expect("tab.open sent");
+            assert_eq!(open.op, wire::TAB_OPEN);
+            open.answer(Err(crate::host_conn::HostOpError::Rejected {
+                code: ServerCode::InvalidParam,
+                message: "no such directory".into(),
+            }));
+
+            let listed = rx.recv().await.expect("tab.list sent before the rollback");
+            assert_eq!(listed.op, wire::TAB_LIST);
+            listed.answer(Ok(serde_json::to_value(TabListResult {
+                projects: vec![empty_project(42)],
+                revision: None,
+            })
+            .unwrap()));
+
+            let delete = rx.recv().await.expect("project.delete sent for rollback");
+            assert_eq!(delete.op, wire::PROJECT_DELETE);
+            assert_eq!(delete.params["project_id"], serde_json::json!("42"));
+            delete.answer(Ok(serde_json::json!({})));
+
+            assert!(
+                rx.try_recv().is_err(),
+                "nothing else should be sent after the rollback"
+            );
+        });
+
+        let error = create_host_project_flow(ops)
+            .await
+            .expect_err("the tab.open failed");
+        assert!(error.contains("no such directory"), "{error}");
+        worker.await.expect("the mock host task must not panic");
+    }
+
+    /// The finding this guard exists for: a `tab.open` whose reply was
+    /// lost, or another client opening a tab first, leaves the project
+    /// non-empty on the host. Deleting it then would destroy a live tab,
+    /// which the local cascade — "closing a project's *last* tab" — never
+    /// does. The tab-open error is still what the caller gets.
+    ///
+    /// Every op after the `tab.list` is drained and answered rather than
+    /// sampled with a `try_recv`: a `try_recv` racing the flow sees an
+    /// empty channel whether or not a rollback was coming (a test that
+    /// cannot fail), and refusing to answer instead deadlocks the flow on
+    /// a reply that never comes (a test that hangs rather than fails).
+    /// Draining until the flow drops `ops` gives a definite list either
+    /// way, so removing the guard fails this on its assertion.
+    #[tokio::test]
+    async fn host_create_leaves_a_project_that_gained_a_tab_alone() {
+        use roost_ipc::agent::{AgentLifecycle, ShellState};
+        use roost_ipc::client::ServerCode;
+        use roost_ipc::messages::{ops as wire, ProjectCreateResult, Tab, TabListResult, TabState};
+
+        let (ops, mut rx) = crate::host_conn::HostOps::channel();
+        let flow = tokio::spawn(create_host_project_flow(ops));
+
+        let create = rx.recv().await.expect("project.create sent");
+        create.answer(Ok(serde_json::to_value(ProjectCreateResult {
+            project: empty_project(42),
+        })
+        .unwrap()));
+
+        let open = rx.recv().await.expect("tab.open sent");
+        open.answer(Err(crate::host_conn::HostOpError::Rejected {
+            code: ServerCode::Internal,
+            message: "connection lost".into(),
+        }));
+
+        // The host disagrees: the project holds a tab after all.
+        let listed = rx.recv().await.expect("tab.list sent before the rollback");
+        assert_eq!(listed.op, wire::TAB_LIST);
+        let mut project = empty_project(42);
+        project.tabs = vec![Tab {
+            id: 7,
+            project_id: 42,
+            title: "zsh".into(),
+            cwd: "/home/x".into(),
+            state: TabState::Idle,
+            has_notification: false,
+            is_active: true,
+            user_titled: false,
+            position: 0,
+            created_at: 0,
+            last_active: 0,
+            hook_active: false,
+            shell_state: ShellState::default(),
+            agent_lifecycle: AgentLifecycle::default(),
+            ownership: None,
+        }];
+        listed.answer(Ok(serde_json::to_value(TabListResult {
+            projects: vec![project],
+            revision: None,
+        })
+        .unwrap()));
+
+        // Answers anything further so the flow can never block, and
+        // records it so the assertion below can name what was sent.
+        let drained = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Some(call) = rx.recv().await {
+                seen.push(call.op.clone());
+                call.answer(Ok(serde_json::json!({})));
+            }
+            seen
+        });
+
+        let error = flow
+            .await
+            .expect("the flow task must not panic")
+            .expect_err("the tab.open failed");
+        assert!(error.contains("connection lost"), "{error}");
+        let seen = drained.await.expect("the drain task must not panic");
+        assert!(
+            seen.is_empty(),
+            "a project holding a tab must never be deleted by the rollback; sent: {seen:?}"
+        );
+    }
+
+    /// The mirror image: a `tab.open` that succeeds must never trigger a
+    /// rollback, on a host exactly as much as locally.
+    #[tokio::test]
+    async fn host_create_does_not_roll_back_on_success() {
+        use roost_ipc::messages::{ops as wire, ProjectCreateResult, Tab, TabOpenResult, TabState};
+
+        // The flow runs in its own task so this one can drive the mock
+        // host inline, on the same `rx` the check at the end reads —
+        // spawning a *separate* worker to both answer and check would
+        // race `create_host_project_flow`'s own return against that
+        // worker's `try_recv`, since `HostOps::send` closing behind a
+        // worker that already exited would silently swallow a stray
+        // call rather than exposing it.
+        let (ops, mut rx) = crate::host_conn::HostOps::channel();
+        let flow = tokio::spawn(create_host_project_flow(ops));
+
+        let create = rx.recv().await.expect("project.create sent");
+        assert_eq!(create.op, wire::PROJECT_CREATE);
+        let project = Project {
+            id: 7,
+            name: "Untitled 1".into(),
+            cwd: "/home/x".into(),
+            position: 0,
+            created_at: 0,
+            tabs: vec![],
+        };
+        create.answer(Ok(
+            serde_json::to_value(ProjectCreateResult { project }).unwrap()
+        ));
+
+        let open = rx.recv().await.expect("tab.open sent");
+        assert_eq!(open.op, wire::TAB_OPEN);
+        let tab = Tab {
+            id: 8,
+            project_id: 7,
+            title: String::new(),
+            cwd: "/home/x".into(),
+            state: TabState::None,
+            has_notification: false,
+            is_active: true,
+            user_titled: false,
+            position: 0,
+            created_at: 0,
+            last_active: 0,
+            hook_active: false,
+            shell_state: Default::default(),
+            agent_lifecycle: Default::default(),
+            ownership: None,
+        };
+        open.answer(Ok(serde_json::to_value(TabOpenResult { tab }).unwrap()));
+
+        let (project_id, tab_id) = flow
+            .await
+            .expect("the flow task must not panic")
+            .expect("create succeeds");
+        assert_eq!(project_id, 7);
+        assert_eq!(tab_id, 8);
+
+        // The flow task has fully returned, so anything it enqueued —
+        // `HostOps::send` lands synchronously, no `.await` needed for
+        // that part — is already sitting on `rx` if it is there at all.
+        assert!(
+            rx.try_recv().is_err(),
+            "a successful create must never be rolled back"
+        );
     }
 
     #[test]

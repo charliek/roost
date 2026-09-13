@@ -79,10 +79,13 @@ use crate::IpcClient;
 /// session start` from.
 ///
 /// The daemon `chdir("/")`s before it does anything else, so the launch
-/// cwd cannot be recovered later — and it is what seeds the first
-/// project on a fresh state file. It travels as an env var because the
+/// cwd cannot be recovered later. It travels as an env var because the
 /// fork happens before any IPC exists, and it is removed from the
-/// environment the instant it is read so no PTY can inherit it.
+/// environment the instant it is read so no PTY can inherit it. A first
+/// run seeds its project at `$HOME` like every UI (plan 063 §D4), not
+/// here — the daemon keeps capturing and erasing this purely so the
+/// hint never leaks into a spawned shell's environment, and logs it for
+/// operators wondering where a session started from.
 pub const LAUNCH_CWD_ENV: &str = "ROOST_SESSION_LAUNCH_CWD";
 
 /// Cap on a verdict line, newline excluded. A verdict is tens of bytes;

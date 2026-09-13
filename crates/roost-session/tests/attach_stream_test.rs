@@ -90,8 +90,7 @@ struct Session {
 impl Session {
     async fn start() -> Self {
         let layout = support::Layout::new();
-        let launch_cwd = layout.launch_cwd.clone();
-        let served = layout.spawn(&launch_cwd);
+        let served = layout.spawn();
         let mut control = support::connect(&layout.socket_path()).await;
         let project_id = support::tabs(&mut control).await[0].project_id;
         Self {

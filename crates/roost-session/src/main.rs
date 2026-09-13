@@ -120,5 +120,5 @@ fn run(foreground: bool, readiness: &mut Readiness) -> anyhow::Result<Outcome> {
     let profile = BundleProfile::session().context("resolve the session bundle profile")?;
     let launch_cwd = roost_session::capture_launch_cwd();
     roost_session::set_process_umask();
-    roost_session::start(&profile, foreground, launch_cwd, readiness)
+    roost_session::start(&profile, foreground, &launch_cwd, readiness)
 }

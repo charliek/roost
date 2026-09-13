@@ -65,8 +65,7 @@ async fn next_batch(reader: &mut Reader) -> EventBatch {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_pushes_its_commits_and_cuts_the_stream_on_stop() {
     let layout = support::Layout::new();
-    let launch_cwd = layout.launch_cwd.clone();
-    let served = layout.spawn(&launch_cwd);
+    let served = layout.spawn();
     let socket_path = layout.socket_path();
 
     let mut client = support::connect(&socket_path).await;

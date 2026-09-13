@@ -19,11 +19,10 @@
 //!   in the file belong to the previous run's tabs, which no longer
 //!   exist.
 //!
-//! The one thing it does differently from a UI: a first-ever start seeds
-//! its project from the directory the user launched from, not from
-//! `$HOME`. A session is started from somewhere on purpose.
-
-use std::path::Path;
+//! A first-ever start seeds its project the same way every UI does: an
+//! empty name (the engine names it `Untitled 1`) at `$HOME`. The daemon's
+//! own cwd (`/`, after `daemonize` moves it there) must never reach a
+//! PTY, which is why every open below passes an explicit directory.
 
 use anyhow::Result;
 use roost_engine::{LocalClient, RestoreLayout, RestoreTab};
@@ -31,22 +30,12 @@ use tracing::warn;
 
 use crate::consts::{DEFAULT_TAB_COLS, DEFAULT_TAB_ROWS};
 
-/// Name given to the project a first-ever start creates. Matches what
-/// the UIs seed, so a state file written by one is unsurprising to the
-/// other.
-const FIRST_PROJECT_NAME: &str = "Roost";
-
-/// Re-open the saved layout, or seed a first project at `launch_cwd`.
-///
-/// `launch_cwd` is the directory the user ran the start command from,
-/// captured before the daemon `chdir`'d away from it. The daemon's own
-/// cwd (`/`) must never reach a PTY, which is why every open below
-/// passes an explicit directory.
-pub async fn hydrate(client: &LocalClient, launch_cwd: &Path) -> Result<()> {
+/// Re-open the saved layout, or seed a first project at `$HOME`.
+pub async fn hydrate(client: &LocalClient) -> Result<()> {
     let mut projects = client.list_projects().await?;
     if projects.is_empty() {
-        let cwd = launch_cwd.to_string_lossy();
-        projects.push(client.create_project(FIRST_PROJECT_NAME, &cwd).await?);
+        let cwd = roost_engine::home_dir();
+        projects.push(client.create_project("", &cwd).await?);
     }
 
     let restore = client.workspace.take_restore_layout();

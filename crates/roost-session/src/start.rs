@@ -61,7 +61,10 @@ pub enum Outcome {
 /// fork, so no code path can ever race a PTY spawn against it.
 ///
 /// The fallback is the process cwd, which is right for a direct
-/// invocation with no `roostctl` in front of it.
+/// invocation with no `roostctl` in front of it. The result is used only
+/// for the startup log line below — a first-ever session seeds its
+/// project at `$HOME` like every UI (plan 063 §D4), not at this
+/// directory.
 pub fn capture_launch_cwd() -> PathBuf {
     let hint = std::env::var_os(LAUNCH_CWD_ENV);
     std::env::remove_var(LAUNCH_CWD_ENV);
@@ -88,7 +91,7 @@ pub fn set_process_umask() {
 pub fn start(
     profile: &BundleProfile,
     foreground: bool,
-    launch_cwd: PathBuf,
+    launch_cwd: &Path,
     readiness: &mut Readiness,
 ) -> Result<Outcome> {
     // Step 0, and it has to be step 0: before the fork (which `chdir`s
@@ -147,7 +150,7 @@ pub fn start(
             Err(error) => return Err(anyhow::anyhow!("single-instance lock failed: {error}")),
         };
 
-    let config = SessionConfig::from_profile(profile, launch_cwd);
+    let config = SessionConfig::from_profile(profile);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("roost-session")

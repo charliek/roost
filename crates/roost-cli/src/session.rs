@@ -141,7 +141,8 @@ async fn start() -> Result<i32> {
         std::env::current_exe().ok().as_deref(),
         std::env::var_os("PATH").as_deref(),
     )?;
-    let cwd = std::env::current_dir().context("read the working directory to seed the session")?;
+    let cwd =
+        std::env::current_dir().context("read the working directory to tell the session about")?;
 
     // Said before the spawn, and phrased for what is true at that
     // moment: this start may yet fail, or find an `already-running`

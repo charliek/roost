@@ -27,8 +27,7 @@ use std::path::Path;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn osc_from_a_child_moves_the_tab_through_the_server_terminal() {
     let layout = support::Layout::new();
-    let launch_cwd = layout.launch_cwd.clone();
-    let served = layout.spawn(&launch_cwd);
+    let served = layout.spawn();
     let mut client = support::connect(&layout.socket_path()).await;
 
     let project_id = support::tabs(&mut client).await[0].project_id;

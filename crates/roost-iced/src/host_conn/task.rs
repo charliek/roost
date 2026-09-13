@@ -868,8 +868,10 @@ async fn spawn_session(config: &ConnectionConfig) -> Result<(), AttemptError> {
         std::env::var_os("PATH").as_deref(),
     )
     .map_err(|error| spawn_failure(SpawnStage::Locate, &error))?;
-    // The launch cwd seeds the session's first project on a fresh state
-    // file only; a UI has no better answer than its own.
+    // A first-ever session seeds its project at its own `$HOME`, not
+    // this cwd (plan 063 §D4) — the hint below is passed on regardless,
+    // purely so the session's log can say where it was spawned from; a
+    // UI has no better answer than its own directory.
     let cwd = std::env::current_dir().map_err(|error| {
         spawn_failure(
             SpawnStage::Cwd,

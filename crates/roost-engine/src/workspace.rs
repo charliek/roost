@@ -1216,7 +1216,7 @@ impl Workspace {
         } else if !project_cwd.is_empty() {
             project_cwd
         } else {
-            std::env::var("HOME").unwrap_or_else(|_| "/".into())
+            crate::home_dir()
         };
         let id = inner.alloc_id();
         let now = unix_now();
@@ -2362,6 +2362,33 @@ fn derive_title(cwd: &str) -> String {
 mod tests {
     use super::*;
     use roost_ipc::agent::{AttentionOp, ShellState};
+
+    #[test]
+    fn an_empty_name_is_named_untitled_from_the_workspaces_own_count() {
+        let ws = Workspace::new();
+        let first = ws.create_project("", "/tmp").unwrap();
+        assert_eq!(first.name, "Untitled 1");
+        let second = ws.create_project("", "/tmp").unwrap();
+        assert_eq!(second.name, "Untitled 2");
+        // An explicit name is never overridden, and does not consume a
+        // slot in the untitled count.
+        let named = ws.create_project("mine", "/tmp").unwrap();
+        assert_eq!(named.name, "mine");
+        let third = ws.create_project("", "/tmp").unwrap();
+        assert_eq!(third.name, "Untitled 4");
+    }
+
+    #[test]
+    fn create_project_stores_an_empty_cwd_verbatim() {
+        // The empty-cwd-to-`$HOME` resolution (D4) lives one layer up, at
+        // `ops::PROJECT_CREATE` — every caller of this method (the wire
+        // arm, `LocalClient::create_project`, the two seeds) already
+        // hands it a resolved directory, so this method itself must not
+        // re-resolve and risk disagreeing with its caller.
+        let ws = Workspace::new();
+        let project = ws.create_project("mine", "").unwrap();
+        assert_eq!(project.cwd, "");
+    }
 
     #[test]
     fn open_tab_emits_tab_opened() {

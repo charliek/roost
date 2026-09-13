@@ -3042,10 +3042,16 @@ async fn dispatch(
         }
         ops::PROJECT_CREATE => {
             let p: ProjectCreateParams = decode(params)?;
-            let project = h
-                .workspace
-                .create_project(&p.name, &p.cwd)
-                .map_err(ws_err)?;
+            // Resolved here, not stored empty and left to `tab.open`'s
+            // own fallback: the project row and its seed tab must agree
+            // on where the project "is", and a caller creating on a
+            // remote host has no `$HOME` of its own to offer (D4).
+            let cwd = if p.cwd.is_empty() {
+                crate::home_dir()
+            } else {
+                p.cwd
+            };
+            let project = h.workspace.create_project(&p.name, &cwd).map_err(ws_err)?;
             encode(&ProjectCreateResult { project })
         }
         ops::PROJECT_RENAME => {

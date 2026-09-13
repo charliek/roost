@@ -60,7 +60,6 @@ pub async fn tick() {
 /// same state and watch it restore.
 pub struct Layout {
     dir: TempDir,
-    pub launch_cwd: PathBuf,
 }
 
 impl Layout {
@@ -76,9 +75,7 @@ impl Layout {
                 .try_init();
         }
         let dir = tempfile::tempdir().expect("tempdir");
-        let launch_cwd = dir.path().join("launch");
-        std::fs::create_dir_all(&launch_cwd).expect("create the launch dir");
-        Self { dir, launch_cwd }
+        Self { dir }
     }
 
     pub fn root(&self) -> &Path {
@@ -117,13 +114,12 @@ impl Layout {
         path
     }
 
-    pub fn config(&self, launch_cwd: &Path) -> SessionConfig {
+    pub fn config(&self) -> SessionConfig {
         SessionConfig {
             socket_path: self.socket_path(),
             state_path: self.state_path(),
             app_label: APP_LABEL.into(),
             app_id: APP_ID.into(),
-            launch_cwd: launch_cwd.to_path_buf(),
             files_dir: Some(self.files_dir()),
             files_fallback: self.dir.path().join("files-fallback"),
             // Always on here: `tab.feed_pty_bytes` and
@@ -151,13 +147,13 @@ impl Layout {
             .expect("take the instance locks")
     }
 
-    /// Start a session over this layout, seeded from `launch_cwd`.
+    /// Start a session over this layout.
     ///
     /// The returned handle resolves when the session has stopped and its
     /// tail has run — socket unlinked, locks released — so a test can
     /// await it and then start another run over the same state.
-    pub fn spawn(&self, launch_cwd: &Path) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-        self.spawn_config(self.config(launch_cwd))
+    pub fn spawn(&self) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        self.spawn_config(self.config())
     }
 
     /// [`Self::spawn`] with the config stated, for a test that needs one
