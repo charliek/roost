@@ -14,6 +14,19 @@ on:
 permissions:
   contents: read
 
+# Every other workflow here already declares one (docs-pr.yml, docs.yml,
+# release.yml); CI was the only one that did not, so a second push to a PR
+# branch left the first run going — and this matrix fans out across Ubuntu
+# and macOS for 21-54 minutes, so a superseded run burns a full matrix of
+# runner-minutes nobody will read.
+#
+# `cancel-in-progress` is deliberately PR-only: a push to `main` is the
+# post-merge gate a release keys off (release.yml's `ci-gate`), so those
+# runs must always finish even when the next merge lands behind them.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   changes:
     runs-on: ubuntu-latest
