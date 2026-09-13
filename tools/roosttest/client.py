@@ -314,10 +314,11 @@ class Roost:
         """{agents_visible, projects: [{project_id, agents: [{tab_id,
         name, lifecycle, status_text, time_text, is_active}]}],
         hosts?: [{id, label, state, projects: [{key, name, tabs:
-        [{key, title}]}]}]}. The sidebar's *last-rendered* agent rows,
-        read from the same per-project cache the sidebar paints from —
-        a missed refresh is observable here rather than invisible.
-        Ungated, read-only (plan 007 §3.8).
+        [{key, title}]}]}], sections?: [{role, label, state, dot,
+        saved_id?, reconnect_row, fidelity?}]}. The sidebar's
+        *last-rendered* agent rows, read from the same per-project cache
+        the sidebar paints from — a missed refresh is observable here
+        rather than invisible. Ungated, read-only (plan 007 §3.8).
 
         `hosts` is the host sections in sidebar order, refreshed before
         the read and reporting the mirror's *authoritative* order rather
@@ -325,7 +326,18 @@ class Roost:
         when there are none — the Swift Mac app never emits it — so read
         it with `.get("hosts", [])`. Each `key` is the host-qualified
         spelling the UI socket's reorder/focus ops take, so a caller
-        needs no incarnation probe."""
+        needs no incarnation probe.
+
+        `sections` is the *band strip* — every header the sidebar draws
+        including the local one, in order (plan 063 §D2). `role` is
+        `local` (the in-process band), `session` (the local band under
+        `local-backend = session`: the slot's own band, or a placeholder
+        while no slot is saved), or `host`. A band is paired to a saved
+        host by `saved_id`, never by index — under `session` the leading
+        band is itself a host. Omitted when the sidebar draws its classic
+        single sticky `PROJECTS` header instead of a strip (in-process
+        with no saved hosts, and every Swift reply), so read it with
+        `.get("sections", [])`."""
         return self.call("app.sidebar_dump", {})
 
     def sidebar_hosts(self) -> list[dict]:
@@ -334,6 +346,19 @@ class Roost:
 
     def sidebar_host(self, saved_id: str) -> dict | None:
         return next((h for h in self.sidebar_hosts() if h["id"] == saved_id), None)
+
+    def sidebar_sections(self) -> list[dict]:
+        """`sidebar_dump()["sections"]`, absent-tolerant."""
+        return self.sidebar_dump().get("sections", [])
+
+    def sidebar_local_band(self) -> dict | None:
+        """The sidebar's leading band — the in-process one under
+        `in-process`, the slot's under `session`. `None` when the
+        sidebar draws no strip at all."""
+        return next(
+            (s for s in self.sidebar_sections() if s["role"] != "host"),
+            None,
+        )
 
     # -- host sessions ----------------------------------------------------
     def host_status(self, id: str | None = None) -> dict:

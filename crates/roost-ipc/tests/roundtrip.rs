@@ -483,3 +483,62 @@ fn both_identify_vectors_decode_as_the_current_typed_result() {
         "typed re-encode must match the vector"
     );
 }
+
+/// The same pair for `app.sidebar_dump` and plan 063 §D2's band strip:
+/// the pre-063 file is a dump with `hosts` and no `sections` (still what
+/// a Swift UI and an `in-process` UI with no saved hosts answer), the
+/// session one is what an iced UI answers under `local-backend =
+/// session` — a leading band that is itself a saved host.
+#[test]
+fn both_sidebar_dump_vectors_decode_as_the_current_typed_result() {
+    fn vector(name: &str) -> serde_json::Value {
+        let path = format!(
+            "{}/../../tests/ipc-vectors/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {path}: {e}"))
+    }
+
+    let pre_063 = vector("app.sidebar_dump.response.json");
+    let result: SidebarDumpResult =
+        serde_json::from_value(pre_063["result"].clone()).expect("pre-063 sidebar dump decodes");
+    assert!(
+        result.sections.is_empty(),
+        "the recorded vector predates the strip and stays as recorded"
+    );
+    assert_eq!(result.hosts.len(), 2);
+    assert_eq!(
+        serde_json::to_value(&result).unwrap(),
+        pre_063["result"],
+        "an empty strip is omitted, so the pre-063 shape re-encodes exactly"
+    );
+
+    let session = vector("app.sidebar_dump.session.response.json");
+    let result: SidebarDumpResult =
+        serde_json::from_value(session["result"].clone()).expect("session sidebar dump decodes");
+    let bands = &result.sections;
+    assert_eq!(bands.len(), 2);
+    // The session-only band: `PROJECTS`, but a saved host's own state
+    // and dot — which is the whole of §D2 row 3 on the wire.
+    assert_eq!(bands[0].role, "session");
+    assert_eq!(bands[0].label, "PROJECTS");
+    assert_eq!(bands[0].dot, "connected");
+    assert_eq!(bands[0].saved_id.as_deref(), Some("hs-2f1c"));
+    assert!(!bands[0].reconnect_row);
+    // The slot leads the strip, so its band is *not* at its own
+    // registry index + 1 — the pairing is `saved_id`, not position.
+    assert_eq!(bands[1].role, "host");
+    assert_eq!(bands[1].saved_id.as_deref(), Some("hs-9d40"));
+    assert!(bands[1].reconnect_row);
+    assert_eq!(
+        result.hosts.first().map(|host| host.id.as_str()),
+        Some("hs-2f1c"),
+        "the slot is still listed among the saved hosts it belongs to"
+    );
+    assert_eq!(
+        serde_json::to_value(&result).unwrap(),
+        session["result"],
+        "typed re-encode must match the vector"
+    );
+}

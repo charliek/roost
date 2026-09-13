@@ -1103,7 +1103,11 @@ actor IPCHandlerImpl: IPCHandler {
                         )
                     }
                 )
-            }
+            },
+            // This UI draws the classic single sticky `PROJECTS` header:
+            // in-process, no host sections, so no band strip — the same
+            // empty strip an iced UI in that state reports.
+            sections: nil
         )
     }
 
@@ -1463,12 +1467,40 @@ struct IPCSidebarDumpProject: Codable {
     }
 }
 
+/// One band of the sidebar's section strip — mirrors
+/// `SidebarDumpSection` in `crates/roost-ipc/src/messages.rs` (plan 063
+/// §D2). Nothing on this UI emits one: the Mac app is always
+/// `local-backend = in-process` with no host sections, which is the same
+/// empty strip an iced UI answers in that state. The type is here so the
+/// mirror stays complete and a Rust-side field rename fails on this side
+/// too.
+struct IPCSidebarDumpSection: Codable {
+    let role: String
+    let label: String
+    let state: String
+    let dot: String
+    let savedID: String?
+    let reconnectRow: Bool
+    let fidelity: String?
+    enum CodingKeys: String, CodingKey {
+        case role, label, state, dot
+        case savedID = "saved_id"
+        case reconnectRow = "reconnect_row"
+        case fidelity
+    }
+}
+
 struct IPCSidebarDumpResult: Codable {
     let agentsVisible: Bool
     let projects: [IPCSidebarDumpProject]
+    /// Omitted, never `[]`, so this UI's reply stays byte-identical to
+    /// the pre-063 shape — matching the Rust side's
+    /// `skip_serializing_if`.
+    let sections: [IPCSidebarDumpSection]?
     enum CodingKeys: String, CodingKey {
         case agentsVisible = "agents_visible"
         case projects
+        case sections
     }
 }
 

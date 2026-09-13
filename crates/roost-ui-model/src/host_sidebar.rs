@@ -9,8 +9,17 @@
 //! projects the ring visits. The toolkit adapter paints it.
 //!
 //! **Zero saved hosts is the zero-change baseline** (roadmap D8):
-//! [`sections`] answers empty, and the sidebar keeps exactly the chrome
-//! it has today.
+//! under `local-backend = in-process` [`sections`] answers empty, and
+//! the sidebar keeps exactly the chrome it has today.
+//!
+//! Under `local-backend = session` (plan 063 §D2) there is no in-process
+//! band to lead with: the local band *is* a saved host — *the slot* — so
+//! it carries a real connection dot, a ↻ row when it is down and the
+//! fidelity pill, all through the same [`Section`] every other host gets.
+//! Which band belongs to which saved host is therefore a question of
+//! [`Section::saved_id`], never of index ([`band_for`]).
+
+use roost_ipc::LocalBackendMode;
 
 use crate::agent_palette::truncate_chars;
 use crate::keys::{HostId, ProjectKey};
@@ -19,6 +28,11 @@ use crate::keys::{HostId, ProjectKey};
 /// may not be called "local" (`Workspace::add_host` rejects it), so the
 /// first band is unambiguous.
 pub const LOCAL_LABEL: &str = "LOCAL";
+
+/// The sole local band's label: the sticky header the sidebar has drawn
+/// since before host sections existed, and what the slot's band is
+/// called under `session`, where it is the only local band on screen.
+pub const PROJECTS_LABEL: &str = "PROJECTS";
 
 /// A section's connection state, reduced to what its header renders.
 /// `roost-iced`'s `HostConnState` maps onto this; the local workspace is
@@ -42,6 +56,18 @@ pub enum HostDot {
     Connected,
     Pending,
     Offline,
+}
+
+impl HostDot {
+    /// The dot's spelling in `app.sidebar_dump` — the colour is the
+    /// renderer's, but which of the three it is, is the model's.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connected => "connected",
+            Self::Pending => "pending",
+            Self::Offline => "offline",
+        }
+    }
 }
 
 /// How a saved host is reached, as the render-agnostic model names it.
@@ -81,6 +107,47 @@ pub enum FidelityAction {
     /// client could reach its binary over. The band says what is wrong
     /// and names who can fix it; nothing is offered to press.
     Manual,
+}
+
+impl FidelityAction {
+    /// The pill's spelling in `app.sidebar_dump`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Update => "update",
+            Self::Restart => "restart",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+/// What a band *is*, independent of what it says.
+///
+/// The sidebar's leading band is the local workspace's under
+/// `in-process` and the slot's under `session` (plan 063 §D2); a client
+/// reading `app.sidebar_dump` needs to tell those apart, and so does the
+/// render loop — only a [`Self::Local`] band owns the in-process project
+/// strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionRole {
+    /// The in-process workspace's band.
+    Local,
+    /// The local band under `local-backend = session`: the slot's own
+    /// host band wearing the local label, or — while no localhost host
+    /// is saved yet — a placeholder for the one the launch path adds.
+    Session,
+    /// An ordinary saved host, below the local band.
+    Host,
+}
+
+impl SectionRole {
+    /// The role's spelling in `app.sidebar_dump`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Session => "session",
+            Self::Host => "host",
+        }
+    }
 }
 
 impl SectionState {
@@ -165,9 +232,12 @@ impl SectionState {
     pub fn wire(self) -> &'static str {
         use roost_ipc::messages::host_state;
         match self {
-            // The LOCAL band is connected by construction and is never a
-            // saved host, so it does not reach the wire — `connected` is
-            // the honest answer if it ever does.
+            // `Local` is the in-process band's state, and that band is
+            // connected by construction and never a saved host, so this
+            // variant does not reach the wire — `connected` is the
+            // honest answer if it ever does. (The *leading* band is a
+            // saved host under `session`, but it carries the slot's own
+            // state, not `Local`.)
             Self::Local | Self::Connected => host_state::CONNECTED,
             Self::Connecting => host_state::CONNECTING,
             Self::Disconnected => host_state::DISCONNECTED,
@@ -233,8 +303,12 @@ pub struct HostInput<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Section {
     pub host: HostId,
-    /// `None` for the local workspace's band.
+    /// The saved host this band renders, and the **only** way a band is
+    /// paired to one ([`band_for`]). `None` for the in-process
+    /// workspace's band — and for the session placeholder, which stands
+    /// in for a slot that is not saved yet.
     pub saved_id: Option<String>,
+    pub role: SectionRole,
     pub label: String,
     pub state: SectionState,
     /// The right-aligned rollup: an agent count for a connected host, or
@@ -248,18 +322,50 @@ pub struct Section {
 }
 
 impl Section {
+    /// Whether this is the sidebar's leading band — the one whose rows
+    /// are "your projects" rather than "that machine's". True for the
+    /// slot's band under `session`, which is a saved host and still the
+    /// local band.
     pub fn is_local(&self) -> bool {
-        self.saved_id.is_none()
+        !matches!(self.role, SectionRole::Host)
     }
 }
 
-/// Every section the sidebar draws, LOCAL first and then the saved hosts
-/// in registry order.
+/// Which local backend the sidebar is drawing for, and which saved host
+/// holds the local band under `session` (plan 063 §D2).
 ///
-/// **Empty when there are no saved hosts** — the caller keeps its single
-/// "PROJECTS" band and changes nothing, which is the acceptance
-/// criterion this whole module is gated behind.
-pub fn sections(hosts: &[HostInput<'_>]) -> Vec<Section> {
+/// `slot_saved_id` is read from the registry the same way whatever the
+/// mode: it is the first saved host with a
+/// [`HostTransportKind::Localhost`] transport. Under `in-process` that
+/// host is an ordinary `LOCALHOST` band beside LOCAL; under `session` it
+/// is *the slot*, and it leads the sidebar in the local band's place.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalSlot<'a> {
+    pub mode: LocalBackendMode,
+    pub slot_saved_id: Option<&'a str>,
+}
+
+/// Every section the sidebar draws: the local band first, then the saved
+/// hosts in registry order.
+///
+/// Under [`LocalBackendMode::InProcess`] this is exactly what it has
+/// always been — LOCAL, then every saved host — and **empty when there
+/// are no saved hosts**, so the caller keeps its single "PROJECTS" band
+/// and changes nothing.
+///
+/// Under [`LocalBackendMode::Session`] the local band is the slot's own
+/// band, labelled [`PROJECTS_LABEL`] because it is the only local band
+/// on screen, and the slot is not repeated below. It is never empty:
+/// there is always a local band to say what the local backend is doing,
+/// even when no slot is saved yet.
+pub fn sections(local: LocalSlot<'_>, hosts: &[HostInput<'_>]) -> Vec<Section> {
+    match local.mode {
+        LocalBackendMode::InProcess => in_process_sections(hosts),
+        LocalBackendMode::Session => session_sections(local.slot_saved_id, hosts),
+    }
+}
+
+fn in_process_sections(hosts: &[HostInput<'_>]) -> Vec<Section> {
     if hosts.is_empty() {
         return Vec::new();
     }
@@ -267,6 +373,7 @@ pub fn sections(hosts: &[HostInput<'_>]) -> Vec<Section> {
     out.push(Section {
         host: HostId::LOCAL,
         saved_id: None,
+        role: SectionRole::Local,
         label: LOCAL_LABEL.to_string(),
         state: SectionState::Local,
         // Deliberately bare: the approved mockup gives LOCAL a dot and
@@ -275,20 +382,77 @@ pub fn sections(hosts: &[HostInput<'_>]) -> Vec<Section> {
         rollup: None,
         fidelity: None,
     });
-    for host in hosts {
-        out.push(Section {
-            host: host.host,
-            saved_id: Some(host.saved_id.to_string()),
-            label: section_label(host.label),
-            state: host.state,
-            rollup: host
-                .state
-                .status_text_with_reason(host.reason)
-                .or_else(|| agent_rollup(host.agents)),
-            fidelity: fidelity_action(host.reduced_fidelity, host.transport, host.state),
-        });
-    }
+    out.extend(hosts.iter().map(host_section));
     out
+}
+
+fn session_sections(slot_saved_id: Option<&str>, hosts: &[HostInput<'_>]) -> Vec<Section> {
+    let slot = slot_saved_id.and_then(|id| hosts.iter().find(|host| host.saved_id == id));
+    let mut out = Vec::with_capacity(hosts.len() + 1);
+    out.push(match slot {
+        Some(slot) => Section {
+            host: slot.host,
+            saved_id: Some(slot.saved_id.to_string()),
+            role: SectionRole::Session,
+            label: PROJECTS_LABEL.to_string(),
+            state: slot.state,
+            // Bare while connected, exactly as the LOCAL band is: the
+            // agent rows below carry the count, and a local band has no
+            // "over there" to roll up. What it does have, once it is not
+            // connected, is trouble worth naming.
+            rollup: slot.state.status_text_with_reason(slot.reason),
+            fidelity: fidelity_action(slot.reduced_fidelity, slot.transport, slot.state),
+        },
+        // Session mode with no localhost host saved: a transient the
+        // launch path closes by adding one (plan 063 §D5). The band says
+        // the local backend is not there yet rather than drawing the
+        // connected chrome of a backend that is absent.
+        None => Section {
+            host: HostId::LOCAL,
+            saved_id: None,
+            role: SectionRole::Session,
+            label: PROJECTS_LABEL.to_string(),
+            state: SectionState::Connecting,
+            rollup: SectionState::Connecting.status_text().map(str::to_string),
+            fidelity: None,
+        },
+    });
+    out.extend(
+        hosts
+            .iter()
+            .filter(|host| Some(host.saved_id) != slot.map(|slot| slot.saved_id))
+            .map(host_section),
+    );
+    out
+}
+
+fn host_section(host: &HostInput<'_>) -> Section {
+    Section {
+        host: host.host,
+        saved_id: Some(host.saved_id.to_string()),
+        role: SectionRole::Host,
+        label: section_label(host.label),
+        state: host.state,
+        rollup: host
+            .state
+            .status_text_with_reason(host.reason)
+            .or_else(|| agent_rollup(host.agents)),
+        fidelity: fidelity_action(host.reduced_fidelity, host.transport, host.state),
+    }
+}
+
+/// The band that renders a given saved host, **found by key**.
+///
+/// Not by index. The local band used to be the one band with no saved
+/// host, so "band `n + 1` belongs to saved host `n`" held; under
+/// `session` the leading band *is* a saved host and the one it names is
+/// not repeated below, so position says nothing. `None` means no band
+/// renders that host, which is an inconsistency worth reporting rather
+/// than a state to paint over.
+pub fn band_for<'a>(sections: &'a [Section], saved_id: &str) -> Option<&'a Section> {
+    sections
+        .iter()
+        .find(|section| section.saved_id.as_deref() == Some(saved_id))
 }
 
 /// A host's band label: the saved label, uppercased so it reads as the
@@ -418,11 +582,50 @@ mod tests {
         }
     }
 
+    /// This machine's own session, as the registry holds it.
+    fn localhost(saved_id: &'static str, state: SectionState, agents: usize) -> HostInput<'static> {
+        HostInput {
+            transport: HostTransportKind::Localhost,
+            ..host(saved_id, state, agents)
+        }
+    }
+
+    /// The sidebar as it has always been: the in-process backend, with
+    /// no slot input at all. Every pre-063 test goes through this, so a
+    /// drift in the `in-process` rendering fails them.
+    fn in_process(hosts: &[HostInput<'_>]) -> Vec<Section> {
+        sections(LocalSlot::default(), hosts)
+    }
+
+    fn session(slot: Option<&str>, hosts: &[HostInput<'_>]) -> Vec<Section> {
+        sections(
+            LocalSlot {
+                mode: LocalBackendMode::Session,
+                slot_saved_id: slot,
+            },
+            hosts,
+        )
+    }
+
+    fn labels(sections: &[Section]) -> Vec<&str> {
+        sections
+            .iter()
+            .map(|section| section.label.as_str())
+            .collect()
+    }
+
+    fn roles(sections: &[Section]) -> Vec<&'static str> {
+        sections
+            .iter()
+            .map(|section| section.role.as_str())
+            .collect()
+    }
+
     /// Acceptance criterion 1: no saved hosts, no sections — the caller
     /// keeps the single "PROJECTS" band it has today.
     #[test]
     fn zero_saved_hosts_is_zero_sections() {
-        assert!(sections(&[]).is_empty());
+        assert!(in_process(&[]).is_empty());
     }
 
     #[test]
@@ -431,7 +634,7 @@ mod tests {
             host("pop-os", SectionState::Connected, 2),
             host("box", SectionState::Disconnected, 0),
         ];
-        let sections = sections(&hosts);
+        let sections = in_process(&hosts);
         assert_eq!(
             sections
                 .iter()
@@ -447,7 +650,7 @@ mod tests {
 
     #[test]
     fn the_rollup_is_the_agent_count_while_connected_and_the_state_otherwise() {
-        let sections = sections(&[
+        let sections = in_process(&[
             host("a", SectionState::Connected, 2),
             host("b", SectionState::Connected, 1),
             host("c", SectionState::Connected, 0),
@@ -557,7 +760,7 @@ mod tests {
     /// a count.
     #[test]
     fn the_bands_rollup_carries_the_reason() {
-        let sections = sections(&[
+        let sections = in_process(&[
             host_because("a", SectionState::Disconnected, "ssh: connection refused"),
             host("b", SectionState::Disconnected, 3),
         ]);
@@ -690,7 +893,7 @@ mod tests {
     /// and the rollup is the agent count it always was.
     #[test]
     fn the_pill_is_its_own_slot_and_the_rollup_stays_the_agent_count() {
-        let sections = sections(&[
+        let sections = in_process(&[
             reduced("a", HostTransportKind::Ssh, 2),
             reduced("b", HostTransportKind::Localhost, 0),
             reduced("c", HostTransportKind::Socket, 1),
@@ -728,6 +931,215 @@ mod tests {
                 Some("disconnected"),
             ]
         );
+    }
+
+    /// Plan 063 §D2, rows 1 and 2: under `in-process` the sidebar is
+    /// what it has always been — LOCAL, then every saved host including
+    /// the localhost one — and naming a slot cannot change that, because
+    /// under `in-process` there is no slot.
+    #[test]
+    fn the_in_process_rendering_ignores_the_slot_input_entirely() {
+        let hosts = [
+            localhost("slot", SectionState::Connected, 0),
+            host("box", SectionState::Disconnected, 0),
+        ];
+        let bare = in_process(&hosts);
+        assert_eq!(labels(&bare), vec!["LOCAL", "SLOT", "BOX"]);
+        assert_eq!(roles(&bare), vec!["local", "host", "host"]);
+        assert_eq!(bare[0].saved_id, None);
+        assert_eq!(bare[0].state, SectionState::Local);
+
+        let named = sections(
+            LocalSlot {
+                mode: LocalBackendMode::InProcess,
+                slot_saved_id: Some("slot"),
+            },
+            &hosts,
+        );
+        assert_eq!(bare, named, "the slot input is inert under in-process");
+        assert!(
+            sections(
+                LocalSlot {
+                    mode: LocalBackendMode::InProcess,
+                    slot_saved_id: Some("slot"),
+                },
+                &[],
+            )
+            .is_empty(),
+            "and the zero-host baseline is still zero sections"
+        );
+    }
+
+    /// Plan 063 §D2, row 3: under `session` the sole local band is
+    /// labelled `PROJECTS` and everything else about it is the slot's
+    /// own — the real dot, the ↻ offer when it is down, the pill.
+    #[test]
+    fn the_session_band_is_projects_carrying_the_slots_real_chrome() {
+        let up = session(
+            Some("slot"),
+            &[localhost("slot", SectionState::Connected, 3)],
+        );
+        assert_eq!(labels(&up), vec!["PROJECTS"]);
+        assert_eq!(roles(&up), vec!["session"]);
+        assert_eq!(up[0].saved_id.as_deref(), Some("slot"));
+        assert_eq!(up[0].state.dot(), HostDot::Connected);
+        assert!(!up[0].state.offers_reconnect());
+        // Parity with today's LOCAL: the agent rows below carry the
+        // count, and a connected local band says nothing.
+        assert_eq!(up[0].rollup, None);
+        assert_eq!(up[0].fidelity, None);
+
+        let down = session(
+            Some("slot"),
+            &[HostInput {
+                reason: Some("the session ended"),
+                ..localhost("slot", SectionState::Disconnected, 3)
+            }],
+        );
+        assert_eq!(labels(&down), vec!["PROJECTS"]);
+        assert_eq!(down[0].state.dot(), HostDot::Offline);
+        assert!(
+            down[0].state.offers_reconnect(),
+            "a slot that is down offers ↻"
+        );
+        assert_eq!(
+            down[0].rollup.as_deref(),
+            Some("disconnected — the session ended")
+        );
+
+        let reduced = session(
+            Some("slot"),
+            &[HostInput {
+                reduced_fidelity: true,
+                ..localhost("slot", SectionState::Connected, 0)
+            }],
+        );
+        assert_eq!(
+            reduced[0].fidelity,
+            Some(FidelityAction::Restart),
+            "the pill reaches the slot's band like any other host's"
+        );
+    }
+
+    /// Plan 063 §D2, row 4: `session` with no localhost host saved. A
+    /// transient the launch path closes, drawn as pending rather than as
+    /// a connected backend that is not there.
+    #[test]
+    fn the_session_band_without_a_slot_is_pending_and_addresses_nothing() {
+        let none = session(None, &[]);
+        assert_eq!(labels(&none), vec!["PROJECTS"]);
+        assert_eq!(roles(&none), vec!["session"]);
+        assert_eq!(none[0].saved_id, None, "no host to address a ↻ to yet");
+        assert_eq!(none[0].state.dot(), HostDot::Pending);
+        assert!(none[0].state.offers_reconnect());
+        assert_eq!(none[0].rollup.as_deref(), Some("connecting…"));
+        assert_eq!(none[0].fidelity, None);
+
+        // A slot id naming a host the registry no longer holds is the
+        // same transient — not a band for a host that is not there.
+        let stale = session(Some("gone"), &[host("box", SectionState::Connected, 0)]);
+        assert_eq!(labels(&stale), vec!["PROJECTS", "BOX"]);
+        assert_eq!(stale[0].saved_id, None);
+        assert_eq!(stale[0].state.dot(), HostDot::Pending);
+    }
+
+    /// The pairing plan 063 §D2 replaces the positional invariant with.
+    ///
+    /// The fixture puts the slot **first** in the registry, so no saved
+    /// host's band sits at its own registry index + 1 — the pairing the
+    /// old `sections.len() == views + 1` invariant licensed. A positional
+    /// walk gets all three wrong; the key gets all three right.
+    #[test]
+    fn a_band_is_paired_to_its_host_by_saved_id_not_by_index() {
+        let hosts = [
+            localhost("slot", SectionState::Connected, 0),
+            host("box", SectionState::Connected, 1),
+            host("pop-os", SectionState::Disconnected, 0),
+        ];
+        let sections = session(Some("slot"), &hosts);
+        assert_eq!(labels(&sections), vec!["PROJECTS", "BOX", "POP-OS"]);
+
+        for (registry_index, saved_id) in ["slot", "box", "pop-os"].into_iter().enumerate() {
+            let band = band_for(&sections, saved_id)
+                .unwrap_or_else(|| panic!("no band renders saved host {saved_id}"));
+            assert_eq!(band.saved_id.as_deref(), Some(saved_id));
+            assert_ne!(
+                sections
+                    .get(registry_index + 1)
+                    .and_then(|band| band.saved_id.as_deref()),
+                Some(saved_id),
+                "saved host {saved_id} must not be paired by position either"
+            );
+        }
+    }
+
+    /// The slot leads whatever its registry position, and every other
+    /// band follows the registry — so a reorder moves bands and a
+    /// removal takes one away, and neither can leave a band claiming a
+    /// host that is not there.
+    #[test]
+    fn the_slot_leads_and_the_rest_follow_the_registry_through_reorder_and_removal() {
+        let slot_first = [
+            localhost("slot", SectionState::Connected, 0),
+            host("box", SectionState::Connected, 0),
+            host("pop-os", SectionState::Disconnected, 0),
+        ];
+        let slot_last = [
+            host("box", SectionState::Connected, 0),
+            host("pop-os", SectionState::Disconnected, 0),
+            localhost("slot", SectionState::Connected, 0),
+        ];
+        assert_eq!(
+            labels(&session(Some("slot"), &slot_first)),
+            vec!["PROJECTS", "BOX", "POP-OS"]
+        );
+        assert_eq!(
+            labels(&session(Some("slot"), &slot_last)),
+            vec!["PROJECTS", "BOX", "POP-OS"],
+            "the slot's registry position does not move its band"
+        );
+
+        let swapped = [
+            localhost("slot", SectionState::Connected, 0),
+            host("pop-os", SectionState::Disconnected, 0),
+            host("box", SectionState::Connected, 0),
+        ];
+        let swapped = session(Some("slot"), &swapped);
+        assert_eq!(labels(&swapped), vec!["PROJECTS", "POP-OS", "BOX"]);
+        for saved_id in ["slot", "box", "pop-os"] {
+            assert!(band_for(&swapped, saved_id).is_some(), "{saved_id}");
+        }
+
+        let removed = session(Some("slot"), &slot_first[..2]);
+        assert_eq!(labels(&removed), vec!["PROJECTS", "BOX"]);
+        assert!(band_for(&removed, "pop-os").is_none());
+        assert_eq!(
+            band_for(&removed, "box").map(|band| band.label.as_str()),
+            Some("BOX")
+        );
+
+        // Removing the slot itself leaves the placeholder and gives the
+        // survivors their own bands back.
+        let slotless = session(Some("slot"), &slot_first[1..]);
+        assert_eq!(labels(&slotless), vec!["PROJECTS", "BOX", "POP-OS"]);
+        assert!(band_for(&slotless, "slot").is_none());
+        assert_eq!(slotless[0].saved_id, None);
+    }
+
+    /// The dump's vocabulary. These three strings are a wire contract —
+    /// `app.sidebar_dump` reports them and the E2E harness reads them —
+    /// so a variant rename is a wire break, not a refactor.
+    #[test]
+    fn every_role_dot_and_fidelity_has_one_wire_spelling() {
+        assert_eq!(SectionRole::Local.as_str(), "local");
+        assert_eq!(SectionRole::Session.as_str(), "session");
+        assert_eq!(SectionRole::Host.as_str(), "host");
+        assert_eq!(HostDot::Connected.as_str(), "connected");
+        assert_eq!(HostDot::Pending.as_str(), "pending");
+        assert_eq!(HostDot::Offline.as_str(), "offline");
+        assert_eq!(FidelityAction::Update.as_str(), "update");
+        assert_eq!(FidelityAction::Restart.as_str(), "restart");
+        assert_eq!(FidelityAction::Manual.as_str(), "manual");
     }
 
     /// The one question the verb policy asks, answered off the transport

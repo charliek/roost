@@ -1,0 +1,46 @@
+{
+  "id": "22",
+  "ok": true,
+  "result": {
+    "agents_visible": true,
+    "projects": [],
+    "hosts": [
+      {
+        "id": "hs-2f1c",
+        "label": "localhost",
+        "state": "connected",
+        "projects": [
+          {
+            "key": "h1.4",
+            "name": "roost",
+            "tabs": [{ "key": "h1.9", "title": "zsh" }]
+          }
+        ]
+      },
+      {
+        "id": "hs-9d40",
+        "label": "workbench",
+        "state": "disconnected",
+        "projects": []
+      }
+    ],
+    "sections": [
+      {
+        "role": "session",
+        "label": "PROJECTS",
+        "state": "connected",
+        "dot": "connected",
+        "saved_id": "hs-2f1c",
+        "reconnect_row": false
+      },
+      {
+        "role": "host",
+        "label": "WORKBENCH",
+        "state": "disconnected",
+        "dot": "offline",
+        "saved_id": "hs-9d40",
+        "reconnect_row": true
+      }
+    ]
+  }
+}

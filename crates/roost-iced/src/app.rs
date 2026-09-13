@@ -36,7 +36,7 @@ use roost_ipc::messages::{
     HostConnectStatus, HostConnectionResult, HostStatus, HostStatusResult, PaletteItemView,
     PalettePresentResult, PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpHost,
     SidebarDumpHostProject, SidebarDumpHostTab, SidebarDumpProject, SidebarDumpResult,
-    WindowMetricsResult,
+    SidebarDumpSection, WindowMetricsResult,
 };
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::{IpcServer, LocalBackendCell, LocalBackendMode};
@@ -1211,6 +1211,58 @@ fn dispatch_keybind_once_unless_repeat<T>(repeat: bool, dispatch: impl FnOnce() 
     (!repeat).then(dispatch)
 }
 
+/// The navigation ring's sections, in the sidebar's own band order —
+/// [`App::ring_sections`]'s body, lifted out so the pairing is testable
+/// without an `App` (plan 063 §D2).
+///
+/// One band, one ring section, paired **by `saved_id`**. The band with
+/// no saved host is the in-process workspace's and takes `local`; under
+/// `local-backend = session` no band is, so the ring leads with the slot
+/// and never visits the in-process rows — which is what keeps
+/// `switch_project_N` counting the rows the sidebar actually drew. A
+/// band naming a host no view holds is dropped rather than guessed at.
+/// Whether this band is the one the in-process project strip hangs
+/// under.
+///
+/// The in-process backend owns exactly one band and only under
+/// `in-process`; the session placeholder shares its empty `saved_id` but
+/// owns nothing, so the test is the role. Both the renderer and
+/// [`ring_sections_from`] ask it, which is what keeps what is drawn and
+/// what Cmd-1..9 reaches from disagreeing (plan 063 §D2/§D3).
+fn band_owns_local_strip(section: &host_sidebar::Section) -> bool {
+    section.role == host_sidebar::SectionRole::Local
+}
+
+fn ring_sections_from(
+    sections: &[host_sidebar::Section],
+    local: &host_sidebar::RingSection,
+    views: &[HostView],
+) -> Vec<host_sidebar::RingSection> {
+    sections
+        .iter()
+        .filter_map(|section| {
+            // Keyed on the *role*, not on `saved_id.is_none()`: the
+            // session placeholder (no localhost host saved yet) also has
+            // no saved id, and treating it as the local band would hand
+            // Cmd-1..9 the in-process rows — the workspace session mode
+            // deliberately does not draw (plan 063 §D3). Only a band the
+            // in-process backend actually owns contributes them.
+            if band_owns_local_strip(section) {
+                return Some(local.clone());
+            }
+            let saved_id = section.saved_id.as_deref()?;
+            views
+                .iter()
+                .find(|view| view.saved_id == saved_id)
+                .map(|view| host_sidebar::RingSection {
+                    host: view.host,
+                    navigable: view.state.interactive(),
+                    projects: view.projects.iter().map(|row| row.id).collect(),
+                })
+        })
+        .collect()
+}
+
 /// The sidebar's band strip. The "PROJECTS" header and every host band
 /// are the same chrome, so the height and insets live in one place —
 /// that parity is the whole reason a host section reads as a band and
@@ -2229,11 +2281,14 @@ pub struct App {
     /// and every host-aware branch in the view is gated on that, which is
     /// what keeps the zero-host sidebar byte-identical to today's.
     host_views: Vec<HostView>,
-    /// The bands drawn above those rows — LOCAL first, then one per
-    /// entry of `host_views`, so `host_sections[1..]` pairs off with it
-    /// positionally. Cached for the same reason `host_views` is: the
-    /// labels and rollups are `String`s the widget tree borrows, and
-    /// rebuilding them per frame would allocate on every PTY burst.
+    /// The bands drawn above those rows: the local band first, then the
+    /// saved hosts. A band is paired to its `host_views` entry by
+    /// `saved_id` and never by index (`host_sidebar::band_for`) — under
+    /// `local-backend = session` the leading band *is* a saved host, the
+    /// slot, and is not repeated below. Cached for the same reason
+    /// `host_views` is: the labels and rollups are `String`s the widget
+    /// tree borrows, and rebuilding them per frame would allocate on
+    /// every PTY burst.
     /// Rebuilt at the tail of `refresh_sidebar_agents`, which is where
     /// the per-host agent counts the rollups read get filled in.
     host_sections: Vec<host_sidebar::Section>,
@@ -4226,9 +4281,34 @@ impl App {
                     scrollable(project_strip).height(Fill).into(),
                 )
             } else {
-                let mut list = column![self.host_band(&sections[0]), project_strip];
-                for (section, view) in sections[1..].iter().zip(&self.host_views) {
+                // The in-process strip belongs to the one band that has
+                // no saved host behind it. Under `session` no band does,
+                // so it is never drawn — the local rows live on the slot.
+                let mut project_strip = Some(project_strip);
+                let mut list = column![];
+                for section in sections {
                     list = list.push(self.host_band(section));
+                    // Keyed, never positional (plan 063 §D2): the
+                    // leading band is the slot's own under `session`.
+                    let Some(view) = section
+                        .saved_id
+                        .as_deref()
+                        .and_then(|saved_id| self.host_view_for(saved_id))
+                    else {
+                        // Same rule as the ring: only the in-process
+                        // band's own rows are the local strip. A band
+                        // whose keyed view is momentarily missing (a slot
+                        // removed while its band is still retained) draws
+                        // its header and nothing under it — putting the
+                        // local strip there would show projects the ring
+                        // cannot reach and session mode never owns.
+                        if band_owns_local_strip(section) {
+                            if let Some(strip) = project_strip.take() {
+                                list = list.push(strip);
+                            }
+                        }
+                        continue;
+                    };
                     let reorderable =
                         host_section_is_reorderable(view.host, section.state.interactive());
                     let dim = !section.state.interactive();
@@ -5221,10 +5301,11 @@ impl App {
         Ok(())
     }
 
-    /// Every section the navigation ring walks, top to bottom. The local
-    /// workspace leads; a saved host contributes its mirrored projects,
-    /// and a section that is not connected is listed but never traversed
-    /// (plan 037 §3.1).
+    /// Every section the navigation ring walks, top to bottom — the
+    /// sidebar's own band order. The local workspace leads, unless
+    /// `local-backend = session` has put the slot in its place; a saved
+    /// host contributes its mirrored projects, and a section that is not
+    /// connected is listed but never traversed (plan 037 §3.1).
     fn ring_sections(&self) -> Vec<host_sidebar::RingSection> {
         // The local rows come off a fresh snapshot, not the reconciled
         // cache: `switch_project_N` resolved against `workspace.snapshot()`
@@ -5242,21 +5323,10 @@ impl App {
                 .map(|project| project.id)
                 .collect(),
         };
-        if self.host_views.is_empty() {
+        if self.host_sections.is_empty() {
             return vec![local];
         }
-        let mut sections = Vec::with_capacity(self.host_views.len() + 1);
-        sections.push(local);
-        sections.extend(
-            self.host_views
-                .iter()
-                .map(|view| host_sidebar::RingSection {
-                    host: view.host,
-                    navigable: view.state.interactive(),
-                    projects: view.projects.iter().map(|row| row.id).collect(),
-                }),
-        );
-        sections
+        ring_sections_from(&self.host_sections, &local, &self.host_views)
     }
 
     fn switch_project_by_index(&mut self, index: u8) -> Result<(), String> {
@@ -5382,6 +5452,15 @@ impl App {
     /// user may act on.
     fn host_view(&self, host: HostId) -> Option<&HostView> {
         self.host_views.iter().find(|view| view.host == host)
+    }
+
+    /// The cached view of a *saved* host — the key a band is paired to
+    /// its rows by (plan 063 §D2). Keyed rather than positional because
+    /// the leading band is itself a saved host under `session`.
+    fn host_view_for(&self, saved_id: &str) -> Option<&HostView> {
+        self.host_views
+            .iter()
+            .find(|view| view.saved_id == saved_id)
     }
 
     /// The host whose frame the window is showing, when that frame is
@@ -8209,6 +8288,227 @@ mod tests {
         );
 
         supervisor.close(doomed_tab_id);
+    }
+
+    /// The navigation ring walks the bands the sidebar drew, paired to
+    /// their rows by `saved_id` — so `switch_project_N` counts exactly
+    /// the rows on screen, under either local backend (plan 063 §D2).
+    ///
+    /// **The fixture is deliberately not in index order**: the slot is
+    /// registry entry *2* of 3, so under `session` no band's position
+    /// equals its view's — band 0 is view 2, band 1 is view 0, band 2 is
+    /// view 1. A positional walk gets all three wrong, which is what
+    /// stops this passing with the keyed pairing reverted.
+    #[test]
+    fn the_ring_walks_the_bands_the_sidebar_drew_and_pairs_them_by_saved_id() {
+        use host_sidebar::{
+            HostInput, HostTransportKind, LocalSlot, RingSection, SectionState, SectionState::*,
+        };
+        use roost_ipc::LocalBackendMode;
+
+        fn view(
+            saved_id: &str,
+            host: u32,
+            state: SectionState,
+            transport: HostTransportKind,
+            projects: &[i64],
+        ) -> HostView {
+            HostView {
+                saved_id: saved_id.to_string(),
+                label: saved_id.to_string(),
+                transport,
+                host: HostId::new(host),
+                state,
+                reduced_fidelity: false,
+                reason: None,
+                projects: projects.iter().copied().map(empty_project).collect(),
+                active_tab_id: 0,
+                agents: 0,
+            }
+        }
+
+        let views = [
+            view("hs-box", 3, Connected, HostTransportKind::Ssh, &[20, 21]),
+            view("hs-pop", 5, Disconnected, HostTransportKind::Ssh, &[30]),
+            // The slot last in the registry — the whole point of the
+            // fixture, since `session` hoists its band to the front.
+            view(
+                "hs-slot",
+                9,
+                Connected,
+                HostTransportKind::Localhost,
+                &[40, 41],
+            ),
+        ];
+        let inputs: Vec<HostInput<'_>> = views
+            .iter()
+            .map(|view| HostInput {
+                saved_id: view.saved_id.as_str(),
+                label: view.label.as_str(),
+                host: view.host,
+                state: view.state,
+                transport: view.transport,
+                reduced_fidelity: false,
+                agents: 0,
+                reason: None,
+            })
+            .collect();
+        let local = RingSection {
+            host: HostId::LOCAL,
+            navigable: true,
+            projects: vec![1, 2],
+        };
+        let ring =
+            |sections: &[host_sidebar::Section]| ring_sections_from(sections, &local, &views);
+        let host_ring = |index: usize| RingSection {
+            host: views[index].host,
+            navigable: views[index].state.interactive(),
+            projects: views[index].projects.iter().map(|p| p.id).collect(),
+        };
+
+        // In-process: LOCAL then the registry, which is what this
+        // function's caller built by hand before the bands drove it.
+        let in_process = ring(&host_sidebar::sections(LocalSlot::default(), &inputs));
+        let before_063: Vec<RingSection> = std::iter::once(local.clone())
+            .chain((0..views.len()).map(host_ring))
+            .collect();
+        assert_eq!(in_process, before_063);
+        assert_eq!(
+            host_sidebar::ring_index(&in_process, 1),
+            Some(ProjectKey::local(1)),
+            "⌘1 still lands on the first in-process project"
+        );
+
+        // Session: the slot's band leads, its rows are the ring's first,
+        // and the in-process rows — which no band draws — are absent.
+        let session = ring(&host_sidebar::sections(
+            LocalSlot {
+                mode: LocalBackendMode::Session,
+                slot_saved_id: Some("hs-slot"),
+            },
+            &inputs,
+        ));
+        assert_eq!(session, vec![host_ring(2), host_ring(0), host_ring(1)]);
+        assert_eq!(
+            host_sidebar::ring_index(&session, 1),
+            Some(ProjectKey::new(HostId::new(9), 40)),
+            "⌘1 lands on the slot's first row, which is what the sidebar drew first"
+        );
+        let walked = host_sidebar::ring(&session);
+        assert!(
+            !walked.iter().any(|key| key.is_local()),
+            "the in-process rows are not drawn under session, so the ring must not visit them: {walked:?}"
+        );
+        assert_eq!(
+            walked,
+            vec![
+                ProjectKey::new(HostId::new(9), 40),
+                ProjectKey::new(HostId::new(9), 41),
+                ProjectKey::new(HostId::new(3), 20),
+                ProjectKey::new(HostId::new(3), 21),
+                // hs-pop is disconnected: listed, never traversed.
+            ]
+        );
+
+        // A band naming a host no view holds is dropped, not guessed at.
+        assert_eq!(
+            ring_sections_from(
+                &host_sidebar::sections(LocalSlot::default(), &inputs[..1]),
+                &local,
+                &[],
+            ),
+            vec![local.clone()]
+        );
+
+        // The session placeholder — session mode with no localhost host
+        // saved yet — also carries `saved_id: None`, so a rule written as
+        // "no saved id means the local band" hands it the in-process
+        // rows: Cmd-1 would select, and New Project would then create in,
+        // the workspace session mode never draws (plan 063 §D3). The
+        // placeholder contributes nothing to the ring.
+        let placeholder = host_sidebar::sections(
+            LocalSlot {
+                mode: LocalBackendMode::Session,
+                slot_saved_id: None,
+            },
+            &inputs,
+        );
+        assert_eq!(
+            placeholder[0].saved_id, None,
+            "the fixture must actually exercise the saved_id-is-none shape"
+        );
+        assert_eq!(
+            placeholder[0].role,
+            host_sidebar::SectionRole::Session,
+            "…and be told apart from the local band only by its role"
+        );
+        let ring_without_a_slot = ring(&placeholder);
+        assert_eq!(
+            ring_without_a_slot,
+            vec![host_ring(0), host_ring(1), host_ring(2)],
+            "no local rows: the placeholder draws none, so the ring reaches none"
+        );
+        assert!(
+            !host_sidebar::ring(&ring_without_a_slot)
+                .iter()
+                .any(|key| key.is_local()),
+            "Cmd-1..9 must never reach the in-process workspace under session"
+        );
+    }
+
+    /// Exactly one band draws the in-process project strip, and only
+    /// under `in-process`. The renderer hangs the strip under whichever
+    /// band answers [`band_owns_local_strip`], so "how many bands answer
+    /// yes" is the whole invariant: two would draw the rows twice, and
+    /// one under `session` would draw a workspace that mode does not own
+    /// and the ring cannot reach.
+    #[test]
+    fn only_the_in_process_band_owns_the_local_project_strip() {
+        use host_sidebar::{HostInput, HostTransportKind, LocalSlot, SectionState};
+        use roost_ipc::LocalBackendMode;
+
+        let host = |saved_id: &'static str, transport| HostInput {
+            saved_id,
+            label: saved_id,
+            host: HostId::new(3),
+            state: SectionState::Connected,
+            transport,
+            reduced_fidelity: false,
+            agents: 0,
+            reason: None,
+        };
+        let hosts = [
+            host("hs-slot", HostTransportKind::Localhost),
+            host("hs-box", HostTransportKind::Ssh),
+        ];
+        let owners = |sections: &[host_sidebar::Section]| {
+            sections.iter().filter(|s| band_owns_local_strip(s)).count()
+        };
+        let session = |slot| LocalSlot {
+            mode: LocalBackendMode::Session,
+            slot_saved_id: slot,
+        };
+
+        // In-process with hosts: the LOCAL band, and only it.
+        assert_eq!(
+            owners(&host_sidebar::sections(LocalSlot::default(), &hosts)),
+            1
+        );
+        // In-process with no hosts: no bands at all — the caller draws
+        // its own PROJECTS band and the strip with it.
+        assert_eq!(
+            owners(&host_sidebar::sections(LocalSlot::default(), &[])),
+            0
+        );
+        // Session with a slot: the local rows live on the slot.
+        assert_eq!(
+            owners(&host_sidebar::sections(session(Some("hs-slot")), &hosts)),
+            0
+        );
+        // Session with no slot saved yet: the placeholder has no saved
+        // id either, and must still own nothing.
+        assert_eq!(owners(&host_sidebar::sections(session(None), &hosts)), 0);
+        assert_eq!(owners(&host_sidebar::sections(session(None), &[])), 0);
     }
 
     /// A host project with no tabs, as `tab.list` would report the one

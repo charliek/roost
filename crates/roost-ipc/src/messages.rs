@@ -1498,6 +1498,43 @@ pub struct SidebarDumpHost {
     pub projects: Vec<SidebarDumpHostProject>,
 }
 
+/// One band of the sidebar's section strip, in sidebar order — the
+/// **presence-derived** rendering of plan 063 §D2, which is what makes
+/// "which local backend is on screen, and is it up?" answerable from
+/// the wire.
+///
+/// `role` tells the three kinds of band apart: `local` is the in-process
+/// workspace's, `session` is the local band under `local-backend =
+/// session` (the slot's own band wearing the local label, or a
+/// placeholder while no slot is saved yet), `host` is an ordinary saved
+/// host below it. `saved_id` is the **only** pairing between a band and
+/// a saved host: under `session` the leading band is itself a host, so
+/// position says nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidebarDumpSection {
+    /// `"local"` | `"session"` | `"host"`.
+    pub role: String,
+    /// The band's header text, as drawn — `LOCAL`, `PROJECTS`, or the
+    /// saved label uppercased.
+    pub label: String,
+    /// The same wire spelling `host.status` reports.
+    pub state: String,
+    /// `"connected"` | `"pending"` | `"offline"`.
+    pub dot: String,
+    /// The saved host this band renders. Absent for the in-process band
+    /// and for the session placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_id: Option<String>,
+    /// Whether the band's state offers the inline ↻ Reconnect row. The
+    /// row is addressed to `saved_id`, so a band without one has the
+    /// offer and nothing to point it at — the transient §D2 row 4.
+    pub reconnect_row: bool,
+    /// `"update"` | `"restart"` | `"manual"` — the reduced-fidelity
+    /// pill's action, absent when the band draws no pill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fidelity: Option<String>,
+}
+
 /// `app.sidebar_dump` response — the sidebar's **last-rendered** agent
 /// rows, read from the same per-project cache the sidebar paints from
 /// (`RenderedAgentRow` on both UIs), not re-derived from the workspace
@@ -1523,6 +1560,15 @@ pub struct SidebarDumpResult {
     /// and a UI with no host sections stays byte-identical on both.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<SidebarDumpHost>,
+    /// Every band of the section strip, in sidebar order, including the
+    /// local one (plan 063 §D2) — where `hosts` lists only the saved
+    /// hosts and their rows.
+    ///
+    /// Empty, and so omitted, when the sidebar draws its classic single
+    /// sticky `PROJECTS` header instead of a strip: `in-process` with no
+    /// saved hosts, which is also every Swift Mac reply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<SidebarDumpSection>,
 }
 
 /// `app.render_stats` request — read the running UI's render-path
@@ -3973,6 +4019,7 @@ mod tests {
                 },
             ],
             hosts: Vec::new(),
+            sections: Vec::new(),
         });
     }
 
@@ -4003,6 +4050,7 @@ mod tests {
                     projects: Vec::new(),
                 },
             ],
+            sections: Vec::new(),
         });
     }
 
@@ -4020,9 +4068,65 @@ mod tests {
             agents_visible: true,
             projects: Vec::new(),
             hosts: Vec::new(),
+            sections: Vec::new(),
         })
         .unwrap();
         assert_eq!(encoded, r#"{"agents_visible":true,"projects":[]}"#);
+    }
+
+    /// The band strip (plan 063 §D2) is additive in both directions: a
+    /// reply that predates it still decodes, and an empty strip — the
+    /// classic single sticky `PROJECTS` header, and every Swift reply —
+    /// stays off the wire, so the pre-063 shape is byte-identical.
+    #[test]
+    fn sidebar_dump_result_round_trips_the_band_strip() {
+        let without: SidebarDumpResult =
+            serde_json::from_str(r#"{"agents_visible":true,"projects":[]}"#).unwrap();
+        assert!(without.sections.is_empty());
+        assert_eq!(
+            serde_json::to_string(&without).unwrap(),
+            r#"{"agents_visible":true,"projects":[]}"#,
+            "an empty strip must stay off the wire, or every pre-063 reply changes shape"
+        );
+
+        let dump = SidebarDumpResult {
+            agents_visible: true,
+            projects: Vec::new(),
+            hosts: Vec::new(),
+            sections: vec![
+                // The session-only band: the slot's own, wearing the
+                // local label and offering ↻ because it is down.
+                SidebarDumpSection {
+                    role: "session".to_string(),
+                    label: "PROJECTS".to_string(),
+                    state: "disconnected".to_string(),
+                    dot: "offline".to_string(),
+                    saved_id: Some("hs-2f1c".to_string()),
+                    reconnect_row: true,
+                    fidelity: None,
+                },
+                SidebarDumpSection {
+                    role: "host".to_string(),
+                    label: "WORKBENCH".to_string(),
+                    state: "connected".to_string(),
+                    dot: "connected".to_string(),
+                    saved_id: Some("hs-9d40".to_string()),
+                    reconnect_row: false,
+                    fidelity: Some("update".to_string()),
+                },
+            ],
+        };
+        round_trip(&dump);
+
+        let encoded = serde_json::to_value(&dump).unwrap();
+        let band = &encoded["sections"][0];
+        assert_eq!(band["role"], "session");
+        assert_eq!(band["saved_id"], "hs-2f1c");
+        assert_eq!(band["reconnect_row"], true);
+        assert!(
+            band.get("fidelity").is_none(),
+            "a band with no pill omits the key"
+        );
     }
 
     #[test]

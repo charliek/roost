@@ -284,6 +284,24 @@ fn host_dump(view: &HostView) -> SidebarDumpHost {
     }
 }
 
+/// One band of the sidebar's section strip, as `app.sidebar_dump`
+/// reports it (plan 063 §D2).
+///
+/// Read off the same `host_sections` the sidebar paints from, for the
+/// same reason the agent rows are: a band derived a second time here
+/// could disagree with the one on screen.
+fn section_dump(section: &host_sidebar::Section) -> SidebarDumpSection {
+    SidebarDumpSection {
+        role: section.role.as_str().to_string(),
+        label: section.label.clone(),
+        state: section.state.wire().to_string(),
+        dot: section.state.dot().as_str().to_string(),
+        saved_id: section.saved_id.clone(),
+        reconnect_row: section.state.offers_reconnect(),
+        fidelity: section.fidelity.map(|action| action.as_str().to_string()),
+    }
+}
+
 pub(crate) struct AgentMetricsResult {
     session: u64,
     claimed: Vec<String>,
@@ -2181,6 +2199,18 @@ impl App {
             .collect();
     }
 
+    /// *The slot*: the saved host that holds the local band under
+    /// `local-backend = session` — the first with a localhost transport,
+    /// in registry order (plan 063 §D2). Read whatever the mode is;
+    /// under `in-process` it is an ordinary `LOCALHOST` band and
+    /// [`host_sidebar::sections`] ignores it.
+    pub(super) fn local_slot_saved_id(&self) -> Option<String> {
+        self.host_views
+            .iter()
+            .find(|view| view.transport.localhost())
+            .map(|view| view.saved_id.clone())
+    }
+
     fn refresh_sidebar_agents(&mut self) {
         let host = self.backend.host();
         let now = agent_palette::now_unix();
@@ -2211,7 +2241,12 @@ impl App {
         }
         self.sidebar_agents = rows;
         // Last, because the rollups read the counts filled just above.
+        let slot = self.local_slot_saved_id();
         self.host_sections = host_sidebar::sections(
+            host_sidebar::LocalSlot {
+                mode: self.local_backend,
+                slot_saved_id: slot.as_deref(),
+            },
             &self
                 .host_views
                 .iter()
@@ -2260,6 +2295,7 @@ impl App {
             agents_visible: self.config.show_sidebar_agents,
             projects,
             hosts: self.host_views.iter().map(host_dump).collect(),
+            sections: self.host_sections.iter().map(section_dump).collect(),
         }
     }
 
@@ -3056,33 +3092,29 @@ impl App {
         self.refresh_sidebar_agents();
 
         let saved = self.workspace.hosts();
-        // `host_sections` is LOCAL plus one band per view, and empty
-        // when there are no saved hosts at all (the zero-host sidebar is
-        // byte-identical to the pre-host-sessions one).
-        let paired = saved.len() == self.host_views.len()
-            && (self.host_views.is_empty()
-                || self.host_sections.len() == self.host_views.len() + 1);
-        if !paired {
+        if saved.len() != self.host_views.len() {
             return Err(roost_engine::WorkspaceError::Inconsistent(format!(
-                "the sidebar has {} bands and {} views for {} saved hosts",
-                self.host_sections.len(),
+                "the sidebar has {} views for {} saved hosts",
                 self.host_views.len(),
                 saved.len(),
             )));
         }
 
         let mut hosts = Vec::new();
-        for (index, host) in saved.into_iter().enumerate() {
+        for host in saved {
             if id.is_some_and(|id| id != host.id) {
                 continue;
             }
-            let band = &self.host_sections[index + 1];
-            if band.saved_id.as_deref() != Some(host.id.as_str()) {
+            // Keyed, never positional (plan 063 §D2): under `session`
+            // the slot's band leads the sidebar in the local band's
+            // place, so "band n + 1 is saved host n" no longer holds.
+            let Some(band) = host_sidebar::band_for(&self.host_sections, &host.id) else {
                 return Err(roost_engine::WorkspaceError::Inconsistent(format!(
-                    "band {index} is {:?}, not host {}",
-                    band.saved_id, host.id
+                    "no sidebar band renders host {} (the sidebar has {} bands)",
+                    host.id,
+                    self.host_sections.len(),
                 )));
-            }
+            };
             hosts.push(HostStatus {
                 id: host.id.clone(),
                 label: host.label,
@@ -3207,6 +3239,117 @@ mod tests {
 
     use super::file_transfer::LostReason;
     use super::*;
+
+    /// `app.sidebar_dump`'s band strip, one row per plan 063 §D2
+    /// rendering, projected from the very sections the sidebar paints.
+    ///
+    /// This is the wire half of AC5: the session-only band answers
+    /// `PROJECTS` with a *saved host's* dot and `saved_id`, and offers ↻
+    /// exactly when that host is down.
+    #[test]
+    fn the_dumped_band_strip_reports_each_presence_rendering() {
+        use host_sidebar::{HostInput, HostTransportKind, LocalSlot, SectionState};
+        use roost_ipc::LocalBackendMode;
+
+        let slot = |state| HostInput {
+            saved_id: "hs-slot",
+            label: "localhost",
+            host: HostId::new(1),
+            state,
+            transport: HostTransportKind::Localhost,
+            reduced_fidelity: false,
+            agents: 0,
+            reason: None,
+        };
+        let ssh = HostInput {
+            saved_id: "hs-box",
+            label: "box",
+            host: HostId::new(2),
+            state: SectionState::Disconnected,
+            transport: HostTransportKind::Ssh,
+            reduced_fidelity: false,
+            agents: 0,
+            reason: None,
+        };
+        let strip = |local: LocalSlot<'_>, hosts: &[HostInput<'_>]| {
+            host_sidebar::sections(local, hosts)
+                .iter()
+                .map(section_dump)
+                .collect::<Vec<_>>()
+        };
+        let session = LocalSlot {
+            mode: LocalBackendMode::Session,
+            slot_saved_id: Some("hs-slot"),
+        };
+        let told =
+            |band: &SidebarDumpSection| (band.role.clone(), band.label.clone(), band.dot.clone());
+
+        // In-process, no saved host: no strip at all — the sidebar draws
+        // its classic sticky header and the field stays off the wire.
+        assert!(strip(LocalSlot::default(), &[]).is_empty());
+
+        // In-process beside a saved localhost: today's two bands.
+        let both = strip(LocalSlot::default(), &[slot(SectionState::Connected), ssh]);
+        assert_eq!(
+            both.iter().map(told).collect::<Vec<_>>(),
+            vec![
+                ("local".into(), "LOCAL".to_string(), "connected".into()),
+                ("host".into(), "LOCALHOST".to_string(), "connected".into()),
+                ("host".into(), "BOX".to_string(), "offline".into()),
+            ]
+        );
+        assert_eq!(both[0].saved_id, None);
+        assert!(!both[0].reconnect_row);
+        assert!(both[2].reconnect_row, "a disconnected host offers ↻");
+
+        // Session with the slot connected: one local band, the slot's.
+        let up = strip(session, &[slot(SectionState::Connected), ssh]);
+        assert_eq!(
+            up.iter().map(told).collect::<Vec<_>>(),
+            vec![
+                ("session".into(), "PROJECTS".to_string(), "connected".into()),
+                ("host".into(), "BOX".to_string(), "offline".into()),
+            ]
+        );
+        assert_eq!(up[0].saved_id.as_deref(), Some("hs-slot"));
+        assert_eq!(up[0].state, "connected");
+        assert!(!up[0].reconnect_row);
+
+        // Session with the slot down: same band, its real dot and ↻.
+        let down = strip(session, &[slot(SectionState::Stopped)]);
+        assert_eq!(
+            told(&down[0]),
+            ("session".into(), "PROJECTS".to_string(), "offline".into())
+        );
+        assert_eq!(down[0].saved_id.as_deref(), Some("hs-slot"));
+        assert_eq!(down[0].state, "stopped");
+        assert!(down[0].reconnect_row);
+
+        // Session with no slot saved: the transient the launch path
+        // closes — pending, and addressed to nothing.
+        let none = strip(
+            LocalSlot {
+                mode: LocalBackendMode::Session,
+                slot_saved_id: None,
+            },
+            &[],
+        );
+        assert_eq!(
+            told(&none[0]),
+            ("session".into(), "PROJECTS".to_string(), "pending".into())
+        );
+        assert_eq!(none[0].saved_id, None);
+
+        // The pill's spelling reaches the wire off the same band.
+        let reduced = strip(
+            session,
+            &[HostInput {
+                reduced_fidelity: true,
+                ..slot(SectionState::Connected)
+            }],
+        );
+        assert_eq!(reduced[0].fidelity.as_deref(), Some("restart"));
+    }
 
     /// Under fan-out every client receives every effect, so the
     /// clipboard asks *this* client's own question: is the tab the copy
