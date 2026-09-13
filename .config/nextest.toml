@@ -1,0 +1,35 @@
+# cargo-nextest configuration.
+#
+# Nextest runs each test in its own process and schedules across binaries,
+# which is the whole point: `cargo test --workspace` runs this workspace's
+# 78 test binaries one after another, and the suite is mostly *asleep* on
+# PTY children and timeout budgets — 121s of wall clock at 9% of one core.
+# Nextest overlaps those waits and finishes in ~31s, which is the floor set
+# by the single slowest test (a 30s budget assertion), not by CPU.
+#
+# Process-per-test also removes the reason three in-binary mutexes existed
+# (`HOME_LOCK`, the doctor's `ENV` lock, `PANIC_HOOK_LOCK`): each guards
+# process-global state, and there is no longer a shared process to guard.
+# They stay put because `cargo test` is still a supported way to run this
+# suite — see the Makefile's fallback.
+
+# `PTY_HEAVY` in `pty_shutdown_test.rs` is the one guard process isolation
+# does NOT replace. It throttles *concurrent resource use*, not shared
+# state: those lanes each hold 65+ live ptys, and the system pty table is
+# not per-process. Two at once on macOS is #444 again — "pty_shutdown_test
+# cannot allocate a PTY on macos-latest, openpty ENXIO". A test group is
+# the only way to serialise them once each test is its own process.
+[test-groups]
+pty-heavy = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary_id(roost-engine::pty_shutdown_test)'
+test-group = 'pty-heavy'
+
+# Three `roostctl` launcher tests deliberately leave a child alive past the
+# test — a launcher that hangs is the property under test — so nextest's
+# leak detector flags them on every run. They pass; the annotation is
+# expected, and a longer grace would only slow the suite.
+[[profile.default.overrides]]
+filter = 'binary_id(roost-cli::bin/roostctl) and test(/^session::tests::a_launcher_that_/)'
+leak-timeout = "1s"

@@ -200,14 +200,36 @@ SPARKLE_TEST_PUBLIC_KEY := tools/roosttest/fixtures/sparkle/TEST-ONLY-public-ed-
 SPARKLE_TEST_PLACEHOLDER_FEED := http://127.0.0.1:1/placeholder
 test: test-rust test-mac test-harness test-linux-scripts test-mac-scripts  ## All unit/integration tests (Rust + Swift + harness)
 
+# `cargo test` runs this workspace's 78 test binaries strictly one after
+# another, and the suite is mostly *asleep* — PTY children, timeout budgets,
+# bounded waits. Measured on a 32-core box with everything already built:
+# 121s at 9% of one core. `cargo nextest` schedules across binaries and
+# finishes the same 3029 tests in 31s, which is the floor set by the single
+# slowest test rather than by CPU.
+#
+# Optional on purpose, so no machine is broken by its absence: nextest is not
+# in mise's registry, so a checkout without it runs the identical binaries
+# through `cargo test`. The two are equivalent in coverage here — the one
+# thing nextest skips is doctests, and this workspace has zero of them
+# (`cargo test --workspace --doc` reports 0 across every crate). Install with
+# `cargo install cargo-nextest` or the binary from https://nexte.st.
+# Serialisation that process isolation would otherwise lose is restored in
+# `.config/nextest.toml`; read that before trusting a parallel run.
+RUST_TEST := $(if $(shell command -v cargo-nextest 2>/dev/null),cargo nextest run,cargo test)
+
 # roost-vt's tests/*.rs all start with `#![cfg(feature = "ffi")]`, so the
 # `--workspace` run compiles and then silently skips every one of them. The
 # second line mirrors CI's separate `cargo test -p roost-vt --features ffi`
 # step (.github/workflows/ci.yml, rust job) so `make test` runs them too.
-test-rust:  ## cargo test --workspace (+ roost-vt ffi and roost-engine server-vt tests, cfg-gated out of the default run)
-	cargo test --workspace
-	cargo test -p roost-vt --features ffi
-	cargo test -p roost-engine --features server-vt
+test-rust:  ## Workspace tests (+ roost-vt ffi and roost-engine server-vt, cfg-gated out of the default run). Uses cargo-nextest when installed.
+	$(RUST_TEST) --workspace
+	$(RUST_TEST) -p roost-vt --features ffi
+	$(RUST_TEST) -p roost-engine --features server-vt
+
+which-runner:  ## Say which test runner `make test-rust` will use, and why it matters
+	@echo "$(RUST_TEST)"
+	@command -v cargo-nextest >/dev/null 2>&1 || \
+		echo "  (cargo-nextest not installed — the suite runs ~4x slower; see https://nexte.st)"
 
 test-iced:  ## Iced unit tests (renderer + input + adapter)
 	cargo test -p roost-iced
