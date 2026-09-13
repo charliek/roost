@@ -238,6 +238,66 @@ fn creation_target(host: HostId) -> CreationTarget {
     }
 }
 
+/// [`creation_target`] once the local backend has had its say (plan 063
+/// §D3).
+///
+/// **This is the gate that keeps a creation out of the invisible
+/// workspace.** Under `local-backend = session` the in-process workspace
+/// is not on screen, and `HostId::LOCAL` reaches a creation dispatch by
+/// two routes that have nothing to do with a user asking for a local
+/// tab: a `HostView` for a host that has never connected carries it as a
+/// placeholder ([`servicing::view_incarnation`]), and so does the
+/// session band the sidebar draws before a slot is saved
+/// (`host_sidebar::sections`). Either one arriving as a creation target
+/// would put a project somewhere nobody can see it, so the mapping is
+/// total and `Local` is simply not reachable under `session`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreationRoute {
+    Local,
+    Host(HostId),
+    /// Session mode with no local workspace to create in. The caller
+    /// says so; it never falls back.
+    NoLocalBackend,
+}
+
+fn creation_route(mode: LocalBackendMode, host: HostId) -> CreationRoute {
+    match (creation_target(host), mode) {
+        (CreationTarget::Host(host), _) => CreationRoute::Host(host),
+        (CreationTarget::Local, LocalBackendMode::InProcess) => CreationRoute::Local,
+        (CreationTarget::Local, LocalBackendMode::Session) => CreationRoute::NoLocalBackend,
+    }
+}
+
+/// Where ⌘N / "+ New Project" creates (plan 063 §D3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewProjectRoute {
+    On(HostId),
+    /// Nowhere obvious — open the picker rather than failing.
+    Picker,
+}
+
+/// The active project's host as today, then the local slot, then the
+/// picker.
+///
+/// `active` is `None` when there is no active project to follow, which
+/// under `session` is the ordinary state: the in-process workspace is
+/// empty and nothing on the slot has been selected yet.
+fn new_project_route(
+    mode: LocalBackendMode,
+    active: Option<HostId>,
+    local_slot: Option<HostId>,
+) -> NewProjectRoute {
+    if let Some(host) = active {
+        if creation_route(mode, host) != CreationRoute::NoLocalBackend {
+            return NewProjectRoute::On(host);
+        }
+    }
+    match local_slot {
+        Some(host) => NewProjectRoute::On(host),
+        None => NewProjectRoute::Picker,
+    }
+}
+
 /// How long a creation on a host may wait for that host's mirror to
 /// list its new row.
 ///
@@ -295,19 +355,38 @@ fn spawn_gate(
     }
 }
 
-/// What launch-time auto-reconnect does with one saved host: dial an
-/// already-listening localhost session, or nothing at all.
+/// What launch-time auto-reconnect does with one saved host: start the
+/// slot's session, dial an already-listening localhost one, or nothing
+/// at all.
 ///
 /// Reading the policy here rather than dialing unconditionally is what
 /// keeps the two halves in agreement — [`host_verbs::verbs`] withholds
 /// Disconnect and Stop for a localhost host under the same flag, so a
 /// build that auto-connected one anyway would hold a connection it
 /// offers no verb to leave.
+///
+/// `slot` amends plan 037 §3.2's "a silent start on every launch is not
+/// something an app should do" (plan 063 §D5). It still holds for every
+/// other host: what changed is that under `local-backend = session` the
+/// slot's session is not a *host* the user opted into, it is where this
+/// window's own tabs live — coming up with an empty band and a ↻ would
+/// be an app that failed to start. `dial_saved_host` runs the result
+/// through [`spawn_gate`], so a build withholding the surface downgrades
+/// it to a probe exactly as an explicit Connect would.
 fn reconnect_mode(
     policy: host_verbs::VerbPolicy,
     localhost: bool,
+    slot: bool,
 ) -> Option<crate::host_conn::ConnectMode> {
-    (policy.localhost_surface && localhost).then_some(crate::host_conn::ConnectMode::IfPresent)
+    use crate::host_conn::ConnectMode;
+    if !(policy.localhost_surface && localhost) {
+        return None;
+    }
+    Some(if slot {
+        ConnectMode::SpawnIfMissing
+    } else {
+        ConnectMode::IfPresent
+    })
 }
 
 /// One modal overlay: the card, the message a press on the card sends
@@ -931,7 +1010,7 @@ async fn create_host_project_flow(ops: crate::host_conn::HostOps) -> Result<(i64
     let opened: Result<TabOpenResult, String> = host_call(
         &ops,
         wire::TAB_OPEN,
-        host_tab_open_params(project.id, &project.cwd),
+        host_tab_open_params(project.id, &project.cwd, "", &[]),
     )
     .await;
     match opened {
@@ -1040,10 +1119,16 @@ async fn open_host_tab_flow(
     ops: crate::host_conn::HostOps,
     project_id: i64,
     cwd: String,
+    title: String,
+    argv: Vec<String>,
 ) -> Result<i64, String> {
     use roost_ipc::messages::{ops as wire, TabOpenResult};
-    let opened: TabOpenResult =
-        host_call(&ops, wire::TAB_OPEN, host_tab_open_params(project_id, &cwd)).await?;
+    let opened: TabOpenResult = host_call(
+        &ops,
+        wire::TAB_OPEN,
+        host_tab_open_params(project_id, &cwd, &title, &argv),
+    )
+    .await?;
     Ok(opened.tab.id)
 }
 
@@ -1053,12 +1138,24 @@ async fn open_host_tab_flow(
 /// the window's real grid at attach (`tab.attach` carries the geometry
 /// and the server resizes there), so this only has to be a legal
 /// starting size, not the right one.
-fn host_tab_open_params(project_id: i64, cwd: &str) -> serde_json::Value {
+///
+/// `title` + `argv` are empty for an ordinary new tab and carry the
+/// launcher row's command when one runs on a host — the same two fields
+/// `open_tab_flow` passes locally, so a launcher row does the same thing
+/// on the slot as it does in-process.
+fn host_tab_open_params(
+    project_id: i64,
+    cwd: &str,
+    title: &str,
+    argv: &[String],
+) -> serde_json::Value {
     serde_json::json!({
         "project_id": project_id.to_string(),
         "cwd": cwd,
         "cols": u32::from(DEFAULT_COLS),
         "rows": u32::from(DEFAULT_ROWS),
+        "title": title,
+        "argv": argv,
     })
 }
 
@@ -2276,6 +2373,16 @@ pub struct App {
     /// message and may land after. The key is parked here and resolved
     /// by the first reconcile that can see the row.
     pending_host_selection: Option<PendingHostSelection>,
+    /// Whether the launch still owes the slot's tab a select + attach
+    /// (plan 063 §D5). Armed at bootstrap under `session` and cleared by
+    /// the first reconcile that can answer — either by selecting, or by
+    /// finding a selection already held.
+    pending_initial_local_selection: bool,
+    /// A saved host to create a project on as soon as it connects: the
+    /// picker's `localhost` row when this machine's session was not
+    /// ready (plan 063 §D3). At most one, because at most one picker row
+    /// can be pressed at a time and a second press supersedes.
+    pending_create_on_connect: Option<String>,
     /// One entry per saved host, in registry order — the sidebar's host
     /// sections, refreshed by `reconcile`. **Empty with no saved hosts**,
     /// and every host-aware branch in the view is gated on that, which is
@@ -2421,8 +2528,15 @@ impl App {
             .enable_all()
             .build()
             .context("build Iced engine runtime")?;
+        // Both disk questions are asked **before** `Workspace::open`,
+        // which is what creates the very `state.json` the fresh-install
+        // clause is about.
+        let backend_mode = resolve_local_backend(profile, &config);
         let workspace = Arc::new(Workspace::open(profile.state_json_path()));
         workspace.set_window_focused(true);
+        if backend_mode == LocalBackendMode::Session {
+            ensure_local_slot(&workspace);
+        }
         let supervisor = Arc::new(PtySupervisor::new());
         let client = LocalClient::new(
             Arc::clone(&workspace),
@@ -2430,7 +2544,7 @@ impl App {
             profile.socket_path.clone(),
         );
 
-        hydrate_workspace(&runtime, &client)?;
+        hydrate_workspace(&runtime, &client, backend_mode)?;
 
         let (feed_tx, feed_rx) = engine_feed::channel();
         // One feed, one arrival order across sources — see engine_feed.
@@ -2443,7 +2557,6 @@ impl App {
         spawn_quit_signals(&runtime, &feed_tx)?;
         // Seeded before the socket is bound: a client that dials during
         // the rest of bootstrap must never be told the wrong backend.
-        let backend_mode = LocalBackendMode::from(config.local_backend);
         let local_route = Arc::new(LocalBackendCell::new(local_backend::route_snapshot(
             backend_mode,
             None,
@@ -2568,6 +2681,8 @@ impl App {
             add_host_socket_id: Id::unique(),
             add_host_focus_requested: false,
             pending_host_selection: None,
+            pending_initial_local_selection: backend_mode == LocalBackendMode::Session,
+            pending_create_on_connect: None,
             host_views: Vec::new(),
             host_sections: Vec::new(),
             runtime_handle: runtime.handle().clone(),
@@ -2597,12 +2712,16 @@ impl App {
     }
 
     /// Launch-time auto-reconnect for saved host sessions: **connect if
-    /// present**, and nothing more (plan 037 §3.2).
+    /// present**, and — for the slot alone — start it (plan 037 §3.2,
+    /// amended by plan 063 §D5).
     ///
-    /// Three rules, all deliberate. No daemon is ever spawned here — an
-    /// absent socket leaves the host disconnected with a ↻, because a
-    /// silent start on every launch is not something an app should do.
-    /// Only a localhost host is dialed — a remote host is
+    /// Three rules. A daemon is spawned here only for *the slot* under
+    /// `local-backend = session`: every other host with an absent socket
+    /// is left disconnected with a ↻, because a silent start on every
+    /// launch is not something an app should do — while the slot is not
+    /// a host somebody opted into, it is where this window's own tabs
+    /// live, and coming up without it is coming up broken. Only a
+    /// localhost host is dialed at all — a remote host is
     /// manual-reconnect only (D8), and an `ssh -L` forward that is not up
     /// would otherwise make every launch wait on a dial. And the dial
     /// happens only where the build offers the localhost surface at all,
@@ -2611,14 +2730,21 @@ impl App {
     /// With no saved hosts this is a no-op over an empty list, which is
     /// the zero-change baseline.
     fn reconnect_saved_hosts(&mut self) {
+        // Read once, off the views the bootstrap reconcile just built:
+        // whichever saved host holds the local band is the one whose
+        // session this launch may start.
+        let slot = (self.local_backend == LocalBackendMode::Session)
+            .then(|| self.local_slot_saved_id())
+            .flatten();
         for host in self.workspace.hosts() {
+            let is_slot = slot.as_deref() == Some(host.id.as_str());
             // Launch-time, so nobody asked and nobody is waiting: an
             // `Ipc` origin, same as `roostctl`'s, and an attempt no
             // person caused — which is what `AutoReconnect` says.
             self.connect_saved_host(
                 &host,
                 crate::host_conn::RequestOrigin::Ipc,
-                |localhost| reconnect_mode(host_verbs::VerbPolicy::current(), localhost),
+                |localhost| reconnect_mode(host_verbs::VerbPolicy::current(), localhost, is_slot),
                 crate::host_conn::AttemptCause::AutoReconnect,
             );
         }
@@ -4962,16 +5088,42 @@ impl App {
     fn new_tab_dispatch(&mut self) -> EngineDispatch {
         // Creation follows context (plan 037 §3.1): a tab opens on the
         // host its project lives on, never on a different one.
+        self.open_tab_here(String::new(), Vec::new())
+    }
+
+    /// Open a tab on whatever the active project's host is (plan 063
+    /// §D3's routing), running `argv` in it when the caller has one.
+    ///
+    /// ⌘T passes nothing; the launcher's command rows pass the row's
+    /// title and its shell invocation. Both must ask `creation_route`
+    /// rather than `workspace.active()`: under `session` the in-process
+    /// workspace is empty, so the bare active pair is project `0` and a
+    /// creation built from it fails `ProjectNotFound` while a slot tab
+    /// is plainly selected.
+    fn open_tab_here(&mut self, title: String, argv: Vec<String>) -> EngineDispatch {
         let project = self.active_project_key();
-        if creation_target(project.host) != CreationTarget::Local {
-            return self.open_host_tab_dispatch(project);
+        match creation_route(self.local_backend, project.host) {
+            CreationRoute::Host(_) => return self.open_host_tab_dispatch(project, title, argv),
+            CreationRoute::NoLocalBackend => {
+                self.no_local_backend();
+                return EngineDispatch::default();
+            }
+            CreationRoute::Local => {}
         }
         let (project_id, _) = self.workspace.active();
         if project_id == 0 {
             return EngineDispatch::default();
         }
         let cwd = self.launch_cwd(project_id);
-        self.open_tab_dispatch(project_id, cwd, String::new(), Vec::new())
+        self.open_tab_dispatch(project_id, cwd, title, argv)
+    }
+
+    /// What a creation addressed at the local workspace answers under
+    /// `session`, where there is no local workspace on screen (plan 063
+    /// §D3). The slot is down or not saved yet; say so rather than
+    /// creating out of sight.
+    fn no_local_backend(&mut self) {
+        self.set_status("the local session is not connected".to_string());
     }
 
     /// ⌘T / the tab bar's "+" on a host project (plan 037 §3.1: a tab
@@ -4980,7 +5132,12 @@ impl App {
     /// Event-confirmed like every other host mutation: the reply names
     /// the new id, and the selection waits for the mirror to list it
     /// (`arm_pending_host_selection`).
-    fn open_host_tab_dispatch(&mut self, project: ProjectKey) -> EngineDispatch {
+    fn open_host_tab_dispatch(
+        &mut self,
+        project: ProjectKey,
+        title: String,
+        argv: Vec<String>,
+    ) -> EngineDispatch {
         let Some(ops) = self.hosts.ops_for(project.host).cloned() else {
             self.set_status("that host is not accepting operations".to_string());
             return EngineDispatch::default();
@@ -4996,7 +5153,7 @@ impl App {
         let project_id = project.project;
         EngineDispatch {
             task: self.engine_op(
-                async move { open_host_tab_flow(ops, project_id, cwd).await },
+                async move { open_host_tab_flow(ops, project_id, cwd, title, argv).await },
                 move |result| EngineOpResult::TabOpened {
                     op,
                     project,
@@ -5063,8 +5220,27 @@ impl App {
     /// the project lands: revealing where the new project will appear is
     /// the user's own gesture answered, not the engine's report.
     fn new_project_dispatch(&mut self) -> EngineDispatch {
-        let host = self.active_project_key().host;
-        self.create_project_on(host)
+        let active = self.active_project_key();
+        // A zero project id is "no active project" — the ordinary state
+        // under `session`, where the in-process workspace is empty and
+        // nothing on the slot has been selected yet.
+        let active = (active.project != 0).then_some(active.host);
+        match new_project_route(self.local_backend, active, self.local_slot_host()) {
+            NewProjectRoute::On(host) => self.create_project_on(host),
+            NewProjectRoute::Picker => {
+                // Nowhere to follow and no slot to fall back on: ask,
+                // rather than fail (plan 063 §D3). The same root frame
+                // ⌘⇧N opens.
+                let task = match self.open_bound_palette_result(palettes::HOST_PICKER_FRAME_ID) {
+                    Ok(task) => task,
+                    Err(error) => {
+                        self.set_status(error);
+                        UiTask::None
+                    }
+                };
+                EngineDispatch { task, op: None }
+            }
+        }
     }
 
     /// The create-project route, host-qualified (plan 037 §3.1's
@@ -5073,9 +5249,19 @@ impl App {
     /// user chose.
     fn create_project_on(&mut self, host: HostId) -> EngineDispatch {
         self.set_sidebar_collapsed(false);
-        if let CreationTarget::Host(host) = creation_target(host) {
-            return self.create_host_project_dispatch(host);
+        match creation_route(self.local_backend, host) {
+            CreationRoute::Host(host) => return self.create_host_project_dispatch(host),
+            CreationRoute::NoLocalBackend => {
+                self.no_local_backend();
+                return EngineDispatch::default();
+            }
+            CreationRoute::Local => {}
         }
+        // Unreachable by construction — `creation_route` maps a local
+        // target under `session` to `NoLocalBackend` above — and asserted
+        // because this is the dispatch plan 063 §D3 exists to keep out of
+        // the invisible workspace.
+        debug_assert_eq!(self.local_backend, LocalBackendMode::InProcess);
         let op = self.take_engine_op_id();
         let client = self.client.clone();
         let host = self.backend.host();
@@ -7027,6 +7213,52 @@ impl App {
         }
     }
 
+    /// The launch's own selection under `session` (plan 063 §D5): once
+    /// the slot's mirror lists a tab, select it and attach.
+    ///
+    /// Same shape and the same reason as
+    /// [`Self::resolve_pending_host_selection`] below, including why it
+    /// does not call `focus_host_tab_and_clear`: this runs *inside*
+    /// reconcile and that helper ends with a reconcile of its own.
+    ///
+    /// Unbounded, unlike the pending-creation wait: there is no round
+    /// trip that might not come back, only a session that might be
+    /// empty until something seeds it — and the moment it has a tab,
+    /// this is the selection the window should be showing.
+    fn resolve_initial_local_selection(&mut self) {
+        if !self.pending_initial_local_selection {
+            return;
+        }
+        let slot = self
+            .local_slot_host()
+            .filter(|host| !host.is_local())
+            .and_then(|host| self.interactive_host_view(host))
+            .map(|view| (view.projects.as_slice(), view.active_tab_id, view.host));
+        let host = slot.map(|(_, _, host)| host);
+        match local_backend::initial_selection(
+            self.local_backend,
+            self.host_selection.is_some(),
+            slot.map(|(projects, active, _)| (projects, active)),
+        ) {
+            local_backend::InitialSelection::Wait => {}
+            local_backend::InitialSelection::Settled => {
+                self.pending_initial_local_selection = false;
+            }
+            local_backend::InitialSelection::Select { project, tab } => {
+                let Some(host) = host else { return };
+                self.pending_initial_local_selection = false;
+                let tab = TabKey::new(host, tab);
+                self.set_host_selection(Some(HostSelection {
+                    project: ProjectKey::new(host, project),
+                    tab,
+                    local_active: self.workspace.active().1,
+                }));
+                self.host_focus_tab(tab);
+                tracing::info!(%tab, "attached the local session's tab at launch");
+            }
+        }
+    }
+
     /// Resolve a pending host creation, if the mirror has caught up.
     ///
     /// Four outcomes, all terminal-or-wait: the row is listed (select
@@ -7379,7 +7611,97 @@ impl Drop for App {
     }
 }
 
-fn hydrate_workspace(runtime: &tokio::runtime::Runtime, client: &LocalClient) -> Result<()> {
+/// Run plan 063 §D5's effective-mode ladder, and perform the one write
+/// it can owe.
+///
+/// The two disk questions are asked of different paths on purpose:
+/// `state_json_path()` is per-profile, `config::config_path()` is not
+/// (`$HOME/.config/roost/config.conf`, `$ROOST_CONFIG` aside). Without
+/// the second, a first run under the `iced-dev` profile — empty state
+/// dir, the developer's real config beside it — would look like a fresh
+/// install and write `local-backend = session` into the file the release
+/// profile reads.
+fn resolve_local_backend(profile: &BundleProfile, config: &RoostConfig) -> LocalBackendMode {
+    let config_path = config::config_path();
+    let ladder = local_backend::ladder(
+        local_backend::configured_key(config),
+        profile.state_json_path().exists(),
+        config_path.as_deref().is_some_and(Path::exists),
+    );
+    let fresh_write_ok = ladder == local_backend::ModeLadder::FreshInstall && {
+        // `create_with_key`, not `set_key`: the ladder concluded there is
+        // no config, so this is a create. Nothing locks this path, and a
+        // read-modify-write would replace a `config.conf` that appeared
+        // since the check — see `config::create_with_key`.
+        let wrote = config_path.as_deref().map(|path| {
+            config::create_with_key(path, "local-backend", LocalBackendMode::Session.as_str())
+        });
+        match wrote {
+            Some(Ok(())) => true,
+            Some(Err(error)) => {
+                tracing::warn!(%error, "could not record the fresh-install local backend");
+                false
+            }
+            None => {
+                tracing::warn!("no config path to record the fresh-install local backend in");
+                false
+            }
+        }
+    };
+    let mode = local_backend::settled_mode(ladder, fresh_write_ok);
+    tracing::info!(?ladder, %mode, "local backend resolved");
+    mode
+}
+
+/// Make sure this machine's session is a saved host, so the local band
+/// under `session` has a slot to be (plan 063 §D5).
+///
+/// Idempotent by transport, not by label: any saved host reached as
+/// `localhost` already *is* the slot (the first one, in registry order —
+/// §D7), so a second entry is never added.
+fn ensure_local_slot(workspace: &Workspace) {
+    if workspace
+        .hosts()
+        .iter()
+        .any(|host| servicing::transport_kind(&host.target).localhost())
+    {
+        return;
+    }
+    let Some(label) =
+        local_backend::slot_label(|candidate| workspace.check_host_label(candidate).is_ok())
+    else {
+        tracing::warn!("the host registry accepted no label for this machine's session");
+        return;
+    };
+    match workspace.add_host(&label, crate::host_conn::LOCALHOST_TARGET) {
+        Ok(host) => {
+            tracing::info!(host = %host.id, %label, "saved this machine's session as the local slot")
+        }
+        Err(error) => tracing::warn!(%error, "could not save this machine's session"),
+    }
+}
+
+fn hydrate_workspace(
+    runtime: &tokio::runtime::Runtime,
+    client: &LocalClient,
+    mode: LocalBackendMode,
+) -> Result<()> {
+    if mode == LocalBackendMode::Session {
+        // Nothing is seeded: the local band is the slot's, and a project
+        // here would be one nobody can see (plan 063 §D5). A workspace
+        // that loaded non-empty is an absent migration — a hand-edited
+        // key, or a default flip over an existing setup — and is left
+        // exactly as it is until the launch-time migration lands.
+        let projects = runtime.block_on(client.list_projects())?;
+        if !projects.is_empty() {
+            tracing::warn!(
+                projects = projects.len(),
+                "local-backend = session over a populated in-process workspace; \
+                 those projects are not shown and are left untouched"
+            );
+        }
+        return Ok(());
+    }
     let mut projects = runtime.block_on(client.list_projects())?;
     if projects.is_empty() {
         let cwd = roost_engine::home_dir();
@@ -7974,13 +8296,152 @@ mod tests {
         use crate::host_conn::ConnectMode;
 
         assert_eq!(
-            reconnect_mode(FULL_POLICY, true),
+            reconnect_mode(FULL_POLICY, true, false),
             Some(ConnectMode::IfPresent),
             "connect-if-present, never a spawn"
         );
-        assert_eq!(reconnect_mode(GATED_POLICY, true), None);
-        assert_eq!(reconnect_mode(FULL_POLICY, false), None);
-        assert_eq!(reconnect_mode(GATED_POLICY, false), None);
+        assert_eq!(reconnect_mode(GATED_POLICY, true, false), None);
+        assert_eq!(reconnect_mode(FULL_POLICY, false, false), None);
+        assert_eq!(reconnect_mode(GATED_POLICY, false, false), None);
+    }
+
+    /// The slot's amendment to that rule (plan 063 §D5): under
+    /// `local-backend = session` the launch dial *starts* this machine's
+    /// session, because it is where the window's own tabs live.
+    ///
+    /// Everything else is unchanged, and that is half the claim: a
+    /// second saved localhost host is still probe-only, and a remote
+    /// host is still not dialed at all. Under `in-process` nothing is
+    /// the slot, so nothing spawns — the regression guard.
+    #[test]
+    fn only_the_slot_may_start_a_session_at_launch() {
+        use crate::host_conn::ConnectMode;
+
+        assert_eq!(
+            reconnect_mode(FULL_POLICY, true, true),
+            Some(ConnectMode::SpawnIfMissing),
+            "the slot comes up rather than showing an empty band"
+        );
+        assert_eq!(
+            reconnect_mode(FULL_POLICY, true, false),
+            Some(ConnectMode::IfPresent),
+            "a second localhost host is still probe-only"
+        );
+        assert_eq!(
+            reconnect_mode(FULL_POLICY, false, true),
+            None,
+            "a remote host is not dialed at launch, slot flag or not"
+        );
+        // The caller only ever sets `slot` under `session`
+        // (`reconnect_saved_hosts`), so `in-process` is the row above:
+        // no spawn from any saved host at launch.
+        assert!(!matches!(
+            reconnect_mode(FULL_POLICY, true, false),
+            Some(ConnectMode::SpawnIfMissing)
+        ));
+        // A build without the surface refuses even the slot: it offers
+        // no verb to leave a local session, so it must not start one.
+        assert_eq!(reconnect_mode(GATED_POLICY, true, true), None);
+    }
+
+    /// Plan 063 §D3's creation gate, driven from **both** routes by
+    /// which `HostId::LOCAL` can reach a creation dispatch.
+    ///
+    /// Neither is a user asking for a local tab: one is a saved host
+    /// that has never connected, the other is the band the sidebar draws
+    /// under `session` before a slot is saved. Under `in-process` both
+    /// still resolve to the local workspace, which is what keeps today's
+    /// behaviour intact.
+    #[test]
+    fn no_creation_reaches_the_in_process_workspace_under_session() {
+        // Route (a): a `HostView` for a host with no live connection.
+        let never_connected = servicing::view_incarnation(None);
+        // Route (b): the session band drawn before a slot is saved.
+        let placeholder = host_sidebar::sections(
+            host_sidebar::LocalSlot {
+                mode: LocalBackendMode::Session,
+                slot_saved_id: None,
+            },
+            &[],
+        );
+        let band = placeholder.first().expect("session always draws a band");
+        assert_eq!(
+            band.saved_id, None,
+            "the no-slot band is the placeholder this test is about"
+        );
+
+        for (route, host) in [
+            ("never-connected view", never_connected),
+            ("band", band.host),
+        ] {
+            assert_eq!(host, HostId::LOCAL, "{route} carries the placeholder");
+            assert_eq!(
+                creation_route(LocalBackendMode::Session, host),
+                CreationRoute::NoLocalBackend,
+                "{route} must not reach the invisible workspace"
+            );
+            assert_eq!(
+                creation_route(LocalBackendMode::InProcess, host),
+                CreationRoute::Local,
+                "{route} is still the local workspace when there is one"
+            );
+        }
+
+        // A real host is routed to itself under either backend.
+        let host = HostId::new(4);
+        for mode in [LocalBackendMode::InProcess, LocalBackendMode::Session] {
+            assert_eq!(creation_route(mode, host), CreationRoute::Host(host));
+        }
+    }
+
+    /// ⌘N / "+ New Project" (plan 063 §D3): follow the active project,
+    /// else the local slot, else ask.
+    #[test]
+    fn new_project_follows_the_active_project_then_the_slot_then_the_picker() {
+        let slot = HostId::new(9);
+        let remote = HostId::new(4);
+
+        // Unchanged under `in-process`, including the no-active-project
+        // case, which resolves to the same local workspace it always did.
+        assert_eq!(
+            new_project_route(LocalBackendMode::InProcess, None, Some(HostId::LOCAL)),
+            NewProjectRoute::On(HostId::LOCAL)
+        );
+        assert_eq!(
+            new_project_route(
+                LocalBackendMode::InProcess,
+                Some(remote),
+                Some(HostId::LOCAL)
+            ),
+            NewProjectRoute::On(remote)
+        );
+
+        // Under `session`: an active project on a remote host still
+        // wins, so ⌘N in a remote band does not jump home.
+        assert_eq!(
+            new_project_route(LocalBackendMode::Session, Some(remote), Some(slot)),
+            NewProjectRoute::On(remote)
+        );
+        // Nothing active: the slot.
+        assert_eq!(
+            new_project_route(LocalBackendMode::Session, None, Some(slot)),
+            NewProjectRoute::On(slot)
+        );
+        // The placeholder must not be followed even when it arrives as
+        // the "active" host — the slot answers instead.
+        assert_eq!(
+            new_project_route(LocalBackendMode::Session, Some(HostId::LOCAL), Some(slot)),
+            NewProjectRoute::On(slot)
+        );
+        // Slot down and nothing active: ask rather than fail.
+        assert_eq!(
+            new_project_route(LocalBackendMode::Session, None, None),
+            NewProjectRoute::Picker
+        );
+        assert_eq!(
+            new_project_route(LocalBackendMode::Session, Some(HostId::LOCAL), None),
+            NewProjectRoute::Picker
+        );
     }
 
     /// The pending-selection wait is bounded. A tab that exits the

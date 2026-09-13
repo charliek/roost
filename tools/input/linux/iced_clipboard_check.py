@@ -170,6 +170,15 @@ class Launch:
                     "keybind = alt+shift+p = copy",
                     "keybind = ctrl+shift+p = command_palette",
                     "show-sidebar-agents = false",
+                    # Plan 063 §D5. Under `session` this UI owns no
+                    # projects of its own — it drives a `roost-session`
+                    # daemon instead — and every tab this check opens
+                    # and reads back would be somewhere else. Writing
+                    # this config is itself what keeps the ladder off
+                    # the fresh-install branch today; the pin is what
+                    # keeps the check honest when the *default* for a
+                    # keyless setup flips.
+                    "local-backend = in-process",
                     "",
                 ]
             ),

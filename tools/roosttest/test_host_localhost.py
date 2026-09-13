@@ -338,6 +338,13 @@ def test_a_localhost_host_reaches_this_lanes_daemon(ground: Ground, roost: Roost
     `host.status` carries no transport field, so nothing here asserts
     one; the verb set the case below reads is where the transport shows.
     """
+    # Plan 063 AC10, and it belongs in *this* lane above all: a saved
+    # `localhost` host is exactly what plan 063 calls the slot, so a UI
+    # that had come up in session mode would render this host as its own
+    # local band and withhold half its verbs. Every assertion below is
+    # written against the in-process rendering.
+    assert roost.identify()["local_backend"] == "in-process", roost.identify()
+
     session_id = ground.start_daemon()
     ground.host.connect_and_wait()
 
@@ -516,3 +523,107 @@ def test_a_killed_session_started_again_comes_back_connected(ground: Ground):
         "the host came back on something other than the session this lane "
         f"just started: {row}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 4. The seed row's label, when an SSH host already holds the plain one
+# ---------------------------------------------------------------------------
+
+
+def test_the_seed_row_steps_past_a_label_an_ssh_host_already_holds(
+    ground: Ground, roost: Roost
+):
+    """Plan 063 §D7's collision rule, reached the way a person reaches
+    it — by pressing `Connect Host: localhost`.
+
+    The rule lives in bootstrap's `slot_label`, but the palette is a
+    second caller, and a literal `"localhost"` there fails
+    `Workspace::add_host`'s duplicate-label check the moment an SSH host
+    is called that. The failure is quiet: the row acts, nothing is saved,
+    and the picker's whole point — reaching this machine's session
+    without an Add Host detour — is gone.
+
+    This lane above all, because the row *connects*: the sentinel it
+    dials is redirected here, so the daemon it reaches is the one this
+    fixture started and the teardown can account for.
+    """
+    # Claimed first, so the row's `SpawnIfMissing` connect dials a daemon
+    # this lane owns instead of starting one nothing reaped.
+    ground.start_daemon()
+    # The seed row is gated on "no saved host has a Localhost transport",
+    # so this lane's own localhost host stands down for the case.
+    ground.host.remove()
+
+    squatter = roost.call(
+        "host.add", {"label": "localhost", "target": "ssh://squatter.invalid"}
+    )["host"]
+    seeded_id: str | None = None
+    try:
+        assert "host:connect_seed" in host_row_ids(roost), host_row_ids(roost)
+
+        activate(roost, "host:connect_seed")
+
+        def seeded() -> dict | None:
+            rows = roost.host_status()["hosts"]
+            return next((row for row in rows if row["target"] == "localhost"), None)
+
+        row = wait_until(seeded, 30.0, "the seeded localhost host to be saved")
+        seeded_id = row["id"]
+        assert row["label"] == "localhost (2)", (
+            "the seed row used the literal label an SSH host already holds "
+            f"instead of stepping past it: {row}"
+        )
+    finally:
+        for host_id in (seeded_id, squatter["id"]):
+            if host_id is None:
+                continue
+            with contextlib.suppress(Exception):
+                roost.call("host.disconnect", {"id": host_id})
+            with contextlib.suppress(Exception):
+                roost.call("host.remove", {"id": host_id})
+
+
+def test_the_picker_row_steps_past_the_same_label(ground: Ground, roost: Roost):
+    """The second caller of §D7's rule: `New Project on…`'s `localhost`
+    row when this machine's session is not saved yet.
+
+    Its own case rather than a second phase of the one above, because it
+    is a different dispatch (`host:create_on_localhost` →
+    `create_on_localhost`) reached through a different frame, and the
+    literal label was written out twice.
+    """
+    ground.start_daemon()
+    ground.host.remove()
+
+    squatter = roost.call(
+        "host.add", {"label": "localhost", "target": "ssh://squatter.invalid"}
+    )["host"]
+    seeded_id: str | None = None
+    try:
+        roost.palette_open("commands")
+        try:
+            picker = roost.palette_activate("host:new_project_on")
+            rows = {item["id"] for item in picker["items"]}
+            assert "host:create_on_localhost" in rows, picker
+            roost.palette_activate("host:create_on_localhost")
+        finally:
+            roost.palette_dismiss()
+
+        def seeded() -> dict | None:
+            hosts = roost.host_status()["hosts"]
+            return next((row for row in hosts if row["target"] == "localhost"), None)
+
+        row = wait_until(seeded, 30.0, "the picker's localhost host to be saved")
+        seeded_id = row["id"]
+        assert row["label"] == "localhost (2)", (
+            "the picker's localhost row used the literal label an SSH host "
+            f"already holds instead of stepping past it: {row}"
+        )
+    finally:
+        for host_id in (seeded_id, squatter["id"]):
+            if host_id is None:
+                continue
+            with contextlib.suppress(Exception):
+                roost.call("host.disconnect", {"id": host_id})
+            with contextlib.suppress(Exception):
+                roost.call("host.remove", {"id": host_id})

@@ -219,6 +219,7 @@ fn command_palette_frame(
     providers: &[provider::Provider],
     keybindings: &HashMap<Accel, KeybindAction>,
     hosts: &[host_verbs::HostRow<'_>],
+    local: host_sidebar::LocalSlot<'_>,
 ) -> palette::PaletteFrame {
     let mut bindings = keybindings.iter().collect::<Vec<_>>();
     bindings.sort_by(|(left, _), (right, _)| accel_order(left, right));
@@ -258,7 +259,7 @@ fn command_palette_frame(
     let picker_shortcut = reverse
         .get(&KeybindAction::NewProjectOnHost)
         .and_then(|accel| accel_label(accel));
-    items.extend(host_verb_items(hosts, picker_shortcut.as_deref()));
+    items.extend(host_verb_items(hosts, local, picker_shortcut.as_deref()));
     palette::PaletteFrame::new(COMMANDS_FRAME_ID, "Execute a command…", items)
 }
 
@@ -269,9 +270,10 @@ fn command_palette_frame(
 /// (the one thing the model has no business knowing) is passed in.
 fn host_verb_items(
     hosts: &[host_verbs::HostRow<'_>],
+    local: host_sidebar::LocalSlot<'_>,
     new_project_on_shortcut: Option<&str>,
 ) -> Vec<palette::PaletteItem> {
-    host_verbs::verbs(hosts, host_verbs::VerbPolicy::current())
+    host_verbs::verbs(hosts, local, host_verbs::VerbPolicy::current())
         .into_iter()
         .map(|verb| {
             let trailing = (verb.id == host_verbs::NEW_PROJECT_ON_ID)
@@ -288,11 +290,19 @@ fn host_verb_items(
 /// The "New Project on…" picker (plan 037 §3.1). Same palette surface as
 /// every other frame — the mock's host picker *is* the command palette
 /// one level down.
-fn host_picker_frame(hosts: &[host_verbs::HostRow<'_>]) -> palette::PaletteFrame {
-    let items = host_verbs::create_targets(hosts, host_sidebar::LOCAL_LABEL)
-        .into_iter()
-        .map(|target| palette::PaletteItem::new(target.id, target.title))
-        .collect();
+fn host_picker_frame(
+    hosts: &[host_verbs::HostRow<'_>],
+    local: host_sidebar::LocalSlot<'_>,
+) -> palette::PaletteFrame {
+    let items = host_verbs::create_targets(
+        hosts,
+        local,
+        host_verbs::VerbPolicy::current(),
+        host_sidebar::LOCAL_LABEL,
+    )
+    .into_iter()
+    .map(|target| palette::PaletteItem::new(target.id, target.title).with_subtitle(target.subtitle))
+    .collect();
     palette::PaletteFrame::new(HOST_PICKER_FRAME_ID, "Create on…", items)
 }
 
@@ -952,12 +962,15 @@ impl App {
                 &self.config.providers,
                 &self.keybindings,
                 &self.host_verb_rows(),
+                self.local_slot_input(),
             ),
             "launcher" => launcher_palette_frame(&self.config),
             "agents" => self.agent_frame_now(),
             "notifications" => notification_inbox::frame(&self.notification_inbox),
             "custom" => provider_palette_frame(&self.config.providers),
-            HOST_PICKER_FRAME_ID => host_picker_frame(&self.host_verb_rows()),
+            HOST_PICKER_FRAME_ID => {
+                host_picker_frame(&self.host_verb_rows(), self.local_slot_input())
+            }
             _ => return Err(format!("unknown palette kind {kind:?}")),
         };
         self.try_dismiss_palette()?;
@@ -1519,12 +1532,14 @@ impl App {
                     .filter(|index| *index < self.config.commands.len())
                     .ok_or_else(|| format!("launcher row {:?} cannot be run", item.id))?;
                 let command = self.config.commands[index].clone();
-                let (project_id, _) = self.workspace.active();
-                let cwd = self.launch_cwd(project_id);
                 let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
                 let argv = custom_command::launch_argv(&shell, &command);
                 self.clear_palette_state();
-                dispatch = self.open_tab_dispatch(project_id, cwd, command.title, argv);
+                // The same route ⌘T takes (plan 063 §D3): a launcher row
+                // opens a tab, so it follows the active project's host.
+                // Reading `workspace.active()` here would address the
+                // hidden in-process workspace under `session`.
+                dispatch = self.open_tab_here(command.title, argv);
             }
             "themes" => {
                 let persistence_error = self.commit_theme_name(&item.id)?;
@@ -1568,8 +1583,16 @@ impl App {
                 );
             }
             HOST_PICKER_FRAME_ID => {
-                let verb = host_verbs::parse(&item.id)
-                    .filter(|verb| matches!(verb, host_verbs::HostVerb::CreateOn(_)));
+                // Both of the frame's verbs: `CreateOn` for LOCAL and
+                // every connected host, and `CreateOnLocalhost` for the
+                // localhost row the picker always carries (§D3) — which
+                // is the one row that has no saved id to name yet.
+                let verb = host_verbs::parse(&item.id).filter(|verb| {
+                    matches!(
+                        verb,
+                        host_verbs::HostVerb::CreateOn(_) | host_verbs::HostVerb::CreateOnLocalhost
+                    )
+                });
                 let Some(verb) = verb else {
                     return Err(format!("host picker row {:?} cannot be activated", item.id));
                 };
@@ -1630,9 +1653,17 @@ impl App {
                 // The seeded row is a save and a connect in one gesture:
                 // from the next frame on it is an ordinary saved host,
                 // with the ordinary verbs.
+                //
+                // The label is the registry-checked one, not the bare
+                // `SEED_LABEL`: an SSH host may already be called
+                // `localhost`, and the literal would fail duplicate-label
+                // validation and seed nothing (§D7).
+                let label = self
+                    .slot_label()
+                    .ok_or_else(|| "no free label for this machine's session".to_string())?;
                 self.clear_palette_state();
                 self.host_add_requested(
-                    host_verbs::SEED_LABEL,
+                    &label,
                     crate::host_conn::LOCALHOST_TARGET,
                     Some(seed_connect_origin(origin)),
                 )
@@ -1676,7 +1707,7 @@ impl App {
                     .map_err(|error| error.to_string())?;
             }
             HostVerb::NewProjectOn => {
-                let frame = host_picker_frame(&self.host_verb_rows());
+                let frame = host_picker_frame(&self.host_verb_rows(), self.local_slot_input());
                 if let Some(state) = &mut self.palette {
                     state.push(frame);
                 }
@@ -1697,8 +1728,55 @@ impl App {
                 self.clear_palette_state();
                 return Ok(self.create_project_on(host));
             }
+            HostVerb::CreateOnLocalhost => {
+                self.clear_palette_state();
+                return Ok(self.create_on_localhost(origin));
+            }
         }
         Ok(EngineDispatch::default())
+    }
+
+    /// The picker's `localhost` row when this machine's session is not
+    /// ready (plan 063 §D3): save it if it is not saved, start it if it
+    /// is not running, and create once it is up.
+    ///
+    /// The create is parked rather than issued: there is nothing to
+    /// create *on* until the connection publishes an incarnation, and
+    /// the connect is asynchronous by construction. The connected edge
+    /// in `service_engine` drains it.
+    fn create_on_localhost(&mut self, origin: crate::host_conn::RequestOrigin) -> EngineDispatch {
+        let saved_id = match self.local_slot_saved_id() {
+            Some(saved_id) => saved_id,
+            None => {
+                // Registry-checked, for the same reason `ConnectSeed`
+                // is: the plain `localhost` may already be an SSH
+                // host's (§D7).
+                let Some(label) = self.slot_label() else {
+                    self.set_status(
+                        "could not save this machine's session: no free label".to_string(),
+                    );
+                    return EngineDispatch::default();
+                };
+                match self.host_add_requested(&label, crate::host_conn::LOCALHOST_TARGET, None) {
+                    Ok(host) => host.id,
+                    Err(error) => {
+                        self.set_status(format!("could not save this machine's session: {error}"));
+                        return EngineDispatch::default();
+                    }
+                }
+            }
+        };
+        // Connected already: this row should have carried the ordinary
+        // create-on-a-host id, but the frame may have been built a
+        // moment ago — create now rather than dialing a live connection.
+        if let Some(host) = self.hosts.incarnation(&saved_id) {
+            if self.interactive_host_view(host).is_some() {
+                return self.create_project_on(host);
+            }
+        }
+        self.pending_create_on_connect = Some(saved_id.clone());
+        self.host_reconnect_requested(&saved_id, origin, crate::host_conn::AttemptCause::Explicit);
+        EngineDispatch::default()
     }
 
     /// A saved host's label, as the registry has it.
@@ -1732,13 +1810,14 @@ impl App {
             return;
         };
         let hosts = self.host_verb_rows();
+        let local = self.local_slot_input();
         let commands = state
             .frames()
             .iter()
             .find(|frame| frame.id == COMMANDS_FRAME_ID)
             .and_then(|frame| {
                 let shortcut = self.shortcut_for(KeybindAction::NewProjectOnHost);
-                let verbs = host_verb_items(&hosts, shortcut.as_deref());
+                let verbs = host_verb_items(&hosts, local, shortcut.as_deref());
                 // The family is one contiguous tail (`command_palette_frame`
                 // appends it last), so the splice is everything before the
                 // first host row followed by the new block — and the
@@ -1760,7 +1839,7 @@ impl App {
             .iter()
             .find(|frame| frame.id == HOST_PICKER_FRAME_ID)
             .and_then(|frame| {
-                let items = host_picker_frame(&hosts).items;
+                let items = host_picker_frame(&hosts, local).items;
                 (items != frame.items).then_some(items)
             });
         if commands.is_none() && picker.is_none() {
@@ -2197,6 +2276,14 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Today's shipping backend. Which local band a frame is built for
+    /// is `host_verbs`' concern and tested there; these cases are about
+    /// how the adapter dresses the rows.
+    const IN_PROCESS: host_sidebar::LocalSlot<'static> = host_sidebar::LocalSlot {
+        mode: roost_ipc::LocalBackendMode::InProcess,
+        slot_saved_id: None,
+    };
 
     /// Every row that dispatches an engine op dismisses the palette
     /// first, so a synchronous version of it would have read this exact
@@ -2891,8 +2978,13 @@ mod tests {
     fn command_palette_uses_shared_ids_and_ranking() {
         let config = RoostConfig::parse(r#"provider = label="Fixture" run="fixture.sh""#);
         let bindings = keybind::default_bindings().into_iter().collect();
-        let mut state =
-            palette::PaletteState::new(command_palette_frame(2, &config.providers, &bindings, &[]));
+        let mut state = palette::PaletteState::new(command_palette_frame(
+            2,
+            &config.providers,
+            &bindings,
+            &[],
+            IN_PROCESS,
+        ));
         let ids: Vec<String> = state
             .matches()
             .into_iter()
@@ -2942,7 +3034,7 @@ mod tests {
             fidelity: None,
         }];
 
-        let frame = command_palette_frame(0, &config.providers, &bindings, &hosts);
+        let frame = command_palette_frame(0, &config.providers, &bindings, &hosts, IN_PROCESS);
         let ids: Vec<&str> = frame.items.iter().map(|item| item.id.as_str()).collect();
         let first_host = ids
             .iter()
@@ -2962,12 +3054,16 @@ mod tests {
         assert!(ids.contains(&"host:stop:h1"));
 
         // Zero hosts is the baseline: no host row is a *saved* host's, so
-        // the block is just Add Host (plus the seed where the platform
-        // has a session to reach).
-        let bare = command_palette_frame(0, &config.providers, &bindings, &[]);
+        // the block is Add Host, the seed where the platform has a
+        // session to reach, and the picker over LOCAL + localhost
+        // (plan 063 §D3).
+        let bare = command_palette_frame(0, &config.providers, &bindings, &[], IN_PROCESS);
         let bare_ids: Vec<&str> = bare.items.iter().map(|item| item.id.as_str()).collect();
         assert!(bare_ids.contains(&host_verbs::ADD_ID));
-        assert!(!bare_ids.contains(&host_verbs::NEW_PROJECT_ON_ID));
+        assert!(bare_ids.contains(&host_verbs::CONNECT_SEED_ID));
+        assert!(!bare_ids
+            .iter()
+            .any(|id| id.starts_with("host:connect:") || id.starts_with("host:remove:")));
     }
 
     /// ⌘⇧N's picker is the same palette surface, and its rows carry the
@@ -2982,11 +3078,13 @@ mod tests {
             transport: host_sidebar::HostTransportKind::Ssh,
             fidelity: None,
         }];
-        let frame = host_picker_frame(&hosts);
+        let frame = host_picker_frame(&hosts, IN_PROCESS);
         assert_eq!(frame.id, HOST_PICKER_FRAME_ID);
         assert_eq!(frame.items[0].id, host_verbs::CREATE_ON_LOCAL_ID);
         assert_eq!(frame.items[0].title, host_sidebar::LOCAL_LABEL);
-        assert_eq!(frame.items[1].title, "pop-os");
+        // Then this machine's session, then the saved hosts (§D3).
+        assert_eq!(frame.items[1].id, host_verbs::CREATE_ON_LOCALHOST_ID);
+        assert_eq!(frame.items[2].title, "pop-os");
     }
 
     /// The "New Project on…" row advertises ⌘⇧N; the rest of the family
@@ -3000,7 +3098,7 @@ mod tests {
             transport: host_sidebar::HostTransportKind::Ssh,
             fidelity: None,
         }];
-        let items = host_verb_items(&hosts, Some("Alt+Shift+N"));
+        let items = host_verb_items(&hosts, IN_PROCESS, Some("Alt+Shift+N"));
         for item in &items {
             let expected = (item.id == host_verbs::NEW_PROJECT_ON_ID).then_some("Alt+Shift+N");
             assert_eq!(item.trailing_text.as_deref(), expected, "{}", item.id);

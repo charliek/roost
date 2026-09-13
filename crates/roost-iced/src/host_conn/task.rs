@@ -92,10 +92,13 @@ impl Shutdown {
 
 /// How the *first* attempt treats a socket that is not there.
 ///
-/// Only an explicit Connect may start a daemon. Launch-time
-/// auto-reconnect is connect-if-present, and a mid-session drop never
-/// spawns at all (plan 037 §3.2) — so the mode is consumed by the first
-/// attempt and every retry after it is a plain dial.
+/// A daemon is started by an explicit Connect, and — since plan 063 §D5
+/// — by the launch-time dial of *the slot* under `local-backend =
+/// session`, which is not a host the user opted into but where this
+/// window's own tabs live. Launch-time auto-reconnect for every other
+/// host is connect-if-present (plan 037 §3.2), and a mid-session drop
+/// never spawns at all — so the mode is consumed by the first attempt
+/// and every retry after it is a plain dial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectMode {
     /// Probe; an absent socket is a plain disconnected state, no daemon.

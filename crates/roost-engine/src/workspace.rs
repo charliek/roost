@@ -20,7 +20,9 @@
 //!   directories. Live state (process, scrollback) is not restored.
 //!   `open()` loads the layout into a one-shot `restore_layout` the UI
 //!   bootstrap drains via `take_restore_layout`; it is kept out of the
-//!   live `tabs` map (those are the re-opened fresh shells).
+//!   live `tabs` map (those are the re-opened fresh shells). Until it
+//!   is drained it also backs `snapshot_for_persist`, so a bootstrap
+//!   that never hydrates cannot write the saved tabs away.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -164,6 +166,19 @@ struct Inner {
     replay: VecDeque<ReplayEntry>,
     /// Running total of `replay`'s [`ReplayEntry::bytes`].
     replay_bytes: usize,
+    /// One-shot tab layout loaded from `state.json` at `open` time,
+    /// awaiting hydration by the UI bootstrap
+    /// ([`Workspace::take_restore_layout`]). `None` for the in-memory
+    /// variant and after it's taken. Kept out of `tabs` — the live tabs
+    /// are the fresh shells the UI re-opens from these descriptors.
+    ///
+    /// It lives under the same lock as `projects`/`tabs` because
+    /// `snapshot_for_persist` reads it: a bootstrap that loads a layout
+    /// and never hydrates it (the `session` local backend does exactly
+    /// that) would otherwise write every saved tab list away on the
+    /// first ordinary commit. Once drained this is `None`, so the live
+    /// tabs are authoritative again.
+    restore_layout: Option<RestoreLayout>,
 }
 
 impl Default for Inner {
@@ -187,6 +202,7 @@ impl Default for Inner {
             revision: 0,
             replay: VecDeque::new(),
             replay_bytes: 0,
+            restore_layout: None,
         }
     }
 }
@@ -500,12 +516,6 @@ pub struct Workspace {
     /// commit can't clobber a newer one when writes race. The seq is
     /// assigned under `inner`, so it reflects commit order (#80).
     persist_guard: Mutex<u64>,
-    /// One-shot tab layout loaded from `state.json` at `open` time,
-    /// awaiting hydration by the UI bootstrap (`take_restore_layout`).
-    /// `None` for the in-memory variant and after it's taken. Kept
-    /// out of `inner.tabs` — the live tabs are the fresh shells the
-    /// UI re-opens from these descriptors.
-    restore_layout: Mutex<Option<RestoreLayout>>,
     /// Set by `flush()` on clean exit, *after* it writes the final
     /// layout. Once set, `persist()` is a no-op so a teardown-induced
     /// PTY-exit cascade (the window closing kills its shells) can't
@@ -656,7 +666,6 @@ impl Workspace {
             versioned_events: versioned_tx,
             state_path: None,
             persist_guard: Mutex::new(0),
-            restore_layout: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
             replay_bounds: None,
         }
@@ -756,13 +765,13 @@ impl Workspace {
                 },
             );
         }
+        inner.restore_layout = Some(restore);
         Self {
             inner: Mutex::new(inner),
             events: tx,
             versioned_events: versioned_tx,
             state_path: Some(state_path),
             persist_guard: Mutex::new(0),
-            restore_layout: Mutex::new(Some(restore)),
             shutting_down: AtomicBool::new(false),
             replay_bounds: None,
         }
@@ -772,8 +781,13 @@ impl Workspace {
     /// `open` time. Returns `None` for the in-memory variant and on
     /// every call after the first. The UI bootstrap calls this once
     /// to re-open each project's saved tabs as fresh shells.
+    ///
+    /// Taking it also hands persistence back to the live tabs: while it
+    /// is retained `snapshot_for_persist` falls back to it for projects
+    /// with no live tabs (see [`Inner::restore_layout`]). No caller may
+    /// hold the `inner` lock — `std::sync::Mutex` is not reentrant.
     pub fn take_restore_layout(&self) -> Option<RestoreLayout> {
-        self.restore_layout.lock().unwrap().take()
+        self.inner.lock().unwrap().restore_layout.take()
     }
 
     /// The sidebar's persisted collapsed state. The UI reads this at
@@ -2153,6 +2167,18 @@ impl Inner {
     /// it to drop stale out-of-order writes (#80). Each project
     /// carries its tab layout (title + cwd + position) so a relaunch
     /// can re-open the tabs in their saved directories.
+    ///
+    /// A project with no live tabs falls back to the retained
+    /// [`Inner::restore_layout`] when one is still un-hydrated, so a
+    /// bootstrap that loads a layout and deliberately does not re-open
+    /// it (the `session` local backend) cannot erase the user's tabs on
+    /// its first commit. The active selection falls back on the same
+    /// terms and for a sharper reason than a lost preference: plan 063
+    /// §D8's forward switch snapshots the in-process layout *including*
+    /// the active project and tab, and holds its fence until the mapped
+    /// active tab is selected and attached — so zeroing this pair
+    /// degrades the migration in exactly the case the migration exists
+    /// for.
     fn snapshot_for_persist(&mut self) -> (SnapshotFile, u64) {
         use crate::persistence::{ProjectSnapshot, TabSnapshot};
         self.persist_seq += 1;
@@ -2171,9 +2197,35 @@ impl Inner {
                     .unwrap_or(0) as i32
             })
             .unwrap_or(0);
+        // The selection half of the un-hydrated fallback. Three
+        // conditions, each load-bearing:
+        //
+        // * an un-hydrated layout — the same discriminator the tab
+        //   fallback uses, so after `take_restore_layout` a genuine
+        //   "nothing is selected" still persists as `0` rather than
+        //   resurrecting a stale choice;
+        // * no live selection to write, so live state always wins when
+        //   it has an answer;
+        // * the retained active project has no live tabs, which is what
+        //   keeps the index honest — `active_tab_position` is a DENSE
+        //   index, and it may only be carried over when the tab list
+        //   written for that project is the retained one it indexes,
+        //   not a live list that would renumber underneath it.
+        let retained_selection = self.restore_layout.as_ref().filter(|layout| {
+            self.active_project_id == 0
+                && layout.active_project_id != 0
+                && !self
+                    .tabs
+                    .values()
+                    .any(|tab| tab.project_id == layout.active_project_id)
+        });
+        let (active_project_id, active_tab_position) = match retained_selection {
+            Some(layout) => (layout.active_project_id, layout.active_tab_position),
+            None => (self.active_project_id, active_tab_position),
+        };
         let snapshot = SnapshotFile {
             next_id: self.next_id,
-            active_project_id: self.active_project_id,
+            active_project_id,
             active_tab_position,
             sidebar_collapsed: self.sidebar_collapsed,
             sidebar_width: self.sidebar_width,
@@ -2182,7 +2234,7 @@ impl Inner {
                 .projects
                 .values()
                 .map(|p| {
-                    let tabs: Vec<TabSnapshot> = self
+                    let mut tabs: Vec<TabSnapshot> = self
                         .tabs_in_display_order(p.id)
                         .into_iter()
                         .map(|t| TabSnapshot {
@@ -2192,6 +2244,9 @@ impl Inner {
                             user_titled: t.user_titled,
                         })
                         .collect();
+                    if tabs.is_empty() {
+                        tabs = retained_tabs(self.restore_layout.as_ref(), p.id);
+                    }
                     ProjectSnapshot {
                         id: p.id,
                         name: p.name.clone(),
@@ -2205,6 +2260,35 @@ impl Inner {
         };
         (snapshot, self.persist_seq)
     }
+}
+
+/// The saved tab descriptors `layout` still holds for `project_id`, as
+/// persistable snapshots. Empty when the layout was already drained or
+/// never held that project.
+///
+/// Positions are re-numbered densely from the layout's display order
+/// rather than carried: `RestoreTab` does not keep the raw `position`
+/// (hydration re-opens them at 0..n through `next_tab_position`), so a
+/// dense rewrite is what a hydrating launch would have written anyway.
+fn retained_tabs(
+    layout: Option<&RestoreLayout>,
+    project_id: i64,
+) -> Vec<crate::persistence::TabSnapshot> {
+    layout
+        .and_then(|l| l.projects.iter().find(|p| p.project_id == project_id))
+        .map(|p| {
+            p.tabs
+                .iter()
+                .enumerate()
+                .map(|(index, t)| crate::persistence::TabSnapshot {
+                    title: t.title.clone(),
+                    cwd: t.cwd.clone(),
+                    position: index as i32,
+                    user_titled: t.user_titled,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn wire_tab(row: &TabRow, is_active: bool) -> Tab {
@@ -3454,6 +3538,168 @@ mod tests {
         assert_eq!(rp.tabs[1].title, "btab");
         // `take_restore_layout` is one-shot.
         assert!(ws2.take_restore_layout().is_none());
+    }
+
+    /// A bootstrap that loads a layout and deliberately does not
+    /// hydrate it (plan 063's `session` local backend) must not write
+    /// the user's tabs away on its first ordinary commit — and
+    /// `add_host` is exactly such a commit, on the same launch.
+    #[test]
+    fn an_unhydrated_layout_outlives_a_persist_that_never_saw_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let pid = {
+            let ws = Workspace::open(path.clone());
+            let pid = ws.create_project("p", "/proj").unwrap().id;
+            ws.open_tab(pid, "/a", "atab").unwrap();
+            ws.open_tab(pid, "/b", "btab").unwrap();
+            pid
+        };
+
+        let ws2 = Workspace::open(path.clone());
+        assert!(
+            ws2.snapshot().iter().all(|p| p.tabs.is_empty()),
+            "the reload holds descriptors, not live tabs"
+        );
+        // The launch commits something unrelated without hydrating.
+        ws2.add_host("box", "ssh://box").unwrap();
+
+        let on_disk = read_state(&path).unwrap().unwrap();
+        let saved = on_disk.projects.iter().find(|p| p.id == pid).unwrap();
+        assert_eq!(
+            saved
+                .tabs
+                .iter()
+                .map(|t| (t.cwd.as_str(), t.title.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("/a", "atab"), ("/b", "btab")],
+            "an un-hydrated layout was flattened by an unrelated commit"
+        );
+        assert_eq!(
+            saved.tabs.iter().map(|t| t.position).collect::<Vec<_>>(),
+            vec![0, 1],
+            "retained tabs are renumbered densely, as hydration would"
+        );
+
+        // And it is still there for the next launch to hydrate.
+        let ws3 = Workspace::open(path);
+        let restore = ws3.take_restore_layout().expect("layout still present");
+        let rp = restore
+            .projects
+            .iter()
+            .find(|p| p.project_id == pid)
+            .unwrap();
+        assert_eq!(
+            rp.tabs.iter().map(|t| t.cwd.as_str()).collect::<Vec<_>>(),
+            vec!["/a", "/b"]
+        );
+    }
+
+    /// The selection half of the same launch, and plan 063 §D8's reason
+    /// for wanting it: the forward switch snapshots the active project
+    /// and tab and fences on the mapped active tab being selected, so a
+    /// zeroed pair degrades the migration rather than merely a
+    /// preference.
+    ///
+    /// The retained selection is deliberately the **second** project at
+    /// a **non-zero** tab index, so `0`, "the first project" and "a live
+    /// value" are three distinguishable answers in the failure message.
+    #[test]
+    fn an_unhydrated_selection_outlives_the_same_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let (first, second) = {
+            let ws = Workspace::open(path.clone());
+            let first = ws.create_project("first", "/first").unwrap().id;
+            let second = ws.create_project("second", "/second").unwrap().id;
+            ws.open_tab(first, "/a0", "a0").unwrap();
+            ws.open_tab(second, "/b0", "b0").unwrap();
+            let b1 = ws.open_tab(second, "/b1", "b1").unwrap().id;
+            ws.open_tab(second, "/b2", "b2").unwrap();
+            ws.focus_tab(b1).unwrap();
+            (first, second)
+        };
+
+        let ws2 = Workspace::open(path.clone());
+        ws2.add_host("box", "ssh://box").unwrap();
+
+        let on_disk = read_state(&path).unwrap().unwrap();
+        assert_eq!(
+            on_disk.active_project_id, second,
+            "the retained selection was flattened (0 = none, {first} = the first project)"
+        );
+        assert_eq!(
+            on_disk.active_tab_position, 1,
+            "the retained active tab index was flattened"
+        );
+        // And the index still names the tab it named: the retained list
+        // is written densely, so position 1 has to be `/b1` — the whole
+        // point of not carrying a raw `position` across.
+        let saved = on_disk.projects.iter().find(|p| p.id == second).unwrap();
+        assert_eq!(
+            saved.tabs[on_disk.active_tab_position as usize].cwd, "/b1",
+            "the persisted index does not name the tab it did before the reload: {saved:?}"
+        );
+    }
+
+    /// The fallback is un-hydrated-only. Once the layout is drained the
+    /// live tabs are authoritative again, including when a project is
+    /// genuinely empty.
+    #[test]
+    fn hydrating_hands_persistence_back_to_the_live_tabs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let (kept, emptied) = {
+            let ws = Workspace::open(path.clone());
+            let kept = ws.create_project("kept", "/kept").unwrap().id;
+            let emptied = ws.create_project("emptied", "/emptied").unwrap().id;
+            ws.open_tab(kept, "/saved-a", "saved-a").unwrap();
+            ws.open_tab(emptied, "/saved-b", "saved-b").unwrap();
+            (kept, emptied)
+        };
+
+        let ws2 = Workspace::open(path.clone());
+        let drained = ws2.take_restore_layout().expect("layout to hydrate");
+        assert_ne!(
+            drained.active_project_id, 0,
+            "the fixture must retain a selection, or the next assert proves nothing"
+        );
+        // A hydration that opened nothing yet, committing something
+        // unrelated. Nothing is selected and nothing is live, and BOTH
+        // must persist as such: the layout is drained, so a genuine
+        // empty state may not resurrect the stale choice.
+        ws2.set_sidebar_collapsed(true);
+        let after_drain = read_state(&path).unwrap().unwrap();
+        assert_eq!(
+            after_drain.active_project_id, 0,
+            "a hydrated workspace with nothing selected resurrected the old selection"
+        );
+        assert!(
+            after_drain.projects.iter().all(|p| p.tabs.is_empty()),
+            "a hydrated workspace with no live tabs resurrected the old layout: {after_drain:?}"
+        );
+
+        // A hydration that re-opens `kept` with a tab that DIFFERS from
+        // its saved descriptor, and gives `emptied` none at all. If the
+        // fallback still fired, both would come back as the saved ones.
+        ws2.open_tab(kept, "/live", "live").unwrap();
+
+        let on_disk = read_state(&path).unwrap().unwrap();
+        let kept_row = on_disk.projects.iter().find(|p| p.id == kept).unwrap();
+        assert_eq!(
+            kept_row
+                .tabs
+                .iter()
+                .map(|t| t.cwd.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/live"],
+            "live tabs must win once the layout has been hydrated"
+        );
+        let emptied_row = on_disk.projects.iter().find(|p| p.id == emptied).unwrap();
+        assert!(
+            emptied_row.tabs.is_empty(),
+            "a project the hydration left empty persists as empty, not as its old layout"
+        );
     }
 
     #[test]

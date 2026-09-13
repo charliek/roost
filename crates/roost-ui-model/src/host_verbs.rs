@@ -6,8 +6,7 @@
 //! menu and no per-section button beyond the inline ↻ Reconnect. One
 //! item per (verb, host) pair, so fuzzy-matching "disc pop" reaches
 //! exactly one row, and **verbs appear only when they apply**: you
-//! cannot Stop a session you are not attached to, and you cannot Remove
-//! a host you are still connected to.
+//! cannot Stop a session you are not attached to.
 //!
 //! Every shipping build offers the localhost surface. The withheld
 //! answer stays expressible as a [`VerbPolicy`] value rather than a
@@ -15,7 +14,11 @@
 //! cannot reach a local session could hide the whole surface coherently
 //! — and both answers stay unit tests that run on any OS.
 
-use crate::host_sidebar::{FidelityAction, HostTransportKind, SectionState};
+use roost_ipc::LocalBackendMode;
+
+use crate::host_sidebar::{
+    FidelityAction, HostTransportKind, LocalSlot, SectionState, LOCAL_LABEL,
+};
 
 /// Palette item ids. The prefix is what routes an activation back here;
 /// everything after the second colon is the saved host's id, which is
@@ -42,6 +45,17 @@ pub const SEED_LABEL: &str = "localhost";
 /// The picker row for the in-process workspace. Not a host id: the
 /// local workspace has none.
 pub const CREATE_ON_LOCAL_ID: &str = "host:create_on:local";
+
+/// The picker's `localhost` row when this machine's session is **not**
+/// ready to create on (plan 063 §D3): not saved yet, or saved and down.
+/// Activating it saves and/or starts the session first and creates once
+/// it is up. A slot that *is* connected gets the ordinary
+/// `host:create_on:<saved_id>` row instead, so the ready case has one
+/// spelling and one dispatch.
+///
+/// Not a `host:create_on:` id: that prefix is followed by a saved id,
+/// and this row exists precisely when there may not be one.
+pub const CREATE_ON_LOCALHOST_ID: &str = "host:create_on_localhost";
 
 /// One saved host, as the verb builder reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +124,10 @@ pub enum HostVerb {
     NewProjectOn,
     /// A picker row: create on this host, or `None` for local.
     CreateOn(Option<String>),
+    /// The picker's `localhost` row for a session that is not ready:
+    /// save it if it is not saved, start it if it is not running, then
+    /// create (plan 063 §D3).
+    CreateOnLocalhost,
 }
 
 /// Parse a palette row id back into the verb it names.
@@ -124,6 +142,7 @@ pub fn parse(id: &str) -> Option<HostVerb> {
         CONNECT_SEED_ID => return Some(HostVerb::ConnectSeed),
         NEW_PROJECT_ON_ID => return Some(HostVerb::NewProjectOn),
         CREATE_ON_LOCAL_ID => return Some(HostVerb::CreateOn(None)),
+        CREATE_ON_LOCALHOST_ID => return Some(HostVerb::CreateOnLocalhost),
         _ => {}
     }
     if let Some(host) = saved(CONNECT_PREFIX) {
@@ -183,28 +202,33 @@ fn is_connected(state: SectionState) -> bool {
 /// * `Add Host…` always — on every platform, with or without saved
 ///   hosts. It is the only free-text flow and the only entry point that
 ///   exists before a registry does.
-/// * `Connect` / `Disconnect` / `Stop` / `Remove` — one per host, gated
-///   on whether that host is attached. A connected host offers the two
-///   ways to leave it (disconnect keeps its shells, stop ends them); a
-///   host that is not offers the way back in, plus Remove once it has
-///   settled — removing a host mid-dial would race its own connection.
+/// * `Connect` / `Disconnect` / `Stop` — one per host, gated on whether
+///   that host is attached. A connected host offers the two ways to
+///   leave it (disconnect keeps its shells, stop ends them); a host that
+///   is not offers the way back in.
+/// * `Remove` — on a connected host too (plan 063 §D7: it disconnects
+///   first and never stops the session), but never mid-dial, which would
+///   race the attempt it is removing, and never on *the slot* under
+///   `session` — see [`removable`].
 /// * `Update` / `Restart` — only on a connected host whose `fidelity`
 ///   names one of them, which is plan 056 §3.4's matrix: an ssh host is
 ///   sent a matching build, this machine's own session is restarted,
 ///   and a socket target lists neither because nothing here can reach
 ///   its binary.
-/// * The seeded `localhost` row appears only on a fresh registry, and
-///   only where the policy offers the localhost surface at all.
-/// * `New Project on…` appears once there is somewhere else to create,
-///   because with no hosts it is exactly `new_project`.
-pub fn verbs(hosts: &[HostRow<'_>], policy: VerbPolicy) -> Vec<VerbItem> {
+/// * The seeded `localhost` row appears while **no saved host has a
+///   localhost transport** (plan 063 §D3 — before R9 that could only be
+///   an empty registry), and only where the policy offers the localhost
+///   surface at all.
+/// * `New Project on…` appears once the picker has more than one
+///   destination, because with one it is exactly `new_project`.
+pub fn verbs(hosts: &[HostRow<'_>], local: LocalSlot<'_>, policy: VerbPolicy) -> Vec<VerbItem> {
     let mut items = vec![VerbItem::new(
         ADD_ID,
         "Add Host…",
         "point Roost at an SSH host or a session socket",
     )];
 
-    if hosts.is_empty() && policy.localhost_surface {
+    if policy.localhost_surface && !hosts.iter().any(|host| host.transport.localhost()) {
         items.push(VerbItem::new(
             CONNECT_SEED_ID,
             format!("Connect Host: {SEED_LABEL}"),
@@ -244,6 +268,13 @@ pub fn verbs(hosts: &[HostRow<'_>], policy: VerbPolicy) -> Vec<VerbItem> {
                     Some(FidelityAction::Manual) | None => {}
                 }
             }
+            if removable(host, local) {
+                items.push(VerbItem::new(
+                    format!("{REMOVE_PREFIX}{}", host.saved_id),
+                    format!("Remove Host: {}", host.label),
+                    "disconnects and forgets it; never stops the session",
+                ));
+            }
             continue;
         }
         if reachable {
@@ -253,7 +284,7 @@ pub fn verbs(hosts: &[HostRow<'_>], policy: VerbPolicy) -> Vec<VerbItem> {
                 connect_subtitle(host.state),
             ));
         }
-        if host.state != SectionState::Connecting {
+        if host.state != SectionState::Connecting && removable(host, local) {
             items.push(VerbItem::new(
                 format!("{REMOVE_PREFIX}{}", host.saved_id),
                 format!("Remove Host: {}", host.label),
@@ -262,7 +293,10 @@ pub fn verbs(hosts: &[HostRow<'_>], policy: VerbPolicy) -> Vec<VerbItem> {
         }
     }
 
-    if !hosts.is_empty() {
+    // Asked of the picker itself rather than recomputed: the row exists
+    // exactly when pressing it would offer a choice, and two spellings
+    // of that count would drift.
+    if create_targets(hosts, local, policy, LOCAL_LABEL).len() > 1 {
         items.push(VerbItem::new(
             NEW_PROJECT_ON_ID,
             "New Project on…",
@@ -270,6 +304,17 @@ pub fn verbs(hosts: &[HostRow<'_>], policy: VerbPolicy) -> Vec<VerbItem> {
         ));
     }
     items
+}
+
+/// Whether Remove is offered for this host at all (plan 063 §D7).
+///
+/// Everything is removable except *the slot* under `session`: it is the
+/// machine the local band runs on, so forgetting it would leave the
+/// window with no local backend and nothing to create in. Under
+/// `in-process` the very same saved host is an ordinary `LOCALHOST`
+/// band and keeps the verb.
+fn removable(host: &HostRow<'_>, local: LocalSlot<'_>) -> bool {
+    !(local.mode == LocalBackendMode::Session && Some(host.saved_id) == local.slot_saved_id)
 }
 
 /// What Connect means from where the host currently is. `NeedsRestart`
@@ -283,23 +328,44 @@ fn connect_subtitle(state: SectionState) -> &'static str {
     }
 }
 
-/// The "New Project on…" picker's rows: the local workspace, then every
+/// The "New Project on…" picker's rows (plan 063 §D3): the in-process
+/// workspace when there is one, then `localhost`, then every other
 /// **connected** host.
 ///
-/// Disconnected hosts are absent rather than disabled, which follows the
-/// sidebar's own rule (§3.1: dimmed rows are non-interactive) — you
-/// cannot create on a session nothing is attached to, and a row that
-/// refuses is worse than a row that is not there.
-pub fn create_targets(hosts: &[HostRow<'_>], local_label: &str) -> Vec<VerbItem> {
-    let mut items = vec![VerbItem {
-        id: CREATE_ON_LOCAL_ID.to_string(),
-        title: local_label.to_string(),
-        subtitle: None,
-    }];
+/// Two rules that are not symmetric, deliberately. Ordinary hosts are
+/// absent unless connected, which follows the sidebar's own rule (§3.1:
+/// dimmed rows are non-interactive) — you cannot create on a session
+/// nothing is attached to, and a row that refuses is worse than a row
+/// that is not there. `localhost` is different: this client can *make*
+/// it ready, so the row is always offered and its subtitle says which of
+/// saving, starting or plain creating pressing it will do.
+pub fn create_targets(
+    hosts: &[HostRow<'_>],
+    local: LocalSlot<'_>,
+    policy: VerbPolicy,
+    local_label: &str,
+) -> Vec<VerbItem> {
+    let slot = slot_row(hosts, local);
+    let mut items = Vec::new();
+    // Under `session` there is no in-process workspace on screen, so
+    // there is nothing for this row to create in.
+    if local.mode == LocalBackendMode::InProcess {
+        items.push(VerbItem {
+            id: CREATE_ON_LOCAL_ID.to_string(),
+            title: local_label.to_string(),
+            subtitle: None,
+        });
+    }
+    if policy.localhost_surface {
+        items.push(localhost_target(slot));
+    }
     items.extend(
         hosts
             .iter()
             .filter(|host| is_connected(host.state))
+            // The slot already has its row above, in the local band's
+            // place; listing it again would be the same session twice.
+            .filter(|host| Some(host.saved_id) != slot.map(|slot| slot.saved_id))
             .map(|host| VerbItem {
                 id: format!("{CREATE_ON_PREFIX}{}", host.saved_id),
                 title: host.label.to_string(),
@@ -307,6 +373,40 @@ pub fn create_targets(hosts: &[HostRow<'_>], local_label: &str) -> Vec<VerbItem>
             }),
     );
     items
+}
+
+/// The saved host holding the local-session slot, if one is saved. Read
+/// whatever the mode is: under `in-process` it is an ordinary
+/// `LOCALHOST` band, and the picker still gives it the `localhost` row.
+fn slot_row<'a, 'h>(hosts: &'a [HostRow<'h>], local: LocalSlot<'_>) -> Option<&'a HostRow<'h>> {
+    local
+        .slot_saved_id
+        .and_then(|id| hosts.iter().find(|host| host.saved_id == id))
+}
+
+/// The picker's `localhost` row, in whichever of its three states this
+/// machine's session is in.
+fn localhost_target(slot: Option<&HostRow<'_>>) -> VerbItem {
+    match slot {
+        // Ready: this is the ordinary create-on-a-host row, sitting in
+        // the local band's position. Same id, so the activation is the
+        // same one every other host row gets.
+        Some(slot) if is_connected(slot.state) => VerbItem {
+            id: format!("{CREATE_ON_PREFIX}{}", slot.saved_id),
+            title: slot.label.to_string(),
+            subtitle: None,
+        },
+        Some(slot) => VerbItem::new(
+            CREATE_ON_LOCALHOST_ID,
+            slot.label,
+            "starts it if needed, then creates",
+        ),
+        None => VerbItem::new(
+            CREATE_ON_LOCALHOST_ID,
+            SEED_LABEL,
+            "saves localhost, starts it if needed, then creates",
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -338,6 +438,28 @@ mod tests {
         localhost_surface: false,
     };
 
+    /// Today's shipping backend, and the one every pre-063 assertion in
+    /// this module was written against.
+    const IN_PROCESS: LocalSlot<'static> = LocalSlot {
+        mode: LocalBackendMode::InProcess,
+        slot_saved_id: None,
+    };
+
+    /// `session`, with `saved_id` holding the slot.
+    fn session(saved_id: &str) -> LocalSlot<'_> {
+        LocalSlot {
+            mode: LocalBackendMode::Session,
+            slot_saved_id: Some(saved_id),
+        }
+    }
+
+    fn localhost_host(saved_id: &str, state: SectionState) -> HostRow<'_> {
+        HostRow {
+            transport: HostTransportKind::Localhost,
+            ..host(saved_id, state)
+        }
+    }
+
     /// Every build ships the localhost surface — asserted on whatever OS
     /// the suite runs, which is how `rust-build`'s two-OS `cargo test`
     /// matrix proves it on both (plan 041 §3.1).
@@ -351,53 +473,95 @@ mod tests {
     /// registry does. The seeded localhost Connect rides the surface, so
     /// a withholding build would offer Add Host alone: fewer rows, but
     /// still a real destination rather than a dead end.
+    ///
+    /// The picker row comes with the surface for the same reason it did
+    /// not before plan 063: `localhost` is now a destination that exists
+    /// before the registry does, so with the surface there are two
+    /// places to create and the picker is a real choice.
     #[test]
     fn a_fresh_registry_offers_add_always_and_the_seed_only_with_the_surface() {
-        assert_eq!(ids(&verbs(&[], FULL)), vec![ADD_ID, CONNECT_SEED_ID]);
-        assert_eq!(ids(&verbs(&[], GATED)), vec![ADD_ID]);
+        assert_eq!(
+            ids(&verbs(&[], IN_PROCESS, FULL)),
+            vec![ADD_ID, CONNECT_SEED_ID, NEW_PROJECT_ON_ID]
+        );
+        assert_eq!(ids(&verbs(&[], IN_PROCESS, GATED)), vec![ADD_ID]);
+    }
+
+    /// The seed row's gate is the *transport*, not the count (plan 063
+    /// §D3). An ssh-only registry has no local session saved, so the one
+    /// gesture that saves one is still worth offering; a registry that
+    /// already holds this machine has nothing left to seed.
+    #[test]
+    fn the_seed_row_is_gated_on_a_localhost_host_rather_than_on_an_empty_registry() {
+        assert!(ids(&verbs(
+            &[host("ssh-only", SectionState::Connected)],
+            IN_PROCESS,
+            FULL
+        ))
+        .contains(&CONNECT_SEED_ID));
+        assert!(!ids(&verbs(
+            &[localhost_host("mine", SectionState::Disconnected)],
+            IN_PROCESS,
+            FULL
+        ))
+        .contains(&CONNECT_SEED_ID));
     }
 
     /// The availability matrix, one host at a time. Connected offers the
-    /// two ways out; everything else offers the way back in.
+    /// two ways out; everything else offers the way back in. Remove
+    /// rides along in every state but mid-dial (plan 063 §D7).
     #[test]
     fn each_state_offers_exactly_the_verbs_that_can_act() {
         let cases = [
             (
                 SectionState::Connected,
-                vec![ADD_ID, "host:disconnect:h", "host:stop:h"],
+                vec![
+                    ADD_ID,
+                    CONNECT_SEED_ID,
+                    "host:disconnect:h",
+                    "host:stop:h",
+                    "host:remove:h",
+                ],
             ),
             (
                 SectionState::Disconnected,
-                vec![ADD_ID, "host:connect:h", "host:remove:h"],
+                vec![ADD_ID, CONNECT_SEED_ID, "host:connect:h", "host:remove:h"],
             ),
             (
                 SectionState::NeedsRestart,
-                vec![ADD_ID, "host:connect:h", "host:remove:h"],
+                vec![ADD_ID, CONNECT_SEED_ID, "host:connect:h", "host:remove:h"],
             ),
             (
                 SectionState::Stopped,
-                vec![ADD_ID, "host:connect:h", "host:remove:h"],
+                vec![ADD_ID, CONNECT_SEED_ID, "host:connect:h", "host:remove:h"],
             ),
             // Mid-dial: reconnecting is fine (it supersedes), removing
             // would race the attempt it is removing.
-            (SectionState::Connecting, vec![ADD_ID, "host:connect:h"]),
+            (
+                SectionState::Connecting,
+                vec![ADD_ID, CONNECT_SEED_ID, "host:connect:h"],
+            ),
         ];
         for (state, mut expected) in cases {
             expected.push(NEW_PROJECT_ON_ID);
             assert_eq!(
-                ids(&verbs(&[host("h", state)], FULL)),
+                ids(&verbs(&[host("h", state)], IN_PROCESS, FULL)),
                 expected,
                 "{state:?}"
             );
         }
     }
 
-    /// Stop is connected-only and Remove is not-connected-only, stated
-    /// as the invariant rather than as a row list: the two must never be
-    /// offered together, or the palette would let a user remove the
-    /// registry entry for a session it is still connected to.
+    /// Remove on a *connected* host (plan 063 §D7), stated as the
+    /// invariant rather than as a row list.
+    ///
+    /// This reverses the pre-063 rule ("you cannot Remove a host you are
+    /// still connected to"): `host_remove_requested` has always
+    /// disconnected first and never stopped the session, so the refusal
+    /// only forced a two-step. Mid-dial is still withheld — that one
+    /// would race the attempt it is removing.
     #[test]
-    fn stop_and_remove_are_never_offered_at_the_same_time() {
+    fn remove_is_offered_in_every_settled_state_including_connected() {
         for state in [
             SectionState::Connected,
             SectionState::Connecting,
@@ -405,14 +569,62 @@ mod tests {
             SectionState::NeedsRestart,
             SectionState::Stopped,
         ] {
-            let items = verbs(&[host("h", state)], FULL);
+            let items = verbs(&[host("h", state)], IN_PROCESS, FULL);
             let has = |prefix: &str| items.iter().any(|item| item.id.starts_with(prefix));
-            assert!(
-                !(has(STOP_PREFIX) && has(REMOVE_PREFIX)),
-                "{state:?} offers both Stop and Remove"
+            assert_eq!(
+                has(REMOVE_PREFIX),
+                state != SectionState::Connecting,
+                "{state:?} remove"
             );
             assert_eq!(has(STOP_PREFIX), is_connected(state), "{state:?} stop");
         }
+        // The subtitle is the promise the reversal rests on, so it is
+        // pinned rather than left to the row's presence.
+        let connected = verbs(&[host("h", SectionState::Connected)], IN_PROCESS, FULL);
+        assert_eq!(
+            connected
+                .iter()
+                .find(|item| item.id.starts_with(REMOVE_PREFIX))
+                .and_then(|item| item.subtitle.as_deref()),
+            Some("disconnects and forgets it; never stops the session")
+        );
+    }
+
+    /// "You cannot forget this machine" (plan 063 §D7): under `session`
+    /// the slot is the local backend, so Remove is withheld on it — and
+    /// on it alone. The identical registry under `in-process` keeps the
+    /// verb, because there the same host is an ordinary LOCALHOST band
+    /// beside a local workspace that does not depend on it.
+    #[test]
+    fn remove_is_withheld_on_the_slot_under_session_only() {
+        let hosts = [
+            localhost_host("slot", SectionState::Connected),
+            host("box", SectionState::Connected),
+        ];
+        let session_items = verbs(&hosts, session("slot"), FULL);
+        let under_session = ids(&session_items);
+        assert!(
+            !under_session.contains(&"host:remove:slot"),
+            "{under_session:?}"
+        );
+        assert!(
+            under_session.contains(&"host:remove:box"),
+            "every other host keeps it: {under_session:?}"
+        );
+
+        let in_process_items = verbs(
+            &hosts,
+            LocalSlot {
+                mode: LocalBackendMode::InProcess,
+                slot_saved_id: Some("slot"),
+            },
+            FULL,
+        );
+        let under_in_process = ids(&in_process_items);
+        assert!(
+            under_in_process.contains(&"host:remove:slot"),
+            "{under_in_process:?}"
+        );
     }
 
     /// What withholding the surface costs, tested on whatever OS this
@@ -430,7 +642,7 @@ mod tests {
         };
         let remote = host("h2", SectionState::Disconnected);
 
-        let gated = verbs(&[local, remote], GATED);
+        let gated = verbs(&[local, remote], IN_PROCESS, GATED);
         assert!(
             !ids(&gated).contains(&"host:connect:h1"),
             "a client without the surface must not offer a session it cannot reach"
@@ -447,7 +659,7 @@ mod tests {
 
         // Same inputs, the shipping answer: the localhost host is
         // ordinary.
-        assert!(ids(&verbs(&[local, remote], FULL)).contains(&"host:connect:h1"));
+        assert!(ids(&verbs(&[local, remote], IN_PROCESS, FULL)).contains(&"host:connect:h1"));
     }
 
     /// A connected localhost host under a withholding policy: the gate
@@ -475,39 +687,123 @@ mod tests {
             // restart one either.
             fidelity: Some(FidelityAction::Restart),
         };
-        let offered = verbs(&[connected], GATED);
+        let offered = verbs(&[connected], IN_PROCESS, GATED);
         let items = ids(&offered);
         assert!(!items.contains(&"host:disconnect:h1"));
         assert!(!items.contains(&"host:stop:h1"));
         assert!(!items.contains(&"host:restart:h1"));
     }
 
-    /// Once a host exists, the picker row does too — and with none it
-    /// stays away, because "New Project on…" with a single LOCAL row is
-    /// ⌘N with an extra keystroke.
+    /// The picker row appears once the picker is a choice, and stays
+    /// away when it would be ⌘N with an extra keystroke (plan 063 §D3).
+    ///
+    /// The one-row cases are the two where the surface is withheld: no
+    /// `localhost` row, so `in-process` is alone and `session` has only
+    /// the row it cannot offer.
     #[test]
-    fn the_picker_row_appears_only_once_there_is_somewhere_else_to_create() {
-        assert!(!ids(&verbs(&[], FULL)).contains(&NEW_PROJECT_ON_ID));
-        assert!(ids(&verbs(&[host("h", SectionState::Disconnected)], FULL))
-            .contains(&NEW_PROJECT_ON_ID));
+    fn the_picker_row_appears_only_when_the_picker_offers_a_choice() {
+        assert!(
+            ids(&verbs(&[], IN_PROCESS, FULL)).contains(&NEW_PROJECT_ON_ID),
+            "LOCAL plus localhost is already two destinations"
+        );
+        assert!(
+            !ids(&verbs(&[], IN_PROCESS, GATED)).contains(&NEW_PROJECT_ON_ID),
+            "without the surface a fresh registry has LOCAL alone"
+        );
+        assert!(
+            !ids(&verbs(&[], session("nothing-saved"), FULL)).contains(&NEW_PROJECT_ON_ID),
+            "session mode with only the localhost row is not a choice"
+        );
+        assert!(ids(&verbs(
+            &[host("h", SectionState::Connected)],
+            session("nothing-saved"),
+            FULL
+        ))
+        .contains(&NEW_PROJECT_ON_ID));
     }
 
-    /// The picker lists local plus connected hosts only. A disconnected
-    /// host is absent rather than disabled — creating on a session
-    /// nothing is attached to cannot work.
+    /// The picker lists local, then `localhost`, then connected hosts. A
+    /// disconnected *ordinary* host is absent rather than disabled —
+    /// creating on a session nothing is attached to cannot work.
     #[test]
-    fn the_picker_lists_local_and_connected_hosts() {
+    fn the_picker_lists_local_localhost_and_connected_hosts() {
         let hosts = [
             host("live", SectionState::Connected),
             host("down", SectionState::Disconnected),
             host("dialing", SectionState::Connecting),
         ];
-        let targets = create_targets(&hosts, "Local");
+        let targets = create_targets(&hosts, IN_PROCESS, FULL, "Local");
         assert_eq!(
             ids(&targets),
-            vec![CREATE_ON_LOCAL_ID, "host:create_on:live"]
+            vec![
+                CREATE_ON_LOCAL_ID,
+                CREATE_ON_LOCALHOST_ID,
+                "host:create_on:live"
+            ]
         );
         assert_eq!(targets[0].title, "Local");
+    }
+
+    /// `localhost` is always a row, and its subtitle is what tells the
+    /// three cases apart (plan 063 §D3). Connected is the one with no
+    /// subtitle: it is the ordinary create-on-a-host row, under the
+    /// saved host's own label and its own id, so pressing it is exactly
+    /// what pressing any other connected row is.
+    #[test]
+    fn the_localhost_row_says_which_of_the_three_things_it_will_do() {
+        // The row after LOCAL, which
+        // `the_picker_lists_local_localhost_and_connected_hosts` pins as
+        // the localhost one.
+        let row = |hosts: &[HostRow<'_>], local: LocalSlot<'_>| {
+            create_targets(hosts, local, FULL, "Local")
+                .into_iter()
+                .nth(1)
+                .expect("the localhost row is always offered")
+        };
+
+        let not_saved = row(&[], IN_PROCESS);
+        assert_eq!(not_saved.id, CREATE_ON_LOCALHOST_ID);
+        assert_eq!(not_saved.title, SEED_LABEL);
+        assert_eq!(
+            not_saved.subtitle.as_deref(),
+            Some("saves localhost, starts it if needed, then creates")
+        );
+
+        let saved_slot = LocalSlot {
+            mode: LocalBackendMode::InProcess,
+            slot_saved_id: Some("mine"),
+        };
+        let down = row(
+            &[localhost_host("mine", SectionState::Disconnected)],
+            saved_slot,
+        );
+        assert_eq!(down.id, CREATE_ON_LOCALHOST_ID);
+        assert_eq!(
+            down.subtitle.as_deref(),
+            Some("starts it if needed, then creates")
+        );
+
+        let up = row(
+            &[localhost_host("mine", SectionState::Connected)],
+            saved_slot,
+        );
+        assert_eq!(up.id, "host:create_on:mine");
+        assert_eq!(up.subtitle, None);
+    }
+
+    /// Under `session` there is no in-process workspace on screen, so
+    /// the picker has no row that would create in one — and the slot is
+    /// listed once, not twice.
+    #[test]
+    fn the_session_picker_drops_the_local_row_and_lists_the_slot_once() {
+        let hosts = [
+            localhost_host("slot", SectionState::Connected),
+            host("box", SectionState::Connected),
+        ];
+        assert_eq!(
+            ids(&create_targets(&hosts, session("slot"), FULL, "Local")),
+            vec!["host:create_on:slot", "host:create_on:box"]
+        );
     }
 
     /// Plan 056 §3.4's matrix, the palette's column — driven through the
@@ -516,19 +812,42 @@ mod tests {
     #[test]
     fn the_fidelity_matrix_lists_exactly_the_verb_its_transport_can_act_on() {
         use HostTransportKind::{Localhost, Socket, Ssh};
-        let connected = vec![ADD_ID, "host:disconnect:h", "host:stop:h"];
+        // Only the fidelity verb varies here; the surrounding rows are
+        // the state matrix's, asserted there. The seed row rides the
+        // transport (a Localhost host is the local session already
+        // saved), which is why it is spliced rather than hardcoded.
+        let expect = |transport: HostTransportKind, rest: Vec<&'static str>| {
+            let mut out = vec![ADD_ID];
+            if !transport.localhost() {
+                out.push(CONNECT_SEED_ID);
+            }
+            out.extend(rest);
+            out.push(NEW_PROJECT_ON_ID);
+            out
+        };
+        let connected = vec!["host:disconnect:h", "host:stop:h", "host:remove:h"];
         let cases = [
             (
                 Ssh,
                 SectionState::Connected,
                 true,
-                vec![ADD_ID, "host:disconnect:h", "host:stop:h", "host:update:h"],
+                vec![
+                    "host:disconnect:h",
+                    "host:stop:h",
+                    "host:update:h",
+                    "host:remove:h",
+                ],
             ),
             (
                 Localhost,
                 SectionState::Connected,
                 true,
-                vec![ADD_ID, "host:disconnect:h", "host:stop:h", "host:restart:h"],
+                vec![
+                    "host:disconnect:h",
+                    "host:stop:h",
+                    "host:restart:h",
+                    "host:remove:h",
+                ],
             ),
             // A socket target names somebody else's process, and there
             // is no transport this client could reach its binary over.
@@ -543,25 +862,24 @@ mod tests {
                 Ssh,
                 SectionState::Disconnected,
                 true,
-                vec![ADD_ID, "host:connect:h", "host:remove:h"],
+                vec!["host:connect:h", "host:remove:h"],
             ),
             (
                 Socket,
                 SectionState::Connecting,
                 true,
-                vec![ADD_ID, "host:connect:h"],
+                vec!["host:connect:h"],
             ),
         ];
-        for (transport, state, reduced_fidelity, mut expected) in cases {
+        for (transport, state, reduced_fidelity, rest) in cases {
             let row = HostRow {
                 transport,
                 fidelity: fidelity_action(reduced_fidelity, transport, state),
                 ..host("h", state)
             };
-            expected.push(NEW_PROJECT_ON_ID);
             assert_eq!(
-                ids(&verbs(&[row], FULL)),
-                expected,
+                ids(&verbs(&[row], IN_PROCESS, FULL)),
+                expect(transport, rest),
                 "{transport:?} {state:?} reduced={reduced_fidelity}"
             );
         }
@@ -587,7 +905,7 @@ mod tests {
                     fidelity: Some(action),
                     ..host("h", state)
                 };
-                let offered = verbs(&[row], FULL);
+                let offered = verbs(&[row], IN_PROCESS, FULL);
                 let items = ids(&offered);
                 assert!(
                     !items
@@ -612,6 +930,7 @@ mod tests {
                     fidelity: fidelity_action(true, transport, SectionState::Connected),
                     ..host("h", SectionState::Connected)
                 }],
+                IN_PROCESS,
                 FULL,
             )
             .into_iter()
@@ -647,9 +966,13 @@ mod tests {
                 ..host("mine", SectionState::Connected)
             },
         ];
-        let mut items = verbs(&hosts, FULL);
-        items.extend(verbs(&[], FULL));
-        items.extend(create_targets(&hosts, "Local"));
+        let mut items = verbs(&hosts, IN_PROCESS, FULL);
+        items.extend(verbs(&[], IN_PROCESS, FULL));
+        items.extend(verbs(&hosts, session("mine"), FULL));
+        items.extend(create_targets(&hosts, IN_PROCESS, FULL, "Local"));
+        // The registry with no localhost host is what emits the picker's
+        // not-yet-saved `localhost` row.
+        items.extend(create_targets(&[], IN_PROCESS, FULL, "Local"));
         for item in &items {
             assert!(parse(&item.id).is_some(), "{} does not parse", item.id);
         }
@@ -674,6 +997,10 @@ mod tests {
             Some(HostVerb::Remove("abc".into()))
         );
         assert_eq!(parse(CREATE_ON_LOCAL_ID), Some(HostVerb::CreateOn(None)));
+        assert_eq!(
+            parse(CREATE_ON_LOCALHOST_ID),
+            Some(HostVerb::CreateOnLocalhost)
+        );
         assert_eq!(
             parse("host:create_on:abc"),
             Some(HostVerb::CreateOn(Some("abc".into())))

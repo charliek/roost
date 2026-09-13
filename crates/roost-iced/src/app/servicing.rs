@@ -855,6 +855,19 @@ fn paste_only_keybind(action: &str) -> Result<KeybindAction, String> {
         .ok_or_else(|| "\"paste\" did not resolve to a KeybindAction".to_string())
 }
 
+/// The `HostId` a [`HostView`](super::HostView) carries when no
+/// connection has ever published rows for that host.
+///
+/// `HostId::LOCAL` is a *placeholder* here — "header-only section, no
+/// rows" — and never a destination. Named rather than spelled inline
+/// because it is one of the two routes by which `HostId::LOCAL` can
+/// reach a creation dispatch: under `local-backend = session` following
+/// it would create in the invisible in-process workspace, which is what
+/// [`creation_route`](super::creation_route) exists to refuse.
+pub(super) fn view_incarnation(incarnation: Option<HostId>) -> HostId {
+    incarnation.unwrap_or(HostId::LOCAL)
+}
+
 /// A saved host's target as the sidebar model names it.
 ///
 /// [`host_sidebar::HostTransportKind`] mirrors
@@ -924,6 +937,7 @@ impl App {
         // Before the selection check, which decides whether the window
         // is still showing a row that exists: whatever this selects is
         // then validated exactly as any other selection would be.
+        self.resolve_initial_local_selection();
         self.resolve_pending_host_selection();
         self.reconcile_host_selection();
         self.refresh_sidebar_agents();
@@ -978,7 +992,18 @@ impl App {
     /// Boot is safe: `hydrate_workspace` seeds a default project before
     /// the first reconcile, so the workspace is never observed empty
     /// except after the user emptied it.
+    ///
+    /// **Except under `local-backend = session`** (plan 063 §D5), where
+    /// the in-process workspace is empty *by design* — nothing is seeded
+    /// into it and the window's content is the slot's. Observing it
+    /// would end the app on its own first reconcile. The full
+    /// every-host-empty predicate that replaces this one is §D9's; this
+    /// clause is the part that has to exist the moment the local band
+    /// can be a session.
     fn request_exit_if_empty(&mut self) {
+        if self.local_backend == LocalBackendMode::Session {
+            return;
+        }
         if self.exit_state.observe(self.projects.is_empty()) {
             tracing::info!("last project closed; exiting");
         }
@@ -1639,6 +1664,16 @@ impl App {
                             // this client's current config — see
                             // `HostConnSet::wire_agent_hooks`.
                             self.wire_host_agent_hooks(host);
+                            // A picker row that asked to create on a
+                            // session that was not up yet (plan 063
+                            // §D3). Drained on the edge, so the create
+                            // happens exactly once per connect.
+                            if self.pending_create_on_connect.as_deref() == Some(host.as_str()) {
+                                self.pending_create_on_connect = None;
+                                if let Some(incarnation) = self.hosts.incarnation(host) {
+                                    task = task.then(self.create_project_on(incarnation).task);
+                                }
+                            }
                         }
                         // Attributed (not a stale task's publication): the
                         // app-side purge follows the set's — everything
@@ -2186,7 +2221,7 @@ impl App {
                     transport: transport_kind(&host.target),
                     reduced_fidelity,
                     reason,
-                    host: incarnation.unwrap_or(HostId::LOCAL),
+                    host: view_incarnation(incarnation),
                     state,
                     projects: mirror
                         .as_ref()
@@ -2201,14 +2236,59 @@ impl App {
 
     /// *The slot*: the saved host that holds the local band under
     /// `local-backend = session` — the first with a localhost transport,
-    /// in registry order (plan 063 §D2). Read whatever the mode is;
+    /// in registry order (plan 063 §D2/§D7). Read whatever the mode is;
     /// under `in-process` it is an ordinary `LOCALHOST` band and
     /// [`host_sidebar::sections`] ignores it.
-    pub(super) fn local_slot_saved_id(&self) -> Option<String> {
+    ///
+    /// The one definition of "which saved host is the slot";
+    /// [`Self::local_slot_saved_id`] and [`Self::local_slot_host`] are
+    /// both this lookup, so they cannot name different hosts.
+    fn local_slot_view(&self) -> Option<&super::HostView> {
         self.host_views
             .iter()
             .find(|view| view.transport.localhost())
-            .map(|view| view.saved_id.clone())
+    }
+
+    pub(super) fn local_slot_saved_id(&self) -> Option<String> {
+        self.local_slot_view().map(|view| view.saved_id.clone())
+    }
+
+    /// The label to save this machine's session under, against the live
+    /// registry (plan 063 §D7's collision rule).
+    ///
+    /// The one spelling of that rule is [`local_backend::slot_label`];
+    /// bootstrap's `ensure_local_slot` and the palette's two localhost
+    /// rows all come here, so the plain `localhost` an SSH host already
+    /// holds cannot make one of them fail duplicate-label validation
+    /// while the other steps past it.
+    pub(super) fn slot_label(&self) -> Option<String> {
+        local_backend::slot_label(|candidate| self.workspace.check_host_label(candidate).is_ok())
+    }
+
+    /// The backend half of every surface that renders or offers the
+    /// local band: the sidebar's sections, the palette's verbs, and the
+    /// "New Project on…" picker all read the same pair.
+    pub(super) fn local_slot_input(&self) -> host_sidebar::LocalSlot<'_> {
+        host_sidebar::LocalSlot {
+            mode: self.local_backend,
+            slot_saved_id: self.local_slot_view().map(|view| view.saved_id.as_str()),
+        }
+    }
+
+    /// **The only seam that resolves "the local target"** (plan 063
+    /// §D3): the in-process workspace under `in-process`, the slot's
+    /// live incarnation under `session`, and `None` when the slot is not
+    /// connected — because under `session` there is no second local
+    /// backend to fall back to, and falling back to `HostId::LOCAL`
+    /// would land in the workspace this mode does not draw.
+    pub(super) fn local_slot_host(&self) -> Option<HostId> {
+        match self.local_backend {
+            LocalBackendMode::InProcess => Some(HostId::LOCAL),
+            LocalBackendMode::Session => self
+                .local_slot_view()
+                .filter(|view| view.state.interactive())
+                .map(|view| view.host),
+        }
     }
 
     fn refresh_sidebar_agents(&mut self) {

@@ -511,6 +511,38 @@ pub fn set_key(path: &Path, key: &str, value: &str) -> io::Result<()> {
     write_atomic(path, &new_contents)
 }
 
+/// Write a config file that holds only `key = value`, failing if one
+/// already exists.
+///
+/// For the write a caller knows is a **create**, not an update — plan
+/// 063 §D5's fresh-install `local-backend` line is the one such caller.
+/// [`set_key`] cannot serve it: read-modify-write plus an atomic rename
+/// prevents a *torn* file, not a *lost update*, and nothing locks this
+/// path (`default_path()` has no profile component, so the per-profile
+/// instance locks do not cover it). Another profile, instance or editor
+/// creating `config.conf` between the caller's "no config" check and
+/// the rename would have its file replaced wholesale — including an
+/// explicit `local-backend = in-process` it had just written.
+/// `create_new` (`O_CREAT|O_EXCL`) makes that race an `AlreadyExists`
+/// the caller degrades on instead.
+pub fn create_with_key(path: &Path, key: &str, value: &str) -> io::Result<()> {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    // No tmp-file + rename: `create_new` is itself the atomic step, and
+    // a rename would be exactly the clobber this exists to avoid.
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(render_set_key("", key, value).as_bytes())?;
+    file.sync_all()
+}
+
 /// Pure helper: compute the post-`set_key` file contents from the
 /// existing contents. Split out so the round-trip tests can assert on
 /// the exact bytes without touching the filesystem.
@@ -1348,6 +1380,61 @@ mod tests {
         assert_eq!(cfg.theme_name.as_deref(), Some("roost-dark"));
         assert_eq!(cfg.font_family.as_deref(), Some("JetBrains Mono"));
         assert_eq!(cfg.font_size, Some(15.0));
+    }
+
+    #[test]
+    fn create_with_key_writes_the_one_line_and_makes_its_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nested/dir/config.conf");
+        super::create_with_key(&path, "local-backend", "session").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "local-backend = session\n"
+        );
+    }
+
+    /// The fresh-install write is a create, and a config that appeared
+    /// since the "no config" check must survive it byte for byte — the
+    /// lost update `set_key`'s rename would have caused.
+    #[test]
+    fn create_with_key_refuses_a_config_that_appeared_meanwhile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.conf");
+        let existing =
+            "# written by the other instance\nlocal-backend = in-process\ntheme = roost-dark\n";
+        fs::write(&path, existing).unwrap();
+
+        let err = super::create_with_key(&path, "local-backend", "session")
+            .expect_err("a create over an existing config must fail");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            existing,
+            "the config on disk was modified by a write that reported failure"
+        );
+        // And nothing was left behind beside it (no orphan tmp file).
+        let mut names: Vec<String> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["config.conf".to_string()]);
+    }
+
+    /// The contrast that gives the test above its teeth: `set_key`,
+    /// which the fresh-install path used to call, happily replaces that
+    /// same file. Pins why the create-only path exists rather than
+    /// re-using the general writer.
+    #[test]
+    fn set_key_by_contrast_overwrites_what_appeared_meanwhile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.conf");
+        fs::write(&path, "local-backend = in-process\n").unwrap();
+        super::set_key(&path, "local-backend", "session").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "local-backend = session\n"
+        );
     }
 
     #[test]
