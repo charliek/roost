@@ -405,16 +405,21 @@ fn dial_mode(
 fn reconnect_mode(
     policy: host_verbs::VerbPolicy,
     localhost: bool,
-    slot: bool,
+    slot: Option<local_backend::ConnectPurpose>,
 ) -> Option<crate::host_conn::ConnectMode> {
     use crate::host_conn::ConnectMode;
     if !(policy.localhost_surface && localhost) {
         return None;
     }
-    Some(if slot {
-        ConnectMode::SpawnIfMissing
-    } else {
-        ConnectMode::IfPresent
+    // The slot's spawn is **derived** from the purpose rather than
+    // chosen beside it, for the reason `dial_mode` exists: the client's
+    // seed-on-connect and the daemon's own first project are two halves
+    // of one decision, and a launch that armed them apart would seed a
+    // project into the workspace §D5's migration is about to replay
+    // into.
+    Some(match slot {
+        Some(purpose) => dial_mode(localhost, purpose),
+        None => ConnectMode::IfPresent,
     })
 }
 
@@ -2333,6 +2338,18 @@ pub struct App {
     /// [`local_backend::SwitchState::Idle`] is spelled as the absence of
     /// a run, so nothing can be mid-phase with no phase data.
     switch: Option<local_backend::SwitchRun>,
+    /// The in-process layout a `session` launch found and owes the slot
+    /// (plan 063 §D5), parked until the slot connects.
+    ///
+    /// Read off the *retained* restore descriptors at bootstrap rather
+    /// than from the live workspace, because a workspace loaded under
+    /// `session` is never hydrated: its project rows carry no tabs, and
+    /// the descriptors are the only record of the user's tabs there is.
+    pending_migration: Option<local_backend::MigrationSource>,
+    /// A previous switch's destination copy that this launch's rollback
+    /// could not delete (plan 063 §D8b), adopted by the next switch to
+    /// start so replacing the journal cannot orphan it.
+    pending_dest_cleanup: Vec<(i64, Option<usize>)>,
     /// Reentrancy guard for the switch driver. Its phases call things
     /// that reconcile (`host_add_requested`, `set_host_selection`), and
     /// reconcile is where the driver runs.
@@ -2693,6 +2710,18 @@ impl App {
         finish_switch_source_deletion(&runtime, &client, profile, &resumed);
 
         hydrate_workspace(&runtime, &client, backend_mode)?;
+        // Plan 063 §D5: a `session` launch over a populated in-process
+        // workspace is an absent migration. Read here, while the
+        // retained layout is still whole and before anything can open a
+        // tab into it; run once the slot connects
+        // (`arm_pending_migration`).
+        let pending_migration = match backend_mode {
+            LocalBackendMode::Session => local_backend::retained_migration(
+                &workspace.snapshot(),
+                workspace.retained_layout().as_ref(),
+            ),
+            LocalBackendMode::InProcess => None,
+        };
 
         let (feed_tx, feed_rx) = engine_feed::channel();
         // One feed, one arrival order across sources — see engine_feed.
@@ -2772,6 +2801,8 @@ impl App {
             local_backend: backend_mode,
             local_route,
             switch: None,
+            pending_migration,
+            pending_dest_cleanup: resumed.delete_dest,
             switch_driving: false,
             switch_generation: 0,
             state_dir: profile.state_dir.clone(),
@@ -2934,24 +2965,37 @@ impl App {
         let slot = (self.local_backend == LocalBackendMode::Session)
             .then(|| self.local_slot_saved_id())
             .flatten();
+        // A migration owns everything that lands on the destination, so
+        // its connect seeds nothing — client-side *or* in the daemon it
+        // may spawn (`dial_mode` derives the unseeded spawn from this
+        // very purpose). A seed here would be one project the source
+        // never had, beside the layout about to be replayed.
+        let migrating = self.pending_migration.is_some();
         for host in self.workspace.hosts() {
             let is_slot = slot.as_deref() == Some(host.id.as_str());
+            // The slot has to come up on something: under `session` it
+            // *is* the local band, and an empty one is a window with
+            // nothing in it (plan 063 §D5/§D12).
+            let purpose = match (is_slot, migrating) {
+                (true, true) => local_backend::ConnectPurpose::SwitchDestination,
+                (true, false) => local_backend::ConnectPurpose::EnsureNonempty,
+                (false, _) => local_backend::ConnectPurpose::OrdinaryConnect,
+            };
             // Launch-time, so nobody asked and nobody is waiting: an
             // `Ipc` origin, same as `roostctl`'s, and an attempt no
             // person caused — which is what `AutoReconnect` says.
             self.connect_saved_host(
                 &host,
                 crate::host_conn::RequestOrigin::Ipc,
-                |localhost| reconnect_mode(host_verbs::VerbPolicy::current(), localhost, is_slot),
-                crate::host_conn::AttemptCause::AutoReconnect,
-                // The slot has to come up on something: under `session`
-                // it *is* the local band, and an empty one is a window
-                // with nothing in it (plan 063 §D5/§D12).
-                if is_slot {
-                    local_backend::ConnectPurpose::EnsureNonempty
-                } else {
-                    local_backend::ConnectPurpose::OrdinaryConnect
+                |localhost| {
+                    reconnect_mode(
+                        host_verbs::VerbPolicy::current(),
+                        localhost,
+                        is_slot.then_some(purpose),
+                    )
                 },
+                crate::host_conn::AttemptCause::AutoReconnect,
+                purpose,
             );
         }
         if !self.hosts.is_empty() {
@@ -7994,6 +8038,16 @@ struct ResumedSwitch {
     /// kept. Done after `Workspace::open`, which is the only thing that
     /// can see them.
     delete_source: Vec<i64>,
+    /// The **destination** projects this launch's rollback could not
+    /// delete — a session that was not listening, or listening and not
+    /// answering (plan 063 §D8b).
+    ///
+    /// Carried into the running app rather than left on disk alone. The
+    /// next switch to start replaces the journal file, so a record that
+    /// lived only there would be erased the moment §D5's migration arms
+    /// — orphaning that copy for good and letting the replay make a
+    /// second one of everything it described.
+    delete_dest: Vec<(i64, Option<usize>)>,
     /// Whether the key on disk was actually made to say [`Self::mode`].
     ///
     /// **The journal may not be cleared while this is false.** The mode
@@ -8026,6 +8080,7 @@ fn resume_switch_journal(
     let none = ResumedSwitch {
         mode: None,
         delete_source: Vec::new(),
+        delete_dest: Vec::new(),
         key_written: false,
     };
     let path = local_backend::journal_path(&profile.state_dir);
@@ -8045,8 +8100,9 @@ fn resume_switch_journal(
         local_backend::JournalRecovery::Ignore => return none,
         local_backend::JournalRecovery::Finish {
             mode,
+            delete_dest,
             delete_source,
-        } => (mode, Vec::new(), delete_source),
+        } => (mode, delete_dest, delete_source),
         local_backend::JournalRecovery::RollBack { mode, delete_dest } => {
             (mode, delete_dest, Vec::new())
         }
@@ -8080,13 +8136,19 @@ fn resume_switch_journal(
     ResumedSwitch {
         mode: Some(mode),
         delete_source,
+        // Idempotent to retry: a project already gone is skipped, and
+        // one that has gained tabs is declined again by the same guard.
+        delete_dest: match dest_cleared {
+            true => Vec::new(),
+            false => delete_dest,
+        },
         key_written,
     }
 }
 
 /// Delete a rolled-back switch's destination projects over the session
 /// socket. `true` when there is nothing of the copy left.
-async fn roll_back_switch_destination(project_ids: &[i64]) -> bool {
+async fn roll_back_switch_destination(targets: &[(i64, Option<usize>)]) -> bool {
     // **Bounded, because this runs before the window exists.** A daemon
     // that is listening but not servicing — SIGSTOPped, wedged, mid-swap
     // — answers the connect and never answers the op, and an unbounded
@@ -8096,7 +8158,7 @@ async fn roll_back_switch_destination(project_ids: &[i64]) -> bool {
     // journal stays exactly where it is, which is the same answer a
     // session that is not there gets.
     let budget = ROLLBACK_BUDGET.mul_f64(roost_ipc::session_launch::timeout_scale());
-    match tokio::time::timeout(budget, delete_switch_destination(project_ids)).await {
+    match tokio::time::timeout(budget, delete_switch_destination(targets)).await {
         Ok(complete) => complete,
         Err(_elapsed) => {
             tracing::warn!(
@@ -8116,7 +8178,7 @@ async fn roll_back_switch_destination(project_ids: &[i64]) -> bool {
 /// a slow start rather than no start at all.
 const ROLLBACK_BUDGET: Duration = Duration::from_secs(20);
 
-async fn delete_switch_destination(project_ids: &[i64]) -> bool {
+async fn delete_switch_destination(targets: &[(i64, Option<usize>)]) -> bool {
     let Some(socket) = roost_ipc::session_socket_path() else {
         return false;
     };
@@ -8127,8 +8189,43 @@ async fn delete_switch_destination(project_ids: &[i64]) -> bool {
             return false;
         }
     };
+    // **What is on the session now**, before anything is deleted. The
+    // ids in the journal were minted by a run that is gone, and a
+    // session serves every client at once: between the crash and this
+    // launch somebody may have opened a tab in the copy and worked
+    // there, and `project.delete` cascades. Failing to read it is
+    // failing to roll back — see `local_backend::rollback_is_still_ours`.
+    let listed = client
+        .call::<_, roost_ipc::messages::TabListResult>(
+            roost_ipc::messages::ops::TAB_LIST,
+            serde_json::json!({}),
+        )
+        .await;
+    let found = match listed {
+        Ok(listed) => local_backend::tab_counts(&listed.projects),
+        Err(error) => {
+            tracing::warn!(%error, "could not read the switch destination back to roll it back");
+            return false;
+        }
+    };
     let mut complete = true;
-    for id in project_ids {
+    for (id, expected) in targets {
+        // Already gone is the state the rollback wanted.
+        let Some(found) = found.get(id).copied() else {
+            continue;
+        };
+        if !local_backend::rollback_is_still_ours(*expected, found) {
+            // Disowned rather than left pending: this launch and every
+            // later one would decline it again, so recording it as
+            // unfinished is a journal that never clears.
+            tracing::warn!(
+                project_id = id,
+                found,
+                ?expected,
+                "leaving a replayed project alone: it has gained tabs since the switch made it"
+            );
+            continue;
+        }
         let deleted = client
             .call_raw(
                 roost_ipc::messages::ops::PROJECT_DELETE,
@@ -8137,7 +8234,6 @@ async fn delete_switch_destination(project_ids: &[i64]) -> bool {
             .await;
         match deleted {
             Ok(_) => {}
-            // Already gone is the state the rollback wanted.
             Err(roost_ipc::client::ClientError::Server { ref code, .. })
                 if roost_ipc::client::ServerCode::from_wire(code)
                     == roost_ipc::client::ServerCode::NotFound => {}
@@ -8274,17 +8370,20 @@ fn hydrate_workspace(
     mode: LocalBackendMode,
 ) -> Result<()> {
     if mode == LocalBackendMode::Session {
-        // Nothing is seeded: the local band is the slot's, and a project
-        // here would be one nobody can see (plan 063 §D5). A workspace
-        // that loaded non-empty is an absent migration — a hand-edited
-        // key, or a default flip over an existing setup — and is left
-        // exactly as it is until the launch-time migration lands.
+        // Nothing is seeded, and nothing is opened: the local band is
+        // the slot's, and a project here would be one nobody can see
+        // (plan 063 §D5). A workspace that loaded non-empty is an absent
+        // migration — a hand-edited key, or a default flip over an
+        // existing setup — and it is deliberately left un-hydrated so
+        // that the migration `App::bootstrap` arms right after this
+        // replays the *retained* tab descriptors rather than a set of
+        // rows with no tabs.
         let projects = runtime.block_on(client.list_projects())?;
         if !projects.is_empty() {
-            tracing::warn!(
+            tracing::info!(
                 projects = projects.len(),
                 "local-backend = session over a populated in-process workspace; \
-                 those projects are not shown and are left untouched"
+                 it moves onto the local session once that connects"
             );
         }
         return Ok(());
@@ -8963,13 +9062,13 @@ mod tests {
         use crate::host_conn::ConnectMode;
 
         assert_eq!(
-            reconnect_mode(FULL_POLICY, true, false),
+            reconnect_mode(FULL_POLICY, true, None),
             Some(ConnectMode::IfPresent),
             "connect-if-present, never a spawn"
         );
-        assert_eq!(reconnect_mode(GATED_POLICY, true, false), None);
-        assert_eq!(reconnect_mode(FULL_POLICY, false, false), None);
-        assert_eq!(reconnect_mode(GATED_POLICY, false, false), None);
+        assert_eq!(reconnect_mode(GATED_POLICY, true, None), None);
+        assert_eq!(reconnect_mode(FULL_POLICY, false, None), None);
+        assert_eq!(reconnect_mode(GATED_POLICY, false, None), None);
     }
 
     /// The slot's amendment to that rule (plan 063 §D5): under
@@ -8983,32 +9082,45 @@ mod tests {
     #[test]
     fn only_the_slot_may_start_a_session_at_launch() {
         use crate::host_conn::ConnectMode;
+        use local_backend::ConnectPurpose;
 
         assert_eq!(
-            reconnect_mode(FULL_POLICY, true, true),
+            reconnect_mode(FULL_POLICY, true, Some(ConnectPurpose::EnsureNonempty)),
             Some(ConnectMode::SpawnIfMissing),
             "the slot comes up rather than showing an empty band"
         );
+        // Plan 063 §D5's migrating launch: the same slot, the same
+        // spawn, with the daemon's own first project withheld — the
+        // migration is about to replay one, and a seed would be a
+        // project the source never had.
         assert_eq!(
-            reconnect_mode(FULL_POLICY, true, false),
+            reconnect_mode(FULL_POLICY, true, Some(ConnectPurpose::SwitchDestination)),
+            Some(ConnectMode::SpawnUnseeded),
+            "a launch that owes a migration starts the session unseeded"
+        );
+        assert_eq!(
+            reconnect_mode(FULL_POLICY, true, None),
             Some(ConnectMode::IfPresent),
             "a second localhost host is still probe-only"
         );
         assert_eq!(
-            reconnect_mode(FULL_POLICY, false, true),
+            reconnect_mode(FULL_POLICY, false, Some(ConnectPurpose::EnsureNonempty)),
             None,
             "a remote host is not dialed at launch, slot flag or not"
         );
-        // The caller only ever sets `slot` under `session`
-        // (`reconnect_saved_hosts`), so `in-process` is the row above:
-        // no spawn from any saved host at launch.
+        // The caller only ever names a purpose for the slot under
+        // `session` (`reconnect_saved_hosts`), so `in-process` is the
+        // row above: no spawn from any saved host at launch.
         assert!(!matches!(
-            reconnect_mode(FULL_POLICY, true, false),
-            Some(ConnectMode::SpawnIfMissing)
+            reconnect_mode(FULL_POLICY, true, None),
+            Some(ConnectMode::SpawnIfMissing | ConnectMode::SpawnUnseeded)
         ));
         // A build without the surface refuses even the slot: it offers
         // no verb to leave a local session, so it must not start one.
-        assert_eq!(reconnect_mode(GATED_POLICY, true, true), None);
+        assert_eq!(
+            reconnect_mode(GATED_POLICY, true, Some(ConnectPurpose::EnsureNonempty)),
+            None
+        );
     }
 
     /// Plan 063 §D3's creation gate, driven from **both** routes by

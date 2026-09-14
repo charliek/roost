@@ -892,6 +892,15 @@ pub struct TabExpandSelectionAtParams {
 /// `cell_x` / `cell_y` are 0-indexed grid coordinates. `mods` carries
 /// the same bit layout as the key encoder's `Mods`. Gated by
 /// `ROOST_TEST_MODE=1`.
+///
+/// **The Rust UI runs the whole press handler, not just the encoder**
+/// (plan 063 §D11): `mods` therefore also decides whether the *link*
+/// modifier is held, so a left press on a hyperlink opens it through the
+/// UI's own launcher exactly as a real click does, and a press with no
+/// mouse reporting negotiated begins a local selection. The Mac UI still
+/// drives the encoder alone (`TerminalView.emitMouseTracking`), which is
+/// why the link case is a Linux-only E2E — `xdg-open` is resolved
+/// through `PATH` and macOS spawns `/usr/bin/open` by absolute path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabDispatchMouseEventParams {

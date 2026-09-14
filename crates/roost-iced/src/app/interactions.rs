@@ -2073,6 +2073,69 @@ pub(super) fn visual_tab_ids(
 
 impl App {
     pub fn pointer(&mut self, event: TerminalPointerEvent) -> UiTask {
+        let key = self.terminal_event_key(event.tab_id);
+        let mods = input::ghostty_modifiers(self.modifiers);
+        let link_modifier_held = self.link_modifier_held();
+        self.route_pointer(key, event, mods, link_modifier_held)
+    }
+
+    /// `tab.dispatch_mouse_event`'s entry into that same handler (plan
+    /// 063 §D11).
+    ///
+    /// The op's contract is "exactly what production does", and it used
+    /// to reach the encoder directly — which is every path a
+    /// mouse-reporting application takes and **none** of the ones the UI
+    /// owns: local selection, middle-click paste, and the one §D11 is
+    /// about, a modifier-held left press on a hyperlink. Those live in
+    /// `handle_native_pointer` and above it, so the op routes through
+    /// [`Self::route_pointer`] like a real press.
+    ///
+    /// The two inputs a synthetic event has no source for: the modifier
+    /// state is the request's own `mods` mask rather than the keyboard's
+    /// (nobody is holding a key), and the press is a single click inside
+    /// the widget.
+    pub(super) fn dispatch_test_pointer(
+        &mut self,
+        tab_id: i64,
+        action: PointerAction,
+        button: Option<PointerButton>,
+        col: u32,
+        row: u32,
+        mods: u16,
+    ) -> std::result::Result<UiTask, String> {
+        // A bare id means the slot under `session` (plan 063 §D10), and
+        // `terminal_event_key`'s "the tab showing is the one meant" rule
+        // is a *widget* reading that an IPC caller naming a tab by id
+        // does not get.
+        let key = self.local_tab_key(tab_id);
+        if !self.tabs.contains_key(&key) {
+            return Err(format!("tab {tab_id} has no live terminal"));
+        }
+        let link_modifier_held = input::accelerator_mods_from_ghostty(mods)
+            .intersects(keybind::resolve_link_modifier(self.config.link_modifier));
+        Ok(self.route_pointer(
+            key,
+            TerminalPointerEvent {
+                tab_id,
+                action,
+                button,
+                col,
+                row,
+                click_count: 1,
+                inside: true,
+            },
+            mods,
+            link_modifier_held,
+        ))
+    }
+
+    fn route_pointer(
+        &mut self,
+        key: TabKey,
+        event: TerminalPointerEvent,
+        mods: u16,
+        link_modifier_held: bool,
+    ) -> UiTask {
         // The confirm overlay's catcher only owns primary presses;
         // motion, right/middle presses, and releases would otherwise
         // reach a mouse-tracking PTY (middle-press can even paste).
@@ -2092,8 +2155,6 @@ impl App {
         if action == PointerAction::Press {
             self.cancel_editor_for_interaction();
         }
-        let link_modifier_held = self.link_modifier_held();
-        let key = self.terminal_event_key(tab_id);
         let Some(tab) = pointer_origin_tab(&mut self.tabs, key) else {
             tracing::debug!(tab_id, "ignored terminal pointer event for a closed tab");
             return UiTask::None;
@@ -2103,7 +2164,7 @@ impl App {
             button,
             col,
             row,
-            mods: input::ghostty_modifiers(self.modifiers),
+            mods,
             click_count,
             inside,
             link_modifier_held,

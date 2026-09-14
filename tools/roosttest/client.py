@@ -645,6 +645,11 @@ class Roost:
         NSEvent / GestureClick takes, so the negotiated mouse-tracking
         mode + encoder format are honored exactly.
 
+        On the Rust UI the whole press handler runs, so `mods` also says
+        whether the **link** modifier is held: a left press on a URL
+        opens it through the UI's own launcher (plan 063 §D11). The Mac
+        UI drives the encoder alone.
+
         `kind` ∈ {"press","release","motion"}; `button` ∈
         {"left","right","middle","wheel_up","wheel_down","none"}
         (use "none" for motion-no-button events under mode 1003).

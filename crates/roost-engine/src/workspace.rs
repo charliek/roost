@@ -881,6 +881,20 @@ impl Workspace {
         self.inner.lock().unwrap().restore_layout.take()
     }
 
+    /// The same layout, **read rather than drained**.
+    ///
+    /// Plan 063 §D5's launch-time migration is the caller: under
+    /// `local-backend = session` the workspace is loaded and never
+    /// hydrated, so the tab descriptors it is about to replay onto the
+    /// session live here and nowhere else. It may not take them —
+    /// taking is what disarms `snapshot_for_persist`'s un-hydrated
+    /// fallback, so a migration that failed, or crashed, or never found
+    /// a session to run against would persist those projects with no
+    /// tabs at all and lose the layout for good.
+    pub fn retained_layout(&self) -> Option<RestoreLayout> {
+        self.inner.lock().unwrap().restore_layout.clone()
+    }
+
     /// The sidebar's persisted collapsed state. The UI reads this at
     /// startup to restore the user's hide/show choice (Rust UI adapter
     /// (Iced) parity with the Mac UI's `RoostSidebarVisible`).
@@ -3967,6 +3981,62 @@ mod tests {
         assert!(
             emptied_row.tabs.is_empty(),
             "a project the hydration left empty persists as empty, not as its old layout"
+        );
+    }
+
+    /// Plan 063 §D5's migration reads the retained layout and **must
+    /// not drain it**.
+    ///
+    /// It is the only record of the tabs of a workspace a `session`
+    /// launch loaded and never hydrated, and the migration can fail, be
+    /// abandoned, or never find a session to run against at all. Draining
+    /// at the read would disarm the un-hydrated fallback above, so the
+    /// very next unrelated commit would write those projects to disk with
+    /// no tabs — and the layout would be gone without anything having
+    /// gone wrong twice.
+    #[test]
+    fn reading_the_retained_layout_does_not_hydrate_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let project = {
+            let ws = Workspace::open(path.clone());
+            let project = ws.create_project("kept", "/kept").unwrap().id;
+            ws.open_tab(project, "/saved-a", "saved-a").unwrap();
+            ws.open_tab(project, "/saved-b", "saved-b").unwrap();
+            project
+        };
+
+        let ws2 = Workspace::open(path.clone());
+        let peeked = ws2.retained_layout().expect("a layout to migrate");
+        assert_eq!(
+            peeked
+                .projects
+                .iter()
+                .find(|row| row.project_id == project)
+                .map(|row| row.tabs.iter().map(|t| t.cwd.as_str()).collect::<Vec<_>>()),
+            Some(vec!["/saved-a", "/saved-b"]),
+            "the migration reads the descriptors the launch did not open"
+        );
+        // Reading it twice answers the same, and the one-shot drain is
+        // still armed for whoever really hydrates.
+        assert_eq!(ws2.retained_layout().as_ref(), Some(&peeked));
+
+        // The consequence, which is the point: an unrelated commit after
+        // the read still persists the tabs.
+        ws2.set_sidebar_collapsed(true);
+        let on_disk = read_state(&path).unwrap().unwrap();
+        assert_eq!(
+            on_disk.projects.iter().find(|p| p.id == project).map(|p| p
+                .tabs
+                .iter()
+                .map(|t| t.cwd.as_str())
+                .collect::<Vec<_>>()),
+            Some(vec!["/saved-a", "/saved-b"]),
+            "a peeked layout was written away by the next commit"
+        );
+        assert!(
+            ws2.take_restore_layout().is_some(),
+            "the peek consumed the one-shot a hydration needs"
         );
     }
 

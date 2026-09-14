@@ -441,6 +441,30 @@ pub(crate) fn ghostty_modifiers(value: keyboard::Modifiers) -> u16 {
     result
 }
 
+/// [`ghostty_modifiers`] read backwards, into the flags the
+/// accelerator table speaks.
+///
+/// One direction of that pair has no keyboard behind it: a synthetic
+/// pointer event arrives as a `Mods` mask (`tab.dispatch_mouse_event`'s
+/// wire shape) while the UI-owned half of a press — whether the link
+/// modifier is down — is asked of [`AccelMods`]. Caps/num lock have no
+/// accelerator spelling and are dropped, which is what
+/// [`accelerator_modifiers`] does with them too.
+pub(crate) fn accelerator_mods_from_ghostty(value: u16) -> AccelMods {
+    let mut result = AccelMods::empty();
+    for (bit, accel) in [
+        (mods::SHIFT, AccelMods::SHIFT),
+        (mods::CTRL, AccelMods::CTRL),
+        (mods::ALT, AccelMods::ALT),
+        (mods::SUPER, AccelMods::SUPER),
+    ] {
+        if value & bit != 0 {
+            result |= accel;
+        }
+    }
+    result
+}
+
 fn ghostty_key(key: &Key<&str>) -> Option<GhosttyKey> {
     use ghostty::*;
     Some(match key {
@@ -544,6 +568,43 @@ mod tests {
     use iced::keyboard::key::{Code, Physical};
     use iced::keyboard::Location;
     use roost_vt::TerminalOptions;
+
+    /// The two mod translations are inverses over every combination
+    /// the accelerator table can spell.
+    ///
+    /// `tab.dispatch_mouse_event` carries a ghostty mask and the link
+    /// modifier is asked of `AccelMods` (plan 063 §D11), so a synthetic
+    /// press holding the link modifier and a real one holding the same
+    /// key have to arrive at the same answer. Asserted against
+    /// `accelerator_modifiers`' own reading of the keyboard state, so
+    /// the pair cannot drift together.
+    #[test]
+    fn a_ghostty_mask_carries_the_same_accelerators_the_keyboard_would() {
+        for bits in 0u8..16 {
+            let mut held = keyboard::Modifiers::empty();
+            for (bit, modifier) in [
+                (1, keyboard::Modifiers::SHIFT),
+                (2, keyboard::Modifiers::CTRL),
+                (4, keyboard::Modifiers::ALT),
+                (8, keyboard::Modifiers::LOGO),
+            ] {
+                if bits & bit != 0 {
+                    held |= modifier;
+                }
+            }
+            assert_eq!(
+                accelerator_mods_from_ghostty(ghostty_modifiers(held)),
+                accelerator_modifiers(held),
+                "{held:?}"
+            );
+        }
+        // A lock bit has no accelerator spelling and is dropped rather
+        // than mistaken for one.
+        assert_eq!(
+            accelerator_mods_from_ghostty(mods::CAPS_LOCK | mods::ALT),
+            AccelMods::ALT
+        );
+    }
 
     fn encoder_pair() -> (KeyEncoder, Terminal) {
         let terminal = Terminal::new(TerminalOptions {

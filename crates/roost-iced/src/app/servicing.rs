@@ -1089,10 +1089,26 @@ impl App {
             .retain(|key, _| key.host != host || live.contains(key));
         self.pending_attachments.retain_live(host, &live);
         let active_key = self.active_tab_key();
+        // **On the edge, not on every reconcile**, which is what the log
+        // line below has always said this was. The pointer can only be
+        // over the tab on screen, so a tab losing that place drops its
+        // gesture and hover — but a tab that was already in the
+        // background has no stale state to drop, and clearing it every
+        // reconcile makes the *whole gesture* unrepresentable there: a
+        // synthetic press through `tab.dispatch_mouse_event` (which
+        // names a tab by id, not by what is showing) had its capture
+        // wiped before the release arrived, so the application on the
+        // far end saw a button go down and never come up.
+        //
+        // `revealed_tab` is the memo of the last observed active tab, so
+        // the edge is read off it before `request_tab_reveal` moves it.
+        let active_changed = self.revealed_tab != Some(active_key);
         self.request_tab_reveal(active_key);
-        for (key, tab) in &mut self.tabs {
-            if *key != active_key && tab.reset_pointer_state() {
-                refresh_or_warn(key.tab, tab, "pointer reset after active tab changed");
+        if active_changed {
+            for (key, tab) in &mut self.tabs {
+                if *key != active_key && tab.reset_pointer_state() {
+                    refresh_or_warn(key.tab, tab, "pointer reset after active tab changed");
+                }
             }
         }
         // Every focus change funnels through `focus_tab_and_clear`, which
@@ -1748,7 +1764,7 @@ impl App {
     ///
     /// Under `in-process` this is `backend.tab_key` and nothing has
     /// moved.
-    fn local_tab_key(&self, tab_id: i64) -> TabKey {
+    pub(super) fn local_tab_key(&self, tab_id: i64) -> TabKey {
         match self.local_slot_host() {
             Some(host) => TabKey::new(host, tab_id),
             None => self.backend.tab_key(tab_id),
@@ -3397,14 +3413,18 @@ impl App {
                     u16::try_from(mods)
                         .map_err(|_| format!("modifier mask {mods} exceeds u16"))
                         .and_then(|mods| {
-                            self.tabs
-                                .get_mut(&self.local_tab_key(tab_id))
-                                .ok_or_else(|| format!("tab {tab_id} has no live terminal"))?
-                                .dispatch_pointer(kind, button, cell_x, cell_y, mods)
-                                .map_err(|error| error.to_string())
+                            self.dispatch_test_pointer(tab_id, kind, button, cell_x, cell_y, mods)
                         })
                 };
-                let _ = reply.send(result);
+                match result {
+                    Ok(next) => {
+                        task = task.then(next);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
             }
             // The host registry + connections, as ops (plan 037 §3.5).
             // Served here rather than in the engine so a `roostctl host`

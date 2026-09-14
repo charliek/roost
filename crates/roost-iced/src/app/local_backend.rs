@@ -807,7 +807,14 @@ pub(crate) struct CreatedProject {
     /// The source project this one is the copy of.
     pub(crate) source: i64,
     pub(crate) project: i64,
-    pub(crate) tabs: Vec<i64>,
+    /// The tabs that landed, each carrying **which source tab it is**.
+    ///
+    /// Positioned rather than a bare id list, because the list is
+    /// *compacted*: a tab that could not be opened leaves no entry, so
+    /// after a failure in the middle the nth entry is no longer the nth
+    /// source tab. The active pair is mapped through here (§D8 phase 4),
+    /// and reading it positionally selected the wrong tab.
+    pub(crate) tabs: Vec<CreatedTab>,
     /// Whether **everything** the source project held reached the
     /// destination — every tab, and every title lock.
     ///
@@ -819,6 +826,14 @@ pub(crate) struct CreatedProject {
     /// came from is **kept** — the user ends up with it on both sides,
     /// which is recoverable, rather than short one tab, which is not.
     pub(crate) complete: bool,
+}
+
+/// One replayed tab: the destination id, and the position in the
+/// source project's tab list it was copied from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CreatedTab {
+    pub(crate) source: usize,
+    pub(crate) tab: i64,
 }
 
 /// Plan 063 §D8b's crash record.
@@ -858,6 +873,59 @@ pub(crate) struct SwitchJournal {
     /// switch kept because the destination does not hold it.
     #[serde(default, with = "id_list")]
     pub(crate) deletable_sources: Vec<i64>,
+    /// Whether this is plan 063 §D5's **launch-time** migration rather
+    /// than a switch the user asked for.
+    ///
+    /// It changes exactly one thing, and only before the commit point:
+    /// which mode the rollback settles on. A user's forward switch
+    /// started from `in-process` and a failure owes them that back. A
+    /// launch migration started from a key that already said `session`
+    /// — nobody asked to leave it — so its rollback undoes the partial
+    /// destination copy and **stays** on `session`, and the next launch
+    /// finds the same populated workspace and tries again. Writing
+    /// `in-process` there would silently un-edit the key the user set.
+    #[serde(default)]
+    pub(crate) launch_migration: bool,
+    /// Destination projects an **earlier** switch left behind and this
+    /// one adopted (plan 063 §D8b).
+    ///
+    /// Writing a journal replaces the one on disk, so without this a
+    /// switch that starts while an unresolved rollback is still on file
+    /// erases the only record of that abandoned copy: it is orphaned
+    /// forever, and a replay then makes a second copy of everything it
+    /// described. A forward switch clears this list *before* it replays;
+    /// every recovery arm deletes what is left of it.
+    ///
+    /// Its own list rather than more `created_dest_ids`, because that
+    /// one is paired with `source_snapshot` **by position** and these
+    /// came from a different snapshot in a different process — so they
+    /// carry their own expected tab count instead.
+    #[serde(default)]
+    pub(crate) inherited_dest: Vec<InheritedDest>,
+}
+
+/// One adopted destination project: its id, and the tab count the
+/// switch that made it expected it to hold (`None` when that switch's
+/// journal could not say).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct InheritedDest {
+    #[serde(with = "source_id")]
+    pub(crate) project: i64,
+    #[serde(default)]
+    pub(crate) tabs: Option<usize>,
+}
+
+impl InheritedDest {
+    fn target(self) -> (i64, Option<usize>) {
+        (self.project, self.tabs)
+    }
+
+    fn of(target: (i64, Option<usize>)) -> Self {
+        Self {
+            project: target.0,
+            tabs: target.1,
+        }
+    }
 }
 
 /// The same string-wrapping [`source_id`] does, over a list.
@@ -885,8 +953,97 @@ impl SwitchJournal {
             source_snapshot,
             created_dest_ids: Vec::new(),
             deletable_sources: Vec::new(),
+            launch_migration: false,
+            inherited_dest: Vec::new(),
         }
     }
+}
+
+/// The in-process layout plan 063 §D5's launch-time migration will
+/// replay, taken before the window exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MigrationSource {
+    pub(crate) projects: Vec<SwitchProject>,
+    /// The active pair as (project index, tab index) into `projects` —
+    /// the same positional shape the in-place switch maps its selection
+    /// through.
+    pub(crate) active_at: Option<(usize, usize)>,
+}
+
+/// Read a `session`-mode launch's in-process layout, if it found one
+/// (plan 063 §D5).
+///
+/// **The tabs come from the retained restore layout, not from the
+/// projects.** A workspace loaded under `session` is never hydrated, so
+/// every project row here has an empty `tabs` — the descriptors are
+/// what `Workspace::open` kept, and they are the only record of the
+/// user's tabs that exists. A snapshot taken from the live rows would
+/// replay projects with no tabs at all and then delete the originals.
+///
+/// A project *with* live tabs still wins, because it is the newer
+/// truth: that is the same precedence `Workspace::snapshot_for_persist`
+/// applies, and it is what keeps this honest if it is ever reached from
+/// a workspace that has been hydrated.
+pub(crate) fn retained_migration(
+    projects: &[Project],
+    layout: Option<&roost_engine::RestoreLayout>,
+) -> Option<MigrationSource> {
+    if projects.is_empty() {
+        return None;
+    }
+    let retained = |project_id: i64| {
+        layout
+            .and_then(|layout| {
+                layout
+                    .projects
+                    .iter()
+                    .find(|row| row.project_id == project_id)
+            })
+            .map(|row| row.tabs.as_slice())
+            .unwrap_or(&[])
+    };
+    let source: Vec<SwitchProject> = projects
+        .iter()
+        .map(|project| SwitchProject {
+            source: project.id,
+            name: project.name.clone(),
+            cwd: project.cwd.clone(),
+            tabs: match project.tabs.is_empty() {
+                true => retained(project.id)
+                    .iter()
+                    .map(|tab| SwitchTab {
+                        cwd: tab.cwd.clone(),
+                        title: tab.title.clone(),
+                        user_titled: tab.user_titled,
+                    })
+                    .collect(),
+                false => project
+                    .tabs
+                    .iter()
+                    .map(|tab| SwitchTab {
+                        cwd: tab.cwd.clone(),
+                        title: tab.title.clone(),
+                        user_titled: tab.user_titled,
+                    })
+                    .collect(),
+            },
+        })
+        .collect();
+    // The retained selection, in the same positional coordinates the
+    // replay maps through. `active_tab_position` is already the dense
+    // display index `RestoreLayout` promises, so it indexes the tab list
+    // built above directly.
+    let active_at = layout.and_then(|layout| {
+        let project = source
+            .iter()
+            .position(|row| row.source == layout.active_project_id)?;
+        let tab = usize::try_from(layout.active_tab_position).ok()?;
+        (tab < source[project].tabs.len()).then_some((project, tab))
+    });
+    Some(MigrationSource {
+        projects: source,
+        active_at,
+    })
 }
 
 /// Where the journal lives: beside `state.json`, in the UI's state dir.
@@ -956,6 +1113,11 @@ pub(crate) enum JournalRecovery {
     /// teardown it did not finish is finished now.
     Finish {
         mode: LocalBackendMode,
+        /// What an *earlier* switch left on the destination and this one
+        /// adopted without resolving — a reverse, which copies nothing
+        /// and so never runs the forward replay that clears the list.
+        /// Never this switch's own copy: that is the work it committed.
+        delete_dest: Vec<(i64, Option<usize>)>,
         /// The source projects to delete — a forward switch that
         /// committed but did not finish emptying the source.
         ///
@@ -970,9 +1132,17 @@ pub(crate) enum JournalRecovery {
     /// assumed, because the crash may have landed *after* the key write
     /// and before the phase update — and whatever the destination
     /// already holds is deleted.
+    ///
+    /// `mode` is `to_mode` for §D5's launch migration, whose `from_mode`
+    /// is not a mode anybody chose: see
+    /// [`SwitchJournal::launch_migration`].
     RollBack {
         mode: LocalBackendMode,
-        delete_dest: Vec<i64>,
+        /// Each destination project paired with the tab count the
+        /// journal says the replay left on it — see
+        /// [`rollback_is_still_ours`], which is what stops this from
+        /// deleting a project somebody else has worked in since.
+        delete_dest: Vec<(i64, Option<usize>)>,
     },
     /// The file describes no switch this build knows how to resolve.
     /// Nothing happens and the ladder decides the mode.
@@ -1005,6 +1175,7 @@ pub(crate) fn journal_recovery(journal: &SwitchJournal) -> JournalRecovery {
     if journal.phase.committed() {
         return JournalRecovery::Finish {
             mode: direction.destination(),
+            delete_dest: inherited_targets(journal),
             // Only a forward switch empties a source. Reverse is
             // No-Replay: it copies nothing and so has nothing to tear
             // down, and deleting the in-process workspace there would
@@ -1016,9 +1187,112 @@ pub(crate) fn journal_recovery(journal: &SwitchJournal) -> JournalRecovery {
         };
     }
     JournalRecovery::RollBack {
-        mode: direction.source(),
-        delete_dest: journal.created_dest_ids.clone(),
+        // A launch migration has no source mode to go back to: the key
+        // already said `session` before it started, and the layout it
+        // was moving is still whole in the in-process workspace. So the
+        // copy goes and the mode stays, which leaves the next launch the
+        // same populated workspace to migrate again.
+        mode: match journal.launch_migration {
+            true => direction.destination(),
+            false => direction.source(),
+        },
+        delete_dest: rollback_targets(journal),
     }
+}
+
+/// The destination projects a rollback may delete, each with the tab
+/// count the journal says the replay left there (plan 063 §D8b).
+///
+/// `created_dest_ids[i]` is the copy of `source_snapshot[i]`: the
+/// replay appends the id the moment `project.create` answers, before it
+/// opens a single tab, so the two lists share an order and the shorter
+/// one is the crash point.
+pub(crate) fn rollback_targets(journal: &SwitchJournal) -> Vec<(i64, Option<usize>)> {
+    inherited_targets(journal)
+        .into_iter()
+        .chain(
+            journal
+                .created_dest_ids
+                .iter()
+                .enumerate()
+                .map(|(index, project)| {
+                    (
+                        *project,
+                        journal
+                            .source_snapshot
+                            .get(index)
+                            .map(|source| source.tabs.len()),
+                    )
+                }),
+        )
+        .collect()
+}
+
+/// Just the adopted half — what a switch that **committed** still owes,
+/// since its own copy is the thing it was for.
+pub(crate) fn inherited_targets(journal: &SwitchJournal) -> Vec<(i64, Option<usize>)> {
+    journal
+        .inherited_dest
+        .iter()
+        .copied()
+        .map(InheritedDest::target)
+        .collect()
+}
+
+/// Whether a destination project a rollback named is still the copy the
+/// replay made, and so still this switch's to delete.
+///
+/// **"I created this id" is not grounds to delete it later.** A session
+/// serves every client at once — that is the whole point of it — so
+/// between the crash and this rollback somebody may have opened a tab
+/// in the very project the replay left behind and started working
+/// there. `project.delete` cascades, so deleting it would take that
+/// work with it. Same reading §D6's auto-remove arrived at: ask what is
+/// there *now*, rather than acting on what this client remembers doing.
+///
+/// The question it can answer is "has it gained tabs since". The replay
+/// opens at most `source_snapshot[i].tabs.len()` of them and nothing
+/// else on a `SwitchDestination` connect creates any (the seed is
+/// withheld, §D12), so anything above that count came from somewhere
+/// else. Fewer is ordinary — that is a crash mid-project.
+///
+/// A journal with no snapshot entry for the id vouches for nothing, and
+/// so deletes nothing. Every journal a real replay writes has one: it
+/// is written at phase 2, before the first `project.create`.
+pub(crate) fn rollback_is_still_ours(expected_tabs: Option<usize>, found_tabs: usize) -> bool {
+    expected_tabs.is_some_and(|expected| found_tabs <= expected)
+}
+
+/// Where the source's active tab ended up (plan 063 §D8 phase 4).
+///
+/// `active_at` is a **source** position pair, because the destination's
+/// ids are not the source's. Resolving it has one trap, and it is the
+/// reason [`CreatedTab`] carries a position at all: `made.tabs` is
+/// *compacted*, so a tab that could not be opened leaves no entry and
+/// every tab after it shifts down one. Indexing that list would select
+/// a tab the user was not looking at — and the further the failure is
+/// from the end, the further off the answer.
+///
+/// The fallback is the first tab of the first project the replay landed
+/// whole. A switch that moved the user's work and then selected nothing
+/// leaves them looking at an empty pane, and the pair it was asked for
+/// may name a project or a tab that never arrived.
+pub(crate) fn mapped_selection(
+    created: &[CreatedProject],
+    active_at: Option<(usize, usize)>,
+) -> Option<(i64, i64)> {
+    active_at
+        .and_then(|(project, tab)| {
+            let made = created.get(project)?;
+            let landed = made.tabs.iter().find(|landed| landed.source == tab)?;
+            Some((made.project, landed.tab))
+        })
+        .or_else(|| {
+            created
+                .iter()
+                .find(|made| made.complete && !made.tabs.is_empty())
+                .map(|made| (made.project, made.tabs[0].tab))
+        })
 }
 
 /// The source projects phase 5 may delete (plan 063 §D8 phase 5).
@@ -1107,7 +1381,7 @@ pub(crate) fn fence_holds(fence: SwitchFence<'_>) -> bool {
                 && created
                     .tabs
                     .iter()
-                    .all(|tab| mirrored(created.project, *tab))
+                    .all(|made| mirrored(created.project, made.tab))
         });
     if !every_row {
         return false;
@@ -1209,6 +1483,12 @@ pub(crate) struct SwitchRun {
     /// waits for it (§D8a's "safe point").
     step_in_flight: bool,
     journal: SwitchJournal,
+    /// Set when this run is plan 063 §D5's launch-time migration, and
+    /// then it **is** phase 2's snapshot: the layout was read off the
+    /// retained restore descriptors at bootstrap, because a workspace
+    /// loaded under `session` is never hydrated and its live project
+    /// rows carry no tabs at all.
+    migration: Option<MigrationSource>,
     /// What the replay's replies said it made, in creation order.
     created: Vec<CreatedProject>,
     /// The source's active pair, as (project index, tab index) into the
@@ -1253,6 +1533,11 @@ fn phase_deadline() -> std::time::Instant {
 #[derive(Debug)]
 pub(crate) struct ReplayOutcome {
     pub(crate) created: Vec<CreatedProject>,
+    /// Whatever is left of an adopted copy (§D8b's `inherited_dest`).
+    /// Empty once the replay has cleared it, which it does before it
+    /// creates anything — so a non-empty list here is always paired
+    /// with an `error`.
+    pub(crate) inherited_left: Vec<InheritedDest>,
     pub(crate) error: Option<String>,
 }
 
@@ -1393,8 +1678,32 @@ impl super::App {
     }
 
     fn begin_switch(&mut self, direction: SwitchDirection) {
+        self.arm_switch(direction, None);
+        self.reconcile();
+    }
+
+    /// Put a run in place. Split from [`Self::begin_switch`] because the
+    /// launch migration arms from *inside* a reconcile and must not
+    /// start a nested one.
+    fn arm_switch(&mut self, direction: SwitchDirection, migration: Option<MigrationSource>) {
         self.switch_generation = self.switch_generation.wrapping_add(1);
         let saved_id = self.local_slot_saved_id().unwrap_or_default();
+        let mut journal = SwitchJournal::new(direction, Vec::new());
+        journal.launch_migration = migration.is_some();
+        // Adopted here, at the one moment the journal on disk is about
+        // to be replaced: an unresolved rollback recorded only there
+        // would be erased, and the replay below would then make a second
+        // copy of everything that record described.
+        journal.inherited_dest = std::mem::take(&mut self.pending_dest_cleanup)
+            .into_iter()
+            .map(InheritedDest::of)
+            .collect();
+        if !journal.inherited_dest.is_empty() {
+            tracing::info!(
+                projects = journal.inherited_dest.len(),
+                "this switch adopts an earlier one's unresolved destination copy"
+            );
+        }
         self.switch = Some(SwitchRun {
             direction,
             state: SwitchState::Preparing,
@@ -1403,7 +1712,8 @@ impl super::App {
             added_slot: false,
             dialed: false,
             step_in_flight: false,
-            journal: SwitchJournal::new(direction, Vec::new()),
+            journal,
+            migration,
             created: Vec::new(),
             active_at: None,
             wanted: None,
@@ -1415,7 +1725,48 @@ impl super::App {
         // slot or closing the window over an emptied source.
         self.publish_local_route();
         tracing::info!(?direction, "local-backend switch started");
-        self.reconcile();
+    }
+
+    // ── the launch-time migration (plan 063 §D5) ────────────────────
+
+    /// Start the migration a `session` launch owes, once there is a slot
+    /// to run it against.
+    ///
+    /// **Parked, not driven.** The migration waits for the slot to
+    /// connect rather than dialing one of its own: §D5 says "after the
+    /// slot connects", and the launch's own `reconnect_saved_hosts`
+    /// already dials it — with [`ConnectPurpose::SwitchDestination`],
+    /// so a session that comes up empty is not seeded under the replay.
+    /// A slot that never connects therefore leaves this parked forever
+    /// and costs nothing: no latch, so no phase backstop, no refused
+    /// `Cmd-N`, and the band shows the spawn failure with ↻ exactly as
+    /// §D5's spawn-failure clause says.
+    ///
+    /// It is dropped the moment the mode is no longer `session`. A
+    /// snapshot of source ids outlives its own workspace otherwise: the
+    /// user reverses, the rows hydrate, a later forward switch moves and
+    /// deletes them, and a migration armed from the stale snapshot would
+    /// replay projects that no longer exist onto the session a second
+    /// time.
+    fn arm_pending_migration(&mut self) {
+        if self.local_backend != LocalBackendMode::Session {
+            if self.pending_migration.take().is_some() {
+                tracing::info!("the local backend left session; the launch migration is dropped");
+            }
+            return;
+        }
+        if self.pending_migration.is_none()
+            || self.switch_in_flight()
+            || self.connected_slot_host().is_none()
+        {
+            return;
+        }
+        let migration = self.pending_migration.take().expect("a pending migration");
+        tracing::info!(
+            projects = migration.projects.len(),
+            "migrating the in-process workspace onto the local session"
+        );
+        self.arm_switch(SwitchDirection::ToSession, Some(migration));
     }
 
     // ── the driver ──────────────────────────────────────────────────
@@ -1429,10 +1780,11 @@ impl super::App {
     /// construction (a phase calls `host_add_requested`, which
     /// reconciles), so the guard is a flag rather than a discipline.
     pub(super) fn drive_switch(&mut self) {
-        if self.switch_driving || self.switch.is_none() {
+        if self.switch_driving {
             return;
         }
         self.switch_driving = true;
+        self.arm_pending_migration();
         while self.advance_switch() {}
         self.switch_driving = false;
     }
@@ -1553,32 +1905,48 @@ impl super::App {
             self.fail_switch("the local session is not accepting operations");
             return false;
         };
-        let snapshot: Vec<SwitchProject> = self
-            .projects
-            .iter()
-            .map(|project| SwitchProject {
-                source: project.id,
-                name: project.name.clone(),
-                cwd: project.cwd.clone(),
-                tabs: project
-                    .tabs
+        // Phase 2's snapshot. A launch migration brought its own — read
+        // off the retained restore descriptors before the window
+        // existed, because the workspace it is moving was loaded and
+        // deliberately never hydrated, so `self.projects` holds its
+        // rows with **no tabs at all** (§D5).
+        let migration = self
+            .switch
+            .as_ref()
+            .and_then(|run| run.migration.as_ref())
+            .cloned();
+        let (snapshot, active_at) = match migration {
+            Some(migration) => (migration.projects, migration.active_at),
+            None => {
+                let snapshot: Vec<SwitchProject> = self
+                    .projects
                     .iter()
-                    .map(|tab| SwitchTab {
-                        cwd: tab.cwd.clone(),
-                        title: tab.title.clone(),
-                        user_titled: tab.user_titled,
+                    .map(|project| SwitchProject {
+                        source: project.id,
+                        name: project.name.clone(),
+                        cwd: project.cwd.clone(),
+                        tabs: project
+                            .tabs
+                            .iter()
+                            .map(|tab| SwitchTab {
+                                cwd: tab.cwd.clone(),
+                                title: tab.title.clone(),
+                                user_titled: tab.user_titled,
+                            })
+                            .collect(),
                     })
-                    .collect(),
-            })
-            .collect();
-        let (_, active_tab) = self.workspace.active();
-        let active_at = self.projects.iter().enumerate().find_map(|(p, project)| {
-            project
-                .tabs
-                .iter()
-                .position(|tab| tab.id == active_tab)
-                .map(|t| (p, t))
-        });
+                    .collect();
+                let (_, active_tab) = self.workspace.active();
+                let active_at = self.projects.iter().enumerate().find_map(|(p, project)| {
+                    project
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.id == active_tab)
+                        .map(|t| (p, t))
+                });
+                (snapshot, active_at)
+            }
+        };
 
         let path = self.journal_path();
         let run = self.switch.as_mut().expect("a run");
@@ -1601,6 +1969,7 @@ impl super::App {
         let home = roost_engine::home_dir();
         self.runtime_handle.spawn(async move {
             let outcome = replay_onto_slot(&ops, snapshot, &path, journal, &home).await;
+
             feed.send(crate::engine_feed::EngineFeed::LocalBackendSwitch(
                 Box::new(SwitchStepDone {
                     generation,
@@ -1657,18 +2026,7 @@ impl super::App {
         // one that could not start), the first tab this switch did land.
         // A switch that moved the user's work and then selected nothing
         // leaves them looking at an empty pane.
-        run.wanted = run
-            .active_at
-            .and_then(|(p, t)| {
-                let made = run.created.get(p)?;
-                Some((made.project, *made.tabs.get(t)?))
-            })
-            .or_else(|| {
-                run.created
-                    .iter()
-                    .find(|made| made.complete && !made.tabs.is_empty())
-                    .map(|made| (made.project, made.tabs[0]))
-            });
+        run.wanted = mapped_selection(&run.created, run.active_at);
         let generation = run.generation;
         let deletable = run.journal.deletable_sources.clone();
         run.kept = run.created.len() - deletable.len();
@@ -1787,19 +2145,52 @@ impl super::App {
     /// here is logged, not raised — the journal still says `replaying`,
     /// so the next launch does this again with the same answer.
     fn forward_roll_back(&mut self, why: &str) {
-        if let Some(config_path) = roost_ui_model::config::config_path() {
-            if let Err(error) = roost_ui_model::config::set_key(
-                &config_path,
-                "local-backend",
-                LocalBackendMode::InProcess.as_str(),
-            ) {
-                tracing::warn!(%error, "could not put the local-backend key back");
-            }
-        }
-        let created: Vec<i64> = self
+        // Except for §D5's launch migration, which has no key to put
+        // back: it started from a key that already said `session`, so
+        // the only thing to undo is the destination copy. Same reading
+        // as [`journal_recovery`]'s rollback arm, and for the same
+        // reason — see [`SwitchJournal::launch_migration`].
+        let launch_migration = self
             .switch
             .as_ref()
-            .map(|run| run.created.iter().map(|made| made.project).collect())
+            .is_some_and(|run| run.journal.launch_migration);
+        if !launch_migration {
+            if let Some(config_path) = roost_ui_model::config::config_path() {
+                if let Err(error) = roost_ui_model::config::set_key(
+                    &config_path,
+                    "local-backend",
+                    LocalBackendMode::InProcess.as_str(),
+                ) {
+                    tracing::warn!(%error, "could not put the local-backend key back");
+                }
+            }
+        }
+        // Paired with what the snapshot said each copy should hold, so
+        // the deletion below can tell the copy from a project somebody
+        // else has since worked in — `rollback_is_still_ours`. The
+        // pairing is positional for `rollback_targets`' reason: the
+        // replay walks the snapshot in order and `created` is what it
+        // got through.
+        let created: Vec<(i64, Option<usize>)> = self
+            .switch
+            .as_ref()
+            .map(|run| {
+                // An adopted copy this run did not manage to clear is
+                // still on the destination and still nobody else's, so
+                // it goes with this run's own.
+                inherited_targets(&run.journal)
+                    .into_iter()
+                    .chain(run.created.iter().enumerate().map(|(index, made)| {
+                        (
+                            made.project,
+                            run.journal
+                                .source_snapshot
+                                .get(index)
+                                .map(|source| source.tabs.len()),
+                        )
+                    }))
+                    .collect()
+            })
             .unwrap_or_default();
         if created.is_empty() {
             self.fail_switch(why);
@@ -1940,6 +2331,10 @@ impl super::App {
             SwitchStep::Replayed(outcome) => {
                 let run = self.switch.as_mut().expect("a run");
                 run.created = outcome.created;
+                // The App's copy of the journal is the one the commit
+                // and the rollback write, so it takes the replay's word
+                // for what is left of the adopted copy.
+                run.journal.inherited_dest = outcome.inherited_left;
                 match outcome.error {
                     Some(error) => self.forward_roll_back(&error),
                     None => self.forward_commit(),
@@ -2049,6 +2444,33 @@ async fn replay_onto_slot(
 ) -> ReplayOutcome {
     use roost_ipc::messages::{ops as wire, ProjectCreateResult, TabOpenResult};
     let mut created: Vec<CreatedProject> = Vec::with_capacity(snapshot.len());
+
+    // **An adopted copy goes before anything is made.** It is a copy of
+    // some of this very layout, made by a switch that crashed, and
+    // replaying over it is how a user ends up with everything twice —
+    // the duplication the owner's No-Replay decision exists to avoid
+    // elsewhere. A failure to clear it is therefore a failure of the
+    // whole replay: the rollback below puts the key back and the journal
+    // keeps naming the copy for a launch that can reach it.
+    let inherited = std::mem::take(&mut journal.inherited_dest);
+    if !inherited.is_empty() {
+        let targets: Vec<(i64, Option<usize>)> = inherited
+            .iter()
+            .copied()
+            .map(InheritedDest::target)
+            .collect();
+        if !delete_dest_projects(ops, &targets).await {
+            return ReplayOutcome {
+                created,
+                inherited_left: inherited,
+                error: Some("an abandoned copy from an earlier switch could not be removed".into()),
+            };
+        }
+        if let Err(error) = write_journal(path, &journal) {
+            tracing::warn!(%error, "could not record an adopted copy's removal");
+        }
+    }
+
     for project in &snapshot {
         let mut complete = true;
         let made: Result<ProjectCreateResult, String> = super::host_call(
@@ -2067,6 +2489,7 @@ async fn replay_onto_slot(
             Err(error) => {
                 return ReplayOutcome {
                     created,
+                    inherited_left: Vec::new(),
                     error: Some(error),
                 }
             }
@@ -2075,8 +2498,8 @@ async fn replay_onto_slot(
         if let Err(error) = write_journal(path, &journal) {
             tracing::warn!(%error, "could not record a replayed project");
         }
-        let mut tabs = Vec::with_capacity(project.tabs.len());
-        for tab in &project.tabs {
+        let mut tabs: Vec<CreatedTab> = Vec::with_capacity(project.tabs.len());
+        for (position, tab) in project.tabs.iter().enumerate() {
             let cwd = replay_cwd(&tab.cwd, &made.cwd, home);
             let opened: Result<TabOpenResult, String> = super::host_call(
                 ops,
@@ -2095,7 +2518,10 @@ async fn replay_onto_slot(
                     continue;
                 }
             };
-            tabs.push(opened.id);
+            tabs.push(CreatedTab {
+                source: position,
+                tab: opened.id,
+            });
             // Only a lock the user set: a title the shell wrote is the
             // shell's to write again over there.
             if tab.user_titled && !tab.title.is_empty() {
@@ -2123,6 +2549,7 @@ async fn replay_onto_slot(
     }
     ReplayOutcome {
         created,
+        inherited_left: Vec::new(),
         error: None,
     }
 }
@@ -2158,12 +2585,46 @@ async fn delete_source_projects(client: &roost_engine::LocalClient, ids: &[i64])
 
 /// The rollback's other half. `true` when the destination holds none of
 /// the copy any more.
-async fn delete_dest_projects(ops: &crate::host_conn::HostOps, ids: &[i64]) -> bool {
+async fn delete_dest_projects(
+    ops: &crate::host_conn::HostOps,
+    targets: &[(i64, Option<usize>)],
+) -> bool {
+    use roost_ipc::messages::{ops as wire, TabListResult};
+
+    // What is there now, asked once. A failure to ask is a failure to
+    // roll back: without it nothing below can tell the copy from
+    // somebody else's work, and deleting on the strength of a remembered
+    // id is exactly what `rollback_is_still_ours` exists to stop.
+    let listed: Result<TabListResult, String> =
+        super::host_call(ops, wire::TAB_LIST, serde_json::json!({})).await;
+    let found = match listed {
+        Ok(listed) => tab_counts(&listed.projects),
+        Err(error) => {
+            tracing::warn!(%error, "could not read the switch destination back to roll it back");
+            return false;
+        }
+    };
     let mut complete = true;
-    for id in ids {
+    for (id, expected) in targets {
+        let Some(found) = found.get(id).copied() else {
+            // Already gone is the state the rollback wanted.
+            continue;
+        };
+        if !rollback_is_still_ours(*expected, found) {
+            // **Disowned, not pending.** This client will never delete
+            // it, so counting it as unfinished would leave a journal
+            // that every later launch re-reads and re-declines.
+            tracing::warn!(
+                project_id = id,
+                found,
+                ?expected,
+                "leaving a replayed project alone: it has gained tabs since the switch made it"
+            );
+            continue;
+        }
         if let Err(error) = super::host_call::<serde_json::Value>(
             ops,
-            roost_ipc::messages::ops::PROJECT_DELETE,
+            wire::PROJECT_DELETE,
             serde_json::json!({ "project_id": id.to_string() }),
         )
         .await
@@ -2173,6 +2634,14 @@ async fn delete_dest_projects(ops: &crate::host_conn::HostOps, ids: &[i64]) -> b
         }
     }
     complete
+}
+
+/// A `tab.list` reply as "how many tabs does each project hold".
+pub(crate) fn tab_counts(projects: &[Project]) -> std::collections::HashMap<i64, usize> {
+    projects
+        .iter()
+        .map(|project| (project.id, project.tabs.len()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -3030,6 +3499,8 @@ mod switch_tests {
                 }],
             }],
             created_dest_ids: created.to_vec(),
+            launch_migration: false,
+            inherited_dest: Vec::new(),
         }
     }
 
@@ -3141,7 +3612,7 @@ mod switch_tests {
                 journal_recovery(&journal(phase, SwitchDirection::ToSession, &[4, 9])),
                 JournalRecovery::RollBack {
                     mode: InProcess,
-                    delete_dest: vec![4, 9],
+                    delete_dest: vec![(4, Some(1)), (9, None)],
                 },
                 "{phase:?}: the destination is partial, so the source wins"
             );
@@ -3151,6 +3622,7 @@ mod switch_tests {
                 journal_recovery(&journal(phase, SwitchDirection::ToSession, &[4, 9])),
                 JournalRecovery::Finish {
                     mode: Session,
+                    delete_dest: Vec::new(),
                     // The journal's own list, not "every project": the
                     // running switch kept whatever the replay did not
                     // land whole, and the recovery has to keep it too.
@@ -3171,7 +3643,7 @@ mod switch_tests {
             )),
             JournalRecovery::RollBack {
                 mode: Session,
-                delete_dest: vec![],
+                delete_dest: Vec::new(),
             }
         );
         assert_eq!(
@@ -3182,6 +3654,7 @@ mod switch_tests {
             )),
             JournalRecovery::Finish {
                 mode: InProcess,
+                delete_dest: Vec::new(),
                 delete_source: vec![],
             }
         );
@@ -3204,9 +3677,60 @@ mod switch_tests {
             journal_recovery(&committed),
             JournalRecovery::Finish {
                 mode: LocalBackendMode::Session,
+                delete_dest: Vec::new(),
                 delete_source: vec![3],
             },
             "the snapshot has two; only one is the recovery's to delete"
+        );
+    }
+
+    /// Plan 063 §D5's launch migration rolls back **without moving the
+    /// key**.
+    ///
+    /// The asymmetry against the verb's own rollback is the subject. A
+    /// user's forward switch began from `in-process` and a failure owes
+    /// them that back. A launch migration began from a key that already
+    /// said `session` — it is the *reason* it ran — so the copy goes and
+    /// the mode stays, and the next launch finds the same populated
+    /// workspace and tries again. Writing `in-process` here would
+    /// silently un-edit the key the user set, and the launch after would
+    /// come up on a backend nobody chose.
+    ///
+    /// Past the commit point there is no asymmetry to have: the
+    /// destination is whole and both roads lead to `session`.
+    #[test]
+    fn a_launch_migration_rolls_its_copy_back_but_never_its_key() {
+        for phase in [SwitchState::Preparing, SwitchState::Replaying] {
+            let verb = journal(phase, SwitchDirection::ToSession, &[4, 9]);
+            let mut launch = verb.clone();
+            launch.launch_migration = true;
+            assert_eq!(
+                journal_recovery(&verb),
+                JournalRecovery::RollBack {
+                    mode: LocalBackendMode::InProcess,
+                    delete_dest: vec![(4, Some(1)), (9, None)],
+                },
+                "{phase:?}: a verb the user pressed owes them the backend they were on"
+            );
+            assert_eq!(
+                journal_recovery(&launch),
+                JournalRecovery::RollBack {
+                    mode: LocalBackendMode::Session,
+                    delete_dest: vec![(4, Some(1)), (9, None)],
+                },
+                "{phase:?}: a launch migration has no backend to go back to"
+            );
+        }
+        let mut committed = journal(SwitchState::Committing, SwitchDirection::ToSession, &[4, 9]);
+        committed.launch_migration = true;
+        assert_eq!(
+            journal_recovery(&committed),
+            JournalRecovery::Finish {
+                mode: LocalBackendMode::Session,
+                delete_dest: Vec::new(),
+                delete_source: vec![3],
+            },
+            "past the commit point the two are the same switch"
         );
     }
 
@@ -3268,19 +3792,207 @@ mod switch_tests {
     /// removes exactly one thing the mirror has not caught up on yet.
     /// That is what the fence is: the difference between what the
     /// control replies said and what the subscription has published.
+    /// A created tab list, from the destination ids in source order.
+    fn landed(tabs: &[i64]) -> Vec<CreatedTab> {
+        tabs.iter()
+            .enumerate()
+            .map(|(source, tab)| CreatedTab { source, tab: *tab })
+            .collect()
+    }
+
+    /// **A rollback may not delete a project somebody else has worked
+    /// in** (plan 063 §D8b).
+    ///
+    /// The ids in a journal were minted by a run that is gone, and a
+    /// session serves every client at once. If a tab was opened in the
+    /// abandoned copy since, `project.delete` would cascade through it.
+    /// So the copy is recognised by what it should hold, not by the fact
+    /// that this client once made it.
+    ///
+    /// The counts either side of the line are what matter: **fewer** is
+    /// an ordinary crash mid-project and still ours; **more** can only
+    /// have come from somewhere else, because a `SwitchDestination`
+    /// connect withholds the seed and nothing else on that path opens a
+    /// tab.
+    #[test]
+    fn a_rollback_disowns_a_destination_project_that_has_gained_tabs() {
+        // What the replay was going to leave: two tabs.
+        assert!(rollback_is_still_ours(Some(2), 2), "exactly what it made");
+        assert!(rollback_is_still_ours(Some(2), 1), "a crash mid-project");
+        assert!(rollback_is_still_ours(Some(2), 0), "a crash before any tab");
+        assert!(
+            !rollback_is_still_ours(Some(2), 3),
+            "somebody opened a tab in the copy and is working there"
+        );
+        assert!(rollback_is_still_ours(Some(0), 0));
+        assert!(!rollback_is_still_ours(Some(0), 1));
+        // A journal that records no source vouches for nothing, so it
+        // deletes nothing. Every journal a real replay writes has one.
+        assert!(!rollback_is_still_ours(None, 0));
+        assert!(!rollback_is_still_ours(None, 7));
+    }
+
+    /// The pairing behind it: `created_dest_ids[i]` is the copy of
+    /// `source_snapshot[i]`, because the replay appends the id the
+    /// moment `project.create` answers — before it opens a single tab.
+    /// So a journal shorter in one list than the other is a crash point,
+    /// and the ids past the snapshot have no expectation at all.
+    #[test]
+    fn a_rollback_target_is_paired_with_the_source_it_was_a_copy_of() {
+        let mut written = journal(SwitchState::Replaying, SwitchDirection::ToSession, &[4]);
+        written.source_snapshot = vec![
+            source(11, &[("a", false), ("b", false)]),
+            source(22, &[("c", false)]),
+        ];
+        assert_eq!(rollback_targets(&written), vec![(4, Some(2))]);
+
+        written.created_dest_ids = vec![4, 9, 13];
+        assert_eq!(
+            rollback_targets(&written),
+            vec![(4, Some(2)), (9, Some(1)), (13, None)],
+            "the third was created after the snapshot ran out, so nothing vouches for it"
+        );
+    }
+
+    /// **An adopted copy outlives the journal that recorded it** (plan
+    /// 063 §D8b).
+    ///
+    /// Starting a switch replaces the journal file. Without
+    /// `inherited_dest` the copy an earlier, unresolved rollback left
+    /// behind would be erased from the only record of it — orphaned for
+    /// good — and the replay would then make a second copy of
+    /// everything that record described.
+    ///
+    /// Both arms answer for it, and they answer differently about the
+    /// rest: a rollback deletes the adopted copy **and** this run's own,
+    /// while a commit deletes only the adopted one — this run's copy is
+    /// the work it just committed.
+    #[test]
+    fn an_adopted_copy_is_deleted_by_both_recovery_arms_and_this_runs_is_not() {
+        let mut adopted = journal(SwitchState::Replaying, SwitchDirection::ToSession, &[4]);
+        adopted.inherited_dest = vec![
+            InheritedDest {
+                project: 90,
+                tabs: Some(2),
+            },
+            InheritedDest {
+                project: 91,
+                tabs: None,
+            },
+        ];
+        assert_eq!(
+            journal_recovery(&adopted),
+            JournalRecovery::RollBack {
+                mode: LocalBackendMode::InProcess,
+                delete_dest: vec![(90, Some(2)), (91, None), (4, Some(1))],
+            },
+            "before the commit point both copies go"
+        );
+
+        // A reverse is the arm that can commit while still carrying one:
+        // it copies nothing, so it never runs the replay that clears the
+        // list.
+        let mut committed = journal(SwitchState::Committing, SwitchDirection::ToInProcess, &[]);
+        committed.inherited_dest = adopted.inherited_dest.clone();
+        assert_eq!(
+            journal_recovery(&committed),
+            JournalRecovery::Finish {
+                mode: LocalBackendMode::InProcess,
+                delete_dest: vec![(90, Some(2)), (91, None)],
+                delete_source: Vec::new(),
+            }
+        );
+
+        // And a forward that committed has already cleared it, so the
+        // ordinary case stays exactly as it was: nothing to delete on
+        // the destination, the source teardown to finish.
+        let plain = journal(SwitchState::Committing, SwitchDirection::ToSession, &[4]);
+        assert_eq!(
+            journal_recovery(&plain),
+            JournalRecovery::Finish {
+                mode: LocalBackendMode::Session,
+                delete_dest: Vec::new(),
+                delete_source: vec![3],
+            }
+        );
+    }
+
+    /// **The active tab is mapped by the source position it came from,
+    /// not by an index into what landed** (plan 063 §D8 phase 4).
+    ///
+    /// The fixture puts the failure in the **middle** on purpose. Four
+    /// source tabs `A B C D`, `B` refused, so what landed is `[A, C,
+    /// D]` — and the source's active tab is `C`, at source index 2,
+    /// which is index *1* in the compacted list. A positional read
+    /// hands back `D`: the switch reports success and the user is
+    /// looking at a tab they did not leave. With the failure at the end
+    /// the two readings agree and the bug is invisible, which is why it
+    /// is not there.
+    #[test]
+    fn the_selection_maps_through_the_source_position_a_compacted_list_loses() {
+        let created = [CreatedProject {
+            source: 101,
+            project: 7,
+            // A(0) → 70, B(1) refused, C(2) → 72, D(3) → 73.
+            tabs: vec![
+                CreatedTab { source: 0, tab: 70 },
+                CreatedTab { source: 2, tab: 72 },
+                CreatedTab { source: 3, tab: 73 },
+            ],
+            complete: false,
+        }];
+        assert_eq!(mapped_selection(&created, Some((0, 2))), Some((7, 72)));
+        assert_eq!(mapped_selection(&created, Some((0, 3))), Some((7, 73)));
+        assert_eq!(mapped_selection(&created, Some((0, 0))), Some((7, 70)));
+    }
+
+    /// The three ways the pair names nothing, and the one answer for
+    /// all of them: the first tab of the first project that landed
+    /// whole. Never `None` while anything landed — a switch that moved
+    /// the work and selected nothing leaves an empty pane.
+    #[test]
+    fn a_selection_that_did_not_land_falls_back_to_a_tab_that_did() {
+        let created = [
+            CreatedProject {
+                source: 101,
+                project: 7,
+                tabs: vec![CreatedTab { source: 0, tab: 70 }],
+                // Its source tab 1 was refused, so the project is not
+                // whole — and tab 1 is what the source had selected.
+                complete: false,
+            },
+            CreatedProject {
+                source: 102,
+                project: 8,
+                tabs: landed(&[80, 81]),
+                complete: true,
+            },
+        ];
+        // The very tab that was active is the one that did not land.
+        assert_eq!(mapped_selection(&created, Some((0, 1))), Some((8, 80)));
+        // A project index past what was created at all.
+        assert_eq!(mapped_selection(&created, Some((9, 0))), Some((8, 80)));
+        // Nothing was selected in the source.
+        assert_eq!(mapped_selection(&created, None), Some((8, 80)));
+        // And with nothing landed whole there is nothing to fall back
+        // to, which the fence reads as "no pair to wait for".
+        assert_eq!(mapped_selection(&created[..1], Some((0, 1))), None);
+        assert_eq!(mapped_selection(&[], Some((0, 0))), None);
+    }
+
     #[test]
     fn the_fence_waits_for_the_mirror_the_selection_and_a_band_to_show() {
         let created = [
             CreatedProject {
                 source: 101,
                 project: 1,
-                tabs: vec![10, 11],
+                tabs: landed(&[10, 11]),
                 complete: true,
             },
             CreatedProject {
                 source: 102,
                 project: 2,
-                tabs: vec![20],
+                tabs: landed(&[20]),
                 complete: true,
             },
         ];
@@ -3315,13 +4027,13 @@ mod switch_tests {
             CreatedProject {
                 source: 101,
                 project: 1,
-                tabs: vec![10, 11],
+                tabs: landed(&[10, 11]),
                 complete: true,
             },
             CreatedProject {
                 source: 102,
                 project: 2,
-                tabs: vec![],
+                tabs: Vec::new(),
                 complete: false,
             },
         ];
@@ -3677,5 +4389,244 @@ mod switch_tests {
         // Nothing resolves: the answer is still a path, never an empty
         // string — an empty cwd would spawn wherever the UI started.
         assert_eq!(replay_cwd(&gone, &gone, &gone), gone);
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use roost_engine::{RestoreLayout, RestoreProject, RestoreTab};
+    use roost_ipc::messages::{Tab, TabState};
+
+    fn project(id: i64, name: &str, cwd: &str, tabs: &[Spec<'_>]) -> Project {
+        Project {
+            id,
+            name: name.into(),
+            cwd: cwd.into(),
+            position: 0,
+            created_at: 0,
+            tabs: tabs
+                .iter()
+                .enumerate()
+                .map(|(index, (cwd, title, user_titled))| Tab {
+                    id: id * 100 + index as i64,
+                    project_id: id,
+                    title: (*title).into(),
+                    cwd: (*cwd).into(),
+                    state: TabState::Idle,
+                    has_notification: false,
+                    is_active: false,
+                    user_titled: *user_titled,
+                    position: index as i32,
+                    created_at: 0,
+                    last_active: 0,
+                    hook_active: false,
+                    shell_state: Default::default(),
+                    agent_lifecycle: Default::default(),
+                    ownership: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// A tab, as both fixtures spell one: `(cwd, title, user_titled)`.
+    type Spec<'a> = (&'a str, &'a str, bool);
+
+    fn retained(rows: &[(i64, &[Spec<'_>])], active: (i64, i32)) -> RestoreLayout {
+        RestoreLayout {
+            projects: rows
+                .iter()
+                .map(|(project_id, tabs)| RestoreProject {
+                    project_id: *project_id,
+                    tabs: tabs
+                        .iter()
+                        .map(|(cwd, title, user_titled)| RestoreTab {
+                            cwd: (*cwd).into(),
+                            title: (*title).into(),
+                            user_titled: *user_titled,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            active_project_id: active.0,
+            active_tab_position: active.1,
+        }
+    }
+
+    fn shape(source: &MigrationSource) -> Vec<(&str, Vec<Spec<'_>>)> {
+        source
+            .projects
+            .iter()
+            .map(|project| {
+                (
+                    project.name.as_str(),
+                    project
+                        .tabs
+                        .iter()
+                        .map(|tab| (tab.cwd.as_str(), tab.title.as_str(), tab.user_titled))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// The fixture the launch migration actually meets: **three
+    /// projects with different tab counts, and not one live tab between
+    /// them.**
+    ///
+    /// That is what a `session`-mode launch leaves — `Workspace::open`
+    /// loads the rows and the bootstrap deliberately does not hydrate
+    /// them (§D5) — and it is why the snapshot may not be read off the
+    /// projects. A migration that counted live tabs would replay three
+    /// empty projects and then delete the originals, and the uneven
+    /// fixture is what makes that visible rather than merely wrong: the
+    /// tab counts, the titles, the one title lock and the active pair
+    /// each fail on their own.
+    #[test]
+    fn the_launch_snapshot_comes_from_the_layout_the_launch_never_opened() {
+        let projects = [
+            project(7, "alpha", "/home/a", &[]),
+            project(8, "beta", "/home/b", &[]),
+            project(9, "gamma", "/home/c", &[]),
+        ];
+        let layout = retained(
+            &[
+                (
+                    7,
+                    &[("/home/a", "editor", true), ("/home/a/src", "build", false)],
+                ),
+                (8, &[("/home/b", "logs", false)]),
+                (
+                    9,
+                    &[
+                        ("/home/c", "one", false),
+                        ("/home/c/x", "two", false),
+                        ("/home/c/y", "three", true),
+                    ],
+                ),
+            ],
+            // The third project's last tab: a pair no off-by-one and no
+            // "just take the first" can land on by accident.
+            (9, 2),
+        );
+
+        let migrated = retained_migration(&projects, Some(&layout)).expect("a layout to migrate");
+        assert_eq!(
+            shape(&migrated),
+            vec![
+                (
+                    "alpha",
+                    vec![("/home/a", "editor", true), ("/home/a/src", "build", false)]
+                ),
+                ("beta", vec![("/home/b", "logs", false)]),
+                (
+                    "gamma",
+                    vec![
+                        ("/home/c", "one", false),
+                        ("/home/c/x", "two", false),
+                        ("/home/c/y", "three", true)
+                    ]
+                ),
+            ]
+        );
+        assert_eq!(
+            migrated
+                .projects
+                .iter()
+                .map(|p| (p.source, p.cwd.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(7, "/home/a"), (8, "/home/b"), (9, "/home/c")],
+            "the source ids are what phase 5 deletes; the cwds are where the copies land"
+        );
+        assert_eq!(migrated.active_at, Some((2, 2)));
+    }
+
+    /// A live tab outranks a descriptor of the same project, because it
+    /// is the newer truth — the same precedence
+    /// `Workspace::snapshot_for_persist` applies to the same two
+    /// sources. Unreachable from a `session` launch, which hydrates
+    /// nothing; asserted so a workspace that *has* been hydrated cannot
+    /// be replayed from a stale layout.
+    #[test]
+    fn a_project_that_has_live_tabs_is_snapshotted_from_them() {
+        let projects = [
+            project(7, "alpha", "/home/a", &[("/live", "live", false)]),
+            project(8, "beta", "/home/b", &[]),
+        ];
+        let layout = retained(
+            &[
+                (7, &[("/stale", "stale", true)]),
+                (8, &[("/home/b", "logs", false)]),
+            ],
+            (0, 0),
+        );
+
+        let migrated = retained_migration(&projects, Some(&layout)).expect("a layout to migrate");
+        assert_eq!(
+            shape(&migrated),
+            vec![
+                ("alpha", vec![("/live", "live", false)]),
+                ("beta", vec![("/home/b", "logs", false)]),
+            ]
+        );
+    }
+
+    /// The two ways there is nothing to migrate, and the one way a
+    /// layout can be short.
+    #[test]
+    fn an_empty_workspace_owes_no_migration_and_a_missing_row_owes_no_tabs() {
+        assert_eq!(retained_migration(&[], None), None);
+        assert_eq!(
+            retained_migration(&[], Some(&retained(&[(7, &[("/x", "x", false)])], (7, 0)))),
+            None,
+            "a layout without projects to hang it on is not a migration"
+        );
+
+        // A project the layout does not mention — a row written after
+        // the file was loaded — migrates as itself with no tabs rather
+        // than aborting the rest.
+        let migrated = retained_migration(
+            &[
+                project(7, "alpha", "/home/a", &[]),
+                project(8, "beta", "/home/b", &[]),
+            ],
+            Some(&retained(&[(7, &[("/home/a", "editor", true)])], (7, 0))),
+        )
+        .expect("a layout to migrate");
+        assert_eq!(
+            shape(&migrated),
+            vec![
+                ("alpha", vec![("/home/a", "editor", true)]),
+                ("beta", vec![]),
+            ]
+        );
+        assert_eq!(migrated.active_at, Some((0, 0)));
+    }
+
+    /// A selection the snapshot cannot name is no selection. Both ways
+    /// it can fail to name one: a project that is gone, and an index
+    /// past the tabs that project actually has. `forward_commit` falls
+    /// back to the first tab it landed, which is a tab the user can
+    /// see — a pair pointing at nothing is not.
+    #[test]
+    fn a_retained_selection_that_does_not_resolve_is_dropped() {
+        let projects = [project(7, "alpha", "/home/a", &[])];
+        let tabs: &[Spec<'_>] = &[("/home/a", "editor", true)];
+        for active in [(99, 0), (7, 4), (7, -1), (0, 0)] {
+            assert_eq!(
+                retained_migration(&projects, Some(&retained(&[(7, tabs)], active)))
+                    .expect("a layout to migrate")
+                    .active_at,
+                None,
+                "{active:?}"
+            );
+        }
+        assert_eq!(
+            retained_migration(&projects, None)
+                .expect("a layout to migrate")
+                .active_at,
+            None,
+            "no layout at all names no tab"
+        );
     }
 }

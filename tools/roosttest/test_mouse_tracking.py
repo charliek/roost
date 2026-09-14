@@ -169,6 +169,47 @@ def test_motion_throttle_dedups_same_cell(roost, project, target):
     assert reports == 1, f"expected 1 throttled report, got {reports}: {captured!r}"
 
 
+def test_a_press_and_release_on_a_background_tab_both_reach_it(roost, project, target):
+    """`tab.dispatch_mouse_event` names a tab by **id**, so which tab the
+    window happens to be showing may not change what the op does.
+
+    The pair is the point. A press that emits and a release that does
+    not leaves the application on the far end holding a button it never
+    saw come up — which is worse than dispatching nothing at all, and it
+    is invisible to every case above, where the tab under test is also
+    the one on screen. Same `wait_tab_attached` + drain shape as the
+    active-tab case, so the only difference between them is the focus.
+    """
+    background = roost.open_tab(project, cwd="/tmp")
+    wait_tab_attached(roost, background)
+    roost.tab_feed_pty_bytes(background, b"\x1b[?1000h\x1b[?1006h")
+    drain(roost, background)
+
+    front = roost.open_tab(project, cwd="/tmp")
+    wait_tab_attached(roost, front)
+    roost.focus(front)
+    deadline = time.monotonic() + scaled_timeout(10.0)
+    while roost.identify()["active_tab_id"] != front:
+        assert time.monotonic() < deadline, "the window never moved off the tab under test"
+        time.sleep(0.05)
+
+    roost.tab_dispatch_mouse_event(
+        background, kind="press", button="left", cell_x=5, cell_y=3
+    )
+    captured = drain_until_match(roost, background, rb"\x1b\[<0;6;4M", timeout=2.0)
+    assert b"\x1b[<0;6;4M" in captured, ("the press never reached a background tab", captured)
+
+    roost.tab_dispatch_mouse_event(
+        background, kind="release", button="left", cell_x=5, cell_y=3
+    )
+    captured = drain_until_match(roost, background, rb"\x1b\[<0;6;4m", timeout=2.0)
+    assert b"\x1b[<0;6;4m" in captured, (
+        "the press was reported and the release was not — the application "
+        "on the far end is left holding a button down",
+        captured,
+    )
+
+
 def _skip_unless_iced(target) -> None:
     """The same-cell drag gate is wired from iced only (plan 026 D11):
     AppKit never synthesizes a same-cell drag, so mac forwards what it

@@ -105,6 +105,13 @@ USE_IN_PROCESS = "local:use_in_process"
 JOURNAL = "switch-journal.json"
 #: `STATUS_NOT_RUNNING_EXIT` (`crates/roost-cli/src/session.rs`).
 NOT_RUNNING_EXIT = 3
+#: A launch with no session to reach and nothing to start one with.
+#:
+#: §D5's launch migration parks until the slot connects, so this is how a
+#: case gets a `session`-mode launch over a populated in-process
+#: workspace to hold still. It is the same lever `test_a_destination_
+#: that_cannot_start_changes_nothing` pulls on the verb.
+NO_SESSION = {"ROOST_SESSION_BIN": str(_ROOT / "no-such-session")}
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +654,12 @@ def test_reverse_over_a_retained_layout_hydrates_it_rather_than_counting_it(lane
 
     Built the way a user reaches it: a real in-process layout, flushed
     by a real quit, then a relaunch with the key hand-edited to
-    `session` — which is the "hand-edited key" case §D5 names.
+    `session` — and **no session to reach**, so §D5's launch migration
+    parks instead of moving the layout away. That pairing is the whole
+    of how this state survives a launch now: a slot that connects takes
+    the layout to the session (`test_a_hand_edited_key_moves_the_layout_
+    at_launch`), and a slot that never does leaves it retained, right
+    here, for the reverse to bring back.
     """
     roost = lane.start("in-process")
     want = layout(source_layout(roost))
@@ -659,7 +671,7 @@ def test_reverse_over_a_retained_layout_hydrates_it_rather_than_counting_it(lane
     assert saved == {"alpha": 2, "beta": 1}, state
 
     lane.write_config("session")
-    roost = lane.restart()
+    roost = lane.restart(extra_env=NO_SESSION)
     assert roost.identify()["local_backend"] == "session"
     # **The state the fix is about**, as far as §D10 leaves it visible
     # from outside: this socket's `tab.list` now answers with the slot's
@@ -725,9 +737,7 @@ def test_a_destination_that_cannot_start_changes_nothing(lane: Lane):
     the slot the switch added on its way in, which a reported failure
     must not leave behind.
     """
-    roost = lane.start(
-        "in-process", extra_env={"ROOST_SESSION_BIN": str(_ROOT / "no-such-session")}
-    )
+    roost = lane.start("in-process", extra_env=NO_SESSION)
     want = layout(source_layout(roost))
     before = roost.host_status()["hosts"]
 
@@ -903,6 +913,28 @@ def write_journal(lane: Lane, **fields) -> None:
     lane.journal_path.write_text(json.dumps(fields))
 
 
+def snapshot_of(*tab_counts: int) -> list[dict]:
+    """A `source_snapshot`, one entry per destination project.
+
+    Every journal a real replay writes carries one — it is written at
+    phase 2, before the first `project.create` — and the rollback needs
+    it: `created_dest_ids[i]` is the copy of `source_snapshot[i]`, and
+    the tab count is how the rollback tells its own abandoned copy from
+    a project somebody else has since worked in. A journal with no
+    snapshot vouches for nothing and so deletes nothing.
+    """
+    return [
+        {
+            "name": f"p{index}",
+            "cwd": "/tmp",
+            "tabs": [
+                {"cwd": "/tmp", "title": "", "user_titled": False} for _ in range(count)
+            ],
+        }
+        for index, count in enumerate(tab_counts)
+    ]
+
+
 @pytest.mark.parametrize("phase", ["preparing", "replaying"])
 def test_a_forward_journal_before_the_commit_point_rolls_back(lane: Lane, phase: str):
     """§D8b's rollback arm, at both phases on that side of the line.
@@ -929,7 +961,7 @@ def test_a_forward_journal_before_the_commit_point_rolls_back(lane: Lane, phase:
         from_mode="in-process",
         to_mode="session",
         phase=phase,
-        source_snapshot=[],
+        source_snapshot=snapshot_of(1, 1),
         created_dest_ids=partial,
     )
 
@@ -944,6 +976,59 @@ def test_a_forward_journal_before_the_commit_point_rolls_back(lane: Lane, phase:
     assert "local-backend = in-process" in lane.config.read_text()
 
 
+def test_a_rollback_leaves_a_copy_somebody_else_has_worked_in(lane: Lane):
+    """§D8b's rollback may not delete work that is not its to delete.
+
+    The ids in a journal were minted by a run that is gone, and a
+    `roost-session` serves every client at once — that is the whole
+    point of it. Between the crash and this launch somebody opened a tab
+    in one of the abandoned copies and started working there, and
+    `project.delete` cascades.
+
+    Two projects, deliberately **not** symmetric: one holds exactly what
+    the replay left it and one holds a tab more. A rollback that deleted
+    on the strength of the recorded id takes the second with it; one
+    that declined everything leaves the first behind. Only telling them
+    apart passes.
+    """
+    roost = lane.start("in-process")
+    lane.start_daemon()
+    lane.empty_the_session()
+    want = layout(source_layout(roost))
+
+    with lane.session() as c:
+        abandoned = c.create_project(name="half-0", cwd="/tmp")
+        c.open_tab(abandoned, cwd="/tmp")
+        worked_in = c.create_project(name="half-1", cwd="/tmp")
+        c.open_tab(worked_in, cwd="/tmp")
+        # Another client, in the copy, after the crash.
+        c.open_tab(worked_in, cwd="/tmp")
+    ui.quit(lane.target)
+
+    lane.write_config("session")
+    write_journal(
+        lane,
+        from_mode="in-process",
+        to_mode="session",
+        phase="replaying",
+        source_snapshot=snapshot_of(1, 1),
+        created_dest_ids=[abandoned, worked_in],
+    )
+
+    roost = lane.restart(extra_env=NO_SESSION)
+    assert roost.identify()["local_backend"] == "in-process"
+    assert layout(roost.list()) == want, "the source layout is intact"
+    survivors = {p["name"]: len(p["tabs"]) for p in lane.session_projects()}
+    assert survivors == {"half-1": 2}, (
+        "the untouched copy goes and the one somebody is working in stays, whole",
+        survivors,
+    )
+    assert lane.journal() is None, (
+        "a project this client will never delete is disowned, not left pending — "
+        "a journal that re-declines it every launch is a record that never clears"
+    )
+
+
 @pytest.mark.parametrize("phase", ["committing", "cleaning-up"])
 def test_a_forward_journal_past_the_commit_point_finishes(lane: Lane, phase: str):
     """§D8b's finish arm, at both phases on that side of the line.
@@ -951,6 +1036,15 @@ def test_a_forward_journal_past_the_commit_point_finishes(lane: Lane, phase: str
     The mirror image of the case above: the same journal one phase later,
     with the key on disk deliberately saying `in-process`. The launch
     must come up on `session` and finish emptying the source.
+
+    What is left over afterwards is then §D5's business, and the two
+    mechanisms make this assertion sharper than either alone. The
+    recovery deletes the journal's own list and no wider, so `kept`
+    survives it; the launch migration then finds a populated in-process
+    workspace and moves *that* — exactly one project — onto the session.
+    A recovery that swept the workspace would leave the session without
+    `kept`; one that deleted nothing would carry `alpha` and `beta` over
+    a second time.
     """
     roost = lane.start("in-process")
     lane.start_daemon()
@@ -961,6 +1055,7 @@ def test_a_forward_journal_past_the_commit_point_finishes(lane: Lane, phase: str
     # the recovery must leave it exactly where it is.
     kept = roost.create_project(name="kept", cwd="/tmp")
     roost.open_tab(kept, cwd="/tmp")
+    kept_layout = layout([p for p in roost.list() if int(p["id"]) == kept])
 
     # The destination the replay finished writing.
     with lane.session() as c:
@@ -982,10 +1077,14 @@ def test_a_forward_journal_past_the_commit_point_finishes(lane: Lane, phase: str
 
     roost = lane.restart()
     assert roost.identify()["local_backend"] == "session"
-    assert [p["name"] for p in lane.in_process_projects()] == ["kept"], (
-        "the source deletion is finished — for the journal's own list, and no wider"
+    wait_until(
+        lambda: settled(roost) == "session" and lane.in_process_projects() == [],
+        180.0,
+        "the launch migration to move what the recovery left behind",
     )
-    assert layout(lane.session_projects()) == want, "the destination is untouched"
+    assert layout(lane.session_projects()) == want + kept_layout, (
+        "the source deletion covered the journal's own list, and no wider"
+    )
     assert lane.journal() is None
     assert "local-backend = session" in lane.config.read_text()
 
@@ -996,10 +1095,15 @@ def test_a_reverse_journal_resolves_symmetrically(lane: Lane):
     Reverse copies nothing, so the only thing either arm may do is settle
     the mode — and the finish arm in particular must **not** empty the
     in-process workspace it is coming back to.
+
+    The rollback arm lands on `session` over a populated in-process
+    workspace, which is §D5's launch migration by definition. It is kept
+    out of the way with `NO_SESSION` rather than worked around: the
+    migration waits for a slot to connect, and with nothing listening and
+    no binary to start one it never arms, so what this case is about —
+    which mode the phase settles on — is all that happens.
     """
     roost = lane.start("in-process")
-    lane.start_daemon()
-    lane.empty_the_session()
     want = layout(source_layout(roost))
     ui.quit(lane.target)
 
@@ -1013,7 +1117,7 @@ def test_a_reverse_journal_resolves_symmetrically(lane: Lane):
         source_snapshot=[],
         created_dest_ids=[],
     )
-    roost = lane.restart()
+    roost = lane.restart(extra_env=NO_SESSION)
     assert roost.identify()["local_backend"] == "session"
     assert lane.journal() is None
     ui.quit(lane.target)
@@ -1111,7 +1215,7 @@ def test_a_bootstrap_rollback_cannot_hang_the_launch(lane: Lane):
         from_mode="in-process",
         to_mode="session",
         phase="replaying",
-        source_snapshot=[],
+        source_snapshot=snapshot_of(1),
         created_dest_ids=[orphan],
     )
     assert lane.pid is not None
@@ -1214,14 +1318,14 @@ def test_a_relaunch_under_session_reattaches_the_same_tabs(lane: Lane):
 # (an empty list, a `not-found`) is asserted against by name.
 
 
-def session_ui(lane: Lane) -> Roost:
+def session_ui(lane: Lane, **launch) -> Roost:
     """A UI up on `session`, its slot connected and its tab selected.
 
     The selection wait is not politeness: `identify.active_*` reporting
     the slot's pair is §D1's half of §D10, and it is what makes
     `roostctl` with no `--tab` address anything at all.
     """
-    roost = lane.start("session")
+    roost = lane.start("session", **launch)
     wait_until(
         lambda: bool(lane.session_projects()),
         120.0,
@@ -1509,3 +1613,307 @@ def test_a_host_qualified_ref_is_never_re_addressed_to_the_slot(lane: Lane):
         roost.call("tab.focus", {"tab_id": "h9999.%d" % bare})
     assert focus.value.code == "not-found", focus.value
     assert roost.identify()["active_tab_id"] == bare
+
+
+# ---------------------------------------------------------------------------
+# 7. §D5: a `session` launch over a populated in-process workspace
+# ---------------------------------------------------------------------------
+
+
+def migration_layout(roost: Roost) -> list[dict]:
+    """Three projects, 2 / 1 / 3 tabs, distinct cwds, two title locks.
+
+    Deliberately none of those numbers alike. The migration's snapshot
+    has to come off the **retained tab descriptors** — a workspace a
+    `session` launch loaded is never hydrated, so its project rows carry
+    no live tabs at all — and a snapshot taken from the rows instead
+    would replay three *empty* projects and then delete the originals.
+    One project with one tab could not tell those two readings apart;
+    this layout fails on the tab counts, on the cwds, on the two locks
+    and on the active pair independently.
+    """
+    boot = roost.list()[0]
+    roost.rename_project(int(boot["id"]), "alpha")
+    roost.set_title(roost.open_tab(int(boot["id"]), cwd="/tmp"), "alpha-two")
+    beta = roost.create_project(name="beta", cwd="/usr")
+    roost.open_tab(beta, cwd="/usr")
+    gamma = roost.create_project(name="gamma", cwd="/var")
+    roost.open_tab(gamma, cwd="/var")
+    roost.set_title(roost.open_tab(gamma, cwd="/var/tmp"), "gamma-two")
+    last = roost.open_tab(gamma, cwd="/var")
+    # The active pair is the LAST tab of the LAST project: a position no
+    # "take the first" and no off-by-one lands on by accident.
+    roost.focus(last)
+    return roost.list()
+
+
+def with_cwds(projects: list[dict]) -> list[tuple]:
+    """`layout`, plus every cwd — the project's and each tab's.
+
+    The cwds are the sharpest thing the retained descriptors carry: a
+    tab replayed from the wrong source has the wrong directory *and*,
+    since an untitled tab's title is derived from it, the wrong title.
+    """
+    return [
+        (
+            p["name"],
+            p["cwd"],
+            tuple(
+                (t["title"], t["cwd"], bool(t.get("user_titled"))) for t in p["tabs"]
+            ),
+        )
+        for p in projects
+    ]
+
+
+def migrated(lane: Lane, roost: Roost, timeout: float = 240.0) -> None:
+    """Wait for §D5's launch migration to finish."""
+    wait_until(
+        lambda: settled(roost) == "session" and lane.in_process_projects() == [],
+        timeout,
+        "the launch migration to move the in-process layout onto the session",
+    )
+
+
+def test_a_hand_edited_key_moves_the_layout_at_launch(lane: Lane):
+    """AC11, on the path that names it: someone edits the key by hand.
+
+    Nothing is listening when the relaunch happens, so the launch's own
+    slot dial is what starts the session — and it carries the no-seed
+    hint, because a launch that owes a migration connects for
+    `SwitchDestination` rather than `EnsureNonempty` (§D5/§D12). The
+    destination is therefore *exactly* the source: a seed from either
+    side would show up as a fourth project.
+    """
+    roost = lane.start("in-process")
+    want = with_cwds(migration_layout(roost))
+    assert [len(p[2]) for p in want] == [2, 1, 3], want
+    active = roost.identify()["active_tab_id"]
+    assert active == int(roost.list()[-1]["tabs"][-1]["id"]), "the fixture's own premise"
+    ui.quit(lane.target)
+
+    lane.write_config("session")
+    assert running_session_id() is None, "the launch must be what starts it"
+    roost = lane.restart()
+    assert roost.identify()["local_backend"] == "session"
+    migrated(lane, roost)
+
+    assert running_session_id() is not None, "the launch started the destination"
+    assert with_cwds(lane.session_projects()) == want, (
+        "the layout moved whole — tab counts, directories and title locks"
+    )
+    assert lane.journal() is None, "the journal goes with the last source delete"
+
+    # Rows are not shells: every replayed tab has a live PTY behind it.
+    with lane.session() as c:
+        for project in c.list():
+            for tab in project["tabs"]:
+                c.resize(int(tab["id"]), 100, 30)
+
+    # The band is the slot's, and the tab the migration selected is the
+    # one that was active in the source — asserted through the
+    # attachment, as the forward switch's case is: `tab.dump` on a
+    # host-qualified key answers off the UI's own client terminal, and
+    # `host_focus_tab` detaches every other.
+    band = local_band(roost)
+    assert band["role"] == "session", band
+    slot_rows = roost.sidebar_host(band["saved_id"])
+    assert [p["name"] for p in slot_rows["projects"]] == ["alpha", "beta", "gamma"]
+    # The tab the migration selected is the one that was active in the
+    # source, mapped by position onto ids the destination minted.
+    # `identify.active_tab_id` is the slot's selected pair (§D1/§D10),
+    # and the fence does not release until that tab is attached and
+    # streaming — so reaching `settled` at all is the attachment half.
+    wanted = int(lane.session_projects()[-1]["tabs"][-1]["id"])
+    assert roost.identify()["active_tab_id"] == wanted, (
+        "the source's active tab is the last tab of the last project"
+    )
+    roost.call("tab.dump", {"tab_id": str(wanted)})
+
+
+def test_a_crashed_launch_migration_clears_its_copy_and_stays_on_session(lane: Lane):
+    """AC11's "or a crash mid-switch resumes", for the migration's own
+    journal.
+
+    A launch migration's rollback is **not** the verb's. The verb began
+    from `in-process` and a failure owes the user that back; this began
+    from a key that already said `session`, so rolling its mode back
+    would silently un-edit the key and come up on a backend nobody
+    chose. What the rollback owes is the partial copy — and then the
+    same launch finds the same populated workspace and migrates it
+    properly, which is what "idempotent across a crash" means here.
+    """
+    roost = lane.start("in-process")
+    lane.start_daemon()
+    lane.empty_the_session()
+    want = with_cwds(migration_layout(roost))
+
+    # The half a crashed replay leaves on the destination.
+    with lane.session() as c:
+        partial = [c.create_project(name=f"half-{n}", cwd="/tmp") for n in range(2)]
+        for project in partial:
+            c.open_tab(project, cwd="/tmp")
+    ui.quit(lane.target)
+    lane.write_config("session")
+    write_journal(
+        lane,
+        from_mode="in-process",
+        to_mode="session",
+        phase="replaying",
+        source_snapshot=snapshot_of(1, 1),
+        created_dest_ids=partial,
+        launch_migration=True,
+    )
+
+    roost = lane.restart()
+    assert roost.identify()["local_backend"] == "session", (
+        "a launch migration has no backend to roll back to; the key stands"
+    )
+    assert "local-backend = session" in lane.config.read_text()
+    migrated(lane, roost)
+
+    assert with_cwds(lane.session_projects()) == want, (
+        "the abandoned copy is gone and the source landed exactly once"
+    )
+    assert lane.journal() is None
+
+
+def test_a_migration_adopts_an_unresolved_rollback_instead_of_orphaning_it(lane: Lane):
+    """§D8b: starting a switch replaces the journal, so what the journal
+    still owed has to come with it.
+
+    The sequence, all three steps of it: a switch crashed leaving a copy
+    on the session; the next launch's rollback could not reach the
+    daemon (SIGSTOPped here, wedged in the wild) and correctly kept its
+    journal; then the daemon answers again and §D5's migration arms. A
+    migration that wrote a fresh journal would erase the only record of
+    that copy — it is orphaned for good — and then replay the same
+    layout over it, leaving the user with everything twice. Which is the
+    duplication the owner's No-Replay decision was taken to avoid
+    elsewhere.
+    """
+    roost = lane.start("in-process")
+    lane.start_daemon()
+    lane.empty_the_session()
+    want = with_cwds(migration_layout(roost))
+
+    with lane.session() as c:
+        orphan = c.create_project(name="half-0", cwd="/tmp")
+        c.open_tab(orphan, cwd="/tmp")
+    ui.quit(lane.target)
+
+    lane.write_config("session")
+    write_journal(
+        lane,
+        from_mode="in-process",
+        to_mode="session",
+        phase="replaying",
+        source_snapshot=snapshot_of(1),
+        created_dest_ids=[orphan],
+        launch_migration=True,
+    )
+
+    # The launch that cannot finish the rollback.
+    assert lane.pid is not None
+    os.kill(lane.pid, signal.SIGSTOP)
+    try:
+        roost = lane.restart()
+    finally:
+        os.kill(lane.pid, signal.SIGCONT)
+    assert roost.identify()["local_backend"] == "session"
+    assert lane.journal() is not None, (
+        "the copy it could not delete stays described — the precondition"
+    )
+
+    # The daemon answers again, so the migration arms.
+    migrated(lane, roost)
+    assert with_cwds(lane.session_projects()) == want, (
+        "the adopted copy was removed before the replay, and nothing landed twice"
+    )
+    assert lane.journal() is None
+
+
+# ---------------------------------------------------------------------------
+# 8. §D11: a link clicked in a session tab opens on THIS machine
+# ---------------------------------------------------------------------------
+#
+# True by construction — `url_launcher.rs` runs in the UI process and the
+# session never opens a URL — which is exactly why it is worth a pin: the
+# thing that would break it is someone moving the launch to where the
+# shell is. Linux-only for a concrete reason: `xdg-open` is resolved
+# through `PATH`, and macOS spawns `/usr/bin/open` by absolute path,
+# which no stub can stand in front of.
+
+#: `mods::ALT` in the key encoder's bit layout (shift 1, ctrl 2, alt 4,
+#: super 8) — the Linux link modifier (`keybind::default_link_modifier`).
+LINK_MOD = 4
+
+
+def url_cell(roost: Roost, tab_id: int, url: str) -> tuple[int, int]:
+    """Where the printed URL is on the grid, as (cell_x, cell_y)."""
+    rows = roost.call("tab.dump", {"tab_id": str(tab_id)})["rows_text"]
+    for y, row in enumerate(rows):
+        index = row.find(url)
+        if index >= 0:
+            # The middle of the run, so neither end can be an off-by-one
+            # onto a cell the hyperlink span does not cover.
+            return index + len(url) // 2, y
+    raise AssertionError(f"{url!r} is not on the grid: {rows!r}")
+
+
+@pytest.mark.skipif(
+    platform.system() != "Linux", reason="the xdg-open stub is a PATH stub; #390"
+)
+def test_a_link_in_a_session_tab_opens_on_the_machine_the_window_is_on(lane: Lane):
+    """AC9. The URL is printed by a shell **inside the session** and the
+    launcher that opens it is the UI's own.
+
+    The stub records every argument it is handed, and the no-modifier
+    press goes first: the file having exactly one line at the end is the
+    negative control, and it is a condition a wait can settle on — which
+    "nothing happened" on its own is not.
+    """
+    opened = _ROOT / f"opened-{uuid.uuid4().hex[:8]}.txt"
+    stub_dir = _ROOT / f"bin-{uuid.uuid4().hex[:8]}"
+    stub_dir.mkdir()
+    stub = stub_dir / "xdg-open"
+    stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$1" >> {opened}\n')
+    stub.chmod(0o755)
+
+    # The stub is only reachable because `xdg-open` is resolved through
+    # `PATH` — which is why this case is Linux-only.
+    roost = session_ui(
+        lane, extra_env={"PATH": f"{stub_dir}:{os.environ['PATH']}"}
+    )
+    tab = roost.identify()["active_tab_id"]
+    url = f"https://roost.test/{uuid.uuid4().hex[:8]}"
+    # Printed by the session's own shell, through the session's socket:
+    # the tab under the pointer is a *remote* one as far as this window
+    # is concerned, which is the whole of §D11.
+    with lane.session() as c:
+        c.send(tab, f"printf '%s\\n' {url}\n")
+    wait_until(
+        lambda: url in "\n".join(roost.call("tab.dump", {"tab_id": str(tab)})["rows_text"])
+        or None,
+        scaled_timeout(30.0),
+        "the URL to reach the window",
+    )
+    cell_x, cell_y = url_cell(roost, tab, url)
+
+    # No modifier: an ordinary press, which begins a selection and opens
+    # nothing.
+    roost.tab_dispatch_mouse_event(tab, "press", "left", cell_x, cell_y, mods=0)
+    roost.tab_dispatch_mouse_event(tab, "release", "left", cell_x, cell_y, mods=0)
+    # With it: the launcher runs, here.
+    roost.tab_dispatch_mouse_event(tab, "press", "left", cell_x, cell_y, mods=LINK_MOD)
+    roost.tab_dispatch_mouse_event(tab, "release", "left", cell_x, cell_y, mods=LINK_MOD)
+
+    wait_until(
+        lambda: opened.exists() and opened.read_text().strip() or None,
+        scaled_timeout(30.0),
+        "the local URL launcher to be handed the link",
+    )
+    assert opened.read_text().splitlines() == [url], (
+        "exactly one launch, from the modifier-held press — a press without "
+        "the link modifier must open nothing"
+    )
