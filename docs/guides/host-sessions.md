@@ -25,7 +25,46 @@ Once connected, the sidebar gains a **LOCALHOST** section (or whatever label you
 
 `roost-session`'s own socket, state, and logs live at: on Linux, `$XDG_RUNTIME_DIR/roost-session/roost.sock` (state under `$XDG_DATA_HOME/roost-session/`, logs under `$XDG_STATE_HOME/roost-session/`); on macOS, `~/Library/Caches/RoostSession/roost.sock` (state under `~/Library/Application Support/RoostSession/`, logs under `~/Library/Logs/RoostSession/` — `RoostSessionDev` in place of `RoostSession` for a debug build, so a dev daemon can never collide with a real one). See [Paths and Environment](../reference/paths.md#session-profile) for the full table.
 
-**Persistence is scoped to host sections, not to Roost as a whole — worth stating plainly.** A project or tab created under *any* host section, including **LOCALHOST**, survives quitting Roost, because its shells live in `roost-session`, not in the app. An ordinary **LOCAL** tab is still hosted in-process and still ends when Roost quits, exactly as before — nothing about this feature changes that. Making persistence the default for local tabs too is a real option, but it's a deliberate future decision, not something this slice changed quietly.
+**Persistence is scoped to host sections, not to Roost as a whole — worth stating plainly.** A project or tab created under *any* host section, including **LOCALHOST**, survives quitting Roost, because its shells live in `roost-session`, not in the app. An ordinary **LOCAL** tab is still hosted in-process and still ends when Roost quits — unless you've switched your *local* tabs onto a session too, which is what the next section covers. Making that the default for every install is a real option, but it's still a deliberate future decision, not something that happens quietly.
+
+## Switching the local backend
+
+Adding a host, above, is opt-in and additive: it puts a *second* section in the sidebar, below your ordinary local tabs. This section is about something different — moving your **local** tabs themselves onto a session, so the ones you always start with (`Cmd-N`, `Cmd-T`, the sidebar's own project list) persist too.
+
+`local-backend` (see [`reference/config.md`](../reference/config.md#local-backend)) is the config key that decides which one you get on launch: `in-process` (the default for any machine that already has Roost on it) or `session` (what a genuinely fresh install starts on, no editing required). Either way, you don't have to relaunch or hand-edit a config file to change it — two palette rows do it in place, live, while Roost is open.
+
+### The two verbs
+
+Open the command palette; the switch row is the last one in the frame, since it's the heaviest thing there — only one of the two ever shows, whichever names the backend you're *not* currently on, and neither shows while a switch is already running:
+
+| Palette row | Shown when | What it does |
+|---|---|---|
+| **Use a session for local tabs** | `local-backend = in-process` | Moves your local projects and tabs onto a `localhost` session — starting one if none is saved yet — and ends the in-process shells. |
+| **Use in-process local tabs** | `local-backend = session` | Flips back. Your local band goes back to being in-process. |
+
+Both raise a confirmation dialog before doing anything; Cancel leaves everything exactly as it was.
+
+### Forward: `Use a session for local tabs`
+
+Confirming replays your current local layout onto the `localhost` session (starting or connecting it first if needed) — every project, in order, with its tabs, cwds, and any title you set by hand — then ends the in-process shells and writes `local-backend = session`. What was selected stays selected: the same project and tab you were looking at are what's selected and attached once the switch finishes. If the session already had projects of its own on it (say, you'd been using it as an ordinary saved host already), your local layout is added alongside them rather than overwriting anything.
+
+This isn't instant — it's copying a real layout onto a real daemon — so the palette is quiesced while it runs: both switch rows disappear, and local mutations (new project, new tab, closing one, dragging to reorder) are refused with a `busy` message until it settles. If something goes wrong partway — the session can't be reached, a project fails to replay — the switch backs out cleanly: your in-process layout is untouched, nothing is left half-moved, and `local-backend` stays `in-process`. A crash mid-switch is recovered the same way the next time Roost launches, picking up wherever it left off rather than leaving things in a mixed state.
+
+### Reverse: `Use in-process local tabs` — nothing is copied back
+
+This is deliberately **not** the mirror image of forward. Reverse does not replay the session's layout back into the in-process workspace — nothing is copied, nothing is duplicated. What it does:
+
+- Writes `local-backend = in-process` and flips the local band back.
+- **The session keeps running, exactly as it was** — every project and tab you had on it is untouched, and none of its shells are stopped, disconnected, or removed. It simply demotes from "the local band" back to being an ordinary **LOCALHOST** section, one click away in the sidebar.
+- Your in-process band comes back from whatever it last held before you switched away — empty (seeded with a fresh `Untitled 1`, the same as any first run) if this is the first time you've gone in-process since switching, or whatever you'd left there if you'd used both backends before.
+
+So a forward-then-reverse round trip never duplicates anything: your session-side work stays exactly where the forward switch put it, one click away under **LOCALHOST**, and your in-process band starts fresh. If you want something back in the local band, that's a deliberate re-create — dragging tabs back and forth was never something this was built to automate.
+
+### Closing a host's last project
+
+Close the last project on any host — including the slot your local tabs are switched onto — and Roost forgets that host from the sidebar (never stops the session itself, whose shells and projects, if any remain elsewhere, keep running). It's added to your **recents**, so getting it back is one row rather than retyping the whole Add Host form — recents show up as `Add Host: <label>` rows right beside **Add Host…**, and as rows at the bottom of the **New Project on…** picker if you'd rather create straight onto one. `localhost` itself never becomes a recent, since it's always offered as its own row regardless (see [the verb set](#the-verb-set) above).
+
+There's one exception, and it's the point where this connects to the exit rule: emptying **the slot** — the localhost host your local tabs are currently switched onto — doesn't leave you looking at an empty local band with nothing in the sidebar. It closes the window instead, the same as closing the very last local project would under `in-process`. A local band that's still trying to reconnect, or one you haven't saved a `localhost` host for yet, is a different case — that keeps the window open, showing the error, rather than exiting out from under you.
 
 ## Adding a remote host (over SSH)
 
@@ -92,7 +131,7 @@ roostctl host connect --id <the id host add printed>
 
 ## The verb set
 
-Every host action lives in the command palette (`Cmd-Shift-P` / `Alt-Shift-P`) — there's no host menu. One row per (verb, host) pair, and a verb only appears where it applies (you can't Stop a session you're not attached to, or Remove one you still are):
+Every host action lives in the command palette (`Cmd-Shift-P` / `Alt-Shift-P`) — there's no host menu. One row per (verb, host) pair, and a verb only appears where it applies (you can't Stop a session you're not attached to):
 
 | Palette row | What it does |
 |---|---|
@@ -100,8 +139,8 @@ Every host action lives in the command palette (`Cmd-Shift-P` / `Alt-Shift-P`) �
 | **Connect Host: `<label>`** | Dials the host, starting it first if it's `localhost` and nothing answers. A second connect to an already-connected host is just another connection, alongside any this window or another already has open (see below). |
 | **Disconnect Host: `<label>`** | Drops the connection. The session's shells keep running. |
 | **Stop Session: `<label>`** | Ends every shell on that host and flushes its layout. Offered only while connected — you can't stop what you're not attached to. Confirms first. |
-| **Remove Host: `<label>`** | Forgets the saved host. Offered only while disconnected (removing a live connection would race it). Never touches the session itself. |
-| **New Project on…** | Opens a picker of LOCAL plus every *connected* host, and creates the new project there. Appears once you have at least one saved host. |
+| **Remove Host: `<label>`** | Forgets the saved host — connected or not; on a connected one it disconnects first, then forgets it, and never stops the session. Not offered mid-dial (that would race the attempt it is removing), and not offered on *the slot* — the localhost host your local tabs are switched onto under [`local-backend = session`](#switching-the-local-backend) — since that host isn't something you can forget. A host you Remove is kept as a [recent](#switching-the-local-backend) so re-adding it is one row, not a retyped form. |
+| **New Project on…** | Opens a picker of LOCAL (when you're in-process), `localhost` (always — even before you've saved it, in which case picking it saves+connects+creates in one go), every other *connected* host, and your recents. Appears once that picker holds more than one destination, which in practice means as soon as Roost has started once. |
 
 `roostctl` has a matching verb for every one of these except Stop (which is a plain `session.stop` on the host's own connection, not a client-side registry op):
 

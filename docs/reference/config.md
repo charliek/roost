@@ -40,7 +40,7 @@ the launcher with deterministic commands.
 | `link-modifier` | `ctrl \| alt \| super` | Cmd (Mac) / Alt (Linux) | Which held modifier reveals + opens a URL on hover/click. iced-only; the Swift Mac app is fixed to Cmd. See [the dedicated section below](#link-modifier). |
 | `agent-hooks` | `auto \| off` | `auto` | Whether Roost wires the supported coding agents' (Claude Code, Codex, grok/gx, cursor-agent, OpenCode) hook entries into their own config files at startup. See [the dedicated section below](#agent-hooks) and the [Agent Hooks](../guides/agents.md) guide. |
 | `agent-hooks-skip` | comma list | (empty) | Agent names (`claude`, `codex`, `grok`, `cursor`, `opencode`) never wired even when `agent-hooks = auto`. See [below](#agent-hooks). |
-| `local-backend` | `in-process \| session` | `in-process` | Where the tabs you start in the Roost window run: in the UI process (they end when Roost quits), or in a local [host session](../guides/host-sessions.md) (they keep running, and any of your own clients can attach). Linux/iced only; the Swift Mac app is always in-process. An unrecognized value logs a warning and reads as `in-process`. |
+| `local-backend` | `in-process \| session` | `in-process` for an existing setup; `session` on a genuinely fresh install | Where the tabs you start in the Roost window run. See [the dedicated section below](#local-backend). |
 
 ## `copy-on-select`
 
@@ -282,6 +282,38 @@ hosts](../guides/agents.md#remote-hosts).
 `roostctl` the app spawns acts on it, and that binary reads this same
 file through the same parser, so a second copy in `Config.swift` could
 only disagree with it.
+
+## `local-backend`
+
+Where the tabs you start in the Roost window run: in the UI process
+(`in-process`, they end when Roost quits), or in a local [host
+session](../guides/host-sessions.md) (`session`, they keep running, and
+any of your own clients can attach). See the [Switching the local
+backend](../guides/host-sessions.md#switching-the-local-backend) guide
+section for the two palette rows that move between them live, with no
+config editing or relaunch required.
+
+```conf
+local-backend = in-process   # in-process (existing setups) | session (fresh installs)
+```
+
+**The default depends on what's already on disk, not on the platform.**
+A genuinely **fresh install** — no `state.json` and no `config.conf`
+anywhere Roost would look — starts on `session` from its very first
+launch, and Roost writes the key to `config.conf` for you so the choice
+is visible and stays put. Any machine that already has either file
+keeps `in-process`, exactly as it always has, until you switch it
+yourself. This asymmetry is deliberate: only a machine with nothing of
+this app on it yet is a machine where "session" isn't a behavior change
+to a saved layout.
+
+An unrecognized value (a typo, an older config surviving a downgrade)
+logs a warning and reads as `in-process` — configured badly, not
+unconfigured, so it never triggers the fresh-install write on a
+later launch.
+
+Linux/iced only; the Swift Mac app is always in-process and never reads
+this key.
 
 ## Example
 

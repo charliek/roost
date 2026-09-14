@@ -1004,12 +1004,30 @@ manual-only validation. The release itself also carries the standing
 live ritual: the shed L1–L4 reconnect checklist and the Mac→shed
 criterion, re-run against the release build.
 
-### HS-5 — Local default flip (decision point, not scheduled)
+### HS-5 — Local default flip: switch shipped (plan 063); default flip for existing setups pending
 
-Launch iced as a client of a local session always, with
-`--ephemeral` as the escape hatch. Explicitly a product decision to
-be made after living with HS-2/3; the HS-0 seams exist so it is a
-default-backend change, not a rewrite.
+Plan 063 (R9, [#426](https://github.com/charliek/roost/issues/426))
+shipped the `local-backend = in-process | session` config key, two
+palette verbs that move the local workspace between the two in place
+(forward replays it onto a local `roost-session` daemon and ends the
+in-process shells; reverse is No-Replay — it flips the key back without
+copying the session's layout out), and a launch-time migration that
+runs the same sequence over a hand-edited key found sitting on a
+populated in-process workspace. A genuinely fresh install (no
+`state.json`, no `config.conf`) already starts on `session`.
+
+What HS-5 originally asked — launching every install as a client of a
+local session **by default**, `--ephemeral` as the escape hatch — is
+still not scheduled: existing setups keep defaulting to `in-process`
+this release, by deliberate owner decision (plan 063 §1). Flipping that
+default is its own follow-up
+([#480](https://github.com/charliek/roost/issues/480)), and the
+launch-time migration above is its prerequisite, now shipped — the
+remaining work is the product decision to flip and ship it, not new
+mechanism. See [`guides/host-sessions.md`](../docs/guides/host-sessions.md#switching-the-local-backend)
+for the shipped switch and
+[`development/vision.md`'s DL-27](../docs/development/vision.md#dl-27-the-local-backend-is-a-users-choice-not-a-default-flip-2026-09-14)
+for the decision record.
 
 ---
 

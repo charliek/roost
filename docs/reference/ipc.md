@@ -249,9 +249,102 @@ Response:
   "app_label": "Roost",
   "app_id": "ai.stridelabs.Roost",
   "ui_version": "0.7.0",
-  "protocol_version": 1
+  "protocol_version": 1,
+  "local_backend": "in-process",
+  "local_session_socket": null,
+  "local_backend_switch": null
 }}
 ```
+
+`local_backend` (plan 063 §D1) is `"in-process"` or `"session"` — which
+backend this UI's own local tabs run on, the [`local-backend` config
+key](config.md#local-backend)'s live value. Absent from a Swift Mac
+reply, which decodes to `"in-process"`: Swift always runs its tabs
+in-process and never reads the key. `local_session_socket` is the local
+`roost-session`'s own socket path, present only under `session` — a
+client that wants the event stream a UI socket cannot serve
+(`events.subscribe` stays [`not-implemented` here](#eventssubscribe))
+dials that socket instead. Under `session`, `active_project_id` and
+`active_tab_id` name **the slot's** own UI-selected pair rather than
+this socket's own (empty) workspace, which is what lets `roostctl tab
+write` / `send` / `state` with no `--tab` still have something to act
+on. `local_backend_switch` names the phase of a local-backend switch in
+progress (plan 063 §D8a) — one of `"preparing"`, `"replaying"`,
+`"committing"`, `"cleaning-up"` — and is absent whenever the UI is idle;
+a mutation refused with `busy: a local-backend switch is in progress`
+can read this to see which phase is holding it up, and a test can tell
+"before the commit point" from "after" it, since `local_backend` itself
+flips at exactly one point inside the sequence.
+
+### A UI socket under `local-backend = session`
+
+Everything below assumes `local-backend = in-process`, where a bare
+project/tab id on a UI socket has always meant a row in this UI's own
+workspace. Under `local-backend = session` (plan 063 §D1) that
+workspace is empty and invisible — every local tab actually lives on
+the slot, the local `roost-session` [`identify.local_session_socket`](#identify)
+names — so a bare id has to mean the slot's id instead, on every
+op that would otherwise silently read or write nothing. Plan 063
+§D10 is the full design; this is the wire-level summary.
+
+Every op is classified exactly one of five ways, exhaustively — a small
+test in `roost-ipc` parses `messages.rs`'s `ops::` constants and fails
+by name if one is ever added without a row:
+
+- **Forward.** The whole request is sent to the slot as-is and its
+  reply is returned unchanged (including its error code and message).
+  A bare id therefore *means* the slot's id. Every workspace mutation is
+  here — `tab.open`, `tab.close`, `tab.list`, `tab.write`, `tab.resize`,
+  `project.create`, `project.rename`, `project.delete`, `tab.set_title`,
+  `tab.set_state`, `tab.clear_notification`, `tab.set_hook_active`,
+  `tab.agent_report`, `notification.create`. (`tab.open`'s `project_id:
+  "0"` special case forwards verbatim too, so it is the *slot* that
+  mints a default project when there is none — not this socket.)
+- **Rewrite.** The UI answers it here, after rewriting any bare id in
+  the request to the slot's `h<n>.<id>` form first; a ref that already
+  arrived host-qualified is left exactly as it was, so an explicit
+  `h<n>.<id>` request is routed by its own parser as if this mode did
+  not exist. This is everything that is really client state rather than
+  a workspace row — a terminal this client has hydrated
+  (`tab.dump`, `tab.dump_resolved`, `tab.capture_pty_input`), this
+  client's own selection (`tab.focus`, `selection.set` /
+  `selection.clear` / `selection.dump`), a file this client is reading
+  off its own filesystem (`tab.send_file`), the order this client's
+  sidebar paints (`tab.reorder`, `project.reorder`), and the low-level
+  input ops (`tab.feed_pty_bytes`, `tab.feed_ime`,
+  `tab.expand_selection_at`, `tab.dispatch_mouse_event`).
+- **UI-owned.** The mode changes nothing — the op carries no local
+  workspace id to mean anything by. `identify`, `palette.*`, `host.*`,
+  `app.screenshot`, `app.window_metrics`, `app.sidebar_dump`,
+  `app.render_stats`, `window.resize`, `clipboard.*`, and the rest of
+  the `app.*` surface all stay exactly as documented elsewhere on this
+  page.
+- **Unsupported.** Not served on a UI socket before this mode or after
+  it: `events.subscribe` (`not-implemented` — dial
+  `identify.local_session_socket` instead) and `tab.attach`
+  (`unknown-op` — a UI socket mints no attach tickets).
+- **Session-only / event.** `session.*` ops and every `tab.*`/`project.*`
+  event name answer `unknown-op` on a UI socket exactly as they always
+  have; the mode plays no part.
+
+A forwarded request that cannot reach the slot — nothing is connected
+yet, the connection dropped mid-op, or a local-backend switch (plan 063
+§D8a) has quiesced it — answers `host-unavailable` with the message
+`local session is not connected` (the same code and shape a host-routed
+[`tab.reorder`/`project.reorder`](#the-reorder-routing-matrix) already
+uses for an unreachable host: the slot *is* a host). During a switch,
+a Rewrite or Forward op instead answers the stable `busy: a
+local-backend switch is in progress`, which is also what
+[`identify.local_backend_switch`](#identify) names the phase of. A
+Forward op's own error code and message cross back unchanged — only
+this socket's own refusals (`host-unavailable`, the busy message) are
+this socket's.
+
+`tab.list`'s `revision` field is **stripped** at this boundary before
+the reply reaches the caller: [`revision`](#tablist) is the fence a
+client pairs with `events.subscribe`, and a UI socket serves no event
+stream to fence — a caller that wants it dials
+`identify.local_session_socket` and asks the session directly.
 
 ### `tab.open`
 
@@ -1104,6 +1197,54 @@ has never connected has an empty `projects`.
 absent-tolerant: host sessions are iced-only, and the Swift Mac app
 answers this op without the field at all. A UI with no host sections
 therefore returns byte-identical bodies on both.
+
+#### `sections` — the section strip, presence-derived (plan 063 §D2)
+
+`hosts` lists only the *saved* hosts and their rows. `sections` is a
+different cut: every band the sidebar's section strip actually draws,
+in sidebar order, including the local one — which is what makes "which
+local backend is on screen, and is it up?" answerable from the wire
+without inferring it from `identify.local_backend` plus a guess about
+what the sidebar chose to render.
+
+```json
+{ "agents_visible": true,
+  "projects": [],
+  "hosts": [ ... ],
+  "sections": [
+    { "role": "session", "label": "PROJECTS", "state": "connected",
+      "dot": "connected", "saved_id": "hs-2f1c", "reconnect_row": false },
+    { "role": "host", "label": "WORKBENCH", "state": "disconnected",
+      "dot": "offline", "saved_id": "hs-91aa", "reconnect_row": true,
+      "fidelity": "restart" }
+  ] }
+```
+
+Each entry:
+
+- `role` — `"local"` (the in-process band), `"session"` (the local band
+  under `local-backend = session` — the slot's own band wearing the
+  local label, or a placeholder while no `localhost` host is saved yet),
+  or `"host"` (an ordinary saved host below it).
+- `label` — the band's header text exactly as drawn: `LOCAL`,
+  `PROJECTS`, or the saved label uppercased.
+- `state` / `dot` — `state` is the same wire spelling `host.status`
+  reports; `dot` is the three-way summary the band's own dot paints —
+  `"connected"`, `"pending"`, or `"offline"`.
+- `saved_id` — the saved host this band renders, and the **only**
+  pairing between a band and a host: under `session` the leading band
+  is itself a host, so position says nothing. Absent for the in-process
+  band and for the session placeholder (no `localhost` host saved yet).
+- `reconnect_row` — whether the band offers the inline ↻ Reconnect row,
+  addressed to `saved_id`.
+- `fidelity` — `"update"` | `"restart"` | `"manual"`, the reduced-fidelity
+  pill's action (see [The upgrade / restart flow](../guides/host-sessions.md#the-upgrade-restart-flow)),
+  omitted when the band draws no pill.
+
+`sections` is **empty, and so omitted**, whenever the sidebar draws its
+classic single sticky `PROJECTS` header instead of a strip:
+`in-process` with no saved hosts, which is also every Swift Mac reply —
+the same absent-tolerant contract `hosts` uses, for the same reason.
 
 Ungated, read-only — always available, matching `app.window_metrics`.
 
