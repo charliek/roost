@@ -1786,7 +1786,7 @@ impl App {
             }
             HostVerb::CreateOnLocalhost => {
                 self.clear_palette_state();
-                return Ok(self.create_on_localhost(origin));
+                return self.create_on_localhost(origin);
             }
             HostVerb::AddRecent { target, create } => {
                 self.clear_palette_state();
@@ -1810,29 +1810,29 @@ impl App {
     /// The picker's `localhost` row when this machine's session is not
     /// ready (plan 063 §D3): save it if it is not saved, start it if it
     /// is not running, and create once it is up.
-    fn create_on_localhost(&mut self, origin: crate::host_conn::RequestOrigin) -> EngineDispatch {
+    /// Errors reach the caller rather than only the status line: this
+    /// row is reachable through `palette.activate`, and a programmatic
+    /// caller told `ok` while nothing was created has no way to find out
+    /// otherwise. `ConnectSeed` beside it already answers this way.
+    fn create_on_localhost(
+        &mut self,
+        origin: crate::host_conn::RequestOrigin,
+    ) -> Result<EngineDispatch, String> {
         let saved_id = match self.local_slot_saved_id() {
             Some(saved_id) => saved_id,
             None => {
                 // Registry-checked, for the same reason `ConnectSeed`
                 // is: the plain `localhost` may already be an SSH
                 // host's (§D7).
-                let Some(label) = self.slot_label() else {
-                    self.set_status(
-                        "could not save this machine's session: no free label".to_string(),
-                    );
-                    return EngineDispatch::default();
-                };
-                match self.host_add_requested(&label, crate::host_conn::LOCALHOST_TARGET, None) {
-                    Ok(host) => host.id,
-                    Err(error) => {
-                        self.set_status(format!("could not save this machine's session: {error}"));
-                        return EngineDispatch::default();
-                    }
-                }
+                let label = self.slot_label().ok_or_else(|| {
+                    "could not save this machine's session: no free label".to_string()
+                })?;
+                self.host_add_requested(&label, crate::host_conn::LOCALHOST_TARGET, None)
+                    .map_err(|error| format!("could not save this machine's session: {error}"))?
+                    .id
             }
         };
-        self.connect_then_create(&saved_id, origin)
+        Ok(self.connect_then_create(&saved_id, origin))
     }
 
     /// A row that names a host this client has to reach before it can

@@ -102,7 +102,12 @@ ut_wait_alive() {
 ut_pinned_config() {
   if [[ -n "${ROOST_CONFIG:-}" ]]; then printf '%s\n' "${ROOST_CONFIG}"; return 0; fi
   local src="${HOME}/.config/roost/config.conf"
-  local dst="${TMPDIR:-/tmp}/roost-uitest-config.conf"
+  # `mktemp`, not a fixed name: this lands in a world-writable directory,
+  # where a predictable path is both a collision between two concurrent
+  # runs and something another user can pre-create for the `>` below to
+  # write through.
+  local dst
+  dst="$(mktemp "${TMPDIR:-/tmp}/roost-uitest-config.XXXXXX")" || return 1
   {
     if [[ -f "${src}" ]]; then cat "${src}"; fi
     printf '\nlocal-backend = in-process\n'

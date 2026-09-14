@@ -312,8 +312,8 @@ logs a warning and reads as `in-process` — configured badly, not
 unconfigured, so it never triggers the fresh-install write on a
 later launch.
 
-Linux/iced only; the Swift Mac app is always in-process and never reads
-this key.
+Read by the iced UI. The Swift Mac app (`Roost.app`) is always
+in-process and never reads this key.
 
 ## Example
 
