@@ -322,8 +322,12 @@ def main() -> int:
         path.mkdir(parents=True)
     runtime.chmod(0o700)
     config = root / "config.conf"
+    # `local-backend = in-process` for the reason its X11 sibling
+    # states (plan 063 §D5): under `session` the tabs this check opens
+    # live on a `roost-session` daemon rather than in the UI it drives.
     config.write_text(
-        "copy-on-select = clipboard\nkeybind = alt+shift+p = copy\n",
+        "copy-on-select = clipboard\nkeybind = alt+shift+p = copy\n"
+        "local-backend = in-process\n",
         encoding="utf-8",
     )
     socket_path = runtime / "roost-iced" / "roost.sock"

@@ -67,7 +67,7 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust which-runner test-iced test-mac test-harness test-linux-scripts e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-session e2e-host-client e2e-host-client-ci e2e-host-ssh e2e-host-ssh-ci e2e-host-missing-daemon e2e-host-missing-daemon-ci e2e-host-local-spawn e2e-host-local-spawn-ci e2e-host-localhost e2e-host-localhost-ci e2e-host-bootstrap e2e-host-bootstrap-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle smoke-iced smoke-mac visual-parity smoke-mac-launch test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
+.PHONY: test test-rust which-runner test-iced test-mac test-harness test-linux-scripts e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-session e2e-host-client e2e-host-client-ci e2e-host-ssh e2e-host-ssh-ci e2e-host-missing-daemon e2e-host-missing-daemon-ci e2e-host-local-spawn e2e-host-local-spawn-ci e2e-host-localhost e2e-host-localhost-ci e2e-local-backend e2e-local-backend-ci e2e-host-bootstrap e2e-host-bootstrap-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle smoke-iced smoke-mac visual-parity smoke-mac-launch test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
 
 ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_agent_lifecycle.py tools/roosttest/test_agent_hooks.py tools/roosttest/test_agent_palette.py tools/roosttest/test_doctor.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_palette_256.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py tools/roosttest/test_tab_dump_scrollback.py tools/roosttest/test_dock_badge.py tools/roosttest/test_menu_bar.py tools/roosttest/test_sparkle.py tools/roosttest/test_view_perf.py
 # `test_tab_dump_scrollback.py` needs no lane entry for Mac: `e2e-mac`
@@ -163,6 +163,16 @@ LOCAL_SPAWN_E2E_TESTS := tools/roosttest/test_host_local_spawn.py
 # machine-wide path: its sentinel, and the UI that dials it, are both
 # inside that root.
 LOCALHOST_E2E_TESTS := tools/roosttest/test_host_localhost.py
+# Plan 063 §D8's local-backend switch lane (#426). Marked `host_client`
+# for the same deselect reasons, and kept in its own list/target for
+# LOCALHOST_E2E_TESTS' two plus one of its own: it redirects
+# `XDG_RUNTIME_DIR` at import (poisoning every module imported after it),
+# it owns the sentinel socket the switch's destination is, and — the new
+# one — it **relaunches the UI under a different `local-backend`** for
+# most of its cases. Every other lane is pinned to `in-process` by
+# `fixtures/launcher.conf`; a lane sharing a pytest process with this one
+# would find the UI on a backend it never asked for.
+LOCAL_BACKEND_E2E_TESTS := tools/roosttest/test_local_backend.py
 # HS-3 slice 2's UI-side bootstrap lane (plan 039 C6): the same shape as
 # SSH_HOST_E2E_TESTS — `fake-ssh.sh`, this time in `run-remote` mode, so
 # the generated probe/install/start scripts really run — plus a loopback
@@ -369,6 +379,18 @@ e2e-host-localhost: $(GHOSTTY_LIB)  ## Plan 058 localhost-sentinel E2E (#460: `h
 e2e-host-localhost-ci: $(GHOSTTY_LIB)  ## Plan 058 localhost-sentinel E2E at CI parity (nothing to force-quit: its XDG_RUNTIME_DIR is private)
 	cargo build -p roost-iced -p roost-cli -p roost-session
 	ROOST_TEST_MODE=1 uv run --group test pytest $(LOCALHOST_E2E_TESTS) --roost-target iced --roost-fresh
+
+# The same three binaries the localhost lane needs, for the same reason:
+# the switch's destination is a real `roost-session` on this build's
+# session socket, spawned by the UI under test. Never beside another host
+# lane — see LOCAL_BACKEND_E2E_TESTS.
+e2e-local-backend: $(GHOSTTY_LIB)  ## Plan 063 §D8 local-backend switch E2E (#426: both directions, the journal, and the quiescence latch)
+	cargo build -p roost-iced -p roost-cli -p roost-session
+	ROOST_TEST_MODE=1 uv run --group test pytest $(LOCAL_BACKEND_E2E_TESTS) --roost-target iced
+
+e2e-local-backend-ci: $(GHOSTTY_LIB)  ## Plan 063 §D8 local-backend switch E2E at CI parity (nothing to force-quit: its XDG_RUNTIME_DIR is private)
+	cargo build -p roost-iced -p roost-cli -p roost-session
+	ROOST_TEST_MODE=1 uv run --group test pytest $(LOCAL_BACKEND_E2E_TESTS) --roost-target iced --roost-fresh
 
 # The same three binaries `e2e-host-ssh` needs — the bootstrap job runs
 # the same fake-`ssh`-fronted transport, this time in `run-remote` mode.

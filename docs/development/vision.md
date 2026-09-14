@@ -1051,6 +1051,61 @@ wire contract at `5` and
 [`development/host-sessions.md`'s multiple-clients section](host-sessions.md#the-leasetakeover-lifecycle)
 for the shipped mechanics.
 
+### DL-27: the local backend is a user's choice, not a default flip (2026-09-14)
+
+Plan 063 (R9, [#426](https://github.com/charliek/roost/issues/426)) gives
+`local-backend = in-process | session` a switch, not a flip. Every
+existing setup keeps running its own tabs in-process, exactly as it
+always has; only a genuinely fresh install — no `state.json` and no
+`config.conf` — starts on `session` and records the key, because that is
+the only machine on which "session" is not a behavior change to
+anyone's saved layout. Two palette verbs move the layout between the two
+in place afterward: forward replays the in-process projects onto a local
+`roost-session` daemon (the *slot*) and ends the in-process shells;
+reverse is **No-Replay** — it flips the key back and brings the
+in-process band up from its own persisted state, and deliberately never
+copies the session's layout back. The slot's work stays exactly where it
+is, one click away under a `LOCALHOST` band, and nothing is ever
+duplicated by flipping back and forth.
+
+**Flipping the default itself for existing setups is still open**,
+tracked as its own follow-up
+([#480](https://github.com/charliek/roost/issues/480)) rather than
+decided here — R9 shipped the machinery a flip would need (the config
+ladder, the switch, and the launch-time migration below) but not the
+flip.
+
+**A launch may now spawn a daemon — scoped to the slot alone.** This
+amends the standing "no daemon by default" rule this file opens with:
+under `session`, launch dials the slot `SpawnIfMissing` the same way an
+explicit Connect always has, because a UI that comes up in session mode
+with nothing listening is a UI with no local band at all. Every other
+host keeps today's rule — connect-if-present, never spawn — unchanged.
+
+**A populated in-process workspace found under `session` at launch
+migrates on its own**, once the slot connects: a hand-edited key today,
+the eventual default flip's on-ramp tomorrow. It is the same six-phase
+switch above, armed with the retained layout instead of a confirm
+dialog, so there is exactly one migration path to keep correct rather
+than two that drift. A slot that never connects parks the migration
+rather than wedging the window — no journal, no refused input, and the
+next launch tries again.
+
+**The Swift Mac app is unchanged by all of this.** It stays in-process
+always, keeps seeding a project named "Roost" (the iced UIs now seed
+`Untitled 1` at `$HOME` instead — see
+[`reference/config.md`](../reference/config.md#local-backend)), never
+reads `local-backend`, and carries the new `recent_hosts` snapshot field
+verbatim the way it already carries `hosts` — a write-through it does
+not understand still cannot drop a field it never parses out. Nothing
+here reopens [DL-1](#dl-1-swift-appkit-on-mac-not-rust): this is a
+gap between the two UIs, recorded rather than closed, the same way
+DL-19's Mac gate and DL-15's GTK retirement were.
+
+See [`guides/host-sessions.md`](../guides/host-sessions.md#switching-the-local-backend)
+for the user-facing shape and
+[`reference/ipc.md`](../reference/ipc.md#identify) for the wire fields.
+
 ## Direction (under evaluation)
 
 **Status: under evaluation — not a commitment.** Nothing in this section

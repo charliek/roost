@@ -63,8 +63,7 @@ fn code(error: &ClientError) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_uploaded_file_lands_private_under_a_pasteable_path() {
     let layout = support::Layout::new();
-    let launch_cwd = layout.launch_cwd.clone();
-    let served = layout.spawn(&launch_cwd);
+    let served = layout.spawn();
     let mut client = support::connect(&layout.socket_path()).await;
 
     let result = put_file(&mut client, "roost-image-1757083567-8f3a.png", PNG)
@@ -106,9 +105,7 @@ async fn an_uploaded_file_lands_private_under_a_pasteable_path() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_clean_stop_sweeps_the_store_and_so_does_the_next_start() {
     let layout = support::Layout::new();
-    let launch_cwd = layout.launch_cwd.clone();
-
-    let served = layout.spawn(&launch_cwd);
+    let served = layout.spawn();
     let mut client = support::connect(&layout.socket_path()).await;
     let landed = put_file(&mut client, "design.pdf", PNG)
         .await
@@ -129,7 +126,7 @@ async fn a_clean_stop_sweeps_the_store_and_so_does_the_next_start() {
     std::fs::create_dir_all(&stale).expect("seed leftovers");
     std::fs::write(stale.join("old.png"), PNG).expect("seed a leftover file");
 
-    let served = layout.spawn(&launch_cwd);
+    let served = layout.spawn();
     let mut client = support::connect(&layout.socket_path()).await;
     assert!(
         !stale.exists(),
@@ -151,8 +148,7 @@ async fn a_clean_stop_sweeps_the_store_and_so_does_the_next_start() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unpasteable_root_falls_back_to_tmp() {
     let layout = support::Layout::new();
-    let launch_cwd = layout.launch_cwd.clone();
-    let mut config = layout.config(&launch_cwd);
+    let mut config = layout.config();
     config.files_dir = Some(layout.root().join("Application Support/files"));
     let config_fallback = config.files_fallback.clone();
 
@@ -186,10 +182,9 @@ async fn an_unpasteable_root_falls_back_to_tmp() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_store_that_cannot_be_created_answers_not_supported() {
     let layout = support::Layout::new();
-    let launch_cwd = layout.launch_cwd.clone();
     let blocker = layout.root().join("blocker");
     std::fs::write(&blocker, b"a file, not a directory").expect("seed the blocker");
-    let mut config = layout.config(&launch_cwd);
+    let mut config = layout.config();
     config.files_dir = Some(blocker.join("files"));
 
     let served = layout.spawn_config(config);
@@ -212,7 +207,8 @@ async fn a_store_that_cannot_be_created_answers_not_supported() {
 #[test]
 fn the_shipped_config_takes_its_store_from_the_profile() {
     let profile = roost_ipc::paths::BundleProfile::session().expect("a session profile");
-    let config = SessionConfig::from_profile(&profile, PathBuf::from("/tmp"));
+    let config =
+        SessionConfig::from_profile(&profile, roost_ipc::session_launch::FirstProject::Seed);
     assert_eq!(
         config.files_dir,
         Some(profile.files_dir().expect("a files dir"))

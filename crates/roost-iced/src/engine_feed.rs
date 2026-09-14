@@ -135,6 +135,20 @@ pub(crate) enum EngineFeed {
     /// asks for. Boxed for [`Self::HostTunnel`]'s reason — every feed
     /// item pays for the largest.
     HostBootstrap(Box<crate::app::bootstrap::BootstrapEvent>),
+    /// One phase of a local-backend switch finished on the engine
+    /// runtime (plan 063 §D8).
+    ///
+    /// It rides the feed rather than an Iced task for the bootstrap's
+    /// and the emptiness probe's reason: every phase is started from a
+    /// reconcile, which cannot return one — and one channel keeps a
+    /// step's completion ordered against the host mirror batches the
+    /// phase after it fences on. Boxed like every other host item.
+    LocalBackendSwitch(Box<crate::app::local_backend::SwitchStepDone>),
+    /// A host answered the confirming `tab.list` plan 063 §D6's
+    /// auto-remove waits on. Same reason it rides the feed rather than
+    /// an Iced task as the bootstrap above: it is started from a
+    /// reconcile. Boxed for the same reason every other host item is.
+    HostEmptiness(Box<crate::host_conn::HostEmptiness>),
     /// A SIGTERM or SIGINT reached the process (plan 039 §3.9). Smaller
     /// than routing through a `UiRequest` — which would drag
     /// `roost-engine`'s ipc module into a signal handler for no benefit —
@@ -221,6 +235,13 @@ impl EngineFeedReceiver {
                 // starts a connect — all three are what the sidebar and
                 // the chrome draw from.
                 | EngineFeed::HostBootstrap(..)
+                // It either forgets a host — a registry change the
+                // sidebar and every palette read — or drops the claim.
+                | EngineFeed::HostEmptiness(..)
+                // A phase completion moves the mode cell, the band the
+                // sidebar draws, and the selection — and it releases the
+                // guard the exit rule reads.
+                | EngineFeed::LocalBackendSwitch(..)
         );
         let tab_bytes = matches!(
             item,
@@ -618,6 +639,7 @@ mod tests {
                 crate::host_conn::HostWorkspaceEvent::Applied {
                     revision: 1,
                     events: Vec::new(),
+                    became_empty_by_delete: false,
                 },
             ),
             EngineFeed::HostState(HostId::new(3), crate::host_conn::HostConnState::Connected),

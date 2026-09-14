@@ -402,6 +402,29 @@ def _boot_refusal(target: str) -> str | None:
     )
 
 
+def _booted(c: Roost) -> bool | None:
+    """Whether this UI's main loop is up, asked the way its **backend**
+    can answer (plan 063 §D1).
+
+    `None` means "not yet"; `True` means booted; the caller closes the
+    client either way.
+
+    Under `in-process` the answer is the historical one: a tab exists.
+    Under `local-backend = session` the UI owns **no** in-process
+    projects by design (§D5), so that predicate can never come true — it
+    is not slow, it is wrong, and before this it timed out at 30s. The
+    session answer is an `app.sidebar_dump` round trip, which is served
+    by a `UiRequest` on the main thread: it can only be answered once the
+    engine feed is being drained there, which is the very thing stage 1
+    exists to establish. `identify` cannot stand in for it — that one is
+    answered engine-side, off the socket, before the UI loop runs.
+    """
+    if c.identify().get("local_backend", "in-process") == "session":
+        c.sidebar_dump()
+        return True
+    return True if c.tabs() else None
+
+
 def wait_alive(target: str, timeout: float = 30.0) -> None:
     """Block until the UI is *ready to drive*, not merely until the socket
     answers.
@@ -409,7 +432,7 @@ def wait_alive(target: str, timeout: float = 30.0) -> None:
     Two startup stages to clear:
       1. The IPC server binds early (so `identify` works the instant the
          process starts), but the workspace + tab machinery come up
-         afterward on the UI main loop. Wait until a tab exists.
+         afterward on the UI main loop. Wait until [`_booted`] says so.
       2. The UI's workspace-event subscription comes up at the end of
          bootstrap. Confirm it's live by round-tripping a probe tab —
          open it, require it to materialize (dump succeeds), then close
@@ -421,15 +444,31 @@ def wait_alive(target: str, timeout: float = 30.0) -> None:
     `engine_feed.rs`, Mac `RoostEvent.resync`), so it materializes regardless.
     This probe is therefore a readiness gate (don't make the first test
     absorb boot latency), not a workaround for a dropped event.
+
+    **Stage 2 is skipped under `session`**, and skipping it is the point:
+    the probe tab it opens would land in the hidden in-process workspace
+    — `tab.open` with a project id of 0 *creates* a project there
+    (`ipc.rs`'s `ensure_default_project`) — which is exactly the "a
+    project nobody can see" §D5 forbids, and would leave every case in a
+    session-mode lane running against a workspace the harness polluted.
+    What stage 2 proves is that the *local* workspace's event
+    subscription is live, and under `session` there is no local workspace
+    to have one; the `UiRequest` round trip in stage 1 already proves the
+    feed drain those events land on. A session-mode test waits on the
+    slot's own rows itself, which is a condition wait like any other.
     """
     timeout = scaled_timeout(timeout)
     deadline = time.monotonic() + timeout
-    # (1) booted: at least one tab exists.
+    # (1) booted, as this UI's backend can answer it.
+    session_mode = False
     while True:
         try:
             c = Roost(socket_path(target))
             try:
-                if c.tabs():
+                if _booted(c):
+                    session_mode = (
+                        c.identify().get("local_backend", "in-process") == "session"
+                    )
                     break
             finally:
                 c.close()
@@ -446,6 +485,9 @@ def wait_alive(target: str, timeout: float = 30.0) -> None:
                 f"{target} UI did not boot within {timeout}s{_boot_failure_detail(target)}"
             )
         time.sleep(0.25)
+
+    if session_mode:
+        return
 
     # (2) subscription live: a freshly opened tab must materialize.
     c = Roost(socket_path(target))
@@ -796,11 +838,39 @@ def _answering_pid(target: str) -> int | None:
         return None
 
 
-def launch(target: str, *, state_dir: Path | None = None, force: bool = False) -> None:
+def launch(
+    target: str,
+    *,
+    state_dir: Path | None = None,
+    force: bool = False,
+    extra_env: dict[str, str] | None = None,
+) -> None:
     """Start the UI. Returns once its socket answers `identify`. No-op if
     already running unless `force` (fresh mode, where the caller has
     already asked the running instance to quit). `state_dir`, when given,
-    is passed as `ROOST_STATE_DIR` so the UI isolates its `state.json`."""
+    is passed as `ROOST_STATE_DIR` so the UI isolates its `state.json`.
+
+    `extra_env` is applied **after** the harness's own `ROOST_CONFIG` /
+    `ROOST_STATE_DIR`, so a lane can point one of them somewhere else —
+    which is the only way to test a UI whose config lives in a directory
+    it cannot write (plan 063's switch: the key write is a phase, and its
+    failure has a rollback behind it).
+
+    **The bare-binary Rust launch only.** Both `open`-launched paths — the
+    Mac app, and the iced *bundle* when `ROOST_ICED_APP` is set — forward
+    a hand-maintained `--env` allowlist rather than an environment, so an
+    override handed to them would be dropped and the lane would run,
+    green, against the config it meant to replace. It is refused instead
+    of threaded through: `open` does not define which of two `--env` flags
+    naming the same variable wins, so "threaded" would trade a silent drop
+    for an unverifiable override, and the allowlist is deliberately
+    curated (`ROOST_BUNDLE_PROFILE` is withheld from it on purpose).
+    """
+    if extra_env and (target == "mac" or iced_bundle_app() is not None):
+        raise ValueError(
+            f"extra_env has no route into the `open`-launched {target} app: "
+            "only the bare-binary Rust launch carries an environment"
+        )
     if is_alive(target) and not force:
         return
     # A mid-test relaunch (e.g. the sidebar-persistence test's quit→launch)
@@ -856,6 +926,8 @@ def launch(target: str, *, state_dir: Path | None = None, force: bool = False) -
         env["ROOST_CONFIG"] = str(_session_config_path() if state_dir is not None else SEED_CONFIG)
         if state_dir is not None:
             env["ROOST_STATE_DIR"] = str(state_dir)
+        # Last, so a lane can redirect what the harness just set.
+        env.update(extra_env or {})
         # Capture stdout+stderr (the UI tees its log to stdout, and an early
         # panic that predates the file logger only shows on stderr) so a boot
         # failure isn't blind — `wait_alive` reads this on timeout and CI

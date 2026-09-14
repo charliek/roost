@@ -15,8 +15,7 @@ use roost_ipc::messages::SESSION_PROTOCOL_VERSION;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_session_serves_identifies_reaps_and_stops_clean() {
     let layout = support::Layout::new();
-    let launch_cwd = layout.launch_cwd.clone();
-    let served = layout.spawn(&launch_cwd);
+    let served = layout.spawn();
     let socket_path = layout.socket_path();
 
     let mut client = support::connect(&socket_path).await;
@@ -58,10 +57,11 @@ async fn a_session_serves_identifies_reaps_and_stops_clean() {
         session.libghostty_build
     );
 
-    // Hydration seeded one project from the launch directory.
+    // Hydration seeded one project at the session's own `$HOME`.
     let seeded = support::tabs(&mut client).await;
     assert_eq!(seeded.len(), 1, "a fresh session opens exactly one tab");
     let project_id = seeded[0].project_id;
+    let seeded_cwd = seeded[0].cwd.clone();
 
     // `tab.dump` with no UI in the process: the answer comes from the
     // tab's own server terminal, at the session's stated geometry.
@@ -127,7 +127,7 @@ async fn a_session_serves_identifies_reaps_and_stops_clean() {
     let state = support::read_state(&layout.state_path());
     assert_eq!(state.projects.len(), 1);
     let project = &state.projects[0];
-    assert_eq!(project.cwd, launch_cwd.to_string_lossy());
+    assert_eq!(project.cwd, seeded_cwd);
     assert_eq!(
         project.tabs.len(),
         1,
@@ -136,7 +136,7 @@ async fn a_session_serves_identifies_reaps_and_stops_clean() {
     );
     assert_eq!(
         support::canonical(&project.tabs[0].cwd),
-        support::canonical(&launch_cwd)
+        support::canonical(&seeded_cwd)
     );
 }
 
@@ -146,16 +146,14 @@ async fn a_session_serves_identifies_reaps_and_stops_clean() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stopped_session_releases_its_locks() {
     let layout = support::Layout::new();
-    let launch_cwd = layout.launch_cwd.clone();
-
-    let first = layout.spawn(&launch_cwd);
+    let first = layout.spawn();
     let mut client = support::connect(&layout.socket_path()).await;
     support::session_stop(&mut client).await;
     first.await.expect("join").expect("first run");
 
     // Would panic inside `Layout::locks` if either flock were still
     // held.
-    let second = layout.spawn(&launch_cwd);
+    let second = layout.spawn();
     let mut client = support::connect(&layout.socket_path()).await;
     support::session_stop(&mut client).await;
     tokio::time::timeout(support::scaled(Duration::from_secs(30)), second)

@@ -260,6 +260,19 @@ pub(crate) enum HostWorkspaceEvent {
     Applied {
         revision: u64,
         events: Vec<EventEnvelope>,
+        /// **This batch** deleted a project and left the host with
+        /// none (plan 063 §D6) — the trigger for the auto-remove.
+        ///
+        /// Per batch, never a mirror flag: "the mirror is empty" is
+        /// also true of a host that was empty when we connected, of one
+        /// whose last project another client deleted before we
+        /// subscribed, and of every subsequent batch after the delete.
+        /// Only the batch that *did* it may say so, which is why the
+        /// claim rides here and not on the mirror itself.
+        /// [`Self::Reset`] deliberately has no such field: a rebuild
+        /// from a fenced `tab.list` is history, and history must never
+        /// read as a live delete.
+        became_empty_by_delete: bool,
     },
 }
 
@@ -513,6 +526,18 @@ impl Drop for HostConn {
         // is nothing left for a hard abort to protect.
         self.shutdown.request();
     }
+}
+
+/// A host's own answer to "are you holding anything?", from the
+/// confirming `tab.list` [`HostConnSet::confirm_empty`] sends.
+#[derive(Debug)]
+pub(crate) struct HostEmptiness {
+    pub(crate) saved_id: String,
+    /// The connection that was asked. A reply attributed to an
+    /// incarnation the set has since replaced describes a world that is
+    /// gone, exactly as a stale mirror batch does.
+    pub(crate) incarnation: HostId,
+    pub(crate) empty: Result<bool, HostOpError>,
 }
 
 /// Rows a replaced connection published, on their way to the connection
@@ -2223,12 +2248,41 @@ impl HostConnSet {
     /// which is a wrong answer to hand a caller who just asked to
     /// connect.
     pub(crate) fn establishing(&self, host: &str) -> bool {
+        self.entries
+            .get(host)
+            .is_some_and(|entry| entry.conn.is_none())
+            && self.ssh_establishing(host)
+    }
+
+    /// Whether an ssh handshake is in flight for this host **whatever a
+    /// previous connection left behind**.
+    ///
+    /// [`Self::establishing`] answers the sidebar's question — "is this
+    /// section connecting *instead of* being driven?" — and so is gated
+    /// on there being no connection at all. That gate is wrong for
+    /// anyone asking "is this client still trying?": a host that reached
+    /// a session and dropped keeps its `HostConn` (that is what the
+    /// dimmed rows and the reconnect copy are drawn from), so a fresh
+    /// `open_ssh` over it is invisible to that accessor. Plan 063 §D9's
+    /// exit rule asks the second question — closing the last local
+    /// project during a handshake must not end the process mid-dial.
+    ///
+    /// Read off the [`SshState::establish`] handle, which is the only
+    /// thing that *is* an attempt: it is seated by `open_ssh` and
+    /// cleared by the answer, both arms. "No tunnel and no failure"
+    /// looks like the same window and is not — a link that dropped with
+    /// a bare EOF records no failure ([`Self::overlay_ssh_reason`]
+    /// folds nothing) and has its tunnel retired by
+    /// [`Self::shutdown_tunnel`], so an entry whose ladder has since
+    /// given up sits there with neither, and a predicate reading their
+    /// absence would call a settled host "still trying" for the life of
+    /// the process — wedging the very exit this exists to defer.
+    pub(crate) fn ssh_establishing(&self, host: &str) -> bool {
         self.entries.get(host).is_some_and(|entry| {
-            entry.conn.is_none()
-                && entry
-                    .ssh
-                    .as_ref()
-                    .is_some_and(|ssh| ssh.tunnel.is_none() && ssh.failure.is_none())
+            entry
+                .ssh
+                .as_ref()
+                .is_some_and(|ssh| ssh.establish.is_some())
         })
     }
 
@@ -2404,6 +2458,51 @@ impl HostConnSet {
             });
             feed.send(crate::engine_feed::EngineFeed::HostAgentHooks(Box::new(
                 crate::app::agent_hooks::HostAgentHooks { label, outcome },
+            )));
+        });
+    }
+
+    /// Ask a host whether it really holds nothing, for plan 063 §D6's
+    /// auto-remove.
+    ///
+    /// **The mirror cannot answer this.** It is a projection that lags
+    /// its session by however long a broadcast takes, and two ordinary
+    /// sequences make it read empty while the session holds projects: a
+    /// creation whose control reply beat its `project.created` event,
+    /// and a resumed connection replaying a delete before the create
+    /// that followed it. Both would forget a host that has work on it —
+    /// and under `session`, end the process. The session's own
+    /// `tab.list` is the only reading that cannot be mid-sequence,
+    /// because it is served *by* the party doing the committing.
+    ///
+    /// It rides the host's own op queue, so it is ordered behind every
+    /// mutation this client has already sent: a `project.create` that
+    /// has been answered has necessarily committed before this list is
+    /// served. It rides the **feed** on the way back for
+    /// [`crate::engine_feed::EngineFeed::HostBootstrap`]'s reason — it
+    /// is started from a reconcile, which cannot return an Iced task.
+    pub(crate) fn confirm_empty(&self, host: &str, incarnation: HostId) {
+        let Some(conn) = self.entries.get(host).and_then(|entry| entry.conn.as_ref()) else {
+            return;
+        };
+        let reply = conn.ops.call(ops::TAB_LIST, serde_json::json!({}));
+        let feed = self.feed.clone();
+        let saved_id = host.to_string();
+        self.runtime.spawn(async move {
+            let empty = reply.await.and_then(|value| {
+                serde_json::from_value::<roost_ipc::messages::TabListResult>(value)
+                    .map(|listed| listed.projects.is_empty())
+                    .map_err(|error| HostOpError::Rejected {
+                        code: roost_ipc::client::ServerCode::Internal,
+                        message: format!("undecodable {} reply: {error}", ops::TAB_LIST),
+                    })
+            });
+            feed.send(crate::engine_feed::EngineFeed::HostEmptiness(Box::new(
+                HostEmptiness {
+                    saved_id,
+                    incarnation,
+                    empty,
+                },
             )));
         });
     }
@@ -2599,7 +2698,7 @@ impl HostConnSet {
     /// one: the host may be gone, or it may have been *replaced* while
     /// the previous task was still winding down. Both are stale, and
     /// both are dropped here rather than landing on the replacement.
-    fn owner_of(&self, incarnation: HostId) -> Option<String> {
+    pub(crate) fn owner_of(&self, incarnation: HostId) -> Option<String> {
         let registration = self.minter.registration(incarnation)?;
         let Some(conn) = self
             .entries
@@ -2874,6 +2973,52 @@ pub(crate) mod fixtures {
         incarnation
     }
 
+    /// A host that reached a session, dropped, and is now being dialed
+    /// again — the shape plan 063 §D9's exit rule has to see as
+    /// "connecting". The dropped connection is still in the set, which
+    /// is exactly what makes it invisible to [`HostConnSet::establishing`].
+    #[tokio::test]
+    async fn a_handshake_over_a_dropped_connection_is_still_an_attempt() {
+        let (mut set, _feed) = a_set();
+        a_dropped_ssh_host(&mut set, "/nonexistent/roost-establishing.sock");
+        abort_establishes(&mut set);
+        // The ladder's own re-entry: the timer came due and `open_ssh`
+        // ran again, over a `HostConn` the drop left behind.
+        assert!(retry_once(&mut set), "the armed rung authorized a dial");
+
+        assert!(
+            !set.establishing("h1"),
+            "the sidebar's question is gated on there being no connection, and there is one"
+        );
+        assert!(
+            set.ssh_establishing("h1"),
+            "but this client is very much still trying, and the exit rule asks that"
+        );
+
+        // And it stops being true the moment the handshake settles.
+        refuse(&mut set, unreachable());
+        assert!(!set.ssh_establishing("h1"));
+    }
+
+    /// A connected host on a socket transport — no handshake of its
+    /// own, so its state is the connection's alone.
+    pub(crate) fn a_connected_socket_host(
+        set: &mut HostConnSet,
+        host: &str,
+        socket: &str,
+    ) -> HostId {
+        set.connect(
+            host,
+            host,
+            PathBuf::from(socket),
+            HostTransport::LocalSession,
+            ConnectMode::Dial,
+        );
+        let incarnation = set.mint_for(host);
+        set.apply_state(incarnation, HostConnState::Connected);
+        incarnation
+    }
+
     pub(crate) fn band_reason(set: &HostConnSet, host: &str) -> String {
         set.section_reason(host)
             .expect("a disconnected host has a reason")
@@ -2961,13 +3106,62 @@ pub(crate) mod fixtures {
         )
     }
 
+    /// A host whose retry ladder **gave up**, reached the way §D9's exit
+    /// rule has to survive it: every rung answered, and the last link
+    /// coming up and then dropping with a bare EOF.
+    ///
+    /// What it leaves is the genuinely settled entry — no tunnel (the
+    /// drop retired it), no failure (a bare EOF classifies as nothing,
+    /// and the last establish's success cleared what the rungs before it
+    /// recorded), no establish (that success answered it) and no outage
+    /// (`Exhausted` takes it). Every one of those is a real transition:
+    /// an entry hand-assembled into that shape would prove nothing about
+    /// whether a run can reach it.
+    ///
+    /// The one `.await` is first, before any `open_ssh`, for the reason
+    /// [`ssh_target`] records.
+    pub(crate) async fn a_ladder_that_gave_up_on_a_bare_eof(
+        set: &mut HostConnSet,
+        parent: PathBuf,
+    ) {
+        let tunnel = an_unestablished_tunnel(parent).await;
+        a_dropped_ssh_host(set, "/nonexistent/roost-gave-up.sock");
+        let budget = budget(set);
+        for rung in 1..budget {
+            assert!(retry_once(set), "rung {rung} of {budget} must be dialed");
+            refuse(set, unreachable());
+        }
+        assert!(retry_once(set), "the last rung must be dialed");
+        let request = set.ssh("h1").request;
+        set.tunnel_ready(HostTunnelReady {
+            host: "h1".to_string(),
+            request,
+            result: Ok(tunnel),
+        });
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, dropped("the connection closed"));
+        assert!(!set.has_outage("h1"), "the ladder settled");
+        assert_eq!(
+            band_reason(set, "h1"),
+            format!("reconnect gave up after {budget} tries"),
+            "it settled by spending its budget, and on a bare EOF — \
+             which is what leaves the entry with no failure recorded"
+        );
+    }
+
     /// Nothing in this suite may dial a real host: stop every handshake
     /// an `open_ssh` spawned before anything is polled. A case that
     /// awaits after an `open_ssh` — and the runtime only polls when it
     /// does — calls this first.
+    ///
+    /// The handle is aborted **in place**, never taken: in production
+    /// only the answer (or the exit path) clears that field, and
+    /// [`HostConnSet::ssh_establishing`] reads it — so taking it here
+    /// would leave the set in a state no run can reach, claiming the
+    /// attempt this fixture is standing in for had already settled.
     pub(crate) fn abort_establishes(set: &mut HostConnSet) {
         for entry in set.entries.values_mut().filter_map(|e| e.ssh.as_mut()) {
-            if let Some(establish) = entry.establish.take() {
+            if let Some(establish) = entry.establish.as_ref() {
                 establish.abort();
             }
         }

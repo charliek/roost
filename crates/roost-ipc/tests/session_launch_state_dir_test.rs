@@ -1,6 +1,7 @@
-//! The state dir a launcher hands the `roost-session` it spawns
-//! ([#397](https://github.com/charliek/roost/issues/397)), driven over a
-//! real child process.
+//! The hints a launcher hands the `roost-session` it spawns — the state
+//! dir ([#397](https://github.com/charliek/roost/issues/397)) and the
+//! no-seed flag (plan 063 §D8 phase 1) — driven over a real child
+//! process.
 //!
 //! # Why these live in their own binary, and must stay there
 //!
@@ -28,9 +29,16 @@
 //! their own binary because the test had to set process-global
 //! `ROOST_STATE_DIR`, which would have collapsed `paths.rs`'s
 //! distinct-profile assertions in the same lib binary. That reason is
-//! gone — the seam is a parameter now, so nothing here touches process
-//! env — and it was replaced by the sharper one above. It also happens
-//! to be what CLAUDE.md asks for (`tests/*_test.rs`).
+//! gone — the seam is a parameter now — and it was replaced by the
+//! sharper one above. It also happens to be what CLAUDE.md asks for
+//! (`tests/*_test.rs`).
+//!
+//! The no-seed hint keeps one process-global write of its own, because
+//! what it has to prove is precisely what a launcher *inherits*:
+//! `NO_SEED` below sets the variable on this process for the length of
+//! one spawn, restores it, and serializes with the other no-seed case
+//! through `NO_SEED_LOCK`. The state-dir cases are unaffected — they
+//! record `ROOST_STATE_DIR` and never read this one.
 //!
 //! **They exec what they write — so they must not write it.** The same
 //! fork-inherits-everything fact bites inside this binary too: a stand-in
@@ -49,7 +57,8 @@
 //!
 //! Only what reaches the child's environment; `paths.rs` table-tests the
 //! derivation rule itself, and `paths::tests::the_state_dir_env_name_is_frozen`
-//! is what keeps the shell script below spelling the variable the same
+//! (plus `session_launch::tests::the_launch_cwd_env_name_is_frozen`) is
+//! what keeps the shell scripts below spelling the variables the same
 //! way the Rust does.
 
 use std::ffi::{OsStr, OsString};
@@ -57,7 +66,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use roost_ipc::paths::STATE_DIR_ENV;
-use roost_ipc::session_launch::{spawn_and_read_verdict, Verdict, BIN_NAME};
+use roost_ipc::session_launch::{spawn_and_read_verdict, FirstProject, Verdict, BIN_NAME};
 
 /// Generous on purpose: the stand-in prints and exits at once, so
 /// nothing here waits on the clock — the budget only bounds a hang, and
@@ -95,7 +104,7 @@ async fn state_dir_handed_to(seam: Option<&OsStr>) -> (tempfile::TempDir, OsStri
     .expect("write the stand-in's body");
     std::os::unix::fs::symlink(fixture_path(), &bin).expect("link the stand-in session");
 
-    let verdict = spawn_and_read_verdict(&bin, dir.path(), seam, SEAM_BUDGET)
+    let verdict = spawn_and_read_verdict(&bin, dir.path(), seam, FirstProject::Seed, SEAM_BUDGET)
         .await
         .expect("the stand-in reports a verdict");
     assert_eq!(verdict, Verdict::Ready(4321));
@@ -128,6 +137,111 @@ async fn no_seam_leaves_the_childs_environment_alone() {
 /// A value the resolver ignores derives nothing — and is not forwarded
 /// either: the launcher sets no variable at all, so the child's
 /// environment is the one `None` leaves it.
+/// The same shape for the no-seed hint (plan 063 §D8 phase 1): spawn a
+/// stand-in through the real launcher and hand back the
+/// `ROOST_SESSION_NO_SEED` it saw.
+async fn no_seed_handed_to(first_project: FirstProject) -> (tempfile::TempDir, OsString) {
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let bin = dir.path().join(BIN_NAME);
+    std::fs::write(
+        bin.with_extension("conf"),
+        "printf '%s' \"${ROOST_SESSION_NO_SEED-UNSET}\" > \"$ROOST_SESSION_LAUNCH_CWD/seen\"\n\
+         echo 'ready pid=4321'\n",
+    )
+    .expect("write the stand-in's body");
+    std::os::unix::fs::symlink(fixture_path(), &bin).expect("link the stand-in session");
+
+    let verdict = spawn_and_read_verdict(&bin, dir.path(), None, first_project, SEAM_BUDGET)
+        .await
+        .expect("the stand-in reports a verdict");
+    assert_eq!(verdict, Verdict::Ready(4321));
+
+    let seen =
+        std::fs::read(dir.path().join("seen")).expect("the stand-in records what it was handed");
+    (dir, OsString::from_vec(seen))
+}
+
+/// **The hint reaches the child, and only when it is asked for.**
+///
+/// Both halves matter and neither is provable from the other: the
+/// switch's destination must actually come up empty, and every other
+/// spawn — `roostctl session start`, the launch-time dial of the very
+/// same slot — must be byte-identical to what it was before this
+/// existed, which for an env hint means *the variable is not there at
+/// all*.
+#[tokio::test]
+async fn only_a_withheld_first_project_puts_the_no_seed_hint_in_the_childs_environment() {
+    let _serialized = NO_SEED_LOCK.lock().await;
+    let (_dir, withheld) = no_seed_handed_to(FirstProject::Withheld).await;
+    assert_eq!(withheld, OsString::from("1"));
+
+    let (_dir, seeded) = no_seed_handed_to(FirstProject::Seed).await;
+    assert_eq!(
+        seeded,
+        // Not "0" and not empty: unset, so a daemon of a release that
+        // has never heard of the hint sees exactly what it always saw.
+        OsString::from("UNSET"),
+        "an ordinary spawn must leave the variable absent, not falsified"
+    );
+}
+
+/// Serializes the two cases that read or write `ROOST_SESSION_NO_SEED` on
+/// this process. Held across the spawns, never only across the
+/// `set_var`: what a child sees is this process's environment at fork
+/// time. A tokio mutex for that reason — it is the only kind that may be
+/// held across an `.await`.
+static NO_SEED_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Sets `ROOST_SESSION_NO_SEED` on *this* process for its lifetime and
+/// puts back whatever was there, so one case cannot leak an inherited
+/// hint into the next.
+struct NoSeedVar(Option<OsString>);
+
+impl NoSeedVar {
+    fn set(value: &str) -> Self {
+        let previous = std::env::var_os("ROOST_SESSION_NO_SEED");
+        std::env::set_var("ROOST_SESSION_NO_SEED", value);
+        Self(previous)
+    }
+}
+
+impl Drop for NoSeedVar {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(previous) => std::env::set_var("ROOST_SESSION_NO_SEED", previous),
+            None => std::env::remove_var("ROOST_SESSION_NO_SEED"),
+        }
+    }
+}
+
+/// **An inherited hint is not this spawn's hint.**
+///
+/// `Command` hands the child a copy of this process's environment, so a
+/// launcher that is itself running under the variable — a UI started
+/// from a tab of a session that was, a harness that exported it — would
+/// spawn a `Seed` session that came up with no project at all, and the
+/// contract "absence means seed normally" would be unenforceable from
+/// the caller's side. Absence has to be *made*.
+#[tokio::test]
+async fn an_inherited_hint_does_not_withhold_a_seeded_spawns_project() {
+    let _serialized = NO_SEED_LOCK.lock().await;
+    let _inherited = NoSeedVar::set("1");
+    let (_dir, seen) = no_seed_handed_to(FirstProject::Seed).await;
+    assert_eq!(
+        seen,
+        OsString::from("UNSET"),
+        "a seeded spawn must clear the hint it inherited, not pass it on"
+    );
+
+    // The control: the same inherited value under a spawn that really
+    // does withhold is still a `1` — this removes a hint, it does not
+    // disarm the one caller that wants it.
+    let (_dir, withheld) = no_seed_handed_to(FirstProject::Withheld).await;
+    assert_eq!(withheld, OsString::from("1"));
+}
+
 #[tokio::test]
 async fn a_seam_the_resolver_ignores_sets_nothing_on_the_child() {
     for raw in ["", "relative/state"] {

@@ -86,6 +86,35 @@ ut_wait_alive() {
   done
 }
 
+# ut_pinned_config — path to a config with `local-backend = in-process`.
+#
+# This harness deliberately runs against the developer's own profile (no
+# ROOST_STATE_DIR, no ROOST_CONFIG), which on a machine that has never
+# run Roost is exactly plan 063 §D5's fresh-install predicate: the UI
+# would come up on a `roost-session` daemon AND write `local-backend =
+# session` into ~/.config/roost/config.conf. The screenshots are of the
+# in-process product, and a smoke harness has no business changing the
+# developer's config, so the key is pinned in a COPY — last-wins parsing
+# means the copy's trailing line overrides whatever the original said.
+#
+# An explicit $ROOST_CONFIG is honoured untouched: a caller who set one
+# is driving this on purpose.
+ut_pinned_config() {
+  if [[ -n "${ROOST_CONFIG:-}" ]]; then printf '%s\n' "${ROOST_CONFIG}"; return 0; fi
+  local src="${HOME}/.config/roost/config.conf"
+  # `mktemp`, not a fixed name: this lands in a world-writable directory,
+  # where a predictable path is both a collision between two concurrent
+  # runs and something another user can pre-create for the `>` below to
+  # write through.
+  local dst
+  dst="$(mktemp "${TMPDIR:-/tmp}/roost-uitest-config.XXXXXX")" || return 1
+  {
+    if [[ -f "${src}" ]]; then cat "${src}"; fi
+    printf '\nlocal-backend = in-process\n'
+  } > "${dst}"
+  printf '%s\n' "${dst}"
+}
+
 # ut_launch — start the target UI if it isn't already running.
 ut_launch() {
   if ut_alive; then
@@ -104,7 +133,9 @@ ut_launch() {
       local bin="${UT_REPO_ROOT}/target/debug/roost-iced"
       [[ -x "${bin}" ]] || { echo "==> building roost-iced"; ( cd "${UT_REPO_ROOT}" && cargo build -p roost-iced >/dev/null ); }
       echo "==> launching roost-iced"
-      ( cd "${UT_REPO_ROOT}" && ROOST_BUNDLE_PROFILE=iced RUST_LOG="${RUST_LOG:-info}" "${bin}" >/tmp/roost-iced-uitest.log 2>&1 & )
+      local cfg; cfg="$(ut_pinned_config)"
+      ( cd "${UT_REPO_ROOT}" && ROOST_BUNDLE_PROFILE=iced ROOST_CONFIG="${cfg}" \
+        RUST_LOG="${RUST_LOG:-info}" "${bin}" >/tmp/roost-iced-uitest.log 2>&1 & )
       ;;
   esac
   ut_wait_alive

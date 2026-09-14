@@ -36,7 +36,8 @@ use roost_ipc::messages::{ops, SessionIdentify, SessionStopResult, TabListResult
 use roost_ipc::paths::{derived_session_state_dir, BundleProfile, STATE_DIR_ENV};
 use roost_ipc::session_launch::{
     self, await_stopped, confirm_serving, locate_session_binary, probe_gone,
-    spawn_and_read_verdict, stop_session, timeout_scale, Verdict, BIN_ENV, BIN_NAME, IPC_TIMEOUT,
+    spawn_and_read_verdict, stop_session, timeout_scale, FirstProject, Verdict, BIN_ENV, BIN_NAME,
+    IPC_TIMEOUT,
 };
 use roost_ipc::IpcClient;
 
@@ -141,7 +142,8 @@ async fn start() -> Result<i32> {
         std::env::current_exe().ok().as_deref(),
         std::env::var_os("PATH").as_deref(),
     )?;
-    let cwd = std::env::current_dir().context("read the working directory to seed the session")?;
+    let cwd =
+        std::env::current_dir().context("read the working directory to tell the session about")?;
 
     // Said before the spawn, and phrased for what is true at that
     // moment: this start may yet fail, or find an `already-running`
@@ -158,7 +160,17 @@ async fn start() -> Result<i32> {
     }
 
     let verdict =
-        spawn_and_read_verdict(&bin.path, &cwd, seam.as_deref(), scaled(VERDICT_TIMEOUT)).await?;
+        // `roostctl session start` is a person asking for a session,
+        // with nothing queued to fill it — so it seeds, exactly as it
+        // did before the switch's spawn had a reason not to.
+        spawn_and_read_verdict(
+            &bin.path,
+            &cwd,
+            seam.as_deref(),
+            FirstProject::Seed,
+            scaled(VERDICT_TIMEOUT),
+        )
+        .await?;
     let (pid, fresh) = match classify_verdict(&verdict) {
         StartStep::Confirm { pid, fresh } => (pid, fresh),
         StartStep::Failed(message) => {
@@ -764,7 +776,8 @@ mod tests {
         let dir = scratch(tag);
         let bin = fake_launcher(&dir, body);
         let started = std::time::Instant::now();
-        let verdict = spawn_and_read_verdict(&bin, &dir, None, TEST_BUDGET).await;
+        let verdict =
+            spawn_and_read_verdict(&bin, &dir, None, FirstProject::Seed, TEST_BUDGET).await;
         // Every case is about what the launcher did once it ran. A spawn
         // that never happened must not read as a launcher verdict: five
         // of these cases expect an `Err`, and without this four of them

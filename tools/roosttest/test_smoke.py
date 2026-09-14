@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
+
 
 EXPECTED_APP_IDS = {
     "mac": "ai.stridelabs.Roost",
@@ -54,6 +56,23 @@ def test_identify_reports_the_target_app_id(roost, target):
     # Exact equality, never a prefix check: the macOS iced id
     # `ai.stridelabs.Roost.iced` has the production id as a prefix.
     assert roost.identify()["app_id"] == EXPECTED_APP_IDS[target]
+
+
+def test_the_suite_runs_against_the_in_process_backend(roost, target):
+    """Plan 063 AC10, asserted rather than assumed.
+
+    Every case in every existing lane opens tabs in the UI's own
+    workspace and reads them back with `tab.list`/`tab.dump`. Under
+    `local-backend = session` those ops answer for a workspace nothing
+    on screen owns, so the lanes would go quietly wrong rather than
+    fail — which is why `fixtures/launcher.conf` pins the key and this
+    asserts the pin reached the process. Its counterpart on a
+    developer's own already-running UI is the same assert: a UI in
+    session mode is not one this suite can drive.
+    """
+    if target == "mac":
+        pytest.skip("Swift omits local_backend: the Mac app is in-process by construction")
+    assert roost.identify()["local_backend"] == "in-process"
 
 
 def test_focus_sets_active_tab(roost, project):

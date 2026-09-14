@@ -35,8 +35,7 @@ impl Session {
     /// reached the screen.
     async fn with_seeded_tab() -> (Self, i64) {
         let layout = support::Layout::new();
-        let launch_cwd = layout.launch_cwd.clone();
-        let served = layout.spawn(&launch_cwd);
+        let served = layout.spawn();
         let mut client = support::connect(&layout.socket_path()).await;
         let project_id = support::tabs(&mut client).await[0].project_id;
 

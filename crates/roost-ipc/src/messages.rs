@@ -19,6 +19,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentLifecycle, AgentTabState, Ownership, ShellState};
+use crate::local_route::LocalBackendMode;
 
 // ============================================================================
 // Shared types
@@ -251,6 +252,26 @@ pub struct IdentifyResult {
     pub app_id: String,
     pub ui_version: String,
     pub protocol_version: u32,
+    /// Which local backend this UI runs its own tabs on (plan 063 §D1).
+    /// Absent from a Swift reply, which is always in-process — the
+    /// default this deserializes to.
+    #[serde(default)]
+    pub local_backend: LocalBackendMode,
+    /// The local host session's socket, present only under
+    /// `local_backend = session`. A client that wants the events a UI
+    /// socket cannot serve subscribes there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_session_socket: Option<String>,
+    /// The phase of a local-backend switch in flight (plan 063 §D8a),
+    /// absent while the UI is idle.
+    ///
+    /// Present so a client told `busy: a local-backend switch is in
+    /// progress` can see *why*, and so a test can tell the phases apart
+    /// — the mode above flips at one documented point inside the
+    /// sequence, and nothing else on the wire distinguishes "before" it
+    /// from "after".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_backend_switch: Option<String>,
 }
 
 // ============================================================================
@@ -871,6 +892,15 @@ pub struct TabExpandSelectionAtParams {
 /// `cell_x` / `cell_y` are 0-indexed grid coordinates. `mods` carries
 /// the same bit layout as the key encoder's `Mods`. Gated by
 /// `ROOST_TEST_MODE=1`.
+///
+/// **The Rust UI runs the whole press handler, not just the encoder**
+/// (plan 063 §D11): `mods` therefore also decides whether the *link*
+/// modifier is held, so a left press on a hyperlink opens it through the
+/// UI's own launcher exactly as a real click does, and a press with no
+/// mouse reporting negotiated begins a local selection. The Mac UI still
+/// drives the encoder alone (`TerminalView.emitMouseTracking`), which is
+/// why the link case is a Linux-only E2E — `xdg-open` is resolved
+/// through `PATH` and macOS spawns `/usr/bin/open` by absolute path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabDispatchMouseEventParams {
@@ -1487,6 +1517,43 @@ pub struct SidebarDumpHost {
     pub projects: Vec<SidebarDumpHostProject>,
 }
 
+/// One band of the sidebar's section strip, in sidebar order — the
+/// **presence-derived** rendering of plan 063 §D2, which is what makes
+/// "which local backend is on screen, and is it up?" answerable from
+/// the wire.
+///
+/// `role` tells the three kinds of band apart: `local` is the in-process
+/// workspace's, `session` is the local band under `local-backend =
+/// session` (the slot's own band wearing the local label, or a
+/// placeholder while no slot is saved yet), `host` is an ordinary saved
+/// host below it. `saved_id` is the **only** pairing between a band and
+/// a saved host: under `session` the leading band is itself a host, so
+/// position says nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidebarDumpSection {
+    /// `"local"` | `"session"` | `"host"`.
+    pub role: String,
+    /// The band's header text, as drawn — `LOCAL`, `PROJECTS`, or the
+    /// saved label uppercased.
+    pub label: String,
+    /// The same wire spelling `host.status` reports.
+    pub state: String,
+    /// `"connected"` | `"pending"` | `"offline"`.
+    pub dot: String,
+    /// The saved host this band renders. Absent for the in-process band
+    /// and for the session placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_id: Option<String>,
+    /// Whether the band's state offers the inline ↻ Reconnect row. The
+    /// row is addressed to `saved_id`, so a band without one has the
+    /// offer and nothing to point it at — the transient §D2 row 4.
+    pub reconnect_row: bool,
+    /// `"update"` | `"restart"` | `"manual"` — the reduced-fidelity
+    /// pill's action, absent when the band draws no pill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fidelity: Option<String>,
+}
+
 /// `app.sidebar_dump` response — the sidebar's **last-rendered** agent
 /// rows, read from the same per-project cache the sidebar paints from
 /// (`RenderedAgentRow` on both UIs), not re-derived from the workspace
@@ -1512,6 +1579,15 @@ pub struct SidebarDumpResult {
     /// and a UI with no host sections stays byte-identical on both.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<SidebarDumpHost>,
+    /// Every band of the section strip, in sidebar order, including the
+    /// local one (plan 063 §D2) — where `hosts` lists only the saved
+    /// hosts and their rows.
+    ///
+    /// Empty, and so omitted, when the sidebar draws its classic single
+    /// sticky `PROJECTS` header instead of a strip: `in-process` with no
+    /// saved hosts, which is also every Swift Mac reply.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sections: Vec<SidebarDumpSection>,
 }
 
 /// `app.render_stats` request — read the running UI's render-path
@@ -3962,6 +4038,7 @@ mod tests {
                 },
             ],
             hosts: Vec::new(),
+            sections: Vec::new(),
         });
     }
 
@@ -3992,6 +4069,7 @@ mod tests {
                     projects: Vec::new(),
                 },
             ],
+            sections: Vec::new(),
         });
     }
 
@@ -4009,9 +4087,65 @@ mod tests {
             agents_visible: true,
             projects: Vec::new(),
             hosts: Vec::new(),
+            sections: Vec::new(),
         })
         .unwrap();
         assert_eq!(encoded, r#"{"agents_visible":true,"projects":[]}"#);
+    }
+
+    /// The band strip (plan 063 §D2) is additive in both directions: a
+    /// reply that predates it still decodes, and an empty strip — the
+    /// classic single sticky `PROJECTS` header, and every Swift reply —
+    /// stays off the wire, so the pre-063 shape is byte-identical.
+    #[test]
+    fn sidebar_dump_result_round_trips_the_band_strip() {
+        let without: SidebarDumpResult =
+            serde_json::from_str(r#"{"agents_visible":true,"projects":[]}"#).unwrap();
+        assert!(without.sections.is_empty());
+        assert_eq!(
+            serde_json::to_string(&without).unwrap(),
+            r#"{"agents_visible":true,"projects":[]}"#,
+            "an empty strip must stay off the wire, or every pre-063 reply changes shape"
+        );
+
+        let dump = SidebarDumpResult {
+            agents_visible: true,
+            projects: Vec::new(),
+            hosts: Vec::new(),
+            sections: vec![
+                // The session-only band: the slot's own, wearing the
+                // local label and offering ↻ because it is down.
+                SidebarDumpSection {
+                    role: "session".to_string(),
+                    label: "PROJECTS".to_string(),
+                    state: "disconnected".to_string(),
+                    dot: "offline".to_string(),
+                    saved_id: Some("hs-2f1c".to_string()),
+                    reconnect_row: true,
+                    fidelity: None,
+                },
+                SidebarDumpSection {
+                    role: "host".to_string(),
+                    label: "WORKBENCH".to_string(),
+                    state: "connected".to_string(),
+                    dot: "connected".to_string(),
+                    saved_id: Some("hs-9d40".to_string()),
+                    reconnect_row: false,
+                    fidelity: Some("update".to_string()),
+                },
+            ],
+        };
+        round_trip(&dump);
+
+        let encoded = serde_json::to_value(&dump).unwrap();
+        let band = &encoded["sections"][0];
+        assert_eq!(band["role"], "session");
+        assert_eq!(band["saved_id"], "hs-2f1c");
+        assert_eq!(band["reconnect_row"], true);
+        assert!(
+            band.get("fidelity").is_none(),
+            "a band with no pill omits the key"
+        );
     }
 
     #[test]
@@ -4496,5 +4630,37 @@ mod tests {
         let extra = r#"{"event":"tab.opened","data":{},"extra":1}"#;
         let parsed: EventEnvelope = serde_json::from_str(extra).unwrap();
         assert_eq!(parsed.event, "tab.opened");
+    }
+
+    /// The Swift UI answers `identify` from its own struct and has never
+    /// heard of `local_backend`, which is correct of it — the Mac app is
+    /// always in-process. The Rust client has to read that reply anyway,
+    /// so both fields default rather than fail.
+    #[test]
+    fn an_identify_without_the_local_backend_fields_still_decodes() {
+        let swift = r#"{
+            "socket_path": "/Users/me/Library/Caches/Roost/roost.sock",
+            "pid": 12345,
+            "active_project_id": "1",
+            "active_tab_id": "3",
+            "app_label": "Roost",
+            "app_id": "ai.stridelabs.Roost",
+            "ui_version": "0.7.0",
+            "protocol_version": 1
+        }"#;
+        let parsed: IdentifyResult = serde_json::from_str(swift).expect("decode");
+        assert_eq!(parsed.local_backend, LocalBackendMode::InProcess);
+        assert_eq!(parsed.local_session_socket, None);
+        // Re-encoding adds `local_backend` but still omits the socket:
+        // a Rust in-process reply is the Swift shape plus one field a
+        // client ignores, which is the additive direction the matrix in
+        // `docs/reference/ipc-compatibility.md` allows for free.
+        let json = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(json["local_backend"], "in-process");
+        assert!(json.get("local_session_socket").is_none());
+        // Same rule for the switch phase: an idle UI's reply is the
+        // Swift shape, so a recorded vector stays byte-identical.
+        assert_eq!(parsed.local_backend_switch, None);
+        assert!(json.get("local_backend_switch").is_none());
     }
 }

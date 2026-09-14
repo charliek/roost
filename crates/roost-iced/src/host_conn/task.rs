@@ -35,7 +35,7 @@ use roost_ipc::messages::{
     ops, EventBatch, OscColorsParams, SessionIdentify, SessionIdentifyParams,
     SessionSetThemeParams, TabListResult,
 };
-use roost_ipc::session_launch;
+use roost_ipc::session_launch::{self, FirstProject};
 use roost_ui_model::keys::HostId;
 use tokio::sync::{mpsc, Notify};
 
@@ -92,16 +92,32 @@ impl Shutdown {
 
 /// How the *first* attempt treats a socket that is not there.
 ///
-/// Only an explicit Connect may start a daemon. Launch-time
-/// auto-reconnect is connect-if-present, and a mid-session drop never
-/// spawns at all (plan 037 §3.2) — so the mode is consumed by the first
-/// attempt and every retry after it is a plain dial.
+/// A daemon is started by an explicit Connect, and — since plan 063 §D5
+/// — by the launch-time dial of *the slot* under `local-backend =
+/// session`, which is not a host the user opted into but where this
+/// window's own tabs live. Launch-time auto-reconnect for every other
+/// host is connect-if-present (plan 037 §3.2), and a mid-session drop
+/// never spawns at all — so the mode is consumed by the first attempt
+/// and every retry after it is a plain dial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectMode {
     /// Probe; an absent socket is a plain disconnected state, no daemon.
     IfPresent,
     /// Probe; an absent socket runs the shared spawn ladder.
     SpawnIfMissing,
+    /// [`Self::SpawnIfMissing`], except the daemon it starts is told
+    /// **not** to seed itself a first project
+    /// ([`session_launch::FirstProject::Withheld`], plan 063 §D8 phase
+    /// 1).
+    ///
+    /// A separate mode rather than a flag beside one, because it is the
+    /// same question this enum already answers — what this attempt does
+    /// about an absent socket — and the only caller is a switch whose
+    /// replay lands on that session a moment later: the forward switch,
+    /// or §D5's launch-time migration, which is that same replay run at
+    /// startup. Every other spawn seeds, including a launch-time dial of
+    /// the very same slot with no migration to run.
+    SpawnUnseeded,
     /// Dial straight away. What a non-localhost host always does — there
     /// is no local socket to probe and nothing this client could spawn.
     Dial,
@@ -844,17 +860,21 @@ async fn ensure_socket(config: &ConnectionConfig, mode: ConnectMode) -> Result<(
     if mode == ConnectMode::Dial || socket_live(&config.socket).await {
         return Ok(());
     }
-    // Nothing is listening, so only the mode that may start one gets to.
-    if mode == ConnectMode::SpawnIfMissing {
-        return spawn_session(config).await;
+    // Nothing is listening, so only a mode that may start one gets to.
+    match mode {
+        ConnectMode::SpawnIfMissing => spawn_session(config, FirstProject::Seed).await,
+        ConnectMode::SpawnUnseeded => spawn_session(config, FirstProject::Withheld).await,
+        _ => Err(AttemptError::Transport(no_session_at(&config.socket))),
     }
-    Err(AttemptError::Transport(no_session_at(&config.socket)))
 }
 
 /// Nothing is listening, and the user asked for a connection: climb the
 /// shared launch ladder (`roost_ipc::session_launch`, the same rungs
 /// `roostctl session start` uses).
-async fn spawn_session(config: &ConnectionConfig) -> Result<(), AttemptError> {
+async fn spawn_session(
+    config: &ConnectionConfig,
+    first_project: FirstProject,
+) -> Result<(), AttemptError> {
     if !config.transport.is_localhost() {
         return Err(AttemptError::Transport(format!(
             "{} and only a localhost session can be started from here",
@@ -868,8 +888,10 @@ async fn spawn_session(config: &ConnectionConfig) -> Result<(), AttemptError> {
         std::env::var_os("PATH").as_deref(),
     )
     .map_err(|error| spawn_failure(SpawnStage::Locate, &error))?;
-    // The launch cwd seeds the session's first project on a fresh state
-    // file only; a UI has no better answer than its own.
+    // A first-ever session seeds its project at its own `$HOME`, not
+    // this cwd (plan 063 §D4) — the hint below is passed on regardless,
+    // purely so the session's log can say where it was spawned from; a
+    // UI has no better answer than its own directory.
     let cwd = std::env::current_dir().map_err(|error| {
         spawn_failure(
             SpawnStage::Cwd,
@@ -888,6 +910,7 @@ async fn spawn_session(config: &ConnectionConfig) -> Result<(), AttemptError> {
         &bin.path,
         &cwd,
         seam.as_deref(),
+        first_project,
         SPAWN_VERDICT_BUDGET.mul_f64(scale),
     )
     .await
@@ -1239,6 +1262,9 @@ async fn serve(
                     // host. Nothing left to serve.
                     return ConnEnd::Shutdown;
                 };
+                let Some(intent) = admit(incarnation, intent) else {
+                    continue;
+                };
                 match run_intent(&mut live, unsupported, intent).await {
                     IntentOutcome::Live => {}
                     IntentOutcome::Ends(end) => return end,
@@ -1262,6 +1288,35 @@ fn reseat(live: &mut Live, events: EventRx, pump: EventPump, what: Subscribed) {
     live.events = events;
     if let Subscribed::Fresh(mirror) = what {
         live.mirror.reset(mirror);
+    }
+}
+
+/// The intent to run, or `None` when it was issued for a connection this
+/// one replaced and has been answered here instead.
+///
+/// The queue outlives a connection — this task's own retry ladder keeps
+/// draining the same receiver across attempts — so without this an
+/// intent enqueued in the window between a drop and the main thread
+/// learning about it is served by the *next* connection. A forwarded
+/// `project.delete` naming a row by bare id would then delete whatever
+/// the restarted session has since minted under that number.
+///
+/// `Disconnected` rather than a new error: that is what happened to the
+/// connection the caller addressed, and it is already the answer every
+/// intent [`queue::flush`] catches gets.
+fn admit(serving: HostId, intent: HostIntent) -> Option<HostIntent> {
+    match intent.fence {
+        Some(issued) if issued != serving => {
+            tracing::debug!(
+                op = %intent.op,
+                issued = issued.raw(),
+                serving = serving.raw(),
+                "refusing an intent issued for a replaced connection"
+            );
+            intent.answer(Err(HostOpError::Disconnected));
+            None
+        }
+        _ => Some(intent),
     }
 }
 
@@ -1345,15 +1400,27 @@ fn apply_batch(
 ) -> bool {
     let revision = batch.revision;
     if !mirror.apply_batch(&batch) {
-        // Below the fence: the snapshot already has it.
+        // Below the fence: the snapshot already has it. Nothing is
+        // published at all, so a replayed delete the mirror was built
+        // from cannot claim to have emptied anything.
         return true;
     }
+    // Read after the apply and only for a batch that carried a delete:
+    // plan 063 §D6's claim is "*this* batch emptied the host", and the
+    // task is the mirror's only writer, so this pair is atomic in
+    // practice.
+    let became_empty_by_delete = batch
+        .events
+        .iter()
+        .any(|envelope| envelope.event == ops::EVENT_PROJECT_DELETED)
+        && mirror.read().projects.is_empty();
     publish_workspace(
         feed,
         incarnation,
         HostWorkspaceEvent::Applied {
             revision,
             events: batch.events,
+            became_empty_by_delete,
         },
     )
 }
@@ -1532,6 +1599,7 @@ mod tests {
             Path::new("/nonexistent/roost-session"),
             cwd,
             None,
+            FirstProject::Seed,
             budget,
         )
         .await
@@ -1544,10 +1612,15 @@ mod tests {
         // `true start` exec's fine and closes its stdout without a
         // readiness line — the shape of a daemon that died on startup
         // *after* the exec, which stays retryable.
-        let no_verdict =
-            session_launch::spawn_and_read_verdict(Path::new("/usr/bin/true"), cwd, None, budget)
-                .await
-                .expect_err("no line, so no verdict");
+        let no_verdict = session_launch::spawn_and_read_verdict(
+            Path::new("/usr/bin/true"),
+            cwd,
+            None,
+            FirstProject::Seed,
+            budget,
+        )
+        .await
+        .expect_err("no line, so no verdict");
         transport(&spawn_failure(SpawnStage::Launch, &no_verdict));
     }
 
@@ -1621,7 +1694,10 @@ mod tests {
             panic!("a mirror delta is a HostWorkspace item");
         };
         assert_eq!(*tagged, host);
-        let HostWorkspaceEvent::Applied { revision, events } = event else {
+        let HostWorkspaceEvent::Applied {
+            revision, events, ..
+        } = event
+        else {
             panic!("expected an applied batch");
         };
         assert_eq!(*revision, 5);
@@ -1631,6 +1707,154 @@ mod tests {
             5,
             "and the state moved on the shared mirror, not on the feed"
         );
+    }
+
+    /// Plan 063 §D6's per-batch claim: **this** batch deleted a project
+    /// and left the host with none.
+    ///
+    /// Three cases, and the middle one is the whole reason the claim is
+    /// per batch rather than a mirror flag — "the mirror is empty" is
+    /// equally true of a host nobody emptied, and auto-removing on that
+    /// would forget a host for having been quiet.
+    #[tokio::test]
+    async fn only_the_batch_that_deleted_the_last_project_claims_it() {
+        let deleted = |project: i64| EventEnvelope {
+            event: ops::EVENT_PROJECT_DELETED.into(),
+            data: serde_json::json!({ "project_id": project.to_string() }),
+        };
+        // 1. The delete that empties it.
+        let (feed, mut rx) = crate::engine_feed::channel();
+        let mirror = seeded_mirror(4);
+        assert!(apply_batch(
+            &mirror,
+            EventBatch {
+                revision: 5,
+                events: vec![deleted(1)],
+            },
+            HostId::new(9),
+            &feed,
+        ));
+        assert_eq!(emptied(&mut rx), Some(true));
+
+        // 2. A batch that carries no delete, on a mirror that is
+        // *already* empty. Every batch after the one above is this one,
+        // and none of them may re-raise the claim.
+        assert!(apply_batch(
+            &mirror,
+            EventBatch {
+                revision: 6,
+                events: vec![EventEnvelope {
+                    event: ops::EVENT_ACTIVE_CHANGED.into(),
+                    data: serde_json::json!({"project_id": "0", "tab_id": "0"}),
+                }],
+            },
+            HostId::new(9),
+            &feed,
+        ));
+        assert!(mirror.read().projects.is_empty(), "still empty");
+        assert_eq!(emptied(&mut rx), Some(false));
+
+        // 3. A delete that leaves something behind is not an emptying.
+        let two = SharedMirror::new(HostMirror::from_list(
+            TabListResult {
+                projects: vec![
+                    seeded_list(None).projects.remove(0),
+                    Project {
+                        id: 2,
+                        name: "second".into(),
+                        cwd: "/tmp".into(),
+                        position: 1,
+                        created_at: 0,
+                        tabs: Vec::new(),
+                    },
+                ],
+                revision: Some(4),
+            },
+            4,
+        ));
+        assert!(apply_batch(
+            &two,
+            EventBatch {
+                revision: 5,
+                events: vec![deleted(1)],
+            },
+            HostId::new(9),
+            &feed,
+        ));
+        assert_eq!(emptied(&mut rx), Some(false));
+    }
+
+    /// The other two ways a host can look empty, and neither is a live
+    /// delete (plan 063 §D6).
+    ///
+    /// **Empty at connect** is a `Reset` — a rebuild from a fenced
+    /// `tab.list`, which carries no such claim at all, by construction:
+    /// the variant has no field for one. That is what routes it to
+    /// §D12's seed instead of to the auto-remove.
+    ///
+    /// **Replayed history** is a batch the snapshot already contains.
+    /// The fence discards it, and a discarded batch publishes nothing —
+    /// so a `project.deleted` the mirror was *built from* can never be
+    /// mistaken for one that just happened.
+    #[tokio::test]
+    async fn an_empty_snapshot_and_a_replayed_delete_make_no_claim() {
+        let (feed, mut rx) = crate::engine_feed::channel();
+        let empty = Arc::new(SharedMirror::new(HostMirror::from_list(
+            TabListResult {
+                projects: Vec::new(),
+                revision: Some(4),
+            },
+            4,
+        )));
+
+        assert!(publish_workspace(
+            &feed,
+            HostId::new(9),
+            HostWorkspaceEvent::Reset(Arc::clone(&empty)),
+        ));
+        let items = feed_items(&mut rx);
+        assert!(
+            matches!(
+                &items[0],
+                EngineFeed::HostWorkspace(_, HostWorkspaceEvent::Reset(_))
+            ),
+            "a connect's snapshot is a Reset, which has nowhere to put a delete claim"
+        );
+
+        // And the replay: the very delete the snapshot above already
+        // reflects, arriving at a revision the fence covers.
+        assert!(apply_batch(
+            &empty,
+            EventBatch {
+                revision: 4,
+                events: vec![EventEnvelope {
+                    event: ops::EVENT_PROJECT_DELETED.into(),
+                    data: serde_json::json!({"project_id": "1"}),
+                }],
+            },
+            HostId::new(9),
+            &feed,
+        ));
+        assert!(
+            feed_items(&mut rx).is_empty(),
+            "history below the fence never reaches the UI at all, let alone as a claim"
+        );
+    }
+
+    /// The `became_empty_by_delete` of the one applied batch on `rx`.
+    fn emptied(rx: &mut crate::engine_feed::EngineFeedReceiver) -> Option<bool> {
+        let items = feed_items(rx);
+        assert_eq!(items.len(), 1, "one batch, one wake");
+        match &items[0] {
+            EngineFeed::HostWorkspace(
+                _,
+                HostWorkspaceEvent::Applied {
+                    became_empty_by_delete,
+                    ..
+                },
+            ) => Some(*became_empty_by_delete),
+            _ => None,
+        }
     }
 
     /// A batch at or below the fence is already in the snapshot, so it
@@ -1813,7 +2037,9 @@ mod tests {
             HostTransport::UnixSocket,
             ConnectMode::SpawnIfMissing,
         );
-        let error = spawn_session(&config).await.expect_err("no spawn");
+        let error = spawn_session(&config, FirstProject::Seed)
+            .await
+            .expect_err("no spawn");
         let AttemptError::Transport(reason) = error else {
             panic!("expected a transport outcome");
         };
@@ -1880,6 +2106,45 @@ mod tests {
                 .expect("every parked waiter must wake")
                 .expect("and not panic");
         }
+    }
+
+    /// Plan 063 §D10/§D6: an intent issued for a connection this task has
+    /// since replaced must not run on its successor.
+    ///
+    /// The window is real and not a theoretical one: this task's retry
+    /// ladder drains the same receiver across attempts, and the main
+    /// thread goes on believing the old incarnation is live until it
+    /// drains the `Disconnected` off the feed. Against a session that
+    /// restarted and re-minted its ids, a forwarded
+    /// `project.delete {"project_id": "1"}` served by the replacement
+    /// deletes a project the caller never named.
+    #[tokio::test]
+    async fn an_intent_issued_for_a_replaced_connection_is_refused_not_rerouted() {
+        let (ops, mut ops_rx) = super::super::queue::HostOps::channel();
+        let issued = HostId::new(4);
+        let queued = ops.call_at(issued, "project.delete", serde_json::json!({}));
+        let intent = ops_rx.recv().await.expect("the intent is on the queue");
+
+        // A different incarnation on the same queue: refused here, and
+        // answered rather than dropped, so the caller never waits.
+        assert!(admit(HostId::new(5), intent).is_none());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), queued)
+                .await
+                .expect("a refused intent must still be answered"),
+            Err(HostOpError::Disconnected)
+        );
+
+        // The connection it was issued for still runs it.
+        let _alive = ops.call_at(issued, "project.delete", serde_json::json!({}));
+        let intent = ops_rx.recv().await.expect("the second intent");
+        assert!(admit(issued, intent).is_some());
+
+        // And an unfenced administrative op is correct on whichever
+        // connection serves it, so it is admitted either way.
+        let _push = ops.call("session.set_focus", serde_json::json!({}));
+        let intent = ops_rx.recv().await.expect("the third intent");
+        assert!(admit(HostId::new(9), intent).is_some());
     }
 
     /// The disconnect contract end to end, and what lets `HostConn::drop`

@@ -555,6 +555,37 @@ struct IPCSidebarDumpResultTests {
         #expect(agents?[0]["tab_id"] as? String == "7")
         #expect(projects?[1]["project_id"] as? String == "2")
         #expect((projects?[1]["agents"] as? [[String: Any]])?.isEmpty == true)
+        // This UI has no band strip, and an absent one must stay off the
+        // wire so the reply is byte-identical to the pre-063 shape.
+        #expect(result.sections == nil)
+        #expect(obj?["sections"] == nil)
+    }
+
+    /// The band strip (plan 063 §D2) is iced-only, but the mirror still
+    /// has to decode one: a Swift client reading an iced UI's dump is
+    /// exactly the direction the shared vector corpus guards.
+    @Test func decodesTheBandStripAnIcedUIEmitsUnderSession() throws {
+        let json = """
+        {"agents_visible":true,"projects":[],
+         "sections":[{"role":"session","label":"PROJECTS","state":"connected",
+                      "dot":"connected","saved_id":"hs-2f1c","reconnect_row":false},
+                     {"role":"host","label":"WORKBENCH","state":"disconnected",
+                      "dot":"offline","saved_id":"hs-9d40","reconnect_row":true,
+                      "fidelity":"update"}]}
+        """
+        let result = try JSONDecoder().decode(IPCSidebarDumpResult.self, from: Data(json.utf8))
+        let sections = try #require(result.sections)
+        #expect(sections.count == 2)
+        #expect(sections[0].role == "session")
+        #expect(sections[0].label == "PROJECTS")
+        #expect(sections[0].dot == "connected")
+        #expect(sections[0].savedID == "hs-2f1c")
+        #expect(!sections[0].reconnectRow)
+        #expect(sections[0].fidelity == nil)
+        #expect(sections[1].role == "host")
+        #expect(sections[1].savedID == "hs-9d40")
+        #expect(sections[1].reconnectRow)
+        #expect(sections[1].fidelity == "update")
     }
 }
 

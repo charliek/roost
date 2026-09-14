@@ -60,7 +60,6 @@ pub async fn tick() {
 /// same state and watch it restore.
 pub struct Layout {
     dir: TempDir,
-    pub launch_cwd: PathBuf,
 }
 
 impl Layout {
@@ -76,9 +75,7 @@ impl Layout {
                 .try_init();
         }
         let dir = tempfile::tempdir().expect("tempdir");
-        let launch_cwd = dir.path().join("launch");
-        std::fs::create_dir_all(&launch_cwd).expect("create the launch dir");
-        Self { dir, launch_cwd }
+        Self { dir }
     }
 
     pub fn root(&self) -> &Path {
@@ -117,13 +114,12 @@ impl Layout {
         path
     }
 
-    pub fn config(&self, launch_cwd: &Path) -> SessionConfig {
+    pub fn config(&self) -> SessionConfig {
         SessionConfig {
             socket_path: self.socket_path(),
             state_path: self.state_path(),
             app_label: APP_LABEL.into(),
             app_id: APP_ID.into(),
-            launch_cwd: launch_cwd.to_path_buf(),
             files_dir: Some(self.files_dir()),
             files_fallback: self.dir.path().join("files-fallback"),
             // Always on here: `tab.feed_pty_bytes` and
@@ -140,6 +136,11 @@ impl Layout {
             // `vt` is negotiable here. The pre-R3 shape is driven out of
             // process by the host-client e2e lane.
             legacy_payload_kinds: false,
+            // The in-process tests are their own starter: a session
+            // that came up empty here would break every case that
+            // hydrates a layout, and the withheld answer is driven out
+            // of process by the local-backend e2e lane.
+            first_project: roost_ipc::session_launch::FirstProject::Seed,
             // Likewise: the shipped window, which no in-process test
             // drives past.
             replay_window: None,
@@ -151,13 +152,13 @@ impl Layout {
             .expect("take the instance locks")
     }
 
-    /// Start a session over this layout, seeded from `launch_cwd`.
+    /// Start a session over this layout.
     ///
     /// The returned handle resolves when the session has stopped and its
     /// tail has run — socket unlinked, locks released — so a test can
     /// await it and then start another run over the same state.
-    pub fn spawn(&self, launch_cwd: &Path) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-        self.spawn_config(self.config(launch_cwd))
+    pub fn spawn(&self) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        self.spawn_config(self.config())
     }
 
     /// [`Self::spawn`] with the config stated, for a test that needs one
@@ -263,6 +264,23 @@ pub async fn open_tab(
         .await
         .expect("tab.open");
     result.tab
+}
+
+/// `project.create` — the op a client uses to fill a workspace it asked
+/// the session not to seed (plan 063 §D8).
+pub async fn create_project(client: &mut IpcClient, name: &str, cwd: &Path) -> i64 {
+    let result: serde_json::Value = client
+        .call(
+            ops::PROJECT_CREATE,
+            serde_json::json!({ "name": name, "cwd": cwd.to_string_lossy() }),
+        )
+        .await
+        .expect("project.create");
+    result["project"]["id"]
+        .as_str()
+        .expect("a string-wrapped project id")
+        .parse()
+        .expect("a numeric project id")
 }
 
 /// `tab.resize` — reaches the supervisor, so its success is a statement

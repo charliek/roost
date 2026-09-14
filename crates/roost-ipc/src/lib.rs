@@ -17,6 +17,9 @@
 //!   `tokio::net::UnixStream`. Enforces the 16 MiB line limit.
 //! * [`dataframe`] — the binary framing a host-session attach
 //!   connection switches to after its JSON handshake.
+//! * [`local_route`] — the local-backend snapshot the UI publishes and
+//!   its own IPC handler reads (plan 063 §D1), in this crate because
+//!   `roost-engine` cannot see `roost-ui-model`.
 //! * [`paths`] — `BundleProfile` path resolution. The Mac UI's Swift
 //!   side has a byte-for-byte equivalent.
 //! * [`socket_state`] — the one shared answer to "is a listener alive
@@ -59,6 +62,7 @@ pub mod agent;
 pub mod bootstrap;
 pub mod dataframe;
 pub mod framing;
+pub mod local_route;
 pub mod messages;
 pub mod paths;
 pub mod session_launch;
@@ -73,6 +77,10 @@ mod runtime_dir;
 mod server;
 
 pub use client::{ClientError, IpcClient};
+pub use local_route::{
+    session_socket_path, LocalBackendCell, LocalBackendMode, LocalRoute, OpClass, SlotIds,
+    SlotRequired,
+};
 pub use peer::{current_euid, peer_uid};
 pub use runtime_dir::validate_runtime_dir;
 pub use server::{

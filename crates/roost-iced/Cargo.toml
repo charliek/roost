@@ -71,10 +71,12 @@ png = "=0.18.1"
 # `uname(2)` behind a safe API — the alternative here is a hand-rolled
 # unsafe `libc::gethostname` for the same three lines.
 gethostname = "1"
-# Trait-only: the host op queue's replies are `serde_json::Value`, and the
-# typed decode of one needs `DeserializeOwned` to be nameable. No derives
-# live in this crate — the wire types are `roost-ipc`'s.
-serde = "1.0"
+# The host op queue's replies are `serde_json::Value`, and the typed
+# decode of one needs `DeserializeOwned` to be nameable. `derive` is for
+# the switch journal (plan 063 §D8b) — a **local file**, not a wire type,
+# which is why it lives here rather than in `roost-ipc` with everything
+# that crosses a socket.
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 tokio = { workspace = true }
 tracing = { workspace = true }

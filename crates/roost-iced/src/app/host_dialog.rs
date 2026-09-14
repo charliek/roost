@@ -271,6 +271,19 @@ pub(super) enum HostDialog {
         /// name at all.
         expected_session: Option<String>,
     },
+    /// Move the local band between backends (plan 063 §D8).
+    ///
+    /// Composed copy for `ConfirmStop`'s reason and then some: the
+    /// forward card names the project and tab counts it is about to
+    /// move, and a tab exiting behind the modal must not rewrite the
+    /// question mid-read. The direction is the whole of what confirming
+    /// does; the card is the only place either verb pauses.
+    ConfirmSwitch {
+        direction: super::local_backend::SwitchDirection,
+        title: String,
+        body: String,
+        confirm: &'static str,
+    },
     /// Consent to install, update or start `roost-session` on a host
     /// reached over ssh (plan 039 §3.5).
     ///
@@ -291,7 +304,10 @@ impl HostDialog {
     pub(super) fn draft_mut(&mut self) -> Option<&mut AddHostDraft> {
         match self {
             Self::Add(draft) => Some(draft),
-            Self::ConfirmStop { .. } | Self::ConfirmRestart { .. } | Self::Bootstrap(_) => None,
+            Self::ConfirmStop { .. }
+            | Self::ConfirmRestart { .. }
+            | Self::ConfirmSwitch { .. }
+            | Self::Bootstrap(_) => None,
         }
     }
 }

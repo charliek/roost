@@ -84,6 +84,60 @@ fn host_unavailable(message: impl Into<String>) -> HostOpFailure {
     HostOpFailure::new(HOST_UNAVAILABLE, message)
 }
 
+/// What a **forwarded** op's failure says on the wire (plan 063 §D10).
+///
+/// Unlike [`host_op_failure`], a session's refusal crosses **verbatim**,
+/// whatever its code. §D10's contract is that a bare id means the slot's
+/// id and the answer is the slot's own — the only transformation
+/// permitted on a forwarded reply is stripping `tab.list`'s `revision` —
+/// so folding a code this socket does not usually mint would rewrite the
+/// session's verdict into a different one. `shutting-down` is the case
+/// that makes it concrete: `host_op_failure` turns it into
+/// `host-unavailable` and buries the original in the message, and a
+/// client cannot then tell "the session is going away" from "I could not
+/// reach it".
+///
+/// Everything that is *not* the session speaking — a queue that was
+/// flushed, a dead wire, this client's own refusal — is still the slot
+/// being unreachable, and says so.
+fn forwarded_failure(error: &crate::host_conn::HostOpError) -> HostOpFailure {
+    match error {
+        crate::host_conn::HostOpError::Rejected { code, message } => {
+            HostOpFailure::new(code.as_str(), message.clone())
+        }
+        other => HostOpFailure::new(
+            roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
+            other.to_string(),
+        ),
+    }
+}
+
+/// A forwarded op that could not be put to the slot (plan 063 §D10) —
+/// the slot is down, or a switch has quiesced it.
+///
+/// The same code both ways, deliberately: from the caller's side "the
+/// local session could not take this" is one outcome with two reasons,
+/// and the sentence says which.
+fn slot_unavailable(message: &str) -> Result<serde_json::Value, HostOpFailure> {
+    Err(HostOpFailure::new(
+        roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
+        message,
+    ))
+}
+
+/// What a forwarded mutation is to [`local_backend::HostOpsInFlight`].
+///
+/// Only a project creation is `Create`, matching the local dispatches:
+/// §D6 and §D9 both ask "is a creation owed?" as its own clause, and a
+/// forwarded `tab.open` is no more a creation than the ⌘T that reaches
+/// `open_host_tab_flow`.
+fn forwarded_op_kind(op: &str) -> local_backend::HostOpKind {
+    match op == roost_ipc::messages::ops::PROJECT_CREATE {
+        true => local_backend::HostOpKind::Create,
+        false => local_backend::HostOpKind::Other,
+    }
+}
+
 /// What a finished gesture says on the `tab.send_file` wire — plan 047
 /// §3.4's error precedence, minus what [`send_file_refusal`] and the
 /// servicing arm answer before a gesture exists at all.
@@ -281,6 +335,24 @@ fn host_dump(view: &HostView) -> SidebarDumpHost {
                     .collect(),
             })
             .collect(),
+    }
+}
+
+/// One band of the sidebar's section strip, as `app.sidebar_dump`
+/// reports it (plan 063 §D2).
+///
+/// Read off the same `host_sections` the sidebar paints from, for the
+/// same reason the agent rows are: a band derived a second time here
+/// could disagree with the one on screen.
+fn section_dump(section: &host_sidebar::Section) -> SidebarDumpSection {
+    SidebarDumpSection {
+        role: section.role.as_str().to_string(),
+        label: section.label.clone(),
+        state: section.state.wire().to_string(),
+        dot: section.state.dot().as_str().to_string(),
+        saved_id: section.saved_id.clone(),
+        reconnect_row: section.state.offers_reconnect(),
+        fidelity: section.fidelity.map(|action| action.as_str().to_string()),
     }
 }
 
@@ -837,6 +909,70 @@ fn paste_only_keybind(action: &str) -> Result<KeybindAction, String> {
         .ok_or_else(|| "\"paste\" did not resolve to a KeybindAction".to_string())
 }
 
+/// The `HostId` a [`HostView`](super::HostView) carries when no
+/// connection has ever published rows for that host.
+///
+/// `HostId::LOCAL` is a *placeholder* here — "header-only section, no
+/// rows" — and never a destination. Named rather than spelled inline
+/// because it is one of the two routes by which `HostId::LOCAL` can
+/// reach a creation dispatch: under `local-backend = session` following
+/// it would create in the invisible in-process workspace, which is what
+/// [`creation_route`](super::creation_route) exists to refuse.
+pub(super) fn view_incarnation(incarnation: Option<HostId>) -> HostId {
+    incarnation.unwrap_or(HostId::LOCAL)
+}
+
+/// The host half of plan 063 §D9's exit inputs, read off the bands and
+/// the connection set together.
+///
+/// Together, because neither is the whole answer on its own. The band
+/// carries the rows; whether an attempt is in flight is the connection
+/// set's, and an ssh host that reached a session and dropped keeps its
+/// `HostConn` — so a fresh handshake over it still renders
+/// `Disconnected`. Reading only the band would let the last local
+/// project closing during that handshake look like "nothing left
+/// anywhere" and end the process mid-dial.
+pub(super) fn host_exit_rows(
+    views: &[super::HostView],
+    hosts: &crate::host_conn::HostConnSet,
+) -> Vec<local_backend::HostExitRow> {
+    views
+        .iter()
+        .map(|view| local_backend::HostExitRow {
+            // A disconnected section keeps the rows its last connection
+            // published (`HostConnSet::section` hands back the retained
+            // mirror), so this one read covers both halves of §D9's
+            // "live mirror or retained".
+            visible_rows: !view.projects.is_empty(),
+            connecting: view.state == host_sidebar::SectionState::Connecting
+                || hosts.ssh_establishing(&view.saved_id),
+        })
+        .collect()
+}
+
+/// Whether this client still has a connection attempt a host could land
+/// on: an ssh handshake out, or a connection in a state a landing can
+/// still come from.
+///
+/// True the instant an attempt starts, under both transports —
+/// [`HostConnSet::connect`] seats a `Connecting` entry synchronously and
+/// `open_ssh` seats the ssh state — so a purpose armed and read in the
+/// same reconcile is never mistaken for a stale one. False the moment
+/// there is nothing left to land: a failed handshake, a drop, a host
+/// that is no longer saved.
+///
+/// [`HostConnSet::connect`]: crate::host_conn::HostConnSet
+pub(super) fn attempt_alive(hosts: &crate::host_conn::HostConnSet, saved_id: &str) -> bool {
+    hosts.ssh_establishing(saved_id)
+        || matches!(
+            hosts.state(saved_id),
+            Some(
+                crate::host_conn::HostConnState::Connecting { .. }
+                    | crate::host_conn::HostConnState::Connected
+            )
+        )
+}
+
 /// A saved host's target as the sidebar model names it.
 ///
 /// [`host_sidebar::HostTransportKind`] mirrors
@@ -886,6 +1022,24 @@ impl App {
         if self.window_id.is_some() {
             self.refresh_pill_labels();
         }
+        // The switch state machine (plan 063 §D8a) runs first of the
+        // three, because the other two *read its latch*: a phase that
+        // ends here must not leave the auto-remove and the exit rule
+        // below acting on a half-migrated workspace, and a phase that
+        // starts here must have raised the latch before they look.
+        // Every input a phase waits on — a host reaching `Connected`, a
+        // mirror batch, a step completion — already passes through this
+        // reconcile, which is why the driver has no clock of its own.
+        self.drive_switch();
+        // Before the exit rule, and in the same reconcile it was
+        // scheduled by, because §D9's slot carve-out is satisfied by
+        // the removal this may perform: the last project on the slot
+        // closing takes the slot out of the registry, and *that* is
+        // what lets the window close (plan 063 §D6/§D9).
+        // Before both guards below read it: a purpose whose attempt is
+        // over owes nothing and must not hold the window open.
+        self.prune_connect_purposes();
+        self.run_pending_host_removals();
         self.request_exit_if_empty();
         self.reconcile_confirm_delete();
         self.reconcile_tab_drag_preview();
@@ -906,8 +1060,14 @@ impl App {
         // Before the selection check, which decides whether the window
         // is still showing a row that exists: whatever this selects is
         // then validated exactly as any other selection would be.
+        self.resolve_initial_local_selection();
         self.resolve_pending_host_selection();
         self.reconcile_host_selection();
+        // Both of this snapshot's inputs are settled here: the views
+        // were rebuilt at the top of this reconcile and the selection
+        // just now. A *connection* change publishes through no other
+        // edge (plan 063 §D10), and the write is change-detected.
+        self.publish_local_route();
         self.refresh_sidebar_agents();
         self.refresh_agent_palette();
         // Host verbs are live state too: a host that connected while the
@@ -929,10 +1089,26 @@ impl App {
             .retain(|key, _| key.host != host || live.contains(key));
         self.pending_attachments.retain_live(host, &live);
         let active_key = self.active_tab_key();
+        // **On the edge, not on every reconcile**, which is what the log
+        // line below has always said this was. The pointer can only be
+        // over the tab on screen, so a tab losing that place drops its
+        // gesture and hover — but a tab that was already in the
+        // background has no stale state to drop, and clearing it every
+        // reconcile makes the *whole gesture* unrepresentable there: a
+        // synthetic press through `tab.dispatch_mouse_event` (which
+        // names a tab by id, not by what is showing) had its capture
+        // wiped before the release arrived, so the application on the
+        // far end saw a button go down and never come up.
+        //
+        // `revealed_tab` is the memo of the last observed active tab, so
+        // the edge is read off it before `request_tab_reveal` moves it.
+        let active_changed = self.revealed_tab != Some(active_key);
         self.request_tab_reveal(active_key);
-        for (key, tab) in &mut self.tabs {
-            if *key != active_key && tab.reset_pointer_state() {
-                refresh_or_warn(key.tab, tab, "pointer reset after active tab changed");
+        if active_changed {
+            for (key, tab) in &mut self.tabs {
+                if *key != active_key && tab.reset_pointer_state() {
+                    refresh_or_warn(key.tab, tab, "pointer reset after active tab changed");
+                }
             }
         }
         // Every focus change funnels through `focus_tab_and_clear`, which
@@ -957,12 +1133,228 @@ impl App {
     /// closing the last tab (the engine cascades tab → project), the
     /// confirm dialog, the palette, and raw `project.delete` over IPC.
     ///
-    /// Boot is safe: `hydrate_workspace` seeds a default project before
-    /// the first reconcile, so the workspace is never observed empty
-    /// except after the user emptied it.
+    /// Boot is safe under `in-process`: `hydrate_workspace` seeds a
+    /// default project before the first reconcile. Under `session` it is
+    /// the *slot* being in the registry that holds the window open
+    /// before the first mirror arrives, which is the same clause that
+    /// keeps it open through a failed spawn.
+    ///
+    /// The predicate itself is [`local_backend::exit_on_empty`] — every
+    /// clause of plan 063 §D9, unit-tested a column at a time. This is
+    /// the reading of the app's state that feeds it.
     fn request_exit_if_empty(&mut self) {
-        if self.exit_state.observe(self.projects.is_empty()) {
+        let hosts = host_exit_rows(&self.host_views, &self.hosts);
+        let exit = local_backend::exit_on_empty(local_backend::ExitInput {
+            mode: self.local_backend,
+            local_projects_empty: self.projects.is_empty(),
+            hosts: &hosts,
+            creation_pending: self.host_creation_pending(),
+            switch_in_flight: self.switch_in_flight(),
+            slot_registered: self.local_slot_saved_id().is_some(),
+            slot_ever_registered: self.slot_ever_registered.ever(),
+        });
+        if self.exit_state.observe(exit) {
             tracing::info!("last project closed; exiting");
+        }
+    }
+
+    /// Whether any host is owed a project this client has not delivered
+    /// yet (plan 063 §D6/§D12) — a seed or a create-after-connect,
+    /// either parked against a connect in flight or already dispatched.
+    ///
+    /// Both halves matter: between arming the purpose and the landing
+    /// there is no op to see, and between the dispatch and its reply
+    /// there is no purpose left.
+    ///
+    /// A parked purpose counts only while [`Self::attempt_alive`] says
+    /// there is still an attempt for it to land on. That is a read, not
+    /// a cleanup, deliberately: this guard blocks the exit, and an ssh
+    /// establish that fails permanently publishes **no** `HostState` at
+    /// all, so the one edge that clears a purpose never runs and a
+    /// cleanup living on it would strand the guard for the life of the
+    /// process. Anything that can end an attempt — a failed handshake,
+    /// a drop, a `host.remove` — makes this answer no by construction.
+    fn host_creation_pending(&self) -> bool {
+        self.host_ops.any_create()
+            || self.connect_purposes.iter().any(|(saved_id, purpose)| {
+                *purpose == local_backend::ConnectPurpose::CreateAfterConnect
+                    && attempt_alive(&self.hosts, saved_id)
+            })
+    }
+
+    /// Drop the parked connect purposes whose attempt is over (plan 063
+    /// §D12).
+    ///
+    /// Hygiene *and* correctness: a stale `CreateAfterConnect` left on a
+    /// host would be drained by `settle_connect_purpose` on some later,
+    /// unrelated connect and create a project nobody asked for. Done as
+    /// a sweep over live state rather than as a cleanup hung off each
+    /// way an attempt can end, because one of those ways — a permanent
+    /// ssh establish failure — publishes no `HostState` at all, so the
+    /// cleanup would never run.
+    fn prune_connect_purposes(&mut self) {
+        let Self {
+            connect_purposes,
+            hosts,
+            ..
+        } = self;
+        connect_purposes.retain(|saved_id, purpose| {
+            let alive = attempt_alive(hosts, saved_id);
+            if !alive {
+                tracing::debug!(host = %saved_id, ?purpose, "an attempt ended owing this");
+            }
+            alive
+        });
+    }
+
+    /// Plan 063 §D6: this batch deleted a project and left the host with
+    /// none. Schedule the removal; [`Self::run_pending_host_removal`]
+    /// decides when — and whether — it happens.
+    ///
+    /// One pending removal at a time. Two hosts emptying in the same
+    /// drain is not a case worth a queue: the second one's next batch,
+    /// state change or reconcile re-raises nothing, so it simply keeps
+    /// its band until the user acts. Overwriting rather than refusing
+    /// means the most recent claim is the one held, which is the one
+    /// whose mirror is most likely still empty.
+    fn schedule_host_auto_remove(&mut self, incarnation: HostId, revision: u64) {
+        let Some(saved_id) = self.hosts.owner_of(incarnation) else {
+            return;
+        };
+        tracing::info!(
+            host = %saved_id,
+            revision,
+            "the last project on a host was deleted; scheduling the auto-remove"
+        );
+        // Keyed by host, so two hosts emptying in one drain are two
+        // claims. Re-claiming the same host replaces its entry — and
+        // resets `confirming`, because a newer emptiness is a newer
+        // question than the one already out.
+        self.pending_auto_remove.insert(
+            saved_id,
+            local_backend::PendingAutoRemove {
+                incarnation,
+                revision,
+                confirming: false,
+            },
+        );
+    }
+
+    /// The gate on one scheduled auto-remove (plan 063 §D6), read off
+    /// live state.
+    fn removal_gate(
+        &self,
+        saved_id: &str,
+        pending: &local_backend::PendingAutoRemove,
+    ) -> local_backend::RemovalGate {
+        local_backend::RemovalGate {
+            owned: self.hosts.owns(pending.incarnation),
+            mirror_empty: self
+                .hosts
+                .mirror(pending.incarnation)
+                .is_some_and(|mirror| mirror.read().projects.is_empty()),
+            ops_settled: self.host_ops.settled(saved_id),
+            creation_pending: self.host_ops.creating(saved_id)
+                || (self.connect_purposes.contains_key(saved_id)
+                    && attempt_alive(&self.hosts, saved_id)),
+            switch_in_flight: self.switch_in_flight(),
+        }
+    }
+
+    /// Carry every scheduled auto-remove forward one reconcile (plan 063
+    /// §D6).
+    ///
+    /// Nothing is forgotten here. A claim that passes the gate asks the
+    /// **host** whether it is really empty
+    /// ([`crate::host_conn::HostConnSet::confirm_empty`]) and waits for
+    /// the answer; [`Self::host_emptiness_confirmed`] is where a host is
+    /// actually removed. The mirror cannot be the verdict — see that
+    /// method's doc for the two ordinary sequences in which it reads
+    /// empty while the session holds projects.
+    ///
+    /// Taken before it is walked, so the nested `reconcile` any of this
+    /// triggers finds nothing to redo.
+    fn run_pending_host_removals(&mut self) {
+        if self.pending_auto_remove.is_empty() {
+            return;
+        }
+        let claims = std::mem::take(&mut self.pending_auto_remove);
+        let sweep = local_backend::sweep_removals(claims, |saved_id, pending| {
+            local_backend::removal_step(self.removal_gate(saved_id, pending))
+        });
+        for saved_id in &sweep.dropped {
+            tracing::debug!(
+                host = %saved_id,
+                "dropping an auto-remove whose host is no longer the one it described"
+            );
+        }
+        for (saved_id, incarnation) in &sweep.confirm {
+            tracing::debug!(
+                host = %saved_id,
+                "asking a host whether its last project really is gone"
+            );
+            self.hosts.confirm_empty(saved_id, *incarnation);
+        }
+        self.pending_auto_remove = sweep.keep;
+    }
+
+    /// A host answered the confirming `tab.list` (plan 063 §D6) — the
+    /// only place the auto-remove actually forgets one.
+    ///
+    /// **Why the mirror is not the verdict.** It is a projection that
+    /// lags its session by however long a broadcast takes, and two
+    /// ordinary sequences make it read empty while the session holds
+    /// projects. A creation whose control reply beat its
+    /// `project.created` event: the delete that emptied the band and
+    /// the create that refilled it are both answered, the mirror has
+    /// only the first, and forgetting here loses the replacement (and
+    /// under `session` ends the process over live work). A resumed
+    /// connection replaying a gap: the delete at revision N and the
+    /// create at N+1 are both history, but the mirror passes through
+    /// "empty" between them, and there is nothing on the wire that says
+    /// a replay burst has more to come. The session is the party doing
+    /// the committing, so its own answer cannot be mid-sequence.
+    ///
+    /// The gate is re-read rather than trusted from before the round
+    /// trip: anything may have moved while the question was out.
+    pub(super) fn host_emptiness_confirmed(&mut self, reply: crate::host_conn::HostEmptiness) {
+        let Some(pending) = self.pending_auto_remove.remove(&reply.saved_id) else {
+            return;
+        };
+        if pending.incarnation != reply.incarnation {
+            // A reconnect replaced the connection that was asked; put
+            // the live claim back and let it ask again.
+            self.pending_auto_remove.insert(reply.saved_id, pending);
+            return;
+        }
+        // The claim is no longer "confirming": whatever this answer
+        // says, the question it was waiting on is answered.
+        let mut pending = pending;
+        pending.confirming = false;
+        let step = local_backend::confirmed_step(
+            reply.empty.as_ref().ok().copied(),
+            true,
+            local_backend::removal_step(self.removal_gate(&reply.saved_id, &pending)),
+        );
+        match step {
+            local_backend::ConfirmedStep::Requeue => {
+                self.pending_auto_remove.insert(reply.saved_id, pending);
+            }
+            local_backend::ConfirmedStep::Drop => tracing::info!(
+                host = %reply.saved_id,
+                answered = ?reply.empty,
+                "not forgetting a host after all — its own answer, or the world, disagreed"
+            ),
+            local_backend::ConfirmedStep::Forget => {
+                tracing::info!(
+                    host = %reply.saved_id,
+                    revision = pending.revision,
+                    "forgetting a host whose last project was closed"
+                );
+                if let Err(error) = self.host_remove_requested(&reply.saved_id) {
+                    tracing::warn!(host = %reply.saved_id, %error, "the auto-remove failed");
+                }
+            }
         }
     }
 
@@ -1352,13 +1744,37 @@ impl App {
     /// an attached host tab's client-side terminal (plan 037 §3.4). A
     /// ref from a dead connection epoch simply misses the map — the
     /// staleness contract `HostId` minting exists for.
-    fn wire_tab_key(&self, tab: roost_ipc::messages::WireTabRef) -> TabKey {
+    fn wire_tab_key(&self, tab: roost_ipc::messages::WireTabRef) -> Option<TabKey> {
         match tab {
-            roost_ipc::messages::WireTabRef::Local(tab_id) => self.backend.tab_key(tab_id),
+            roost_ipc::messages::WireTabRef::Local(tab_id) => self.local_tab_key(tab_id),
             roost_ipc::messages::WireTabRef::Host { host, tab } => {
-                TabKey::new(HostId::new(host), tab)
+                Some(TabKey::new(HostId::new(host), tab))
             }
         }
+    }
+
+    /// What a **bare** id off the IPC wire names (plan 063 §D10).
+    ///
+    /// The UI half of the bare-id rewrite. Most rewrite rows are
+    /// re-addressed at the handler, which can spell `h<n>.<id>` in the
+    /// params; the test ops whose `tab_id` is a bare `string_int64`
+    /// cannot be, so their resolution lands here instead — and it has to
+    /// agree with the handler's, because both are answering "which tab
+    /// is the user looking at".
+    ///
+    /// Under `in-process` the slot is always there and is
+    /// `backend.tab_key`'s own `HostId::LOCAL`, so nothing has moved.
+    ///
+    /// `None` is a slot that is **down** under `session`, and it is an
+    /// answer rather than a fallback to the in-process backend: that
+    /// workspace is the one the window does not draw, and it can still
+    /// hold live tabs — `forward_commit` flips the mode before the
+    /// source teardown finishes, and an attached in-process tab outlives
+    /// that flip. Handing a bare id one of those would break §D10's
+    /// invariant that a bare id means the slot, silently, on the caller
+    /// whose slot went away mid-op.
+    pub(super) fn local_tab_key(&self, tab_id: i64) -> Option<TabKey> {
+        self.local_slot_host().map(|host| TabKey::new(host, tab_id))
     }
 
     /// Queue a strip reveal when the OBSERVED active tab changed. Hooked
@@ -1575,8 +1991,16 @@ impl App {
                     // publishes every effect to every subscriber, and
                     // which of them this client acts on is decided
                     // below — see `apply_host_clipboard_effect`.
-                    if let crate::host_conn::HostWorkspaceEvent::Applied { events, .. } = &event {
+                    if let crate::host_conn::HostWorkspaceEvent::Applied {
+                        events,
+                        revision,
+                        became_empty_by_delete,
+                    } = &event
+                    {
                         task = task.then(self.apply_host_envelopes(host, events));
+                        if *became_empty_by_delete {
+                            self.schedule_host_auto_remove(host, *revision);
+                        }
                     }
                     // The mirror moving leaves the view's copy of it
                     // behind — the tail reconcile is what rebuilds the
@@ -1621,6 +2045,26 @@ impl App {
                             // this client's current config — see
                             // `HostConnSet::wire_agent_hooks`.
                             self.wire_host_agent_hooks(host);
+                            // What this connect owed its landing (plan
+                            // 063 §D12). Drained on the edge, so it is
+                            // spent exactly once per connect.
+                            task = task.then(self.settle_connect_purpose(host));
+                        } else if !matches!(
+                            self.hosts.state(host),
+                            Some(crate::host_conn::HostConnState::Connecting { .. })
+                        ) {
+                            // The attempt ended somewhere other than
+                            // `Connected` and nothing is retrying: a
+                            // purpose parked against a landing that is
+                            // not going to happen would otherwise fire
+                            // on some later connect nobody asked it for.
+                            if let Some(purpose) = self.connect_purposes.remove(host) {
+                                tracing::debug!(
+                                    %host,
+                                    ?purpose,
+                                    "dropping what a failed connect was going to do"
+                                );
+                            }
                         }
                         // Attributed (not a stale task's publication): the
                         // app-side purge follows the set's — everything
@@ -1646,6 +2090,8 @@ impl App {
                 }
                 EngineFeed::HostTunnel(ready) => self.host_tunnel_ready(*ready),
                 EngineFeed::HostBootstrap(event) => self.host_bootstrap_event(*event),
+                EngineFeed::HostEmptiness(reply) => self.host_emptiness_confirmed(*reply),
+                EngineFeed::LocalBackendSwitch(done) => self.switch_step_completed(*done),
                 // A signal reached the process (plan 039 §3.9). Same
                 // latch the macOS menu's Quit item uses — `take_exit_task`
                 // (called every `update()`) is what turns this into
@@ -2134,6 +2580,11 @@ impl App {
     /// one that has never connected lists none. With no saved hosts this
     /// clears to empty and the sidebar keeps exactly today's chrome.
     pub(super) fn refresh_host_views(&mut self) {
+        // Read together with the registry below, because the palette's
+        // recents rows are filtered against it (plan 063 §D7): a
+        // recents list taken at a different moment could offer back a
+        // host the sidebar is already showing.
+        self.recent_hosts = self.workspace.recent_hosts();
         self.host_views = self
             .workspace
             .hosts()
@@ -2166,9 +2617,10 @@ impl App {
                     // one that exists before a connection does.
                     label: host.label,
                     transport: transport_kind(&host.target),
+                    target: host.target,
                     reduced_fidelity,
                     reason,
-                    host: incarnation.unwrap_or(HostId::LOCAL),
+                    host: view_incarnation(incarnation),
                     state,
                     projects: mirror
                         .as_ref()
@@ -2179,6 +2631,118 @@ impl App {
                 }
             })
             .collect();
+        // One-way, and armed from the registry rather than from the
+        // launch path, so a slot a *user* adds by hand arms it too
+        // (plan 063 §D9). Read by the exit rule below, which cannot
+        // otherwise tell the slot the auto-remove just took out from
+        // one `ensure_local_slot` never managed to save.
+        self.slot_ever_registered
+            .observe(self.local_slot_view().is_some());
+    }
+
+    /// Spend what a connect owed its landing (plan 063 §D6/§D12).
+    ///
+    /// Two things can be owed, and both are creations, which is why one
+    /// place decides between them: a caller that parked
+    /// `CreateAfterConnect` gets its project unconditionally, and every
+    /// purpose that *seeds* gets one only if the host came up holding
+    /// nothing.
+    ///
+    /// The emptiness is read here rather than carried, and it is a
+    /// different question from §D6's `became_empty_by_delete`: a host
+    /// that is empty **at connect** is one nobody emptied — it may never
+    /// have held anything, or another client may have cleared it while
+    /// this one was away — so it is seeded, not forgotten. Only a batch
+    /// this client watched arrive can say a project was deleted.
+    ///
+    /// Safe to read on this edge because the connect publishes its
+    /// `Reset` before `Connected` and the feed preserves that order, so
+    /// the mirror below is the one the fenced `tab.list` built.
+    fn settle_connect_purpose(&mut self, saved_id: &str) -> UiTask {
+        let purpose = self.connect_purposes.remove(saved_id).unwrap_or_default();
+        let Some(incarnation) = self.hosts.incarnation(saved_id) else {
+            return UiTask::None;
+        };
+        let empty = self
+            .hosts
+            .mirror(incarnation)
+            .is_some_and(|mirror| mirror.read().projects.is_empty());
+        let create = match purpose {
+            local_backend::ConnectPurpose::CreateAfterConnect => true,
+            purpose => purpose.seeds() && empty,
+        };
+        if !create {
+            return UiTask::None;
+        }
+        tracing::info!(host = %saved_id, ?purpose, "creating a project on a host that just connected");
+        self.create_host_project_dispatch(incarnation).task
+    }
+
+    /// *The slot*: the saved host that holds the local band under
+    /// `local-backend = session` — the first with a localhost transport,
+    /// in registry order (plan 063 §D2/§D7). Read whatever the mode is;
+    /// under `in-process` it is an ordinary `LOCALHOST` band and
+    /// [`host_sidebar::sections`] ignores it.
+    ///
+    /// The one definition of "which saved host is the slot";
+    /// [`Self::local_slot_saved_id`] and [`Self::local_slot_host`] are
+    /// both this lookup, so they cannot name different hosts.
+    fn local_slot_view(&self) -> Option<&super::HostView> {
+        self.host_views
+            .iter()
+            .find(|view| view.transport.localhost())
+    }
+
+    pub(super) fn local_slot_saved_id(&self) -> Option<String> {
+        self.local_slot_view().map(|view| view.saved_id.clone())
+    }
+
+    /// The label to save this machine's session under, against the live
+    /// registry (plan 063 §D7's collision rule).
+    ///
+    /// The one spelling of that rule is [`local_backend::slot_label`];
+    /// bootstrap's `ensure_local_slot` and the palette's two localhost
+    /// rows all come here, so the plain `localhost` an SSH host already
+    /// holds cannot make one of them fail duplicate-label validation
+    /// while the other steps past it.
+    pub(super) fn slot_label(&self) -> Option<String> {
+        local_backend::slot_label(|candidate| self.workspace.check_host_label(candidate).is_ok())
+    }
+
+    /// The backend half of every surface that renders or offers the
+    /// local band: the sidebar's sections, the palette's verbs, and the
+    /// "New Project on…" picker all read the same pair.
+    pub(super) fn local_slot_input(&self) -> host_sidebar::LocalSlot<'_> {
+        host_sidebar::LocalSlot {
+            mode: self.local_backend,
+            slot_saved_id: self.local_slot_view().map(|view| view.saved_id.as_str()),
+        }
+    }
+
+    /// **The only seam that resolves "the local target"** (plan 063
+    /// §D3): the in-process workspace under `in-process`, the slot's
+    /// live incarnation under `session`, and `None` when the slot is not
+    /// connected — because under `session` there is no second local
+    /// backend to fall back to, and falling back to `HostId::LOCAL`
+    /// would land in the workspace this mode does not draw.
+    pub(super) fn local_slot_host(&self) -> Option<HostId> {
+        match self.local_backend {
+            LocalBackendMode::InProcess => Some(HostId::LOCAL),
+            LocalBackendMode::Session => self.connected_slot_host(),
+        }
+    }
+
+    /// The slot's live incarnation, **whatever the mode says**.
+    ///
+    /// [`Self::local_slot_host`] is this plus the mode's own answer, and
+    /// the difference is the forward switch (plan 063 §D8): it replays
+    /// onto the slot while the mode still reads `in-process`, so asking
+    /// the mode-aware seam there would answer `HostId::LOCAL` — the
+    /// workspace it is migrating *away* from.
+    pub(super) fn connected_slot_host(&self) -> Option<HostId> {
+        self.local_slot_view()
+            .filter(|view| view.state.interactive())
+            .map(|view| view.host)
     }
 
     fn refresh_sidebar_agents(&mut self) {
@@ -2211,7 +2775,12 @@ impl App {
         }
         self.sidebar_agents = rows;
         // Last, because the rollups read the counts filled just above.
+        let slot = self.local_slot_saved_id();
         self.host_sections = host_sidebar::sections(
+            host_sidebar::LocalSlot {
+                mode: self.local_backend,
+                slot_saved_id: slot.as_deref(),
+            },
             &self
                 .host_views
                 .iter()
@@ -2260,6 +2829,7 @@ impl App {
             agents_visible: self.config.show_sidebar_agents,
             projects,
             hosts: self.host_views.iter().map(host_dump).collect(),
+            sections: self.host_sections.iter().map(section_dump).collect(),
         }
     }
 
@@ -2361,7 +2931,7 @@ impl App {
                 reply,
             } => {
                 let key = self.wire_tab_key(tab_id);
-                let result = match self.tabs.get_mut(&key) {
+                let result = match key.and_then(|key| self.tabs.get_mut(&key)) {
                     Some(tab) => tab
                         .dump(scrollback)
                         .map_err(|error| DumpError::Read(error.to_string())),
@@ -2376,25 +2946,30 @@ impl App {
                 data,
                 reply,
             } => {
-                let key = self.backend.tab_key(tab_id);
+                let key = self.local_tab_key(tab_id);
                 // Same ordering as the feed batch's tail: an OSC action can
                 // mutate the tab (pointer shape), so it lands before the
                 // refresh that publishes it, never after. That second
                 // lookup is the price of handing `self` to `apply_osc_actions`.
                 let result = if !self.test_mode {
                     Err("ROOST_TEST_MODE=1 is required".to_string())
-                } else if let Some(actions) = self
-                    .tabs
-                    .get_mut(&key)
-                    .map(|tab| tab.scan_and_write_vt(&data))
-                {
-                    task = task.then(self.apply_osc_actions(key, actions));
-                    self.tabs
-                        .get_mut(&key)
-                        .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
-                        .and_then(|tab| tab.refresh_snapshot().map_err(|error| error.to_string()))
                 } else {
-                    Err(format!("tab {tab_id} has no live terminal"))
+                    let scanned = key.and_then(|key| {
+                        let actions = self.tabs.get_mut(&key)?.scan_and_write_vt(&data);
+                        Some((key, actions))
+                    });
+                    match scanned {
+                        Some((key, actions)) => {
+                            task = task.then(self.apply_osc_actions(key, actions));
+                            self.tabs
+                                .get_mut(&key)
+                                .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
+                                .and_then(|tab| {
+                                    tab.refresh_snapshot().map_err(|error| error.to_string())
+                                })
+                        }
+                        None => Err(format!("tab {tab_id} has no live terminal")),
+                    }
                 };
                 let _ = reply.send(result);
             }
@@ -2404,8 +2979,8 @@ impl App {
                 reply,
             } => {
                 let result = self
-                    .tabs
-                    .get(&self.wire_tab_key(tab_id))
+                    .wire_tab_key(tab_id)
+                    .and_then(|key| self.tabs.get(&key))
                     .and_then(|tab| tab.session.capture())
                     .ok_or_else(|| "ROOST_TEST_MODE=1 is required or tab is missing".to_string())
                     .and_then(|capture| {
@@ -2437,7 +3012,7 @@ impl App {
                         // pin; the route it is checked against carries the
                         // key, so both halves have to agree.
                         KeyboardRoute::Terminal(active)
-                            if active == self.backend.tab_key(tab_id) =>
+                            if Some(active) == self.local_tab_key(tab_id) =>
                         {
                             match action.as_str() {
                                 "preedit" => {
@@ -2474,8 +3049,8 @@ impl App {
             }
             UiRequest::TabDumpResolved { tab_id, reply } => {
                 let result = self
-                    .tabs
-                    .get(&self.wire_tab_key(tab_id))
+                    .wire_tab_key(tab_id)
+                    .and_then(|key| self.tabs.get(&key))
                     .map(TerminalTab::resolved_cells)
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"));
                 let _ = reply.send(result);
@@ -2577,7 +3152,11 @@ impl App {
                 let _ = reply.send(Ok(focused));
             }
             UiRequest::AppSelectedTabId { reply } => {
-                let _ = reply.send(Ok(self.workspace.active().1));
+                // UI truth, which under `session` is a tab on the slot
+                // and not a row in the workspace this mode hides. The
+                // same reading the title bar, the tab strip and
+                // `identify.active_tab_id` take (plan 063 §D10).
+                let _ = reply.send(Ok(self.active_tab_key().tab));
             }
             UiRequest::AppDockBadge { reply } => {
                 // Reads AppKit, deliberately without re-deriving the
@@ -2715,8 +3294,8 @@ impl App {
                 reply,
             } => {
                 let result = self
-                    .tabs
-                    .get_mut(&self.backend.tab_key(tab_id))
+                    .local_tab_key(tab_id)
+                    .and_then(|key| self.tabs.get_mut(&key))
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| {
                         let anchored = tab
@@ -2734,8 +3313,8 @@ impl App {
             }
             UiRequest::SelectionClear { tab_id, reply } => {
                 let result = self
-                    .tabs
-                    .get_mut(&self.backend.tab_key(tab_id))
+                    .local_tab_key(tab_id)
+                    .and_then(|key| self.tabs.get_mut(&key))
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| {
                         tab.selection.clear();
@@ -2745,8 +3324,8 @@ impl App {
             }
             UiRequest::SelectionDump { tab_id, reply } => {
                 let result = self
-                    .tabs
-                    .get_mut(&self.backend.tab_key(tab_id))
+                    .local_tab_key(tab_id)
+                    .and_then(|key| self.tabs.get_mut(&key))
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| tab.selection_dump().map_err(|error| error.to_string()));
                 let _ = reply.send(result);
@@ -2777,8 +3356,8 @@ impl App {
                 let result = if !self.test_mode {
                     Err("tab.expand_selection_at requires ROOST_TEST_MODE=1 at UI launch".into())
                 } else {
-                    self.tabs
-                        .get_mut(&self.backend.tab_key(tab_id))
+                    self.local_tab_key(tab_id)
+                        .and_then(|key| self.tabs.get_mut(&key))
                         .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                         .and_then(|tab| {
                             let expanded = tab.expand_selection_at(col, row, click_count);
@@ -2847,14 +3426,18 @@ impl App {
                     u16::try_from(mods)
                         .map_err(|_| format!("modifier mask {mods} exceeds u16"))
                         .and_then(|mods| {
-                            self.tabs
-                                .get_mut(&self.backend.tab_key(tab_id))
-                                .ok_or_else(|| format!("tab {tab_id} has no live terminal"))?
-                                .dispatch_pointer(kind, button, cell_x, cell_y, mods)
-                                .map_err(|error| error.to_string())
+                            self.dispatch_test_pointer(tab_id, kind, button, cell_x, cell_y, mods)
                         })
                 };
-                let _ = reply.send(result);
+                match result {
+                    Ok(next) => {
+                        task = task.then(next);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
             }
             // The host registry + connections, as ops (plan 037 §3.5).
             // Served here rather than in the engine so a `roostctl host`
@@ -2897,13 +3480,15 @@ impl App {
             // cannot express, in §3.4's order: the tab, then the host,
             // then the paths.
             UiRequest::TabSendFile { tab, paths, reply } => {
-                let key = self.wire_tab_key(tab);
-                if !self.tab_live(key) {
+                let live = self.wire_tab_key(tab).filter(|key| self.tab_live(*key));
+                let Some(key) = live else {
                     let _ = reply.send(Err(HostOpFailure::new(
                         "not-found",
                         format!("tab {tab} has no live terminal"),
                     )));
-                } else if let Some(failure) = send_file_refusal(self.transfer_target(key), &paths) {
+                    return task;
+                };
+                if let Some(failure) = send_file_refusal(self.transfer_target(key), &paths) {
                     let _ = reply.send(Err(failure));
                 } else {
                     let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
@@ -2911,6 +3496,12 @@ impl App {
                     task = task.then(self.send_files(key, paths, Some(outcome_tx)));
                     defer_send_file_reply(&self.runtime_handle, outcome_rx, reply);
                 }
+            }
+            // Plan 063 §D10: one bare-id op, put to the slot. Spawned
+            // like every other host call — `update` never waits on a
+            // round trip to a session.
+            UiRequest::LocalSessionForward { op, params, reply } => {
+                task = task.then(self.local_session_forward(op, params, reply));
             }
             UiRequest::HostTabReorder {
                 host,
@@ -3007,6 +3598,76 @@ impl App {
     /// the reply rides into the spawned future and is answered there.
     /// Dropping it instead would reach the caller as
     /// `internal: UI dropped reply`, which says nothing about a host.
+    /// Put one forwarded op to the slot and answer its caller with the
+    /// slot's own reply (plan 063 §D10).
+    ///
+    /// Three things happen here that a plain `HostOps::call` would not
+    /// do, and each has a rule behind it:
+    ///
+    /// * a mutation is refused while a switch is in flight (§D8a), with
+    ///   the same stable sentence `run_host_verb` gives the palette;
+    /// * a mutation mints its id through [`App::take_host_op_id`], so
+    ///   §D6's auto-remove waits for it — a forwarded `project.delete`
+    ///   is exactly the op that can empty the slot, and exactly the one
+    ///   whose reply a removal must not swallow;
+    /// * a session's refusal crosses verbatim ([`forwarded_failure`]),
+    ///   which is what makes a forwarded error *be* the session's.
+    ///
+    /// The call is fenced at the slot's current incarnation, so an
+    /// intent that reaches the queue after the connection dropped is
+    /// refused rather than served by its replacement — see
+    /// [`crate::host_conn::queue::HostIntent::fence`].
+    ///
+    /// The reply does **not** travel with the dispatch: it is parked
+    /// under the op id and written on the main thread in
+    /// [`App::engine_op_completed`], immediately before the same
+    /// `HostOpsInFlight` entry is retired. That is what makes "the op is
+    /// retired after its caller has been answered" a statement about one
+    /// thread rather than a race between two.
+    fn local_session_forward(
+        &mut self,
+        op: String,
+        params: serde_json::Value,
+        reply: roost_engine::ipc::HostOpReply<serde_json::Value>,
+    ) -> UiTask {
+        let Some(host) = self.connected_slot_host() else {
+            let _ = reply.send(slot_unavailable(roost_ipc::local_route::SLOT_UNAVAILABLE));
+            return UiTask::None;
+        };
+        let Some(queue) = self.hosts.ops_for(host).cloned() else {
+            let _ = reply.send(slot_unavailable(roost_ipc::local_route::SLOT_UNAVAILABLE));
+            return UiTask::None;
+        };
+        let mutating = roost_engine::ipc::is_mutating_op(&op);
+        if mutating && self.switch_in_flight() {
+            let _ = reply.send(slot_unavailable(local_backend::SWITCH_BUSY));
+            return UiTask::None;
+        }
+        // A read mints an id too, so the dispatch has one shape; only a
+        // mutation is *registered*, and `HostOpsInFlight::finish` on an
+        // unregistered id is a no-op.
+        let op_id = match mutating {
+            true => self.take_host_op_id(host, forwarded_op_kind(&op)),
+            false => self.take_engine_op_id(),
+        };
+        self.forward_replies.insert(op_id, reply);
+        let call = queue.call_at(host, op, params);
+        self.engine_op(
+            async move { Ok::<_, String>(call.await.map_err(|error| forwarded_failure(&error))) },
+            move |joined| {
+                // The join half can only fail if the op panicked or the
+                // runtime is going away; either way the client is owed
+                // an answer rather than a dropped channel.
+                let answer =
+                    joined.unwrap_or_else(|error| Err(HostOpFailure::new("internal", error)));
+                EngineOpResult::LocalForward {
+                    op: op_id,
+                    answer: Box::new(answer),
+                }
+            },
+        )
+    }
+
     fn host_reorder_op(
         &self,
         host: HostId,
@@ -3056,33 +3717,29 @@ impl App {
         self.refresh_sidebar_agents();
 
         let saved = self.workspace.hosts();
-        // `host_sections` is LOCAL plus one band per view, and empty
-        // when there are no saved hosts at all (the zero-host sidebar is
-        // byte-identical to the pre-host-sessions one).
-        let paired = saved.len() == self.host_views.len()
-            && (self.host_views.is_empty()
-                || self.host_sections.len() == self.host_views.len() + 1);
-        if !paired {
+        if saved.len() != self.host_views.len() {
             return Err(roost_engine::WorkspaceError::Inconsistent(format!(
-                "the sidebar has {} bands and {} views for {} saved hosts",
-                self.host_sections.len(),
+                "the sidebar has {} views for {} saved hosts",
                 self.host_views.len(),
                 saved.len(),
             )));
         }
 
         let mut hosts = Vec::new();
-        for (index, host) in saved.into_iter().enumerate() {
+        for host in saved {
             if id.is_some_and(|id| id != host.id) {
                 continue;
             }
-            let band = &self.host_sections[index + 1];
-            if band.saved_id.as_deref() != Some(host.id.as_str()) {
+            // Keyed, never positional (plan 063 §D2): under `session`
+            // the slot's band leads the sidebar in the local band's
+            // place, so "band n + 1 is saved host n" no longer holds.
+            let Some(band) = host_sidebar::band_for(&self.host_sections, &host.id) else {
                 return Err(roost_engine::WorkspaceError::Inconsistent(format!(
-                    "band {index} is {:?}, not host {}",
-                    band.saved_id, host.id
+                    "no sidebar band renders host {} (the sidebar has {} bands)",
+                    host.id,
+                    self.host_sections.len(),
                 )));
-            }
+            };
             hosts.push(HostStatus {
                 id: host.id.clone(),
                 label: host.label,
@@ -3207,6 +3864,211 @@ mod tests {
 
     use super::file_transfer::LostReason;
     use super::*;
+
+    /// Plan 063 §D10: a forwarded mutation is registered by what it does
+    /// to the slot, and only a project creation is a creation.
+    #[test]
+    fn a_forwarded_project_create_is_the_only_creation() {
+        use roost_ipc::messages::ops;
+        assert_eq!(
+            forwarded_op_kind(ops::PROJECT_CREATE),
+            local_backend::HostOpKind::Create
+        );
+        for op in [
+            ops::TAB_OPEN,
+            ops::TAB_CLOSE,
+            ops::PROJECT_DELETE,
+            ops::TAB_WRITE,
+        ] {
+            assert_eq!(
+                forwarded_op_kind(op),
+                local_backend::HostOpKind::Other,
+                "{op}"
+            );
+        }
+    }
+
+    /// The forward arm asks `is_mutating_op`, so the two ends of §D10's
+    /// guard cannot drift: everything forwarded except the one read has
+    /// to be gated, and the read has to not be.
+    #[test]
+    fn every_forwarded_op_but_the_read_is_a_mutation() {
+        for (op, class) in roost_ipc::local_route::OP_CLASSES {
+            if *class != roost_ipc::OpClass::Forward {
+                continue;
+            }
+            let mutating = roost_engine::ipc::is_mutating_op(op);
+            assert_eq!(
+                mutating,
+                *op != roost_ipc::messages::ops::TAB_LIST,
+                "{op} is forwarded; is_mutating_op says {mutating}"
+            );
+        }
+    }
+
+    /// Plan 063 §D10/AC8: a forwarded op returns **the session's** error,
+    /// and `shutting-down` is the case that proves it is not the same
+    /// mapping the rewrite path uses.
+    ///
+    /// `shutting-down` is deliberately excluded from
+    /// [`CODES_A_UI_SOCKET_ALSO_SPEAKS`] — it describes a *session's*
+    /// stop latch, which a UI socket has no notion of — so it is a code
+    /// this socket cannot mint on its own, and the two mappers
+    /// demonstrably disagree about it.
+    #[test]
+    fn a_forwarded_refusal_crosses_verbatim_where_the_rewrite_path_would_fold_it() {
+        let refusal = crate::host_conn::HostOpError::Rejected {
+            code: roost_ipc::client::ServerCode::from_wire("shutting-down"),
+            message: "session is shutting down".into(),
+        };
+
+        let forwarded = forwarded_failure(&refusal);
+        assert_eq!(forwarded.code, "shutting-down");
+        assert_eq!(forwarded.message, "session is shutting down");
+
+        // The mapping the UI-answered ops keep, on the same input.
+        let folded = host_op_failure(&refusal);
+        assert_eq!(folded.code, HOST_UNAVAILABLE);
+        assert_ne!(folded.code, forwarded.code, "the two mappers differ here");
+        assert!(folded.message.contains("shutting-down"), "{folded:?}");
+
+        // A code this socket does speak crosses on both paths, which is
+        // why `shutting-down` and not `invalid-param` is the case above.
+        let ordinary = crate::host_conn::HostOpError::Rejected {
+            code: roost_ipc::client::ServerCode::from_wire("invalid-param"),
+            message: "tab 9 is not in project 1".into(),
+        };
+        assert_eq!(forwarded_failure(&ordinary), host_op_failure(&ordinary));
+
+        // Not the session speaking: the slot is simply unreachable.
+        let dropped = forwarded_failure(&crate::host_conn::HostOpError::Disconnected);
+        assert_eq!(dropped.code, roost_ipc::local_route::SLOT_UNAVAILABLE_CODE);
+        assert_eq!(dropped.message, "the host disconnected before this ran");
+    }
+
+    /// Both refusals a forward can answer keep the UI socket's own
+    /// documented code, and differ only in the sentence.
+    #[test]
+    fn a_refused_forward_says_which_of_the_two_reasons_it_was() {
+        let down = slot_unavailable(roost_ipc::local_route::SLOT_UNAVAILABLE).unwrap_err();
+        let busy = slot_unavailable(local_backend::SWITCH_BUSY).unwrap_err();
+        // The typed code this socket already documents, not a new one.
+        assert_eq!(down.code, HOST_UNAVAILABLE);
+        assert_eq!(busy.code, down.code);
+        assert_eq!(down.message, "local session is not connected");
+        assert!(busy.message.starts_with("busy:"), "{}", busy.message);
+    }
+
+    /// `app.sidebar_dump`'s band strip, one row per plan 063 §D2
+    /// rendering, projected from the very sections the sidebar paints.
+    ///
+    /// This is the wire half of AC5: the session-only band answers
+    /// `PROJECTS` with a *saved host's* dot and `saved_id`, and offers ↻
+    /// exactly when that host is down.
+    #[test]
+    fn the_dumped_band_strip_reports_each_presence_rendering() {
+        use host_sidebar::{HostInput, HostTransportKind, LocalSlot, SectionState};
+        use roost_ipc::LocalBackendMode;
+
+        let slot = |state| HostInput {
+            saved_id: "hs-slot",
+            label: "localhost",
+            host: HostId::new(1),
+            state,
+            transport: HostTransportKind::Localhost,
+            reduced_fidelity: false,
+            agents: 0,
+            reason: None,
+        };
+        let ssh = HostInput {
+            saved_id: "hs-box",
+            label: "box",
+            host: HostId::new(2),
+            state: SectionState::Disconnected,
+            transport: HostTransportKind::Ssh,
+            reduced_fidelity: false,
+            agents: 0,
+            reason: None,
+        };
+        let strip = |local: LocalSlot<'_>, hosts: &[HostInput<'_>]| {
+            host_sidebar::sections(local, hosts)
+                .iter()
+                .map(section_dump)
+                .collect::<Vec<_>>()
+        };
+        let session = LocalSlot {
+            mode: LocalBackendMode::Session,
+            slot_saved_id: Some("hs-slot"),
+        };
+        let told =
+            |band: &SidebarDumpSection| (band.role.clone(), band.label.clone(), band.dot.clone());
+
+        // In-process, no saved host: no strip at all — the sidebar draws
+        // its classic sticky header and the field stays off the wire.
+        assert!(strip(LocalSlot::default(), &[]).is_empty());
+
+        // In-process beside a saved localhost: today's two bands.
+        let both = strip(LocalSlot::default(), &[slot(SectionState::Connected), ssh]);
+        assert_eq!(
+            both.iter().map(told).collect::<Vec<_>>(),
+            vec![
+                ("local".into(), "LOCAL".to_string(), "connected".into()),
+                ("host".into(), "LOCALHOST".to_string(), "connected".into()),
+                ("host".into(), "BOX".to_string(), "offline".into()),
+            ]
+        );
+        assert_eq!(both[0].saved_id, None);
+        assert!(!both[0].reconnect_row);
+        assert!(both[2].reconnect_row, "a disconnected host offers ↻");
+
+        // Session with the slot connected: one local band, the slot's.
+        let up = strip(session, &[slot(SectionState::Connected), ssh]);
+        assert_eq!(
+            up.iter().map(told).collect::<Vec<_>>(),
+            vec![
+                ("session".into(), "PROJECTS".to_string(), "connected".into()),
+                ("host".into(), "BOX".to_string(), "offline".into()),
+            ]
+        );
+        assert_eq!(up[0].saved_id.as_deref(), Some("hs-slot"));
+        assert_eq!(up[0].state, "connected");
+        assert!(!up[0].reconnect_row);
+
+        // Session with the slot down: same band, its real dot and ↻.
+        let down = strip(session, &[slot(SectionState::Stopped)]);
+        assert_eq!(
+            told(&down[0]),
+            ("session".into(), "PROJECTS".to_string(), "offline".into())
+        );
+        assert_eq!(down[0].saved_id.as_deref(), Some("hs-slot"));
+        assert_eq!(down[0].state, "stopped");
+        assert!(down[0].reconnect_row);
+
+        // Session with no slot saved: the transient the launch path
+        // closes — pending, and addressed to nothing.
+        let none = strip(
+            LocalSlot {
+                mode: LocalBackendMode::Session,
+                slot_saved_id: None,
+            },
+            &[],
+        );
+        assert_eq!(
+            told(&none[0]),
+            ("session".into(), "PROJECTS".to_string(), "pending".into())
+        );
+        assert_eq!(none[0].saved_id, None);
+
+        // The pill's spelling reaches the wire off the same band.
+        let reduced = strip(
+            session,
+            &[HostInput {
+                reduced_fidelity: true,
+                ..slot(SectionState::Connected)
+            }],
+        );
+        assert_eq!(reduced[0].fidelity.as_deref(), Some("restart"));
+    }
 
     /// Under fan-out every client receives every effect, so the
     /// clipboard asks *this* client's own question: is the tab the copy
@@ -5025,6 +5887,185 @@ mod tests {
         );
 
         supervisor.close(84);
+    }
+
+    /// Plan 063 §D12's parked purposes are read through
+    /// `attempt_alive`, so what it answers is what releases that guard.
+    /// The case that matters is the one no `HostState` is published for:
+    /// a permanent establish failure, where a cleanup hung off the
+    /// state edge would never run and the guard would block the exit
+    /// for the life of the process.
+    #[tokio::test]
+    async fn an_attempt_is_alive_from_the_handshake_until_it_settles() {
+        use crate::host_conn::fixtures::{
+            a_connected_socket_host, a_set, abort_establishes, dropped, refuse, ssh_target,
+            unreachable,
+        };
+        use crate::host_conn::{AttemptCause, ConnectMode, RequestOrigin};
+
+        let (mut set, _feed) = a_set();
+        assert!(
+            !attempt_alive(&set, "h1"),
+            "a host nothing has dialed has no attempt to land on"
+        );
+
+        set.open_ssh(
+            "h1",
+            "one",
+            ssh_target("workbox"),
+            ConnectMode::Dial,
+            RequestOrigin::User,
+            AttemptCause::Explicit,
+        );
+        abort_establishes(&mut set);
+        assert!(
+            attempt_alive(&set, "h1"),
+            "alive from the instant the handshake starts, with no connection yet"
+        );
+
+        refuse(&mut set, unreachable());
+        assert!(
+            !attempt_alive(&set, "h1"),
+            "and dead when the handshake fails — the edge that publishes no HostState"
+        );
+
+        // A connection that lands is alive; one that drops is not.
+        // On a socket transport, which has no handshake of its own, so
+        // this half is the connection state alone.
+        let incarnation = a_connected_socket_host(&mut set, "h2", "/nonexistent/roost-alive.sock");
+        assert!(attempt_alive(&set, "h2"));
+        set.apply_state(incarnation, dropped("the connection closed"));
+        assert!(
+            !attempt_alive(&set, "h2"),
+            "a dropped connection is not something a landing can still come from"
+        );
+
+        // And a host that is not saved at all cannot be waiting on one.
+        set.remove("h2");
+        assert!(!attempt_alive(&set, "h2"));
+    }
+
+    /// Plan 063 §D9's `connecting` column, built from the band and the
+    /// connection set together.
+    ///
+    /// The row that matters is the one the band cannot describe: an ssh
+    /// host that reached a session, dropped, and is being dialed again
+    /// keeps its `HostConn`, so the section still renders
+    /// `Disconnected`. Reading only that would let the last local
+    /// project closing during the handshake end the process mid-dial.
+    #[tokio::test]
+    async fn a_band_that_reads_disconnected_mid_handshake_still_blocks_the_exit() {
+        use crate::host_conn::fixtures::{
+            a_dropped_ssh_host, a_set, abort_establishes, refuse, retry_once, unreachable,
+        };
+
+        let (mut hosts, _feed) = a_set();
+        a_dropped_ssh_host(&mut hosts, "/nonexistent/roost-exit-rows.sock");
+        abort_establishes(&mut hosts);
+        assert!(retry_once(&mut hosts), "the armed rung authorized a dial");
+
+        // The band as `refresh_host_views` builds it for this host: a
+        // dropped connection with no rows left to show.
+        let view = super::HostView {
+            saved_id: "h1".to_string(),
+            label: "one".to_string(),
+            target: "workbox".to_string(),
+            transport: host_sidebar::HostTransportKind::Ssh,
+            host: HostId::LOCAL,
+            state: host_sidebar::SectionState::Disconnected,
+            reduced_fidelity: false,
+            reason: None,
+            projects: Vec::new(),
+            active_tab_id: 0,
+            agents: 0,
+        };
+        let views = [view];
+
+        let rows = host_exit_rows(&views, &hosts);
+        assert!(
+            rows[0].connecting,
+            "a handshake in flight is an attempt, whatever the band says"
+        );
+        assert!(!rows[0].visible_rows);
+        assert!(
+            !local_backend::exit_on_empty(local_backend::ExitInput {
+                mode: roost_ipc::LocalBackendMode::InProcess,
+                local_projects_empty: true,
+                hosts: &rows,
+                creation_pending: false,
+                switch_in_flight: false,
+                slot_registered: false,
+                slot_ever_registered: false,
+            }),
+            "and the window stays open through it"
+        );
+
+        // The control the row is worth having: once the handshake
+        // settles, the same band exits.
+        refuse(&mut hosts, unreachable());
+        let settled = host_exit_rows(&views, &hosts);
+        assert!(!settled[0].connecting);
+        assert!(local_backend::exit_on_empty(local_backend::ExitInput {
+            mode: roost_ipc::LocalBackendMode::InProcess,
+            local_projects_empty: true,
+            hosts: &settled,
+            creation_pending: false,
+            switch_in_flight: false,
+            slot_registered: false,
+            slot_ever_registered: false,
+        }));
+    }
+
+    /// **The other end of the same row: an attempt that is over has to
+    /// stop blocking the exit.**
+    ///
+    /// A ladder that gives up on a *bare EOF* leaves the entry with no
+    /// tunnel and no failure — the same two absences a handshake in
+    /// flight has — so a `connecting` read off those absences is true
+    /// forever. `exit_on_empty` then never fires, `prune_connect_purposes`
+    /// keeps a parked `CreateAfterConnect` alive, and the window cannot
+    /// be closed for the life of the process.
+    #[tokio::test]
+    async fn a_ladder_that_gave_up_stops_blocking_the_exit() {
+        use crate::host_conn::fixtures::{a_ladder_that_gave_up_on_a_bare_eof, a_set};
+
+        let scratch = tempfile::tempdir().expect("temp dir");
+        let (mut hosts, _feed) = a_set();
+        a_ladder_that_gave_up_on_a_bare_eof(&mut hosts, scratch.path().to_path_buf()).await;
+
+        assert!(
+            !hosts.ssh_establishing("h1"),
+            "nothing is in flight: the ladder gave up and the entry holds no handshake"
+        );
+        assert!(
+            !attempt_alive(&hosts, "h1"),
+            "and there is nothing left for a parked purpose to land on"
+        );
+
+        let views = [super::HostView {
+            saved_id: "h1".to_string(),
+            label: "one".to_string(),
+            target: "workbox".to_string(),
+            transport: host_sidebar::HostTransportKind::Ssh,
+            host: HostId::LOCAL,
+            state: host_sidebar::SectionState::Disconnected,
+            reduced_fidelity: false,
+            reason: None,
+            projects: Vec::new(),
+            active_tab_id: 0,
+            agents: 0,
+        }];
+        let rows = host_exit_rows(&views, &hosts);
+        assert!(!rows[0].connecting, "the band and the set agree it is over");
+        assert!(local_backend::exit_on_empty(local_backend::ExitInput {
+            mode: roost_ipc::LocalBackendMode::InProcess,
+            local_projects_empty: true,
+            hosts: &rows,
+            creation_pending: false,
+            switch_in_flight: false,
+            slot_registered: false,
+            slot_ever_registered: false,
+        }));
     }
 
     /// [`App::apply_host_tab_frame`]'s reduced-fidelity edge (plan 056

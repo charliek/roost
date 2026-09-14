@@ -34,13 +34,13 @@ const PROMPT: Duration = Duration::from_secs(5);
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_fast_exiting_tab_closes_its_own_row() {
     let layout = support::Layout::new();
-    let launch_cwd = layout.launch_cwd.clone();
-    let served = layout.spawn(&launch_cwd);
+    let served = layout.spawn();
     let mut client = support::connect(&layout.socket_path()).await;
 
     let seeded = support::tabs(&mut client).await;
     assert_eq!(seeded.len(), 1);
     let project_id = seeded[0].project_id;
+    let seeded_cwd = seeded[0].cwd.clone();
     let scratch = layout.subdir("fast-exit");
 
     // No waiting between opens: each drain task is still being scheduled
@@ -96,7 +96,7 @@ async fn every_fast_exiting_tab_closes_its_own_row() {
         .collect();
     assert_eq!(
         persisted,
-        vec![support::canonical(&launch_cwd)],
+        vec![support::canonical(&seeded_cwd)],
         "an exited tab must not be persisted for the next start to resurrect"
     );
 }

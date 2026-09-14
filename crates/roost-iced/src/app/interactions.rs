@@ -391,6 +391,14 @@ impl App {
     /// dropping it (`HostOps`' contract), so the completion always
     /// arrives and the editor never sticks open waiting on nothing.
     fn host_rename_dispatch(&mut self, target: RenameTarget, label: &str, op: u64) -> UiTask {
+        // The id was minted by the editor's own state machine, so the
+        // registration is here rather than at a `take_host_op_id`
+        // (plan 063 §D6 tracks every locally-initiated host mutation).
+        self.host_ops.begin(
+            op,
+            self.hosts.owner_of(target.host()),
+            local_backend::HostOpKind::Other,
+        );
         let Some(ops) = self.hosts.ops_for(target.host()).cloned() else {
             return self.engine_op(
                 async move { Err("that host is not accepting operations".to_string()) },
@@ -1028,7 +1036,14 @@ impl App {
     /// local workspace always, a host only while its section is
     /// interactive at the incarnation the gesture armed against.
     pub(super) fn reorderable(&self, host: HostId) -> bool {
-        host.is_local() || self.interactive_host_view(host).is_some()
+        // A switch in flight quiesces layout mutations (plan 063 §D8a),
+        // and a reorder is one: the forward switch has already
+        // snapshotted the order it is replaying, so a drag committed
+        // under it would be silently discarded. Refused at the
+        // gesture's own gate rather than at each dispatch, which is
+        // what makes the strip decline the drag instead of accepting a
+        // drop and dropping it.
+        !self.switch_in_flight() && (host.is_local() || self.interactive_host_view(host).is_some())
     }
 
     /// The gesture-driven cancel, and the choke point every caller
@@ -1211,6 +1226,13 @@ impl App {
         ordered_ids: Vec<i64>,
         op: u64,
     ) -> UiTask {
+        // Same reason as `host_rename_dispatch`: the drag's own state
+        // machine minted the id (plan 063 §D6).
+        self.host_ops.begin(
+            op,
+            self.hosts.owner_of(host),
+            local_backend::HostOpKind::Other,
+        );
         match host_reorder_call(&self.hosts, host, target, &ordered_ids) {
             Some(call) => self.engine_op(
                 async move { call.await.map_err(|error| error.to_string()) },
@@ -2051,6 +2073,71 @@ pub(super) fn visual_tab_ids(
 
 impl App {
     pub fn pointer(&mut self, event: TerminalPointerEvent) -> UiTask {
+        let key = self.terminal_event_key(event.tab_id);
+        let mods = input::ghostty_modifiers(self.modifiers);
+        let link_modifier_held = self.link_modifier_held();
+        self.route_pointer(key, event, mods, link_modifier_held)
+    }
+
+    /// `tab.dispatch_mouse_event`'s entry into that same handler (plan
+    /// 063 §D11).
+    ///
+    /// The op's contract is "exactly what production does", and it used
+    /// to reach the encoder directly — which is every path a
+    /// mouse-reporting application takes and **none** of the ones the UI
+    /// owns: local selection, middle-click paste, and the one §D11 is
+    /// about, a modifier-held left press on a hyperlink. Those live in
+    /// `handle_native_pointer` and above it, so the op routes through
+    /// [`Self::route_pointer`] like a real press.
+    ///
+    /// The two inputs a synthetic event has no source for: the modifier
+    /// state is the request's own `mods` mask rather than the keyboard's
+    /// (nobody is holding a key), and the press is a single click inside
+    /// the widget.
+    pub(super) fn dispatch_test_pointer(
+        &mut self,
+        tab_id: i64,
+        action: PointerAction,
+        button: Option<PointerButton>,
+        col: u32,
+        row: u32,
+        mods: u16,
+    ) -> std::result::Result<UiTask, String> {
+        // A bare id means the slot under `session` (plan 063 §D10), and
+        // `terminal_event_key`'s "the tab showing is the one meant" rule
+        // is a *widget* reading that an IPC caller naming a tab by id
+        // does not get.
+        let Some(key) = self
+            .local_tab_key(tab_id)
+            .filter(|key| self.tabs.contains_key(key))
+        else {
+            return Err(format!("tab {tab_id} has no live terminal"));
+        };
+        let link_modifier_held = input::accelerator_mods_from_ghostty(mods)
+            .intersects(keybind::resolve_link_modifier(self.config.link_modifier));
+        Ok(self.route_pointer(
+            key,
+            TerminalPointerEvent {
+                tab_id,
+                action,
+                button,
+                col,
+                row,
+                click_count: 1,
+                inside: true,
+            },
+            mods,
+            link_modifier_held,
+        ))
+    }
+
+    fn route_pointer(
+        &mut self,
+        key: TabKey,
+        event: TerminalPointerEvent,
+        mods: u16,
+        link_modifier_held: bool,
+    ) -> UiTask {
         // The confirm overlay's catcher only owns primary presses;
         // motion, right/middle presses, and releases would otherwise
         // reach a mouse-tracking PTY (middle-press can even paste).
@@ -2070,8 +2157,6 @@ impl App {
         if action == PointerAction::Press {
             self.cancel_editor_for_interaction();
         }
-        let link_modifier_held = self.link_modifier_held();
-        let key = self.terminal_event_key(tab_id);
         let Some(tab) = pointer_origin_tab(&mut self.tabs, key) else {
             tracing::debug!(tab_id, "ignored terminal pointer event for a closed tab");
             return UiTask::None;
@@ -2081,7 +2166,7 @@ impl App {
             button,
             col,
             row,
-            mods: input::ghostty_modifiers(self.modifiers),
+            mods,
             click_count,
             inside,
             link_modifier_held,

@@ -14,7 +14,9 @@ use std::time::Duration;
 /// too, and a shell-integration binary must not depend on the engine to
 /// learn them. Re-exported here so this module stays the one place to
 /// look for a named constant.
-pub use roost_ipc::session_launch::{timeout_scale, LAUNCH_CWD_ENV, MAX_VERDICT_BYTES};
+pub use roost_ipc::session_launch::{
+    timeout_scale, FirstProject, LAUNCH_CWD_ENV, MAX_VERDICT_BYTES, NO_SEED_ENV,
+};
 
 /// Test-mode override for the `libghostty_build` string this session
 /// reports and negotiates against (plan 037 §3.7).

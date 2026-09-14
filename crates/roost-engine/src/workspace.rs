@@ -20,7 +20,9 @@
 //!   directories. Live state (process, scrollback) is not restored.
 //!   `open()` loads the layout into a one-shot `restore_layout` the UI
 //!   bootstrap drains via `take_restore_layout`; it is kept out of the
-//!   live `tabs` map (those are the re-opened fresh shells).
+//!   live `tabs` map (those are the re-opened fresh shells). Until it
+//!   is drained it also backs `snapshot_for_persist`, so a bootstrap
+//!   that never hydrates cannot write the saved tabs away.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
@@ -139,6 +141,10 @@ struct Inner {
     /// without them silently erases the user's hosts on the first
     /// ordinary write-through.
     hosts: Vec<HostSnapshot>,
+    /// Hosts that have been forgotten, most recent first (plan 063 §D7).
+    /// Written by [`Workspace::remove_host`] and carried opaquely
+    /// otherwise, for the same reason [`Inner::hosts`] is.
+    recent_hosts: Vec<HostSnapshot>,
     /// Whether the UI window currently has focus. Half of the
     /// notification-suppression predicate (plan §3.5); reported by the
     /// UI via [`Workspace::set_window_focused`]. Never persisted — focus
@@ -164,6 +170,19 @@ struct Inner {
     replay: VecDeque<ReplayEntry>,
     /// Running total of `replay`'s [`ReplayEntry::bytes`].
     replay_bytes: usize,
+    /// One-shot tab layout loaded from `state.json` at `open` time,
+    /// awaiting hydration by the UI bootstrap
+    /// ([`Workspace::take_restore_layout`]). `None` for the in-memory
+    /// variant and after it's taken. Kept out of `tabs` — the live tabs
+    /// are the fresh shells the UI re-opens from these descriptors.
+    ///
+    /// It lives under the same lock as `projects`/`tabs` because
+    /// `snapshot_for_persist` reads it: a bootstrap that loads a layout
+    /// and never hydrates it (the `session` local backend does exactly
+    /// that) would otherwise write every saved tab list away on the
+    /// first ordinary commit. Once drained this is `None`, so the live
+    /// tabs are authoritative again.
+    restore_layout: Option<RestoreLayout>,
 }
 
 impl Default for Inner {
@@ -178,6 +197,7 @@ impl Default for Inner {
             sidebar_collapsed: false,
             sidebar_width: SIDEBAR_DEFAULT_WIDTH,
             hosts: Vec::new(),
+            recent_hosts: Vec::new(),
             // The safe default for a workspace nobody reports focus to:
             // unfocused would route every notification the opposite way
             // from a real window. [`Workspace::open`] overrides it.
@@ -187,6 +207,7 @@ impl Default for Inner {
             revision: 0,
             replay: VecDeque::new(),
             replay_bytes: 0,
+            restore_layout: None,
         }
     }
 }
@@ -500,12 +521,6 @@ pub struct Workspace {
     /// commit can't clobber a newer one when writes race. The seq is
     /// assigned under `inner`, so it reflects commit order (#80).
     persist_guard: Mutex<u64>,
-    /// One-shot tab layout loaded from `state.json` at `open` time,
-    /// awaiting hydration by the UI bootstrap (`take_restore_layout`).
-    /// `None` for the in-memory variant and after it's taken. Kept
-    /// out of `inner.tabs` — the live tabs are the fresh shells the
-    /// UI re-opens from these descriptors.
-    restore_layout: Mutex<Option<RestoreLayout>>,
     /// Set by `flush()` on clean exit, *after* it writes the final
     /// layout. Once set, `persist()` is a no-op so a teardown-induced
     /// PTY-exit cascade (the window closing kills its shells) can't
@@ -645,6 +660,88 @@ fn validate_host_label(existing: &[HostSnapshot], label: &str) -> Result<(), Wor
     Ok(())
 }
 
+/// How many forgotten hosts `state.json` remembers (plan 063 §D7).
+///
+/// A recents list is a shortcut, not a history: eight is more rows than
+/// the palette can show without scrolling and far more hosts than a
+/// laptop dials.
+pub const RECENT_HOSTS_CAP: usize = 8;
+
+/// A host target as the recents list compares it — the dedupe key.
+///
+/// Trimmed only. Everything else about a target is significant: a socket
+/// path is case-sensitive on Linux, and an ssh destination's user half is
+/// too, so folding case here would merge two hosts that are not the same
+/// host.
+fn normalized_target(target: &str) -> &str {
+    target.trim()
+}
+
+/// Re-mint any saved host id that repeats an earlier one, at load.
+///
+/// Two entries answering one id is pathological input — `mint_host_id`
+/// avoids collisions among existing entries and `add_host` enforces
+/// unique labels, so only a hand-edited or corrupted `state.json`
+/// produces it — but plan 063 keys the sidebar's band↔view pairing, the
+/// slot, and every palette verb on that id, and a duplicate silently
+/// aims all of them at the *first* entry: the second band's fidelity
+/// instruction names the wrong host, and Remove forgets the wrong row.
+///
+/// The later entry is the one re-minted, so the ids a user's shortcuts
+/// and scripts already know keep naming the row they always did.
+///
+/// The replacement avoids **every** id in the file, not just the ones
+/// walked so far. Excluding only the visited half would let a repair
+/// mint an id a *later* row already holds — `[A, A, Z]` re-minting the
+/// second row as `Z` — which then re-mints the innocent third row and
+/// leaves every reference to `Z` naming a different host. It needs a
+/// random collision to happen at all, and it is one comparison to make
+/// impossible.
+fn ensure_unique_host_ids(hosts: &mut [HostSnapshot]) {
+    ensure_unique_host_ids_with(hosts, mint_host_id_avoiding)
+}
+
+/// [`ensure_unique_host_ids`] against a caller's minter.
+///
+/// The exclusion list is the whole of what this decides — the minting
+/// itself is 64 bits of OS entropy, which no test can force a collision
+/// out of — so the seam is the minter, and the suite drives *this*.
+fn ensure_unique_host_ids_with(hosts: &mut [HostSnapshot], mint: impl Fn(&[String]) -> String) {
+    let mut taken: Vec<String> = hosts.iter().map(|host| host.id.clone()).collect();
+    let mut seen: Vec<String> = Vec::with_capacity(hosts.len());
+    for host in hosts.iter_mut() {
+        if !seen.contains(&host.id) {
+            seen.push(host.id.clone());
+            continue;
+        }
+        let minted = mint(&taken);
+        warn!(
+            duplicate = %host.id,
+            label = %host.label,
+            replacement = %minted,
+            "state.json repeated a saved host id; re-minting the later entry"
+        );
+        host.id = minted.clone();
+        seen.push(minted.clone());
+        taken.push(minted);
+    }
+}
+
+/// Record a forgotten host at the head of the recents list (plan 063
+/// §D7): most recent first, deduped by [`normalized_target`], capped at
+/// [`RECENT_HOSTS_CAP`], and **never this machine's own session** — a
+/// `localhost` row is always one gesture away, so remembering it would
+/// only be a row that offers what the seed verb already offers.
+fn remember_forgotten_host(recents: &mut Vec<HostSnapshot>, host: HostSnapshot) {
+    if roost_ipc::ssh::target_is_localhost(&host.target) {
+        return;
+    }
+    let key = normalized_target(&host.target).to_string();
+    recents.retain(|recent| normalized_target(&recent.target) != key);
+    recents.insert(0, host);
+    recents.truncate(RECENT_HOSTS_CAP);
+}
+
 impl Workspace {
     /// Construct an empty in-memory workspace. Used by tests.
     pub fn new() -> Self {
@@ -656,7 +753,6 @@ impl Workspace {
             versioned_events: versioned_tx,
             state_path: None,
             persist_guard: Mutex::new(0),
-            restore_layout: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
             replay_bounds: None,
         }
@@ -698,6 +794,9 @@ impl Workspace {
         // Before anything reads a position: a pre-#80 file can hold
         // colliding project positions, and those survive the load.
         normalize_project_positions(&mut snapshot.projects);
+        // Before anything keys off a host id: plan 063 pairs the
+        // sidebar's bands, the slot and every palette verb by it.
+        ensure_unique_host_ids(&mut snapshot.hosts);
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (versioned_tx, _versioned_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let mut inner = Inner {
@@ -706,6 +805,7 @@ impl Workspace {
             sidebar_width: normalize_sidebar_width(snapshot.sidebar_width)
                 .unwrap_or(SIDEBAR_DEFAULT_WIDTH),
             hosts: std::mem::take(&mut snapshot.hosts),
+            recent_hosts: std::mem::take(&mut snapshot.recent_hosts),
             window_focused: false,
             ..Inner::default()
         };
@@ -756,13 +856,13 @@ impl Workspace {
                 },
             );
         }
+        inner.restore_layout = Some(restore);
         Self {
             inner: Mutex::new(inner),
             events: tx,
             versioned_events: versioned_tx,
             state_path: Some(state_path),
             persist_guard: Mutex::new(0),
-            restore_layout: Mutex::new(Some(restore)),
             shutting_down: AtomicBool::new(false),
             replay_bounds: None,
         }
@@ -772,8 +872,27 @@ impl Workspace {
     /// `open` time. Returns `None` for the in-memory variant and on
     /// every call after the first. The UI bootstrap calls this once
     /// to re-open each project's saved tabs as fresh shells.
+    ///
+    /// Taking it also hands persistence back to the live tabs: while it
+    /// is retained `snapshot_for_persist` falls back to it for projects
+    /// with no live tabs (see [`Inner::restore_layout`]). No caller may
+    /// hold the `inner` lock — `std::sync::Mutex` is not reentrant.
     pub fn take_restore_layout(&self) -> Option<RestoreLayout> {
-        self.restore_layout.lock().unwrap().take()
+        self.inner.lock().unwrap().restore_layout.take()
+    }
+
+    /// The same layout, **read rather than drained**.
+    ///
+    /// Plan 063 §D5's launch-time migration is the caller: under
+    /// `local-backend = session` the workspace is loaded and never
+    /// hydrated, so the tab descriptors it is about to replay onto the
+    /// session live here and nowhere else. It may not take them —
+    /// taking is what disarms `snapshot_for_persist`'s un-hydrated
+    /// fallback, so a migration that failed, or crashed, or never found
+    /// a session to run against would persist those projects with no
+    /// tabs at all and lose the layout for good.
+    pub fn retained_layout(&self) -> Option<RestoreLayout> {
+        self.inner.lock().unwrap().restore_layout.clone()
     }
 
     /// The sidebar's persisted collapsed state. The UI reads this at
@@ -879,16 +998,30 @@ impl Workspace {
         validate_host_label(&inner.hosts, label.trim())
     }
 
+    /// The hosts this client has forgotten, most recent first (plan 063
+    /// §D7) — the rows `Add Host…` and the creation picker offer to put
+    /// back.
+    pub fn recent_hosts(&self) -> Vec<HostSnapshot> {
+        self.inner.lock().unwrap().recent_hosts.clone()
+    }
+
     /// Forget a saved host by its stable id. Does not touch a live
     /// connection — HostConn owns disconnecting before a remove reaches
-    /// here (the UI only offers Remove while disconnected, §3.1).
+    /// here.
+    ///
+    /// The forgotten host lands in the recents list on the way out
+    /// ([`remember_forgotten_host`]), which is what makes the
+    /// last-project auto-remove (plan 063 §D6) recoverable: the row the
+    /// UI dropped is one palette gesture from being saved again. Written
+    /// here rather than at the two call sites so an explicit Remove and
+    /// an auto-remove cannot disagree about it.
     pub fn remove_host(&self, id: &str) -> Result<(), WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
-        let before = inner.hosts.len();
-        inner.hosts.retain(|h| h.id != id);
-        if inner.hosts.len() == before {
+        let Some(at) = inner.hosts.iter().position(|h| h.id == id) else {
             return Err(WorkspaceError::HostNotFound(id.to_string()));
-        }
+        };
+        let removed = inner.hosts.remove(at);
+        remember_forgotten_host(&mut inner.recent_hosts, removed);
         self.commit(inner, Vec::new(), Persist::Write);
         Ok(())
     }
@@ -1216,7 +1349,7 @@ impl Workspace {
         } else if !project_cwd.is_empty() {
             project_cwd
         } else {
-            std::env::var("HOME").unwrap_or_else(|_| "/".into())
+            crate::home_dir()
         };
         let id = inner.alloc_id();
         let now = unix_now();
@@ -2153,6 +2286,18 @@ impl Inner {
     /// it to drop stale out-of-order writes (#80). Each project
     /// carries its tab layout (title + cwd + position) so a relaunch
     /// can re-open the tabs in their saved directories.
+    ///
+    /// A project with no live tabs falls back to the retained
+    /// [`Inner::restore_layout`] when one is still un-hydrated, so a
+    /// bootstrap that loads a layout and deliberately does not re-open
+    /// it (the `session` local backend) cannot erase the user's tabs on
+    /// its first commit. The active selection falls back on the same
+    /// terms and for a sharper reason than a lost preference: plan 063
+    /// §D8's forward switch snapshots the in-process layout *including*
+    /// the active project and tab, and holds its fence until the mapped
+    /// active tab is selected and attached — so zeroing this pair
+    /// degrades the migration in exactly the case the migration exists
+    /// for.
     fn snapshot_for_persist(&mut self) -> (SnapshotFile, u64) {
         use crate::persistence::{ProjectSnapshot, TabSnapshot};
         self.persist_seq += 1;
@@ -2171,18 +2316,45 @@ impl Inner {
                     .unwrap_or(0) as i32
             })
             .unwrap_or(0);
+        // The selection half of the un-hydrated fallback. Three
+        // conditions, each load-bearing:
+        //
+        // * an un-hydrated layout — the same discriminator the tab
+        //   fallback uses, so after `take_restore_layout` a genuine
+        //   "nothing is selected" still persists as `0` rather than
+        //   resurrecting a stale choice;
+        // * no live selection to write, so live state always wins when
+        //   it has an answer;
+        // * the retained active project has no live tabs, which is what
+        //   keeps the index honest — `active_tab_position` is a DENSE
+        //   index, and it may only be carried over when the tab list
+        //   written for that project is the retained one it indexes,
+        //   not a live list that would renumber underneath it.
+        let retained_selection = self.restore_layout.as_ref().filter(|layout| {
+            self.active_project_id == 0
+                && layout.active_project_id != 0
+                && !self
+                    .tabs
+                    .values()
+                    .any(|tab| tab.project_id == layout.active_project_id)
+        });
+        let (active_project_id, active_tab_position) = match retained_selection {
+            Some(layout) => (layout.active_project_id, layout.active_tab_position),
+            None => (self.active_project_id, active_tab_position),
+        };
         let snapshot = SnapshotFile {
             next_id: self.next_id,
-            active_project_id: self.active_project_id,
+            active_project_id,
             active_tab_position,
             sidebar_collapsed: self.sidebar_collapsed,
             sidebar_width: self.sidebar_width,
             hosts: self.hosts.clone(),
+            recent_hosts: self.recent_hosts.clone(),
             projects: self
                 .projects
                 .values()
                 .map(|p| {
-                    let tabs: Vec<TabSnapshot> = self
+                    let mut tabs: Vec<TabSnapshot> = self
                         .tabs_in_display_order(p.id)
                         .into_iter()
                         .map(|t| TabSnapshot {
@@ -2192,6 +2364,9 @@ impl Inner {
                             user_titled: t.user_titled,
                         })
                         .collect();
+                    if tabs.is_empty() {
+                        tabs = retained_tabs(self.restore_layout.as_ref(), p.id);
+                    }
                     ProjectSnapshot {
                         id: p.id,
                         name: p.name.clone(),
@@ -2205,6 +2380,35 @@ impl Inner {
         };
         (snapshot, self.persist_seq)
     }
+}
+
+/// The saved tab descriptors `layout` still holds for `project_id`, as
+/// persistable snapshots. Empty when the layout was already drained or
+/// never held that project.
+///
+/// Positions are re-numbered densely from the layout's display order
+/// rather than carried: `RestoreTab` does not keep the raw `position`
+/// (hydration re-opens them at 0..n through `next_tab_position`), so a
+/// dense rewrite is what a hydrating launch would have written anyway.
+fn retained_tabs(
+    layout: Option<&RestoreLayout>,
+    project_id: i64,
+) -> Vec<crate::persistence::TabSnapshot> {
+    layout
+        .and_then(|l| l.projects.iter().find(|p| p.project_id == project_id))
+        .map(|p| {
+            p.tabs
+                .iter()
+                .enumerate()
+                .map(|(index, t)| crate::persistence::TabSnapshot {
+                    title: t.title.clone(),
+                    cwd: t.cwd.clone(),
+                    position: index as i32,
+                    user_titled: t.user_titled,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn wire_tab(row: &TabRow, is_active: bool) -> Tab {
@@ -2271,9 +2475,17 @@ fn unix_now() -> i64 {
 /// permanent — two entries answering one id — so the loop buys
 /// certainty for one extra comparison per add.
 fn mint_host_id(existing: &[HostSnapshot]) -> String {
+    let taken: Vec<String> = existing.iter().map(|h| h.id.clone()).collect();
+    mint_host_id_avoiding(&taken)
+}
+
+/// [`mint_host_id`] against a bare id list — what
+/// [`ensure_unique_host_ids`] has while it is halfway through the
+/// registry it is repairing.
+fn mint_host_id_avoiding(taken: &[String]) -> String {
     loop {
         let id = random_hex(8);
-        if !existing.iter().any(|h| h.id == id) {
+        if !taken.contains(&id) {
             return id;
         }
     }
@@ -2362,6 +2574,187 @@ fn derive_title(cwd: &str) -> String {
 mod tests {
     use super::*;
     use roost_ipc::agent::{AttentionOp, ShellState};
+
+    fn a_host(id: &str, label: &str, target: &str) -> HostSnapshot {
+        HostSnapshot {
+            id: id.to_string(),
+            label: label.to_string(),
+            target: target.to_string(),
+            last_connected: None,
+        }
+    }
+
+    /// The repair's exclusion list is **every** id in the file, not the
+    /// ones walked so far.
+    ///
+    /// Driven through an injected minter because the real one is OS
+    /// entropy: this one hands back the first candidate the caller has
+    /// not excluded, starting with an id a *later* row already holds.
+    /// Given only the visited half, it answers `Z` — and the repair then
+    /// collides with row 3, re-mints that innocent row, and every
+    /// reference to `Z` names a different host than it did.
+    #[test]
+    fn the_id_repair_cannot_mint_an_id_a_later_row_already_holds() {
+        let mut hosts = vec![
+            a_host("A", "one", "user@one"),
+            a_host("A", "two", "user@two"),
+            a_host("Z", "three", "user@three"),
+        ];
+        let candidates = ["Z", "fresh"];
+        ensure_unique_host_ids_with(&mut hosts, |taken| {
+            candidates
+                .iter()
+                .find(|candidate| !taken.iter().any(|id| id == *candidate))
+                .expect("a free candidate")
+                .to_string()
+        });
+
+        let ids: Vec<&str> = hosts.iter().map(|host| host.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["A", "fresh", "Z"],
+            "the duplicate steps past the id row 3 already holds, and row 3 keeps its own"
+        );
+    }
+
+    /// Plan 063 §D7's recents list, all three of its rules at once: most
+    /// recent first, one row per target, and never more than the cap.
+    ///
+    /// The fixture starts over-cap and re-forgets a target it already
+    /// holds, so a list that only ever appended — or only ever
+    /// truncated — reads differently from this one.
+    #[test]
+    fn forgotten_hosts_are_remembered_newest_first_deduped_and_capped() {
+        let mut recents = Vec::new();
+        for n in 0..RECENT_HOSTS_CAP + 3 {
+            remember_forgotten_host(
+                &mut recents,
+                a_host(
+                    &format!("h{n}"),
+                    &format!("box-{n}"),
+                    &format!("user@box-{n}"),
+                ),
+            );
+        }
+        let targets = |recents: &[HostSnapshot]| {
+            recents
+                .iter()
+                .map(|host| host.target.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(recents.len(), RECENT_HOSTS_CAP, "the cap holds");
+        assert_eq!(
+            targets(&recents)[0],
+            format!("user@box-{}", RECENT_HOSTS_CAP + 2),
+            "newest first"
+        );
+        assert!(
+            !targets(&recents).contains(&"user@box-0".to_string()),
+            "and the oldest fell off the end: {:?}",
+            targets(&recents)
+        );
+
+        // A target already in the list moves to the head instead of
+        // appearing twice — and takes its current label with it.
+        let before = recents.len();
+        remember_forgotten_host(&mut recents, a_host("fresh", "renamed", "  user@box-5  "));
+        assert_eq!(recents.len(), before, "a re-forget is not a new row");
+        assert_eq!(recents[0].label, "renamed");
+        assert_eq!(
+            targets(&recents)
+                .iter()
+                .filter(|target| target.trim() == "user@box-5")
+                .count(),
+            1,
+            "deduped on the trimmed target: {:?}",
+            targets(&recents)
+        );
+    }
+
+    /// This machine's own session is implicit (§D7): `Connect Host:
+    /// localhost` is always one gesture away, so a recents row for it
+    /// would offer nothing the seed verb does not.
+    #[test]
+    fn the_local_session_is_never_a_recent() {
+        let mut recents = Vec::new();
+        remember_forgotten_host(&mut recents, a_host("h1", "localhost", "localhost"));
+        assert!(recents.is_empty());
+        // The control, one target over: an ssh host is remembered.
+        remember_forgotten_host(&mut recents, a_host("h2", "box", "user@box"));
+        assert_eq!(recents.len(), 1);
+    }
+
+    /// Removing a host is what writes the recent, whether a person asked
+    /// or plan 063 §D6's auto-remove did — both come through here.
+    #[test]
+    fn removing_a_host_remembers_it_and_re_adding_it_mints_a_fresh_id() {
+        let ws = Workspace::new();
+        let saved = ws.add_host("box", "user@box").unwrap();
+        assert!(ws.recent_hosts().is_empty());
+
+        ws.remove_host(&saved.id).unwrap();
+        let recents = ws.recent_hosts();
+        assert_eq!(recents.len(), 1);
+        assert_eq!(recents[0].target, "user@box");
+        assert_eq!(recents[0].label, "box");
+        assert!(ws.hosts().is_empty());
+
+        // Putting it back is an ordinary add: the recents row survives
+        // it, because nothing here prunes the list.
+        let again = ws.add_host("box", "user@box").unwrap();
+        assert_ne!(again.id, saved.id);
+        assert_eq!(ws.recent_hosts().len(), 1);
+    }
+
+    /// Two saved entries answering one id is pathological input, and
+    /// plan 063 keys the sidebar's band↔view pairing, the slot and every
+    /// palette verb on that id — so the later one is re-minted at load.
+    /// The first keeps its id, so ids already in a script keep naming
+    /// the row they named.
+    #[test]
+    fn a_repeated_saved_host_id_is_re_minted_at_load() {
+        let mut hosts = vec![
+            a_host("dup", "one", "user@one"),
+            a_host("dup", "two", "user@two"),
+            a_host("other", "three", "user@three"),
+        ];
+        ensure_unique_host_ids(&mut hosts);
+
+        assert_eq!(hosts[0].id, "dup", "the first entry keeps the id");
+        assert_ne!(hosts[1].id, "dup", "the later entry is re-minted");
+        assert_eq!(hosts[1].label, "two", "and is otherwise untouched");
+        assert_eq!(hosts[2].id, "other", "an id nobody repeated is left alone");
+        let ids: std::collections::HashSet<&str> =
+            hosts.iter().map(|host| host.id.as_str()).collect();
+        assert_eq!(ids.len(), hosts.len(), "every id is now unique: {hosts:?}");
+    }
+
+    #[test]
+    fn an_empty_name_is_named_untitled_from_the_workspaces_own_count() {
+        let ws = Workspace::new();
+        let first = ws.create_project("", "/tmp").unwrap();
+        assert_eq!(first.name, "Untitled 1");
+        let second = ws.create_project("", "/tmp").unwrap();
+        assert_eq!(second.name, "Untitled 2");
+        // An explicit name is never overridden, and does not consume a
+        // slot in the untitled count.
+        let named = ws.create_project("mine", "/tmp").unwrap();
+        assert_eq!(named.name, "mine");
+        let third = ws.create_project("", "/tmp").unwrap();
+        assert_eq!(third.name, "Untitled 4");
+    }
+
+    #[test]
+    fn create_project_stores_an_empty_cwd_verbatim() {
+        // The empty-cwd-to-`$HOME` resolution (D4) lives one layer up, at
+        // `ops::PROJECT_CREATE` — every caller of this method (the wire
+        // arm, `LocalClient::create_project`, the two seeds) already
+        // hands it a resolved directory, so this method itself must not
+        // re-resolve and risk disagreeing with its caller.
+        let ws = Workspace::new();
+        let project = ws.create_project("mine", "").unwrap();
+        assert_eq!(project.cwd, "");
+    }
 
     #[test]
     fn open_tab_emits_tab_opened() {
@@ -3427,6 +3820,224 @@ mod tests {
         assert_eq!(rp.tabs[1].title, "btab");
         // `take_restore_layout` is one-shot.
         assert!(ws2.take_restore_layout().is_none());
+    }
+
+    /// A bootstrap that loads a layout and deliberately does not
+    /// hydrate it (plan 063's `session` local backend) must not write
+    /// the user's tabs away on its first ordinary commit — and
+    /// `add_host` is exactly such a commit, on the same launch.
+    #[test]
+    fn an_unhydrated_layout_outlives_a_persist_that_never_saw_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let pid = {
+            let ws = Workspace::open(path.clone());
+            let pid = ws.create_project("p", "/proj").unwrap().id;
+            ws.open_tab(pid, "/a", "atab").unwrap();
+            ws.open_tab(pid, "/b", "btab").unwrap();
+            pid
+        };
+
+        let ws2 = Workspace::open(path.clone());
+        assert!(
+            ws2.snapshot().iter().all(|p| p.tabs.is_empty()),
+            "the reload holds descriptors, not live tabs"
+        );
+        // The launch commits something unrelated without hydrating.
+        ws2.add_host("box", "ssh://box").unwrap();
+
+        let on_disk = read_state(&path).unwrap().unwrap();
+        let saved = on_disk.projects.iter().find(|p| p.id == pid).unwrap();
+        assert_eq!(
+            saved
+                .tabs
+                .iter()
+                .map(|t| (t.cwd.as_str(), t.title.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("/a", "atab"), ("/b", "btab")],
+            "an un-hydrated layout was flattened by an unrelated commit"
+        );
+        assert_eq!(
+            saved.tabs.iter().map(|t| t.position).collect::<Vec<_>>(),
+            vec![0, 1],
+            "retained tabs are renumbered densely, as hydration would"
+        );
+
+        // And it is still there for the next launch to hydrate.
+        let ws3 = Workspace::open(path);
+        let restore = ws3.take_restore_layout().expect("layout still present");
+        let rp = restore
+            .projects
+            .iter()
+            .find(|p| p.project_id == pid)
+            .unwrap();
+        assert_eq!(
+            rp.tabs.iter().map(|t| t.cwd.as_str()).collect::<Vec<_>>(),
+            vec!["/a", "/b"]
+        );
+    }
+
+    /// The selection half of the same launch, and plan 063 §D8's reason
+    /// for wanting it: the forward switch snapshots the active project
+    /// and tab and fences on the mapped active tab being selected, so a
+    /// zeroed pair degrades the migration rather than merely a
+    /// preference.
+    ///
+    /// The retained selection is deliberately the **second** project at
+    /// a **non-zero** tab index, so `0`, "the first project" and "a live
+    /// value" are three distinguishable answers in the failure message.
+    #[test]
+    fn an_unhydrated_selection_outlives_the_same_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let (first, second) = {
+            let ws = Workspace::open(path.clone());
+            let first = ws.create_project("first", "/first").unwrap().id;
+            let second = ws.create_project("second", "/second").unwrap().id;
+            ws.open_tab(first, "/a0", "a0").unwrap();
+            ws.open_tab(second, "/b0", "b0").unwrap();
+            let b1 = ws.open_tab(second, "/b1", "b1").unwrap().id;
+            ws.open_tab(second, "/b2", "b2").unwrap();
+            ws.focus_tab(b1).unwrap();
+            (first, second)
+        };
+
+        let ws2 = Workspace::open(path.clone());
+        ws2.add_host("box", "ssh://box").unwrap();
+
+        let on_disk = read_state(&path).unwrap().unwrap();
+        assert_eq!(
+            on_disk.active_project_id, second,
+            "the retained selection was flattened (0 = none, {first} = the first project)"
+        );
+        assert_eq!(
+            on_disk.active_tab_position, 1,
+            "the retained active tab index was flattened"
+        );
+        // And the index still names the tab it named: the retained list
+        // is written densely, so position 1 has to be `/b1` — the whole
+        // point of not carrying a raw `position` across.
+        let saved = on_disk.projects.iter().find(|p| p.id == second).unwrap();
+        assert_eq!(
+            saved.tabs[on_disk.active_tab_position as usize].cwd, "/b1",
+            "the persisted index does not name the tab it did before the reload: {saved:?}"
+        );
+    }
+
+    /// The fallback is un-hydrated-only. Once the layout is drained the
+    /// live tabs are authoritative again, including when a project is
+    /// genuinely empty.
+    #[test]
+    fn hydrating_hands_persistence_back_to_the_live_tabs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let (kept, emptied) = {
+            let ws = Workspace::open(path.clone());
+            let kept = ws.create_project("kept", "/kept").unwrap().id;
+            let emptied = ws.create_project("emptied", "/emptied").unwrap().id;
+            ws.open_tab(kept, "/saved-a", "saved-a").unwrap();
+            ws.open_tab(emptied, "/saved-b", "saved-b").unwrap();
+            (kept, emptied)
+        };
+
+        let ws2 = Workspace::open(path.clone());
+        let drained = ws2.take_restore_layout().expect("layout to hydrate");
+        assert_ne!(
+            drained.active_project_id, 0,
+            "the fixture must retain a selection, or the next assert proves nothing"
+        );
+        // A hydration that opened nothing yet, committing something
+        // unrelated. Nothing is selected and nothing is live, and BOTH
+        // must persist as such: the layout is drained, so a genuine
+        // empty state may not resurrect the stale choice.
+        ws2.set_sidebar_collapsed(true);
+        let after_drain = read_state(&path).unwrap().unwrap();
+        assert_eq!(
+            after_drain.active_project_id, 0,
+            "a hydrated workspace with nothing selected resurrected the old selection"
+        );
+        assert!(
+            after_drain.projects.iter().all(|p| p.tabs.is_empty()),
+            "a hydrated workspace with no live tabs resurrected the old layout: {after_drain:?}"
+        );
+
+        // A hydration that re-opens `kept` with a tab that DIFFERS from
+        // its saved descriptor, and gives `emptied` none at all. If the
+        // fallback still fired, both would come back as the saved ones.
+        ws2.open_tab(kept, "/live", "live").unwrap();
+
+        let on_disk = read_state(&path).unwrap().unwrap();
+        let kept_row = on_disk.projects.iter().find(|p| p.id == kept).unwrap();
+        assert_eq!(
+            kept_row
+                .tabs
+                .iter()
+                .map(|t| t.cwd.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/live"],
+            "live tabs must win once the layout has been hydrated"
+        );
+        let emptied_row = on_disk.projects.iter().find(|p| p.id == emptied).unwrap();
+        assert!(
+            emptied_row.tabs.is_empty(),
+            "a project the hydration left empty persists as empty, not as its old layout"
+        );
+    }
+
+    /// Plan 063 §D5's migration reads the retained layout and **must
+    /// not drain it**.
+    ///
+    /// It is the only record of the tabs of a workspace a `session`
+    /// launch loaded and never hydrated, and the migration can fail, be
+    /// abandoned, or never find a session to run against at all. Draining
+    /// at the read would disarm the un-hydrated fallback above, so the
+    /// very next unrelated commit would write those projects to disk with
+    /// no tabs — and the layout would be gone without anything having
+    /// gone wrong twice.
+    #[test]
+    fn reading_the_retained_layout_does_not_hydrate_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let project = {
+            let ws = Workspace::open(path.clone());
+            let project = ws.create_project("kept", "/kept").unwrap().id;
+            ws.open_tab(project, "/saved-a", "saved-a").unwrap();
+            ws.open_tab(project, "/saved-b", "saved-b").unwrap();
+            project
+        };
+
+        let ws2 = Workspace::open(path.clone());
+        let peeked = ws2.retained_layout().expect("a layout to migrate");
+        assert_eq!(
+            peeked
+                .projects
+                .iter()
+                .find(|row| row.project_id == project)
+                .map(|row| row.tabs.iter().map(|t| t.cwd.as_str()).collect::<Vec<_>>()),
+            Some(vec!["/saved-a", "/saved-b"]),
+            "the migration reads the descriptors the launch did not open"
+        );
+        // Reading it twice answers the same, and the one-shot drain is
+        // still armed for whoever really hydrates.
+        assert_eq!(ws2.retained_layout().as_ref(), Some(&peeked));
+
+        // The consequence, which is the point: an unrelated commit after
+        // the read still persists the tabs.
+        ws2.set_sidebar_collapsed(true);
+        let on_disk = read_state(&path).unwrap().unwrap();
+        assert_eq!(
+            on_disk.projects.iter().find(|p| p.id == project).map(|p| p
+                .tabs
+                .iter()
+                .map(|t| t.cwd.as_str())
+                .collect::<Vec<_>>()),
+            Some(vec!["/saved-a", "/saved-b"]),
+            "a peeked layout was written away by the next commit"
+        );
+        assert!(
+            ws2.take_restore_layout().is_some(),
+            "the peek consumed the one-shot a hydration needs"
+        );
     }
 
     #[test]

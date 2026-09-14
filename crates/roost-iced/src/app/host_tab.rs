@@ -378,6 +378,19 @@ impl HostAttach {
         !matches!(self.phase, Phase::Ended)
     }
 
+    /// Whether the stream is actually up — the handshake accepted and
+    /// the snapshot hydrated.
+    ///
+    /// Narrower than [`Self::live`] on purpose, and the two are not
+    /// interchangeable: `live` means "keep queuing input for this tab",
+    /// which is true of an attempt that has not landed yet. This means
+    /// "there is something on screen", which is what plan 063 §D8 phase
+    /// 6's fence has to wait for — a selection starts an attach, and an
+    /// attach can still be refused.
+    pub(super) fn streaming(&self) -> bool {
+        matches!(self.phase, Phase::Live)
+    }
+
     /// Start (or restart) an attach attempt. Must be called inside the
     /// app runtime (`Runtime::enter`) — every task binds to the ambient
     /// runtime. `ops` is the host's op queue (token minting rides it so

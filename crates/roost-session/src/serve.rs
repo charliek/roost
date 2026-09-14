@@ -46,7 +46,7 @@ use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::consts::{
-    DEFAULT_TAB_COLS, DEFAULT_TAB_ROWS, FINALIZE_JOIN_TIMEOUT, SIGNAL_STOP_TIMEOUT,
+    FirstProject, DEFAULT_TAB_COLS, DEFAULT_TAB_ROWS, FINALIZE_JOIN_TIMEOUT, SIGNAL_STOP_TIMEOUT,
 };
 use crate::readiness::{Readiness, Verdict};
 use crate::socket_guard::{unlink_if_ours, SocketIdentity, Unlinked};
@@ -60,9 +60,6 @@ pub struct SessionConfig {
     pub state_path: PathBuf,
     pub app_label: String,
     pub app_id: String,
-    /// Directory the user launched from, captured before the daemon
-    /// `chdir`'d to `/`. Seeds the first project on an empty state file.
-    pub launch_cwd: PathBuf,
     /// Where `session.put_file` lands what a client uploads, swept at
     /// every start and every clean stop.
     ///
@@ -121,11 +118,26 @@ pub struct SessionConfig {
     /// the environment is read once at the edge and a production daemon
     /// keeps `REPLAY_WINDOW`.
     pub replay_window: Option<usize>,
+    /// Whether a first-ever start seeds itself a project (plan 063 §D4)
+    /// or leaves the workspace empty for whoever started it to fill
+    /// (§D8's switch destination).
+    ///
+    /// Carried rather than read here, and that is the point: the hint
+    /// is a *consumed-once* env var
+    /// ([`crate::consts::NO_SEED_ENV`]), so it has to be taken at the
+    /// one moment in the process's life that is before the fork and
+    /// before any thread — `main`, beside `capture_launch_cwd`. A read
+    /// from inside `serve` would be a `remove_var` on a live tokio
+    /// runtime.
+    pub first_project: FirstProject,
 }
 
 impl SessionConfig {
     /// The shipped configuration for a profile.
-    pub fn from_profile(profile: &BundleProfile, launch_cwd: PathBuf) -> Self {
+    ///
+    /// `first_project` comes in from `main`'s pre-fork capture; every
+    /// other field is read from the profile or the environment here.
+    pub fn from_profile(profile: &BundleProfile, first_project: FirstProject) -> Self {
         let (test_mode, fake_libghostty_build) = identity::test_mode_env();
         let replay_window = parse_replay_window(
             test_mode,
@@ -149,13 +161,13 @@ impl SessionConfig {
             state_path: profile.state_json_path(),
             app_label: profile.app_label.to_string(),
             app_id: profile.app_id.to_string(),
-            launch_cwd,
             files_dir,
             files_fallback: profile.files_dir_fallback(),
             test_mode,
             fake_libghostty_build,
             legacy_payload_kinds: identity::legacy_kinds_env(test_mode),
             replay_window,
+            first_project,
         }
     }
 }
@@ -226,7 +238,7 @@ pub async fn serve(
         config.socket_path.clone(),
     );
 
-    hydrate::hydrate(&client, &config.launch_cwd)
+    hydrate::hydrate(&client, config.first_project)
         .await
         .context("hydrate the saved layout")?;
 

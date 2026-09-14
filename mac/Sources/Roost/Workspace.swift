@@ -134,6 +134,12 @@ final class Workspace {
     /// because a snapshot rebuilt without them silently erases the
     /// user's hosts on the first ordinary write-through.
     private var hosts: [SnapshotFile.HostSnapshot] = []
+    /// Hosts the Rust UI has forgotten, carried verbatim for exactly
+    /// the reason `hosts` is (plan 063 §D7): this UI never reads or
+    /// writes the list, but a snapshot rebuilt without it would erase
+    /// the user's recents on the first Mac write-through of a shared
+    /// `state.json`.
+    private var recentHosts: [SnapshotFile.HostSnapshot] = []
     /// Whether the UI window currently has focus — half of the
     /// notification-suppression predicate (plan §3.5), reported by the
     /// UI via `setWindowFocused`. Never persisted: focus is a property
@@ -171,6 +177,7 @@ final class Workspace {
         if let snapshot = Self.readSnapshot(at: statePath) {
             self.nextID = max(1, snapshot.nextID)
             self.hosts = snapshot.hosts
+            self.recentHosts = snapshot.recentHosts
             // A pre-fix file can hold colliding project positions, and
             // unlike tabs (re-opened through `openTab`, so freshly
             // allocated) projects load their position verbatim — the
@@ -1018,7 +1025,8 @@ final class Workspace {
                 },
             activeProjectID: activeProjectID,
             activeTabPosition: activeTabPosition,
-            hosts: hosts
+            hosts: hosts,
+            recentHosts: recentHosts
         )
         do {
             try Self.write(snapshot: snapshot, to: statePath, sync: sync)
@@ -1116,19 +1124,25 @@ final class Workspace {
         /// Defaulted on decode so a file from a build predating host
         /// sessions (or from the other UI) still loads.
         let hosts: [HostSnapshot]
+        /// Hosts the user has forgotten, most recent first — the Rust
+        /// UI's recents list (plan 063 §D7). Carried, never read here.
+        /// Defaulted on decode like `hosts`.
+        let recentHosts: [HostSnapshot]
 
         init(
             nextID: Int64,
             projects: [ProjectSnapshot],
             activeProjectID: Int64 = 0,
             activeTabPosition: Int32 = 0,
-            hosts: [HostSnapshot] = []
+            hosts: [HostSnapshot] = [],
+            recentHosts: [HostSnapshot] = []
         ) {
             self.nextID = nextID
             self.projects = projects
             self.activeProjectID = activeProjectID
             self.activeTabPosition = activeTabPosition
             self.hosts = hosts
+            self.recentHosts = recentHosts
         }
 
         struct ProjectSnapshot: Codable, Equatable, Sendable {
@@ -1256,11 +1270,12 @@ final class Workspace {
             case activeProjectID = "active_project_id"
             case activeTabPosition = "active_tab_position"
             case hosts
+            case recentHosts = "recent_hosts"
         }
 
-        // Custom decode so missing `tabs` / `active_*` / `hosts` keys
-        // default instead of throwing (cross-version + legacy
-        // compatibility).
+        // Custom decode so missing `tabs` / `active_*` / `hosts` /
+        // `recent_hosts` keys default instead of throwing
+        // (cross-version + legacy compatibility).
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             nextID = try c.decode(Int64.self, forKey: .nextID)
@@ -1268,6 +1283,7 @@ final class Workspace {
             activeProjectID = try c.decodeIfPresent(Int64.self, forKey: .activeProjectID) ?? 0
             activeTabPosition = try c.decodeIfPresent(Int32.self, forKey: .activeTabPosition) ?? 0
             hosts = try c.decodeIfPresent([HostSnapshot].self, forKey: .hosts) ?? []
+            recentHosts = try c.decodeIfPresent([HostSnapshot].self, forKey: .recentHosts) ?? []
         }
     }
 

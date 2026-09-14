@@ -79,11 +79,59 @@ use crate::IpcClient;
 /// session start` from.
 ///
 /// The daemon `chdir("/")`s before it does anything else, so the launch
-/// cwd cannot be recovered later — and it is what seeds the first
-/// project on a fresh state file. It travels as an env var because the
+/// cwd cannot be recovered later. It travels as an env var because the
 /// fork happens before any IPC exists, and it is removed from the
-/// environment the instant it is read so no PTY can inherit it.
+/// environment the instant it is read so no PTY can inherit it. A first
+/// run seeds its project at `$HOME` like every UI (plan 063 §D4), not
+/// here — the daemon keeps capturing and erasing this purely so the
+/// hint never leaks into a spawned shell's environment, and logs it for
+/// operators wondering where a session started from.
 pub const LAUNCH_CWD_ENV: &str = "ROOST_SESSION_LAUNCH_CWD";
+
+/// Consumed-once hint telling a first-ever session **not** to seed
+/// itself a project (plan 063 §D8 phase 1).
+///
+/// Same mechanism and the same discipline as [`LAUNCH_CWD_ENV`]: it
+/// travels as an env var because the fork happens before any IPC
+/// exists, and the daemon removes it from its environment the instant
+/// it is read so no PTY can inherit it.
+///
+/// Set by exactly one caller — the spawn a local-backend switch
+/// performs for its destination. That spawn is followed immediately by
+/// the switch's own replay, and a session that seeded itself first
+/// would hand the user a stray empty project sitting beside their
+/// migrated layout. §D4's seed is right for every *other* first run,
+/// which is why this is a hint on one spawn rather than a change to the
+/// rule.
+pub const NO_SEED_ENV: &str = "ROOST_SESSION_NO_SEED";
+
+/// What a session does when it comes up with no saved layout.
+///
+/// Decided by whoever started it, not by the daemon: only the starter
+/// knows whether something is about to fill the workspace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FirstProject {
+    /// Seed one at `$HOME`, the way every UI does (plan 063 §D4). Every
+    /// spawn but one, and the answer a daemon started by hand gets.
+    #[default]
+    Seed,
+    /// Leave the workspace empty: the caller is about to fill it.
+    Withheld,
+}
+
+impl FirstProject {
+    /// Read the hint out of an environment value, whatever set it.
+    ///
+    /// Presence is not enough — an empty or `0` value reads as `Seed`,
+    /// so a variable exported and blanked cannot silently withhold a
+    /// project.
+    pub fn from_env_value(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            Some("1") | Some("true") => Self::Withheld,
+            _ => Self::Seed,
+        }
+    }
+}
 
 /// Cap on a verdict line, newline excluded. A verdict is tens of bytes;
 /// anything past this is a session writing garbage down the pipe.
@@ -534,7 +582,7 @@ pub async fn read_verdict_line<R: AsyncRead + Unpin>(reader: R, cap: usize) -> V
     }
 }
 
-/// Spawn `<bin> start` with the two env hints and read the one line it
+/// Spawn `<bin> start` with its env hints and read the one line it
 /// prints, everything bounded by `budget`.
 ///
 /// The child here is the *launcher* — for a real `roost-session` it is
@@ -572,6 +620,7 @@ pub async fn spawn_and_read_verdict(
     bin: &Path,
     cwd: &Path,
     seam: Option<&OsStr>,
+    first_project: FirstProject,
     budget: Duration,
 ) -> Result<Verdict> {
     let deadline = Instant::now() + budget;
@@ -592,6 +641,21 @@ pub async fn spawn_and_read_verdict(
             "{STATE_DIR_ENV} is set; giving the spawned {BIN_NAME} a state dir under it"
         );
         command.env(STATE_DIR_ENV, &derived);
+    }
+    // Removed first, always: `Command` inherits this process's
+    // environment, so "absent" is only what every other spawn means by
+    // "seed normally" if absence is made real here. A launcher that was
+    // itself started under the hint — a UI in a tab of a session that
+    // was, a test harness that exported it — would otherwise hand a
+    // `Seed` spawn a `1` nobody chose for it, and that session comes up
+    // with no project at all.
+    command.env_remove(NO_SEED_ENV);
+    if first_project == FirstProject::Withheld {
+        // Only set when withheld: the absence of the variable is what
+        // every other spawn means by "seed normally", and setting a
+        // `0` would leave a hint in the environment for a reader that
+        // does not exist yet to misread.
+        command.env(NO_SEED_ENV, "1");
     }
     let mut child = command
         .spawn()
@@ -1118,12 +1182,42 @@ mod tests {
         );
     }
 
-    /// The launch hint's name is a cross-process contract: `roostctl`
-    /// sets it, `roost-session` consumes it, and nothing renames it
-    /// without both ends moving.
+    /// The no-seed hint reads as *withheld* only when it says so.
+    #[test]
+    fn only_an_affirmative_value_withholds_the_first_project() {
+        assert_eq!(
+            FirstProject::from_env_value(Some("1")),
+            FirstProject::Withheld
+        );
+        assert_eq!(
+            FirstProject::from_env_value(Some(" true ")),
+            FirstProject::Withheld
+        );
+        // Presence is deliberately not enough. An exported-and-blanked
+        // variable, or one somebody set to `0` expecting it to mean
+        // "seed", must not silently cost a session its first project —
+        // and `Seed` is the default a daemon of any other release has.
+        for raw in [None, Some(""), Some("0"), Some("false"), Some("yes")] {
+            assert_eq!(
+                FirstProject::from_env_value(raw),
+                FirstProject::Seed,
+                "{raw:?}"
+            );
+        }
+        assert_eq!(FirstProject::default(), FirstProject::Seed);
+    }
+
+    /// The launch hints' names are a cross-process contract: `roostctl`
+    /// and the UI set them, `roost-session` consumes them, and nothing
+    /// renames one without both ends moving.
     #[test]
     fn the_launch_cwd_env_name_is_frozen() {
         assert_eq!(LAUNCH_CWD_ENV, "ROOST_SESSION_LAUNCH_CWD");
+        // The other consumed-once hint (plan 063 §D8 phase 1). Frozen
+        // for the same reason: a launcher of one release spawns a
+        // daemon of another during an upgrade, and a renamed hint is a
+        // silently ignored one.
+        assert_eq!(NO_SEED_ENV, "ROOST_SESSION_NO_SEED");
     }
 
     #[test]

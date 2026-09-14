@@ -510,8 +510,13 @@ def test_a_client_with_no_saved_hosts_offers_no_host_rows(roost):
     assert "host:add" in rows, rows
     per_host = {row for row in rows if row.startswith(("host:connect:", "host:disconnect:"))}
     assert per_host == set(), per_host
-    assert "host:new_project_on" not in rows, (
-        "the picker row is offered only once there is somewhere else to create"
+    # Plan 063 §D3 moved this row's gate from "any saved host" to "the
+    # picker offers a choice", and `localhost` is now always one of its
+    # destinations — so with an empty registry the picker is LOCAL plus
+    # localhost, and the row is offered. The zero-change claim this case
+    # is about is unchanged: no *per-host* row exists.
+    assert "host:new_project_on" in rows, (
+        "the picker offers LOCAL and localhost even before a host is saved"
     )
 
 
@@ -776,6 +781,54 @@ def test_disconnect_leaves_the_shells_running_and_stop_reaps_them(host, roost):
     host.connect_and_wait()
     with host.client() as session:
         host_key(roost, int(session.tabs()[0]["id"]))
+
+
+def test_a_launcher_row_runs_on_the_host_the_selection_names(host, roost):
+    """Plan 063 §D3: a launcher row opens a tab, so it follows the active
+    project's host — the same route ⌘T takes.
+
+    It used to read `workspace.active()` and hand the id straight to the
+    local `tab.open`, which lands the command in the in-process
+    workspace no matter what is selected. That is invisible with a host
+    tab on screen and fatal under `local-backend = session`, where the
+    in-process workspace is empty and the pair is project `0`
+    (`ProjectNotFound`, and the command never runs). The slot is an
+    ordinary host, so pinning the host case pins both.
+
+    The tab landing over there is the routing claim; the marker is the
+    argv one — `tab.open` toward a host now carries `argv` + `title`,
+    which it did not have to before a launcher row could reach it.
+    """
+    host.connect_and_wait()
+    with host.client() as session:
+        project = first_project(session)
+        parked = quiet_tab(session, project, host.env.launch_cwd)
+        # Focusing is the attach (§3.4), and it is also what makes the
+        # host project the selected one a creation follows.
+        host_key(roost, parked)
+
+        frame = roost.palette_open(kind="launcher")
+        assert frame["frame"] == "launcher", frame
+        rows = {item["title"]: item["id"] for item in frame["items"]}
+        if "Echo Marker" not in rows:
+            pytest.skip("the seed config is not active (the UI is not the harness's)")
+
+        local_before = {int(row["id"]) for row in roost.tabs()}
+        host_before = set(session.project_tab_ids(project))
+
+        activated = roost.palette_activate(rows["Echo Marker"])
+        assert activated["open"] is False, activated
+
+        spawned = wait_until(
+            lambda: set(session.project_tab_ids(project)) - host_before,
+            30.0,
+            "the launcher's tab to appear on the host",
+        )
+        assert {int(row["id"]) for row in roost.tabs()} == local_before, (
+            "the launcher opened its tab in the local workspace while a host "
+            "project was selected"
+        )
+        wait_session_dump_contains(session, next(iter(spawned)), "LAUNCH_MARKER=ok")
 
 
 # ---------------------------------------------------------------------------

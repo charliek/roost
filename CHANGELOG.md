@@ -13,6 +13,43 @@ release workflow asserts they agree).
 
 ### Added
 
+- **A switchable local backend: local tabs can now run on a session
+  instead of in-process (#426)** — a new `local-backend = in-process |
+  session` config key, and two command-palette rows,
+  **Use a session for local tabs** / **Use in-process local tabs**, that
+  move your local projects and tabs between the two in place, live,
+  with no relaunch. Forward replays your current layout onto a local
+  `roost-session` daemon (starting it if needed), preserving project and
+  tab order, cwds, and any titles you set by hand, then ends the
+  in-process shells and writes the key. Reverse is deliberately
+  **No-Replay**: it flips the key back without copying anything — the
+  session keeps running exactly as it was, one click away under a
+  `LOCALHOST` band, and the in-process band comes back from its own
+  persisted state (seeded fresh if empty). A **genuinely fresh
+  install** — no `state.json` and no `config.conf` on disk yet — starts
+  on `session` from the first launch, key written automatically; every
+  existing setup keeps defaulting to `in-process` this release. A
+  hand-edited key found sitting over a populated in-process workspace
+  migrates automatically at the next launch, using the same sequence,
+  once the session connects. The sidebar's local band is now
+  presence-derived rather than hardcoded: it shows whichever local
+  backends actually exist, and `app.sidebar_dump` grows a `sections`
+  array reporting the dot, saved host id, reconnect offer, and fidelity
+  pill for each band on the wire. Closing a host's last project — on
+  any host, including the one your local tabs are switched onto — now
+  forgets that host (never stops its session) and remembers it as a
+  **recent** for one-row re-adding; emptying *every* local project and
+  host closes the window, the same rule that has always governed
+  closing the last one when everything was in-process. `roostctl` and
+  every shell hook keep working unchanged under `session`: a bare tab
+  or project id on the UI socket is forwarded to the session
+  transparently (`identify.local_backend` / `local_session_socket` /
+  `local_backend_switch` report the mode, the session's socket, and any
+  switch in progress). See the [host sessions
+  guide](docs/guides/host-sessions.md#switching-the-local-backend),
+  [`config.md`](docs/reference/config.md#local-backend), and
+  [`ipc.md`](docs/reference/ipc.md#a-ui-socket-under-local-backend--session)
+  for the full behavior.
 - **`roostctl host status` prints why a reconnect rung is armed (#401)**
   — while a rung is armed, the band's own line (and so the human form's
   rollup) *is* the countdown, `reconnecting in 8s (3/10)`, which is

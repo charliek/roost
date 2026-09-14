@@ -101,6 +101,15 @@ keep launching.
 
 The directories are created at first launch with mode `0700`.
 
+**`switch-journal.json`** lives beside `state.json`, in whichever UI
+profile above is running — not in the `Session` profile below, since
+the journal belongs to whichever iced UI is driving a local-backend
+switch (see [Switching the local backend](../guides/host-sessions.md#switching-the-local-backend)),
+not to the daemon it switches onto. It only exists while a switch is in
+progress or was interrupted mid-flight; a UI that starts up and finds
+one resumes or rolls it back before doing anything else, then deletes
+it. Swift never writes one — `local-backend` isn't a key it reads.
+
 ### Session profile
 
 `Session` resolves paths the same way the three UI profiles do, and is
@@ -169,6 +178,20 @@ time and drops any connection from a different user, which no UI socket
 does. `validate_runtime_dir` rejects rather than repairs a socket
 directory some other mode or owner already created, so a session's
 lock-acquisition step never silently inherits a loosened directory.
+
+### Session launch hints
+
+Two environment variables pass one-time information into a
+`roost-session` process at the moment it is spawned. Both are
+**consumed once**: the daemon reads and removes each from its own
+environment before doing anything else, specifically so a shell it
+later spawns can never inherit either — a hint about how the session
+itself started has no business leaking into a tab.
+
+| Variable | Set by | Effect |
+|---|---|---|
+| `ROOST_SESSION_LAUNCH_CWD` | `roostctl session start`, and the UI's own spawn-if-missing connect | The directory the daemon was launched from. The daemon `chdir("/")`s immediately, so this is the only way to log where a session came from — it is logged and then discarded, never used to seed anything (a first-ever session seeds `Untitled 1` at `$HOME` like every UI, regardless of where it was started from — see [`config.md`'s `local-backend`](config.md#local-backend)). |
+| `ROOST_SESSION_NO_SEED` | Only a spawn made *for a [local-backend switch](../guides/host-sessions.md#switching-the-local-backend)'s own destination*: the forward switch you ask for, and the launch-time migration a `session` start performs over an in-process workspace that still has a layout. Both dial that destination the same way, so both withhold. | Tells a first-ever session **not** to seed itself a project. Set because that spawn is immediately followed by the switch's own replay — a session that seeded itself first would hand you a stray empty project sitting beside the layout you just moved over. Every other spawn — `roostctl session start`, an ordinary launch-time connect to the same session, a Connect you press — gets the ordinary seeded behavior. |
 
 ### SSH scratch directories
 

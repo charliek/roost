@@ -39,6 +39,31 @@ pub mod single_instance;
 pub mod tab_task;
 pub mod workspace;
 
+/// Where a project with no directory of its own is placed.
+///
+/// An unset `HOME` is not the only way to have no home: an **empty** one
+/// (`HOME=`) is what `env::var` hands back as `Ok("")`, and a relative
+/// one resolves against a cwd the caller does not control — a
+/// `roost-session` daemon has already `chdir("/")`d by the time it asks.
+/// Both would otherwise reach a PTY as "spawn wherever you happen to
+/// be", so both fall back to `/` alongside the unset case.
+///
+/// Every place that seeds or resolves a project cwd goes through here,
+/// because `project.create` and `tab.open` resolving it differently is
+/// exactly the disagreement plan 063 §D4 set out to remove.
+pub fn home_dir() -> String {
+    resolve_home(std::env::var("HOME").ok().as_deref())
+}
+
+/// [`home_dir`] without the environment, so the rule above can be tested
+/// without a process-global `HOME` two parallel tests would race over.
+fn resolve_home(raw: Option<&str>) -> String {
+    match raw {
+        Some(home) if std::path::Path::new(home).is_absolute() => home.to_string(),
+        _ => "/".into(),
+    }
+}
+
 pub use application::LocalClient;
 #[cfg(feature = "facade")]
 pub use facade::{
@@ -57,3 +82,22 @@ pub use workspace::{
     ResumeError, TabEffectKind, VersionedWorkspaceEvent, Workspace, WorkspaceError, WorkspaceEvent,
     SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
+
+#[cfg(test)]
+mod home_tests {
+    use super::resolve_home;
+
+    #[test]
+    fn only_an_absolute_home_is_somewhere_to_put_a_project() {
+        assert_eq!(resolve_home(Some("/home/x")), "/home/x");
+        assert_eq!(resolve_home(Some("/")), "/");
+        // `HOME=` reaches us as `Ok("")`, not as "unset" — the case the
+        // old `unwrap_or_else(|_| ..)` spelling silently let through.
+        assert_eq!(resolve_home(Some("")), "/");
+        // Relative resolves against a cwd the caller does not control;
+        // a daemon has already `chdir("/")`d by the time it asks.
+        assert_eq!(resolve_home(Some("home/x")), "/");
+        assert_eq!(resolve_home(Some("./x")), "/");
+        assert_eq!(resolve_home(None), "/");
+    }
+}

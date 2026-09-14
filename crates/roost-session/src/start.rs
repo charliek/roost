@@ -37,7 +37,9 @@ use roost_ipc::paths::BundleProfile;
 use roost_ipc::validate_runtime_dir;
 use tracing::info;
 
-use crate::consts::{LAUNCH_CWD_ENV, OWNER_ONLY_DIR_MODE, PROCESS_UMASK};
+use crate::consts::{
+    FirstProject, LAUNCH_CWD_ENV, NO_SEED_ENV, OWNER_ONLY_DIR_MODE, PROCESS_UMASK,
+};
 use crate::readiness::{Readiness, Verdict};
 use crate::serve::{serve, SessionConfig};
 use crate::{daemonize, logging};
@@ -61,7 +63,10 @@ pub enum Outcome {
 /// fork, so no code path can ever race a PTY spawn against it.
 ///
 /// The fallback is the process cwd, which is right for a direct
-/// invocation with no `roostctl` in front of it.
+/// invocation with no `roostctl` in front of it. The result is used only
+/// for the startup log line below — a first-ever session seeds its
+/// project at `$HOME` like every UI (plan 063 §D4), not at this
+/// directory.
 pub fn capture_launch_cwd() -> PathBuf {
     let hint = std::env::var_os(LAUNCH_CWD_ENV);
     std::env::remove_var(LAUNCH_CWD_ENV);
@@ -69,6 +74,20 @@ pub fn capture_launch_cwd() -> PathBuf {
         .filter(|path| path.is_absolute())
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// Read and consume the no-seed hint (plan 063 §D8 phase 1).
+///
+/// [`capture_launch_cwd`]'s sibling, in every respect that matters:
+/// captured here, at the one point in the process's life that is before
+/// the fork and before any thread, and **erased** so no shell this
+/// session spawns can inherit it. A daemon started by any other route
+/// finds nothing and seeds normally, which is what makes this a hint on
+/// one spawn rather than a change to §D4's rule.
+pub fn capture_first_project() -> FirstProject {
+    let hint = std::env::var(NO_SEED_ENV).ok();
+    std::env::remove_var(NO_SEED_ENV);
+    FirstProject::from_env_value(hint.as_deref())
 }
 
 /// Install the file-creation posture for everything this process makes.
@@ -88,7 +107,8 @@ pub fn set_process_umask() {
 pub fn start(
     profile: &BundleProfile,
     foreground: bool,
-    launch_cwd: PathBuf,
+    launch_cwd: &Path,
+    first_project: FirstProject,
     readiness: &mut Readiness,
 ) -> Result<Outcome> {
     // Step 0, and it has to be step 0: before the fork (which `chdir`s
@@ -115,6 +135,7 @@ pub fn start(
         profile = profile.kind.as_str(),
         foreground,
         launch_cwd = %launch_cwd.display(),
+        ?first_project,
         "roost-session starting"
     );
 
@@ -147,7 +168,7 @@ pub fn start(
             Err(error) => return Err(anyhow::anyhow!("single-instance lock failed: {error}")),
         };
 
-    let config = SessionConfig::from_profile(profile, launch_cwd);
+    let config = SessionConfig::from_profile(profile, first_project);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("roost-session")

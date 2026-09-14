@@ -106,6 +106,90 @@ fn saved_hosts_survive_an_ordinary_rewrite() {
     ws2.create_project("Third", "/tmp").unwrap();
 }
 
+/// Plan 063 §D7's recents list is client-side state the workspace never
+/// reads, so it carries the same erase-on-rewrite risk `hosts` does —
+/// and one more: a build that persisted only `hosts` would drop the
+/// row the last-project auto-remove just recorded.
+#[test]
+fn recent_hosts_survive_an_ordinary_rewrite_and_a_removal_appends_one() {
+    let dir = tempdir().unwrap();
+    let state_path = dir.path().join("state.json");
+    std::fs::write(
+        &state_path,
+        br#"{
+            "next_id": 3,
+            "projects": [],
+            "hosts": [{ "id": "h1", "label": "shed", "target": "test1@localhost" }],
+            "recent_hosts": [
+                { "id": "r1", "label": "old-box", "target": "user@old-box" }
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    {
+        let ws = Workspace::open(state_path.clone());
+        assert_eq!(ws.recent_hosts().len(), 1, "the list loads");
+        ws.create_project("Roost", "/tmp").unwrap();
+    }
+    let back = read_state(&state_path).unwrap().expect("present");
+    assert_eq!(
+        back.recent_hosts.len(),
+        1,
+        "and survives an unrelated write"
+    );
+    assert_eq!(back.recent_hosts[0].target, "user@old-box");
+
+    // Forgetting the saved host puts it at the head, ahead of the row
+    // that was already there.
+    {
+        let ws = Workspace::open(state_path.clone());
+        ws.remove_host("h1").unwrap();
+    }
+    let back = read_state(&state_path).unwrap().expect("present");
+    assert!(back.hosts.is_empty());
+    let targets: Vec<&str> = back
+        .recent_hosts
+        .iter()
+        .map(|host| host.target.as_str())
+        .collect();
+    assert_eq!(targets, vec!["test1@localhost", "user@old-box"]);
+}
+
+/// A hand-edited `state.json` that repeats a saved host id is repaired
+/// at load (plan 063 §D7 / C3's keyed band↔view pairing): both rows
+/// survive, with distinct ids, and the repair is persisted.
+#[test]
+fn a_state_file_repeating_a_host_id_loads_with_both_rows_addressable() {
+    let dir = tempdir().unwrap();
+    let state_path = dir.path().join("state.json");
+    std::fs::write(
+        &state_path,
+        br#"{
+            "next_id": 3,
+            "projects": [],
+            "hosts": [
+                { "id": "dup", "label": "one", "target": "user@one" },
+                { "id": "dup", "label": "two", "target": "user@two" }
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let ws = Workspace::open(state_path.clone());
+    let hosts = ws.hosts();
+    assert_eq!(hosts.len(), 2, "neither row is dropped");
+    assert_eq!(hosts[0].id, "dup", "the first keeps the id");
+    assert_ne!(hosts[1].id, hosts[0].id);
+
+    // Addressable separately, which is the whole point: removing the
+    // second must not take the first with it.
+    ws.remove_host(&hosts[1].id).unwrap();
+    let left = ws.hosts();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].label, "one");
+}
+
 /// `add_host` mints a fresh id, persists through a reopen, and
 /// `remove_host` forgets it the same way — the accessor round-trip the
 /// opaque-carry tests above don't cover (those load hosts from a
