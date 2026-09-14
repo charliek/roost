@@ -578,10 +578,12 @@ pub enum UiRequest {
     /// The `op` is a bare-id workspace op this socket would otherwise
     /// have answered against its own workspace — which under
     /// `local-backend = session` is the one the window does not draw.
-    /// `params` cross verbatim: bare ids mean the slot's ids, so there
-    /// is nothing to translate, and `tab.open`'s `project_id: 0` gets
-    /// the slot's default project exactly as a client on the session
-    /// socket would.
+    /// Answering it here would not merely land in the wrong workspace:
+    /// `tab.open` begins with `ensure_default_project`, so it would
+    /// *create* a project in there to land in. `params` cross verbatim:
+    /// bare ids mean the slot's ids, so there is nothing to translate,
+    /// and `tab.open`'s `project_id: 0` gets the slot's default project
+    /// exactly as a client on the session socket would.
     ///
     /// Like [`UiRequest::HostTabReorder`] this cannot be answered inside
     /// `update` — the app has to await a session — so the reply travels
@@ -2931,7 +2933,8 @@ fn local_session_unavailable() -> HandlerError {
 }
 
 /// Plan 063 §D10: hand one whole request to the slot and answer with
-/// its reply.
+/// its reply — [`UiRequest::LocalSessionForward`] is where the request
+/// and its rationale are defined.
 async fn forward_to_local_session(
     h: &IpcHandler,
     op: &str,
@@ -2970,11 +2973,10 @@ async fn dispatch(
     op: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, HandlerError> {
-    // Plan 063 §D10. Under `local-backend = session` this socket's own
-    // workspace is the one the window does not draw, so a bare id names
-    // a tab on the slot and not a row in here — a `tab.open` answered
-    // locally would not merely land in the wrong workspace, it would
-    // `ensure_default_project` a project there to land in.
+    // Plan 063 §D10: under `session` a bare id names a tab on the slot,
+    // not a row in this socket's own workspace — see
+    // [`UiRequest::LocalSessionForward`] for what answering one here
+    // would cost.
     //
     // Neither branch touches a ref that already names a host: the
     // rewrite is bare-only, so an explicit `h<n>.<id>` reaches the op's
@@ -4620,9 +4622,8 @@ mod tests {
         h.with_local_route(cell)
     }
 
-    /// The defect §D10 exists to close: answered locally, this arm's
-    /// first act is `ensure_default_project`, so a bare `tab.open`
-    /// **creates** a project in the workspace `session` mode hides.
+    /// The defect §D10 exists to close, driven through the dispatcher:
+    /// a bare `tab.open` under `session` leaves through the forward.
     #[tokio::test]
     async fn a_bare_tab_open_under_session_never_touches_the_local_workspace() {
         let dir = tempfile::tempdir().unwrap();

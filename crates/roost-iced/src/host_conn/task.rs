@@ -112,10 +112,11 @@ pub(crate) enum ConnectMode {
     ///
     /// A separate mode rather than a flag beside one, because it is the
     /// same question this enum already answers — what this attempt does
-    /// about an absent socket — and the only caller is the local-backend
-    /// switch, whose replay lands on that session a moment later. Every
-    /// other spawn seeds, including the launch-time dial of the very
-    /// same slot.
+    /// about an absent socket — and the only caller is a switch whose
+    /// replay lands on that session a moment later: the forward switch,
+    /// or §D5's launch-time migration, which is that same replay run at
+    /// startup. Every other spawn seeds, including a launch-time dial of
+    /// the very same slot with no migration to run.
     SpawnUnseeded,
     /// Dial straight away. What a non-localhost host always does — there
     /// is no local socket to probe and nothing this client could spawn.

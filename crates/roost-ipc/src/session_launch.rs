@@ -642,6 +642,14 @@ pub async fn spawn_and_read_verdict(
         );
         command.env(STATE_DIR_ENV, &derived);
     }
+    // Removed first, always: `Command` inherits this process's
+    // environment, so "absent" is only what every other spawn means by
+    // "seed normally" if absence is made real here. A launcher that was
+    // itself started under the hint — a UI in a tab of a session that
+    // was, a test harness that exported it — would otherwise hand a
+    // `Seed` spawn a `1` nobody chose for it, and that session comes up
+    // with no project at all.
+    command.env_remove(NO_SEED_ENV);
     if first_project == FirstProject::Withheld {
         // Only set when withheld: the absence of the variable is what
         // every other spawn means by "seed normally", and setting a

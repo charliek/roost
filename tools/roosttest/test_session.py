@@ -441,8 +441,11 @@ def test_the_layout_is_restored_across_a_restart(env):
     with env.client() as client:
         projects = client.list()
         assert len(projects) == 1, projects
-        # A first-ever start seeds its project from the launch directory.
-        assert projects[0]["cwd"] == str(env.launch_cwd)
+        # A first-ever start seeds at `$HOME`, not at the directory the
+        # start command ran from (plan 063 §D4): both backends seed the
+        # same way now, so a state file written by one is unsurprising to
+        # the other. `launch_cwd` survives only as a startup log line.
+        assert projects[0]["cwd"] == env.env["HOME"]
         project = int(projects[0]["id"])
 
         first = client.open_tab(project, cwd=str(alpha))

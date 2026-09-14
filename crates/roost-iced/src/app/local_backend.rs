@@ -1263,6 +1263,82 @@ pub(crate) fn rollback_is_still_ours(expected_tabs: Option<usize>, found_tabs: u
     expected_tabs.is_some_and(|expected| found_tabs <= expected)
 }
 
+/// Put the `local-backend` key back to `mode` on a run that is unwinding.
+///
+/// Warned, not raised: the run is already failing, and the journal on
+/// disk still describes an uncommitted switch — so the next launch
+/// rewrites this key from [`journal_recovery`] whatever happens here.
+fn put_backend_key_back(config_path: &Path, mode: LocalBackendMode) {
+    if let Err(error) = roost_ui_model::config::set_key(config_path, "local-backend", mode.as_str())
+    {
+        tracing::warn!(%error, %mode, "could not put the local-backend key back");
+    }
+}
+
+/// Retire a failing run's journal, and answer with what the app must go
+/// on remembering (plan 063 §D8b).
+///
+/// **The file is never dropped over an adopted copy, at any call site.**
+/// `arm_switch` moves the app's outstanding list into the run at the one
+/// moment the file is about to be replaced, so from then until the run
+/// ends the pair — the file on disk and the run in memory — is the only
+/// record that copy exists. Clearing the file on a failure would leave
+/// the ids in a run `end_switch` is about to drop: orphaned for good,
+/// which is the whole thing the adoption exists to prevent. Every
+/// pre-commit failure can be reached with that list populated — a label
+/// that is taken, a session that will not start, a journal that will not
+/// write, a phase that times out — so this is a property of the ending
+/// rather than a check some of them remember to make.
+///
+/// The copies **this** run made are a different question and not this
+/// one's: they are named by the same file, and §D8b's answer for them is
+/// that a partial destination copy may remain until a launch can reach
+/// it.
+fn retire_failed_journal(path: &Path, journal: &SwitchJournal) -> Vec<(i64, Option<usize>)> {
+    let adopted = inherited_targets(journal);
+    if adopted.is_empty() {
+        clear_journal(path);
+    }
+    adopted
+}
+
+/// The reverse's commit point as the two writes it is: the key, then the
+/// journal that says the key may be trusted.
+///
+/// **Both are refusals, and the order is the forward commit's order for
+/// the forward commit's reason.** The key goes first so the crash window
+/// between them is the recoverable one (a journal still reading
+/// `preparing` over a key that says `in-process` resolves as an
+/// uncommitted reverse and puts `session` back). Which is exactly why a
+/// journal write that *fails* cannot be logged and stepped over: past
+/// this point the mode flips and the run reports success, and the next
+/// launch would read that same `preparing` and restore `session` —
+/// undoing a completed switch behind the user's back. So it refuses,
+/// and puts the key back on its way out.
+///
+/// Free of the app so the refusal can be driven directly.
+fn reverse_commit_record(
+    config_path: &Path,
+    journal_path: &Path,
+    journal: &mut SwitchJournal,
+) -> Result<(), String> {
+    if let Err(error) = roost_ui_model::config::set_key(
+        config_path,
+        "local-backend",
+        LocalBackendMode::InProcess.as_str(),
+    ) {
+        return Err(format!("could not record the local backend: {error}"));
+    }
+    let uncommitted = journal.phase;
+    journal.phase = SwitchState::Committing;
+    if let Err(error) = write_journal(journal_path, journal) {
+        journal.phase = uncommitted;
+        put_backend_key_back(config_path, LocalBackendMode::Session);
+        return Err(format!("could not record the switch commit: {error}"));
+    }
+    Ok(())
+}
+
 /// Where the source's active tab ended up (plan 063 §D8 phase 4).
 ///
 /// `active_at` is a **source** position pair, because the destination's
@@ -2156,13 +2232,7 @@ impl super::App {
             .is_some_and(|run| run.journal.launch_migration);
         if !launch_migration {
             if let Some(config_path) = roost_ui_model::config::config_path() {
-                if let Err(error) = roost_ui_model::config::set_key(
-                    &config_path,
-                    "local-backend",
-                    LocalBackendMode::InProcess.as_str(),
-                ) {
-                    tracing::warn!(%error, "could not put the local-backend key back");
-                }
+                put_backend_key_back(&config_path, LocalBackendMode::InProcess);
             }
         }
         // Paired with what the snapshot said each copy should hold, so
@@ -2250,20 +2320,16 @@ impl super::App {
             self.fail_switch("there is no config file to record the local backend in");
             return false;
         };
-        if let Err(error) = roost_ui_model::config::set_key(
-            &config_path,
-            "local-backend",
-            LocalBackendMode::InProcess.as_str(),
-        ) {
-            self.fail_switch(&format!("could not record the local backend: {error}"));
-            return false;
-        }
         let path = self.journal_path();
         let run = self.switch.as_mut().expect("a run");
-        run.journal.phase = SwitchState::Committing;
-        if let Err(error) = write_journal(&path, &run.journal) {
-            tracing::warn!(%error, "could not record the switch commit");
+        if let Err(why) = reverse_commit_record(&config_path, &path, &mut run.journal) {
+            // The journal is the only record of an adopted copy (§D8b),
+            // so it stays: the next launch resolves what is on disk —
+            // an uncommitted reverse — and deletes that copy.
+            self.fail_switch_keeping_journal(&why);
+            return false;
         }
+        let run = self.switch.as_mut().expect("a run");
         run.phase(SwitchState::CleaningUp);
         self.local_backend = LocalBackendMode::InProcess;
         self.publish_local_route();
@@ -2387,9 +2453,28 @@ impl super::App {
     // ── endings ─────────────────────────────────────────────────────
 
     /// A failure before the commit point: say so, undo this run's own
-    /// registry addition, and drop the journal.
+    /// registry addition, and drop the journal — unless the run adopted
+    /// an earlier switch's destination copy, which
+    /// [`retire_failed_journal`] is what decides.
     fn fail_switch(&mut self, why: &str) {
-        clear_journal(&self.journal_path());
+        let path = self.journal_path();
+        let adopted = match self.switch.as_ref() {
+            Some(run) => retire_failed_journal(&path, &run.journal),
+            // No run means no journal of ours to reason about.
+            None => {
+                clear_journal(&path);
+                Vec::new()
+            }
+        };
+        if !adopted.is_empty() {
+            tracing::info!(
+                projects = adopted.len(),
+                "a refused switch hands its adopted copy back to the next one"
+            );
+            // Back where `arm_switch` took it from, so the next run in
+            // this process adopts it exactly as a launch would.
+            self.pending_dest_cleanup = adopted;
+        }
         self.fail_switch_keeping_journal(why);
     }
 
@@ -2496,7 +2581,25 @@ async fn replay_onto_slot(
         };
         journal.created_dest_ids.push(made.id);
         if let Err(error) = write_journal(path, &journal) {
-            tracing::warn!(%error, "could not record a replayed project");
+            // **If we cannot record it, we cannot recover it.** The id is
+            // in memory and not on disk, so a crash from here on leaves a
+            // real destination project that the next launch's rollback —
+            // which reads its targets off the journal — can neither name
+            // nor delete. So the replay stops while this run can still
+            // roll it back, and the copy goes into `created` first:
+            // that list is what [`super::App::forward_roll_back`]
+            // deletes.
+            created.push(CreatedProject {
+                source: project.source,
+                project: made.id,
+                tabs: Vec::new(),
+                complete: false,
+            });
+            return ReplayOutcome {
+                created,
+                inherited_left: Vec::new(),
+                error: Some(format!("could not record a replayed project: {error}")),
+            };
         }
         let mut tabs: Vec<CreatedTab> = Vec::with_capacity(project.tabs.len());
         for (position, tab) in project.tabs.iter().enumerate() {
@@ -3734,6 +3837,108 @@ mod switch_tests {
         );
     }
 
+    /// **The reverse's commit point refuses a journal it cannot write**
+    /// (plan 063 §D8).
+    ///
+    /// The forward commit's rule, and the same consequence read the
+    /// other way round: the flip behind this write makes the run report
+    /// success, while a journal still on disk at `preparing` is exactly
+    /// what the next launch resolves as an *uncommitted* reverse — it
+    /// puts `session` back, undoing a completed switch nobody was told
+    /// had failed. So it stops, and the key goes back with it.
+    #[test]
+    fn a_reverse_commit_that_cannot_record_itself_refuses_and_puts_the_key_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.conf");
+        roost_ui_model::config::set_key(&config, "local-backend", "session").unwrap();
+        let mut reverse = SwitchJournal::new(SwitchDirection::ToInProcess, Vec::new());
+        reverse.inherited_dest = vec![InheritedDest {
+            project: 7,
+            tabs: Some(2),
+        }];
+
+        // The control first: with a writable journal this is the commit,
+        // and it moves both.
+        let ok = journal_path(dir.path());
+        assert_eq!(
+            reverse_commit_record(&config, &ok, &mut reverse.clone()),
+            Ok(())
+        );
+        assert_eq!(backend_key(&config), Some("in-process".to_string()));
+        assert_eq!(
+            read_journal(&ok).map(|written| written.phase),
+            Some(SwitchState::Committing)
+        );
+
+        roost_ui_model::config::set_key(&config, "local-backend", "session").unwrap();
+        let blocked = an_unwritable_journal_path(dir.path());
+        let error = reverse_commit_record(&config, &blocked, &mut reverse)
+            .expect_err("the commit journal could not be written");
+        assert!(
+            error.contains("could not record the switch commit"),
+            "{error}"
+        );
+        assert_eq!(
+            backend_key(&config),
+            Some("session".to_string()),
+            "the key goes back: the run stopped before the commit point, not after it"
+        );
+        assert_eq!(
+            reverse.phase,
+            SwitchState::Preparing,
+            "and the run's own copy still says what is on disk, \
+             so the adopted copy is still named by an uncommitted journal"
+        );
+    }
+
+    /// **A refused run never drops the journal that names an adopted
+    /// copy** (plan 063 §D8b).
+    ///
+    /// The third of this class in this file, and the reason it is a
+    /// property of the ending rather than a check at nine call sites:
+    /// eight of them can be reached with the list populated. The file is
+    /// the only record a *launch* can read, and the returned list is the
+    /// only record this *process* can re-adopt, so a failure has to
+    /// leave both.
+    #[test]
+    fn a_refused_run_keeps_the_journal_naming_an_adopted_copy_and_hands_it_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = journal_path(dir.path());
+        let mut journal = SwitchJournal::new(SwitchDirection::ToInProcess, Vec::new());
+
+        // A run that adopted nothing: the file is its own and goes with
+        // it, exactly as before.
+        write_journal(&path, &journal).unwrap();
+        assert!(retire_failed_journal(&path, &journal).is_empty());
+        assert!(
+            read_journal(&path).is_none(),
+            "a run with nothing adopted still takes its journal with it"
+        );
+
+        // A run that adopted one: the file stays, and the list comes
+        // back for the next `arm_switch` to re-adopt.
+        journal.inherited_dest = vec![InheritedDest {
+            project: 7,
+            tabs: Some(2),
+        }];
+        write_journal(&path, &journal).unwrap();
+        assert_eq!(retire_failed_journal(&path, &journal), vec![(7, Some(2))]);
+        assert_eq!(
+            read_journal(&path).map(|kept| kept.inherited_dest),
+            Some(journal.inherited_dest.clone()),
+            "the copy has no other record: deleting this file orphans it for good"
+        );
+    }
+
+    /// What the `local-backend` line in a config file says, if any.
+    fn backend_key(path: &Path) -> Option<String> {
+        std::fs::read_to_string(path)
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("local-backend = "))
+            .map(str::to_string)
+    }
+
     /// A journal naming no switch at all — a hand-edited file, or one
     /// from a build that spelled the modes differently — is not acted
     /// on. Both same-mode pairs, because either would otherwise pick a
@@ -4234,19 +4439,39 @@ mod switch_tests {
         refuse: impl Fn(&str, usize) -> bool + Send + 'static,
     ) -> ReplayOutcome {
         let dir = tempfile::tempdir().unwrap();
+        replay_journalled_at(&journal_path(dir.path()), snapshot, refuse).await
+    }
+
+    /// The same replay with the journal somewhere the caller chose —
+    /// which is the only way to drive a journal write that *fails*.
+    async fn replay_journalled_at(
+        path: &Path,
+        snapshot: Vec<SwitchProject>,
+        refuse: impl Fn(&str, usize) -> bool + Send + 'static,
+    ) -> ReplayOutcome {
+        let home = tempfile::tempdir().unwrap();
         let (ops, worker) = fake_slot(refuse);
         let journal = SwitchJournal::new(SwitchDirection::ToSession, snapshot.clone());
         let outcome = replay_onto_slot(
             &ops,
             snapshot,
-            &journal_path(dir.path()),
+            path,
             journal,
-            &dir.path().to_string_lossy(),
+            &home.path().to_string_lossy(),
         )
         .await;
         drop(ops);
         let _ = worker.await;
         outcome
+    }
+
+    /// A journal path nothing can be written to, arranged by **creating**
+    /// a file where `write_journal` needs a directory — never by removing
+    /// or chmod-ing anything, and inside this test's own temp dir.
+    fn an_unwritable_journal_path(dir: &Path) -> PathBuf {
+        let blocked = dir.join("not-a-directory");
+        std::fs::write(&blocked, b"").unwrap();
+        journal_path(&blocked)
     }
 
     fn source(id: i64, tabs: &[(&str, bool)]) -> SwitchProject {
@@ -4263,6 +4488,52 @@ mod switch_tests {
                 })
                 .collect(),
         }
+    }
+
+    /// **A destination copy whose id could not be recorded stops the
+    /// replay** (plan 063 §D8 phase 3).
+    ///
+    /// C6's rule at the other journal write: if we cannot record it, we
+    /// cannot recover it. The id lives in memory until the write lands,
+    /// so a replay that logged the failure and carried on would leave a
+    /// real project on the destination that no later launch can name —
+    /// `rollback_targets` reads the list off the file — and the switch
+    /// would go on to delete the source it copied.
+    #[tokio::test]
+    async fn a_project_whose_id_cannot_be_recorded_fails_the_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = vec![source(11, &[("a", false)]), source(22, &[("b", false)])];
+        let outcome =
+            replay_journalled_at(&an_unwritable_journal_path(dir.path()), snapshot, |_, _| {
+                false
+            })
+            .await;
+
+        assert!(
+            outcome.error.is_some(),
+            "an id that could not be recorded is a replay failure, not a warning"
+        );
+        // **The copy is still handed back.** It exists on the
+        // destination, and `forward_roll_back` deletes exactly what is
+        // in this list — an id missing here is an orphan for good.
+        assert_eq!(
+            outcome
+                .created
+                .iter()
+                .map(|made| made.source)
+                .collect::<Vec<_>>(),
+            vec![11],
+            "it stopped at the first project, and carried that project out"
+        );
+        assert!(
+            !outcome.created[0].complete,
+            "nothing was opened in it, so it can never cost its source a deletion"
+        );
+        assert!(outcome.created[0].tabs.is_empty());
+        assert!(
+            deletable_sources(&outcome.created).is_empty(),
+            "and the source of the copy this run abandons is kept"
+        );
     }
 
     /// **A tab that failed to replay must cost its project the source

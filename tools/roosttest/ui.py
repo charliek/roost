@@ -854,11 +854,23 @@ def launch(
     `ROOST_STATE_DIR`, so a lane can point one of them somewhere else —
     which is the only way to test a UI whose config lives in a directory
     it cannot write (plan 063's switch: the key write is a phase, and its
-    failure has a rollback behind it). Rust UIs only; the Mac app is
-    launched through `open`, which does not carry an environment.
+    failure has a rollback behind it).
+
+    **The bare-binary Rust launch only.** Both `open`-launched paths — the
+    Mac app, and the iced *bundle* when `ROOST_ICED_APP` is set — forward
+    a hand-maintained `--env` allowlist rather than an environment, so an
+    override handed to them would be dropped and the lane would run,
+    green, against the config it meant to replace. It is refused instead
+    of threaded through: `open` does not define which of two `--env` flags
+    naming the same variable wins, so "threaded" would trade a silent drop
+    for an unverifiable override, and the allowlist is deliberately
+    curated (`ROOST_BUNDLE_PROFILE` is withheld from it on purpose).
     """
-    if extra_env and target == "mac":
-        raise ValueError("extra_env has no route into a `open`-launched Mac app")
+    if extra_env and (target == "mac" or iced_bundle_app() is not None):
+        raise ValueError(
+            f"extra_env has no route into the `open`-launched {target} app: "
+            "only the bare-binary Rust launch carries an environment"
+        )
     if is_alive(target) and not force:
         return
     # A mid-test relaunch (e.g. the sidebar-persistence test's quit→launch)

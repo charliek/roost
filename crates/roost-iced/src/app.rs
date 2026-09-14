@@ -367,9 +367,11 @@ fn spawn_gate(
 /// inputs is how one of them gets forgotten. So the mode is *derived*
 /// from the purpose rather than passed beside it.
 ///
-/// Only the switch withholds. A launch-time dial of the very same slot
-/// wants the seed (§D4/§D5: coming up on an empty band is coming up
-/// broken), and so does every Connect a person presses.
+/// Only a switch withholds — the forward one, and §D5's launch-time
+/// migration, which arms the same purpose because it is the same replay.
+/// A launch-time dial with no migration to run wants the seed (§D4/§D5:
+/// coming up on an empty band is coming up broken), and so does every
+/// Connect a person presses.
 fn dial_mode(
     localhost: bool,
     purpose: local_backend::ConnectPurpose,

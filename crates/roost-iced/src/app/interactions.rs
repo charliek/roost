@@ -2107,10 +2107,12 @@ impl App {
         // `terminal_event_key`'s "the tab showing is the one meant" rule
         // is a *widget* reading that an IPC caller naming a tab by id
         // does not get.
-        let key = self.local_tab_key(tab_id);
-        if !self.tabs.contains_key(&key) {
+        let Some(key) = self
+            .local_tab_key(tab_id)
+            .filter(|key| self.tabs.contains_key(key))
+        else {
             return Err(format!("tab {tab_id} has no live terminal"));
-        }
+        };
         let link_modifier_held = input::accelerator_mods_from_ghostty(mods)
             .intersects(keybind::resolve_link_modifier(self.config.link_modifier));
         Ok(self.route_pointer(

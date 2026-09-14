@@ -1744,11 +1744,11 @@ impl App {
     /// an attached host tab's client-side terminal (plan 037 §3.4). A
     /// ref from a dead connection epoch simply misses the map — the
     /// staleness contract `HostId` minting exists for.
-    fn wire_tab_key(&self, tab: roost_ipc::messages::WireTabRef) -> TabKey {
+    fn wire_tab_key(&self, tab: roost_ipc::messages::WireTabRef) -> Option<TabKey> {
         match tab {
             roost_ipc::messages::WireTabRef::Local(tab_id) => self.local_tab_key(tab_id),
             roost_ipc::messages::WireTabRef::Host { host, tab } => {
-                TabKey::new(HostId::new(host), tab)
+                Some(TabKey::new(HostId::new(host), tab))
             }
         }
     }
@@ -1762,13 +1762,19 @@ impl App {
     /// agree with the handler's, because both are answering "which tab
     /// is the user looking at".
     ///
-    /// Under `in-process` this is `backend.tab_key` and nothing has
-    /// moved.
-    pub(super) fn local_tab_key(&self, tab_id: i64) -> TabKey {
-        match self.local_slot_host() {
-            Some(host) => TabKey::new(host, tab_id),
-            None => self.backend.tab_key(tab_id),
-        }
+    /// Under `in-process` the slot is always there and is
+    /// `backend.tab_key`'s own `HostId::LOCAL`, so nothing has moved.
+    ///
+    /// `None` is a slot that is **down** under `session`, and it is an
+    /// answer rather than a fallback to the in-process backend: that
+    /// workspace is the one the window does not draw, and it can still
+    /// hold live tabs — `forward_commit` flips the mode before the
+    /// source teardown finishes, and an attached in-process tab outlives
+    /// that flip. Handing a bare id one of those would break §D10's
+    /// invariant that a bare id means the slot, silently, on the caller
+    /// whose slot went away mid-op.
+    pub(super) fn local_tab_key(&self, tab_id: i64) -> Option<TabKey> {
+        self.local_slot_host().map(|host| TabKey::new(host, tab_id))
     }
 
     /// Queue a strip reveal when the OBSERVED active tab changed. Hooked
@@ -2925,7 +2931,7 @@ impl App {
                 reply,
             } => {
                 let key = self.wire_tab_key(tab_id);
-                let result = match self.tabs.get_mut(&key) {
+                let result = match key.and_then(|key| self.tabs.get_mut(&key)) {
                     Some(tab) => tab
                         .dump(scrollback)
                         .map_err(|error| DumpError::Read(error.to_string())),
@@ -2947,18 +2953,23 @@ impl App {
                 // lookup is the price of handing `self` to `apply_osc_actions`.
                 let result = if !self.test_mode {
                     Err("ROOST_TEST_MODE=1 is required".to_string())
-                } else if let Some(actions) = self
-                    .tabs
-                    .get_mut(&key)
-                    .map(|tab| tab.scan_and_write_vt(&data))
-                {
-                    task = task.then(self.apply_osc_actions(key, actions));
-                    self.tabs
-                        .get_mut(&key)
-                        .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
-                        .and_then(|tab| tab.refresh_snapshot().map_err(|error| error.to_string()))
                 } else {
-                    Err(format!("tab {tab_id} has no live terminal"))
+                    let scanned = key.and_then(|key| {
+                        let actions = self.tabs.get_mut(&key)?.scan_and_write_vt(&data);
+                        Some((key, actions))
+                    });
+                    match scanned {
+                        Some((key, actions)) => {
+                            task = task.then(self.apply_osc_actions(key, actions));
+                            self.tabs
+                                .get_mut(&key)
+                                .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
+                                .and_then(|tab| {
+                                    tab.refresh_snapshot().map_err(|error| error.to_string())
+                                })
+                        }
+                        None => Err(format!("tab {tab_id} has no live terminal")),
+                    }
                 };
                 let _ = reply.send(result);
             }
@@ -2968,8 +2979,8 @@ impl App {
                 reply,
             } => {
                 let result = self
-                    .tabs
-                    .get(&self.wire_tab_key(tab_id))
+                    .wire_tab_key(tab_id)
+                    .and_then(|key| self.tabs.get(&key))
                     .and_then(|tab| tab.session.capture())
                     .ok_or_else(|| "ROOST_TEST_MODE=1 is required or tab is missing".to_string())
                     .and_then(|capture| {
@@ -3000,7 +3011,9 @@ impl App {
                         // `tab_id` arrives off the wire, which is bare by
                         // pin; the route it is checked against carries the
                         // key, so both halves have to agree.
-                        KeyboardRoute::Terminal(active) if active == self.local_tab_key(tab_id) => {
+                        KeyboardRoute::Terminal(active)
+                            if Some(active) == self.local_tab_key(tab_id) =>
+                        {
                             match action.as_str() {
                                 "preedit" => {
                                     self.ime_preedit(text, cursor);
@@ -3036,8 +3049,8 @@ impl App {
             }
             UiRequest::TabDumpResolved { tab_id, reply } => {
                 let result = self
-                    .tabs
-                    .get(&self.wire_tab_key(tab_id))
+                    .wire_tab_key(tab_id)
+                    .and_then(|key| self.tabs.get(&key))
                     .map(TerminalTab::resolved_cells)
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"));
                 let _ = reply.send(result);
@@ -3281,8 +3294,8 @@ impl App {
                 reply,
             } => {
                 let result = self
-                    .tabs
-                    .get_mut(&self.local_tab_key(tab_id))
+                    .local_tab_key(tab_id)
+                    .and_then(|key| self.tabs.get_mut(&key))
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| {
                         let anchored = tab
@@ -3300,8 +3313,8 @@ impl App {
             }
             UiRequest::SelectionClear { tab_id, reply } => {
                 let result = self
-                    .tabs
-                    .get_mut(&self.local_tab_key(tab_id))
+                    .local_tab_key(tab_id)
+                    .and_then(|key| self.tabs.get_mut(&key))
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| {
                         tab.selection.clear();
@@ -3311,8 +3324,8 @@ impl App {
             }
             UiRequest::SelectionDump { tab_id, reply } => {
                 let result = self
-                    .tabs
-                    .get_mut(&self.local_tab_key(tab_id))
+                    .local_tab_key(tab_id)
+                    .and_then(|key| self.tabs.get_mut(&key))
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| tab.selection_dump().map_err(|error| error.to_string()));
                 let _ = reply.send(result);
@@ -3343,8 +3356,8 @@ impl App {
                 let result = if !self.test_mode {
                     Err("tab.expand_selection_at requires ROOST_TEST_MODE=1 at UI launch".into())
                 } else {
-                    self.tabs
-                        .get_mut(&self.local_tab_key(tab_id))
+                    self.local_tab_key(tab_id)
+                        .and_then(|key| self.tabs.get_mut(&key))
                         .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                         .and_then(|tab| {
                             let expanded = tab.expand_selection_at(col, row, click_count);
@@ -3467,13 +3480,15 @@ impl App {
             // cannot express, in §3.4's order: the tab, then the host,
             // then the paths.
             UiRequest::TabSendFile { tab, paths, reply } => {
-                let key = self.wire_tab_key(tab);
-                if !self.tab_live(key) {
+                let live = self.wire_tab_key(tab).filter(|key| self.tab_live(*key));
+                let Some(key) = live else {
                     let _ = reply.send(Err(HostOpFailure::new(
                         "not-found",
                         format!("tab {tab} has no live terminal"),
                     )));
-                } else if let Some(failure) = send_file_refusal(self.transfer_target(key), &paths) {
+                    return task;
+                };
+                if let Some(failure) = send_file_refusal(self.transfer_target(key), &paths) {
                     let _ = reply.send(Err(failure));
                 } else {
                     let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
@@ -5994,6 +6009,58 @@ mod tests {
             mode: roost_ipc::LocalBackendMode::InProcess,
             local_projects_empty: true,
             hosts: &settled,
+            creation_pending: false,
+            switch_in_flight: false,
+            slot_registered: false,
+            slot_ever_registered: false,
+        }));
+    }
+
+    /// **The other end of the same row: an attempt that is over has to
+    /// stop blocking the exit.**
+    ///
+    /// A ladder that gives up on a *bare EOF* leaves the entry with no
+    /// tunnel and no failure — the same two absences a handshake in
+    /// flight has — so a `connecting` read off those absences is true
+    /// forever. `exit_on_empty` then never fires, `prune_connect_purposes`
+    /// keeps a parked `CreateAfterConnect` alive, and the window cannot
+    /// be closed for the life of the process.
+    #[tokio::test]
+    async fn a_ladder_that_gave_up_stops_blocking_the_exit() {
+        use crate::host_conn::fixtures::{a_ladder_that_gave_up_on_a_bare_eof, a_set};
+
+        let scratch = tempfile::tempdir().expect("temp dir");
+        let (mut hosts, _feed) = a_set();
+        a_ladder_that_gave_up_on_a_bare_eof(&mut hosts, scratch.path().to_path_buf()).await;
+
+        assert!(
+            !hosts.ssh_establishing("h1"),
+            "nothing is in flight: the ladder gave up and the entry holds no handshake"
+        );
+        assert!(
+            !attempt_alive(&hosts, "h1"),
+            "and there is nothing left for a parked purpose to land on"
+        );
+
+        let views = [super::HostView {
+            saved_id: "h1".to_string(),
+            label: "one".to_string(),
+            target: "workbox".to_string(),
+            transport: host_sidebar::HostTransportKind::Ssh,
+            host: HostId::LOCAL,
+            state: host_sidebar::SectionState::Disconnected,
+            reduced_fidelity: false,
+            reason: None,
+            projects: Vec::new(),
+            active_tab_id: 0,
+            agents: 0,
+        }];
+        let rows = host_exit_rows(&views, &hosts);
+        assert!(!rows[0].connecting, "the band and the set agree it is over");
+        assert!(local_backend::exit_on_empty(local_backend::ExitInput {
+            mode: roost_ipc::LocalBackendMode::InProcess,
+            local_projects_empty: true,
+            hosts: &rows,
             creation_pending: false,
             switch_in_flight: false,
             slot_registered: false,

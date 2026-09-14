@@ -2266,12 +2266,23 @@ impl HostConnSet {
     /// `open_ssh` over it is invisible to that accessor. Plan 063 §D9's
     /// exit rule asks the second question — closing the last local
     /// project during a handshake must not end the process mid-dial.
+    ///
+    /// Read off the [`SshState::establish`] handle, which is the only
+    /// thing that *is* an attempt: it is seated by `open_ssh` and
+    /// cleared by the answer, both arms. "No tunnel and no failure"
+    /// looks like the same window and is not — a link that dropped with
+    /// a bare EOF records no failure ([`Self::overlay_ssh_reason`]
+    /// folds nothing) and has its tunnel retired by
+    /// [`Self::shutdown_tunnel`], so an entry whose ladder has since
+    /// given up sits there with neither, and a predicate reading their
+    /// absence would call a settled host "still trying" for the life of
+    /// the process — wedging the very exit this exists to defer.
     pub(crate) fn ssh_establishing(&self, host: &str) -> bool {
         self.entries.get(host).is_some_and(|entry| {
             entry
                 .ssh
                 .as_ref()
-                .is_some_and(|ssh| ssh.tunnel.is_none() && ssh.failure.is_none())
+                .is_some_and(|ssh| ssh.establish.is_some())
         })
     }
 
@@ -3095,13 +3106,62 @@ pub(crate) mod fixtures {
         )
     }
 
+    /// A host whose retry ladder **gave up**, reached the way §D9's exit
+    /// rule has to survive it: every rung answered, and the last link
+    /// coming up and then dropping with a bare EOF.
+    ///
+    /// What it leaves is the genuinely settled entry — no tunnel (the
+    /// drop retired it), no failure (a bare EOF classifies as nothing,
+    /// and the last establish's success cleared what the rungs before it
+    /// recorded), no establish (that success answered it) and no outage
+    /// (`Exhausted` takes it). Every one of those is a real transition:
+    /// an entry hand-assembled into that shape would prove nothing about
+    /// whether a run can reach it.
+    ///
+    /// The one `.await` is first, before any `open_ssh`, for the reason
+    /// [`ssh_target`] records.
+    pub(crate) async fn a_ladder_that_gave_up_on_a_bare_eof(
+        set: &mut HostConnSet,
+        parent: PathBuf,
+    ) {
+        let tunnel = an_unestablished_tunnel(parent).await;
+        a_dropped_ssh_host(set, "/nonexistent/roost-gave-up.sock");
+        let budget = budget(set);
+        for rung in 1..budget {
+            assert!(retry_once(set), "rung {rung} of {budget} must be dialed");
+            refuse(set, unreachable());
+        }
+        assert!(retry_once(set), "the last rung must be dialed");
+        let request = set.ssh("h1").request;
+        set.tunnel_ready(HostTunnelReady {
+            host: "h1".to_string(),
+            request,
+            result: Ok(tunnel),
+        });
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, dropped("the connection closed"));
+        assert!(!set.has_outage("h1"), "the ladder settled");
+        assert_eq!(
+            band_reason(set, "h1"),
+            format!("reconnect gave up after {budget} tries"),
+            "it settled by spending its budget, and on a bare EOF — \
+             which is what leaves the entry with no failure recorded"
+        );
+    }
+
     /// Nothing in this suite may dial a real host: stop every handshake
     /// an `open_ssh` spawned before anything is polled. A case that
     /// awaits after an `open_ssh` — and the runtime only polls when it
     /// does — calls this first.
+    ///
+    /// The handle is aborted **in place**, never taken: in production
+    /// only the answer (or the exit path) clears that field, and
+    /// [`HostConnSet::ssh_establishing`] reads it — so taking it here
+    /// would leave the set in a state no run can reach, claiming the
+    /// attempt this fixture is standing in for had already settled.
     pub(crate) fn abort_establishes(set: &mut HostConnSet) {
         for entry in set.entries.values_mut().filter_map(|e| e.ssh.as_mut()) {
-            if let Some(establish) = entry.establish.take() {
+            if let Some(establish) = entry.establish.as_ref() {
                 establish.abort();
             }
         }
