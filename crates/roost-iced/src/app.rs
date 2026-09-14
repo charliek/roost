@@ -831,6 +831,25 @@ pub enum EngineOpResult {
         saved_id: String,
         result: Result<(), String>,
     },
+    /// A bare-id IPC op forwarded to the slot has been answered (plan
+    /// 063 §D10).
+    ///
+    /// The slot's answer rides here rather than being written off the
+    /// UI thread, and the `oneshot` it is written to is parked on
+    /// `App::forward_replies` under the same `op`. Both halves are
+    /// then one main-thread step: hand the caller its answer, *then*
+    /// retire the op from [`local_backend::HostOpsInFlight`], which is
+    /// what releases §D6's auto-remove. Sending it earlier, from the
+    /// dispatch's own task, put those two in a race — and a forwarded
+    /// `project.delete` that empties the slot is exactly the op whose
+    /// caller must be answered first.
+    ///
+    /// Boxed because this enum is `Clone`, and a whole reply value on
+    /// every clone of every completion is not worth the inline word.
+    LocalForward {
+        op: u64,
+        answer: Box<Result<serde_json::Value, roost_engine::ipc::HostOpFailure>>,
+    },
 }
 
 /// Build the future behind [`UiTask::EngineOp`]: the op runs on the
@@ -909,11 +928,14 @@ fn engine_op_status(result: EngineOpResult) -> Option<String> {
         // the modal did not close.
         // And a restart's failure already names the rung it stopped at,
         // so `host_restart_completed` puts that on the status bar itself.
+        // And a forward has already answered the client it belongs to:
+        // there is no second surface that owes anything.
         EngineOpResult::Renamed { .. }
         | EngineOpResult::TabsReordered { .. }
         | EngineOpResult::ProjectsReordered { .. }
         | EngineOpResult::HostVerified { .. }
-        | EngineOpResult::HostRestarted { .. } => None,
+        | EngineOpResult::HostRestarted { .. }
+        | EngineOpResult::LocalForward { .. } => None,
         EngineOpResult::TabOpened {
             project, result, ..
         } => match result {
@@ -954,7 +976,8 @@ impl EngineOpResult {
             | Self::ProjectCreated { op, .. }
             | Self::Renamed { op, .. }
             | Self::TabsReordered { op, .. }
-            | Self::ProjectsReordered { op, .. } => Some(*op),
+            | Self::ProjectsReordered { op, .. }
+            | Self::LocalForward { op, .. } => Some(*op),
             // Not workspace mutations: a verify dials a target that may
             // not even be saved, and a restart is keyed by saved id.
             Self::HostVerified { .. } | Self::HostRestarted { .. } => None,
@@ -973,10 +996,13 @@ impl EngineOpResult {
             // Delete reaches the palette only through the confirm
             // overlay, which answers `palette.activate` the moment it
             // opens; renames and reorders have no palette row at all.
+            // A forward is nobody's palette row either — its caller is
+            // the IPC client holding the oneshot.
             Self::ProjectDeleted { .. }
             | Self::Renamed { .. }
             | Self::TabsReordered { .. }
             | Self::ProjectsReordered { .. }
+            | Self::LocalForward { .. }
             // Add Host and the upgrade prompt are dialogs, not palette
             // rows: the palette is already dismissed by the time either
             // opens, so the `palette.activate` that opened it was
@@ -2372,6 +2398,11 @@ pub struct App {
     /// by the user's pick or dismiss, these belong to invocations whose
     /// row already ran and are answered by their own completion.
     palette_activate_replies: HashMap<u64, PaletteActivateReply>,
+    /// Where a forwarded op's caller is waiting, keyed by the dispatch
+    /// id (plan 063 §D10). Parked here rather than carried by the
+    /// dispatch so the answer is written on the main thread, in the same
+    /// step that retires the op — see [`EngineOpResult::LocalForward`].
+    forward_replies: HashMap<u64, roost_engine::ipc::HostOpReply<serde_json::Value>>,
     clipboard: ClipboardQueue,
     desktop_notifications: DesktopNotifications,
     /// Connected host sessions and their workspace mirrors (plan 037).
@@ -2676,7 +2707,7 @@ impl App {
         // the rest of bootstrap must never be told the wrong backend.
         let local_route = Arc::new(LocalBackendCell::new(local_backend::route_snapshot(
             backend_mode,
-            None,
+            local_backend::SlotSelection::default(),
             local_backend::SwitchState::Idle,
         )));
         let handler = IpcHandler::new(
@@ -2781,6 +2812,7 @@ impl App {
             provider_frames: HashMap::new(),
             palette_present_reply: None,
             palette_activate_replies: HashMap::new(),
+            forward_replies: HashMap::new(),
             clipboard: ClipboardQueue::default(),
             desktop_notifications: DesktopNotifications::new(
                 runtime.handle(),
@@ -2832,12 +2864,49 @@ impl App {
     /// or to the slot's selection goes through here, so `identify` (and
     /// what a bare id means over the UI socket) can never disagree with
     /// what the UI is actually doing.
+    /// Publish [`local_backend::route_snapshot`] — the only thing the
+    /// IPC handler knows about where this window's tabs live.
+    ///
+    /// Called at every edge that moves one of its inputs: the mode
+    /// (bootstrap and both switch directions), the selection
+    /// ([`Self::set_host_selection`], the one writer of
+    /// `host_selection`), and the **connection** — the tail of
+    /// `reconcile`, after `refresh_host_views` has rebuilt what
+    /// `connected_slot_host` reads.
+    ///
+    /// That last one is not redundant. A slot that drops publishes no
+    /// selection change: `reconcile_host_selection` keeps the selection
+    /// for the frozen frame it is still drawing, so without a
+    /// connection-driven publish `identify.active_*` would go on naming
+    /// a tab on a dead incarnation and the rewrite would go on
+    /// addressing it.
+    ///
+    /// The slot reading is taken here rather than passed in, so the two
+    /// fields cannot be assembled from different moments.
     fn publish_local_route(&self) {
-        self.local_route.store(local_backend::route_snapshot(
+        let next = local_backend::route_snapshot(
             self.local_backend,
-            None,
+            self.slot_selection(),
             self.switch_state(),
-        ));
+        );
+        // Change-detected, because one of the callers is the tail of
+        // every `reconcile`: in the steady state this is a read and a
+        // comparison, and the allocation only happens on an edge.
+        if *self.local_route.load() != next {
+            self.local_route.store(next);
+        }
+    }
+
+    /// Which connection a bare id names right now, and which pair it
+    /// defaults to (plan 063 §D1's `identify.active_*`, §D10's
+    /// rewrite).
+    ///
+    /// The selection counts only when it is *on the slot*: a window
+    /// showing an unrelated remote host has no slot selection, and
+    /// answering with the remote's ids would send `roostctl tab write`
+    /// with no `--tab` to the wrong machine.
+    fn slot_selection(&self) -> local_backend::SlotSelection {
+        local_backend::slot_selection(self.connected_slot_host(), self.host_selection)
     }
 
     /// Launch-time auto-reconnect for saved host sessions: **connect if
@@ -3246,11 +3315,26 @@ impl App {
         // Before the match consumes it: a creation on a host owes the
         // selection the local path gets for free (plan 037 §3.9).
         self.arm_pending_host_selection(&result);
+        // Strictly before the retirement below: a forwarded op's caller
+        // is handed its answer, and only then does the op stop holding
+        // §D6's auto-remove off (plan 063 §D10). One main-thread step,
+        // in that order, rather than a reply written from the dispatch's
+        // own task racing this one.
+        //
+        // What this does NOT establish is that the answer has reached
+        // the client's socket: `roost-ipc`'s server writes the frame
+        // when the handler it woke returns, and no path in this app —
+        // local or forwarded — can observe that. The one mitigation is
+        // framework-wide and pre-existing: `main.rs` puts a message hop
+        // between `UiTask::Exit` and `iced::exit()` for exactly this.
+        if let EngineOpResult::LocalForward { op, answer } = &result {
+            if let Some(reply) = self.forward_replies.remove(op) {
+                let _ = reply.send((**answer).clone());
+            }
+        }
         // And before the reconcile at the tail, which is where a
         // scheduled auto-remove asks whether this host's ops have
-        // settled (plan 063 §D6). This completion IS the reply reaching
-        // the main thread, so retiring it here is what makes the answer
-        // "yes, after this one".
+        // settled (plan 063 §D6).
         if let Some(op) = result.op_id() {
             self.host_ops.finish(op);
         }
@@ -3294,6 +3378,11 @@ impl App {
             EngineOpResult::HostRestarted { saved_id, result } => {
                 self.host_restart_completed(&saved_id, result)
             }
+            // Handled ahead of the match, beside the retirement it has
+            // to precede; what this arm is here for is the tail
+            // `reconcile()`, which is how a forwarded mutation's effect
+            // on the slot reaches the auto-remove and the exit rule.
+            EngineOpResult::LocalForward { .. } => {}
         }
         self.reconcile();
         if let Some((op, error)) = deferred_activation {
@@ -6038,6 +6127,10 @@ impl App {
     fn set_host_selection(&mut self, next: Option<HostSelection>) {
         let released = host_selection_detach(self.host_selection, next);
         self.host_selection = next;
+        // Under `session` this *is* the local selection, so it is what
+        // `identify.active_*` answers and what a bare-id op with no
+        // `--tab` acts on (plan 063 §D1/§D10).
+        self.publish_local_route();
         if let Some(tab) = released {
             self.host_detach_tab(tab);
         }

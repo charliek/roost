@@ -14,6 +14,7 @@ use std::borrow::Cow;
 
 use roost_ipc::client::{ClientError, ServerCode};
 use roost_ipc::messages::SessionPutFileResult;
+use roost_ui_model::keys::HostId;
 use tokio::sync::{mpsc, oneshot};
 
 use super::upload::{UploadSource, Uploads};
@@ -76,6 +77,22 @@ pub(crate) struct HostIntent {
     /// session one release older refusing `session.set_focus` — where
     /// the worker says it once per incarnation instead.
     pub(crate) quiet: bool,
+    /// The incarnation this intent was issued *for*, when the caller
+    /// cared.
+    ///
+    /// The queue outlives a connection: the task's own retry ladder
+    /// keeps draining the same receiver across attempts, so an intent
+    /// enqueued after a drop but before the main thread has drained the
+    /// `Disconnected` off the feed would otherwise be served by the
+    /// **replacement** connection. Against a session that restarted and
+    /// re-minted its ids, a forwarded `project.delete {"project_id":
+    /// "1"}` would then delete a project the caller never named.
+    ///
+    /// `None` is the unfenced form every existing call site keeps —
+    /// administrative ops (`session.set_focus`, a theme push) that are
+    /// about the connection rather than about a row on it, and are
+    /// correct on whichever connection serves them.
+    pub(crate) fence: Option<HostId>,
     pub(crate) reply: Option<HostOpReply>,
 }
 
@@ -86,8 +103,16 @@ impl HostIntent {
             op: op.into(),
             params,
             quiet: false,
+            fence: None,
             reply: None,
         }
+    }
+
+    /// Bind this intent to the connection it was issued for. See
+    /// [`Self::fence`].
+    pub(crate) fn fenced_at(mut self, incarnation: HostId) -> Self {
+        self.fence = Some(incarnation);
+        self
     }
 
     /// A failure on this op is not news. See [`Self::quiet`].
@@ -213,8 +238,29 @@ impl HostOps {
         params: serde_json::Value,
     ) -> impl std::future::Future<Output = Result<serde_json::Value, HostOpError>> + Send + 'static
     {
+        self.dispatch(HostIntent::new(op, params))
+    }
+
+    /// [`Self::call`] bound to the incarnation it was issued for — see
+    /// [`HostIntent::fence`]. The form every op that names a *row* on
+    /// the session should use.
+    pub(crate) fn call_at(
+        &self,
+        incarnation: HostId,
+        op: impl Into<Cow<'static, str>>,
+        params: serde_json::Value,
+    ) -> impl std::future::Future<Output = Result<serde_json::Value, HostOpError>> + Send + 'static
+    {
+        self.dispatch(HostIntent::new(op, params).fenced_at(incarnation))
+    }
+
+    fn dispatch(
+        &self,
+        intent: HostIntent,
+    ) -> impl std::future::Future<Output = Result<serde_json::Value, HostOpError>> + Send + 'static
+    {
         let (tx, rx) = oneshot::channel();
-        let intent = HostIntent::new(op, params).answering(tx);
+        let intent = intent.answering(tx);
         // `send` already answers the intent on failure, so the receiver
         // resolves either way and no caller waits forever.
         let _ = self.send(intent);

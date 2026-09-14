@@ -572,6 +572,25 @@ pub enum UiRequest {
         paths: Vec<String>,
         reply: HostOpReply<TabSendFileResult>,
     },
+    /// One whole request, put to *the slot* and answered from the
+    /// slot's own reply (plan 063 §D10).
+    ///
+    /// The `op` is a bare-id workspace op this socket would otherwise
+    /// have answered against its own workspace — which under
+    /// `local-backend = session` is the one the window does not draw.
+    /// `params` cross verbatim: bare ids mean the slot's ids, so there
+    /// is nothing to translate, and `tab.open`'s `project_id: 0` gets
+    /// the slot's default project exactly as a client on the session
+    /// socket would.
+    ///
+    /// Like [`UiRequest::HostTabReorder`] this cannot be answered inside
+    /// `update` — the app has to await a session — so the reply travels
+    /// with the dispatch and is answered from its completion.
+    LocalSessionForward {
+        op: String,
+        params: serde_json::Value,
+        reply: HostOpReply<serde_json::Value>,
+    },
     /// `tab.reorder` for a host-qualified project: send that host's
     /// session the whole new tab order over its op queue (plan 044
     /// §3.1 d6). The ids are already narrowed to the session's own bare
@@ -1490,7 +1509,12 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// on a session it writes into the tab task's terminal, which is a
 /// mutation like any other. This whole set is consulted only on a
 /// session socket, so listing it costs a UI nothing.
-fn is_mutating_op(op: &str) -> bool {
+///
+/// Public because plan 063 §D10's forward arm asks the same question of
+/// the same set: a forwarded op that changes what the slot holds is the
+/// one that has to register with `HostOpsInFlight` and the one a switch
+/// in flight refuses. A second list would drift from this one.
+pub fn is_mutating_op(op: &str) -> bool {
     matches!(
         op,
         ops::TAB_OPEN
@@ -2896,11 +2920,89 @@ fn local_session_socket(mode: LocalBackendMode) -> Option<String> {
     (mode == LocalBackendMode::Session).then(roost_ipc::session_socket_path)?
 }
 
+/// An op meant for the slot could not be put to it — see
+/// [`roost_ipc::local_route::SLOT_UNAVAILABLE_CODE`] for why this is not
+/// a code of its own.
+fn local_session_unavailable() -> HandlerError {
+    HandlerError::new(
+        roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
+        roost_ipc::local_route::SLOT_UNAVAILABLE,
+    )
+}
+
+/// Plan 063 §D10: hand one whole request to the slot and answer with
+/// its reply.
+async fn forward_to_local_session(
+    h: &IpcHandler,
+    op: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, HandlerError> {
+    let mut reply = h
+        .ui_call(|reply| UiRequest::LocalSessionForward {
+            op: op.to_string(),
+            params,
+            reply,
+        })
+        .await??;
+    strip_ui_socket_fence(op, &mut reply);
+    Ok(reply)
+}
+
+/// Take the session's `revision` back off a forwarded reply.
+///
+/// The `tab.list` arm rides its fence only on a socket that also serves
+/// the event stream it fences. A forwarded reply carries the
+/// *session's* fence, and this socket still cannot serve that stream —
+/// `events.subscribe` is `not-implemented` here — so a client holding
+/// one could not do anything with it but believe it had a fence. One
+/// that wants it dials `identify.local_session_socket`.
+fn strip_ui_socket_fence(op: &str, reply: &mut serde_json::Value) {
+    if op != ops::TAB_LIST {
+        return;
+    }
+    if let Some(object) = reply.as_object_mut() {
+        object.remove("revision");
+    }
+}
+
 async fn dispatch(
     h: &IpcHandler,
     op: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, HandlerError> {
+    // Plan 063 §D10. Under `local-backend = session` this socket's own
+    // workspace is the one the window does not draw, so a bare id names
+    // a tab on the slot and not a row in here — a `tab.open` answered
+    // locally would not merely land in the wrong workspace, it would
+    // `ensure_default_project` a project there to land in.
+    //
+    // Neither branch touches a ref that already names a host: the
+    // rewrite is bare-only, so an explicit `h<n>.<id>` reaches the op's
+    // own route parser below exactly as it does under `in-process`.
+    // That is why this runs per-op off the table rather than as one
+    // "session mode ⇒ forward" test.
+    let route = h.local_route();
+    let params = if route.mode == LocalBackendMode::Session {
+        match roost_ipc::local_route::classify(op) {
+            Some(roost_ipc::OpClass::Forward) => {
+                return forward_to_local_session(h, op, params).await;
+            }
+            Some(roost_ipc::OpClass::Rewrite(ids)) => {
+                let mut params = params;
+                // The *reference* decides, not the mode: a request that
+                // already names a host has never needed the local
+                // backend, and refusing it for want of a slot would be a
+                // regression against `in-process`, where the same
+                // request works.
+                roost_ipc::local_route::rewrite_slot_ids(ids, &mut params, route.slot_host)
+                    .map_err(|roost_ipc::SlotRequired| local_session_unavailable())?;
+                params
+            }
+            _ => params,
+        }
+    } else {
+        params
+    };
     match op {
         ops::IDENTIFY => {
             let _p: IdentifyParams = decode(params)?;
@@ -4396,6 +4498,7 @@ mod tests {
         cell.store(LocalRoute {
             mode: LocalBackendMode::Session,
             slot_socket: Some("/ignored/by/identify.sock".into()),
+            slot_host: Some(3),
             slot_active: Some((41, 42)),
             switch: None,
         });
@@ -4416,6 +4519,7 @@ mod tests {
         cell.store(LocalRoute {
             mode: LocalBackendMode::Session,
             slot_socket: None,
+            slot_host: None,
             slot_active: None,
             switch: Some("replaying"),
         });
@@ -4442,5 +4546,252 @@ mod tests {
             (id.active_project_id, id.active_tab_id),
             h.workspace.active()
         );
+    }
+
+    // ── plan 063 §D10: the classification, against this dispatcher ──
+
+    /// Every `ops::NAME` this file names, read out of its own source.
+    ///
+    /// The companion to `roost_ipc::local_route`'s parse of the
+    /// *declarations*: that one catches a constant nobody classified,
+    /// this one catches a **dispatch arm** added for an op this crate
+    /// reaches by some other spelling. Reading the source rather than
+    /// the table is the whole point — a walk of `OP_CLASSES` would
+    /// agree with itself about anything.
+    fn ops_this_dispatcher_names() -> Vec<String> {
+        let source = include_str!("ipc.rs");
+        let mut found: Vec<String> = Vec::new();
+        for (index, _) in source.match_indices("ops::") {
+            let name: String = source[index + 5..]
+                .chars()
+                .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                .collect();
+            if !name.is_empty() && !found.contains(&name) {
+                found.push(name);
+            }
+        }
+        assert!(
+            found.len() > 40,
+            "only {} `ops::` names scanned out of ipc.rs - the scan has \
+             drifted and would pass vacuously",
+            found.len()
+        );
+        found
+    }
+
+    #[test]
+    fn every_dispatched_op_is_classified() {
+        // The scan finds identifiers; the table is keyed by the wire
+        // strings, so the bridge is `messages.rs`'s own declarations —
+        // read the same way, for the same reason.
+        let declared = include_str!("../../roost-ipc/src/messages.rs");
+        let unclassified: Vec<_> = ops_this_dispatcher_names()
+            .into_iter()
+            .filter_map(|name| {
+                let marker = format!("pub const {name}: &str = \"");
+                let at = declared.find(&marker)?;
+                let rest = &declared[at + marker.len()..];
+                let value = &rest[..rest.find('"')?];
+                roost_ipc::local_route::classify(value)
+                    .is_none()
+                    .then(|| format!("ops::{name} ({value:?})"))
+            })
+            .collect();
+        assert!(
+            unclassified.is_empty(),
+            "this dispatcher serves ops plan 063 §D10's table does not \
+             classify: {}",
+            unclassified.join(", ")
+        );
+    }
+
+    /// A handler with a session-mode route and no UI: the forward has
+    /// nowhere to go, which is exactly what makes the *routing* visible
+    /// without a running app.
+    fn forwarding_handler(dir: &Path, slot: Option<u32>) -> IpcHandler {
+        let h = identify_handler(dir);
+        let cell = Arc::new(LocalBackendCell::new(LocalRoute {
+            mode: LocalBackendMode::Session,
+            slot_socket: None,
+            slot_host: slot,
+            slot_active: None,
+            switch: None,
+        }));
+        h.with_local_route(cell)
+    }
+
+    /// The defect §D10 exists to close: answered locally, this arm's
+    /// first act is `ensure_default_project`, so a bare `tab.open`
+    /// **creates** a project in the workspace `session` mode hides.
+    #[tokio::test]
+    async fn a_bare_tab_open_under_session_never_touches_the_local_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = forwarding_handler(dir.path(), Some(2));
+        let before = h.workspace.snapshot().len();
+
+        let error = dispatch(&h, ops::TAB_OPEN, serde_json::json!({"project_id": "0"}))
+            .await
+            .expect_err("there is no UI to forward to");
+        // It left through the forward, not through the local arm.
+        assert_eq!(error.code, "internal", "{error:?}");
+        assert_eq!(error.message, "no UI attached");
+        assert_eq!(
+            h.workspace.snapshot().len(),
+            before,
+            "the forward must not have created a project here"
+        );
+    }
+
+    /// `project.create`'s twin, and the same assertion: nothing lands in
+    /// the hidden workspace.
+    #[tokio::test]
+    async fn a_bare_project_create_under_session_never_touches_the_local_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = forwarding_handler(dir.path(), Some(2));
+        let before = h.workspace.snapshot().len();
+        let error = dispatch(
+            &h,
+            ops::PROJECT_CREATE,
+            serde_json::json!({"name": "ghost", "cwd": "/tmp"}),
+        )
+        .await
+        .expect_err("there is no UI to forward to");
+        assert_eq!(error.code, "internal", "{error:?}");
+        assert_eq!(h.workspace.snapshot().len(), before);
+        assert!(!h
+            .workspace
+            .snapshot()
+            .iter()
+            .any(|project| project.name == "ghost"));
+    }
+
+    /// Under `in-process` the very same request is answered here, which
+    /// is what makes the two assertions above about the *mode* rather
+    /// than about a handler with no UI.
+    #[tokio::test]
+    async fn the_same_request_under_in_process_is_answered_locally() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path());
+        let before = h.workspace.snapshot().len();
+        dispatch(
+            &h,
+            ops::PROJECT_CREATE,
+            serde_json::json!({"name": "ghost", "cwd": "/tmp"}),
+        )
+        .await
+        .expect("in-process serves it from the local workspace");
+        assert_eq!(h.workspace.snapshot().len(), before + 1);
+    }
+
+    /// §D10's ordering clause. A host-qualified reorder must reach the
+    /// op's own route parser, which refuses it here for want of a UI —
+    /// *not* be re-addressed to the slot.
+    #[tokio::test]
+    async fn a_host_qualified_op_is_not_re_addressed_to_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = forwarding_handler(dir.path(), Some(2));
+        let error = dispatch(
+            &h,
+            ops::TAB_REORDER,
+            serde_json::json!({"project_id": "h9.1", "tab_ids": ["h9.7"]}),
+        )
+        .await
+        .expect_err("no UI to route a host-qualified reorder through");
+        assert_eq!(error.code, "invalid-param", "{error:?}");
+        assert!(
+            error.message.contains("host-qualified tab.reorder"),
+            "it left through the host route parser, naming host 9: {error:?}"
+        );
+    }
+
+    /// A rewrite row with no slot to rewrite to answers the one
+    /// sentence, rather than falling through to the hidden workspace and
+    /// reporting `not-found` about a tab that exists.
+    #[tokio::test]
+    async fn a_rewrite_op_with_no_connected_slot_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = forwarding_handler(dir.path(), None);
+        let error = dispatch(&h, ops::TAB_DUMP, serde_json::json!({"tab_id": "7"}))
+            .await
+            .expect_err("no slot");
+        assert_eq!(error.code, roost_ipc::local_route::SLOT_UNAVAILABLE_CODE);
+        assert_eq!(error.message, roost_ipc::local_route::SLOT_UNAVAILABLE);
+    }
+
+    /// A host-qualified request has never needed the local backend, so a
+    /// slot that is down must not refuse it.
+    ///
+    /// The pair is the point: the *same op* with a bare id is
+    /// `host-unavailable` (that tab lives on a slot that is not there),
+    /// and with `h9.7` it reaches the op's own route parser — which
+    /// here, with no UI, refuses it for the reason it always has. A
+    /// slot-availability gate placed ahead of the reference would have
+    /// answered both the same way, which is a straight regression
+    /// against `in-process`.
+    #[tokio::test]
+    async fn a_host_qualified_op_does_not_need_a_connected_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = forwarding_handler(dir.path(), None);
+
+        let bare = dispatch(&h, ops::TAB_DUMP, serde_json::json!({"tab_id": "7"}))
+            .await
+            .expect_err("a bare id names a slot that is not there");
+        assert_eq!(bare.code, roost_ipc::local_route::SLOT_UNAVAILABLE_CODE);
+
+        let qualified = dispatch(&h, ops::TAB_DUMP, serde_json::json!({"tab_id": "h9.7"}))
+            .await
+            .expect_err("there is no UI to read host 9's terminal");
+        assert_ne!(
+            qualified.code,
+            roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
+            "host 9 is not the local backend's business: {qualified:?}"
+        );
+        assert_eq!(qualified.code, "internal", "{qualified:?}");
+
+        // The same for the ops that carry their own route parser.
+        let reorder = dispatch(
+            &h,
+            ops::TAB_REORDER,
+            serde_json::json!({"project_id": "h9.1", "tab_ids": ["h9.7"]}),
+        )
+        .await
+        .expect_err("no UI");
+        assert_eq!(reorder.code, "invalid-param", "{reorder:?}");
+        assert!(reorder.message.contains("host-qualified tab.reorder"));
+
+        let send_file = dispatch(
+            &h,
+            ops::TAB_SEND_FILE,
+            serde_json::json!({"tab": "h9.7", "paths": ["/tmp/x"]}),
+        )
+        .await
+        .expect_err("no UI");
+        assert_ne!(
+            send_file.code,
+            roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
+            "{send_file:?}"
+        );
+    }
+
+    /// The UI socket's `tab.list` omits `revision` by contract, and a
+    /// forwarded one has to keep that promise even though the session's
+    /// answer carries one.
+    #[test]
+    fn a_forwarded_tab_list_loses_the_sessions_fence() {
+        let mut listed = serde_json::json!({"projects": [], "revision": "12"});
+        strip_ui_socket_fence(ops::TAB_LIST, &mut listed);
+        assert_eq!(listed, serde_json::json!({"projects": []}));
+
+        // Only that one op, and only that one field: a forward is
+        // otherwise the session's reply verbatim.
+        let mut dumped = serde_json::json!({"rows_text": [], "revision": "12"});
+        strip_ui_socket_fence(ops::TAB_DUMP, &mut dumped);
+        assert_eq!(
+            dumped,
+            serde_json::json!({"rows_text": [], "revision": "12"})
+        );
+        let mut without = serde_json::json!({"projects": []});
+        strip_ui_socket_fence(ops::TAB_LIST, &mut without);
+        assert_eq!(without, serde_json::json!({"projects": []}));
     }
 }

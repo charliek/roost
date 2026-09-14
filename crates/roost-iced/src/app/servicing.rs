@@ -84,6 +84,60 @@ fn host_unavailable(message: impl Into<String>) -> HostOpFailure {
     HostOpFailure::new(HOST_UNAVAILABLE, message)
 }
 
+/// What a **forwarded** op's failure says on the wire (plan 063 §D10).
+///
+/// Unlike [`host_op_failure`], a session's refusal crosses **verbatim**,
+/// whatever its code. §D10's contract is that a bare id means the slot's
+/// id and the answer is the slot's own — the only transformation
+/// permitted on a forwarded reply is stripping `tab.list`'s `revision` —
+/// so folding a code this socket does not usually mint would rewrite the
+/// session's verdict into a different one. `shutting-down` is the case
+/// that makes it concrete: `host_op_failure` turns it into
+/// `host-unavailable` and buries the original in the message, and a
+/// client cannot then tell "the session is going away" from "I could not
+/// reach it".
+///
+/// Everything that is *not* the session speaking — a queue that was
+/// flushed, a dead wire, this client's own refusal — is still the slot
+/// being unreachable, and says so.
+fn forwarded_failure(error: &crate::host_conn::HostOpError) -> HostOpFailure {
+    match error {
+        crate::host_conn::HostOpError::Rejected { code, message } => {
+            HostOpFailure::new(code.as_str(), message.clone())
+        }
+        other => HostOpFailure::new(
+            roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
+            other.to_string(),
+        ),
+    }
+}
+
+/// A forwarded op that could not be put to the slot (plan 063 §D10) —
+/// the slot is down, or a switch has quiesced it.
+///
+/// The same code both ways, deliberately: from the caller's side "the
+/// local session could not take this" is one outcome with two reasons,
+/// and the sentence says which.
+fn slot_unavailable(message: &str) -> Result<serde_json::Value, HostOpFailure> {
+    Err(HostOpFailure::new(
+        roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
+        message,
+    ))
+}
+
+/// What a forwarded mutation is to [`local_backend::HostOpsInFlight`].
+///
+/// Only a project creation is `Create`, matching the local dispatches:
+/// §D6 and §D9 both ask "is a creation owed?" as its own clause, and a
+/// forwarded `tab.open` is no more a creation than the ⌘T that reaches
+/// `open_host_tab_flow`.
+fn forwarded_op_kind(op: &str) -> local_backend::HostOpKind {
+    match op == roost_ipc::messages::ops::PROJECT_CREATE {
+        true => local_backend::HostOpKind::Create,
+        false => local_backend::HostOpKind::Other,
+    }
+}
+
 /// What a finished gesture says on the `tab.send_file` wire — plan 047
 /// §3.4's error precedence, minus what [`send_file_refusal`] and the
 /// servicing arm answer before a gesture exists at all.
@@ -1009,6 +1063,11 @@ impl App {
         self.resolve_initial_local_selection();
         self.resolve_pending_host_selection();
         self.reconcile_host_selection();
+        // Both of this snapshot's inputs are settled here: the views
+        // were rebuilt at the top of this reconcile and the selection
+        // just now. A *connection* change publishes through no other
+        // edge (plan 063 §D10), and the write is change-detected.
+        self.publish_local_route();
         self.refresh_sidebar_agents();
         self.refresh_agent_palette();
         // Host verbs are live state too: a host that connected while the
@@ -1671,10 +1730,28 @@ impl App {
     /// staleness contract `HostId` minting exists for.
     fn wire_tab_key(&self, tab: roost_ipc::messages::WireTabRef) -> TabKey {
         match tab {
-            roost_ipc::messages::WireTabRef::Local(tab_id) => self.backend.tab_key(tab_id),
+            roost_ipc::messages::WireTabRef::Local(tab_id) => self.local_tab_key(tab_id),
             roost_ipc::messages::WireTabRef::Host { host, tab } => {
                 TabKey::new(HostId::new(host), tab)
             }
+        }
+    }
+
+    /// What a **bare** id off the IPC wire names (plan 063 §D10).
+    ///
+    /// The UI half of the bare-id rewrite. Most rewrite rows are
+    /// re-addressed at the handler, which can spell `h<n>.<id>` in the
+    /// params; the test ops whose `tab_id` is a bare `string_int64`
+    /// cannot be, so their resolution lands here instead — and it has to
+    /// agree with the handler's, because both are answering "which tab
+    /// is the user looking at".
+    ///
+    /// Under `in-process` this is `backend.tab_key` and nothing has
+    /// moved.
+    fn local_tab_key(&self, tab_id: i64) -> TabKey {
+        match self.local_slot_host() {
+            Some(host) => TabKey::new(host, tab_id),
+            None => self.backend.tab_key(tab_id),
         }
     }
 
@@ -2847,7 +2924,7 @@ impl App {
                 data,
                 reply,
             } => {
-                let key = self.backend.tab_key(tab_id);
+                let key = self.local_tab_key(tab_id);
                 // Same ordering as the feed batch's tail: an OSC action can
                 // mutate the tab (pointer shape), so it lands before the
                 // refresh that publishes it, never after. That second
@@ -2907,9 +2984,7 @@ impl App {
                         // `tab_id` arrives off the wire, which is bare by
                         // pin; the route it is checked against carries the
                         // key, so both halves have to agree.
-                        KeyboardRoute::Terminal(active)
-                            if active == self.backend.tab_key(tab_id) =>
-                        {
+                        KeyboardRoute::Terminal(active) if active == self.local_tab_key(tab_id) => {
                             match action.as_str() {
                                 "preedit" => {
                                     self.ime_preedit(text, cursor);
@@ -3048,7 +3123,11 @@ impl App {
                 let _ = reply.send(Ok(focused));
             }
             UiRequest::AppSelectedTabId { reply } => {
-                let _ = reply.send(Ok(self.workspace.active().1));
+                // UI truth, which under `session` is a tab on the slot
+                // and not a row in the workspace this mode hides. The
+                // same reading the title bar, the tab strip and
+                // `identify.active_tab_id` take (plan 063 §D10).
+                let _ = reply.send(Ok(self.active_tab_key().tab));
             }
             UiRequest::AppDockBadge { reply } => {
                 // Reads AppKit, deliberately without re-deriving the
@@ -3187,7 +3266,7 @@ impl App {
             } => {
                 let result = self
                     .tabs
-                    .get_mut(&self.backend.tab_key(tab_id))
+                    .get_mut(&self.local_tab_key(tab_id))
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| {
                         let anchored = tab
@@ -3206,7 +3285,7 @@ impl App {
             UiRequest::SelectionClear { tab_id, reply } => {
                 let result = self
                     .tabs
-                    .get_mut(&self.backend.tab_key(tab_id))
+                    .get_mut(&self.local_tab_key(tab_id))
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| {
                         tab.selection.clear();
@@ -3217,7 +3296,7 @@ impl App {
             UiRequest::SelectionDump { tab_id, reply } => {
                 let result = self
                     .tabs
-                    .get_mut(&self.backend.tab_key(tab_id))
+                    .get_mut(&self.local_tab_key(tab_id))
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| tab.selection_dump().map_err(|error| error.to_string()));
                 let _ = reply.send(result);
@@ -3249,7 +3328,7 @@ impl App {
                     Err("tab.expand_selection_at requires ROOST_TEST_MODE=1 at UI launch".into())
                 } else {
                     self.tabs
-                        .get_mut(&self.backend.tab_key(tab_id))
+                        .get_mut(&self.local_tab_key(tab_id))
                         .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                         .and_then(|tab| {
                             let expanded = tab.expand_selection_at(col, row, click_count);
@@ -3319,7 +3398,7 @@ impl App {
                         .map_err(|_| format!("modifier mask {mods} exceeds u16"))
                         .and_then(|mods| {
                             self.tabs
-                                .get_mut(&self.backend.tab_key(tab_id))
+                                .get_mut(&self.local_tab_key(tab_id))
                                 .ok_or_else(|| format!("tab {tab_id} has no live terminal"))?
                                 .dispatch_pointer(kind, button, cell_x, cell_y, mods)
                                 .map_err(|error| error.to_string())
@@ -3382,6 +3461,12 @@ impl App {
                     task = task.then(self.send_files(key, paths, Some(outcome_tx)));
                     defer_send_file_reply(&self.runtime_handle, outcome_rx, reply);
                 }
+            }
+            // Plan 063 §D10: one bare-id op, put to the slot. Spawned
+            // like every other host call — `update` never waits on a
+            // round trip to a session.
+            UiRequest::LocalSessionForward { op, params, reply } => {
+                task = task.then(self.local_session_forward(op, params, reply));
             }
             UiRequest::HostTabReorder {
                 host,
@@ -3478,6 +3563,76 @@ impl App {
     /// the reply rides into the spawned future and is answered there.
     /// Dropping it instead would reach the caller as
     /// `internal: UI dropped reply`, which says nothing about a host.
+    /// Put one forwarded op to the slot and answer its caller with the
+    /// slot's own reply (plan 063 §D10).
+    ///
+    /// Three things happen here that a plain `HostOps::call` would not
+    /// do, and each has a rule behind it:
+    ///
+    /// * a mutation is refused while a switch is in flight (§D8a), with
+    ///   the same stable sentence `run_host_verb` gives the palette;
+    /// * a mutation mints its id through [`App::take_host_op_id`], so
+    ///   §D6's auto-remove waits for it — a forwarded `project.delete`
+    ///   is exactly the op that can empty the slot, and exactly the one
+    ///   whose reply a removal must not swallow;
+    /// * a session's refusal crosses verbatim ([`forwarded_failure`]),
+    ///   which is what makes a forwarded error *be* the session's.
+    ///
+    /// The call is fenced at the slot's current incarnation, so an
+    /// intent that reaches the queue after the connection dropped is
+    /// refused rather than served by its replacement — see
+    /// [`crate::host_conn::queue::HostIntent::fence`].
+    ///
+    /// The reply does **not** travel with the dispatch: it is parked
+    /// under the op id and written on the main thread in
+    /// [`App::engine_op_completed`], immediately before the same
+    /// `HostOpsInFlight` entry is retired. That is what makes "the op is
+    /// retired after its caller has been answered" a statement about one
+    /// thread rather than a race between two.
+    fn local_session_forward(
+        &mut self,
+        op: String,
+        params: serde_json::Value,
+        reply: roost_engine::ipc::HostOpReply<serde_json::Value>,
+    ) -> UiTask {
+        let Some(host) = self.connected_slot_host() else {
+            let _ = reply.send(slot_unavailable(roost_ipc::local_route::SLOT_UNAVAILABLE));
+            return UiTask::None;
+        };
+        let Some(queue) = self.hosts.ops_for(host).cloned() else {
+            let _ = reply.send(slot_unavailable(roost_ipc::local_route::SLOT_UNAVAILABLE));
+            return UiTask::None;
+        };
+        let mutating = roost_engine::ipc::is_mutating_op(&op);
+        if mutating && self.switch_in_flight() {
+            let _ = reply.send(slot_unavailable(local_backend::SWITCH_BUSY));
+            return UiTask::None;
+        }
+        // A read mints an id too, so the dispatch has one shape; only a
+        // mutation is *registered*, and `HostOpsInFlight::finish` on an
+        // unregistered id is a no-op.
+        let op_id = match mutating {
+            true => self.take_host_op_id(host, forwarded_op_kind(&op)),
+            false => self.take_engine_op_id(),
+        };
+        self.forward_replies.insert(op_id, reply);
+        let call = queue.call_at(host, op, params);
+        self.engine_op(
+            async move { Ok::<_, String>(call.await.map_err(|error| forwarded_failure(&error))) },
+            move |joined| {
+                // The join half can only fail if the op panicked or the
+                // runtime is going away; either way the client is owed
+                // an answer rather than a dropped channel.
+                let answer =
+                    joined.unwrap_or_else(|error| Err(HostOpFailure::new("internal", error)));
+                EngineOpResult::LocalForward {
+                    op: op_id,
+                    answer: Box::new(answer),
+                }
+            },
+        )
+    }
+
     fn host_reorder_op(
         &self,
         host: HostId,
@@ -3674,6 +3829,100 @@ mod tests {
 
     use super::file_transfer::LostReason;
     use super::*;
+
+    /// Plan 063 §D10: a forwarded mutation is registered by what it does
+    /// to the slot, and only a project creation is a creation.
+    #[test]
+    fn a_forwarded_project_create_is_the_only_creation() {
+        use roost_ipc::messages::ops;
+        assert_eq!(
+            forwarded_op_kind(ops::PROJECT_CREATE),
+            local_backend::HostOpKind::Create
+        );
+        for op in [
+            ops::TAB_OPEN,
+            ops::TAB_CLOSE,
+            ops::PROJECT_DELETE,
+            ops::TAB_WRITE,
+        ] {
+            assert_eq!(
+                forwarded_op_kind(op),
+                local_backend::HostOpKind::Other,
+                "{op}"
+            );
+        }
+    }
+
+    /// The forward arm asks `is_mutating_op`, so the two ends of §D10's
+    /// guard cannot drift: everything forwarded except the one read has
+    /// to be gated, and the read has to not be.
+    #[test]
+    fn every_forwarded_op_but_the_read_is_a_mutation() {
+        for (op, class) in roost_ipc::local_route::OP_CLASSES {
+            if *class != roost_ipc::OpClass::Forward {
+                continue;
+            }
+            let mutating = roost_engine::ipc::is_mutating_op(op);
+            assert_eq!(
+                mutating,
+                *op != roost_ipc::messages::ops::TAB_LIST,
+                "{op} is forwarded; is_mutating_op says {mutating}"
+            );
+        }
+    }
+
+    /// Plan 063 §D10/AC8: a forwarded op returns **the session's** error,
+    /// and `shutting-down` is the case that proves it is not the same
+    /// mapping the rewrite path uses.
+    ///
+    /// `shutting-down` is deliberately excluded from
+    /// [`CODES_A_UI_SOCKET_ALSO_SPEAKS`] — it describes a *session's*
+    /// stop latch, which a UI socket has no notion of — so it is a code
+    /// this socket cannot mint on its own, and the two mappers
+    /// demonstrably disagree about it.
+    #[test]
+    fn a_forwarded_refusal_crosses_verbatim_where_the_rewrite_path_would_fold_it() {
+        let refusal = crate::host_conn::HostOpError::Rejected {
+            code: roost_ipc::client::ServerCode::from_wire("shutting-down"),
+            message: "session is shutting down".into(),
+        };
+
+        let forwarded = forwarded_failure(&refusal);
+        assert_eq!(forwarded.code, "shutting-down");
+        assert_eq!(forwarded.message, "session is shutting down");
+
+        // The mapping the UI-answered ops keep, on the same input.
+        let folded = host_op_failure(&refusal);
+        assert_eq!(folded.code, HOST_UNAVAILABLE);
+        assert_ne!(folded.code, forwarded.code, "the two mappers differ here");
+        assert!(folded.message.contains("shutting-down"), "{folded:?}");
+
+        // A code this socket does speak crosses on both paths, which is
+        // why `shutting-down` and not `invalid-param` is the case above.
+        let ordinary = crate::host_conn::HostOpError::Rejected {
+            code: roost_ipc::client::ServerCode::from_wire("invalid-param"),
+            message: "tab 9 is not in project 1".into(),
+        };
+        assert_eq!(forwarded_failure(&ordinary), host_op_failure(&ordinary));
+
+        // Not the session speaking: the slot is simply unreachable.
+        let dropped = forwarded_failure(&crate::host_conn::HostOpError::Disconnected);
+        assert_eq!(dropped.code, roost_ipc::local_route::SLOT_UNAVAILABLE_CODE);
+        assert_eq!(dropped.message, "the host disconnected before this ran");
+    }
+
+    /// Both refusals a forward can answer keep the UI socket's own
+    /// documented code, and differ only in the sentence.
+    #[test]
+    fn a_refused_forward_says_which_of_the_two_reasons_it_was() {
+        let down = slot_unavailable(roost_ipc::local_route::SLOT_UNAVAILABLE).unwrap_err();
+        let busy = slot_unavailable(local_backend::SWITCH_BUSY).unwrap_err();
+        // The typed code this socket already documents, not a new one.
+        assert_eq!(down.code, HOST_UNAVAILABLE);
+        assert_eq!(busy.code, down.code);
+        assert_eq!(down.message, "local session is not connected");
+        assert!(busy.message.starts_with("busy:"), "{}", busy.message);
+    }
 
     /// `app.sidebar_dump`'s band strip, one row per plan 063 §D2
     /// rendering, projected from the very sections the sidebar paints.

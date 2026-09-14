@@ -67,6 +67,7 @@ if platform.system() == "Darwin":
 
 import agent_jail  # noqa: E402
 import session as sessionlib  # noqa: E402
+import util  # noqa: E402
 
 _ROOT = Path(tempfile.mkdtemp(prefix="roost-lb-", dir="/tmp")).resolve()
 _RUN = _ROOT / "run"
@@ -146,6 +147,21 @@ class Lane:
             return json.loads(self.journal_path.read_text())
         except FileNotFoundError:
             return None
+
+    def in_process_projects(self) -> list[dict]:
+        """The workspace `session` mode hides, read off its own disk.
+
+        Since §D10 the UI socket's `tab.list` under `session` answers
+        with the **slot's** projects, so this is the only observable the
+        in-process layout has left. It is not a weaker one: the
+        workspace writes through on every mutation, and the rows carry
+        `name` + `tabs[].title` + `tabs[].user_titled` — everything
+        `layout` reduces.
+        """
+        try:
+            return json.loads((self.state_dir / "state.json").read_text())["projects"]
+        except FileNotFoundError:
+            return []
 
     # -- the UI ---------------------------------------------------------
     def write_config(self, backend: str, path: Path | None = None) -> None:
@@ -418,7 +434,7 @@ def test_the_forward_switch_moves_the_layout_onto_an_empty_session(lane: Lane):
     wait_until(lambda: settled(roost) == "session", 120.0, "the switch to settle")
 
     assert layout(lane.session_projects()) == want
-    assert roost.list() == [], "the in-process workspace is emptied"
+    assert lane.in_process_projects() == [], "the in-process workspace is emptied"
     assert lane.journal() is None, "the journal is deleted after the final delete"
 
     # The band the sidebar draws is the slot's, and the tab it selected
@@ -486,7 +502,7 @@ def test_a_switch_that_starts_the_session_lands_on_exactly_the_source(lane: Lane
     assert layout(lane.session_projects()) == want, (
         "a session the switch started must hold the migrated layout and nothing else"
     )
-    assert roost.list() == []
+    assert lane.in_process_projects() == []
 
     # **The hint is consumed, not merely read.** It is an env var on the
     # daemon's own process, so a session that did not erase it before
@@ -540,8 +556,9 @@ def test_a_tab_that_cannot_be_replayed_keeps_its_source_project(lane: Lane):
         # gone. That asymmetry is the whole fix: phase 5 deletes exactly
         # what phase 3 proved present, so a project the destination does
         # not hold stays where the user left it.
-        assert [p["name"] for p in roost.list()] == ["stuck"]
-        assert len(roost.list()[0]["tabs"]) == 1, "with its tab still running"
+        kept = lane.in_process_projects()
+        assert [p["name"] for p in kept] == ["stuck"]
+        assert len(kept[0]["tabs"]) == 1, "with its tab row kept"
     finally:
         locked.chmod(0o755)
 
@@ -570,7 +587,7 @@ def test_a_non_empty_destination_keeps_what_it_had_and_gains_the_source(lane: La
 
     after = layout(lane.session_projects())
     assert after == before + want, after
-    assert roost.list() == []
+    assert lane.in_process_projects() == []
 
 
 # ---------------------------------------------------------------------------
@@ -644,14 +661,15 @@ def test_reverse_over_a_retained_layout_hydrates_it_rather_than_counting_it(lane
     lane.write_config("session")
     roost = lane.restart()
     assert roost.identify()["local_backend"] == "session"
-    # **The state the fix is about**, asserted before the switch touches
-    # it: `Workspace::open` loaded the rows, and session-mode bootstrap
-    # did not hydrate them, so they are projects with no shells. The
-    # sidebar draws the slot's band instead, which is why nobody sees
-    # this.
-    retained = roost.list()
-    assert [p["name"] for p in retained] == ["alpha", "beta"], retained
-    assert all(not p["tabs"] for p in retained), retained
+    # **The state the fix is about**, as far as §D10 leaves it visible
+    # from outside: this socket's `tab.list` now answers with the slot's
+    # list, so the retained layout is read off the disk it is retained
+    # on. That it is still whole there is the precondition — session
+    # bootstrap neither hydrated it nor persisted over it — and the
+    # post-switch assertions below are what prove the rows in memory
+    # carried no tabs.
+    retained = lane.in_process_projects()
+    assert layout(retained) == want, retained
     assert local_band(roost)["role"] == "session"
 
     switch(roost, USE_IN_PROCESS, "in-process")
@@ -964,7 +982,7 @@ def test_a_forward_journal_past_the_commit_point_finishes(lane: Lane, phase: str
 
     roost = lane.restart()
     assert roost.identify()["local_backend"] == "session"
-    assert [p["name"] for p in roost.list()] == ["kept"], (
+    assert [p["name"] for p in lane.in_process_projects()] == ["kept"], (
         "the source deletion is finished — for the journal's own list, and no wider"
     )
     assert layout(lane.session_projects()) == want, "the destination is untouched"
@@ -1183,3 +1201,311 @@ def test_a_relaunch_under_session_reattaches_the_same_tabs(lane: Lane):
     assert token in history, (
         "the shell that printed it is still the shell behind the tab"
     )
+
+
+# ---------------------------------------------------------------------------
+# 6. §D10: what `roostctl` and a hook reach on the UI socket under `session`
+# ---------------------------------------------------------------------------
+#
+# Every case here leans on one fact: under `session` the UI's own
+# in-process workspace holds **nothing**. So an answer that names a
+# project, moves a shell, or refuses with the session's verdict is an
+# answer the local path could not have produced — and the one that could
+# (an empty list, a `not-found`) is asserted against by name.
+
+
+def session_ui(lane: Lane) -> Roost:
+    """A UI up on `session`, its slot connected and its tab selected.
+
+    The selection wait is not politeness: `identify.active_*` reporting
+    the slot's pair is §D1's half of §D10, and it is what makes
+    `roostctl` with no `--tab` address anything at all.
+    """
+    roost = lane.start("session")
+    wait_until(
+        lambda: bool(lane.session_projects()),
+        120.0,
+        "the slot to come up holding a project",
+    )
+    wait_until(
+        lambda: roost.identify()["active_tab_id"] != 0,
+        scaled_timeout(60.0),
+        "the UI to select and attach the slot's tab",
+    )
+    return roost
+
+
+def roostctl(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess:
+    """`roostctl` as a user with no Roost environment runs it.
+
+    `ROOST_SOCKET` and `ROOST_TAB_ID` are removed rather than left
+    alone, which is the whole claim of AC8's "no `--tab`, profile
+    route": the target is resolved from the bundle profile and the tab
+    from `identify`.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ("ROOST_SOCKET", "ROOST_TAB_ID")
+    }
+    return subprocess.run(
+        [util.roostctl_path(), "--target", "iced", *args],
+        capture_output=True,
+        text=True,
+        timeout=scaled_timeout(timeout),
+        env=env,
+    )
+
+
+def token() -> str:
+    return f"ROOST-D10-{uuid.uuid4().hex[:8]}"
+
+
+def session_tab_ids(lane: Lane) -> list[int]:
+    return [int(t["id"]) for p in lane.session_projects() for t in p["tabs"]]
+
+
+def test_bare_ids_on_the_ui_socket_act_on_the_session(lane: Lane):
+    """AC8's first clause, on the ops a hook and a script actually send.
+
+    The project created here exists only on the slot, so every later
+    assertion is about *which workspace answered*. The last one reads the
+    UI's own `state.json` after the quit: that is the workspace `session`
+    mode hides, and it has to be empty — a `project.create` answered
+    locally would have landed there, and a `tab.open` with
+    `project_id: 0` would have created a project there to land in.
+    """
+    roost = session_ui(lane)
+    project = roost.create_project(name="forwarded", cwd="/tmp")
+    tab = roost.open_tab(project, cwd="/tmp", title="forwarded-tab")
+
+    on_the_session = lane.session_projects()
+    assert "forwarded" in [p["name"] for p in on_the_session]
+    assert [p["name"] for p in roost.list()] == [p["name"] for p in on_the_session], (
+        "the UI socket's tab.list is the session's list"
+    )
+
+    # `tab.write` reaches the shell the *session* is running.
+    printed = token()
+    roost.send(tab, f"echo {printed}\n")
+    with lane.session() as c:
+        wait_until(
+            lambda: printed in c.dump_text(tab),
+            scaled_timeout(30.0),
+            "the forwarded write to reach the session's shell",
+        )
+
+    # `tab.set_state` lands on the session's row, not on a local one.
+    roost.set_state(tab, "needs_input")
+    with lane.session() as c:
+        assert c.agent_lifecycle(tab) == "waiting", c.tab(tab)
+        assert c.ownership(tab)["source"] == "manual"
+
+    # The fence is stripped at this boundary even though the session's
+    # own answer carries one: a UI socket cannot serve the stream it
+    # fences (§D10).
+    assert "revision" not in roost.call("tab.list", {})
+    with lane.session() as c:
+        assert "revision" in c.call("tab.list", {}), (
+            "the session still fences its own answer, which is what "
+            "makes the line above a strip rather than a coincidence"
+        )
+
+    ui.quit(lane.target)
+    persisted = json.loads((lane.state_dir / "state.json").read_text())
+    assert persisted["projects"] == [], (
+        f"something landed in the workspace this mode hides: {persisted['projects']}"
+    )
+
+
+def test_roostctl_with_no_tab_flag_drives_the_session(lane: Lane):
+    """AC8's `roostctl tab list/send/set-state` clause.
+
+    No `--tab`, no `ROOST_SOCKET`: the socket comes from the bundle
+    profile and the tab from `identify.active_tab_id`, which under
+    `session` is the slot's pair. Before §D10 that field answered `0`
+    and every one of these exited non-zero with "no active tab".
+    """
+    roost = session_ui(lane)
+    active = roost.identify()["active_tab_id"]
+    assert active in session_tab_ids(lane), (
+        "the active tab roostctl will resolve is one of the session's"
+    )
+
+    listed = roostctl("tab", "list", "--json")
+    assert listed.returncode == 0, listed
+    payload = json.loads(listed.stdout)
+    assert "revision" not in payload, payload
+    assert [p["name"] for p in payload["projects"]] == [
+        p["name"] for p in lane.session_projects()
+    ]
+
+    printed = token()
+    sent = roostctl("tab", "send", "--bytes", f"echo {printed}\\n")
+    assert sent.returncode == 0, sent
+    with lane.session() as c:
+        wait_until(
+            lambda: printed in c.dump_text(active),
+            scaled_timeout(30.0),
+            "roostctl's write to reach the session's shell",
+        )
+
+    stated = roostctl("tab", "set-state", "--state", "needs_input")
+    assert stated.returncode == 0, stated
+    with lane.session() as c:
+        assert c.agent_lifecycle(active) == "waiting", c.tab(active)
+
+
+def test_a_forwarded_refusal_is_the_sessions_own_verdict(lane: Lane):
+    """AC8's error-parity clause, on a refusal only the session can give.
+
+    `tab.reorder` naming a tab that belongs to *another* project is
+    `invalid-param` on the session, because the project is there and the
+    tab is not in it. Answered against the hidden workspace it would be
+    `not-found`, because no project with that id is there at all — so the
+    code alone separates the two, and the message is compared byte for
+    byte on top.
+    """
+    roost = session_ui(lane)
+    home = int(roost.list()[0]["id"])
+    other = roost.create_project(name="elsewhere", cwd="/tmp")
+    stray = roost.open_tab(other, cwd="/tmp")
+
+    with lane.session() as c:
+        with pytest.raises(RoostError) as direct:
+            c.reorder_tabs(home, [stray])
+    with pytest.raises(RoostError) as forwarded:
+        roost.reorder_tabs(home, [stray])
+
+    assert direct.value.code == "invalid-param", direct.value
+    assert forwarded.value.code == direct.value.code, (
+        f"a local answer would have been not-found: {forwarded.value}"
+    )
+    assert forwarded.value.message == direct.value.message
+
+
+def test_the_ui_reports_the_tab_it_is_showing_not_the_hidden_workspaces(lane: Lane):
+    """`app.selected_tab_id` is UI truth, and under `session` the tab on
+    screen lives on the slot.
+
+    The in-process workspace holds nothing at all here, so the op read
+    against it answers `0` — a wrong answer that looks like a legitimate
+    "nothing selected". Directly assertable, and asserted against
+    `identify`, which is the same question at a different width.
+    """
+    roost = session_ui(lane)
+    active = roost.identify()["active_tab_id"]
+    assert active != 0
+    assert roost.app_selected_tab_id() == active
+    assert active in session_tab_ids(lane)
+    assert roost.list() != [], "and the list it came from is the slot's"
+
+
+def test_a_forwarded_delete_of_the_last_project_is_answered_before_the_exit(lane: Lane):
+    """AC7 on the far side of §D10: the deletion reply is written before
+    the process goes.
+
+    Same assertion shape as `test_exit_on_empty.py`: `Roost.call` raises
+    on an error envelope **and** on a socket that closes mid-response, so
+    a normal return from the last `project.delete` is the proof. The
+    difference is where the delete goes — it is forwarded to the slot,
+    and the auto-remove it triggers is what takes the slot out of the
+    registry and lets §D9's predicate close the window.
+
+    **What this does not pin.** No control flips it: neither dropping
+    the forward's `HostOpsInFlight` registration nor removing `main.rs`'s
+    one-message-hop before `iced::exit()` makes it fail, because the
+    auto-remove asks the session `tab.list` before it forgets the host,
+    and that round trip is slack enough on its own. So this pins the
+    *outcome* — the reply arrives and the process ends cleanly — and not
+    the ordering mechanism, which no test in this tree reaches. See
+    `negative-controls.md`.
+    """
+    roost = session_ui(lane)
+    projects = [int(p["id"]) for p in roost.list()]
+    assert projects, roost.list()
+    process = ui.owned_process(lane.target)
+    assert process is not None, "this lane owns the UI it is about to watch exit"
+
+    for project in projects[:-1]:
+        roost.delete_project(project)
+    assert process.poll() is None, "a non-empty slot must not exit"
+
+    # The reply for THIS call is the assertion.
+    roost.delete_project(projects[-1])
+
+    exit_code = process.wait(timeout=scaled_timeout(30.0))
+    assert exit_code == 0, (
+        f"the UI must end its run loop normally (exit {exit_code})"
+    )
+    assert not ui.is_alive(lane.target), "the IPC socket must not answer after the exit"
+
+
+def test_a_slot_that_goes_away_stops_being_what_a_bare_id_means(lane: Lane):
+    """§D10's route follows the **connection**, not just the selection.
+
+    Stopping the daemon under a UI that has one of its tabs selected
+    moves no selection — `reconcile_host_selection` keeps the frozen
+    frame it is still drawing — so a route published only on selection
+    and mode changes would go on naming a tab on a dead incarnation, and
+    `roostctl` with no `--tab` would keep addressing it.
+    """
+    roost = session_ui(lane)
+    active = roost.identify()["active_tab_id"]
+    assert active != 0
+
+    lane.stop_daemon()
+    wait_until(
+        lambda: local_band(roost)["state"] != "connected",
+        scaled_timeout(60.0),
+        "the slot's band to leave connected",
+    )
+    wait_until(
+        lambda: roost.identify()["active_tab_id"] == 0,
+        scaled_timeout(30.0),
+        "identify to stop naming a tab on a connection that is gone",
+    )
+
+    # And the rewrite destination went with it, rather than addressing
+    # the dead incarnation.
+    with pytest.raises(RoostError) as refused:
+        roost.call("tab.dump", {"tab_id": str(active)})
+    assert refused.value.code == "host-unavailable", refused.value
+    assert "local session is not connected" in refused.value.message
+
+
+def test_a_host_qualified_ref_is_never_re_addressed_to_the_slot(lane: Lane):
+    """§D10's ordering clause, end to end.
+
+    The slot's own `h<n>.<id>` spelling is read off `app.sidebar_dump`,
+    so the pair below differs in exactly one thing: which host the ref
+    names. Naming the slot works; naming an incarnation nobody holds is
+    `not-found` — it is never quietly turned into the slot's tab, which
+    is what a generic "session mode ⇒ forward" branch would have done.
+    """
+    roost = session_ui(lane)
+    bare = roost.identify()["active_tab_id"]
+    keys = [
+        tab["key"]
+        for host in roost.sidebar_hosts()
+        for project in host["projects"]
+        for tab in project["tabs"]
+    ]
+    qualified = next(key for key in keys if key.endswith(f".{bare}"))
+    assert qualified != str(bare), keys
+
+    bare_rows = roost.call("tab.dump", {"tab_id": str(bare)})["rows_text"]
+    assert roost.call("tab.dump", {"tab_id": qualified})["rows_text"] == bare_rows, (
+        "the explicit spelling of the slot's own tab is the same tab"
+    )
+
+    with pytest.raises(RoostError) as refused:
+        roost.call("tab.dump", {"tab_id": "h9999.%d" % bare})
+    assert refused.value.code == "not-found", refused.value
+
+    # And a host-qualified *mutation* is not re-addressed either: the
+    # selection must not have moved onto the slot's tab.
+    with pytest.raises(RoostError) as focus:
+        roost.call("tab.focus", {"tab_id": "h9999.%d" % bare})
+    assert focus.value.code == "not-found", focus.value
+    assert roost.identify()["active_tab_id"] == bare

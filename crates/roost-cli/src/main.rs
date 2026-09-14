@@ -80,7 +80,20 @@ use roost_ipc::IpcClient;
 const CLIENT_NAME: &str = "roostctl";
 
 #[derive(Parser, Debug)]
-#[command(name = "roostctl", version, about = "Roost shell-integration CLI")]
+#[command(
+    name = "roostctl",
+    version,
+    about = "Roost shell-integration CLI",
+    long_about = "Roost shell-integration CLI.\n\n\
+                  Bare tab and project ids mean whichever backend the UI \
+                  runs its own tabs on. With `local-backend = session` the \
+                  UI hands those ops to the local `roost-session` and \
+                  answers with the session's reply, so `--tab 7` and the \
+                  no-flag active tab both name a session tab; `--tab \
+                  h<n>.<id>` still names a saved host's tab and is never \
+                  re-addressed. `roostctl identify` prints the backend and \
+                  the session socket."
+)]
 struct Args {
     /// Explicit socket path. Highest precedence; overrides
     /// `--target`, `ROOST_SOCKET`, and auto-detect.
@@ -166,9 +179,18 @@ enum Cmd {
         interval_ms: u64,
     },
     /// Tab subcommands.
+    ///
+    /// A bare `--tab` (and the active tab used when the flag is
+    /// omitted) names a tab on whichever backend the UI runs its own
+    /// tabs on — see `roostctl --help`. `events.subscribe` is not
+    /// served on a UI socket either way; a client that wants the event
+    /// stream dials `identify`'s `local_session_socket`.
     #[command(subcommand)]
     Tab(TabCmd),
     /// Project subcommands.
+    ///
+    /// Bare project ids follow the same rule as `roostctl tab`: under
+    /// `local-backend = session` they are the local session's projects.
     #[command(subcommand)]
     Project(ProjectCmd),
     /// Command-palette subcommands: drive the overlay (open, inspect,
@@ -361,6 +383,10 @@ enum TabCmd {
     },
     /// List projects + their tabs. `--json` emits the machine-readable
     /// workspace snapshot (the `tab.list` result) instead of plain text.
+    ///
+    /// Never carries a `revision`: that fence only means something on a
+    /// socket that also serves the event stream, which a UI socket does
+    /// not — including when the answer came from the local session.
     List {
         #[arg(long, default_value_t = false)]
         json: bool,

@@ -1261,6 +1261,9 @@ async fn serve(
                     // host. Nothing left to serve.
                     return ConnEnd::Shutdown;
                 };
+                let Some(intent) = admit(incarnation, intent) else {
+                    continue;
+                };
                 match run_intent(&mut live, unsupported, intent).await {
                     IntentOutcome::Live => {}
                     IntentOutcome::Ends(end) => return end,
@@ -1284,6 +1287,35 @@ fn reseat(live: &mut Live, events: EventRx, pump: EventPump, what: Subscribed) {
     live.events = events;
     if let Subscribed::Fresh(mirror) = what {
         live.mirror.reset(mirror);
+    }
+}
+
+/// The intent to run, or `None` when it was issued for a connection this
+/// one replaced and has been answered here instead.
+///
+/// The queue outlives a connection — this task's own retry ladder keeps
+/// draining the same receiver across attempts — so without this an
+/// intent enqueued in the window between a drop and the main thread
+/// learning about it is served by the *next* connection. A forwarded
+/// `project.delete` naming a row by bare id would then delete whatever
+/// the restarted session has since minted under that number.
+///
+/// `Disconnected` rather than a new error: that is what happened to the
+/// connection the caller addressed, and it is already the answer every
+/// intent [`queue::flush`] catches gets.
+fn admit(serving: HostId, intent: HostIntent) -> Option<HostIntent> {
+    match intent.fence {
+        Some(issued) if issued != serving => {
+            tracing::debug!(
+                op = %intent.op,
+                issued = issued.raw(),
+                serving = serving.raw(),
+                "refusing an intent issued for a replaced connection"
+            );
+            intent.answer(Err(HostOpError::Disconnected));
+            None
+        }
+        _ => Some(intent),
     }
 }
 
@@ -2073,6 +2105,45 @@ mod tests {
                 .expect("every parked waiter must wake")
                 .expect("and not panic");
         }
+    }
+
+    /// Plan 063 §D10/§D6: an intent issued for a connection this task has
+    /// since replaced must not run on its successor.
+    ///
+    /// The window is real and not a theoretical one: this task's retry
+    /// ladder drains the same receiver across attempts, and the main
+    /// thread goes on believing the old incarnation is live until it
+    /// drains the `Disconnected` off the feed. Against a session that
+    /// restarted and re-minted its ids, a forwarded
+    /// `project.delete {"project_id": "1"}` served by the replacement
+    /// deletes a project the caller never named.
+    #[tokio::test]
+    async fn an_intent_issued_for_a_replaced_connection_is_refused_not_rerouted() {
+        let (ops, mut ops_rx) = super::super::queue::HostOps::channel();
+        let issued = HostId::new(4);
+        let queued = ops.call_at(issued, "project.delete", serde_json::json!({}));
+        let intent = ops_rx.recv().await.expect("the intent is on the queue");
+
+        // A different incarnation on the same queue: refused here, and
+        // answered rather than dropped, so the caller never waits.
+        assert!(admit(HostId::new(5), intent).is_none());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), queued)
+                .await
+                .expect("a refused intent must still be answered"),
+            Err(HostOpError::Disconnected)
+        );
+
+        // The connection it was issued for still runs it.
+        let _alive = ops.call_at(issued, "project.delete", serde_json::json!({}));
+        let intent = ops_rx.recv().await.expect("the second intent");
+        assert!(admit(issued, intent).is_some());
+
+        // And an unfenced administrative op is correct on whichever
+        // connection serves it, so it is admitted either way.
+        let _push = ops.call("session.set_focus", serde_json::json!({}));
+        let intent = ops_rx.recv().await.expect("the third intent");
+        assert!(admit(HostId::new(9), intent).is_some());
     }
 
     /// The disconnect contract end to end, and what lets `HostConn::drop`

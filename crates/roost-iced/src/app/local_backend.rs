@@ -579,19 +579,57 @@ pub(crate) fn initial_selection(
     }
 }
 
+/// What the UI knows about the slot, as one reading (plan 063
+/// §D1/§D10).
+///
+/// The two fields travel together because they answer the same
+/// question at two widths — *which* connection a bare id names, and
+/// *which pair* a bare id defaults to — and a snapshot that had one
+/// without the other would let `identify` report a selection on a slot
+/// the forward arm would refuse.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SlotSelection {
+    /// The slot's live incarnation, or `None` when it is not connected.
+    pub(crate) host: Option<u32>,
+    /// What this window has selected *on that incarnation*.
+    pub(crate) active: Option<(i64, i64)>,
+}
+
+/// What a bare id names, given the slot and what this window has
+/// selected (plan 063 §D1's `identify.active_*`, §D10's rewrite).
+///
+/// The filter is the whole of it: a selection counts only when it is on
+/// **the slot's own incarnation**. A window showing an unrelated remote
+/// host has no slot selection, because answering with the remote's ids
+/// would send a `roostctl tab write` with no `--tab` to the wrong
+/// machine — and a selection left over from a previous incarnation names
+/// tabs the reconnected session has renumbered.
+pub(super) fn slot_selection(
+    slot: Option<HostId>,
+    selection: Option<super::HostSelection>,
+) -> SlotSelection {
+    SlotSelection {
+        host: slot.map(HostId::raw),
+        active: selection
+            .filter(|showing| Some(showing.tab.host) == slot)
+            .map(|showing| (showing.project.project, showing.tab.tab)),
+    }
+}
+
 /// The snapshot for `mode`.
 ///
-/// Both derived fields hang off the mode: in-process has no slot, so it
-/// has neither a slot socket nor a slot selection. The socket comes
-/// from the session bundle profile because that is what determines it —
-/// the daemon binds that path whether or not anyone is connected to it.
+/// Every derived field hangs off the mode: in-process has no slot, so it
+/// has neither a slot socket nor an incarnation nor a slot selection.
+/// The socket comes from the session bundle profile because that is what
+/// determines it — the daemon binds that path whether or not anyone is
+/// connected to it.
 ///
 /// `switch` rides along rather than hanging off the mode, because it is
 /// the one field that is *about* the mode moving: a client reading a
 /// mode mid-switch has to be able to see that it is mid-switch.
 pub(crate) fn route_snapshot(
     mode: LocalBackendMode,
-    slot_active: Option<(i64, i64)>,
+    slot: SlotSelection,
     switch: SwitchState,
 ) -> LocalRoute {
     let switch = switch.wire();
@@ -599,13 +637,15 @@ pub(crate) fn route_snapshot(
         LocalBackendMode::InProcess => LocalRoute {
             mode,
             slot_socket: None,
+            slot_host: None,
             slot_active: None,
             switch,
         },
         LocalBackendMode::Session => LocalRoute {
             mode,
             slot_socket: roost_ipc::session_socket_path(),
-            slot_active,
+            slot_host: slot.host,
+            slot_active: slot.active,
             switch,
         },
     }
@@ -2143,14 +2183,27 @@ mod tests {
 
     #[test]
     fn the_session_snapshot_carries_the_profile_socket_and_the_slot_selection() {
-        let route = route_snapshot(LocalBackendMode::Session, Some((4, 9)), SwitchState::Idle);
+        let route = route_snapshot(
+            LocalBackendMode::Session,
+            SlotSelection {
+                host: Some(2),
+                active: Some((4, 9)),
+            },
+            SwitchState::Idle,
+        );
         assert_eq!(route.mode, LocalBackendMode::Session);
+        assert_eq!(route.slot_host, Some(2));
         assert_eq!(route.slot_active, Some((4, 9)));
         assert_eq!(route.switch, None, "an idle UI publishes no phase");
         // And the phase rides through, which is what lets `identify`
         // say why a mutation was refused (§D8a).
         assert_eq!(
-            route_snapshot(LocalBackendMode::Session, None, SwitchState::Replaying).switch,
+            route_snapshot(
+                LocalBackendMode::Session,
+                SlotSelection::default(),
+                SwitchState::Replaying
+            )
+            .switch,
             Some("replaying")
         );
         assert_eq!(
@@ -2165,13 +2218,67 @@ mod tests {
         );
     }
 
+    fn showing(host: HostId, project: i64, tab: i64) -> super::super::HostSelection {
+        super::super::HostSelection {
+            project: ProjectKey::new(host, project),
+            tab: TabKey::new(host, tab),
+            local_active: 0,
+        }
+    }
+
+    /// §D1's `identify.active_*` under `session`: what a bare id means
+    /// when no `--tab` was given.
+    #[test]
+    fn the_slot_selection_is_the_pair_showing_on_the_slot() {
+        let slot = HostId::new(2);
+        assert_eq!(
+            slot_selection(Some(slot), Some(showing(slot, 4, 9))),
+            SlotSelection {
+                host: Some(2),
+                active: Some((4, 9)),
+            }
+        );
+    }
+
+    /// The filter, one reason at a time. Each of these would otherwise
+    /// answer `roostctl tab write` with ids on the wrong machine — or on
+    /// an incarnation that has renumbered since.
+    #[test]
+    fn a_selection_that_is_not_the_slots_is_not_a_slot_selection() {
+        let slot = HostId::new(2);
+        let elsewhere = HostId::new(7);
+        assert_eq!(
+            slot_selection(Some(slot), Some(showing(elsewhere, 4, 9))).active,
+            None,
+            "a remote host's tab is not the local one"
+        );
+        assert_eq!(
+            slot_selection(Some(slot), None).active,
+            None,
+            "nothing selected"
+        );
+        // A slot that is not connected has no incarnation to name, so a
+        // stale selection cannot be reported against it either.
+        let down = slot_selection(None, Some(showing(slot, 4, 9)));
+        assert_eq!(down.host, None);
+        assert_eq!(down.active, None);
+    }
+
     /// In-process has no slot at all, so a selection handed in from a
     /// previous session mode cannot survive the switch back.
     #[test]
     fn the_in_process_snapshot_has_no_slot() {
-        let route = route_snapshot(LocalBackendMode::InProcess, Some((4, 9)), SwitchState::Idle);
+        let route = route_snapshot(
+            LocalBackendMode::InProcess,
+            SlotSelection {
+                host: Some(2),
+                active: Some((4, 9)),
+            },
+            SwitchState::Idle,
+        );
         assert_eq!(route.mode, LocalBackendMode::InProcess);
         assert_eq!(route.slot_socket, None);
+        assert_eq!(route.slot_host, None);
         assert_eq!(route.slot_active, None);
     }
 

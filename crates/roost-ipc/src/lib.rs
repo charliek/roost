@@ -77,7 +77,10 @@ mod runtime_dir;
 mod server;
 
 pub use client::{ClientError, IpcClient};
-pub use local_route::{session_socket_path, LocalBackendCell, LocalBackendMode, LocalRoute};
+pub use local_route::{
+    session_socket_path, LocalBackendCell, LocalBackendMode, LocalRoute, OpClass, SlotIds,
+    SlotRequired,
+};
 pub use peer::{current_euid, peer_uid};
 pub use runtime_dir::validate_runtime_dir;
 pub use server::{
