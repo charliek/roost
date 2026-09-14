@@ -136,6 +136,11 @@ impl Layout {
             // `vt` is negotiable here. The pre-R3 shape is driven out of
             // process by the host-client e2e lane.
             legacy_payload_kinds: false,
+            // The in-process tests are their own starter: a session
+            // that came up empty here would break every case that
+            // hydrates a layout, and the withheld answer is driven out
+            // of process by the local-backend e2e lane.
+            first_project: roost_ipc::session_launch::FirstProject::Seed,
             // Likewise: the shipped window, which no in-process test
             // drives past.
             replay_window: None,
@@ -259,6 +264,23 @@ pub async fn open_tab(
         .await
         .expect("tab.open");
     result.tab
+}
+
+/// `project.create` — the op a client uses to fill a workspace it asked
+/// the session not to seed (plan 063 §D8).
+pub async fn create_project(client: &mut IpcClient, name: &str, cwd: &Path) -> i64 {
+    let result: serde_json::Value = client
+        .call(
+            ops::PROJECT_CREATE,
+            serde_json::json!({ "name": name, "cwd": cwd.to_string_lossy() }),
+        )
+        .await
+        .expect("project.create");
+    result["project"]["id"]
+        .as_str()
+        .expect("a string-wrapped project id")
+        .parse()
+        .expect("a numeric project id")
 }
 
 /// `tab.resize` — reaches the supervisor, so its success is a statement

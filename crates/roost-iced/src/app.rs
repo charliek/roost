@@ -85,7 +85,7 @@ pub(crate) mod host_lifecycle;
 pub(crate) mod host_notice;
 pub(crate) mod host_tab;
 mod interactions;
-mod local_backend;
+pub(crate) mod local_backend;
 mod palettes;
 mod servicing;
 mod tab_backend;
@@ -350,8 +350,37 @@ fn spawn_gate(
 ) -> crate::host_conn::ConnectMode {
     use crate::host_conn::ConnectMode;
     match mode {
-        ConnectMode::SpawnIfMissing if !policy.localhost_surface => ConnectMode::IfPresent,
+        ConnectMode::SpawnIfMissing | ConnectMode::SpawnUnseeded if !policy.localhost_surface => {
+            ConnectMode::IfPresent
+        }
         mode => mode,
+    }
+}
+
+/// What an *explicit* dial does about an absent socket, given what the
+/// caller owes the landing (plan 063 §D12).
+///
+/// One rule, one place, for the same reason [`reconnect_mode`] is one:
+/// the two things a `SwitchDestination` turns off — the client's
+/// seed-on-connect and the daemon's own first project — are the same
+/// decision made half a second apart, and arming them from separate
+/// inputs is how one of them gets forgotten. So the mode is *derived*
+/// from the purpose rather than passed beside it.
+///
+/// Only the switch withholds. A launch-time dial of the very same slot
+/// wants the seed (§D4/§D5: coming up on an empty band is coming up
+/// broken), and so does every Connect a person presses.
+fn dial_mode(
+    localhost: bool,
+    purpose: local_backend::ConnectPurpose,
+) -> crate::host_conn::ConnectMode {
+    use crate::host_conn::ConnectMode;
+    match (localhost, purpose) {
+        // Nothing here could start a remote session, and there is no
+        // local socket to probe.
+        (false, _) => ConnectMode::Dial,
+        (true, local_backend::ConnectPurpose::SwitchDestination) => ConnectMode::SpawnUnseeded,
+        (true, _) => ConnectMode::SpawnIfMissing,
     }
 }
 
@@ -2274,6 +2303,21 @@ pub struct App {
     /// What the IPC handler answers `identify` from. Written only by
     /// [`Self::publish_local_route`].
     local_route: Arc<LocalBackendCell>,
+    /// The local-backend switch in flight (plan 063 §D8), or `None`.
+    /// [`local_backend::SwitchState::Idle`] is spelled as the absence of
+    /// a run, so nothing can be mid-phase with no phase data.
+    switch: Option<local_backend::SwitchRun>,
+    /// Reentrancy guard for the switch driver. Its phases call things
+    /// that reconcile (`host_add_requested`, `set_host_selection`), and
+    /// reconcile is where the driver runs.
+    switch_driving: bool,
+    /// Bumped per switch, carried by every step future, so a completion
+    /// from an abandoned run is dropped rather than folded into the next
+    /// one. Nothing can recall a future already on the runtime.
+    switch_generation: u64,
+    /// This profile's state dir — where the switch journal lives beside
+    /// `state.json` (plan 063 §D8b).
+    state_dir: PathBuf,
     typography: TerminalTypography,
     font_registry: &'static FontRegistry,
     terminal_metrics: TerminalMetrics,
@@ -2589,10 +2633,17 @@ impl App {
             .enable_all()
             .build()
             .context("build Iced engine runtime")?;
+        // Plan 063 §D5's ladder, step 1: an unfinished switch decides
+        // the mode before anything else is asked, because it is the one
+        // input that knows the key on disk may not describe reality.
+        let resumed = resume_switch_journal(profile, &runtime);
         // Both disk questions are asked **before** `Workspace::open`,
         // which is what creates the very `state.json` the fresh-install
         // clause is about.
-        let backend_mode = resolve_local_backend(profile, &config);
+        let backend_mode = match resumed.mode {
+            Some(mode) => mode,
+            None => resolve_local_backend(profile, &config),
+        };
         let workspace = Arc::new(Workspace::open(profile.state_json_path()));
         workspace.set_window_focused(true);
         if backend_mode == LocalBackendMode::Session {
@@ -2604,6 +2655,11 @@ impl App {
             Arc::clone(&supervisor),
             profile.socket_path.clone(),
         );
+
+        // After `Workspace::open` (there is nothing to delete before
+        // it) and before the hydrate, which would otherwise warn about
+        // a populated in-process workspace this is about to empty.
+        finish_switch_source_deletion(&runtime, &client, profile, &resumed);
 
         hydrate_workspace(&runtime, &client, backend_mode)?;
 
@@ -2621,6 +2677,7 @@ impl App {
         let local_route = Arc::new(LocalBackendCell::new(local_backend::route_snapshot(
             backend_mode,
             None,
+            local_backend::SwitchState::Idle,
         )));
         let handler = IpcHandler::new(
             Arc::clone(&workspace),
@@ -2683,6 +2740,10 @@ impl App {
             config,
             local_backend: backend_mode,
             local_route,
+            switch: None,
+            switch_driving: false,
+            switch_generation: 0,
+            state_dir: profile.state_dir.clone(),
             typography,
             font_registry,
             terminal_metrics,
@@ -2772,8 +2833,11 @@ impl App {
     /// what a bare id means over the UI socket) can never disagree with
     /// what the UI is actually doing.
     fn publish_local_route(&self) {
-        self.local_route
-            .store(local_backend::route_snapshot(self.local_backend, None));
+        self.local_route.store(local_backend::route_snapshot(
+            self.local_backend,
+            None,
+            self.switch_state(),
+        ));
     }
 
     /// Launch-time auto-reconnect for saved host sessions: **connect if
@@ -3310,6 +3374,18 @@ impl App {
     /// loop unwinds rather than in the middle of it — and the two of
     /// them are the same latch, so it cannot fire twice.
     pub fn take_exit_task(&mut self) -> UiTask {
+        // Plan 063 §D8a: a Quit during a switch is honoured, but only
+        // at a safe point. Between phases the journal fully describes
+        // where the switch got to, so the next launch resumes or rolls
+        // back; **mid-step** it does not, because the step is still
+        // writing to the destination and its ids have not all reached
+        // the journal. The request stays latched — `ExitState` is
+        // one-way — and every step completion is a message, so the
+        // batched drain this sits in is re-asked the moment the phase
+        // ends.
+        if self.switch_step_in_flight() {
+            return UiTask::None;
+        }
         if self.exit_state.take() {
             self.hosts.abandon_reconnects();
             UiTask::Exit
@@ -3509,6 +3585,9 @@ impl App {
                                 }
                                 Some(host_dialog::HostDialog::ConfirmRestart { .. }) => {
                                     task = self.host_restart_dialog_confirmed();
+                                }
+                                Some(host_dialog::HostDialog::ConfirmSwitch { .. }) => {
+                                    self.local_switch_confirmed();
                                 }
                                 Some(host_dialog::HostDialog::Bootstrap(_)) => {
                                     self.host_bootstrap_confirmed();
@@ -3780,6 +3859,15 @@ impl App {
     }
 
     fn dispatch_keybind_action_once(&mut self, action: KeybindAction) -> Result<UiTask, String> {
+        // Plan 063 §D8a's quiescence, at the one boundary every keybind
+        // refusal already passes through (the caller toasts and logs
+        // it). Which actions count is
+        // [`local_backend::keybind_mutates_local_backend`] — one list,
+        // one test, rather than a check per arm that a new mutating
+        // action could be added without.
+        if local_backend::keybind_mutates_local_backend(action) {
+            self.refuse_during_switch()?;
+        }
         match action {
             KeybindAction::NewTab => Ok(self.new_tab_dispatch().task),
             KeybindAction::CloseTab => {
@@ -4082,6 +4170,28 @@ impl App {
                         label,
                         style: chrome::danger_button,
                         press: Some(Message::HostRestartConfirm),
+                    }),
+                    None,
+                )
+            ],
+            // The local-backend switch (plan 063 §D8). Destructive in
+            // both directions — forward ends every local shell, reverse
+            // leaves the session's work behind a band — so both get the
+            // danger button.
+            host_dialog::HostDialog::ConfirmSwitch {
+                title,
+                body,
+                confirm,
+                ..
+            } => column![
+                modal_heading(title.clone(), body),
+                modal_buttons(
+                    "Cancel",
+                    Message::HostDialogCancel,
+                    Some(ConfirmButton {
+                        label: confirm,
+                        style: chrome::danger_button,
+                        press: Some(Message::LocalSwitchConfirm),
                     }),
                     None,
                 )
@@ -6061,13 +6171,7 @@ impl App {
         self.connect_saved_host(
             &host,
             origin,
-            |localhost| {
-                Some(if localhost {
-                    crate::host_conn::ConnectMode::SpawnIfMissing
-                } else {
-                    crate::host_conn::ConnectMode::Dial
-                })
-            },
+            |localhost| Some(dial_mode(localhost, purpose)),
             cause,
             purpose,
         );
@@ -6581,6 +6685,10 @@ impl App {
                     return Err("this dialog has no confirming action".to_string());
                 }
                 self.host_restart_dialog_confirmed()
+            }
+            Some(host_dialog::HostDialog::ConfirmSwitch { .. }) => {
+                self.local_switch_confirmed();
+                UiTask::None
             }
             Some(host_dialog::HostDialog::Bootstrap(_)) => {
                 self.host_bootstrap_confirmed();
@@ -7685,6 +7793,22 @@ fn dialog_shape(dialog: &host_dialog::HostDialog) -> roost_ipc::messages::AppDia
                 .collect(),
             Some(saved_id.clone()),
         ),
+        host_dialog::HostDialog::ConfirmSwitch {
+            direction,
+            title,
+            body,
+            confirm,
+        } => (
+            "confirm_switch",
+            // The direction is the whole payload, so it is what the dump
+            // has to carry: the two cards differ in nothing else a test
+            // could key on.
+            Some(direction.destination().as_str()),
+            title.clone(),
+            body.clone(),
+            vec!["Cancel".to_string(), confirm.to_string()],
+            None,
+        ),
         host_dialog::HostDialog::Bootstrap(draft) => (
             "bootstrap",
             Some(draft.plan.variant.wire_name()),
@@ -7760,6 +7884,224 @@ impl Drop for App {
         // than the process being killed under it — the exit-on-empty path
         // depends on this running.
         tracing::info!("workspace state flushed on shutdown");
+    }
+}
+
+/// What a resumed switch journal decided (plan 063 §D8b).
+struct ResumedSwitch {
+    /// The mode this launch runs on, overriding the ladder. `None` when
+    /// there was no journal, or none this build can act on.
+    mode: Option<LocalBackendMode>,
+    /// The **source** projects a committed forward switch had not
+    /// finished deleting, from the journal's own list.
+    ///
+    /// A list, not "everything in the workspace": the running switch
+    /// deletes only what the replay landed whole, and a recovery that
+    /// swept the workspace would delete the project it deliberately
+    /// kept. Done after `Workspace::open`, which is the only thing that
+    /// can see them.
+    delete_source: Vec<i64>,
+    /// Whether the key on disk was actually made to say [`Self::mode`].
+    ///
+    /// **The journal may not be cleared while this is false.** The mode
+    /// is settled for *this* launch either way — it is a value in
+    /// memory — but the next launch reads the file, and a file still
+    /// naming the other mode with no journal left to correct it is a
+    /// rollback that silently un-rolls itself.
+    key_written: bool,
+}
+
+/// Plan 063 §D5's step 1 / §D8b's recovery, run before the ladder.
+///
+/// The key is **written**, on both arms, rather than read. That is the
+/// whole reason the journal exists: the crash window this recovers from
+/// is the one between `set_key` and the journal's own phase update, and
+/// on either side of it the config file and the phase disagree. The
+/// phase is the one that knows whether the destination is whole, so the
+/// phase wins and the key is made to match it.
+///
+/// The destination rollback is done here, synchronously, over the
+/// session's own socket — not through the host connection set, which
+/// does not exist yet. A session that is not listening leaves the
+/// journal in place for a later launch, which is exactly the promise:
+/// "a partial destination copy may remain and is cleaned up on the next
+/// launch".
+fn resume_switch_journal(
+    profile: &BundleProfile,
+    runtime: &tokio::runtime::Runtime,
+) -> ResumedSwitch {
+    let none = ResumedSwitch {
+        mode: None,
+        delete_source: Vec::new(),
+        key_written: false,
+    };
+    let path = local_backend::journal_path(&profile.state_dir);
+    let Some(journal) = local_backend::read_journal(&path) else {
+        return none;
+    };
+    tracing::warn!(
+        from = %journal.from_mode,
+        to = %journal.to_mode,
+        phase = ?journal.phase,
+        projects = journal.source_snapshot.len(),
+        created = journal.created_dest_ids.len(),
+        "a local-backend switch did not finish; resolving it"
+    );
+    let recovery = local_backend::journal_recovery(&journal);
+    let (mode, delete_dest, delete_source) = match recovery {
+        local_backend::JournalRecovery::Ignore => return none,
+        local_backend::JournalRecovery::Finish {
+            mode,
+            delete_source,
+        } => (mode, Vec::new(), delete_source),
+        local_backend::JournalRecovery::RollBack { mode, delete_dest } => {
+            (mode, delete_dest, Vec::new())
+        }
+    };
+    let key_written = match config::config_path() {
+        Some(config_path) => match config::set_key(&config_path, "local-backend", mode.as_str()) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, %mode, "could not settle the local backend after a switch");
+                false
+            }
+        },
+        None => {
+            tracing::warn!("no config path to settle the local backend in");
+            false
+        }
+    };
+    // The destination copy goes only when there is one to go, and the
+    // journal goes only when **everything** it describes is done — the
+    // key included. A journal cleared over a key that still names the
+    // other mode is a rollback the next launch has no record of, and it
+    // would come up on the very mode this one decided against.
+    let dest_cleared =
+        delete_dest.is_empty() || runtime.block_on(roll_back_switch_destination(&delete_dest));
+    if !dest_cleared {
+        tracing::warn!("the switch destination could not be rolled back; its partial copy stays for a later launch");
+    }
+    if key_written && dest_cleared && delete_source.is_empty() {
+        local_backend::clear_journal(&path);
+    }
+    ResumedSwitch {
+        mode: Some(mode),
+        delete_source,
+        key_written,
+    }
+}
+
+/// Delete a rolled-back switch's destination projects over the session
+/// socket. `true` when there is nothing of the copy left.
+async fn roll_back_switch_destination(project_ids: &[i64]) -> bool {
+    // **Bounded, because this runs before the window exists.** A daemon
+    // that is listening but not servicing — SIGSTOPped, wedged, mid-swap
+    // — answers the connect and never answers the op, and an unbounded
+    // wait here is a Roost that never reaches hydration and never draws
+    // anything at all. The switch's own phase backstop lives on the
+    // running app's driver and does not reach this path. On expiry the
+    // journal stays exactly where it is, which is the same answer a
+    // session that is not there gets.
+    let budget = ROLLBACK_BUDGET.mul_f64(roost_ipc::session_launch::timeout_scale());
+    match tokio::time::timeout(budget, delete_switch_destination(project_ids)).await {
+        Ok(complete) => complete,
+        Err(_elapsed) => {
+            tracing::warn!(
+                seconds = budget.as_secs(),
+                "the local session did not answer the switch rollback in time"
+            );
+            false
+        }
+    }
+}
+
+/// How long a launch may spend undoing a rolled-back switch's
+/// destination before it gives up and comes up anyway.
+///
+/// Generous for what it is — a handful of `project.delete`s over a unix
+/// socket on this machine — and short enough that a wedged daemon costs
+/// a slow start rather than no start at all.
+const ROLLBACK_BUDGET: Duration = Duration::from_secs(20);
+
+async fn delete_switch_destination(project_ids: &[i64]) -> bool {
+    let Some(socket) = roost_ipc::session_socket_path() else {
+        return false;
+    };
+    let mut client = match roost_ipc::client::IpcClient::connect(&socket).await {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(%socket, %error, "no local session to roll the switch back on");
+            return false;
+        }
+    };
+    let mut complete = true;
+    for id in project_ids {
+        let deleted = client
+            .call_raw(
+                roost_ipc::messages::ops::PROJECT_DELETE,
+                serde_json::json!({ "project_id": id.to_string() }),
+            )
+            .await;
+        match deleted {
+            Ok(_) => {}
+            // Already gone is the state the rollback wanted.
+            Err(roost_ipc::client::ClientError::Server { ref code, .. })
+                if roost_ipc::client::ServerCode::from_wire(code)
+                    == roost_ipc::client::ServerCode::NotFound => {}
+            Err(error) => {
+                tracing::warn!(project_id = id, %error, "rolling back a replayed project failed");
+                complete = false;
+            }
+        }
+    }
+    complete
+}
+
+/// The other half of a committed forward switch: empty the source.
+///
+/// Only reached when the crash landed between the commit point and the
+/// last `project.delete` — the mode already says `session`, so these
+/// projects are invisible and their PTYs are running in this process for
+/// nobody.
+fn finish_switch_source_deletion(
+    runtime: &tokio::runtime::Runtime,
+    client: &LocalClient,
+    profile: &BundleProfile,
+    resumed: &ResumedSwitch,
+) {
+    if resumed.delete_source.is_empty() {
+        return;
+    }
+    let path = local_backend::journal_path(&profile.state_dir);
+    let mut left = 0;
+    for project_id in &resumed.delete_source {
+        match runtime.block_on(client.delete_project(*project_id)) {
+            Ok(_) => {}
+            // Already gone is the state the recovery wanted: the switch
+            // may have deleted some of the list before it crashed.
+            // Downcast rather than matched on text — the message is an
+            // operator convenience a refactor may reword, the variant is
+            // not.
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<roost_engine::WorkspaceError>(),
+                    Some(roost_engine::WorkspaceError::ProjectNotFound(_))
+                ) => {}
+            Err(error) => {
+                tracing::warn!(project_id, %error, "finishing a switch's source deletion failed");
+                left += 1;
+            }
+        }
+    }
+    tracing::info!(
+        deleted = resumed.delete_source.len() - left,
+        left,
+        "finished a committed switch's source deletion"
+    );
+    // Same rule as the rollback arm: the journal describes the key too,
+    // so it stays until the key is right as well.
+    if left == 0 && resumed.key_written {
+        local_backend::clear_journal(&path);
     }
 }
 
@@ -7854,13 +8196,37 @@ fn hydrate_workspace(
         }
         return Ok(());
     }
-    let mut projects = runtime.block_on(client.list_projects())?;
+    runtime.block_on(hydrate_local_workspace(client))
+}
+
+/// Bring the in-process workspace up: seed it if it is empty, open the
+/// saved tabs of every project that has none, and restore the selection.
+///
+/// **Two callers, one spelling** — the launch under `in-process`, and
+/// the reverse switch (plan 063 §D8), which is a launch of this
+/// workspace in every respect that matters. Coming back from `session`
+/// over a `state.json` the session-mode launch loaded but deliberately
+/// did **not** hydrate leaves project rows carrying no live tabs, and a
+/// reverse that only counted projects would hand the user a band of
+/// empty rows — then a forward switch would snapshot those empty tab
+/// lists and delete the originals for good.
+///
+/// The `tabs.is_empty()` guard is what makes it safe to run twice. At
+/// bootstrap it is true of every project, so this is byte-for-byte the
+/// launch behaviour it replaced; on a reverse it is true of exactly the
+/// rows that need shells, and `take_restore_layout` being a one-shot
+/// means a second pass finds nothing to restore and adds nothing.
+async fn hydrate_local_workspace(client: &LocalClient) -> Result<()> {
+    let mut projects = client.list_projects().await?;
     if projects.is_empty() {
         let cwd = roost_engine::home_dir();
-        projects.push(runtime.block_on(client.create_project("", &cwd))?);
+        projects.push(client.create_project("", &cwd).await?);
     }
     let restore = client.workspace.take_restore_layout();
     for project in &projects {
+        if !project.tabs.is_empty() {
+            continue;
+        }
         let saved = restore
             .as_ref()
             .and_then(|layout| {
@@ -7883,14 +8249,17 @@ fn hydrate_workspace(
             saved
         };
         for spec in specs {
-            match runtime.block_on(client.open_tab(
-                project.id,
-                &spec.cwd,
-                &spec.title,
-                &[],
-                u32::from(DEFAULT_COLS),
-                u32::from(DEFAULT_ROWS),
-            )) {
+            match client
+                .open_tab(
+                    project.id,
+                    &spec.cwd,
+                    &spec.title,
+                    &[],
+                    u32::from(DEFAULT_COLS),
+                    u32::from(DEFAULT_ROWS),
+                )
+                .await
+            {
                 Ok(tab) if spec.user_titled && !spec.title.is_empty() => {
                     client.workspace.set_tab_title(tab.id, &spec.title)?;
                 }
@@ -7948,6 +8317,7 @@ impl Message {
             Self::HostDialogCancel => app.host_dialog_cancel(),
             Self::HostDialogCardPressed => {}
             Self::HostStopConfirm => app.host_stop_confirmed(),
+            Self::LocalSwitchConfirm => app.local_switch_confirmed(),
             Self::HostRestartConfirm => return app.host_restart_dialog_confirmed(),
             Self::HostBootstrapConfirm => app.host_bootstrap_confirmed(),
             Self::ConfirmDeleteCancel => app.cancel_confirm_delete(),
@@ -8432,10 +8802,62 @@ mod tests {
             spawn_gate(ConnectMode::SpawnIfMissing, FULL_POLICY),
             ConnectMode::SpawnIfMissing
         );
+        // The switch's own spawn (plan 063 §D8 phase 1) is a spawn, so
+        // the gate downgrades it too — a build that cannot start a
+        // session here cannot start an unseeded one either, and the
+        // switch's phase 1 then fails honestly rather than dialing a
+        // socket nothing will ever bind.
+        assert_eq!(
+            spawn_gate(ConnectMode::SpawnUnseeded, GATED_POLICY),
+            ConnectMode::IfPresent
+        );
+        assert_eq!(
+            spawn_gate(ConnectMode::SpawnUnseeded, FULL_POLICY),
+            ConnectMode::SpawnUnseeded
+        );
         // Every other mode is already spawn-free, under both answers.
         for mode in [ConnectMode::IfPresent, ConnectMode::Dial] {
             assert_eq!(spawn_gate(mode, GATED_POLICY), mode);
             assert_eq!(spawn_gate(mode, FULL_POLICY), mode);
+        }
+    }
+
+    /// Plan 063 §D8 phase 1: the switch's destination dial is the one
+    /// spawn that withholds the daemon's own first project.
+    ///
+    /// Every purpose is enumerated, and only one of them moves — the
+    /// point being that a *launch-time* dial of the very same slot must
+    /// keep seeding (§D5: an empty band at launch is a broken start),
+    /// and so must every Connect a person presses.
+    #[test]
+    fn only_the_switchs_destination_dial_starts_a_session_that_does_not_seed() {
+        use crate::host_conn::ConnectMode;
+        use local_backend::ConnectPurpose;
+
+        assert_eq!(
+            dial_mode(true, ConnectPurpose::SwitchDestination),
+            ConnectMode::SpawnUnseeded
+        );
+        for purpose in [
+            ConnectPurpose::OrdinaryConnect,
+            ConnectPurpose::EnsureNonempty,
+            ConnectPurpose::CreateAfterConnect,
+        ] {
+            assert_eq!(
+                dial_mode(true, purpose),
+                ConnectMode::SpawnIfMissing,
+                "{purpose:?}"
+            );
+        }
+        // A remote host has no local socket to probe and nothing this
+        // client could start, whatever the caller owes the landing.
+        for purpose in [
+            ConnectPurpose::OrdinaryConnect,
+            ConnectPurpose::EnsureNonempty,
+            ConnectPurpose::CreateAfterConnect,
+            ConnectPurpose::SwitchDestination,
+        ] {
+            assert_eq!(dial_mode(false, purpose), ConnectMode::Dial, "{purpose:?}");
         }
     }
 

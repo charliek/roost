@@ -57,4 +57,6 @@ pub mod start;
 
 pub use readiness::{Readiness, Verdict};
 pub use serve::{serve, SessionConfig};
-pub use start::{capture_launch_cwd, report, set_process_umask, start, Outcome};
+pub use start::{
+    capture_first_project, capture_launch_cwd, report, set_process_umask, start, Outcome,
+};

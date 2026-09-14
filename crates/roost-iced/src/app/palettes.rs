@@ -221,6 +221,7 @@ fn command_palette_frame(
     hosts: &[host_verbs::HostRow<'_>],
     recents: &[host_verbs::RecentRow<'_>],
     local: host_sidebar::LocalSlot<'_>,
+    switching: bool,
 ) -> palette::PaletteFrame {
     let mut bindings = keybindings.iter().collect::<Vec<_>>();
     bindings.sort_by(|(left, _), (right, _)| accel_order(left, right));
@@ -264,6 +265,7 @@ fn command_palette_frame(
         hosts,
         recents,
         local,
+        switching,
         picker_shortcut.as_deref(),
     ));
     palette::PaletteFrame::new(COMMANDS_FRAME_ID, "Execute a command…", items)
@@ -278,20 +280,27 @@ fn host_verb_items(
     hosts: &[host_verbs::HostRow<'_>],
     recents: &[host_verbs::RecentRow<'_>],
     local: host_sidebar::LocalSlot<'_>,
+    switching: bool,
     new_project_on_shortcut: Option<&str>,
 ) -> Vec<palette::PaletteItem> {
-    host_verbs::verbs(hosts, recents, local, host_verbs::VerbPolicy::current())
-        .into_iter()
-        .map(|verb| {
-            let trailing = (verb.id == host_verbs::NEW_PROJECT_ON_ID)
-                .then_some(new_project_on_shortcut)
-                .flatten()
-                .map(str::to_string);
-            palette::PaletteItem::new(verb.id, verb.title)
-                .with_subtitle(verb.subtitle)
-                .with_trailing(trailing)
-        })
-        .collect()
+    host_verbs::verbs(
+        hosts,
+        recents,
+        local,
+        host_verbs::VerbPolicy::current(),
+        switching,
+    )
+    .into_iter()
+    .map(|verb| {
+        let trailing = (verb.id == host_verbs::NEW_PROJECT_ON_ID)
+            .then_some(new_project_on_shortcut)
+            .flatten()
+            .map(str::to_string);
+        palette::PaletteItem::new(verb.id, verb.title)
+            .with_subtitle(verb.subtitle)
+            .with_trailing(trailing)
+    })
+    .collect()
 }
 
 /// The "New Project on…" picker (plan 037 §3.1). Same palette surface as
@@ -973,6 +982,7 @@ impl App {
                 &self.host_verb_rows(),
                 &self.host_recent_rows(),
                 self.local_slot_input(),
+                self.switch_in_flight(),
             ),
             "launcher" => launcher_palette_frame(&self.config),
             "agents" => self.agent_frame_now(),
@@ -1404,6 +1414,14 @@ impl App {
         origin: crate::host_conn::RequestOrigin,
     ) -> Result<EngineDispatch, String> {
         let mut dispatch = EngineDispatch::default();
+        // The other surface plan 063 §D8a's quiescence has to cover:
+        // these four rows are `dispatch_keybind_action_once`'s four
+        // actions, reachable from the palette and therefore from
+        // `palette.activate` over IPC — which is the route that needs
+        // the error *text*, not a toast.
+        if frame_id == "commands" && local_backend::palette_row_mutates_local_backend(&item.id) {
+            self.refuse_during_switch()?;
+        }
         match frame_id {
             "commands" => match item.id.as_str() {
                 palette::PaletteCommands::SELECT_THEME_ID => {
@@ -1660,6 +1678,24 @@ impl App {
         origin: crate::host_conn::RequestOrigin,
     ) -> Result<EngineDispatch, String> {
         use host_verbs::HostVerb;
+        // Plan 063 §D8a's quiescence, at the other creation surface.
+        // `new_project`'s four-command guard covers the command row; the
+        // picker reaches the *same* dispatches through a different frame
+        // — including the slot, which under `session` is the very
+        // workspace a switch is mid-way through moving. Every creating
+        // verb is refused rather than only the local-looking ones: the
+        // window is sub-second, telling a person "not right now" costs
+        // nothing, and a rule with a carve-out for remote hosts is one
+        // more thing to get wrong.
+        if matches!(
+            verb,
+            HostVerb::NewProjectOn
+                | HostVerb::CreateOn(_)
+                | HostVerb::CreateOnLocalhost
+                | HostVerb::AddRecent { create: true, .. }
+        ) {
+            self.refuse_during_switch()?;
+        }
         match verb {
             HostVerb::Add => {
                 self.clear_palette_state();
@@ -1755,6 +1791,17 @@ impl App {
             HostVerb::AddRecent { target, create } => {
                 self.clear_palette_state();
                 return self.add_recent_host(&target, create, origin);
+            }
+            // Both open a confirm, like `Stop Session` above: the two
+            // rows differ in nothing the dispatch has to decide, so the
+            // direction is the whole payload (plan 063 §D8).
+            HostVerb::UseSession | HostVerb::UseInProcess => {
+                let direction = match verb {
+                    HostVerb::UseSession => local_backend::SwitchDirection::ToSession,
+                    _ => local_backend::SwitchDirection::ToInProcess,
+                };
+                self.clear_palette_state();
+                self.open_local_switch_dialog(direction)?;
             }
         }
         Ok(EngineDispatch::default())
@@ -1891,13 +1938,15 @@ impl App {
         let hosts = self.host_verb_rows();
         let recents = self.host_recent_rows();
         let local = self.local_slot_input();
+        let switching = self.switch_in_flight();
         let commands = state
             .frames()
             .iter()
             .find(|frame| frame.id == COMMANDS_FRAME_ID)
             .and_then(|frame| {
                 let shortcut = self.shortcut_for(KeybindAction::NewProjectOnHost);
-                let verbs = host_verb_items(&hosts, &recents, local, shortcut.as_deref());
+                let verbs =
+                    host_verb_items(&hosts, &recents, local, switching, shortcut.as_deref());
                 // The family is one contiguous tail (`command_palette_frame`
                 // appends it last), so the splice is everything before the
                 // first host row followed by the new block — and the
@@ -3065,6 +3114,7 @@ mod tests {
             &[],
             &[],
             IN_PROCESS,
+            false,
         ));
         let ids: Vec<String> = state
             .matches()
@@ -3116,7 +3166,15 @@ mod tests {
             fidelity: None,
         }];
 
-        let frame = command_palette_frame(0, &config.providers, &bindings, &hosts, &[], IN_PROCESS);
+        let frame = command_palette_frame(
+            0,
+            &config.providers,
+            &bindings,
+            &hosts,
+            &[],
+            IN_PROCESS,
+            false,
+        );
         let ids: Vec<&str> = frame.items.iter().map(|item| item.id.as_str()).collect();
         let first_host = ids
             .iter()
@@ -3139,7 +3197,8 @@ mod tests {
         // the block is Add Host, the seed where the platform has a
         // session to reach, and the picker over LOCAL + localhost
         // (plan 063 §D3).
-        let bare = command_palette_frame(0, &config.providers, &bindings, &[], &[], IN_PROCESS);
+        let bare =
+            command_palette_frame(0, &config.providers, &bindings, &[], &[], IN_PROCESS, false);
         let bare_ids: Vec<&str> = bare.items.iter().map(|item| item.id.as_str()).collect();
         assert!(bare_ids.contains(&host_verbs::ADD_ID));
         assert!(bare_ids.contains(&host_verbs::CONNECT_SEED_ID));
@@ -3182,7 +3241,7 @@ mod tests {
             transport: host_sidebar::HostTransportKind::Ssh,
             fidelity: None,
         }];
-        let items = host_verb_items(&hosts, &[], IN_PROCESS, Some("Alt+Shift+N"));
+        let items = host_verb_items(&hosts, &[], IN_PROCESS, false, Some("Alt+Shift+N"));
         for item in &items {
             let expected = (item.id == host_verbs::NEW_PROJECT_ON_ID).then_some("Alt+Shift+N");
             assert_eq!(item.trailing_text.as_deref(), expected, "{}", item.id);

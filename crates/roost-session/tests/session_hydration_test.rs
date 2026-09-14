@@ -117,6 +117,73 @@ async fn a_restart_reopens_the_saved_layout() {
     second.await.expect("join").expect("run 2");
 }
 
+/// Plan 063 §D8 phase 1: the starter can withhold the first project,
+/// and that withholds **only** the seed.
+///
+/// Two runs, because the sharp edge is the second one. Skipping the
+/// seed is one branch of `hydrate`; skipping *hydration* would look
+/// identical on an empty workspace and lose the whole saved layout on a
+/// populated one — so run 2 comes up `Withheld` over a layout run 1
+/// left and must restore every tab of it.
+///
+/// Run 1 also pins the part the switch depends on: a session that comes
+/// up with nothing is a **working, empty** session, not a wedged one.
+/// It answers, and it accepts a creation — which is what makes a
+/// rolled-back switch's leftover daemon a legitimate state rather than
+/// a casualty (the next ordinary connect seeds it, §D6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withheld_first_project_skips_the_seed_and_nothing_else() {
+    use roost_ipc::session_launch::FirstProject;
+
+    let layout = support::Layout::new();
+    let unseeded = || roost_session::SessionConfig {
+        first_project: FirstProject::Withheld,
+        ..layout.config()
+    };
+
+    // ---- run 1: nothing on disk, and nothing seeded -----------------
+    let first = layout.spawn_config(unseeded());
+    let mut client = support::connect(&layout.socket_path()).await;
+    assert!(
+        support::tab_list(&mut client).await.projects.is_empty(),
+        "the starter said it would fill this workspace itself"
+    );
+
+    // Serving, not wedged: it takes work the way any session does.
+    let made = support::create_project(&mut client, "migrated", &layout.subdir("migrated")).await;
+    let tab = support::open_tab(
+        &mut client,
+        made,
+        &layout.subdir("migrated"),
+        "",
+        &["/bin/sh", "-c", "exec cat"],
+    )
+    .await;
+    support::set_tab_title(&mut client, tab.id, "Pinned").await;
+    support::session_stop(&mut client).await;
+    first.await.expect("join").expect("run 1");
+
+    // ---- run 2: still withheld, but there IS a layout now -----------
+    let second = layout.spawn_config(unseeded());
+    let mut client = support::connect(&layout.socket_path()).await;
+    let restored = support::wait_for_tabs(&mut client, "the saved tab to reopen", |tabs| {
+        tabs.len() == 1
+    })
+    .await;
+    let projects = support::tab_list(&mut client).await.projects;
+    assert_eq!(
+        projects.len(),
+        1,
+        "withholding the seed must not withhold the restore"
+    );
+    assert_eq!(projects[0].name, "migrated");
+    assert_eq!(restored[0].title, "Pinned");
+    assert!(restored[0].user_titled, "the title lock survives too");
+
+    support::session_stop(&mut client).await;
+    second.await.expect("join").expect("run 2");
+}
+
 /// A first-ever start has no layout, so it seeds one — at its own
 /// `$HOME`, the same place every UI seeds from (plan 063 §D4), never at
 /// the `/` the daemon `chdir`'d to and never at the directory the start

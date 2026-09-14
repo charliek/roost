@@ -2924,6 +2924,7 @@ async fn dispatch(
                 protocol_version: roost_ipc::PROTOCOL_VERSION,
                 local_backend: route.mode,
                 local_session_socket: local_session_socket(route.mode),
+                local_backend_switch: route.switch.map(str::to_string),
             };
             encode(&result)
         }
@@ -4396,9 +4397,11 @@ mod tests {
             mode: LocalBackendMode::Session,
             slot_socket: Some("/ignored/by/identify.sock".into()),
             slot_active: Some((41, 42)),
+            switch: None,
         });
         let id = identify_of(&h).await;
         assert_eq!(id.local_backend, LocalBackendMode::Session);
+        assert_eq!(id.local_backend_switch, None, "nothing is switching");
         assert_eq!((id.active_project_id, id.active_tab_id), (41, 42));
         assert_ne!((id.active_project_id, id.active_tab_id), local);
         // Profile-derived, not the cell's `slot_socket`.
@@ -4414,9 +4417,13 @@ mod tests {
             mode: LocalBackendMode::Session,
             slot_socket: None,
             slot_active: None,
+            switch: Some("replaying"),
         });
         let id = identify_of(&h).await;
         assert_eq!((id.active_project_id, id.active_tab_id), (0, 0));
+        // The one thing outside the UI process that can see a switch
+        // (plan 063 §D8a), and the reason a mutation was refused.
+        assert_eq!(id.local_backend_switch.as_deref(), Some("replaying"));
     }
 
     /// A session daemon installs no route cell, so its `identify` is

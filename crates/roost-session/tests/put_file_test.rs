@@ -207,7 +207,8 @@ async fn a_store_that_cannot_be_created_answers_not_supported() {
 #[test]
 fn the_shipped_config_takes_its_store_from_the_profile() {
     let profile = roost_ipc::paths::BundleProfile::session().expect("a session profile");
-    let config = SessionConfig::from_profile(&profile);
+    let config =
+        SessionConfig::from_profile(&profile, roost_ipc::session_launch::FirstProject::Seed);
     assert_eq!(
         config.files_dir,
         Some(profile.files_dir().expect("a files dir"))

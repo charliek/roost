@@ -73,6 +73,16 @@ pub struct LocalRoute {
     /// bare id means on the UI socket under
     /// [`LocalBackendMode::Session`]. `None` when nothing is selected.
     pub slot_active: Option<(i64, i64)>,
+    /// Which phase of a local-backend switch the UI is in, or `None`
+    /// when it is idle (plan 063 §D8a).
+    ///
+    /// A string rather than an enum because the phases are the UI's:
+    /// the state machine lives in `roost-iced`, and duplicating its
+    /// variants here would be a second spelling that could drift. This
+    /// crate only carries the name so `identify` can report it — the
+    /// one thing outside the UI process that can see a switch is in
+    /// flight, and therefore why a mutation was refused.
+    pub switch: Option<&'static str>,
 }
 
 /// The shared cell the UI writes and the IPC handler reads.
@@ -144,11 +154,13 @@ mod tests {
             mode: LocalBackendMode::Session,
             slot_socket: Some("/run/roost/session.sock".into()),
             slot_active: Some((3, 7)),
+            switch: Some("replaying"),
         });
 
         let seen = reader.load();
         assert_eq!(seen.mode, LocalBackendMode::Session);
         assert_eq!(seen.slot_socket.as_deref(), Some("/run/roost/session.sock"));
         assert_eq!(seen.slot_active, Some((3, 7)));
+        assert_eq!(seen.switch, Some("replaying"));
     }
 }

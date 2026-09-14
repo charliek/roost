@@ -191,6 +191,11 @@ enum Message {
     HostDialogCardPressed,
     /// The Stop Session confirmation's destructive button.
     HostStopConfirm,
+    /// The local-backend switch confirmation's destructive button
+    /// (plan 063 §D8). The direction is on the dialog, not the message:
+    /// the card is the only thing that knows which way the user was
+    /// asked, and re-deriving it here could disagree with the copy.
+    LocalSwitchConfirm,
     /// The upgrade prompt's primary button, whichever of the two it is
     /// (plan 037 §3.7, plan 039 §3.5): "Restart session" for a host this
     /// client could spawn for, or "Update roost-session on <label>" for
@@ -633,6 +638,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         | Message::HostDialogCancel
         | Message::HostDialogCardPressed
         | Message::HostStopConfirm
+        | Message::LocalSwitchConfirm
         | Message::HostRestartConfirm
         | Message::HostBootstrapConfirm
         | Message::ConfirmDeleteCancel

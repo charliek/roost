@@ -23,19 +23,40 @@
 //! empty name (the engine names it `Untitled 1`) at `$HOME`. The daemon's
 //! own cwd (`/`, after `daemonize` moves it there) must never reach a
 //! PTY, which is why every open below passes an explicit directory.
+//!
+//! The one exception is [`FirstProject::Withheld`] — the spawn a
+//! local-backend switch performs for its destination (plan 063 §D8
+//! phase 1). That session is about to be handed a whole layout, and a
+//! project it seeded first would sit beside the migrated one as a stray
+//! the user never asked for. It arrives as a hint from the *starter*,
+//! decided before the fork: nothing after hydrate can tell a pristine
+//! seed from a project somebody made, so a guess here would have to be
+//! a heuristic and this is not one.
 
 use anyhow::Result;
 use roost_engine::{LocalClient, RestoreLayout, RestoreTab};
 use tracing::warn;
 
-use crate::consts::{DEFAULT_TAB_COLS, DEFAULT_TAB_ROWS};
+use crate::consts::{FirstProject, DEFAULT_TAB_COLS, DEFAULT_TAB_ROWS};
 
 /// Re-open the saved layout, or seed a first project at `$HOME`.
-pub async fn hydrate(client: &LocalClient) -> Result<()> {
+pub async fn hydrate(client: &LocalClient, first_project: FirstProject) -> Result<()> {
     let mut projects = client.list_projects().await?;
     if projects.is_empty() {
-        let cwd = roost_engine::home_dir();
-        projects.push(client.create_project("", &cwd).await?);
+        match first_project {
+            FirstProject::Seed => {
+                let cwd = roost_engine::home_dir();
+                projects.push(client.create_project("", &cwd).await?);
+            }
+            // An empty workspace is a legitimate state: nothing in a
+            // session exits on empty, and the next *ordinary* connect
+            // seeds it anyway (plan 063 §D6's "empty at connect is
+            // seeded, not forgotten"), so a caller that withheld the
+            // seed and then failed leaves a session that heals itself.
+            FirstProject::Withheld => warn!(
+                "starting with no seeded project; the client that started this session fills it"
+            ),
+        }
     }
 
     let restore = client.workspace.take_restore_layout();

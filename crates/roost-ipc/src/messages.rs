@@ -262,6 +262,16 @@ pub struct IdentifyResult {
     /// socket cannot serve subscribes there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_session_socket: Option<String>,
+    /// The phase of a local-backend switch in flight (plan 063 §D8a),
+    /// absent while the UI is idle.
+    ///
+    /// Present so a client told `busy: a local-backend switch is in
+    /// progress` can see *why*, and so a test can tell the phases apart
+    /// — the mode above flips at one documented point inside the
+    /// sequence, and nothing else on the wire distinguishes "before" it
+    /// from "after".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_backend_switch: Option<String>,
 }
 
 // ============================================================================
@@ -4639,5 +4649,9 @@ mod tests {
         let json = serde_json::to_value(&parsed).unwrap();
         assert_eq!(json["local_backend"], "in-process");
         assert!(json.get("local_session_socket").is_none());
+        // Same rule for the switch phase: an idle UI's reply is the
+        // Swift shape, so a recorded vector stays byte-identical.
+        assert_eq!(parsed.local_backend_switch, None);
+        assert!(json.get("local_backend_switch").is_none());
     }
 }

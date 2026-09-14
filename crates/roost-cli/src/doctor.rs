@@ -3759,6 +3759,7 @@ mod tests {
             protocol_version: 1,
             local_backend: LocalBackendMode::InProcess,
             local_session_socket: None,
+            local_backend_switch: None,
         }
     }
 

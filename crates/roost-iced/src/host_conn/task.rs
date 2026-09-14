@@ -35,7 +35,7 @@ use roost_ipc::messages::{
     ops, EventBatch, OscColorsParams, SessionIdentify, SessionIdentifyParams,
     SessionSetThemeParams, TabListResult,
 };
-use roost_ipc::session_launch;
+use roost_ipc::session_launch::{self, FirstProject};
 use roost_ui_model::keys::HostId;
 use tokio::sync::{mpsc, Notify};
 
@@ -105,6 +105,18 @@ pub(crate) enum ConnectMode {
     IfPresent,
     /// Probe; an absent socket runs the shared spawn ladder.
     SpawnIfMissing,
+    /// [`Self::SpawnIfMissing`], except the daemon it starts is told
+    /// **not** to seed itself a first project
+    /// ([`session_launch::FirstProject::Withheld`], plan 063 §D8 phase
+    /// 1).
+    ///
+    /// A separate mode rather than a flag beside one, because it is the
+    /// same question this enum already answers — what this attempt does
+    /// about an absent socket — and the only caller is the local-backend
+    /// switch, whose replay lands on that session a moment later. Every
+    /// other spawn seeds, including the launch-time dial of the very
+    /// same slot.
+    SpawnUnseeded,
     /// Dial straight away. What a non-localhost host always does — there
     /// is no local socket to probe and nothing this client could spawn.
     Dial,
@@ -847,17 +859,21 @@ async fn ensure_socket(config: &ConnectionConfig, mode: ConnectMode) -> Result<(
     if mode == ConnectMode::Dial || socket_live(&config.socket).await {
         return Ok(());
     }
-    // Nothing is listening, so only the mode that may start one gets to.
-    if mode == ConnectMode::SpawnIfMissing {
-        return spawn_session(config).await;
+    // Nothing is listening, so only a mode that may start one gets to.
+    match mode {
+        ConnectMode::SpawnIfMissing => spawn_session(config, FirstProject::Seed).await,
+        ConnectMode::SpawnUnseeded => spawn_session(config, FirstProject::Withheld).await,
+        _ => Err(AttemptError::Transport(no_session_at(&config.socket))),
     }
-    Err(AttemptError::Transport(no_session_at(&config.socket)))
 }
 
 /// Nothing is listening, and the user asked for a connection: climb the
 /// shared launch ladder (`roost_ipc::session_launch`, the same rungs
 /// `roostctl session start` uses).
-async fn spawn_session(config: &ConnectionConfig) -> Result<(), AttemptError> {
+async fn spawn_session(
+    config: &ConnectionConfig,
+    first_project: FirstProject,
+) -> Result<(), AttemptError> {
     if !config.transport.is_localhost() {
         return Err(AttemptError::Transport(format!(
             "{} and only a localhost session can be started from here",
@@ -893,6 +909,7 @@ async fn spawn_session(config: &ConnectionConfig) -> Result<(), AttemptError> {
         &bin.path,
         &cwd,
         seam.as_deref(),
+        first_project,
         SPAWN_VERDICT_BUDGET.mul_f64(scale),
     )
     .await
@@ -1549,6 +1566,7 @@ mod tests {
             Path::new("/nonexistent/roost-session"),
             cwd,
             None,
+            FirstProject::Seed,
             budget,
         )
         .await
@@ -1561,10 +1579,15 @@ mod tests {
         // `true start` exec's fine and closes its stdout without a
         // readiness line — the shape of a daemon that died on startup
         // *after* the exec, which stays retryable.
-        let no_verdict =
-            session_launch::spawn_and_read_verdict(Path::new("/usr/bin/true"), cwd, None, budget)
-                .await
-                .expect_err("no line, so no verdict");
+        let no_verdict = session_launch::spawn_and_read_verdict(
+            Path::new("/usr/bin/true"),
+            cwd,
+            None,
+            FirstProject::Seed,
+            budget,
+        )
+        .await
+        .expect_err("no line, so no verdict");
         transport(&spawn_failure(SpawnStage::Launch, &no_verdict));
     }
 
@@ -1981,7 +2004,9 @@ mod tests {
             HostTransport::UnixSocket,
             ConnectMode::SpawnIfMissing,
         );
-        let error = spawn_session(&config).await.expect_err("no spawn");
+        let error = spawn_session(&config, FirstProject::Seed)
+            .await
+            .expect_err("no spawn");
         let AttemptError::Transport(reason) = error else {
             panic!("expected a transport outcome");
         };

@@ -119,6 +119,9 @@ fn run(foreground: bool, readiness: &mut Readiness) -> anyhow::Result<Outcome> {
     // so it is captured (and erased) while it still exists.
     let profile = BundleProfile::session().context("resolve the session bundle profile")?;
     let launch_cwd = roost_session::capture_launch_cwd();
+    // The same window, for the same reason: read and erased before the
+    // fork, so no shell this session spawns inherits it (plan 063 §D8).
+    let first_project = roost_session::capture_first_project();
     roost_session::set_process_umask();
-    roost_session::start(&profile, foreground, &launch_cwd, readiness)
+    roost_session::start(&profile, foreground, &launch_cwd, first_project, readiness)
 }

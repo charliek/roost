@@ -968,6 +968,15 @@ impl App {
         if self.window_id.is_some() {
             self.refresh_pill_labels();
         }
+        // The switch state machine (plan 063 §D8a) runs first of the
+        // three, because the other two *read its latch*: a phase that
+        // ends here must not leave the auto-remove and the exit rule
+        // below acting on a half-migrated workspace, and a phase that
+        // starts here must have raised the latch before they look.
+        // Every input a phase waits on — a host reaching `Connected`, a
+        // mirror batch, a step completion — already passes through this
+        // reconcile, which is why the driver has no clock of its own.
+        self.drive_switch();
         // Before the exit rule, and in the same reconcile it was
         // scheduled by, because §D9's slot carve-out is satisfied by
         // the removal this may perform: the last project on the slot
@@ -1065,10 +1074,7 @@ impl App {
             local_projects_empty: self.projects.is_empty(),
             hosts: &hosts,
             creation_pending: self.host_creation_pending(),
-            // The switch state machine is plan 063 §D8a, which C6
-            // ships; until then nothing can be mid-switch, and the
-            // column is here because the predicate is where it belongs.
-            switch_in_flight: false,
+            switch_in_flight: self.switch_in_flight(),
             slot_registered: self.local_slot_saved_id().is_some(),
             slot_ever_registered: self.slot_ever_registered.ever(),
         });
@@ -1176,8 +1182,7 @@ impl App {
             creation_pending: self.host_ops.creating(saved_id)
                 || (self.connect_purposes.contains_key(saved_id)
                     && attempt_alive(&self.hosts, saved_id)),
-            // As in `request_exit_if_empty`: C6's latch (§D8a).
-            switch_in_flight: false,
+            switch_in_flight: self.switch_in_flight(),
         }
     }
 
@@ -1987,6 +1992,7 @@ impl App {
                 EngineFeed::HostTunnel(ready) => self.host_tunnel_ready(*ready),
                 EngineFeed::HostBootstrap(event) => self.host_bootstrap_event(*event),
                 EngineFeed::HostEmptiness(reply) => self.host_emptiness_confirmed(*reply),
+                EngineFeed::LocalBackendSwitch(done) => self.switch_step_completed(*done),
                 // A signal reached the process (plan 039 §3.9). Same
                 // latch the macOS menu's Quit item uses — `take_exit_task`
                 // (called every `update()`) is what turns this into
@@ -2623,11 +2629,21 @@ impl App {
     pub(super) fn local_slot_host(&self) -> Option<HostId> {
         match self.local_backend {
             LocalBackendMode::InProcess => Some(HostId::LOCAL),
-            LocalBackendMode::Session => self
-                .local_slot_view()
-                .filter(|view| view.state.interactive())
-                .map(|view| view.host),
+            LocalBackendMode::Session => self.connected_slot_host(),
         }
+    }
+
+    /// The slot's live incarnation, **whatever the mode says**.
+    ///
+    /// [`Self::local_slot_host`] is this plus the mode's own answer, and
+    /// the difference is the forward switch (plan 063 §D8): it replays
+    /// onto the slot while the mode still reads `in-process`, so asking
+    /// the mode-aware seam there would answer `HostId::LOCAL` — the
+    /// workspace it is migrating *away* from.
+    pub(super) fn connected_slot_host(&self) -> Option<HostId> {
+        self.local_slot_view()
+            .filter(|view| view.state.interactive())
+            .map(|view| view.host)
     }
 
     fn refresh_sidebar_agents(&mut self) {

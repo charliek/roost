@@ -1036,7 +1036,14 @@ impl App {
     /// local workspace always, a host only while its section is
     /// interactive at the incarnation the gesture armed against.
     pub(super) fn reorderable(&self, host: HostId) -> bool {
-        host.is_local() || self.interactive_host_view(host).is_some()
+        // A switch in flight quiesces layout mutations (plan 063 §D8a),
+        // and a reorder is one: the forward switch has already
+        // snapshotted the order it is replaying, so a drag committed
+        // under it would be silently discarded. Refused at the
+        // gesture's own gate rather than at each dispatch, which is
+        // what makes the strip decline the drag instead of accepting a
+        // drop and dropping it.
+        !self.switch_in_flight() && (host.is_local() || self.interactive_host_view(host).is_some())
     }
 
     /// The gesture-driven cancel, and the choke point every caller
