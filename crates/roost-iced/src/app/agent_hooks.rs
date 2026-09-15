@@ -756,6 +756,25 @@ mod tests {
         );
     }
 
+    /// A card that could not be shown does not spend the one ask.
+    ///
+    /// The latch stops Alt-Tab asking twice; it must not swallow the
+    /// prompt because another dialog happened to be up when the survey
+    /// came back. `App::agent_hooks_surveyed` puts it back for exactly
+    /// that case.
+    #[test]
+    fn a_released_latch_asks_again_in_the_same_process() {
+        let mut raised = false;
+        assert!(claim_first_run(&mut raised, &Start::Ask, Guard::PERMITTED));
+        assert!(raised);
+        // What the `ScreenTaken` arm does.
+        raised = false;
+        assert!(
+            claim_first_run(&mut raised, &Start::Ask, Guard::PERMITTED),
+            "a released latch did not ask again"
+        );
+    }
+
     /// `ask` — `resolve` returning `None` — declines the same way `off`
     /// does: neither claims the latch, and the two must stay tellable
     /// apart in the log line each produces.

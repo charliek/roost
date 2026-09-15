@@ -340,7 +340,7 @@ whatever the union now allows:
 - **A host whose key is explicitly `off`, or unanswered, is raised
   anyway.** This is the one genuinely surprising part: a host has no
   screen to put a consent dialog on, so the client in front of the user
-  — reaching the host over the same same-UID socket boundary every other
+  — reaching the host over the same-UID socket boundary every other
   op already trusts — is the only authority there is. Connecting with
   `agent-hooks = claude` to a host whose key says `off` wires Claude
   there, full stop.

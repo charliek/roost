@@ -3555,6 +3555,14 @@ impl App {
             }
             agent_hooks_dialog::SurveyVerdict::ScreenTaken => {
                 tracing::info!("another dialog is open; not raising the agent-hooks card");
+                // The latch goes back: it exists to stop Alt-Tab asking
+                // twice, not to spend the one ask on a moment the card
+                // could not be shown. Without this the user closes the
+                // other dialog and is never asked again this process —
+                // which for a consent prompt is the whole feature lost.
+                if survey.mode == agent_hooks_dialog::CardMode::FirstRun {
+                    self.agent_hooks_card_raised = false;
+                }
             }
             agent_hooks_dialog::SurveyVerdict::Raise => {
                 self.open_host_dialog(host_dialog::HostDialog::AgentHooks(
