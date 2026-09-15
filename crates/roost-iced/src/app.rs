@@ -19,8 +19,8 @@ use iced::widget::{
 use iced::{font, window, Alignment, Color, Element, Fill, Font, Shrink, Size};
 use roost_engine::git_metrics;
 use roost_engine::ipc::{
-    ClipboardOp, DumpData, ExpandSelectionData, IpcHandler, ResolvedCellData, ResolvedCellsData,
-    SelectionData, UiRequest,
+    ClipboardOp, DumpData, ExpandSelectionData, HostOpFailure, HostOpReply, IpcHandler,
+    ResolvedCellData, ResolvedCellsData, SelectionData, UiRequest,
 };
 use roost_engine::osc::{ClipboardTarget, OscAction, OscColorSnapshot};
 use roost_engine::pointer::{DragCellGate, MotionEmitter, PointerAction, PointerButton};
@@ -32,11 +32,12 @@ use roost_engine::{
 };
 use roost_ipc::agent;
 use roost_ipc::messages::{
-    AppMenuDumpResult, AppNotificationStatusResult, AppRenderStatsResult, AppUpdateStatusResult,
-    HostConnectStatus, HostConnectionResult, HostStatus, HostStatusResult, PaletteItemView,
-    PalettePresentResult, PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpHost,
-    SidebarDumpHostProject, SidebarDumpHostTab, SidebarDumpProject, SidebarDumpResult,
-    SidebarDumpSection, WindowMetricsResult,
+    AgentSetHooksAgents, AgentSetHooksHostOutcome, AgentSetHooksResult, AppMenuDumpResult,
+    AppNotificationStatusResult, AppRenderStatsResult, AppUpdateStatusResult, HostConnectStatus,
+    HostConnectionResult, HostStatus, HostStatusResult, PaletteItemView, PalettePresentResult,
+    PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpHost, SidebarDumpHostProject,
+    SidebarDumpHostTab, SidebarDumpProject, SidebarDumpResult, SidebarDumpSection,
+    WindowMetricsResult,
 };
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::{IpcServer, LocalBackendCell, LocalBackendMode};
@@ -3151,6 +3152,12 @@ impl App {
     /// now, and none of those three states has an allow-list to raise it
     /// with.
     fn wire_host_agent_hooks(&mut self, host: &str) {
+        // Re-read, not `self.config`: plan 064 §3.4. Another writer —
+        // a remote client raising this machine, or `roostctl agent set
+        // --local` — may have moved the key since launch, and a raise
+        // the host cannot lower is the wrong thing to be stale about.
+        let hooks = agent_hooks::hooks_on_disk(&self.config);
+        self.config.agent_hooks = hooks;
         let Some(agents) = agent_hooks::remote_request(&self.config) else {
             return;
         };
@@ -3229,17 +3236,156 @@ impl App {
         self.set_status(toast);
     }
 
+    /// `agent.set_hooks` — the consent dialog's Apply and `roostctl
+    /// agent set`, as one op (plan 064 §3.4).
+    ///
+    /// The order is the plan's, and only the first two steps happen
+    /// here: refuse a request this machine must not act on, then put the
+    /// raise on every connected host's queue while this thread still
+    /// holds the connection set. The install itself — a key write and up
+    /// to five dotfile rewrites under an advisory lock — and the waiting
+    /// go to the runtime, and the reply is answered from there.
+    ///
+    /// **The harness fence is checked here, before anything is sent.**
+    /// [`roost_agent_install::set_hooks`] checks it too, but only after
+    /// this op would already have raised every host; the fence covers
+    /// the *key*, so it has to be the first thing that can refuse.
+    fn agent_set_hooks_op(
+        &mut self,
+        agents: &AgentSetHooksAgents,
+        reply: HostOpReply<AgentSetHooksResult>,
+    ) {
+        let mode = match agent_hooks::resolve_set(agents) {
+            Ok(mode) => mode,
+            Err(message) => {
+                let _ = reply.send(Err(HostOpFailure::new("invalid-param", message)));
+                return;
+            }
+        };
+        let guard = roost_agent_install::Guard::from_env();
+        if let Err(error) = guard.check() {
+            // `internal`, the same code a whole-run install failure
+            // answers with on a host — a refusal is this machine
+            // declining, not a malformed request.
+            let _ = reply.send(Err(HostOpFailure::new("internal", error.to_string())));
+            return;
+        }
+
+        // `off` reaches no host at all: only an allow-list has anything
+        // to raise one with (see `agent_hooks::raise_list`). The hosts
+        // are *chosen* here, on the main thread, because the registry is
+        // main-thread state; nothing is sent until the local install
+        // below has come back clean.
+        let raise_names = agent_hooks::raise_list(&mode);
+        let raises: Vec<crate::host_conn::HostRaise> = match &raise_names {
+            None => Vec::new(),
+            Some(_) => {
+                // Saved-registry order, which is what `host.list` and the
+                // sidebar show — the stable order the reply promises.
+                self.workspace
+                    .hosts()
+                    .iter()
+                    .filter_map(|host| self.hosts.raise_agent_hooks(&host.id))
+                    .collect()
+            }
+        };
+        let client = agent_hooks::client_label();
+
+        let feed = self.feed_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let local = tokio::task::spawn_blocking(move || {
+                agent_hooks::set_hooks_blocking(&mode, guard)
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("the agent-hooks install did not finish: {error}")));
+            let done = match local {
+                Ok(done) => done,
+                Err(message) => {
+                    // Reported to the caller, which is the boundary that
+                    // handles it; the log line is for the launches where
+                    // the caller was a dialog nobody was watching.
+                    tracing::warn!(error = %message, "agent.set_hooks could not set this machine's agent hooks");
+                    let _ = reply.send(Err(HostOpFailure::new("internal", message)));
+                    return;
+                }
+            };
+            // Only now: this machine has recorded the user's answer, so
+            // it has something it is entitled to propagate. A local
+            // write that failed reaches no host at all.
+            let names = raise_names.unwrap_or_default();
+            let pending: Vec<_> = raises
+                .iter()
+                .map(|raise| (raise.label.clone(), raise.send(&names, &client)))
+                .collect();
+            let mut hosts = Vec::new();
+            for (label, outcome) in pending {
+                hosts.push(match outcome.await {
+                    Ok(result) => AgentSetHooksHostOutcome::Result {
+                        host: label,
+                        result,
+                    },
+                    // Never fatal, and never an error frame: this
+                    // machine's own key is set either way, and a host
+                    // that could not be asked is one line in the reply.
+                    Err(error) => AgentSetHooksHostOutcome::Error {
+                        host: label,
+                        error: error.to_string(),
+                    },
+                });
+            }
+            let _ = reply.send(Ok(AgentSetHooksResult {
+                config_path: done.config_path.clone(),
+                local: done.outcome.clone(),
+                hosts,
+            }));
+            feed.send(EngineFeed::AgentHooksSet(Box::new(done)));
+        });
+    }
+
+    /// `agent.set_hooks` finished writing this machine's files.
+    ///
+    /// Two things only the main thread can do: bring the running UI's
+    /// `agent-hooks` value in line with the key on disk — every connect
+    /// after this one reads it — and say once what was wired.
+    fn agent_hooks_applied(&mut self, done: agent_hooks::AgentHooksSet) {
+        for failure in &done.outcome.errors {
+            tracing::warn!(agent = %failure.agent, error = %failure.error, "agent hooks");
+        }
+        tracing::info!(
+            key = %done.key.to_config_value().unwrap_or_else(|| "ask".to_string()),
+            unannounced = done.unnoticed.len(),
+            errors = done.outcome.errors.len(),
+            "agent.set_hooks applied"
+        );
+        self.config.agent_hooks = done.key;
+        let Some(toast) = agent_hooks::wired_toast(&done.unnoticed, None) else {
+            return;
+        };
+        // Shown straight away rather than held like the startup toast:
+        // this one answers a gesture the user just made, so a line that
+        // lands behind another of this drain's `set_status` calls would
+        // be a receipt for something they can no longer see.
+        self.show_wired_toast(toast, done.unnoticed);
+    }
+
     /// Put the held agent-hooks toast on the banner, last in its drain.
     ///
     /// Called from the tail of `service_engine`, after every other
     /// `set_status` that batch can reach — the mechanism that makes
-    /// "shown" true before `mark_noticed` makes it permanent. The log
-    /// line is deliberate: no IPC op carries the status banner, so it is
-    /// the only thing the E2E can read the toast text out of.
+    /// "shown" true before `mark_noticed` makes it permanent.
     pub(super) fn show_agent_hooks_toast(&mut self) {
         let Some((toast, agents)) = self.pending_agent_hooks_toast.take() else {
             return;
         };
+        self.show_wired_toast(toast, agents);
+    }
+
+    /// Say what Roost wired, then let `mark_noticed` make it permanent —
+    /// the order `agent_hooks`'s own header pins.
+    ///
+    /// The log line is deliberate: no IPC op carries the status banner,
+    /// so it is the only thing the E2E can read the toast text out of.
+    fn show_wired_toast(&mut self, toast: String, agents: Vec<roost_agent::Agent>) {
         tracing::info!(toast, "agent hooks toast shown");
         self.set_status(toast);
         agent_hooks::spawn_mark_noticed(&self.runtime_handle, agents);

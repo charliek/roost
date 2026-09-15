@@ -65,7 +65,7 @@ impl Mode {
     /// value parses back as `Ask`, which would turn "the user switched
     /// every agent off" into "nobody has answered" and bring the consent
     /// dialog back on the next launch.
-    fn to_config(&self) -> AgentHooks {
+    pub fn to_config(&self) -> AgentHooks {
         match self {
             Mode::Allow(agents) if agents.is_empty() => AgentHooks::Off,
             Mode::Allow(agents) => {

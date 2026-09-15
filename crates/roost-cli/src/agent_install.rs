@@ -4,8 +4,13 @@
 //! Five verbs over `roost-agent-install`. Four of them never dial a UI:
 //! they read and write dotfiles, so they work with nothing running,
 //! which is exactly when a user reaches for them. `set --local` is the
-//! fifth and shares that property; the UI-routed form of `set` (no
-//! `--local`, dialing the running UI's socket) is plan 064 C6.
+//! fifth and shares that property.
+//!
+//! **`set` without `--local` is the one verb that does dial** ([`run_over_ipc`]).
+//! It puts `agent.set_hooks` to the running UI, which sets this
+//! machine's key *and* raises every connected non-localhost host in the
+//! same call — the half a `--local` write cannot do, because a host is
+//! reached through a connection only the UI holds.
 //!
 //! `ensure` here is the explicit reconcile — it wires what the key allows
 //! **and takes out what it does not**. `--startup` is the other shape,
@@ -28,6 +33,11 @@ use roost_agent_install::{
     ensure, install, reconcile, resolve_names, set_hooks, status, uninstall, AgentSkip, Guard,
     Home, Mode, Outcome, Status, ALL_AGENTS,
 };
+use roost_ipc::messages::{
+    ops, AgentHooksOutcome, AgentSetHooksAgents, AgentSetHooksHostOutcome, AgentSetHooksParams,
+    AgentSetHooksResult,
+};
+use roost_ipc::IpcClient;
 use roost_ui_model::config::RoostConfig;
 
 /// How this client identifies itself in the state record.
@@ -53,17 +63,12 @@ pub enum AgentCmd {
     /// this machine's files in line with it — the explicit answer to
     /// the consent dialog's question, from a terminal.
     ///
-    /// `--local` is required for now: it writes straight to this
-    /// machine's `config.conf` under the install lock, same as `ensure`
-    /// and `install` do. The UI-routed form — dialling the running UI's
-    /// socket, so a headless box and a desk box agree without either
-    /// editing the other's dotfiles — is not implemented yet; a bare
-    /// `agent set` exits 2 naming `--local` until it lands.
-    ///
-    /// Because `--local` never dials a UI, a host that is currently
-    /// connected to by a client does not learn about the change until
-    /// that connection reattaches — `roostctl agent set` here is what
-    /// changes on disk, not what a live session has already wired.
+    /// By default this dials the running UI, which sets the key here and
+    /// raises every connected non-localhost host to at least the same
+    /// list in the same call. `--local` writes this machine's
+    /// `config.conf` directly instead, under the install lock and with
+    /// nothing running — and reaches no host at all, so a connected one
+    /// does not learn about the change until it connects again.
     Set {
         /// A comma list of agent names (`claude`, `codex`, `grok`,
         /// `cursor`, `opencode`), or the literal `off`. `ask`/`auto` are
@@ -71,8 +76,7 @@ pub enum AgentCmd {
         /// "unanswered" is not an answer to give it.
         spec: String,
         /// Write this machine's `agent-hooks` key directly instead of
-        /// dialing the running UI. Required for now — see the verb's
-        /// own help.
+        /// dialing the running UI. No host is told.
         #[arg(long, default_value_t = false)]
         local: bool,
         #[arg(long, default_value_t = false)]
@@ -107,16 +111,6 @@ pub enum AgentCmd {
 /// worth printing, so the report goes to stdout and the code says
 /// whether anything in it failed.
 pub fn run(cmd: &AgentCmd) -> i32 {
-    // Before `$HOME` is resolved: a usage error is the caller's, not
-    // this machine's, and a box without a `$HOME` answering 1 here
-    // would send them looking for the wrong fault.
-    if let AgentCmd::Set { local: false, .. } = cmd {
-        eprintln!(
-            "roostctl agent set: the UI-routed form is not implemented yet; pass \
-             --local to set this machine's agent-hooks key directly"
-        );
-        return 2;
-    }
     let home = match Home::from_env() {
         Ok(home) => home,
         Err(e) => {
@@ -148,6 +142,14 @@ pub fn run(cmd: &AgentCmd) -> i32 {
                 0
             }
         },
+        // Unreachable through `main`, which sends this shape to
+        // [`run_over_ipc`]. Refused rather than written: the one thing a
+        // misroute must never do is quietly set the local key when the
+        // caller asked for every connected host to be set too.
+        AgentCmd::Set { local: false, .. } => {
+            eprintln!("roostctl agent set: the UI-routed form is not served here");
+            2
+        }
         AgentCmd::Set { spec, json, .. } => match parse_set_spec(spec) {
             Ok(mode) => {
                 let allow = matches!(mode, Mode::Allow(_));
@@ -207,6 +209,141 @@ pub fn run(cmd: &AgentCmd) -> i32 {
                 1
             }
         },
+    }
+}
+
+/// Whether this verb is served by [`run_over_ipc`] instead of [`run`].
+///
+/// Exactly one shape is: `set` without `--local`. Every other `agent`
+/// verb must keep working with nothing running, which is why `main`
+/// asks this before its connect prologue rather than after.
+pub fn dials_the_ui(cmd: &AgentCmd) -> bool {
+    matches!(cmd, AgentCmd::Set { local: false, .. })
+}
+
+/// `roostctl agent set <list|off>` — the UI-routed form, over
+/// `agent.set_hooks` (plan 064 §3.4).
+///
+/// The spec is parsed here, before the op is sent, so an unknown name is
+/// the same exit 2 `--local` gives rather than a round trip that ends in
+/// `invalid-param`.
+pub async fn run_over_ipc(cmd: &AgentCmd, client: &mut IpcClient) -> i32 {
+    let AgentCmd::Set { spec, json, .. } = cmd else {
+        eprintln!("roostctl agent: {cmd:?} does not dial the UI");
+        return 2;
+    };
+    let mode = match parse_set_spec(spec) {
+        Ok(mode) => mode,
+        Err(message) => {
+            eprintln!("roostctl agent set: {message}");
+            return 2;
+        }
+    };
+    let params = AgentSetHooksParams {
+        agents: match &mode {
+            Mode::Off => AgentSetHooksAgents::Off,
+            Mode::Allow(agents) => {
+                AgentSetHooksAgents::List(agents.iter().map(|a| a.source().to_string()).collect())
+            }
+        },
+    };
+    let result: AgentSetHooksResult = match client.call(ops::AGENT_SET_HOOKS, params).await {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("roostctl agent set: {error}");
+            return 1;
+        }
+    };
+    if *json {
+        match serde_json::to_string(&result) {
+            Ok(body) => println!("{body}"),
+            Err(error) => {
+                eprintln!("roostctl agent set: {error}");
+                return 1;
+            }
+        }
+    } else {
+        print_set_result(&result);
+    }
+    // A host that could not be asked counts, and so does one that was
+    // asked and could not write: the caller told this machine and every
+    // host it is connected to, and only part of that happened. A
+    // per-agent failure riding inside a nominally successful `result` is
+    // still a file that did not get written — reporting 0 for it is how
+    // a script concludes every host is wired when one is not.
+    let failed = !result.local.errors.is_empty()
+        || result.hosts.iter().any(|host| match host {
+            AgentSetHooksHostOutcome::Error { .. } => true,
+            AgentSetHooksHostOutcome::Result { result, .. } => !result.errors.is_empty(),
+        });
+    i32::from(failed)
+}
+
+/// `agent.set_hooks`'s reply in [`print_outcome`]'s shape, plus the two
+/// things only this op has: where the key landed, and one line per host.
+fn print_set_result(result: &AgentSetHooksResult) {
+    println!("config: {}", result.config_path);
+    print_wire_outcome(&result.local);
+    for entry in &result.hosts {
+        match entry {
+            AgentSetHooksHostOutcome::Result { host, result } => {
+                let changed: Vec<&str> = result
+                    .wired
+                    .iter()
+                    .chain(&result.refreshed)
+                    .map(String::as_str)
+                    .collect();
+                if changed.is_empty() {
+                    // "already current" only when there is genuinely
+                    // nothing to say. A host that wired nothing because
+                    // the agent is not installed there, or because its
+                    // `config.toml` would not parse, has a reason — and
+                    // reporting that as "current" is how somebody
+                    // concludes a host is wired when it is not.
+                    if result.skipped.is_empty() {
+                        println!("on {host}: already current");
+                    } else {
+                        println!("on {host}: nothing wired");
+                    }
+                } else {
+                    println!("on {host}: {}", changed.join(", "));
+                }
+                for skip in &result.skipped {
+                    println!("on {host}: skipped {}: {}", skip.agent, skip.reason);
+                }
+                for failure in &result.errors {
+                    eprintln!("on {host}: error {}: {}", failure.agent, failure.error);
+                }
+            }
+            AgentSetHooksHostOutcome::Error { host, error } => {
+                eprintln!("on {host}: {error}");
+            }
+        }
+    }
+}
+
+/// [`print_outcome`] for the wire shape. The two differ in what they
+/// have to say — an [`Outcome`] carries `current` and `warnings`, which
+/// no reply does — so they are two renderings of two types rather than
+/// one over a lowest common denominator.
+fn print_wire_outcome(outcome: &AgentHooksOutcome) {
+    for (label, agents) in [
+        ("wired", &outcome.wired),
+        ("refreshed", &outcome.refreshed),
+        ("removed", &outcome.removed),
+    ] {
+        if !agents.is_empty() {
+            println!("{label}: {}", agents.join(", "));
+        }
+    }
+    for skip in &outcome.skipped {
+        println!("skipped {}: {}", skip.agent, skip.reason);
+    }
+    for error in &outcome.errors {
+        eprintln!("error {}: {}", error.agent, error.error);
+    }
+    if outcome.wired.is_empty() && outcome.refreshed.is_empty() && outcome.removed.is_empty() {
+        println!("nothing to do");
     }
 }
 
@@ -510,13 +647,25 @@ mod tests {
             parse(&["set", "off", "--local", "--json"]),
             AgentCmd::Set { spec, local: true, json: true } if spec == "off"
         ));
-        // `--local` defaults false, which is what `run` checks to
-        // print the "not implemented yet" refusal for the UI-routed
-        // form (plan 064 C6).
         assert!(matches!(
             parse(&["set", "claude"]),
             AgentCmd::Set { local: false, .. }
         ));
+    }
+
+    #[test]
+    fn only_a_bare_agent_set_dials_the_ui() {
+        assert!(dials_the_ui(&parse(&["set", "claude"])));
+        assert!(!dials_the_ui(&parse(&["set", "claude", "--local"])));
+        for offline in [
+            vec!["ensure"],
+            vec!["ensure", "--startup"],
+            vec!["status"],
+            vec!["install", "--all"],
+            vec!["uninstall", "--all"],
+        ] {
+            assert!(!dials_the_ui(&parse(&offline)), "{offline:?}");
+        }
     }
 
     /// The argument shapes that are mistakes rather than instructions.

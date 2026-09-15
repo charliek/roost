@@ -68,9 +68,20 @@ from pathlib import Path
 import pytest
 import session as sessionlib
 import ui
+from agent_jail import Jail
 from client import Roost, RoostError, scaled_timeout
 from eventstream import EventStream
 from host_probe import host_key, sibling_key  # noqa: F401  (re-exported)
+# The jailed-UI launch lives beside the agent-hooks lanes it was written
+# for; §13b below needs a client UI that may write agent files, and one
+# implementation of that is the point (`test_agent_hooks.py`'s own
+# header states the fences it stands on).
+from test_agent_hooks import (  # noqa: F401  (`short_root` is used as a fixture)
+    jailed_socket,
+    jailed_ui,
+    short_root,
+    wait_for_jailed_window,
+)
 from util import drain, drain_until_match
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "screenshot"))
@@ -2374,6 +2385,161 @@ def test_a_session_resolves_the_config_the_ui_wrote_however_it_was_launched(sess
         "the two launch paths resolved different config files"
     )
     assert wired_agents(jail) == {"claude", "codex"}
+
+
+# ---------------------------------------------------------------------------
+# 13b. Plan 064 §3.4 — `agent.set_hooks`: one machine's own key, and
+# every host it is connected to, in one call.
+#
+# Section 13 above drives the *host* half from a scripted client. This
+# one drives the whole op from the client side, which means the CLIENT
+# writes agent files too — so the UI here is a second, fully jailed
+# instance (`test_agent_hooks.py`'s `jailed_ui`, the one launch in the
+# tree that lifts the install engine's test-mode refusal) rather than
+# the harness's own. Three jails, one per machine in the story.
+# ---------------------------------------------------------------------------
+
+
+def test_agent_set_hooks_answers_per_host_without_touching_the_local_half(
+    short_root, target
+):
+    """Plan 064 §7 W4: two connected hosts, one of which cannot write its
+    own config, and the reply carries one `result`, one `error`, and a
+    local outcome neither of them affected.
+
+    The broken host is broken **structurally** — its `.config/roost` is
+    made unwritable, so the install engine cannot even take its lock.
+    That is a whole-run failure, which is the shape that becomes an
+    `error` entry; a per-agent failure would have ridden back inside a
+    `result` instead, and the two must not be confused.
+
+    A raise is never fatal to the op that asked for it: the point of the
+    local assertions at the end is that this machine's own key and files
+    are exactly what a lone `set` would have left, with a broken host
+    beside it.
+    """
+    if target != "iced":
+        pytest.skip("the jailed client UI is launched as a bare iced binary")
+
+    ui_jail = Jail(short_root, agent_hooks=None)
+    healthy = sessionlib.make_env()
+    broken = sessionlib.make_env()
+    broken_config_dir = None
+    try:
+        healthy_jail = start_jailed_session(healthy)
+        broken_jail = start_jailed_session(broken)
+        # After the launch, so the daemon still read its own config.
+        broken_config_dir = broken_jail.config.parent
+        broken_config_dir.chmod(0o500)
+
+        with jailed_ui(ui_jail) as (proc, log):
+            wait_for_jailed_window(ui_jail, proc, log)
+            with Roost(str(jailed_socket(ui_jail)), timeout=scaled_timeout(30)) as client:
+                saved = [
+                    client.call(
+                        "host.add",
+                        {"label": label, "target": str(env.socket)},
+                    )["host"]
+                    for label, env in (("good", healthy), ("bad", broken))
+                ]
+                for host in saved:
+                    client.call("host.connect", {"id": host["id"]})
+                for host in saved:
+                    wait_until(
+                        lambda h=host: host_status_row(client, h["id"])["state"]
+                        == "connected",
+                        60.0,
+                        f"host {host['label']} to connect",
+                    )
+
+                # A writer that is not this UI moves the key under it —
+                # `roostctl agent set --local`, or a remote client
+                # raising this machine. The connect-time send must read
+                # the file, not the snapshot it launched with (plan 064
+                # §3.4), or a host would be handed a list the user has
+                # since changed and could never lower it again.
+                ui_jail.write_config(agent_hooks="grok")
+                client.call("host.disconnect", {"id": saved[0]["id"]})
+                wait_until(
+                    lambda: host_status_row(client, saved[0]["id"])["state"] != "connected",
+                    60.0,
+                    "the healthy host to drop",
+                )
+                client.call("host.connect", {"id": saved[0]["id"]})
+                wait_until(
+                    lambda: host_status_row(client, saved[0]["id"])["state"] == "connected",
+                    60.0,
+                    "the healthy host to reconnect",
+                )
+                wait_until(
+                    lambda: healthy_jail.read_key() == "grok",
+                    60.0,
+                    "the reconnect to raise the key written behind the UI's back",
+                )
+                ui_jail.write_config(agent_hooks=None)
+
+                reply = client.call("agent.set_hooks", {"agents": ["claude"]})
+                # `off` reaches no host at all: the wire can only ever
+                # raise, and an off client has no allow-list to raise
+                # one with (plan 064 §3.3). An empty `hosts` is the
+                # assertion — a push that went out would appear here
+                # whether the host accepted it or refused it.
+                switched_off = client.call("agent.set_hooks", {"agents": "off"})
+
+                # And the ordering: a machine that cannot record the
+                # user's answer must not propagate it. With this UI's own
+                # config directory unwritable, the local write fails —
+                # and the healthy host, which a successful call would
+                # have widened to `claude, codex`, must be untouched.
+                ui_config_dir = ui_jail.config.parent
+                ui_config_dir.chmod(0o500)
+                try:
+                    denied = refused(
+                        client.call, "agent.set_hooks", {"agents": ["claude", "codex"]}
+                    )
+                finally:
+                    ui_config_dir.chmod(0o700)
+                assert denied.code == "internal", denied
+
+            # Read after the UI is gone: a `mark_noticed` still in flight
+            # would otherwise race the record assertions below.
+
+        assert reply["config_path"] == str(ui_jail.config), reply
+        assert reply["local"]["wired"] == ["claude"], reply
+        assert reply["local"]["errors"] == [], reply
+
+        # Stable connection order is the saved-registry order, so it is
+        # asserted against that rather than against the order the two
+        # hosts happened to answer in.
+        assert [entry["host"] for entry in reply["hosts"]] == ["good", "bad"], reply
+        good, bad = reply["hosts"]
+        assert good["result"]["wired"] == ["claude"], good
+        assert good["result"]["errors"] == [], good
+        assert "error" in bad and "result" not in bad, bad
+
+        # The local half of the first call, untouched by either host.
+        assert reply["local"]["removed"] == [], reply
+
+        assert switched_off["hosts"] == [], switched_off
+        assert switched_off["local"]["removed"] == ["claude"], switched_off
+
+        # The local half went back off; the hosts kept what they had,
+        # because nothing was sent to them.
+        assert ui_jail.read_key() == "off", "the refused call wrote the key anyway"
+        # `grok` from the re-read above, `claude` from the Apply — a
+        # raise only ever widens.
+        assert healthy_jail.read_key() == "claude, grok", (
+            "a local write that failed still reached a host"
+        )
+        assert wired_agents(healthy_jail) == {"claude", "grok"}
+        assert broken_jail.read_key() is None, "the unwritable host was written anyway"
+        assert not broken_jail.record.exists()
+    finally:
+        # Before teardown, or the tempdir sweep cannot remove it.
+        if broken_config_dir is not None:
+            broken_config_dir.chmod(0o700)
+        broken.teardown()
+        healthy.teardown()
 
 
 # ---------------------------------------------------------------------------

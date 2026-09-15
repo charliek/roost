@@ -2104,6 +2104,7 @@ impl App {
                 }
                 EngineFeed::AgentHooks(result) => self.agent_hooks_ensured(result),
                 EngineFeed::HostAgentHooks(reply) => self.host_agent_hooks_set(*reply),
+                EngineFeed::AgentHooksSet(done) => self.agent_hooks_applied(*done),
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
                 EngineFeed::NotificationActivated { tab } => {
@@ -3540,6 +3541,9 @@ impl App {
             }
             UiRequest::HostStatus { id, reply } => {
                 let _ = reply.send(self.host_status_op(id.as_deref()));
+            }
+            UiRequest::AgentSetHooks { agents, reply } => {
+                self.agent_set_hooks_op(&agents, reply);
             }
         }
         task
@@ -5932,7 +5936,12 @@ mod tests {
         // A connection that lands is alive; one that drops is not.
         // On a socket transport, which has no handshake of its own, so
         // this half is the connection state alone.
-        let incarnation = a_connected_socket_host(&mut set, "h2", "/nonexistent/roost-alive.sock");
+        let incarnation = a_connected_socket_host(
+            &mut set,
+            "h2",
+            "/nonexistent/roost-alive.sock",
+            crate::host_conn::HostTransport::LocalSession,
+        );
         assert!(attempt_alive(&set, "h2"));
         set.apply_state(incarnation, dropped("the connection closed"));
         assert!(

@@ -30,7 +30,9 @@
 
 use roost_agent::Agent;
 use roost_agent_install::{Guard, Home, Mode};
-use roost_ipc::messages::AgentHooksOutcome;
+use roost_ipc::messages::{
+    AgentHooksFailed, AgentHooksOutcome, AgentHooksSkipped, AgentSetHooksAgents,
+};
 use roost_ui_model::config::{AgentHooks, RoostConfig};
 
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
@@ -186,6 +188,113 @@ pub(crate) fn spawn_mark_noticed(runtime: &tokio::runtime::Handle, agents: Vec<A
     });
 }
 
+/// What `agent.set_hooks` asks for, or the `invalid-param` it is refused
+/// with before anything is written (plan 064 §3.4).
+///
+/// The same rule `session.set_agent_hooks` draws on a host
+/// (`roost-session`'s `agent_hooks::resolve`) and `roostctl agent set`
+/// draws on a spec: this op answers the consent question, and a consent
+/// answer has no honest partial reading — one name nothing answers to
+/// refuses the whole list rather than silently narrowing it. The one
+/// difference is that `off` arrives here as its own wire spelling
+/// instead of as a word in the list.
+pub(crate) fn resolve_set(agents: &AgentSetHooksAgents) -> Result<Mode, String> {
+    let names = match agents {
+        AgentSetHooksAgents::Off => return Ok(Mode::Off),
+        AgentSetHooksAgents::List(names) => names,
+    };
+    // Checked before `resolve_names`, which skips blanks: skipping is
+    // right for a human-typed CLI list and wrong on a wire, where a
+    // blank element can only be a bug in the client.
+    if names.iter().any(|name| name.trim().is_empty()) {
+        return Err("agent.set_hooks: `agents` carries an empty name".to_string());
+    }
+    let (agents, unknown) = roost_agent_install::resolve_names(names.iter().map(String::as_str));
+    if let Some(name) = unknown.first() {
+        return Err(format!(
+            "agent.set_hooks: no agent named {name:?} ({})",
+            roost_agent_install::agent_names()
+        ));
+    }
+    if agents.is_empty() {
+        return Err(format!(
+            "agent.set_hooks requires a non-empty `agents` ({}) or the word \"off\"",
+            roost_agent_install::agent_names()
+        ));
+    }
+    Ok(Mode::Allow(agents))
+}
+
+/// What one local `agent.set_hooks` did to this machine, on its way back
+/// to the main thread.
+pub(crate) struct AgentHooksSet {
+    pub config_path: String,
+    pub outcome: AgentHooksOutcome,
+    /// The key this machine now has, read off the mode that was written
+    /// rather than out of `outcome` — an outcome describes files, and
+    /// the running UI's in-memory config has to match the key.
+    pub key: AgentHooks,
+    /// The toast list, and what `mark_noticed` is then given. The names
+    /// are already in [`AgentHooksOutcome::wired`]; the agents are kept
+    /// beside them because that is what both of those take.
+    pub unnoticed: Vec<Agent>,
+}
+
+/// The blocking half of `agent.set_hooks`: the key write and the
+/// reconcile, under the install lock.
+///
+/// Off the UI thread for this module's own reason — see its header.
+/// Only a whole-run failure is an `Err`; a per-agent one rides back in
+/// [`AgentHooksOutcome::errors`], because one unparseable `config.toml`
+/// must not cost the user the answer they just gave.
+pub(crate) fn set_hooks_blocking(mode: &Mode, guard: Guard) -> Result<AgentHooksSet, String> {
+    let home = Home::from_env().map_err(|error| error.to_string())?;
+    let outcome =
+        roost_agent_install::set_hooks(&home, mode, BY, guard).map_err(|e| e.to_string())?;
+    Ok(AgentHooksSet {
+        config_path: home.config_path().display().to_string(),
+        outcome: wire_outcome(&outcome),
+        key: mode.to_config(),
+        unnoticed: outcome.unnoticed,
+    })
+}
+
+/// One install [`roost_agent_install::Outcome`] as the wire carries it.
+///
+/// `roost-session`'s `agent_hooks::reply` is the same map for the host
+/// half of the same wire type, and the two copies are deliberate:
+/// `roost-agent-install` owns `Outcome` and does not depend on
+/// `roost-ipc`, so the only shared home would be a leaf crate holding
+/// one function. Change one and check the other.
+fn wire_outcome(outcome: &roost_agent_install::Outcome) -> AgentHooksOutcome {
+    let names = |agents: &[Agent]| -> Vec<String> {
+        agents.iter().map(|a| a.source().to_string()).collect()
+    };
+    AgentHooksOutcome {
+        // The toast list, not this run's writes — see the field's own
+        // doc in `roost-ipc`.
+        wired: names(&outcome.unnoticed),
+        refreshed: names(&outcome.refreshed),
+        removed: names(&outcome.removed),
+        skipped: outcome
+            .skipped
+            .iter()
+            .map(|skip| AgentHooksSkipped {
+                agent: skip.agent.source().to_string(),
+                reason: skip.reason.to_string(),
+            })
+            .collect(),
+        errors: outcome
+            .errors
+            .iter()
+            .map(|failure| AgentHooksFailed {
+                agent: failure.agent.source().to_string(),
+                error: failure.error.to_string(),
+            })
+            .collect(),
+    }
+}
+
 /// What one host answered `session.set_agent_hooks` with, on its way to
 /// the toast (plan 046 §3.4).
 pub(crate) struct HostAgentHooks {
@@ -194,31 +303,76 @@ pub(crate) struct HostAgentHooks {
     pub outcome: Result<AgentHooksOutcome, HostOpError>,
 }
 
-/// What this client asks a host to do, read fresh from its config, or
-/// `None` to send nothing at all.
+/// The allow-list one `session.set_agent_hooks` carries, or `None` when
+/// this decision reaches a host at all.
+///
+/// **Only `Allow` ever sends anything, because the wire can now only
+/// ever raise.** Plan 064 §3.3 reshaped `session.set_agent_hooks` into a
+/// pure widen: there is no wire spelling of "off" or "narrow this" left
+/// to send, so a host's key can only move up, never down. That retires
+/// the C1-era "off is off everywhere" rule this decision used to carry —
+/// `Off` sends nothing now, exactly like an unanswered key, because
+/// neither state has an allow-list to widen a host with. Taking a host's
+/// entries back out stays a deliberate, local act: `roostctl agent
+/// ensure`/`uninstall`, run by hand on the host itself.
+///
+/// Both send sites resolve through here — the connect-time
+/// [`remote_request`] and `agent.set_hooks`'s Apply push — so "what does
+/// `off` do to a host?" has one answer and not two.
+pub(crate) fn raise_list(mode: &Mode) -> Option<Vec<String>> {
+    match mode {
+        Mode::Allow(agents) if !agents.is_empty() => {
+            Some(agents.iter().map(|a| a.source().to_string()).collect())
+        }
+        Mode::Allow(_) | Mode::Off => None,
+    }
+}
+
+/// What this client asks a host to do at connect time, read fresh from
+/// its config, or `None` to send nothing at all.
 ///
 /// Sent on **every** connect, values and all, when there is a decision
 /// to send: the op is idempotent, and a config edit made since the last
 /// connect has no other way to reach the host.
 ///
-/// **Only `Allow` ever sends anything, because the wire can now only
-/// ever raise.** Plan 064 §3.3 reshaped `session.set_agent_hooks` into a
-/// pure widen: there is no wire spelling of "off" or "narrow this" left
-/// to send, so a host's key can only move up, never down, from a
-/// connect. That retires the C1-era "off is off everywhere" rule this
-/// function used to carry — `Off` sends nothing now, exactly like `Ask`,
-/// because neither state has an allow-list to widen the host with.
-/// Taking a host's entries back out stays a deliberate, local act:
-/// `roostctl agent ensure`/`uninstall`, run by hand on the host itself.
-///
-/// `Ask` (unconfigured) sending nothing was always the rule: wiring a
+/// An unanswered key sending nothing was always the rule: wiring a
 /// host's dotfiles before the user has answered the local consent
 /// dialog would be exactly the unconsented write plan 064 exists to
-/// stop.
+/// stop. It arrives here as [`resolve`]'s `None`, which is why this
+/// reads the key through [`Mode`] rather than matching [`AgentHooks`]
+/// directly — that also drops a name no agent answers to, so a stale
+/// `config.conf` cannot put one on the wire.
 pub(crate) fn remote_request(config: &RoostConfig) -> Option<Vec<String>> {
-    match &config.agent_hooks {
-        AgentHooks::Allow(names) if !names.is_empty() => Some(names.clone()),
-        AgentHooks::Allow(_) | AgentHooks::Off | AgentHooks::Ask => None,
+    raise_list(&resolve(config)?)
+}
+
+/// This machine's `agent-hooks` key **as it is on disk right now**.
+///
+/// `self.config` is a snapshot of launch time, and since plan 064 this
+/// process is not its only writer: a connecting client raises this
+/// machine's key through its own `roost-session`, and `roostctl agent
+/// set --local` writes it with no UI running at all. A connect that
+/// sent the snapshot would hand a host a list the user has since
+/// changed — and because a raise can only widen, the host would keep it.
+///
+/// Reads and parses one small file rather than calling
+/// `RoostConfig::load_default`, which also walks the providers
+/// directory; this runs once per connect, not once per frame. An
+/// unreadable config falls back to what this process already believes,
+/// because failing to read is not a reason to say something different.
+pub(crate) fn hooks_on_disk(fallback: &RoostConfig) -> AgentHooks {
+    let Some(path) = roost_ui_model::config::config_path() else {
+        return fallback.agent_hooks.clone();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => RoostConfig::parse(&text).agent_hooks,
+        // Absent is unanswered, which is a real state and not a failure:
+        // it is what a machine nobody has consented on looks like.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => AgentHooks::Ask,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "could not re-read agent-hooks");
+            fallback.agent_hooks.clone()
+        }
     }
 }
 
@@ -271,8 +425,8 @@ pub(crate) fn wired_toast(agents: &[Agent], host: Option<&str>) -> Option<String
         None => String::new(),
     };
     Some(format!(
-        "{prefix}Roost wired agent hooks for {} — undo: \
-         `roostctl agent uninstall --all` or `agent-hooks = off`",
+        "{prefix}Roost wired agent hooks for {} — change it under \
+         Agent Hooks… in the command palette",
         names.join(", ")
     ))
 }
@@ -323,9 +477,22 @@ mod tests {
     /// `Off` sends nothing — the wire can only ever raise a host now
     /// (plan 064 §3.3), and an off client has no allow-list to raise it
     /// with. Retiring the host's entries stays a local, explicit act.
+    ///
+    /// Asserted at both send sites: the connect-time read of the key,
+    /// and the Apply push `agent.set_hooks` makes.
     #[test]
     fn off_sends_nothing_to_a_host() {
         assert_eq!(remote_request(&config("agent-hooks = off")), None);
+        assert_eq!(raise_list(&Mode::Off), None);
+    }
+
+    /// The Apply push carries exactly what was applied.
+    #[test]
+    fn an_applied_allow_list_travels_as_itself() {
+        assert_eq!(
+            raise_list(&Mode::Allow(vec![Agent::Claude, Agent::Cursor])),
+            Some(vec!["claude".to_string(), "cursor".to_string()])
+        );
     }
 
     #[test]
@@ -343,6 +510,34 @@ mod tests {
         assert_eq!(remote_request(&config("")), None);
     }
 
+    fn set(agents: &[&str]) -> Result<Mode, String> {
+        resolve_set(&AgentSetHooksAgents::List(
+            agents.iter().map(|s| (*s).to_string()).collect(),
+        ))
+    }
+
+    #[test]
+    fn agent_set_hooks_takes_a_list_or_the_word_off() {
+        assert_eq!(
+            set(&["claude", "codex"]),
+            Ok(Mode::Allow(vec![Agent::Claude, Agent::Codex]))
+        );
+        assert_eq!(resolve_set(&AgentSetHooksAgents::Off), Ok(Mode::Off));
+    }
+
+    /// The two shapes that are bugs in the caller rather than answers.
+    #[test]
+    fn agent_set_hooks_refuses_an_empty_or_unknown_list() {
+        assert!(set(&[]).unwrap_err().contains("non-empty"));
+        assert!(set(&["  "]).unwrap_err().contains("empty name"));
+        assert!(set(&["claude", ""]).unwrap_err().contains("empty name"));
+        let refused = set(&["claude", "gemini"]).unwrap_err();
+        assert!(refused.contains("gemini"), "{refused}");
+        for known in ["claude", "codex", "grok", "cursor", "opencode"] {
+            assert!(refused.contains(known), "{refused}");
+        }
+    }
+
     /// It goes into the host's state record, so it has to be a name and
     /// never an empty string.
     #[test]
@@ -351,16 +546,16 @@ mod tests {
     }
 
     /// The text is what the user is left with after Roost has edited
-    /// their dotfiles, so both escape hatches have to be *in* it.
+    /// their dotfiles, so it has to name both what was wired and the one
+    /// surface that changes it again (plan 064 §3.4).
     #[test]
-    fn the_toast_names_the_agents_and_both_ways_out() {
+    fn the_toast_names_the_agents_and_the_way_back() {
         let toast = wired_toast(&[Agent::Claude, Agent::Codex], None).unwrap();
         assert!(
             toast.starts_with("Roost wired agent hooks for claude, codex"),
             "{toast}"
         );
-        assert!(toast.contains("roostctl agent uninstall --all"), "{toast}");
-        assert!(toast.contains("agent-hooks = off"), "{toast}");
+        assert!(toast.contains("Agent Hooks…"), "{toast}");
     }
 
     /// C8 wires a host's result through the same text; the prefix is the

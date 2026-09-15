@@ -63,6 +63,12 @@ pub(crate) enum EngineFeed {
     /// attachment that asked for it. Boxed: the result carries five
     /// vectors, and every feed item pays for the largest variant.
     HostAgentHooks(Box<crate::app::agent_hooks::HostAgentHooks>),
+    /// `agent.set_hooks` wrote this machine's own key and reconciled its
+    /// files (plan 064 §3.4). Off the thread for [`Self::AgentHooks`]'s
+    /// reason; on the feed because the two things left to do — the
+    /// running UI's in-memory `agent-hooks` value and the receipt toast
+    /// — are both main-thread state. Boxed like its host sibling.
+    AgentHooksSet(Box<crate::app::agent_hooks::AgentHooksSet>),
     AgentMetrics(AgentMetricsResult),
     Provider(Box<ProviderRunResult>),
     /// The user picked an item off the native macOS menu bar. Not an

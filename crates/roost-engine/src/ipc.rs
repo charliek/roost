@@ -25,34 +25,34 @@ use std::time::Duration;
 
 use roost_ipc::agent::{self, TabAgentReportParams};
 use roost_ipc::messages::{
-    ops, AgentHooksOutcome, AppActivateParams, AppActiveTerminalFocusedParams,
-    AppActiveTerminalFocusedResult, AppCursorShapeParams, AppCursorShapeResult,
-    AppDialogAnswerParams, AppDialogDumpParams, AppDialogDumpResult, AppDockBadgeParams,
-    AppDockBadgeResult, AppKeybindDispatchParams, AppMenuActivateParams, AppMenuDumpParams,
-    AppMenuDumpResult, AppNotificationStatusParams, AppNotificationStatusResult,
-    AppRenderStatsParams, AppRenderStatsResult, AppSelectedTabIdParams, AppSelectedTabIdResult,
-    AppSetWindowFocusParams, AppUpdateCheckParams, AppUpdateStatusParams, AppUpdateStatusResult,
-    AttachPayloadKind, ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteParams,
-    EventsSubscribeParams, EventsSubscribeResult, Host, HostAddParams, HostAddResult,
-    HostConnectParams, HostConnectionResult, HostDisconnectParams, HostListParams, HostListResult,
-    HostRemoveParams, HostStatusParams, HostStatusResult, IdentifyParams, IdentifyResult,
-    NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
-    PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
-    PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
-    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
-    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
-    SessionIdentify, SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult,
-    SessionSetAgentHooksParams, SessionSetFocusParams, SessionSetThemeParams, SessionStopParams,
-    SessionStopResult, SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams,
-    TabAgentReportResult, TabAttachParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
-    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
-    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
-    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
-    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams, TabSendFileResult,
-    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
-    WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef, WireTabRef,
-    MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
+    ops, AgentHooksOutcome, AgentSetHooksAgents, AgentSetHooksParams, AgentSetHooksResult,
+    AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
+    AppCursorShapeParams, AppCursorShapeResult, AppDialogAnswerParams, AppDialogDumpParams,
+    AppDialogDumpResult, AppDockBadgeParams, AppDockBadgeResult, AppKeybindDispatchParams,
+    AppMenuActivateParams, AppMenuDumpParams, AppMenuDumpResult, AppNotificationStatusParams,
+    AppNotificationStatusResult, AppRenderStatsParams, AppRenderStatsResult,
+    AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams, AppUpdateCheckParams,
+    AppUpdateStatusParams, AppUpdateStatusResult, AttachPayloadKind, ClipboardDumpParams,
+    ClipboardDumpResult, ClipboardWriteParams, EventsSubscribeParams, EventsSubscribeResult, Host,
+    HostAddParams, HostAddResult, HostConnectParams, HostConnectionResult, HostDisconnectParams,
+    HostListParams, HostListResult, HostRemoveParams, HostStatusParams, HostStatusResult,
+    IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
+    PaletteDismissParams, PaletteOpenParams, PalettePresentParams, PalettePresentResult,
+    PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
+    ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
+    ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
+    SelectionDumpResult, SelectionSetParams, SessionIdentify, SessionIdentifyParams,
+    SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams, SessionSetFocusParams,
+    SessionSetThemeParams, SessionStopParams, SessionStopResult, SidebarDumpParams,
+    SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult, TabAttachParams,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
+    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
+    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
+    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams,
+    TabSendFileResult, TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams,
+    TabWriteParams, WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef,
+    WireTabRef, MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{SessionSetThemeResult, TabAttachResult};
@@ -525,6 +525,23 @@ pub enum UiRequest {
     /// macOS-iced-only like `AppDockBadge`.
     AppNotificationStatus {
         reply: tokio::sync::oneshot::Sender<Result<AppNotificationStatusResult, String>>,
+    },
+    /// `agent.set_hooks` — set *this* machine's own `agent-hooks` key
+    /// and raise every connected non-localhost host to at least the
+    /// same allow-list (plan 064 §3.4).
+    ///
+    /// The engine decodes the op and answers with what the app reports;
+    /// it never touches the install engine itself, for
+    /// [`AgentHooksHandle`]'s reason — this crate is linked into the UI
+    /// processes, and a UI has no business carrying a dotfile writer.
+    ///
+    /// Like [`UiRequest::HostTabReorder`] this cannot be answered inside
+    /// `update`: the install is file I/O under an advisory lock and the
+    /// host raises are round trips. The reply travels with the work and
+    /// is answered from wherever it ends.
+    AgentSetHooks {
+        agents: AgentSetHooksAgents,
+        reply: HostOpReply<AgentSetHooksResult>,
     },
     /// `host.add` — save a host to the client-side registry (plan 037
     /// §3.5).
@@ -2283,12 +2300,21 @@ async fn dispatch_outcome(
         // The host registry is client-side state (D8): a UI socket's op
         // family. Letting it fall through would grow a shadow registry in
         // the daemon's own state.json that nothing ever reads.
+        //
+        // `agent.set_hooks` is refused here for the same reason from the
+        // other direction: the op sets a machine's own key *and* raises
+        // every host that machine is connected to, and a session has no
+        // connections of its own. `session.set_agent_hooks` is what a
+        // client puts to a session; answering both here would give a
+        // host two spellings of one act, one of which cannot keep half
+        // its promise.
         ops::HOST_ADD
         | ops::HOST_REMOVE
         | ops::HOST_LIST
         | ops::HOST_CONNECT
         | ops::HOST_DISCONNECT
-        | ops::HOST_STATUS => {
+        | ops::HOST_STATUS
+        | ops::AGENT_SET_HOOKS => {
             return Err(HandlerError::unknown_op(op));
         }
         _ => {}
@@ -3912,6 +3938,20 @@ async fn dispatch(
                 "not-implemented",
                 "events.subscribe is not yet implemented",
             ))
+        }
+        // Answered by the app alone, with no headless fallback: the
+        // reply names what every *connected* host did, and the
+        // connection set is the app's. A socket with no window behind
+        // it therefore gets `ui_call`'s `no UI attached`.
+        ops::AGENT_SET_HOOKS => {
+            let p: AgentSetHooksParams = decode(params)?;
+            let result = h
+                .ui_call(|reply| UiRequest::AgentSetHooks {
+                    agents: p.agents,
+                    reply,
+                })
+                .await??;
+            encode(&result)
         }
         // The four registry mutations route through the app when one is
         // attached (plan 037 §3.5): the app owns the connections and the

@@ -1691,10 +1691,16 @@ the op is refused before the config write — the same fence
 `roost-session`'s agent-hooks install applies, so a test harness cannot
 accidentally wire a real dotfile.
 
-Served by the UI socket only; no server implementation ships until
-plan 064 C6 (the iced UI) and C8 (the Mac app) — until then a UI
-answers whatever its `unknown-op` shape already is for an
-unimplemented op.
+A **localhost** host is never sent the raise, which is why `hosts`
+excludes it: on this machine the UI has already written the key and
+reconciled the files directly, and the session behind a localhost host
+reads that same `config.conf`. Raising it would be the UI raising
+itself — and since a raise can only ever widen, a local "switch codex
+off" would come straight back on that session's next connect.
+
+Served by the UI socket only. The Linux (iced) UI serves it; the Mac
+app's implementation is plan 064 C8, and until it lands that UI answers
+whatever its `unknown-op` shape already is for an unimplemented op.
 
 ### Command palette (`palette.*`)
 

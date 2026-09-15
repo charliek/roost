@@ -628,9 +628,13 @@ async fn main() -> Result<()> {
 
     // The `agent` verbs write dotfiles and never dial a UI, so they run
     // before the connect prologue — wiring an agent has to work with
-    // nothing running, which is exactly when a user reaches for it.
+    // nothing running, which is exactly when a user reaches for it. The
+    // one shape `dials_the_ui` names falls through to the prologue
+    // instead, and is served after it.
     if let Cmd::Agent(cmd) = &args.command {
-        std::process::exit(agent_install::run(cmd));
+        if !agent_install::dials_the_ui(cmd) {
+            std::process::exit(agent_install::run(cmd));
+        }
     }
 
     // `claude install` doesn't dial the UI either — it is a bare alias
@@ -1202,10 +1206,12 @@ async fn main() -> Result<()> {
         Cmd::Host(cmd) => {
             std::process::exit(host::run(&cmd, &mut client).await);
         }
+        Cmd::Agent(cmd) => {
+            std::process::exit(agent_install::run_over_ipc(&cmd, &mut client).await);
+        }
         // Already handled above before client connect.
         Cmd::ClaudeHook { .. }
         | Cmd::AgentHook { .. }
-        | Cmd::Agent(_)
         | Cmd::Claude(_)
         | Cmd::Doctor { .. }
         | Cmd::Session(_) => {

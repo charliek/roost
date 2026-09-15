@@ -305,15 +305,16 @@ roostctl palette dismiss
 ## `agent` subcommands
 
 Wire Roost's hook entries into each supported agent's own configuration
-file, and take them back out. As of this writing all five verbs read and
-write dotfiles directly and work with nothing running; `set`'s
-UI-routed form (dialling a running UI's socket instead of `--local`) is
-planned but not yet implemented — see below.
+file, and take them back out. Every verb but one reads and writes
+dotfiles directly and works with nothing running; bare `agent set` is
+the exception — it dials the running UI, because only the UI can reach
+the hosts this machine is connected to.
 
 ```bash
 roostctl agent status                        # per agent: installed, wired, up to date
 roostctl agent ensure [--json] [--startup]    # reconcile to `agent-hooks`; --startup never removes
-roostctl agent set claude,codex --local       # set `agent-hooks` to exactly this list, and wire it
+roostctl agent set claude,codex [--json]      # via the running UI: set the key here, raise every connected host
+roostctl agent set claude,codex --local       # set `agent-hooks` to exactly this list here, and wire it
 roostctl agent set off --local                # set `agent-hooks = off`, and unwire everything
 roostctl agent install claude                 # or --all; explicit wins over `agent-hooks = off`
 roostctl agent uninstall claude               # or --all
@@ -332,16 +333,24 @@ unanswered key (nobody has run the consent dialog or `agent set` yet) is
 a no-op for either shape: nothing is wired, and nothing already wired is
 touched.
 
-`set <list|off> --local` writes the `agent-hooks` key directly to
-exactly the given comma list of agent names (`claude`, `codex`, `grok`,
-`cursor`, `opencode`) or to `off`, then reconciles this machine's files
-to match, the same way `ensure` does. `--local` is required for now —
-bare `agent set` (no `--local`) is meant to dial the running UI instead,
-so a headless box and a desk box can agree on the setting without either
-editing the other's dotfiles, but that path is not implemented yet and
-currently exits with an error naming `--local`. Because `--local` never
-dials a UI, a connected host's live session does not pick up the change
-until it reconnects.
+`set <list|off>` answers the consent question from a terminal: the
+argument is a comma list of agent names (`claude`, `codex`, `grok`,
+`cursor`, `opencode`) or the literal `off`, and an unrecognised name
+refuses the whole list rather than narrowing it silently.
+
+Bare `set` puts [`agent.set_hooks`](ipc.md#agentset_hooks) to the
+running UI, which writes this machine's `agent-hooks` key, reconciles
+its files, and raises every **connected non-localhost** host to at least
+the same list in the same call — so a headless box and a desk box agree
+without either editing the other's dotfiles. It prints where the key
+landed, what changed here, and one line per host (`--json` prints the
+op's reply verbatim), and exits non-zero if anything failed here or a
+host could not be asked.
+
+`set <list|off> --local` writes the key and reconciles this machine's
+files directly instead, the same way `ensure` does — with nothing
+running, and reaching no host at all, so a connected host's live session
+does not pick up the change until it reconnects.
 
 `install` and `uninstall` take an agent name or `--all`, and
 deliberately ignore `agent-hooks = off` — an explicit verb always wins.
