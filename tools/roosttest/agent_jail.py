@@ -29,7 +29,6 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-import pytest
 import ui
 from client import Roost, RoostError, scaled_timeout
 from util import REPO_ROOT
@@ -241,6 +240,11 @@ def jailed_ui(jail: Jail, *, force: bool = True):
     binary, explicit = ui.rust_binary_path("iced")
     if not binary.is_file():
         if explicit:
+            # Imported here, not at the top: `session.py` imports this
+            # module, and `roosttest_unit` imports that under a bare
+            # `python3` with no test dependencies installed.
+            import pytest
+
             pytest.skip(f"explicit iced binary does not exist: {binary}")
         subprocess.run(["cargo", "build", "-p", "roost-iced"], cwd=REPO_ROOT, check=True)
 
@@ -319,19 +323,3 @@ def wait_for_log_line(log: Path, needle: str, what: str) -> str:
 
     Roost._wait(seen, 30.0, what)
     return found[0]
-
-
-@pytest.fixture
-def short_root():
-    """A jail root short enough to hold a Unix socket path.
-
-    `sun_path` is 104 bytes on macOS, and pytest's `tmp_path` spends
-    ~70 of them before this test adds
-    `home/Library/Caches/Roost-iced/roost.sock` — the jailed UI then
-    refuses to bind. `/tmp` is the only root with room, and it is short
-    on Linux too."""
-    root = Path(tempfile.mkdtemp(prefix="roost-jail-", dir="/tmp"))
-    try:
-        yield root
-    finally:
-        shutil.rmtree(root, ignore_errors=True)

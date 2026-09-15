@@ -35,7 +35,6 @@ from agent_jail import (
     Jail,
     jailed_socket,
     jailed_ui,
-    short_root,  # noqa: F401  (used as a fixture)
     wait_for_jailed_window,
     wait_for_log_line,
 )

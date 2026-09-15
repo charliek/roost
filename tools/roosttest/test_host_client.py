@@ -71,11 +71,10 @@ import ui
 # §13b below needs a client UI that may write agent files, and one
 # implementation of that launch is the point — `agent_jail.py`'s header
 # states the fences it stands on.
-from agent_jail import (  # noqa: F401  (`short_root` is used as a fixture)
+from agent_jail import (
     Jail,
     jailed_socket,
     jailed_ui,
-    short_root,
     wait_for_jailed_window,
 )
 from client import Roost, RoostError, scaled_timeout
