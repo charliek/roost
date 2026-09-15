@@ -44,6 +44,25 @@ def _pytest():
 
     return pytest
 
+
+def is_live_wayland_desktop(wayland_display: str | None) -> bool:
+    """True when `wayland_display` names a live desktop compositor socket
+    rather than the harness's own throwaway one.
+
+    `tools/wayland/weston-run.sh` mints `wayland-roost-$$` for its
+    headless compositor (`weston-run.sh:43`); a live desktop session
+    (COSMIC, GNOME, ...) uses `wayland-0`, `wayland-1`, etc. Pixel and
+    render-stat captures (`app.screenshot` / `app.render_stats`) are
+    reliable only under the harness's controlled compositor — a live
+    desktop's own window decorations and output scaling perturb them.
+    Pure and pytest-free so `roosttest_unit` can pin it directly
+    (issue #488).
+    """
+    if not wayland_display:
+        return False
+    return not wayland_display.startswith("wayland-roost-")
+
+
 # A shell with NO startup files, therefore no Roost shell integration,
 # therefore no OSC 133 marks the test didn't feed itself. Any tab whose
 # agent lifecycle a test seeds MUST be opened with this argv: a real

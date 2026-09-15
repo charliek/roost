@@ -14,7 +14,7 @@ regression patterns" below.
 
 ```bash
 make e2e            # dispatch on $ROOST_TARGET (default iced): the curated e2e-iced lane, or e2e-mac
-make e2e-iced       # the curated iced lane (see ICED_E2E_TESTS in the Makefile)
+make e2e-iced       # the curated iced lane (see ICED_E2E_TESTS in the Makefile); sets ROOST_TEST_MODE=1 but NOT --roost-fresh, so it still reuses a running dev instance — tests that need test-mode ops on a reused non-test-mode instance skip with a reason (#483) rather than failing confusingly
 make e2e-mac        # against the Mac app (full tools/roosttest directory)
 make e2e-iced-ci    # CI parity: ROOST_TEST_MODE=1 + --roost-fresh (owns a fresh UI)
 make e2e-mac-ci     # CI parity (DESTRUCTIVE: force-quits any running Roost.app)

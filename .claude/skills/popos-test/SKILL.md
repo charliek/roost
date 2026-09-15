@@ -53,12 +53,20 @@ make e2e-iced-ci    # same lane, fresh + isolated state (CI parity — sets ROOS
 ```
 
 On a live COSMIC session `$WAYLAND_DISPLAY` is already set, so these targets
-already run the Wayland-primary path natively — no weston needed. `e2e-iced`
-checks `WAYLAND_DISPLAY` and skips the clipboard tests
-(`ICED_CLIPBOARD_TESTS`) when it's set, since Wayland clipboard needs a
-focused seat/serial only a real interactive session provides; that means
-running it on your live desktop is actually the one place those tests *don't*
-run — use `xvfb-run` (below) to exercise them.
+will run against it directly with no weston needed — but **prefer
+`tools/wayland/weston-run.sh make e2e-iced-ci`** instead. Eight
+pixel/render-stat tests (screenshot- and `render_stats`-based: sidebar dot
+colors, tab-strip painting, sprite cells, IME preedit, the renderer-geometry
+walking-skeleton case) self-skip whenever `WAYLAND_DISPLAY` names a live
+desktop compositor rather than the harness's own weston socket — a live
+session's own window decorations and output scaling make captured pixels
+unreliable (issue #488). So running directly against your live COSMIC
+session is not full coverage: those eight tests silently skip. `weston-run.sh`
+mints its own `wayland-roost-$$` socket, which the self-skip recognizes, so
+they run there. `e2e-iced` also checks `WAYLAND_DISPLAY` and skips the
+clipboard tests (`ICED_CLIPBOARD_TESTS`) when it's set, since Wayland
+clipboard needs a focused seat/serial only a real interactive session
+provides — use `xvfb-run` (below) to exercise those specifically.
 
 Or reach for the pieces directly, isolated so a run never touches your real
 workspace:

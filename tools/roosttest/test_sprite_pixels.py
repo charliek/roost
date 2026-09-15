@@ -38,6 +38,7 @@ from pathlib import Path
 import pytest
 
 from client import Roost
+from conftest import skip_on_live_wayland_desktop
 from test_sidebar_collapse_persistence import _toggle_to_visible
 from test_sidebar_pixels import _capture
 from util import BARE_SHELL_ARGV, wait_tab_quiet
@@ -77,6 +78,11 @@ SCENE_ROWS: dict[int, str] = {
 def _iced_only(target):
     if target != "iced":
         pytest.skip("sprite pixel e2e pins the iced sprite adapter (plan 020 C4)")
+
+
+# Both tests in this module capture pixels; no other tests here to spare
+# (issue #488).
+_skip_wayland = skip_on_live_wayland_desktop()
 
 
 def _scene_bytes() -> bytes:

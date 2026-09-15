@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 import ui
 from client import Roost
+from util import is_live_wayland_desktop
 
 
 def pytest_addoption(parser):
@@ -138,6 +139,39 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         if isinstance(lr, tuple) and len(lr) == 3:
             reason = str(lr[2]).removeprefix("Skipped: ")
         terminalreporter.write_line(f"  SKIP {rep.nodeid} — {reason}")
+
+
+def skip_on_live_wayland_desktop(*only: str):
+    """Build an autouse fixture that skips pixel/render-stat tests when
+    `WAYLAND_DISPLAY` points at a live desktop compositor (see
+    `util.is_live_wayland_desktop`) instead of the harness's own
+    `tools/wayland/weston-run.sh` socket.
+
+    A bare `skip_on_live_wayland_desktop()` gates every test in the
+    importing module — only sound when the whole module is pixel/
+    render-stat tests (issue #488). Pass the test names that need it
+    (`request.node.name`, so a class method's bare name, no class
+    prefix) and every other test in the module is left alone. This is
+    a **module-level opt-in wired by name**, never a conftest-level
+    autouse: a root/session-scoped version here would silently skip the
+    whole suite on a live desktop instead of just the eight tests that
+    actually need a controlled compositor.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _skip_on_live_wayland_desktop(request):
+        if only and request.node.name not in only:
+            return
+        if is_live_wayland_desktop(os.environ.get("WAYLAND_DISPLAY")):
+            pytest.skip(
+                "pixel/render-stat capture (app.screenshot / "
+                "app.render_stats) is unreliable on a live Wayland "
+                "desktop session — its own window decorations and "
+                "output scaling perturb the pixels; run under "
+                "tools/wayland/weston-run.sh"
+            )
+
+    return _skip_on_live_wayland_desktop
 
 
 @pytest.fixture
