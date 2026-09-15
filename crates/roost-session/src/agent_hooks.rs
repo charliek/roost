@@ -1,4 +1,5 @@
-//! The host half of `session.set_agent_hooks` (plan 046 §3.4).
+//! The host half of `session.set_agent_hooks` (plan 046 §3.4, reshaped
+//! by plan 064 §3.3).
 //!
 //! `roost-engine` decodes the op; the work lands here, in the one
 //! process that has both the install engine linked and the `$HOME` being
@@ -6,12 +7,16 @@
 //! linked into the UI processes too, and a UI has no business carrying a
 //! dotfile writer.
 //!
-//! **The client's config is the authority, and it is re-sent on every
-//! connect.** `mode = off` therefore *removes* Roost's entries here,
-//! where on the client's own machine the same key only opts out of
-//! future wiring: a host has no `config.conf` of its own to consult, so
-//! if `off` did nothing remotely there would be no way to take a host's
-//! entries back out short of an ssh session. Off is off everywhere.
+//! **A client may only ever raise the host's `agent-hooks` key, never
+//! lower it.** The wire carries an allow-list, and this module unions it
+//! into whatever the key already says — `off`, unanswered, or a
+//! narrower list — and wires what the union now allows. There is no way
+//! to spell "off" or "narrow this" on this op: a client whose own
+//! `agent-hooks` is `off`, or unconfigured, has nothing to widen the
+//! host with, so it sends this op **not at all** (the caller's decision,
+//! not this module's — see [`crate::agent_hooks`]'s sibling in
+//! `roost-iced`). Taking entries back out is `roostctl agent
+//! ensure`/`uninstall`, run by hand on the host itself.
 //!
 //! The entries themselves name no path — `installed_command` is
 //! env-indirected through `$ROOST_AGENT_HOOK`, which
@@ -20,17 +25,14 @@
 //! that could not resolve its own binary wires entries that are inert
 //! rather than wrong.
 //!
-//! **Two clients that disagree flip the files on every reconnect.** Last
-//! writer wins by design: the record stores `by` (the asking client's
-//! label) and `wired_at`, and each run is logged, so the oscillation is
-//! diagnosable from `roostctl agent status` on the host. Reconciling the
-//! two is filed as future work (§9), not solved here.
+//! **Two clients that raise different lists both win, additively.** The
+//! record stores `by` (the asking client's label) and `wired_at`, and
+//! each run is logged, so which client asked for which agent is
+//! diagnosable from `roostctl agent status` on the host.
 
-use roost_agent_install::{Guard, Home, Mode, Outcome};
+use roost_agent_install::{Guard, Home};
 use roost_engine::ipc::{AgentHooksError, AgentHooksHandle, AgentHooksRequest};
-use roost_ipc::messages::{
-    AgentHooksFailed, AgentHooksMode, AgentHooksSkipped, SessionSetAgentHooksResult,
-};
+use roost_ipc::messages::{AgentHooksFailed, AgentHooksOutcome, AgentHooksSkipped};
 use tracing::{info, warn};
 
 /// The callback `IpcHandler::with_agent_hooks` takes.
@@ -53,54 +55,37 @@ pub fn handle() -> AgentHooksHandle {
     })
 }
 
-/// One ensure, against an explicit [`Home`] — the seam the tests drive.
+/// One raise, against an explicit [`Home`] — the seam the tests drive.
 ///
 /// Only a whole-run install failure (no `$HOME`, an unwritable record, a
 /// lock another writer held past the deadline) becomes an `Err` here, and
 /// the engine turns that into one error frame. A *per-agent* failure is not
-/// that: it rides back in [`SessionSetAgentHooksResult::errors`], because
+/// that: it rides back in [`AgentHooksOutcome::errors`], because
 /// a codex file Roost could not parse must not cost the client the
 /// session it just attached to.
 ///
-/// `raise` rather than `ensure`, for the two things that are only true
-/// remotely: the client's list is unioned into the host's own
-/// `agent-hooks` key, and the record's `noticed` flag is flipped in the
-/// install's own locked write. The flip belongs there because this reply
-/// *is* the announcement: there is no second step to defer it to, and
-/// doing it afterwards under a re-taken lock let two clients connecting
-/// at once both be told about the same agent.
+/// A name this session does not recognise is reported as a skip rather
+/// than refused here — validating the request (empty `agents`, or an
+/// unrecognised name, as `invalid-param`) is the engine's job before this
+/// ever runs (plan 064 C4), not this module's.
 fn ensure_in(
     home: &Home,
     request: &AgentHooksRequest,
     guard: Guard,
-) -> Result<SessionSetAgentHooksResult, AgentHooksError> {
-    let (skip, unknown) =
-        roost_agent_install::resolve_names(request.skip.iter().map(String::as_str));
-    let outcome = match request.mode {
-        // The wire still carries mode + a skip list (C3 reshapes it into
-        // the allow-list it has meant since C1), so the agents this
-        // client allows are the ones it did not skip.
-        AgentHooksMode::Auto => {
-            let allowed: Vec<roost_agent::Agent> = roost_agent_install::ALL_AGENTS
-                .into_iter()
-                .filter(|agent| !skip.contains(agent))
-                .collect();
-            roost_agent_install::raise(home, &allowed, &request.client, guard)
-        }
-        AgentHooksMode::Off => {
-            roost_agent_install::reconcile(home, &Mode::Off, &request.client, guard)
-        }
-    }
-    .map_err(|error| AgentHooksError::Failed(error.to_string()))?;
+) -> Result<AgentHooksOutcome, AgentHooksError> {
+    let (agents, unknown) =
+        roost_agent_install::resolve_names(request.agents.iter().map(String::as_str));
+    let outcome = roost_agent_install::raise(home, &agents, &request.client, guard)
+        .map_err(|error| AgentHooksError::Failed(error.to_string()))?;
 
     info!(
         client = %request.client,
-        mode = ?request.mode,
+        agents = ?request.agents,
         wired = outcome.wired.len(),
         refreshed = outcome.refreshed.len(),
         removed = outcome.removed.len(),
         errors = outcome.errors.len(),
-        "a client set this host's agent hooks"
+        "a client raised this host's agent hooks"
     );
     for error in &outcome.errors {
         warn!(agent = error.agent.source(), %error.error, "agent hooks");
@@ -109,7 +94,7 @@ fn ensure_in(
     Ok(reply(&outcome, &unknown))
 }
 
-fn reply(outcome: &Outcome, unknown_skip_names: &[String]) -> SessionSetAgentHooksResult {
+fn reply(outcome: &roost_agent_install::Outcome, unknown_names: &[String]) -> AgentHooksOutcome {
     let names = |agents: &[roost_agent::Agent]| -> Vec<String> {
         agents.iter().map(|a| a.source().to_string()).collect()
     };
@@ -126,18 +111,19 @@ fn reply(outcome: &Outcome, unknown_skip_names: &[String]) -> SessionSetAgentHoo
     // "nothing is wired and nothing says why". It may equally be an
     // agent a newer client knows about, which is the second reason not
     // to treat it as an error.
-    skipped.extend(unknown_skip_names.iter().map(|name| AgentHooksSkipped {
+    skipped.extend(unknown_names.iter().map(|name| AgentHooksSkipped {
         agent: name.clone(),
         reason: format!(
             "no agent named that ({})",
             roost_agent_install::agent_names()
         ),
     }));
-    SessionSetAgentHooksResult {
+    AgentHooksOutcome {
         // The agents this host has wired and never announced — not the
         // ones this run happened to write. See the field's own doc.
         wired: names(&outcome.unnoticed),
         refreshed: names(&outcome.refreshed),
+        // A raise never removes — see this module's own doc.
         removed: names(&outcome.removed),
         skipped,
         errors: outcome
@@ -155,10 +141,9 @@ fn reply(outcome: &Outcome, unknown_skip_names: &[String]) -> SessionSetAgentHoo
 mod tests {
     use super::*;
 
-    fn request(mode: AgentHooksMode, skip: &[&str]) -> AgentHooksRequest {
+    fn request(agents: &[&str]) -> AgentHooksRequest {
         AgentHooksRequest {
-            mode,
-            skip: skip.iter().map(|s| (*s).to_string()).collect(),
+            agents: agents.iter().map(|s| (*s).to_string()).collect(),
             client: "charlie-mbp".into(),
         }
     }
@@ -174,16 +159,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_wires_the_present_agents_and_says_who_asked() {
+    fn a_raise_wires_the_named_present_agents_and_says_who_asked() {
         let dir = tempfile::tempdir().unwrap();
         let home = a_home(dir.path());
 
-        let first = ensure_in(
-            &home,
-            &request(AgentHooksMode::Auto, &["cursor"]),
-            Guard::PERMITTED,
-        )
-        .expect("ensure");
+        let first = ensure_in(&home, &request(&["claude"]), Guard::PERMITTED).expect("raise");
         assert_eq!(first.wired, vec!["claude".to_string()]);
         assert!(first.errors.is_empty(), "{first:?}");
         let reasons: Vec<(&str, &str)> = first
@@ -191,7 +171,10 @@ mod tests {
             .iter()
             .map(|s| (s.agent.as_str(), s.reason.as_str()))
             .collect();
-        assert!(reasons.contains(&("cursor", "not allowed")), "{reasons:?}");
+        assert!(
+            reasons.contains(&("cursor", "not allowed")),
+            "cursor is present but never named: {reasons:?}"
+        );
         assert!(
             reasons.iter().any(|(agent, _)| *agent == "codex"),
             "an absent agent is a skip, not an error: {reasons:?}"
@@ -211,7 +194,7 @@ mod tests {
     /// flips `noticed` for what it reports, so the next client to
     /// connect hears nothing.
     ///
-    /// The flip happens inside the ensure's own lock, which is what makes
+    /// The flip happens inside the raise's own lock, which is what makes
     /// this true of two *overlapping* clients and not just two sequential
     /// ones — a flip taken afterwards, under a re-acquired lock, would
     /// let both read the same agent as unannounced.
@@ -219,47 +202,52 @@ mod tests {
     fn a_second_client_is_told_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let home = a_home(dir.path());
-        let ask = request(AgentHooksMode::Auto, &[]);
+        let ask = request(&["claude"]);
 
-        let first = ensure_in(&home, &ask, Guard::PERMITTED).expect("ensure");
+        let first = ensure_in(&home, &ask, Guard::PERMITTED).expect("raise");
         assert!(first.wired.contains(&"claude".to_string()));
-        let second = ensure_in(&home, &ask, Guard::PERMITTED).expect("ensure again");
+        let second = ensure_in(&home, &ask, Guard::PERMITTED).expect("raise again");
         assert!(second.wired.is_empty(), "{second:?}");
         assert!(second.refreshed.is_empty(), "{second:?}");
     }
 
-    /// `off` from the client takes the host's entries back out — the
-    /// half of the pin that makes an opt-out reach a machine that has no
-    /// config of its own.
+    /// A second client that raises a *different* agent widens the host
+    /// rather than replacing the first client's grant — the additive
+    /// half of the raise rule, and the reason this op never takes
+    /// anything out.
     #[test]
-    fn off_from_the_client_unwires_the_host() {
+    fn a_second_client_widens_rather_than_replaces() {
         let dir = tempfile::tempdir().unwrap();
         let home = a_home(dir.path());
-        ensure_in(&home, &request(AgentHooksMode::Auto, &[]), Guard::PERMITTED).expect("wire");
+        ensure_in(&home, &request(&["claude"]), Guard::PERMITTED).expect("first raise");
 
-        let swept =
-            ensure_in(&home, &request(AgentHooksMode::Off, &[]), Guard::PERMITTED).expect("unwire");
-        assert!(swept.removed.contains(&"claude".to_string()), "{swept:?}");
-        assert!(swept.wired.is_empty(), "{swept:?}");
-        let settings =
-            std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap_or_default();
-        assert!(!settings.contains("ROOST_AGENT_HOOK"), "{settings}");
+        let second =
+            ensure_in(&home, &request(&["cursor"]), Guard::PERMITTED).expect("second raise");
+        assert!(second.wired.contains(&"cursor".to_string()), "{second:?}");
+        assert!(
+            second.removed.is_empty(),
+            "a raise never removes: {second:?}"
+        );
+        assert!(
+            std::fs::read_to_string(dir.path().join(".claude/settings.json"))
+                .unwrap()
+                .contains("ROOST_AGENT_HOOK"),
+            "the first client's grant survives the second's raise"
+        );
     }
 
-    /// A skip name no agent answers to is reported and otherwise
-    /// ignored — never a refusal, so a newer client's agent name cannot
-    /// break an older host.
+    /// A name no agent answers to is reported and otherwise ignored —
+    /// never a refusal here, so a newer client's agent name cannot break
+    /// an older host. (Whether the request should have been refused
+    /// outright is the engine's call, made before this function ever
+    /// runs — see this module's own doc.)
     #[test]
-    fn an_unknown_skip_name_is_reported_not_fatal() {
+    fn an_unknown_agent_name_is_reported_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
         let home = a_home(dir.path());
 
-        let done = ensure_in(
-            &home,
-            &request(AgentHooksMode::Auto, &["gemini"]),
-            Guard::PERMITTED,
-        )
-        .expect("an unknown name must not fail the run");
+        let done = ensure_in(&home, &request(&["claude", "gemini"]), Guard::PERMITTED)
+            .expect("an unknown name must not fail the run");
         assert!(done.wired.contains(&"claude".to_string()), "{done:?}");
         let named = done
             .skipped
@@ -273,7 +261,7 @@ mod tests {
     /// `ROOST_TEST_MODE=1` and no explicit override writes nothing, and
     /// says so rather than reporting an empty success.
     #[test]
-    fn the_test_mode_fence_applies_to_a_remote_ensure() {
+    fn the_test_mode_fence_applies_to_a_remote_raise() {
         let dir = tempfile::tempdir().unwrap();
         let home = a_home(dir.path());
         let guard = Guard {
@@ -281,7 +269,7 @@ mod tests {
             forced: false,
         };
 
-        let refused = ensure_in(&home, &request(AgentHooksMode::Auto, &[]), guard)
+        let refused = ensure_in(&home, &request(&["claude"]), guard)
             .expect_err("test mode must stop the install engine dead")
             .to_string();
         assert!(refused.contains("ROOST_TEST_MODE"), "{refused}");
@@ -298,7 +286,7 @@ mod tests {
     /// a session's mutation barrier — and with it `session.stop` — is
     /// released in bounded time whatever the home is mounted on.
     #[test]
-    fn an_ensure_waits_for_a_busy_lock_and_still_runs() {
+    fn a_raise_waits_for_a_busy_lock_and_still_runs() {
         let dir = tempfile::tempdir().unwrap();
         let home = a_home(dir.path());
         let held = roost_agent_install::write::lock(&home.lock_path()).expect("take the lock");
@@ -307,7 +295,7 @@ mod tests {
             drop(held);
         });
 
-        let done = ensure_in(&home, &request(AgentHooksMode::Auto, &[]), Guard::PERMITTED)
+        let done = ensure_in(&home, &request(&["claude"]), Guard::PERMITTED)
             .expect("the lock frees well inside the deadline");
         releasing.join().unwrap();
         assert!(done.wired.contains(&"claude".to_string()), "{done:?}");

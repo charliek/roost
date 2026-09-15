@@ -387,7 +387,10 @@ def test_a_second_client_changes_nothing_for_the_first(env):
         first.call("session.set_theme", {"osc_colors": theme()})
         wired = first.call(
             "session.set_agent_hooks",
-            {"mode": "auto", "skip": [], "client": "roosttest"},
+            {
+                "agents": list(sessionlib.agent_jail.INSTALLABLE_AGENTS),
+                "client": "roosttest",
+            },
         )
         assert wired["errors"] == [], wired
         assert set(jail.read_record()) == set(wired["wired"]), wired

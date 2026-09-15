@@ -1,0 +1,7 @@
+{
+  "id": "22",
+  "op": "agent.set_hooks",
+  "params": {
+    "agents": "off"
+  }
+}

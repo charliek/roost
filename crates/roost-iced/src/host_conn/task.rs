@@ -460,27 +460,31 @@ impl Live {
 /// The ops an older session answers `unknown-op` to, and whether this
 /// *task* has been told about each yet.
 ///
+/// `session.set_agent_hooks` predating a host used to have an entry
+/// here too (plan 046), but protocol equality (plan 061) retired it: a
+/// session too old to know the op is also too old to pass the
+/// `session-mismatch` protocol-version check at attach, so this task
+/// never reaches a live connection with it in the first place. That
+/// leaves `session.set_focus`, which really does predate some attached
+/// hosts (HS-2).
+///
 /// A session that predates one of these is not a fault: the client keeps
 /// sending (it has no other way to find out, and the refusal costs one
 /// round trip), the connection is unaffected, and one line is the whole
-/// story — a line per selection change, or per reconnect's ensure, is
-/// noise.
+/// story — a line per selection change is noise.
 ///
-/// It deliberately outlives [`Live`]. `session.set_agent_hooks` is
-/// re-sent on **every** connect, and a localhost session that drops
-/// reconnects on a 250 ms ladder, so a flag rebuilt per connection would
-/// say the same sentence about the same unchanging session forever. The
-/// facts it latches are properties of the session, not of the wire to
-/// it, so [`connect_loop`] owns one for as long as it keeps dialling the
-/// same host.
+/// It deliberately outlives [`Live`]. `session.set_focus` is re-sent
+/// whenever the client's selection changes, and a localhost session
+/// that drops reconnects on a 250 ms ladder, so a flag rebuilt per
+/// connection would say the same sentence about the same unchanging
+/// session forever. The fact it latches is a property of the session,
+/// not of the wire to it, so [`connect_loop`] owns one for as long as
+/// it keeps dialling the same host.
 #[derive(Default)]
 struct Unsupported {
     /// HS-2 sessions predate `session.set_focus`; their attached tab
     /// suppresses its own notifications.
     focus: bool,
-    /// Sessions before plan 046 predate `session.set_agent_hooks`; their
-    /// agent hooks are whatever the host itself last set.
-    agent_hooks: bool,
 }
 
 impl Unsupported {
@@ -504,11 +508,6 @@ impl Unsupported {
                 &mut self.focus,
                 "this host session predates session.set_focus; its attached \
                  tab suppresses its own notifications",
-            ),
-            ops::SESSION_SET_AGENT_HOOKS => (
-                &mut self.agent_hooks,
-                "this host session predates session.set_agent_hooks; this \
-                 client's agent-hooks setting does not reach it",
             ),
             _ => return None,
         };
@@ -2210,284 +2209,20 @@ mod tests {
         }
     }
 
-    /// The latch itself: one sentence per op, and each op independent of
-    /// the others.
-    ///
-    /// This says nothing about *who owns* the latch, which is the half
-    /// that actually decides whether the user sees one line or one per
-    /// reconnect — that is
-    /// [`an_old_session_is_noted_once_across_reconnects`], driven through
-    /// the real task.
+    /// The latch itself: one sentence per op, never repeated.
     #[test]
     fn a_refusal_is_noted_once_per_op_and_never_again() {
         let mut flags = Unsupported::default();
 
         let first = flags
-            .note(
-                ops::SESSION_SET_AGENT_HOOKS,
-                &refused(ServerCode::UnknownOp),
-            )
+            .note(ops::SESSION_SET_FOCUS, &refused(ServerCode::UnknownOp))
             .expect("the first refusal is worth saying");
-        assert!(first.contains("session.set_agent_hooks"), "{first}");
+        assert!(first.contains("session.set_focus"), "{first}");
         assert!(
             flags
-                .note(
-                    ops::SESSION_SET_AGENT_HOOKS,
-                    &refused(ServerCode::UnknownOp)
-                )
+                .note(ops::SESSION_SET_FOCUS, &refused(ServerCode::UnknownOp))
                 .is_none(),
             "every reconnect re-sends it; only the first refusal is news"
-        );
-
-        // Independent latches: an old session refuses both, and each
-        // gets its own sentence.
-        assert!(flags
-            .note(ops::SESSION_SET_FOCUS, &refused(ServerCode::UnknownOp))
-            .is_some_and(|note| note.contains("session.set_focus")));
-        assert!(flags
-            .note(ops::SESSION_SET_FOCUS, &refused(ServerCode::UnknownOp))
-            .is_none());
-    }
-
-    /// Everything `tracing` emitted while a guard was held.
-    #[derive(Clone, Default)]
-    struct Captured(Arc<Mutex<Vec<u8>>>);
-
-    impl Captured {
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-        }
-    }
-
-    impl std::io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-        type Writer = Captured;
-        fn make_writer(&'a self) -> Captured {
-            self.clone()
-        }
-    }
-
-    /// A session that serves the whole prologue, refuses
-    /// `session.set_agent_hooks` as `unknown-op`, and then goes away so
-    /// the client reconnects.
-    ///
-    /// **Goes away entirely**, not just on the control connection: every
-    /// open connection ends on the same generation bump.
-    ///
-    /// The `events.subscribe` counter is the script, and it is
-    /// deterministic because the client's own ladder is: **#1** is the
-    /// first connection's real subscribe; **#2** is the retry's, refused
-    /// so it drops and tries again; **#3** is the second connection's
-    /// real subscribe; **#4** is answered `shutting-down`, which is
-    /// terminal and is what ends the task.
-    ///
-    /// Returns how many agent-hooks requests it served, so the test can
-    /// assert the op really reached two separate connections rather than
-    /// silently one.
-    fn a_session_that_never_heard_of_agent_hooks(socket: &Path) -> Arc<Mutex<usize>> {
-        let listener = tokio::net::UnixListener::bind(socket).expect("bind a fake session");
-        let served = Arc::new(Mutex::new(0usize));
-        let counted = Arc::clone(&served);
-        let subscribes = Arc::new(Mutex::new(0u32));
-        let (bump, generation) = tokio::sync::watch::channel(0u32);
-        let bump = Arc::new(bump);
-        tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let served = Arc::clone(&counted);
-                let subscribes = Arc::clone(&subscribes);
-                let bump = Arc::clone(&bump);
-                let mut generation = generation.clone();
-                generation.mark_unchanged();
-                tokio::spawn(async move {
-                    let (reader, mut writer) = stream.into_split();
-                    let mut lines =
-                        tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(reader));
-                    loop {
-                        let line = tokio::select! {
-                            _ = generation.changed() => return,
-                            line = lines.next_line() => match line {
-                                Ok(Some(line)) => line,
-                                _ => return,
-                            },
-                        };
-                        let request: serde_json::Value =
-                            serde_json::from_str(&line).expect("a request");
-                        let id = request["id"].clone();
-                        let op = request["op"].as_str().unwrap_or_default().to_string();
-                        let mut close_after = false;
-                        let response = match op.as_str() {
-                            ops::SESSION_IDENTIFY => serde_json::json!({
-                                "id": id,
-                                "ok": true,
-                                "result": identify_result(SESSION_ID),
-                            }),
-                            ops::SESSION_SET_THEME => {
-                                serde_json::json!({"id": id, "ok": true, "result": {}})
-                            }
-                            ops::TAB_LIST => serde_json::json!({
-                                "id": id,
-                                "ok": true,
-                                "result": seeded_list(Some(1)),
-                            }),
-                            ops::EVENTS_SUBSCRIBE => {
-                                let nth = {
-                                    let mut count = subscribes.lock().unwrap();
-                                    *count += 1;
-                                    *count
-                                };
-                                match nth {
-                                    // A refusal the ladder retries, so
-                                    // the second ensure lands on a third
-                                    // connection.
-                                    2 => serde_json::json!({
-                                        "id": id,
-                                        "ok": false,
-                                        "error": {
-                                            "code": "internal",
-                                            "message": "not this time",
-                                        },
-                                    }),
-                                    // And the one that ends the task, so
-                                    // `run` returns and the log can be
-                                    // read.
-                                    4 => serde_json::json!({
-                                        "id": id,
-                                        "ok": false,
-                                        "error": {
-                                            "code": "shutting-down",
-                                            "message": "going away",
-                                        },
-                                    }),
-                                    // A real subscribe. Answering and
-                                    // then simply reading on is what a
-                                    // push connection looks like: the
-                                    // client sends nothing more on it,
-                                    // and it ends when the client
-                                    // closes it.
-                                    _ => serde_json::json!({
-                                        "id": id,
-                                        "ok": true,
-                                        "result": { "revision": 1, "session_id": SESSION_ID },
-                                    }),
-                                }
-                            }
-                            ops::SESSION_SET_AGENT_HOOKS => {
-                                *served.lock().unwrap() += 1;
-                                // The session going away after the
-                                // refusal is what makes this a
-                                // *reconnect* rather than one long
-                                // connection with two ensures on it.
-                                // The bump takes the event stream with
-                                // it; `close_after` ends this one after
-                                // the refusal is on the wire.
-                                bump.send_modify(|generation| *generation += 1);
-                                close_after = true;
-                                serde_json::json!({
-                                    "id": id,
-                                    "ok": false,
-                                    "error": {
-                                        "code": "unknown-op",
-                                        "message": "no such op: session.set_agent_hooks",
-                                    },
-                                })
-                            }
-                            _ => serde_json::json!({
-                                "id": id,
-                                "ok": false,
-                                "error": { "code": "internal", "message": "refused" },
-                            }),
-                        };
-                        let mut body = serde_json::to_vec(&response).expect("encode a response");
-                        body.push(b'\n');
-                        if tokio::io::AsyncWriteExt::write_all(&mut writer, &body)
-                            .await
-                            .is_err()
-                            || close_after
-                        {
-                            break;
-                        }
-                    }
-                });
-            }
-        });
-        served
-    }
-
-    /// **An old session costs one line for the life of the connection
-    /// task, not one per reconnect.**
-    ///
-    /// `session.set_agent_hooks` is re-sent on every connect and a
-    /// dropped localhost session reconnects on a 250 ms ladder, so
-    /// a latch rebuilt per connection would repeat the same sentence
-    /// about the same unchanging session forever. Driven through the real
-    /// [`run`] against a session that refuses the op, across two
-    /// connections, because that is the only place the latch's *owner*
-    /// is observable — asserting on `Unsupported` alone would pass just
-    /// as well if nothing ever called it.
-    #[tokio::test]
-    async fn an_old_session_is_noted_once_across_reconnects() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let socket = dir.path().join("old-session.sock");
-        let served = a_session_that_never_heard_of_agent_hooks(&socket);
-
-        let logs = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(logs.clone())
-            .with_max_level(tracing::Level::INFO)
-            .without_time()
-            .with_ansi(false)
-            .finish();
-        let restore = tracing::subscriber::set_default(subscriber);
-
-        // Localhost, so a dropped connection is retried by this same
-        // task — which is exactly the reconnect under test.
-        let config = config(socket, HostTransport::LocalSession, ConnectMode::Dial);
-        let (feed, _rx) = crate::engine_feed::channel();
-        let (ops_tx, ops_rx) = super::super::HostOps::channel();
-        // The app re-sends the op on every connected edge; this stands in
-        // for that, and keeps sending so each connection serves one.
-        let asking = tokio::spawn(async move {
-            loop {
-                let _ = ops_tx
-                    .call(
-                        ops::SESSION_SET_AGENT_HOOKS,
-                        serde_json::json!({"mode": "auto", "skip": [], "client": "t"}),
-                    )
-                    .await;
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        });
-        run(
-            config,
-            HostIdMinter::new(),
-            ops_rx,
-            feed,
-            Arc::new(Shutdown::default()),
-        )
-        .await;
-        asking.abort();
-        drop(restore);
-
-        assert!(
-            *served.lock().unwrap() >= 2,
-            "the op has to reach two separate connections for this to prove anything, \
-             not {}",
-            served.lock().unwrap()
-        );
-        let text = logs.text();
-        assert_eq!(
-            text.matches("predates session.set_agent_hooks").count(),
-            1,
-            "an old session is one line, whatever the reconnect count: {text}"
         );
     }
 
@@ -2503,15 +2238,12 @@ mod tests {
             HostOpError::Transport("the wire died".into()),
             HostOpError::Disconnected,
         ] {
-            assert!(flags.note(ops::SESSION_SET_AGENT_HOOKS, &error).is_none());
+            assert!(flags.note(ops::SESSION_SET_FOCUS, &error).is_none());
         }
         // And the latch was never spent, so the real thing still gets
         // its line.
         assert!(flags
-            .note(
-                ops::SESSION_SET_AGENT_HOOKS,
-                &refused(ServerCode::UnknownOp)
-            )
+            .note(ops::SESSION_SET_FOCUS, &refused(ServerCode::UnknownOp))
             .is_some());
     }
 

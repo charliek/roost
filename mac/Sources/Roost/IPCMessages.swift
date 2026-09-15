@@ -642,10 +642,14 @@ let ipcProtocolVersion: UInt32 = 1
 /// the two move independently. Mirrors Rust's
 /// `messages::SESSION_PROTOCOL_VERSION`.
 ///
-/// At `5` every same-UID connection to a session is symmetric: no
+/// At `5` every same-UID connection to a session became symmetric: no
 /// owner, no lease, no foreground. Effects fan out to every subscriber,
 /// `session.set_focus` is a per-connection statement about what that
 /// client is looking at, and the PTY is sized by the last interactor.
+/// `6` reshapes `session.set_agent_hooks`: it carries the agents a
+/// client's own `agent-hooks` key allows, and a client only ever
+/// *raises* the host's setting — `mode` and `skip` are gone, and a
+/// client that allows nothing sends no frame at all (plan 064 §3.3).
 ///
 /// The rule: a **session-socket change bumps this when a pre-bump peer
 /// could not refuse it meaningfully**, in either direction. A new event
@@ -654,7 +658,7 @@ let ipcProtocolVersion: UInt32 = 1
 /// **equality** and refuses anything else, so it is the whole
 /// negotiation; what each generation changed is `CHANGELOG.md`'s to
 /// tell.
-let ipcSessionProtocolVersion: UInt32 = 5
+let ipcSessionProtocolVersion: UInt32 = 6
 
 /// Maximum length of a single framed line. Matches roost-ipc's
 /// `MAX_FRAME_BYTES`.

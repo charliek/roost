@@ -3137,24 +3137,25 @@ impl App {
         self.pending_agent_hooks_toast = Some((toast, result.unnoticed));
     }
 
-    /// Ask a host that has just connected to bring its agent hooks in
-    /// line with this client's config (plan 046 §3.4).
+    /// Ask a host that has just connected to raise its agent hooks to at
+    /// least this client's own allow-list (plan 046 §3.4, plan 064
+    /// §3.3).
     ///
     /// The config is read here, on every connect, rather than captured
     /// when the connection was opened: a reconnect after the user edited
     /// `agent-hooks` has to carry the new answer, and this is the only
     /// place that runs on both the first connect and every retry.
     ///
-    /// `None` (plan 064: `agent-hooks` is unconfigured, `Ask`) sends
-    /// nothing — an unconfigured client must not wire a host's dotfiles
-    /// either, so this connect is silent rather than defaulting to
-    /// `Auto`.
+    /// `None` — `agent-hooks` is `off`, unconfigured, or an empty
+    /// allow-list — sends nothing: the wire can only ever raise a host
+    /// now, and none of those three states has an allow-list to raise it
+    /// with.
     fn wire_host_agent_hooks(&mut self, host: &str) {
-        let Some((mode, skip)) = agent_hooks::remote_request(&self.config) else {
+        let Some(agents) = agent_hooks::remote_request(&self.config) else {
             return;
         };
         self.hosts
-            .wire_agent_hooks(host, mode, &skip, &agent_hooks::client_label());
+            .wire_agent_hooks(host, &agents, &agent_hooks::client_label());
     }
 
     /// A host answered `session.set_agent_hooks`.

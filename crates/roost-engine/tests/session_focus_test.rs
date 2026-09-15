@@ -11,7 +11,7 @@ use roost_engine::ipc::{
     AgentHooksError, AgentHooksHandle, AgentHooksRequest, IpcHandler, SessionInfo, StopHandle,
 };
 use roost_engine::{AttentionSource, PtySupervisor, Workspace};
-use roost_ipc::messages::{ops, SessionSetAgentHooksResult};
+use roost_ipc::messages::{ops, AgentHooksOutcome};
 use roost_ipc::{ConnAction, ConnCloseWatch, ConnCtx, Handler, HandlerOutcome, PushSource};
 use tempfile::TempDir;
 
@@ -317,14 +317,9 @@ async fn a_ui_sockets_connection_ending_changes_nothing() {
 // session.set_agent_hooks — what the install backend's answers become
 // ---------------------------------------------------------------------------
 
-async fn set_agent_hooks(
-    f: &Fixture,
-    c: &Conn,
-    mode: &str,
-) -> Result<SessionSetAgentHooksResult, String> {
+async fn set_agent_hooks(f: &Fixture, c: &Conn) -> Result<AgentHooksOutcome, String> {
     let params = serde_json::json!({
-        "mode": mode,
-        "skip": ["cursor"],
+        "agents": ["claude"],
         "client": "charlie-mbp",
     });
     match f
@@ -345,7 +340,7 @@ async fn a_session_without_an_install_backend_says_not_supported() {
     let f = fixture();
     let asking = conn(1);
     assert_eq!(
-        set_agent_hooks(&f, &asking, "auto").await,
+        set_agent_hooks(&f, &asking).await,
         Err("not-supported".into())
     );
 }
@@ -361,8 +356,5 @@ async fn a_failing_install_backend_surfaces_as_internal() {
     });
     let f = fixture_with(Some(handle));
     let asking = conn(1);
-    assert_eq!(
-        set_agent_hooks(&f, &asking, "auto").await,
-        Err("internal".into())
-    );
+    assert_eq!(set_agent_hooks(&f, &asking).await, Err("internal".into()));
 }

@@ -17,12 +17,12 @@ use std::fs;
 use std::path::PathBuf;
 
 use roost_ipc::messages::{
-    ops, AgentHooksMode, AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode,
-    AttachPayloadKind, ClipboardEffectTarget, ClipboardWriteParams, EventBatch, EventEnvelope,
-    EventsSubscribeParams, EventsSubscribeResult, ProjectReorderParams, ResponseError,
-    RetrySchedule, SentFile, SessionBinaryIdentity, SessionIdentify, SessionIdentifyParams,
-    SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams,
-    SessionSetAgentHooksResult, SessionSetFocusParams, SessionSetThemeParams,
+    ops, AgentHooksOutcome, AgentSetHooksAgents, AgentSetHooksParams, AgentSetHooksResult,
+    AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode, AttachPayloadKind,
+    ClipboardEffectTarget, ClipboardWriteParams, EventBatch, EventEnvelope, EventsSubscribeParams,
+    EventsSubscribeResult, ProjectReorderParams, ResponseError, RetrySchedule, SentFile,
+    SessionBinaryIdentity, SessionIdentify, SessionIdentifyParams, SessionPutFileParams,
+    SessionPutFileResult, SessionSetAgentHooksParams, SessionSetFocusParams, SessionSetThemeParams,
     SessionSetThemeResult, SessionStopParams, SessionStopResult, SessionStoppingEvent, SkippedFile,
     TabAttachParams, TabAttachResult, TabDumpCursor, TabDumpParams, TabDumpResult, TabEffect,
     TabEffectEvent, TabReorderParams, TabSendFileParams, TabSendFileResult, TabWriteParams,
@@ -88,13 +88,14 @@ where
     );
 }
 
-/// `5` retires the lease: no `session.connect`, no `lease` on any op, no
-/// `session.driver_changed`, no `features` — breaking in both
-/// directions. The request/response wire version did not move with it —
-/// the two version different things.
+/// `6` reshapes `session.set_agent_hooks` into a pure raise: `mode` +
+/// `skip` are gone, replaced by a single `agents` allow-list, and the
+/// op can no longer spell `off` or a narrowing — breaking in both
+/// directions (plan 064 §3.3). The request/response wire version did
+/// not move with it — the two version different things.
 #[test]
-fn session_protocol_version_is_five() {
-    assert_eq!(SESSION_PROTOCOL_VERSION, 5);
+fn session_protocol_version_is_six() {
+    assert_eq!(SESSION_PROTOCOL_VERSION, 6);
     assert_eq!(roost_ipc::PROTOCOL_VERSION, 1);
 }
 
@@ -155,7 +156,7 @@ fn a_request_carrying_a_lease_is_refused_by_every_op_that_took_one() {
     refused(
         ops::SESSION_SET_AGENT_HOOKS,
         serde_json::from_value::<SessionSetAgentHooksParams>(
-            serde_json::json!({"lease": "l", "mode": "auto", "client": "c"}),
+            serde_json::json!({"lease": "l", "agents": ["claude"], "client": "c"}),
         )
         .map(drop),
     );
@@ -246,7 +247,7 @@ fn unknown_attach_payload_kind_survives_a_round_trip() {
 #[test]
 fn session_identify_matches_its_golden_json() {
     const GOLDEN: &str = concat!(
-        r#"{"app_version":"0.0.18","session_protocol":5,"#,
+        r#"{"app_version":"0.0.18","session_protocol":6,"#,
         r#""payload_kinds":["ghostty-snapshot","vt"],"#,
         r#""libghostty_build":"ghostty-3f6b1c9a4d2e5f80+snapshot.v1","#,
         r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","#,
@@ -267,7 +268,7 @@ fn session_identify_matches_its_golden_json() {
 #[test]
 fn session_binary_identity_matches_its_golden_json() {
     const GOLDEN: &str = concat!(
-        r#"{"app_version":"0.0.19","session_protocol":5,"#,
+        r#"{"app_version":"0.0.19","session_protocol":6,"#,
         r#""libghostty_build":"ghostty-abcdef0123456789+snapshot.v1"}"#,
     );
 
@@ -600,9 +601,9 @@ fn tab_attach_result_matches_its_golden_json() {
 
 #[test]
 fn attach_handshake_matches_its_golden_json() {
-    const SNAPSHOT: &str = r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":5}"#;
+    const SNAPSHOT: &str = r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":6}"#;
     const RESUME: &str = concat!(
-        r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":5,"#,
+        r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":6,"#,
         r#""resume_from_seq":901,"server_epoch":6032428321756423947,"#,
         r#""tab_generation":3}"#,
     );
@@ -1151,7 +1152,8 @@ fn session_set_focus_params_reject_unknown_fields_and_junk_ids() {
 }
 
 // ---------------------------------------------------------------------------
-// session.set_agent_hooks (plan 046 C8)
+// session.set_agent_hooks (plan 046 C8, reshaped into a raise by plan 064
+// C3 — see docs/reference/ipc-compatibility.md's generation-6 entry)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1165,34 +1167,26 @@ fn session_set_agent_hooks_vectors_decode_into_their_typed_shapes() {
     );
     let params: SessionSetAgentHooksParams =
         serde_json::from_value(request.params).expect("decode set_agent_hooks params");
-    assert_eq!(params.mode, AgentHooksMode::Auto);
-    assert_eq!(params.skip, vec!["cursor".to_string()]);
+    assert_eq!(
+        params.agents,
+        vec!["claude".to_string(), "codex".to_string()]
+    );
     assert_eq!(params.client, "charlie-mbp");
-    round_trip(&params);
-
-    // The other half of the pin: `off` on the client is `off` on the
-    // host, and it travels as a value of this same op rather than as an
-    // absence of it.
-    let raw = read_vector("session.set_agent_hooks.off.request.json");
-    let request: roost_ipc::messages::RawRequest =
-        serde_json::from_str(&raw).expect("decode request envelope");
-    let params: SessionSetAgentHooksParams =
-        serde_json::from_value(request.params).expect("decode an off request");
-    assert_eq!(params.mode, AgentHooksMode::Off);
-    assert!(params.skip.is_empty());
     round_trip(&params);
 
     let raw = read_vector("session.set_agent_hooks.response.json");
     let resp: roost_ipc::messages::Response =
         serde_json::from_str(&raw).expect("decode response envelope");
     assert!(resp.ok);
-    let result: SessionSetAgentHooksResult = serde_json::from_value(resp.result.expect("result"))
+    let result: AgentHooksOutcome = serde_json::from_value(resp.result.expect("result"))
         .expect("decode set_agent_hooks result");
     assert_eq!(
         result.wired,
         vec!["claude".to_string(), "codex".to_string()]
     );
     assert!(result.refreshed.is_empty());
+    // Always empty from this op now: a raise only ever widens, so there
+    // is nothing for it to report as taken out (plan 064 §3.3).
     assert!(result.removed.is_empty());
     assert!(result.errors.is_empty());
     let reasons: Vec<(&str, &str)> = result
@@ -1202,61 +1196,183 @@ fn session_set_agent_hooks_vectors_decode_into_their_typed_shapes() {
         .collect();
     assert_eq!(
         reasons,
-        vec![("cursor", "skip-list"), ("grok", "not installed")]
+        vec![("cursor", "not allowed"), ("grok", "not installed")]
     );
     round_trip(&result);
 }
 
-/// `mode` is the whole decision, so it is a closed set rather than a
-/// string: a typo has to be `invalid-param` on the wire, not a silent
-/// `auto` that wires a host the user asked to leave alone — nor a silent
-/// `off` that strips one.
+/// `agents` is the whole decision now: a raise-only allow-list, with no
+/// wire spelling left for `off` or a narrowing (plan 064 §3.3). Strict
+/// like every other request type — an unknown field, or a missing
+/// required one, is refused rather than silently accepted.
 #[test]
-fn session_set_agent_hooks_params_are_strict_about_mode_and_shape() {
+fn session_set_agent_hooks_params_are_strict_about_shape() {
     let ok = serde_json::json!({
-        "mode": "off",
-        "skip": [],
+        "agents": ["claude"],
         "client": "charlie-mbp",
     });
     assert!(serde_json::from_value::<SessionSetAgentHooksParams>(ok).is_ok());
 
-    for bad in [
-        serde_json::json!({"mode": "Auto", "client": "c"}),
-        serde_json::json!({"mode": "on", "client": "c"}),
-        serde_json::json!({"mode": true, "client": "c"}),
-    ] {
-        assert!(
-            serde_json::from_value::<SessionSetAgentHooksParams>(bad.clone()).is_err(),
-            "{bad} must not decode"
-        );
-    }
-
-    // `client` is required — the host's record has to name who asked.
+    // `agents` is required — there is no default allow-list, and an
+    // absent field is a client that forgot to say, not `off` or `ask`.
     let missing = serde_json::from_value::<SessionSetAgentHooksParams>(serde_json::json!({
-        "mode": "auto",
-    }))
-    .expect_err("an omitted client must not decode");
-    assert!(missing.to_string().contains("missing field"), "{missing}");
-
-    // `skip` is the one field a client may omit: no skip list is the
-    // ordinary case, and demanding an empty array would break nothing
-    // except hand-written requests.
-    let bare: SessionSetAgentHooksParams = serde_json::from_value(serde_json::json!({
-        "mode": "auto",
         "client": "charlie-mbp",
     }))
-    .expect("an omitted skip list is an empty one");
-    assert!(bare.skip.is_empty());
+    .expect_err("an omitted agents list must not decode");
+    assert!(missing.to_string().contains("missing field"), "{missing}");
+
+    // `client` is required too — the host's record has to name who asked.
+    let missing_client = serde_json::from_value::<SessionSetAgentHooksParams>(serde_json::json!({
+        "agents": ["claude"],
+    }))
+    .expect_err("an omitted client must not decode");
+    assert!(
+        missing_client.to_string().contains("missing field"),
+        "{missing_client}"
+    );
 
     assert!(
         serde_json::from_value::<SessionSetAgentHooksParams>(serde_json::json!({
-            "mode": "auto",
+            "agents": ["claude"],
             "client": "charlie-mbp",
             "tab_id": "5",
         }))
         .is_err(),
         "strict like every other request type"
     );
+}
+
+/// The retired `mode` + `skip` shape fails to decode rather than
+/// silently reinterpreting `mode` as an agent name or dropping `skip` on
+/// the floor. Protocol equality (plan 061) means a v5-shaped frame can
+/// never actually arrive from a real peer — a session too old to send
+/// this shape is also too old to pass the `session-mismatch` check at
+/// attach — but the type itself must not paper over it either.
+#[test]
+fn session_set_agent_hooks_rejects_the_pre_reshape_v5_wire_shape() {
+    let v5_shaped = serde_json::json!({
+        "mode": "auto",
+        "skip": ["cursor"],
+        "client": "charlie-mbp",
+    });
+    assert!(serde_json::from_value::<SessionSetAgentHooksParams>(v5_shaped).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// agent.set_hooks (plan 064 §3.4) — UI-socket types only; no server
+// implementation ships until C6 (iced) / C8 (Mac).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn agent_set_hooks_vectors_decode_into_their_typed_shapes() {
+    let raw = read_vector("agent.set_hooks.request.json");
+    let request: roost_ipc::messages::RawRequest =
+        serde_json::from_str(&raw).expect("decode request envelope");
+    assert_eq!(request.op, roost_ipc::messages::ops::AGENT_SET_HOOKS);
+    let params: AgentSetHooksParams =
+        serde_json::from_value(request.params).expect("decode agent.set_hooks params");
+    assert_eq!(
+        params.agents,
+        AgentSetHooksAgents::List(vec!["claude".to_string(), "codex".to_string()])
+    );
+    round_trip(&params);
+
+    let raw = read_vector("agent.set_hooks.off.request.json");
+    let request: roost_ipc::messages::RawRequest =
+        serde_json::from_str(&raw).expect("decode request envelope");
+    let off: AgentSetHooksParams =
+        serde_json::from_value(request.params).expect("decode an off agent.set_hooks request");
+    assert_eq!(off.agents, AgentSetHooksAgents::Off);
+    round_trip(&off);
+
+    let raw = read_vector("agent.set_hooks.response.json");
+    let resp: roost_ipc::messages::Response =
+        serde_json::from_str(&raw).expect("decode response envelope");
+    assert!(resp.ok);
+    let result: AgentSetHooksResult = serde_json::from_value(resp.result.expect("result"))
+        .expect("decode agent.set_hooks result");
+    assert_eq!(
+        result.config_path,
+        "/home/charlie/.config/roost/config.conf"
+    );
+    assert_eq!(
+        result.local.wired,
+        vec!["claude".to_string(), "codex".to_string()]
+    );
+    assert_eq!(result.hosts.len(), 2);
+    round_trip(&result);
+}
+
+/// `agents` accepts a list of any length, including empty — whether an
+/// empty list is a *valid* request is the server's call (`invalid-param`,
+/// plan 064 C6), not this type's. It also accepts the one word `off`,
+/// and rejects everything else: a two-variant `#[serde(untagged)]` enum
+/// would have let any string through as `Off`, silently. `[]` and other
+/// non-`"off"` strings are exercised together with the shape checks
+/// below rather than split out, since both are about what the wire
+/// format itself does or does not carry.
+#[test]
+fn agent_set_hooks_agents_accepts_lists_and_off_only() {
+    assert_eq!(
+        serde_json::from_value::<AgentSetHooksAgents>(serde_json::json!([])).unwrap(),
+        AgentSetHooksAgents::List(vec![])
+    );
+    assert_eq!(
+        serde_json::from_value::<AgentSetHooksAgents>(serde_json::json!(["claude"])).unwrap(),
+        AgentSetHooksAgents::List(vec!["claude".to_string()])
+    );
+    assert_eq!(
+        serde_json::from_value::<AgentSetHooksAgents>(serde_json::json!("off")).unwrap(),
+        AgentSetHooksAgents::Off
+    );
+
+    for bad in [
+        serde_json::json!("Off"),
+        serde_json::json!("none"),
+        serde_json::json!("ask"),
+        serde_json::json!(true),
+        serde_json::json!(5),
+        serde_json::json!({"agents": ["claude"]}),
+    ] {
+        assert!(
+            serde_json::from_value::<AgentSetHooksAgents>(bad.clone()).is_err(),
+            "{bad} must not decode"
+        );
+    }
+}
+
+/// `off` round-trips back to the exact string `"off"`, not to `null` or
+/// an empty array — the failure mode a naively-derived untagged enum
+/// would have produced.
+#[test]
+fn agent_set_hooks_agents_off_serializes_to_the_literal_string() {
+    assert_eq!(
+        serde_json::to_value(AgentSetHooksAgents::Off).unwrap(),
+        serde_json::json!("off")
+    );
+}
+
+#[test]
+fn agent_set_hooks_params_are_strict_about_shape() {
+    assert!(
+        serde_json::from_value::<AgentSetHooksParams>(serde_json::json!({
+            "agents": ["claude"],
+        }))
+        .is_ok()
+    );
+
+    assert!(
+        serde_json::from_value::<AgentSetHooksParams>(serde_json::json!({
+            "agents": ["claude"],
+            "client": "charlie-mbp",
+        }))
+        .is_err(),
+        "unlike session.set_agent_hooks this op has no client field —          the UI socket already knows who is asking"
+    );
+
+    let missing = serde_json::from_value::<AgentSetHooksParams>(serde_json::json!({}))
+        .expect_err("an omitted agents field must not decode");
+    assert!(missing.to_string().contains("missing field"), "{missing}");
 }
 
 // ============================================================================

@@ -30,8 +30,8 @@
 
 use roost_agent::Agent;
 use roost_agent_install::{Guard, Home, Mode};
-use roost_ipc::messages::{AgentHooksMode, SessionSetAgentHooksResult};
-use roost_ui_model::config::{AgentHooks, RoostConfig, AGENT_NAMES};
+use roost_ipc::messages::AgentHooksOutcome;
+use roost_ui_model::config::{AgentHooks, RoostConfig};
 
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
 use crate::host_conn::queue::HostOpError;
@@ -191,7 +191,7 @@ pub(crate) fn spawn_mark_noticed(runtime: &tokio::runtime::Handle, agents: Vec<A
 pub(crate) struct HostAgentHooks {
     /// The host's label, for the toast prefix and the log.
     pub label: String,
-    pub outcome: Result<SessionSetAgentHooksResult, HostOpError>,
+    pub outcome: Result<AgentHooksOutcome, HostOpError>,
 }
 
 /// What this client asks a host to do, read fresh from its config, or
@@ -201,39 +201,24 @@ pub(crate) struct HostAgentHooks {
 /// to send: the op is idempotent, and a config edit made since the last
 /// connect has no other way to reach the host.
 ///
-/// **`Ask` sends nothing — deliberately, not yet the full C4 raise
-/// semantics.** An unconfigured client has not been told which agents it
-/// may touch; wiring a host's dotfiles anyway would be exactly the
-/// unconsented write plan 064 exists to stop, so `wire_host_agent_hooks`
-/// (the one caller) skips the send entirely rather than mapping `Ask` to
-/// `Auto`. What C4 adds on top of this is host state raising an
-/// unconfigured client's *local* dialog; this commit only has to make
-/// sure that client stays silent toward the host until then.
+/// **Only `Allow` ever sends anything, because the wire can now only
+/// ever raise.** Plan 064 §3.3 reshaped `session.set_agent_hooks` into a
+/// pure widen: there is no wire spelling of "off" or "narrow this" left
+/// to send, so a host's key can only move up, never down, from a
+/// connect. That retires the C1-era "off is off everywhere" rule this
+/// function used to carry — `Off` sends nothing now, exactly like `Ask`,
+/// because neither state has an allow-list to widen the host with.
+/// Taking a host's entries back out stays a deliberate, local act:
+/// `roostctl agent ensure`/`uninstall`, run by hand on the host itself.
 ///
-/// `Off`, by contrast, still travels rather than staying silent: locally
-/// it means "wire nothing" and the UI never opens an agent's file;
-/// remotely it means "unwire", and the difference is not an
-/// inconsistency — a host has no `config.conf` of its own, so an
-/// explicitly-off client is the only authority that can tell it to come
-/// clean (§3.4, and §3.6's C7 amendment for the local half).
-///
-/// `Allow`'s skip list travels as the complement of the allowed names,
-/// spelled out rather than sent as an allow-list: the wire shape still
-/// carries mode+skip at this commit (C3 reshapes it). The host resolves
-/// the names and reports the ones it does not know, which is the only
-/// place that can tell a typo from an agent a newer client knows about.
-pub(crate) fn remote_request(config: &RoostConfig) -> Option<(AgentHooksMode, Vec<String>)> {
+/// `Ask` (unconfigured) sending nothing was always the rule: wiring a
+/// host's dotfiles before the user has answered the local consent
+/// dialog would be exactly the unconsented write plan 064 exists to
+/// stop.
+pub(crate) fn remote_request(config: &RoostConfig) -> Option<Vec<String>> {
     match &config.agent_hooks {
-        AgentHooks::Allow(names) => {
-            let skip: Vec<String> = AGENT_NAMES
-                .iter()
-                .filter(|name| !names.iter().any(|n| n == *name))
-                .map(|name| name.to_string())
-                .collect();
-            Some((AgentHooksMode::Auto, skip))
-        }
-        AgentHooks::Off => Some((AgentHooksMode::Off, Vec::new())),
-        AgentHooks::Ask => None,
+        AgentHooks::Allow(names) if !names.is_empty() => Some(names.clone()),
+        AgentHooks::Allow(_) | AgentHooks::Off | AgentHooks::Ask => None,
     }
 }
 
@@ -335,26 +320,24 @@ mod tests {
         assert_eq!(resolve(&config("agent-hooks = off")), Some(Mode::Off));
     }
 
-    /// The remote half sends `off` rather than staying quiet, which is
-    /// the whole of "off is off everywhere": the host has no config of
-    /// its own to read, so silence would leave its files wired forever.
+    /// `Off` sends nothing — the wire can only ever raise a host now
+    /// (plan 064 §3.3), and an off client has no allow-list to raise it
+    /// with. Retiring the host's entries stays a local, explicit act.
     #[test]
-    fn off_travels_to_a_host_instead_of_being_withheld() {
-        let (mode, skip) = remote_request(&config("agent-hooks = off")).unwrap();
-        assert_eq!(mode, AgentHooksMode::Off);
-        assert!(skip.is_empty());
+    fn off_sends_nothing_to_a_host() {
+        assert_eq!(remote_request(&config("agent-hooks = off")), None);
     }
 
     #[test]
-    fn an_allow_list_travels_as_the_complement_skip_list() {
-        let (mode, skip) = remote_request(&config("agent-hooks = claude, cursor")).unwrap();
-        assert_eq!(mode, AgentHooksMode::Auto);
-        assert_eq!(skip, vec!["codex", "grok", "opencode"]);
+    fn an_allow_list_travels_as_itself() {
+        assert_eq!(
+            remote_request(&config("agent-hooks = claude, cursor")),
+            Some(vec!["claude".to_string(), "cursor".to_string()])
+        );
     }
 
-    /// `Ask` sends nothing at all — the deliberate deviation from "off is
-    /// off everywhere" that plan 064 draws: an unconfigured client must
-    /// not wire a host's dotfiles either.
+    /// `Ask` sends nothing at all: an unconfigured client must not wire
+    /// a host's dotfiles either.
     #[test]
     fn an_unconfigured_config_sends_nothing_to_a_host() {
         assert_eq!(remote_request(&config("")), None);

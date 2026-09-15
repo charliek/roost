@@ -25,24 +25,24 @@ use std::time::Duration;
 
 use roost_ipc::agent::{self, TabAgentReportParams};
 use roost_ipc::messages::{
-    ops, AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
-    AppCursorShapeParams, AppCursorShapeResult, AppDialogAnswerParams, AppDialogDumpParams,
-    AppDialogDumpResult, AppDockBadgeParams, AppDockBadgeResult, AppKeybindDispatchParams,
-    AppMenuActivateParams, AppMenuDumpParams, AppMenuDumpResult, AppNotificationStatusParams,
-    AppNotificationStatusResult, AppRenderStatsParams, AppRenderStatsResult,
-    AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams, AppUpdateCheckParams,
-    AppUpdateStatusParams, AppUpdateStatusResult, AttachPayloadKind, ClipboardDumpParams,
-    ClipboardDumpResult, ClipboardWriteParams, EventsSubscribeParams, EventsSubscribeResult, Host,
-    HostAddParams, HostAddResult, HostConnectParams, HostConnectionResult, HostDisconnectParams,
-    HostListParams, HostListResult, HostRemoveParams, HostStatusParams, HostStatusResult,
-    IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
-    PaletteDismissParams, PaletteOpenParams, PalettePresentParams, PalettePresentResult,
-    PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
-    ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
-    ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
-    SelectionDumpResult, SelectionSetParams, SessionIdentify, SessionIdentifyParams,
-    SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams,
-    SessionSetAgentHooksResult, SessionSetFocusParams, SessionSetThemeParams, SessionStopParams,
+    ops, AgentHooksOutcome, AppActivateParams, AppActiveTerminalFocusedParams,
+    AppActiveTerminalFocusedResult, AppCursorShapeParams, AppCursorShapeResult,
+    AppDialogAnswerParams, AppDialogDumpParams, AppDialogDumpResult, AppDockBadgeParams,
+    AppDockBadgeResult, AppKeybindDispatchParams, AppMenuActivateParams, AppMenuDumpParams,
+    AppMenuDumpResult, AppNotificationStatusParams, AppNotificationStatusResult,
+    AppRenderStatsParams, AppRenderStatsResult, AppSelectedTabIdParams, AppSelectedTabIdResult,
+    AppSetWindowFocusParams, AppUpdateCheckParams, AppUpdateStatusParams, AppUpdateStatusResult,
+    AttachPayloadKind, ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteParams,
+    EventsSubscribeParams, EventsSubscribeResult, Host, HostAddParams, HostAddResult,
+    HostConnectParams, HostConnectionResult, HostDisconnectParams, HostListParams, HostListResult,
+    HostRemoveParams, HostStatusParams, HostStatusResult, IdentifyParams, IdentifyResult,
+    NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
+    PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
+    PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
+    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
+    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
+    SessionIdentify, SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult,
+    SessionSetAgentHooksParams, SessionSetFocusParams, SessionSetThemeParams, SessionStopParams,
     SessionStopResult, SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams,
     TabAgentReportResult, TabAttachParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
     TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
@@ -742,10 +742,15 @@ impl std::fmt::Debug for StopHandle {
 pub struct AgentHooksHandle(Arc<dyn Fn(AgentHooksRequest) -> AgentHooksFuture + Send + Sync>);
 
 /// The op's params, as the daemon receives them.
+///
+/// `agents` is the allow-list the client's own `agent-hooks` key names —
+/// what this host's `agent-hooks` key is raised (unioned) to, never
+/// lowered (plan 064 §3.3). There is no `off` here: a client whose own
+/// key is `off` or unconfigured has nothing to raise the host with, so
+/// it never sends this op at all.
 #[derive(Debug, Clone)]
 pub struct AgentHooksRequest {
-    pub mode: roost_ipc::messages::AgentHooksMode,
-    pub skip: Vec<String>,
+    pub agents: Vec<String>,
     /// How the asking client names itself, for the host's state record.
     pub client: String,
 }
@@ -769,21 +774,18 @@ impl std::fmt::Display for AgentHooksError {
 }
 
 type AgentHooksFuture =
-    Pin<Box<dyn Future<Output = Result<SessionSetAgentHooksResult, AgentHooksError>> + Send>>;
+    Pin<Box<dyn Future<Output = Result<AgentHooksOutcome, AgentHooksError>> + Send>>;
 
 impl AgentHooksHandle {
     pub fn new<F, Fut>(f: F) -> Self
     where
         F: Fn(AgentHooksRequest) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<SessionSetAgentHooksResult, AgentHooksError>> + Send + 'static,
+        Fut: Future<Output = Result<AgentHooksOutcome, AgentHooksError>> + Send + 'static,
     {
         Self(Arc::new(move |request| Box::pin(f(request))))
     }
 
-    async fn run(
-        &self,
-        request: AgentHooksRequest,
-    ) -> Result<SessionSetAgentHooksResult, AgentHooksError> {
+    async fn run(&self, request: AgentHooksRequest) -> Result<AgentHooksOutcome, AgentHooksError> {
         (self.0)(request).await
     }
 }
@@ -2568,8 +2570,9 @@ fn session_set_focus(
     Ok(serde_json::json!({}))
 }
 
-/// `session.set_agent_hooks`: bring the host's agent hook entries in
-/// line with the connected client's config (plan 046 §3.4).
+/// `session.set_agent_hooks`: raise the host's `agent-hooks` key to at
+/// least the connected client's own allow-list (plan 046 §3.4, plan 064
+/// §3.3).
 ///
 /// Everything this function does is admission. The work — reading and
 /// rewriting five agents' config files under the session user's `$HOME`
@@ -2579,8 +2582,9 @@ fn session_set_focus(
 /// In [`is_mutating_op`] because a session that has latched
 /// `session.stop` has already flushed and reaped: entries pointing at a
 /// socket about to be unlinked are worse than no entries at all.
-/// Otherwise every same-UID connection may state it, and the last one to
-/// reach the install lock wins (plan 046 §3.4).
+/// Otherwise every same-UID connection may state it, and every raise
+/// only ever widens what the key allows (plan 064 §3.3) — two
+/// connections naming different agents both win.
 ///
 /// A per-agent install failure is a *reported* failure, never an error
 /// frame: the reply's `errors` list carries it, so a client hears which
@@ -2599,8 +2603,7 @@ async fn session_set_agent_hooks(
     })?;
     let result = handle
         .run(AgentHooksRequest {
-            mode: p.mode,
-            skip: p.skip,
+            agents: p.agents,
             client: p.client,
         })
         .await
