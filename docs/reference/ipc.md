@@ -1558,7 +1558,8 @@ Without it every op in this group errors. `tools/roosttest/` drives a
 real UI over this socket and nothing else, so without a seam onto the
 host dialog family (`HostDialog::{Add, ConfirmStop, ConfirmRestart,
 Bootstrap}` — [Host sessions (development)](../development/host-sessions.md#bootstrap-installupgrade-over-ssh))
-the consent card the SSH bootstrap flow (plan 039) gates on could not
+the consent card the SSH bootstrap flow (plan 039) gates on — and the
+agent-hooks consent card (plan 064) — could not
 be exercised at all. Unlike the upgrade prompt, whose button composes
 ops a test can already send directly, the bootstrap job is
 deliberately UI-only and has no such back door.
@@ -1587,8 +1588,9 @@ Request: `{"params": {}}`. Response:
 }
 ```
 
-`dialog` is `"add" | "confirm_stop" | "confirm_restart" | "bootstrap"`,
-or absent (with every other field defaulted/empty) when no host modal
+`dialog` is
+`"add" | "confirm_stop" | "confirm_restart" | "confirm_switch" | "bootstrap" | "agent_hooks"`,
+or absent (with every other field defaulted/empty) when no modal
 is open. `variant` is present only for `"bootstrap"` —
 `"install" | "update" | "start"` — and `null`/absent otherwise.
 `buttons` lists every button in render order, the dismissing one
@@ -1597,6 +1599,49 @@ first, exactly as the card draws them. `host` is the saved host's
 same value `host.connect` takes — not its label, even though the
 rendered `title` and `body` above interpolate the label. Absent when
 the dialog is not about a saved host.
+
+Two fields belong to the agent-hooks consent card (plan 064) and are
+absent/empty for every other dialog. `mode` is
+`"first_run" | "preferences"` — which card this is, not what it would
+do, which is why it isn't folded into `variant`. `rows` is one entry
+per agent, in the install engine's `ALL_AGENTS` order (the order the
+card draws them):
+
+```json
+{
+  "dialog": "agent_hooks",
+  "mode": "preferences",
+  "title": "Agent hooks",
+  "body": "Roost adds a hook to each agent you switch on so its tabs show status and send notifications. …",
+  "buttons": ["Cancel", "Apply"],
+  "rows": [
+    {
+      "agent": "claude",
+      "on": true,
+      "found": true,
+      "status": "wired v3",
+      "files": ["/home/u/.claude/settings.json"]
+    },
+    {
+      "agent": "codex",
+      "on": false,
+      "found": true,
+      "status": "found, not wired",
+      "files": ["/home/u/.codex/hooks.json", "/home/u/.codex/config.toml"]
+    }
+  ]
+}
+```
+
+`agent` is the canonical name the `agent-hooks` key uses. `on` is what
+Apply would write — prefilled from the **key**, not from what is wired,
+so an agent whose entries are on disk but which the key doesn't name
+starts off. `found` says whether that agent is installed on this
+machine. `status` is the row's status line — `"wired v3"`,
+`"wired v2, out of date"`, `"found, not wired"`, `"wired, not allowed"`,
+`"not found"` — and is `null` on the first-run card, which doesn't
+render one. `files` are the files that agent's install owns or merges
+into (two for codex).
 
 `app.dialog_answer` presses the visible modal's primary button, or
 dismisses it — through the same production handlers a real click or
@@ -1607,13 +1652,22 @@ here too.
 Request: `{"params": {"action": "confirm"}}` (or `"cancel"`). Response:
 `{}`.
 
-`action` outside `"confirm" | "cancel"` is rejected `invalid-param`
-before anything else runs. Every other refusal is `internal`, carrying
+`"toggle:<agent>"` is the third action, and only the agent-hooks card
+takes it: it flips that row's switch, the same route a click on the
+switch or Space on the focused one takes. `toggle:claude`,
+`toggle:codex`, `toggle:grok`, `toggle:cursor`, `toggle:opencode`. The
+switches are that card's answer, so a harness that can only `confirm`
+could never apply anything but the defaults.
+
+`action` outside `"confirm" | "cancel" | "toggle:<agent>"` is rejected
+`invalid-param` before anything else runs. Every other refusal is
+`internal`, carrying
 a human-readable reason: no host dialog is open; `"confirm"` sent to a
 dialog with no confirming action (a
 remote host whose `NeedsRestart` dialog can only offer the
-docs-pointer copy, `RestartAction::None`); or `"confirm"` sent to the
-Add Host dialog while it's already dialing a verify. A dialog with no
+docs-pointer copy, `RestartAction::None`); `"confirm"` sent to the
+Add Host dialog while it's already dialing a verify; or a `toggle:` for
+an agent the card has no row for. A dialog with no
 primary action refuses `confirm` rather than silently dismissing — a
 test that thinks it pressed a button that isn't there should fail
 loudly, not pass by accident.

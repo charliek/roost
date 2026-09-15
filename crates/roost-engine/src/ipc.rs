@@ -491,7 +491,8 @@ pub enum UiRequest {
     },
     /// `app.dialog_answer` — confirm or cancel the visible host modal,
     /// through the same routes a click and Enter/Escape take. `action`
-    /// is `"confirm" | "cancel"`. Gated like `AppDialogDump`.
+    /// is `"confirm" | "cancel"`, or `"toggle:<agent>"` for one of the
+    /// agent-hooks card's switches. Gated like `AppDialogDump`.
     AppDialogAnswer {
         action: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
@@ -3871,9 +3872,14 @@ async fn dispatch(
         }
         ops::APP_DIALOG_ANSWER => {
             let p: AppDialogAnswerParams = decode(params)?;
-            if !matches!(p.action.as_str(), "confirm" | "cancel") {
+            // `toggle:<agent>` is the agent-hooks card's third answer
+            // (plan 064 §3.5); which agents exist is the card's to say,
+            // so the shape is checked here and the name over there.
+            if !matches!(p.action.as_str(), "confirm" | "cancel")
+                && p.action.strip_prefix("toggle:").is_none_or(str::is_empty)
+            {
                 return Err(HandlerError::invalid_param(format!(
-                    "action must be confirm or cancel (got {:?})",
+                    "action must be confirm, cancel or toggle:<agent> (got {:?})",
                     p.action
                 )));
             }

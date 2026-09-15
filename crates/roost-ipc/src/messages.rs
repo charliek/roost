@@ -807,6 +807,12 @@ pub struct AppDialogDumpResult {
     /// `null` for every other dialog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
+    /// The agent-hooks card's mode — `"first_run" | "preferences"`
+    /// (plan 064 §3.5). `null` for every other dialog. Separate from
+    /// `variant` because it is a different question: `variant` says what
+    /// a bootstrap would *do*, and this says who raised the card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     pub title: String,
     pub body: String,
     /// Every button on the card, in render order (the dismissing one
@@ -817,6 +823,35 @@ pub struct AppDialogDumpResult {
     /// not about a saved host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// The agent-hooks card's switches, in the install engine's
+    /// `ALL_AGENTS` order — the order the card draws them. Empty for
+    /// every other dialog, which has no rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<AppDialogAgentRow>,
+}
+
+/// One agent's switch on the agent-hooks card.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppDialogAgentRow {
+    /// The canonical agent name — `claude`, `codex`, `grok`, `cursor`,
+    /// `opencode` — the same spelling the `agent-hooks` key uses.
+    pub agent: String,
+    /// Whether the switch is on: what Apply would write, not what is
+    /// wired.
+    pub on: bool,
+    /// Whether this agent is installed on this machine.
+    pub found: bool,
+    /// The row's status line — `"wired v3"`, `"wired v2, out of date"`,
+    /// `"found, not wired"`, `"wired, not allowed"`, `"not found"`.
+    /// `null` on the first-run card, which does not render one — sent
+    /// as an explicit null rather than omitted, so a reader walking the
+    /// rows can tell "no status line" from "this build has no such
+    /// field" without consulting the mode.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// The files this agent's install owns or merges into, as the card
+    /// names them. Two for codex, one for everything else.
+    pub files: Vec<String>,
 }
 
 /// `app.dialog_answer` request: press the visible host modal's primary
@@ -825,7 +860,9 @@ pub struct AppDialogDumpResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppDialogAnswerParams {
-    /// `"confirm"` or `"cancel"`.
+    /// `"confirm"`, `"cancel"`, or `"toggle:<agent>"` — the last being
+    /// the agent-hooks card's five switches, which are the answer that
+    /// card is asking for and so cannot be pressed by confirm alone.
     pub action: String,
 }
 
@@ -3100,10 +3137,12 @@ pub mod ops {
     /// so the e2e suite can pin button-event and motion encoding
     /// without a window manager. Gated by `ROOST_TEST_MODE=1`.
     pub const TAB_DISPATCH_MOUSE_EVENT: &str = "tab.dispatch_mouse_event";
-    /// Test-only focus-state driver. Drives the focus-tracking emit
-    /// path so the e2e suite can pin mode 1004 `\x1b[I` / `\x1b[O`
-    /// without taking real OS focus from the test runner. Gated by
-    /// `ROOST_TEST_MODE=1`.
+    /// Test-only focus-state driver. Drives the same route a real
+    /// window focus change takes — the window-opened pass and then the
+    /// focus-tracking emit — so the e2e suite can pin mode 1004
+    /// `\x1b[I` / `\x1b[O`, and the once-per-process latches that hang
+    /// off a focus change, without taking real OS focus from the test
+    /// runner. Gated by `ROOST_TEST_MODE=1`.
     pub const APP_SET_WINDOW_FOCUS: &str = "app.set_window_focus";
     /// Ungated read of the active tab's current W3C cursor name —
     /// the latest OSC 22 payload, or `"default"` if none has landed.

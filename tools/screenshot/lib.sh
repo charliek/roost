@@ -86,7 +86,8 @@ ut_wait_alive() {
   done
 }
 
-# ut_pinned_config — path to a config with `local-backend = in-process`.
+# ut_pinned_config — path to a config with `local-backend = in-process`
+# and `agent-hooks = off`.
 #
 # This harness deliberately runs against the developer's own profile (no
 # ROOST_STATE_DIR, no ROOST_CONFIG), which on a machine that has never
@@ -96,6 +97,12 @@ ut_wait_alive() {
 # in-process product, and a smoke harness has no business changing the
 # developer's config, so the key is pinned in a COPY — last-wins parsing
 # means the copy's trailing line overrides whatever the original said.
+#
+# `agent-hooks` is pinned for a second reason on top of that one: an
+# unanswered key is what plan 064's first-run consent card is raised on,
+# so a developer who has never answered it would get that card over
+# every single screenshot. `off` is also the only value that touches no
+# agent file — this harness runs against the real `$HOME`.
 #
 # An explicit $ROOST_CONFIG is honoured untouched: a caller who set one
 # is driving this on purpose.
@@ -110,7 +117,7 @@ ut_pinned_config() {
   dst="$(mktemp "${TMPDIR:-/tmp}/roost-uitest-config.XXXXXX")" || return 1
   {
     if [[ -f "${src}" ]]; then cat "${src}"; fi
-    printf '\nlocal-backend = in-process\n'
+    printf '\nlocal-backend = in-process\nagent-hooks = off\n'
   } > "${dst}"
   printf '%s\n' "${dst}"
 }

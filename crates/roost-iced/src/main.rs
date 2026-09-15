@@ -206,6 +206,14 @@ enum Message {
     /// The bootstrap consent card's primary button: Install, Update or
     /// Start, whichever the probe's answer made this card.
     HostBootstrapConfirm,
+    /// One of the agent-hooks card's five switches (plan 064 §3.5),
+    /// by row index. The index rather than the agent because the rows
+    /// ARE the card's state: an index names the row the user pressed
+    /// whatever the inventory grows to.
+    AgentHooksToggled(usize),
+    /// The agent-hooks card's primary button — "Instrument N" on first
+    /// run, "Apply" from the palette.
+    AgentHooksConfirm,
     ConfirmDeleteCancel,
     ConfirmDeleteConfirm,
     ConfirmDeleteCardPressed,
@@ -641,6 +649,8 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         | Message::LocalSwitchConfirm
         | Message::HostRestartConfirm
         | Message::HostBootstrapConfirm
+        | Message::AgentHooksToggled(_)
+        | Message::AgentHooksConfirm
         | Message::ConfirmDeleteCancel
         | Message::ConfirmDeleteConfirm) => message.apply(app).map_task(),
     }

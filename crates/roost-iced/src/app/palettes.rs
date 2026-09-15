@@ -1507,6 +1507,10 @@ impl App {
                     self.clear_palette_state();
                     self.toggle_sidebar_agents();
                 }
+                "agent_hooks" => {
+                    self.clear_palette_state();
+                    self.open_agent_hooks_preferences();
+                }
                 "font_increase" => {
                     self.clear_palette_state();
                     self.apply_font_size_transition(FontSizeTransition::Adjust(1.0))?;

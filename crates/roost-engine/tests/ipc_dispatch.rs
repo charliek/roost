@@ -683,6 +683,53 @@ async fn app_keybind_dispatch_rejects_non_paste_action() {
     }
 }
 
+/// `app.dialog_answer` takes `confirm`, `cancel`, or `toggle:<agent>`
+/// (plan 064 §3.5) — and checks the SHAPE at the dispatcher, ahead of
+/// `ui_call`, which is what its doc comment promises. A bare `toggle:`
+/// names nothing, so it is refused here rather than reaching a card that
+/// would have to invent which switch was meant.
+///
+/// `invalid-param` and not `internal`, with no UI attached (this handler
+/// has no `ui_tx`), is the proof the check ran before the hop — the same
+/// shape `app_keybind_dispatch_rejects_non_paste_action` pins next door.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_dialog_answer_rejects_an_action_that_names_nothing() {
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("roost.sock");
+
+    let workspace = Arc::new(Workspace::new());
+    let supervisor = Arc::new(PtySupervisor::new());
+    let handler = IpcHandler::new(
+        workspace,
+        supervisor,
+        socket_path.clone(),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    );
+
+    let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
+    let server_socket = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    let mut client = connect_with_retry(&server_socket).await;
+    for action in ["apply", "toggle:", "toggle", ""] {
+        let err = client
+            .call_raw(
+                ops::APP_DIALOG_ANSWER,
+                serde_json::json!({"action": action}),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            roost_ipc::ClientError::Server { code, .. } => {
+                assert_eq!(code, "invalid-param", "{action:?}")
+            }
+            other => panic!("expected Server error for {action:?}, got {other:?}"),
+        }
+    }
+}
+
 // ============================================================================
 // `session.put_file` — plan 047 §3.1 / W1
 // ============================================================================

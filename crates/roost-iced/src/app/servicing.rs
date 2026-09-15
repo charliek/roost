@@ -2105,6 +2105,8 @@ impl App {
                 EngineFeed::AgentHooks(result) => self.agent_hooks_ensured(result),
                 EngineFeed::HostAgentHooks(reply) => self.host_agent_hooks_set(*reply),
                 EngineFeed::AgentHooksSet(done) => self.agent_hooks_applied(*done),
+                EngineFeed::AgentHooksSurvey(survey) => self.agent_hooks_surveyed(*survey),
+                EngineFeed::AgentHooksApplyFailed(error) => self.set_status(error),
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
                 EngineFeed::NotificationActivated { tab } => {
@@ -3134,6 +3136,18 @@ impl App {
             }
             UiRequest::AppSetWindowFocus { focused, reply } => {
                 let result = if self.test_mode {
+                    // The WHOLE production focus route, not just the
+                    // emit half: `Message::WindowFocus` runs
+                    // `window_opened` first and `set_window_focus`
+                    // second, and the once-per-process latches that hang
+                    // off `window_opened` (the agent-hooks startup
+                    // ensure, plan 064's consent card) exist precisely
+                    // because a focus change re-enters it. An op that
+                    // skipped that half could not fail when a latch was
+                    // removed, which is the same as not testing it.
+                    if let Some(id) = self.window_id {
+                        task = task.then(self.window_opened(id));
+                    }
                     self.set_window_focus(focused);
                     Ok(())
                 } else {

@@ -68,20 +68,19 @@ from pathlib import Path
 import pytest
 import session as sessionlib
 import ui
-from agent_jail import Jail
-from client import Roost, RoostError, scaled_timeout
-from eventstream import EventStream
-from host_probe import host_key, sibling_key  # noqa: F401  (re-exported)
-# The jailed-UI launch lives beside the agent-hooks lanes it was written
-# for; §13b below needs a client UI that may write agent files, and one
-# implementation of that is the point (`test_agent_hooks.py`'s own
-# header states the fences it stands on).
-from test_agent_hooks import (  # noqa: F401  (`short_root` is used as a fixture)
+# §13b below needs a client UI that may write agent files, and one
+# implementation of that launch is the point — `agent_jail.py`'s header
+# states the fences it stands on.
+from agent_jail import (  # noqa: F401  (`short_root` is used as a fixture)
+    Jail,
     jailed_socket,
     jailed_ui,
     short_root,
     wait_for_jailed_window,
 )
+from client import Roost, RoostError, scaled_timeout
+from eventstream import EventStream
+from host_probe import host_key, sibling_key  # noqa: F401  (re-exported)
 from util import drain, drain_until_match
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "screenshot"))

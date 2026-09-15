@@ -35,6 +35,7 @@ use roost_ipc::messages::{
 };
 use roost_ui_model::config::{AgentHooks, RoostConfig};
 
+use super::agent_hooks_dialog::{AgentHooksRow, CardMode};
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
 use crate::host_conn::queue::HostOpError;
 
@@ -104,7 +105,29 @@ pub(crate) fn claim_start(started: &mut bool, resolved: Option<&Mode>) -> Start 
     }
 }
 
-/// Start the startup ensure, or decline to.
+/// Claim the one first-run consent card this process gets (plan 064
+/// §3.5).
+///
+/// Its own latch beside [`claim_start`], because they answer different
+/// questions and `window_opened` asks both on **every focus change**: an
+/// Alt-Tab back to the window must not put the card up a second time,
+/// and the `Ask` branch deliberately never claims `claim_start`'s latch.
+///
+/// Three conditions, and the two that are not the latch are refusals:
+/// only an unanswered key has anything to ask about, and a UI under
+/// `ROOST_TEST_MODE` asks nothing at all unless the harness lifted the
+/// fence — the same [`Guard`] the install engine itself checks, read
+/// here so a test-mode launch never even raises the card.
+pub(crate) fn claim_first_run(raised: &mut bool, start: &Start, guard: Guard) -> bool {
+    if !matches!(start, Start::Ask) || guard.check().is_err() || *raised {
+        return false;
+    }
+    *raised = true;
+    true
+}
+
+/// Start the startup ensure, or decline to — and say which, because the
+/// caller has its own thing to do about `Ask`.
 ///
 /// `agent-hooks = off` returns without touching a single file — the key
 /// means "Roost wires nothing here", and a startup that *removed*
@@ -116,19 +139,20 @@ pub(crate) fn spawn_ensure(
     runtime: &tokio::runtime::Handle,
     feed: &EngineFeedSender,
     config: &RoostConfig,
-) {
+) -> Start {
     let resolved = resolve(config);
-    let mode = match claim_start(started, resolved.as_ref()) {
+    let start = claim_start(started, resolved.as_ref());
+    let mode = match &start {
         Start::Run => resolved.expect("Start::Run implies resolve() returned Some"),
         Start::Off => {
             tracing::debug!("agent-hooks = off: not wiring agent hooks");
-            return;
+            return start;
         }
         Start::Ask => {
             tracing::debug!("agent-hooks is not configured; not wiring agent hooks");
-            return;
+            return start;
         }
-        Start::Already => return,
+        Start::Already => return start,
     };
 
     let feed = feed.clone();
@@ -139,6 +163,81 @@ pub(crate) fn spawn_ensure(
     runtime.spawn_blocking(move || {
         feed.send(EngineFeed::AgentHooks(ensure_blocking(&mode, guard)));
     });
+    start
+}
+
+/// What one read-only status walk found, on its way to the consent card.
+///
+/// `mode` rides outside the `Result` because a failure still has to be
+/// routed: a preferences card the user asked for owes them a sentence,
+/// and a first-run probe nobody asked for stays quiet.
+pub(crate) struct AgentHooksSurvey {
+    pub mode: CardMode,
+    /// Which survey this is. A survey reads five agents' files, so two
+    /// can be in flight at once — a second palette activation, or the
+    /// startup probe still running when the user opens preferences. The
+    /// app keeps the id it is waiting for and drops anything else, so a
+    /// stale result cannot replace the card the user is looking at.
+    pub id: u64,
+    pub result: Result<AgentHooksFound, String>,
+}
+
+pub(crate) struct AgentHooksFound {
+    pub rows: Vec<AgentHooksRow>,
+    /// The key **as the survey read it off disk**, which is not
+    /// necessarily the one the caller decided to ask about: the gate
+    /// runs against the launch-time config, and another process can
+    /// answer the key in between. A first-run card is not raised over an
+    /// answer somebody has already given.
+    pub key: AgentHooks,
+    /// At least one of the five is installed on this machine. The
+    /// first-run card is not raised without one: there is nothing to
+    /// consent about, and the key stays absent rather than being
+    /// answered by a dialog nobody could act on.
+    pub any_present: bool,
+}
+
+/// Read every agent's status for the consent card, off the UI thread.
+///
+/// Off the thread for this module's own reason — see its header:
+/// `status` opens up to six files across five agents' config
+/// directories, and the preferences card re-runs it on every open.
+pub(crate) fn spawn_survey(
+    mode: CardMode,
+    id: u64,
+    fallback: AgentHooks,
+    runtime: &tokio::runtime::Handle,
+    feed: &EngineFeedSender,
+) {
+    let feed = feed.clone();
+    runtime.spawn_blocking(move || {
+        feed.send(EngineFeed::AgentHooksSurvey(Box::new(AgentHooksSurvey {
+            mode,
+            id,
+            result: survey_blocking(mode, &fallback),
+        })));
+    });
+}
+
+/// The blocking half of the survey.
+///
+/// The key is re-read from disk rather than taken from the running UI's
+/// snapshot, for [`hooks_on_disk`]'s reason and one more: opening the
+/// preferences card is exactly when a key changed by `roostctl agent set
+/// --local`, or raised through this machine's own session, has to be
+/// what the switches show.
+fn survey_blocking(mode: CardMode, fallback: &AgentHooks) -> Result<AgentHooksFound, String> {
+    let home = Home::from_env().map_err(|error| error.to_string())?;
+    let key = hooks_on_disk(fallback);
+    // `Ask` allows nothing: the card reads `Status::allowed` as "named
+    // in the key", and nobody has named anything yet.
+    let resolved = Mode::from_config(&key).unwrap_or_else(|| Mode::Allow(Vec::new()));
+    let statuses = roost_agent_install::status(&home, &resolved).map_err(|e| e.to_string())?;
+    Ok(AgentHooksFound {
+        any_present: statuses.iter().any(|status| status.present),
+        rows: super::agent_hooks_dialog::rows(mode, &key, &statuses),
+        key,
+    })
 }
 
 /// The blocking half. Every failure becomes a line in
@@ -360,9 +459,9 @@ pub(crate) fn remote_request(config: &RoostConfig) -> Option<Vec<String>> {
 /// directory; this runs once per connect, not once per frame. An
 /// unreadable config falls back to what this process already believes,
 /// because failing to read is not a reason to say something different.
-pub(crate) fn hooks_on_disk(fallback: &RoostConfig) -> AgentHooks {
+pub(crate) fn hooks_on_disk(fallback: &AgentHooks) -> AgentHooks {
     let Some(path) = roost_ui_model::config::config_path() else {
-        return fallback.agent_hooks.clone();
+        return fallback.clone();
     };
     match std::fs::read_to_string(&path) {
         Ok(text) => RoostConfig::parse(&text).agent_hooks,
@@ -371,7 +470,7 @@ pub(crate) fn hooks_on_disk(fallback: &RoostConfig) -> AgentHooks {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => AgentHooks::Ask,
         Err(error) => {
             tracing::warn!(path = %path.display(), %error, "could not re-read agent-hooks");
-            fallback.agent_hooks.clone()
+            fallback.clone()
         }
     }
 }
@@ -603,6 +702,57 @@ mod tests {
         assert_eq!(
             claim_start(&mut started, Some(&Mode::Allow(vec![Agent::Claude]))),
             Start::Run
+        );
+    }
+
+    /// The consent card is a *startup* act too, and `window_opened`
+    /// runs on every focus **and** unfocus — so without its own latch an
+    /// Alt-Tab back to the window would put a second card over the one
+    /// the user is reading.
+    #[test]
+    fn the_first_run_card_is_raised_once_per_process() {
+        let mut raised = false;
+        assert!(claim_first_run(&mut raised, &Start::Ask, Guard::PERMITTED));
+        assert!(raised);
+        assert!(
+            !claim_first_run(&mut raised, &Start::Ask, Guard::PERMITTED),
+            "the focus that follows the open re-raised the card"
+        );
+        assert!(
+            !claim_first_run(&mut raised, &Start::Ask, Guard::PERMITTED),
+            "and so did an ordinary Alt-Tab"
+        );
+    }
+
+    /// Only an unanswered key has anything to ask about, and a UI under
+    /// the harness fence asks nothing at all unless the harness lifted
+    /// it — the same [`Guard`] the install engine checks, read before
+    /// the card is raised rather than after it has been answered.
+    #[test]
+    fn nothing_but_an_unanswered_key_outside_the_fence_raises_the_card() {
+        for start in [Start::Run, Start::Off, Start::Already] {
+            let mut raised = false;
+            assert!(
+                !claim_first_run(&mut raised, &start, Guard::PERMITTED),
+                "{start:?} raised the consent card"
+            );
+            assert!(!raised, "{start:?} spent the latch");
+        }
+
+        let fenced = Guard {
+            test_mode: true,
+            forced: false,
+        };
+        let mut raised = false;
+        assert!(!claim_first_run(&mut raised, &Start::Ask, fenced));
+        assert!(!raised, "the fence spent the latch it refused to use");
+        let forced = Guard {
+            test_mode: true,
+            forced: true,
+        };
+        assert!(
+            claim_first_run(&mut raised, &Start::Ask, forced),
+            "ROOST_AGENT_HOOKS_FORCE=1 is what lets the E2E see the card"
         );
     }
 

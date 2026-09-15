@@ -615,6 +615,22 @@ fn chrome_button(selected: Option<Color>, status: button::Status, radius: f32) -
     }
 }
 
+/// One agent's row on the consent card (plan 064 §3.5).
+///
+/// Highlighted when the agent is installed here: the found rows are what
+/// the card's default answer is about, and the rest are there to be
+/// switched on deliberately.
+pub fn agent_hooks_row(found: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: found.then_some(Background::Color(ACTIVE_TAB)),
+        border: Border {
+            radius: 6.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
