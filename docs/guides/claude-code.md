@@ -7,10 +7,12 @@ the guarantee about what a merge does and doesn't touch, the
 path shared by all five. This page is what's specific to Claude: three
 notes worth knowing plus the day-one verification walk.
 
-Nothing to install by hand: Roost wires Claude's hooks itself the first
-time the UI starts (`agent-hooks = auto` in `config.conf`, the default).
-See [Agent Hooks → Install](agents.md#install) to do it manually, and
-[Agent Hooks → How to opt out](agents.md#how-to-opt-out) to turn it off.
+Nothing to install by hand: once you say yes in the consent dialog Roost
+raises on first launch (or set `agent-hooks = claude` yourself in
+`config.conf`), Roost wires Claude's hooks itself. See [Agent Hooks →
+Roost asks once](agents.md#roost-asks-once) for the dialog, [Agent Hooks
+→ Install](agents.md#install) to wire it manually, and [Agent Hooks →
+How to opt out](agents.md#how-to-opt-out) to turn it off.
 
 ## Three things specific to Claude
 

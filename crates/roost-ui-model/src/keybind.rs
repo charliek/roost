@@ -47,6 +47,13 @@ pub enum KeybindAction {
     /// toggle — `dispatch_action`'s `is_picker_toggle` allowlist
     /// doesn't include it.
     ToggleSidebarAgents,
+    /// Open the agent-hooks consent card in preferences mode (plan 064
+    /// §3.5) — the same card the first launch raises, with Cancel/Apply
+    /// instead of Decide later/Instrument N. **Default unbound**: it is
+    /// a settings surface reached by name from the command palette, and
+    /// spending an accelerator on it would cost one the user could give
+    /// to something they do every day.
+    AgentHooks,
     /// Browser-style font sizing on the active tab's terminal.
     /// Defaults to `primary+plus`/`primary+equal` (both are bound
     /// because `Cmd-+` on US layouts is really `Cmd-Shift-=` and
@@ -113,6 +120,7 @@ impl KeybindAction {
             "paste" => Some(Self::Paste),
             "toggle_sidebar" => Some(Self::ToggleSidebar),
             "toggle_sidebar_agents" => Some(Self::ToggleSidebarAgents),
+            "agent_hooks" => Some(Self::AgentHooks),
             "font_increase" => Some(Self::FontIncrease),
             "font_decrease" => Some(Self::FontDecrease),
             "font_reset" => Some(Self::FontReset),
@@ -160,6 +168,7 @@ impl KeybindAction {
             Self::Paste => "paste".into(),
             Self::ToggleSidebar => "toggle_sidebar".into(),
             Self::ToggleSidebarAgents => "toggle_sidebar_agents".into(),
+            Self::AgentHooks => "agent_hooks".into(),
             Self::FontIncrease => "font_increase".into(),
             Self::FontDecrease => "font_decrease".into(),
             Self::FontReset => "font_reset".into(),
@@ -605,6 +614,7 @@ mod tests {
             KeybindAction::Paste,
             KeybindAction::ToggleSidebar,
             KeybindAction::ToggleSidebarAgents,
+            KeybindAction::AgentHooks,
             KeybindAction::FontIncrease,
             KeybindAction::FontDecrease,
             KeybindAction::FontReset,

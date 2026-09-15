@@ -1,0 +1,18 @@
+{
+  "id": "21",
+  "ok": true,
+  "result": {
+    "config_path": "/home/charlie/.config/roost/config.conf",
+    "local": {
+      "wired": ["claude", "codex"],
+      "refreshed": [],
+      "removed": [],
+      "skipped": [{ "agent": "cursor", "reason": "not allowed" }],
+      "errors": []
+    },
+    "hosts": [
+      { "host": "mac-mini", "result": { "wired": ["claude"], "refreshed": [], "removed": [], "skipped": [], "errors": [] } },
+      { "host": "build-box", "error": "connection refused" }
+    ]
+  }
+}

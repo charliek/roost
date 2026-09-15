@@ -137,7 +137,9 @@ _SANITIZE = (
     # escape — but each of these can name an ABSOLUTE path outside it,
     # and `session.set_agent_hooks` is an op a client can send to any
     # session this module starts. Stripped so the jail is complete, then
-    # re-set by `jail_agents`.
+    # re-set by `jail_agents` — which is also where `ROOST_CONFIG` above
+    # comes back, now that a raise writes `agent-hooks` into a file that
+    # variable can relocate (plan 064 §3.3).
     *agent_jail.AGENT_CONFIG_DIR_ENV.values(),
 )
 
@@ -395,10 +397,10 @@ class SessionEnv:
         return proc
 
     # -- the agent-hooks jail ---------------------------------------------
-    def jail_agents(self) -> "agent_jail.Jail":
-        """Point this session's five agent config directories inside its
-        own root, so `session.set_agent_hooks` cannot reach a real
-        dotfile (plan 046 §3.9).
+    def jail_agents(self, **options) -> "agent_jail.Jail":
+        """Point this session's five agent config directories — and its
+        `config.conf` — inside its own root, so `session.set_agent_hooks`
+        cannot reach a real dotfile (plan 046 §3.9, plan 064 §3.3).
 
         The same `Jail` `test_agent_hooks.py` uses, rooted at this
         profile's root — which is where `HOME` already lives, so the
@@ -406,8 +408,11 @@ class SessionEnv:
         state / log resolution moves. From here on every launch asserts
         the merged environment before spawning (`command_env`), which is
         what makes the fence an assertion rather than a convention.
+
+        `options` reach `Jail` — `agent_hooks=` seeds the host's own
+        starting key, which is what a raise unions into.
         """
-        jail = agent_jail.Jail(self.root)
+        jail = agent_jail.Jail(self.root, **options)
         assert str(jail.home) == self.env["HOME"], (
             f"the jail's home {jail.home} is not the session's {self.env['HOME']}"
         )

@@ -13,14 +13,14 @@ use anyhow::{Context, Result};
 use iced::keyboard::{self, key::Named, Key};
 use iced::widget::Id;
 use iced::widget::{
-    button, column, container, image, mouse_area, row, scrollable, stack, text, text_input, Column,
-    Row, Space,
+    button, column, container, image, mouse_area, row, scrollable, stack, text, text_input,
+    toggler, Column, Row, Space,
 };
 use iced::{font, window, Alignment, Color, Element, Fill, Font, Shrink, Size};
 use roost_engine::git_metrics;
 use roost_engine::ipc::{
-    ClipboardOp, DumpData, ExpandSelectionData, IpcHandler, ResolvedCellData, ResolvedCellsData,
-    SelectionData, UiRequest,
+    ClipboardOp, DumpData, ExpandSelectionData, HostOpFailure, HostOpReply, IpcHandler,
+    ResolvedCellData, ResolvedCellsData, SelectionData, UiRequest,
 };
 use roost_engine::osc::{ClipboardTarget, OscAction, OscColorSnapshot};
 use roost_engine::pointer::{DragCellGate, MotionEmitter, PointerAction, PointerButton};
@@ -32,11 +32,12 @@ use roost_engine::{
 };
 use roost_ipc::agent;
 use roost_ipc::messages::{
-    AppMenuDumpResult, AppNotificationStatusResult, AppRenderStatsResult, AppUpdateStatusResult,
-    HostConnectStatus, HostConnectionResult, HostStatus, HostStatusResult, PaletteItemView,
-    PalettePresentResult, PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpHost,
-    SidebarDumpHostProject, SidebarDumpHostTab, SidebarDumpProject, SidebarDumpResult,
-    SidebarDumpSection, WindowMetricsResult,
+    AgentSetHooksAgents, AgentSetHooksHostOutcome, AgentSetHooksResult, AppMenuDumpResult,
+    AppNotificationStatusResult, AppRenderStatsResult, AppUpdateStatusResult, HostConnectStatus,
+    HostConnectionResult, HostStatus, HostStatusResult, PaletteItemView, PalettePresentResult,
+    PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpHost, SidebarDumpHostProject,
+    SidebarDumpHostTab, SidebarDumpProject, SidebarDumpResult, SidebarDumpSection,
+    WindowMetricsResult,
 };
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::{IpcServer, LocalBackendCell, LocalBackendMode};
@@ -78,6 +79,7 @@ use crate::{chrome, input};
 // this module's namespace, so the palette-overlay half of App lives in
 // `palettes` (it hosts the command/agent/provider/notification palettes).
 pub(crate) mod agent_hooks;
+pub(crate) mod agent_hooks_dialog;
 pub(crate) mod bootstrap;
 pub(crate) mod file_transfer;
 mod host_dialog;
@@ -478,7 +480,10 @@ fn modal_heading<'a>(title: String, body: &'a str) -> Column<'a, Message> {
 /// flight), which renders the button disabled rather than removing it —
 /// the card must not resize under the pointer.
 struct ConfirmButton<'a> {
-    label: &'a str,
+    /// `Cow` because one primary's label is composed rather than named:
+    /// the agent-hooks card counts the switches that are on, and the
+    /// count changes under the pointer.
+    label: std::borrow::Cow<'a, str>,
     style: fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style,
     press: Option<Message>,
 }
@@ -535,6 +540,90 @@ fn modal_buttons<'a>(
         ));
     }
     buttons.spacing(8).align_y(Alignment::Center)
+}
+
+/// The agent-hooks consent card's contents (plan 064 §3.5): the lede,
+/// one row per agent, the footer, and the two buttons.
+///
+/// Every string it draws comes from [`agent_hooks_dialog`], which is
+/// also what `app.dialog_dump` reports — one source, so the card and the
+/// dump cannot say different things about the same card.
+fn agent_hooks_body(draft: &agent_hooks_dialog::AgentHooksDraft) -> Column<'_, Message> {
+    let mut body = column![modal_heading(
+        agent_hooks_dialog::TITLE.to_string(),
+        agent_hooks_dialog::LEDE
+    )];
+    for (index, entry) in draft.rows().iter().enumerate() {
+        body = body.push(agent_hooks_row(draft, index, entry));
+    }
+    body = body.push(
+        text(agent_hooks_dialog::FOOTER)
+            .size(11)
+            .color(chrome::MUTED_TEXT),
+    );
+    body.push(modal_buttons(
+        draft.dismiss_label(),
+        Message::HostDialogCancel,
+        Some(ConfirmButton {
+            label: draft.confirm_label().into(),
+            style: chrome::primary_button,
+            press: Some(Message::AgentHooksConfirm),
+        }),
+        Some(draft.button_ring()),
+    ))
+}
+
+/// One agent's row: the switch, the name, the found chip, the files the
+/// install would touch, and — in preferences mode — where that agent
+/// stands right now.
+fn agent_hooks_row<'a>(
+    draft: &'a agent_hooks_dialog::AgentHooksDraft,
+    index: usize,
+    entry: &'a agent_hooks_dialog::AgentHooksRow,
+) -> Element<'a, Message> {
+    let chip = text(entry.chip()).size(10).color(if entry.found {
+        chrome::HOST_DOT_CONNECTED
+    } else {
+        chrome::MUTED_TEXT
+    });
+    let mut detail = column![row![
+        text(agent_hooks_dialog::display_name(entry.agent))
+            .size(12)
+            .font(chrome::chrome_font(font::Weight::Medium)),
+        chip,
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)];
+    for file in &entry.files {
+        detail = detail.push(text(file.as_str()).size(10).color(chrome::MUTED_TEXT));
+    }
+    if let Some(status) = &entry.status {
+        detail = detail.push(text(status.as_str()).size(10).color(chrome::MUTED_TEXT));
+    }
+    if let Some(note) = agent_hooks_dialog::note(entry.agent) {
+        detail = detail.push(text(note).size(10).color(chrome::MUTED_TEXT));
+    }
+    // The ring wrapper reserves its space whether or not it draws, so
+    // stepping the ring never moves the switches under the pointer —
+    // the same rule `modal_buttons` follows for the two buttons.
+    let switch = container(
+        toggler(entry.on)
+            .size(16)
+            .on_toggle(move |_| Message::AgentHooksToggled(index)),
+    )
+    .padding(chrome::FOCUS_RING_PADDING)
+    .style(chrome::focus_ring(
+        draft.focus() == agent_hooks_dialog::CardFocus::Switch(index),
+    ));
+    container(
+        row![switch, detail.spacing(2)]
+            .spacing(10)
+            .align_y(Alignment::Start),
+    )
+    .padding(6)
+    .width(Fill)
+    .style(chrome::agent_hooks_row(entry.found))
+    .into()
 }
 
 /// A host tab's last frame, kept on screen under a scrim and a banner:
@@ -2289,6 +2378,17 @@ pub struct App {
     /// §3.7). `window_opened` also runs on every focus change, so this
     /// is what keeps a startup act from becoming a focus act.
     agent_hooks_started: bool,
+    /// The one first-run consent card this process gets (plan 064 §3.5).
+    /// Beside `agent_hooks_started` rather than folded into it: the two
+    /// answer different questions about the same `window_opened`, which
+    /// every focus change runs. See `agent_hooks::claim_first_run`.
+    agent_hooks_card_raised: bool,
+    /// The survey whose result may still open a card, and the counter it
+    /// comes from. Two surveys can be in flight — the startup probe and
+    /// a palette activation, or two activations — and only the newest
+    /// may act; see [`agent_hooks::AgentHooksSurvey::id`].
+    agent_hooks_survey: Option<u64>,
+    agent_hooks_surveys: u64,
     /// The agent-hooks toast, waiting for the end of the drain that
     /// produced it. Held rather than set on arrival so nothing later in
     /// the same batch — a PTY error, an OSC action — can replace it
@@ -2783,6 +2883,9 @@ impl App {
             test_mode,
             status: StatusBanner::default(),
             agent_hooks_started: false,
+            agent_hooks_card_raised: false,
+            agent_hooks_survey: None,
+            agent_hooks_surveys: 0,
             pending_agent_hooks_toast: None,
             rename_editor: None,
             rename_input_id: Id::unique(),
@@ -3100,12 +3203,35 @@ impl App {
         // is the whole reason it is started from here rather than from
         // `bootstrap`. Once per process — this function also runs on
         // every focus and unfocus.
-        agent_hooks::spawn_ensure(
+        let start = agent_hooks::spawn_ensure(
             &mut self.agent_hooks_started,
             &self.runtime_handle,
             &self.feed_tx,
             &self.config,
         );
+        // Nobody has answered the key yet, so ask — once per process,
+        // never under the harness fence, and only once the status walk
+        // has said there is an agent here to ask about (plan 064 §3.5).
+        if agent_hooks::claim_first_run(
+            &mut self.agent_hooks_card_raised,
+            &start,
+            roost_agent_install::Guard::from_env(),
+        ) {
+            // Logged on the main thread, inside the call that claimed
+            // the latch: `app.set_window_focus` runs this whole function
+            // before it answers, so a client that has its reply knows
+            // the decision has been made — which is what lets the E2E
+            // assert "once per process" without racing the status walk
+            // this starts.
+            tracing::info!("agent-hooks consent card requested (first run)");
+            agent_hooks::spawn_survey(
+                agent_hooks_dialog::CardMode::FirstRun,
+                self.claim_agent_hooks_survey(),
+                self.config.agent_hooks.clone(),
+                &self.runtime_handle,
+                &self.feed_tx,
+            );
+        }
         opened.task
     }
 
@@ -3137,17 +3263,31 @@ impl App {
         self.pending_agent_hooks_toast = Some((toast, result.unnoticed));
     }
 
-    /// Ask a host that has just connected to bring its agent hooks in
-    /// line with this client's config (plan 046 §3.4).
+    /// Ask a host that has just connected to raise its agent hooks to at
+    /// least this client's own allow-list (plan 046 §3.4, plan 064
+    /// §3.3).
     ///
     /// The config is read here, on every connect, rather than captured
     /// when the connection was opened: a reconnect after the user edited
     /// `agent-hooks` has to carry the new answer, and this is the only
     /// place that runs on both the first connect and every retry.
+    ///
+    /// `None` — `agent-hooks` is `off`, unconfigured, or an empty
+    /// allow-list — sends nothing: the wire can only ever raise a host
+    /// now, and none of those three states has an allow-list to raise it
+    /// with.
     fn wire_host_agent_hooks(&mut self, host: &str) {
-        let (mode, skip) = agent_hooks::remote_request(&self.config);
+        // Re-read, not `self.config`: plan 064 §3.4. Another writer —
+        // a remote client raising this machine, or `roostctl agent set
+        // --local` — may have moved the key since launch, and a raise
+        // the host cannot lower is the wrong thing to be stale about.
+        let hooks = agent_hooks::hooks_on_disk(&self.config.agent_hooks);
+        self.config.agent_hooks = hooks;
+        let Some(agents) = agent_hooks::remote_request(&self.config) else {
+            return;
+        };
         self.hosts
-            .wire_agent_hooks(host, mode, &skip, &agent_hooks::client_label());
+            .wire_agent_hooks(host, &agents, &agent_hooks::client_label());
     }
 
     /// A host answered `session.set_agent_hooks`.
@@ -3221,17 +3361,330 @@ impl App {
         self.set_status(toast);
     }
 
+    /// `agent.set_hooks` — the consent dialog's Apply and `roostctl
+    /// agent set`, as one op (plan 064 §3.4).
+    ///
+    /// The order is the plan's, and only the first two steps happen
+    /// here: refuse a request this machine must not act on, then put the
+    /// raise on every connected host's queue while this thread still
+    /// holds the connection set. The install itself — a key write and up
+    /// to five dotfile rewrites under an advisory lock — and the waiting
+    /// go to the runtime, and the reply is answered from there.
+    ///
+    /// **The harness fence is checked here, before anything is sent.**
+    /// [`roost_agent_install::set_hooks`] checks it too, but only after
+    /// this op would already have raised every host; the fence covers
+    /// the *key*, so it has to be the first thing that can refuse.
+    fn agent_set_hooks_op(
+        &mut self,
+        agents: &AgentSetHooksAgents,
+        reply: HostOpReply<AgentSetHooksResult>,
+    ) {
+        let mode = match agent_hooks::resolve_set(agents) {
+            Ok(mode) => mode,
+            Err(message) => {
+                let _ = reply.send(Err(HostOpFailure::new("invalid-param", message)));
+                return;
+            }
+        };
+        let guard = roost_agent_install::Guard::from_env();
+        if let Err(error) = guard.check() {
+            // `internal`, the same code a whole-run install failure
+            // answers with on a host — a refusal is this machine
+            // declining, not a malformed request.
+            let _ = reply.send(Err(HostOpFailure::new("internal", error.to_string())));
+            return;
+        }
+
+        // `off` reaches no host at all: only an allow-list has anything
+        // to raise one with (see `agent_hooks::raise_list`). The hosts
+        // are *chosen* here, on the main thread, because the registry is
+        // main-thread state; nothing is sent until the local install
+        // below has come back clean.
+        let raise_names = agent_hooks::raise_list(&mode);
+        let raises: Vec<crate::host_conn::HostRaise> = match &raise_names {
+            None => Vec::new(),
+            Some(_) => {
+                // Saved-registry order, which is what `host.list` and the
+                // sidebar show — the stable order the reply promises.
+                self.workspace
+                    .hosts()
+                    .iter()
+                    .filter_map(|host| self.hosts.raise_agent_hooks(&host.id))
+                    .collect()
+            }
+        };
+        let client = agent_hooks::client_label();
+
+        let feed = self.feed_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let local = tokio::task::spawn_blocking(move || {
+                agent_hooks::set_hooks_blocking(&mode, guard)
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("the agent-hooks install did not finish: {error}")));
+            let done = match local {
+                Ok(done) => done,
+                Err(message) => {
+                    // Reported to the caller, which is the boundary that
+                    // handles it; the log line is for the launches where
+                    // the caller was a dialog nobody was watching.
+                    tracing::warn!(error = %message, "agent.set_hooks could not set this machine's agent hooks");
+                    let _ = reply.send(Err(HostOpFailure::new("internal", message)));
+                    return;
+                }
+            };
+            // Only now: this machine has recorded the user's answer, so
+            // it has something it is entitled to propagate. A local
+            // write that failed reaches no host at all.
+            let names = raise_names.unwrap_or_default();
+            let pending: Vec<_> = raises
+                .iter()
+                .map(|raise| (raise.label.clone(), raise.send(&names, &client)))
+                .collect();
+            let mut hosts = Vec::new();
+            for (label, outcome) in pending {
+                hosts.push(match outcome.await {
+                    Ok(result) => AgentSetHooksHostOutcome::Result {
+                        host: label,
+                        result,
+                    },
+                    // Never fatal, and never an error frame: this
+                    // machine's own key is set either way, and a host
+                    // that could not be asked is one line in the reply.
+                    Err(error) => AgentSetHooksHostOutcome::Error {
+                        host: label,
+                        error: error.to_string(),
+                    },
+                });
+            }
+            let _ = reply.send(Ok(AgentSetHooksResult {
+                config_path: done.config_path.clone(),
+                local: done.outcome.clone(),
+                hosts,
+            }));
+            feed.send(EngineFeed::AgentHooksSet(Box::new(done)));
+        });
+    }
+
+    /// `agent.set_hooks` finished writing this machine's files.
+    ///
+    /// Two things only the main thread can do: bring the running UI's
+    /// `agent-hooks` value in line with the key on disk — every connect
+    /// after this one reads it — and say once what was wired.
+    fn agent_hooks_applied(&mut self, done: agent_hooks::AgentHooksSet) {
+        for failure in &done.outcome.errors {
+            tracing::warn!(agent = %failure.agent, error = %failure.error, "agent hooks");
+        }
+        tracing::info!(
+            key = %done.key.to_config_value().unwrap_or_else(|| "ask".to_string()),
+            unannounced = done.unnoticed.len(),
+            errors = done.outcome.errors.len(),
+            "agent.set_hooks applied"
+        );
+        self.config.agent_hooks = done.key;
+        let Some(toast) = agent_hooks::wired_toast(&done.unnoticed, None) else {
+            return;
+        };
+        // Shown straight away rather than held like the startup toast:
+        // this one answers a gesture the user just made, so a line that
+        // lands behind another of this drain's `set_status` calls would
+        // be a receipt for something they can no longer see.
+        self.show_wired_toast(toast, done.unnoticed);
+    }
+
+    // ── the agent-hooks consent card (plan 064 §3.5) ────────────────
+
+    /// `Agent Hooks…` — the palette row and the (default-unbound)
+    /// `agent_hooks` action.
+    ///
+    /// Opening it re-reads the key **from disk** and re-runs the status
+    /// walk, both off the thread: this process is not the key's only
+    /// writer, and the card's whole job is to show what is true now.
+    pub(crate) fn open_agent_hooks_preferences(&mut self) {
+        agent_hooks::spawn_survey(
+            agent_hooks_dialog::CardMode::Preferences,
+            self.claim_agent_hooks_survey(),
+            self.config.agent_hooks.clone(),
+            &self.runtime_handle,
+            &self.feed_tx,
+        );
+    }
+
+    /// The id of the survey starting now, and the only one whose result
+    /// may open a card until another supersedes it.
+    fn claim_agent_hooks_survey(&mut self) -> u64 {
+        self.agent_hooks_surveys += 1;
+        self.agent_hooks_survey = Some(self.agent_hooks_surveys);
+        self.agent_hooks_surveys
+    }
+
+    /// A status walk came back: raise the card, or decline to.
+    fn agent_hooks_surveyed(&mut self, survey: agent_hooks::AgentHooksSurvey) {
+        // Superseded: a newer survey was started while this one walked
+        // five agents' files. Acting on it would replace the card the
+        // user is looking at — with their toggles on it.
+        if self.agent_hooks_survey != Some(survey.id) {
+            return;
+        }
+        self.agent_hooks_survey = None;
+        let found = match survey.result {
+            Ok(found) => found,
+            Err(error) => {
+                tracing::warn!(%error, mode = survey.mode.wire_name(), "agent hooks");
+                // A card the user asked for owes them a sentence; a
+                // first-run probe nobody asked for does not.
+                if survey.mode == agent_hooks_dialog::CardMode::Preferences {
+                    self.set_status(error);
+                }
+                return;
+            }
+        };
+        match agent_hooks_dialog::survey_verdict(
+            survey.mode,
+            found.any_present,
+            &found.key,
+            self.host_dialog.is_some(),
+        ) {
+            agent_hooks_dialog::SurveyVerdict::NoAgent => {
+                tracing::info!("no coding agent is installed here; not asking about agent hooks");
+            }
+            agent_hooks_dialog::SurveyVerdict::AlreadyAnswered => {
+                tracing::info!("agent-hooks was answered while this launch asked; no card");
+                self.config.agent_hooks = found.key;
+            }
+            agent_hooks_dialog::SurveyVerdict::ScreenTaken => {
+                tracing::info!("another dialog is open; not raising the agent-hooks card");
+                // The latch goes back: it exists to stop Alt-Tab asking
+                // twice, not to spend the one ask on a moment the card
+                // could not be shown. Without this the user closes the
+                // other dialog and is never asked again this process —
+                // which for a consent prompt is the whole feature lost.
+                if survey.mode == agent_hooks_dialog::CardMode::FirstRun {
+                    self.agent_hooks_card_raised = false;
+                }
+            }
+            agent_hooks_dialog::SurveyVerdict::Raise => {
+                self.open_host_dialog(host_dialog::HostDialog::AgentHooks(
+                    agent_hooks_dialog::AgentHooksDraft::new(survey.mode, found.rows),
+                ));
+            }
+        }
+    }
+
+    /// The agent-hooks card's whole keyboard: Tab steps the ring, Space
+    /// acts on whatever it is on, Enter is the primary action and Esc is
+    /// the dismiss (which on the first-run card is "Decide later", and
+    /// writes nothing).
+    ///
+    /// `is_enter` rides in rather than being re-derived because the
+    /// rename-completion latch is cleared by its own key's *release*:
+    /// latching Enter for a Space activation would strand it and eat the
+    /// user's next Enter press — the same hazard Add Host's ring has.
+    fn agent_hooks_key(&mut self, event: &keyboard::Event, is_enter: bool) -> UiTask {
+        if let Some(backwards) = agent_hooks_dialog::tab_step_direction(event) {
+            if let Some(draft) = self
+                .host_dialog
+                .as_mut()
+                .and_then(host_dialog::HostDialog::agent_hooks_mut)
+            {
+                draft.step_focus(backwards);
+            }
+            return UiTask::None;
+        }
+        let Some(draft) = self
+            .host_dialog
+            .as_mut()
+            .and_then(host_dialog::HostDialog::agent_hooks_mut)
+        else {
+            return UiTask::None;
+        };
+        match agent_hooks_dialog::key_action(event, draft.focus()) {
+            agent_hooks_dialog::CardKey::Toggle(index) => draft.toggle(index),
+            agent_hooks_dialog::CardKey::Confirm => {
+                if is_enter {
+                    self.rename_completion_key = Some(RenameCompletionKey::Enter);
+                }
+                return self.agent_hooks_confirmed();
+            }
+            agent_hooks_dialog::CardKey::Cancel => {
+                // Space needs no latch — neither the terminal encoder
+                // nor the accelerator table acts on a `KeyReleased` —
+                // so only its two named keys claim one.
+                if is_enter {
+                    self.rename_completion_key = Some(RenameCompletionKey::Enter);
+                } else if matches!(
+                    event,
+                    keyboard::Event::KeyPressed {
+                        key: Key::Named(Named::Escape),
+                        ..
+                    }
+                ) {
+                    self.rename_completion_key = Some(RenameCompletionKey::Escape);
+                }
+                self.host_dialog_cancel();
+            }
+            agent_hooks_dialog::CardKey::Nothing => {}
+        }
+        UiTask::None
+    }
+
+    /// One switch flipped, by pointer or by Space.
+    pub(crate) fn agent_hooks_toggled(&mut self, index: usize) {
+        if let Some(draft) = self
+            .host_dialog
+            .as_mut()
+            .and_then(host_dialog::HostDialog::agent_hooks_mut)
+        {
+            draft.toggle(index);
+        }
+    }
+
+    /// Apply: the card's answer, through `agent.set_hooks` and nothing
+    /// else.
+    ///
+    /// The card is one more caller of the op every other surface uses,
+    /// which is what keeps "the dialog wrote the key" and "`roostctl
+    /// agent set` wrote the key" the same act. It holds the op's reply
+    /// itself because it *is* the caller: the receipt toast arrives on
+    /// the feed either way, and a refusal has nowhere else to be said.
+    fn agent_hooks_confirmed(&mut self) -> UiTask {
+        let Some(host_dialog::HostDialog::AgentHooks(draft)) = self.host_dialog.take() else {
+            return UiTask::None;
+        };
+        let agents = draft.wire_agents();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.agent_set_hooks_op(&agents, reply);
+        let feed = self.feed_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let error = match answer.await {
+                Ok(Ok(_)) => return,
+                Ok(Err(failure)) => failure.message,
+                Err(_) => "the agent-hooks apply did not finish".to_string(),
+            };
+            feed.send(EngineFeed::AgentHooksApplyFailed(error));
+        });
+        UiTask::None
+    }
+
     /// Put the held agent-hooks toast on the banner, last in its drain.
     ///
     /// Called from the tail of `service_engine`, after every other
     /// `set_status` that batch can reach — the mechanism that makes
-    /// "shown" true before `mark_noticed` makes it permanent. The log
-    /// line is deliberate: no IPC op carries the status banner, so it is
-    /// the only thing the E2E can read the toast text out of.
+    /// "shown" true before `mark_noticed` makes it permanent.
     pub(super) fn show_agent_hooks_toast(&mut self) {
         let Some((toast, agents)) = self.pending_agent_hooks_toast.take() else {
             return;
         };
+        self.show_wired_toast(toast, agents);
+    }
+
+    /// Say what Roost wired, then let `mark_noticed` make it permanent —
+    /// the order `agent_hooks`'s own header pins.
+    ///
+    /// The log line is deliberate: no IPC op carries the status banner,
+    /// so it is the only thing the E2E can read the toast text out of.
+    fn show_wired_toast(&mut self, toast: String, agents: Vec<roost_agent::Agent>) {
         tracing::info!(toast, "agent hooks toast shown");
         self.set_status(toast);
         agent_hooks::spawn_mark_noticed(&self.runtime_handle, agents);
@@ -3676,6 +4129,16 @@ impl App {
                 // needs no latch: neither the terminal encoder nor the
                 // accelerator table acts on a `KeyReleased`.
                 let is_enter = matches!(key.as_ref(), Key::Named(Named::Enter));
+                // The agent-hooks card answers every key itself: it has
+                // no text input, so nothing in it can hold the caret and
+                // its ring needs no widget probe at all.
+                if self
+                    .host_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| matches!(dialog, host_dialog::HostDialog::AgentHooks(_)))
+                {
+                    return self.agent_hooks_key(&event, is_enter);
+                }
                 // Not captured by a focused `text_input` (it has no Tab
                 // arm, and `\t` is a control char it never inserts), so
                 // Tab is the one key the dialog sees whether or not a
@@ -3727,7 +4190,12 @@ impl App {
                                 Some(host_dialog::HostDialog::Bootstrap(_)) => {
                                     self.host_bootstrap_confirmed();
                                 }
-                                Some(host_dialog::HostDialog::Add(_)) | None => {}
+                                // The agent-hooks card never reaches
+                                // here: it returns above with its own
+                                // whole keyboard.
+                                Some(host_dialog::HostDialog::Add(_))
+                                | Some(host_dialog::HostDialog::AgentHooks(_))
+                                | None => {}
                             }
                         }
                         None => {}
@@ -4061,6 +4529,10 @@ impl App {
                 self.toggle_sidebar_agents();
                 Ok(UiTask::None)
             }
+            KeybindAction::AgentHooks => {
+                self.open_agent_hooks_preferences();
+                Ok(UiTask::None)
+            }
             KeybindAction::FontIncrease => {
                 self.apply_font_size_transition(FontSizeTransition::Adjust(1.0))?;
                 Ok(UiTask::None)
@@ -4254,7 +4726,7 @@ impl App {
                 "Cancel",
                 Message::ConfirmDeleteCancel,
                 Some(ConfirmButton {
-                    label: "Close Project",
+                    label: "Close Project".into(),
                     style: chrome::danger_button,
                     press: Some(Message::ConfirmDeleteConfirm),
                 }),
@@ -4284,7 +4756,7 @@ impl App {
                     "Cancel",
                     Message::HostDialogCancel,
                     Some(ConfirmButton {
-                        label: STOP_SESSION_CONFIRM,
+                        label: STOP_SESSION_CONFIRM.into(),
                         style: chrome::danger_button,
                         press: Some(Message::HostStopConfirm),
                     }),
@@ -4302,7 +4774,7 @@ impl App {
                     prompt.dismiss_label(),
                     Message::HostDialogCancel,
                     prompt.confirm.as_deref().map(|label| ConfirmButton {
-                        label,
+                        label: label.into(),
                         style: chrome::danger_button,
                         press: Some(Message::HostRestartConfirm),
                     }),
@@ -4324,7 +4796,7 @@ impl App {
                     "Cancel",
                     Message::HostDialogCancel,
                     Some(ConfirmButton {
-                        label: confirm,
+                        label: (*confirm).into(),
                         style: chrome::danger_button,
                         press: Some(Message::LocalSwitchConfirm),
                     }),
@@ -4340,13 +4812,14 @@ impl App {
                     "Cancel",
                     Message::HostDialogCancel,
                     Some(ConfirmButton {
-                        label: draft.copy.confirm,
+                        label: draft.copy.confirm.into(),
                         style: chrome::primary_button,
                         press: Some(Message::HostBootstrapConfirm),
                     }),
                     None,
                 )
             ],
+            host_dialog::HostDialog::AgentHooks(draft) => agent_hooks_body(draft),
         };
         Some(Modal {
             card: modal_card(body),
@@ -4389,7 +4862,7 @@ impl App {
             "Cancel",
             Message::HostDialogCancel,
             Some(ConfirmButton {
-                label: draft.confirm_label(),
+                label: draft.confirm_label().into(),
                 style: chrome::primary_button,
                 press: confirm,
             }),
@@ -6803,6 +7276,21 @@ impl App {
         if self.host_dialog.is_none() {
             return Err("no host dialog is open".to_string());
         }
+        // The one dialog with something to answer besides yes and no:
+        // the agent-hooks card's switches are the answer, so a test that
+        // cannot flip them can only ever confirm the defaults.
+        if let Some(agent) = action.strip_prefix("toggle:") {
+            let Some(draft) = self
+                .host_dialog
+                .as_mut()
+                .and_then(host_dialog::HostDialog::agent_hooks_mut)
+            else {
+                return Err("no agent-hooks dialog is open".to_string());
+            };
+            draft.toggle_named(agent)?;
+            self.reconcile();
+            return Ok(UiTask::None);
+        }
         if action == "cancel" {
             self.host_dialog_cancel();
             self.reconcile();
@@ -6833,6 +7321,7 @@ impl App {
                 self.host_bootstrap_confirmed();
                 UiTask::None
             }
+            Some(host_dialog::HostDialog::AgentHooks(_)) => self.agent_hooks_confirmed(),
             None => unreachable!("checked above"),
         };
         self.reconcile();
@@ -7956,14 +8445,43 @@ fn dialog_shape(dialog: &host_dialog::HostDialog) -> roost_ipc::messages::AppDia
             vec!["Cancel".to_string(), draft.copy.confirm.to_string()],
             Some(draft.saved_id.clone()),
         ),
+        host_dialog::HostDialog::AgentHooks(draft) => (
+            "agent_hooks",
+            None,
+            agent_hooks_dialog::TITLE.to_string(),
+            agent_hooks_dialog::LEDE.to_string(),
+            draft.buttons(),
+            None,
+        ),
+    };
+    // The one dialog with rows: five switches whose state is the whole
+    // question, and which no title or body could carry.
+    let (mode, rows) = match dialog {
+        host_dialog::HostDialog::AgentHooks(draft) => (
+            Some(draft.mode().wire_name().to_string()),
+            draft
+                .rows()
+                .iter()
+                .map(|row| roost_ipc::messages::AppDialogAgentRow {
+                    agent: row.agent.source().to_string(),
+                    on: row.on,
+                    found: row.found,
+                    status: row.status.clone(),
+                    files: row.files.clone(),
+                })
+                .collect(),
+        ),
+        _ => (None, Vec::new()),
     };
     roost_ipc::messages::AppDialogDumpResult {
         dialog: Some(kind.to_string()),
         variant: variant.map(str::to_string),
+        mode,
         title,
         body,
         buttons,
         host,
+        rows,
     }
 }
 
@@ -8514,6 +9032,8 @@ impl Message {
             Self::LocalSwitchConfirm => app.local_switch_confirmed(),
             Self::HostRestartConfirm => return app.host_restart_dialog_confirmed(),
             Self::HostBootstrapConfirm => app.host_bootstrap_confirmed(),
+            Self::AgentHooksToggled(index) => app.agent_hooks_toggled(index),
+            Self::AgentHooksConfirm => return app.agent_hooks_confirmed(),
             Self::ConfirmDeleteCancel => app.cancel_confirm_delete(),
             Self::ConfirmDeleteConfirm => return app.execute_confirmed_delete(),
             _ => {}
@@ -11162,5 +11682,67 @@ mod tests {
             "{restart:?}"
         );
         assert_eq!(restart.buttons, vec!["Not now", "Restart session"]);
+    }
+
+    /// The agent-hooks card's own dump: the pinned copy, the mode, and
+    /// five rows in the install engine's order.
+    ///
+    /// Same reason as the two above — the dump is the harness's only
+    /// view of a card — plus one more: the rows ARE this card's
+    /// question, and a dump that lost them would leave the E2E able to
+    /// press Apply and unable to say what it applied.
+    #[test]
+    fn the_agent_hooks_card_dumps_its_mode_and_every_switch() {
+        let home = roost_agent_install::Home::rooted("/home/u");
+        let statuses: Vec<roost_agent_install::Status> = roost_agent_install::ALL_AGENTS
+            .into_iter()
+            .map(|agent| roost_agent_install::Status {
+                agent,
+                present: agent != roost_agent::Agent::Grok,
+                wired: None,
+                entries_on_disk: false,
+                up_to_date: false,
+                noticed: false,
+                allowed: false,
+                files: roost_agent_install::owned_files(&home, agent),
+                skipped: None,
+                warnings: Vec::new(),
+            })
+            .collect();
+        let rows = agent_hooks_dialog::rows(
+            agent_hooks_dialog::CardMode::FirstRun,
+            &roost_ui_model::config::AgentHooks::Ask,
+            &statuses,
+        );
+        let card = dialog_shape(&host_dialog::HostDialog::AgentHooks(
+            agent_hooks_dialog::AgentHooksDraft::new(agent_hooks_dialog::CardMode::FirstRun, rows),
+        ));
+        assert_eq!(card.dialog.as_deref(), Some("agent_hooks"));
+        assert_eq!(card.mode.as_deref(), Some("first_run"));
+        assert_eq!(card.host, None);
+        assert_eq!(card.title, "Agent hooks");
+        assert!(
+            card.body
+                .starts_with("Roost adds a hook to each agent you switch on"),
+            "{card:?}"
+        );
+        assert!(
+            card.body.contains("roostctl agent uninstall --all"),
+            "the way back has to be in the sentence that says what is edited: {card:?}"
+        );
+        assert_eq!(
+            card.rows
+                .iter()
+                .map(|row| row.agent.as_str())
+                .collect::<Vec<_>>(),
+            ["claude", "codex", "grok", "cursor", "opencode"]
+        );
+        assert_eq!(
+            card.rows.iter().map(|row| row.on).collect::<Vec<_>>(),
+            [true, true, false, true, true],
+            "the unanswered key starts the installed agents on and the rest off"
+        );
+        assert!(card.rows.iter().all(|row| row.status.is_none()));
+        assert_eq!(card.buttons, vec!["Decide later", "Instrument 4"]);
     }
 }

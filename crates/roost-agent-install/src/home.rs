@@ -51,6 +51,7 @@ const fn default_config_dir(agent: Agent) -> &'static str {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Home {
     home: PathBuf,
+    config: PathBuf,
     claude: PathBuf,
     codex: PathBuf,
     grok: PathBuf,
@@ -85,6 +86,10 @@ impl Home {
             grok: dir(Agent::Grok),
             cursor: dir(Agent::Cursor),
             opencode: dir(Agent::Opencode),
+            config: roost_ui_model::config::config_path_in(
+                &home,
+                env("ROOST_CONFIG").as_deref().map(std::ffi::OsStr::new),
+            ),
             home,
         }
     }
@@ -96,7 +101,20 @@ impl Home {
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
             .ok_or(InstallError::NoHome)?;
-        Ok(Home::resolve(home, |key| std::env::var(key).ok()))
+        let mut resolved = Home::resolve(home, |key| std::env::var(key).ok());
+        // `ROOST_CONFIG` is re-read as an `OsString` because that is how
+        // the UI reads it, and a path is not required to be UTF-8. The
+        // `env` closure above hands back `String`s — right for the agent
+        // directories, whose overrides are trimmed as text — and a
+        // non-UTF-8 override taken through it would vanish, leaving this
+        // process writing the default config while the UI read the
+        // override. One file, two names, is the one failure this key
+        // must not have.
+        resolved.config = roost_ui_model::config::config_path_in(
+            &resolved.home,
+            std::env::var_os("ROOST_CONFIG").as_deref(),
+        );
+        Ok(resolved)
     }
 
     /// Defaults only, under `root`. The environment is ignored, which is
@@ -159,6 +177,15 @@ impl Home {
     /// `<config dir>/roost/agent-hooks.lock`.
     pub fn lock_path(&self) -> PathBuf {
         self.roost_config_dir().join("agent-hooks.lock")
+    }
+
+    /// `config.conf` — the file carrying the `agent-hooks` key this
+    /// crate writes, resolved at construction by
+    /// [`roost_ui_model::config::config_path_in`] *against this `Home`*,
+    /// so a [`Home::rooted`] jail cannot reach the developer's real
+    /// config however the process environment is set.
+    pub fn config_path(&self) -> &Path {
+        &self.config
     }
 }
 
@@ -229,6 +256,35 @@ mod tests {
         let env = env_of(&[("CLAUDE_CONFIG_DIR", "   ")]);
         let home = Home::resolve("/home/u", |k| env.get(k).cloned());
         assert_eq!(home.agent_dir(Agent::Claude), Path::new("/home/u/.claude"));
+    }
+
+    /// The jail covers `config.conf` too. Every acceptance test and the
+    /// e2e harness build a `Home::rooted(tempdir)`, and this crate now
+    /// *writes* the `agent-hooks` key — a resolution that consulted the
+    /// process environment would put that write in the developer's real
+    /// config.
+    #[test]
+    fn a_rooted_home_keeps_its_config_inside_the_jail() {
+        // Set on the process, which is the whole assertion: `rooted`
+        // resolves through its own `|_| None` closure, so what the
+        // developer running the suite has exported cannot reach it.
+        std::env::set_var("ROOST_CONFIG", "/etc/roost/config.conf");
+        let home = Home::rooted("/jail");
+        std::env::remove_var("ROOST_CONFIG");
+
+        assert_eq!(
+            home.config_path(),
+            Path::new("/jail/.config/roost/config.conf")
+        );
+    }
+
+    /// …and the real user's layout does honour it, which is what the E2E
+    /// harness's seeded config depends on.
+    #[test]
+    fn an_explicit_override_moves_the_config_path() {
+        let env = env_of(&[("ROOST_CONFIG", "/jail/config.conf")]);
+        let home = Home::resolve("/home/u", |k| env.get(k).cloned());
+        assert_eq!(home.config_path(), Path::new("/jail/config.conf"));
     }
 
     #[test]

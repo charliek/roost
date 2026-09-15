@@ -25,7 +25,8 @@ use std::time::Duration;
 
 use roost_ipc::agent::{self, TabAgentReportParams};
 use roost_ipc::messages::{
-    ops, AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
+    ops, AgentHooksOutcome, AgentSetHooksAgents, AgentSetHooksParams, AgentSetHooksResult,
+    AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
     AppCursorShapeParams, AppCursorShapeResult, AppDialogAnswerParams, AppDialogDumpParams,
     AppDialogDumpResult, AppDockBadgeParams, AppDockBadgeResult, AppKeybindDispatchParams,
     AppMenuActivateParams, AppMenuDumpParams, AppMenuDumpResult, AppNotificationStatusParams,
@@ -41,18 +42,17 @@ use roost_ipc::messages::{
     ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
     ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
     SelectionDumpResult, SelectionSetParams, SessionIdentify, SessionIdentifyParams,
-    SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams,
-    SessionSetAgentHooksResult, SessionSetFocusParams, SessionSetThemeParams, SessionStopParams,
-    SessionStopResult, SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams,
-    TabAgentReportResult, TabAttachParams, TabCapturePtyInputParams, TabCapturePtyInputResult,
-    TabClearNotificationParams, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
-    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
-    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
-    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams, TabSendFileResult,
-    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
-    WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef, WireTabRef,
-    MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
+    SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams, SessionSetFocusParams,
+    SessionSetThemeParams, SessionStopParams, SessionStopResult, SidebarDumpParams,
+    SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult, TabAttachParams,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
+    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
+    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
+    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
+    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams,
+    TabSendFileResult, TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams,
+    TabWriteParams, WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef,
+    WireTabRef, MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{SessionSetThemeResult, TabAttachResult};
@@ -491,7 +491,8 @@ pub enum UiRequest {
     },
     /// `app.dialog_answer` — confirm or cancel the visible host modal,
     /// through the same routes a click and Enter/Escape take. `action`
-    /// is `"confirm" | "cancel"`. Gated like `AppDialogDump`.
+    /// is `"confirm" | "cancel"`, or `"toggle:<agent>"` for one of the
+    /// agent-hooks card's switches. Gated like `AppDialogDump`.
     AppDialogAnswer {
         action: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
@@ -525,6 +526,23 @@ pub enum UiRequest {
     /// macOS-iced-only like `AppDockBadge`.
     AppNotificationStatus {
         reply: tokio::sync::oneshot::Sender<Result<AppNotificationStatusResult, String>>,
+    },
+    /// `agent.set_hooks` — set *this* machine's own `agent-hooks` key
+    /// and raise every connected non-localhost host to at least the
+    /// same allow-list (plan 064 §3.4).
+    ///
+    /// The engine decodes the op and answers with what the app reports;
+    /// it never touches the install engine itself, for
+    /// [`AgentHooksHandle`]'s reason — this crate is linked into the UI
+    /// processes, and a UI has no business carrying a dotfile writer.
+    ///
+    /// Like [`UiRequest::HostTabReorder`] this cannot be answered inside
+    /// `update`: the install is file I/O under an advisory lock and the
+    /// host raises are round trips. The reply travels with the work and
+    /// is answered from wherever it ends.
+    AgentSetHooks {
+        agents: AgentSetHooksAgents,
+        reply: HostOpReply<AgentSetHooksResult>,
     },
     /// `host.add` — save a host to the client-side registry (plan 037
     /// §3.5).
@@ -742,48 +760,65 @@ impl std::fmt::Debug for StopHandle {
 pub struct AgentHooksHandle(Arc<dyn Fn(AgentHooksRequest) -> AgentHooksFuture + Send + Sync>);
 
 /// The op's params, as the daemon receives them.
+///
+/// `agents` is the allow-list the client's own `agent-hooks` key names —
+/// what this host's `agent-hooks` key is raised (unioned) to, never
+/// lowered (plan 064 §3.3). There is no `off` here: a client whose own
+/// key is `off` or unconfigured has nothing to raise the host with, so
+/// it never sends this op at all.
+///
+/// Unvalidated: the agent set lives in the install engine, which this
+/// crate deliberately does not link, so the handle's far side refuses a
+/// malformed list with [`AgentHooksError::InvalidParam`].
 #[derive(Debug, Clone)]
 pub struct AgentHooksRequest {
-    pub mode: roost_ipc::messages::AgentHooksMode,
-    pub skip: Vec<String>,
+    pub agents: Vec<String>,
     /// How the asking client names itself, for the host's state record.
     pub client: String,
 }
 
 /// Why a session could not run an install at all.
-///
-/// A whole-run failure: no `$HOME`, an unwritable state record, a lock
-/// another writer never released. A *per-agent* failure is not one — it
-/// rides back in the reply's `errors`.
 #[derive(Debug)]
 pub enum AgentHooksError {
+    /// The request itself is malformed — an empty `agents`, or a name no
+    /// agent answers to — and nothing was written.
+    ///
+    /// Its own variant rather than a [`Self::Failed`] because the two
+    /// instruct differently, and under protocol equality a name this
+    /// host does not know can only be a bug in the client: `invalid-param`
+    /// says "fix the request", `internal` says "something on the host
+    /// broke", and a client told the second would go hunting on the wrong
+    /// machine.
+    InvalidParam(String),
+    /// A whole-run failure: no `$HOME`, an unwritable state record, a lock
+    /// another writer never released. A *per-agent* failure is not one —
+    /// it rides back in the reply's `errors`.
     Failed(String),
 }
 
 impl std::fmt::Display for AgentHooksError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AgentHooksError::Failed(error) => f.write_str(error),
+            AgentHooksError::InvalidParam(error) | AgentHooksError::Failed(error) => {
+                f.write_str(error)
+            }
         }
     }
 }
 
 type AgentHooksFuture =
-    Pin<Box<dyn Future<Output = Result<SessionSetAgentHooksResult, AgentHooksError>> + Send>>;
+    Pin<Box<dyn Future<Output = Result<AgentHooksOutcome, AgentHooksError>> + Send>>;
 
 impl AgentHooksHandle {
     pub fn new<F, Fut>(f: F) -> Self
     where
         F: Fn(AgentHooksRequest) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<SessionSetAgentHooksResult, AgentHooksError>> + Send + 'static,
+        Fut: Future<Output = Result<AgentHooksOutcome, AgentHooksError>> + Send + 'static,
     {
         Self(Arc::new(move |request| Box::pin(f(request))))
     }
 
-    async fn run(
-        &self,
-        request: AgentHooksRequest,
-    ) -> Result<SessionSetAgentHooksResult, AgentHooksError> {
+    async fn run(&self, request: AgentHooksRequest) -> Result<AgentHooksOutcome, AgentHooksError> {
         (self.0)(request).await
     }
 }
@@ -2266,12 +2301,21 @@ async fn dispatch_outcome(
         // The host registry is client-side state (D8): a UI socket's op
         // family. Letting it fall through would grow a shadow registry in
         // the daemon's own state.json that nothing ever reads.
+        //
+        // `agent.set_hooks` is refused here for the same reason from the
+        // other direction: the op sets a machine's own key *and* raises
+        // every host that machine is connected to, and a session has no
+        // connections of its own. `session.set_agent_hooks` is what a
+        // client puts to a session; answering both here would give a
+        // host two spellings of one act, one of which cannot keep half
+        // its promise.
         ops::HOST_ADD
         | ops::HOST_REMOVE
         | ops::HOST_LIST
         | ops::HOST_CONNECT
         | ops::HOST_DISCONNECT
-        | ops::HOST_STATUS => {
+        | ops::HOST_STATUS
+        | ops::AGENT_SET_HOOKS => {
             return Err(HandlerError::unknown_op(op));
         }
         _ => {}
@@ -2568,8 +2612,9 @@ fn session_set_focus(
     Ok(serde_json::json!({}))
 }
 
-/// `session.set_agent_hooks`: bring the host's agent hook entries in
-/// line with the connected client's config (plan 046 §3.4).
+/// `session.set_agent_hooks`: raise the host's `agent-hooks` key to at
+/// least the connected client's own allow-list (plan 046 §3.4, plan 064
+/// §3.3).
 ///
 /// Everything this function does is admission. The work — reading and
 /// rewriting five agents' config files under the session user's `$HOME`
@@ -2579,14 +2624,16 @@ fn session_set_focus(
 /// In [`is_mutating_op`] because a session that has latched
 /// `session.stop` has already flushed and reaped: entries pointing at a
 /// socket about to be unlinked are worse than no entries at all.
-/// Otherwise every same-UID connection may state it, and the last one to
-/// reach the install lock wins (plan 046 §3.4).
+/// Otherwise every same-UID connection may state it, and every raise
+/// only ever widens what the key allows (plan 064 §3.3) — two
+/// connections naming different agents both win.
 ///
 /// A per-agent install failure is a *reported* failure, never an error
 /// frame: the reply's `errors` list carries it, so a client hears which
 /// agent broke and still keeps the session it just attached to. Only a
 /// whole-run failure — no `$HOME`, an unwritable record, a lock another
-/// writer never released — is an error frame.
+/// writer never released — is an error frame, and a malformed request is
+/// a different one ([`AgentHooksError::InvalidParam`]).
 async fn session_set_agent_hooks(
     h: &IpcHandler,
     p: SessionSetAgentHooksParams,
@@ -2599,12 +2646,14 @@ async fn session_set_agent_hooks(
     })?;
     let result = handle
         .run(AgentHooksRequest {
-            mode: p.mode,
-            skip: p.skip,
+            agents: p.agents,
             client: p.client,
         })
         .await
-        .map_err(|AgentHooksError::Failed(message)| HandlerError::new("internal", message))?;
+        .map_err(|error| match error {
+            AgentHooksError::InvalidParam(message) => HandlerError::new("invalid-param", message),
+            AgentHooksError::Failed(message) => HandlerError::new("internal", message),
+        })?;
     encode(&result)
 }
 
@@ -3823,9 +3872,14 @@ async fn dispatch(
         }
         ops::APP_DIALOG_ANSWER => {
             let p: AppDialogAnswerParams = decode(params)?;
-            if !matches!(p.action.as_str(), "confirm" | "cancel") {
+            // `toggle:<agent>` is the agent-hooks card's third answer
+            // (plan 064 §3.5); which agents exist is the card's to say,
+            // so the shape is checked here and the name over there.
+            if !matches!(p.action.as_str(), "confirm" | "cancel")
+                && p.action.strip_prefix("toggle:").is_none_or(str::is_empty)
+            {
                 return Err(HandlerError::invalid_param(format!(
-                    "action must be confirm or cancel (got {:?})",
+                    "action must be confirm, cancel or toggle:<agent> (got {:?})",
                     p.action
                 )));
             }
@@ -3890,6 +3944,20 @@ async fn dispatch(
                 "not-implemented",
                 "events.subscribe is not yet implemented",
             ))
+        }
+        // Answered by the app alone, with no headless fallback: the
+        // reply names what every *connected* host did, and the
+        // connection set is the app's. A socket with no window behind
+        // it therefore gets `ui_call`'s `no UI attached`.
+        ops::AGENT_SET_HOOKS => {
+            let p: AgentSetHooksParams = decode(params)?;
+            let result = h
+                .ui_call(|reply| UiRequest::AgentSetHooks {
+                    agents: p.agents,
+                    reply,
+                })
+                .await??;
+            encode(&result)
         }
         // The four registry mutations route through the app when one is
         // attached (plan 037 §3.5): the app owns the connections and the

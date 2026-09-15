@@ -329,7 +329,7 @@ async fn session_stop_reaps_latches_and_finalizes() {
         &f.handler,
         ops::SESSION_SET_AGENT_HOOKS,
         serde_json::json!({
-            "mode": "auto",
+            "agents": ["claude"],
             "client": "charlie-mbp",
         }),
     )

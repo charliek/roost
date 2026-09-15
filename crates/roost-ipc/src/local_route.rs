@@ -292,6 +292,10 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ("app.dialog_dump", OpClass::UiOwned),
     ("app.dialog_answer", OpClass::UiOwned),
     ("app.keybind_dispatch", OpClass::UiOwned),
+    // Sets *this* machine's own `agent-hooks` key and raises every
+    // connected host to match — a property of this UI's config and its
+    // host registry, neither of which the slot has any view of.
+    ("agent.set_hooks", OpClass::UiOwned),
     // Host registry + connections: client state, and the slot is one of
     // the rows. Forwarding would ask the session about a registry it
     // does not keep.

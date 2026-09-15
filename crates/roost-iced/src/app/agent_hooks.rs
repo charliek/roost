@@ -30,9 +30,12 @@
 
 use roost_agent::Agent;
 use roost_agent_install::{Guard, Home, Mode};
-use roost_ipc::messages::{AgentHooksMode, SessionSetAgentHooksResult};
+use roost_ipc::messages::{
+    AgentHooksFailed, AgentHooksOutcome, AgentHooksSkipped, AgentSetHooksAgents,
+};
 use roost_ui_model::config::{AgentHooks, RoostConfig};
 
+use super::agent_hooks_dialog::{AgentHooksRow, CardMode};
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
 use crate::host_conn::queue::HostOpError;
 
@@ -53,16 +56,11 @@ pub(crate) struct AgentHooksEnsured {
     pub errors: Vec<String>,
 }
 
-/// The mode and skip list `config.conf` asks for, plus any skip name no
-/// agent answers to.
-fn resolve(config: &RoostConfig) -> (Mode, Vec<Agent>, Vec<String>) {
-    let (skip, unknown) =
-        roost_agent_install::skip_list(config.agent_hooks_skip.iter().map(String::as_str));
-    let mode = match config.agent_hooks {
-        AgentHooks::Auto => Mode::Auto,
-        AgentHooks::Off => Mode::Off,
-    };
-    (mode, skip, unknown)
+/// What `config.conf` asks for, or `None` when nobody has answered the
+/// consent dialog yet (plan 064) — the caller must wire and unwire
+/// nothing in that case, not guess.
+fn resolve(config: &RoostConfig) -> Option<Mode> {
+    Mode::from_config(&config.agent_hooks)
 }
 
 /// What a `window_opened` should do about the startup ensure.
@@ -71,6 +69,10 @@ pub(crate) enum Start {
     Run,
     /// `agent-hooks = off`.
     Off,
+    /// Nobody has answered the consent dialog yet (plan 064) — the same
+    /// non-decision as `Off` for the purposes of this latch, but a
+    /// distinct reason worth telling apart in a log line.
+    Ask,
     /// Already run once in this process.
     Already,
 }
@@ -83,19 +85,49 @@ pub(crate) enum Start {
 /// hand would watch Roost put it back for the crime of clicking on the
 /// window. The plan says startup, so the latch says startup: it is
 /// claimed only when the ensure actually starts, which leaves the `off`
-/// case free to be reconsidered if a later launch ever re-reads config.
-pub(crate) fn claim_start(started: &mut bool, mode: Mode) -> Start {
-    if mode == Mode::Off {
-        return Start::Off;
+/// and `ask` cases free to be reconsidered if a later launch ever
+/// re-reads config.
+///
+/// `resolved` is `None` for `Ask` — [`resolve`]'s shape, carried through
+/// rather than re-derived, so this function cannot itself decide to run
+/// an ensure `resolve` said not to.
+pub(crate) fn claim_start(started: &mut bool, resolved: Option<&Mode>) -> Start {
+    match resolved {
+        None => Start::Ask,
+        Some(Mode::Off) => Start::Off,
+        Some(Mode::Allow(_)) => {
+            if *started {
+                return Start::Already;
+            }
+            *started = true;
+            Start::Run
+        }
     }
-    if *started {
-        return Start::Already;
-    }
-    *started = true;
-    Start::Run
 }
 
-/// Start the startup ensure, or decline to.
+/// Claim the one first-run consent card this process gets (plan 064
+/// §3.5).
+///
+/// Its own latch beside [`claim_start`], because they answer different
+/// questions and `window_opened` asks both on **every focus change**: an
+/// Alt-Tab back to the window must not put the card up a second time,
+/// and the `Ask` branch deliberately never claims `claim_start`'s latch.
+///
+/// Three conditions, and the two that are not the latch are refusals:
+/// only an unanswered key has anything to ask about, and a UI under
+/// `ROOST_TEST_MODE` asks nothing at all unless the harness lifted the
+/// fence — the same [`Guard`] the install engine itself checks, read
+/// here so a test-mode launch never even raises the card.
+pub(crate) fn claim_first_run(raised: &mut bool, start: &Start, guard: Guard) -> bool {
+    if !matches!(start, Start::Ask) || guard.check().is_err() || *raised {
+        return false;
+    }
+    *raised = true;
+    true
+}
+
+/// Start the startup ensure, or decline to — and say which, because the
+/// caller has its own thing to do about `Ask`.
 ///
 /// `agent-hooks = off` returns without touching a single file — the key
 /// means "Roost wires nothing here", and a startup that *removed*
@@ -107,23 +139,21 @@ pub(crate) fn spawn_ensure(
     runtime: &tokio::runtime::Handle,
     feed: &EngineFeedSender,
     config: &RoostConfig,
-) {
-    let (mode, skip, unknown) = resolve(config);
-    match claim_start(started, mode) {
-        Start::Run => {}
+) -> Start {
+    let resolved = resolve(config);
+    let start = claim_start(started, resolved.as_ref());
+    let mode = match &start {
+        Start::Run => resolved.expect("Start::Run implies resolve() returned Some"),
         Start::Off => {
             tracing::debug!("agent-hooks = off: not wiring agent hooks");
-            return;
+            return start;
         }
-        Start::Already => return,
-    }
-    for name in unknown {
-        tracing::warn!(
-            name,
-            known = %roost_agent_install::agent_names(),
-            "agent-hooks-skip names no agent Roost knows how to wire"
-        );
-    }
+        Start::Ask => {
+            tracing::debug!("agent-hooks is not configured; not wiring agent hooks");
+            return start;
+        }
+        Start::Already => return start,
+    };
 
     let feed = feed.clone();
     let guard = Guard::from_env();
@@ -131,15 +161,90 @@ pub(crate) fn spawn_ensure(
     // over there: a config edit landing mid-launch would otherwise split
     // the decision from the action it authorised.
     runtime.spawn_blocking(move || {
-        feed.send(EngineFeed::AgentHooks(ensure_blocking(&skip, guard)));
+        feed.send(EngineFeed::AgentHooks(ensure_blocking(&mode, guard)));
     });
+    start
+}
+
+/// What one read-only status walk found, on its way to the consent card.
+///
+/// `mode` rides outside the `Result` because a failure still has to be
+/// routed: a preferences card the user asked for owes them a sentence,
+/// and a first-run probe nobody asked for stays quiet.
+pub(crate) struct AgentHooksSurvey {
+    pub mode: CardMode,
+    /// Which survey this is. A survey reads five agents' files, so two
+    /// can be in flight at once — a second palette activation, or the
+    /// startup probe still running when the user opens preferences. The
+    /// app keeps the id it is waiting for and drops anything else, so a
+    /// stale result cannot replace the card the user is looking at.
+    pub id: u64,
+    pub result: Result<AgentHooksFound, String>,
+}
+
+pub(crate) struct AgentHooksFound {
+    pub rows: Vec<AgentHooksRow>,
+    /// The key **as the survey read it off disk**, which is not
+    /// necessarily the one the caller decided to ask about: the gate
+    /// runs against the launch-time config, and another process can
+    /// answer the key in between. A first-run card is not raised over an
+    /// answer somebody has already given.
+    pub key: AgentHooks,
+    /// At least one of the five is installed on this machine. The
+    /// first-run card is not raised without one: there is nothing to
+    /// consent about, and the key stays absent rather than being
+    /// answered by a dialog nobody could act on.
+    pub any_present: bool,
+}
+
+/// Read every agent's status for the consent card, off the UI thread.
+///
+/// Off the thread for this module's own reason — see its header:
+/// `status` opens up to six files across five agents' config
+/// directories, and the preferences card re-runs it on every open.
+pub(crate) fn spawn_survey(
+    mode: CardMode,
+    id: u64,
+    fallback: AgentHooks,
+    runtime: &tokio::runtime::Handle,
+    feed: &EngineFeedSender,
+) {
+    let feed = feed.clone();
+    runtime.spawn_blocking(move || {
+        feed.send(EngineFeed::AgentHooksSurvey(Box::new(AgentHooksSurvey {
+            mode,
+            id,
+            result: survey_blocking(mode, &fallback),
+        })));
+    });
+}
+
+/// The blocking half of the survey.
+///
+/// The key is re-read from disk rather than taken from the running UI's
+/// snapshot, for [`hooks_on_disk`]'s reason and one more: opening the
+/// preferences card is exactly when a key changed by `roostctl agent set
+/// --local`, or raised through this machine's own session, has to be
+/// what the switches show.
+fn survey_blocking(mode: CardMode, fallback: &AgentHooks) -> Result<AgentHooksFound, String> {
+    let home = Home::from_env().map_err(|error| error.to_string())?;
+    let key = hooks_on_disk(fallback);
+    // `Ask` allows nothing: the card reads `Status::allowed` as "named
+    // in the key", and nobody has named anything yet.
+    let resolved = Mode::from_config(&key).unwrap_or_else(|| Mode::Allow(Vec::new()));
+    let statuses = roost_agent_install::status(&home, &resolved).map_err(|e| e.to_string())?;
+    Ok(AgentHooksFound {
+        any_present: statuses.iter().any(|status| status.present),
+        rows: super::agent_hooks_dialog::rows(mode, &key, &statuses),
+        key,
+    })
 }
 
 /// The blocking half. Every failure becomes a line in
 /// [`AgentHooksEnsured::errors`] rather than a panic or a swallow: this
 /// runs with nobody waiting on it, so the only honest thing to do with a
 /// failure is carry it back to a thread that can log it.
-fn ensure_blocking(skip: &[Agent], guard: Guard) -> AgentHooksEnsured {
+fn ensure_blocking(mode: &Mode, guard: Guard) -> AgentHooksEnsured {
     let home = match Home::from_env() {
         Ok(home) => home,
         Err(error) => {
@@ -149,7 +254,7 @@ fn ensure_blocking(skip: &[Agent], guard: Guard) -> AgentHooksEnsured {
             }
         }
     };
-    match roost_agent_install::ensure(&home, Mode::Auto, skip, BY, guard) {
+    match roost_agent_install::ensure(&home, mode, BY, guard) {
         Ok(outcome) => AgentHooksEnsured {
             unnoticed: outcome.unnoticed,
             errors: outcome
@@ -182,36 +287,192 @@ pub(crate) fn spawn_mark_noticed(runtime: &tokio::runtime::Handle, agents: Vec<A
     });
 }
 
+/// What `agent.set_hooks` asks for, or the `invalid-param` it is refused
+/// with before anything is written (plan 064 §3.4).
+///
+/// The same rule `session.set_agent_hooks` draws on a host
+/// (`roost-session`'s `agent_hooks::resolve`) and `roostctl agent set`
+/// draws on a spec: this op answers the consent question, and a consent
+/// answer has no honest partial reading — one name nothing answers to
+/// refuses the whole list rather than silently narrowing it. The one
+/// difference is that `off` arrives here as its own wire spelling
+/// instead of as a word in the list.
+pub(crate) fn resolve_set(agents: &AgentSetHooksAgents) -> Result<Mode, String> {
+    let names = match agents {
+        AgentSetHooksAgents::Off => return Ok(Mode::Off),
+        AgentSetHooksAgents::List(names) => names,
+    };
+    // Checked before `resolve_names`, which skips blanks: skipping is
+    // right for a human-typed CLI list and wrong on a wire, where a
+    // blank element can only be a bug in the client.
+    if names.iter().any(|name| name.trim().is_empty()) {
+        return Err("agent.set_hooks: `agents` carries an empty name".to_string());
+    }
+    let (agents, unknown) = roost_agent_install::resolve_names(names.iter().map(String::as_str));
+    if let Some(name) = unknown.first() {
+        return Err(format!(
+            "agent.set_hooks: no agent named {name:?} ({})",
+            roost_agent_install::agent_names()
+        ));
+    }
+    if agents.is_empty() {
+        return Err(format!(
+            "agent.set_hooks requires a non-empty `agents` ({}) or the word \"off\"",
+            roost_agent_install::agent_names()
+        ));
+    }
+    Ok(Mode::Allow(agents))
+}
+
+/// What one local `agent.set_hooks` did to this machine, on its way back
+/// to the main thread.
+pub(crate) struct AgentHooksSet {
+    pub config_path: String,
+    pub outcome: AgentHooksOutcome,
+    /// The key this machine now has, read off the mode that was written
+    /// rather than out of `outcome` — an outcome describes files, and
+    /// the running UI's in-memory config has to match the key.
+    pub key: AgentHooks,
+    /// The toast list, and what `mark_noticed` is then given. The names
+    /// are already in [`AgentHooksOutcome::wired`]; the agents are kept
+    /// beside them because that is what both of those take.
+    pub unnoticed: Vec<Agent>,
+}
+
+/// The blocking half of `agent.set_hooks`: the key write and the
+/// reconcile, under the install lock.
+///
+/// Off the UI thread for this module's own reason — see its header.
+/// Only a whole-run failure is an `Err`; a per-agent one rides back in
+/// [`AgentHooksOutcome::errors`], because one unparseable `config.toml`
+/// must not cost the user the answer they just gave.
+pub(crate) fn set_hooks_blocking(mode: &Mode, guard: Guard) -> Result<AgentHooksSet, String> {
+    let home = Home::from_env().map_err(|error| error.to_string())?;
+    let outcome =
+        roost_agent_install::set_hooks(&home, mode, BY, guard).map_err(|e| e.to_string())?;
+    Ok(AgentHooksSet {
+        config_path: home.config_path().display().to_string(),
+        outcome: wire_outcome(&outcome),
+        key: mode.to_config(),
+        unnoticed: outcome.unnoticed,
+    })
+}
+
+/// One install [`roost_agent_install::Outcome`] as the wire carries it.
+///
+/// `roost-session`'s `agent_hooks::reply` is the same map for the host
+/// half of the same wire type, and the two copies are deliberate:
+/// `roost-agent-install` owns `Outcome` and does not depend on
+/// `roost-ipc`, so the only shared home would be a leaf crate holding
+/// one function. Change one and check the other.
+fn wire_outcome(outcome: &roost_agent_install::Outcome) -> AgentHooksOutcome {
+    let names = |agents: &[Agent]| -> Vec<String> {
+        agents.iter().map(|a| a.source().to_string()).collect()
+    };
+    AgentHooksOutcome {
+        // The toast list, not this run's writes — see the field's own
+        // doc in `roost-ipc`.
+        wired: names(&outcome.unnoticed),
+        refreshed: names(&outcome.refreshed),
+        removed: names(&outcome.removed),
+        skipped: outcome
+            .skipped
+            .iter()
+            .map(|skip| AgentHooksSkipped {
+                agent: skip.agent.source().to_string(),
+                reason: skip.reason.to_string(),
+            })
+            .collect(),
+        errors: outcome
+            .errors
+            .iter()
+            .map(|failure| AgentHooksFailed {
+                agent: failure.agent.source().to_string(),
+                error: failure.error.to_string(),
+            })
+            .collect(),
+    }
+}
+
 /// What one host answered `session.set_agent_hooks` with, on its way to
 /// the toast (plan 046 §3.4).
 pub(crate) struct HostAgentHooks {
     /// The host's label, for the toast prefix and the log.
     pub label: String,
-    pub outcome: Result<SessionSetAgentHooksResult, HostOpError>,
+    pub outcome: Result<AgentHooksOutcome, HostOpError>,
 }
 
-/// What this client asks a host to do, read fresh from its config.
+/// The allow-list one `session.set_agent_hooks` carries, or `None` when
+/// this decision reaches a host at all.
 ///
-/// Sent on **every** connect, values and all: the op is idempotent, and
-/// a config edit made since the last connect has no other way to reach
-/// the host.
+/// **Only `Allow` ever sends anything, because the wire can now only
+/// ever raise.** Plan 064 §3.3 reshaped `session.set_agent_hooks` into a
+/// pure widen: there is no wire spelling of "off" or "narrow this" left
+/// to send, so a host's key can only move up, never down. That retires
+/// the C1-era "off is off everywhere" rule this decision used to carry —
+/// `Off` sends nothing now, exactly like an unanswered key, because
+/// neither state has an allow-list to widen a host with. Taking a host's
+/// entries back out stays a deliberate, local act: `roostctl agent
+/// ensure`/`uninstall`, run by hand on the host itself.
 ///
-/// **`off` is not silence here.** Locally it means "wire nothing" and
-/// the UI never opens an agent's file; remotely it means "unwire", and
-/// the difference is not an inconsistency — a host has no `config.conf`
-/// of its own, so the client is the only authority that can tell it to
-/// come clean. Off is off everywhere (§3.4, and §3.6's C7 amendment for
-/// the local half).
+/// Both send sites resolve through here — the connect-time
+/// [`remote_request`] and `agent.set_hooks`'s Apply push — so "what does
+/// `off` do to a host?" has one answer and not two.
+pub(crate) fn raise_list(mode: &Mode) -> Option<Vec<String>> {
+    match mode {
+        Mode::Allow(agents) if !agents.is_empty() => {
+            Some(agents.iter().map(|a| a.source().to_string()).collect())
+        }
+        Mode::Allow(_) | Mode::Off => None,
+    }
+}
+
+/// What this client asks a host to do at connect time, read fresh from
+/// its config, or `None` to send nothing at all.
 ///
-/// The skip list travels as the user typed it. The host resolves the
-/// names and reports the ones it does not know, which is the only place
-/// that can tell a typo from an agent a newer client knows about.
-pub(crate) fn remote_request(config: &RoostConfig) -> (AgentHooksMode, Vec<String>) {
-    let mode = match config.agent_hooks {
-        AgentHooks::Auto => AgentHooksMode::Auto,
-        AgentHooks::Off => AgentHooksMode::Off,
+/// Sent on **every** connect, values and all, when there is a decision
+/// to send: the op is idempotent, and a config edit made since the last
+/// connect has no other way to reach the host.
+///
+/// An unanswered key sending nothing was always the rule: wiring a
+/// host's dotfiles before the user has answered the local consent
+/// dialog would be exactly the unconsented write plan 064 exists to
+/// stop. It arrives here as [`resolve`]'s `None`, which is why this
+/// reads the key through [`Mode`] rather than matching [`AgentHooks`]
+/// directly — that also drops a name no agent answers to, so a stale
+/// `config.conf` cannot put one on the wire.
+pub(crate) fn remote_request(config: &RoostConfig) -> Option<Vec<String>> {
+    raise_list(&resolve(config)?)
+}
+
+/// This machine's `agent-hooks` key **as it is on disk right now**.
+///
+/// `self.config` is a snapshot of launch time, and since plan 064 this
+/// process is not its only writer: a connecting client raises this
+/// machine's key through its own `roost-session`, and `roostctl agent
+/// set --local` writes it with no UI running at all. A connect that
+/// sent the snapshot would hand a host a list the user has since
+/// changed — and because a raise can only widen, the host would keep it.
+///
+/// Reads and parses one small file rather than calling
+/// `RoostConfig::load_default`, which also walks the providers
+/// directory; this runs once per connect, not once per frame. An
+/// unreadable config falls back to what this process already believes,
+/// because failing to read is not a reason to say something different.
+pub(crate) fn hooks_on_disk(fallback: &AgentHooks) -> AgentHooks {
+    let Some(path) = roost_ui_model::config::config_path() else {
+        return fallback.clone();
     };
-    (mode, config.agent_hooks_skip.clone())
+    match std::fs::read_to_string(&path) {
+        Ok(text) => RoostConfig::parse(&text).agent_hooks,
+        // Absent is unanswered, which is a real state and not a failure:
+        // it is what a machine nobody has consented on looks like.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => AgentHooks::Ask,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "could not re-read agent-hooks");
+            fallback.clone()
+        }
+    }
 }
 
 /// How this client names itself in a host's state record.
@@ -263,8 +524,8 @@ pub(crate) fn wired_toast(agents: &[Agent], host: Option<&str>) -> Option<String
         None => String::new(),
     };
     Some(format!(
-        "{prefix}Roost wired agent hooks for {} — undo: \
-         `roostctl agent uninstall --all` or `agent-hooks = off`",
+        "{prefix}Roost wired agent hooks for {} — change it under \
+         Agent Hooks… in the command palette",
         names.join(", ")
     ))
 }
@@ -292,41 +553,88 @@ mod tests {
         assert_eq!(unknown, vec!["gemini"]);
     }
 
+    /// `Ask` — the default — resolves to `None`: nobody has consented
+    /// yet, so `spawn_ensure` must not wire anything.
     #[test]
-    fn the_default_config_wires_everything() {
-        let (mode, skip, unknown) = resolve(&config(""));
-        assert_eq!(mode, Mode::Auto);
-        assert!(skip.is_empty());
-        assert!(unknown.is_empty());
+    fn an_unconfigured_config_resolves_to_none() {
+        assert_eq!(resolve(&config("")), None);
     }
 
     #[test]
-    fn off_and_the_skip_list_reach_the_engine() {
-        let (mode, skip, unknown) = resolve(&config(
-            "agent-hooks = off\nagent-hooks-skip = cursor, gemini",
-        ));
-        assert_eq!(mode, Mode::Off);
-        assert_eq!(skip, vec![Agent::Cursor]);
-        assert_eq!(unknown, vec!["gemini"]);
+    fn an_allow_list_wires_only_the_named_agents() {
+        assert_eq!(
+            resolve(&config("agent-hooks = claude, cursor")),
+            Some(Mode::Allow(vec![Agent::Claude, Agent::Cursor]))
+        );
     }
 
-    /// The remote half sends `off` rather than staying quiet, which is
-    /// the whole of "off is off everywhere": the host has no config of
-    /// its own to read, so silence would leave its files wired forever.
     #[test]
-    fn off_travels_to_a_host_instead_of_being_withheld() {
-        let (mode, skip) = remote_request(&config(
-            "agent-hooks = off\nagent-hooks-skip = cursor, gemini",
-        ));
-        assert_eq!(mode, AgentHooksMode::Off);
-        // Unresolved on purpose: only the host can say which names it
-        // knows, and a client that dropped `gemini` here would leave the
-        // typo undiagnosable from either end.
-        assert_eq!(skip, vec!["cursor".to_string(), "gemini".to_string()]);
+    fn off_resolves_to_off() {
+        assert_eq!(resolve(&config("agent-hooks = off")), Some(Mode::Off));
+    }
 
-        let (mode, skip) = remote_request(&config(""));
-        assert_eq!(mode, AgentHooksMode::Auto);
-        assert!(skip.is_empty());
+    /// `Off` sends nothing — the wire can only ever raise a host now
+    /// (plan 064 §3.3), and an off client has no allow-list to raise it
+    /// with. Retiring the host's entries stays a local, explicit act.
+    ///
+    /// Asserted at both send sites: the connect-time read of the key,
+    /// and the Apply push `agent.set_hooks` makes.
+    #[test]
+    fn off_sends_nothing_to_a_host() {
+        assert_eq!(remote_request(&config("agent-hooks = off")), None);
+        assert_eq!(raise_list(&Mode::Off), None);
+    }
+
+    /// The Apply push carries exactly what was applied.
+    #[test]
+    fn an_applied_allow_list_travels_as_itself() {
+        assert_eq!(
+            raise_list(&Mode::Allow(vec![Agent::Claude, Agent::Cursor])),
+            Some(vec!["claude".to_string(), "cursor".to_string()])
+        );
+    }
+
+    #[test]
+    fn an_allow_list_travels_as_itself() {
+        assert_eq!(
+            remote_request(&config("agent-hooks = claude, cursor")),
+            Some(vec!["claude".to_string(), "cursor".to_string()])
+        );
+    }
+
+    /// `Ask` sends nothing at all: an unconfigured client must not wire
+    /// a host's dotfiles either.
+    #[test]
+    fn an_unconfigured_config_sends_nothing_to_a_host() {
+        assert_eq!(remote_request(&config("")), None);
+    }
+
+    fn set(agents: &[&str]) -> Result<Mode, String> {
+        resolve_set(&AgentSetHooksAgents::List(
+            agents.iter().map(|s| (*s).to_string()).collect(),
+        ))
+    }
+
+    #[test]
+    fn agent_set_hooks_takes_a_list_or_the_word_off() {
+        assert_eq!(
+            set(&["claude", "codex"]),
+            Ok(Mode::Allow(vec![Agent::Claude, Agent::Codex]))
+        );
+        assert_eq!(resolve_set(&AgentSetHooksAgents::Off), Ok(Mode::Off));
+    }
+
+    /// The two shapes that are bugs in the caller rather than answers.
+    #[test]
+    fn agent_set_hooks_refuses_an_empty_or_unknown_list() {
+        assert!(set(&[]).unwrap_err().contains("non-empty"));
+        assert!(set(&["  "]).unwrap_err().contains("empty name"));
+        assert!(set(&["claude", ""]).unwrap_err().contains("empty name"));
+        let refused = set(&["claude", "gemini"]).unwrap_err();
+        assert!(refused.contains("gemini"), "{refused}");
+        for known in ["claude", "codex", "grok", "cursor", "opencode"] {
+            assert!(refused.contains(known), "{refused}");
+        }
     }
 
     /// It goes into the host's state record, so it has to be a name and
@@ -337,16 +645,16 @@ mod tests {
     }
 
     /// The text is what the user is left with after Roost has edited
-    /// their dotfiles, so both escape hatches have to be *in* it.
+    /// their dotfiles, so it has to name both what was wired and the one
+    /// surface that changes it again (plan 064 §3.4).
     #[test]
-    fn the_toast_names_the_agents_and_both_ways_out() {
+    fn the_toast_names_the_agents_and_the_way_back() {
         let toast = wired_toast(&[Agent::Claude, Agent::Codex], None).unwrap();
         assert!(
             toast.starts_with("Roost wired agent hooks for claude, codex"),
             "{toast}"
         );
-        assert!(toast.contains("roostctl agent uninstall --all"), "{toast}");
-        assert!(toast.contains("agent-hooks = off"), "{toast}");
+        assert!(toast.contains("Agent Hooks…"), "{toast}");
     }
 
     /// C8 wires a host's result through the same text; the prefix is the
@@ -375,12 +683,13 @@ mod tests {
     #[test]
     fn the_startup_ensure_runs_once_per_process() {
         let mut started = false;
-        assert_eq!(claim_start(&mut started, Mode::Auto), Start::Run);
+        let allow = Mode::Allow(vec![Agent::Claude]);
+        assert_eq!(claim_start(&mut started, Some(&allow)), Start::Run);
         assert!(started);
         // The second window event is the focus that follows the open;
         // the third is an ordinary Alt-Tab. Neither may wire anything.
-        assert_eq!(claim_start(&mut started, Mode::Auto), Start::Already);
-        assert_eq!(claim_start(&mut started, Mode::Auto), Start::Already);
+        assert_eq!(claim_start(&mut started, Some(&allow)), Start::Already);
+        assert_eq!(claim_start(&mut started, Some(&allow)), Start::Already);
     }
 
     /// `off` declines without consuming the latch: the two answers are
@@ -388,8 +697,95 @@ mod tests {
     #[test]
     fn off_declines_without_claiming_the_latch() {
         let mut started = false;
-        assert_eq!(claim_start(&mut started, Mode::Off), Start::Off);
+        assert_eq!(claim_start(&mut started, Some(&Mode::Off)), Start::Off);
         assert!(!started);
-        assert_eq!(claim_start(&mut started, Mode::Auto), Start::Run);
+        assert_eq!(
+            claim_start(&mut started, Some(&Mode::Allow(vec![Agent::Claude]))),
+            Start::Run
+        );
+    }
+
+    /// The consent card is a *startup* act too, and `window_opened`
+    /// runs on every focus **and** unfocus — so without its own latch an
+    /// Alt-Tab back to the window would put a second card over the one
+    /// the user is reading.
+    #[test]
+    fn the_first_run_card_is_raised_once_per_process() {
+        let mut raised = false;
+        assert!(claim_first_run(&mut raised, &Start::Ask, Guard::PERMITTED));
+        assert!(raised);
+        assert!(
+            !claim_first_run(&mut raised, &Start::Ask, Guard::PERMITTED),
+            "the focus that follows the open re-raised the card"
+        );
+        assert!(
+            !claim_first_run(&mut raised, &Start::Ask, Guard::PERMITTED),
+            "and so did an ordinary Alt-Tab"
+        );
+    }
+
+    /// Only an unanswered key has anything to ask about, and a UI under
+    /// the harness fence asks nothing at all unless the harness lifted
+    /// it — the same [`Guard`] the install engine checks, read before
+    /// the card is raised rather than after it has been answered.
+    #[test]
+    fn nothing_but_an_unanswered_key_outside_the_fence_raises_the_card() {
+        for start in [Start::Run, Start::Off, Start::Already] {
+            let mut raised = false;
+            assert!(
+                !claim_first_run(&mut raised, &start, Guard::PERMITTED),
+                "{start:?} raised the consent card"
+            );
+            assert!(!raised, "{start:?} spent the latch");
+        }
+
+        let fenced = Guard {
+            test_mode: true,
+            forced: false,
+        };
+        let mut raised = false;
+        assert!(!claim_first_run(&mut raised, &Start::Ask, fenced));
+        assert!(!raised, "the fence spent the latch it refused to use");
+        let forced = Guard {
+            test_mode: true,
+            forced: true,
+        };
+        assert!(
+            claim_first_run(&mut raised, &Start::Ask, forced),
+            "ROOST_AGENT_HOOKS_FORCE=1 is what lets the E2E see the card"
+        );
+    }
+
+    /// A card that could not be shown does not spend the one ask.
+    ///
+    /// The latch stops Alt-Tab asking twice; it must not swallow the
+    /// prompt because another dialog happened to be up when the survey
+    /// came back. `App::agent_hooks_surveyed` puts it back for exactly
+    /// that case.
+    #[test]
+    fn a_released_latch_asks_again_in_the_same_process() {
+        let mut raised = false;
+        assert!(claim_first_run(&mut raised, &Start::Ask, Guard::PERMITTED));
+        assert!(raised);
+        // What the `ScreenTaken` arm does.
+        raised = false;
+        assert!(
+            claim_first_run(&mut raised, &Start::Ask, Guard::PERMITTED),
+            "a released latch did not ask again"
+        );
+    }
+
+    /// `ask` — `resolve` returning `None` — declines the same way `off`
+    /// does: neither claims the latch, and the two must stay tellable
+    /// apart in the log line each produces.
+    #[test]
+    fn ask_declines_without_claiming_the_latch() {
+        let mut started = false;
+        assert_eq!(claim_start(&mut started, None), Start::Ask);
+        assert!(!started);
+        assert_eq!(
+            claim_start(&mut started, Some(&Mode::Allow(vec![Agent::Claude]))),
+            Start::Run
+        );
     }
 }

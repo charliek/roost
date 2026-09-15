@@ -20,7 +20,7 @@ final class IPCSessionTypesTests: XCTestCase {
     func testSessionProtocolVersionIsSeparateFromTheWireVersion() {
         // Retiring the lease bumped the session protocol to 5; the
         // request/response wire version did not move with it.
-        XCTAssertEqual(ipcSessionProtocolVersion, 5)
+        XCTAssertEqual(ipcSessionProtocolVersion, 6)
         XCTAssertEqual(ipcProtocolVersion, 1)
     }
 

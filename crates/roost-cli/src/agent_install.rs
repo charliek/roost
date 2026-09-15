@@ -1,51 +1,97 @@
 //! `roostctl agent` — wire Roost's hook entries into the supported
 //! agents' own config files, and take them out again.
 //!
-//! Four verbs over `roost-agent-install`. None of them dials a UI: they
-//! read and write dotfiles, so they work with nothing running, which is
-//! exactly when a user reaches for them.
+//! Five verbs over `roost-agent-install`. Four of them never dial a UI:
+//! they read and write dotfiles, so they work with nothing running,
+//! which is exactly when a user reaches for them. `set --local` is the
+//! fifth and shares that property.
 //!
-//! `ensure` is what the UIs run at startup and what a host session runs
-//! on connect; the other three are the manual controls the toast points
-//! at.
+//! **`set` without `--local` is the one verb that does dial** ([`run_over_ipc`]).
+//! It puts `agent.set_hooks` to the running UI, which sets this
+//! machine's key *and* raises every connected non-localhost host in the
+//! same call — the half a `--local` write cannot do, because a host is
+//! reached through a connection only the UI holds.
 //!
-//! Only `ensure` reads the config, and it reads the **same** file and
-//! the same parser the UIs do (`roost-ui-model`), so `agent-hooks = off`
-//! means one thing on this machine rather than one thing per surface.
-//! `install` and `uninstall` are explicit instructions and deliberately
-//! ignore it — `agent install codex` while the key says `off` still
-//! wires codex — and `status` changes nothing at all.
+//! `ensure` here is the explicit reconcile — it wires what the key allows
+//! **and takes out what it does not**. `--startup` is the other shape,
+//! the one a UI launch runs: wire and refresh, remove nothing (plan 064
+//! §3.2). The Mac app spawns that one, because a launch must not undo a
+//! hand edit.
+//!
+//! Every verb reads the config, and reads the **same** file and parser
+//! the UIs do (`roost-ui-model`), so `agent-hooks` means one thing on
+//! this machine rather than one thing per surface. `install`, `uninstall`
+//! and `set --local` are explicit instructions and *move the key* rather
+//! than ignoring it: `agent install codex` while the key says `off` wires
+//! codex and adds it to the list, so the next launch does not treat what
+//! the user just asked for as unconsented. `status` changes nothing at
+//! all.
 
 use clap::Subcommand;
 use roost_agent::Agent;
 use roost_agent_install::{
-    agent_names, ensure, install, skip_list, status, uninstall, AgentSkip, Guard, Home, Mode,
-    Outcome, Status, ALL_AGENTS,
+    ensure, install, reconcile, resolve_names, set_hooks, status, uninstall, AgentSkip, Guard,
+    Home, Mode, Outcome, Status, ALL_AGENTS,
 };
-use roost_ui_model::config::{AgentHooks, RoostConfig};
+use roost_ipc::messages::{
+    ops, AgentHooksOutcome, AgentSetHooksAgents, AgentSetHooksHostOutcome, AgentSetHooksParams,
+    AgentSetHooksResult,
+};
+use roost_ipc::IpcClient;
+use roost_ui_model::config::RoostConfig;
 
 /// How this client identifies itself in the state record.
 const BY: &str = "local";
 
 #[derive(Subcommand, Debug)]
 pub enum AgentCmd {
-    /// Wire every present agent whose entries are missing or stale, per
-    /// `agent-hooks` / `agent-hooks-skip` in `config.conf`. Safe to run
-    /// any number of times, and a run with nothing to do writes nothing.
-    /// With `agent-hooks = off` it takes Roost's entries back out.
+    /// Bring this machine in line with `agent-hooks` in `config.conf`:
+    /// wire and refresh what it names, and take Roost's entries out of
+    /// what it does not. Safe to run any number of times, and a run with
+    /// nothing to do writes nothing.
     Ensure {
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Wire and refresh what `agent-hooks` names, and remove
+        /// nothing. What a UI runs at launch: a launch must never undo a
+        /// hook somebody added by hand, and it must never act on a key
+        /// that changed while the app was closed (plan 064 §3.2).
+        #[arg(long, default_value_t = false)]
+        startup: bool,
     },
-    /// Wire one agent, or all of them. Explicit wins: this works even
-    /// when `agent-hooks = off` would otherwise leave the agent alone.
+    /// Set `agent-hooks` to exactly this list (or `off`), then bring
+    /// this machine's files in line with it — the explicit answer to
+    /// the consent dialog's question, from a terminal.
+    ///
+    /// By default this dials the running UI, which sets the key here and
+    /// raises every connected non-localhost host to at least the same
+    /// list in the same call. `--local` writes this machine's
+    /// `config.conf` directly instead, under the install lock and with
+    /// nothing running — and reaches no host at all, so a connected one
+    /// does not learn about the change until it connects again.
+    Set {
+        /// A comma list of agent names (`claude`, `codex`, `grok`,
+        /// `cursor`, `opencode`), or the literal `off`. `ask`/`auto` are
+        /// not accepted: this verb answers the consent question, and
+        /// "unanswered" is not an answer to give it.
+        spec: String,
+        /// Write this machine's `agent-hooks` key directly instead of
+        /// dialing the running UI. No host is told.
+        #[arg(long, default_value_t = false)]
+        local: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Wire one agent, or all of them, and add it to `agent-hooks`.
+    /// Explicit wins: this works even when the key says `off`.
     Install {
         /// `claude`, `codex`, `grok`, `cursor`, or `opencode`.
         agent: Option<String>,
         #[arg(long, default_value_t = false)]
         all: bool,
     },
-    /// Remove Roost's entries from one agent, or all of them. Only what
+    /// Remove Roost's entries from one agent, or all of them, and take
+    /// it back out of `agent-hooks` (`--all` writes `off`). Only what
     /// Roost wrote comes out — a hook you wrote that happens to mention
     /// `$ROOST_AGENT_HOOK` stays exactly where it is.
     Uninstall {
@@ -75,10 +121,54 @@ pub fn run(cmd: &AgentCmd) -> i32 {
     let guard = Guard::from_env();
 
     match cmd {
-        AgentCmd::Ensure { json } => {
-            let (mode, skip) = configured();
-            report(ensure(&home, mode, &skip, BY, guard), *json)
+        AgentCmd::Ensure { json, startup } => match configured() {
+            Some(mode) if *startup => report(ensure(&home, &mode, BY, guard), *json),
+            Some(mode) => report(reconcile(&home, &mode, BY, guard), *json),
+            None => {
+                // `--json` is a machine contract — the Mac app spawns
+                // exactly this and decodes stdout — so the unconfigured
+                // path answers in the shape an ensure would (an empty
+                // outcome) and puts its one human sentence on stderr,
+                // rather than breaking the decode with prose.
+                let note = "agent-hooks is not configured; nothing was wired. Choose agents \
+                            in Roost (Agent Hooks… in the command palette) or run `roostctl \
+                            agent set <list|off> --local`.";
+                if *json {
+                    println!("{}", outcome_json(&Outcome::default()));
+                    eprintln!("{note}");
+                } else {
+                    println!("{note}");
+                }
+                0
+            }
+        },
+        // Unreachable through `main`, which sends this shape to
+        // [`run_over_ipc`]. Refused rather than written: the one thing a
+        // misroute must never do is quietly set the local key when the
+        // caller asked for every connected host to be set too.
+        AgentCmd::Set { local: false, .. } => {
+            eprintln!("roostctl agent set: the UI-routed form is not served here");
+            2
         }
+        AgentCmd::Set { spec, json, .. } => match parse_set_spec(spec) {
+            Ok(mode) => {
+                let allow = matches!(mode, Mode::Allow(_));
+                let code = report(set_hooks(&home, &mode, BY, guard), *json);
+                if allow {
+                    let note = "a connected host will not see this until it connects again";
+                    if *json {
+                        eprintln!("{note}");
+                    } else {
+                        println!("{note}");
+                    }
+                }
+                code
+            }
+            Err(message) => {
+                eprintln!("roostctl agent set: {message}");
+                2
+            }
+        },
         AgentCmd::Install { agent, all } => match targets(agent.as_deref(), *all) {
             Ok(agents) => report(install(&home, &agents, BY, guard), false),
             Err(code) => code,
@@ -109,7 +199,7 @@ pub fn run(cmd: &AgentCmd) -> i32 {
             }
             Err(code) => code,
         },
-        AgentCmd::Status { json } => match status(&home) {
+        AgentCmd::Status { json } => match status(&home, &resolved_or_nothing()) {
             Ok(rows) => {
                 print_status(&rows, *json);
                 0
@@ -122,25 +212,189 @@ pub fn run(cmd: &AgentCmd) -> i32 {
     }
 }
 
-/// `agent-hooks` / `agent-hooks-skip`, as `ensure` wants them.
+/// Whether this verb is served by [`run_over_ipc`] instead of [`run`].
 ///
-/// A skip name no agent answers to is reported and otherwise ignored:
-/// refusing to run would turn one typo into "no agent is wired and
-/// nothing says why", and silence would do the same without the line.
-fn configured() -> (Mode, Vec<Agent>) {
-    let config = RoostConfig::load_default();
-    let (skip, unknown) = skip_list(config.agent_hooks_skip.iter().map(String::as_str));
-    for name in unknown {
-        eprintln!(
-            "roostctl agent: agent-hooks-skip: no agent named {name:?} ({})",
-            agent_names()
-        );
-    }
-    let mode = match config.agent_hooks {
-        AgentHooks::Auto => Mode::Auto,
-        AgentHooks::Off => Mode::Off,
+/// Exactly one shape is: `set` without `--local`. Every other `agent`
+/// verb must keep working with nothing running, which is why `main`
+/// asks this before its connect prologue rather than after.
+pub fn dials_the_ui(cmd: &AgentCmd) -> bool {
+    matches!(cmd, AgentCmd::Set { local: false, .. })
+}
+
+/// `roostctl agent set <list|off>` — the UI-routed form, over
+/// `agent.set_hooks` (plan 064 §3.4).
+///
+/// The spec is parsed here, before the op is sent, so an unknown name is
+/// the same exit 2 `--local` gives rather than a round trip that ends in
+/// `invalid-param`.
+pub async fn run_over_ipc(cmd: &AgentCmd, client: &mut IpcClient) -> i32 {
+    let AgentCmd::Set { spec, json, .. } = cmd else {
+        eprintln!("roostctl agent: {cmd:?} does not dial the UI");
+        return 2;
     };
-    (mode, skip)
+    let mode = match parse_set_spec(spec) {
+        Ok(mode) => mode,
+        Err(message) => {
+            eprintln!("roostctl agent set: {message}");
+            return 2;
+        }
+    };
+    let params = AgentSetHooksParams {
+        agents: match &mode {
+            Mode::Off => AgentSetHooksAgents::Off,
+            Mode::Allow(agents) => {
+                AgentSetHooksAgents::List(agents.iter().map(|a| a.source().to_string()).collect())
+            }
+        },
+    };
+    let result: AgentSetHooksResult = match client.call(ops::AGENT_SET_HOOKS, params).await {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("roostctl agent set: {error}");
+            return 1;
+        }
+    };
+    if *json {
+        match serde_json::to_string(&result) {
+            Ok(body) => println!("{body}"),
+            Err(error) => {
+                eprintln!("roostctl agent set: {error}");
+                return 1;
+            }
+        }
+    } else {
+        print_set_result(&result);
+    }
+    // A host that could not be asked counts, and so does one that was
+    // asked and could not write: the caller told this machine and every
+    // host it is connected to, and only part of that happened. A
+    // per-agent failure riding inside a nominally successful `result` is
+    // still a file that did not get written — reporting 0 for it is how
+    // a script concludes every host is wired when one is not.
+    let failed = !result.local.errors.is_empty()
+        || result.hosts.iter().any(|host| match host {
+            AgentSetHooksHostOutcome::Error { .. } => true,
+            AgentSetHooksHostOutcome::Result { result, .. } => !result.errors.is_empty(),
+        });
+    i32::from(failed)
+}
+
+/// `agent.set_hooks`'s reply in [`print_outcome`]'s shape, plus the two
+/// things only this op has: where the key landed, and one line per host.
+fn print_set_result(result: &AgentSetHooksResult) {
+    println!("config: {}", result.config_path);
+    print_wire_outcome(&result.local);
+    for entry in &result.hosts {
+        match entry {
+            AgentSetHooksHostOutcome::Result { host, result } => {
+                let changed: Vec<&str> = result
+                    .wired
+                    .iter()
+                    .chain(&result.refreshed)
+                    .map(String::as_str)
+                    .collect();
+                if changed.is_empty() {
+                    // "already current" only when there is genuinely
+                    // nothing to say. A host that wired nothing because
+                    // the agent is not installed there, or because its
+                    // `config.toml` would not parse, has a reason — and
+                    // reporting that as "current" is how somebody
+                    // concludes a host is wired when it is not.
+                    if result.skipped.is_empty() {
+                        println!("on {host}: already current");
+                    } else {
+                        println!("on {host}: nothing wired");
+                    }
+                } else {
+                    println!("on {host}: {}", changed.join(", "));
+                }
+                for skip in &result.skipped {
+                    println!("on {host}: skipped {}: {}", skip.agent, skip.reason);
+                }
+                for failure in &result.errors {
+                    eprintln!("on {host}: error {}: {}", failure.agent, failure.error);
+                }
+            }
+            AgentSetHooksHostOutcome::Error { host, error } => {
+                eprintln!("on {host}: {error}");
+            }
+        }
+    }
+}
+
+/// [`print_outcome`] for the wire shape. The two differ in what they
+/// have to say — an [`Outcome`] carries `current` and `warnings`, which
+/// no reply does — so they are two renderings of two types rather than
+/// one over a lowest common denominator.
+fn print_wire_outcome(outcome: &AgentHooksOutcome) {
+    for (label, agents) in [
+        ("wired", &outcome.wired),
+        ("refreshed", &outcome.refreshed),
+        ("removed", &outcome.removed),
+    ] {
+        if !agents.is_empty() {
+            println!("{label}: {}", agents.join(", "));
+        }
+    }
+    for skip in &outcome.skipped {
+        println!("skipped {}: {}", skip.agent, skip.reason);
+    }
+    for error in &outcome.errors {
+        eprintln!("error {}: {}", error.agent, error.error);
+    }
+    if outcome.wired.is_empty() && outcome.refreshed.is_empty() && outcome.removed.is_empty() {
+        println!("nothing to do");
+    }
+}
+
+/// The resolved `agent-hooks` key — `None` when nobody has answered the
+/// consent dialog yet (plan 064), which `Ensure` reports rather than
+/// wiring or unwiring anything.
+///
+/// `pub(crate)` for doctor, which renders the same rows `status` prints
+/// and must resolve the key the same way.
+pub(crate) fn configured() -> Option<Mode> {
+    Mode::from_config(&RoostConfig::load_default().agent_hooks)
+}
+
+/// The key for a *reader*: unanswered means nothing is allowed yet.
+/// Reading is never a reason to guess at a consent nobody gave.
+pub(crate) fn resolved_or_nothing() -> Mode {
+    configured().unwrap_or(Mode::Allow(Vec::new()))
+}
+
+/// Parse `agent set`'s argument: a comma list of agent names, or the
+/// literal `off`.
+///
+/// Not [`roost_ui_model::config::AgentHooks::parse`], which is the
+/// config *reader*: it is deliberately lenient — a value naming one
+/// unrecognised agent beside real ones still resolves, with a warning,
+/// to the names it does know, because a stale `config.conf` must keep
+/// working. `set` is the opposite kind of call: a user command whose
+/// only job is recording consent has no honest partial answer, so an
+/// unknown name refuses the whole list rather than silently narrowing
+/// it. [`resolve_names`] already draws that line the same way for
+/// `session.set_agent_hooks` (`roost-session`'s `agent_hooks::resolve`),
+/// so this reuses it instead of a third copy of the rule.
+fn parse_set_spec(spec: &str) -> Result<Mode, String> {
+    let trimmed = spec.trim();
+    if trimmed.eq_ignore_ascii_case("off") {
+        return Ok(Mode::Off);
+    }
+    let (agents, unknown) = resolve_names(trimmed.split(','));
+    if let Some(name) = unknown.first() {
+        return Err(format!(
+            "no agent named {name:?} ({})",
+            roost_agent_install::agent_names()
+        ));
+    }
+    if agents.is_empty() {
+        return Err(format!(
+            "name at least one agent ({}), or pass `off`",
+            roost_agent_install::agent_names()
+        ));
+    }
+    Ok(Mode::Allow(agents))
 }
 
 fn targets(agent: Option<&str>, all: bool) -> Result<Vec<Agent>, i32> {
@@ -152,11 +406,7 @@ fn targets(agent: Option<&str>, all: bool) -> Result<Vec<Agent>, i32> {
         (None, false) => {
             eprintln!(
                 "roostctl agent: name an agent ({}) or pass --all",
-                ALL_AGENTS
-                    .iter()
-                    .map(|a| a.source())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                roost_agent_install::agent_names()
             );
             Err(2)
         }
@@ -265,6 +515,8 @@ fn print_status(rows: &[Status], json: bool) {
                     "entries_on_disk": row.entries_on_disk,
                     "up_to_date": row.up_to_date,
                     "noticed": row.noticed,
+                    "allowed": row.allowed,
+                    "files": row.files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                     "skipped": row.skipped.as_ref().map(ToString::to_string),
                     "warnings": row.warnings.iter().map(ToString::to_string).collect::<Vec<_>>(),
                 })
@@ -274,26 +526,8 @@ fn print_status(rows: &[Status], json: bool) {
         return;
     }
 
-    // `wired` is the state record's claim and `entries_on_disk` is the
-    // agent's own files; they can disagree, and saying which is which is
-    // the difference between a status line and a guess.
     for row in rows {
-        let state = match (row.present, row.entries_on_disk, row.wired, row.up_to_date) {
-            (false, _, _, _) => "not installed".to_string(),
-            (true, false, None, _) => "present, not wired".to_string(),
-            (true, false, Some(version), _) => {
-                format!("record says wired@v{version}, nothing wired on disk")
-            }
-            (true, true, None, _) => "wired on disk, not in the state record".to_string(),
-            (true, true, Some(version), false) => format!("wired@v{version}, out of date"),
-            (true, true, Some(version), true)
-                if version != roost_agent_install::INTEGRATION_VERSION =>
-            {
-                format!("wired and current on disk, record still says v{version}")
-            }
-            (true, true, Some(version), true) => format!("wired@v{version}"),
-        };
-        println!("{:<9} {state}", row.agent.source());
+        println!("{:<9} {}", row.agent.source(), status_line(row));
         if let Some(reason) = &row.skipped {
             if row.present {
                 println!("          skipped: {reason}");
@@ -303,6 +537,41 @@ fn print_status(rows: &[Status], json: bool) {
             println!("          warning: {warning}");
         }
     }
+}
+
+/// Three independent facts per row, in the order that reads: is the
+/// agent here, may Roost touch it, and what is actually wired.
+///
+/// `wired` is the state record's claim and `entries_on_disk` is the
+/// agent's own files; they can disagree, and saying which is which is
+/// the difference between a status line and a guess.
+fn status_line(row: &Status) -> String {
+    if !row.present {
+        return "not installed".to_string();
+    }
+    let allowed = if row.allowed {
+        "allowed"
+    } else {
+        "not allowed"
+    };
+    let mut clauses = vec!["present".to_string(), allowed.to_string()];
+    // Nothing wired and nothing claimed adds no third clause: "present"
+    // has already said it.
+    match (row.entries_on_disk, row.wired, row.up_to_date) {
+        (false, None, _) => {}
+        (false, Some(version), _) => clauses.push(format!(
+            "record says wired@v{version}, nothing wired on disk"
+        )),
+        (true, None, _) => clauses.push("wired on disk, not in the state record".to_string()),
+        (true, Some(version), false) => clauses.push(format!("wired@v{version}, out of date")),
+        (true, Some(version), true) if version != roost_agent_install::INTEGRATION_VERSION => {
+            clauses.push(format!(
+                "wired and current on disk, record still says v{version}"
+            ))
+        }
+        (true, Some(version), true) => clauses.push(format!("wired@v{version}")),
+    }
+    clauses.join(", ")
 }
 
 #[cfg(test)]
@@ -322,15 +591,42 @@ mod tests {
             .cmd
     }
 
+    /// `roost_ui_model::config::AGENT_NAMES` cannot depend on
+    /// `roost-agent-install` (it would pull the install engine into
+    /// every consumer of the config parser), so the dialog's row order
+    /// and the install engine's agent inventory are two separately
+    /// maintained tables. This crate is the one place both are already
+    /// linked, so it is where drift between them gets caught.
     #[test]
-    fn the_four_verbs_parse_the_way_the_docs_spell_them() {
+    fn the_config_name_table_matches_the_agent_inventory() {
+        let inventory: Vec<&str> = roost_agent_install::ALL_AGENTS
+            .iter()
+            .map(|a| a.source())
+            .collect();
+        assert_eq!(roost_ui_model::config::AGENT_NAMES.to_vec(), inventory);
+    }
+
+    #[test]
+    fn the_five_verbs_parse_the_way_the_docs_spell_them() {
         assert!(matches!(
             parse(&["ensure"]),
-            AgentCmd::Ensure { json: false }
+            AgentCmd::Ensure {
+                json: false,
+                startup: false
+            }
         ));
         assert!(matches!(
             parse(&["ensure", "--json"]),
-            AgentCmd::Ensure { json: true }
+            AgentCmd::Ensure { json: true, .. }
+        ));
+        // What the Mac app spawns at launch, spelled here so a rename
+        // breaks this before it breaks a launch nobody is watching.
+        assert!(matches!(
+            parse(&["ensure", "--startup", "--json"]),
+            AgentCmd::Ensure {
+                json: true,
+                startup: true
+            }
         ));
         assert!(matches!(
             parse(&["status"]),
@@ -343,6 +639,33 @@ mod tests {
         assert!(
             matches!(parse(&["uninstall", "codex"]), AgentCmd::Uninstall { agent: Some(name), .. } if name == "codex")
         );
+        assert!(matches!(
+            parse(&["set", "claude,codex", "--local"]),
+            AgentCmd::Set { spec, local: true, json: false } if spec == "claude,codex"
+        ));
+        assert!(matches!(
+            parse(&["set", "off", "--local", "--json"]),
+            AgentCmd::Set { spec, local: true, json: true } if spec == "off"
+        ));
+        assert!(matches!(
+            parse(&["set", "claude"]),
+            AgentCmd::Set { local: false, .. }
+        ));
+    }
+
+    #[test]
+    fn only_a_bare_agent_set_dials_the_ui() {
+        assert!(dials_the_ui(&parse(&["set", "claude"])));
+        assert!(!dials_the_ui(&parse(&["set", "claude", "--local"])));
+        for offline in [
+            vec!["ensure"],
+            vec!["ensure", "--startup"],
+            vec!["status"],
+            vec!["install", "--all"],
+            vec!["uninstall", "--all"],
+        ] {
+            assert!(!dials_the_ui(&parse(&offline)), "{offline:?}");
+        }
     }
 
     /// The argument shapes that are mistakes rather than instructions.
@@ -357,6 +680,77 @@ mod tests {
         assert_eq!(targets(Some("gemini"), false), Err(2));
         // gx reports as grok and has no name of its own.
         assert_eq!(targets(Some("gx"), false), Err(2));
+    }
+
+    /// `set`'s argument, unlike `AgentHooks::parse`, refuses a list that
+    /// names even one agent it does not know — see the function's own
+    /// doc for why a reader's leniency is wrong for a writer.
+    #[test]
+    fn parse_set_spec_accepts_a_list_or_off_and_refuses_everything_else() {
+        assert_eq!(
+            parse_set_spec("claude,codex"),
+            Ok(Mode::Allow(vec![Agent::Claude, Agent::Codex]))
+        );
+        assert_eq!(parse_set_spec(" OFF "), Ok(Mode::Off));
+        assert_eq!(parse_set_spec("off"), Ok(Mode::Off));
+        assert!(parse_set_spec("").is_err());
+        assert!(parse_set_spec("banana").is_err());
+        // One unknown name refuses the whole list, not just the token
+        // that named nothing.
+        let refused = parse_set_spec("claude,banana").unwrap_err();
+        assert!(refused.contains("banana"), "{refused}");
+        // `ask`/`auto` are the "unanswered" spelling, not something this
+        // verb can be told to *set*.
+        assert!(parse_set_spec("ask").is_err());
+        assert!(parse_set_spec("auto").is_err());
+    }
+
+    fn a_row(agent: Agent, allowed: bool) -> Status {
+        Status {
+            agent,
+            present: true,
+            wired: Some(roost_agent_install::INTEGRATION_VERSION),
+            entries_on_disk: true,
+            up_to_date: true,
+            noticed: true,
+            allowed,
+            files: vec!["/home/u/.codex/hooks.json".into()],
+            skipped: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_status_line_says_present_allowed_and_wired_separately() {
+        let version = roost_agent_install::INTEGRATION_VERSION;
+        assert_eq!(
+            status_line(&a_row(Agent::Codex, true)),
+            format!("present, allowed, wired@v{version}")
+        );
+        assert_eq!(
+            status_line(&Status {
+                entries_on_disk: false,
+                wired: None,
+                up_to_date: false,
+                ..a_row(Agent::Grok, false)
+            }),
+            "present, not allowed"
+        );
+        // The record-vs-disk disagreement is kept word for word.
+        assert_eq!(
+            status_line(&Status {
+                entries_on_disk: false,
+                ..a_row(Agent::Claude, true)
+            }),
+            format!("present, allowed, record says wired@v{version}, nothing wired on disk")
+        );
+        assert_eq!(
+            status_line(&Status {
+                present: false,
+                ..a_row(Agent::Cursor, true)
+            }),
+            "not installed"
+        );
     }
 
     #[test]

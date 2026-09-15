@@ -9,9 +9,11 @@
 
 use std::sync::Arc;
 
-use roost_engine::ipc::{AgentHooksHandle, AgentHooksRequest, IpcHandler, SessionInfo, StopHandle};
+use roost_engine::ipc::{
+    AgentHooksError, AgentHooksHandle, AgentHooksRequest, IpcHandler, SessionInfo, StopHandle,
+};
 use roost_engine::{PtySupervisor, Workspace};
-use roost_ipc::messages::{ops, AgentHooksMode, AgentHooksSkipped, SessionSetAgentHooksResult};
+use roost_ipc::messages::{ops, AgentHooksOutcome, AgentHooksSkipped};
 use roost_ipc::{
     CloseReason, ConnAction, ConnCloseWatch, ConnCtx, Handler, HandlerOutcome, PushSource,
 };
@@ -155,7 +157,7 @@ async fn a_second_client_gates_nothing_and_deposes_nobody() {
         .handle(
             &first.ctx,
             ops::SESSION_SET_AGENT_HOOKS,
-            serde_json::json!({"mode": "auto", "skip": [], "client": "charlie-mbp"}),
+            serde_json::json!({"agents": ["claude"], "client": "charlie-mbp"}),
         )
         .await
         .expect("session.set_agent_hooks");
@@ -365,7 +367,7 @@ async fn session_connect_and_a_lease_bearing_request_are_both_refused() {
         ),
         (
             ops::SESSION_SET_AGENT_HOOKS,
-            serde_json::json!({"lease": "l", "mode": "auto", "skip": [], "client": "c"}),
+            serde_json::json!({"lease": "l", "agents": ["claude"], "client": "c"}),
         ),
         (
             ops::SESSION_PUT_FILE,
@@ -401,13 +403,13 @@ fn recording_backend() -> (
     let handle = AgentHooksHandle::new(move |request: AgentHooksRequest| {
         sink.lock().unwrap().push(request);
         async {
-            Ok(SessionSetAgentHooksResult {
+            Ok(AgentHooksOutcome {
                 wired: vec!["claude".into()],
                 skipped: vec![AgentHooksSkipped {
                     agent: "cursor".into(),
-                    reason: "skip-list".into(),
+                    reason: "not allowed".into(),
                 }],
-                ..SessionSetAgentHooksResult::default()
+                ..AgentHooksOutcome::default()
             })
         }
     });
@@ -417,11 +419,10 @@ fn recording_backend() -> (
 async fn set_agent_hooks(
     f: &Fixture,
     c: &Conn,
-    mode: &str,
-) -> Result<SessionSetAgentHooksResult, String> {
+    agents: &[&str],
+) -> Result<AgentHooksOutcome, String> {
     let params = serde_json::json!({
-        "mode": mode,
-        "skip": ["cursor"],
+        "agents": agents,
         "client": "charlie-mbp",
     });
     match f
@@ -434,29 +435,67 @@ async fn set_agent_hooks(
     }
 }
 
-/// What gets through carries the client's own values verbatim —
-/// including `off`, which on a host means *remove*. Two clients stating
-/// opposite policies are last-writer-wins (plan 046 §3.4).
+/// What gets through carries the client's own allow-list verbatim.
+/// Two clients raising different lists are both additive — last-writer
+/// wins nothing here, because a raise never removes what an earlier one
+/// added (plan 064 §3.3).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn set_agent_hooks_hands_the_client_values_on() {
     let (handle, seen) = recording_backend();
     let f = fixture_with(Some(handle));
     let asking = conn(1);
 
-    let result = set_agent_hooks(&f, &asking, "auto")
+    let result = set_agent_hooks(&f, &asking, &["claude"])
         .await
         .expect("any same-UID client may wire the host");
     assert_eq!(result.wired, vec!["claude".to_string()]);
     assert_eq!(result.skipped[0].agent, "cursor");
 
-    set_agent_hooks(&f, &conn(2), "off")
+    set_agent_hooks(&f, &conn(2), &["cursor"])
         .await
-        .expect("off is a value of the same op, from whichever client sends it");
+        .expect("a second client may raise the same host to a different list");
 
     let asked = seen.lock().unwrap();
     assert_eq!(asked.len(), 2);
-    assert_eq!(asked[0].mode, AgentHooksMode::Auto);
-    assert_eq!(asked[0].skip, vec!["cursor".to_string()]);
+    assert_eq!(asked[0].agents, vec!["claude".to_string()]);
     assert_eq!(asked[0].client, "charlie-mbp");
-    assert_eq!(asked[1].mode, AgentHooksMode::Off);
+    assert_eq!(asked[1].agents, vec!["cursor".to_string()]);
+}
+
+/// A malformed `agents` — empty, or a name no agent answers to — reaches
+/// the client as `invalid-param` rather than `internal`.
+///
+/// The *deciding* is the backend's: the agent set lives in the install
+/// engine, which this crate does not link. What the engine owes the op is
+/// that the two failure kinds stay tellable apart on the wire, because
+/// they instruct differently — `invalid-param` says "fix the request",
+/// `internal` sends the client hunting for a fault on the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_agent_hooks_refuses_a_malformed_request_as_invalid_param() {
+    let handle = AgentHooksHandle::new(|request: AgentHooksRequest| async move {
+        Err(match request.agents.first().map(String::as_str) {
+            None => AgentHooksError::InvalidParam("non-empty `agents`".into()),
+            Some("banana") => AgentHooksError::InvalidParam("no agent named \"banana\"".into()),
+            Some(_) => AgentHooksError::Failed("$HOME is not readable".into()),
+        })
+    });
+    let f = fixture_with(Some(handle));
+
+    assert_eq!(
+        set_agent_hooks(&f, &conn(1), &[]).await.unwrap_err(),
+        "invalid-param"
+    );
+    assert_eq!(
+        set_agent_hooks(&f, &conn(1), &["banana"])
+            .await
+            .unwrap_err(),
+        "invalid-param"
+    );
+    assert_eq!(
+        set_agent_hooks(&f, &conn(1), &["claude"])
+            .await
+            .unwrap_err(),
+        "internal",
+        "a host that really did break is not the client's bug to fix"
+    );
 }

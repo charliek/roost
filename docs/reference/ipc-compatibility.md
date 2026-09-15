@@ -300,6 +300,20 @@ intra-generation capabilities comes back when there is a second real
 consumer for one. No shim was left behind in either direction — that is
 the point of a generation.
 
+**`5` → `6` reshaped `session.set_agent_hooks` into a pure raise
+(plan 064 §3.3), breaking in both directions.** The op's params lost
+`mode` and `skip` — both `deny_unknown_fields`, so a pre-bump client's
+request now decodes as `unknown-field` rather than as the two-mode
+value it means — and gained a single `agents` allow-list a client
+unions into the host's `agent-hooks` key, never lowering it: there is
+no wire spelling of `off` or a narrowing left at all. A pre-bump
+session, symmetrically, cannot serve the new shape's meaning even if it
+tolerated the field rename, because "off removes" was load-bearing on
+the old wire and is gone from this one. `AgentHooksMode` is retired
+with the params it typed. No shim was left in either direction — a v5
+peer meeting a v6 build hits the ordinary `session-mismatch` refusal at
+the handshake, same as any other generation bump.
+
 ## Fixtures are the contract
 
 [`tests/ipc-vectors/`](https://github.com/charliek/roost/blob/main/tests/ipc-vectors/README.md)

@@ -294,6 +294,17 @@ pub(super) enum HostDialog {
     /// the card describes the far side as a *read-only* probe found it,
     /// and nothing has been touched over there yet.
     Bootstrap(super::bootstrap::BootstrapDraft),
+    /// Consent to wire this machine's coding agents (plan 064 §3.5) —
+    /// the fifth member, and the only one that is not about a host.
+    ///
+    /// It belongs here anyway for the family's own reason: it is a
+    /// question the user owes an answer to, drawn over chrome that keeps
+    /// working underneath, owning the pointer and the keyboard while it
+    /// is up. Its rows are a snapshot of what a read-only
+    /// `roost_agent_install::status` walk found, for `ConfirmStop`'s
+    /// reason: nothing has been written yet, and a file changing behind
+    /// the card must not rewrite the question mid-read.
+    AgentHooks(super::agent_hooks_dialog::AgentHooksDraft),
 }
 
 impl HostDialog {
@@ -305,6 +316,21 @@ impl HostDialog {
         match self {
             Self::Add(draft) => Some(draft),
             Self::ConfirmStop { .. }
+            | Self::ConfirmRestart { .. }
+            | Self::ConfirmSwitch { .. }
+            | Self::Bootstrap(_)
+            | Self::AgentHooks(_) => None,
+        }
+    }
+
+    /// The agent-hooks card's contents, for the routes that edit it.
+    pub(super) fn agent_hooks_mut(
+        &mut self,
+    ) -> Option<&mut super::agent_hooks_dialog::AgentHooksDraft> {
+        match self {
+            Self::AgentHooks(draft) => Some(draft),
+            Self::Add(_)
+            | Self::ConfirmStop { .. }
             | Self::ConfirmRestart { .. }
             | Self::ConfirmSwitch { .. }
             | Self::Bootstrap(_) => None,

@@ -179,6 +179,9 @@ enum PaletteCommands {
         // lands right after `selectFontID`) pushes this entry to sit
         // immediately after "Clear All Notifications" — plan 007 §3.7.
         (KeybindAction.toggleSidebarAgents, "Toggle Sidebar Agents"),
+        // The one surface that changes `agent-hooks` after the first
+        // launch, and the row the consent sheet's footer names.
+        (KeybindAction.agentHooks, "Agent Hooks…"),
         (KeybindAction.newTab, "New Tab"),
         (KeybindAction.closeTab, "Close Tab"),
         (KeybindAction.renameTab, "Rename Tab"),

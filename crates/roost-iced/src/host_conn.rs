@@ -71,7 +71,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use roost_ipc::messages::{ops, AttachPayloadKind, EventEnvelope, OscColorsParams, RetrySchedule};
+use roost_ipc::messages::{
+    ops, AgentHooksOutcome, AttachPayloadKind, EventEnvelope, OscColorsParams, RetrySchedule,
+};
 use roost_ipc::ssh::{SshFailure, SshTunnel};
 use roost_ui_model::keys::{HostId, TabKey};
 use roost_ui_model::theme::Theme;
@@ -895,6 +897,63 @@ pub(crate) struct HostTunnelReady {
     pub(crate) host: String,
     pub(crate) request: u64,
     pub(crate) result: Result<Arc<SshTunnel>, ConnectFailure>,
+}
+
+/// One host's pending answer to a `session.set_agent_hooks` this client
+/// has already put on its queue.
+pub(crate) struct HostRaise {
+    /// The host's label — the `agent.set_hooks` reply's `host` field,
+    /// which is how a caller tells two hosts' answers apart.
+    pub(crate) label: String,
+    ops: crate::host_conn::queue::HostOps,
+}
+
+impl HostRaise {
+    /// Put the frame on this host's queue and decode what comes back.
+    ///
+    /// Callable off the main thread, which is the point: the caller
+    /// sends only once its own machine's key is written.
+    pub(crate) fn send(
+        &self,
+        agents: &[String],
+        client: &str,
+    ) -> impl std::future::Future<Output = Result<AgentHooksOutcome, HostOpError>> + Send + 'static
+    {
+        raise_agent_hooks_on(&self.ops, agents, client)
+    }
+}
+
+/// Put one `session.set_agent_hooks` on a connection's queue and decode
+/// what comes back.
+///
+/// Shared by the connect-time send and the Apply push so the two cannot
+/// drift in what they send or in how they read the answer; which hosts
+/// each one reaches is the caller's question.
+fn raise_agent_hooks_on(
+    ops: &crate::host_conn::queue::HostOps,
+    agents: &[String],
+    client: &str,
+) -> impl std::future::Future<Output = Result<AgentHooksOutcome, HostOpError>> + Send + 'static {
+    let reply = ops.call(
+        ops::SESSION_SET_AGENT_HOOKS,
+        serde_json::json!({ "agents": agents, "client": client }),
+    );
+    async move {
+        reply.await.and_then(|value| {
+            serde_json::from_value(value).map_err(|error| {
+                // A reply this client cannot read is the host's answer
+                // all the same, so it is reported as a refusal rather
+                // than dropped.
+                HostOpError::Rejected {
+                    code: roost_ipc::client::ServerCode::Internal,
+                    message: format!(
+                        "undecodable {} reply: {error}",
+                        ops::SESSION_SET_AGENT_HOOKS
+                    ),
+                }
+            })
+        })
+    }
 }
 
 impl HostConnSet {
@@ -2410,14 +2469,14 @@ impl HostConnSet {
         }
     }
 
-    /// Ask one host to bring its agent hooks in line with this client's
-    /// config (plan 046 §3.4).
+    /// Ask one host to raise its `agent-hooks` key to at least this
+    /// client's own allow-list (plan 046 §3.4, plan 064 §3.3).
     ///
     /// **Queued, not chained.** It rides the ordinary op queue — the same
     /// road `session.set_theme` and `session.set_focus` take — rather
     /// than joining the connect chain in `task::attempt`, and the two
     /// reasons are both about the attachment: an error there fails the
-    /// whole attempt, and an ensure on a network-mounted `$HOME` would
+    /// whole attempt, and a raise on a network-mounted `$HOME` would
     /// hold hydration up behind file I/O this client is not waiting on.
     /// So the reply comes back on the feed, where a failure costs a log
     /// line and a toast that does not appear.
@@ -2425,41 +2484,65 @@ impl HostConnSet {
     /// Sent on **every** connect with the client's own values, because
     /// the op is idempotent and a config edit since the last connect has
     /// no other way to reach the host.
-    pub(crate) fn wire_agent_hooks(
-        &self,
-        host: &str,
-        mode: roost_ipc::messages::AgentHooksMode,
-        skip: &[String],
-        client: &str,
-    ) {
-        let Some(conn) = self.entries.get(host).and_then(|entry| entry.conn.as_ref()) else {
+    pub(crate) fn wire_agent_hooks(&self, host: &str, agents: &[String], client: &str) {
+        let Some(conn) = self.agent_hooks_conn(host) else {
             return;
         };
         let label = conn.label.clone();
-        let reply = conn.ops.call(
-            ops::SESSION_SET_AGENT_HOOKS,
-            serde_json::json!({ "mode": mode, "skip": skip, "client": client }),
-        );
+        let reply = raise_agent_hooks_on(&conn.ops, agents, client);
         let feed = self.feed.clone();
         self.runtime.spawn(async move {
-            let outcome = reply.await.and_then(|value| {
-                serde_json::from_value(value).map_err(|error| {
-                    // A reply this client cannot read is the host's
-                    // answer all the same, so it is reported as a
-                    // refusal rather than dropped.
-                    HostOpError::Rejected {
-                        code: roost_ipc::client::ServerCode::Internal,
-                        message: format!(
-                            "undecodable {} reply: {error}",
-                            ops::SESSION_SET_AGENT_HOOKS
-                        ),
-                    }
-                })
-            });
             feed.send(crate::engine_feed::EngineFeed::HostAgentHooks(Box::new(
-                crate::app::agent_hooks::HostAgentHooks { label, outcome },
+                crate::app::agent_hooks::HostAgentHooks {
+                    label,
+                    outcome: reply.await,
+                },
             )));
         });
+    }
+
+    /// The same raise, put to one *connected* host the moment the user
+    /// applies a new local `agent-hooks` value (plan 064 §3.4) — the
+    /// Apply push behind `agent.set_hooks`, where
+    /// [`Self::wire_agent_hooks`] is the connect-time one.
+    ///
+    /// Which hosts are eligible is decided here, on the main thread,
+    /// because the registry is main-thread state and a host that
+    /// disconnects later should be missed visibly rather than silently.
+    /// `None` is a host this op has nothing to say to: not connected, or
+    /// localhost — see [`Self::agent_hooks_conn`].
+    ///
+    /// Deliberately does **not** send: `agent.set_hooks` writes this
+    /// machine's own key first, and a machine that could not record the
+    /// user's answer has no business propagating it. Picking the hosts
+    /// has to happen here — the registry is main-thread state — but the
+    /// frame goes out from [`HostRaise::send`] once the local half is
+    /// known to have worked.
+    pub(crate) fn raise_agent_hooks(&self, host: &str) -> Option<HostRaise> {
+        let conn = self
+            .agent_hooks_conn(host)
+            .filter(|conn| conn.state.is_connected())?;
+        Some(HostRaise {
+            label: conn.label.clone(),
+            ops: conn.ops.clone(),
+        })
+    }
+
+    /// The connection `session.set_agent_hooks` may be put to, or `None`
+    /// for a host it must never be sent to.
+    ///
+    /// **A localhost transport is never sent this op.** On this machine
+    /// the UI is the authority: it has already written the
+    /// `agent-hooks` key and reconciled the files directly, and the
+    /// session behind the slot reads that very same `config.conf`. So
+    /// sending it would be the UI raising *itself* — and a raise cannot
+    /// lower, so a local "switch codex off" would be undone by the
+    /// localhost session re-raising it on the next connect.
+    fn agent_hooks_conn(&self, host: &str) -> Option<&HostConn> {
+        self.entries
+            .get(host)
+            .and_then(|entry| entry.conn.as_ref())
+            .filter(|conn| !conn.transport.is_localhost())
     }
 
     /// Ask a host whether it really holds nothing, for plan 063 §D6's
@@ -3006,12 +3089,13 @@ pub(crate) mod fixtures {
         set: &mut HostConnSet,
         host: &str,
         socket: &str,
+        transport: HostTransport,
     ) -> HostId {
         set.connect(
             host,
             host,
             PathBuf::from(socket),
-            HostTransport::LocalSession,
+            transport,
             ConnectMode::Dial,
         );
         let incarnation = set.mint_for(host);
@@ -4918,6 +5002,119 @@ mod tests {
             before.1,
             "a host that is not connected is not: the intent would only warn"
         );
+    }
+
+    /// One localhost host and one socket host, both connected, for the
+    /// two `session.set_agent_hooks` send sites below.
+    fn a_localhost_and_a_remote(set: &mut HostConnSet) {
+        for (host, transport) in [
+            ("h1", HostTransport::LocalSession),
+            ("h2", HostTransport::UnixSocket),
+        ] {
+            a_connected_socket_host(
+                set,
+                host,
+                &format!("/nonexistent/roost-agent-hooks-{host}.sock"),
+                transport,
+            );
+        }
+    }
+
+    fn queued(set: &HostConnSet) -> (usize, usize) {
+        (
+            set.conn("h1").ops.queued_for_test(),
+            set.conn("h2").ops.queued_for_test(),
+        )
+    }
+
+    /// The connect-time send skips this machine's own session (plan 064
+    /// §3.3).
+    ///
+    /// Asserted on the queue rather than on a reply, because the whole
+    /// claim is that **no frame** is put on the wire.
+    #[tokio::test]
+    async fn the_connect_time_agent_hooks_send_skips_a_localhost_transport() {
+        let (mut set, _feed) = a_set();
+        a_localhost_and_a_remote(&mut set);
+        // Nothing has awaited since the spawns, so no worker has run and
+        // whatever is in these queues is what was enqueued.
+        let before = queued(&set);
+
+        set.wire_agent_hooks("h1", &["claude".to_string()], "desk");
+        set.wire_agent_hooks("h2", &["claude".to_string()], "desk");
+
+        assert_eq!(
+            queued(&set),
+            (before.0, before.1 + 1),
+            "localhost was sent a raise, or the remote host was not"
+        );
+    }
+
+    /// The Apply push skips it too, and for the same reason — two send
+    /// sites, one rule.
+    #[tokio::test]
+    async fn the_apply_push_skips_a_localhost_transport() {
+        let (mut set, _feed) = a_set();
+        a_localhost_and_a_remote(&mut set);
+        let before = queued(&set);
+        let agents = ["claude".to_string()];
+
+        assert!(
+            set.raise_agent_hooks("h1").is_none(),
+            "localhost was offered to the Apply push"
+        );
+        let raise = set
+            .raise_agent_hooks("h2")
+            .expect("a remote host is raised");
+        assert_eq!(raise.label, "h2");
+        // Picking a host queues nothing; the frame goes out on `send`,
+        // which `agent.set_hooks` only reaches once its own machine's
+        // key is written.
+        assert_eq!(queued(&set), before);
+        // Dropped unawaited on purpose: `HostOps::call` puts the frame
+        // on the queue eagerly, and the queue is what this asserts on.
+        drop(raise.send(&agents, "desk"));
+
+        assert_eq!(queued(&set), (before.0, before.1 + 1));
+    }
+
+    /// Every connected remote host gets its own frame and its own
+    /// labelled answer — what the reply's `hosts` list is built from.
+    /// A host that is not connected is offered nothing: the intent
+    /// would only be flushed back as `Disconnected`.
+    #[tokio::test]
+    async fn the_apply_push_reaches_each_connected_remote_host_once() {
+        let (mut set, _feed) = a_set();
+        let socket = |host: &str| format!("/nonexistent/roost-raise-{host}.sock");
+        for host in ["h1", "h2"] {
+            a_connected_socket_host(&mut set, host, &socket(host), HostTransport::UnixSocket);
+        }
+        // Never reaches `Connected`, which is the state under test.
+        set.connect(
+            "h3",
+            "h3",
+            PathBuf::from(socket("h3")),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+        );
+        let dropped_host = set.mint_for("h3");
+        set.apply_state(dropped_host, dropped("the connection closed"));
+        let before = set.conn("h3").ops.queued_for_test();
+        let agents = ["claude".to_string()];
+
+        let raises: Vec<_> = ["h1", "h2", "h3"]
+            .iter()
+            .filter_map(|host| set.raise_agent_hooks(host))
+            .collect();
+        let labels: Vec<String> = raises.iter().map(|raise| raise.label.clone()).collect();
+        for raise in &raises {
+            drop(raise.send(&agents, "desk"));
+        }
+
+        assert_eq!(labels, vec!["h1".to_string(), "h2".to_string()]);
+        assert_eq!(set.conn("h1").ops.queued_for_test(), 1);
+        assert_eq!(set.conn("h2").ops.queued_for_test(), 1);
+        assert_eq!(set.conn("h3").ops.queued_for_test(), before);
     }
 
     /// Disconnecting drops everything keyed on the host, so a late item

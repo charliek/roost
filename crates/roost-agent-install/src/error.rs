@@ -96,8 +96,9 @@ impl InstallError {
 pub enum SkipReason {
     /// The agent's config directory does not exist.
     NotPresent,
-    /// The caller's skip list named it.
-    SkipList,
+    /// The resolved `agent-hooks` key does not name it. Nothing was
+    /// touched — not wired, and (outside `reconcile`) not unwired either.
+    NotAllowed,
     /// `agent-hooks = off`.
     ModeOff,
     /// The file is not JSON/TOML we can parse. Never coerced, never
@@ -115,7 +116,7 @@ impl std::fmt::Display for SkipReason {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             SkipReason::NotPresent => f.write_str("not installed"),
-            SkipReason::SkipList => f.write_str("skip-list"),
+            SkipReason::NotAllowed => f.write_str("not allowed"),
             SkipReason::ModeOff => f.write_str("agent-hooks = off"),
             SkipReason::Unparseable { path, detail } => {
                 write!(f, "{}: unreadable ({detail})", path.display())

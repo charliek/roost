@@ -4,11 +4,10 @@
 //! normalization: same lenient-line parsing (blank lines and
 //! `#`-comments dropped), same forward-compat (unknown keys silently
 //! ignored), same raw-vs-unquoted split per key. The recognized-key
-//! sets are not identical — `link-modifier` and `agent-hooks-skip` are
-//! Rust-only (the Mac app's `roostctl agent ensure` spawn reads the
-//! latter through *this* parser), `tab-min-width` / `tab-max-width` are
-//! Mac-only.
+//! sets are not identical — `link-modifier` is Rust-only, `tab-min-width`
+//! / `tab-max-width` are Mac-only.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -71,17 +70,12 @@ pub struct RoostConfig {
     /// live value straight back here through `set_key`.
     pub show_sidebar_agents: bool,
 
-    /// `agent-hooks` — whether Roost wires the supported coding agents'
-    /// hook entries into their own config files (plan 046). Defaults to
-    /// [`AgentHooks::Auto`].
+    /// `agent-hooks` — which coding agents Roost is allowed to wire its
+    /// hook entries into, or whether the user has been asked at all
+    /// (plan 064). Defaults to [`AgentHooks::Ask`]: an unconfigured
+    /// client writes nothing into another product's config file before
+    /// the user has confirmed which agents it may touch.
     pub agent_hooks: AgentHooks,
-
-    /// `agent-hooks-skip` — agent names never wired, lowercased and in
-    /// source order. Kept as written rather than resolved to a typed
-    /// agent here: this crate has no agent inventory, so the caller that
-    /// does (`roost-agent-install`) is also the one that can name the
-    /// spellings it did not recognise.
-    pub agent_hooks_skip: Vec<String>,
 
     /// `local-backend` — where the UI's own tabs run (plan 063 §D1).
     /// Defaults to [`LocalBackend::InProcess`], which an unparseable
@@ -110,7 +104,6 @@ impl Default for RoostConfig {
             link_modifier: None,
             show_sidebar_agents: true,
             agent_hooks: AgentHooks::default(),
-            agent_hooks_skip: Vec::new(),
             local_backend: LocalBackend::default(),
             local_backend_key_present: false,
         }
@@ -160,48 +153,146 @@ impl From<LocalBackend> for LocalBackendMode {
     }
 }
 
-/// Two-state `agent-hooks` policy (plan 046 §3.6).
+/// The agents Roost knows how to wire, canonical spelling, in the order
+/// [`AgentHooks::to_config_value`] serialises them and the order the
+/// consent dialog (plan 064) lists its rows. This is
+/// `roost_agent_install::ALL_AGENTS` order — this crate cannot depend on
+/// `roost-agent-install` (it would pull the install engine into every
+/// consumer of `roost-ui-model`, including the CLI's config-only paths),
+/// so the two tables are kept in step by
+/// `crates/roost-cli/src/agent_install.rs`'s
+/// `the_config_name_table_matches_the_agent_inventory` parity test —
+/// that crate is the one place both are already linked.
+pub const AGENT_NAMES: [&str; 5] = ["claude", "codex", "grok", "cursor", "opencode"];
+
+/// Reserved words that are never agent names: the two documented
+/// spellings (`off`/`false`/`no`) plus the retired ones this key used to
+/// accept (`auto`/`on`/`true`/`yes`, plan 046). A reserved word is only
+/// legal as the *entire* single-token value — see [`AgentHooks::parse`].
+const RESERVED_WORDS: [&str; 7] = ["off", "false", "no", "auto", "on", "true", "yes"];
+
+/// Three-state `agent-hooks` policy (plan 064; supersedes plan 046's
+/// two-state `Auto`/`Off`).
 ///
-/// * `Auto` (default) — every present agent that is not in
-///   `agent-hooks-skip` gets Roost's hook entries, refreshed on launch.
+/// * `Allow(names)` — the agents the user has explicitly consented to,
+///   canonical names in [`AGENT_NAMES`] order. Every present one not
+///   listed is left alone; nothing is ever removed just for being
+///   absent from the list.
 /// * `Off` — the UIs wire nothing at startup. It does not *remove*
 ///   anything on its own; an explicit `roostctl agent ensure` reads the
 ///   same key and takes Roost's entries back out, which is what the
 ///   startup toast points at alongside `agent uninstall --all`.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// * `Ask` (default) — the key is absent, empty, or unparseable: nobody
+///   has answered the consent dialog yet, so nothing is written into
+///   another product's config file and nothing already wired is
+///   touched. This is the state a fresh install starts in.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum AgentHooks {
-    #[default]
-    Auto,
+    Allow(Vec<String>),
     Off,
+    #[default]
+    Ask,
 }
 
 impl AgentHooks {
-    /// Parse a config value. `auto` and `off` are the documented
-    /// spellings; the boolean-ish forms are accepted for the same reason
-    /// [`ClipboardWrite::parse`] accepts them — the key reads like a
-    /// switch and users write it like one. Any other value returns
-    /// `None` so the caller can warn and keep the default.
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "auto" | "on" | "true" | "yes" => Some(Self::Auto),
-            "off" | "false" | "no" => Some(Self::Off),
-            _ => None,
+    /// Parse a config value.
+    ///
+    /// `None` means "could not be resolved at all" — the caller warns
+    /// and falls back to [`AgentHooks::Ask`], same shape as every other
+    /// switch-like key in this parser. An **empty** value is not in that
+    /// group: it is `Some(Ask)`, so the caller does not warn — a fresh
+    /// install with the key never written must not look like a mistake.
+    ///
+    /// The value is split on `,` and lowercased; each token that names
+    /// an agent in [`AGENT_NAMES`] is kept (order-independent, reordered
+    /// into `AGENT_NAMES` order on the way out, duplicates collapsed).
+    /// `off`/`false`/`no` as the *entire* single-token value means
+    /// `Off`. A reserved word ([`RESERVED_WORDS`]) anywhere else in the
+    /// value — alone as one of the retired spellings, or beside a name —
+    /// makes the whole value unparseable: `auto, claude` is exactly as
+    /// ambiguous as `auto` alone, since the user's two possible
+    /// intentions (the old default, or an allow-list that happens to
+    /// start with a stray word) cannot be told apart.
+    ///
+    /// A value with at least one recognised name and some unrecognised
+    /// ones (`claude, banana`) still resolves — to the recognised subset
+    /// — but warns once from here, since the caller's `None` path never
+    /// runs for it.
+    pub fn parse(s: &str) -> Option<AgentHooks> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Some(AgentHooks::Ask);
         }
+        let lower = trimmed.to_ascii_lowercase();
+        let mut tokens: Vec<String> = Vec::new();
+        for tok in lower.split(',') {
+            let tok = tok.trim().to_string();
+            if !tok.is_empty() && !tokens.contains(&tok) {
+                tokens.push(tok);
+            }
+        }
+        if tokens.is_empty() {
+            return None;
+        }
+        // Deliberately *after* the de-duplication above: `off, off` is
+        // somebody saying `off` twice, not an ambiguous mixed value, and
+        // it resolves to `Off`. What the reserved-word rule below rejects
+        // is a reserved word standing beside something that is not it.
+        if tokens.len() == 1 && matches!(tokens[0].as_str(), "off" | "false" | "no") {
+            return Some(AgentHooks::Off);
+        }
+        if tokens.iter().any(|t| RESERVED_WORDS.contains(&t.as_str())) {
+            return None;
+        }
+        let mut known: Vec<String> = Vec::new();
+        let mut unrecognised: Vec<String> = Vec::new();
+        for tok in &tokens {
+            if AGENT_NAMES.contains(&tok.as_str()) {
+                known.push(tok.clone());
+            } else {
+                unrecognised.push(tok.clone());
+            }
+        }
+        if known.is_empty() {
+            return None;
+        }
+        if !unrecognised.is_empty() {
+            tracing::warn!(
+                value = trimmed,
+                unrecognised = unrecognised.join(", "),
+                "agent-hooks: unrecognised agent name(s); allowing the rest"
+            );
+        }
+        let ordered: Vec<String> = AGENT_NAMES
+            .iter()
+            .copied()
+            .filter(|name| known.iter().any(|k| k.as_str() == *name))
+            .map(|name| name.to_string())
+            .collect();
+        Some(AgentHooks::Allow(ordered))
     }
-}
 
-/// Split an `agent-hooks-skip` value into lowercased names, in source
-/// order, without empties or repeats. Names are not validated here —
-/// see [`RoostConfig::agent_hooks_skip`].
-fn parse_agent_skip_list(value: &str) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    for name in value.split(',') {
-        let name = name.trim().to_ascii_lowercase();
-        if !name.is_empty() && !names.contains(&name) {
-            names.push(name);
+    /// The `config.conf` value for this state, in [`AGENT_NAMES`] order.
+    /// `Ask` has none: it is the *absence* of a decision, not a value —
+    /// it is never written until the user answers the consent dialog.
+    pub fn to_config_value(&self) -> Option<String> {
+        match self {
+            AgentHooks::Allow(names) => {
+                // Re-ordered defensively rather than joined as-is: a
+                // caller that hand-builds a `Vec` (a test, or a future
+                // dialog that lets the user reorder rows) must still
+                // serialise in canonical order.
+                let ordered: Vec<&str> = AGENT_NAMES
+                    .iter()
+                    .copied()
+                    .filter(|name| names.iter().any(|n| n.as_str() == *name))
+                    .collect();
+                Some(ordered.join(", "))
+            }
+            AgentHooks::Off => Some("off".to_string()),
+            AgentHooks::Ask => None,
         }
     }
-    names
 }
 
 /// Two-state policy for OSC 52 program-initiated clipboard writes.
@@ -378,21 +469,23 @@ impl RoostConfig {
                     }
                 }
                 "agent-hooks" => {
-                    // A value that does not parse — the empty one
-                    // included — resolves to the *default*, not to
-                    // whatever an earlier line set. The key is last-wins
-                    // like every other scalar here, and the failure it
-                    // must never have is a stray line leaving `off`
-                    // quietly in force: nothing then wires, and nothing
-                    // says why.
+                    // Empty (`Some(Ask)`) is silent — a fresh install
+                    // that never wrote the key is not a mistake. An
+                    // unparseable value (`None`) is: it resolves to the
+                    // same `Ask`, but warns, because it must never read
+                    // as a quiet `off` or a quiet consent nobody gave.
+                    // Last-wins like every other scalar here, so a later
+                    // line that fails to parse returns to `Ask` rather
+                    // than leaving an earlier line's decision in force.
                     cfg.agent_hooks = match AgentHooks::parse(value) {
                         Some(v) => v,
                         None => {
                             tracing::warn!(
                                 value,
-                                "unknown agent-hooks value; falling back to default `auto`"
+                                "unrecognised agent-hooks value; leaving agent hooks \
+                                 unconfigured (ask)"
                             );
-                            AgentHooks::default()
+                            AgentHooks::Ask
                         }
                     };
                 }
@@ -413,12 +506,6 @@ impl RoostConfig {
                             LocalBackend::default()
                         }
                     };
-                }
-                "agent-hooks-skip" => {
-                    // Empty value is a deliberate "skip nothing", and it
-                    // has to clear an earlier line for the key to stay
-                    // last-wins like every other scalar here.
-                    cfg.agent_hooks_skip = parse_agent_skip_list(value);
                 }
                 "word-break-chars" => {
                     // Empty value is a deliberate user choice meaning
@@ -610,6 +697,14 @@ fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
     // theme.set immediately followed by font-family.set).
     static NONCE: AtomicU64 = AtomicU64::new(0);
 
+    // Renaming onto the *link* would replace it with a regular file and
+    // silently orphan the target — someone whose `config.conf` is a link
+    // into a dotfiles repo would find Roost had stopped writing the file
+    // their repo tracks. Since plan 064 that write can happen with nobody
+    // at the keyboard (a connecting client raises this machine's
+    // `agent-hooks`), so the link has to survive it.
+    let path = follow_links(path);
+    let path = path.as_path();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let parent = if parent.as_os_str().is_empty() {
         Path::new(".")
@@ -632,6 +727,30 @@ fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
         f.sync_all()?;
     }
     fs::rename(&tmp, path)
+}
+
+/// `path` with its own symlink chain followed, lexically.
+///
+/// Lexical, not [`fs::canonicalize`], for the reason
+/// `roost_agent_install::write::follow_links` gives at length: a link
+/// whose target does not exist yet is exactly the case `canonicalize`
+/// cannot answer, and calling that "absent" is how the link gets
+/// replaced. A cycle stops at the hop limit and the caller writes
+/// through whatever it reached, which is no worse than not following at
+/// all.
+fn follow_links(path: &Path) -> PathBuf {
+    const MAX_HOPS: usize = 16;
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_HOPS {
+        let Ok(link) = fs::read_link(&current) else {
+            break;
+        };
+        current = match current.parent() {
+            Some(dir) if link.is_relative() => dir.join(link),
+            _ => link,
+        };
+    }
+    current
 }
 
 /// Public so the UI can pass `&ROOST_CONFIG`-aware paths into
@@ -699,17 +818,35 @@ fn read_header(path: &Path) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-fn default_path() -> Option<PathBuf> {
-    // `ROOST_CONFIG` overrides the path with an absolute file — used by
-    // the E2E harness to drive the command launcher off a seeded config
-    // (mirrors `ROOST_SOCKET` / `ROOST_BUNDLE_PROFILE`). Empty is ignored.
-    if let Some(raw) = std::env::var_os("ROOST_CONFIG") {
-        if !raw.is_empty() {
-            return Some(PathBuf::from(raw));
-        }
+/// Where `config.conf` lives: `$ROOST_CONFIG` when it is set and
+/// non-empty, else `<home>/.config/roost/config.conf`.
+///
+/// **The one place that rule lives.** `roost_agent_install::Home`
+/// resolves the same path against the root it was handed — a tempdir
+/// under test, the real `$HOME` in production — and a second spelling of
+/// the rule would eventually send the install engine's `agent-hooks`
+/// write into a different file than the one the UI reads back.
+///
+/// `ROOST_CONFIG` overrides with an absolute file — used by the E2E
+/// harness to drive the command launcher off a seeded config (mirrors
+/// `ROOST_SOCKET` / `ROOST_BUNDLE_PROFILE`).
+pub fn config_path_in(home: &Path, roost_config: Option<&OsStr>) -> PathBuf {
+    match roost_config.filter(|raw| !raw.is_empty()) {
+        Some(raw) => PathBuf::from(raw),
+        None => home.join(".config/roost/config.conf"),
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config/roost/config.conf"))
+}
+
+fn default_path() -> Option<PathBuf> {
+    let over = std::env::var_os("ROOST_CONFIG").filter(|raw| !raw.is_empty());
+    // Only the fallback half of the rule needs `$HOME`, so a machine
+    // without one still answers when the override is set.
+    let home = match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home),
+        None if over.is_some() => PathBuf::new(),
+        None => return None,
+    };
+    Some(config_path_in(&home, over.as_deref()))
 }
 
 #[cfg(test)]
@@ -945,50 +1082,44 @@ mod tests {
         assert!(cfg.show_sidebar_agents);
     }
 
-    // ----- agent-hooks / agent-hooks-skip (plan 046 §3.6) ------------
+    // ----- agent-hooks (plan 064 §3.1; supersedes plan 046 §3.6) -----
     // Mirrored 1:1 by `mac/Sources/Roost/Config.swift`'s
     // `ConfigAgentHooksTests`.
 
+    fn allow(names: &[&str]) -> AgentHooks {
+        AgentHooks::Allow(names.iter().map(|s| s.to_string()).collect())
+    }
+
     #[test]
-    fn agent_hooks_defaults_to_auto() {
+    fn agent_hooks_defaults_to_ask() {
         let cfg = RoostConfig::parse("");
-        assert_eq!(cfg.agent_hooks, AgentHooks::Auto);
-        assert!(cfg.agent_hooks_skip.is_empty());
+        assert_eq!(cfg.agent_hooks, AgentHooks::Ask);
     }
 
     #[test]
-    fn agent_hooks_accepts_auto_and_off() {
+    fn agent_hooks_accepts_a_name_list_normalised_into_agent_names_order() {
         assert_eq!(
-            RoostConfig::parse("agent-hooks = auto").agent_hooks,
-            AgentHooks::Auto
+            RoostConfig::parse("agent-hooks = claude, codex").agent_hooks,
+            allow(&["claude", "codex"])
+        );
+        // Mixed case, extra whitespace, and codex-first input all
+        // normalise the same way: `AGENT_NAMES` order, not source order.
+        assert_eq!(
+            RoostConfig::parse(" agent-hooks = Codex , CLAUDE ").agent_hooks,
+            allow(&["claude", "codex"])
         );
         assert_eq!(
-            RoostConfig::parse("agent-hooks = off").agent_hooks,
-            AgentHooks::Off
-        );
-        // Switch spellings, same as `clipboard-write`.
-        assert_eq!(
-            RoostConfig::parse("agent-hooks = false").agent_hooks,
-            AgentHooks::Off
-        );
-        assert_eq!(
-            RoostConfig::parse("agent-hooks = no").agent_hooks,
-            AgentHooks::Off
-        );
-        assert_eq!(
-            RoostConfig::parse("agent-hooks = on").agent_hooks,
-            AgentHooks::Auto
+            RoostConfig::parse("agent-hooks = \"claude,codex\"").agent_hooks,
+            allow(&["claude", "codex"])
         );
     }
 
-    // Quoted and CRLF forms must agree with the Swift mirror.
     #[test]
-    fn agent_hooks_accepts_quoted_and_crlf_values() {
+    fn agent_hooks_accepts_the_off_spellings() {
         for line in [
-            "agent-hooks = \"off\"",
-            "agent-hooks = 'off'",
-            "agent-hooks = off\r\n",
-            "agent-hooks = \"off\"\r\n",
+            "agent-hooks = off",
+            "agent-hooks = false",
+            "agent-hooks = no",
             "agent-hooks = OFF",
         ] {
             assert_eq!(
@@ -999,62 +1130,104 @@ mod tests {
         }
     }
 
-    /// An unknown value must not read as `off`: silently disabling the
-    /// wiring on a typo is the failure that is hardest to notice.
+    /// Absent or empty resolves to `Ask` — silently. A fresh install
+    /// that never wrote the key is the common path, not a mistake, and
+    /// must never warn.
     #[test]
-    fn agent_hooks_unknown_value_keeps_default() {
-        assert_eq!(
-            RoostConfig::parse("agent-hooks = pancakes").agent_hooks,
-            AgentHooks::Auto
-        );
-    }
-
-    /// …and "keeps the default" has to mean the *default*, not "keeps
-    /// whatever an earlier line said". The key is last-wins like every
-    /// other scalar here, so a repeat that does not parse — including
-    /// the empty one, which for its sibling `agent-hooks-skip` is a
-    /// deliberate "nothing" — returns to `auto` rather than leaving an
-    /// earlier `off` silently in force. Mirrored in
-    /// `ConfigAgentHooksTests.repeatedKeyReturnsToTheDefault`.
-    #[test]
-    fn agent_hooks_is_last_wins_including_an_empty_or_invalid_repeat() {
-        for body in [
-            "agent-hooks = off\nagent-hooks =",
-            "agent-hooks = off\nagent-hooks = \"\"",
-            "agent-hooks = off\nagent-hooks = pancakes",
-        ] {
+    fn agent_hooks_absent_or_empty_is_ask_with_no_warning() {
+        for body in ["", "agent-hooks =", "agent-hooks = \"\""] {
             assert_eq!(
                 RoostConfig::parse(body).agent_hooks,
-                AgentHooks::Auto,
-                "{body:?} left the earlier `off` in force"
+                AgentHooks::Ask,
+                "{body:?}"
             );
         }
-        // The reverse repeat is ordinary last-wins and must still work.
+    }
+
+    /// The retired switch spellings (plan 046's `auto`/`on`/`true`/
+    /// `yes`) and plain garbage both resolve to `Ask`, and both warn —
+    /// unlike the empty case above, these are values somebody actually
+    /// wrote, so silence would hide a typo.
+    #[test]
+    fn agent_hooks_unrecognised_values_are_ask() {
+        for body in ["auto", "on", "true", "yes", "banana"] {
+            assert_eq!(
+                RoostConfig::parse(&format!("agent-hooks = {body}")).agent_hooks,
+                AgentHooks::Ask,
+                "{body}"
+            );
+        }
+    }
+
+    /// A reserved word beside anything else — a name, another reserved
+    /// word — makes the whole value ambiguous rather than "off with an
+    /// extra": `off, claude` could mean either "turn off" or "allow
+    /// claude", and guessing either way silently would be the second
+    /// wrong guess this key has already made once (plan 046's `auto`).
+    #[test]
+    fn agent_hooks_a_reserved_word_mixed_with_anything_else_is_ask() {
+        for body in ["off, claude", "auto, claude", "no, codex"] {
+            assert_eq!(
+                RoostConfig::parse(&format!("agent-hooks = {body}")).agent_hooks,
+                AgentHooks::Ask,
+                "{body}"
+            );
+        }
+    }
+
+    /// An unrecognised name beside a recognised one is not ambiguous the
+    /// same way — the recognised name is the answer, and the unknown one
+    /// is dropped with a warning naming it.
+    #[test]
+    fn agent_hooks_drops_unrecognised_names_and_keeps_the_rest() {
         assert_eq!(
-            RoostConfig::parse("agent-hooks = auto\nagent-hooks = off").agent_hooks,
-            AgentHooks::Off
+            RoostConfig::parse("agent-hooks = claude, banana").agent_hooks,
+            allow(&["claude"])
         );
     }
 
     #[test]
-    fn agent_hooks_skip_is_a_lowercased_comma_list_in_source_order() {
-        let cfg = RoostConfig::parse("agent-hooks-skip = Codex, cursor ,, codex,grok");
-        assert_eq!(cfg.agent_hooks_skip, vec!["codex", "cursor", "grok"]);
+    fn agent_hooks_collapses_duplicates() {
+        assert_eq!(
+            RoostConfig::parse("agent-hooks = claude, claude").agent_hooks,
+            allow(&["claude"])
+        );
     }
 
-    /// The key is scalar, so a later line replaces an earlier one —
-    /// including with the empty list, which is how a user turns an
-    /// inherited skip list back off.
+    /// The key is last-wins like every other scalar here, including when
+    /// the later line fails to parse: it returns to `Ask`, not to
+    /// whatever an earlier line set. Mirrored in
+    /// `ConfigAgentHooksTests.repeatedKeyReturnsToAsk`.
     #[test]
-    fn agent_hooks_skip_is_last_wins_including_empty() {
-        let cfg = RoostConfig::parse("agent-hooks-skip = codex\nagent-hooks-skip =");
-        assert!(cfg.agent_hooks_skip.is_empty());
+    fn agent_hooks_is_last_wins() {
+        assert_eq!(
+            RoostConfig::parse("agent-hooks = claude\nagent-hooks = off").agent_hooks,
+            AgentHooks::Off
+        );
+        assert_eq!(
+            RoostConfig::parse("agent-hooks = claude\nagent-hooks = banana").agent_hooks,
+            AgentHooks::Ask,
+            "the later unparseable line left the earlier `claude` in force"
+        );
     }
 
     #[test]
-    fn agent_hooks_skip_accepts_a_quoted_value() {
-        let cfg = RoostConfig::parse("agent-hooks-skip = \"codex, grok\"");
-        assert_eq!(cfg.agent_hooks_skip, vec!["codex", "grok"]);
+    fn agent_hooks_to_config_value_round_trips() {
+        assert_eq!(
+            allow(&["cursor", "claude"]).to_config_value().as_deref(),
+            Some("claude, cursor")
+        );
+        assert_eq!(AgentHooks::Off.to_config_value().as_deref(), Some("off"));
+        assert_eq!(AgentHooks::Ask.to_config_value(), None);
+    }
+
+    /// The retired `agent-hooks-skip` key now parses as an ignored
+    /// unknown key — `RoostConfig` no longer has a field for it, and it
+    /// must not disturb `agent-hooks` on the same line set.
+    #[test]
+    fn agent_hooks_skip_is_an_ignored_unknown_key() {
+        let cfg = RoostConfig::parse("agent-hooks-skip = codex\nagent-hooks = off");
+        assert_eq!(cfg.agent_hooks, AgentHooks::Off);
     }
 
     // ----- local-backend (plan 063 §D1) ------------------------------

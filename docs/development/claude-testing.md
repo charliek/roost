@@ -176,9 +176,10 @@ UI edit rather than infer it from log lines.
 
 ## Permanent hook setup (Claude Code)
 
-The Roost UI wires the actual Claude Code CLI itself the first time it
-starts (`agent-hooks = auto`), so on a normal machine there is nothing
-to do. To do it by hand:
+The Roost UI wires the actual Claude Code CLI itself once you've said
+yes — the first launch with no answer on file raises a consent dialog,
+and only after you pick Claude Code (or set `agent-hooks = claude` by
+hand) does anything get written. To wire it without the dialog:
 
 ```bash
 roostctl agent install claude

@@ -188,43 +188,70 @@ release workflow asserts they agree).
   code the UI socket already speaks (a latched `session.stop`, say) now
   reports as the new `host-unavailable`, with the session's own sentence
   kept in the message.
-- **Five coding agents get the tab dot, automatically (plan 046)** — Claude
-  Code, Codex, grok (and its fork gx), cursor-agent, and OpenCode all now
-  drive the running/needs-input/idle/failed indicator, the sidebar rollup,
-  and the desktop banner, on local tabs and on host-session tabs alike.
-  Wiring happens by itself the first time Roost starts (`agent-hooks = auto`
-  in `config.conf`, the default): Roost merges one hook entry per event into
-  each present agent's own config file (`~/.claude/settings.json`,
-  `~/.codex/hooks.json` + `config.toml`, `$GROK_HOME/hooks/roost.json`,
-  `~/.cursor/hooks.json`, an OpenCode plugin) beside whatever else is
-  already there, pointed at a new `$ROOST_AGENT_HOOK` environment variable
-  every tab gets rather than a baked-in absolute path — so the exact same
-  entry works after a relocated install, on a second machine, or over a
-  host session, and is inert (drains stdin, answers `{}`) on a machine
-  where Roost isn't running — every reference in it is spelled
-  `${NAME:-}`, because grok checks a hook's variables itself before it
-  spawns a shell and would otherwise draw a red "hook not executed" row per
-  tool call in any non-Roost terminal; codex's `SessionEnd`/`Interrupt`
-  entries carry its 3 s cap so it stops warning about clamping them on
-  every launch. `roostctl agent ensure/install/uninstall/status`
-  are the manual controls; `agent-hooks-skip` opts individual agents out;
-  `agent-hooks = off` stops future wiring, and `roostctl agent uninstall
-  --all` (or a fresh `agent ensure`, which reads the same key) takes
-  Roost's entries back out — to the byte where the format allows it
-  (TOML), or semantically where it can't (JSON — see the [Agent
-  Hooks](docs/guides/agents.md#the-guarantee) guide for the guarantee
-  stated in full). A connecting host session gets
-  the same treatment via a new `session.set_agent_hooks` op, sent after
-  every connect with the client's own config — `off` on a host means
-  unwire, since there's no one there to clean up by hand otherwise. Riding
+- **Five coding agents get the tab dot — and Roost asks before it wires
+  any of them (plan 046, reshaped by plan 064)** — Claude Code, Codex,
+  grok (and its fork gx), cursor-agent, and OpenCode all drive the
+  running/needs-input/idle/failed indicator, the sidebar rollup, and the
+  desktop banner, on local tabs and on host-session tabs alike, once
+  wired: Roost merges one hook entry per event into each present agent's
+  own config file (`~/.claude/settings.json`, `~/.codex/hooks.json` +
+  `config.toml`, `$GROK_HOME/hooks/roost.json`, `~/.cursor/hooks.json`,
+  an OpenCode plugin) beside whatever else is already there, pointed at
+  a `$ROOST_AGENT_HOOK` environment variable every tab gets rather than
+  a baked-in absolute path — so the exact same entry works after a
+  relocated install, on a second machine, or over a host session, and is
+  inert (drains stdin, answers `{}`) on a machine where Roost isn't
+  running — every reference in it is spelled `${NAME:-}`, because grok
+  checks a hook's variables itself before it spawns a shell and would
+  otherwise draw a red "hook not executed" row per tool call in any
+  non-Roost terminal; codex's `SessionEnd`/`Interrupt` entries carry its
+  3 s cap so it stops warning about clamping them on every launch.
+  **Plan 064 replaced how any of that gets turned on.** `agent-hooks` is
+  now three states — a list of agent names, `off`, or **absent**, which
+  means nobody has answered yet and Roost writes nothing into any
+  agent's config and removes nothing until they do. A consent dialog
+  (iced's **Agent Hooks…** card, the Mac **Agent Hooks…** sheet — both
+  also a command-palette row / Mac View-menu item, the default-unbound
+  `agent_hooks` action) opens once per process on first run when the key
+  is unanswered and at least one supported agent is installed, and
+  reopens on demand from the palette; picking agents there, or running
+  `roostctl agent set <list|off>`, is what actually wires anything —
+  never before that "yes". `agent-hooks-skip` is gone; the retired
+  `auto`/`on`/`true`/`yes` spellings, and any value mixing a reserved
+  word with a name, now parse back as unanswered (with a warning)
+  instead of silently turning wiring on. Names normalise — trimmed,
+  lowercased, de-duplicated, reordered into `claude, codex, grok,
+  cursor, opencode` — and an unknown name beside a known one is dropped
+  with a warning. `roostctl agent ensure/install/uninstall/status` are
+  still the manual controls; `agent set <list|off>` dials the running UI
+  (setting the key here and raising every connected non-localhost host
+  in the same call), `--local` writes this machine's key with nothing
+  running, and `ensure --startup` — what a UI launch runs — wires and
+  refreshes what the key names but never removes. **The host side
+  reverses plan 046's rule entirely.** A connecting client now only ever
+  *raises* the host's own `agent-hooks` key — set union, never
+  removing — and, deliberately, that includes a host whose key is
+  explicitly `off` or still unanswered; a client whose own key is `off`
+  or unanswered sends no frame at all, so it can't lower anything
+  either. Lowering a host is done on that machine (`roostctl agent
+  ensure`/`uninstall`, or its own dialog) and holds until a more
+  permissive client connects again — there is no more "last writer
+  wins" on this key. This reshapes `session.set_agent_hooks` and bumps
+  `SESSION_PROTOCOL_VERSION` **5 → 6**; every deployed `roost-session`
+  needs updating alongside its client, or it hits the same
+  `session-mismatch` refusal any other protocol bump would cause. Riding
   along: the long-standing defect where approving a Claude permission
   prompt left the dot orange until the whole turn ended is fixed (Claude
-  now hears `PreToolUse`/`PostToolUse`, so the dot returns to blue when the
-  approved tool finishes); `roostctl doctor` gains a per-agent `Agents`
-  section (wired version, ownership, codex's hook-trust hash, a warning if
-  the retired `~/.config/roost/claude-settings.json` is still around); and
-  the agents palette (`Cmd-Shift-O` / `Alt-Shift-O`) now names which agent
-  owns each row instead of just `project · tab`.
+  now hears `PreToolUse`/`PostToolUse`, so the dot returns to blue when
+  the approved tool finishes); `roostctl doctor` gains a per-agent
+  `Agents` section (wired version, ownership, codex's hook-trust hash, a
+  warning if the retired `~/.config/roost/claude-settings.json` is still
+  around); and the agents palette (`Cmd-Shift-O` / `Alt-Shift-O`) now
+  names which agent owns each row instead of just `project · tab`. See
+  the [Agent Hooks](docs/guides/agents.md) guide and
+  [`config.md`](docs/reference/config.md#agent-hooks) for the full
+  behavior, including the guarantee about what a merge does and doesn't
+  touch.
 - **The `vt` fallback now says so, and a remote host can fix itself
   in-app (#447)** — a libghostty build skew used to connect silently
   (#420): the dot stayed green, and the only way to notice was to poll

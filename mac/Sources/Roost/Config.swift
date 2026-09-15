@@ -76,27 +76,129 @@ enum ClipboardWrite: Sendable {
     }
 }
 
-/// Two-state `agent-hooks` policy (plan 046 §3.6).
+/// Three-state `agent-hooks` policy (plan 064; supersedes plan 046's
+/// two-state `.auto`/`.off`).
 ///
-/// `.auto` (the default) lets Roost wire the supported coding agents'
-/// hook entries into their own config files. `.off` means this app
-/// wires nothing at launch — it does not *remove* anything on its own;
-/// `roostctl agent ensure` reads the same key and is the explicit verb
-/// that takes Roost's entries back out.
+/// * `.allow(names)` — the agents the user has explicitly consented to,
+///   canonical names in `AgentHooks.agentNames` order. Every present one
+///   not listed is left alone; nothing is ever removed just for being
+///   absent from the list.
+/// * `.off` — this app wires nothing at launch. It does not *remove*
+///   anything on its own; `roostctl agent ensure` reads the same key and
+///   is the explicit verb that takes Roost's entries back out.
+/// * `.ask` (the default) — the key is absent, empty, or unparseable:
+///   nobody has answered the consent dialog yet, so nothing is written
+///   into another product's config file and nothing already wired is
+///   touched. This is the state a fresh install starts in.
 ///
 /// Mirrors `crates/roost-ui-model/src/config.rs::AgentHooks`, including
-/// the switch spellings.
-enum AgentHooks: Sendable {
-    case auto
+/// the normalisation rules.
+enum AgentHooks: Sendable, Equatable {
+    case allow([String])
     case off
+    case ask
 
-    static let `default`: AgentHooks = .auto
+    static let `default`: AgentHooks = .ask
 
+    /// The agents Roost knows how to wire, canonical spelling, in the
+    /// order `configValue` serialises them and the order the consent
+    /// dialog (plan 064) lists its rows. Mirrors
+    /// `crates/roost-ui-model/src/config.rs::AGENT_NAMES`.
+    static let agentNames: [String] = ["claude", "codex", "grok", "cursor", "opencode"]
+
+    /// Reserved words that are never agent names: the two documented
+    /// spellings (`off`/`false`/`no`) plus the retired ones this key
+    /// used to accept (`auto`/`on`/`true`/`yes`, plan 046). A reserved
+    /// word is only legal as the *entire* single-token value.
+    private static let reservedWords: Set<String> = [
+        "off", "false", "no", "auto", "on", "true", "yes",
+    ]
+
+    /// ASCII-only lowercasing, and splitting on comma *scalars* rather
+    /// than Characters, are both deliberate: the Rust mirror uses
+    /// `to_ascii_lowercase` and `str::split(',')`, and Swift's Unicode-
+    /// aware defaults disagree with it on inputs that do reach a config
+    /// file — `groK` with a Kelvin sign U+212A would parse here and not
+    /// there, and a combining mark right after a comma makes
+    /// `Character`-based splitting miss the delimiter Rust splits on.
+    /// The agent names are ASCII; the two parsers agreeing matters more
+    /// than either one's locale behaviour.
+    private static func asciiLowercased(_ s: String) -> String {
+        var out = String.UnicodeScalarView()
+        for scalar in s.unicodeScalars {
+            if scalar.value >= 0x41 && scalar.value <= 0x5A {
+                out.append(UnicodeScalar(scalar.value + 0x20)!)
+            } else {
+                out.append(scalar)
+            }
+        }
+        return String(out)
+    }
+
+    /// Parse a config value.
+    ///
+    /// `nil` means "could not be resolved at all" — the caller warns and
+    /// falls back to `.ask`, same shape as every other switch-like key
+    /// in this parser. An **empty** value is not in that group: it is
+    /// `.ask` (non-nil), so the caller does not warn — a fresh install
+    /// with the key never written must not look like a mistake.
+    ///
+    /// A value with at least one recognised name and some unrecognised
+    /// ones (`claude, banana`) still resolves — to the recognised subset
+    /// — but logs once from here, since the caller's nil path never runs
+    /// for it. Mirrors `AgentHooks::parse` in the Rust config parser.
     static func parse(_ s: String) -> AgentHooks? {
-        switch s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "auto", "on", "true", "yes": return .auto
-        case "off", "false", "no": return .off
-        default: return nil
+        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return .ask }
+        let lower = asciiLowercased(trimmed)
+        var tokens: [String] = []
+        for tok in lower.unicodeScalars.split(separator: ",", omittingEmptySubsequences: false) {
+            let tok = String(String.UnicodeScalarView(tok))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !tok.isEmpty && !tokens.contains(tok) {
+                tokens.append(tok)
+            }
+        }
+        if tokens.isEmpty { return nil }
+        if tokens.count == 1, ["off", "false", "no"].contains(tokens[0]) {
+            return .off
+        }
+        if tokens.contains(where: { reservedWords.contains($0) }) {
+            return nil
+        }
+        var known: [String] = []
+        var unrecognised: [String] = []
+        for tok in tokens {
+            if agentNames.contains(tok) {
+                known.append(tok)
+            } else {
+                unrecognised.append(tok)
+            }
+        }
+        if known.isEmpty { return nil }
+        if !unrecognised.isEmpty {
+            NSLog(
+                "roost-mac: agent-hooks: unrecognised agent name(s) %@ in '%@'; allowing the rest",
+                unrecognised.joined(separator: ", "),
+                trimmed
+            )
+        }
+        let ordered = agentNames.filter { known.contains($0) }
+        return .allow(ordered)
+    }
+
+    /// The `config.conf` value for this state, in `agentNames` order.
+    /// `.ask` has none: it is the *absence* of a decision, not a value —
+    /// it is never written until the user answers the consent dialog.
+    var configValue: String? {
+        switch self {
+        case .allow(let names):
+            let ordered = AgentHooks.agentNames.filter { names.contains($0) }
+            return ordered.joined(separator: ", ")
+        case .off:
+            return "off"
+        case .ask:
+            return nil
         }
     }
 }
@@ -173,17 +275,15 @@ struct RoostConfig: Sendable {
     /// `crates/roost-ui-model/src/config.rs::RoostConfig::show_sidebar_agents`
     /// (shared by iced).
     var showSidebarAgents: Bool = true
-    /// `agent-hooks` — whether Roost wires the supported coding
-    /// agents' hook entries into their own config files (plan 046
-    /// §3.6). `.off` stops the launch-time `roostctl agent ensure`
-    /// spawn in `applicationDidFinishLaunching`. Mirrors
+    /// `agent-hooks` — which coding agents Roost is allowed to wire its
+    /// hook entries into, or whether the user has been asked at all
+    /// (plan 064). `.off` and the unconfigured `.ask` both stop the
+    /// launch-time `roostctl agent ensure` spawn in
+    /// `applicationDidFinishLaunching`; only `.allow` runs it. Parsed
+    /// here (not left to `roostctl` alone) because the Mac consent
+    /// dialog (plan 064 §C8) renders and writes this list itself.
+    /// Mirrors
     /// `crates/roost-ui-model/src/config.rs::RoostConfig::agent_hooks`.
-    ///
-    /// Its companion key `agent-hooks-skip` has no Swift mirror on
-    /// purpose: the only thing on this platform that acts on it is the
-    /// `roostctl` this app spawns, and that process reads the same
-    /// `config.conf` through the Rust parser. A second copy here could
-    /// only disagree with it.
     var agentHooks: AgentHooks = .default
 
     static let empty = RoostConfig(
@@ -211,6 +311,34 @@ struct RoostConfig: Sendable {
         // entries, so config order wins and the dir fills in the rest.
         cfg.providers.append(contentsOf: discoverProviders(dir: providersDir(configPath: path)))
         return cfg
+    }
+
+    /// The `agent-hooks` key as it is on disk **right now**.
+    ///
+    /// This process is not the key's only writer — `roostctl agent set
+    /// --local` writes it with no UI running at all, and a connecting
+    /// client can raise this machine through its own `roost-session` —
+    /// so anything that turns on the key's current value reads it back
+    /// instead of trusting a snapshot.
+    ///
+    /// One small file read and a parse rather than [`load`], which also
+    /// walks the providers directory: this answers one key, and it is
+    /// answered at moments (a finished Apply, a finished status walk)
+    /// where the main thread is waiting for the hop back. Absent is
+    /// `.ask` — unanswered is a real state, not a failure, and is what a
+    /// machine nobody has consented on looks like. A file that exists
+    /// and cannot be read falls back to what the caller already
+    /// believes, because failing to read is not a reason to say
+    /// something different.
+    ///
+    /// Mirrors `crates/roost-iced/src/app/agent_hooks.rs::hooks_on_disk`.
+    static func agentHooksOnDisk(
+        fallback: AgentHooks = .ask, at path: URL = defaultPath()
+    ) -> AgentHooks {
+        guard let text = try? String(contentsOf: path, encoding: .utf8) else {
+            return FileManager.default.fileExists(atPath: path.path) ? fallback : .ask
+        }
+        return parse(text).agentHooks
     }
 
     /// `~/.config/roost/config.conf` — XDG-style even on macOS, by
@@ -443,17 +571,21 @@ func parse(_ text: String) -> RoostConfig {
                 )
             }
         case "agent-hooks":
-            // A value that does not parse — the empty one included —
-            // resolves to the *default*, not to whatever an earlier line
-            // set. Last-wins like every other scalar here, and the
-            // failure it must never have is a stray line leaving `off`
-            // quietly in force. Mirrors the Rust parser.
+            // Empty (`.ask`, non-nil) is silent — a fresh install that
+            // never wrote the key is not a mistake. An unparseable value
+            // (`nil`) resolves to the same `.ask`, but logs, because it
+            // must never read as a quiet `off` or a quiet consent nobody
+            // gave. Last-wins like every other scalar here, so a later
+            // line that fails to parse returns to `.ask` rather than
+            // leaving an earlier line's decision in force. Mirrors the
+            // Rust parser.
             if let v = AgentHooks.parse(value) {
                 cfg.agentHooks = v
             } else {
-                cfg.agentHooks = .default
+                cfg.agentHooks = .ask
                 NSLog(
-                    "roost-mac: unknown agent-hooks value '%@'; falling back to default 'auto'",
+                    "roost-mac: unrecognised agent-hooks value '%@'; leaving agent hooks " +
+                        "unconfigured (ask)",
                     value
                 )
             }

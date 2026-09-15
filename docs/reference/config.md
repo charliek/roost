@@ -38,8 +38,7 @@ the launcher with deterministic commands.
 | `copy-on-select` | `off \| true \| clipboard` | `true` | What a mouse-drag selection writes to the clipboard on release. See [the dedicated section below](#copy-on-select). |
 | `clipboard-write` | `allow \| deny` | `allow` | Whether a program running in the terminal can write the host clipboard via OSC 52. See [the dedicated section below](#clipboard-write). |
 | `link-modifier` | `ctrl \| alt \| super` | Cmd (Mac) / Alt (Linux) | Which held modifier reveals + opens a URL on hover/click. iced-only; the Swift Mac app is fixed to Cmd. See [the dedicated section below](#link-modifier). |
-| `agent-hooks` | `auto \| off` | `auto` | Whether Roost wires the supported coding agents' (Claude Code, Codex, grok/gx, cursor-agent, OpenCode) hook entries into their own config files at startup. See [the dedicated section below](#agent-hooks) and the [Agent Hooks](../guides/agents.md) guide. |
-| `agent-hooks-skip` | comma list | (empty) | Agent names (`claude`, `codex`, `grok`, `cursor`, `opencode`) never wired even when `agent-hooks = auto`. See [below](#agent-hooks). |
+| `agent-hooks` | agent list \| `off` \| absent | absent (unanswered) | Which supported coding agents (Claude Code, Codex, grok/gx, cursor-agent, OpenCode) Roost wires its hook entries into, at startup. Absent means nobody has answered the consent dialog yet — Roost writes nothing until they do. See [the dedicated section below](#agent-hooks) and the [Agent Hooks](../guides/agents.md) guide. |
 | `local-backend` | `in-process \| session` | `in-process` for an existing setup; `session` on a genuinely fresh install | Where the tabs you start in the Roost window run. See [the dedicated section below](#local-backend). |
 
 ## `copy-on-select`
@@ -235,7 +234,7 @@ list and trigger syntax.
 
 ## `agent-hooks`
 
-Whether Roost wires the supported coding agents' hook entries into
+Which supported coding agents Roost wires its hook entries into, in
 their own config files. Both UIs read this at startup, and `roostctl
 agent ensure` (the same verb the UIs run) reads it too — see the [Agent
 Hooks](../guides/agents.md) guide for the full mechanism, what gets
@@ -243,45 +242,57 @@ written where, and the guarantee about what a merge does and doesn't
 touch.
 
 ```conf
-agent-hooks = auto        # auto (default) | off
-agent-hooks-skip = cursor, codex
+agent-hooks = claude, codex   # a list, off, or absent (nobody has answered yet)
 ```
 
 | Value | Effect |
 |---|---|
-| `auto` *(default)* — also accepts `on`, `true`, `yes` | Every present agent not named in `agent-hooks-skip` gets Roost's hook entries, refreshed on launch if they're stale. |
+| a comma list of agent names | Every named agent gets Roost's hook entries, refreshed on launch if they're stale. Everything present and *not* named is left alone — nothing is ever removed just for being absent from the list. |
 | `off` — also accepts `false`, `no` | The UIs wire nothing at startup; an agent's config file is never opened. This does **not** remove anything already wired on its own — see below. |
+| absent, empty, or unrecognized | **Unanswered.** Nobody has run the consent dialog or `roostctl agent set` yet. Nothing is wired, and nothing already wired is touched, until they do — a fresh install starts here, and a launch raises the consent dialog once per process when at least one supported agent is installed. See [Agent Hooks → Roost asks once](../guides/agents.md#roost-asks-once). |
 
-An unrecognized value (a typo, say) falls back to `auto`, never `off` —
-silently disabling the feature on a typo is the failure mode hardest to
-notice, so an unparseable value keeps the safer default instead. A
-repeated key is last-wins, including when the repeat is empty or
-unparseable (it still resolves to the default, `auto`, not to whatever
-an earlier line in the file said).
-
-`agent-hooks-skip` is a comma-separated list of agent names — `claude`,
-`codex`, `grok`, `cursor`, `opencode` — that are never wired regardless
-of `agent-hooks`. Names are lowercased and de-duplicated; a name that
-isn't one of the five is reported (by whichever tool is reading the
-config) and otherwise ignored, never fatal.
+**Names normalise.** Each token is trimmed and lowercased; duplicates
+collapse; the result is reordered into `claude, codex, grok, cursor,
+opencode` regardless of the order written. A token that names none of
+the five is dropped with a warning, and the rest of the list still
+resolves — one typo shouldn't turn into "nothing is wired and nothing
+says why." A value that names *no* recognised agent at all, or mixes a
+reserved word (`off`/`false`/`no`, or the retired `auto`/`on`/`true`/
+`yes`) with anything else, resolves to **unanswered** with a warning —
+the retired spellings no longer mean "wire everything"; they mean
+"nobody has said yet." A repeated key is last-wins, including when the
+repeat is empty or unparseable (it resolves to unanswered, not to
+whatever an earlier line in the file said).
 
 **`off` stops future wiring; it does not itself remove anything.** This
 split is deliberate, not an oversight: flipping the key to `off` and
 relaunching means the UI won't wire anything *new*, but entries already
 on disk stay there until something explicit takes them out —
-`roostctl agent uninstall --all`, or running `roostctl agent ensure`
+`roostctl agent uninstall --all`, running `roostctl agent ensure`
 yourself (which reads this same key and, seeing `off`, does perform the
-removal). The UIs themselves never rewrite an agent's config file just
-because the key changed to `off` — they simply stop touching it. Over a
-connected host session the split is reversed: the client is the only
-authority a session has, so an `agent-hooks = off` client tells the
-host to actively unwire on every connect. See [Agent Hooks → Remote
-hosts](../guides/agents.md#remote-hosts).
+removal), or reopening the consent dialog (the **Agent Hooks…** palette
+row) and choosing `off` there. The UIs themselves never rewrite an
+agent's config file just because the key changed to `off` — they simply
+stop touching it.
 
-`agent-hooks-skip` has no separate Swift mirror: on macOS, only the
-`roostctl` the app spawns acts on it, and that binary reads this same
-file through the same parser, so a second copy in `Config.swift` could
-only disagree with it.
+**Over a connected host session the rule is different again, and
+reversed from an earlier design.** A connecting client can only ever
+**raise** a host's `agent-hooks` key — union its own allow-list into
+whatever the host's key already says, never removing — and that
+includes raising a host whose key is explicitly `off` or still
+unanswered: a host has no screen to ask on, so the connecting client is
+the only authority there is. A client whose own key is `off` or
+unanswered sends nothing and so cannot raise or lower a host either.
+**Lowering a host is done on that machine** — `roostctl agent
+ensure`/`uninstall` run there, or its own dialog — and holds until a
+more permissive client connects again. See [Agent Hooks → Remote
+hosts](../guides/agents.md#remote-hosts) for the full behavior.
+
+The Mac app carries its own mirror of this parser (`AgentHooks` in
+`Config.swift`) rather than reading it only through `roostctl` — it
+needs the key at launch to decide whether to raise the consent sheet
+before it has spawned anything — kept in parity with the Rust parser,
+including the normalisation rules, by `ConfigAgentHooksTests`.
 
 ## `local-backend`
 
@@ -355,17 +366,18 @@ command = label="Claude" run="claude --resume"
 # its rows on `list` and acts on the choice on `activate`:
 provider = label="Open shed" run="~/.config/roost/providers/shed.sh"
 
-# Default: Roost wires Claude Code, Codex, grok/gx, cursor-agent and
-# OpenCode's own hook files automatically. Skip one or two, or turn the
-# whole thing off (which stops future wiring — it doesn't by itself
-# remove what's already there; see docs/guides/agents.md).
-agent-hooks = auto
-agent-hooks-skip = cursor
+# Left absent (the default), Roost asks once — a consent dialog opens
+# on first launch naming whichever of Claude Code, Codex, grok/gx,
+# cursor-agent and OpenCode it finds installed, and nothing is wired
+# until you answer it. Answering by hand instead: name the agents to
+# wire, or turn the whole thing off (which stops future wiring — it
+# doesn't by itself remove what's already there; see
+# docs/guides/agents.md).
+agent-hooks = claude, codex
 ```
 
 See [Extending Roost](../guides/extending.md) for the full `command =` /
 `provider =` contract (with bash / Python / TypeScript examples),
 [`paths.md`](paths.md) for where the file lives on each platform,
 [`themes.md`](themes.md) for the `theme` value enumeration, and the
-[Agent Hooks](../guides/agents.md) guide for `agent-hooks` /
-`agent-hooks-skip` in full.
+[Agent Hooks](../guides/agents.md) guide for `agent-hooks` in full.

@@ -219,9 +219,9 @@ pub fn now_secs() -> i64 {
 ///
 /// A host session does **not** use this: it has no screen to put a toast
 /// on and answers a client in one round trip, so its flip happens inside
-/// the ensure's own lock ([`crate::ensure_on_behalf`]). Re-acquiring the
-/// lock here would leave two clients connecting at once both reading the
-/// same agent as unannounced.
+/// the raise's own lock ([`crate::raise`]). Re-acquiring the lock here
+/// would leave two clients connecting at once both reading the same
+/// agent as unannounced.
 pub fn mark_noticed(home: &Home, agents: &[Agent]) -> Result<bool, InstallError> {
     let _lock = write::lock(&home.lock_path())?;
     let (mut record, _) = load(home)?;

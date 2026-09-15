@@ -1,0 +1,7 @@
+{
+  "id": "21",
+  "op": "agent.set_hooks",
+  "params": {
+    "agents": ["claude", "codex"]
+  }
+}

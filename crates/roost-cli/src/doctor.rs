@@ -879,7 +879,11 @@ fn collect_agent_status_blocking() -> AgentStatusResult {
             return (Vec::new(), Some(msg.clone()), Vec::new(), Some(msg));
         }
     };
-    let (status, status_error) = match roost_agent_install::status(&home) {
+    // The same resolution `roostctl agent status` prints: doctor renders
+    // those rows, and two answers to "is this agent allowed" would be two
+    // diagnoses of one machine.
+    let mode = crate::agent_install::resolved_or_nothing();
+    let (status, status_error) = match roost_agent_install::status(&home, &mode) {
         Ok(rows) => (rows, None),
         Err(e) => (Vec::new(), Some(e.to_string())),
     };
@@ -5741,6 +5745,8 @@ mod tests {
                     wired: Some(roost_agent_install::INTEGRATION_VERSION),
                     up_to_date: true,
                     noticed: true,
+                    allowed: true,
+                    files: Vec::new(),
                     skipped: None,
                     warnings: Vec::new(),
                 })
@@ -6962,6 +6968,8 @@ mod tests {
             wired,
             up_to_date,
             noticed: true,
+            allowed: true,
+            files: Vec::new(),
             skipped,
             warnings,
         }

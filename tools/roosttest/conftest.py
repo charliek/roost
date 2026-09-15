@@ -9,7 +9,10 @@ needed, and quitting only what it launched). Each test gets a fresh
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 import uuid
+from pathlib import Path
 
 import pytest
 import ui
@@ -135,3 +138,19 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
         if isinstance(lr, tuple) and len(lr) == 3:
             reason = str(lr[2]).removeprefix("Skipped: ")
         terminalreporter.write_line(f"  SKIP {rep.nodeid} — {reason}")
+
+
+@pytest.fixture
+def short_root():
+    """A jail root short enough to hold a Unix socket path.
+
+    `sun_path` is 104 bytes on macOS, and pytest's `tmp_path` spends
+    ~70 of them before this test adds
+    `home/Library/Caches/Roost-iced/roost.sock` — the jailed UI then
+    refuses to bind. `/tmp` is the only root with room, and it is short
+    on Linux too."""
+    root = Path(tempfile.mkdtemp(prefix="roost-jail-", dir="/tmp"))
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root, ignore_errors=True)

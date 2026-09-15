@@ -1,9 +1,0 @@
-{
-  "id": "12",
-  "op": "session.set_agent_hooks",
-  "params": {
-    "mode": "off",
-    "skip": [],
-    "client": "charlie-mbp"
-  }
-}

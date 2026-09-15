@@ -807,6 +807,12 @@ pub struct AppDialogDumpResult {
     /// `null` for every other dialog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
+    /// The agent-hooks card's mode — `"first_run" | "preferences"`
+    /// (plan 064 §3.5). `null` for every other dialog. Separate from
+    /// `variant` because it is a different question: `variant` says what
+    /// a bootstrap would *do*, and this says who raised the card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     pub title: String,
     pub body: String,
     /// Every button on the card, in render order (the dismissing one
@@ -817,6 +823,35 @@ pub struct AppDialogDumpResult {
     /// not about a saved host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// The agent-hooks card's switches, in the install engine's
+    /// `ALL_AGENTS` order — the order the card draws them. Empty for
+    /// every other dialog, which has no rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<AppDialogAgentRow>,
+}
+
+/// One agent's switch on the agent-hooks card.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppDialogAgentRow {
+    /// The canonical agent name — `claude`, `codex`, `grok`, `cursor`,
+    /// `opencode` — the same spelling the `agent-hooks` key uses.
+    pub agent: String,
+    /// Whether the switch is on: what Apply would write, not what is
+    /// wired.
+    pub on: bool,
+    /// Whether this agent is installed on this machine.
+    pub found: bool,
+    /// The row's status line — `"wired v3"`, `"wired v2, out of date"`,
+    /// `"found, not wired"`, `"wired, not allowed"`, `"not found"`.
+    /// `null` on the first-run card, which does not render one — sent
+    /// as an explicit null rather than omitted, so a reader walking the
+    /// rows can tell "no status line" from "this build has no such
+    /// field" without consulting the mode.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// The files this agent's install owns or merges into, as the card
+    /// names them. Two for codex, one for everything else.
+    pub files: Vec<String>,
 }
 
 /// `app.dialog_answer` request: press the visible host modal's primary
@@ -825,7 +860,9 @@ pub struct AppDialogDumpResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppDialogAnswerParams {
-    /// `"confirm"` or `"cancel"`.
+    /// `"confirm"`, `"cancel"`, or `"toggle:<agent>"` — the last being
+    /// the agent-hooks card's five switches, which are the answer that
+    /// card is asking for and so cannot be pressed by confirm alone.
     pub action: String,
 }
 
@@ -1802,7 +1839,7 @@ pub struct AgentReportChangedEvent {
 /// speaks. A host-session change must not force every `roostctl` build
 /// to be re-gated, and vice versa.
 ///
-/// # The contract at `5`
+/// # The contract at `6`
 ///
 /// Every same-UID connection to a session is **symmetric**. There is no
 /// owner, no lease and no foreground: reading, typing, attaching and
@@ -1811,7 +1848,10 @@ pub struct AgentReportChangedEvent {
 /// client decides what to do with it. [`ops::SESSION_SET_FOCUS`] is a
 /// per-connection statement about what that client is looking at — a
 /// tab is muted while *any* connection views it — and the PTY is sized
-/// by whoever interacted with it last.
+/// by whoever interacted with it last. [`ops::SESSION_SET_AGENT_HOOKS`]
+/// is a **raise, never a lower**: a client widens the host's own
+/// `agent-hooks` key with its own allow-list and can only ever add to
+/// it (plan 064 §3.3).
 ///
 /// # The versioning rule
 ///
@@ -1826,7 +1866,7 @@ pub struct AgentReportChangedEvent {
 /// [`SessionIdentify::session_protocol`] for **equality** and refuses
 /// anything else, so the integer is the whole negotiation. What each
 /// generation changed is `CHANGELOG.md`'s to tell.
-pub const SESSION_PROTOCOL_VERSION: u32 = 5;
+pub const SESSION_PROTOCOL_VERSION: u32 = 6;
 
 /// What a host session can encode a tab's attach payload as.
 ///
@@ -2641,40 +2681,29 @@ pub struct SessionSetFocusParams {
     pub focused_tab_id: Option<i64>,
 }
 
-/// Whether the client wants Roost's hook entries on the host at all.
+/// [`ops::SESSION_SET_AGENT_HOOKS`] params: raise the host's `agent-hooks`
+/// key to (at least) the connected client's own allow-list.
 ///
-/// The same two values `agent-hooks` takes in `config.conf`, spelled the
-/// same way, because the client sends its own config value verbatim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AgentHooksMode {
-    Auto,
-    Off,
-}
-
-/// [`ops::SESSION_SET_AGENT_HOOKS`] params: bring the host's agent hook
-/// entries in line with the connected client's configuration.
+/// Open to every same-UID connection, last writer... no — **widest
+/// writer** wins, and that is the whole of plan 064 §3.3's contentious
+/// half, pinned on the wire: a client may only ever *raise* the host's
+/// own `agent-hooks` key in that machine's `config.conf`, never lower
+/// it. There is no way to spell "off" or "narrow this" here — a client
+/// whose own `agent-hooks` is `off`, or unanswered (`ask`), sends this
+/// op **not at all**, because there is nothing for it to ask the host to
+/// widen. `roostctl agent ensure`/`uninstall`, run by hand on the host
+/// itself, are the only way to take entries back out.
 ///
-/// Open to every same-UID connection, last writer wins — and this one
-/// writes files under the session user's `$HOME`.
-///
-/// The client sends it on **every** connect, with its own `agent-hooks` /
-/// `agent-hooks-skip` values, because the op is idempotent and a config
-/// change made since the last connect has to reach the host. That is also why [`AgentHooksMode::Off`] *removes*
-/// Roost's entries here rather than meaning "do nothing": on the client's
-/// own machine `off` is an opt-out of future wiring, but a host has no
-/// config of its own to consult — the client is the authority, so `off`
-/// on the client means the host comes clean (plan 046 §3.4).
+/// The client sends it on **every** connect with its own `agent-hooks`
+/// value, because the op is idempotent and a config change made since
+/// the last connect has no other way to reach the host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSetAgentHooksParams {
-    pub mode: AgentHooksMode,
-    /// Agent names never wired, from the client's `agent-hooks-skip`. A
-    /// name the host does not recognise is reported as a skip and
-    /// otherwise ignored: a newer client's agent must not break an older
-    /// session.
-    #[serde(default)]
-    pub skip: Vec<String>,
+    /// The agents the client's own `agent-hooks` key allows. Never
+    /// empty and never a name the host does not recognise — both are
+    /// `invalid-param` refusals the server validates.
+    pub agents: Vec<String>,
     /// Who is asking, for the host's state record and its log. Required:
     /// the record's `by` exists so two clients that disagree about
     /// `agent-hooks` are tellable apart, and a guessed value would be
@@ -2682,7 +2711,14 @@ pub struct SessionSetAgentHooksParams {
     pub client: String,
 }
 
-/// One agent [`SessionSetAgentHooksParams`] did not act on, and why.
+/// One agent an [`ops::SESSION_SET_AGENT_HOOKS`] or
+/// [`ops::AGENT_SET_HOOKS`] run did not act on, and why.
+///
+/// `reason` is a free string for the client to show or log verbatim,
+/// not a code to match on: the raise rule means the only skip reason
+/// [`ops::SESSION_SET_AGENT_HOOKS`] can report now is "not allowed" (the
+/// agent's own consent did not name it) — the two-mode-era `"skip-list"`
+/// spelling this field used to carry is gone with the mode it named.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentHooksSkipped {
     pub agent: String,
@@ -2697,7 +2733,11 @@ pub struct AgentHooksFailed {
     pub error: String,
 }
 
-/// [`ops::SESSION_SET_AGENT_HOOKS`] result: what the host did.
+/// What one agent-hooks install did to one machine's files — the shape
+/// [`ops::SESSION_SET_AGENT_HOOKS`] answers with directly, and
+/// [`AgentSetHooksResult::local`] carries for the same machine's own
+/// `agent.set_hooks` (the name says both: an outcome of an install, not
+/// a particular op's reply).
 ///
 /// `wired` is the **toast list** — the agents this host has wired and
 /// never announced to any client — not merely the ones this call
@@ -2705,13 +2745,107 @@ pub struct AgentHooksFailed {
 /// hooks on ‹host›" at most once per agent per host: the session flips
 /// the record's `noticed` for exactly what it reports here, so the next
 /// client to connect hears nothing (plan 046 §3.3).
+///
+/// `removed` is always empty from [`ops::SESSION_SET_AGENT_HOOKS`]: a
+/// raise only ever widens, so there is nothing for that op to take out.
+/// The field stays on the shared shape because `agent.set_hooks` (an
+/// explicit local `set_hooks`, not a raise) can still populate it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionSetAgentHooksResult {
+pub struct AgentHooksOutcome {
     pub wired: Vec<String>,
     pub refreshed: Vec<String>,
     pub removed: Vec<String>,
     pub skipped: Vec<AgentHooksSkipped>,
     pub errors: Vec<AgentHooksFailed>,
+}
+
+/// [`ops::AGENT_SET_HOOKS`]'s `agents`: the client's new `agent-hooks`
+/// value, spelled the way `config.conf` itself would — either an
+/// explicit allow-list or the literal word `off`.
+///
+/// A hand-rolled `(De)serialize` rather than a two-variant
+/// `#[serde(untagged)]` enum: untagged would decode *any* JSON string
+/// into the "off" shape (a typo like `"ofF"` or a stray `"none"` would
+/// silently become `Off` instead of failing to parse), where this field
+/// means exactly one string. A list, of any length including empty, is
+/// always the list shape — `[]` is a value this type carries; whether it
+/// is a valid one is the server's call (`invalid-param`), not the wire
+/// format's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentSetHooksAgents {
+    List(Vec<String>),
+    Off,
+}
+
+impl Serialize for AgentSetHooksAgents {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        match self {
+            AgentSetHooksAgents::List(agents) => agents.serialize(ser),
+            AgentSetHooksAgents::Off => ser.serialize_str("off"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentSetHooksAgents {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            List(Vec<String>),
+            Str(String),
+        }
+        match Raw::deserialize(de)? {
+            Raw::List(agents) => Ok(AgentSetHooksAgents::List(agents)),
+            Raw::Str(word) if word == "off" => Ok(AgentSetHooksAgents::Off),
+            Raw::Str(other) => Err(serde::de::Error::custom(format!(
+                "agents must be a list of agent names or \"off\", not {other:?}"
+            ))),
+        }
+    }
+}
+
+/// [`ops::AGENT_SET_HOOKS`] params: set *this* client's own `agent-hooks`
+/// key — the UI-socket twin of [`SessionSetAgentHooksParams`], for the
+/// machine the UI is running on rather than a connected host.
+///
+/// Unlike the session op this one can lower as well as raise: it is the
+/// wire path behind the consent dialog and `roostctl agent set`, both of
+/// which the user drives directly on their own machine, where
+/// [`SessionSetAgentHooksParams`]'s raise-only rule exists only because
+/// nobody is at the far end's keyboard to ask.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSetHooksParams {
+    pub agents: AgentSetHooksAgents,
+}
+
+/// One connected host's answer to the [`ops::AGENT_SET_HOOKS`] raise
+/// this UI pushed on to it, or why it could not be asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AgentSetHooksHostOutcome {
+    Result {
+        host: String,
+        result: AgentHooksOutcome,
+    },
+    Error {
+        host: String,
+        error: String,
+    },
+}
+
+/// [`ops::AGENT_SET_HOOKS`] result: what changed on this machine, and
+/// what every connected non-localhost host reported back once its own
+/// `agent-hooks` key was raised to match.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSetHooksResult {
+    /// Where this machine's `agent-hooks` key now lives, for the
+    /// confirmation surface to name.
+    pub config_path: String,
+    pub local: AgentHooksOutcome,
+    /// One entry per connected non-localhost host, in stable connection
+    /// order.
+    pub hosts: Vec<AgentSetHooksHostOutcome>,
 }
 
 // ============================================================================
@@ -3003,10 +3137,12 @@ pub mod ops {
     /// so the e2e suite can pin button-event and motion encoding
     /// without a window manager. Gated by `ROOST_TEST_MODE=1`.
     pub const TAB_DISPATCH_MOUSE_EVENT: &str = "tab.dispatch_mouse_event";
-    /// Test-only focus-state driver. Drives the focus-tracking emit
-    /// path so the e2e suite can pin mode 1004 `\x1b[I` / `\x1b[O`
-    /// without taking real OS focus from the test runner. Gated by
-    /// `ROOST_TEST_MODE=1`.
+    /// Test-only focus-state driver. Drives the same route a real
+    /// window focus change takes — the window-opened pass and then the
+    /// focus-tracking emit — so the e2e suite can pin mode 1004
+    /// `\x1b[I` / `\x1b[O`, and the once-per-process latches that hang
+    /// off a focus change, without taking real OS focus from the test
+    /// runner. Gated by `ROOST_TEST_MODE=1`.
     pub const APP_SET_WINDOW_FOCUS: &str = "app.set_window_focus";
     /// Ungated read of the active tab's current W3C cursor name —
     /// the latest OSC 22 payload, or `"default"` if none has landed.
@@ -3073,6 +3209,16 @@ pub mod ops {
     /// rule as `app.dialog_dump` — it exists because the paste
     /// accelerator (issue #376's regression) has no other IPC seam.
     pub const APP_KEYBIND_DISPATCH: &str = "app.keybind_dispatch";
+
+    /// Set *this* machine's own `agent-hooks` key — the consent
+    /// dialog's Apply and `roostctl agent set`'s wire path — and raise
+    /// every connected non-localhost host to at least the same
+    /// allow-list. Served by the UI socket; a session socket answers
+    /// `unknown-op`, same as any other UI-only op (plan 064 §3.4). No
+    /// server implementation ships until plan 064 C6 (iced) and C8
+    /// (Mac); until then a UI answers whatever its `unknown op` shape
+    /// is.
+    pub const AGENT_SET_HOOKS: &str = "agent.set_hooks";
 
     pub const EVENT_TAB_OPENED: &str = "tab.opened";
     pub const EVENT_TAB_CLOSED: &str = "tab.closed";

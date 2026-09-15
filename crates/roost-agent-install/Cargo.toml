@@ -14,6 +14,13 @@ path = "src/lib.rs"
 [dependencies]
 roost-agent = { path = "../roost-agent" }
 
+# The `agent-hooks` key: this crate writes it (plan 064 §3.2), so it
+# parses it with the same parser every reader uses and resolves
+# `config.conf`'s path through the same rule. No cycle — `roost-ui-model`
+# reaches `roost-ipc` and `roost-vt` (without `ffi`), neither of which
+# knows this crate exists.
+roost-ui-model = { path = "../roost-ui-model" }
+
 serde      = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 thiserror  = { workspace = true }

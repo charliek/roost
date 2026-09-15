@@ -27,11 +27,22 @@ import time
 import uuid
 from pathlib import Path
 
-import pytest
-
 from client import RoostError, Timeout, scaled_timeout
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _pytest():
+    """`pytest`, imported at the point of use rather than at the top.
+
+    This module is reached from `roosttest_unit`, which CI's
+    `harness-unit` job runs under a bare `python3` with no test
+    dependencies installed — so a module-level import here breaks a lane
+    that never calls any of the three functions below. Every caller of
+    those is inside a pytest run and has it."""
+    import pytest
+
+    return pytest
 
 # A shell with NO startup files, therefore no Roost shell integration,
 # therefore no OSC 133 marks the test didn't feed itself. Any tab whose
@@ -169,7 +180,7 @@ def skip_on_ci(reason: str, alt_coverage: str | None = None) -> None:
     `alt_coverage`, so a remote skip never silently drops coverage."""
     if os.environ.get("CI") == "true":
         msg = reason if alt_coverage is None else f"{reason} [alt-coverage: {alt_coverage}]"
-        pytest.skip(msg)
+        _pytest().skip(msg)
 
 
 def precondition(ok: bool, reason: str) -> None:
@@ -181,8 +192,8 @@ def precondition(ok: bool, reason: str) -> None:
     if ok:
         return
     if is_fresh():
-        pytest.fail(f"precondition failed in fresh (harness-owned) mode: {reason}")
-    pytest.skip(reason)
+        _pytest().fail(f"precondition failed in fresh (harness-owned) mode: {reason}")
+    _pytest().skip(reason)
 
 
 def cwd_reaches(roost, tab_id: int, want: str, timeout: float = 3.0) -> bool:

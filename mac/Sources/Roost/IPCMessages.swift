@@ -502,6 +502,108 @@ struct IPCEventBatch: Codable, Sendable {
     }
 }
 
+// MARK: - Agent hooks (`agent.set_hooks`)
+
+/// `agent.set_hooks`'s `agents`: this machine's new `agent-hooks`
+/// value, spelled the way `config.conf` itself would — either an
+/// explicit allow-list or the literal word `off`.
+///
+/// Decoded by hand rather than as an "any string is off" shape, for
+/// Rust's `AgentSetHooksAgents` reason: this field means *exactly* one
+/// string, and a typo like `"ofF"` or a stray `"none"` must fail to
+/// parse rather than silently become `off`. A list of any length,
+/// including empty, is always the list shape — whether it is a *valid*
+/// one is the op's call (`invalid-param`), not the wire format's.
+enum IPCAgentSetHooksAgents: Equatable, Sendable {
+    case list([String])
+    case off
+}
+
+extension IPCAgentSetHooksAgents: Codable {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let names = try? c.decode([String].self) {
+            self = .list(names)
+            return
+        }
+        let word = try c.decode(String.self)
+        guard word == "off" else {
+            throw DecodingError.dataCorruptedError(
+                in: c,
+                debugDescription:
+                    "agents must be a list of agent names or \"off\", not \"\(word)\""
+            )
+        }
+        self = .off
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        switch self {
+        case .list(let names): try c.encode(names)
+        case .off: try c.encode("off")
+        }
+    }
+}
+
+struct IPCAgentSetHooksParams: Codable, Equatable, Sendable {
+    var agents: IPCAgentSetHooksAgents
+}
+
+struct IPCAgentHooksSkipped: Codable, Equatable, Sendable {
+    var agent: String
+    var reason: String
+}
+
+struct IPCAgentHooksFailed: Codable, Equatable, Sendable {
+    var agent: String
+    var error: String
+}
+
+/// What one agent-hooks install did to one machine's files. Mirrors
+/// Rust's `AgentHooksOutcome`, and decodes `roostctl agent set
+/// --local --json` directly — the CLI prints these five keys under
+/// exactly these names (plus `current` and `warnings`, which nothing
+/// here reads).
+///
+/// One deliberate difference from the iced UI's reply: the CLI's
+/// `wired` is *this run's* writes, where the in-process op reports the
+/// record's never-announced list. The Mac has no toast to drive off the
+/// latter, and what the CLI can honestly report is what it did.
+struct IPCAgentHooksOutcome: Codable, Equatable, Sendable {
+    var wired: [String] = []
+    var refreshed: [String] = []
+    var removed: [String] = []
+    var skipped: [IPCAgentHooksSkipped] = []
+    var errors: [IPCAgentHooksFailed] = []
+}
+
+/// One connected host's answer to the raise this UI pushed onto it.
+///
+/// Never populated here: the Mac app has no host connections and
+/// answers `unknown-op` to every `host.*` op. The type exists because
+/// the reply shape is shared with the Linux UI, which does, and
+/// `roostctl agent set` decodes one reply from either.
+struct IPCAgentSetHooksHostOutcome: Codable, Equatable, Sendable {
+    var host: String
+    var result: IPCAgentHooksOutcome?
+    var error: String?
+}
+
+struct IPCAgentSetHooksResult: Codable, Equatable, Sendable {
+    /// Where this machine's `agent-hooks` key now lives, for the
+    /// confirmation surface to name.
+    var configPath: String
+    var local: IPCAgentHooksOutcome
+    var hosts: [IPCAgentSetHooksHostOutcome] = []
+
+    enum CodingKeys: String, CodingKey {
+        case configPath = "config_path"
+        case local
+        case hosts
+    }
+}
+
 // MARK: - String-wrapped int64 helpers
 
 enum StringInt64DecodeError: Error, CustomStringConvertible {
@@ -642,10 +744,14 @@ let ipcProtocolVersion: UInt32 = 1
 /// the two move independently. Mirrors Rust's
 /// `messages::SESSION_PROTOCOL_VERSION`.
 ///
-/// At `5` every same-UID connection to a session is symmetric: no
+/// At `5` every same-UID connection to a session became symmetric: no
 /// owner, no lease, no foreground. Effects fan out to every subscriber,
 /// `session.set_focus` is a per-connection statement about what that
 /// client is looking at, and the PTY is sized by the last interactor.
+/// `6` reshapes `session.set_agent_hooks`: it carries the agents a
+/// client's own `agent-hooks` key allows, and a client only ever
+/// *raises* the host's setting — `mode` and `skip` are gone, and a
+/// client that allows nothing sends no frame at all (plan 064 §3.3).
 ///
 /// The rule: a **session-socket change bumps this when a pre-bump peer
 /// could not refuse it meaningfully**, in either direction. A new event
@@ -654,7 +760,7 @@ let ipcProtocolVersion: UInt32 = 1
 /// **equality** and refuses anything else, so it is the whole
 /// negotiation; what each generation changed is `CHANGELOG.md`'s to
 /// tell.
-let ipcSessionProtocolVersion: UInt32 = 5
+let ipcSessionProtocolVersion: UInt32 = 6
 
 /// Maximum length of a single framed line. Matches roost-ipc's
 /// `MAX_FRAME_BYTES`.

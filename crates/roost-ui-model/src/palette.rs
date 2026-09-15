@@ -235,6 +235,9 @@ impl PaletteCommands {
         // lands right after `SELECT_FONT_ID`) pushes this entry to sit
         // immediately after "Clear All Notifications" — plan 007 §3.7.
         ("toggle_sidebar_agents", "Toggle Sidebar Agents"),
+        // The one surface that changes `agent-hooks` after the first
+        // launch, and the row the wiring toast points at by name.
+        ("agent_hooks", "Agent Hooks\u{2026}"),
         ("new_tab", "New Tab"),
         ("close_tab", "Close Tab"),
         ("rename_tab", "Rename Tab"),

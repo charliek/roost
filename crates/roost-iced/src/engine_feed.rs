@@ -63,6 +63,25 @@ pub(crate) enum EngineFeed {
     /// attachment that asked for it. Boxed: the result carries five
     /// vectors, and every feed item pays for the largest variant.
     HostAgentHooks(Box<crate::app::agent_hooks::HostAgentHooks>),
+    /// `agent.set_hooks` wrote this machine's own key and reconciled its
+    /// files (plan 064 §3.4). Off the thread for [`Self::AgentHooks`]'s
+    /// reason; on the feed because the two things left to do — the
+    /// running UI's in-memory `agent-hooks` value and the receipt toast
+    /// — are both main-thread state. Boxed like its host sibling.
+    AgentHooksSet(Box<crate::app::agent_hooks::AgentHooksSet>),
+    /// A read-only `roost_agent_install::status` walk finished for the
+    /// consent card (plan 064 §3.5) — the five agents' config files,
+    /// read off the UI thread for [`Self::AgentHooks`]'s reason. The
+    /// card it raises can only be raised on the main thread. Boxed: it
+    /// carries five rows with their file lists.
+    AgentHooksSurvey(Box<crate::app::agent_hooks::AgentHooksSurvey>),
+    /// The consent card's Apply was refused or could not finish.
+    ///
+    /// `agent.set_hooks` answers its *caller*, and when the caller is a
+    /// dialog the user just confirmed, the answer has nowhere else to
+    /// go: a refusal it never showed would be a change they asked for
+    /// and were never told did not happen.
+    AgentHooksApplyFailed(String),
     AgentMetrics(AgentMetricsResult),
     Provider(Box<ProviderRunResult>),
     /// The user picked an item off the native macOS menu bar. Not an

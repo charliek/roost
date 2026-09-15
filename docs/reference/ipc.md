@@ -1558,7 +1558,8 @@ Without it every op in this group errors. `tools/roosttest/` drives a
 real UI over this socket and nothing else, so without a seam onto the
 host dialog family (`HostDialog::{Add, ConfirmStop, ConfirmRestart,
 Bootstrap}` — [Host sessions (development)](../development/host-sessions.md#bootstrap-installupgrade-over-ssh))
-the consent card the SSH bootstrap flow (plan 039) gates on could not
+the consent card the SSH bootstrap flow (plan 039) gates on — and the
+agent-hooks consent card (plan 064) — could not
 be exercised at all. Unlike the upgrade prompt, whose button composes
 ops a test can already send directly, the bootstrap job is
 deliberately UI-only and has no such back door.
@@ -1587,8 +1588,9 @@ Request: `{"params": {}}`. Response:
 }
 ```
 
-`dialog` is `"add" | "confirm_stop" | "confirm_restart" | "bootstrap"`,
-or absent (with every other field defaulted/empty) when no host modal
+`dialog` is
+`"add" | "confirm_stop" | "confirm_restart" | "confirm_switch" | "bootstrap" | "agent_hooks"`,
+or absent (with every other field defaulted/empty) when no modal
 is open. `variant` is present only for `"bootstrap"` —
 `"install" | "update" | "start"` — and `null`/absent otherwise.
 `buttons` lists every button in render order, the dismissing one
@@ -1597,6 +1599,49 @@ first, exactly as the card draws them. `host` is the saved host's
 same value `host.connect` takes — not its label, even though the
 rendered `title` and `body` above interpolate the label. Absent when
 the dialog is not about a saved host.
+
+Two fields belong to the agent-hooks consent card (plan 064) and are
+absent/empty for every other dialog. `mode` is
+`"first_run" | "preferences"` — which card this is, not what it would
+do, which is why it isn't folded into `variant`. `rows` is one entry
+per agent, in the install engine's `ALL_AGENTS` order (the order the
+card draws them):
+
+```json
+{
+  "dialog": "agent_hooks",
+  "mode": "preferences",
+  "title": "Agent hooks",
+  "body": "Roost adds a hook to each agent you switch on so its tabs show status and send notifications. …",
+  "buttons": ["Cancel", "Apply"],
+  "rows": [
+    {
+      "agent": "claude",
+      "on": true,
+      "found": true,
+      "status": "wired v3",
+      "files": ["/home/u/.claude/settings.json"]
+    },
+    {
+      "agent": "codex",
+      "on": false,
+      "found": true,
+      "status": "found, not wired",
+      "files": ["/home/u/.codex/hooks.json", "/home/u/.codex/config.toml"]
+    }
+  ]
+}
+```
+
+`agent` is the canonical name the `agent-hooks` key uses. `on` is what
+Apply would write — prefilled from the **key**, not from what is wired,
+so an agent whose entries are on disk but which the key doesn't name
+starts off. `found` says whether that agent is installed on this
+machine. `status` is the row's status line — `"wired v3"`,
+`"wired v2, out of date"`, `"found, not wired"`, `"wired, not allowed"`,
+`"not found"` — and is `null` on the first-run card, which doesn't
+render one. `files` are the files that agent's install owns or merges
+into (two for codex).
 
 `app.dialog_answer` presses the visible modal's primary button, or
 dismisses it — through the same production handlers a real click or
@@ -1607,13 +1652,22 @@ here too.
 Request: `{"params": {"action": "confirm"}}` (or `"cancel"`). Response:
 `{}`.
 
-`action` outside `"confirm" | "cancel"` is rejected `invalid-param`
-before anything else runs. Every other refusal is `internal`, carrying
+`"toggle:<agent>"` is the third action, and only the agent-hooks card
+takes it: it flips that row's switch, the same route a click on the
+switch or Space on the focused one takes. `toggle:claude`,
+`toggle:codex`, `toggle:grok`, `toggle:cursor`, `toggle:opencode`. The
+switches are that card's answer, so a harness that can only `confirm`
+could never apply anything but the defaults.
+
+`action` outside `"confirm" | "cancel" | "toggle:<agent>"` is rejected
+`invalid-param` before anything else runs. Every other refusal is
+`internal`, carrying
 a human-readable reason: no host dialog is open; `"confirm"` sent to a
 dialog with no confirming action (a
 remote host whose `NeedsRestart` dialog can only offer the
-docs-pointer copy, `RestartAction::None`); or `"confirm"` sent to the
-Add Host dialog while it's already dialing a verify. A dialog with no
+docs-pointer copy, `RestartAction::None`); `"confirm"` sent to the
+Add Host dialog while it's already dialing a verify; or a `toggle:` for
+an agent the card has no row for. A dialog with no
 primary action refuses `confirm` rather than silently dismissing — a
 test that thinks it pressed a button that isn't there should fail
 loudly, not pass by accident.
@@ -1634,6 +1688,81 @@ workspace state, or write the system clipboard. Like
 `app.dialog_answer`'s `action` check, this is rejected `invalid-param`
 before anything else runs. Widening the allowlist happens one name at
 a time, alongside a concrete test need.
+
+### `agent.set_hooks`
+
+Set *this* machine's own `agent-hooks` key — the consent dialog's Apply
+and `roostctl agent set`'s wire path — and raise every connected
+non-localhost host to at least the same allow-list in the same call
+(plan 064 §3.4). UI-socket, like `app.*`: a session socket answers
+`unknown-op`. Unlike [`session.set_agent_hooks`](#sessionset_agent_hooks)
+this op can *lower* the key as well as raise it — it is the path behind
+a user directly at this machine's own keyboard, where
+`session.set_agent_hooks`'s raise-only rule exists only because nobody
+is at the far end's.
+
+Request:
+```json
+{"id": "21", "op": "agent.set_hooks", "params": {"agents": ["claude", "codex"]}}
+```
+or, to switch every agent off:
+```json
+{"id": "22", "op": "agent.set_hooks", "params": {"agents": "off"}}
+```
+
+Response:
+```json
+{
+  "config_path": "/home/charlie/.config/roost/config.conf",
+  "local": {"wired": ["claude", "codex"], "refreshed": [], "removed": [],
+            "skipped": [{"agent": "cursor", "reason": "not allowed"}],
+            "errors": []},
+  "hosts": [
+    {"host": "mac-mini", "result": {"wired": ["claude"], "refreshed": [],
+                                     "removed": [], "skipped": [], "errors": []}},
+    {"host": "build-box", "error": "connection refused"}
+  ]
+}
+```
+
+`agents` is either a JSON array of agent names or the literal string
+`"off"` — nothing else decodes. An empty array and a name outside the
+fixed set `agent-hooks` itself takes are both `invalid-param`. `local`
+is this machine's own install outcome, the same shape
+`session.set_agent_hooks` answers with; `removed` can be non-empty here
+(unlike the session op's), because this is an explicit local set, not a
+raise. `hosts` carries one entry per **connected, non-localhost** saved
+host, in stable connection order — each either the host's own `result`
+(its raise's outcome) or an `error` string for a host that could not be
+asked (not connected, refused the raise, timed out).
+
+`config_path` names where this machine's `agent-hooks` key now lives,
+for the confirmation surface to show.
+
+**Test-mode fenced like the install engine's other write paths**: with
+`ROOST_TEST_MODE=1` set and no `ROOST_AGENT_HOOKS_FORCE=1` override,
+the op is refused before the config write — the same fence
+`roost-session`'s agent-hooks install applies, so a test harness cannot
+accidentally wire a real dotfile.
+
+A **localhost** host is never sent the raise, which is why `hosts`
+excludes it: on this machine the UI has already written the key and
+reconciled the files directly, and the session behind a localhost host
+reads that same `config.conf`. Raising it would be the UI raising
+itself — and since a raise can only ever widen, a local "switch codex
+off" would come straight back on that session's next connect.
+
+Served by the UI socket only, by both UIs. The Linux (iced) UI links
+the install engine and does the work in process. The Mac app has no
+Swift binding for it, so it spawns `roostctl agent set --local <list|off>
+--json` — the same binary, the same `config.conf`, the same state record
+— and answers from that JSON, with this app's own `HOME` and
+`ROOST_CONFIG` handed to the child so it cannot resolve a different
+config file. `hosts` is always `[]` there: the Mac app holds no host
+connections and answers `unknown-op` to every `host.*` op. One further
+consequence of spawning the CLI: its `wired` is *this run's* writes
+rather than the record's never-announced list, because that is what the
+CLI can honestly report.
 
 ### Command palette (`palette.*`)
 
@@ -1956,7 +2085,7 @@ ignored — HS-2 scope. Silently serving an unfiltered stream to a client
 that asked for one tab would make it mis-attribute every other tab's
 events.
 
-At `SESSION_PROTOCOL_VERSION` `5` this op gates on nothing but the
+At `SESSION_PROTOCOL_VERSION` `6` this op gates on nothing but the
 socket's own same-UID check, and there is no other classification left
 to describe — every subscriber gets every event. That is a change, not a
 constant: generations 2 through 4 required the lease here, and a
@@ -2116,7 +2245,7 @@ Params: `{}`. Response:
 ```json
 {
   "app_version": "0.0.18",
-  "session_protocol": 5,
+  "session_protocol": 6,
   "payload_kinds": ["ghostty-snapshot", "vt"],
   "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
   "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
@@ -2128,8 +2257,8 @@ The handshake a client runs before anything binary exists, so every
 incompatibility is caught on stable JSON. `session_protocol` is
 `SESSION_PROTOCOL_VERSION` — deliberately separate from the
 request/response `protocol_version` in [`identify`](#identify), because
-the two version different things and move independently. It is **`5`**.
-There is no `features` field: at `5` the integer is the whole
+the two version different things and move independently. It is **`6`**.
+There is no `features` field: at `6` the integer is the whole
 negotiation, and there is no other capability a client needs to
 detect. **The compatibility rule is one comparison:** a conforming
 client checks `session_protocol` for exact equality against its own
@@ -2137,10 +2266,11 @@ constant before anything else, and refuses to proceed on a mismatch —
 the [attach handshake](#data-plane) carries the same integer and
 enforces it server-side too, before it even looks at the token. Every
 op on this page assumes that equality already holds; what came before
-`5` — the interactive lease, `session.connect`, per-connection
-classification, and the `features` list that once carried
-intra-generation capabilities — is history, not this build's contract,
-and lives in CHANGELOG rather than here.
+`6` — the interactive lease, `session.connect`, per-connection
+classification, the `features` list that once carried intra-generation
+capabilities, and `session.set_agent_hooks`'s own `mode`/`skip` shape —
+is history, not this build's contract, and lives in CHANGELOG rather
+than here.
 
 `payload_kinds` names what this session can encode a tab's attach
 payload as, in no particular order; it is an **open list of strings**,
@@ -2262,13 +2392,12 @@ Answers `shutting-down` once `session.stop` has latched.
 
 ### `session.set_agent_hooks`
 
-Bring the host's agent hook entries in line with the connected client's `agent-hooks` configuration. Same-UID, last-writer-wins: this one writes files under the session user's `$HOME`, and any connected client may send it — the socket's UID check is the only gate.
+Raise the host's `agent-hooks` key to (at least) the connected client's own allow-list. Same-UID, and every connection is additive: this one writes files under the session user's `$HOME`, and any connected client may send it — the socket's UID check is the only gate.
 
 Request:
 ```json
 {"id": "11", "op": "session.set_agent_hooks", "params": {
-  "mode": "auto",
-  "skip": ["cursor"],
+  "agents": ["claude", "codex"],
   "client": "charlie-mbp"
 }}
 ```
@@ -2276,24 +2405,22 @@ Request:
 Response:
 ```json
 {"wired": ["claude", "codex"], "refreshed": [], "removed": [],
- "skipped": [{"agent": "cursor", "reason": "skip-list"},
+ "skipped": [{"agent": "cursor", "reason": "not allowed"},
              {"agent": "grok", "reason": "not installed"}],
  "errors": []}
 ```
 
-`mode` is `auto` or `off` — the same two values `agent-hooks` takes in [`config.md`](config.md#agent-hooks); any other spelling is `invalid-param` rather than a silent default in either direction. `skip` is the client's `agent-hooks-skip` list **verbatim**: the host resolves the names and reports back any it does not recognise as a skip with reason `no agent named that (…)`, because only the host can tell a typo from an agent a newer client knows about, and neither is a reason to refuse the run. `skip` may be omitted (an empty list); `client` may not — it is recorded as `by` in the host's state record, which is what makes two clients of one host tellable apart.
+**This op only ever raises the key, never lowers it (plan 064 §3.3).** `agents` is unioned into whatever `agent-hooks` already says on the host — `off`, unanswered, or a narrower list — and the union is what gets wired. There is no wire spelling of "off" or "narrow this" here: a client whose own `agent-hooks` is `off`, or unconfigured, has no allow-list to raise a host with, so it sends this op **not at all**. Taking a host's entries back out stays a deliberate, local act — `roostctl agent ensure`/`uninstall`, run by hand on the host itself. `removed` is therefore always empty from this op; the field stays on the reply shape because [`agent.set_hooks`](#agentset_hooks) — an explicit local set, not a raise — can populate it for the *local* machine.
 
-**`off` removes, it does not abstain.** On the client's own machine `agent-hooks = off` means "wire nothing", and the UI never opens an agent's config file. Here it means "unwire": a host has no `config.conf` of its own to consult, so the client is the only authority that can tell it to come clean, and an `off` that did nothing remotely would leave a host's entries in place with no way to remove them short of an ssh session. Off is off everywhere.
+`agents` must name at least one agent the host recognises; an empty list, or a name outside the fixed set `agent-hooks` itself takes, is `invalid-param`. Under [protocol equality](#versioning) both ends run the same build's agent set, so an unrecognised name here is a bug to surface, not a forward-compatibility case — unlike `skipped[].reason`, which remains free text for the client to show or log verbatim. `client` is required — it is recorded as `by` in the host's state record, which is what makes two clients of one host tellable apart.
 
-**`wired` is the toast list, not this call's writes.** It names the agents this host has wired and has never announced to *any* client — the session flips its record's `noticed` for exactly what it reports here, in the same locked write that recorded the wiring, so the sentence "Roost wired agent hooks on ‹host›" appears at most once per agent per host even when two clients connect at the same moment, and including for a wiring done by `roostctl agent ensure` on the host itself. A reconnect, or a second client, gets an empty `wired`. `refreshed` and `removed` *are* this call's writes.
+**`wired` is the toast list, not this call's writes.** It names the agents this host has wired and has never announced to *any* client — the session flips its record's `noticed` for exactly what it reports here, in the same locked write that recorded the wiring, so the sentence "Roost wired agent hooks on ‹host›" appears at most once per agent per host even when two clients connect at the same moment, and including for a wiring done by `roostctl agent ensure` on the host itself. A reconnect, or a second client raising an already-covered list, gets an empty `wired`. `refreshed` *is* this call's writes; two clients raising different allow-lists both win, additively.
 
 **A per-agent failure is reported, never raised.** A `config.toml` the host could not parse, a read-only file, a file that changed underneath the plan: each is an entry in `errors` beside a successful reply, because the wiring is not what the client dialed in for and must not cost it the session it just attached to. Only a whole-run failure — no `$HOME`, an unwritable state record, an install lock another writer held past its deadline — is an error frame (`internal`).
 
 **The install engine holds one advisory lock per home across plan and apply**, so this op can wait behind another writer's run; neither dropping the client's connection nor the client's own 15 s timeout cancels a run already under way on the host. The wait for that lock is itself bounded — a lock nobody releases is a whole-run `internal` failure rather than a request that never answers, because this op holds the mutation barrier [`session.stop`](#sessionstop) waits on.
 
-**A client sends this right after connecting**, with its own config values, because the op is idempotent and a config edit made since the last connect has no other way to reach the host. It is *queued* rather than chained into the connection sequence: an error there fails the whole attempt, and an ensure on a network-mounted `$HOME` would hold hydration up behind file I/O nothing is waiting on. A session that predates the op answers `unknown-op`, which is a refusal like any other — the connection is unaffected, and the client logs one line, once, for as long as it keeps dialling that host. It is deliberately not one line per connection: the op is re-sent on every connect and a dropped localhost session reconnects on a 250 ms ladder, so the latch outlives the connection, exactly like the fact it records.
-
-**Two clients that disagree flip the files on every reconnect.** Last writer wins, by design: the record stores `by` and `wired_at`, the session logs each run, and `roostctl agent status` on the host shows who did what. Reconciling them is future work.
+**A client sends this right after connecting**, with its own config values, because the op is idempotent and a config edit made since the last connect has no other way to reach the host. It is *queued* rather than chained into the connection sequence: an error there fails the whole attempt, and a raise on a network-mounted `$HOME` would hold hydration up behind file I/O nothing is waiting on.
 
 No new authority: any same-UID client can already [`tab.open`](#tabopen) an arbitrary command on the host.
 
@@ -3033,7 +3160,7 @@ is the UI socket's schema version — currently **`1`**
 (`roost_ipc::PROTOCOL_VERSION`); it is reported by
 [`identify`](#identify) but nothing compares it, so the UI socket has no
 handshake gate. `session.identify.session_protocol` is the session
-sockets' — currently **`5`** (`roost_ipc::messages::SESSION_PROTOCOL_VERSION`),
+sockets' — currently **`6`** (`roost_ipc::messages::SESSION_PROTOCOL_VERSION`),
 covering both the session JSON ops and the binary [data
 plane](#data-plane); conforming clients check it for equality before
 anything else and the [attach handshake](#tabattach) refuses a mismatch.

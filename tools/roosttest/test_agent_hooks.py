@@ -30,28 +30,32 @@ can move the lifecycle, and every read is a condition wait rather than a
 sleep.
 
 The second half of the file is the other direction entirely: `roostctl
-agent ensure` and a UI's own startup wiring, driven against a **jailed
-`$HOME`** (plan 046 §3.9). Those lanes write agent config files, so read
-the fence comment above them before adding to them — nothing in this
-suite may reach a real dotfile.
+agent ensure`/`set`/`install`/`uninstall` and a UI's own startup wiring,
+driven against a **jailed `$HOME`** (plan 046 §3.9, extended by plan 064
+§5 C5 for the list-shaped `agent-hooks` key and the `set` verb). Those
+lanes write agent config files, so read the fence comment above them
+before adding to them — nothing in this suite may reach a real dotfile.
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
-import platform
-import shutil
 import socket as socketlib
 import subprocess
 import tempfile
-from pathlib import Path
 
 import pytest
 import ui
-from agent_jail import INSTALLABLE_AGENTS, Jail
-from client import Roost, RoostError, scaled_timeout
+from agent_jail import (
+    INSTALLABLE_AGENTS,
+    Jail,
+    jailed_socket,
+    jailed_ui,
+    wait_for_jailed_window,
+    wait_for_log_line,
+)
+from client import Roost, scaled_timeout
 from test_agent_lifecycle import agent_tab
 from util import HOOK_DEADLINE, REPO_ROOT, roostctl_path, run_hook
 
@@ -717,10 +721,15 @@ def test_a_spawned_tab_carries_the_hook_entrypoint(roost, project):
 # ---------------------------------------------------------------------------
 
 
-def run_agent(jail: Jail, *args: str, force: bool = True):
+def run_agent(jail: Jail, *args: str, force: bool = True, socket: str | None = None):
     """`roostctl agent …` inside `jail`. Never `check=True`: several
     cases assert on a non-zero exit, and a failure's stdout is the most
-    useful thing in the report."""
+    useful thing in the report.
+
+    `socket` is for the one verb that dials — bare `agent set`, the
+    UI-routed form — and must name a jailed UI's socket: pointing it at
+    the harness's own UI would ask a process whose `$HOME` is the
+    developer's to write agent files."""
     env = {**os.environ, **jail.env}
     env["ROOST_TEST_MODE"] = "1"
     if force:
@@ -731,6 +740,8 @@ def run_agent(jail: Jail, *args: str, force: bool = True):
     # left in it would point these verbs at the running UI.
     for leaked in ("ROOST_TAB_ID", "ROOST_SOCKET"):
         env.pop(leaked, None)
+    if socket is not None:
+        env["ROOST_SOCKET"] = socket
     env["ROOST_CONFIG"] = str(jail.config)
     jail.assert_jailed(env)
     return subprocess.run(
@@ -798,6 +809,16 @@ def test_agent_ensure_wires_a_jailed_home(tmp_path):
         assert rows[agent]["wired"] is not None, rows[agent]
         assert rows[agent]["up_to_date"] is True, rows[agent]
         assert rows[agent]["noticed"] is False, rows[agent]
+        # `allowed` is the resolved `agent-hooks` key's own claim, kept
+        # apart from `wired`/`up_to_date` (the disk's claim) — every
+        # agent here is both, since the jail's default key names all
+        # five (plan 064 §5 C5).
+        assert rows[agent]["allowed"] is True, rows[agent]
+    # codex is the one adapter split across two files (`hooks.json` +
+    # `config.toml`'s `[features] hooks`); `files` is what an uninstall
+    # touches and what the consent sheet names, so both paths have to be
+    # in it.
+    assert len(rows["codex"]["files"]) == 2, rows["codex"]
 
     # Read the file list off the record before it is dropped: it is the
     # only thing that knows which of the five layouts wrote what.
@@ -813,17 +834,11 @@ def test_agent_ensure_wires_a_jailed_home(tmp_path):
                 )
 
 
-def test_agent_hooks_off_wires_nothing_and_unwires_on_request(tmp_path):
+def test_agent_hooks_off_wires_nothing_and_leaves_the_record_absent(tmp_path):
     """`agent-hooks = off`, read from a real `config.conf` by the real
-    binary.
-
-    Two halves, and they differ deliberately. With nothing wired, `off`
-    writes **nothing at all** — not even an empty state record, which is
-    what makes the key safe to leave in the harness's own config. Asked
-    explicitly (`agent install`), Roost still wires: explicit wins over
-    the config. A later `ensure` then reads the same `off` and removes
-    what it put there — which is the difference between a config switch
-    (opt out of future wiring) and the verb (take it out now)."""
+    binary: with nothing already wired, `off` writes **nothing at all**
+    — not even an empty state record, which is what makes the key safe
+    to leave in the harness's own config."""
     jail = Jail(tmp_path, agent_hooks="off")
 
     quiet = ensure_json(jail)
@@ -831,39 +846,161 @@ def test_agent_hooks_off_wires_nothing_and_unwires_on_request(tmp_path):
     assert not jail.record.exists(), "`off` with nothing to remove still wrote the record"
     assert not (jail.agent_dirs["claude"] / "settings.json").exists()
 
-    forced = run_agent(jail, "install", "codex")
-    assert forced.returncode == 0, forced.stdout + forced.stderr
-    assert "codex" in jail.read_record(), "explicit `agent install` did not win over off"
+
+def test_agent_set_local_wires_and_unwires_exactly_the_named_agents(tmp_path):
+    """`roostctl agent set <list|off> --local` (plan 064 §5 C5): a comma
+    list writes the key and wires exactly what it names — nothing else
+    on this machine — and `off` unwires it again.
+
+    The list form is asserted against two named agents with three more
+    present but unnamed, so "exactly" is the thing under test rather
+    than "wires everything present"."""
+    jail = Jail(tmp_path, agent_hooks=None)
+    assert jail.read_key() is None
+
+    wired = run_agent(jail, "set", "claude,codex", "--local", "--json")
+    assert wired.returncode == 0, wired.stdout + wired.stderr
+    outcome = json.loads(wired.stdout)
+    assert sorted(outcome["wired"]) == ["claude", "codex"], outcome
+    assert jail.read_key() == "claude, codex"
+    assert (jail.agent_dirs["claude"] / "settings.json").exists()
+    assert (jail.agent_dirs["codex"] / "hooks.json").exists()
+    # grok is present in the jail (`INSTALLABLE_AGENTS` default) but was
+    # never named, so `set` must have left it alone.
+    assert not any(jail.agent_dirs["grok"].iterdir()), "set wired an agent it was not given"
+
+    off = run_agent(jail, "set", "off", "--local", "--json")
+    assert off.returncode == 0, off.stdout + off.stderr
+    outcome = json.loads(off.stdout)
+    assert sorted(outcome["removed"]) == ["claude", "codex"], outcome
+    assert jail.read_key() == "off"
+    assert jail.read_record() == {}, "off left the record naming an agent it unwired"
+    for agent, filename in (("claude", "settings.json"), ("codex", "hooks.json")):
+        path = jail.agent_dirs[agent] / filename
+        assert not path.exists() or "ROOST_AGENT_HOOK" not in path.read_text()
+
+
+def test_agent_set_refuses_an_empty_or_unknown_list_and_writes_nothing(tmp_path):
+    """An empty spec and an unrecognised name are the two shapes `set`
+    must refuse before it writes anything — a partial answer to a
+    consent question is not an answer (plan 064 §5 C5)."""
+    jail = Jail(tmp_path, agent_hooks=None)
+
+    for spec in ("", "banana"):
+        refused = run_agent(jail, "set", spec, "--local")
+        assert refused.returncode == 2, f"set {spec!r} --local: {refused.stdout}{refused.stderr}"
+        assert not refused.stdout.strip(), f"set {spec!r} --local wrote to stdout: {refused.stdout}"
+
+    assert jail.read_key() is None, "a refused `set` changed the key"
+    assert not jail.record.exists(), "a refused `set` wrote the state record"
+
+
+def test_agent_install_and_uninstall_move_the_key(tmp_path):
+    """`agent install <name>` unions the key rather than ignoring it, and
+    `agent uninstall <name>` narrows it back — `uninstall --all` is the
+    one shape that spells the result `off` rather than leaving the key
+    unanswered (plan 064 §5 C5's `install`/`uninstall` cases)."""
+    jail = Jail(tmp_path, agent_hooks=None)
+
+    installed = run_agent(jail, "install", "codex")
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+    assert jail.read_key() == "codex", "explicit `agent install` did not add codex to the key"
     assert (jail.agent_dirs["codex"] / "hooks.json").exists()
 
-    swept = ensure_json(jail)
-    assert swept["removed"] == ["codex"], swept
-    assert jail.read_record() == {}, "off left the record naming an agent it unwired"
+    uninstalled = run_agent(jail, "uninstall", "codex")
+    assert uninstalled.returncode == 0, uninstalled.stdout + uninstalled.stderr
+    assert jail.read_key() == "off", "narrowing the key to nothing must spell it `off`"
+    assert jail.read_record() == {}
     hooks = jail.agent_dirs["codex"] / "hooks.json"
     assert not hooks.exists() or "ROOST_AGENT_HOOK" not in hooks.read_text()
 
+    run_agent(jail, "install", "claude")
+    run_agent(jail, "install", "codex")
+    assert jail.read_key() == "claude, codex"
+    all_out = run_agent(jail, "uninstall", "--all")
+    assert all_out.returncode == 0, all_out.stdout + all_out.stderr
+    assert jail.read_key() == "off"
+    assert jail.read_record() == {}
 
-def test_agent_hooks_skip_is_honoured_and_a_typo_is_reported(tmp_path):
-    """`agent-hooks-skip` keeps a named agent unwired; a name no agent
-    answers to is reported on stderr and otherwise ignored.
 
-    Ignoring it is the deliberate half: refusing to run would turn one
-    typo into "nothing is wired and nothing says why", and a newer
-    Roost's agent name must not break an older one's config."""
-    jail = Jail(tmp_path, skip="codex, gemini")
+def test_a_config_warning_never_lands_on_the_json_channel(tmp_path):
+    """`--json` is decoded by the Mac app; a diagnostic must not precede it.
 
-    outcome = ensure_json(jail)
-    assert "codex" not in outcome["wired"], outcome
-    assert sorted(outcome["wired"]) == sorted(
-        a for a in INSTALLABLE_AGENTS if a != "codex"
-    ), outcome
-    skipped = {row["agent"]: row["reason"] for row in outcome["skipped"]}
-    assert "codex" in skipped, outcome
-    assert not (jail.agent_dirs["codex"] / "hooks.json").exists()
-    assert "codex" not in jail.read_record()
+    The retired `agent-hooks = auto` spelling is exactly the value that
+    warns now (plan 064 §3.1), and it is what every machine that ran the
+    old default still has in its config — so this is the common case, not
+    an exotic one. `roostctl` logs to stderr for this reason; on stdout
+    the warning would sit in front of the JSON and break the decode."""
+    jail = Jail(tmp_path, agent_hooks="auto")
 
-    done = run_agent(jail, "ensure")
-    assert "gemini" in done.stderr, done.stderr
+    done = run_agent(jail, "ensure", "--json")
+    assert done.returncode == 0, done.stderr
+    json.loads(done.stdout)
+    assert "agent-hooks" in done.stderr, (
+        "the unparseable value was not diagnosed anywhere"
+    )
+    assert jail.read_key() == "auto", "a warned-about value was rewritten"
+
+
+def test_agent_ensure_under_an_unanswered_key_is_a_quiet_no_op(tmp_path):
+    """No `agent-hooks` key at all — nobody has answered the consent
+    dialog — is a no-op: `ensure` writes nothing, exits 0, and its
+    `--json` output is valid JSON (plan 064 C1 fixed a build where prose
+    leaked onto stdout and broke the decode; this pins it)."""
+    jail = Jail(tmp_path, agent_hooks=None)
+    assert jail.read_key() is None
+
+    outcome = ensure_json(jail)  # raises if stdout does not parse as JSON
+    assert outcome == {
+        "wired": [],
+        "refreshed": [],
+        "current": [],
+        "removed": [],
+        "skipped": [],
+        "warnings": [],
+        "errors": [],
+    }, outcome
+    assert not jail.record.exists(), "an unanswered key still wrote the state record"
+    for agent in INSTALLABLE_AGENTS:
+        assert not any(jail.agent_dirs[agent].iterdir()), f"{agent}: wired under an unanswered key"
+
+
+def test_ensure_startup_leaves_a_hand_wired_agent_alone_but_bare_ensure_sweeps_it(tmp_path):
+    """The pair plan 064 §5 C5 asks for: `--startup` is what a UI launch
+    runs, and a launch must never undo a hook somebody added by hand or
+    react to a key that changed while the app was closed — only the
+    explicit, no-flag `ensure` (`reconcile` underneath) takes an agent
+    back out once the key stops naming it.
+
+    Built by installing two agents and then hand-lowering the key to
+    name only one — the same shape a user editing `config.conf` in an
+    editor produces, and the one thing the Mac launch spawn (`ensure
+    --startup`) must not be able to undo."""
+    jail = Jail(tmp_path, agent_hooks=None)
+    run_agent(jail, "install", "claude")
+    run_agent(jail, "install", "grok")
+    assert jail.read_key() == "claude, grok"
+    grok_files = jail.owned_files("grok")
+    assert grok_files, "grok wired nothing to hand-lower away from"
+
+    jail.write_config(agent_hooks="claude")
+    assert jail.read_key() == "claude"
+
+    startup = run_agent(jail, "ensure", "--startup", "--json")
+    assert startup.returncode == 0, startup.stdout + startup.stderr
+    startup_outcome = json.loads(startup.stdout)
+    assert startup_outcome["removed"] == [], startup_outcome
+    for path in grok_files:
+        assert path.exists() and "ROOST_AGENT_HOOK" in path.read_text(), (
+            f"--startup undid a hand-wired agent's entry: {path}"
+        )
+
+    bare = ensure_json(jail)
+    assert bare["removed"] == ["grok"], bare
+    for path in grok_files:
+        assert not path.exists() or "ROOST_AGENT_HOOK" not in path.read_text(), (
+            f"bare ensure left grok's entry behind: {path}"
+        )
 
 
 def test_the_test_mode_fence_refuses_without_the_override(tmp_path):
@@ -893,158 +1030,10 @@ def test_the_test_mode_fence_refuses_without_the_override(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def jailed_ui_env(jail: Jail) -> dict:
-    """The environment a jailed UI launch gets: the agent jail, XDG dirs
-    inside it (so the socket, the log and the caches land there too), and
-    the two variables that let the install engine run under
-    `ROOST_TEST_MODE`."""
-    env = {**os.environ}
-    # Same list `ui.launch` strips, and for the same reason: per-tab
-    # values Roost injects itself, plus the selectors set explicitly
-    # below. Stripped first so the explicit values cannot be undone.
-    for leaked in ui._UI_ENV_SANITIZE:
-        env.pop(leaked, None)
-    env.update(jail.env)
-    env.update(
-        {
-            "XDG_RUNTIME_DIR": str(jail.runtime_dir),
-            "XDG_DATA_HOME": str(jail.home / ".local/share"),
-            "XDG_STATE_HOME": str(jail.home / ".local/state"),
-            "XDG_CACHE_HOME": str(jail.home / ".cache"),
-            "ROOST_BUNDLE_PROFILE": ui.TARGET_SPECS["iced"].profile,
-            "ROOST_CONFIG": str(jail.config),
-            "ROOST_STATE_DIR": str(jail.state_dir),
-            "ROOST_TEST_MODE": "1",
-            # The one place in the tree that lifts the install engine's
-            # test-mode refusal. Everything it can reach is in the jail.
-            "ROOST_AGENT_HOOKS_FORCE": "1",
-            "RUST_LOG": os.environ.get("RUST_LOG", "warn") + ",roost_iced=info",
-        }
-    )
-    return env
-
-
-def jailed_socket(jail: Jail) -> Path:
-    """Where a UI launched with `jailed_ui_env` binds. MIRRORS
-    `ui.socket_path`, rooted in the jail rather than in `$HOME` /
-    `$XDG_RUNTIME_DIR`."""
-    spec = ui.TARGET_SPECS["iced"]
-    if platform.system() == "Darwin":
-        return jail.home / f"Library/Caches/{spec.mac_label}/roost.sock"
-    return jail.runtime_dir / spec.linux_namespace / "roost.sock"
-
-
-@contextlib.contextmanager
-def jailed_ui(jail: Jail):
-    """Launch a jailed iced UI, yield `(process, log path)`, and stop it.
-
-    Teardown waits for the process to *exit* before the caller's
-    assertions run against the jail. That is what makes "nothing was
-    written" an assertion rather than a race: a dead process has no more
-    writes left in it."""
-    binary, explicit = ui.rust_binary_path("iced")
-    if not binary.is_file():
-        if explicit:
-            pytest.skip(f"explicit iced binary does not exist: {binary}")
-        subprocess.run(["cargo", "build", "-p", "roost-iced"], cwd=REPO_ROOT, check=True)
-
-    env = jailed_ui_env(jail)
-    jail.assert_jailed(env)
-    log = jail.root / f"ui-{jail.launches}.log"
-    jail.launches += 1
-    with open(log, "wb") as handle:
-        proc = subprocess.Popen(
-            [str(binary)],
-            cwd=REPO_ROOT,
-            env=env,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    try:
-        yield proc, log
-    finally:
-        if proc.poll() is None:
-            proc.terminate()
-        try:
-            proc.wait(timeout=scaled_timeout(20))
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=scaled_timeout(10))
-
-
-def wait_for_jailed_window(jail: Jail, proc, log: Path) -> None:
-    """Block until the jailed UI has a window on screen.
-
-    `app.screenshot` is answered only once `window_id` is set, and that
-    happens inside the same `window_opened` handler that decides whether
-    to start the agent-hooks ensure — *before* it returns. So a
-    screenshot that comes back proves the decision has been made, which
-    is what lets the `off` case assert on an empty jail instead of racing
-    a write that was never going to happen."""
-    sock = jailed_socket(jail)
-
-    def windowed() -> bool:
-        if proc.poll() is not None:
-            raise AssertionError(
-                f"jailed UI exited {proc.returncode} before opening a window:\n"
-                f"{log.read_text(errors='replace')}"
-            )
-        if not sock.exists():
-            return False
-        try:
-            with Roost(str(sock), timeout=scaled_timeout(10)) as roost:
-                roost.screenshot()
-            return True
-        except (OSError, RoostError):
-            return False
-
-    Roost._wait(windowed, 60.0, f"the jailed UI to open a window ({sock})")
-
-
-def wait_for_log_line(log: Path, needle: str, what: str) -> str:
-    """Block until a line of the jailed UI's log contains `needle`, and
-    return that line.
-
-    The log is how this module reads the status banner. No IPC op
-    carries it — `app.*` exposes the menu, the dialogs and the sidebar's
-    last-rendered rows, and `tab.dump` is the terminal grid; the
-    transient line is drawn straight from `App::status` in `view` and is
-    exposed nowhere else — so a test that wants to know what the banner
-    says has the UI's own log and nothing better."""
-    found: list[str] = []
-
-    def seen() -> bool:
-        for line in log.read_text(errors="replace").splitlines():
-            if needle in line:
-                found.append(line)
-                return True
-        return False
-
-    Roost._wait(seen, 30.0, what)
-    return found[0]
-
-
 @pytest.fixture
 def iced_only(target):
     if target != "iced":
         pytest.skip("the startup ensure is asserted against the iced UI's own launch")
-
-
-@pytest.fixture
-def short_root():
-    """A jail root short enough to hold a Unix socket path.
-
-    `sun_path` is 104 bytes on macOS, and pytest's `tmp_path` spends
-    ~70 of them before this test adds
-    `home/Library/Caches/Roost-iced/roost.sock` — the jailed UI then
-    refuses to bind. `/tmp` is the only root with room, and it is short
-    on Linux too."""
-    root = Path(tempfile.mkdtemp(prefix="roost-jail-", dir="/tmp"))
-    try:
-        yield root
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_the_ui_wires_agent_hooks_at_startup_and_notices_once(short_root, iced_only):
@@ -1078,10 +1067,9 @@ def test_the_ui_wires_agent_hooks_at_startup_and_notices_once(short_root, iced_o
         )
         # Agent order is `ALL_AGENTS`, which `INSTALLABLE_AGENTS` mirrors.
         assert f"for {', '.join(INSTALLABLE_AGENTS)}" in toast, toast
-        # Roost has just edited five of the user's config files. Both
-        # ways back out have to be in the sentence that says so.
-        assert "roostctl agent uninstall --all" in toast, toast
-        assert "agent-hooks = off" in toast, toast
+        # Roost has just edited five of the user's config files. The way
+        # back has to be in the sentence that says so (plan 064 §3.4).
+        assert "Agent Hooks\u2026" in toast, toast
         Roost._wait(
             lambda: jail.record.exists()
             and all(
@@ -1156,3 +1144,54 @@ def test_the_ui_wires_nothing_when_agent_hooks_is_off(short_root, iced_only):
     for agent in INSTALLABLE_AGENTS:
         contents = sorted(p.name for p in jail.agent_dirs[agent].iterdir())
         assert contents == [], f"`off` wrote into {agent}'s config dir: {contents}"
+
+
+def test_agent_set_without_local_goes_through_the_running_ui(short_root, iced_only):
+    """Bare `agent set` is the UI-routed form (plan 064 C6): it puts
+    `agent.set_hooks` to the running UI, which writes the key and
+    reconciles the files in *that* process's home.
+
+    Driven against a jailed UI rather than the harness's own, because
+    this verb really writes: the jailed launch is the one place in the
+    tree that lifts the install engine's test-mode refusal, and
+    everything it can reach is inside the jail.
+
+    The offline probe first is what proves the routing rather than the
+    effect. With nothing listening the verb has to fail — a `set` that
+    quietly fell back to `--local` would have written the key, the
+    record and claude's own file from exactly this argument.
+    """
+    jail = Jail(short_root, agent_hooks=None)
+    sock = jailed_socket(jail)
+
+    offline = run_agent(jail, "set", "claude,codex", socket=str(sock))
+    assert offline.returncode != 0, offline.stdout + offline.stderr
+    assert jail.read_key() is None, "with no UI to dial, `set` wrote the local key anyway"
+    assert not jail.record.exists(), "with no UI to dial, `set` wired this machine anyway"
+
+    with jailed_ui(jail) as (proc, log):
+        wait_for_jailed_window(jail, proc, log)
+        applied = run_agent(jail, "set", "claude,codex", "--json", socket=str(sock))
+        assert applied.returncode == 0, applied.stdout + applied.stderr
+        reply = json.loads(applied.stdout)
+        assert reply["config_path"] == str(jail.config), reply
+        assert sorted(reply["local"]["wired"]) == ["claude", "codex"], reply
+        assert reply["local"]["errors"] == [], reply
+        # Nothing is saved in this UI's own registry, so there is no
+        # host to raise and the list is empty rather than absent.
+        assert reply["hosts"] == [], reply
+        # The receipt, read off the log for `wait_for_log_line`'s reason.
+        toast = wait_for_log_line(
+            log,
+            "agent hooks toast shown",
+            "the jailed UI to put the agent.set_hooks receipt on the banner",
+        )
+        assert "for claude, codex" in toast, toast
+        assert "Agent Hooks…" in toast, toast
+
+    # Read after the UI has exited, so nothing is still in flight.
+    assert jail.read_key() == "claude, codex"
+    assert "ROOST_AGENT_HOOK" in (jail.agent_dirs["claude"] / "settings.json").read_text()
+    # grok is present in the jail but was never named: "exactly this
+    # list" is the claim, not "everything installed".
+    assert not any(jail.agent_dirs["grok"].iterdir()), "the UI wired an agent nobody named"

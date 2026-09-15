@@ -147,10 +147,44 @@ fn keys(value: &Json) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Every agent allowed — what a user who ticked all five rows has.
+fn all() -> ensure::Mode {
+    allow(&ALL_AGENTS)
+}
+
+fn allow(agents: &[Agent]) -> ensure::Mode {
+    ensure::Mode::Allow(agents.to_vec())
+}
+
+/// Every row ticked but one — the shape that proves a skip is a skip.
+fn all_but(agent: Agent) -> ensure::Mode {
+    allow(&others(agent))
+}
+
+fn others(agent: Agent) -> Vec<Agent> {
+    ALL_AGENTS.into_iter().filter(|a| *a != agent).collect()
+}
+
+/// `installed_command` as a JSON string value spells it: the commands
+/// carry quotes, and the files carry them escaped.
+fn escaped(s: &str) -> String {
+    s.replace('"', "\\\"")
+}
+
 fn wire_all(home: &Home) -> ensure::Outcome {
-    let outcome = ensure::ensure(home, ensure::Mode::Auto, &[], "local", Guard::PERMITTED).unwrap();
+    let outcome = ensure::ensure(home, &all(), "local", Guard::PERMITTED).unwrap();
     assert!(outcome.is_clean(), "{:?}", outcome.errors);
     outcome
+}
+
+/// The `agent-hooks` line this home's `config.conf` now carries, or `""`.
+fn hooks_key(home: &Home) -> String {
+    std::fs::read_to_string(home.config_path())
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.trim_start().starts_with("agent-hooks"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A guard on the fixtures themselves: the byte-restore claim below only
@@ -363,7 +397,6 @@ fn ensure_refreshes_an_install_left_by_the_previous_version() {
     let (dir, home) = fixture("all");
     wire_all(&home);
     let previous_version = INTEGRATION_VERSION - 1;
-    let escaped = |s: &str| s.replace('"', "\\\"");
     let hash = |command: &str, event: &str| {
         let timeout = codex_hash::normalize_timeout(event, Some(HOOK_TIMEOUT_SECS));
         codex_hash::trusted_hash(event, None, &Handler::roost(command, timeout)).unwrap()
@@ -426,7 +459,7 @@ fn ensure_refreshes_an_install_left_by_the_previous_version() {
     // The rewind is what an out-of-date machine looks like: wired, on
     // disk, not current — the row `roostctl agent status` prints as
     // "wired@vN, out of date".
-    for row in ensure::status(&home).unwrap() {
+    for row in ensure::status(&home, &all()).unwrap() {
         assert_eq!(row.wired, Some(previous_version), "{}", row.agent.source());
         assert!(row.entries_on_disk, "{}", row.agent.source());
         assert!(!row.up_to_date, "{}", row.agent.source());
@@ -435,9 +468,12 @@ fn ensure_refreshes_an_install_left_by_the_previous_version() {
     let outcome = wire_all(&home);
     let mut refreshed: Vec<&str> = outcome.refreshed.iter().map(|a| a.source()).collect();
     refreshed.sort_unstable();
-    let mut all: Vec<&str> = ALL_AGENTS.iter().map(|a| a.source()).collect();
-    all.sort_unstable();
-    assert_eq!(refreshed, all, "every agent is refreshed, none wired anew");
+    let mut every: Vec<&str> = ALL_AGENTS.iter().map(|a| a.source()).collect();
+    every.sort_unstable();
+    assert_eq!(
+        refreshed, every,
+        "every agent is refreshed, none wired anew"
+    );
     assert!(outcome.wired.is_empty(), "{:?}", outcome.wired);
 
     // Every file carries the current spelling exactly as many times as
@@ -515,7 +551,7 @@ fn ensure_refreshes_an_install_left_by_the_previous_version() {
 
     // And it is done: a second ensure has nothing left to write.
     for agent in ALL_AGENTS {
-        let plan = ensure::plan(agent, &home, ensure::Mode::Auto).unwrap();
+        let plan = ensure::plan(agent, &home, &all()).unwrap();
         assert!(plan.is_noop(), "{} would edit again", agent.source());
     }
     drop(dir);
@@ -568,7 +604,7 @@ fn the_second_ensure_still_has_the_unannounced_agents_to_toast() {
 
     // Nobody said anything. A second ensure wires nothing at all — and
     // still owes the user the sentence.
-    let second = ensure::ensure(&home, ensure::Mode::Auto, &[], "local", Guard::PERMITTED).unwrap();
+    let second = ensure::ensure(&home, &all(), "local", Guard::PERMITTED).unwrap();
     assert!(second.wired.is_empty(), "{second:?}");
     assert_eq!(second.current.len(), ALL_AGENTS.len(), "{second:?}");
     let mut unnoticed = second.unnoticed.clone();
@@ -578,24 +614,17 @@ fn the_second_ensure_still_has_the_unannounced_agents_to_toast() {
     // Once it has been said, it is never said again — including across
     // the refresh a version bump would drive.
     assert!(state::mark_noticed(&home, &ALL_AGENTS).unwrap());
-    let third = ensure::ensure(&home, ensure::Mode::Auto, &[], "local", Guard::PERMITTED).unwrap();
+    let third = ensure::ensure(&home, &all(), "local", Guard::PERMITTED).unwrap();
     assert!(third.unnoticed.is_empty(), "{third:?}");
     drop(dir);
 }
 
-/// A skipped agent has no record entry, so it is not on the toast list
-/// either — the sentence names what Roost actually wired.
+/// An agent nobody allowed has no record entry, so it is not on the
+/// toast list either — the sentence names what Roost actually wired.
 #[test]
 fn a_skipped_agent_is_never_on_the_toast_list() {
     let (dir, home) = fixture("all");
-    let outcome = ensure::ensure(
-        &home,
-        ensure::Mode::Auto,
-        &[Agent::Codex],
-        "local",
-        Guard::PERMITTED,
-    )
-    .unwrap();
+    let outcome = ensure::ensure(&home, &all_but(Agent::Codex), "local", Guard::PERMITTED).unwrap();
     assert!(outcome.is_clean(), "{:?}", outcome.errors);
     assert!(!outcome.unnoticed.contains(&Agent::Codex), "{outcome:?}");
     assert!(outcome.unnoticed.contains(&Agent::Claude), "{outcome:?}");
@@ -778,7 +807,7 @@ fn off_cleans_a_recorded_file_at_a_config_dir_that_has_since_moved() {
     // to unwire. The record still names the old file.
     let now = Home::rooted(dir.path());
     std::fs::create_dir_all(now.agent_dir(Agent::Codex)).unwrap();
-    let outcome = ensure::ensure(&now, ensure::Mode::Off, &[], "local", Guard::PERMITTED).unwrap();
+    let outcome = ensure::reconcile(&now, &ensure::Mode::Off, "local", Guard::PERMITTED).unwrap();
     assert!(outcome.is_clean(), "{:?}", outcome.errors);
 
     assert!(
@@ -829,7 +858,7 @@ fn a_second_ensure_plans_zero_edits() {
     wire_all(&home);
 
     for agent in ALL_AGENTS {
-        let plan = ensure::plan(agent, &home, ensure::Mode::Auto).unwrap();
+        let plan = ensure::plan(agent, &home, &all()).unwrap();
         assert!(
             plan.is_noop(),
             "{} would edit {:?} again",
@@ -841,7 +870,7 @@ fn a_second_ensure_plans_zero_edits() {
         );
     }
 
-    let second = ensure::ensure(&home, ensure::Mode::Auto, &[], "local", Guard::PERMITTED).unwrap();
+    let second = ensure::ensure(&home, &all(), "local", Guard::PERMITTED).unwrap();
     assert!(second.wired.is_empty(), "{:?}", second.wired);
     assert!(second.refreshed.is_empty(), "{:?}", second.refreshed);
     assert_eq!(second.current.len(), ALL_AGENTS.len());
@@ -892,8 +921,7 @@ fn a_malformed_file_is_skipped_with_a_reason() {
     let (dir, home) = fixture("malformed");
     let before = snapshot(dir.path());
 
-    let outcome =
-        ensure::ensure(&home, ensure::Mode::Auto, &[], "local", Guard::PERMITTED).unwrap();
+    let outcome = ensure::ensure(&home, &all(), "local", Guard::PERMITTED).unwrap();
     assert!(outcome.is_clean(), "{:?}", outcome.errors);
 
     let reasons: BTreeMap<&str, &SkipReason> = outcome
@@ -1008,7 +1036,7 @@ fn an_explicit_install_wires_even_while_the_mode_is_off() {
     // `off` is still `off` for everything the user did not ask for —
     // and it does take the explicit one back out, which is what makes
     // `off` mean off.
-    let outcome = ensure::ensure(&home, ensure::Mode::Off, &[], "local", Guard::PERMITTED).unwrap();
+    let outcome = ensure::reconcile(&home, &ensure::Mode::Off, "local", Guard::PERMITTED).unwrap();
     assert_eq!(outcome.removed, vec![Agent::Codex]);
     assert!(!std::fs::read_to_string(codex::hooks_path(&home))
         .unwrap()
@@ -1022,7 +1050,7 @@ fn off_with_nothing_to_remove_writes_nothing() {
     let (dir, home) = fixture("all");
     let before = snapshot(dir.path());
 
-    let outcome = ensure::ensure(&home, ensure::Mode::Off, &[], "local", Guard::PERMITTED).unwrap();
+    let outcome = ensure::reconcile(&home, &ensure::Mode::Off, "local", Guard::PERMITTED).unwrap();
     assert!(outcome.is_clean(), "{:?}", outcome.errors);
     assert!(outcome.removed.is_empty());
     assert!(!outcome.wrote, "off wrote something with nothing to remove");
@@ -1045,7 +1073,7 @@ fn off_cleans_an_agent_the_record_remembers() {
     wire_all(&home);
     assert!(state::entry(&state::load(&home).unwrap().0, Agent::Grok).is_some());
 
-    let outcome = ensure::ensure(&home, ensure::Mode::Off, &[], "local", Guard::PERMITTED).unwrap();
+    let outcome = ensure::reconcile(&home, &ensure::Mode::Off, "local", Guard::PERMITTED).unwrap();
     assert!(outcome.is_clean(), "{:?}", outcome.errors);
     assert!(!grok::hooks_path(&home).exists());
     assert!(!opencode::plugin_path(&home).exists());
@@ -1055,22 +1083,17 @@ fn off_cleans_an_agent_the_record_remembers() {
     );
 }
 
+/// An agent the key does not name is left alone, and says why.
 #[test]
-fn the_skip_list_leaves_an_agent_alone_and_says_so() {
+fn an_agent_outside_the_allow_list_is_left_alone_and_says_so() {
     let (_dir, home) = fixture("all");
-    let outcome = ensure::ensure(
-        &home,
-        ensure::Mode::Auto,
-        &[Agent::Cursor],
-        "local",
-        Guard::PERMITTED,
-    )
-    .unwrap();
+    let outcome =
+        ensure::ensure(&home, &all_but(Agent::Cursor), "local", Guard::PERMITTED).unwrap();
     assert!(!outcome.wired.contains(&Agent::Cursor));
     assert!(outcome
         .skipped
         .iter()
-        .any(|s| s.agent == Agent::Cursor && matches!(s.reason, SkipReason::SkipList)));
+        .any(|s| s.agent == Agent::Cursor && matches!(s.reason, SkipReason::NotAllowed)));
     assert!(!std::fs::read_to_string(cursor::hooks_path(&home))
         .unwrap()
         .contains("ROOST_AGENT_HOOK"));
@@ -1086,12 +1109,8 @@ fn two_concurrent_ensures_leave_exactly_one_entry() {
     let a = home.clone();
     let b = home.clone();
 
-    let left = std::thread::spawn(move || {
-        ensure::ensure(&a, ensure::Mode::Auto, &[], "local", Guard::PERMITTED)
-    });
-    let right = std::thread::spawn(move || {
-        ensure::ensure(&b, ensure::Mode::Auto, &[], "local", Guard::PERMITTED)
-    });
+    let left = std::thread::spawn(move || ensure::ensure(&a, &all(), "local", Guard::PERMITTED));
+    let right = std::thread::spawn(move || ensure::ensure(&b, &all(), "local", Guard::PERMITTED));
     for outcome in [
         left.join().unwrap().unwrap(),
         right.join().unwrap().unwrap(),
@@ -1132,7 +1151,7 @@ fn two_concurrent_ensures_leave_exactly_one_entry() {
 #[test]
 fn a_user_edit_between_plan_and_apply_is_refused_not_clobbered() {
     let (_dir, home) = fixture("all");
-    let plan = ensure::plan(Agent::Claude, &home, ensure::Mode::Auto).unwrap();
+    let plan = ensure::plan(Agent::Claude, &home, &all()).unwrap();
     assert!(!plan.is_noop());
 
     let path = claude::settings_path(&home);
@@ -1162,8 +1181,10 @@ fn the_test_mode_refusal_stops_every_verb_before_it_writes() {
     };
 
     for result in [
-        ensure::ensure(&home, ensure::Mode::Auto, &[], "local", jailed),
-        ensure::ensure(&home, ensure::Mode::Off, &[], "local", jailed),
+        ensure::ensure(&home, &all(), "local", jailed),
+        ensure::reconcile(&home, &ensure::Mode::Off, "local", jailed),
+        ensure::raise(&home, &ALL_AGENTS, "remote", jailed),
+        ensure::set_hooks(&home, &all(), "local", jailed),
         ensure::install(&home, &ALL_AGENTS, "local", jailed),
         ensure::uninstall(&home, &ALL_AGENTS, jailed),
     ] {
@@ -1179,11 +1200,9 @@ fn the_test_mode_refusal_stops_every_verb_before_it_writes() {
         test_mode: true,
         forced: true,
     };
-    assert!(
-        ensure::ensure(&home, ensure::Mode::Auto, &[], "local", forced)
-            .unwrap()
-            .is_clean()
-    );
+    assert!(ensure::ensure(&home, &all(), "local", forced)
+        .unwrap()
+        .is_clean());
 }
 
 /// An agent that is not installed is not a problem to report — it is a
@@ -1193,8 +1212,7 @@ fn the_test_mode_refusal_stops_every_verb_before_it_writes() {
 fn an_absent_agent_is_skipped_and_gets_no_directory() {
     let dir = tempfile::tempdir().unwrap();
     let home = Home::rooted(dir.path());
-    let outcome =
-        ensure::ensure(&home, ensure::Mode::Auto, &[], "local", Guard::PERMITTED).unwrap();
+    let outcome = ensure::ensure(&home, &all(), "local", Guard::PERMITTED).unwrap();
 
     assert!(outcome.wired.is_empty());
     assert_eq!(outcome.skipped.len(), ALL_AGENTS.len());
@@ -1210,14 +1228,14 @@ fn an_absent_agent_is_skipped_and_gets_no_directory() {
 #[test]
 fn status_reports_present_wired_and_current_per_agent() {
     let (_dir, home) = fixture("all");
-    let before = ensure::status(&home).unwrap();
+    let before = ensure::status(&home, &all()).unwrap();
     assert_eq!(before.len(), ALL_AGENTS.len());
     assert!(before.iter().all(|s| s.present));
     assert!(before.iter().all(|s| s.wired.is_none()));
     assert!(before.iter().all(|s| !s.up_to_date));
 
     wire_all(&home);
-    let after = ensure::status(&home).unwrap();
+    let after = ensure::status(&home, &all()).unwrap();
     assert!(after
         .iter()
         .all(|s| s.wired == Some(crate::INTEGRATION_VERSION)));
@@ -1225,5 +1243,351 @@ fn status_reports_present_wired_and_current_per_agent() {
     assert!(after.iter().all(|s| !s.noticed), "the toast fired early");
 
     crate::mark_noticed(&home, &ALL_AGENTS).unwrap();
-    assert!(ensure::status(&home).unwrap().iter().all(|s| s.noticed));
+    assert!(ensure::status(&home, &all())
+        .unwrap()
+        .iter()
+        .all(|s| s.noticed));
+}
+
+fn row(rows: &[ensure::Status], agent: Agent) -> &ensure::Status {
+    rows.iter().find(|row| row.agent == agent).expect("a row")
+}
+
+/// The consent the whole of plan 064 is about: a key naming one agent
+/// wires that agent and **touches nobody else's file**. The bytes are
+/// asserted, not the outcome's lists — a skip that still wrote would
+/// report itself correctly and be exactly the bug.
+#[test]
+fn an_allow_list_wires_what_it_names_and_only_that() {
+    let (dir, home) = fixture("all");
+    let untouched = snapshot(dir.path());
+
+    let outcome =
+        ensure::ensure(&home, &allow(&[Agent::Claude]), "local", Guard::PERMITTED).unwrap();
+    assert!(outcome.is_clean(), "{:?}", outcome.errors);
+
+    let after = snapshot(dir.path());
+    for agent in others(Agent::Claude) {
+        for file in crate::owned_files(&home, agent) {
+            let rel = file.strip_prefix(dir.path()).unwrap();
+            assert_eq!(
+                after.get(rel).map(|b| String::from_utf8_lossy(b)),
+                untouched.get(rel).map(|b| String::from_utf8_lossy(b)),
+                "{}: {} changed",
+                agent.source(),
+                rel.display()
+            );
+        }
+    }
+    assert_eq!(outcome.wired, vec![Agent::Claude]);
+    assert!(outcome
+        .skipped
+        .iter()
+        .any(|skip| skip.agent == Agent::Codex && matches!(skip.reason, SkipReason::NotAllowed)));
+}
+
+/// An upgrade reaches an allowed agent and stops at the boundary. The
+/// stale entry of an agent nobody allowed is not Roost's to bring
+/// forward — rewriting it would be a write into a file the user never
+/// consented to, dressed up as maintenance.
+#[test]
+fn a_stale_entry_is_refreshed_only_for_an_allowed_agent() {
+    let (_dir, home) = fixture("all");
+    wire_all(&home);
+
+    let rewind = |agent: Agent| -> String {
+        let file = crate::owned_files(&home, agent)[0].clone();
+        let text = std::fs::read_to_string(&file).unwrap();
+        let rewound = text.replace(
+            &escaped(&installed_command(agent)),
+            &escaped(&owned_commands(agent)[1]),
+        );
+        assert_ne!(
+            rewound,
+            text,
+            "{}: the rewind matched nothing",
+            agent.source()
+        );
+        std::fs::write(&file, &rewound).unwrap();
+        rewound
+    };
+    rewind(Agent::Claude);
+    let cursor_was = rewind(Agent::Cursor);
+
+    let outcome =
+        ensure::ensure(&home, &allow(&[Agent::Claude]), "local", Guard::PERMITTED).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(cursor::hooks_path(&home)).unwrap(),
+        cursor_was,
+        "a not-allowed agent's stale entry was rewritten"
+    );
+    assert!(std::fs::read_to_string(claude::settings_path(&home))
+        .unwrap()
+        .contains(&escaped(&installed_command(Agent::Claude))));
+    assert_eq!(outcome.refreshed, vec![Agent::Claude]);
+}
+
+/// What `ensure` must never do and `reconcile` must: narrowing the key
+/// and reconciling takes the dropped agent's entries back out.
+#[test]
+fn reconcile_wires_the_newly_allowed_and_unwires_the_rest() {
+    let (_dir, home) = fixture("all");
+    ensure::ensure(&home, &allow(&[Agent::Claude]), "local", Guard::PERMITTED).unwrap();
+
+    let outcome =
+        ensure::reconcile(&home, &allow(&[Agent::Codex]), "local", Guard::PERMITTED).unwrap();
+    assert!(outcome.is_clean(), "{:?}", outcome.errors);
+    assert_eq!(outcome.wired, vec![Agent::Codex]);
+    assert_eq!(outcome.removed, vec![Agent::Claude]);
+    assert!(std::fs::read_to_string(codex::hooks_path(&home))
+        .unwrap()
+        .contains("ROOST_AGENT_HOOK"));
+    assert!(!std::fs::read_to_string(claude::settings_path(&home))
+        .unwrap()
+        .contains("ROOST_AGENT_HOOK"));
+}
+
+/// `reconcile(off)` is the explicit sweep, and it comes back to the byte
+/// on a file already in the printer's layout — the same claim
+/// `an_uninstall_puts_a_canonically_laid_out_file_back_byte_for_byte`
+/// makes of the named verb.
+#[test]
+fn reconcile_off_restores_the_fixture_byte_for_byte() {
+    let (dir, home) = fixture("all");
+    let before = snapshot(dir.path());
+    wire_all(&home);
+    assert_ne!(snapshot(dir.path()), before, "the install changed nothing");
+
+    let outcome = ensure::reconcile(&home, &ensure::Mode::Off, "local", Guard::PERMITTED).unwrap();
+    assert!(outcome.is_clean(), "{:?}", outcome.errors);
+
+    let restored: BTreeMap<_, _> = snapshot(dir.path())
+        .into_iter()
+        .filter(|(path, _)| !path.starts_with(".config/roost"))
+        .collect();
+    assert_eq!(restored, before);
+}
+
+/// A raise is additive, and the agent it was not asked about is the
+/// proof. grok here stands for anything else Roost owns on that machine
+/// — a second client's agent, or one the user installed by hand — and a
+/// connecting client that could quietly unwire it would make every
+/// reconnect a race between two people's choices.
+#[test]
+fn a_raise_never_removes_an_agent_it_was_not_asked_about() {
+    let (_dir, home) = fixture("all");
+    ensure::install(&home, &[Agent::Grok], "local", Guard::PERMITTED).unwrap();
+    // The machine this models: grok already wired, and nobody has
+    // answered the key on this host.
+    std::fs::remove_file(home.config_path()).unwrap();
+
+    let done = ensure::raise(&home, &[Agent::Claude], "charlie-mbp", Guard::PERMITTED).unwrap();
+    assert_eq!(done.wired, vec![Agent::Claude]);
+    assert!(
+        std::fs::read_to_string(grok::hooks_path(&home))
+            .unwrap()
+            .contains("ROOST_AGENT_HOOK"),
+        "the raise unwired an agent it was not asked about"
+    );
+    assert_eq!(hooks_key(&home), "agent-hooks = claude");
+
+    // And status says exactly that: wired on disk, not in the key.
+    let rows = ensure::status(&home, &allow(&[Agent::Claude])).unwrap();
+    assert!(!row(&rows, Agent::Grok).allowed);
+    assert!(row(&rows, Agent::Grok).entries_on_disk);
+
+    // Naming it explicitly is how it joins the key.
+    ensure::install(&home, &[Agent::Grok], "local", Guard::PERMITTED).unwrap();
+    assert_eq!(hooks_key(&home), "agent-hooks = claude, grok");
+}
+
+/// An empty allow-list is `off` in the file, never an empty value.
+///
+/// An empty value parses back as `Ask`, so a `set_hooks` that spelled it
+/// that way would unwire everything and then ask the user again on the
+/// next launch — the one answer the consent dialog is supposed to make
+/// stick.
+#[test]
+fn switching_every_agent_off_writes_off_not_an_empty_value() {
+    let (_dir, home) = fixture("all");
+    ensure::set_hooks(&home, &all(), "local", Guard::PERMITTED).unwrap();
+
+    let done = ensure::set_hooks(&home, &allow(&[]), "local", Guard::PERMITTED).unwrap();
+    assert_eq!(hooks_key(&home), "agent-hooks = off");
+    assert!(done.wrote);
+    assert!(!claude::settings_path(&home)
+        .exists()
+        .then(|| std::fs::read_to_string(claude::settings_path(&home)).unwrap())
+        .is_some_and(|text| text.contains("ROOST_AGENT_HOOK")));
+}
+
+/// A raise that adds nothing must not touch the key at all — least of
+/// all lower an unanswered one to `off`, which is what spelling an empty
+/// union would do.
+#[test]
+fn a_raise_with_no_agents_leaves_an_unanswered_key_unanswered() {
+    let (_dir, home) = fixture("all");
+    assert!(!home.config_path().exists(), "the fixture came with a key");
+
+    let done = ensure::raise(&home, &[], "charlie-mbp", Guard::PERMITTED).unwrap();
+    assert!(done.wired.is_empty(), "{done:?}");
+    assert!(
+        !home.config_path().exists(),
+        "a raise that allowed nothing wrote the key anyway"
+    );
+}
+
+/// A `config.conf` symlinked into a dotfiles repo survives a key write.
+///
+/// This is not hypothetical since plan 064: a connecting client raises
+/// this machine's `agent-hooks` with nobody at the keyboard, so a rename
+/// onto the link would quietly detach the file the user's repo tracks.
+#[test]
+fn a_symlinked_config_is_written_through_not_replaced() {
+    let (dir, home) = fixture("all");
+    let real = dir.path().join("dotfiles/roost.conf");
+    std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+    std::fs::write(
+        &real,
+        "theme = roost-dark
+",
+    )
+    .unwrap();
+    let link = home.config_path();
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(link);
+    std::os::unix::fs::symlink(&real, link).unwrap();
+
+    ensure::raise(&home, &[Agent::Claude], "charlie-mbp", Guard::PERMITTED).unwrap();
+
+    assert!(
+        link.symlink_metadata().unwrap().file_type().is_symlink(),
+        "the raise replaced the symlink with a regular file"
+    );
+    let text = std::fs::read_to_string(&real).unwrap();
+    assert!(text.contains("agent-hooks = claude"), "{text}");
+    assert!(text.contains("theme = roost-dark"), "{text}");
+}
+
+/// A raise onto a key that says `off` produces the client's list (plan
+/// 064 §3.3). The contentious half, pinned: a host has no screen to ask
+/// on, so the client in front of the user is the only authority there
+/// is, and a remote `off` nobody can lift would leave that user with no
+/// way to say yes.
+#[test]
+fn a_raise_onto_off_produces_the_clients_list() {
+    let (_dir, home) = fixture("all");
+    ensure::set_hooks(&home, &ensure::Mode::Off, "local", Guard::PERMITTED).unwrap();
+    assert_eq!(hooks_key(&home), "agent-hooks = off");
+
+    ensure::raise(&home, &[Agent::Claude], "charlie-mbp", Guard::PERMITTED).unwrap();
+    assert_eq!(hooks_key(&home), "agent-hooks = claude");
+}
+
+/// Taking all of them out is an answer, and it is written down. Without
+/// this the next launch has an unanswered key and asks again — which is
+/// the dialog reappearing immediately after the user said no.
+#[test]
+fn uninstalling_every_agent_writes_off() {
+    let (_dir, home) = fixture("all");
+    wire_all(&home);
+    ensure::uninstall(&home, &ALL_AGENTS, Guard::PERMITTED).unwrap();
+    assert_eq!(hooks_key(&home), "agent-hooks = off");
+}
+
+/// Two clients raising at once. The key is read **and** written inside
+/// the lock, so the second sees the first's list rather than the
+/// pre-image of it — read it outside and one of the two consents is
+/// silently dropped.
+///
+/// Both threads are started against a lock this test holds, so they are
+/// certain to overlap rather than merely likely to.
+#[test]
+fn two_concurrent_raises_keep_both_agents() {
+    let (_dir, home) = fixture("all");
+    let held = crate::write::lock(&home.lock_path()).expect("take the lock");
+    let a = home.clone();
+    let b = home.clone();
+
+    let left =
+        std::thread::spawn(move || ensure::raise(&a, &[Agent::Claude], "one", Guard::PERMITTED));
+    let right =
+        std::thread::spawn(move || ensure::raise(&b, &[Agent::Codex], "two", Guard::PERMITTED));
+    // Long enough for both to be parked on the lock, and two orders of
+    // magnitude inside `LOCK_DEADLINE`.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    drop(held);
+
+    for outcome in [
+        left.join().unwrap().unwrap(),
+        right.join().unwrap().unwrap(),
+    ] {
+        assert!(outcome.is_clean(), "{:?}", outcome.errors);
+    }
+    assert_eq!(hooks_key(&home), "agent-hooks = claude, codex");
+    for agent in [Agent::Claude, Agent::Codex] {
+        assert!(
+            std::fs::read_to_string(&crate::owned_files(&home, agent)[0])
+                .unwrap()
+                .contains("ROOST_AGENT_HOOK"),
+            "{}",
+            agent.source()
+        );
+    }
+}
+
+/// The key is the permission, so a key that cannot be written is a run
+/// that has not been permitted: it fails, and no agent's file is
+/// touched. Writing the files first and the key second would leave a
+/// machine wired by a consent nothing recorded.
+#[test]
+fn a_config_that_cannot_be_written_wires_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, home) = fixture("all");
+    let locked = dir.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    let config = locked.join("config.conf").to_string_lossy().into_owned();
+    // `ROOST_CONFIG` moves only the config: the lock and the state
+    // record stay under `.config/roost`, so this test fails on the
+    // config write and on nothing else.
+    let home = Home::resolve(home.path(), |key| {
+        (key == "ROOST_CONFIG").then(|| config.clone())
+    });
+    let before = snapshot(dir.path());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let refused = ensure::set_hooks(&home, &all(), "local", Guard::PERMITTED).unwrap_err();
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        matches!(refused, crate::InstallError::ReadOnly { .. }),
+        "{refused:?}"
+    );
+    let agent_files = |snap: BTreeMap<PathBuf, Vec<u8>>| -> BTreeMap<PathBuf, Vec<u8>> {
+        snap.into_iter()
+            .filter(|(path, _)| !path.starts_with(".config/roost") && !path.starts_with("locked"))
+            .collect()
+    };
+    assert_eq!(agent_files(snapshot(dir.path())), agent_files(before));
+}
+
+/// The two fields the Mac consent sheet renders: whether the key names
+/// this agent, and which files ticking its row would touch.
+#[test]
+fn status_carries_the_allow_flag_and_the_files_a_row_would_touch() {
+    let (_dir, home) = fixture("all");
+    let rows = ensure::status(&home, &allow(&[Agent::Codex])).unwrap();
+
+    assert!(row(&rows, Agent::Codex).allowed);
+    assert!(!row(&rows, Agent::Claude).allowed);
+    // codex owns two: the handlers, and the trust hashes that stop it
+    // asking about them.
+    assert_eq!(
+        row(&rows, Agent::Codex).files,
+        vec![codex::hooks_path(&home), codex::config_path(&home)]
+    );
+    for agent in ALL_AGENTS {
+        assert!(!row(&rows, agent).files.is_empty(), "{}", agent.source());
+    }
 }

@@ -2743,6 +2743,7 @@ name = "roost-agent-install"
 version = "0.0.19"
 dependencies = [
  "roost-agent",
+ "roost-ui-model",
  "serde",
  "serde_json",
  "sha2",
