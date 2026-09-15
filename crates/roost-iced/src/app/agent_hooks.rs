@@ -245,6 +245,27 @@ fn apply_delay(ticket: u64) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_millis(ms))
 }
 
+/// Make the apply holding this ticket refuse **before it writes
+/// anything**, so a test can pin what a *superseded* apply still owes
+/// the running config when the apply that superseded it lands nothing.
+///
+/// A seam rather than the real thing because the real thing cannot be
+/// scheduled: the one worker runs applies back to back, so there is no
+/// moment at which a test could take `config.lock` between two of them
+/// — and that refusal, mid-queue and after an earlier apply succeeded,
+/// is exactly the interleaving [`super::App::agent_hooks_applied`]
+/// reasons about. Gated on `ROOST_TEST_MODE=1` like [`apply_delay`].
+fn apply_refusal(ticket: u64) -> Option<String> {
+    if std::env::var("ROOST_TEST_MODE").as_deref() != Ok("1") {
+        return None;
+    }
+    let refused: u64 = std::env::var("ROOST_TEST_AGENT_HOOKS_REFUSE_TICKET")
+        .ok()?
+        .parse()
+        .ok()?;
+    (refused == ticket).then(|| "config.lock is busy (test seam)".to_string())
+}
+
 async fn apply_set_hooks(apply: AgentHooksApply, feed: &EngineFeedSender) {
     let AgentHooksApply {
         ticket,
@@ -258,9 +279,14 @@ async fn apply_set_hooks(apply: AgentHooksApply, feed: &EngineFeedSender) {
     if let Some(delay) = apply_delay(ticket) {
         tokio::time::sleep(delay).await;
     }
-    let local = tokio::task::spawn_blocking(move || set_hooks_blocking(ticket, &mode, guard))
-        .await
-        .unwrap_or_else(|error| Err(format!("the agent-hooks install did not finish: {error}")));
+    let local = match apply_refusal(ticket) {
+        Some(refused) => Err(refused),
+        None => tokio::task::spawn_blocking(move || set_hooks_blocking(ticket, &mode, guard))
+            .await
+            .unwrap_or_else(|error| {
+                Err(format!("the agent-hooks install did not finish: {error}"))
+            }),
+    };
     let done = match local {
         Ok(done) => done,
         Err(message) => {
@@ -466,9 +492,11 @@ pub(crate) fn resolve_set(agents: &AgentSetHooksAgents) -> Result<Mode, String> 
 /// to the main thread.
 pub(crate) struct AgentHooksSet {
     /// Which apply this is (plan 065 §3.5). The main thread takes the
-    /// number at receipt and applies only the newest, so an older answer
-    /// landing late cannot replace a newer one — the
-    /// [`AgentHooksSurvey::id`] rule, for the same reason.
+    /// number at receipt and shows a *receipt* only for the newest, so
+    /// a choice the user has already replaced says nothing — the
+    /// [`AgentHooksSurvey::id`] rule, for the same reason. The key
+    /// itself is not gated on it; see
+    /// [`super::App::agent_hooks_applied`].
     pub ticket: u64,
     pub config_path: String,
     pub outcome: AgentHooksOutcome,

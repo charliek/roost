@@ -3467,16 +3467,27 @@ impl App {
             errors = done.outcome.errors.len(),
             "agent.set_hooks applied"
         );
-        // Superseded (#490): a newer apply was requested while this one
-        // wrote. The file already holds the newer answer — the worker
-        // runs them in request order — so taking this one into `config`
-        // or onto the receipt would show the user the choice they
-        // replaced. The `agent_hooks_surveyed` rule, for the same
-        // reason. Failures above are still logged: they happened.
+        // The key is taken **whatever the ticket says**. This message
+        // exists only for an apply that got past `set_hooks`' first
+        // step, which writes the key and fails the whole run if it
+        // cannot — so the file holds `done.key`, and the running UI's
+        // copy has to say the same or every later fallback read answers
+        // with something that is not on disk. Dropping a superseded one
+        // because "the newer apply already wrote the file" assumes the
+        // newer apply *lands*; it may yet refuse without writing
+        // anything (a `config.lock` it never gets), and then the newest
+        // thing on disk is this one. Ordering is safe to lean on: one
+        // worker drains the queue and one FIFO feed carries the answers,
+        // so results arrive in ticket order and the last key taken is
+        // the last key written.
+        self.config.agent_hooks = done.key;
+        // The receipt is the opposite rule (#490): it answers the user's
+        // latest gesture, so a choice they have already replaced says
+        // nothing. The `agent_hooks_surveyed` rule, for the same reason.
+        // Failures above are still logged: they happened.
         if done.ticket != self.agent_hooks_applies {
             return;
         }
-        self.config.agent_hooks = done.key;
         let Some(toast) = agent_hooks::wired_toast(&done.unnoticed, None) else {
             return;
         };

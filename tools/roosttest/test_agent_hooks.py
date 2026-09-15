@@ -46,6 +46,7 @@ import socket as socketlib
 import subprocess
 import threading
 import tempfile
+from pathlib import Path
 
 import pytest
 import ui
@@ -1220,6 +1221,28 @@ def test_agent_set_without_local_goes_through_the_running_ui(short_root, iced_on
     assert not any(jail.agent_dirs["grok"].iterdir()), "the UI wired an agent nobody named"
 
 
+def holds_open(pid: int, path: Path) -> bool:
+    """Whether `pid` has `path` open.
+
+    How a *contending* `ConfigLock` is observed. It opens the lock file
+    and then polls `flock(LOCK_EX|LOCK_NB)`, and a non-blocking flock
+    joins no queue — so a waiting writer never appears in `/proc/locks`
+    and an open descriptor on the lock file is the only evidence the
+    kernel offers that one got as far as the lock at all.
+    """
+    try:
+        fds = list(Path(f"/proc/{pid}/fd").iterdir())
+    except OSError:
+        return False
+    for fd in fds:
+        try:
+            if fd.resolve() == path:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def test_two_processes_writing_config_conf_share_one_lock(short_root, iced_only):
     """#487: `config.conf` has more than one writer, and they all take
     the same `config.lock`.
@@ -1232,10 +1255,15 @@ def test_two_processes_writing_config_conf_share_one_lock(short_root, iced_only)
     prevents a torn file, not a lost update.
 
     Contention is arranged rather than hoped for: this test holds
-    `config.lock` itself (the same `flock` Rust takes), so both writers
-    are provably waiting on it, and neither may touch the file until it
-    lets go. The loop afterwards is the same claim under real overlap.
+    `config.lock` itself (the same `flock` Rust takes), and waits until
+    each writer has the lock file **open** before asserting that neither
+    has written. "It has not finished yet" is also true of a process the
+    scheduler has not run, so on a loaded machine that alone would pass
+    over a build that took no lock at all. The loop afterwards is the
+    same claim under real overlap.
     """
+    if not Path("/proc/self/fd").is_dir():
+        pytest.skip("proving a writer reached config.lock needs /proc")
     jail = Jail(short_root, agent_hooks="claude")
     sock = jailed_socket(jail)
     lock_path = jail.config.parent / "config.lock"
@@ -1254,8 +1282,18 @@ def test_two_processes_writing_config_conf_share_one_lock(short_root, iced_only)
                 fcntl.flock(handle, fcntl.LOCK_EX)
                 toggle()
                 roostctl = run_agent_async(jail, "set", "codex", "--local")
-                # A bounded wait, and the assertion is that it does NOT
-                # finish: a writer that ignored the lock would be done.
+                Roost._wait(
+                    lambda: holds_open(proc.pid, lock_path),
+                    30.0,
+                    "the UI's config writer to reach config.lock",
+                )
+                Roost._wait(
+                    lambda: holds_open(roostctl.pid, lock_path),
+                    30.0,
+                    "roostctl to reach config.lock",
+                )
+                # Both are at the lock; now the assertion that neither
+                # got past it.
                 with pytest.raises(subprocess.TimeoutExpired):
                     roostctl.wait(timeout=scaled_timeout(2))
                 assert config_value(jail.config, "show-sidebar-agents") is None, (
@@ -1320,8 +1358,8 @@ def test_two_overlapping_applies_land_in_request_order(short_root, iced_only):
     completion first and leave `claude` — the *older* answer — on disk.
 
     The receipt is asserted too, and it is the other half of the same
-    rule: only the newest ticket reaches `self.config` and the banner, so
-    the superseded apply says nothing at all.
+    rule: only the newest ticket reaches the banner, so the superseded
+    apply says nothing at all.
     """
     jail = Jail(short_root, agent_hooks=None)
     sock = jailed_socket(jail)
@@ -1350,3 +1388,73 @@ def test_two_overlapping_applies_land_in_request_order(short_root, iced_only):
     assert not any(jail.agent_dirs["claude"].iterdir()), (
         "the superseded apply left claude wired"
     )
+
+
+def wait_for_agent_hooks_card(roost: Roost) -> dict:
+    """Block until the preferences card is up, and return its dump.
+
+    A condition wait rather than a settle: the card is raised from the
+    engine feed, one status walk after the palette row was activated."""
+    seen: list[dict] = []
+
+    def carded() -> bool:
+        card = roost.call("app.dialog_dump", {})
+        if card.get("dialog") != "agent_hooks":
+            return False
+        seen.append(card)
+        return True
+
+    Roost._wait(carded, 30.0, "the agent-hooks card to open")
+    assert seen[0]["mode"] == "preferences", seen[0]
+    return seen[0]
+
+
+def test_a_superseded_apply_still_moves_the_running_key(short_root, iced_only):
+    """#490's other half: the UI's own `agent-hooks` value never lags the
+    file.
+
+    The apply that supersedes another can still *fail* — this one is
+    refused before it writes anything, the shape a `config.lock` it never
+    gets has — and then the newest answer on disk is the superseded one.
+    A UI that discarded it on the grounds that "the newer apply already
+    wrote the file" would hold the value it launched with while the file
+    holds `claude`.
+
+    The running value has exactly one surface: it is what the preferences
+    card falls back to when `config.conf` cannot be **read**. So the file
+    is made unreadable for the length of one card, which is the only way
+    to tell the UI's copy and the file apart.
+    """
+    jail = Jail(short_root, agent_hooks="off", present=("claude", "codex"))
+    sock = jailed_socket(jail)
+    seams = {
+        "ROOST_TEST_AGENT_HOOKS_DELAY_MS": "3000",
+        "ROOST_TEST_AGENT_HOOKS_REFUSE_TICKET": "2",
+    }
+
+    with jailed_ui(jail, extra_env=seams) as (proc, log):
+        wait_for_jailed_window(jail, proc, log)
+        first = run_agent_async(jail, "set", "claude", socket=str(sock))
+        wait_for_log_line(log, "agent.set_hooks queued", "the first apply to be queued")
+        second = run_agent(jail, "set", "codex", socket=str(sock))
+        assert second.returncode != 0, "the seam did not refuse the second apply"
+        done = first.communicate(timeout=scaled_timeout(60))
+        assert first.returncode == 0, done
+        assert jail.read_key() == "claude", jail.config.read_text()
+
+        jail.config.chmod(0o000)
+        try:
+            with Roost(str(sock), timeout=scaled_timeout(30)) as roost:
+                roost.palette_dismiss()
+                roost.palette_open()
+                roost.palette_activate("agent_hooks")
+                roost.palette_dismiss()
+                card = wait_for_agent_hooks_card(roost)
+        finally:
+            jail.config.chmod(0o600)
+
+    rows = {row["agent"]: row for row in card["rows"]}
+    assert rows["claude"]["on"] is True, (
+        f"the UI still holds the key it launched with, not the one on disk: {card}"
+    )
+    assert rows["codex"]["on"] is False, card

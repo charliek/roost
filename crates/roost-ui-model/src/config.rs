@@ -789,7 +789,7 @@ pub fn set_key(path: &Path, key: &str, value: &str) -> io::Result<()> {
 /// waited on.
 pub fn set_key_locked(lock: &ConfigLock, path: &Path, key: &str, value: &str) -> io::Result<()> {
     let target = follow_links(path);
-    if lock.config_path() != target {
+    if !same_config_file(lock.config_path(), &target) {
         // Returned rather than panicked: this runs inside a long-lived
         // session daemon, where a wrong guard must fail one op, not the
         // process.
@@ -804,6 +804,24 @@ pub fn set_key_locked(lock: &ConfigLock, path: &Path, key: &str, value: &str) ->
         ));
     }
     write_key(&target, key, value)
+}
+
+/// Whether an already-link-resolved guard path and write target name the
+/// same file.
+///
+/// Compared with `.` components dropped, so a caller's *spelling* cannot
+/// turn a legitimate write into a refusal. `Path`'s own equality already
+/// drops a `.` in the middle; a leading one it keeps, which is the
+/// spelling a relative config path produces. `..` is deliberately left
+/// alone — collapsing it lexically is unsound the moment a component is
+/// a symlink, and these paths have been through [`follow_links`] already.
+fn same_config_file(guard: &Path, target: &Path) -> bool {
+    let named = |path: &Path| -> PathBuf {
+        path.components()
+            .filter(|part| !matches!(part, std::path::Component::CurDir))
+            .collect()
+    };
+    named(guard) == named(target)
 }
 
 /// [`set_key`]'s body, against an already-resolved path and with the
@@ -912,6 +930,23 @@ fn line_key_matches(line: &str, target: &str) -> bool {
     trimmed[..eq].trim_end() == target
 }
 
+/// Replace `path`'s contents in one step: tmp file beside it, then
+/// rename.
+///
+/// **`path` is already link-resolved**, and resolving it here instead
+/// would be a bug rather than a belt-and-braces. Renaming onto the
+/// *link* would replace it with a regular file and silently orphan the
+/// target — someone whose `config.conf` is a link into a dotfiles repo
+/// would find Roost had stopped writing the file their repo tracks, and
+/// since plan 064 that write can happen with nobody at the keyboard (a
+/// connecting client raises this machine's `agent-hooks`) — so every
+/// caller resolves, and the [`ConfigLock`] it holds was taken beside
+/// that same answer. Resolving a second time here would break that
+/// pairing: [`follow_links`] stops at its hop limit and is therefore
+/// **not idempotent** over a longer chain, so the second answer can walk
+/// further down it than the first. The lock would sit beside one file
+/// while the rename landed on another — two locks over one config, which
+/// is the lost update the lock exists to prevent.
 fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -922,14 +957,6 @@ fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
     // theme.set immediately followed by font-family.set).
     static NONCE: AtomicU64 = AtomicU64::new(0);
 
-    // Renaming onto the *link* would replace it with a regular file and
-    // silently orphan the target — someone whose `config.conf` is a link
-    // into a dotfiles repo would find Roost had stopped writing the file
-    // their repo tracks. Since plan 064 that write can happen with nobody
-    // at the keyboard (a connecting client raises this machine's
-    // `agent-hooks`), so the link has to survive it.
-    let path = follow_links(path);
-    let path = path.as_path();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let parent = if parent.as_os_str().is_empty() {
         Path::new(".")
@@ -1822,10 +1849,11 @@ mod tests {
         );
         assert!(refused.to_string().contains("config lock"), "{refused}");
         assert!(waited >= Duration::from_millis(200), "{waited:?}");
-        assert!(
-            waited < Duration::from_secs(5),
-            "the bound did not hold: {waited:?}"
-        );
+        // No upper bound on the elapsed wall clock: a suspended process
+        // would blow any figure picked here without a defect having
+        // happened. What is asserted instead is that the wait *ended* —
+        // which is the claim — and `LOCK_DEADLINE` is pinned by name in
+        // `the_default_deadline_stays_inside_the_op_budget`.
 
         drop(held);
         super::ConfigLock::acquire_within(&config, Duration::from_millis(200))
@@ -1848,6 +1876,12 @@ mod tests {
     /// Deterministic rather than probabilistic: the lock is held by the
     /// test itself, so the writer is certainly contending, and the
     /// 200 ms window is two orders of magnitude inside `LOCK_DEADLINE`.
+    ///
+    /// The writer says so before it starts. "Has not finished in 200 ms"
+    /// is also true of a thread the scheduler has not run at all, so on
+    /// a loaded runner it would pass over an implementation that takes
+    /// no lock; waiting for the signal first means the 200 ms is spent
+    /// inside `set_key` rather than possibly ahead of it.
     #[test]
     fn set_key_waits_for_a_held_lock_and_lands_on_release() {
         use std::sync::mpsc;
@@ -1858,14 +1892,19 @@ mod tests {
         fs::write(&config, "theme = roost-dark\n").unwrap();
         let held = super::ConfigLock::acquire(&config).expect("take the lock");
 
+        let (entered_tx, entered_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let writing = config.clone();
         let writer = std::thread::spawn(move || {
+            let _ = entered_tx.send(());
             let outcome = super::set_key(&writing, "font-size", "17");
             let _ = done_tx.send(());
             outcome
         });
 
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the writer thread to reach set_key");
         assert!(
             done_rx.recv_timeout(Duration::from_millis(200)).is_err(),
             "set_key returned while the lock was held: the write is not serialised"
@@ -1901,6 +1940,71 @@ mod tests {
             super::ConfigLock::acquire(&link).unwrap().config_path(),
             target
         );
+    }
+
+    /// #487, the other way a lock splits: a chain past
+    /// [`follow_links`]'s hop limit resolves to a *different* answer the
+    /// second time, so a write that re-resolved would land beside a lock
+    /// nobody else takes.
+    ///
+    /// Sixteen hops of chain in one directory, with the last link
+    /// pointing at the real file in another. The lock is taken beside
+    /// hop 16; a writer that resolved again would rename onto the real
+    /// file in the far directory, where the writer who reached it by its
+    /// own path holds a different lock.
+    #[test]
+    fn a_write_lands_on_the_file_its_lock_covers_past_the_hop_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let near = tmp.path().join("near");
+        let far = tmp.path().join("far");
+        fs::create_dir_all(&near).unwrap();
+        fs::create_dir_all(&far).unwrap();
+        let real = far.join("config.conf");
+        fs::write(&real, "theme = far\n").unwrap();
+
+        let entry = near.join("config.conf");
+        let hop = |n: usize| near.join(format!("hop{n}"));
+        std::os::unix::fs::symlink(hop(1), &entry).unwrap();
+        for n in 1..16 {
+            std::os::unix::fs::symlink(hop(n + 1), hop(n)).unwrap();
+        }
+        std::os::unix::fs::symlink(&real, hop(16)).unwrap();
+
+        assert_eq!(
+            super::lock_path(&entry),
+            near.join("config.lock"),
+            "the chain is not long enough to split the two resolutions"
+        );
+        super::set_key(&entry, "theme", "roost-dark").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&real).unwrap(),
+            "theme = far\n",
+            "the write ran past the file its lock covers and landed on the far target"
+        );
+        assert_eq!(
+            RoostConfig::load_from(&entry).theme_name.as_deref(),
+            Some("roost-dark")
+        );
+    }
+
+    /// A guard covers a *file*, and two spellings of one file are not a
+    /// caller aiming at somebody else's config — see `same_config_file`.
+    #[test]
+    fn a_guard_is_matched_by_the_file_it_names_not_by_the_spelling() {
+        let same = |a: &str, b: &str| super::same_config_file(Path::new(a), Path::new(b));
+
+        // `Path`'s own equality already drops a `.` in the middle…
+        assert!(same("/cfg/config.conf", "/cfg/./config.conf"));
+        // …and keeps a leading one, which is the spelling this closes.
+        assert!(same("config.conf", "./config.conf"));
+        assert!(same("./cfg/config.conf", "cfg/config.conf"));
+
+        // The bug the guard exists for is still caught.
+        assert!(!same("/mine/config.conf", "/theirs/config.conf"));
+        // And `..` is left alone: with a symlink anywhere above it, the
+        // two spellings are genuinely different files.
+        assert!(!same("/cfg/config.conf", "/cfg/sub/../config.conf"));
     }
 
     /// A guard for another file is a bug in the caller, and it is said

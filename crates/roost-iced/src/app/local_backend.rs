@@ -2254,12 +2254,7 @@ impl super::App {
             .switch
             .as_ref()
             .is_some_and(|run| run.journal.launch_migration);
-        if !launch_migration {
-            let writer = self.config_writer.clone();
-            self.runtime_handle.spawn(async move {
-                put_backend_key_back(&writer, LocalBackendMode::InProcess).await
-            });
-        }
+        let writer = (!launch_migration).then(|| self.config_writer.clone());
         // Paired with what the snapshot said each copy should hold, so
         // the deletion below can tell the copy from a project somebody
         // else has since worked in — `rollback_is_still_ours`. The
@@ -2288,7 +2283,23 @@ impl super::App {
             })
             .unwrap_or_default();
         if created.is_empty() {
-            self.fail_switch(why);
+            // Nothing reached the destination, so the key restore *is*
+            // the rollback — and `fail_switch`'s journal clear is the
+            // one thing that must not overtake it, so the two ride one
+            // ordered task. (Nothing created means nothing adopted
+            // either, which is all `fail_switch` would do beyond that
+            // clear — see `retire_failed_journal`.)
+            let path = self.journal_path();
+            match writer {
+                Some(writer) => {
+                    self.runtime_handle.spawn(async move {
+                        put_backend_key_back(&writer, LocalBackendMode::InProcess).await;
+                        clear_journal(&path);
+                    });
+                }
+                None => clear_journal(&path),
+            }
+            self.fail_switch_keeping_journal(why);
             return;
         }
         let Some(ops) = self
@@ -2300,7 +2311,13 @@ impl super::App {
             // Nothing to delete it with. The journal stays where it is,
             // so the next launch — which will have a connection — is the
             // one that cleans it up (§D8b's "a partial destination copy
-            // may remain").
+            // may remain"), and it is also what makes an unordered key
+            // restore safe on this arm alone: nothing here can clear it.
+            if let Some(writer) = writer {
+                self.runtime_handle.spawn(async move {
+                    put_backend_key_back(&writer, LocalBackendMode::InProcess).await;
+                });
+            }
             self.fail_switch_keeping_journal(why);
             return;
         };
@@ -2314,7 +2331,7 @@ impl super::App {
         // is bookkeeping they did not.
         self.set_status(format!("{why} — nothing was changed"));
         self.runtime_handle.spawn(async move {
-            let complete = delete_dest_projects(&ops, &created).await;
+            let complete = roll_back_destination(writer, &ops, &created).await;
             feed.send(crate::engine_feed::EngineFeed::LocalBackendSwitch(
                 Box::new(SwitchStepDone {
                     generation,
@@ -2730,6 +2747,33 @@ async fn delete_source_projects(client: &roost_engine::LocalClient, ids: &[i64])
         }
     }
     left
+}
+
+/// The forward rollback's work on disk, in the one order that leaves it
+/// recoverable: the key first, then the destination copy.
+///
+/// **One task, not two.** The journal is the only record that tells the
+/// next launch to put this key back, and it is cleared the moment this
+/// returns `true` — so a restore running *beside* the deletion can still
+/// be in flight when that journal goes. A crash in that window leaves
+/// `local-backend = session` with nothing left to describe it, on a run
+/// that already told the user nothing was changed. Awaiting the key here
+/// is what makes "the journal outlives the key write" true rather than
+/// usually true.
+///
+/// `writer` is `None` for §D5's launch migration, which has no key to
+/// put back — see [`super::App::forward_roll_back`].
+///
+/// Free of the app so the ordering can be driven directly.
+async fn roll_back_destination(
+    writer: Option<ConfigWriter>,
+    ops: &crate::host_conn::HostOps,
+    created: &[(i64, Option<usize>)],
+) -> bool {
+    if let Some(writer) = writer {
+        put_backend_key_back(&writer, LocalBackendMode::InProcess).await;
+    }
+    delete_dest_projects(ops, created).await
 }
 
 /// The rollback's other half. `true` when the destination holds none of
@@ -3942,6 +3986,87 @@ mod switch_tests {
             "and the run's own copy still says what is on disk, \
              so the adopted copy is still named by an uncommitted journal"
         );
+    }
+
+    /// **A forward rollback puts the key back before it reaches the
+    /// destination** (plan 063 §D8b).
+    ///
+    /// The ordering is not cosmetic: the journal is cleared the moment
+    /// the destination cleanup reports itself complete, so a key restore
+    /// running *beside* that cleanup can still be queued when the record
+    /// that would redo it is gone — and the next launch comes up on
+    /// `session` after a run that said nothing was changed. The
+    /// stand-in below answers nothing until it has read the key, so
+    /// "before" is observed rather than timed.
+    #[tokio::test]
+    async fn a_forward_rollback_restores_the_key_before_it_clears_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.conf");
+        roost_ui_model::config::set_key(&config, "local-backend", "session").unwrap();
+        let (feed, _feed_rx) = crate::engine_feed::channel();
+        let writer = ConfigWriter::spawn(
+            &tokio::runtime::Handle::current(),
+            Some(config.clone()),
+            feed,
+        );
+
+        let (ops, worker, seen) = a_slot_reading_the_key(&config);
+        assert!(roll_back_destination(Some(writer.clone()), &ops, &[(101, Some(1))]).await);
+        drop(ops);
+        worker.await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap().first().cloned(),
+            Some(Some("in-process".to_string())),
+            "the destination cleanup started while the key still said session"
+        );
+        assert_eq!(backend_key(&config), Some("in-process".to_string()));
+
+        // §D5's launch migration has no key to put back, and the copy
+        // still goes.
+        roost_ui_model::config::set_key(&config, "local-backend", "session").unwrap();
+        let (ops, worker, seen) = a_slot_reading_the_key(&config);
+        assert!(roll_back_destination(None, &ops, &[(101, Some(1))]).await);
+        drop(ops);
+        worker.await.unwrap();
+        assert_eq!(
+            backend_key(&config),
+            Some("session".to_string()),
+            "a launch migration started from `session`; there is no key to undo"
+        );
+        assert!(
+            !seen.lock().unwrap().is_empty(),
+            "the copy was never cleared"
+        );
+    }
+
+    /// A stand-in session that records what `local-backend` said on disk
+    /// as each op reached it — enough of one to answer the rollback's
+    /// `tab.list` and `project.delete`.
+    #[allow(clippy::type_complexity)]
+    fn a_slot_reading_the_key(
+        config: &Path,
+    ) -> (
+        crate::host_conn::HostOps,
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    ) {
+        use roost_ipc::messages::ops as wire;
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (ops, mut rx) = crate::host_conn::HostOps::channel();
+        let config = config.to_path_buf();
+        let recorded = seen.clone();
+        let worker = tokio::spawn(async move {
+            while let Some(intent) = rx.recv().await {
+                recorded.lock().unwrap().push(backend_key(&config));
+                let answer = match intent.op.as_ref() {
+                    wire::TAB_LIST => serde_json::json!({ "projects": [row(101, &[7])] }),
+                    _ => serde_json::json!({}),
+                };
+                intent.answer(Ok(answer));
+            }
+        });
+        (ops, worker, seen)
     }
 
     /// **A refused run never drops the journal that names an adopted
