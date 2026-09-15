@@ -3,10 +3,12 @@
 Roost drives the tab dot, the sidebar rollup, and the desktop banner for
 five coding agents — Claude Code, Codex, OpenCode, grok (and its fork
 gx), and cursor-agent — by wiring one hook entry per lifecycle event into
-each agent's own configuration file. Wiring happens automatically the
-first time the Roost UI starts (`agent-hooks = auto` in `config.conf`,
-the default); nothing here is a per-machine manual step, and it works
-the same way on a remote host session.
+each agent's own configuration file. Roost **asks before it wires
+anything**: the first time the UI starts with no answer on file and at
+least one supported agent installed, a consent dialog opens naming
+what it found, and nothing is written into any agent's config until you
+choose. It works the same way on a remote host session, with one
+difference — see [Remote hosts](#remote-hosts).
 
 ## Supported agents
 
@@ -33,17 +35,36 @@ themselves (grok can be configured to, and cursor always does via its
 carries the other's telltale fields rather than relying on which file it
 came from — see [Per-agent caveats](#per-agent-caveats).
 
-## What Roost does automatically
+## Roost asks once
 
-At startup — the iced UI, the Swift app, and (on connect) a host
-session — Roost runs the equivalent of `roostctl agent ensure`: for
-every one of the five agents whose config directory exists on that
-machine, it makes sure Roost's hook entry is present and current,
-merging in beside whatever else is already in that agent's config. The
-first time any agent is newly wired on a machine, a one-line toast names
-which ones and how to undo it; after that, refreshes on upgrade are
-silent. `roostctl agent status` and `roostctl doctor`'s `Agents` section
-are the durable way to see what's wired without waiting for a toast.
+Roost never writes into an agent's config file before you've said yes.
+`agent-hooks` in `config.conf` has three states — a list of agent names,
+`off`, or **absent**, which means nobody has answered yet:
+
+- **Absent (a fresh install).** The first time the UI starts with no
+  answer on file *and* at least one of the five agents installed, a
+  consent dialog opens — the iced **Agent Hooks…** card, the Mac
+  **Agent Hooks…** sheet — naming which agents it found and letting you
+  pick which to wire, or none. Nothing is written before you answer it.
+  It reopens on demand from the command palette (or, on Mac, the View
+  menu) as the same **Agent Hooks…** row, bound to the default-unbound
+  `agent_hooks` keybind action, so you can revisit the choice later.
+- **A list.** At startup — the iced UI, the Swift app, and (on connect)
+  a host session — Roost runs the equivalent of `roostctl agent ensure`:
+  for every agent the list names whose config directory exists on that
+  machine, it makes sure Roost's hook entry is present and current,
+  merging in beside whatever else is already in that agent's config.
+- **`off`.** Nothing is wired at startup. See [How to opt
+  out](#how-to-opt-out) for what this does and doesn't remove.
+
+The iced UI also shows a one-line toast the first time any agent is
+*newly* wired on a machine, naming which ones and how to undo it; after
+that, refreshes on upgrade are silent. **The Mac app has no equivalent
+toast** — its chrome has no transient status surface — so a machine
+wired only through the Swift app or `roostctl` stays unannounced until
+either the iced UI runs there too, or you check by hand.
+`roostctl agent status` and `roostctl doctor`'s `Agents` section are the
+durable way to see what's wired without waiting for a toast.
 
 Every entry Roost installs invokes `roostctl` (or `roost-session` on a
 host) indirectly, through the `$ROOST_AGENT_HOOK` environment variable
@@ -54,19 +75,21 @@ machine, or over a host session; see [How
 
 ## How to opt out
 
-Two `config.conf` keys, read by both UIs and by `roostctl agent ensure`:
+One `config.conf` key, read by both UIs and by `roostctl agent ensure`:
 
 ```conf
-agent-hooks = auto        # auto (default) | off
-agent-hooks-skip = cursor, codex   # comma list; never wired even under auto
+agent-hooks = claude, codex   # a list, off, or absent (nobody has answered yet)
 ```
 
-`agent-hooks-skip` takes any of `claude`, `codex`, `grok`, `cursor`,
-`opencode`; a name it doesn't recognize is reported and otherwise
-ignored, never fatal — one typo shouldn't turn into "nothing is wired
-and nothing says why." See [`config.md`](../reference/config.md#agent-hooks)
-for the full parsing rules (accepted spellings, what an unknown value
-falls back to).
+The value is a comma list of any of `claude`, `codex`, `grok`, `cursor`,
+`opencode` — normalised trimmed, lowercased, de-duplicated, and
+reordered into that same canonical order — or the literal `off`. A name
+the parser doesn't recognize is dropped with a warning rather than
+failing the whole value; the retired `auto`/`on`/`true`/`yes` spellings,
+and anything mixing one of those reserved words with a real name, now
+parse back as **absent** (unanswered) with a warning, not as "wire
+everything". See [`config.md`](../reference/config.md#agent-hooks) for
+the full parsing rules.
 
 **`off` means two different things, deliberately.** On the machine
 whose `config.conf` says `off`, the UI does nothing at all — it never
@@ -74,20 +97,22 @@ opens an agent's config file, at startup or ever. That is the whole of
 what the key does locally, and it is worth being exact about the part
 that surprises people: **restarting the UI removes nothing.** Entries
 already on disk stay exactly where they are until you run one of the two
-commands that take them out:
+commands that take them out, or reopen the consent dialog and choose
+`off`/fewer agents there:
 
 ```bash
 roostctl agent uninstall --all   # or a single agent name
 roostctl agent ensure            # reads the same key; on `off`, unwires
 ```
 
-`agent ensure` is the same verb the UIs run under `auto`; run by hand
-while the key says `off`, it removes Roost's entries from every agent it
-can see. Nothing else does. The split exists so a config switch can mean
-"stop wiring from now on" without every process that merely *reads* the
-config key being trusted to also *rewrite* dotfiles on its own — see
-[Remote hosts](#remote-hosts) for how this plays out over a host session,
-where the split reverses.
+`agent ensure` is the same verb the UIs run at startup with `--startup`
+(never removing); run bare, by hand, while the key says `off` (or names
+fewer agents than are wired), it removes Roost's entries from whatever
+the key does not allow. Nothing else does — a launch never undoes a hook
+someone added by hand, and never reacts to a key that changed while the
+app was closed. See [Remote hosts](#remote-hosts) for how a host session
+handles the same key differently — it can only ever be **raised**, never
+lowered, by a connecting client.
 
 ## How to override
 
@@ -110,23 +135,27 @@ silently leaving it be.
 
 ## Install
 
-`roostctl agent ensure` is exactly what the UIs run at startup. The
-other three verbs are the manual controls the startup toast and doctor
-point at:
+`roostctl agent ensure --startup` is exactly what the UIs run at
+startup — wire and refresh what the key names, remove nothing. The
+other verbs are the manual controls doctor points at, including the one
+that answers the consent question from a terminal:
 
 ```bash
-roostctl agent status              # per agent: present, wired@vN, up to date
-roostctl agent ensure [--json]     # wire everything agent-hooks/-skip allow
+roostctl agent status                       # per agent: present, wired@vN, up to date
+roostctl agent ensure [--json] [--startup]  # reconcile to `agent-hooks`; --startup never removes
+roostctl agent set claude,codex             # via the running UI: set the key here, raise every connected host
+roostctl agent set claude,codex --local     # set `agent-hooks` here directly, with nothing running
 roostctl agent install <agent>|--all
 roostctl agent uninstall <agent>|--all
 ```
 
-None of the four dials a running UI — they read and write dotfiles
-directly, so they work with nothing running, which is exactly when a
-new machine needs them. `agent status` reports each agent's file-level
-wiring — not the state record, which only supplies the integration
-version — so deleting `<config dir>/roost/agent-hooks.json` by hand
-doesn't make a correctly wired agent lie about itself.
+Every verb but bare `set` reads and writes dotfiles directly, so it
+works with nothing running, which is exactly when a new machine needs
+it; `agent status` reports each agent's file-level wiring — not the
+state record, which only supplies the integration version — so deleting
+`<config dir>/roost/agent-hooks.json` by hand doesn't make a correctly
+wired agent lie about itself. See [`cli.md`](../reference/cli.md#agent-subcommands)
+for `set`'s full behavior, including what it does over a running UI.
 
 `roostctl claude install` remains a bare alias of `agent install claude`
 (exit 0 when already wired). It no longer writes
@@ -292,34 +321,45 @@ first time someone notices the extra process per tool call.
 
 ## Remote hosts
 
-A host session (`roost-session`) has no `config.conf` of its own — the
-connecting client's config is the only authority a session has for what
-"wired" should mean there. So the client sends its `agent-hooks` /
-`agent-hooks-skip` values to the host as the `session.set_agent_hooks`
-op right after every connect
-([`ipc.md`](../reference/ipc.md#sessionset_agent_hooks)):
+**Every machine, including a host, has exactly one `agent-hooks`
+setting: the key in its own `config.conf`.** There is no separate host
+stance. What plan 064 changed is what a *connecting client* may do to
+that key — and the answer, stated plainly because it's the contentious
+part, is: **raise it, never lower it.**
 
-- **Connecting wires the host.** With `agent-hooks = auto` (the
-  default), connecting to a host brings its agent hook files in line
-  with your config, the same way local startup does.
-- **`off` on a host means unwire, not abstain.** This is the one place
-  the local/remote split in [How to opt out](#how-to-opt-out) reverses:
-  locally, `off` only stops *future* wiring because there's a human at
-  the keyboard who can run `agent uninstall` themselves; on a host,
-  nobody is going to SSH in and clean up by hand, so the client sending
-  `off` actively removes Roost's entries there. Reconnect with
-  `agent-hooks = off` and the host comes clean.
+Right after connecting, a client whose own `agent-hooks` names at least
+one agent sends that list to the host as the `session.set_agent_hooks`
+op ([`ipc.md`](../reference/ipc.md#sessionset_agent_hooks)). The host
+**unions** the list into whatever its own key already says, then wires
+whatever the union now allows:
+
+- **A client whose own key is `off`, or still unanswered, sends nothing
+  at all.** It has no allow-list to widen a host with, so it doesn't try
+  — and it also cannot narrow or unwire the host, on this connect or
+  ever, through this op.
+- **A host whose key is explicitly `off`, or unanswered, is raised
+  anyway.** This is the one genuinely surprising part: a host has no
+  screen to put a consent dialog on, so the client in front of the user
+  — reaching the host over the same same-UID socket boundary every other
+  op already trusts — is the only authority there is. Connecting with
+  `agent-hooks = claude` to a host whose key says `off` wires Claude
+  there, full stop.
+- **Lowering a host only ever happens on that machine.** `roostctl
+  agent ensure`/`uninstall` run there (over SSH, say), or its own
+  consent dialog if one is ever opened on it, is what takes the key —
+  and the files — back down. Once lowered, it holds until a more
+  permissive client connects and raises it again.
+- **Two clients raising different lists both win, additively.** Neither
+  narrows what the other asked for — the union just grows. The host's
+  state record stores which client (`by`) raised which agent and when,
+  so `roostctl agent status` run on the host names who asked for what.
+  This reverses plan 046's original rule, where a disagreeing
+  `agent-hooks` was last-writer-wins and an `off` client actively
+  unwired the host on every connect — that behavior is gone.
 - **Agents already running when you first connect pick up the hooks on
   their next launch**, not retroactively — a `claude` process started
-  before Roost wired the host is still reading whatever hooks were on
+  before the host was raised is still reading whatever hooks were on
   disk when it started.
-- **Two clients with different configs flip the host's files on every
-  reconnect.** This is last-writer-wins, by design, not a bug: the
-  host's state record stores which client (`by`) wired or unwired an
-  agent and when, and `roostctl agent status` run on the host names the
-  most recent flip so the oscillation is at least diagnosable.
-  Reconciling disagreeing clients against one host is filed as future
-  work, not solved here.
 
 No new remote command surface is added by this: any same-UID client
 that can reach a host's socket can already run arbitrary commands there
