@@ -1,5 +1,5 @@
-// Config parser tests for the `agent-hooks` setting (plan 046 §3.6),
-// plus the launch-time decision it drives. Mirrors
+// Config parser tests for the `agent-hooks` setting (plan 064; supersedes
+// plan 046 §3.6), plus the launch-time decision it drives. Mirrors
 // `crates/roost-ui-model/src/config.rs::tests` (`agent_hooks_*`; shared
 // by iced) so the two UIs agree on the switch that decides whether
 // Roost edits the user's dotfiles.
@@ -11,48 +11,81 @@ import Testing
 
 @Suite("RoostConfig agent-hooks parsing")
 struct ConfigAgentHooksTests {
-    @Test func defaultsToAuto() {
-        #expect(parse("").agentHooks == .auto)
-        #expect(RoostConfig.empty.agentHooks == .auto)
+    @Test func defaultsToAsk() {
+        #expect(parse("").agentHooks == .ask)
+        #expect(RoostConfig.empty.agentHooks == .ask)
     }
 
-    @Test func parsesAutoAndOff() {
-        #expect(parse("agent-hooks = auto").agentHooks == .auto)
-        #expect(parse("agent-hooks = on").agentHooks == .auto)
+    @Test func acceptsANameListNormalisedIntoAgentNamesOrder() {
+        #expect(parse("agent-hooks = claude, codex").agentHooks == .allow(["claude", "codex"]))
+        // Mixed case, extra whitespace, and codex-first input all
+        // normalise the same way: `agentNames` order, not source order.
+        #expect(parse(" agent-hooks = Codex , CLAUDE ").agentHooks == .allow(["claude", "codex"]))
+        #expect(parse("agent-hooks = \"claude,codex\"").agentHooks == .allow(["claude", "codex"]))
+    }
+
+    @Test func acceptsTheOffSpellings() {
         #expect(parse("agent-hooks = off").agentHooks == .off)
         #expect(parse("agent-hooks = false").agentHooks == .off)
         #expect(parse("agent-hooks = no").agentHooks == .off)
-    }
-
-    // Quoted and CRLF forms must agree with the Rust mirror.
-    @Test func parsesQuotedAndCRLFValues() {
-        #expect(parse("agent-hooks = \"off\"").agentHooks == .off)
-        #expect(parse("agent-hooks = 'off'").agentHooks == .off)
-        #expect(parse("agent-hooks = off\r\n").agentHooks == .off)
-        #expect(parse("agent-hooks = \"off\"\r\n").agentHooks == .off)
         #expect(parse("agent-hooks = OFF").agentHooks == .off)
     }
 
-    /// A typo must not read as `off`: silently disabling the wiring is
-    /// the failure that is hardest to notice.
-    @Test func unknownValueKeepsDefault() {
-        #expect(parse("agent-hooks = pancakes").agentHooks == .auto)
+    /// Absent or empty resolves to `.ask` — silently. A fresh install
+    /// that never wrote the key is the common path, not a mistake, and
+    /// must never log.
+    @Test func absentOrEmptyIsAskWithNoLog() {
+        #expect(parse("").agentHooks == .ask)
+        #expect(parse("agent-hooks =").agentHooks == .ask)
+        #expect(parse("agent-hooks = \"\"").agentHooks == .ask)
     }
 
-    /// …and "keeps the default" has to mean the *default*, not "keeps
-    /// whatever an earlier line said". Mirrors the Rust
-    /// `agent_hooks_is_last_wins_including_an_empty_or_invalid_repeat`.
-    @Test func repeatedKeyReturnsToTheDefault() {
-        #expect(parse("agent-hooks = off\nagent-hooks =").agentHooks == .auto)
-        #expect(parse("agent-hooks = off\nagent-hooks = \"\"").agentHooks == .auto)
-        #expect(parse("agent-hooks = off\nagent-hooks = pancakes").agentHooks == .auto)
-        // The reverse repeat is ordinary last-wins and must still work.
-        #expect(parse("agent-hooks = auto\nagent-hooks = off").agentHooks == .off)
+    /// The retired switch spellings (plan 046's `auto`/`on`/`true`/
+    /// `yes`) and plain garbage both resolve to `.ask` — values somebody
+    /// actually wrote, so a typo must not read as `off` or as consent
+    /// nobody gave.
+    @Test func unrecognisedValuesAreAsk() {
+        for body in ["auto", "on", "true", "yes", "banana"] {
+            #expect(parse("agent-hooks = \(body)").agentHooks == .ask, "\(body)")
+        }
     }
 
-    /// `agent-hooks-skip` has no Swift mirror — the `roostctl` this app
-    /// spawns reads it — so it must fall through the parser as an
-    /// unknown key rather than disturbing anything.
+    /// A reserved word beside anything else makes the whole value
+    /// ambiguous rather than "off with an extra".
+    @Test func aReservedWordMixedWithAnythingElseIsAsk() {
+        for body in ["off, claude", "auto, claude", "no, codex"] {
+            #expect(parse("agent-hooks = \(body)").agentHooks == .ask, "\(body)")
+        }
+    }
+
+    /// An unrecognised name beside a recognised one is not ambiguous the
+    /// same way — the recognised name is the answer.
+    @Test func dropsUnrecognisedNamesAndKeepsTheRest() {
+        #expect(parse("agent-hooks = claude, banana").agentHooks == .allow(["claude"]))
+    }
+
+    @Test func collapsesDuplicates() {
+        #expect(parse("agent-hooks = claude, claude").agentHooks == .allow(["claude"]))
+    }
+
+    /// The key is last-wins like every other scalar here, including when
+    /// the later line fails to parse: it returns to `.ask`, not to
+    /// whatever an earlier line set. Mirrors the Rust
+    /// `agent_hooks_is_last_wins`.
+    @Test func repeatedKeyReturnsToAsk() {
+        #expect(parse("agent-hooks = claude\nagent-hooks = off").agentHooks == .off)
+        #expect(parse("agent-hooks = claude\nagent-hooks = banana").agentHooks == .ask)
+    }
+
+    @Test func configValueRoundTrips() {
+        #expect(AgentHooks.allow(["cursor", "claude"]).configValue == "claude, cursor")
+        #expect(AgentHooks.off.configValue == "off")
+        #expect(AgentHooks.ask.configValue == nil)
+    }
+
+    /// The retired `agent-hooks-skip` key now falls through the parser
+    /// as an unknown key and must not disturb `agent-hooks` on the same
+    /// line set.
     @Test func theSkipKeyIsIgnoredHereWithoutDisturbingItsSibling() {
         let cfg = parse("agent-hooks-skip = codex, grok\nagent-hooks = off\n")
         #expect(cfg.agentHooks == .off)
@@ -62,9 +95,12 @@ struct ConfigAgentHooksTests {
 
 @Suite("Launch-time agent-hooks ensure")
 struct AgentHooksLaunchPlanTests {
-    @Test func autoRunsTheEnsureVerb() {
+    @Test func allowRunsTheEnsureVerb() {
         #expect(
-            agentHooksLaunchPlan(mode: .auto, roostctl: "/Apps/Roost.app/Resources/bin/roostctl")
+            agentHooksLaunchPlan(
+                mode: .allow(["claude"]),
+                roostctl: "/Apps/Roost.app/Resources/bin/roostctl"
+            )
                 == .run(argv: [
                     "/Apps/Roost.app/Resources/bin/roostctl", "agent", "ensure", "--json",
                 ])
@@ -83,10 +119,20 @@ struct AgentHooksLaunchPlanTests {
         #expect(agentHooksLaunchPlan(mode: .off, roostctl: nil) == .disabledByConfig)
     }
 
+    /// `ask` — nobody has answered the consent dialog — must not spawn
+    /// anything either, and reports its own distinct reason.
+    @Test func askSpawnsNothing() {
+        #expect(
+            agentHooksLaunchPlan(mode: .ask, roostctl: "/Apps/Roost.app/Resources/bin/roostctl")
+                == .notConfigured
+        )
+        #expect(agentHooksLaunchPlan(mode: .ask, roostctl: nil) == .notConfigured)
+    }
+
     /// A `swift run` dev build has no embedded CLI. Nothing to run is
     /// not an error.
     @Test func noBundledRoostctlIsNotAFailure() {
-        #expect(agentHooksLaunchPlan(mode: .auto, roostctl: nil) == .noRoostctl)
+        #expect(agentHooksLaunchPlan(mode: .allow(["claude"]), roostctl: nil) == .noRoostctl)
     }
 }
 
@@ -141,12 +187,35 @@ struct AgentHooksLaunchThreadingTests {
         #expect(sink.all() == ["agent hooks: agent-hooks = off; not wiring"])
     }
 
-    /// And when it is on, the resolution happens — but off the main
+    /// `ask` returns just as early as `off` does — the unconfigured
+    /// state must not probe the filesystem either.
+    @MainActor
+    @Test func askResolvesNothingAndTouchesNoFilesystem() {
+        var config = RoostConfig.empty
+        config.agentHooks = .ask
+        let resolved = TimeoutFlag()
+        let sink = LogSink()
+
+        startAgentHooksEnsure(
+            config: config,
+            roostctl: {
+                resolved.set()
+                return nil
+            },
+            log: sink.log
+        )
+
+        #expect(resolved.get() == false, "`ask` still probed the bundle for roostctl")
+        #expect(sink.all() == ["agent hooks: agent-hooks is not configured; not wiring"])
+    }
+
+    /// And when it is allowed, the resolution happens — but off the main
     /// thread, which is the thread `applicationDidFinishLaunching` calls
     /// this from.
     @MainActor
-    @Test func autoResolvesRoostctlOffTheMainThread() {
-        let config = RoostConfig.empty  // `agent-hooks` defaults to auto
+    @Test func allowResolvesRoostctlOffTheMainThread() {
+        var config = RoostConfig.empty
+        config.agentHooks = .allow(["claude"])
         let ran = TimeoutFlag()
         let onMain = TimeoutFlag()
         let sink = LogSink()

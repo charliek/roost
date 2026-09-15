@@ -19,8 +19,7 @@
 use clap::Subcommand;
 use roost_agent::Agent;
 use roost_agent_install::{
-    agent_names, ensure, install, skip_list, status, uninstall, AgentSkip, Guard, Home, Mode,
-    Outcome, Status, ALL_AGENTS,
+    ensure, install, status, uninstall, AgentSkip, Guard, Home, Mode, Outcome, Status, ALL_AGENTS,
 };
 use roost_ui_model::config::{AgentHooks, RoostConfig};
 
@@ -75,10 +74,25 @@ pub fn run(cmd: &AgentCmd) -> i32 {
     let guard = Guard::from_env();
 
     match cmd {
-        AgentCmd::Ensure { json } => {
-            let (mode, skip) = configured();
-            report(ensure(&home, mode, &skip, BY, guard), *json)
-        }
+        AgentCmd::Ensure { json } => match configured() {
+            Some((mode, skip)) => report(ensure(&home, mode, &skip, BY, guard), *json),
+            None => {
+                // `--json` is a machine contract — the Mac app spawns
+                // exactly this and decodes stdout — so the unconfigured
+                // path answers in the shape an ensure would (an empty
+                // outcome) and puts its one human sentence on stderr,
+                // rather than breaking the decode with prose.
+                let note = "agent-hooks is not configured; nothing was wired. Choose agents \
+                            in Roost (Agent Hooks… in the command palette).";
+                if *json {
+                    println!("{}", outcome_json(&Outcome::default()));
+                    eprintln!("{note}");
+                } else {
+                    println!("{note}");
+                }
+                0
+            }
+        },
         AgentCmd::Install { agent, all } => match targets(agent.as_deref(), *all) {
             Ok(agents) => report(install(&home, &agents, BY, guard), false),
             Err(code) => code,
@@ -122,25 +136,31 @@ pub fn run(cmd: &AgentCmd) -> i32 {
     }
 }
 
-/// `agent-hooks` / `agent-hooks-skip`, as `ensure` wants them.
+/// `agent-hooks`, as `ensure` wants it — `None` when nobody has answered
+/// the consent dialog yet (plan 064), which `Ensure` reports rather than
+/// wiring or unwiring anything.
 ///
-/// A skip name no agent answers to is reported and otherwise ignored:
-/// refusing to run would turn one typo into "no agent is wired and
-/// nothing says why", and silence would do the same without the line.
-fn configured() -> (Mode, Vec<Agent>) {
+/// `Allow(names)` maps onto the still-two-state engine as `Mode::Auto`
+/// with every agent *not* named skipped: every name in the list is
+/// already validated by [`AgentHooks::parse`] against
+/// [`roost_ui_model::config::AGENT_NAMES`], so there is no unrecognised-
+/// name path to report here (contrast the retired `agent-hooks-skip`,
+/// which had one).
+fn configured() -> Option<(Mode, Vec<Agent>)> {
     let config = RoostConfig::load_default();
-    let (skip, unknown) = skip_list(config.agent_hooks_skip.iter().map(String::as_str));
-    for name in unknown {
-        eprintln!(
-            "roostctl agent: agent-hooks-skip: no agent named {name:?} ({})",
-            agent_names()
-        );
+    match config.agent_hooks {
+        AgentHooks::Allow(names) => {
+            let allowed: Vec<Agent> = names.iter().filter_map(|name| Agent::parse(name)).collect();
+            let skip: Vec<Agent> = ALL_AGENTS
+                .iter()
+                .copied()
+                .filter(|agent| !allowed.contains(agent))
+                .collect();
+            Some((Mode::Auto, skip))
+        }
+        AgentHooks::Off => Some((Mode::Off, Vec::new())),
+        AgentHooks::Ask => None,
     }
-    let mode = match config.agent_hooks {
-        AgentHooks::Auto => Mode::Auto,
-        AgentHooks::Off => Mode::Off,
-    };
-    (mode, skip)
 }
 
 fn targets(agent: Option<&str>, all: bool) -> Result<Vec<Agent>, i32> {
@@ -320,6 +340,21 @@ mod tests {
         Wrapper::try_parse_from(std::iter::once("agent").chain(args.iter().copied()))
             .unwrap()
             .cmd
+    }
+
+    /// `roost_ui_model::config::AGENT_NAMES` cannot depend on
+    /// `roost-agent-install` (it would pull the install engine into
+    /// every consumer of the config parser), so the dialog's row order
+    /// and the install engine's agent inventory are two separately
+    /// maintained tables. This crate is the one place both are already
+    /// linked, so it is where drift between them gets caught.
+    #[test]
+    fn the_config_name_table_matches_the_agent_inventory() {
+        let inventory: Vec<&str> = roost_agent_install::ALL_AGENTS
+            .iter()
+            .map(|a| a.source())
+            .collect();
+        assert_eq!(roost_ui_model::config::AGENT_NAMES.to_vec(), inventory);
     }
 
     #[test]

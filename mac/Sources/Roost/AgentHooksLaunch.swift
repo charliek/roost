@@ -31,6 +31,11 @@ import Foundation
 enum AgentHooksLaunchPlan: Equatable {
     /// `agent-hooks = off` — Roost wires nothing at launch.
     case disabledByConfig
+    /// `agent-hooks` is unconfigured (plan 064) — nobody has answered
+    /// the consent dialog yet, so nothing is wired and nothing already
+    /// wired is touched. C8 turns this into "show the dialog"; here it
+    /// is the same no-op shape as `.disabledByConfig`.
+    case notConfigured
     /// No `roostctl` to run (a `swift run` dev build with no embedded
     /// CLI). Nothing to do, and nothing wrong.
     case noRoostctl
@@ -40,9 +45,13 @@ enum AgentHooksLaunchPlan: Equatable {
 /// The `roostctl agent ensure` invocation for this launch, or the reason
 /// there isn't one.
 func agentHooksLaunchPlan(mode: AgentHooks, roostctl: String?) -> AgentHooksLaunchPlan {
-    if mode == .off { return .disabledByConfig }
-    guard let roostctl else { return .noRoostctl }
-    return .run(argv: [roostctl, "agent", "ensure", "--json"])
+    switch mode {
+    case .off: return .disabledByConfig
+    case .ask: return .notConfigured
+    case .allow:
+        guard let roostctl else { return .noRoostctl }
+        return .run(argv: [roostctl, "agent", "ensure", "--json"])
+    }
 }
 
 /// How long the spawned `roostctl` gets before it is terminated. The
@@ -71,10 +80,16 @@ func startAgentHooksEnsure(
         log("agent hooks: agent-hooks = off; not wiring")
         return
     }
+    if mode == .ask {
+        log("agent hooks: agent-hooks is not configured; not wiring")
+        return
+    }
     DispatchQueue.global(qos: .utility).async {
         switch agentHooksLaunchPlan(mode: mode, roostctl: roostctl()) {
         case .disabledByConfig:
             log("agent hooks: agent-hooks = off; not wiring")
+        case .notConfigured:
+            log("agent hooks: agent-hooks is not configured; not wiring")
         case .noRoostctl:
             log("agent hooks: no bundled roostctl; not wiring")
         case .run(let argv):

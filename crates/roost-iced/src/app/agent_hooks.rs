@@ -31,7 +31,7 @@
 use roost_agent::Agent;
 use roost_agent_install::{Guard, Home, Mode};
 use roost_ipc::messages::{AgentHooksMode, SessionSetAgentHooksResult};
-use roost_ui_model::config::{AgentHooks, RoostConfig};
+use roost_ui_model::config::{AgentHooks, RoostConfig, AGENT_NAMES};
 
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
 use crate::host_conn::queue::HostOpError;
@@ -53,16 +53,29 @@ pub(crate) struct AgentHooksEnsured {
     pub errors: Vec<String>,
 }
 
-/// The mode and skip list `config.conf` asks for, plus any skip name no
-/// agent answers to.
-fn resolve(config: &RoostConfig) -> (Mode, Vec<Agent>, Vec<String>) {
-    let (skip, unknown) =
-        roost_agent_install::skip_list(config.agent_hooks_skip.iter().map(String::as_str));
-    let mode = match config.agent_hooks {
-        AgentHooks::Auto => Mode::Auto,
-        AgentHooks::Off => Mode::Off,
-    };
-    (mode, skip, unknown)
+/// The mode and skip list `config.conf` asks for, or `None` when nobody
+/// has answered the consent dialog yet (plan 064) — the caller must wire
+/// and unwire nothing in that case, not guess.
+///
+/// `Allow(names)` maps onto the still-two-state engine as `Mode::Auto`
+/// with every agent *not* named skipped. Every name is already validated
+/// against `roost_ui_model::config::AGENT_NAMES` by the parser, so
+/// there is no unrecognised-name path to report here (contrast the
+/// retired `agent-hooks-skip`, which had one).
+fn resolve(config: &RoostConfig) -> Option<(Mode, Vec<Agent>)> {
+    match &config.agent_hooks {
+        AgentHooks::Allow(names) => {
+            let allowed: Vec<Agent> = names.iter().filter_map(|name| Agent::parse(name)).collect();
+            let skip: Vec<Agent> = roost_agent_install::ALL_AGENTS
+                .iter()
+                .copied()
+                .filter(|agent| !allowed.contains(agent))
+                .collect();
+            Some((Mode::Auto, skip))
+        }
+        AgentHooks::Off => Some((Mode::Off, Vec::new())),
+        AgentHooks::Ask => None,
+    }
 }
 
 /// What a `window_opened` should do about the startup ensure.
@@ -71,6 +84,10 @@ pub(crate) enum Start {
     Run,
     /// `agent-hooks = off`.
     Off,
+    /// Nobody has answered the consent dialog yet (plan 064) — the same
+    /// non-decision as `Off` for the purposes of this latch, but a
+    /// distinct reason worth telling apart in a log line.
+    Ask,
     /// Already run once in this process.
     Already,
 }
@@ -83,16 +100,24 @@ pub(crate) enum Start {
 /// hand would watch Roost put it back for the crime of clicking on the
 /// window. The plan says startup, so the latch says startup: it is
 /// claimed only when the ensure actually starts, which leaves the `off`
-/// case free to be reconsidered if a later launch ever re-reads config.
-pub(crate) fn claim_start(started: &mut bool, mode: Mode) -> Start {
-    if mode == Mode::Off {
-        return Start::Off;
+/// and `ask` cases free to be reconsidered if a later launch ever
+/// re-reads config.
+///
+/// `resolved` is `None` for `Ask` — [`resolve`]'s shape, carried through
+/// rather than re-derived, so this function cannot itself decide to run
+/// an ensure `resolve` said not to.
+pub(crate) fn claim_start(started: &mut bool, resolved: Option<Mode>) -> Start {
+    match resolved {
+        None => Start::Ask,
+        Some(Mode::Off) => Start::Off,
+        Some(Mode::Auto) => {
+            if *started {
+                return Start::Already;
+            }
+            *started = true;
+            Start::Run
+        }
     }
-    if *started {
-        return Start::Already;
-    }
-    *started = true;
-    Start::Run
 }
 
 /// Start the startup ensure, or decline to.
@@ -108,22 +133,23 @@ pub(crate) fn spawn_ensure(
     feed: &EngineFeedSender,
     config: &RoostConfig,
 ) {
-    let (mode, skip, unknown) = resolve(config);
-    match claim_start(started, mode) {
-        Start::Run => {}
+    let resolved = resolve(config);
+    let skip = match claim_start(started, resolved.as_ref().map(|(mode, _)| *mode)) {
+        Start::Run => {
+            resolved
+                .expect("Start::Run implies resolve() returned Some")
+                .1
+        }
         Start::Off => {
             tracing::debug!("agent-hooks = off: not wiring agent hooks");
             return;
         }
+        Start::Ask => {
+            tracing::debug!("agent-hooks is not configured; not wiring agent hooks");
+            return;
+        }
         Start::Already => return,
-    }
-    for name in unknown {
-        tracing::warn!(
-            name,
-            known = %roost_agent_install::agent_names(),
-            "agent-hooks-skip names no agent Roost knows how to wire"
-        );
-    }
+    };
 
     let feed = feed.clone();
     let guard = Guard::from_env();
@@ -190,28 +216,47 @@ pub(crate) struct HostAgentHooks {
     pub outcome: Result<SessionSetAgentHooksResult, HostOpError>,
 }
 
-/// What this client asks a host to do, read fresh from its config.
+/// What this client asks a host to do, read fresh from its config, or
+/// `None` to send nothing at all.
 ///
-/// Sent on **every** connect, values and all: the op is idempotent, and
-/// a config edit made since the last connect has no other way to reach
-/// the host.
+/// Sent on **every** connect, values and all, when there is a decision
+/// to send: the op is idempotent, and a config edit made since the last
+/// connect has no other way to reach the host.
 ///
-/// **`off` is not silence here.** Locally it means "wire nothing" and
-/// the UI never opens an agent's file; remotely it means "unwire", and
-/// the difference is not an inconsistency — a host has no `config.conf`
-/// of its own, so the client is the only authority that can tell it to
-/// come clean. Off is off everywhere (§3.4, and §3.6's C7 amendment for
-/// the local half).
+/// **`Ask` sends nothing — deliberately, not yet the full C4 raise
+/// semantics.** An unconfigured client has not been told which agents it
+/// may touch; wiring a host's dotfiles anyway would be exactly the
+/// unconsented write plan 064 exists to stop, so `wire_host_agent_hooks`
+/// (the one caller) skips the send entirely rather than mapping `Ask` to
+/// `Auto`. What C4 adds on top of this is host state raising an
+/// unconfigured client's *local* dialog; this commit only has to make
+/// sure that client stays silent toward the host until then.
 ///
-/// The skip list travels as the user typed it. The host resolves the
-/// names and reports the ones it does not know, which is the only place
-/// that can tell a typo from an agent a newer client knows about.
-pub(crate) fn remote_request(config: &RoostConfig) -> (AgentHooksMode, Vec<String>) {
-    let mode = match config.agent_hooks {
-        AgentHooks::Auto => AgentHooksMode::Auto,
-        AgentHooks::Off => AgentHooksMode::Off,
-    };
-    (mode, config.agent_hooks_skip.clone())
+/// `Off`, by contrast, still travels rather than staying silent: locally
+/// it means "wire nothing" and the UI never opens an agent's file;
+/// remotely it means "unwire", and the difference is not an
+/// inconsistency — a host has no `config.conf` of its own, so an
+/// explicitly-off client is the only authority that can tell it to come
+/// clean (§3.4, and §3.6's C7 amendment for the local half).
+///
+/// `Allow`'s skip list travels as the complement of the allowed names,
+/// spelled out rather than sent as an allow-list: the wire shape still
+/// carries mode+skip at this commit (C3 reshapes it). The host resolves
+/// the names and reports the ones it does not know, which is the only
+/// place that can tell a typo from an agent a newer client knows about.
+pub(crate) fn remote_request(config: &RoostConfig) -> Option<(AgentHooksMode, Vec<String>)> {
+    match &config.agent_hooks {
+        AgentHooks::Allow(names) => {
+            let skip: Vec<String> = AGENT_NAMES
+                .iter()
+                .filter(|name| !names.iter().any(|n| n == *name))
+                .map(|name| name.to_string())
+                .collect();
+            Some((AgentHooksMode::Auto, skip))
+        }
+        AgentHooks::Off => Some((AgentHooksMode::Off, Vec::new())),
+        AgentHooks::Ask => None,
+    }
 }
 
 /// How this client names itself in a host's state record.
@@ -292,22 +337,26 @@ mod tests {
         assert_eq!(unknown, vec!["gemini"]);
     }
 
+    /// `Ask` — the default — resolves to `None`: nobody has consented
+    /// yet, so `spawn_ensure` must not wire anything.
     #[test]
-    fn the_default_config_wires_everything() {
-        let (mode, skip, unknown) = resolve(&config(""));
-        assert_eq!(mode, Mode::Auto);
-        assert!(skip.is_empty());
-        assert!(unknown.is_empty());
+    fn an_unconfigured_config_resolves_to_none() {
+        assert_eq!(resolve(&config("")), None);
     }
 
     #[test]
-    fn off_and_the_skip_list_reach_the_engine() {
-        let (mode, skip, unknown) = resolve(&config(
-            "agent-hooks = off\nagent-hooks-skip = cursor, gemini",
-        ));
+    fn an_allow_list_wires_only_the_named_agents() {
+        let (mode, skip) = resolve(&config("agent-hooks = claude, cursor")).unwrap();
+        assert_eq!(mode, Mode::Auto);
+        // Every other agent is skipped, in `ALL_AGENTS` order.
+        assert_eq!(skip, vec![Agent::Codex, Agent::Grok, Agent::Opencode]);
+    }
+
+    #[test]
+    fn off_resolves_with_nothing_skipped() {
+        let (mode, skip) = resolve(&config("agent-hooks = off")).unwrap();
         assert_eq!(mode, Mode::Off);
-        assert_eq!(skip, vec![Agent::Cursor]);
-        assert_eq!(unknown, vec!["gemini"]);
+        assert!(skip.is_empty());
     }
 
     /// The remote half sends `off` rather than staying quiet, which is
@@ -315,18 +364,24 @@ mod tests {
     /// its own to read, so silence would leave its files wired forever.
     #[test]
     fn off_travels_to_a_host_instead_of_being_withheld() {
-        let (mode, skip) = remote_request(&config(
-            "agent-hooks = off\nagent-hooks-skip = cursor, gemini",
-        ));
+        let (mode, skip) = remote_request(&config("agent-hooks = off")).unwrap();
         assert_eq!(mode, AgentHooksMode::Off);
-        // Unresolved on purpose: only the host can say which names it
-        // knows, and a client that dropped `gemini` here would leave the
-        // typo undiagnosable from either end.
-        assert_eq!(skip, vec!["cursor".to_string(), "gemini".to_string()]);
-
-        let (mode, skip) = remote_request(&config(""));
-        assert_eq!(mode, AgentHooksMode::Auto);
         assert!(skip.is_empty());
+    }
+
+    #[test]
+    fn an_allow_list_travels_as_the_complement_skip_list() {
+        let (mode, skip) = remote_request(&config("agent-hooks = claude, cursor")).unwrap();
+        assert_eq!(mode, AgentHooksMode::Auto);
+        assert_eq!(skip, vec!["codex", "grok", "opencode"]);
+    }
+
+    /// `Ask` sends nothing at all — the deliberate deviation from "off is
+    /// off everywhere" that plan 064 draws: an unconfigured client must
+    /// not wire a host's dotfiles either.
+    #[test]
+    fn an_unconfigured_config_sends_nothing_to_a_host() {
+        assert_eq!(remote_request(&config("")), None);
     }
 
     /// It goes into the host's state record, so it has to be a name and
@@ -375,12 +430,12 @@ mod tests {
     #[test]
     fn the_startup_ensure_runs_once_per_process() {
         let mut started = false;
-        assert_eq!(claim_start(&mut started, Mode::Auto), Start::Run);
+        assert_eq!(claim_start(&mut started, Some(Mode::Auto)), Start::Run);
         assert!(started);
         // The second window event is the focus that follows the open;
         // the third is an ordinary Alt-Tab. Neither may wire anything.
-        assert_eq!(claim_start(&mut started, Mode::Auto), Start::Already);
-        assert_eq!(claim_start(&mut started, Mode::Auto), Start::Already);
+        assert_eq!(claim_start(&mut started, Some(Mode::Auto)), Start::Already);
+        assert_eq!(claim_start(&mut started, Some(Mode::Auto)), Start::Already);
     }
 
     /// `off` declines without consuming the latch: the two answers are
@@ -388,8 +443,19 @@ mod tests {
     #[test]
     fn off_declines_without_claiming_the_latch() {
         let mut started = false;
-        assert_eq!(claim_start(&mut started, Mode::Off), Start::Off);
+        assert_eq!(claim_start(&mut started, Some(Mode::Off)), Start::Off);
         assert!(!started);
-        assert_eq!(claim_start(&mut started, Mode::Auto), Start::Run);
+        assert_eq!(claim_start(&mut started, Some(Mode::Auto)), Start::Run);
+    }
+
+    /// `ask` — `resolve` returning `None` — declines the same way `off`
+    /// does: neither claims the latch, and the two must stay tellable
+    /// apart in the log line each produces.
+    #[test]
+    fn ask_declines_without_claiming_the_latch() {
+        let mut started = false;
+        assert_eq!(claim_start(&mut started, None), Start::Ask);
+        assert!(!started);
+        assert_eq!(claim_start(&mut started, Some(Mode::Auto)), Start::Run);
     }
 }

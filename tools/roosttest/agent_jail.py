@@ -65,8 +65,7 @@ class Jail:
         self,
         root,
         *,
-        agent_hooks: str = "auto",
-        skip: str | None = None,
+        agent_hooks: str = ", ".join(INSTALLABLE_AGENTS),
         present=INSTALLABLE_AGENTS,
     ):
         self.root = root.resolve()
@@ -84,7 +83,7 @@ class Jail:
             self.agent_dirs[name].mkdir(parents=True, exist_ok=True)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         make_private_runtime_dir(self.runtime_dir)
-        self.write_config(agent_hooks=agent_hooks, skip=skip)
+        self.write_config(agent_hooks=agent_hooks)
 
         self.env = {
             "HOME": str(self.home),
@@ -95,12 +94,9 @@ class Jail:
             },
         }
 
-    def write_config(self, *, agent_hooks: str, skip: str | None = None) -> None:
+    def write_config(self, *, agent_hooks: str) -> None:
         self.config.parent.mkdir(parents=True, exist_ok=True)
-        body = f"agent-hooks = {agent_hooks}\n"
-        if skip is not None:
-            body += f"agent-hooks-skip = {skip}\n"
-        self.config.write_text(body)
+        self.config.write_text(f"agent-hooks = {agent_hooks}\n")
 
     def assert_jailed(self, env: dict) -> None:
         """Every jail variable is set, absolute, and inside this root.

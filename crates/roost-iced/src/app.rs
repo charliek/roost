@@ -3144,8 +3144,15 @@ impl App {
     /// when the connection was opened: a reconnect after the user edited
     /// `agent-hooks` has to carry the new answer, and this is the only
     /// place that runs on both the first connect and every retry.
+    ///
+    /// `None` (plan 064: `agent-hooks` is unconfigured, `Ask`) sends
+    /// nothing — an unconfigured client must not wire a host's dotfiles
+    /// either, so this connect is silent rather than defaulting to
+    /// `Auto`.
     fn wire_host_agent_hooks(&mut self, host: &str) {
-        let (mode, skip) = agent_hooks::remote_request(&self.config);
+        let Some((mode, skip)) = agent_hooks::remote_request(&self.config) else {
+            return;
+        };
         self.hosts
             .wire_agent_hooks(host, mode, &skip, &agent_hooks::client_label());
     }

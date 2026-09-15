@@ -843,29 +843,6 @@ def test_agent_hooks_off_wires_nothing_and_unwires_on_request(tmp_path):
     assert not hooks.exists() or "ROOST_AGENT_HOOK" not in hooks.read_text()
 
 
-def test_agent_hooks_skip_is_honoured_and_a_typo_is_reported(tmp_path):
-    """`agent-hooks-skip` keeps a named agent unwired; a name no agent
-    answers to is reported on stderr and otherwise ignored.
-
-    Ignoring it is the deliberate half: refusing to run would turn one
-    typo into "nothing is wired and nothing says why", and a newer
-    Roost's agent name must not break an older one's config."""
-    jail = Jail(tmp_path, skip="codex, gemini")
-
-    outcome = ensure_json(jail)
-    assert "codex" not in outcome["wired"], outcome
-    assert sorted(outcome["wired"]) == sorted(
-        a for a in INSTALLABLE_AGENTS if a != "codex"
-    ), outcome
-    skipped = {row["agent"]: row["reason"] for row in outcome["skipped"]}
-    assert "codex" in skipped, outcome
-    assert not (jail.agent_dirs["codex"] / "hooks.json").exists()
-    assert "codex" not in jail.read_record()
-
-    done = run_agent(jail, "ensure")
-    assert "gemini" in done.stderr, done.stderr
-
-
 def test_the_test_mode_fence_refuses_without_the_override(tmp_path):
     """`ROOST_TEST_MODE=1` alone must stop the install engine dead.
 
