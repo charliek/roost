@@ -19,12 +19,24 @@ actor IPCHandlerImpl: IPCHandler {
     private let appLabel: String
     private let appID: String
 
+    /// How `agent.set_hooks` reaches the install engine. Injected so a
+    /// test can watch what this handler spawns without a `roostctl` and
+    /// without touching a real dotfile.
+    private let agentHooks: AgentHooksRunner
+
     @MainActor
-    init(client: LocalClient, socketPath: String, appLabel: String, appID: String) {
+    init(
+        client: LocalClient,
+        socketPath: String,
+        appLabel: String,
+        appID: String,
+        agentHooks: AgentHooksRunner = .bundled
+    ) {
         self.client = client
         self.socketPath = socketPath
         self.appLabel = appLabel
         self.appID = appID
+        self.agentHooks = agentHooks
     }
 
     func handle(op: String, params: AnyCodable?) async throws -> AnyCodable? {
@@ -142,6 +154,8 @@ actor IPCHandlerImpl: IPCHandler {
             return try await encodeResult(self.appCursorShape(params: params))
         case "app.notification_status":
             return try await encodeResult(self.appNotificationStatus(params: params))
+        case "agent.set_hooks":
+            return try await encodeResult(self.agentSetHooks(params: params))
         case "events.subscribe":
             // Honest failure rather than a false ACK: the server never
             // pushes events on the connection yet, so a client that
@@ -902,6 +916,42 @@ actor IPCHandlerImpl: IPCHandler {
             reason: status.reason,
             authorized: status.authorized
         )
+    }
+
+    // MARK: agent hooks
+
+    /// `agent.set_hooks` — set this machine's own `agent-hooks` key and
+    /// reconcile its files (plan 064 §3.4).
+    ///
+    /// Not `@MainActor`: it touches no workspace state, and the one
+    /// thing it does do is wait on a child process holding an advisory
+    /// lock.
+    ///
+    /// `hosts` is always empty. The Mac app holds no host connections —
+    /// it answers `unknown-op` to every `host.*` op — so there is never
+    /// anything to raise, and the field is on the reply because the
+    /// shape is shared with the Linux UI.
+    private func agentSetHooks(params: AnyCodable?) async throws -> IPCAgentSetHooksResult {
+        let p = try decodeParams(
+            params, as: IPCAgentSetHooksParams.self, expected: ["agents"]
+        )
+        let spec: String
+        switch agentHooksSetSpec(p.agents) {
+        case .success(let resolved): spec = resolved
+        case .failure(let error): throw IPCHandlerError.invalidParam(error.message)
+        }
+        let runner = agentHooks
+        guard let roostctl = runner.roostctl() else {
+            throw IPCHandlerError.internalError(
+                "no bundled roostctl: this build cannot set agent-hooks")
+        }
+        let command = agentHooksSetCommand(
+            roostctl: roostctl, spec: spec, environment: runner.environment())
+        let outcome = await agentHooksRunOffPool(command, using: runner)
+        switch agentHooksSetReply(outcome) {
+        case .success(let reply): return reply
+        case .failure(let error): throw IPCHandlerError.internalError(error.message)
+        }
     }
 
     @MainActor

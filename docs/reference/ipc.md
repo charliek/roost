@@ -1752,9 +1752,17 @@ reads that same `config.conf`. Raising it would be the UI raising
 itself — and since a raise can only ever widen, a local "switch codex
 off" would come straight back on that session's next connect.
 
-Served by the UI socket only. The Linux (iced) UI serves it; the Mac
-app's implementation is plan 064 C8, and until it lands that UI answers
-whatever its `unknown-op` shape already is for an unimplemented op.
+Served by the UI socket only, by both UIs. The Linux (iced) UI links
+the install engine and does the work in process. The Mac app has no
+Swift binding for it, so it spawns `roostctl agent set --local <list|off>
+--json` — the same binary, the same `config.conf`, the same state record
+— and answers from that JSON, with this app's own `HOME` and
+`ROOST_CONFIG` handed to the child so it cannot resolve a different
+config file. `hosts` is always `[]` there: the Mac app holds no host
+connections and answers `unknown-op` to every `host.*` op. One further
+consequence of spawning the CLI: its `wired` is *this run's* writes
+rather than the record's never-announced list, because that is what the
+CLI can honestly report.
 
 ### Command palette (`palette.*`)
 

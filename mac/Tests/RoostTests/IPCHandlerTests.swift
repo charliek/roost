@@ -627,3 +627,176 @@ struct IPCAppNotificationStatusResultTests {
         #expect(obj?["authorized"] as? Bool == false)
     }
 }
+
+/// `agent.set_hooks` — the Mac's half of plan 064 §3.4.
+///
+/// The op spawns exactly one `roostctl agent set --local … --json` and
+/// answers from its JSON. The handler's runner is injected, so these
+/// never reach a real `roostctl` or a real dotfile.
+@Suite("IPC handler: agent.set_hooks")
+struct IPCHandlerAgentSetHooksTests {
+    private let socket = "/tmp/roost-ipc-agent-set-hooks-test.sock"
+
+    @MainActor
+    private func makeHandler(_ log: AgentHooksSpawnLog) -> IPCHandlerImpl {
+        let workspace = Workspace()
+        let supervisor = PtySupervisor()
+        let client = LocalClient(
+            workspace: workspace, supervisor: supervisor, socketPath: socket)
+        return IPCHandlerImpl(
+            client: client,
+            socketPath: socket,
+            appLabel: "Roost-test",
+            appID: "ai.stridelabs.Roost.test",
+            agentHooks: log.runner
+        )
+    }
+
+    /// One writer, one spawn — and the two variables that decide which
+    /// `config.conf` the child writes go with it.
+    @Test func aListSpawnsOneLocalSetAndAnswersFromItsJSON() async throws {
+        let log = AgentHooksSpawnLog(
+            roostctl: "/bin/roostctl",
+            reply: { _ in
+                AgentHooksRun(
+                    status: 0,
+                    stdout: """
+                        {"wired":["claude"],"refreshed":["codex"],"current":[],"removed":[],\
+                        "skipped":[{"agent":"grok","reason":"not installed"}],\
+                        "warnings":[],"errors":[]}
+                        """)
+            })
+        let handler = await makeHandler(log)
+
+        let result = try await handler.handle(
+            op: "agent.set_hooks",
+            params: AnyCodable(["agents": ["claude", "codex"]])
+        )
+
+        let spawned = log.commands()
+        #expect(spawned.count == 1, "expected exactly one spawn, got \(spawned.count)")
+        #expect(
+            spawned.first?.argv == [
+                "/bin/roostctl", "agent", "set", "--local", "claude,codex", "--json",
+            ])
+        #expect(spawned.first?.environment["HOME"] == "/home/test-u")
+        #expect(spawned.first?.environment["ROOST_CONFIG"] == "/tmp/roost-test/config.conf")
+
+        let body = result?.value as? [String: Any]
+        let local = body?["local"] as? [String: Any]
+        #expect(local?["wired"] as? [String] == ["claude"])
+        #expect(local?["refreshed"] as? [String] == ["codex"])
+        #expect((local?["skipped"] as? [[String: Any]])?.first?["agent"] as? String == "grok")
+        #expect((body?["config_path"] as? String)?.isEmpty == false)
+        // The Mac holds no host connections, so the raise list is always
+        // empty — the field is on the reply because the shape is shared.
+        #expect((body?["hosts"] as? [Any])?.isEmpty == true)
+    }
+
+    /// The spec is the inventory's order, not the caller's: the same
+    /// answer however a client spells the list, and the same spec the
+    /// iced UI resolves that list to. Case and duplicates normalise
+    /// along the way, as they do on the Rust side.
+    @Test func theSpecIsInInventoryOrderWhateverOrderTheCallerSent() async throws {
+        let log = AgentHooksSpawnLog(
+            roostctl: "/bin/roostctl",
+            reply: { _ in
+                AgentHooksRun(
+                    status: 0,
+                    stdout: """
+                        {"wired":[],"refreshed":[],"current":[],"removed":[],\
+                        "skipped":[],"warnings":[],"errors":[]}
+                        """)
+            })
+        let handler = await makeHandler(log)
+
+        _ = try await handler.handle(
+            op: "agent.set_hooks",
+            params: AnyCodable(["agents": ["opencode", "CLAUDE", "codex", "claude"]])
+        )
+
+        #expect(
+            log.commands().first?.argv == [
+                "/bin/roostctl", "agent", "set", "--local", "claude,codex,opencode", "--json",
+            ])
+    }
+
+    @Test func offTravelsAsTheWordAndNotAnEmptyList() async throws {
+        let log = AgentHooksSpawnLog(
+            roostctl: "/bin/roostctl",
+            reply: { _ in
+                AgentHooksRun(
+                    status: 0,
+                    stdout: """
+                        {"wired":[],"refreshed":[],"current":[],"removed":["claude"],\
+                        "skipped":[],"warnings":[],"errors":[]}
+                        """)
+            })
+        let handler = await makeHandler(log)
+
+        let result = try await handler.handle(
+            op: "agent.set_hooks", params: AnyCodable(["agents": "off"]))
+
+        #expect(
+            log.commands().first?.argv == [
+                "/bin/roostctl", "agent", "set", "--local", "off", "--json",
+            ])
+        let local = (result?.value as? [String: Any])?["local"] as? [String: Any]
+        #expect(local?["removed"] as? [String] == ["claude"])
+    }
+
+    /// Refused before anything is written, and matching the iced side's
+    /// rule exactly: a consent answer has no honest partial reading.
+    @Test func anEmptyListAndAnUnknownNameAreBothRefusedWithoutSpawning() async {
+        let log = AgentHooksSpawnLog(roostctl: "/bin/roostctl")
+        let handler = await makeHandler(log)
+
+        for agents in [[String](), ["claude", "gemini"], [""]] {
+            await expectError(
+                "invalid-param", "agent.set_hooks", AnyCodable(["agents": agents]), on: handler)
+        }
+        // A string that is not the one word this field means is a decode
+        // failure, not a silent `off`.
+        await expectError(
+            "invalid-param", "agent.set_hooks", AnyCodable(["agents": "none"]), on: handler)
+        #expect(log.commands().isEmpty, "a refused request still reached roostctl")
+    }
+
+    /// A whole-run failure — no outcome printed at all — is an error
+    /// frame; a per-agent failure riding inside a printed outcome is not.
+    @Test func aRunThatPrintedNoOutcomeIsAnErrorFrame() async {
+        let log = AgentHooksSpawnLog(
+            roostctl: "/bin/roostctl",
+            reply: { _ in AgentHooksRun(status: 1, stderr: "roostctl agent: no $HOME") })
+        let handler = await makeHandler(log)
+        await expectError(
+            "internal", "agent.set_hooks", AnyCodable(["agents": ["claude"]]), on: handler)
+    }
+
+    @Test func aPerAgentFailureRidesInsideASuccessfulReply() async throws {
+        let log = AgentHooksSpawnLog(
+            roostctl: "/bin/roostctl",
+            reply: { _ in
+                AgentHooksRun(
+                    status: 1,
+                    stdout: """
+                        {"wired":[],"refreshed":[],"current":[],"removed":[],"skipped":[],\
+                        "warnings":[],"errors":[{"agent":"codex","error":"bad config.toml"}]}
+                        """)
+            })
+        let handler = await makeHandler(log)
+        let result = try await handler.handle(
+            op: "agent.set_hooks", params: AnyCodable(["agents": ["codex"]]))
+        let errors =
+            ((result?.value as? [String: Any])?["local"] as? [String: Any])?["errors"]
+            as? [[String: Any]]
+        #expect(errors?.first?["agent"] as? String == "codex")
+    }
+
+    @Test func unknownParamFieldsAreStillRejected() async {
+        let handler = await makeHandler(AgentHooksSpawnLog(roostctl: "/bin/roostctl"))
+        await expectError(
+            "unknown-field", "agent.set_hooks",
+            AnyCodable(["agents": ["claude"], "client": "roostctl"]), on: handler)
+    }
+}

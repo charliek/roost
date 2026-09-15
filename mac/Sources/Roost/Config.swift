@@ -313,6 +313,34 @@ struct RoostConfig: Sendable {
         return cfg
     }
 
+    /// The `agent-hooks` key as it is on disk **right now**.
+    ///
+    /// This process is not the key's only writer — `roostctl agent set
+    /// --local` writes it with no UI running at all, and a connecting
+    /// client can raise this machine through its own `roost-session` —
+    /// so anything that turns on the key's current value reads it back
+    /// instead of trusting a snapshot.
+    ///
+    /// One small file read and a parse rather than [`load`], which also
+    /// walks the providers directory: this answers one key, and it is
+    /// answered at moments (a finished Apply, a finished status walk)
+    /// where the main thread is waiting for the hop back. Absent is
+    /// `.ask` — unanswered is a real state, not a failure, and is what a
+    /// machine nobody has consented on looks like. A file that exists
+    /// and cannot be read falls back to what the caller already
+    /// believes, because failing to read is not a reason to say
+    /// something different.
+    ///
+    /// Mirrors `crates/roost-iced/src/app/agent_hooks.rs::hooks_on_disk`.
+    static func agentHooksOnDisk(
+        fallback: AgentHooks = .ask, at path: URL = defaultPath()
+    ) -> AgentHooks {
+        guard let text = try? String(contentsOf: path, encoding: .utf8) else {
+            return FileManager.default.fileExists(atPath: path.path) ? fallback : .ask
+        }
+        return parse(text).agentHooks
+    }
+
     /// `~/.config/roost/config.conf` — XDG-style even on macOS, by
     /// deliberate divergence from Apple HIG (matches Ghostty / nvim
     /// / fish / the Linux UI's behavior). `ROOST_CONFIG` overrides it

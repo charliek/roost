@@ -50,6 +50,13 @@ enum KeybindAction {
     /// sidebar (plan 007 §3.7). Default ⌘⇧A on Mac, Alt+Shift+A on
     /// Linux.
     static let toggleSidebarAgents = "toggle_sidebar_agents"
+    /// The agent-hooks consent sheet, reopened (plan 064 §3.5).
+    /// **Deliberately unbound by default**: it is a settings surface
+    /// reached by name from the command palette, and spending an
+    /// accelerator on it would cost one the user could give to
+    /// something they do every day. Peer of iced's
+    /// `KeybindAction::AgentHooks`.
+    static let agentHooks = "agent_hooks"
     /// Phase 6a P7: jump to the next unread (notified) tab
     /// (cmux-inspired ⌘⇧U convention).
     static let jumpToUnread  = "jump_to_unread"
@@ -81,7 +88,7 @@ enum KeybindAction {
         newTab, closeTab, renameTab, cycleTabPrev, cycleTabNext,
         paste, copy, newProject, renameProject, closeProject,
         fontIncrease, fontDecrease, fontReset, toggleSidebar,
-        toggleSidebarAgents,
+        toggleSidebarAgents, agentHooks,
         jumpToUnread, commandPalette, commandLauncher, customPalette,
         agentPalette,
     ]

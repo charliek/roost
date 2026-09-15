@@ -271,6 +271,11 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// + font selection.
     private var config: RoostConfig = .empty
 
+    /// Whether the agent-hooks consent sheet is on screen (plan 064
+    /// §3.5). The launch probe and a palette activation can finish at
+    /// the same moment, and only one of them gets the window.
+    private var agentHooksSheetOpen = false
+
     /// Resolved keybind table — `(keyEquivalent, modifierMask) →
     /// action`. Built from `defaultBindingsMac()` layered with
     /// `config.keybinds` via `canonicalizeBindings`. Phase 6a P1
@@ -703,8 +708,160 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
         // Last, and off this thread: `roostctl agent ensure` writes into
         // the user's agent dotfiles under an advisory lock, which is not
-        // something AppKit may wait on (plan 046 §3.7).
-        startAgentHooksEnsure(config: config)
+        // something AppKit may wait on (plan 046 §3.7). An unanswered
+        // `agent-hooks` writes nothing and asks instead (plan 064 §3.5).
+        startAgentHooksLaunch(config: config) { [weak self] found in
+            self?.agentHooksSurveyed(found)
+        }
+    }
+
+    // MARK: - Agent hooks consent (plan 064 §3.5)
+
+    @objc @MainActor
+    private func showAgentHooksPreferences(_ sender: Any?) {
+        openAgentHooksPreferences()
+    }
+
+    /// `Agent Hooks…` — the palette row, the View-menu item, and the
+    /// (default-unbound) `agent_hooks` action.
+    ///
+    /// Opening it re-reads the key **from disk** and re-runs the status
+    /// walk, both off this thread: this process is not the key's only
+    /// writer (`roostctl agent set --local` and a connecting client's
+    /// `roost-session` reach the same file), and the sheet's whole job
+    /// is to show what is true now.
+    @MainActor
+    private func openAgentHooksPreferences() {
+        let runner = AgentHooksRunner.bundled
+        let believed = config.agentHooks
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let roostctl = runner.roostctl() else {
+                Task { @MainActor in
+                    self?.showAgentHooksError(
+                        "This build has no bundled roostctl to read agent status with.")
+                }
+                return
+            }
+            let outcome = agentHooksSurvey(
+                mode: .preferences,
+                command: agentHooksStatusCommand(
+                    roostctl: roostctl, environment: runner.environment()),
+                key: { RoostConfig.agentHooksOnDisk(fallback: believed) },
+                run: runner.run
+            )
+            Task { @MainActor in
+                switch outcome {
+                case .found(let found):
+                    self?.agentHooksSurveyed(found)
+                // Only a status walk that did not finish has nothing to
+                // show, and a card the user asked for owes them a
+                // sentence about it — which a first-run probe nobody
+                // asked for does not.
+                case .failed(let line):
+                    self?.showAgentHooksError(line)
+                }
+            }
+        }
+    }
+
+    /// A status walk came back: raise the card, or decline to.
+    ///
+    /// The verdict is `AgentHooksCard.swift`'s, and the key it judges is
+    /// the walk's own reading rather than this app's snapshot — the
+    /// walk can sit on the install lock for twenty seconds, and in that
+    /// time `roostctl agent set --local` or a connecting client's
+    /// `roost-session` can answer the key. Asking a question somebody
+    /// has just answered is the thing this refuses to do; when that is
+    /// what happened, their answer becomes this app's too.
+    @MainActor
+    private func agentHooksSurveyed(_ found: AgentHooksFound) {
+        switch agentHooksSurveyVerdict(
+            mode: found.mode, anyPresent: found.anyPresent, key: found.key,
+            sheetOpen: agentHooksSheetOpen)
+        {
+        case .raise:
+            showAgentHooksSheet(found.card)
+        case .noAgent:
+            RoostLogger.shared.info("agent hooks: no agent installed here; not asking")
+        case .alreadyAnswered:
+            RoostLogger.shared.info(
+                "agent hooks: agent-hooks was answered while the survey ran; not asking")
+            config.agentHooks = found.key
+        case .screenTaken:
+            RoostLogger.shared.info(
+                "agent hooks: another sheet is open; not raising the agent-hooks card")
+        }
+    }
+
+    /// Put the consent sheet up, unless one is already up.
+    ///
+    /// The guard is the last word on the "screen taken" verdict: the
+    /// launch probe and a palette activation can be judged in the same
+    /// turn of the main queue, and the second must not replace the sheet
+    /// the user is already answering — with their switches on it.
+    @MainActor
+    private func showAgentHooksSheet(_ card: AgentHooksCard) {
+        if agentHooksSheetOpen { return }
+        agentHooksSheetOpen = true
+        AgentHooksSheetController(
+            card: card,
+            confirm: { [weak self] spec in
+                self?.agentHooksSheetOpen = false
+                self?.applyAgentHooks(spec: spec)
+            },
+            dismissed: { [weak self] in self?.agentHooksSheetOpen = false }
+        ).present(in: window)
+    }
+
+    /// Write the answer: one `roostctl agent set --local`, off this
+    /// thread, and nothing else (plan §3.4 — one writer on this
+    /// platform).
+    ///
+    /// Success is silent. The user just answered a question about their
+    /// own files; a receipt for it would be one more thing to dismiss.
+    @MainActor
+    private func applyAgentHooks(spec: String) {
+        let runner = AgentHooksRunner.bundled
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = agentHooksSetLocal(spec: spec, runner: runner)
+            // The file the child just wrote is the one this app reads,
+            // so the in-memory key is refreshed from it rather than
+            // patched to what was asked for — and read **here**, on the
+            // thread that already waited for the child, because a file
+            // read is not something the thread AppKit draws from may do.
+            let key = (try? result.get()).map {
+                RoostConfig.agentHooksOnDisk(at: URL(fileURLWithPath: $0.configPath))
+            }
+            Task { @MainActor in
+                switch result {
+                case .success(let reply):
+                    RoostLogger.shared.info(
+                        "agent hooks: set to \(spec); key at \(reply.configPath)")
+                    if let key { self?.config.agentHooks = key }
+                    for failure in reply.local.errors {
+                        RoostLogger.shared.info(
+                            "agent hooks: \(failure.agent): \(failure.error)")
+                    }
+                case .failure(let error):
+                    self?.showAgentHooksError(error.message)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func showAgentHooksError(_ message: String) {
+        RoostLogger.shared.info("agent hooks: \(message)")
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Couldn't change agent hooks"
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        if let window {
+            alert.beginSheetModal(for: window, completionHandler: nil)
+        } else {
+            alert.runModal()
+        }
     }
 
     // MARK: - Layout
@@ -2168,6 +2325,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         case KeybindAction.closeProject:  closeActiveProject(nil)
         case KeybindAction.toggleSidebar: toggleSidebar(nil)
         case KeybindAction.toggleSidebarAgents: toggleSidebarAgents(nil)
+        case KeybindAction.agentHooks:    openAgentHooksPreferences()
         case KeybindAction.jumpToUnread:  jumpToUnread(nil)
         case KeybindAction.fontIncrease:  fontIncrease(nil)
         case KeybindAction.fontDecrease:  fontDecrease(nil)
@@ -4167,6 +4325,18 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         toggleSidebarAgentsItem.target = self
         bind(toggleSidebarAgentsItem, to: KeybindAction.toggleSidebarAgents)
         viewMenu.addItem(toggleSidebarAgentsItem)
+        // Plan 064 §3.5. Default-unbound like iced's `agent_hooks`, but
+        // it needs a menu item all the same: on this platform a keybind
+        // fires through the menu, so an action with no item is one a
+        // user can bind and never reach.
+        let agentHooksItem = NSMenuItem(
+            title: "Agent Hooks…",
+            action: #selector(showAgentHooksPreferences(_:)),
+            keyEquivalent: ""
+        )
+        agentHooksItem.target = self
+        bind(agentHooksItem, to: KeybindAction.agentHooks)
+        viewMenu.addItem(agentHooksItem)
         viewMenu.addItem(.separator())
         // Phase 6a P7: jump-to-unread shortcut.
         let jumpItem = NSMenuItem(
