@@ -95,14 +95,17 @@ struct ConfigAgentHooksTests {
 
 @Suite("Launch-time agent-hooks ensure")
 struct AgentHooksLaunchPlanTests {
-    @Test func allowRunsTheEnsureVerb() {
+    /// `--startup` is not decoration: the bare verb reconciles, which
+    /// would have a launch remove a hook the user added by hand.
+    @Test func allowRunsTheNonDestructiveStartupEnsure() {
         #expect(
             agentHooksLaunchPlan(
                 mode: .allow(["claude"]),
                 roostctl: "/Apps/Roost.app/Resources/bin/roostctl"
             )
                 == .run(argv: [
-                    "/Apps/Roost.app/Resources/bin/roostctl", "agent", "ensure", "--json",
+                    "/Apps/Roost.app/Resources/bin/roostctl", "agent", "ensure", "--startup",
+                    "--json",
                 ])
         )
     }

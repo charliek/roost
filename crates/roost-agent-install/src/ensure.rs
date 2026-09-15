@@ -1,33 +1,103 @@
-//! `ensure`, `install`, `uninstall`, `status` — the four things the
-//! callers actually do.
+//! `ensure`, `reconcile`, `raise`, `install`, `uninstall`, `set_hooks`,
+//! `status` — the things the callers actually do.
 //!
-//! Each of the first three takes the lock, plans every agent it is
-//! responsible for, applies what it planned, and updates the record —
-//! in that order, once, under one lock. Planning inside the lock is the
-//! point: an atomic rename stops a torn file, but two ensures that both
-//! *read* before either *wrote* would still lose one of the two writes.
+//! Each writer takes the lock, plans every agent it is responsible for,
+//! applies what it planned, and updates the record — in that order,
+//! once, under one lock. Planning inside the lock is the point: an
+//! atomic rename stops a torn file, but two ensures that both *read*
+//! before either *wrote* would still lose one of the two writes.
 //!
-//! Nothing here decides policy. `mode` and `skip` arrive as parameters
-//! rather than as a config read, so `roost-cli` does not have to grow a
-//! dependency on the config parser to call it, and the UI, the CLI and a
-//! host session can all pass the same values from wherever they hold
-//! them.
+//! [`write::lock`](crate::write::lock) is **not re-entrant**: `flock`
+//! belongs to the open file description, so a second `lock` on the same
+//! path blocks even inside this process. Every entry point here is
+//! therefore a thin wrapper that takes the lock once and hands the guard
+//! to a `*_locked` worker; nothing below that line locks again.
+//!
+//! # What decides policy, and what does not
+//!
+//! The four wiring entries take a [`Mode`] their caller resolved — the
+//! UI, the CLI and a host session each hold it from somewhere different.
+//! The two that own the `agent-hooks` key ([`set_hooks`] and [`raise`])
+//! read and write [`Home::config_path`] themselves, because the key and
+//! the files it authorises have to move under one lock: an `install`
+//! that wrote the key outside it could lose a concurrent `raise`.
 
 use roost_agent::Agent;
+use roost_ui_model::config::{AgentHooks, RoostConfig};
 
 use crate::command::INTEGRATION_VERSION;
 use crate::error::{AgentError, AgentSkip, AgentWarning, InstallError, SkipReason};
 use crate::home::{Home, ALL_AGENTS};
 use crate::plan::{apply, Guard, InstallPlan, Intent};
 use crate::state::{self, Record};
+use crate::write::HooksLock;
 use crate::{claude, codex, cursor, grok, opencode};
 
-/// Whether Roost wires agents on this machine at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Which agents Roost may wire on this machine.
+///
+/// The resolved `agent-hooks` key, minus its third state: `Ask` never
+/// reaches this crate, because "nobody has answered yet" is not an
+/// instruction to write or to remove anything. Callers resolve it
+/// (usually to "do nothing at all") before they get here — which is also
+/// why there is no `Default`: there is no safe default, so the caller
+/// has to say.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
-    #[default]
-    Auto,
+    /// The agents the user consented to, in [`ALL_AGENTS`] order.
+    Allow(Vec<Agent>),
     Off,
+}
+
+impl Mode {
+    /// The engine's view of a parsed `agent-hooks` key. `None` is
+    /// `Ask` — see the type's own doc.
+    pub fn from_config(hooks: &AgentHooks) -> Option<Mode> {
+        match hooks {
+            AgentHooks::Allow(names) => Some(Mode::Allow(allowed_from(names))),
+            AgentHooks::Off => Some(Mode::Off),
+            AgentHooks::Ask => None,
+        }
+    }
+
+    /// What this mode spells in `config.conf`.
+    ///
+    /// An empty allow-list spells `off`, not an empty value: an empty
+    /// value parses back as `Ask`, which would turn "the user switched
+    /// every agent off" into "nobody has answered" and bring the consent
+    /// dialog back on the next launch.
+    fn to_config(&self) -> AgentHooks {
+        match self {
+            Mode::Allow(agents) if agents.is_empty() => AgentHooks::Off,
+            Mode::Allow(agents) => {
+                AgentHooks::Allow(agents.iter().map(|a| a.source().to_string()).collect())
+            }
+            Mode::Off => AgentHooks::Off,
+        }
+    }
+
+    fn allows(&self, agent: Agent) -> bool {
+        matches!(self, Mode::Allow(agents) if agents.contains(&agent))
+    }
+
+    /// Why an agent this mode does not name was left where it was.
+    fn left_alone(&self) -> SkipReason {
+        match self {
+            Mode::Off => SkipReason::ModeOff,
+            Mode::Allow(_) => SkipReason::NotAllowed,
+        }
+    }
+}
+
+/// Config names to agents, in [`ALL_AGENTS`] order.
+///
+/// A name no agent answers to is dropped rather than reported: the
+/// parser has already warned about it once, and it cannot name a file
+/// this crate knows how to write.
+fn allowed_from(names: &[String]) -> Vec<Agent> {
+    ALL_AGENTS
+        .into_iter()
+        .filter(|agent| names.iter().any(|name| name == agent.source()))
+        .collect()
 }
 
 /// Who flips the state record's `noticed` flag for what a run reports.
@@ -49,15 +119,15 @@ enum Notice {
     Here,
 }
 
-/// Resolve `agent-hooks-skip`'s names against the agents this crate can
-/// wire: the ones it recognises, and the spellings it does not.
+/// Resolve a wire message's agent names against the agents this crate
+/// can wire: the ones it recognises, and the spellings it does not.
 ///
 /// The unknown half is returned rather than dropped because the only
-/// thing a user gets from a typo'd skip entry is an agent that keeps
-/// being wired, with nothing to say why. Every caller reports the list
-/// on its own surface; none of them treats it as fatal, so a name added
-/// by a newer Roost does not break an older one's config.
-pub fn skip_list<'a>(names: impl IntoIterator<Item = &'a str>) -> (Vec<Agent>, Vec<String>) {
+/// thing a client gets from a typo'd name is a host that behaves
+/// differently with nothing to say why. Every caller reports the list on
+/// its own surface; none of them treats it as fatal, so a name added by
+/// a newer Roost does not break an older one.
+pub fn resolve_names<'a>(names: impl IntoIterator<Item = &'a str>) -> (Vec<Agent>, Vec<String>) {
     let mut known = Vec::new();
     let mut unknown = Vec::new();
     for name in names {
@@ -74,7 +144,8 @@ pub fn skip_list<'a>(names: impl IntoIterator<Item = &'a str>) -> (Vec<Agent>, V
     (known, unknown)
 }
 
-/// The agent names [`skip_list`] accepts, for a caller's error message.
+/// The agent names [`resolve_names`] accepts, for a caller's error
+/// message.
 pub fn agent_names() -> String {
     ALL_AGENTS
         .iter()
@@ -151,6 +222,14 @@ pub struct Status {
     /// True when a fresh `plan` would make no edits.
     pub up_to_date: bool,
     pub noticed: bool,
+    /// Whether the resolved `agent-hooks` key names this agent. A caller
+    /// holding `Ask` — nobody has answered the consent dialog — passes
+    /// `Mode::Allow(vec![])`: nothing is allowed until the user says so.
+    pub allowed: bool,
+    /// The files this agent's install owns or merges into — what the Mac
+    /// consent sheet names before the user answers, and what an
+    /// uninstall touches. Two of them for codex.
+    pub files: Vec<std::path::PathBuf>,
     pub skipped: Option<SkipReason>,
     pub warnings: Vec<crate::error::Warning>,
 }
@@ -186,61 +265,160 @@ fn plan_for(agent: Agent, home: &Home, intent: Intent) -> Result<InstallPlan, In
 /// The public half of the plan/apply split: callers that want to *see*
 /// the edits — a dry run, a doctor check — use this and never call
 /// [`apply`].
-pub fn plan(agent: Agent, home: &Home, mode: Mode) -> Result<InstallPlan, InstallError> {
+pub fn plan(agent: Agent, home: &Home, mode: &Mode) -> Result<InstallPlan, InstallError> {
     match mode {
         Mode::Off => plan_for(agent, home, Intent::Uninstall),
-        Mode::Auto if !home.is_present(agent) => Ok(InstallPlan::skip(
+        Mode::Allow(_) if !mode.allows(agent) => Ok(InstallPlan::skip(
+            agent,
+            Intent::Install,
+            SkipReason::NotAllowed,
+        )),
+        Mode::Allow(_) if !home.is_present(agent) => Ok(InstallPlan::skip(
             agent,
             Intent::Install,
             SkipReason::NotPresent,
         )),
-        Mode::Auto => plan_for(agent, home, Intent::Install),
+        Mode::Allow(_) => plan_for(agent, home, Intent::Install),
     }
 }
 
-/// What the UIs and `roostctl agent ensure` run.
+/// What the UIs run at startup: wire and refresh what the user allowed,
+/// and **never take anything out**.
 ///
-/// `auto` wires every present agent that is not skipped; `off` removes
-/// Roost's entries from every present agent **and** from every agent the
-/// record names, so a machine whose `~/.config/roost` was wiped still
-/// comes clean. With nothing to remove, `off` writes nothing at all.
-pub fn ensure(
+/// The no-unwire half is load-bearing (plan 046 C7, plan 064 §3.2). A
+/// startup that reconciled downward would strip a developer's real
+/// entries the moment an e2e lane ran without `ROOST_TEST_MODE`, and it
+/// would turn "I have not said yes yet" into a removal nobody asked for.
+/// Under [`Mode::Off`] it therefore writes nothing at all and reports
+/// every agent as [`SkipReason::ModeOff`]; [`reconcile`] is the explicit
+/// verb that does take entries back out.
+pub fn ensure(home: &Home, mode: &Mode, by: &str, guard: Guard) -> Result<Outcome, InstallError> {
+    guard.check()?;
+    let lock = crate::write::lock(&home.lock_path())?;
+    wire_locked(home, mode, by, guard, Notice::Caller, &lock)
+}
+
+/// Bring this machine's files in line with `mode`, both ways.
+///
+/// `Allow` wires and refreshes what it names and **unwires what it does
+/// not** — for every agent present on disk or named in the record, so a
+/// machine whose `~/.config/roost` was wiped still comes clean. `Off`
+/// unwires all of them. With nothing to remove it writes nothing.
+///
+/// What `roostctl agent ensure` and the consent dialog's Apply run. The
+/// difference from [`ensure`] is the one sentence above: this is the
+/// path a hand-lowered `agent-hooks` key gets reconciled downward on.
+pub fn reconcile(
     home: &Home,
-    mode: Mode,
-    skip: &[Agent],
+    mode: &Mode,
     by: &str,
     guard: Guard,
 ) -> Result<Outcome, InstallError> {
-    ensure_with(home, mode, skip, by, guard, Notice::Caller)
+    guard.check()?;
+    let lock = crate::write::lock(&home.lock_path())?;
+    reconcile_locked(home, mode, by, guard, &lock)
 }
 
-/// [`ensure`] run for somebody who is not this machine — a host session
-/// acting on a connected client's config (plan 046 §3.4).
+/// Union `agents` into this home's `agent-hooks` key — never removing —
+/// then wire what it now allows.
 ///
-/// One thing differs, and it follows from the caller being remote: the
-/// run flips `noticed` itself, in the same record write — see
-/// [`Notice::Here`].
-pub fn ensure_on_behalf(
+/// What a connecting client is allowed to do to a host (plan 064 §3.3).
+/// A raise is additive against whatever the key already says, `off` and
+/// `ask` included: both become the client's list, because a host has no
+/// screen to ask on and the client in front of the user is the only
+/// authority there is. It never removes, so a second client — or an
+/// agent somebody wired by hand — survives a raise it was not named in.
+///
+/// One thing differs from [`ensure`], and it follows from the caller
+/// being remote: the run flips `noticed` itself, in the same record
+/// write — see [`Notice::Here`].
+pub fn raise(
     home: &Home,
-    mode: Mode,
-    skip: &[Agent],
+    agents: &[Agent],
     by: &str,
     guard: Guard,
 ) -> Result<Outcome, InstallError> {
-    ensure_with(home, mode, skip, by, guard, Notice::Here)
+    guard.check()?;
+    let lock = crate::write::lock(&home.lock_path())?;
+    let (mode, wrote) = widen(home, agents)?;
+    let mut outcome = wire_locked(home, &mode, by, guard, Notice::Here, &lock)?;
+    outcome.wrote |= wrote;
+    Ok(outcome)
 }
 
-fn ensure_with(
+/// Set the `agent-hooks` key to exactly `mode`, then bring this
+/// machine's files in line with it.
+///
+/// The key is written **first and under the same lock**: a partial
+/// reconcile leaves the permission durable (a later `roostctl agent
+/// ensure` retries what failed), where a key written afterwards would be
+/// lost by every failure and by any concurrent [`raise`]. A key that
+/// cannot be written is an error and nothing else happens — no agent
+/// file is touched.
+pub fn set_hooks(
     home: &Home,
-    mode: Mode,
-    skip: &[Agent],
+    mode: &Mode,
+    by: &str,
+    guard: Guard,
+) -> Result<Outcome, InstallError> {
+    guard.check()?;
+    let lock = crate::write::lock(&home.lock_path())?;
+    let wrote = write_hooks(home, &read_hooks(home)?, mode)?;
+    let mut outcome = reconcile_locked(home, mode, by, guard, &lock)?;
+    outcome.wrote |= wrote;
+    Ok(outcome)
+}
+
+fn wire_locked(
+    home: &Home,
+    mode: &Mode,
     by: &str,
     guard: Guard,
     notice: Notice,
+    lock: &HooksLock,
 ) -> Result<Outcome, InstallError> {
-    guard.check()?;
-    let _lock = crate::write::lock(&home.lock_path())?;
-    let (mut record, warning) = state::load(home)?;
+    let (mut record, mut outcome) = start(home)?;
+    for agent in ALL_AGENTS {
+        if mode.allows(agent) {
+            wire_one(home, agent, by, guard, &mut record, &mut outcome);
+        } else {
+            outcome.skipped.push(AgentSkip {
+                agent,
+                reason: mode.left_alone(),
+            });
+        }
+    }
+    finish(home, record, outcome, notice, lock)
+}
+
+fn reconcile_locked(
+    home: &Home,
+    mode: &Mode,
+    by: &str,
+    guard: Guard,
+    lock: &HooksLock,
+) -> Result<Outcome, InstallError> {
+    let (mut record, mut outcome) = start(home)?;
+    let targets = unwire_targets(home, &record);
+    for agent in ALL_AGENTS {
+        if mode.allows(agent) {
+            wire_one(home, agent, by, guard, &mut record, &mut outcome);
+        } else if targets.contains(&agent) {
+            unwire_one(home, agent, guard, &mut record, &mut outcome);
+        } else {
+            outcome.skipped.push(AgentSkip {
+                agent,
+                reason: mode.left_alone(),
+            });
+        }
+    }
+    finish(home, record, outcome, Notice::Caller, lock)
+}
+
+/// The record, plus an [`Outcome`] carrying anything reading it had to
+/// say.
+fn start(home: &Home) -> Result<(Record, Outcome), InstallError> {
+    let (record, warning) = state::load(home)?;
     let mut outcome = Outcome::default();
     if let Some(warning) = warning {
         // Not attributable to one agent; the first one carries it so the
@@ -250,27 +428,19 @@ fn ensure_with(
             warning,
         });
     }
+    Ok((record, outcome))
+}
 
-    match mode {
-        Mode::Auto => {
-            for agent in ALL_AGENTS {
-                if skip.contains(&agent) {
-                    outcome.skipped.push(AgentSkip {
-                        agent,
-                        reason: SkipReason::SkipList,
-                    });
-                    continue;
-                }
-                wire_one(home, agent, by, guard, &mut record, &mut outcome);
-            }
-        }
-        Mode::Off => {
-            for agent in unwire_targets(home, &record) {
-                unwire_one(home, agent, guard, &mut record, &mut outcome);
-            }
-        }
-    }
-
+/// The toast list, the `noticed` flip that goes with it, and the record
+/// write that makes both durable — in one place, so every entry point
+/// spends a notice the same way.
+fn finish(
+    home: &Home,
+    mut record: Record,
+    mut outcome: Outcome,
+    notice: Notice,
+    _lock: &HooksLock,
+) -> Result<Outcome, InstallError> {
     outcome.unnoticed = unnoticed(&record);
     if notice == Notice::Here {
         for agent in &outcome.unnoticed {
@@ -296,12 +466,13 @@ fn unnoticed(record: &Record) -> Vec<Agent> {
         .collect()
 }
 
-/// Wire exactly these agents, whatever the mode says.
+/// Wire exactly these agents, and say so in the `agent-hooks` key.
 ///
 /// `agent install <name>` is an explicit instruction, and explicit wins:
 /// a user who has turned `agent-hooks` off and then asks for one agent
-/// gets that agent. The skip list is not consulted either, for the same
-/// reason.
+/// gets that agent — and gets the key unioned with it, so the next
+/// startup [`ensure`] does not treat what they just asked for as
+/// unconsented. The union never removes, exactly as [`raise`]'s does.
 pub fn install(
     home: &Home,
     agents: &[Agent],
@@ -309,30 +480,43 @@ pub fn install(
     guard: Guard,
 ) -> Result<Outcome, InstallError> {
     guard.check()?;
-    let _lock = crate::write::lock(&home.lock_path())?;
-    let (mut record, _) = state::load(home)?;
-    let mut outcome = Outcome::default();
+    let lock = crate::write::lock(&home.lock_path())?;
+    let (_, wrote) = widen(home, agents)?;
+    let (mut record, mut outcome) = start(home)?;
+    outcome.wrote |= wrote;
     for agent in agents {
         wire_one(home, *agent, by, guard, &mut record, &mut outcome);
     }
-    outcome.wrote |= state::save(home, &record)?;
-    Ok(outcome)
+    finish(home, record, outcome, Notice::Caller, &lock)
 }
 
+/// Take Roost's entries back out of exactly these agents, and narrow the
+/// `agent-hooks` key to match.
+///
+/// Narrowing is the mirror of [`install`]'s union, with one asymmetry:
+/// an unanswered key (`ask`) is left unanswered rather than rewritten as
+/// "everything except this one", which would be a consent the user never
+/// gave. Uninstalling *every* agent is the exception — that is an answer,
+/// and it is written as `off` so the dialog does not come back asking
+/// again.
 pub fn uninstall(home: &Home, agents: &[Agent], guard: Guard) -> Result<Outcome, InstallError> {
     guard.check()?;
-    let _lock = crate::write::lock(&home.lock_path())?;
-    let (mut record, _) = state::load(home)?;
-    let mut outcome = Outcome::default();
+    let lock = crate::write::lock(&home.lock_path())?;
+    let current = read_hooks(home)?;
+    let wrote = match narrowed(&current, agents) {
+        Some(narrowed) => write_hooks(home, &current, &narrowed)?,
+        None => false,
+    };
+    let (mut record, mut outcome) = start(home)?;
+    outcome.wrote |= wrote;
     for agent in agents {
         unwire_one(home, *agent, guard, &mut record, &mut outcome);
     }
-    outcome.wrote |= state::save(home, &record)?;
-    Ok(outcome)
+    finish(home, record, outcome, Notice::Caller, &lock)
 }
 
 /// Read-only: what `roostctl agent status` and doctor render.
-pub fn status(home: &Home) -> Result<Vec<Status>, InstallError> {
+pub fn status(home: &Home, mode: &Mode) -> Result<Vec<Status>, InstallError> {
     let (record, _) = state::load(home)?;
     ALL_AGENTS
         .into_iter()
@@ -358,6 +542,8 @@ pub fn status(home: &Home) -> Result<Vec<Status>, InstallError> {
                 entries_on_disk: removal.is_some_and(|p| !p.is_noop()),
                 up_to_date: plan.as_ref().is_some_and(InstallPlan::is_noop),
                 noticed: entry.is_some_and(|e| e.noticed),
+                allowed: mode.allows(agent),
+                files: crate::owned_files(home, agent),
                 skipped: match &plan {
                     Some(plan) => plan.skipped.clone(),
                     None => Some(SkipReason::NotPresent),
@@ -366,6 +552,102 @@ pub fn status(home: &Home) -> Result<Vec<Status>, InstallError> {
             })
         })
         .collect()
+}
+
+/// This home's `agent-hooks` key, through the same parser every reader
+/// uses.
+///
+/// An absent `config.conf` is `Ask`, like an absent key. Anything else
+/// the filesystem says is returned: a config Roost cannot read is a
+/// config it must not overwrite, because the union it would compute is
+/// a guess at what the user consented to.
+fn read_hooks(home: &Home) -> Result<AgentHooks, InstallError> {
+    let path = home.config_path();
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(RoostConfig::parse(&text).agent_hooks),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AgentHooks::Ask),
+        Err(e) => Err(InstallError::io(path, e)),
+    }
+}
+
+/// Write `mode` into the `agent-hooks` key — unless `current`, the key
+/// as it stands, already says exactly that, because this runs on every
+/// host connect and rewriting the user's `config.conf` to the bytes it
+/// already holds is churn they would see in a dotfile diff.
+///
+/// `current` is a parameter rather than a [`read_hooks`] call because
+/// every caller has just read it to work out `mode`, and re-parsing
+/// repeats every warning the config's other keys emit.
+fn write_hooks(home: &Home, current: &AgentHooks, mode: &Mode) -> Result<bool, InstallError> {
+    let desired = mode.to_config();
+    if *current == desired {
+        return Ok(false);
+    }
+    let path = home.config_path();
+    let value = desired
+        .to_config_value()
+        .expect("a Mode is never Ask, and only Ask has no config value");
+    roost_ui_model::config::set_key(path, "agent-hooks", &value)
+        .map_err(|e| InstallError::io(path, e))?;
+    Ok(true)
+}
+
+/// The `agent-hooks` key widened by `agents` and written back — the
+/// shared half of [`raise`] and [`install`], and the reason both are
+/// additive.
+fn widen(home: &Home, agents: &[Agent]) -> Result<(Mode, bool), InstallError> {
+    let current = read_hooks(home)?;
+    let widened = union(&current, agents);
+    // A union that allows nothing writes nothing. Widening is the only
+    // thing these two callers may do to the key, and an empty union can
+    // only mean the key allowed nothing and nothing was asked for —
+    // writing then would spell that as `off`, which is a *lowering* of
+    // an unanswered key nobody requested.
+    let wrote = if widened.is_empty() {
+        false
+    } else {
+        write_hooks(home, &current, &Mode::Allow(widened.clone()))?
+    };
+    Ok((Mode::Allow(widened), wrote))
+}
+
+/// `hooks` widened by `agents`, in [`ALL_AGENTS`] order.
+///
+/// `Off` and `Ask` both widen to exactly `agents` (plan 064 §3.3): a
+/// client that says "wire claude" on a host whose key says `off` is
+/// answering the question the host cannot ask, and the alternative —
+/// treating `off` as a veto no remote client can lift — leaves that
+/// client with no way to say yes at all.
+fn union(hooks: &AgentHooks, agents: &[Agent]) -> Vec<Agent> {
+    let current = match hooks {
+        AgentHooks::Allow(names) => allowed_from(names),
+        AgentHooks::Off | AgentHooks::Ask => Vec::new(),
+    };
+    ALL_AGENTS
+        .into_iter()
+        .filter(|agent| current.contains(agent) || agents.contains(agent))
+        .collect()
+}
+
+/// `hooks` with `agents` taken out of it, or `None` to leave the key
+/// exactly as it is. See [`uninstall`] for why `ask` survives a partial
+/// uninstall and not a total one.
+fn narrowed(hooks: &AgentHooks, agents: &[Agent]) -> Option<Mode> {
+    if ALL_AGENTS.iter().all(|agent| agents.contains(agent)) {
+        return Some(Mode::Off);
+    }
+    let AgentHooks::Allow(names) = hooks else {
+        return None;
+    };
+    let kept: Vec<Agent> = allowed_from(names)
+        .into_iter()
+        .filter(|agent| !agents.contains(agent))
+        .collect();
+    Some(if kept.is_empty() {
+        Mode::Off
+    } else {
+        Mode::Allow(kept)
+    })
 }
 
 /// Everything `off` has to clean: what is installed now, plus what the
@@ -524,17 +806,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_skip_list_resolves_names_and_keeps_the_ones_it_cannot() {
-        let (known, unknown) = skip_list(["codex", "Cursor", "gemini", "codex"]);
+    fn the_name_resolver_keeps_the_ones_it_cannot_resolve() {
+        let (known, unknown) = resolve_names(["codex", "Cursor", "gemini", "codex"]);
         assert_eq!(known, vec![Agent::Codex, Agent::Cursor]);
         assert_eq!(unknown, vec!["gemini"]);
     }
 
     /// gx shares grok's file and reports as grok; it is not a name of
-    /// its own, so skipping by it has to be visible rather than silent.
+    /// its own, so naming it has to be visible rather than silent.
     #[test]
     fn a_name_no_agent_answers_to_is_unknown() {
-        let (known, unknown) = skip_list(["gx"]);
+        let (known, unknown) = resolve_names(["gx"]);
         assert!(known.is_empty());
         assert_eq!(unknown, vec!["gx"]);
     }
@@ -544,17 +826,24 @@ mod tests {
         Home::rooted(root)
     }
 
-    /// A delegated run wires, records, and reports exactly as a local
-    /// `ensure` does.
+    fn all() -> Mode {
+        Mode::Allow(ALL_AGENTS.to_vec())
+    }
+
+    /// A raise wires, records, and reports exactly as a local `ensure`
+    /// does — and says in the key what it was allowed to do.
     #[test]
-    fn a_delegate_wires_exactly_as_ensure_does() {
+    fn a_raise_wires_exactly_as_ensure_does() {
         let dir = tempfile::tempdir().unwrap();
         let home = a_home(dir.path());
 
-        let done =
-            ensure_on_behalf(&home, Mode::Auto, &[], "remote", Guard::PERMITTED).expect("ensure");
+        let done = raise(&home, &[Agent::Claude], "remote", Guard::PERMITTED).expect("raise");
         assert_eq!(done.wired, vec![Agent::Claude]);
         assert_eq!(done.unnoticed, vec![Agent::Claude]);
+        assert_eq!(
+            read_hooks(&home).unwrap(),
+            AgentHooks::Allow(vec!["claude".to_string()])
+        );
     }
 
     /// The `noticed` flip happens in the run's own record write, so the
@@ -567,12 +856,11 @@ mod tests {
     /// show-then-mark order on purpose (a crash there should lose the
     /// toast, not repeat it); a host has no toast to lose.
     #[test]
-    fn a_delegated_run_spends_the_notice_in_the_same_write() {
+    fn a_raise_spends_the_notice_in_the_same_write() {
         let dir = tempfile::tempdir().unwrap();
         let home = a_home(dir.path());
 
-        let first =
-            ensure_on_behalf(&home, Mode::Auto, &[], "remote", Guard::PERMITTED).expect("ensure");
+        let first = raise(&home, &ALL_AGENTS, "remote", Guard::PERMITTED).expect("raise");
         assert_eq!(first.unnoticed, vec![Agent::Claude]);
         // Read straight off the record: no `mark_noticed` ran in between,
         // which is exactly the point.
@@ -580,8 +868,7 @@ mod tests {
             .expect("state record");
         assert!(recorded.contains("\"noticed\": true"), "{recorded}");
 
-        let second = ensure_on_behalf(&home, Mode::Auto, &[], "remote", Guard::PERMITTED)
-            .expect("ensure again");
+        let second = raise(&home, &ALL_AGENTS, "remote", Guard::PERMITTED).expect("raise again");
         assert!(second.unnoticed.is_empty(), "{second:?}");
     }
 
@@ -592,10 +879,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = a_home(dir.path());
 
-        let first = ensure(&home, Mode::Auto, &[], "local", Guard::PERMITTED).expect("ensure");
+        let first = ensure(&home, &all(), "local", Guard::PERMITTED).expect("ensure");
         assert_eq!(first.unnoticed, vec![Agent::Claude]);
-        let second =
-            ensure(&home, Mode::Auto, &[], "local", Guard::PERMITTED).expect("ensure again");
+        let second = ensure(&home, &all(), "local", Guard::PERMITTED).expect("ensure again");
         assert_eq!(
             second.unnoticed,
             vec![Agent::Claude],
@@ -603,8 +889,75 @@ mod tests {
         );
     }
 
-    fn claude_row(home: &Home) -> Status {
-        status(home)
+    /// `ensure` is the startup path, and startup never unwires (plan 046
+    /// C7): an agent that has dropped off the allow-list keeps its
+    /// entries until something explicit takes them out.
+    #[test]
+    fn a_startup_ensure_leaves_an_agent_the_key_no_longer_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = a_home(dir.path());
+        install(&home, &[Agent::Claude], "local", Guard::PERMITTED).expect("install");
+
+        let narrowed = ensure(
+            &home,
+            &Mode::Allow(vec![Agent::Codex]),
+            "local",
+            Guard::PERMITTED,
+        )
+        .expect("ensure");
+        assert!(narrowed.removed.is_empty(), "{narrowed:?}");
+        assert!(
+            std::fs::read_to_string(dir.path().join(".claude/settings.json"))
+                .unwrap()
+                .contains("ROOST_AGENT_HOOK")
+        );
+
+        // `off` is the same promise, stated harder: nothing at all.
+        let off = ensure(&home, &Mode::Off, "local", Guard::PERMITTED).expect("ensure off");
+        assert!(off.removed.is_empty(), "{off:?}");
+        assert!(!off.wrote, "{off:?}");
+        assert_eq!(off.skipped.len(), ALL_AGENTS.len());
+        assert!(off
+            .skipped
+            .iter()
+            .all(|skip| matches!(skip.reason, SkipReason::ModeOff)));
+    }
+
+    /// The union is what makes a raise additive. `off` and `ask` are the
+    /// contentious half of plan 064 §3.3: both become the client's list.
+    #[test]
+    fn a_union_never_removes_and_answers_for_off_and_ask() {
+        let allowed = AgentHooks::Allow(vec!["grok".into()]);
+        assert_eq!(
+            union(&allowed, &[Agent::Claude]),
+            vec![Agent::Claude, Agent::Grok],
+            "a raise removed what it was not asked about"
+        );
+        for unanswered in [AgentHooks::Off, AgentHooks::Ask] {
+            assert_eq!(union(&unanswered, &[Agent::Codex]), vec![Agent::Codex]);
+        }
+    }
+
+    /// The mirror: an uninstall narrows an allow-list, leaves an
+    /// unanswered key unanswered, and treats "all of them" as an answer.
+    #[test]
+    fn narrowing_leaves_an_unanswered_key_alone() {
+        let allowed = AgentHooks::Allow(vec!["claude".into(), "codex".into()]);
+        assert_eq!(
+            narrowed(&allowed, &[Agent::Codex]),
+            Some(Mode::Allow(vec![Agent::Claude]))
+        );
+        assert_eq!(
+            narrowed(&allowed, &[Agent::Claude, Agent::Codex]),
+            Some(Mode::Off)
+        );
+        assert_eq!(narrowed(&AgentHooks::Ask, &[Agent::Codex]), None);
+        assert_eq!(narrowed(&AgentHooks::Off, &[Agent::Codex]), None);
+        assert_eq!(narrowed(&AgentHooks::Ask, &ALL_AGENTS), Some(Mode::Off));
+    }
+
+    fn claude_row(home: &Home, mode: &Mode) -> Status {
+        status(home, mode)
             .expect("status")
             .into_iter()
             .find(|row| row.agent == Agent::Claude)
@@ -622,14 +975,14 @@ mod tests {
         let home = a_home(dir.path());
         install(&home, &[Agent::Claude], "local", Guard::PERMITTED).expect("install");
 
-        let wired = claude_row(&home);
+        let wired = claude_row(&home, &all());
         assert_eq!(wired.wired, Some(crate::command::INTEGRATION_VERSION));
         assert!(wired.entries_on_disk);
         assert!(wired.up_to_date);
 
         std::fs::remove_file(dir.path().join(".config/roost/agent-hooks.json")).unwrap();
 
-        let orphaned = claude_row(&home);
+        let orphaned = claude_row(&home, &all());
         assert_eq!(orphaned.wired, None, "the record really is gone");
         assert!(
             orphaned.entries_on_disk,
@@ -648,7 +1001,7 @@ mod tests {
         install(&home, &[Agent::Claude], "local", Guard::PERMITTED).expect("install");
         std::fs::write(dir.path().join(".claude/settings.json"), "{}\n").unwrap();
 
-        let row = claude_row(&home);
+        let row = claude_row(&home, &all());
         assert_eq!(row.wired, Some(crate::command::INTEGRATION_VERSION));
         assert!(!row.entries_on_disk, "the settings file was emptied");
         assert!(!row.up_to_date);
@@ -679,19 +1032,35 @@ mod tests {
         assert_ne!(before, after, "the v1 rewrite matched nothing");
         std::fs::write(&settings, after).unwrap();
 
-        let row = claude_row(&home);
+        let row = claude_row(&home, &all());
         assert!(row.entries_on_disk, "a v1 entry is still an entry");
         assert!(!row.up_to_date, "but it is not current");
     }
 
     #[test]
-    fn every_agent_can_be_skipped_by_the_name_status_prints() {
+    fn every_agent_resolves_by_the_name_status_prints() {
         let names: Vec<&str> = ALL_AGENTS.iter().map(|a| a.source()).collect();
-        let (known, unknown) = skip_list(names);
+        let (known, unknown) = resolve_names(names);
         assert_eq!(known, ALL_AGENTS.to_vec());
         assert!(unknown.is_empty());
         for agent in ALL_AGENTS {
             assert!(agent_names().contains(agent.source()), "{}", agent.source());
         }
+    }
+
+    /// The config key and the engine's mode are one decision in two
+    /// spellings; `Ask` is the third state that never reaches the engine.
+    #[test]
+    fn a_mode_round_trips_through_the_config_key() {
+        for mode in [Mode::Allow(vec![Agent::Codex, Agent::Grok]), Mode::Off] {
+            assert_eq!(Mode::from_config(&mode.to_config()), Some(mode));
+        }
+        assert_eq!(Mode::from_config(&AgentHooks::Ask), None);
+        // A name from a newer Roost is dropped, not fatal: the parser has
+        // already said so once, and nothing here can write its file.
+        assert_eq!(
+            Mode::from_config(&AgentHooks::Allow(vec!["gemini".into(), "codex".into()])),
+            Some(Mode::Allow(vec![Agent::Codex]))
+        );
     }
 }

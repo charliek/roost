@@ -53,29 +53,11 @@ pub(crate) struct AgentHooksEnsured {
     pub errors: Vec<String>,
 }
 
-/// The mode and skip list `config.conf` asks for, or `None` when nobody
-/// has answered the consent dialog yet (plan 064) — the caller must wire
-/// and unwire nothing in that case, not guess.
-///
-/// `Allow(names)` maps onto the still-two-state engine as `Mode::Auto`
-/// with every agent *not* named skipped. Every name is already validated
-/// against `roost_ui_model::config::AGENT_NAMES` by the parser, so
-/// there is no unrecognised-name path to report here (contrast the
-/// retired `agent-hooks-skip`, which had one).
-fn resolve(config: &RoostConfig) -> Option<(Mode, Vec<Agent>)> {
-    match &config.agent_hooks {
-        AgentHooks::Allow(names) => {
-            let allowed: Vec<Agent> = names.iter().filter_map(|name| Agent::parse(name)).collect();
-            let skip: Vec<Agent> = roost_agent_install::ALL_AGENTS
-                .iter()
-                .copied()
-                .filter(|agent| !allowed.contains(agent))
-                .collect();
-            Some((Mode::Auto, skip))
-        }
-        AgentHooks::Off => Some((Mode::Off, Vec::new())),
-        AgentHooks::Ask => None,
-    }
+/// What `config.conf` asks for, or `None` when nobody has answered the
+/// consent dialog yet (plan 064) — the caller must wire and unwire
+/// nothing in that case, not guess.
+fn resolve(config: &RoostConfig) -> Option<Mode> {
+    Mode::from_config(&config.agent_hooks)
 }
 
 /// What a `window_opened` should do about the startup ensure.
@@ -106,11 +88,11 @@ pub(crate) enum Start {
 /// `resolved` is `None` for `Ask` — [`resolve`]'s shape, carried through
 /// rather than re-derived, so this function cannot itself decide to run
 /// an ensure `resolve` said not to.
-pub(crate) fn claim_start(started: &mut bool, resolved: Option<Mode>) -> Start {
+pub(crate) fn claim_start(started: &mut bool, resolved: Option<&Mode>) -> Start {
     match resolved {
         None => Start::Ask,
         Some(Mode::Off) => Start::Off,
-        Some(Mode::Auto) => {
+        Some(Mode::Allow(_)) => {
             if *started {
                 return Start::Already;
             }
@@ -134,12 +116,8 @@ pub(crate) fn spawn_ensure(
     config: &RoostConfig,
 ) {
     let resolved = resolve(config);
-    let skip = match claim_start(started, resolved.as_ref().map(|(mode, _)| *mode)) {
-        Start::Run => {
-            resolved
-                .expect("Start::Run implies resolve() returned Some")
-                .1
-        }
+    let mode = match claim_start(started, resolved.as_ref()) {
+        Start::Run => resolved.expect("Start::Run implies resolve() returned Some"),
         Start::Off => {
             tracing::debug!("agent-hooks = off: not wiring agent hooks");
             return;
@@ -157,7 +135,7 @@ pub(crate) fn spawn_ensure(
     // over there: a config edit landing mid-launch would otherwise split
     // the decision from the action it authorised.
     runtime.spawn_blocking(move || {
-        feed.send(EngineFeed::AgentHooks(ensure_blocking(&skip, guard)));
+        feed.send(EngineFeed::AgentHooks(ensure_blocking(&mode, guard)));
     });
 }
 
@@ -165,7 +143,7 @@ pub(crate) fn spawn_ensure(
 /// [`AgentHooksEnsured::errors`] rather than a panic or a swallow: this
 /// runs with nobody waiting on it, so the only honest thing to do with a
 /// failure is carry it back to a thread that can log it.
-fn ensure_blocking(skip: &[Agent], guard: Guard) -> AgentHooksEnsured {
+fn ensure_blocking(mode: &Mode, guard: Guard) -> AgentHooksEnsured {
     let home = match Home::from_env() {
         Ok(home) => home,
         Err(error) => {
@@ -175,7 +153,7 @@ fn ensure_blocking(skip: &[Agent], guard: Guard) -> AgentHooksEnsured {
             }
         }
     };
-    match roost_agent_install::ensure(&home, Mode::Auto, skip, BY, guard) {
+    match roost_agent_install::ensure(&home, mode, BY, guard) {
         Ok(outcome) => AgentHooksEnsured {
             unnoticed: outcome.unnoticed,
             errors: outcome
@@ -346,17 +324,15 @@ mod tests {
 
     #[test]
     fn an_allow_list_wires_only_the_named_agents() {
-        let (mode, skip) = resolve(&config("agent-hooks = claude, cursor")).unwrap();
-        assert_eq!(mode, Mode::Auto);
-        // Every other agent is skipped, in `ALL_AGENTS` order.
-        assert_eq!(skip, vec![Agent::Codex, Agent::Grok, Agent::Opencode]);
+        assert_eq!(
+            resolve(&config("agent-hooks = claude, cursor")),
+            Some(Mode::Allow(vec![Agent::Claude, Agent::Cursor]))
+        );
     }
 
     #[test]
-    fn off_resolves_with_nothing_skipped() {
-        let (mode, skip) = resolve(&config("agent-hooks = off")).unwrap();
-        assert_eq!(mode, Mode::Off);
-        assert!(skip.is_empty());
+    fn off_resolves_to_off() {
+        assert_eq!(resolve(&config("agent-hooks = off")), Some(Mode::Off));
     }
 
     /// The remote half sends `off` rather than staying quiet, which is
@@ -430,12 +406,13 @@ mod tests {
     #[test]
     fn the_startup_ensure_runs_once_per_process() {
         let mut started = false;
-        assert_eq!(claim_start(&mut started, Some(Mode::Auto)), Start::Run);
+        let allow = Mode::Allow(vec![Agent::Claude]);
+        assert_eq!(claim_start(&mut started, Some(&allow)), Start::Run);
         assert!(started);
         // The second window event is the focus that follows the open;
         // the third is an ordinary Alt-Tab. Neither may wire anything.
-        assert_eq!(claim_start(&mut started, Some(Mode::Auto)), Start::Already);
-        assert_eq!(claim_start(&mut started, Some(Mode::Auto)), Start::Already);
+        assert_eq!(claim_start(&mut started, Some(&allow)), Start::Already);
+        assert_eq!(claim_start(&mut started, Some(&allow)), Start::Already);
     }
 
     /// `off` declines without consuming the latch: the two answers are
@@ -443,9 +420,12 @@ mod tests {
     #[test]
     fn off_declines_without_claiming_the_latch() {
         let mut started = false;
-        assert_eq!(claim_start(&mut started, Some(Mode::Off)), Start::Off);
+        assert_eq!(claim_start(&mut started, Some(&Mode::Off)), Start::Off);
         assert!(!started);
-        assert_eq!(claim_start(&mut started, Some(Mode::Auto)), Start::Run);
+        assert_eq!(
+            claim_start(&mut started, Some(&Mode::Allow(vec![Agent::Claude]))),
+            Start::Run
+        );
     }
 
     /// `ask` — `resolve` returning `None` — declines the same way `off`
@@ -456,6 +436,9 @@ mod tests {
         let mut started = false;
         assert_eq!(claim_start(&mut started, None), Start::Ask);
         assert!(!started);
-        assert_eq!(claim_start(&mut started, Some(Mode::Auto)), Start::Run);
+        assert_eq!(
+            claim_start(&mut started, Some(&Mode::Allow(vec![Agent::Claude]))),
+            Start::Run
+        );
     }
 }

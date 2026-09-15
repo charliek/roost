@@ -50,7 +50,11 @@ func agentHooksLaunchPlan(mode: AgentHooks, roostctl: String?) -> AgentHooksLaun
     case .ask: return .notConfigured
     case .allow:
         guard let roostctl else { return .noRoostctl }
-        return .run(argv: [roostctl, "agent", "ensure", "--json"])
+        // `--startup` is the non-destructive shape: wire and refresh
+        // what `agent-hooks` names, remove nothing. The bare verb is a
+        // reconcile, and a launch has no business undoing a hook
+        // somebody added by hand (plan 064 §3.2).
+        return .run(argv: [roostctl, "agent", "ensure", "--startup", "--json"])
     }
 }
 

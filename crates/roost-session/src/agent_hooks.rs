@@ -62,8 +62,9 @@ pub fn handle() -> AgentHooksHandle {
 /// a codex file Roost could not parse must not cost the client the
 /// session it just attached to.
 ///
-/// `ensure_on_behalf` rather than `ensure`, for the one thing that is
-/// only true remotely: the record's `noticed` flag is flipped in the
+/// `raise` rather than `ensure`, for the two things that are only true
+/// remotely: the client's list is unioned into the host's own
+/// `agent-hooks` key, and the record's `noticed` flag is flipped in the
 /// install's own locked write. The flip belongs there because this reply
 /// *is* the announcement: there is no second step to defer it to, and
 /// doing it afterwards under a re-taken lock let two clients connecting
@@ -73,13 +74,24 @@ fn ensure_in(
     request: &AgentHooksRequest,
     guard: Guard,
 ) -> Result<SessionSetAgentHooksResult, AgentHooksError> {
-    let (skip, unknown) = roost_agent_install::skip_list(request.skip.iter().map(String::as_str));
-    let mode = match request.mode {
-        AgentHooksMode::Auto => Mode::Auto,
-        AgentHooksMode::Off => Mode::Off,
-    };
-    let outcome = roost_agent_install::ensure_on_behalf(home, mode, &skip, &request.client, guard)
-        .map_err(|error| AgentHooksError::Failed(error.to_string()))?;
+    let (skip, unknown) =
+        roost_agent_install::resolve_names(request.skip.iter().map(String::as_str));
+    let outcome = match request.mode {
+        // The wire still carries mode + a skip list (C3 reshapes it into
+        // the allow-list it has meant since C1), so the agents this
+        // client allows are the ones it did not skip.
+        AgentHooksMode::Auto => {
+            let allowed: Vec<roost_agent::Agent> = roost_agent_install::ALL_AGENTS
+                .into_iter()
+                .filter(|agent| !skip.contains(agent))
+                .collect();
+            roost_agent_install::raise(home, &allowed, &request.client, guard)
+        }
+        AgentHooksMode::Off => {
+            roost_agent_install::reconcile(home, &Mode::Off, &request.client, guard)
+        }
+    }
+    .map_err(|error| AgentHooksError::Failed(error.to_string()))?;
 
     info!(
         client = %request.client,
@@ -179,7 +191,7 @@ mod tests {
             .iter()
             .map(|s| (s.agent.as_str(), s.reason.as_str()))
             .collect();
-        assert!(reasons.contains(&("cursor", "skip-list")), "{reasons:?}");
+        assert!(reasons.contains(&("cursor", "not allowed")), "{reasons:?}");
         assert!(
             reasons.iter().any(|(agent, _)| *agent == "codex"),
             "an absent agent is a skip, not an error: {reasons:?}"

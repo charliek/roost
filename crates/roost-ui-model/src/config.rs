@@ -7,6 +7,7 @@
 //! sets are not identical — `link-modifier` is Rust-only, `tab-min-width`
 //! / `tab-max-width` are Mac-only.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -696,6 +697,14 @@ fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
     // theme.set immediately followed by font-family.set).
     static NONCE: AtomicU64 = AtomicU64::new(0);
 
+    // Renaming onto the *link* would replace it with a regular file and
+    // silently orphan the target — someone whose `config.conf` is a link
+    // into a dotfiles repo would find Roost had stopped writing the file
+    // their repo tracks. Since plan 064 that write can happen with nobody
+    // at the keyboard (a connecting client raises this machine's
+    // `agent-hooks`), so the link has to survive it.
+    let path = follow_links(path);
+    let path = path.as_path();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let parent = if parent.as_os_str().is_empty() {
         Path::new(".")
@@ -718,6 +727,30 @@ fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
         f.sync_all()?;
     }
     fs::rename(&tmp, path)
+}
+
+/// `path` with its own symlink chain followed, lexically.
+///
+/// Lexical, not [`fs::canonicalize`], for the reason
+/// `roost_agent_install::write::follow_links` gives at length: a link
+/// whose target does not exist yet is exactly the case `canonicalize`
+/// cannot answer, and calling that "absent" is how the link gets
+/// replaced. A cycle stops at the hop limit and the caller writes
+/// through whatever it reached, which is no worse than not following at
+/// all.
+fn follow_links(path: &Path) -> PathBuf {
+    const MAX_HOPS: usize = 16;
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_HOPS {
+        let Ok(link) = fs::read_link(&current) else {
+            break;
+        };
+        current = match current.parent() {
+            Some(dir) if link.is_relative() => dir.join(link),
+            _ => link,
+        };
+    }
+    current
 }
 
 /// Public so the UI can pass `&ROOST_CONFIG`-aware paths into
@@ -785,17 +818,35 @@ fn read_header(path: &Path) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-fn default_path() -> Option<PathBuf> {
-    // `ROOST_CONFIG` overrides the path with an absolute file — used by
-    // the E2E harness to drive the command launcher off a seeded config
-    // (mirrors `ROOST_SOCKET` / `ROOST_BUNDLE_PROFILE`). Empty is ignored.
-    if let Some(raw) = std::env::var_os("ROOST_CONFIG") {
-        if !raw.is_empty() {
-            return Some(PathBuf::from(raw));
-        }
+/// Where `config.conf` lives: `$ROOST_CONFIG` when it is set and
+/// non-empty, else `<home>/.config/roost/config.conf`.
+///
+/// **The one place that rule lives.** `roost_agent_install::Home`
+/// resolves the same path against the root it was handed — a tempdir
+/// under test, the real `$HOME` in production — and a second spelling of
+/// the rule would eventually send the install engine's `agent-hooks`
+/// write into a different file than the one the UI reads back.
+///
+/// `ROOST_CONFIG` overrides with an absolute file — used by the E2E
+/// harness to drive the command launcher off a seeded config (mirrors
+/// `ROOST_SOCKET` / `ROOST_BUNDLE_PROFILE`).
+pub fn config_path_in(home: &Path, roost_config: Option<&OsStr>) -> PathBuf {
+    match roost_config.filter(|raw| !raw.is_empty()) {
+        Some(raw) => PathBuf::from(raw),
+        None => home.join(".config/roost/config.conf"),
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config/roost/config.conf"))
+}
+
+fn default_path() -> Option<PathBuf> {
+    let over = std::env::var_os("ROOST_CONFIG").filter(|raw| !raw.is_empty());
+    // Only the fallback half of the rule needs `$HOME`, so a machine
+    // without one still answers when the override is set.
+    let home = match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home),
+        None if over.is_some() => PathBuf::new(),
+        None => return None,
+    };
+    Some(config_path_in(&home, over.as_deref()))
 }
 
 #[cfg(test)]

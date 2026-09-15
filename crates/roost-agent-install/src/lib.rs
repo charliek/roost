@@ -2,9 +2,10 @@
 //! takes them out again, to the byte.
 //!
 //! Five agents, five config formats, one contract. `roostctl`, the iced
-//! UI and `roost-session` all call [`ensure`]; what lands on disk is one
-//! entry per hook event, pointing at `$ROOST_AGENT_HOOK`, identical on
-//! every machine (see [`command`]).
+//! UI and `roost-session` all come in through [`ensure`], [`reconcile`]
+//! or [`raise`]; what lands on disk is one entry per hook event,
+//! pointing at `$ROOST_AGENT_HOOK`, identical on every machine (see
+//! [`command`]).
 //!
 //! It lives outside `roost-agent` on purpose. That crate's charter is
 //! "no I/O, no socket", and it is what makes the adapters replayable
@@ -101,15 +102,16 @@ mod acceptance;
 pub use codex::{trust_entries, TrustEntry};
 pub use command::{installed_command, is_roost_command, owned_commands, INTEGRATION_VERSION};
 pub use ensure::{
-    agent_names, ensure, ensure_on_behalf, install, plan, skip_list, status, Mode, Outcome, Status,
+    agent_names, ensure, install, plan, raise, reconcile, resolve_names, set_hooks, status, Mode,
+    Outcome, Status,
 };
 pub use error::{AgentError, AgentSkip, AgentWarning, InstallError, SkipReason, Warning};
 pub use home::{Home, ALL_AGENTS};
 pub use plan::{apply, Applied, FileEdit, Guard, InstallPlan, Intent};
 pub use state::mark_noticed;
 
-/// `ensure`'s counterpart for a named set of agents. Re-exported here
-/// rather than as `ensure::uninstall` so the four verbs read alike.
+/// [`install`]'s counterpart for a named set of agents. Re-exported here
+/// rather than as `ensure::uninstall` so the verbs read alike.
 pub use ensure::uninstall;
 
 /// The files Roost owns or merges into, per agent — what
