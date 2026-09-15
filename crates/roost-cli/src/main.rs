@@ -24,7 +24,8 @@
 //!   roostctl screenshot [--out PATH] [--scale 1|2]
 //!   roostctl render-stats [--reset]
 //!   roostctl agent-hook AGENT
-//!   roostctl agent {ensure,install,uninstall,status}
+//!   roostctl agent {ensure,set,install,uninstall,status}
+//!   roostctl agent set <list|off> --local
 //!   roostctl claude-hook EVENT
 //!   roostctl claude install        (alias of `agent install claude`)
 //!   roostctl session {start,stop,status}
@@ -591,10 +592,17 @@ enum PaletteCmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Diagnostics to stderr, because stdout is this binary's *data*
+    // channel: `--json` on any verb, `tab dump`, and the hook payloads
+    // are all decoded by something. The config parser warns about a key
+    // it cannot read, and since plan 064 the retired `agent-hooks =
+    // auto` spelling is one of those — so on stdout that warning would
+    // land in front of the JSON the Mac app decodes from `agent ensure`.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     let args = Args::parse();

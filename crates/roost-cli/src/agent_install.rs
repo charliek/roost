@@ -1,9 +1,11 @@
 //! `roostctl agent` — wire Roost's hook entries into the supported
 //! agents' own config files, and take them out again.
 //!
-//! Four verbs over `roost-agent-install`. None of them dials a UI: they
-//! read and write dotfiles, so they work with nothing running, which is
-//! exactly when a user reaches for them.
+//! Five verbs over `roost-agent-install`. Four of them never dial a UI:
+//! they read and write dotfiles, so they work with nothing running,
+//! which is exactly when a user reaches for them. `set --local` is the
+//! fifth and shares that property; the UI-routed form of `set` (no
+//! `--local`, dialing the running UI's socket) is plan 064 C6.
 //!
 //! `ensure` here is the explicit reconcile — it wires what the key allows
 //! **and takes out what it does not**. `--startup` is the other shape,
@@ -13,9 +15,9 @@
 //!
 //! Every verb reads the config, and reads the **same** file and parser
 //! the UIs do (`roost-ui-model`), so `agent-hooks` means one thing on
-//! this machine rather than one thing per surface. `install` and
-//! `uninstall` are explicit instructions and *move the key* rather than
-//! ignoring it: `agent install codex` while the key says `off` wires
+//! this machine rather than one thing per surface. `install`, `uninstall`
+//! and `set --local` are explicit instructions and *move the key* rather
+//! than ignoring it: `agent install codex` while the key says `off` wires
 //! codex and adds it to the list, so the next launch does not treat what
 //! the user just asked for as unconsented. `status` changes nothing at
 //! all.
@@ -23,8 +25,8 @@
 use clap::Subcommand;
 use roost_agent::Agent;
 use roost_agent_install::{
-    ensure, install, reconcile, status, uninstall, AgentSkip, Guard, Home, Mode, Outcome, Status,
-    ALL_AGENTS,
+    ensure, install, reconcile, resolve_names, set_hooks, status, uninstall, AgentSkip, Guard,
+    Home, Mode, Outcome, Status, ALL_AGENTS,
 };
 use roost_ui_model::config::RoostConfig;
 
@@ -46,6 +48,35 @@ pub enum AgentCmd {
         /// that changed while the app was closed (plan 064 §3.2).
         #[arg(long, default_value_t = false)]
         startup: bool,
+    },
+    /// Set `agent-hooks` to exactly this list (or `off`), then bring
+    /// this machine's files in line with it — the explicit answer to
+    /// the consent dialog's question, from a terminal.
+    ///
+    /// `--local` is required for now: it writes straight to this
+    /// machine's `config.conf` under the install lock, same as `ensure`
+    /// and `install` do. The UI-routed form — dialling the running UI's
+    /// socket, so a headless box and a desk box agree without either
+    /// editing the other's dotfiles — is not implemented yet; a bare
+    /// `agent set` exits 2 naming `--local` until it lands.
+    ///
+    /// Because `--local` never dials a UI, a host that is currently
+    /// connected to by a client does not learn about the change until
+    /// that connection reattaches — `roostctl agent set` here is what
+    /// changes on disk, not what a live session has already wired.
+    Set {
+        /// A comma list of agent names (`claude`, `codex`, `grok`,
+        /// `cursor`, `opencode`), or the literal `off`. `ask`/`auto` are
+        /// not accepted: this verb answers the consent question, and
+        /// "unanswered" is not an answer to give it.
+        spec: String,
+        /// Write this machine's `agent-hooks` key directly instead of
+        /// dialing the running UI. Required for now — see the verb's
+        /// own help.
+        #[arg(long, default_value_t = false)]
+        local: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Wire one agent, or all of them, and add it to `agent-hooks`.
     /// Explicit wins: this works even when the key says `off`.
@@ -76,6 +107,16 @@ pub enum AgentCmd {
 /// worth printing, so the report goes to stdout and the code says
 /// whether anything in it failed.
 pub fn run(cmd: &AgentCmd) -> i32 {
+    // Before `$HOME` is resolved: a usage error is the caller's, not
+    // this machine's, and a box without a `$HOME` answering 1 here
+    // would send them looking for the wrong fault.
+    if let AgentCmd::Set { local: false, .. } = cmd {
+        eprintln!(
+            "roostctl agent set: the UI-routed form is not implemented yet; pass \
+             --local to set this machine's agent-hooks key directly"
+        );
+        return 2;
+    }
     let home = match Home::from_env() {
         Ok(home) => home,
         Err(e) => {
@@ -96,7 +137,8 @@ pub fn run(cmd: &AgentCmd) -> i32 {
                 // outcome) and puts its one human sentence on stderr,
                 // rather than breaking the decode with prose.
                 let note = "agent-hooks is not configured; nothing was wired. Choose agents \
-                            in Roost (Agent Hooks… in the command palette).";
+                            in Roost (Agent Hooks… in the command palette) or run `roostctl \
+                            agent set <list|off> --local`.";
                 if *json {
                     println!("{}", outcome_json(&Outcome::default()));
                     eprintln!("{note}");
@@ -104,6 +146,25 @@ pub fn run(cmd: &AgentCmd) -> i32 {
                     println!("{note}");
                 }
                 0
+            }
+        },
+        AgentCmd::Set { spec, json, .. } => match parse_set_spec(spec) {
+            Ok(mode) => {
+                let allow = matches!(mode, Mode::Allow(_));
+                let code = report(set_hooks(&home, &mode, BY, guard), *json);
+                if allow {
+                    let note = "a connected host will not see this until it connects again";
+                    if *json {
+                        eprintln!("{note}");
+                    } else {
+                        println!("{note}");
+                    }
+                }
+                code
+            }
+            Err(message) => {
+                eprintln!("roostctl agent set: {message}");
+                2
             }
         },
         AgentCmd::Install { agent, all } => match targets(agent.as_deref(), *all) {
@@ -163,6 +224,40 @@ pub(crate) fn configured() -> Option<Mode> {
 /// Reading is never a reason to guess at a consent nobody gave.
 pub(crate) fn resolved_or_nothing() -> Mode {
     configured().unwrap_or(Mode::Allow(Vec::new()))
+}
+
+/// Parse `agent set`'s argument: a comma list of agent names, or the
+/// literal `off`.
+///
+/// Not [`roost_ui_model::config::AgentHooks::parse`], which is the
+/// config *reader*: it is deliberately lenient — a value naming one
+/// unrecognised agent beside real ones still resolves, with a warning,
+/// to the names it does know, because a stale `config.conf` must keep
+/// working. `set` is the opposite kind of call: a user command whose
+/// only job is recording consent has no honest partial answer, so an
+/// unknown name refuses the whole list rather than silently narrowing
+/// it. [`resolve_names`] already draws that line the same way for
+/// `session.set_agent_hooks` (`roost-session`'s `agent_hooks::resolve`),
+/// so this reuses it instead of a third copy of the rule.
+fn parse_set_spec(spec: &str) -> Result<Mode, String> {
+    let trimmed = spec.trim();
+    if trimmed.eq_ignore_ascii_case("off") {
+        return Ok(Mode::Off);
+    }
+    let (agents, unknown) = resolve_names(trimmed.split(','));
+    if let Some(name) = unknown.first() {
+        return Err(format!(
+            "no agent named {name:?} ({})",
+            roost_agent_install::agent_names()
+        ));
+    }
+    if agents.is_empty() {
+        return Err(format!(
+            "name at least one agent ({}), or pass `off`",
+            roost_agent_install::agent_names()
+        ));
+    }
+    Ok(Mode::Allow(agents))
 }
 
 fn targets(agent: Option<&str>, all: bool) -> Result<Vec<Agent>, i32> {
@@ -375,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn the_four_verbs_parse_the_way_the_docs_spell_them() {
+    fn the_five_verbs_parse_the_way_the_docs_spell_them() {
         assert!(matches!(
             parse(&["ensure"]),
             AgentCmd::Ensure {
@@ -407,6 +502,21 @@ mod tests {
         assert!(
             matches!(parse(&["uninstall", "codex"]), AgentCmd::Uninstall { agent: Some(name), .. } if name == "codex")
         );
+        assert!(matches!(
+            parse(&["set", "claude,codex", "--local"]),
+            AgentCmd::Set { spec, local: true, json: false } if spec == "claude,codex"
+        ));
+        assert!(matches!(
+            parse(&["set", "off", "--local", "--json"]),
+            AgentCmd::Set { spec, local: true, json: true } if spec == "off"
+        ));
+        // `--local` defaults false, which is what `run` checks to
+        // print the "not implemented yet" refusal for the UI-routed
+        // form (plan 064 C6).
+        assert!(matches!(
+            parse(&["set", "claude"]),
+            AgentCmd::Set { local: false, .. }
+        ));
     }
 
     /// The argument shapes that are mistakes rather than instructions.
@@ -421,6 +531,29 @@ mod tests {
         assert_eq!(targets(Some("gemini"), false), Err(2));
         // gx reports as grok and has no name of its own.
         assert_eq!(targets(Some("gx"), false), Err(2));
+    }
+
+    /// `set`'s argument, unlike `AgentHooks::parse`, refuses a list that
+    /// names even one agent it does not know — see the function's own
+    /// doc for why a reader's leniency is wrong for a writer.
+    #[test]
+    fn parse_set_spec_accepts_a_list_or_off_and_refuses_everything_else() {
+        assert_eq!(
+            parse_set_spec("claude,codex"),
+            Ok(Mode::Allow(vec![Agent::Claude, Agent::Codex]))
+        );
+        assert_eq!(parse_set_spec(" OFF "), Ok(Mode::Off));
+        assert_eq!(parse_set_spec("off"), Ok(Mode::Off));
+        assert!(parse_set_spec("").is_err());
+        assert!(parse_set_spec("banana").is_err());
+        // One unknown name refuses the whole list, not just the token
+        // that named nothing.
+        let refused = parse_set_spec("claude,banana").unwrap_err();
+        assert!(refused.contains("banana"), "{refused}");
+        // `ask`/`auto` are the "unanswered" spelling, not something this
+        // verb can be told to *set*.
+        assert!(parse_set_spec("ask").is_err());
+        assert!(parse_set_spec("auto").is_err());
     }
 
     fn a_row(agent: Agent, allowed: bool) -> Status {

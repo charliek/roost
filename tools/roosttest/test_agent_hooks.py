@@ -30,10 +30,11 @@ can move the lifecycle, and every read is a condition wait rather than a
 sleep.
 
 The second half of the file is the other direction entirely: `roostctl
-agent ensure` and a UI's own startup wiring, driven against a **jailed
-`$HOME`** (plan 046 §3.9). Those lanes write agent config files, so read
-the fence comment above them before adding to them — nothing in this
-suite may reach a real dotfile.
+agent ensure`/`set`/`install`/`uninstall` and a UI's own startup wiring,
+driven against a **jailed `$HOME`** (plan 046 §3.9, extended by plan 064
+§5 C5 for the list-shaped `agent-hooks` key and the `set` verb). Those
+lanes write agent config files, so read the fence comment above them
+before adding to them — nothing in this suite may reach a real dotfile.
 """
 
 from __future__ import annotations
@@ -798,6 +799,16 @@ def test_agent_ensure_wires_a_jailed_home(tmp_path):
         assert rows[agent]["wired"] is not None, rows[agent]
         assert rows[agent]["up_to_date"] is True, rows[agent]
         assert rows[agent]["noticed"] is False, rows[agent]
+        # `allowed` is the resolved `agent-hooks` key's own claim, kept
+        # apart from `wired`/`up_to_date` (the disk's claim) — every
+        # agent here is both, since the jail's default key names all
+        # five (plan 064 §5 C5).
+        assert rows[agent]["allowed"] is True, rows[agent]
+    # codex is the one adapter split across two files (`hooks.json` +
+    # `config.toml`'s `[features] hooks`); `files` is what an uninstall
+    # touches and what the consent sheet names, so both paths have to be
+    # in it.
+    assert len(rows["codex"]["files"]) == 2, rows["codex"]
 
     # Read the file list off the record before it is dropped: it is the
     # only thing that knows which of the five layouts wrote what.
@@ -813,17 +824,11 @@ def test_agent_ensure_wires_a_jailed_home(tmp_path):
                 )
 
 
-def test_agent_hooks_off_wires_nothing_and_unwires_on_request(tmp_path):
+def test_agent_hooks_off_wires_nothing_and_leaves_the_record_absent(tmp_path):
     """`agent-hooks = off`, read from a real `config.conf` by the real
-    binary.
-
-    Two halves, and they differ deliberately. With nothing wired, `off`
-    writes **nothing at all** — not even an empty state record, which is
-    what makes the key safe to leave in the harness's own config. Asked
-    explicitly (`agent install`), Roost still wires: explicit wins over
-    the config. A later `ensure` then reads the same `off` and removes
-    what it put there — which is the difference between a config switch
-    (opt out of future wiring) and the verb (take it out now)."""
+    binary: with nothing already wired, `off` writes **nothing at all**
+    — not even an empty state record, which is what makes the key safe
+    to leave in the harness's own config."""
     jail = Jail(tmp_path, agent_hooks="off")
 
     quiet = ensure_json(jail)
@@ -831,16 +836,175 @@ def test_agent_hooks_off_wires_nothing_and_unwires_on_request(tmp_path):
     assert not jail.record.exists(), "`off` with nothing to remove still wrote the record"
     assert not (jail.agent_dirs["claude"] / "settings.json").exists()
 
-    forced = run_agent(jail, "install", "codex")
-    assert forced.returncode == 0, forced.stdout + forced.stderr
-    assert "codex" in jail.read_record(), "explicit `agent install` did not win over off"
+
+def test_agent_set_local_wires_and_unwires_exactly_the_named_agents(tmp_path):
+    """`roostctl agent set <list|off> --local` (plan 064 §5 C5): a comma
+    list writes the key and wires exactly what it names — nothing else
+    on this machine — and `off` unwires it again.
+
+    The list form is asserted against two named agents with three more
+    present but unnamed, so "exactly" is the thing under test rather
+    than "wires everything present"."""
+    jail = Jail(tmp_path, agent_hooks=None)
+    assert jail.read_key() is None
+
+    wired = run_agent(jail, "set", "claude,codex", "--local", "--json")
+    assert wired.returncode == 0, wired.stdout + wired.stderr
+    outcome = json.loads(wired.stdout)
+    assert sorted(outcome["wired"]) == ["claude", "codex"], outcome
+    assert jail.read_key() == "claude, codex"
+    assert (jail.agent_dirs["claude"] / "settings.json").exists()
+    assert (jail.agent_dirs["codex"] / "hooks.json").exists()
+    # grok is present in the jail (`INSTALLABLE_AGENTS` default) but was
+    # never named, so `set` must have left it alone.
+    assert not any(jail.agent_dirs["grok"].iterdir()), "set wired an agent it was not given"
+
+    off = run_agent(jail, "set", "off", "--local", "--json")
+    assert off.returncode == 0, off.stdout + off.stderr
+    outcome = json.loads(off.stdout)
+    assert sorted(outcome["removed"]) == ["claude", "codex"], outcome
+    assert jail.read_key() == "off"
+    assert jail.read_record() == {}, "off left the record naming an agent it unwired"
+    for agent, filename in (("claude", "settings.json"), ("codex", "hooks.json")):
+        path = jail.agent_dirs[agent] / filename
+        assert not path.exists() or "ROOST_AGENT_HOOK" not in path.read_text()
+
+
+def test_agent_set_refuses_an_empty_or_unknown_list_and_writes_nothing(tmp_path):
+    """An empty spec and an unrecognised name are the two shapes `set`
+    must refuse before it writes anything — a partial answer to a
+    consent question is not an answer (plan 064 §5 C5)."""
+    jail = Jail(tmp_path, agent_hooks=None)
+
+    for spec in ("", "banana"):
+        refused = run_agent(jail, "set", spec, "--local")
+        assert refused.returncode == 2, f"set {spec!r} --local: {refused.stdout}{refused.stderr}"
+        assert not refused.stdout.strip(), f"set {spec!r} --local wrote to stdout: {refused.stdout}"
+
+    assert jail.read_key() is None, "a refused `set` changed the key"
+    assert not jail.record.exists(), "a refused `set` wrote the state record"
+
+
+def test_agent_set_without_local_is_not_yet_implemented(tmp_path):
+    """Bare `agent set` (no `--local`) is the UI-routed form plan 064 C6
+    adds; until then it must refuse rather than silently behave like
+    `--local`, so a script written against the eventual contract fails
+    loudly instead of writing the wrong machine's key."""
+    jail = Jail(tmp_path, agent_hooks=None)
+
+    refused = run_agent(jail, "set", "claude")
+    assert refused.returncode == 2, (refused.returncode, refused.stdout, refused.stderr)
+    assert "--local" in refused.stderr, refused.stderr
+    assert jail.read_key() is None
+    assert not jail.record.exists()
+
+
+def test_agent_install_and_uninstall_move_the_key(tmp_path):
+    """`agent install <name>` unions the key rather than ignoring it, and
+    `agent uninstall <name>` narrows it back — `uninstall --all` is the
+    one shape that spells the result `off` rather than leaving the key
+    unanswered (plan 064 §5 C5's `install`/`uninstall` cases)."""
+    jail = Jail(tmp_path, agent_hooks=None)
+
+    installed = run_agent(jail, "install", "codex")
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+    assert jail.read_key() == "codex", "explicit `agent install` did not add codex to the key"
     assert (jail.agent_dirs["codex"] / "hooks.json").exists()
 
-    swept = ensure_json(jail)
-    assert swept["removed"] == ["codex"], swept
-    assert jail.read_record() == {}, "off left the record naming an agent it unwired"
+    uninstalled = run_agent(jail, "uninstall", "codex")
+    assert uninstalled.returncode == 0, uninstalled.stdout + uninstalled.stderr
+    assert jail.read_key() == "off", "narrowing the key to nothing must spell it `off`"
+    assert jail.read_record() == {}
     hooks = jail.agent_dirs["codex"] / "hooks.json"
     assert not hooks.exists() or "ROOST_AGENT_HOOK" not in hooks.read_text()
+
+    run_agent(jail, "install", "claude")
+    run_agent(jail, "install", "codex")
+    assert jail.read_key() == "claude, codex"
+    all_out = run_agent(jail, "uninstall", "--all")
+    assert all_out.returncode == 0, all_out.stdout + all_out.stderr
+    assert jail.read_key() == "off"
+    assert jail.read_record() == {}
+
+
+def test_a_config_warning_never_lands_on_the_json_channel(tmp_path):
+    """`--json` is decoded by the Mac app; a diagnostic must not precede it.
+
+    The retired `agent-hooks = auto` spelling is exactly the value that
+    warns now (plan 064 §3.1), and it is what every machine that ran the
+    old default still has in its config — so this is the common case, not
+    an exotic one. `roostctl` logs to stderr for this reason; on stdout
+    the warning would sit in front of the JSON and break the decode."""
+    jail = Jail(tmp_path, agent_hooks="auto")
+
+    done = run_agent(jail, "ensure", "--json")
+    assert done.returncode == 0, done.stderr
+    json.loads(done.stdout)
+    assert "agent-hooks" in done.stderr, (
+        "the unparseable value was not diagnosed anywhere"
+    )
+    assert jail.read_key() == "auto", "a warned-about value was rewritten"
+
+
+def test_agent_ensure_under_an_unanswered_key_is_a_quiet_no_op(tmp_path):
+    """No `agent-hooks` key at all — nobody has answered the consent
+    dialog — is a no-op: `ensure` writes nothing, exits 0, and its
+    `--json` output is valid JSON (plan 064 C1 fixed a build where prose
+    leaked onto stdout and broke the decode; this pins it)."""
+    jail = Jail(tmp_path, agent_hooks=None)
+    assert jail.read_key() is None
+
+    outcome = ensure_json(jail)  # raises if stdout does not parse as JSON
+    assert outcome == {
+        "wired": [],
+        "refreshed": [],
+        "current": [],
+        "removed": [],
+        "skipped": [],
+        "warnings": [],
+        "errors": [],
+    }, outcome
+    assert not jail.record.exists(), "an unanswered key still wrote the state record"
+    for agent in INSTALLABLE_AGENTS:
+        assert not any(jail.agent_dirs[agent].iterdir()), f"{agent}: wired under an unanswered key"
+
+
+def test_ensure_startup_leaves_a_hand_wired_agent_alone_but_bare_ensure_sweeps_it(tmp_path):
+    """The pair plan 064 §5 C5 asks for: `--startup` is what a UI launch
+    runs, and a launch must never undo a hook somebody added by hand or
+    react to a key that changed while the app was closed — only the
+    explicit, no-flag `ensure` (`reconcile` underneath) takes an agent
+    back out once the key stops naming it.
+
+    Built by installing two agents and then hand-lowering the key to
+    name only one — the same shape a user editing `config.conf` in an
+    editor produces, and the one thing the Mac launch spawn (`ensure
+    --startup`) must not be able to undo."""
+    jail = Jail(tmp_path, agent_hooks=None)
+    run_agent(jail, "install", "claude")
+    run_agent(jail, "install", "grok")
+    assert jail.read_key() == "claude, grok"
+    grok_files = jail.owned_files("grok")
+    assert grok_files, "grok wired nothing to hand-lower away from"
+
+    jail.write_config(agent_hooks="claude")
+    assert jail.read_key() == "claude"
+
+    startup = run_agent(jail, "ensure", "--startup", "--json")
+    assert startup.returncode == 0, startup.stdout + startup.stderr
+    startup_outcome = json.loads(startup.stdout)
+    assert startup_outcome["removed"] == [], startup_outcome
+    for path in grok_files:
+        assert path.exists() and "ROOST_AGENT_HOOK" in path.read_text(), (
+            f"--startup undid a hand-wired agent's entry: {path}"
+        )
+
+    bare = ensure_json(jail)
+    assert bare["removed"] == ["grok"], bare
+    for path in grok_files:
+        assert not path.exists() or "ROOST_AGENT_HOOK" not in path.read_text(), (
+            f"bare ensure left grok's entry behind: {path}"
+        )
 
 
 def test_the_test_mode_fence_refuses_without_the_override(tmp_path):

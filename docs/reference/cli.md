@@ -29,7 +29,7 @@ roostctl [--socket <PATH>] <COMMAND>
 | `tab clear-notification` | Clear a tab's pending-attention flag |
 | `tab open` / `close` / `send` / `resize` / `reorder` | Tab lifecycle + I/O |
 | `project list` / `create` / `rename` / `delete` / `reorder` | Project lifecycle |
-| `agent ensure` / `install` / `uninstall` / `status` | Wire Roost's hook entries into the supported agents' own configs |
+| `agent ensure` / `set` / `install` / `uninstall` / `status` | Wire Roost's hook entries into the supported agents' own configs |
 | `agent-hook <agent>` | Internal: the one hook entrypoint every supported agent invokes |
 | `claude install` | Alias of `agent install claude` |
 | `claude-hook` | Internal: invoked by Claude on each hook event (kept for settings files an earlier Roost wrote) |
@@ -305,25 +305,54 @@ roostctl palette dismiss
 ## `agent` subcommands
 
 Wire Roost's hook entries into each supported agent's own configuration
-file, and take them back out. None of these dials a running UI — they
-read and write dotfiles, so they work with nothing running.
+file, and take them back out. As of this writing all five verbs read and
+write dotfiles directly and work with nothing running; `set`'s
+UI-routed form (dialling a running UI's socket instead of `--local`) is
+planned but not yet implemented — see below.
 
 ```bash
-roostctl agent status              # per agent: installed, wired, up to date
-roostctl agent ensure [--json]     # what the UIs run at startup
-roostctl agent install claude      # or --all; explicit wins over `agent-hooks = off`
-roostctl agent uninstall claude    # or --all
+roostctl agent status                        # per agent: installed, wired, up to date
+roostctl agent ensure [--json] [--startup]    # reconcile to `agent-hooks`; --startup never removes
+roostctl agent set claude,codex --local       # set `agent-hooks` to exactly this list, and wire it
+roostctl agent set off --local                # set `agent-hooks = off`, and unwire everything
+roostctl agent install claude                 # or --all; explicit wins over `agent-hooks = off`
+roostctl agent uninstall claude               # or --all
 ```
 
-`ensure` reads `agent-hooks` / `agent-hooks-skip` from `config.conf`
-([`config.md`](config.md#agent-hooks)) — the same values the UIs act on
+`ensure` reads the `agent-hooks` key from `config.conf`
+([`config.md`](config.md#agent-hooks)) — the same value the UIs act on
 at startup, through the same parser (`roost-cli` depends on
-`roost-ui-model` for exactly this). `install` and `uninstall` take an
-agent name (`claude`, `codex`, `grok`, `cursor`, `opencode`) or `--all`,
-and deliberately ignore `agent-hooks = off` — an explicit verb always
-wins. `status` changes nothing on disk; each row names the agent,
-whether its config directory is present, whether Roost's entries are
-wired, and whether they're at the current integration version.
+`roost-ui-model` for exactly this) — and reconciles this machine's files
+to match: wires what the key allows and **takes out what it does not**.
+Bare `agent ensure` is that full reconcile; `--startup` is the narrower
+shape a UI launch runs — wire and refresh what the key names, but never
+remove anything, because a launch must not undo a hook someone added by
+hand or react to a key that changed while the app was closed. An
+unanswered key (nobody has run the consent dialog or `agent set` yet) is
+a no-op for either shape: nothing is wired, and nothing already wired is
+touched.
+
+`set <list|off> --local` writes the `agent-hooks` key directly to
+exactly the given comma list of agent names (`claude`, `codex`, `grok`,
+`cursor`, `opencode`) or to `off`, then reconciles this machine's files
+to match, the same way `ensure` does. `--local` is required for now —
+bare `agent set` (no `--local`) is meant to dial the running UI instead,
+so a headless box and a desk box can agree on the setting without either
+editing the other's dotfiles, but that path is not implemented yet and
+currently exits with an error naming `--local`. Because `--local` never
+dials a UI, a connected host's live session does not pick up the change
+until it reconnects.
+
+`install` and `uninstall` take an agent name or `--all`, and
+deliberately ignore `agent-hooks = off` — an explicit verb always wins.
+Both also *move* the key rather than leaving it alone: `install`
+unions the named agent(s) into it (so the next `ensure` does not treat
+what you just asked for as unconsented), and `uninstall` narrows it back
+out, spelling the result `off` when nothing would be left allowed.
+`status` changes nothing on disk; each row names the agent, whether its
+config directory is present, whether the resolved `agent-hooks` key
+allows it, whether Roost's entries are actually wired on disk, and
+whether they're at the current integration version.
 
 See the [Agent Hooks](../guides/agents.md) guide for the mechanism, the
 wire format each agent gets, and the guarantee about what a merge does
