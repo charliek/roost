@@ -748,6 +748,10 @@ pub struct AgentHooksHandle(Arc<dyn Fn(AgentHooksRequest) -> AgentHooksFuture + 
 /// lowered (plan 064 §3.3). There is no `off` here: a client whose own
 /// key is `off` or unconfigured has nothing to raise the host with, so
 /// it never sends this op at all.
+///
+/// Unvalidated: the agent set lives in the install engine, which this
+/// crate deliberately does not link, so the handle's far side refuses a
+/// malformed list with [`AgentHooksError::InvalidParam`].
 #[derive(Debug, Clone)]
 pub struct AgentHooksRequest {
     pub agents: Vec<String>,
@@ -756,19 +760,30 @@ pub struct AgentHooksRequest {
 }
 
 /// Why a session could not run an install at all.
-///
-/// A whole-run failure: no `$HOME`, an unwritable state record, a lock
-/// another writer never released. A *per-agent* failure is not one — it
-/// rides back in the reply's `errors`.
 #[derive(Debug)]
 pub enum AgentHooksError {
+    /// The request itself is malformed — an empty `agents`, or a name no
+    /// agent answers to — and nothing was written.
+    ///
+    /// Its own variant rather than a [`Self::Failed`] because the two
+    /// instruct differently, and under protocol equality a name this
+    /// host does not know can only be a bug in the client: `invalid-param`
+    /// says "fix the request", `internal` says "something on the host
+    /// broke", and a client told the second would go hunting on the wrong
+    /// machine.
+    InvalidParam(String),
+    /// A whole-run failure: no `$HOME`, an unwritable state record, a lock
+    /// another writer never released. A *per-agent* failure is not one —
+    /// it rides back in the reply's `errors`.
     Failed(String),
 }
 
 impl std::fmt::Display for AgentHooksError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AgentHooksError::Failed(error) => f.write_str(error),
+            AgentHooksError::InvalidParam(error) | AgentHooksError::Failed(error) => {
+                f.write_str(error)
+            }
         }
     }
 }
@@ -2590,7 +2605,8 @@ fn session_set_focus(
 /// frame: the reply's `errors` list carries it, so a client hears which
 /// agent broke and still keeps the session it just attached to. Only a
 /// whole-run failure — no `$HOME`, an unwritable record, a lock another
-/// writer never released — is an error frame.
+/// writer never released — is an error frame, and a malformed request is
+/// a different one ([`AgentHooksError::InvalidParam`]).
 async fn session_set_agent_hooks(
     h: &IpcHandler,
     p: SessionSetAgentHooksParams,
@@ -2607,7 +2623,10 @@ async fn session_set_agent_hooks(
             client: p.client,
         })
         .await
-        .map_err(|AgentHooksError::Failed(message)| HandlerError::new("internal", message))?;
+        .map_err(|error| match error {
+            AgentHooksError::InvalidParam(message) => HandlerError::new("invalid-param", message),
+            AgentHooksError::Failed(message) => HandlerError::new("internal", message),
+        })?;
     encode(&result)
 }
 

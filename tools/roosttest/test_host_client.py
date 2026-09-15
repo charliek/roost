@@ -57,7 +57,9 @@ import contextlib
 import json
 import os
 import re
+import socket as socketlib
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -66,7 +68,6 @@ from pathlib import Path
 import pytest
 import session as sessionlib
 import ui
-from agent_jail import INSTALLABLE_AGENTS
 from client import Roost, RoostError, scaled_timeout
 from eventstream import EventStream
 from host_probe import host_key, sibling_key  # noqa: F401  (re-exported)
@@ -229,7 +230,7 @@ class HostUnderTest:
 
 
 @contextlib.contextmanager
-def saved_host(roost: Roost, env: sessionlib.SessionEnv):
+def saved_host(roost: Roost, env: sessionlib.SessionEnv, target: Path | None = None):
     """Register `env`'s socket as a host, and forget it afterwards.
 
     Registry-first on purpose: `host.add` is documented as registry-only
@@ -237,11 +238,16 @@ def saved_host(roost: Roost, env: sessionlib.SessionEnv):
     asks for one and a test about the zero-connection state does not have
     to unpick one.
 
+    `target` overrides the path the client dials — what
+    [`recording_relay`] needs, since the whole point of the relay is that
+    the client must not reach the session directly.
+
     The removal happens **before** the session dies, so the client is
     never left dialing a socket the fixture is about to delete.
     """
     label = f"hs-{uuid.uuid4().hex[:8]}"
-    added = roost.call("host.add", {"label": label, "target": str(env.socket)})["host"]
+    dialed = str(target if target is not None else env.socket)
+    added = roost.call("host.add", {"label": label, "target": dialed})["host"]
     under_test = HostUnderTest(roost=roost, env=env, saved_id=added["id"], label=label)
     try:
         # [`host_key`] finds a tab by the number it has, and two connected
@@ -1929,40 +1935,239 @@ def test_reordering_a_hosts_projects_routes_to_the_session_and_the_mirror_follow
 
 
 # ---------------------------------------------------------------------------
-# 13. Plan 046 C8 — `session.set_agent_hooks`, and `off` reaching a host
+# 13. Plan 064 §3.3 — `session.set_agent_hooks`: a client RAISES a host
 #
-# THIS SECTION WRITES AGENT CONFIG FILES. Everything above it drives
-# terminals; this one drives an install engine, and a bug in it would
-# otherwise land in the developer's own `~/.claude/settings.json`. The
-# fences are `test_agent_hooks.py`'s, applied to the *session* side:
+# THIS SECTION WRITES AGENT CONFIG FILES, and since plan 064 it writes
+# the host's `config.conf` too. Everything above it drives terminals;
+# this one drives an install engine, and a bug in it would otherwise land
+# in the developer's own `~/.claude/settings.json`. The fences are
+# `test_agent_hooks.py`'s, applied to the *session* side:
 #
-#   1. `SessionEnv.jail_agents()` puts `HOME`, `XDG_CONFIG_HOME` and all
-#      five agent-directory variables inside the session's own temp root,
-#      and every launch from then on asserts the merged environment
-#      before spawning (`session.command_env`).
+#   1. `SessionEnv.jail_agents()` puts `HOME`, `XDG_CONFIG_HOME`,
+#      `ROOST_CONFIG` and all five agent-directory variables inside the
+#      session's own temp root, and every launch from then on asserts the
+#      merged environment before spawning (`session.command_env`).
 #   2. `roost-agent-install` refuses to run under `ROOST_TEST_MODE=1`
-#      unless `ROOST_AGENT_HOOKS_FORCE=1` is set. Only the fixture below
+#      unless `ROOST_AGENT_HOOKS_FORCE=1` is set. Only the helper below
 #      sets it, and only for a session that is already jailed.
 #   3. The *client* here is the ordinary harness UI, whose `launcher.conf`
 #      says `agent-hooks = off`. That is not a limitation — it is the
-#      assertion: a client on `off` must take a host's entries back out.
+#      assertion: a client with nothing to raise must send nothing at all.
 #
-# What is NOT here: the old-session tolerance path. A session that
-# predates the op cannot be produced from this harness — there is no
-# version knob on the fake-`ssh` fixture or anywhere else that removes an
-# op from a live daemon's dispatcher — so the client's side of it (one
-# log line per connection, no toast, connection unaffected) is covered by
-# `roost-iced`'s inline `an_old_session_is_noted_once_per_op_and_never_again`.
+# The rule these cases pin: **every machine has one `agent-hooks` setting,
+# in its own `config.conf`, and a connecting client may only ever raise
+# it.** A host whose key says `off` is raised anyway — the contentious
+# half, pinned by its own case below — and the same-UID socket is the
+# consent boundary. Lowering a host is a local act on that box and holds
+# until a more permissive client connects again.
+#
+# What is NOT here:
+#
+# * The v5 → v6 refusal. A session that predates the reshape cannot be
+#   produced from this harness (there is no protocol-version knob on any
+#   fixture), and it does not need to be: protocol equality means such a
+#   session never reaches a live connection at all, which
+#   `host_conn::task`'s `Unsupported` doc states and
+#   `roost-ipc`'s `session_set_agent_hooks_rejects_the_pre_reshape_v5_wire_shape`
+#   pins on the type.
+# * The old-session tolerance path, retired with it.
 # ---------------------------------------------------------------------------
+
+
+class RecordingRelay:
+    """A unix socket standing in front of a session's, recording the ops
+    a client sends through it.
+
+    The only wire-observation seam this lane has for `session.*`: the ops
+    a UI queues toward a host are per-connection state inside it, and no
+    IPC op reports them (`tab.capture_pty_input` reads a *tab's* input,
+    which is a different pipe). Standing between the two processes is the
+    honest alternative to asking the UI what it thinks it sent — what
+    lands here is what the host would have received.
+
+    A dumb byte pump in both directions, so an attach's binary payload
+    crosses unharmed; only the client→server half is parsed, only for
+    whole JSON lines, and anything that is not one is skipped rather than
+    an error.
+    """
+
+    def __init__(self, path: Path, upstream: Path):
+        self.path = path
+        self._upstream = upstream
+        self._ops: list[str] = []
+        self._overflows = 0
+        self._threads: list[threading.Thread] = []
+        self._recorders: list[threading.Thread] = []
+        self._live: list[socketlib.socket] = []
+        self._lock = threading.Lock()
+        self._closing = False
+        self._listener = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
+        self._listener.bind(str(path))
+        path.chmod(0o600)
+        self._listener.listen(16)
+        # So the accept loop notices `close()` rather than blocking past it.
+        self._listener.settimeout(0.1)
+        self._spawn(self._accept_loop)
+
+    def ops(self) -> list[str]:
+        """Every op a client has sent through this relay, in order.
+
+        Call [`wait_drained`] first when the assertion is that an op was
+        **not** sent: a reader that has not caught up looks exactly like
+        a client that stayed quiet."""
+        with self._lock:
+            return list(self._ops)
+
+    def overflows(self) -> int:
+        """How many times the line reader gave up on an over-long frame.
+
+        Non-zero means this relay skipped bytes it could not frame, so
+        `ops()` is a floor rather than the whole traffic — which a test
+        asserting an op was *absent* has to know about."""
+        with self._lock:
+            return self._overflows
+
+    def wait_drained(self, timeout: float = 10.0) -> None:
+        """Wait until every finished client connection's reader has
+        finished with it.
+
+        A closed client socket makes that reader's `recv` return empty
+        and its thread exit, so joining the threads is the fence: after
+        this, everything the client put on the wire is in `ops()`."""
+        deadline = scaled_timeout(timeout)
+        with self._lock:
+            readers = list(self._recorders)
+        for thread in readers:
+            thread.join(timeout=deadline)
+            assert not thread.is_alive(), "a relay reader is still going after the client left"
+
+    def client(self, timeout: float = 30.0) -> Roost:
+        return Roost(self.path, timeout=scaled_timeout(timeout))
+
+    def close(self) -> None:
+        self._closing = True
+        with contextlib.suppress(OSError):
+            self._listener.close()
+        with self._lock:
+            live, threads = list(self._live), list(self._threads)
+        for sock in live:
+            with contextlib.suppress(OSError):
+                sock.shutdown(socketlib.SHUT_RDWR)
+            with contextlib.suppress(OSError):
+                sock.close()
+        for thread in threads:
+            thread.join(timeout=scaled_timeout(5.0))
+        with contextlib.suppress(OSError):
+            self.path.unlink()
+
+    # -- internals --------------------------------------------------------
+    def _spawn(self, target, *args) -> threading.Thread:
+        thread = threading.Thread(target=target, args=args, daemon=True)
+        with self._lock:
+            self._threads.append(thread)
+        thread.start()
+        return thread
+
+    def _accept_loop(self) -> None:
+        while not self._closing:
+            try:
+                downstream, _ = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            upstream = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
+            try:
+                upstream.connect(str(self._upstream))
+            except OSError:
+                downstream.close()
+                upstream.close()
+                continue
+            with self._lock:
+                self._live.extend((downstream, upstream))
+            reader = self._spawn(self._pump, downstream, upstream, True)
+            with self._lock:
+                self._recorders.append(reader)
+            self._spawn(self._pump, upstream, downstream, False)
+
+    def _pump(self, src, dst, record: bool) -> None:
+        carry = b""
+        try:
+            while True:
+                chunk = src.recv(65536)
+                if not chunk:
+                    break
+                # Recorded before it is forwarded, never after: the
+                # far side must not be able to answer a frame this
+                # relay has not written down yet, or "no frame was
+                # sent" would be racing the reader that proves it.
+                if record:
+                    carry = self._record(carry + chunk)
+                dst.sendall(chunk)
+        except OSError:
+            pass
+        finally:
+            for sock in (src, dst):
+                with contextlib.suppress(OSError):
+                    sock.shutdown(socketlib.SHUT_RDWR)
+
+    def _record(self, buffered: bytes) -> bytes:
+        *lines, rest = buffered.split(b"\n")
+        for line in lines:
+            try:
+                frame = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(frame, dict) and isinstance(frame.get("op"), str):
+                with self._lock:
+                    self._ops.append(frame["op"])
+        # A data connection stops being newline-framed after its
+        # handshake, so the carry is capped: an attach's payload must not
+        # grow this without bound. Dropping bytes silently is what would
+        # make an absence assertion unsound, so the drop is counted and
+        # `overflows()` is what a test checks before trusting `ops()`.
+        if len(rest) > 65536:
+            with self._lock:
+                self._overflows += 1
+            return rest[-65536:]
+        return rest
+
+
+@contextlib.contextmanager
+def recording_relay(env: sessionlib.SessionEnv):
+    """A [`RecordingRelay`] in front of `env`'s socket, torn down whatever
+    the test did to it.
+
+    Rooted beside the session's own socket, which the fixture already
+    created `0700` — a unix path has ~107 bytes to spend and this one is
+    the shortest honest place for it.
+    """
+    relay = RecordingRelay(env.socket.parent / "relay.sock", env.socket)
+    try:
+        yield relay
+    finally:
+        relay.close()
+
+
+def start_jailed_session(env, *, agent_hooks=None, **overrides):
+    """Jail `env`'s agent dotfiles and `config.conf`, start the daemon,
+    and hand back the jail.
+
+    `agent_hooks` seeds the host's OWN key — the thing a raise unions
+    into. It defaults to absent, which is where a machine nobody has
+    consented on starts.
+    """
+    jail = env.jail_agents(agent_hooks=agent_hooks)
+    start_session(env, ROOST_AGENT_HOOKS_FORCE="1", **overrides)
+    return jail
 
 
 @pytest.fixture
 def jailed_host(roost, session_env):
-    """A running session whose agent dotfiles are inside its own root,
-    saved as a host, not yet connected."""
+    """A running session whose agent dotfiles and `config.conf` are inside
+    its own root, saved as a host, not yet connected."""
     require_test_mode(roost)
-    jail = session_env.jail_agents()
-    start_session(session_env, ROOST_AGENT_HOOKS_FORCE="1")
+    jail = start_jailed_session(session_env)
     with saved_host(roost, session_env) as under_test:
         yield under_test, jail
 
@@ -1975,87 +2180,200 @@ def wired_agents(jail) -> set:
         return set()
 
 
-def test_a_client_wires_a_hosts_agent_hooks_and_off_takes_them_back(jailed_host):
-    """The remote half of plan 046: a client's `agent-hooks` config is
-    what decides whether a host is wired.
+def raise_hooks(client: Roost, agents: list, by: str = "roosttest") -> dict:
+    return client.call("session.set_agent_hooks", {"agents": agents, "client": by})
 
-    Two clients, deliberately. The **scripted** one sends `auto` and is
-    the only place the op's reply is readable, since no IPC op on the UI
-    side reports what a host answered. The **real** one is the harness UI,
-    which runs on `agent-hooks = off` and connects afterwards — so the
-    unwiring is not something this test asks for, it is what the client
-    does on its own once connected, which is the whole claim of §3.4
-    ("off is off everywhere") and the only way to see that the client
-    really queues the op.
+
+def assert_inside_the_jail(jail, agent: str) -> None:
+    """Every file the record says Roost wrote for `agent` exists and is
+    inside this jail — the assertion the whole section exists for."""
+    for path in jail.owned_files(agent):
+        assert path.is_relative_to(jail.root), f"{agent} wrote outside the jail: {path}"
+        assert path.exists(), f"{agent}: {path} was recorded but not written"
+
+
+def test_a_client_raises_a_hosts_key_and_a_second_client_widens_it(jailed_host):
+    """The remote half of plan 064: a connecting client's allow-list is
+    unioned into the host's own `agent-hooks` key, and what the union
+    allows is wired.
+
+    Two scripted clients, deliberately. The op's reply is readable only
+    from a scripted client — no IPC op on the UI side reports what a host
+    answered — and the second one asking for a *different* agent is the
+    additive half of the rule: a raise never removes, so the first
+    client's grant is still standing afterwards.
     """
     host, jail = jailed_host
     claude_settings = jail.agent_dirs["claude"] / "settings.json"
     assert not jail.record.exists(), "the session wired something before a client asked"
+    assert jail.read_key() is None, "the fixture consented on the host's behalf"
 
-    with host.client() as scripted:
-        reply = scripted.call(
-            "session.set_agent_hooks",
-            {
-                "mode": "auto",
-                "skip": ["cursor", "gemini"],
-                "client": "roosttest",
-            },
-        )
+    with host.client() as first:
+        reply = raise_hooks(first, ["claude"])
 
-    expected = [a for a in INSTALLABLE_AGENTS if a != "cursor"]
-    assert sorted(reply["wired"]) == sorted(expected), reply
+    assert reply["wired"] == ["claude"], reply
     assert reply["errors"] == [], reply
+    assert reply["removed"] == [], reply
     skipped = {row["agent"]: row["reason"] for row in reply["skipped"]}
-    assert skipped.get("cursor") == "skip-list", reply
-    assert "no agent named that" in skipped.get("gemini", ""), (
-        "a skip name no agent answers to is reported, never fatal"
-    )
+    assert skipped.get("cursor") == "not allowed", reply
 
-    # The files, not just the reply — and every one of them inside the
-    # jail, which is the assertion the whole section exists for.
-    record = jail.read_record()
-    assert sorted(record) == sorted(expected), record
-    for agent in expected:
-        assert record[agent]["by"] == "roosttest", record[agent]
-        for path in jail.owned_files(agent):
-            assert path.is_relative_to(jail.root), f"{agent} wrote outside the jail: {path}"
-            assert path.exists(), f"{agent}: {path} was recorded but not written"
+    # The files and the key, not just the reply.
+    assert jail.read_key() == "claude"
+    assert set(jail.read_record()) == {"claude"}
+    assert jail.read_record()["claude"]["by"] == "roosttest"
+    assert_inside_the_jail(jail, "claude")
     assert "ROOST_AGENT_HOOK" in claude_settings.read_text()
 
-    # A second client asking the same thing is told nothing new: the
-    # session flipped `noticed` for what it reported, so the toast is at
-    # most once per agent per host. It needs no standing of any kind —
-    # every same-UID connection may state this host's policy, and the
-    # last one to reach the install lock wins.
     with host.client() as second:
-        again = second.call(
-            "session.set_agent_hooks",
-            {
-                "mode": "auto",
-                "skip": ["cursor"],
-                "client": "roosttest",
-            },
-        )
-    assert again["wired"] == [], again
-    assert again["removed"] == [], again
+        widened = raise_hooks(second, ["codex"], by="another-box")
 
-    # Now the real client. Nothing below asks for an unwiring — the UI
-    # reads `agent-hooks = off` out of the harness config and sends it on
-    # connecting.
-    host.connect_and_wait()
-    wait_until(
-        lambda: wired_agents(jail) == set(),
-        30.0,
-        "the connected client to unwire the host it reads `agent-hooks = off` for",
+    assert widened["wired"] == ["codex"], widened
+    assert widened["removed"] == [], widened
+    assert jail.read_key() == "claude, codex", "a raise replaced the key instead of widening it"
+    assert wired_agents(jail) == {"claude", "codex"}
+    assert "ROOST_AGENT_HOOK" in claude_settings.read_text(), (
+        "the second client's raise took the first client's grant back out"
     )
-    # Gone, because Roost created it and the record says so; a
-    # `settings.json` that was already there comes back without the
-    # entry instead. Both are "clean", and the record is what tells them
-    # apart — so both are accepted here and neither may still name the
-    # hook.
-    assert not claude_settings.exists() or (
-        "ROOST_AGENT_HOOK" not in claude_settings.read_text()
-    ), "off removed the record but left the entry in the file"
+    assert_inside_the_jail(jail, "codex")
+
+
+def test_a_host_whose_key_says_off_is_raised_anyway(session_env):
+    """The contentious half of §3.3, stated as a test: `off` on a host is
+    not a veto over a connecting client.
+
+    A host has no screen to ask on, so the client in front of the user is
+    the only authority there is, and the same-UID socket is the consent
+    boundary. `off`, unanswered and a narrower list are one case here.
+    Lowering a host for good is a local act on that box — and it holds
+    only until a more permissive client connects again, which is exactly
+    what this case does.
+    """
+    jail = start_jailed_session(session_env, agent_hooks="off")
+    assert jail.read_key() == "off"
+
+    with session_env.client() as scripted:
+        reply = raise_hooks(scripted, ["claude"])
+
+    assert reply["wired"] == ["claude"], reply
+    assert reply["removed"] == [], reply
+    assert jail.read_key() == "claude"
+    assert wired_agents(jail) == {"claude"}
+    assert "ROOST_AGENT_HOOK" in (jail.agent_dirs["claude"] / "settings.json").read_text()
+
+
+def test_an_empty_or_unknown_agent_list_is_refused(session_env):
+    """`invalid-param`, before anything is written.
+
+    Under protocol equality both ends of this wire know the same five
+    agents, so a name that resolves to none of them is a bug in the
+    client rather than a newer Roost meeting an older host; and a client
+    with nothing to raise does not send the op at all, so an empty list
+    is a bug too. Filtering either out and reporting it as a skip would
+    leave the client believing it had raised something it had not.
+    """
+    jail = start_jailed_session(session_env)
+
+    with session_env.client() as scripted:
+        for agents in ([], ["banana"], ["claude", "banana"]):
+            refusal = refused(raise_hooks, scripted, agents)
+            assert refusal.code == "invalid-param", (agents, refusal)
+
+    assert jail.read_key() is None, "a refused raise wrote the key"
+    assert not jail.record.exists(), "a refused raise wired something"
+    assert not (jail.agent_dirs["claude"] / "settings.json").exists(), (
+        "`claude, banana` wired the half it recognised"
+    )
+
+
+def test_a_client_with_nothing_to_raise_sends_no_agent_hooks_frame(roost, session_env):
+    """A client whose own `agent-hooks` is `off` (or unanswered) sends the
+    op **not at all** — asserted on the wire, through a relay standing
+    between the two processes.
+
+    The wire is the only honest place for this. The ops a UI queues toward
+    a host are per-connection state inside it and no IPC op reports them,
+    so "the host's files are untouched" would pass just as well for a
+    frame the host *refused* — and, being an assertion that nothing
+    happened, it would pass if the reading were broken too. Hence the
+    positive control at the end: the same relay, the same assertion, a
+    raise that really is sent, and it is seen.
+
+    The harness UI reads `agent-hooks = off` out of `launcher.conf`, so
+    "off" here is the client's real configuration rather than something
+    this case arranges.
+    """
+    require_test_mode(roost)
+    jail = start_jailed_session(session_env)
+
+    with recording_relay(session_env) as relay:
+        with saved_host(roost, session_env, target=relay.path) as host:
+            host.connect_and_wait()
+            wait_live_connect(host)
+            # The connection is over before anything is read: every frame
+            # the client was ever going to put on it has been put on it,
+            # which is what makes "no frame" an assertion and not a race.
+            host.disconnect()
+            host.wait_not_connected()
+
+        # The client is gone; now wait for the reader that watched it, or
+        # "no frame" would be asserting that a thread had not caught up.
+        relay.wait_drained()
+        sent = relay.ops()
+        assert relay.overflows() == 0, (
+            "the relay skipped bytes it could not frame, so an op it did not "
+            "record is not evidence the client never sent one"
+        )
+        assert "session.identify" in sent, f"the relay saw no client traffic at all: {sent}"
+        assert "session.set_agent_hooks" not in sent, sent
+        assert jail.read_key() is None
+        assert wired_agents(jail) == set()
+
+        with relay.client() as control:
+            raise_hooks(control, ["claude"], by="positive-control")
+        relay.wait_drained()
+        assert "session.set_agent_hooks" in relay.ops(), (
+            "the relay cannot see the op it was just sent, so it could not "
+            "have seen the client send one either"
+        )
+        assert jail.read_key() == "claude"
+
+
+def test_a_session_resolves_the_config_the_ui_wrote_however_it_was_launched(session_env):
+    """One machine, one `config.conf`, whichever way its session started.
+
+    A session spawned by the UI inherits the environment additively, so a
+    `ROOST_CONFIG` override reaches it; a `roostctl session start` typed
+    into another shell carries no such value and has to resolve the file
+    through `$HOME` instead. Both must land on the same key, or a raise
+    would write a file nobody reads.
+
+    The second launch reading what the first one wrote is what keeps this
+    from passing on a technicality: `claude, codex` can only appear if the
+    `$HOME`-resolved session unioned into the override-resolved session's
+    write.
+    """
+    jail = start_jailed_session(session_env, agent_hooks="off")
+    assert session_env.env["ROOST_CONFIG"] == str(jail.config), (
+        "the UI-spawn shape needs the override actually set"
+    )
+
+    with session_env.client() as spawned_by_the_ui:
+        raise_hooks(spawned_by_the_ui, ["claude"])
+    assert jail.read_key() == "claude"
+
+    session_env.stop_over_the_wire()
+    session_env.wait_socket_gone()
+    # What `roostctl session start` from an unrelated shell hands the
+    # daemon: no override, so `$HOME` governs.
+    session_env.env.pop("ROOST_CONFIG")
+    start_session(session_env, ROOST_AGENT_HOOKS_FORCE="1")
+
+    with session_env.client() as started_by_hand:
+        raise_hooks(started_by_hand, ["codex"])
+    assert jail.read_key() == "claude, codex", (
+        "the two launch paths resolved different config files"
+    )
+    assert wired_agents(jail) == {"claude", "codex"}
 
 
 # ---------------------------------------------------------------------------

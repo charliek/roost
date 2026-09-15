@@ -122,11 +122,11 @@ enum Notice {
 /// Resolve a wire message's agent names against the agents this crate
 /// can wire: the ones it recognises, and the spellings it does not.
 ///
-/// The unknown half is returned rather than dropped because the only
-/// thing a client gets from a typo'd name is a host that behaves
-/// differently with nothing to say why. Every caller reports the list on
-/// its own surface; none of them treats it as fatal, so a name added by
-/// a newer Roost does not break an older one.
+/// The unknown half is returned rather than dropped because its one
+/// caller — `session.set_agent_hooks`, on a host — **refuses the whole
+/// request on it** (`invalid-param`, plan 064 §3.3). The only thing a
+/// client would get from a silently dropped name is a host that behaves
+/// differently with nothing to say why.
 pub fn resolve_names<'a>(names: impl IntoIterator<Item = &'a str>) -> (Vec<Agent>, Vec<String>) {
     let mut known = Vec::new();
     let mut unknown = Vec::new();

@@ -9,7 +9,9 @@
 
 use std::sync::Arc;
 
-use roost_engine::ipc::{AgentHooksHandle, AgentHooksRequest, IpcHandler, SessionInfo, StopHandle};
+use roost_engine::ipc::{
+    AgentHooksError, AgentHooksHandle, AgentHooksRequest, IpcHandler, SessionInfo, StopHandle,
+};
 use roost_engine::{PtySupervisor, Workspace};
 use roost_ipc::messages::{ops, AgentHooksOutcome, AgentHooksSkipped};
 use roost_ipc::{
@@ -458,4 +460,42 @@ async fn set_agent_hooks_hands_the_client_values_on() {
     assert_eq!(asked[0].agents, vec!["claude".to_string()]);
     assert_eq!(asked[0].client, "charlie-mbp");
     assert_eq!(asked[1].agents, vec!["cursor".to_string()]);
+}
+
+/// A malformed `agents` — empty, or a name no agent answers to — reaches
+/// the client as `invalid-param` rather than `internal`.
+///
+/// The *deciding* is the backend's: the agent set lives in the install
+/// engine, which this crate does not link. What the engine owes the op is
+/// that the two failure kinds stay tellable apart on the wire, because
+/// they instruct differently — `invalid-param` says "fix the request",
+/// `internal` sends the client hunting for a fault on the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn set_agent_hooks_refuses_a_malformed_request_as_invalid_param() {
+    let handle = AgentHooksHandle::new(|request: AgentHooksRequest| async move {
+        Err(match request.agents.first().map(String::as_str) {
+            None => AgentHooksError::InvalidParam("non-empty `agents`".into()),
+            Some("banana") => AgentHooksError::InvalidParam("no agent named \"banana\"".into()),
+            Some(_) => AgentHooksError::Failed("$HOME is not readable".into()),
+        })
+    });
+    let f = fixture_with(Some(handle));
+
+    assert_eq!(
+        set_agent_hooks(&f, &conn(1), &[]).await.unwrap_err(),
+        "invalid-param"
+    );
+    assert_eq!(
+        set_agent_hooks(&f, &conn(1), &["banana"])
+            .await
+            .unwrap_err(),
+        "invalid-param"
+    );
+    assert_eq!(
+        set_agent_hooks(&f, &conn(1), &["claude"])
+            .await
+            .unwrap_err(),
+        "internal",
+        "a host that really did break is not the client's bug to fix"
+    );
 }

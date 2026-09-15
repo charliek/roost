@@ -7,16 +7,26 @@
 //! linked into the UI processes too, and a UI has no business carrying a
 //! dotfile writer.
 //!
-//! **A client may only ever raise the host's `agent-hooks` key, never
-//! lower it.** The wire carries an allow-list, and this module unions it
-//! into whatever the key already says — `off`, unanswered, or a
-//! narrower list — and wires what the union now allows. There is no way
-//! to spell "off" or "narrow this" on this op: a client whose own
-//! `agent-hooks` is `off`, or unconfigured, has nothing to widen the
-//! host with, so it sends this op **not at all** (the caller's decision,
-//! not this module's — see [`crate::agent_hooks`]'s sibling in
-//! `roost-iced`). Taking entries back out is `roostctl agent
-//! ensure`/`uninstall`, run by hand on the host itself.
+//! **Every machine has one agent-hooks setting: the `agent-hooks` key in
+//! its own `config.conf`** — the same key whether the machine is used at
+//! a desk or dialled into as a host. There is no separate host stance and
+//! no pin.
+//!
+//! **A connecting client may only ever raise that key, never lower it.**
+//! The wire carries an allow-list, and this module unions it into
+//! whatever the key already says, then wires what the union now allows.
+//! There is no way to spell "off" or "narrow this" on this op: a client
+//! whose own `agent-hooks` is `off`, or unconfigured, has nothing to
+//! widen the host with, so it sends this op **not at all** (the caller's
+//! decision, not this module's — see `roost-iced`'s `remote_request`).
+//!
+//! The contentious half, stated plainly: **a host whose key is
+//! explicitly `off` is raised too.** `off`, unanswered and a narrower
+//! list are one case here — a host has no screen to ask on, so the client
+//! in front of the user is the only authority there is, and the same-UID
+//! socket is the consent boundary. Lowering a host is done *on that box*
+//! (`roostctl agent ensure`/`uninstall`, the dialog, or editing the key),
+//! and it holds until a more permissive client connects again.
 //!
 //! The entries themselves name no path — `installed_command` is
 //! env-indirected through `$ROOST_AGENT_HOOK`, which
@@ -44,6 +54,14 @@ use tracing::{info, warn};
 pub fn handle() -> AgentHooksHandle {
     AgentHooksHandle::new(|request: AgentHooksRequest| async move {
         tokio::task::spawn_blocking(move || {
+            // Validated here as well as inside `ensure_in`, and the
+            // order is the point: a malformed request is the client's
+            // bug whatever state this machine is in, so a host without
+            // a `$HOME` must still answer an empty `agents` with
+            // `invalid-param` rather than `internal` and send the
+            // client looking for the fault at this end. `resolve` is
+            // pure, so the second call costs five string compares.
+            resolve(&request.agents)?;
             let home =
                 Home::from_env().map_err(|error| AgentHooksError::Failed(error.to_string()))?;
             ensure_in(&home, &request, Guard::from_env())
@@ -64,17 +82,16 @@ pub fn handle() -> AgentHooksHandle {
 /// a codex file Roost could not parse must not cost the client the
 /// session it just attached to.
 ///
-/// A name this session does not recognise is reported as a skip rather
-/// than refused here — validating the request (empty `agents`, or an
-/// unrecognised name, as `invalid-param`) is the engine's job before this
-/// ever runs (plan 064 C4), not this module's.
+/// Validation happens here, at the top, rather than in the engine that
+/// decodes the op: the agent set lives in the install engine, and this is
+/// the only path into it, so a second caller of the handle cannot reach a
+/// write without passing through [`resolve`] first.
 fn ensure_in(
     home: &Home,
     request: &AgentHooksRequest,
     guard: Guard,
 ) -> Result<AgentHooksOutcome, AgentHooksError> {
-    let (agents, unknown) =
-        roost_agent_install::resolve_names(request.agents.iter().map(String::as_str));
+    let agents = resolve(&request.agents)?;
     let outcome = roost_agent_install::raise(home, &agents, &request.client, guard)
         .map_err(|error| AgentHooksError::Failed(error.to_string()))?;
 
@@ -91,14 +108,51 @@ fn ensure_in(
         warn!(agent = error.agent.source(), %error.error, "agent hooks");
     }
 
-    Ok(reply(&outcome, &unknown))
+    Ok(reply(&outcome))
 }
 
-fn reply(outcome: &roost_agent_install::Outcome, unknown_names: &[String]) -> AgentHooksOutcome {
+/// The agents a request names, or the `invalid-param` it is refused with
+/// before anything is written.
+///
+/// Both refusals are bugs in the client rather than states a host should
+/// absorb. An empty list means the client had nothing to raise, and a
+/// client with nothing to raise does not send the op at all. A name that
+/// resolves to no agent cannot be a newer Roost talking to an older host
+/// either: `SESSION_PROTOCOL_VERSION` is compared for **equality** at
+/// attach, so both ends of this wire know the same five agents. Filtering
+/// such a name out and reporting it as a skip would leave the client
+/// believing it had raised something it had not.
+fn resolve(names: &[String]) -> Result<Vec<roost_agent::Agent>, AgentHooksError> {
+    // Checked before `resolve_names`, which skips blanks: skipping is
+    // right for a human-typed CLI list and wrong here, where under
+    // protocol equality an empty element can only be a client bug.
+    if names.iter().any(|name| name.trim().is_empty()) {
+        return Err(AgentHooksError::InvalidParam(
+            "session.set_agent_hooks: `agents` carries an empty name".to_string(),
+        ));
+    }
+    let (agents, unknown) = roost_agent_install::resolve_names(names.iter().map(String::as_str));
+    if let Some(name) = unknown.first() {
+        return Err(AgentHooksError::InvalidParam(format!(
+            "session.set_agent_hooks: no agent named {name:?} ({})",
+            roost_agent_install::agent_names()
+        )));
+    }
+    if agents.is_empty() {
+        return Err(AgentHooksError::InvalidParam(
+            "session.set_agent_hooks requires a non-empty `agents`: a client with \
+             nothing to raise does not send the op"
+                .to_string(),
+        ));
+    }
+    Ok(agents)
+}
+
+fn reply(outcome: &roost_agent_install::Outcome) -> AgentHooksOutcome {
     let names = |agents: &[roost_agent::Agent]| -> Vec<String> {
         agents.iter().map(|a| a.source().to_string()).collect()
     };
-    let mut skipped: Vec<AgentHooksSkipped> = outcome
+    let skipped: Vec<AgentHooksSkipped> = outcome
         .skipped
         .iter()
         .map(|skip| AgentHooksSkipped {
@@ -106,18 +160,6 @@ fn reply(outcome: &roost_agent_install::Outcome, unknown_names: &[String]) -> Ag
             reason: skip.reason.to_string(),
         })
         .collect();
-    // Reported, never fatal: a name this session does not recognise is
-    // most likely a typo, and refusing the whole run would turn it into
-    // "nothing is wired and nothing says why". It may equally be an
-    // agent a newer client knows about, which is the second reason not
-    // to treat it as an error.
-    skipped.extend(unknown_names.iter().map(|name| AgentHooksSkipped {
-        agent: name.clone(),
-        reason: format!(
-            "no agent named that ({})",
-            roost_agent_install::agent_names()
-        ),
-    }));
     AgentHooksOutcome {
         // The agents this host has wired and never announced — not the
         // ones this run happened to write. See the field's own doc.
@@ -156,6 +198,19 @@ mod tests {
             std::fs::create_dir_all(root.join(agent)).unwrap();
         }
         Home::rooted(root)
+    }
+
+    /// This home's `agent-hooks` value, read off the file rather than out
+    /// of an outcome: the key is the durable half of a raise, and an
+    /// outcome can be right while the write is not.
+    fn key_of(home: &Home) -> String {
+        let text = std::fs::read_to_string(home.config_path()).expect("config.conf");
+        text.lines()
+            .filter_map(|line| line.trim().strip_prefix("agent-hooks"))
+            .filter_map(|rest| rest.trim().strip_prefix('='))
+            .map(|value| value.trim().to_string())
+            .next_back()
+            .expect("an agent-hooks key")
     }
 
     #[test]
@@ -228,6 +283,7 @@ mod tests {
             second.removed.is_empty(),
             "a raise never removes: {second:?}"
         );
+        assert_eq!(key_of(&home), "claude, cursor");
         assert!(
             std::fs::read_to_string(dir.path().join(".claude/settings.json"))
                 .unwrap()
@@ -236,25 +292,77 @@ mod tests {
         );
     }
 
-    /// A name no agent answers to is reported and otherwise ignored —
-    /// never a refusal here, so a newer client's agent name cannot break
-    /// an older host. (Whether the request should have been refused
-    /// outright is the engine's call, made before this function ever
-    /// runs — see this module's own doc.)
+    /// The contentious half of §3.3: a host that said `off` is raised by
+    /// a connecting client anyway. `off`, unanswered and a narrower list
+    /// are one case on this path — the client in front of the user is the
+    /// only authority a screenless host has.
     #[test]
-    fn an_unknown_agent_name_is_reported_not_fatal() {
+    fn a_raise_widens_a_host_whose_key_is_explicitly_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = a_home(dir.path());
+        std::fs::create_dir_all(home.config_path().parent().unwrap()).unwrap();
+        std::fs::write(home.config_path(), "agent-hooks = off\n").unwrap();
+
+        let raised = ensure_in(&home, &request(&["claude"]), Guard::PERMITTED).expect("raise");
+        assert!(raised.wired.contains(&"claude".to_string()), "{raised:?}");
+        assert_eq!(key_of(&home), "claude");
+        assert!(
+            std::fs::read_to_string(dir.path().join(".claude/settings.json"))
+                .unwrap()
+                .contains("ROOST_AGENT_HOOK")
+        );
+    }
+
+    fn refused(home: &Home, agents: &[&str]) -> String {
+        match ensure_in(home, &request(agents), Guard::PERMITTED) {
+            Err(AgentHooksError::InvalidParam(message)) => message,
+            other => panic!("{agents:?} must be refused as invalid-param: {other:?}"),
+        }
+    }
+
+    /// A name no agent answers to takes the whole request down, and the
+    /// refusal names both the offender and what would have been accepted.
+    /// The `claude` beside it is the point: a partly-valid list is not
+    /// partly applied.
+    #[test]
+    fn an_unknown_agent_name_refuses_the_whole_request() {
         let dir = tempfile::tempdir().unwrap();
         let home = a_home(dir.path());
 
-        let done = ensure_in(&home, &request(&["claude", "gemini"]), Guard::PERMITTED)
-            .expect("an unknown name must not fail the run");
-        assert!(done.wired.contains(&"claude".to_string()), "{done:?}");
-        let named = done
-            .skipped
-            .iter()
-            .find(|skip| skip.agent == "gemini")
-            .expect("the unknown name is reported back to the client");
-        assert!(named.reason.contains("no agent named that"), "{named:?}");
+        let message = refused(&home, &["claude", "gemini"]);
+        assert!(message.contains("gemini"), "{message}");
+        for known in ["claude", "codex", "grok", "cursor", "opencode"] {
+            assert!(message.contains(known), "{message}");
+        }
+        assert!(
+            !dir.path().join(".claude/settings.json").exists(),
+            "a refused request wired claude anyway"
+        );
+        assert!(
+            !home.config_path().exists(),
+            "a refused request wrote the key"
+        );
+    }
+
+    /// An empty list is refused rather than absorbed as a no-op: a client
+    /// with nothing to raise does not send the op, so an empty one is a
+    /// bug the host has to say out loud. A blank *element* is the same
+    /// bug in a different spelling, and is named separately so the
+    /// client can tell "you sent me nothing" from "one of these is not a
+    /// name".
+    #[test]
+    fn an_empty_agent_list_is_refused_before_anything_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = a_home(dir.path());
+
+        assert!(refused(&home, &[]).contains("non-empty"));
+        assert!(refused(&home, &["  "]).contains("empty name"));
+        assert!(refused(&home, &["claude", ""]).contains("empty name"));
+        assert!(
+            !home.config_path().exists(),
+            "a refused request wrote the key"
+        );
+        assert!(!dir.path().join(".config/roost/agent-hooks.json").exists());
     }
 
     /// The harness fence reaches this path too: a session launched with

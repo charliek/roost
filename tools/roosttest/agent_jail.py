@@ -29,11 +29,21 @@ AGENT_CONFIG_DIR_ENV = {
 # Report order of `roost_agent_install::ALL_AGENTS`.
 INSTALLABLE_AGENTS = ("claude", "codex", "grok", "cursor", "opencode")
 
-# The seven variables §3.9 pins. `XDG_CONFIG_HOME` is belt and braces:
+# The variables §3.9 pins. `XDG_CONFIG_HOME` is belt and braces:
 # Roost's own state record is `$HOME/.config/roost/agent-hooks.json`
 # whatever XDG says, so `HOME` already covers it — but a future move to
 # the XDG dir must not silently unjail this suite.
-JAIL_ENV_KEYS = ("HOME", "XDG_CONFIG_HOME", *AGENT_CONFIG_DIR_ENV.values())
+#
+# `ROOST_CONFIG` is not belt and braces. Since plan 064 the install
+# engine *writes* `agent-hooks` into `config.conf` — `Home::config_path`
+# resolves it through the same `ROOST_CONFIG`-then-`$HOME` rule the UI
+# uses — so a stray value in a developer's shell would send a raise at
+# their real config file while every other variable here stayed jailed.
+JAIL_ENV_KEYS = ("HOME", "XDG_CONFIG_HOME", "ROOST_CONFIG", *AGENT_CONFIG_DIR_ENV.values())
+
+# Checked only when set — see `Jail.assert_jailed` for why absence is
+# safe for this one and for nothing else here.
+OPTIONAL_JAIL_ENV_KEYS = ("ROOST_CONFIG",)
 
 
 def make_private_runtime_dir(path: Path) -> None:
@@ -65,7 +75,7 @@ class Jail:
         self,
         root,
         *,
-        agent_hooks: str = ", ".join(INSTALLABLE_AGENTS),
+        agent_hooks: "str | None" = ", ".join(INSTALLABLE_AGENTS),
         present=INSTALLABLE_AGENTS,
     ):
         self.root = root.resolve()
@@ -88,24 +98,52 @@ class Jail:
         self.env = {
             "HOME": str(self.home),
             "XDG_CONFIG_HOME": str(self.home / ".config"),
+            # The same file `HOME` already resolves to, said explicitly:
+            # a raise writes this key, and a process that reached it by
+            # a different rule than the one the jail asserts on would
+            # write somewhere `assert_jailed` never looked.
+            "ROOST_CONFIG": str(self.config),
             **{
                 AGENT_CONFIG_DIR_ENV[name]: str(path)
                 for name, path in self.agent_dirs.items()
             },
         }
 
-    def write_config(self, *, agent_hooks: str) -> None:
+    def write_config(self, *, agent_hooks: "str | None") -> None:
+        """Seed this jail's `config.conf`. `None` leaves the key absent,
+        which is the unanswered state a host starts in before anyone has
+        consented on it."""
         self.config.parent.mkdir(parents=True, exist_ok=True)
-        self.config.write_text(f"agent-hooks = {agent_hooks}\n")
+        self.config.write_text("" if agent_hooks is None else f"agent-hooks = {agent_hooks}\n")
+
+    def read_key(self) -> "str | None":
+        """This jail's `agent-hooks` value, or `None` if the key is
+        absent. Last-wins, matching the parser."""
+        found = None
+        for line in self.config.read_text().splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() == "agent-hooks":
+                found = value.strip()
+        return found
 
     def assert_jailed(self, env: dict) -> None:
         """Every jail variable is set, absolute, and inside this root.
 
         Run on the *merged* environment a spawn is about to get, right
         before the spawn. An assertion on `self.env` would prove only
-        that the dict was built correctly."""
+        that the dict was built correctly.
+
+        `ROOST_CONFIG` is the one variable allowed to be *absent*: unset
+        means the config resolves through `HOME`, which is required and
+        checked here — so absence is jailed by construction, and a
+        launch that deliberately drops it (the `roostctl session start`
+        shape, which inherits no override) stays inside the fence. What
+        must never happen is a value pointing OUT of the jail, since a
+        raise writes `agent-hooks` through exactly that rule."""
         for key in JAIL_ENV_KEYS:
             value = env.get(key)
+            if value is None and key in OPTIONAL_JAIL_ENV_KEYS:
+                continue
             assert value, f"{key} is not set: the jail is not in force"
             path = Path(value)
             assert path.is_absolute(), f"{key}={value} is not absolute"
