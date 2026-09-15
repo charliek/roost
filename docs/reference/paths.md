@@ -28,7 +28,7 @@ The two sides treat an **unrecognized** `ROOST_BUNDLE_PROFILE` value differently
 
 ## File locations
 
-The user-editable config file lives under XDG on **both** platforms — `~/.config/roost/config.conf` (or `$XDG_CONFIG_HOME/roost/config.conf` if set). Set `ROOST_CONFIG` to an absolute path to read config from there instead (used by the E2E harness to drive the command launcher off a seeded config). The state files (`state.json`, socket) follow each platform's native convention. The directory component on macOS is the profile's `app_label` — `Roost`, `Roost-linux`, `Roost-iced`, or `RoostSession`/`RoostSessionDev` for a headless session.
+The user-editable config file lives under XDG on **both** platforms — `~/.config/roost/config.conf` (or `$XDG_CONFIG_HOME/roost/config.conf` if set). Set `ROOST_CONFIG` to an absolute path to read config from there instead (used by the E2E harness to drive the command launcher off a seeded config). A `config.lock` sits beside it, after symlinks are resolved: the UI, the Swift app, `roostctl` and a connecting client can all rewrite `config.conf`, and an atomic rename stops a torn file but not a lost update, so every Roost writer takes that lock first. It moves with `ROOST_CONFIG`. The state files (`state.json`, socket) follow each platform's native convention. The directory component on macOS is the profile's `app_label` — `Roost`, `Roost-linux`, `Roost-iced`, or `RoostSession`/`RoostSessionDev` for a headless session.
 
 Set `ROOST_STATE_DIR` to an **absolute** path to redirect **only** the state directory (where `state.json` and its `state.lock` live) — the socket, the socket lock, and the log dir stay on the default profile path, so `roostctl` and the E2E harness still find the running UI by its unchanged socket. A `roost-session` under the override also puts its [upload store](#session-profile) inside that directory rather than on the cache path, which is the point: an isolated session must not sweep a developer's real one at start. Note the consequence: two UIs with different `ROOST_STATE_DIR` values no longer collide on state, so a collision that used to be loud is now silent isolation; the socket lock is what still catches a genuine second instance on one socket. The E2E harness uses this to give each run an isolated, throwaway `state.json` without touching a developer's real saved tabs. Unlike `ROOST_CONFIG` (which accepts any non-empty value), `ROOST_STATE_DIR` requires an absolute path: a relative value is ignored (a relative state dir would resolve against the process's working directory). Note this does **not** isolate the macOS app's `UserDefaults` (e.g. sidebar visibility), which is a separate store.
 
@@ -41,6 +41,7 @@ This is a deliberate divergence from Apple's HIG on macOS: Roost matches the con
 | Path | Purpose |
 |---|---|
 | `~/.config/roost/config.conf` | User-editable config; see [Config keys](#config-keys) below |
+| `~/.config/roost/config.lock` | flock serialising every Roost writer of `config.conf`; moves with `ROOST_CONFIG` |
 | `~/Library/Application Support/Roost/state.json` | UI-owned workspace state (projects, tabs) |
 | `~/Library/Application Support/Roost/state.lock` | flock guarding `state.json` (moves with `ROOST_STATE_DIR`) |
 | `~/Library/Caches/Roost/roost.sock` | Unix socket the UI listens on |
@@ -80,6 +81,7 @@ it can run beside the installed package.
 | Path | Purpose |
 |---|---|
 | `$XDG_CONFIG_HOME/roost/config.conf` | User-editable config; defaults to `~/.config/roost/` |
+| `$XDG_CONFIG_HOME/roost/config.lock` | flock serialising every Roost writer of `config.conf`; moves with `ROOST_CONFIG` |
 | `$XDG_DATA_HOME/roost/state.json` | UI-owned workspace state; defaults to `~/.local/share/roost/` |
 | `$XDG_DATA_HOME/roost/state.lock` | flock guarding `state.json`; moves with `ROOST_STATE_DIR` |
 | `$XDG_RUNTIME_DIR/roost/roost.sock` | Unix socket; falls back to `/tmp/roost-<uid>/roost.sock` when `XDG_RUNTIME_DIR` is unset |

@@ -2107,6 +2107,9 @@ impl App {
                 EngineFeed::AgentHooksSet(done) => self.agent_hooks_applied(*done),
                 EngineFeed::AgentHooksSurvey(survey) => self.agent_hooks_surveyed(*survey),
                 EngineFeed::AgentHooksApplyFailed(error) => self.set_status(error),
+                EngineFeed::ConfigWriteFailed { key, error } => {
+                    self.set_status(format!("couldn't save {key}: {error}"))
+                }
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
                 EngineFeed::NotificationActivated { tab } => {

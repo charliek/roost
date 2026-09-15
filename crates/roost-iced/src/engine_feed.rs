@@ -82,6 +82,14 @@ pub(crate) enum EngineFeed {
     /// go: a refusal it never showed would be a change they asked for
     /// and were never told did not happen.
     AgentHooksApplyFailed(String),
+    /// A queued `config.conf` write failed (plan 065 §3.5). The write
+    /// itself is fire-and-forget — the value it records already moved in
+    /// the UI — so the only thing left is to say it did not stick, and
+    /// the status line is main-thread state.
+    ConfigWriteFailed {
+        key: String,
+        error: String,
+    },
     AgentMetrics(AgentMetricsResult),
     Provider(Box<ProviderRunResult>),
     /// The user picked an item off the native macOS menu bar. Not an

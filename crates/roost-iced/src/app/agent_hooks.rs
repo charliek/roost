@@ -32,12 +32,14 @@ use roost_agent::Agent;
 use roost_agent_install::{Guard, Home, Mode};
 use roost_ipc::messages::{
     AgentHooksFailed, AgentHooksOutcome, AgentHooksSkipped, AgentSetHooksAgents,
+    AgentSetHooksHostOutcome, AgentSetHooksResult,
 };
 use roost_ui_model::config::{AgentHooks, RoostConfig};
 
 use super::agent_hooks_dialog::{AgentHooksRow, CardMode};
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
 use crate::host_conn::queue::HostOpError;
+use crate::host_conn::HostRaise;
 
 /// How this UI identifies itself in the state record. The same label
 /// `roostctl` writes: both are this machine acting on its own behalf,
@@ -134,16 +136,21 @@ pub(crate) fn claim_first_run(raised: &mut bool, start: &Start, guard: Guard) ->
 /// entries would make an opt-out into an action the user did not ask
 /// for. `roostctl agent ensure` is the explicit verb that reads the same
 /// `off` and takes them back out.
+///
+/// The launch-time config decides only **whether** to start; what is
+/// wired is [`roost_agent_install::ensure`]'s own read of the key,
+/// inside the lock. Carrying this snapshot over would let a `roostctl
+/// agent uninstall` that lands between launch and window re-appear as a
+/// re-wiring nobody asked for.
 pub(crate) fn spawn_ensure(
     started: &mut bool,
     runtime: &tokio::runtime::Handle,
     feed: &EngineFeedSender,
     config: &RoostConfig,
 ) -> Start {
-    let resolved = resolve(config);
-    let start = claim_start(started, resolved.as_ref());
-    let mode = match &start {
-        Start::Run => resolved.expect("Start::Run implies resolve() returned Some"),
+    let start = claim_start(started, resolve(config).as_ref());
+    match &start {
+        Start::Run => {}
         Start::Off => {
             tracing::debug!("agent-hooks = off: not wiring agent hooks");
             return start;
@@ -153,17 +160,148 @@ pub(crate) fn spawn_ensure(
             return start;
         }
         Start::Already => return start,
-    };
+    }
 
     let feed = feed.clone();
     let guard = Guard::from_env();
-    // The resolved values ride the closure rather than being re-read
-    // over there: a config edit landing mid-launch would otherwise split
-    // the decision from the action it authorised.
     runtime.spawn_blocking(move || {
-        feed.send(EngineFeed::AgentHooks(ensure_blocking(&mode, guard)));
+        feed.send(EngineFeed::AgentHooks(ensure_blocking(guard)));
     });
     start
+}
+
+/// One queued `agent.set_hooks`, and the machinery that keeps two of
+/// them in the order the user asked for (#490, plan 065 §3.5).
+///
+/// # Why a queue and not a mutex
+///
+/// Each request rewrites the `agent-hooks` key outright, so two applies
+/// that overlap decide the file between them. A `tokio::sync::Mutex` is
+/// fair in *acquisition-attempt* order, which is the order independently
+/// spawned tasks happen to reach it — not the order the requests
+/// arrived. The ticket is taken on the main thread at receipt and one
+/// worker drains the queue, so "last request wins" means the user's last
+/// gesture, not whichever task the runtime polled last.
+pub(crate) struct AgentHooksApply {
+    pub ticket: u64,
+    pub mode: Mode,
+    pub guard: Guard,
+    /// What each connected host is asked to raise, and who to raise it
+    /// as. Chosen on the main thread with the rest of this request — the
+    /// connection registry is main-thread state.
+    pub raise_names: Option<Vec<String>>,
+    pub raises: Vec<HostRaise>,
+    pub client: String,
+    pub reply: super::HostOpReply<AgentSetHooksResult>,
+}
+
+/// The one worker every `agent.set_hooks` goes through.
+#[derive(Debug, Clone)]
+pub(crate) struct AgentHooksApplies {
+    tx: tokio::sync::mpsc::UnboundedSender<AgentHooksApply>,
+}
+
+impl AgentHooksApplies {
+    pub(crate) fn spawn(
+        runtime: &tokio::runtime::Handle,
+        feed: EngineFeedSender,
+    ) -> AgentHooksApplies {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentHooksApply>();
+        runtime.spawn(async move {
+            // Awaited inline: the next apply does not start until this
+            // one has written the key and answered its caller.
+            while let Some(apply) = rx.recv().await {
+                apply_set_hooks(apply, &feed).await;
+            }
+        });
+        AgentHooksApplies { tx }
+    }
+
+    pub(crate) fn send(&self, apply: AgentHooksApply) {
+        if let Err(tokio::sync::mpsc::error::SendError(apply)) = self.tx.send(apply) {
+            let _ = apply.reply.send(Err(super::HostOpFailure::new(
+                "internal",
+                "the agent-hooks worker went away".to_string(),
+            )));
+        }
+    }
+}
+
+/// How long the **first** apply of this process is held before it
+/// writes, so a test can send a second one behind it and prove the file
+/// lands in request order.
+///
+/// Gated on `ROOST_TEST_MODE=1` like every other harness seam here, and
+/// read per call so a jailed UI launched with it set is the only thing
+/// that can slow down.
+fn apply_delay(ticket: u64) -> Option<std::time::Duration> {
+    if ticket != 1 || std::env::var("ROOST_TEST_MODE").as_deref() != Ok("1") {
+        return None;
+    }
+    let ms: u64 = std::env::var("ROOST_TEST_AGENT_HOOKS_DELAY_MS")
+        .ok()?
+        .parse()
+        .ok()?;
+    Some(std::time::Duration::from_millis(ms))
+}
+
+async fn apply_set_hooks(apply: AgentHooksApply, feed: &EngineFeedSender) {
+    let AgentHooksApply {
+        ticket,
+        mode,
+        guard,
+        raise_names,
+        raises,
+        client,
+        reply,
+    } = apply;
+    if let Some(delay) = apply_delay(ticket) {
+        tokio::time::sleep(delay).await;
+    }
+    let local = tokio::task::spawn_blocking(move || set_hooks_blocking(ticket, &mode, guard))
+        .await
+        .unwrap_or_else(|error| Err(format!("the agent-hooks install did not finish: {error}")));
+    let done = match local {
+        Ok(done) => done,
+        Err(message) => {
+            // Reported to the caller, which is the boundary that handles
+            // it; the log line is for the launches where the caller was
+            // a dialog nobody was watching.
+            tracing::warn!(error = %message, "agent.set_hooks could not set this machine's agent hooks");
+            let _ = reply.send(Err(super::HostOpFailure::new("internal", message)));
+            return;
+        }
+    };
+    // Only now: this machine has recorded the user's answer, so it has
+    // something it is entitled to propagate. A local write that failed
+    // reaches no host at all.
+    let names = raise_names.unwrap_or_default();
+    let pending: Vec<_> = raises
+        .iter()
+        .map(|raise| (raise.label.clone(), raise.send(&names, &client)))
+        .collect();
+    let mut hosts = Vec::new();
+    for (label, outcome) in pending {
+        hosts.push(match outcome.await {
+            Ok(result) => AgentSetHooksHostOutcome::Result {
+                host: label,
+                result,
+            },
+            // Never fatal, and never an error frame: this machine's own
+            // key is set either way, and a host that could not be asked
+            // is one line in the reply.
+            Err(error) => AgentSetHooksHostOutcome::Error {
+                host: label,
+                error: error.to_string(),
+            },
+        });
+    }
+    let _ = reply.send(Ok(AgentSetHooksResult {
+        config_path: done.config_path.clone(),
+        local: done.outcome.clone(),
+        hosts,
+    }));
+    feed.send(EngineFeed::AgentHooksSet(Box::new(done)));
 }
 
 /// What one read-only status walk found, on its way to the consent card.
@@ -244,7 +382,7 @@ fn survey_blocking(mode: CardMode, fallback: &AgentHooks) -> Result<AgentHooksFo
 /// [`AgentHooksEnsured::errors`] rather than a panic or a swallow: this
 /// runs with nobody waiting on it, so the only honest thing to do with a
 /// failure is carry it back to a thread that can log it.
-fn ensure_blocking(mode: &Mode, guard: Guard) -> AgentHooksEnsured {
+fn ensure_blocking(guard: Guard) -> AgentHooksEnsured {
     let home = match Home::from_env() {
         Ok(home) => home,
         Err(error) => {
@@ -254,7 +392,7 @@ fn ensure_blocking(mode: &Mode, guard: Guard) -> AgentHooksEnsured {
             }
         }
     };
-    match roost_agent_install::ensure(&home, mode, BY, guard) {
+    match roost_agent_install::ensure(&home, BY, guard) {
         Ok(outcome) => AgentHooksEnsured {
             unnoticed: outcome.unnoticed,
             errors: outcome
@@ -327,6 +465,11 @@ pub(crate) fn resolve_set(agents: &AgentSetHooksAgents) -> Result<Mode, String> 
 /// What one local `agent.set_hooks` did to this machine, on its way back
 /// to the main thread.
 pub(crate) struct AgentHooksSet {
+    /// Which apply this is (plan 065 §3.5). The main thread takes the
+    /// number at receipt and applies only the newest, so an older answer
+    /// landing late cannot replace a newer one — the
+    /// [`AgentHooksSurvey::id`] rule, for the same reason.
+    pub ticket: u64,
     pub config_path: String,
     pub outcome: AgentHooksOutcome,
     /// The key this machine now has, read off the mode that was written
@@ -346,11 +489,16 @@ pub(crate) struct AgentHooksSet {
 /// Only a whole-run failure is an `Err`; a per-agent one rides back in
 /// [`AgentHooksOutcome::errors`], because one unparseable `config.toml`
 /// must not cost the user the answer they just gave.
-pub(crate) fn set_hooks_blocking(mode: &Mode, guard: Guard) -> Result<AgentHooksSet, String> {
+pub(crate) fn set_hooks_blocking(
+    ticket: u64,
+    mode: &Mode,
+    guard: Guard,
+) -> Result<AgentHooksSet, String> {
     let home = Home::from_env().map_err(|error| error.to_string())?;
     let outcome =
         roost_agent_install::set_hooks(&home, mode, BY, guard).map_err(|e| e.to_string())?;
     Ok(AgentHooksSet {
+        ticket,
         config_path: home.config_path().display().to_string(),
         outcome: wire_outcome(&outcome),
         key: mode.to_config(),

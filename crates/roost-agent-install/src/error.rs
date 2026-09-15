@@ -50,7 +50,7 @@ pub enum InstallError {
     #[error("{}: not writable", .path.display())]
     ReadOnly { path: PathBuf },
 
-    /// Another writer held this home's lock for the whole deadline.
+    /// Another writer held this config's lock for the whole deadline.
     ///
     /// Waiting forever was the defect: an `ensure` on a host session
     /// runs holding that session's mutation barrier, and `session.stop`
@@ -58,9 +58,11 @@ pub enum InstallError {
     /// on a network-mounted `$HOME`, a stale `flock` an NFS server has
     /// not reclaimed) stopped the daemon from ever flushing, reaping or
     /// answering. A bounded wait turns that into a refusal that names
-    /// itself.
+    /// itself. The bound itself lives with the lock
+    /// ([`roost_ui_model::config::LOCK_DEADLINE`]); this is only how
+    /// this crate's callers hear about it.
     #[error(
-        "{}: another Roost held this home's agent-hooks lock for {:.0?}; nothing was written",
+        "{}: another Roost held this config lock for {:.0?}; nothing was written",
         .path.display(), .waited
     )]
     LockBusy {
@@ -77,6 +79,19 @@ pub enum InstallError {
 
     #[error("no home directory: neither $HOME nor a passed-in root")]
     NoHome,
+}
+
+impl From<roost_ui_model::config::LockError> for InstallError {
+    fn from(error: roost_ui_model::config::LockError) -> InstallError {
+        match error {
+            roost_ui_model::config::LockError::Busy { path, waited } => {
+                InstallError::LockBusy { path, waited }
+            }
+            roost_ui_model::config::LockError::Io { path, source } => {
+                InstallError::io(path, source)
+            }
+        }
+    }
 }
 
 impl InstallError {

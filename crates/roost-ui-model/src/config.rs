@@ -561,7 +561,195 @@ impl RoostConfig {
     }
 }
 
-/// Round-trip-safe edit of `~/.config/roost/config.conf`.
+/// `config.lock`, beside the **resolved** `config.conf`.
+///
+/// Resolved, because that is the file everything here actually writes
+/// (see [`write_atomic`]): a `config.conf` symlinked into a dotfiles
+/// repo is written in the repo, so two Roosts reaching it by different
+/// link paths have to contend on one file. `$ROOST_CONFIG` therefore
+/// moves the lock with the config, which is what lets a jailed harness
+/// — and a second profile — write without touching the developer's.
+///
+/// Public because Roost's Swift half resolves the same path in its own
+/// `setKey`, and `flock(2)` only serialises writers that agree on which
+/// file they are contending for.
+pub fn lock_path(config_path: &Path) -> PathBuf {
+    lock_beside(&follow_links(config_path))
+}
+
+/// [`lock_path`] for a caller that has already resolved, so the guard it
+/// builds and the file it locks come out of **one** resolution rather
+/// than two that a swapped symlink could disagree about.
+fn lock_beside(resolved: &Path) -> PathBuf {
+    let parent = match resolved.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    parent.join("config.lock")
+}
+
+/// How long [`ConfigLock::acquire`] waits for the current holder before
+/// it gives up.
+///
+/// Bounded rather than blocking, because of who waits behind it: an
+/// agent-hooks ensure on a host session runs holding that session's
+/// mutation barrier, and `session.stop` takes the same barrier for
+/// write — so an unbounded `flock` on a `$HOME` that may be
+/// network-mounted was a wedge that no client disconnect and no
+/// shutdown could clear. Ten seconds is far longer than an honest
+/// ensure (a key plus five small files) and comfortably shorter than
+/// the 15 s a client gives `session.set_agent_hooks`, so the caller
+/// hears [`LockError::Busy`] instead of timing out on the wire.
+pub const LOCK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often a waiter re-asks. Short enough that the normal hand-off is
+/// imperceptible, long enough that a full deadline is 400 syscalls
+/// rather than a spin.
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// A config file `0600` is created with, so a `config.lock` Roost makes
+/// is no more readable than the config beside it.
+const LOCK_MODE: u32 = 0o600;
+
+#[derive(Debug)]
+pub enum LockError {
+    /// Another writer held the lock for the whole deadline.
+    Busy {
+        path: PathBuf,
+        waited: std::time::Duration,
+    },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+}
+
+impl std::fmt::Display for LockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LockError::Busy { path, waited } => write!(
+                f,
+                "{}: another Roost held this config lock for {:.0?}; nothing was written",
+                path.display(),
+                waited
+            ),
+            LockError::Io { path, source } => write!(f, "{}: {source}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for LockError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LockError::Busy { .. } => None,
+            LockError::Io { source, .. } => Some(source),
+        }
+    }
+}
+
+impl From<LockError> for io::Error {
+    fn from(error: LockError) -> io::Error {
+        let kind = match &error {
+            LockError::Busy { .. } => io::ErrorKind::WouldBlock,
+            LockError::Io { source, .. } => source.kind(),
+        };
+        io::Error::new(kind, error.to_string())
+    }
+}
+
+/// The advisory lock every writer of one `config.conf` goes through.
+///
+/// An atomic rename stops a *torn* file but not a lost update: two
+/// readers, two renders built on the same pre-image, and the second
+/// rename silently discards the first's work. `config.conf` has four
+/// writers that can all run at once — this UI, the Swift app,
+/// `roostctl`, and a remote connect raising `agent-hooks` — so the
+/// rename alone was never enough.
+///
+/// **Never acquired on a UI thread.** The hold spans a whole
+/// agent-hooks ensure (read the key, union it, write up to five agent
+/// files, write the key back), which on a network-mounted `$HOME` is
+/// seconds.
+#[derive(Debug)]
+pub struct ConfigLock {
+    file: fs::File,
+    /// The resolved config path this guard covers — what
+    /// [`set_key_locked`] checks its target against.
+    config: PathBuf,
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        // `flock` belongs to the open file description, so a forked
+        // child holding an inherited fd would keep it past our close.
+        // Unlock explicitly rather than relying on that.
+        let _ = self.file.unlock();
+    }
+}
+
+impl ConfigLock {
+    /// Take `config_path`'s lock, waiting at most [`LOCK_DEADLINE`].
+    pub fn acquire(config_path: &Path) -> Result<ConfigLock, LockError> {
+        ConfigLock::acquire_within(config_path, LOCK_DEADLINE)
+    }
+
+    /// [`ConfigLock::acquire`] with the deadline stated, for the tests
+    /// that need a short one.
+    pub fn acquire_within(
+        config_path: &Path,
+        deadline: std::time::Duration,
+    ) -> Result<ConfigLock, LockError> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let config = follow_links(config_path);
+        let path = lock_beside(&config);
+        let dir = path.parent().unwrap_or(Path::new("."));
+        fs::create_dir_all(dir).map_err(|source| LockError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(LOCK_MODE)
+            .open(&path)
+            .map_err(|source| LockError::Io {
+                path: path.clone(),
+                source,
+            })?;
+
+        let started = std::time::Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(ConfigLock { file, config }),
+                // `flock` is per open file description, so this is
+                // reached by a second writer *in this process* too —
+                // which is what lets a test prove a write ran while the
+                // lock was held.
+                Err(fs::TryLockError::WouldBlock) => {}
+                Err(fs::TryLockError::Error(source)) => return Err(LockError::Io { path, source }),
+            }
+            let waited = started.elapsed();
+            if waited >= deadline {
+                return Err(LockError::Busy {
+                    path,
+                    waited: deadline,
+                });
+            }
+            std::thread::sleep(LOCK_POLL.min(deadline - waited));
+        }
+    }
+
+    /// The resolved config path this guard covers.
+    pub fn config_path(&self) -> &Path {
+        &self.config
+    }
+}
+
+/// Round-trip-safe edit of `~/.config/roost/config.conf`, under
+/// [`ConfigLock`].
 ///
 /// Replaces every line whose key (the text before the first `=`,
 /// trimmed) equals `key`. The parser is "last-wins" on duplicates, so
@@ -583,19 +771,56 @@ impl RoostConfig {
 /// `font-size = 14` do not). The write is atomic via tmp-file +
 /// rename in the same directory. The parent directory is created if
 /// missing.
+///
+/// This blocks for as long as the lock is held, so it belongs off any
+/// UI thread — see [`ConfigLock`].
 pub fn set_key(path: &Path, key: &str, value: &str) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
+    let lock = ConfigLock::acquire(path)?;
+    write_key(lock.config_path(), key, value)
+}
+
+/// [`set_key`] for a caller that already holds the lock.
+///
+/// `File::try_lock` is per open file description, so a nested
+/// *unlocked* [`set_key`] under a held guard would contend with its own
+/// holder and stall to the full [`LOCK_DEADLINE`]. Passing the guard is
+/// what makes that unwritable, and the guard carries the file it
+/// covers so aiming one at a different config is caught rather than
+/// waited on.
+pub fn set_key_locked(lock: &ConfigLock, path: &Path, key: &str, value: &str) -> io::Result<()> {
+    let target = follow_links(path);
+    if lock.config_path() != target {
+        // Returned rather than panicked: this runs inside a long-lived
+        // session daemon, where a wrong guard must fail one op, not the
+        // process.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "config lock covers {} but the write targets {}; \
+                 passing a guard for another file is a programming error",
+                lock.config_path().display(),
+                target.display()
+            ),
+        ));
+    }
+    write_key(&target, key, value)
+}
+
+/// [`set_key`]'s body, against an already-resolved path and with the
+/// lock already held.
+fn write_key(target: &Path, key: &str, value: &str) -> io::Result<()> {
+    if let Some(parent) = target.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
     }
-    let existing = match fs::read_to_string(path) {
+    let existing = match fs::read_to_string(target) {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };
     let new_contents = render_set_key(&existing, key, value);
-    write_atomic(path, &new_contents)
+    write_atomic(target, &new_contents)
 }
 
 /// Write a config file that holds only `key = value`, failing if one
@@ -603,18 +828,18 @@ pub fn set_key(path: &Path, key: &str, value: &str) -> io::Result<()> {
 ///
 /// For the write a caller knows is a **create**, not an update — plan
 /// 063 §D5's fresh-install `local-backend` line is the one such caller.
-/// [`set_key`] cannot serve it: read-modify-write plus an atomic rename
-/// prevents a *torn* file, not a *lost update*, and nothing locks this
-/// path (`default_path()` has no profile component, so the per-profile
-/// instance locks do not cover it). Another profile, instance or editor
-/// creating `config.conf` between the caller's "no config" check and
-/// the rename would have its file replaced wholesale — including an
-/// explicit `local-backend = in-process` it had just written.
-/// `create_new` (`O_CREAT|O_EXCL`) makes that race an `AlreadyExists`
-/// the caller degrades on instead.
+/// [`set_key`] cannot serve it even under [`ConfigLock`]: the lock
+/// serialises Roost's own writers, not an editor or a `printf >>` the
+/// user runs, and read-modify-write plus an atomic rename would replace
+/// such a file wholesale — including an explicit `local-backend =
+/// in-process` it had just written. `create_new` (`O_CREAT|O_EXCL`)
+/// makes that race an `AlreadyExists` the caller degrades on instead.
+/// The lock is taken all the same, so this cannot land between another
+/// Roost's read and its rename.
 pub fn create_with_key(path: &Path, key: &str, value: &str) -> io::Result<()> {
     use std::io::Write;
 
+    let _lock = ConfigLock::acquire(path)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -1566,6 +1791,144 @@ mod tests {
         );
     }
 
+    /// The lock waits, and then stops waiting.
+    ///
+    /// Blocking forever was the defect, not the waiting: an agent-hooks
+    /// ensure on a host session runs holding that session's mutation
+    /// barrier, and `session.stop` takes the same barrier — so a holder
+    /// that never releases (a crashed writer, a stale `flock` on a
+    /// network home) meant the daemon never flushed, never reaped and
+    /// never answered. Both halves are asserted: a busy lock is still
+    /// waited for, and the wait ends in a named refusal rather than
+    /// never.
+    #[test]
+    fn a_lock_nobody_releases_is_refused_at_the_deadline() {
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.conf");
+        // `flock` belongs to the open file description, so a second
+        // holder in *this* process contends exactly like another one.
+        let held = super::ConfigLock::acquire(&config).expect("take the lock");
+
+        let started = Instant::now();
+        let refused = super::ConfigLock::acquire_within(&config, Duration::from_millis(200))
+            .expect_err("a lock that never frees must not be waited on forever");
+        let waited = started.elapsed();
+
+        assert!(
+            matches!(refused, super::LockError::Busy { .. }),
+            "{refused:?}"
+        );
+        assert!(refused.to_string().contains("config lock"), "{refused}");
+        assert!(waited >= Duration::from_millis(200), "{waited:?}");
+        assert!(
+            waited < Duration::from_secs(5),
+            "the bound did not hold: {waited:?}"
+        );
+
+        drop(held);
+        super::ConfigLock::acquire_within(&config, Duration::from_millis(200))
+            .expect("free again once the holder is gone");
+    }
+
+    /// The production default is the one the callers reason about: long
+    /// enough that an honest ensure never reaches it, short enough that
+    /// a client's own 15 s budget for `session.set_agent_hooks` is not
+    /// what gives up first.
+    #[test]
+    fn the_default_deadline_stays_inside_the_op_budget() {
+        assert_eq!(super::LOCK_DEADLINE, std::time::Duration::from_secs(10));
+    }
+
+    /// #487: the lost update, closed. A writer that finds the lock held
+    /// **waits** rather than building a render on a pre-image somebody
+    /// else is about to replace.
+    ///
+    /// Deterministic rather than probabilistic: the lock is held by the
+    /// test itself, so the writer is certainly contending, and the
+    /// 200 ms window is two orders of magnitude inside `LOCK_DEADLINE`.
+    #[test]
+    fn set_key_waits_for_a_held_lock_and_lands_on_release() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.conf");
+        fs::write(&config, "theme = roost-dark\n").unwrap();
+        let held = super::ConfigLock::acquire(&config).expect("take the lock");
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let writing = config.clone();
+        let writer = std::thread::spawn(move || {
+            let outcome = super::set_key(&writing, "font-size", "17");
+            let _ = done_tx.send(());
+            outcome
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "set_key returned while the lock was held: the write is not serialised"
+        );
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            "theme = roost-dark\n",
+            "the file moved while the lock was held"
+        );
+
+        drop(held);
+        writer.join().unwrap().expect("the write lands on release");
+        let cfg = RoostConfig::load_from(&config);
+        assert_eq!(cfg.font_size, Some(17.0));
+        assert_eq!(cfg.theme_name.as_deref(), Some("roost-dark"));
+    }
+
+    /// The lock follows the config, so `$ROOST_CONFIG` and a dotfiles
+    /// symlink both land two writers on the same file.
+    #[test]
+    fn the_lock_sits_beside_the_resolved_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("dotfiles");
+        fs::create_dir_all(&real).unwrap();
+        let target = real.join("config.conf");
+        fs::write(&target, "").unwrap();
+        let link = tmp.path().join("config.conf");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(super::lock_path(&link), real.join("config.lock"));
+        assert_eq!(super::lock_path(&target), real.join("config.lock"));
+        assert_eq!(
+            super::ConfigLock::acquire(&link).unwrap().config_path(),
+            target
+        );
+    }
+
+    /// A guard for another file is a bug in the caller, and it is said
+    /// so rather than waited on — see `set_key_locked`.
+    #[test]
+    fn set_key_locked_refuses_a_guard_for_another_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mine = tmp.path().join("mine/config.conf");
+        let theirs = tmp.path().join("theirs/config.conf");
+        let lock = super::ConfigLock::acquire(&mine).unwrap();
+
+        let refused = super::set_key_locked(&lock, &theirs, "theme", "roost-dark")
+            .expect_err("a guard for another file must not write");
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            refused.to_string().contains("mine/config.conf"),
+            "{refused}"
+        );
+        assert!(
+            refused.to_string().contains("theirs/config.conf"),
+            "{refused}"
+        );
+        assert!(!theirs.exists());
+
+        super::set_key_locked(&lock, &mine, "theme", "roost-dark").expect("its own file writes");
+        assert_eq!(fs::read_to_string(&mine).unwrap(), "theme = roost-dark\n");
+    }
+
     /// The fresh-install write is a create, and a config that appeared
     /// since the "no config" check must survive it byte for byte — the
     /// lost update `set_key`'s rename would have caused.
@@ -1591,7 +1954,10 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        assert_eq!(names, vec!["config.conf".to_string()]);
+        assert_eq!(
+            names,
+            vec!["config.conf".to_string(), "config.lock".to_string()]
+        );
     }
 
     /// The contrast that gives the test above its teeth: `set_key`,

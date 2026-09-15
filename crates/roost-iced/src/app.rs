@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -32,12 +31,11 @@ use roost_engine::{
 };
 use roost_ipc::agent;
 use roost_ipc::messages::{
-    AgentSetHooksAgents, AgentSetHooksHostOutcome, AgentSetHooksResult, AppMenuDumpResult,
-    AppNotificationStatusResult, AppRenderStatsResult, AppUpdateStatusResult, HostConnectStatus,
-    HostConnectionResult, HostStatus, HostStatusResult, PaletteItemView, PalettePresentResult,
-    PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpHost, SidebarDumpHostProject,
-    SidebarDumpHostTab, SidebarDumpProject, SidebarDumpResult, SidebarDumpSection,
-    WindowMetricsResult,
+    AgentSetHooksAgents, AgentSetHooksResult, AppMenuDumpResult, AppNotificationStatusResult,
+    AppRenderStatsResult, AppUpdateStatusResult, HostConnectStatus, HostConnectionResult,
+    HostStatus, HostStatusResult, PaletteItemView, PalettePresentResult, PaletteStateResult,
+    Project, SidebarDumpAgentRow, SidebarDumpHost, SidebarDumpHostProject, SidebarDumpHostTab,
+    SidebarDumpProject, SidebarDumpResult, SidebarDumpSection, WindowMetricsResult,
 };
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::{IpcServer, LocalBackendCell, LocalBackendMode};
@@ -2389,6 +2387,10 @@ pub struct App {
     /// may act; see [`agent_hooks::AgentHooksSurvey::id`].
     agent_hooks_survey: Option<u64>,
     agent_hooks_surveys: u64,
+    /// The last `agent.set_hooks` ticket issued — see
+    /// [`agent_hooks::AgentHooksApply`]. Only this one's answer is
+    /// applied to `config` and to the receipt toast.
+    agent_hooks_applies: u64,
     /// The agent-hooks toast, waiting for the end of the drain that
     /// produced it. Held rather than set on arrival so nothing later in
     /// the same batch — a PTY error, an OSC action — can replace it
@@ -2654,6 +2656,12 @@ pub struct App {
     /// task. Cheap and `Send`; dropping one is inert, so it takes no part
     /// in the ordering below.
     runtime_handle: tokio::runtime::Handle,
+    /// Every `config.conf` write this process makes, in request order
+    /// and off this thread — see [`crate::config_writer`].
+    config_writer: crate::config_writer::ConfigWriter,
+    /// Every `agent.set_hooks` apply, in request order and off this
+    /// thread — see [`agent_hooks::AgentHooksApply`].
+    agent_hooks_worker: agent_hooks::AgentHooksApplies,
     // Field order is intentional: terminal sessions and the engine feed
     // (whose receiver carries the wake every sender notifies on) are
     // dropped before the runtime — a dropped receiver is how the adapter
@@ -2886,6 +2894,7 @@ impl App {
             agent_hooks_card_raised: false,
             agent_hooks_survey: None,
             agent_hooks_surveys: 0,
+            agent_hooks_applies: 0,
             pending_agent_hooks_toast: None,
             rename_editor: None,
             rename_input_id: Id::unique(),
@@ -2980,6 +2989,15 @@ impl App {
             host_views: Vec::new(),
             host_sections: Vec::new(),
             runtime_handle: runtime.handle().clone(),
+            config_writer: crate::config_writer::ConfigWriter::spawn(
+                runtime.handle(),
+                config::config_path(),
+                feed_tx.clone(),
+            ),
+            agent_hooks_worker: agent_hooks::AgentHooksApplies::spawn(
+                runtime.handle(),
+                feed_tx.clone(),
+            ),
             feed_rx,
             feed_tx,
             _restore_quit_signals: RestoreDefaultQuitSignalsOnDrop,
@@ -3416,54 +3434,20 @@ impl App {
         };
         let client = agent_hooks::client_label();
 
-        let feed = self.feed_tx.clone();
-        self.runtime_handle.spawn(async move {
-            let local = tokio::task::spawn_blocking(move || {
-                agent_hooks::set_hooks_blocking(&mode, guard)
-            })
-            .await
-            .unwrap_or_else(|error| Err(format!("the agent-hooks install did not finish: {error}")));
-            let done = match local {
-                Ok(done) => done,
-                Err(message) => {
-                    // Reported to the caller, which is the boundary that
-                    // handles it; the log line is for the launches where
-                    // the caller was a dialog nobody was watching.
-                    tracing::warn!(error = %message, "agent.set_hooks could not set this machine's agent hooks");
-                    let _ = reply.send(Err(HostOpFailure::new("internal", message)));
-                    return;
-                }
-            };
-            // Only now: this machine has recorded the user's answer, so
-            // it has something it is entitled to propagate. A local
-            // write that failed reaches no host at all.
-            let names = raise_names.unwrap_or_default();
-            let pending: Vec<_> = raises
-                .iter()
-                .map(|raise| (raise.label.clone(), raise.send(&names, &client)))
-                .collect();
-            let mut hosts = Vec::new();
-            for (label, outcome) in pending {
-                hosts.push(match outcome.await {
-                    Ok(result) => AgentSetHooksHostOutcome::Result {
-                        host: label,
-                        result,
-                    },
-                    // Never fatal, and never an error frame: this
-                    // machine's own key is set either way, and a host
-                    // that could not be asked is one line in the reply.
-                    Err(error) => AgentSetHooksHostOutcome::Error {
-                        host: label,
-                        error: error.to_string(),
-                    },
-                });
-            }
-            let _ = reply.send(Ok(AgentSetHooksResult {
-                config_path: done.config_path.clone(),
-                local: done.outcome.clone(),
-                hosts,
-            }));
-            feed.send(EngineFeed::AgentHooksSet(Box::new(done)));
+        // The ticket is taken **here**, on the main thread, at receipt —
+        // see `AgentHooksApply` for why the order cannot be left to the
+        // runtime.
+        self.agent_hooks_applies += 1;
+        let ticket = self.agent_hooks_applies;
+        tracing::info!(ticket, "agent.set_hooks queued");
+        self.agent_hooks_worker.send(agent_hooks::AgentHooksApply {
+            ticket,
+            mode,
+            guard,
+            raise_names,
+            raises,
+            client,
+            reply,
         });
     }
 
@@ -3477,11 +3461,21 @@ impl App {
             tracing::warn!(agent = %failure.agent, error = %failure.error, "agent hooks");
         }
         tracing::info!(
+            ticket = done.ticket,
             key = %done.key.to_config_value().unwrap_or_else(|| "ask".to_string()),
             unannounced = done.unnoticed.len(),
             errors = done.outcome.errors.len(),
             "agent.set_hooks applied"
         );
+        // Superseded (#490): a newer apply was requested while this one
+        // wrote. The file already holds the newer answer — the worker
+        // runs them in request order — so taking this one into `config`
+        // or onto the receipt would show the user the choice they
+        // replaced. The `agent_hooks_surveyed` rule, for the same
+        // reason. Failures above are still logged: they happened.
+        if done.ticket != self.agent_hooks_applies {
+            return;
+        }
         self.config.agent_hooks = done.key;
         let Some(toast) = agent_hooks::wired_toast(&done.unnoticed, None) else {
             return;
@@ -5893,11 +5887,7 @@ impl App {
         } else {
             "false"
         };
-        if let Some(path) = config::config_path() {
-            if let Err(error) = config::set_key(&path, "show-sidebar-agents", value) {
-                self.set_status(format!("persist show-sidebar-agents: {error}"));
-            }
-        }
+        self.config_writer.set("show-sidebar-agents", value);
     }
 
     pub fn new_tab(&mut self) -> UiTask {
@@ -8627,6 +8617,11 @@ fn resume_switch_journal(
             (mode, delete_dest, Vec::new())
         }
     };
+    // The one `config.conf` write this process still makes inline. It
+    // runs during bootstrap, before the engine feed a `ConfigWriter`
+    // failure would travel on exists and before any window — so there is
+    // no UI thread here to keep responsive, and the launch genuinely
+    // cannot continue until the key says which backend it is resuming.
     let key_written = match config::config_path() {
         Some(config_path) => match config::set_key(&config_path, "local-backend", mode.as_str()) {
             Ok(()) => true,

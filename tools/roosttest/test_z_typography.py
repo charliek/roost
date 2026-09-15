@@ -14,20 +14,12 @@ import uuid
 
 import pytest
 import ui
-from util import BARE_SHELL_ARGV, wait_tab_attached
+from util import BARE_SHELL_ARGV, wait_for_config_line, wait_tab_attached
 
 
 def _grid(roost, tab_id: int) -> tuple[int, int]:
     dump = roost.dump(tab_id)
     return dump["cols"], dump["rows"]
-
-
-def _config_lines(path, key: str) -> list[str]:
-    return [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.partition("=")[0].strip() == key
-    ]
 
 
 def _require_owned_rust(target: str):
@@ -110,7 +102,7 @@ def test_rust_shared_font_size_reflows_all_tabs_and_persists(
         5.0,
         "shared font-size transition reaches the hidden Rust UI tab",
     )
-    assert _config_lines(config_path, "font-size") == ["font-size = 14"]
+    wait_for_config_line(config_path, "font-size", "font-size = 14")
 
     third = roost.open_tab(rust_project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     wait_tab_attached(roost, third)
@@ -134,7 +126,7 @@ def test_rust_shared_font_size_reflows_all_tabs_and_persists(
             5.0,
             f"font reset restores the launch baseline on Rust UI tab {tab_id}",
         )
-    assert _config_lines(config_path, "font-size") == ["font-size = 13"]
+    wait_for_config_line(config_path, "font-size", "font-size = 13")
 
     before_second_reset = config_path.read_bytes()
     before_stat = config_path.stat()
@@ -221,9 +213,9 @@ def test_rust_font_preview_dismiss_and_confirmation_are_commit_bounded(
                     5.0,
                     f"font confirmation reflows live tab {tab_id}",
                 )
-        assert _config_lines(config_path, "font-family") == [
-            f'font-family = "{target_font["id"]}"'
-        ]
+        wait_for_config_line(
+            config_path, "font-family", f'font-family = "{target_font["id"]}"'
+        )
         inherited_tab = roost.open_tab(
             rust_project, cwd="/tmp", argv=BARE_SHELL_ARGV
         )
@@ -242,7 +234,7 @@ def test_rust_font_preview_dismiss_and_confirmation_are_commit_bounded(
         rust_palette.palette_activate("select_font")
         restored = rust_palette.palette_activate(original["id"])
         assert restored["open"] is False
-        assert _config_lines(config_path, "font-family") == [
-            f'font-family = "{original["id"]}"'
-        ]
+        wait_for_config_line(
+            config_path, "font-family", f'font-family = "{original["id"]}"'
+        )
         assert ui.SEED_CONFIG.read_bytes() == seed_before

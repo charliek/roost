@@ -122,7 +122,12 @@ pub fn run(cmd: &AgentCmd) -> i32 {
 
     match cmd {
         AgentCmd::Ensure { json, startup } => match configured() {
-            Some(mode) if *startup => report(ensure(&home, &mode, BY, guard), *json),
+            // `--startup` passes no mode: `ensure` re-reads the key
+            // inside the lock. This read decides only whether there is
+            // an answer to act on at all — the Mac spawns exactly this
+            // at launch, and the key can be answered between its read
+            // and this process's write.
+            Some(_) if *startup => report(ensure(&home, BY, guard), *json),
             Some(mode) => report(reconcile(&home, &mode, BY, guard), *json),
             None => {
                 // `--json` is a machine contract — the Mac app spawns

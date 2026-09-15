@@ -388,7 +388,7 @@ mod tests {
     /// deadline is a backstop, not a fast failure.
     ///
     /// The bound itself, and the typed refusal at the end of it, are
-    /// `roost_agent_install::write`'s to prove
+    /// `roost_ui_model::config`'s to prove
     /// (`a_lock_nobody_releases_is_refused_at_the_deadline`); what
     /// matters here is that this path goes through that lock at all, so
     /// a session's mutation barrier — and with it `session.stop` — is
@@ -397,7 +397,7 @@ mod tests {
     fn a_raise_waits_for_a_busy_lock_and_still_runs() {
         let dir = tempfile::tempdir().unwrap();
         let home = a_home(dir.path());
-        let held = roost_agent_install::write::lock(&home.lock_path()).expect("take the lock");
+        let held = home.config_lock().expect("take the lock");
         let releasing = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(200));
             drop(held);

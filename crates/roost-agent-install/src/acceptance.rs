@@ -171,8 +171,19 @@ fn escaped(s: &str) -> String {
     s.replace('"', "\\\"")
 }
 
+/// [`ensure::answer`] and then the startup ensure — the pair nearly
+/// every case here wants.
+fn ensure_answered(
+    home: &Home,
+    mode: &ensure::Mode,
+    guard: Guard,
+) -> Result<ensure::Outcome, crate::InstallError> {
+    ensure::answer(home, mode);
+    ensure::ensure(home, "local", guard)
+}
+
 fn wire_all(home: &Home) -> ensure::Outcome {
-    let outcome = ensure::ensure(home, &all(), "local", Guard::PERMITTED).unwrap();
+    let outcome = ensure_answered(home, &all(), Guard::PERMITTED).unwrap();
     assert!(outcome.is_clean(), "{:?}", outcome.errors);
     outcome
 }
@@ -604,7 +615,7 @@ fn the_second_ensure_still_has_the_unannounced_agents_to_toast() {
 
     // Nobody said anything. A second ensure wires nothing at all — and
     // still owes the user the sentence.
-    let second = ensure::ensure(&home, &all(), "local", Guard::PERMITTED).unwrap();
+    let second = ensure_answered(&home, &all(), Guard::PERMITTED).unwrap();
     assert!(second.wired.is_empty(), "{second:?}");
     assert_eq!(second.current.len(), ALL_AGENTS.len(), "{second:?}");
     let mut unnoticed = second.unnoticed.clone();
@@ -614,7 +625,7 @@ fn the_second_ensure_still_has_the_unannounced_agents_to_toast() {
     // Once it has been said, it is never said again — including across
     // the refresh a version bump would drive.
     assert!(state::mark_noticed(&home, &ALL_AGENTS).unwrap());
-    let third = ensure::ensure(&home, &all(), "local", Guard::PERMITTED).unwrap();
+    let third = ensure_answered(&home, &all(), Guard::PERMITTED).unwrap();
     assert!(third.unnoticed.is_empty(), "{third:?}");
     drop(dir);
 }
@@ -624,7 +635,7 @@ fn the_second_ensure_still_has_the_unannounced_agents_to_toast() {
 #[test]
 fn a_skipped_agent_is_never_on_the_toast_list() {
     let (dir, home) = fixture("all");
-    let outcome = ensure::ensure(&home, &all_but(Agent::Codex), "local", Guard::PERMITTED).unwrap();
+    let outcome = ensure_answered(&home, &all_but(Agent::Codex), Guard::PERMITTED).unwrap();
     assert!(outcome.is_clean(), "{:?}", outcome.errors);
     assert!(!outcome.unnoticed.contains(&Agent::Codex), "{outcome:?}");
     assert!(outcome.unnoticed.contains(&Agent::Claude), "{outcome:?}");
@@ -870,7 +881,7 @@ fn a_second_ensure_plans_zero_edits() {
         );
     }
 
-    let second = ensure::ensure(&home, &all(), "local", Guard::PERMITTED).unwrap();
+    let second = ensure_answered(&home, &all(), Guard::PERMITTED).unwrap();
     assert!(second.wired.is_empty(), "{:?}", second.wired);
     assert!(second.refreshed.is_empty(), "{:?}", second.refreshed);
     assert_eq!(second.current.len(), ALL_AGENTS.len());
@@ -921,7 +932,7 @@ fn a_malformed_file_is_skipped_with_a_reason() {
     let (dir, home) = fixture("malformed");
     let before = snapshot(dir.path());
 
-    let outcome = ensure::ensure(&home, &all(), "local", Guard::PERMITTED).unwrap();
+    let outcome = ensure_answered(&home, &all(), Guard::PERMITTED).unwrap();
     assert!(outcome.is_clean(), "{:?}", outcome.errors);
 
     let reasons: BTreeMap<&str, &SkipReason> = outcome
@@ -1087,8 +1098,7 @@ fn off_cleans_an_agent_the_record_remembers() {
 #[test]
 fn an_agent_outside_the_allow_list_is_left_alone_and_says_so() {
     let (_dir, home) = fixture("all");
-    let outcome =
-        ensure::ensure(&home, &all_but(Agent::Cursor), "local", Guard::PERMITTED).unwrap();
+    let outcome = ensure_answered(&home, &all_but(Agent::Cursor), Guard::PERMITTED).unwrap();
     assert!(!outcome.wired.contains(&Agent::Cursor));
     assert!(outcome
         .skipped
@@ -1106,11 +1116,12 @@ fn an_agent_outside_the_allow_list_is_left_alone_and_says_so() {
 #[test]
 fn two_concurrent_ensures_leave_exactly_one_entry() {
     let (_dir, home) = fixture("all");
+    ensure::answer(&home, &all());
     let a = home.clone();
     let b = home.clone();
 
-    let left = std::thread::spawn(move || ensure::ensure(&a, &all(), "local", Guard::PERMITTED));
-    let right = std::thread::spawn(move || ensure::ensure(&b, &all(), "local", Guard::PERMITTED));
+    let left = std::thread::spawn(move || ensure::ensure(&a, "local", Guard::PERMITTED));
+    let right = std::thread::spawn(move || ensure::ensure(&b, "local", Guard::PERMITTED));
     for outcome in [
         left.join().unwrap().unwrap(),
         right.join().unwrap().unwrap(),
@@ -1174,6 +1185,9 @@ fn a_user_edit_between_plan_and_apply_is_refused_not_clobbered() {
 #[test]
 fn the_test_mode_refusal_stops_every_verb_before_it_writes() {
     let (dir, home) = fixture("all");
+    // Answered before the snapshot: the key is the *user's* write, and
+    // what this case is about is that the engine adds nothing to it.
+    ensure::answer(&home, &all());
     let before = snapshot(dir.path());
     let jailed = Guard {
         test_mode: true,
@@ -1181,7 +1195,7 @@ fn the_test_mode_refusal_stops_every_verb_before_it_writes() {
     };
 
     for result in [
-        ensure::ensure(&home, &all(), "local", jailed),
+        ensure::ensure(&home, "local", jailed),
         ensure::reconcile(&home, &ensure::Mode::Off, "local", jailed),
         ensure::raise(&home, &ALL_AGENTS, "remote", jailed),
         ensure::set_hooks(&home, &all(), "local", jailed),
@@ -1200,9 +1214,7 @@ fn the_test_mode_refusal_stops_every_verb_before_it_writes() {
         test_mode: true,
         forced: true,
     };
-    assert!(ensure::ensure(&home, &all(), "local", forced)
-        .unwrap()
-        .is_clean());
+    assert!(ensure::ensure(&home, "local", forced).unwrap().is_clean());
 }
 
 /// An agent that is not installed is not a problem to report — it is a
@@ -1212,7 +1224,7 @@ fn the_test_mode_refusal_stops_every_verb_before_it_writes() {
 fn an_absent_agent_is_skipped_and_gets_no_directory() {
     let dir = tempfile::tempdir().unwrap();
     let home = Home::rooted(dir.path());
-    let outcome = ensure::ensure(&home, &all(), "local", Guard::PERMITTED).unwrap();
+    let outcome = ensure_answered(&home, &all(), Guard::PERMITTED).unwrap();
 
     assert!(outcome.wired.is_empty());
     assert_eq!(outcome.skipped.len(), ALL_AGENTS.len());
@@ -1262,8 +1274,7 @@ fn an_allow_list_wires_what_it_names_and_only_that() {
     let (dir, home) = fixture("all");
     let untouched = snapshot(dir.path());
 
-    let outcome =
-        ensure::ensure(&home, &allow(&[Agent::Claude]), "local", Guard::PERMITTED).unwrap();
+    let outcome = ensure_answered(&home, &allow(&[Agent::Claude]), Guard::PERMITTED).unwrap();
     assert!(outcome.is_clean(), "{:?}", outcome.errors);
 
     let after = snapshot(dir.path());
@@ -1314,8 +1325,7 @@ fn a_stale_entry_is_refreshed_only_for_an_allowed_agent() {
     rewind(Agent::Claude);
     let cursor_was = rewind(Agent::Cursor);
 
-    let outcome =
-        ensure::ensure(&home, &allow(&[Agent::Claude]), "local", Guard::PERMITTED).unwrap();
+    let outcome = ensure_answered(&home, &allow(&[Agent::Claude]), Guard::PERMITTED).unwrap();
     assert_eq!(
         std::fs::read_to_string(cursor::hooks_path(&home)).unwrap(),
         cursor_was,
@@ -1332,7 +1342,7 @@ fn a_stale_entry_is_refreshed_only_for_an_allowed_agent() {
 #[test]
 fn reconcile_wires_the_newly_allowed_and_unwires_the_rest() {
     let (_dir, home) = fixture("all");
-    ensure::ensure(&home, &allow(&[Agent::Claude]), "local", Guard::PERMITTED).unwrap();
+    ensure_answered(&home, &allow(&[Agent::Claude]), Guard::PERMITTED).unwrap();
 
     let outcome =
         ensure::reconcile(&home, &allow(&[Agent::Codex]), "local", Guard::PERMITTED).unwrap();
@@ -1505,7 +1515,8 @@ fn uninstalling_every_agent_writes_off() {
 #[test]
 fn two_concurrent_raises_keep_both_agents() {
     let (_dir, home) = fixture("all");
-    let held = crate::write::lock(&home.lock_path()).expect("take the lock");
+    let held =
+        roost_ui_model::config::ConfigLock::acquire(home.config_path()).expect("take the lock");
     let a = home.clone();
     let b = home.clone();
 
@@ -1540,6 +1551,13 @@ fn two_concurrent_raises_keep_both_agents() {
 /// that has not been permitted: it fails, and no agent's file is
 /// touched. Writing the files first and the key second would leave a
 /// machine wired by a consent nothing recorded.
+///
+/// An unwritable config *directory* now fails one step earlier than it
+/// used to — at `config.lock`, which lives beside the resolved config
+/// rather than under `~/.config/roost` — so this pins the refusal on the
+/// lock. Same class either way (`ReadOnly`), and the same consequence:
+/// nothing on this machine is wired by a consent that could not be
+/// recorded.
 #[test]
 fn a_config_that_cannot_be_written_wires_nothing() {
     use std::os::unix::fs::PermissionsExt;
@@ -1548,9 +1566,9 @@ fn a_config_that_cannot_be_written_wires_nothing() {
     let locked = dir.path().join("locked");
     std::fs::create_dir(&locked).unwrap();
     let config = locked.join("config.conf").to_string_lossy().into_owned();
-    // `ROOST_CONFIG` moves only the config: the lock and the state
-    // record stay under `.config/roost`, so this test fails on the
-    // config write and on nothing else.
+    // `ROOST_CONFIG` moves the config **and its lock**; the state record
+    // stays under `.config/roost`, so this test fails on the config
+    // directory and on nothing else.
     let home = Home::resolve(home.path(), |key| {
         (key == "ROOST_CONFIG").then(|| config.clone())
     });
@@ -1560,9 +1578,13 @@ fn a_config_that_cannot_be_written_wires_nothing() {
     let refused = ensure::set_hooks(&home, &all(), "local", Guard::PERMITTED).unwrap_err();
 
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(
-        matches!(refused, crate::InstallError::ReadOnly { .. }),
-        "{refused:?}"
+    let crate::InstallError::ReadOnly { path } = &refused else {
+        panic!("{refused:?}");
+    };
+    assert_eq!(
+        path,
+        &locked.join("config.lock"),
+        "the refusal must name the lock beside the config it could not create"
     );
     let agent_files = |snap: BTreeMap<PathBuf, Vec<u8>>| -> BTreeMap<PathBuf, Vec<u8>> {
         snap.into_iter()

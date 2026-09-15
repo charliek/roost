@@ -223,7 +223,7 @@ pub fn now_secs() -> i64 {
 /// would leave two clients connecting at once both reading the same
 /// agent as unannounced.
 pub fn mark_noticed(home: &Home, agents: &[Agent]) -> Result<bool, InstallError> {
-    let _lock = write::lock(&home.lock_path())?;
+    let _lock = home.config_lock()?;
     let (mut record, _) = load(home)?;
     let mut changed = false;
     for agent in agents {

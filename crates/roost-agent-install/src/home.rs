@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use roost_agent::Agent;
+use roost_ui_model::config::ConfigLock;
 
 use crate::error::InstallError;
 
@@ -163,8 +164,8 @@ impl Home {
         self.agent_dir(agent).is_dir()
     }
 
-    /// Roost's own configuration directory — where the state record and
-    /// the ensure lock live.
+    /// Roost's own configuration directory — where the state record
+    /// lives.
     pub fn roost_config_dir(&self) -> PathBuf {
         self.home.join(".config/roost")
     }
@@ -174,11 +175,6 @@ impl Home {
         self.roost_config_dir().join("agent-hooks.json")
     }
 
-    /// `<config dir>/roost/agent-hooks.lock`.
-    pub fn lock_path(&self) -> PathBuf {
-        self.roost_config_dir().join("agent-hooks.lock")
-    }
-
     /// `config.conf` — the file carrying the `agent-hooks` key this
     /// crate writes, resolved at construction by
     /// [`roost_ui_model::config::config_path_in`] *against this `Home`*,
@@ -186,6 +182,17 @@ impl Home {
     /// config however the process environment is set.
     pub fn config_path(&self) -> &Path {
         &self.config
+    }
+
+    /// The lock every writer in this crate runs under — one per
+    /// [`Home::config_path`], because the `agent-hooks` key and the
+    /// agent files it authorises have to move together.
+    ///
+    /// Named here rather than spelled out at each entry point so there
+    /// is one answer to "which file do Roost's writers contend on", and
+    /// so a `Home` built for a jail locks inside that jail.
+    pub fn config_lock(&self) -> Result<ConfigLock, InstallError> {
+        Ok(ConfigLock::acquire(self.config_path())?)
     }
 }
 
