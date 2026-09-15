@@ -2701,8 +2701,10 @@ pub struct SessionSetFocusParams {
 #[serde(deny_unknown_fields)]
 pub struct SessionSetAgentHooksParams {
     /// The agents the client's own `agent-hooks` key allows. Never
-    /// empty and never a name the host does not recognise — both are
-    /// `invalid-param` refusals the server validates.
+    /// empty, and no element blank — both are `invalid-param` refusals
+    /// the server validates. A name the *host* does not recognise is
+    /// not: it comes back in `skipped` with reason `"unknown"`, and the
+    /// rest of the list is wired.
     pub agents: Vec<String>,
     /// Who is asking, for the host's state record and its log. Required:
     /// the record's `by` exists so two clients that disagree about
@@ -2715,14 +2717,34 @@ pub struct SessionSetAgentHooksParams {
 /// [`ops::AGENT_SET_HOOKS`] run did not act on, and why.
 ///
 /// `reason` is a free string for the client to show or log verbatim,
-/// not a code to match on: the raise rule means the only skip reason
-/// [`ops::SESSION_SET_AGENT_HOOKS`] can report now is "not allowed" (the
-/// agent's own consent did not name it) — the two-mode-era `"skip-list"`
-/// spelling this field used to carry is gone with the mode it named.
+/// not a code to match on. Two reach a client: `"not allowed"` (the
+/// machine's own consent did not name the agent) and `"unknown"` (the
+/// answering binary has no adapter for the name the client sent, plan
+/// 065 §3.1) — the two-mode-era `"skip-list"` spelling this field used
+/// to carry is gone with the mode it named.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentHooksSkipped {
     pub agent: String,
     pub reason: String,
+}
+
+impl AgentHooksSkipped {
+    /// `names` as the `"unknown"` skips both ops answer a name the
+    /// receiving binary has no adapter for with.
+    ///
+    /// Here rather than in either op, because the two are implemented in
+    /// different crates (`roost-session` for the host, `roost-iced` for
+    /// the local one) and a client that groups a reply by reason has
+    /// only this string to group on.
+    pub fn unknown(names: &[String]) -> Vec<AgentHooksSkipped> {
+        names
+            .iter()
+            .map(|name| AgentHooksSkipped {
+                agent: name.clone(),
+                reason: "unknown".to_string(),
+            })
+            .collect()
+    }
 }
 
 /// One agent the host tried and failed to wire. Reported, never

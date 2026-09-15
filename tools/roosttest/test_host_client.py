@@ -2270,27 +2270,78 @@ def test_a_host_whose_key_says_off_is_raised_anyway(session_env):
     assert "ROOST_AGENT_HOOK" in (jail.agent_dirs["claude"] / "settings.json").read_text()
 
 
-def test_an_empty_or_unknown_agent_list_is_refused(session_env):
+def test_an_empty_agent_list_is_refused(session_env):
     """`invalid-param`, before anything is written.
 
-    Under protocol equality both ends of this wire know the same five
-    agents, so a name that resolves to none of them is a bug in the
-    client rather than a newer Roost meeting an older host; and a client
-    with nothing to raise does not send the op at all, so an empty list
-    is a bug too. Filtering either out and reporting it as a skip would
-    leave the client believing it had raised something it had not.
+    A client with nothing to raise does not send the op at all, so an
+    empty list is a bug the host has to say out loud; a blank element is
+    the same bug in a different spelling. A *name* the host does not know
+    is not in this group — see the two tests below.
     """
     jail = start_jailed_session(session_env)
 
     with session_env.client() as scripted:
-        for agents in ([], ["banana"], ["claude", "banana"]):
+        for agents in ([], ["  "], ["claude", ""]):
             refusal = refused(raise_hooks, scripted, agents)
             assert refusal.code == "invalid-param", (agents, refusal)
 
     assert jail.read_key() is None, "a refused raise wrote the key"
     assert not jail.record.exists(), "a refused raise wired something"
-    assert not (jail.agent_dirs["claude"] / "settings.json").exists(), (
-        "`claude, banana` wired the half it recognised"
+    assert not (jail.agent_dirs["claude"] / "settings.json").exists()
+
+
+def test_a_name_the_host_does_not_know_is_skipped_not_refused(session_env):
+    """Plan 065 §3.1, the wire half: a name this host has no adapter for
+    comes back as `skipped/unknown` and the rest of the list is wired.
+
+    Protocol equality pins one wire *generation*, not one agent set — a
+    newer Roost can ship an adapter inside it — so refusing the whole
+    raise is what kept a newly supported agent switched off forever. The
+    unknown-only arm is the one that has to answer `ok`: there is nothing
+    for this host to write, and an error there is a client that can never
+    grow past it.
+    """
+    jail = start_jailed_session(session_env)
+
+    with session_env.client() as scripted:
+        mixed = raise_hooks(scripted, ["claude", "gemini"])
+        assert mixed["wired"] == ["claude"], mixed
+        assert {"agent": "gemini", "reason": "unknown"} in mixed["skipped"], mixed
+        assert jail.read_key() == "claude"
+        assert wired_agents(jail) == {"claude"}
+
+        alone = raise_hooks(scripted, ["gemini", "amp"])
+
+    assert alone["wired"] == [], alone
+    assert alone["errors"] == [], alone
+    assert alone["skipped"] == [
+        {"agent": "gemini", "reason": "unknown"},
+        {"agent": "amp", "reason": "unknown"},
+    ], alone
+    # Written by the `claude` raise above and by nothing since: an
+    # unknown-only list must not so much as touch the key.
+    assert jail.read_key() == "claude"
+    assert wired_agents(jail) == {"claude"}
+
+
+def test_a_raise_keeps_a_name_this_host_cannot_wire(session_env):
+    """The data-loss half of plan 065 §3.1, end to end.
+
+    The raise is a read-modify-write of the host's `agent-hooks`, so a
+    token the host's own parser could not resolve has to survive it —
+    otherwise the older of two Roosts erases the newer one's answer on
+    every connect, and it does so silently.
+    """
+    jail = start_jailed_session(session_env, agent_hooks="claude, gemini")
+
+    with session_env.client() as scripted:
+        raised = raise_hooks(scripted, ["codex"])
+
+    # Both, because the key already allowed claude and neither had been
+    # announced to any client yet — `wired` is the toast list.
+    assert sorted(raised["wired"]) == ["claude", "codex"], raised
+    assert jail.read_key() == "claude, codex, gemini", (
+        "the raise dropped a name this host cannot wire"
     )
 
 

@@ -221,8 +221,11 @@ release workflow asserts they agree).
   word with a name, now parse back as unanswered (with a warning)
   instead of silently turning wiring on. Names normalise — trimmed,
   lowercased, de-duplicated, reordered into `claude, codex, grok,
-  cursor, opencode` — and an unknown name beside a known one is dropped
-  with a warning. `roostctl agent ensure/install/uninstall/status` are
+  cursor, opencode` — and a name this build has no adapter for wires
+  nothing, warns once, and is **kept in the key**, written back
+  unchanged, so a newer Roost's answer survives an older one reading the
+  same file (`roostctl agent status` lists it as `unknown to this
+  build`). `roostctl agent ensure/install/uninstall/status` are
   still the manual controls; `agent set <list|off>` dials the running UI
   (setting the key here and raising every connected non-localhost host
   in the same call), `--local` writes this machine's key with nothing
@@ -236,7 +239,11 @@ release workflow asserts they agree).
   either. Lowering a host is done on that machine (`roostctl agent
   ensure`/`uninstall`, or its own dialog) and holds until a more
   permissive client connects again — there is no more "last writer
-  wins" on this key. This reshapes `session.set_agent_hooks` and bumps
+  wins" on this key. A name the answering end does not recognise is
+  reported as `skipped`/`unknown` on both `session.set_agent_hooks` and
+  `agent.set_hooks` rather than refusing the whole call, so a list naming
+  only agents the other end predates succeeds having written nothing.
+  This reshapes `session.set_agent_hooks` and bumps
   `SESSION_PROTOCOL_VERSION` **5 → 6**; every deployed `roost-session`
   needs updating alongside its client, or it hits the same
   `session-mismatch` refusal any other protocol bump would cause. Riding

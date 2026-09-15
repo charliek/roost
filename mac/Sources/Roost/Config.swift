@@ -232,7 +232,7 @@ enum AgentHooks: Sendable, Equatable {
     /// The agents Roost knows how to wire, canonical spelling, in the
     /// order `configValue` serialises them and the order the consent
     /// dialog (plan 064) lists its rows. Mirrors
-    /// `crates/roost-ui-model/src/config.rs::AGENT_NAMES`.
+    /// `crates/roost-agent/src/lib.rs::ALL_AGENTS`.
     static let agentNames: [String] = ["claude", "codex", "grok", "cursor", "opencode"]
 
     /// Reserved words that are never agent names: the two documented
@@ -275,7 +275,11 @@ enum AgentHooks: Sendable, Equatable {
     /// A value with at least one recognised name and some unrecognised
     /// ones (`claude, banana`) still resolves — to the recognised subset
     /// — but logs once from here, since the caller's nil path never runs
-    /// for it. Mirrors `AgentHooks::parse` in the Rust config parser.
+    /// for it. Mirrors `AgentHooks::parse` in the Rust config parser,
+    /// minus its `unknown` list: that exists so a *writer* can put an
+    /// unrecognised name back, and this app never writes this key — it
+    /// shells out to `roostctl agent set --local`, which does (plan 065
+    /// §3.1).
     static func parse(_ s: String) -> AgentHooks? {
         let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return .ask }

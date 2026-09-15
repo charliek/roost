@@ -2873,6 +2873,7 @@ name = "roost-ui-model"
 version = "0.0.19"
 dependencies = [
  "bitflags 2.11.1",
+ "roost-agent",
  "roost-ipc",
  "roost-vt",
  "serde",

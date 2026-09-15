@@ -12,6 +12,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use roost_agent::{Agent, ALL_AGENTS};
 use roost_ipc::LocalBackendMode;
 
 use crate::custom_command::{self, CustomCommand};
@@ -153,18 +154,6 @@ impl From<LocalBackend> for LocalBackendMode {
     }
 }
 
-/// The agents Roost knows how to wire, canonical spelling, in the order
-/// [`AgentHooks::to_config_value`] serialises them and the order the
-/// consent dialog (plan 064) lists its rows. This is
-/// `roost_agent_install::ALL_AGENTS` order — this crate cannot depend on
-/// `roost-agent-install` (it would pull the install engine into every
-/// consumer of `roost-ui-model`, including the CLI's config-only paths),
-/// so the two tables are kept in step by
-/// `crates/roost-cli/src/agent_install.rs`'s
-/// `the_config_name_table_matches_the_agent_inventory` parity test —
-/// that crate is the one place both are already linked.
-pub const AGENT_NAMES: [&str; 5] = ["claude", "codex", "grok", "cursor", "opencode"];
-
 /// Reserved words that are never agent names: the two documented
 /// spellings (`off`/`false`/`no`) plus the retired ones this key used to
 /// accept (`auto`/`on`/`true`/`yes`, plan 046). A reserved word is only
@@ -174,10 +163,11 @@ const RESERVED_WORDS: [&str; 7] = ["off", "false", "no", "auto", "on", "true", "
 /// Three-state `agent-hooks` policy (plan 064; supersedes plan 046's
 /// two-state `Auto`/`Off`).
 ///
-/// * `Allow(names)` — the agents the user has explicitly consented to,
-///   canonical names in [`AGENT_NAMES`] order. Every present one not
-///   listed is left alone; nothing is ever removed just for being
-///   absent from the list.
+/// * `Allow { agents, unknown }` — the agents the user has explicitly
+///   consented to, canonical names in [`ALL_AGENTS`] order, plus every
+///   token in the key this build has no [`Agent`] for. Every present
+///   agent not listed is left alone; nothing is ever removed just for
+///   being absent from the list.
 /// * `Off` — the UIs wire nothing at startup. It does not *remove*
 ///   anything on its own; an explicit `roostctl agent ensure` reads the
 ///   same key and takes Roost's entries back out, which is what the
@@ -186,15 +176,51 @@ const RESERVED_WORDS: [&str; 7] = ["off", "false", "no", "auto", "on", "true", "
 ///   has answered the consent dialog yet, so nothing is written into
 ///   another product's config file and nothing already wired is
 ///   touched. This is the state a fresh install starts in.
+///
+/// `unknown` is what keeps a *newer* Roost's answer intact when an older
+/// one writes the key: every write path here is a read-modify-write, so
+/// a token dropped on the way in is a name erased off disk the next time
+/// any binary touches it. Carrying it costs nothing — this build cannot
+/// wire what it cannot name, so an unknown token allows nothing — and it
+/// is re-emitted verbatim by [`AgentHooks::to_config_value`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum AgentHooks {
-    Allow(Vec<String>),
+    /// `agents` is never empty: a value naming nothing this build knows
+    /// is [`AgentHooks::Ask`], so `unknown` only ever rides alongside a
+    /// real allow-list. That is what makes `to_config_value` round-trip
+    /// through `parse` — a value spelling only unknown tokens would come
+    /// back as `Ask` and put the consent dialog up again.
+    Allow {
+        agents: Vec<String>,
+        unknown: Vec<String>,
+    },
     Off,
     #[default]
     Ask,
 }
 
 impl AgentHooks {
+    /// An allow-list with nothing unknown in it — what a caller that
+    /// built the list itself (a dialog, a test) has.
+    pub fn allow<I, S>(agents: I) -> AgentHooks
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        AgentHooks::Allow {
+            agents: agents.into_iter().map(Into::into).collect(),
+            unknown: Vec::new(),
+        }
+    }
+
+    /// The tokens in this key that name no agent this build can wire.
+    pub fn unknown(&self) -> &[String] {
+        match self {
+            AgentHooks::Allow { unknown, .. } => unknown,
+            AgentHooks::Off | AgentHooks::Ask => &[],
+        }
+    }
+
     /// Parse a config value.
     ///
     /// `None` means "could not be resolved at all" — the caller warns
@@ -203,9 +229,9 @@ impl AgentHooks {
     /// group: it is `Some(Ask)`, so the caller does not warn — a fresh
     /// install with the key never written must not look like a mistake.
     ///
-    /// The value is split on `,` and lowercased; each token that names
-    /// an agent in [`AGENT_NAMES`] is kept (order-independent, reordered
-    /// into `AGENT_NAMES` order on the way out, duplicates collapsed).
+    /// The value is split on `,` and lowercased; each token
+    /// [`Agent::parse`] answers is kept (order-independent, reordered
+    /// into [`ALL_AGENTS`] order on the way out, duplicates collapsed).
     /// `off`/`false`/`no` as the *entire* single-token value means
     /// `Off`. A reserved word ([`RESERVED_WORDS`]) anywhere else in the
     /// value — alone as one of the retired spellings, or beside a name —
@@ -215,9 +241,16 @@ impl AgentHooks {
     /// start with a stray word) cannot be told apart.
     ///
     /// A value with at least one recognised name and some unrecognised
-    /// ones (`claude, banana`) still resolves — to the recognised subset
-    /// — but warns once from here, since the caller's `None` path never
-    /// runs for it.
+    /// ones (`claude, banana`) resolves to the recognised subset and
+    /// **keeps the rest** in `unknown`, warning once from here since the
+    /// caller's `None` path never runs for it. The kept token is the
+    /// lower-cased one this function split out, not the user's original
+    /// spelling: the key is normalised on the way in and there is
+    /// nothing else left to preserve.
+    ///
+    /// A value with *no* recognised name is `None` — unparseable, so
+    /// `Ask`. Preserving it instead would make `agent-hooks = clade` a
+    /// typo that silently answers the consent question forever.
     pub fn parse(s: &str) -> Option<AgentHooks> {
         let trimmed = s.trim();
         if trimmed.is_empty() {
@@ -244,55 +277,61 @@ impl AgentHooks {
         if tokens.iter().any(|t| RESERVED_WORDS.contains(&t.as_str())) {
             return None;
         }
-        let mut known: Vec<String> = Vec::new();
-        let mut unrecognised: Vec<String> = Vec::new();
+        let mut known: Vec<Agent> = Vec::new();
+        let mut unknown: Vec<String> = Vec::new();
         for tok in &tokens {
-            if AGENT_NAMES.contains(&tok.as_str()) {
-                known.push(tok.clone());
-            } else {
-                unrecognised.push(tok.clone());
+            match Agent::parse(tok) {
+                Some(agent) => known.push(agent),
+                None => unknown.push(tok.clone()),
             }
         }
         if known.is_empty() {
             return None;
         }
-        if !unrecognised.is_empty() {
+        if !unknown.is_empty() {
             tracing::warn!(
                 value = trimmed,
-                unrecognised = unrecognised.join(", "),
-                "agent-hooks: unrecognised agent name(s); allowing the rest"
+                unknown = unknown.join(", "),
+                "agent-hooks: agent name(s) this build cannot wire; kept in the key, \
+                 allowing the rest"
             );
         }
-        let ordered: Vec<String> = AGENT_NAMES
-            .iter()
-            .copied()
-            .filter(|name| known.iter().any(|k| k.as_str() == *name))
-            .map(|name| name.to_string())
-            .collect();
-        Some(AgentHooks::Allow(ordered))
+        Some(AgentHooks::Allow {
+            agents: ordered_names(&known),
+            unknown,
+        })
     }
 
-    /// The `config.conf` value for this state, in [`AGENT_NAMES`] order.
-    /// `Ask` has none: it is the *absence* of a decision, not a value —
-    /// it is never written until the user answers the consent dialog.
+    /// The `config.conf` value for this state: the known names in
+    /// [`ALL_AGENTS`] order, then every unknown token verbatim. `Ask`
+    /// has none: it is the *absence* of a decision, not a value — it is
+    /// never written until the user answers the consent dialog.
     pub fn to_config_value(&self) -> Option<String> {
         match self {
-            AgentHooks::Allow(names) => {
+            AgentHooks::Allow { agents, unknown } => {
                 // Re-ordered defensively rather than joined as-is: a
                 // caller that hand-builds a `Vec` (a test, or a future
                 // dialog that lets the user reorder rows) must still
                 // serialise in canonical order.
-                let ordered: Vec<&str> = AGENT_NAMES
-                    .iter()
-                    .copied()
-                    .filter(|name| names.iter().any(|n| n.as_str() == *name))
-                    .collect();
-                Some(ordered.join(", "))
+                let known: Vec<Agent> = agents.iter().filter_map(|n| Agent::parse(n)).collect();
+                let mut out = ordered_names(&known);
+                out.extend(unknown.iter().cloned());
+                Some(out.join(", "))
             }
             AgentHooks::Off => Some("off".to_string()),
             AgentHooks::Ask => None,
         }
     }
+}
+
+/// `agents` as canonical names in [`ALL_AGENTS`] order, duplicates
+/// collapsed.
+fn ordered_names(agents: &[Agent]) -> Vec<String> {
+    ALL_AGENTS
+        .into_iter()
+        .filter(|agent| agents.contains(agent))
+        .map(|agent| agent.source().to_string())
+        .collect()
 }
 
 /// Two-state policy for OSC 52 program-initiated clipboard writes.
@@ -1339,7 +1378,7 @@ mod tests {
     // `ConfigAgentHooksTests`.
 
     fn allow(names: &[&str]) -> AgentHooks {
-        AgentHooks::Allow(names.iter().map(|s| s.to_string()).collect())
+        AgentHooks::allow(names.iter().copied())
     }
 
     #[test]
@@ -1355,7 +1394,7 @@ mod tests {
             allow(&["claude", "codex"])
         );
         // Mixed case, extra whitespace, and codex-first input all
-        // normalise the same way: `AGENT_NAMES` order, not source order.
+        // normalise the same way: `ALL_AGENTS` order, not source order.
         assert_eq!(
             RoostConfig::parse(" agent-hooks = Codex , CLAUDE ").agent_hooks,
             allow(&["claude", "codex"])
@@ -1429,12 +1468,27 @@ mod tests {
 
     /// An unrecognised name beside a recognised one is not ambiguous the
     /// same way — the recognised name is the answer, and the unknown one
-    /// is dropped with a warning naming it.
+    /// is warned about but **kept**, so the round trip through
+    /// `to_config_value` cannot erase what a newer Roost wrote.
     #[test]
-    fn agent_hooks_drops_unrecognised_names_and_keeps_the_rest() {
+    fn agent_hooks_keeps_unrecognised_names_beside_the_rest() {
+        let key = RoostConfig::parse("agent-hooks = banana, claude").agent_hooks;
         assert_eq!(
-            RoostConfig::parse("agent-hooks = claude, banana").agent_hooks,
-            allow(&["claude"])
+            key,
+            AgentHooks::Allow {
+                agents: vec!["claude".to_string()],
+                unknown: vec!["banana".to_string()],
+            }
+        );
+        // Known names in `ALL_AGENTS` order first, then the unknown as
+        // the parser normalised it — which is lower-cased, because that
+        // is all there is left of the original spelling.
+        assert_eq!(
+            RoostConfig::parse("agent-hooks = Banana, CODEX, claude")
+                .agent_hooks
+                .to_config_value()
+                .unwrap(),
+            "claude, codex, banana"
         );
     }
 

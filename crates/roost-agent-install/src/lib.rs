@@ -107,8 +107,9 @@ pub use ensure::{
     Outcome, Status,
 };
 pub use error::{AgentError, AgentSkip, AgentWarning, InstallError, SkipReason, Warning};
-pub use home::{Home, ALL_AGENTS};
+pub use home::Home;
 pub use plan::{apply, Applied, FileEdit, Guard, InstallPlan, Intent};
+pub use roost_agent::ALL_AGENTS;
 pub use state::mark_noticed;
 
 /// The lock every writer here runs under, and what [`Home::config_lock`]

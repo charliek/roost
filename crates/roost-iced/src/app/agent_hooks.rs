@@ -185,6 +185,10 @@ pub(crate) fn spawn_ensure(
 pub(crate) struct AgentHooksApply {
     pub ticket: u64,
     pub mode: Mode,
+    /// Names the request carried that this build cannot wire. Not the
+    /// worker's business beyond reporting them: they reach neither the
+    /// key (`set_hooks` replaces it with what was applied) nor a host.
+    pub unknown: Vec<String>,
     pub guard: Guard,
     /// What each connected host is asked to raise, and who to raise it
     /// as. Chosen on the main thread with the rest of this request — the
@@ -270,6 +274,7 @@ async fn apply_set_hooks(apply: AgentHooksApply, feed: &EngineFeedSender) {
     let AgentHooksApply {
         ticket,
         mode,
+        unknown,
         guard,
         raise_names,
         raises,
@@ -287,7 +292,7 @@ async fn apply_set_hooks(apply: AgentHooksApply, feed: &EngineFeedSender) {
                 Err(format!("the agent-hooks install did not finish: {error}"))
             }),
     };
-    let done = match local {
+    let mut done = match local {
         Ok(done) => done,
         Err(message) => {
             // Reported to the caller, which is the boundary that handles
@@ -298,6 +303,9 @@ async fn apply_set_hooks(apply: AgentHooksApply, feed: &EngineFeedSender) {
             return;
         }
     };
+    done.outcome
+        .skipped
+        .extend(AgentHooksSkipped::unknown(&unknown));
     // Only now: this machine has recorded the user's answer, so it has
     // something it is entitled to propagate. A local write that failed
     // reaches no host at all.
@@ -451,19 +459,36 @@ pub(crate) fn spawn_mark_noticed(runtime: &tokio::runtime::Handle, agents: Vec<A
     });
 }
 
+/// What one `agent.set_hooks` resolved to on this machine.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SetRequest {
+    /// `None` when the list named **only** agents this build cannot
+    /// wire: there is nothing to write, so the op answers `ok` with
+    /// everything skipped and touches neither the key nor a dotfile.
+    pub mode: Option<Mode>,
+    /// The names this build has no [`Agent`] for, reported back as
+    /// `skipped`.
+    pub unknown: Vec<String>,
+}
+
 /// What `agent.set_hooks` asks for, or the `invalid-param` it is refused
-/// with before anything is written (plan 064 §3.4).
+/// with before anything is written (plan 064 §3.4, reshaped by 065
+/// §3.1).
 ///
-/// The same rule `session.set_agent_hooks` draws on a host
-/// (`roost-session`'s `agent_hooks::resolve`) and `roostctl agent set`
-/// draws on a spec: this op answers the consent question, and a consent
-/// answer has no honest partial reading — one name nothing answers to
-/// refuses the whole list rather than silently narrowing it. The one
-/// difference is that `off` arrives here as its own wire spelling
-/// instead of as a word in the list.
-pub(crate) fn resolve_set(agents: &AgentSetHooksAgents) -> Result<Mode, String> {
+/// The same rule `session.set_agent_hooks` draws on a host: a name this
+/// binary does not know is **skipped**, not a refusal (the why, once, in
+/// `roost-session`'s `agent_hooks` module doc). What is still refused is
+/// a request with no content: an empty list, or a blank element. The one
+/// difference from the host op is that `off` arrives here as its own
+/// wire spelling instead of as a word in the list.
+pub(crate) fn resolve_set(agents: &AgentSetHooksAgents) -> Result<SetRequest, String> {
     let names = match agents {
-        AgentSetHooksAgents::Off => return Ok(Mode::Off),
+        AgentSetHooksAgents::Off => {
+            return Ok(SetRequest {
+                mode: Some(Mode::Off),
+                unknown: Vec::new(),
+            })
+        }
         AgentSetHooksAgents::List(names) => names,
     };
     // Checked before `resolve_names`, which skips blanks: skipping is
@@ -472,20 +497,17 @@ pub(crate) fn resolve_set(agents: &AgentSetHooksAgents) -> Result<Mode, String> 
     if names.iter().any(|name| name.trim().is_empty()) {
         return Err("agent.set_hooks: `agents` carries an empty name".to_string());
     }
-    let (agents, unknown) = roost_agent_install::resolve_names(names.iter().map(String::as_str));
-    if let Some(name) = unknown.first() {
-        return Err(format!(
-            "agent.set_hooks: no agent named {name:?} ({})",
-            roost_agent_install::agent_names()
-        ));
-    }
-    if agents.is_empty() {
+    if names.is_empty() {
         return Err(format!(
             "agent.set_hooks requires a non-empty `agents` ({}) or the word \"off\"",
             roost_agent_install::agent_names()
         ));
     }
-    Ok(Mode::Allow(agents))
+    let (agents, unknown) = roost_agent_install::resolve_names(names.iter().map(String::as_str));
+    Ok(SetRequest {
+        mode: (!agents.is_empty()).then_some(Mode::Allow(agents)),
+        unknown,
+    })
 }
 
 /// What one local `agent.set_hooks` did to this machine, on its way back
@@ -615,8 +637,8 @@ pub(crate) fn raise_list(mode: &Mode) -> Option<Vec<String>> {
 /// dialog would be exactly the unconsented write plan 064 exists to
 /// stop. It arrives here as [`resolve`]'s `None`, which is why this
 /// reads the key through [`Mode`] rather than matching [`AgentHooks`]
-/// directly — that also drops a name no agent answers to, so a stale
-/// `config.conf` cannot put one on the wire.
+/// directly — that also leaves behind any name this build cannot wire,
+/// so a host is asked only for agents this client can name.
 pub(crate) fn remote_request(config: &RoostConfig) -> Option<Vec<String>> {
     raise_list(&resolve(config)?)
 }
@@ -785,32 +807,50 @@ mod tests {
         assert_eq!(remote_request(&config("")), None);
     }
 
-    fn set(agents: &[&str]) -> Result<Mode, String> {
+    fn set(agents: &[&str]) -> Result<SetRequest, String> {
         resolve_set(&AgentSetHooksAgents::List(
             agents.iter().map(|s| (*s).to_string()).collect(),
         ))
+    }
+
+    fn resolved(mode: Option<Mode>, unknown: &[&str]) -> Result<SetRequest, String> {
+        Ok(SetRequest {
+            mode,
+            unknown: unknown.iter().map(|s| (*s).to_string()).collect(),
+        })
     }
 
     #[test]
     fn agent_set_hooks_takes_a_list_or_the_word_off() {
         assert_eq!(
             set(&["claude", "codex"]),
-            Ok(Mode::Allow(vec![Agent::Claude, Agent::Codex]))
+            resolved(Some(Mode::Allow(vec![Agent::Claude, Agent::Codex])), &[])
         );
-        assert_eq!(resolve_set(&AgentSetHooksAgents::Off), Ok(Mode::Off));
+        assert_eq!(
+            resolve_set(&AgentSetHooksAgents::Off),
+            resolved(Some(Mode::Off), &[])
+        );
+    }
+
+    /// A name this build cannot wire is skipped and the rest is applied
+    /// (plan 065 §3.1). A list of *only* such names resolves to no mode
+    /// at all, which is how the op answers `ok` having written nothing.
+    #[test]
+    fn agent_set_hooks_skips_the_names_this_build_cannot_wire() {
+        assert_eq!(
+            set(&["claude", "gemini"]),
+            resolved(Some(Mode::Allow(vec![Agent::Claude])), &["gemini"])
+        );
+        assert_eq!(set(&["gemini", "amp"]), resolved(None, &["gemini", "amp"]));
     }
 
     /// The two shapes that are bugs in the caller rather than answers.
     #[test]
-    fn agent_set_hooks_refuses_an_empty_or_unknown_list() {
+    fn agent_set_hooks_refuses_an_empty_list_or_a_blank_name() {
         assert!(set(&[]).unwrap_err().contains("non-empty"));
         assert!(set(&["  "]).unwrap_err().contains("empty name"));
         assert!(set(&["claude", ""]).unwrap_err().contains("empty name"));
-        let refused = set(&["claude", "gemini"]).unwrap_err();
-        assert!(refused.contains("gemini"), "{refused}");
-        for known in ["claude", "codex", "grok", "cursor", "opencode"] {
-            assert!(refused.contains(known), "{refused}");
-        }
+        assert!(set(&["gemini", ""]).unwrap_err().contains("empty name"));
     }
 
     /// It goes into the host's state record, so it has to be a name and

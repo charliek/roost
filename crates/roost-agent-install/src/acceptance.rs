@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use roost_agent::Agent;
+use roost_agent::{Agent, ALL_AGENTS};
 use tempfile::TempDir;
 
 use crate::codex_hash::{self, Handler};
@@ -24,7 +24,7 @@ use crate::command::{
     INTEGRATION_VERSION,
 };
 use crate::error::SkipReason;
-use crate::home::{Home, ALL_AGENTS};
+use crate::home::Home;
 use crate::json::{Json, Style};
 use crate::plan::Guard;
 use crate::{claude, codex, cursor, ensure, grok, opencode, state};

@@ -1726,8 +1726,12 @@ Response:
 ```
 
 `agents` is either a JSON array of agent names or the literal string
-`"off"` — nothing else decodes. An empty array and a name outside the
-fixed set `agent-hooks` itself takes are both `invalid-param`. `local`
+`"off"` — nothing else decodes. An empty array, and an array with a
+blank element, are both `invalid-param`. A name this build has no
+adapter for is **skipped**, not refused: it comes back in
+`local.skipped` with reason `"unknown"` and the rest of the list is
+applied, and an array naming *only* such agents answers `ok` having
+written nothing at all — no key, no dotfile, no host raised. `local`
 is this machine's own install outcome, the same shape
 `session.set_agent_hooks` answers with; `removed` can be non-empty here
 (unlike the session op's), because this is an explicit local set, not a
@@ -2412,7 +2416,9 @@ Response:
 
 **This op only ever raises the key, never lowers it (plan 064 §3.3).** `agents` is unioned into whatever `agent-hooks` already says on the host — `off`, unanswered, or a narrower list — and the union is what gets wired. There is no wire spelling of "off" or "narrow this" here: a client whose own `agent-hooks` is `off`, or unconfigured, has no allow-list to raise a host with, so it sends this op **not at all**. Taking a host's entries back out stays a deliberate, local act — `roostctl agent ensure`/`uninstall`, run by hand on the host itself. `removed` is therefore always empty from this op; the field stays on the reply shape because [`agent.set_hooks`](#agentset_hooks) — an explicit local set, not a raise — can populate it for the *local* machine.
 
-`agents` must name at least one agent the host recognises; an empty list, or a name outside the fixed set `agent-hooks` itself takes, is `invalid-param`. Under [protocol equality](#versioning) both ends run the same build's agent set, so an unrecognised name here is a bug to surface, not a forward-compatibility case — unlike `skipped[].reason`, which remains free text for the client to show or log verbatim. `client` is required — it is recorded as `by` in the host's state record, which is what makes two clients of one host tellable apart.
+`agents` must be non-empty and carry no blank element; both are `invalid-param`. **A name the host does not recognise is not** — it comes back as `{"agent": "gemini", "reason": "unknown"}` in `skipped`, and the names the host *does* know are wired. [Protocol equality](#versioning) pins one wire generation, not one agent set: a newer Roost can ship an adapter inside the same generation, so refusing the whole raise on an unfamiliar name is what would keep a newly supported agent switched off forever. A list with **no** recognised name at all is a successful, empty run — everything `skipped`, `wired` empty, nothing written, including the key. `skipped[].reason` remains free text for the client to show or log verbatim. `client` is required — it is recorded as `by` in the host's state record, which is what makes two clients of one host tellable apart.
+
+**A name the host cannot wire still survives in its key.** The raise is a read-modify-write of `agent-hooks`, so an older host asked to widen a key a newer Roost wrote re-emits every token it could not resolve, verbatim, after the names it could: `claude, gemini` raised with `["codex"]` reads back `claude, codex, gemini`. Only an explicit local set — [`agent.set_hooks`](#agentset_hooks), `roostctl agent set` — replaces the key outright and drops them, because there the user is looking at the list they just chose. `roostctl agent status` on the host lists such a name as `unknown to this build`.
 
 **`wired` is the toast list, not this call's writes.** It names the agents this host has wired and has never announced to *any* client — the session flips its record's `noticed` for exactly what it reports here, in the same locked write that recorded the wiring, so the sentence "Roost wired agent hooks on ‹host›" appears at most once per agent per host even when two clients connect at the same moment, and including for a wiring done by `roostctl agent ensure` on the host itself. A reconnect, or a second client raising an already-covered list, gets an empty `wired`. `refreshed` *is* this call's writes; two clients raising different allow-lists both win, additively.
 

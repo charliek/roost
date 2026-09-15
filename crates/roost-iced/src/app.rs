@@ -31,11 +31,12 @@ use roost_engine::{
 };
 use roost_ipc::agent;
 use roost_ipc::messages::{
-    AgentSetHooksAgents, AgentSetHooksResult, AppMenuDumpResult, AppNotificationStatusResult,
-    AppRenderStatsResult, AppUpdateStatusResult, HostConnectStatus, HostConnectionResult,
-    HostStatus, HostStatusResult, PaletteItemView, PalettePresentResult, PaletteStateResult,
-    Project, SidebarDumpAgentRow, SidebarDumpHost, SidebarDumpHostProject, SidebarDumpHostTab,
-    SidebarDumpProject, SidebarDumpResult, SidebarDumpSection, WindowMetricsResult,
+    AgentHooksOutcome, AgentHooksSkipped, AgentSetHooksAgents, AgentSetHooksResult,
+    AppMenuDumpResult, AppNotificationStatusResult, AppRenderStatsResult, AppUpdateStatusResult,
+    HostConnectStatus, HostConnectionResult, HostStatus, HostStatusResult, PaletteItemView,
+    PalettePresentResult, PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpHost,
+    SidebarDumpHostProject, SidebarDumpHostTab, SidebarDumpProject, SidebarDumpResult,
+    SidebarDumpSection, WindowMetricsResult,
 };
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::{IpcServer, LocalBackendCell, LocalBackendMode};
@@ -3398,12 +3399,29 @@ impl App {
         agents: &AgentSetHooksAgents,
         reply: HostOpReply<AgentSetHooksResult>,
     ) {
-        let mode = match agent_hooks::resolve_set(agents) {
-            Ok(mode) => mode,
+        let request = match agent_hooks::resolve_set(agents) {
+            Ok(request) => request,
             Err(message) => {
                 let _ = reply.send(Err(HostOpFailure::new("invalid-param", message)));
                 return;
             }
+        };
+        // Answered before the harness fence and before any host is
+        // chosen: a list naming only agents this build cannot wire has
+        // nothing to write, so there is no dotfile for the fence to
+        // protect and no local answer to propagate.
+        let Some(mode) = request.mode else {
+            let _ = reply.send(Ok(AgentSetHooksResult {
+                config_path: config::config_path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                local: AgentHooksOutcome {
+                    skipped: AgentHooksSkipped::unknown(&request.unknown),
+                    ..AgentHooksOutcome::default()
+                },
+                hosts: Vec::new(),
+            }));
+            return;
         };
         let guard = roost_agent_install::Guard::from_env();
         if let Err(error) = guard.check() {
@@ -3443,6 +3461,7 @@ impl App {
         self.agent_hooks_worker.send(agent_hooks::AgentHooksApply {
             ticket,
             mode,
+            unknown: request.unknown,
             guard,
             raise_names,
             raises,

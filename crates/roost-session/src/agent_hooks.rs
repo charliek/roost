@@ -39,6 +39,15 @@
 //! record stores `by` (the asking client's label) and `wired_at`, and
 //! each run is logged, so which client asked for which agent is
 //! diagnosable from `roostctl agent status` on the host.
+//!
+//! **A name this binary does not know is a skip, not a refusal** (plan
+//! 065 §3.1). Protocol equality does *not* mean both ends know the same
+//! agents: the two builds are pinned to one wire generation, and a newer
+//! Roost can ship an adapter inside it. So the known half of the list is
+//! wired and the rest comes back as `skipped: [{agent, reason:
+//! "unknown"}]` — a client that named only agents this host predates
+//! gets a successful, empty run rather than a refusal it cannot act on,
+//! which is what kept a newly supported agent switched off forever.
 
 use roost_agent_install::{Guard, Home};
 use roost_engine::ipc::{AgentHooksError, AgentHooksHandle, AgentHooksRequest};
@@ -59,9 +68,9 @@ pub fn handle() -> AgentHooksHandle {
             // bug whatever state this machine is in, so a host without
             // a `$HOME` must still answer an empty `agents` with
             // `invalid-param` rather than `internal` and send the
-            // client looking for the fault at this end. `resolve` is
-            // pure, so the second call costs five string compares.
-            resolve(&request.agents)?;
+            // client looking for the fault at this end. `check_names`
+            // is pure, so the second call costs a few string compares.
+            check_names(&request.agents)?;
             let home =
                 Home::from_env().map_err(|error| AgentHooksError::Failed(error.to_string()))?;
             ensure_in(&home, &request, Guard::from_env())
@@ -85,13 +94,32 @@ pub fn handle() -> AgentHooksHandle {
 /// Validation happens here, at the top, rather than in the engine that
 /// decodes the op: the agent set lives in the install engine, and this is
 /// the only path into it, so a second caller of the handle cannot reach a
-/// write without passing through [`resolve`] first.
+/// write without passing through [`check_names`] first.
 fn ensure_in(
     home: &Home,
     request: &AgentHooksRequest,
     guard: Guard,
 ) -> Result<AgentHooksOutcome, AgentHooksError> {
-    let agents = resolve(&request.agents)?;
+    check_names(&request.agents)?;
+    let (agents, unknown) =
+        roost_agent_install::resolve_names(request.agents.iter().map(String::as_str));
+
+    // Nothing this host can act on, which is a fine answer and not a
+    // failure: the client named agents a newer Roost knows about. The
+    // install engine is never entered, so the key and the dotfiles are
+    // untouched.
+    if agents.is_empty() {
+        info!(
+            client = %request.client,
+            agents = ?request.agents,
+            "a client raised only agents this host does not know"
+        );
+        return Ok(AgentHooksOutcome {
+            skipped: AgentHooksSkipped::unknown(&unknown),
+            ..AgentHooksOutcome::default()
+        });
+    }
+
     let outcome = roost_agent_install::raise(home, &agents, &request.client, guard)
         .map_err(|error| AgentHooksError::Failed(error.to_string()))?;
 
@@ -101,6 +129,7 @@ fn ensure_in(
         wired = outcome.wired.len(),
         refreshed = outcome.refreshed.len(),
         removed = outcome.removed.len(),
+        unknown = unknown.len(),
         errors = outcome.errors.len(),
         "a client raised this host's agent hooks"
     );
@@ -108,44 +137,35 @@ fn ensure_in(
         warn!(agent = error.agent.source(), %error.error, "agent hooks");
     }
 
-    Ok(reply(&outcome))
+    let mut reply = reply(&outcome);
+    reply.skipped.extend(AgentHooksSkipped::unknown(&unknown));
+    Ok(reply)
 }
 
-/// The agents a request names, or the `invalid-param` it is refused with
-/// before anything is written.
+/// The two shapes of `agents` that are bugs in the client rather than
+/// states a host should absorb, as the `invalid-param` they are refused
+/// with before anything is written.
 ///
-/// Both refusals are bugs in the client rather than states a host should
-/// absorb. An empty list means the client had nothing to raise, and a
-/// client with nothing to raise does not send the op at all. A name that
-/// resolves to no agent cannot be a newer Roost talking to an older host
-/// either: `SESSION_PROTOCOL_VERSION` is compared for **equality** at
-/// attach, so both ends of this wire know the same five agents. Filtering
-/// such a name out and reporting it as a skip would leave the client
-/// believing it had raised something it had not.
-fn resolve(names: &[String]) -> Result<Vec<roost_agent::Agent>, AgentHooksError> {
+/// An empty list means the client had nothing to raise, and a client
+/// with nothing to raise does not send the op at all. A name no agent
+/// answers to is *not* in this group — see this module's own doc.
+fn check_names(names: &[String]) -> Result<(), AgentHooksError> {
     // Checked before `resolve_names`, which skips blanks: skipping is
-    // right for a human-typed CLI list and wrong here, where under
-    // protocol equality an empty element can only be a client bug.
+    // right for a human-typed CLI list and wrong here, where a blank
+    // element can only be a client bug.
     if names.iter().any(|name| name.trim().is_empty()) {
         return Err(AgentHooksError::InvalidParam(
             "session.set_agent_hooks: `agents` carries an empty name".to_string(),
         ));
     }
-    let (agents, unknown) = roost_agent_install::resolve_names(names.iter().map(String::as_str));
-    if let Some(name) = unknown.first() {
-        return Err(AgentHooksError::InvalidParam(format!(
-            "session.set_agent_hooks: no agent named {name:?} ({})",
-            roost_agent_install::agent_names()
-        )));
-    }
-    if agents.is_empty() {
+    if names.is_empty() {
         return Err(AgentHooksError::InvalidParam(
             "session.set_agent_hooks requires a non-empty `agents`: a client with \
              nothing to raise does not send the op"
                 .to_string(),
         ));
     }
-    Ok(agents)
+    Ok(())
 }
 
 fn reply(outcome: &roost_agent_install::Outcome) -> AgentHooksOutcome {
@@ -320,28 +340,73 @@ mod tests {
         }
     }
 
-    /// A name no agent answers to takes the whole request down, and the
-    /// refusal names both the offender and what would have been accepted.
-    /// The `claude` beside it is the point: a partly-valid list is not
-    /// partly applied.
+    /// A name this host does not know is skipped and the rest of the
+    /// list is wired — the fix for an agent that stayed switched off
+    /// forever because nothing could announce it (plan 065 §3.1).
     #[test]
-    fn an_unknown_agent_name_refuses_the_whole_request() {
+    fn an_unknown_agent_name_is_skipped_and_the_known_ones_are_wired() {
         let dir = tempfile::tempdir().unwrap();
         let home = a_home(dir.path());
 
-        let message = refused(&home, &["claude", "gemini"]);
-        assert!(message.contains("gemini"), "{message}");
-        for known in ["claude", "codex", "grok", "cursor", "opencode"] {
-            assert!(message.contains(known), "{message}");
-        }
+        let outcome =
+            ensure_in(&home, &request(&["claude", "gemini"]), Guard::PERMITTED).expect("raise");
+        assert_eq!(outcome.wired, vec!["claude".to_string()], "{outcome:?}");
         assert!(
-            !dir.path().join(".claude/settings.json").exists(),
-            "a refused request wired claude anyway"
+            outcome
+                .skipped
+                .iter()
+                .any(|skip| skip.agent == "gemini" && skip.reason == "unknown"),
+            "{outcome:?}"
         );
         assert!(
-            !home.config_path().exists(),
-            "a refused request wrote the key"
+            std::fs::read_to_string(dir.path().join(".claude/settings.json"))
+                .unwrap()
+                .contains("ROOST_AGENT_HOOK")
         );
+        assert_eq!(key_of(&home), "claude");
+    }
+
+    /// A list with *no* known name is a successful, empty run: the
+    /// client is newer than this host, and there is nothing here to
+    /// write. The key and the record must stay absent — an empty union
+    /// written as `off` would lower a key nobody asked to lower.
+    #[test]
+    fn a_list_of_only_unknown_names_writes_nothing_and_still_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = a_home(dir.path());
+
+        let outcome =
+            ensure_in(&home, &request(&["gemini", "amp"]), Guard::PERMITTED).expect("raise");
+        assert!(outcome.wired.is_empty(), "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{outcome:?}");
+        let skipped: Vec<(&str, &str)> = outcome
+            .skipped
+            .iter()
+            .map(|s| (s.agent.as_str(), s.reason.as_str()))
+            .collect();
+        assert_eq!(
+            skipped,
+            vec![("gemini", "unknown"), ("amp", "unknown")],
+            "{outcome:?}"
+        );
+        assert!(!home.config_path().exists(), "the key was written");
+        assert!(!dir.path().join(".config/roost/agent-hooks.json").exists());
+        assert!(!dir.path().join(".claude/settings.json").exists());
+    }
+
+    /// The data-loss half: a host key naming an agent this build
+    /// predates survives the raise that widens it. The install engine
+    /// rebuilds the key from its own read, so a token dropped on the way
+    /// in is a name erased off the host's disk.
+    #[test]
+    fn a_raise_keeps_a_name_this_host_cannot_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = a_home(dir.path());
+        std::fs::create_dir_all(home.config_path().parent().unwrap()).unwrap();
+        std::fs::write(home.config_path(), "agent-hooks = claude, gemini\n").unwrap();
+
+        ensure_in(&home, &request(&["codex"]), Guard::PERMITTED).expect("raise");
+        assert_eq!(key_of(&home), "claude, codex, gemini");
     }
 
     /// An empty list is refused rather than absorbed as a no-op: a client
@@ -358,6 +423,7 @@ mod tests {
         assert!(refused(&home, &[]).contains("non-empty"));
         assert!(refused(&home, &["  "]).contains("empty name"));
         assert!(refused(&home, &["claude", ""]).contains("empty name"));
+        assert!(refused(&home, &["gemini", ""]).contains("empty name"));
         assert!(
             !home.config_path().exists(),
             "a refused request wrote the key"

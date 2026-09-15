@@ -26,12 +26,12 @@
 //! startup [`ensure`] could wire what an `uninstall` had just taken
 //! back.
 
-use roost_agent::Agent;
+use roost_agent::{Agent, ALL_AGENTS};
 use roost_ui_model::config::{AgentHooks, ConfigLock, RoostConfig};
 
 use crate::command::INTEGRATION_VERSION;
 use crate::error::{AgentError, AgentSkip, AgentWarning, InstallError, SkipReason};
-use crate::home::{Home, ALL_AGENTS};
+use crate::home::Home;
 use crate::plan::{apply, Guard, InstallPlan, Intent};
 use crate::state::{self, Record};
 use crate::{claude, codex, cursor, grok, opencode};
@@ -56,7 +56,7 @@ impl Mode {
     /// `Ask` — see the type's own doc.
     pub fn from_config(hooks: &AgentHooks) -> Option<Mode> {
         match hooks {
-            AgentHooks::Allow(names) => Some(Mode::Allow(allowed_from(names))),
+            AgentHooks::Allow { agents, .. } => Some(Mode::Allow(allowed_from(agents))),
             AgentHooks::Off => Some(Mode::Off),
             AgentHooks::Ask => None,
         }
@@ -71,9 +71,7 @@ impl Mode {
     pub fn to_config(&self) -> AgentHooks {
         match self {
             Mode::Allow(agents) if agents.is_empty() => AgentHooks::Off,
-            Mode::Allow(agents) => {
-                AgentHooks::Allow(agents.iter().map(|a| a.source().to_string()).collect())
-            }
+            Mode::Allow(agents) => AgentHooks::allow(agents.iter().map(|a| a.source())),
             Mode::Off => AgentHooks::Off,
         }
     }
@@ -93,14 +91,36 @@ impl Mode {
 
 /// Config names to agents, in [`ALL_AGENTS`] order.
 ///
-/// A name no agent answers to is dropped rather than reported: the
-/// parser has already warned about it once, and it cannot name a file
-/// this crate knows how to write.
+/// The parser has already split the names it could not resolve out into
+/// [`AgentHooks::unknown`], so there is nothing to drop here: this sees
+/// only names that answer to an agent.
 fn allowed_from(names: &[String]) -> Vec<Agent> {
     ALL_AGENTS
         .into_iter()
         .filter(|agent| names.iter().any(|name| name == agent.source()))
         .collect()
+}
+
+/// The agents `hooks` allows, in [`ALL_AGENTS`] order. `Off` and an
+/// unanswered key both allow nothing.
+fn allowed_in(hooks: &AgentHooks) -> Vec<Agent> {
+    match hooks {
+        AgentHooks::Allow { agents, .. } => allowed_from(agents),
+        AgentHooks::Off | AgentHooks::Ask => Vec::new(),
+    }
+}
+
+/// `hooks` rewritten to allow exactly `agents`, still carrying whatever
+/// it said that this build cannot name.
+///
+/// Every key this crate writes is a read-modify-write, so a token
+/// dropped here is a name erased off the user's disk — see
+/// [`AgentHooks`]'s own doc.
+fn allowing(hooks: &AgentHooks, agents: &[Agent]) -> AgentHooks {
+    AgentHooks::Allow {
+        agents: agents.iter().map(|a| a.source().to_string()).collect(),
+        unknown: hooks.unknown().to_vec(),
+    }
 }
 
 /// Who flips the state record's `noticed` flag for what a run reports.
@@ -125,11 +145,12 @@ enum Notice {
 /// Resolve a wire message's agent names against the agents this crate
 /// can wire: the ones it recognises, and the spellings it does not.
 ///
-/// The unknown half is returned rather than dropped because its one
-/// caller — `session.set_agent_hooks`, on a host — **refuses the whole
-/// request on it** (`invalid-param`, plan 064 §3.3). The only thing a
-/// client would get from a silently dropped name is a host that behaves
-/// differently with nothing to say why.
+/// The unknown half is returned rather than dropped because every
+/// caller has something to say about it, and they do not agree on what:
+/// the two wire ops report it as a `skipped` entry and act on the rest
+/// (plan 065 §3.1), `roostctl agent set` refuses the whole list. What
+/// none of them may do is drop it silently — that is a Roost that
+/// behaves differently with nothing to say why.
 pub fn resolve_names<'a>(names: impl IntoIterator<Item = &'a str>) -> (Vec<Agent>, Vec<String>) {
     let mut known = Vec::new();
     let mut unknown = Vec::new();
@@ -378,7 +399,11 @@ pub fn set_hooks(
 ) -> Result<Outcome, InstallError> {
     guard.check()?;
     let lock = home.config_lock()?;
-    let wrote = write_hooks(home, &read_hooks(home)?, mode, &lock)?;
+    // `mode.to_config()` and not a union: this op *replaces* the key, so
+    // a token this build cannot name goes with the rest of the old value.
+    // That is the difference between an explicit local answer and a
+    // raise — the user is looking at the list they just chose.
+    let wrote = write_hooks(home, &read_hooks(home)?, &mode.to_config(), &lock)?;
     let mut outcome = reconcile_locked(home, mode, by, guard, &lock)?;
     outcome.wrote |= wrote;
     Ok(outcome)
@@ -585,22 +610,21 @@ fn read_hooks(home: &Home) -> Result<AgentHooks, InstallError> {
     }
 }
 
-/// Write `mode` into the `agent-hooks` key — unless `current`, the key
-/// as it stands, already says exactly that, because this runs on every
-/// host connect and rewriting the user's `config.conf` to the bytes it
-/// already holds is churn they would see in a dotfile diff.
+/// Write `desired` into the `agent-hooks` key — unless `current`, the
+/// key as it stands, already says exactly that, because this runs on
+/// every host connect and rewriting the user's `config.conf` to the
+/// bytes it already holds is churn they would see in a dotfile diff.
 ///
 /// `current` is a parameter rather than a [`read_hooks`] call because
-/// every caller has just read it to work out `mode`, and re-parsing
+/// every caller has just read it to work out `desired`, and re-parsing
 /// repeats every warning the config's other keys emit.
 fn write_hooks(
     home: &Home,
     current: &AgentHooks,
-    mode: &Mode,
+    desired: &AgentHooks,
     lock: &ConfigLock,
 ) -> Result<bool, InstallError> {
-    let desired = mode.to_config();
-    if *current == desired {
+    if current == desired {
         return Ok(false);
     }
     let path = home.config_path();
@@ -623,12 +647,13 @@ fn widen(home: &Home, agents: &[Agent], lock: &ConfigLock) -> Result<(Mode, bool
     // only mean the key allowed nothing and nothing was asked for —
     // writing then would spell that as `off`, which is a *lowering* of
     // an unanswered key nobody requested.
-    let wrote = if widened.is_empty() {
+    let allowed = allowed_in(&widened);
+    let wrote = if allowed.is_empty() {
         false
     } else {
-        write_hooks(home, &current, &Mode::Allow(widened.clone()), lock)?
+        write_hooks(home, &current, &widened, lock)?
     };
-    Ok((Mode::Allow(widened), wrote))
+    Ok((Mode::Allow(allowed), wrote))
 }
 
 /// `hooks` widened by `agents`, in [`ALL_AGENTS`] order.
@@ -638,25 +663,31 @@ fn widen(home: &Home, agents: &[Agent], lock: &ConfigLock) -> Result<(Mode, bool
 /// answering the question the host cannot ask, and the alternative —
 /// treating `off` as a veto no remote client can lift — leaves that
 /// client with no way to say yes at all.
-fn union(hooks: &AgentHooks, agents: &[Agent]) -> Vec<Agent> {
-    let current = match hooks {
-        AgentHooks::Allow(names) => allowed_from(names),
-        AgentHooks::Off | AgentHooks::Ask => Vec::new(),
-    };
-    ALL_AGENTS
+fn union(hooks: &AgentHooks, agents: &[Agent]) -> AgentHooks {
+    let current = allowed_in(hooks);
+    let widened: Vec<Agent> = ALL_AGENTS
         .into_iter()
         .filter(|agent| current.contains(agent) || agents.contains(agent))
-        .collect()
+        .collect();
+    if widened.is_empty() {
+        return AgentHooks::Ask;
+    }
+    allowing(hooks, &widened)
 }
 
 /// `hooks` with `agents` taken out of it, or `None` to leave the key
 /// exactly as it is. See [`uninstall`] for why `ask` survives a partial
 /// uninstall and not a total one.
-fn narrowed(hooks: &AgentHooks, agents: &[Agent]) -> Option<Mode> {
+///
+/// A *partial* narrowing keeps what this build cannot name — the user
+/// took one agent out, not every agent a newer Roost knows. Narrowing to
+/// nothing does not: an `off` key carrying names beside it would not
+/// parse back as `off`.
+fn narrowed(hooks: &AgentHooks, agents: &[Agent]) -> Option<AgentHooks> {
     if ALL_AGENTS.iter().all(|agent| agents.contains(agent)) {
-        return Some(Mode::Off);
+        return Some(AgentHooks::Off);
     }
-    let AgentHooks::Allow(names) = hooks else {
+    let AgentHooks::Allow { agents: names, .. } = hooks else {
         return None;
     };
     let kept: Vec<Agent> = allowed_from(names)
@@ -664,9 +695,9 @@ fn narrowed(hooks: &AgentHooks, agents: &[Agent]) -> Option<Mode> {
         .filter(|agent| !agents.contains(agent))
         .collect();
     Some(if kept.is_empty() {
-        Mode::Off
+        AgentHooks::Off
     } else {
-        Mode::Allow(kept)
+        allowing(hooks, &kept)
     })
 }
 
@@ -876,10 +907,7 @@ mod tests {
         let done = raise(&home, &[Agent::Claude], "remote", Guard::PERMITTED).expect("raise");
         assert_eq!(done.wired, vec![Agent::Claude]);
         assert_eq!(done.unnoticed, vec![Agent::Claude]);
-        assert_eq!(
-            read_hooks(&home).unwrap(),
-            AgentHooks::Allow(vec!["claude".to_string()])
-        );
+        assert_eq!(read_hooks(&home).unwrap(), AgentHooks::allow(["claude"]));
     }
 
     /// The `noticed` flip happens in the run's own record write, so the
@@ -993,33 +1021,54 @@ mod tests {
     /// contentious half of plan 064 §3.3: both become the client's list.
     #[test]
     fn a_union_never_removes_and_answers_for_off_and_ask() {
-        let allowed = AgentHooks::Allow(vec!["grok".into()]);
+        let allowed = AgentHooks::allow(["grok"]);
         assert_eq!(
             union(&allowed, &[Agent::Claude]),
-            vec![Agent::Claude, Agent::Grok],
+            AgentHooks::allow(["claude", "grok"]),
             "a raise removed what it was not asked about"
         );
         for unanswered in [AgentHooks::Off, AgentHooks::Ask] {
-            assert_eq!(union(&unanswered, &[Agent::Codex]), vec![Agent::Codex]);
+            assert_eq!(
+                union(&unanswered, &[Agent::Codex]),
+                AgentHooks::allow(["codex"])
+            );
         }
+    }
+
+    /// A raise computed off a key naming an agent this build predates
+    /// keeps that name. Without this the older of two Roosts silently
+    /// erases the newer one's answer every time a client connects.
+    #[test]
+    fn a_union_carries_a_name_this_build_cannot_wire() {
+        let newer = AgentHooks::Allow {
+            agents: vec!["claude".into()],
+            unknown: vec!["gemini".into()],
+        };
+        assert_eq!(
+            union(&newer, &[Agent::Codex]).to_config_value().unwrap(),
+            "claude, codex, gemini"
+        );
     }
 
     /// The mirror: an uninstall narrows an allow-list, leaves an
     /// unanswered key unanswered, and treats "all of them" as an answer.
     #[test]
     fn narrowing_leaves_an_unanswered_key_alone() {
-        let allowed = AgentHooks::Allow(vec!["claude".into(), "codex".into()]);
+        let allowed = AgentHooks::allow(["claude", "codex"]);
         assert_eq!(
             narrowed(&allowed, &[Agent::Codex]),
-            Some(Mode::Allow(vec![Agent::Claude]))
+            Some(AgentHooks::allow(["claude"]))
         );
         assert_eq!(
             narrowed(&allowed, &[Agent::Claude, Agent::Codex]),
-            Some(Mode::Off)
+            Some(AgentHooks::Off)
         );
         assert_eq!(narrowed(&AgentHooks::Ask, &[Agent::Codex]), None);
         assert_eq!(narrowed(&AgentHooks::Off, &[Agent::Codex]), None);
-        assert_eq!(narrowed(&AgentHooks::Ask, &ALL_AGENTS), Some(Mode::Off));
+        assert_eq!(
+            narrowed(&AgentHooks::Ask, &ALL_AGENTS),
+            Some(AgentHooks::Off)
+        );
     }
 
     fn claude_row(home: &Home, mode: &Mode) -> Status {
@@ -1122,10 +1171,13 @@ mod tests {
             assert_eq!(Mode::from_config(&mode.to_config()), Some(mode));
         }
         assert_eq!(Mode::from_config(&AgentHooks::Ask), None);
-        // A name from a newer Roost is dropped, not fatal: the parser has
-        // already said so once, and nothing here can write its file.
+        // A name from a newer Roost allows nothing here — this build has
+        // no file to write for it — but it stays in the key it came from.
         assert_eq!(
-            Mode::from_config(&AgentHooks::Allow(vec!["gemini".into(), "codex".into()])),
+            Mode::from_config(&AgentHooks::Allow {
+                agents: vec!["codex".into()],
+                unknown: vec!["gemini".into()],
+            }),
             Some(Mode::Allow(vec![Agent::Codex]))
         );
     }

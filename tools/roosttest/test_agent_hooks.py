@@ -1221,6 +1221,45 @@ def test_agent_set_without_local_goes_through_the_running_ui(short_root, iced_on
     assert not any(jail.agent_dirs["grok"].iterdir()), "the UI wired an agent nobody named"
 
 
+def test_agent_set_hooks_skips_a_name_this_build_cannot_wire(short_root, iced_only):
+    """Plan 065 §3.1 on the UI socket, the sibling of the host op's rule.
+
+    Driven over IPC rather than through `roostctl agent set`, which
+    parses its spec locally and so can never put an unknown name on the
+    wire — only a newer client can, which is the case this exists for.
+
+    Two arms. A mixed list applies the half this build knows and reports
+    the rest; a list of *only* unknown names answers `ok` having written
+    nothing at all — no key, no dotfile — because an error there is a
+    client that can never grow past it.
+    """
+    jail = Jail(short_root, agent_hooks=None)
+    sock = jailed_socket(jail)
+
+    with jailed_ui(jail) as (proc, log):
+        wait_for_jailed_window(jail, proc, log)
+        with Roost(str(sock), timeout=scaled_timeout(30)) as roost:
+            alone = roost.call("agent.set_hooks", {"agents": ["gemini", "amp"]})
+            assert alone["local"]["wired"] == [], alone
+            assert alone["local"]["skipped"] == [
+                {"agent": "gemini", "reason": "unknown"},
+                {"agent": "amp", "reason": "unknown"},
+            ], alone
+            assert alone["hosts"] == [], alone
+            assert jail.read_key() is None, "an unknown-only list wrote the key"
+            assert not jail.record.exists(), "an unknown-only list wired something"
+
+            mixed = roost.call("agent.set_hooks", {"agents": ["claude", "gemini"]})
+            assert mixed["local"]["wired"] == ["claude"], mixed
+            assert {"agent": "gemini", "reason": "unknown"} in mixed["local"]["skipped"], mixed
+
+    # Read after the UI has exited, so nothing is still in flight. The
+    # key is what was applied: `agent.set_hooks` replaces it, so the name
+    # it could not act on is not carried into an answer the user gave.
+    assert jail.read_key() == "claude"
+    assert "ROOST_AGENT_HOOK" in (jail.agent_dirs["claude"] / "settings.json").read_text()
+
+
 def holds_open(pid: int, path: Path) -> bool:
     """Whether `pid` has `path` open.
 

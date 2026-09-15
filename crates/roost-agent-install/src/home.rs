@@ -13,16 +13,6 @@ use roost_ui_model::config::ConfigLock;
 
 use crate::error::InstallError;
 
-/// Every agent Roost can wire, in the order status and ensure report
-/// them.
-pub const ALL_AGENTS: [Agent; 5] = [
-    Agent::Claude,
-    Agent::Codex,
-    Agent::Grok,
-    Agent::Cursor,
-    Agent::Opencode,
-];
-
 /// The environment variable that relocates `agent`'s config directory,
 /// as that agent itself documents it.
 pub const fn config_dir_env(agent: Agent) -> &'static str {
@@ -199,6 +189,7 @@ impl Home {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roost_agent::ALL_AGENTS;
     use std::collections::HashMap;
 
     fn env_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {

@@ -9,6 +9,7 @@ publish.workspace = true
 description = "Toolkit-neutral Roost configuration and presentation models"
 
 [dependencies]
+roost-agent = { path = "../roost-agent" }
 roost-ipc = { path = "../roost-ipc" }
 roost-vt = { path = "../roost-vt" }
 bitflags = "2"
