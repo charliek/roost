@@ -328,6 +328,26 @@ with the params it typed. No shim was left in either direction — a v5
 peer meeting a v6 build hits the ordinary `session-mismatch` refusal at
 the handshake, same as any other generation bump.
 
+**An unreleased generation is a special case of the rule above: with no
+consumer's lockfile ever able to sit on a commit between two of its
+breaking changes, it may be amended in place instead of bumped again
+per merge, and `6` was (Charlie, 2026-09-15).** `5` shipped in no
+release — `v0.0.19` still speaks `2` — so plan 065 folded three more
+breaking changes into `6` rather than counting to `9`: `tab.effect`
+opened from a closed enum into a string list ahead of #188 and #364,
+`session.set_focus` deleted in favor of a `notification.fired` every
+connection receives and a per-tab generation each acknowledges, and the
+attach ticket replaced by a `session_id`-bound handshake the data
+connection negotiates on its own first line (`tab.attach` retired).
+`session.set_agent_hooks`'s unknown-name behavior rode the same
+generation without spending a bump of its own — `skipped.reason` is
+already a free string, so refusing the whole call for an unrecognised
+name was a behavior choice, not a shape the wire had to change. Each
+change still gets its one CHANGELOG entry — a rewritten "Session
+protocol 2 → 6" bullet describing the resulting contract, not a bullet
+per step — and the fixtures below were re-cut once, at `6`, not once
+per absorbed step.
+
 ## Fixtures are the contract
 
 [`tests/ipc-vectors/`](https://github.com/charliek/roost/blob/main/tests/ipc-vectors/README.md)

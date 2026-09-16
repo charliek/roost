@@ -113,10 +113,9 @@ release workflow asserts they agree).
   more than exists is clamped rather than refused, which makes
   `--scrollback 1000000` a legitimate way to say "all of it". Served
   identically on a host session's socket, a UI socket, and by both the
-  Linux and macOS UIs; a session advertises it as `tab_dump_scrollback`
-  in `session.identify.features`. No protocol bump — but the request
-  key is new, so a Roost or session predating it answers `unknown-field`
-  to the flag rather than quietly ignoring it.
+  Linux and macOS UIs. No protocol bump — the request key is new, so a
+  Roost or session predating it answers `unknown-field` to the flag
+  rather than quietly ignoring it, which is refusal enough.
 - **`server_url` metadata key makes an opencode session drivable (#439)** —
   a bare `opencode` binds no socket (its TUI talks to its server
   in-process), so nothing could act on the session roost already
@@ -161,8 +160,10 @@ release workflow asserts they agree).
   `from_revision`, land on the ack before the stream ever spawns, so the
   connection stays usable for a plain re-subscribe. `tab.effect` (bells,
   clipboard writes) is never replayed — only live clients see it —
-  while `notification.fired` is. No protocol bump: the
-  capability rides `session.identify.features` as `events_resume`.
+  while `notification.fired` is. No protocol bump: `from_revision` and
+  `session_id` are new optional request fields, and a session predating
+  them answers `unknown-field` to either — refusal enough with no
+  capability channel needed.
 - **`gx.remote` metadata key surfaces a gx session's remote lane (#425)** —
   when gx's remote lane is up it stamps its loopback base URL (`gxRemote`,
   e.g. `http://127.0.0.1:2421`) onto every hook payload; roost now forwards
@@ -225,7 +226,14 @@ release workflow asserts they agree).
   nothing, warns once, and is **kept in the key**, written back
   unchanged, so a newer Roost's answer survives an older one reading the
   same file (`roostctl agent status` lists it as `unknown to this
-  build`). `roostctl agent ensure/install/uninstall/status` are
+  build`). One consequence worth flagging: a *targeted* `roostctl agent
+  uninstall` that removes the last name this build knows keeps the
+  unknown ones rather than erasing them — `uninstall claude` against
+  `claude, gemini`, with `gemini` unknown here, writes `gemini` alone
+  rather than `off`. That value parses back as unanswered, so the
+  consent dialog raises again next launch: deliberate (an `off` next to
+  a name it can't wire would be a second kind of data loss), but a user
+  will notice it. `roostctl agent ensure/install/uninstall/status` are
   still the manual controls; `agent set <list|off>` dials the running UI
   (setting the key here and raising every connected non-localhost host
   in the same call), `--local` writes this machine's key with nothing
@@ -243,10 +251,8 @@ release workflow asserts they agree).
   reported as `skipped`/`unknown` on both `session.set_agent_hooks` and
   `agent.set_hooks` rather than refusing the whole call, so a list naming
   only agents the other end predates succeeds having written nothing.
-  This reshapes `session.set_agent_hooks` and bumps
-  `SESSION_PROTOCOL_VERSION` **5 → 6**; every deployed `roost-session`
-  needs updating alongside its client, or it hits the same
-  `session-mismatch` refusal any other protocol bump would cause. Riding
+  This reshapes `session.set_agent_hooks` into a pure raise — part of
+  the session-protocol-6 contract described below. Riding
   along: the long-standing defect where approving a Claude permission
   prompt left the dot orange until the whole turn ended is fixed (Claude
   now hears `PreToolUse`/`PostToolUse`, so the dot returns to blue when
@@ -330,33 +336,69 @@ release workflow asserts they agree).
 
 ### Changed
 
-- **Session protocol 5: no lease, no takeover, every connection
-  symmetric (#468)** — the interactive lease host sessions grew across
-  R1–R17 is retired outright rather than amended again. `session.connect`
-  and everything it minted are gone: opening a control connection and
-  sending `session.identify` is the whole handshake now. The `lease`
-  field is gone from every op that carried one — `tab.write`,
-  `tab.attach`, `events.subscribe`, `session.set_theme`,
-  `session.set_focus`, `session.set_agent_hooks`, `session.put_file` — a
-  session refuses any of them with `unknown-field` if a client still
-  sends it, and refuses `session.connect` itself with `unknown-op`.
+- **Session protocol 2 → 6: the final generation-6 contract** — every wire
+  change since v0.0.19's protocol 2 folds into one entry describing the
+  contract as it now stands, not the history of getting here (the
+  generation-by-generation bump history stays in
+  `docs/reference/ipc-compatibility.md`). The interactive lease host
+  sessions grew across R1–R17 is retired outright: `session.connect` and
+  everything it minted are gone, opening a control connection and sending
+  `session.identify` is the whole handshake, and every same-UID connection
+  is symmetric — no owner, no lease, no foreground, nobody deposed by a
+  second window or a phone attaching (#453, #468). The `lease` field is gone
+  from every op that carried one — `tab.write`, `events.subscribe`,
+  `session.set_theme`, `session.set_agent_hooks`, `session.put_file` — a
+  session refuses any of them with `unknown-field` if a client still sends
+  it, and refuses `session.connect` itself with `unknown-op`.
   `events.subscribe`'s ack now always carries `session_id`, naming the
   incarnation the subscribe landed on (see the #458 fix below).
-  `session.identify` no longer reports a `features` array — at protocol
-  5 the version number says the whole contract, so there is nothing left
-  to feature-detect. `tab.attach`'s `focus` parameter is no longer
-  optional: every attach states it, always. None of this is eased in
-  with a shim, by decision — a session or client stuck on protocol 2
-  through 4 is refused loudly rather than half-supported. Concretely: a
-  `roost-session` from v0.0.19 still speaks protocol 2, so it lands
-  exactly where a libghostty build skew Roost can't cover already
-  lands — the existing compatibility gate's amber "needs restart" state,
-  offering to fix it in place: the update offer on a host reached over
-  SSH, the restart offer on `localhost`. Restarting (by either route, or
-  by hand) is the only way forward, and it costs what a restart always
-  has — every shell on that session comes back only as **layout**
+  `session.identify` no longer reports a `features` array — the integer is
+  the whole negotiation now, and a capability channel returns only with a
+  second real consumer. `tab.effect` opened from a closed two-value enum
+  into a string list, so a future effect (#188, #364) costs nothing to add:
+  a client with no handler for one logs and ignores it instead of failing to
+  decode. Notifications fan out the way effects already did —
+  `session.set_focus` is gone (`unknown-op`); a session fires
+  `notification.fired` at every viewer unconditionally and each client
+  decides for itself whether it's the one looking; a tab carries a
+  `notification_generation` that a client's own `tab.clear_notification`
+  names back, so a stale acknowledgement can never erase a notification
+  nobody has actually seen (#474). `session.set_agent_hooks` is a pure raise
+  now: it carries only the agents a client's own `agent-hooks` key allows
+  and can only widen the host's, never narrow it — `mode` and `skip` are
+  gone — and a name the host doesn't recognise no longer fails the whole
+  call, coming back `skipped`/`unknown` while the known names are still
+  wired (#486). `session.put_file` (plan 047), documented here for the first
+  time, lands one client-supplied file per frame in a private per-connection
+  directory and answers with a paste-safe path for `tab.send_file`. And the
+  attach ticket is gone: `tab.attach` answers `unknown-op`, and a data
+  connection instead states its tab, the session id `session.identify`
+  reported, and its terms on its own first line — the session accepts,
+  resumes, or refuses right there (#473; see [the
+  handshake](docs/reference/ipc.md#the-handshake) for the accepted and
+  rejected shapes). None of this is eased in with a shim, by decision — a
+  session or client stuck on protocol 2 through 5 is refused loudly rather
+  than half-supported. Concretely: a `roost-session` from v0.0.19 still
+  speaks protocol 2, so it lands exactly where a libghostty build skew Roost
+  can't cover already lands — the existing compatibility gate's amber "needs
+  restart" state, offering to fix it in place: the update offer on a host
+  reached over SSH, the restart offer on `localhost`. Restarting (by either
+  route, or by hand) is the only way forward, and it costs what a restart
+  always has — every shell on that session comes back only as **layout**
   (title, cwd, position), never as the process or scrollback that was
-  running.
+  running. Riding along in the same cycle: `config.conf`'s four writers
+  (iced, the Mac app, `roostctl`, and a connecting host raising
+  `agent-hooks`) now serialize through one `config.lock` beside the resolved
+  file, closing a lost-update race, and overlapping `agent.set_hooks`
+  applies land in request order rather than lock-acquisition order (#487,
+  #490); a session whose state directory goes unwritable now reports it — a
+  live `workspace.durability_changed` event and a standing `persist_error`
+  on `identify`/`session.identify` — instead of silently remembering nothing
+  (#481); an ssh host whose far side is merely restarting now reconnects on
+  its own instead of settling on the first "no session" answer (#387); and
+  the Mac socket refuses non-canonical ids (`"+4"`, `"04"`) the way iced and
+  a session already did, and now emits the bytes ghostty expects for
+  `ctrl+[`, `ctrl+i`, and `ctrl+m` instead of nothing at all (#402, #343).
 - **A second window, or a phone, can type into a tab you already have
   open — nobody is deposed (#453)** — attaching to a tab and writing
   into it used to need the session's one interactive lease, so picking
