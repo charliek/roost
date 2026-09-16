@@ -739,14 +739,7 @@ async fn open_control(
 ) -> Result<(IpcClient, ConnectFacts), AttemptError> {
     ensure_socket(config, mode).await?;
     let mut control = dial_control(config, mode).await?;
-    let raw = call(
-        &mut control,
-        ops::SESSION_IDENTIFY,
-        serde_json::json!(SessionIdentifyParams {}),
-    )
-    .await?;
-    let identity: SessionIdentify =
-        serde_json::from_value(raw).map_err(|error| undecodable(ops::SESSION_IDENTIFY, &error))?;
+    let identity = session_identify(&mut control).await?;
     let compatibility = check_compatibility(
         &identity,
         &config.client_build,
@@ -1222,7 +1215,8 @@ async fn serve(
                                     feed,
                                     incarnation,
                                     HostWorkspaceEvent::Reset(Arc::clone(&live.mirror)),
-                                ) {
+                                ) || !publish_facts(feed, incarnation, live.facts.clone())
+                                {
                                     return ConnEnd::FeedClosed;
                                 }
                             }
@@ -1383,7 +1377,22 @@ async fn resync(config: &ConnectionConfig, live: &mut Live) -> Result<(), Attemp
     let plan = SubscribePlan::resuming(&resume);
     let (events, pump, subscribed) = subscribe(&config.socket, &mut live.control, plan).await?;
     reseat(live, events, pump, subscribed);
+    // The one fact a closed gap can have swallowed — see
+    // [`ConnectFacts::persist_error`] (#481).
+    live.facts.persist_error = session_identify(&mut live.control).await?.persist_error;
     Ok(())
+}
+
+/// Ask the session who it is. The gate at connect, and what a resync
+/// re-reads the standing durability state off.
+async fn session_identify(control: &mut IpcClient) -> Result<SessionIdentify, AttemptError> {
+    let raw = call(
+        control,
+        ops::SESSION_IDENTIFY,
+        serde_json::json!(SessionIdentifyParams {}),
+    )
+    .await?;
+    serde_json::from_value(raw).map_err(|error| undecodable(ops::SESSION_IDENTIFY, &error))
 }
 
 /// Fold a batch in and publish the wake. `false` means the feed is gone.
@@ -2379,6 +2388,10 @@ mod tests {
         /// Subscribed connections whose peer has hung up. Read through
         /// [`Self::held_streams`].
         streams_ended: Arc<AtomicUsize>,
+        /// What `session.identify` reports as `persist_error`, settable
+        /// mid-connection so a test can make the standing value move
+        /// while the only event that announces it is being lost.
+        persist_error: Arc<Mutex<Option<String>>>,
     }
 
     impl Fake {
@@ -2406,6 +2419,7 @@ mod tests {
                 subscribes: Arc::new(Mutex::new(Vec::new())),
                 tab_lists: Arc::new(AtomicUsize::new(0)),
                 streams_ended: Arc::new(AtomicUsize::new(0)),
+                persist_error: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -2439,6 +2453,14 @@ mod tests {
 
         fn identifies(&self) -> usize {
             self.identifies.load(Ordering::Acquire)
+        }
+
+        /// From now on, this session says it cannot write its layout.
+        fn saving_fails(&self, error: &str) {
+            *self
+                .persist_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.to_string());
         }
 
         /// Subscribed connections whose peer is still on the other end.
@@ -2570,11 +2592,16 @@ mod tests {
                     _ if refused.is_some() => refused.expect("just checked"),
                     ops::SESSION_IDENTIFY => {
                         self.identifies.fetch_add(1, Ordering::AcqRel);
-                        serde_json::json!({
-                            "id": id,
-                            "ok": true,
-                            "result": identify_result(self.session_id),
-                        })
+                        let mut result = identify_result(self.session_id);
+                        let persist_error = self
+                            .persist_error
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        if let Some(error) = persist_error {
+                            result["persist_error"] = serde_json::json!(error);
+                        }
+                        serde_json::json!({"id": id, "ok": true, "result": result})
                     }
                     ops::TAB_LIST => {
                         self.tab_lists.fetch_add(1, Ordering::AcqRel);
@@ -3050,6 +3077,63 @@ mod tests {
         assert_eq!(subscribes[0].from_revision, None);
         assert_eq!(fake.snapshots(), 1);
         assert_eq!(resumed(&host.stop().await), None);
+    }
+
+    /// **#481.** A resync re-reads `session.identify` and republishes
+    /// the facts, which is the whole of the recovery
+    /// [`ConnectFacts::persist_error`] describes.
+    #[tokio::test]
+    async fn a_resync_re_reads_the_hosts_durability_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("durability.sock");
+        let fake = Fake::new(PutFile::Land);
+        fake.serve(&socket);
+
+        let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
+        assert_eq!(fake.identifies(), 1);
+        assert_eq!(
+            host.states
+                .1
+                .last()
+                .expect("the prologue filed facts")
+                .persist_error,
+            None
+        );
+
+        // The session stops saving while this client is not being told:
+        // a batch that skips revisions is the loss the resync answers.
+        fake.saving_fails("Read-only file system (os error 30)");
+        fake.next_emit
+            .store(SESSION_REVISION + 5, Ordering::Release);
+        fake.emit_batch();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                host.states.drain(&mut host.feed);
+                if host.states.1.len() >= 2 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the resync republishes this host's facts");
+
+        assert_eq!(
+            host.states
+                .1
+                .last()
+                .expect("the resync filed facts")
+                .persist_error
+                .as_deref(),
+            Some("Read-only file system (os error 30)"),
+            "the state a live-only event could not carry is read off session.identify"
+        );
+        assert!(
+            fake.identifies() >= 2,
+            "the resync must have identified again"
+        );
+        host.stop().await;
     }
 
     // ---- one subscribe, one incarnation (#458) --------------------------

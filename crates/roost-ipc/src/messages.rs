@@ -272,6 +272,11 @@ pub struct IdentifyResult {
     /// from "after".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_backend_switch: Option<String>,
+    /// Why the last attempt to write `state.json` failed, absent while
+    /// the layout is landing (#481). A UI serves no event stream, so
+    /// this field is the whole of its durability surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist_error: Option<String>,
 }
 
 // ============================================================================
@@ -1951,6 +1956,12 @@ pub struct SessionIdentify {
     pub libghostty_build: String,
     pub session_id: String,
     pub started_at: String,
+    /// Why the last attempt to write `state.json` failed, absent while
+    /// the layout is landing (#481). The standing value behind the
+    /// live-only [`DurabilityChangedEvent`], read here at connect and
+    /// again after a resync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist_error: Option<String>,
 }
 
 /// `session.identify` params — empty today, a struct (not a bare
@@ -2619,6 +2630,22 @@ pub struct TabEffectEvent {
 /// and debug-logged by size, never by content.
 pub const CLIPBOARD_EFFECT_MAX_BYTES: usize = 256 * 1024;
 
+/// `workspace.durability_changed` event data — the session's ability to
+/// write `state.json` changed (#481).
+///
+/// `error` is the write's message while it is failing and `null` the
+/// moment one lands again; the field is always present, because "no
+/// error" is the news half the time. Emitted on a change of value only,
+/// so a session on a full disk says it once, not once per mutation.
+///
+/// Live-only: it rides the event stream and is never replayed. The
+/// standing value is [`SessionIdentify::persist_error`], which is what a
+/// client re-reads after a resync.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurabilityChangedEvent {
+    pub error: Option<String>,
+}
+
 /// One full terminal palette, as the client's theme states it.
 ///
 /// Colors ride as `#rrggbb` strings, the spelling `tab.dump_resolved`
@@ -3265,6 +3292,12 @@ pub mod ops {
     /// these only mean anything to an attached client;
     /// [`crate::messages::TabEffectEvent`] is the payload.
     pub const EVENT_TAB_EFFECT: &str = "tab.effect";
+    /// The session could not write `state.json`, or can again (#481).
+    /// Carried on the session event stream only — a UI socket serves no
+    /// subscription, and the in-process UI reads the same change off its
+    /// own workspace. [`crate::messages::DurabilityChangedEvent`] is the
+    /// payload.
+    pub const EVENT_WORKSPACE_DURABILITY_CHANGED: &str = "workspace.durability_changed";
 
     /// Client-side saved-host registry and its connections
     /// (host-sessions HS-2, plan 037 §3.5). Every palette host verb has

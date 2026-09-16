@@ -1,0 +1,6 @@
+{
+  "event": "workspace.durability_changed",
+  "data": {
+    "error": null
+  }
+}

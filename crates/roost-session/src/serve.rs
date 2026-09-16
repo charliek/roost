@@ -431,7 +431,9 @@ impl StopState {
         // so there is no time left to spend hanging children up politely;
         // they die with the process, which is the same posture a crash
         // leaves behind.
-        self.workspace.flush();
+        if let Err(error) = self.workspace.flush() {
+            error!(%error, "the session layout could not be written on the way out");
+        }
 
         match self.socket_identity.get() {
             Some(identity) => match unlink_if_ours(&self.socket_path, *identity) {

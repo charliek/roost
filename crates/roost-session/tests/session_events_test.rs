@@ -156,3 +156,119 @@ async fn a_session_pushes_its_commits_and_cuts_the_stream_on_stop() {
 
     served.await.expect("join").expect("serve");
 }
+
+/// A directory whose mode is restored when the test ends, however it
+/// ends — a `0o500` directory left behind survives `TempDir`'s own
+/// cleanup and breaks whatever runs next.
+struct ReadOnlyDir {
+    path: std::path::PathBuf,
+    restore: u32,
+}
+
+impl ReadOnlyDir {
+    fn seal(path: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let restore = std::fs::metadata(path).unwrap().permissions().mode();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        Self {
+            path: path.to_path_buf(),
+            restore,
+        }
+    }
+
+    fn unseal(self) {}
+}
+
+impl Drop for ReadOnlyDir {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.restore));
+    }
+}
+
+/// #481 end to end on the real daemon: a session whose state directory
+/// goes read-only answers every op, reports the failure on
+/// `session.identify`, and puts exactly one `workspace.durability_changed`
+/// on the stream however many commits fail — then one more, the other
+/// way, when a write lands again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_that_cannot_write_its_layout_says_so_once_and_keeps_serving() {
+    let layout = support::Layout::new();
+    let state_dir = layout.subdir("state");
+    let config = roost_session::SessionConfig {
+        state_path: state_dir.join("state.json"),
+        ..layout.config()
+    };
+    let served = layout.spawn_config(config);
+    let socket_path = layout.socket_path();
+
+    let mut client = support::connect(&socket_path).await;
+    let seeded = support::tabs(&mut client).await;
+    let project_id = seeded[0].project_id;
+    assert_eq!(
+        support::session_identify(&mut client).await.persist_error,
+        None,
+        "the hydrating session wrote fine"
+    );
+
+    let (mut reader, _w, _fence) = subscribe(&socket_path).await;
+    let sealed = ReadOnlyDir::seal(&state_dir);
+
+    // Two failing commits. The op still answers: a workspace nobody can
+    // save is still a workspace, and refusing here would block opening a
+    // tab on a full disk.
+    let cwd = layout.subdir("sealed");
+    let tab = support::open_tab(
+        &mut client,
+        project_id,
+        &cwd,
+        "one",
+        &["/bin/sh", "-c", "sleep 30"],
+    )
+    .await;
+    support::set_tab_title(&mut client, tab.id, "two").await;
+
+    let failure = support::session_identify(&mut client)
+        .await
+        .persist_error
+        .expect("the session must report the write it could not make");
+
+    sealed.unseal();
+    // The recovery is what terminates the walk below, so the count is
+    // exact rather than "however many had arrived by now".
+    support::set_tab_title(&mut client, tab.id, "three").await;
+
+    let mut announced: Vec<serde_json::Value> = vec![];
+    tokio::time::timeout(support::scaled(Duration::from_secs(10)), async {
+        loop {
+            let batch = next_batch(&mut reader).await;
+            for event in batch.events {
+                if event.event == ops::EVENT_WORKSPACE_DURABILITY_CHANGED {
+                    let recovered = event.data["error"].is_null();
+                    announced.push(event.data);
+                    if recovered {
+                        return;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("the recovery must reach the stream");
+
+    assert_eq!(
+        announced.len(),
+        2,
+        "two failing commits are one announcement, and the recovery is the other: {announced:?}"
+    );
+    assert_eq!(announced[0]["error"], serde_json::json!(failure));
+    assert_eq!(announced[1]["error"], serde_json::json!(null));
+    assert_eq!(
+        support::session_identify(&mut client).await.persist_error,
+        None,
+        "and the standing value a resyncing client reads is cleared too"
+    );
+
+    let _ = support::session_stop(&mut client).await;
+    served.await.expect("join").expect("serve");
+}

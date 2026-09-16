@@ -601,6 +601,8 @@ enum HostEnvelopeAction {
     TabClosed(i64),
     /// The project is gone: retire every row under it.
     ProjectDeleted(i64),
+    /// The session's layout stopped — or started — reaching disk (#481).
+    Durability(Option<String>),
     /// A workspace fact the mirror already folded in, or an event from a
     /// newer session this client does not know. Both are silent by
     /// contract (`ipc.md` #versioning: old clients ignore new events).
@@ -610,7 +612,8 @@ enum HostEnvelopeAction {
 
 fn host_envelope_action(envelope: &roost_ipc::messages::EventEnvelope) -> HostEnvelopeAction {
     use roost_ipc::messages::{
-        ops, NotificationFiredEvent, ProjectDeletedEvent, TabClosedEvent, TabNotificationEvent,
+        ops, DurabilityChangedEvent, NotificationFiredEvent, ProjectDeletedEvent, TabClosedEvent,
+        TabNotificationEvent,
     };
     use serde::Deserialize;
     // Read out of the borrowed payload: `serde_json` deserializes from
@@ -642,6 +645,10 @@ fn host_envelope_action(envelope: &roost_ipc::messages::EventEnvelope) -> HostEn
         ops::EVENT_PROJECT_DELETED => decode::<ProjectDeletedEvent>(envelope)
             .map_or_else(HostEnvelopeAction::Undecodable, |event| {
                 HostEnvelopeAction::ProjectDeleted(event.project_id)
+            }),
+        ops::EVENT_WORKSPACE_DURABILITY_CHANGED => decode::<DurabilityChangedEvent>(envelope)
+            .map_or_else(HostEnvelopeAction::Undecodable, |event| {
+                HostEnvelopeAction::Durability(event.error)
             }),
         _ => HostEnvelopeAction::Ignore,
     }
@@ -1628,6 +1635,11 @@ impl App {
                 HostEnvelopeAction::ProjectDeleted(project_id) => {
                     self.retire_project_notifications(ProjectKey::new(host, project_id));
                 }
+                HostEnvelopeAction::Durability(error) => {
+                    if let Some(name) = self.hosts.owner_of(host) {
+                        self.set_durability(DurabilitySource::Host(name), error);
+                    }
+                }
                 HostEnvelopeAction::Undecodable(error) => tracing::debug!(
                     ?host, event = %envelope.event, %error,
                     "a host event envelope did not decode"
@@ -2049,21 +2061,29 @@ impl App {
                             // 063 §D12). Drained on the edge, so it is
                             // spent exactly once per connect.
                             task = task.then(self.settle_connect_purpose(host));
-                        } else if !matches!(
-                            self.hosts.state(host),
-                            Some(crate::host_conn::HostConnState::Connecting { .. })
-                        ) {
-                            // The attempt ended somewhere other than
-                            // `Connected` and nothing is retrying: a
-                            // purpose parked against a landing that is
-                            // not going to happen would otherwise fire
-                            // on some later connect nobody asked it for.
-                            if let Some(purpose) = self.connect_purposes.remove(host) {
-                                tracing::debug!(
-                                    %host,
-                                    ?purpose,
-                                    "dropping what a failed connect was going to do"
-                                );
+                        } else {
+                            // Nothing left to recover from: a failure on
+                            // a host that is gone is not one the user
+                            // can act on, and the next connect re-reads
+                            // it from `session.identify` (#481).
+                            self.set_durability(DurabilitySource::Host(host.clone()), None);
+                            if !matches!(
+                                self.hosts.state(host),
+                                Some(crate::host_conn::HostConnState::Connecting { .. })
+                            ) {
+                                // The attempt ended somewhere other than
+                                // `Connected` and nothing is retrying: a
+                                // purpose parked against a landing that
+                                // is not going to happen would otherwise
+                                // fire on some later connect nobody
+                                // asked it for.
+                                if let Some(purpose) = self.connect_purposes.remove(host) {
+                                    tracing::debug!(
+                                        %host,
+                                        ?purpose,
+                                        "dropping what a failed connect was going to do"
+                                    );
+                                }
                             }
                         }
                         // Attributed (not a stale task's publication): the
@@ -2083,6 +2103,14 @@ impl App {
                     // the batch for the reconcile that rebuilds them.
                 }
                 EngineFeed::HostConnectFacts(host, facts) => {
+                    // The connect (and every resync) re-reads
+                    // `session.identify`, which is the only place a
+                    // client learns a durability failure it was not
+                    // connected for (#481).
+                    if let Some(name) = self.hosts.owner_of(host) {
+                        let error = facts.persist_error.clone();
+                        self.set_durability(DurabilitySource::Host(name), error);
+                    }
                     self.hosts.note_connect_facts(host, facts)
                 }
                 EngineFeed::ReconnectDue { host, request } => {
@@ -2241,6 +2269,11 @@ impl App {
             // active is still a focus intent, and it must win the window
             // back from the host row (`Workspace::focus_tab` emits this
             // unconditionally, which is what makes it a reliable seam).
+            // #481. The local backend's own layout is not reaching
+            // disk, or is again.
+            WorkspaceEvent::DurabilityChanged { error } => {
+                self.set_durability(DurabilitySource::Local, error)
+            }
             WorkspaceEvent::ActiveChanged { .. } => self.set_host_selection(None),
             WorkspaceEvent::ProjectDeleted { project_id } => {
                 self.retire_project_notifications(ProjectKey::new(self.backend.host(), project_id));
@@ -4667,6 +4700,21 @@ mod tests {
                 "{event}"
             );
         }
+    }
+
+    /// Both directions route: a failure, and the `null` that retires it
+    /// (#481).
+    #[test]
+    fn a_hosts_durability_change_routes_in_both_directions() {
+        let op = roost_ipc::messages::ops::EVENT_WORKSPACE_DURABILITY_CHANGED;
+        assert!(matches!(
+            host_envelope_action(&envelope(op, serde_json::json!({"error": "disk full"}))),
+            HostEnvelopeAction::Durability(Some(error)) if error == "disk full"
+        ));
+        assert!(matches!(
+            host_envelope_action(&envelope(op, serde_json::json!({"error": null}))),
+            HostEnvelopeAction::Durability(None)
+        ));
     }
 
     /// The retiring edges a host owes, and the reason they are here at

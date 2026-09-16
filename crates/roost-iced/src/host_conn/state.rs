@@ -227,6 +227,13 @@ pub(crate) struct ConnectFacts {
     /// replayed from a carried fence, `None` when it took a fresh
     /// snapshot.
     pub(crate) resumed: Option<ResumeFacts>,
+    /// The session's standing durability failure, from
+    /// `session.identify` (#481).
+    ///
+    /// Re-read and re-published after a resync, unlike everything else
+    /// here: `workspace.durability_changed` is live-only, so the one
+    /// change a gap can swallow is exactly this one.
+    pub(crate) persist_error: Option<String>,
 }
 
 /// The two libghostty builds a reduced-fidelity connection sits between.
@@ -266,6 +273,7 @@ impl ConnectFacts {
             },
             reduced_fidelity: compatibility == Compatibility::BuildSkew,
             resumed: None,
+            persist_error: identity.persist_error.clone(),
         }
     }
 }
@@ -559,6 +567,7 @@ mod tests {
             libghostty_build: build.into(),
             session_id: "sess-1".into(),
             started_at: "2026-08-29T00:00:00Z".into(),
+            persist_error: None,
         }
     }
 

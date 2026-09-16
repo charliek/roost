@@ -680,6 +680,7 @@ mod tests {
                     },
                     reduced_fidelity: true,
                     resumed: None,
+                    persist_error: None,
                 },
             ),
         ] {

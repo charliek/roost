@@ -30,11 +30,11 @@
 use std::time::Duration;
 
 use roost_ipc::messages::{
-    bytes_base64, ops, ActiveChangedEvent, AgentReportChangedEvent, EventBatch, EventEnvelope,
-    HookActiveChangedEvent, NotificationFiredEvent, ProjectCreatedEvent, ProjectDeletedEvent,
-    ProjectRenamedEvent, ProjectsReorderedEvent, TabClosedEvent, TabCwdChangedEvent, TabEffect,
-    TabEffectEvent, TabNotificationEvent, TabOpenedEvent, TabStateChangedEvent,
-    TabTitleChangedEvent, TabsReorderedEvent,
+    bytes_base64, ops, ActiveChangedEvent, AgentReportChangedEvent, DurabilityChangedEvent,
+    EventBatch, EventEnvelope, HookActiveChangedEvent, NotificationFiredEvent, ProjectCreatedEvent,
+    ProjectDeletedEvent, ProjectRenamedEvent, ProjectsReorderedEvent, TabClosedEvent,
+    TabCwdChangedEvent, TabEffect, TabEffectEvent, TabNotificationEvent, TabOpenedEvent,
+    TabStateChangedEvent, TabTitleChangedEvent, TabsReorderedEvent,
 };
 use roost_ipc::PushSource;
 use tokio::sync::broadcast::error::RecvError;
@@ -234,6 +234,15 @@ pub fn envelope(event: &WorkspaceEvent) -> Option<EventEnvelope> {
                     data: Some(bytes_base64::encode(text.as_bytes())),
                     target: Some(*target),
                 },
+            }),
+        ),
+        // #481. A session has no view, so what it owes a client is the
+        // fact that its layout is not reaching disk; the client decides
+        // how to say so.
+        WorkspaceEvent::DurabilityChanged { error } => (
+            ops::EVENT_WORKSPACE_DURABILITY_CHANGED,
+            to_value(DurabilityChangedEvent {
+                error: error.clone(),
             }),
         ),
         WorkspaceEvent::ProjectsReordered { project_ids } => (

@@ -394,6 +394,18 @@ pub enum WorkspaceEvent {
         tab_id: i64,
         effect: TabEffectKind,
     },
+    /// The workspace's ability to write `state.json` changed (#481):
+    /// `Some(error)` when the newest write failed, `None` when the next
+    /// one landed. Emitted on a *change of value* only, so a session
+    /// that cannot write does not repeat itself once per mutation.
+    ///
+    /// Live-only, like [`Self::TabEffect`]: the standing value is what a
+    /// client resyncs against (`identify`/`session.identify` report
+    /// `persist_error`), so replaying the moment it changed would raise
+    /// a failure that has since been fixed.
+    DurabilityChanged {
+        error: Option<String>,
+    },
     /// Fired after `reorder_projects`. `project_ids` is the
     /// post-reorder sidebar order.
     ProjectsReordered {
@@ -515,12 +527,12 @@ pub struct Workspace {
     /// Where to write the `state.json` file. `None` means the
     /// in-memory variant (used by tests).
     state_path: Option<PathBuf>,
-    /// Guards `state.json` writes and tracks the highest commit seq
-    /// already persisted. `persist()` serializes on this and skips
+    /// Guards `state.json` writes and carries what the newest real
+    /// attempt at one decided. `persist()` serializes on this and skips
     /// any snapshot older than what's on disk, so a slow earlier
     /// commit can't clobber a newer one when writes race. The seq is
     /// assigned under `inner`, so it reflects commit order (#80).
-    persist_guard: Mutex<u64>,
+    persist_guard: Mutex<PersistState>,
     /// Set by `flush()` on clean exit, *after* it writes the final
     /// layout. Once set, `persist()` is a no-op so a teardown-induced
     /// PTY-exit cascade (the window closing kills its shells) can't
@@ -752,7 +764,7 @@ impl Workspace {
             events: tx,
             versioned_events: versioned_tx,
             state_path: None,
-            persist_guard: Mutex::new(0),
+            persist_guard: Mutex::new(PersistState::default()),
             shutting_down: AtomicBool::new(false),
             replay_bounds: None,
         }
@@ -862,7 +874,7 @@ impl Workspace {
             events: tx,
             versioned_events: versioned_tx,
             state_path: Some(state_path),
-            persist_guard: Mutex::new(0),
+            persist_guard: Mutex::new(PersistState::default()),
             shutting_down: AtomicBool::new(false),
             replay_bounds: None,
         }
@@ -2053,25 +2065,69 @@ impl Workspace {
     /// writers and drops any snapshot older than the newest already
     /// on disk, so a slow earlier commit can never clobber a newer
     /// one (#80).
-    fn persist(&self, seq: u64, snapshot: &SnapshotFile, sync: bool) {
+    ///
+    /// The write is also where durability is *decided* (#481): only a
+    /// real attempt at the latest snapshot — [`PersistOutcome::Written`]
+    /// or [`PersistOutcome::Failed`] — moves `persist_error`, and it
+    /// moves under `persist_guard`, in `seq` order, so an older
+    /// completion can never clear a newer failure. A change of value
+    /// (and only a change) emits [`WorkspaceEvent::DurabilityChanged`]
+    /// after the guard drops: a repeated identical failure is the same
+    /// news twice.
+    fn persist(&self, seq: u64, snapshot: &SnapshotFile, sync: bool) -> PersistOutcome {
         // Frozen by `flush()` on clean exit: ignore any later write so
         // a teardown cascade can't overwrite the flushed layout.
         if self.shutting_down.load(Ordering::Relaxed) {
-            return;
+            return PersistOutcome::Frozen;
         }
         let Some(path) = self.state_path.clone() else {
-            return; // in-memory variant; no persistence
+            return PersistOutcome::InMemory; // in-memory variant; no persistence
         };
-        let mut last = self.persist_guard.lock().unwrap();
-        if seq <= *last {
-            return; // a newer commit already persisted; this write is stale
+        let (error, changed) = {
+            let mut state = self.persist_guard.lock().unwrap();
+            if seq <= state.last_seq {
+                // A newer commit already persisted; this write is stale,
+                // and so is whatever it would have had to say about the
+                // disk.
+                return PersistOutcome::Superseded;
+            }
+            let error = match persist_state(&path, snapshot, sync) {
+                Ok(()) => None,
+                Err(err) => {
+                    warn!(?err, "failed to persist state.json");
+                    Some(err.to_string())
+                }
+            };
+            let changed = error != state.error;
+            state.error = error.clone();
+            // Advance past this seq even on write failure: an older
+            // snapshot must never win, and there is no retry of `seq`.
+            state.last_seq = seq;
+            (error, changed)
+        };
+        if changed {
+            // Safe in this order because `commit` drops `inner` before it
+            // ever reaches `persist_guard`, so no thread holds both.
+            let inner = self.inner.lock().unwrap();
+            self.commit(
+                inner,
+                vec![WorkspaceEvent::DurabilityChanged {
+                    error: error.clone(),
+                }],
+                Persist::Skip,
+            );
         }
-        if let Err(err) = persist_state(&path, snapshot, sync) {
-            warn!(?err, "failed to persist state.json");
+        match error {
+            Some(error) => PersistOutcome::Failed(error),
+            None => PersistOutcome::Written,
         }
-        // Advance past this seq even on write failure: an older
-        // snapshot must never win, and there is no retry of `seq`.
-        *last = seq;
+    }
+
+    /// What the newest real write attempt decided — `None` while the
+    /// layout is landing on disk, the write's error while it is not.
+    /// This is what `identify` and `session.identify` report.
+    pub fn persist_error(&self) -> Option<String> {
+        self.persist_guard.lock().unwrap().error.clone()
     }
 
     /// Persist the current layout with `fsync` and then freeze further
@@ -2084,13 +2140,17 @@ impl Workspace {
     /// while every subsequent one is, so a teardown-induced PTY-exit
     /// cascade can't clobber the flushed layout. Idempotent: a second
     /// call is a no-op (the freeze short-circuits its `persist`).
-    pub fn flush(&self) {
+    pub fn flush(&self) -> Result<(), String> {
         let (snapshot, seq) = {
             let mut inner = self.inner.lock().unwrap();
             inner.snapshot_for_persist()
         };
-        self.persist(seq, &snapshot, true);
+        let outcome = self.persist(seq, &snapshot, true);
         self.shutting_down.store(true, Ordering::Relaxed);
+        match outcome {
+            PersistOutcome::Failed(error) => Err(error),
+            _ => Ok(()),
+        }
     }
 
     /// Centralize the mutate → emit → persist tail shared by every
@@ -2120,9 +2180,10 @@ impl Workspace {
         if let Some(bounds) = self.replay_bounds {
             // Effects are live-only: replaying a clipboard write from
             // thirty seconds ago is wrong in itself, and a 256 KiB one
-            // would burn the byte budget for nothing. A batch whose
-            // events were all
-            // effects is still retained — empty — because the revision
+            // would burn the byte budget for nothing.
+            // [`WorkspaceEvent::DurabilityChanged`] is stripped for the
+            // reason stated on it. A batch whose events were all
+            // live-only is still retained — empty — because the revision
             // is what the client's gap check reads. A clone and a
             // `VecDeque` push are non-blocking, which is what this lock
             // permits.
@@ -2130,7 +2191,13 @@ impl Workspace {
                 revision,
                 events: events
                     .iter()
-                    .filter(|ev| !matches!(ev, WorkspaceEvent::TabEffect { .. }))
+                    .filter(|ev| {
+                        !matches!(
+                            ev,
+                            WorkspaceEvent::TabEffect { .. }
+                                | WorkspaceEvent::DurabilityChanged { .. }
+                        )
+                    })
                     .cloned()
                     .collect(),
             };
@@ -2167,6 +2234,41 @@ pub enum AttentionSource {
 enum Persist {
     Skip,
     Write,
+}
+
+/// What one `persist()` call actually did: two variants for a real
+/// attempt at the latest snapshot, three for a write that never
+/// happened. `Workspace::persist` states what the split is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PersistOutcome {
+    /// The snapshot is on disk.
+    Written,
+    /// The write was attempted and failed; the string is what the
+    /// user is told.
+    Failed(String),
+    /// A newer commit already persisted, so this snapshot is older than
+    /// what is on disk.
+    Superseded,
+    /// `flush()` has run: persistence is frozen for the rest of the
+    /// process's life.
+    Frozen,
+    /// The in-memory variant, which has no `state.json` at all.
+    InMemory,
+}
+
+/// Everything `persist_guard` protects: how far disk has got, and what
+/// the attempt that got it there decided.
+///
+/// One mutex rather than two because the pair has to move together —
+/// the verdict belongs to `last_seq`'s attempt, and a reader that saw
+/// one without the other could report a failure the next write already
+/// cleared.
+#[derive(Debug, Default)]
+struct PersistState {
+    /// The highest commit seq a real attempt has been made at.
+    last_seq: u64,
+    /// That attempt's error, or `None` if it landed.
+    error: Option<String>,
 }
 
 impl Default for Workspace {
@@ -4347,7 +4449,7 @@ mod tests {
             let ws = Workspace::open(path.clone());
             let pid = ws.create_project("p", "/").unwrap().id;
             let tid = ws.open_tab(pid, "/flushed", "").unwrap().id;
-            ws.flush();
+            ws.flush().expect("the flush lands");
             // Frozen — this write is a no-op.
             ws.set_tab_cwd(tid, "/after-flush").unwrap();
         }
@@ -4883,6 +4985,192 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "nothing the replay already carried is repeated on the receiver"
+        );
+    }
+
+    // ================================================================
+    // Durability (#481)
+    // ================================================================
+
+    /// A directory whose mode is restored when the test ends, however it
+    /// ends.
+    ///
+    /// Without the restore a panicking test leaves a `0o500` directory
+    /// behind that `TempDir`'s own cleanup cannot remove, and the next
+    /// lane inherits the mess.
+    struct ReadOnlyDir {
+        path: PathBuf,
+        restore: u32,
+    }
+
+    impl ReadOnlyDir {
+        fn seal(path: &std::path::Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let restore = std::fs::metadata(path).unwrap().permissions().mode();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
+            Self {
+                path: path.to_path_buf(),
+                restore,
+            }
+        }
+
+        fn unseal(self) {}
+    }
+
+    impl Drop for ReadOnlyDir {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.restore));
+        }
+    }
+
+    fn durability_events(rx: &mut broadcast::Receiver<WorkspaceEvent>) -> Vec<Option<String>> {
+        let mut seen = vec![];
+        while let Ok(event) = rx.try_recv() {
+            if let WorkspaceEvent::DurabilityChanged { error } = event {
+                seen.push(error);
+            }
+        }
+        seen
+    }
+
+    /// The whole of #481 in one walk: a session whose state directory
+    /// goes read-only keeps answering, says so exactly once, and says so
+    /// again — the other way — when the next write lands.
+    #[test]
+    fn an_unwritable_state_dir_is_announced_once_and_retired_on_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let ws = Workspace::open(path.clone());
+        let mut events = ws.subscribe();
+        let pid = ws.create_project("p", "/").unwrap().id;
+        assert_eq!(ws.persist_error(), None, "the setup wrote fine");
+
+        let sealed = ReadOnlyDir::seal(dir.path());
+
+        // The op still succeeds: a full disk must not block opening a
+        // tab, and the change has already been broadcast to every
+        // client.
+        let tid = ws
+            .open_tab(pid, "/one", "a")
+            .expect("the op still succeeds")
+            .id;
+        let first = ws.persist_error().expect("the write failed");
+        ws.set_tab_title(tid, "b").expect("and again");
+        assert_eq!(
+            ws.persist_error().as_deref(),
+            Some(first.as_str()),
+            "the failure stands across commits"
+        );
+        assert_eq!(
+            durability_events(&mut events),
+            vec![Some(first.clone())],
+            "two failing commits are one change of value, so one event"
+        );
+
+        sealed.unseal();
+
+        ws.set_tab_title(tid, "c").expect("the op still succeeds");
+        assert_eq!(
+            ws.persist_error(),
+            None,
+            "the next write that lands clears it"
+        );
+        assert_eq!(durability_events(&mut events), vec![None]);
+        assert_eq!(
+            read_state(&path).unwrap().unwrap().projects[0].tabs[0].title,
+            "c",
+            "and the recovered write is the one on disk"
+        );
+    }
+
+    /// The ordering rule the [`PersistOutcome`] split exists for, driven
+    /// through `persist` directly because no public op can make a late
+    /// write land out of seq order on purpose.
+    #[test]
+    fn a_superseded_completion_never_clears_a_newer_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let ws = Workspace::open(path);
+        let mut events = ws.subscribe();
+
+        let sealed = ReadOnlyDir::seal(dir.path());
+        let failed = ws.persist(2, &SnapshotFile::default(), false);
+        let PersistOutcome::Failed(error) = failed else {
+            panic!("the sealed directory must have refused the write: {failed:?}");
+        };
+        sealed.unseal();
+
+        // Seq 1 is the slow earlier commit landing after seq 2. It is
+        // dropped for the same reason its bytes are (#80) — and with it
+        // the recovery it would otherwise have claimed.
+        assert_eq!(
+            ws.persist(1, &SnapshotFile::default(), false),
+            PersistOutcome::Superseded
+        );
+        assert_eq!(ws.persist_error().as_deref(), Some(error.as_str()));
+        assert_eq!(
+            durability_events(&mut events),
+            vec![Some(error)],
+            "a superseded write announces nothing at all"
+        );
+    }
+
+    /// `Persist::Skip` commits — a notification flag, an agent report —
+    /// never touch disk, so they can neither confirm nor clear what the
+    /// last real write decided.
+    #[test]
+    fn a_skipped_commit_never_claims_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let ws = Workspace::open(path);
+        let pid = ws.create_project("p", "/").unwrap().id;
+        let tid = ws.open_tab(pid, "/one", "a").unwrap().id;
+
+        let sealed = ReadOnlyDir::seal(dir.path());
+        ws.set_tab_title(tid, "b").unwrap();
+        let error = ws.persist_error().expect("the write failed");
+        let mut events = ws.subscribe();
+
+        sealed.unseal();
+        ws.set_tab_has_notification(tid, true).unwrap();
+
+        assert_eq!(
+            ws.persist_error().as_deref(),
+            Some(error.as_str()),
+            "a writable directory is not a write"
+        );
+        assert!(durability_events(&mut events).is_empty());
+    }
+
+    #[test]
+    fn a_durability_change_is_stripped_from_the_replay_ring() {
+        let ws = replaying(16, REPLAY_BUDGET_BYTES);
+        ws.create_project("p", "/").unwrap();
+        let fence = ws.revision();
+        ws.commit(
+            ws.inner.lock().unwrap(),
+            vec![WorkspaceEvent::DurabilityChanged {
+                error: Some("nope".into()),
+            }],
+            Persist::Skip,
+        );
+        ws.create_project("q", "/").unwrap();
+
+        let cut = ws.subscribe_from(fence).expect("young enough");
+        let replayed: Vec<&WorkspaceEvent> =
+            cut.replay.iter().flat_map(|batch| &batch.events).collect();
+        assert!(
+            !replayed
+                .iter()
+                .any(|ev| matches!(ev, WorkspaceEvent::DurabilityChanged { .. })),
+            "a durability change must never be replayed: {replayed:?}"
+        );
+        assert_eq!(
+            cut.replay.len(),
+            2,
+            "the batch is retained — empty — because the revision is the gap check"
         );
     }
 }

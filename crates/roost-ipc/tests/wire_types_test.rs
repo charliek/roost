@@ -19,15 +19,15 @@ use std::path::PathBuf;
 use roost_ipc::messages::{
     ops, AgentHooksOutcome, AgentSetHooksAgents, AgentSetHooksParams, AgentSetHooksResult,
     AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode, AttachPayloadKind,
-    ClipboardEffectTarget, ClipboardWriteParams, EventBatch, EventEnvelope, EventsSubscribeParams,
-    EventsSubscribeResult, ProjectReorderParams, ResponseError, RetrySchedule, SentFile,
-    SessionBinaryIdentity, SessionIdentify, SessionIdentifyParams, SessionPutFileParams,
-    SessionPutFileResult, SessionSetAgentHooksParams, SessionSetFocusParams, SessionSetThemeParams,
-    SessionSetThemeResult, SessionStopParams, SessionStopResult, SessionStoppingEvent, SkippedFile,
-    TabAttachParams, TabAttachResult, TabDumpCursor, TabDumpParams, TabDumpResult, TabEffect,
-    TabEffectEvent, TabReorderParams, TabSendFileParams, TabSendFileResult, TabWriteParams,
-    WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
-    SESSION_STOPPING_EVENT,
+    ClipboardEffectTarget, ClipboardWriteParams, DurabilityChangedEvent, EventBatch, EventEnvelope,
+    EventsSubscribeParams, EventsSubscribeResult, IdentifyResult, ProjectReorderParams,
+    ResponseError, RetrySchedule, SentFile, SessionBinaryIdentity, SessionIdentify,
+    SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams,
+    SessionSetFocusParams, SessionSetThemeParams, SessionSetThemeResult, SessionStopParams,
+    SessionStopResult, SessionStoppingEvent, SkippedFile, TabAttachParams, TabAttachResult,
+    TabDumpCursor, TabDumpParams, TabDumpResult, TabEffect, TabEffectEvent, TabReorderParams,
+    TabSendFileParams, TabSendFileResult, TabWriteParams, WireProjectRef, WireTabRef,
+    MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -56,6 +56,7 @@ fn sample_identify() -> SessionIdentify {
         libghostty_build: "ghostty-3f6b1c9a4d2e5f80+snapshot.v1".into(),
         session_id: "01K3S8TQ4F0Q9YB2K6WZ5D7XN".into(),
         started_at: "2026-08-27T14:03:11Z".into(),
+        persist_error: None,
     }
 }
 
@@ -1003,6 +1004,88 @@ fn tab_effect_vector_decodes_into_its_typed_shape() {
         }
     );
     round_trip(&data);
+}
+
+/// `error` is deliberately **not** `skip_serializing_if` — see
+/// [`DurabilityChangedEvent`].
+#[test]
+fn a_durability_recovery_says_so_with_an_explicit_null() {
+    let recovered = DurabilityChangedEvent { error: None };
+    assert_eq!(
+        serde_json::to_string(&recovered).unwrap(),
+        r#"{"error":null}"#
+    );
+    round_trip(&recovered);
+}
+
+#[test]
+fn durability_vectors_decode_into_their_typed_shape() {
+    for (name, expected) in [
+        (
+            "workspace.durability_changed.event.json",
+            Some("Read-only file system (os error 30)".to_string()),
+        ),
+        ("workspace.durability_changed.recovered.event.json", None),
+    ] {
+        let raw = read_vector(name);
+        let envelope: EventEnvelope = serde_json::from_str(&raw).expect("decode event envelope");
+        assert_eq!(
+            envelope.event,
+            roost_ipc::messages::ops::EVENT_WORKSPACE_DURABILITY_CHANGED
+        );
+        let data: DurabilityChangedEvent =
+            serde_json::from_value(envelope.data).expect("decode durability data");
+        assert_eq!(data.error, expected, "{name}");
+        round_trip(&data);
+    }
+}
+
+/// The field is additive, which is exactly what the pair of vectors
+/// pins: the plain `v6` file has no `persist_error` and still decodes to
+/// this build's identity, and the variant carries one.
+#[test]
+fn session_identify_carries_a_persist_error_only_when_there_is_one() {
+    let plain = decode_identify_vector(&identify_vector_name(SESSION_PROTOCOL_VERSION));
+    assert_eq!(plain.persist_error, None);
+    assert!(
+        !serde_json::to_string(&plain)
+            .unwrap()
+            .contains("persist_error"),
+        "an absent durability failure is omitted, not null"
+    );
+
+    let failing = decode_identify_vector(&format!(
+        "session.identify.persist_error.response.v{SESSION_PROTOCOL_VERSION}.json"
+    ));
+    assert_eq!(
+        failing.persist_error.as_deref(),
+        Some("No space left on device (os error 28)")
+    );
+    assert_eq!(
+        SessionIdentify {
+            persist_error: None,
+            ..failing
+        },
+        sample_identify()
+    );
+}
+
+#[test]
+fn identify_carries_a_persist_error_only_when_there_is_one() {
+    fn result(name: &str) -> IdentifyResult {
+        let raw = read_vector(name);
+        let resp: roost_ipc::messages::Response =
+            serde_json::from_str(&raw).expect("decode response envelope");
+        serde_json::from_value(resp.result.expect("result body")).expect("decode identify result")
+    }
+
+    assert_eq!(result("identify.response.json").persist_error, None);
+    assert_eq!(
+        result("identify.persist_error.response.json")
+            .persist_error
+            .as_deref(),
+        Some("Read-only file system (os error 30)")
+    );
 }
 
 #[test]

@@ -256,6 +256,13 @@ Response:
 }}
 ```
 
+`persist_error` is present only when the last attempt to write
+`state.json` failed — the message of that write, and absent otherwise.
+A UI socket serves no event stream, so this field is the whole of its
+durability surface; see
+[`workspace.durability_changed`](#events) for the session's live
+counterpart and what the value means.
+
 `local_backend` (plan 063 §D1) is `"in-process"` or `"session"` — which
 backend this UI's own local tabs run on, the [`local-backend` config
 key](config.md#local-backend)'s live value. Absent from a Swift Mac
@@ -2053,6 +2060,13 @@ batch the gap rule already requires. `notification.fired` is not an
 effect and **is replayed** — it is a workspace fact, and a watcher that
 blinked wants the one it missed.
 
+[`workspace.durability_changed`](#events) is stripped from the ring for
+the neighbouring reason: it announces the *moment* a standing value
+moved, and that value is
+[`session.identify.persist_error`](#sessionidentify). Replaying it would
+raise a failure the session has since recovered from, so a client
+re-reads `session.identify` after a resync instead.
+
 Three properties made this lossless before the replay ring existed, and
 still do — the ring just means fewer clients ever need the third one:
 
@@ -2256,6 +2270,13 @@ Params: `{}`. Response:
   "started_at": "2026-08-27T14:03:11Z"
 }
 ```
+
+An optional `persist_error` rides beside them, present only when the
+last attempt to write `state.json` failed, carrying that write's
+message. It is the **standing** value behind the live-only
+[`workspace.durability_changed`](#events) event, which is why a client
+re-reads it on connect and again after a resync. Its absence is not a
+capability signal — a session that is writing fine omits it.
 
 The handshake a client runs before anything binary exists, so every
 incompatibility is caught on stable JSON. `session_protocol` is
@@ -3158,6 +3179,18 @@ See [`events.subscribe`](#eventssubscribe) for the full envelope shape.
   exactly these two effects — every other client-local OSC effect
   (pointer shape, today) stays dropped + debug-logged in the tab task
   rather than added to this envelope.
+* `workspace.durability_changed` — `{"error": "<string>" | null}`.
+  The session stopped — or started — writing `state.json`. `error` is
+  the write's message while it is failing and `null` the moment one
+  lands again; the key is always present, because recovery is the news
+  half the time. Emitted on a **change of value** only, so a session on a
+  full disk says it once rather than once per mutation, and **ops keep
+  succeeding** throughout: a workspace nobody can save is still a
+  workspace, and refusing `tab.open` on a full disk would be worse than
+  losing the layout. The event is
+  [live-only](#eventssubscribe) — the standing value is
+  [`session.identify.persist_error`](#sessionidentify), which a client
+  re-reads after a resync.
 
 ## Versioning
 

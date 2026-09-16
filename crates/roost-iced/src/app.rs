@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -175,6 +175,42 @@ impl StatusBanner {
     fn is_active(&self) -> bool {
         self.message.is_some()
     }
+}
+
+/// Whose `state.json` a durability failure belongs to (#481).
+///
+/// The variant order is the priority order: a local failure is this
+/// machine's own layout and is named first, then hosts alphabetically —
+/// derived from `Ord`, so the bottom line just reads the first entry.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DurabilitySource {
+    Local,
+    Host(String),
+}
+
+/// What the bottom-right line says: the transient toast while one is up,
+/// otherwise the first standing durability failure (#481).
+///
+/// The toast *covers* a failure rather than replacing it — a receipt or
+/// a PTY error is still seen, and the failure line comes back when the
+/// toast expires. Taking the first entry means one host recovering never
+/// uncovers silence where another failure still stands.
+///
+/// "last save failed" rather than "still failing": the value is a
+/// standing fact recovered on the next write that lands, and a client
+/// that reconnected mid-failure has no idea how long it has been true.
+fn bottom_line<'a>(
+    status: &'a StatusBanner,
+    durability: &'a BTreeMap<DurabilitySource, String>,
+) -> Option<Cow<'a, str>> {
+    if let Some(status) = status.message() {
+        return Some(Cow::Borrowed(status));
+    }
+    let (source, error) = durability.iter().next()?;
+    Some(Cow::Owned(match source {
+        DurabilitySource::Local => format!("Roost couldn't save your workspace: {error}"),
+        DurabilitySource::Host(host) => format!("on {host}: last save failed: {error}"),
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2373,6 +2409,16 @@ pub struct App {
     modifiers: keyboard::Modifiers,
     test_mode: bool,
     status: StatusBanner,
+    /// Standing "this workspace is not reaching disk" failures, one per
+    /// source (#481).
+    ///
+    /// Deliberately *not* in [`StatusBanner`]: that is a single slot on
+    /// a five-second timer, and a receipt toast landing in it would hide
+    /// a failure that is still true. Keyed per source so a local failure
+    /// and a host's coexist, and so one host recovering cannot clear
+    /// another's. `BTreeMap` so the first entry is the one
+    /// [`bottom_line`] names.
+    durability: BTreeMap<DurabilitySource, String>,
     /// The one startup agent-hooks ensure has been started (plan 046
     /// §3.7). `window_opened` also runs on every focus change, so this
     /// is what keeps a startup act from becoming a focus act.
@@ -2891,6 +2937,7 @@ impl App {
             modifiers: keyboard::Modifiers::default(),
             test_mode,
             status: StatusBanner::default(),
+            durability: BTreeMap::new(),
             agent_hooks_started: false,
             agent_hooks_card_raised: false,
             agent_hooks_survey: None,
@@ -3954,6 +4001,23 @@ impl App {
 
     pub fn status_active(&self) -> bool {
         self.status.is_active()
+    }
+
+    fn bottom_line(&self) -> Option<Cow<'_, str>> {
+        bottom_line(&self.status, &self.durability)
+    }
+
+    /// Record or retire one source's durability failure.
+    fn set_durability(&mut self, source: DurabilitySource, error: Option<String>) {
+        match error {
+            Some(error) => {
+                tracing::error!(?source, %error, "a workspace could not be saved");
+                self.durability.insert(source, error);
+            }
+            None => {
+                self.durability.remove(&source);
+            }
+        }
     }
 
     pub fn palette_retry_pending(&self) -> bool {
@@ -5639,7 +5703,7 @@ impl App {
             )
             .into()
         };
-        let content: Element<'_, Message> = if let Some(status) = self.status.message() {
+        let content: Element<'_, Message> = if let Some(status) = self.bottom_line() {
             let toast = container(text(status).size(12).color(chrome::ERROR_TEXT))
                 .max_width(520)
                 .padding([8, 12])
@@ -6900,6 +6964,10 @@ impl App {
         if let Some(incarnation) = self.hosts.remove(saved_id) {
             self.purge_host_incarnation(incarnation);
         }
+        // Keyed by name, so `purge_host_incarnation` cannot reach it:
+        // a forgotten host's last save is nothing the user can act on
+        // (#481).
+        self.set_durability(DurabilitySource::Host(saved_id.to_string()), None);
         let removed = self.workspace.remove_host(saved_id);
         self.reconcile();
         removed
@@ -8556,11 +8624,17 @@ impl Drop for App {
     fn drop(&mut self) {
         // Freeze and fsync the authoritative layout before PTY-exit tasks can
         // observe teardown and attempt a later persistence write.
-        self.workspace.flush();
+        //
         // The one observable proof that the run loop dropped `App` rather
         // than the process being killed under it — the exit-on-empty path
-        // depends on this running.
-        tracing::info!("workspace state flushed on shutdown");
+        // depends on this running. There is no surface left to raise a
+        // failure on, so the log is where it goes (#481).
+        match self.workspace.flush() {
+            Ok(()) => tracing::info!("workspace state flushed on shutdown"),
+            Err(error) => {
+                tracing::error!(%error, "the workspace layout could not be written on shutdown")
+            }
+        }
     }
 }
 
@@ -9375,6 +9449,77 @@ mod tests {
         status.clear();
         assert_eq!(status.message(), None);
         assert!(!status.is_active());
+    }
+
+    fn durability(entries: &[(DurabilitySource, &str)]) -> BTreeMap<DurabilitySource, String> {
+        entries
+            .iter()
+            .map(|(source, error)| (source.clone(), (*error).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_host_recovering_leaves_the_other_hosts_failure_on_the_line() {
+        let quiet = StatusBanner::default();
+        let mut failing = durability(&[
+            (DurabilitySource::Host("alpha".into()), "disk full"),
+            (DurabilitySource::Host("beta".into()), "read-only"),
+        ]);
+        assert_eq!(
+            bottom_line(&quiet, &failing).as_deref(),
+            Some("on alpha: last save failed: disk full")
+        );
+
+        failing.remove(&DurabilitySource::Host("alpha".into()));
+        assert_eq!(
+            bottom_line(&quiet, &failing).as_deref(),
+            Some("on beta: last save failed: read-only")
+        );
+
+        failing.remove(&DurabilitySource::Host("beta".into()));
+        assert_eq!(bottom_line(&quiet, &failing), None);
+    }
+
+    /// A local failure and a host's are different workspaces on
+    /// different disks, so they coexist — and this machine's own is
+    /// named first.
+    #[test]
+    fn a_local_failure_is_named_before_a_hosts() {
+        let quiet = StatusBanner::default();
+        let mut failing = durability(&[
+            (DurabilitySource::Host("alpha".into()), "disk full"),
+            (DurabilitySource::Local, "read-only"),
+        ]);
+        assert_eq!(
+            bottom_line(&quiet, &failing).as_deref(),
+            Some("Roost couldn't save your workspace: read-only")
+        );
+
+        failing.remove(&DurabilitySource::Local);
+        assert_eq!(
+            bottom_line(&quiet, &failing).as_deref(),
+            Some("on alpha: last save failed: disk full"),
+            "the host's failure was never overwritten, only covered"
+        );
+    }
+
+    #[test]
+    fn a_transient_toast_covers_a_standing_failure_and_then_uncovers_it() {
+        let now = Instant::now();
+        let failing = durability(&[(DurabilitySource::Local, "read-only")]);
+        let mut status = StatusBanner::default();
+        status.set_at("agent hooks wired", now);
+
+        assert_eq!(
+            bottom_line(&status, &failing).as_deref(),
+            Some("agent hooks wired")
+        );
+
+        status.expire_at(now + STATUS_BANNER_DURATION);
+        assert_eq!(
+            bottom_line(&status, &failing).as_deref(),
+            Some("Roost couldn't save your workspace: read-only")
+        );
     }
 
     #[test]
@@ -11475,6 +11620,7 @@ mod tests {
             skew: skew(),
             reduced_fidelity,
             resumed: None,
+            persist_error: None,
         }
     }
 

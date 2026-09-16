@@ -309,7 +309,9 @@ impl Engine {
             }
             EngineCommand::TabResize(p) => self.resize_tab(p).await.map(|()| CommandResult::Ack),
             EngineCommand::Shutdown => {
-                self.workspace.flush();
+                if let Err(error) = self.workspace.flush() {
+                    tracing::error!(%error, "the workspace layout could not be written on shutdown");
+                }
                 for project in self.workspace.snapshot() {
                     for tab in project.tabs {
                         self.supervisor.close(tab.id);

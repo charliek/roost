@@ -2287,6 +2287,7 @@ async fn dispatch_outcome(
                 libghostty_build: session.info.libghostty_build.clone(),
                 session_id: session.info.session_id.clone(),
                 started_at: session.info.started_at.clone(),
+                persist_error: h.workspace.persist_error(),
             };
             return encode(&result).map(HandlerOutcome::Reply);
         }
@@ -2949,7 +2950,11 @@ async fn session_stop(
     // Waits out exactly the mutations that got past the latch.
     let _drained = session.barrier.write().await;
 
-    h.workspace.flush();
+    // Reported, not swallowed: a stop that could not write the layout is
+    // the last chance anyone has to learn the tabs are not coming back.
+    if let Err(error) = h.workspace.flush() {
+        tracing::error!(%error, "session.stop could not flush the workspace layout");
+    }
     let report = h.supervisor.shutdown_all(SESSION_STOP_SOFT_DEADLINE).await;
     let reply = encode(&SessionStopResult {
         reaped: report.reaped,
@@ -3078,6 +3083,7 @@ async fn dispatch(
                 local_backend: route.mode,
                 local_session_socket: local_session_socket(route.mode),
                 local_backend_switch: route.switch.map(str::to_string),
+                persist_error: h.workspace.persist_error(),
             };
             encode(&result)
         }

@@ -335,6 +335,7 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ("tabs.reordered", OpClass::Event),
     ("projects.reordered", OpClass::Event),
     ("tab.effect", OpClass::Event),
+    ("workspace.durability_changed", OpClass::Event),
 ];
 
 /// The code a UI socket answers with when an op meant for the slot

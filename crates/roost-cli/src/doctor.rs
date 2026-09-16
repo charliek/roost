@@ -3764,6 +3764,7 @@ mod tests {
             local_backend: LocalBackendMode::InProcess,
             local_session_socket: None,
             local_backend_switch: None,
+            persist_error: None,
         }
     }
 
