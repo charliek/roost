@@ -118,10 +118,11 @@ terminal from. It shares the socket path but not the framing; see
   [`session.stop`](#sessionstop) latches, every mutating op answers it
   (reads still answer normally), and a second `session.stop` on the
   same session gets it too instead of a fresh reap report. Session
-  sockets add a further five: `unsupported-kind`, `build-mismatch` from
-  the [attach handshake](#the-handshake)'s negotiation, and
-  `replay-expired`, `revision-ahead`, `session-mismatch` from
-  [`events.subscribe`](#eventssubscribe)'s resume. Every same-UID
+  sockets add a further six: `unsupported-kind`, `build-mismatch` and
+  `too-many-attaches` from the [attach handshake](#the-handshake)'s
+  negotiation, and `replay-expired`, `revision-ahead`,
+  `session-mismatch` from [`events.subscribe`](#eventssubscribe)'s
+  resume. Every same-UID
   connection is otherwise symmetric — there is no per-connection
   authority code, because there is no per-connection authority.
 

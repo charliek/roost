@@ -353,6 +353,34 @@ def test_reorder_ops_refuse_a_non_canonical_id(roost, project):
     )
 
 
+def test_dump_ops_refuse_a_non_canonical_id(roost):
+    """`tab.dump` and `tab.dump_resolved` are `WireTabRef`-backed too
+    (Rust `messages.rs`'s `TabDumpParams`/`TabDumpResolvedParams`), so
+    the same #402 narrowing from the test above applies to them —
+    that plan's discovery record only named `tab.reorder`/
+    `project.reorder`, missing these two (and `tab.capture_pty_input`,
+    covered separately in `test_test_ops.py` since it's gated behind
+    `ROOST_TEST_MODE=1`).
+
+    Both handlers decode params before ever looking up the tab, so a
+    non-canonical id never needs a real tab to trip this — no `project`
+    fixture required. Parity test, not target-gated, like the one
+    above.
+    """
+    for bad_id in ("+4", "04"):
+        with pytest.raises(RoostError) as dump_exc:
+            roost.dump(bad_id)
+        assert dump_exc.value.code == "invalid-param", (
+            f"tab.dump with non-canonical id {bad_id!r}: {dump_exc.value}"
+        )
+
+        with pytest.raises(RoostError) as resolved_exc:
+            roost.tab_dump_resolved(bad_id)
+        assert resolved_exc.value.code == "invalid-param", (
+            f"tab.dump_resolved with non-canonical id {bad_id!r}: {resolved_exc.value}"
+        )
+
+
 # -- Iced-only: full UI dispatch path --------------------------------------
 
 

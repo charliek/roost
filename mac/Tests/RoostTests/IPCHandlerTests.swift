@@ -213,6 +213,62 @@ struct IPCHandlerDispatchTests {
         )
     }
 
+    // The plan 065 discovery record that added the tests above named
+    // only `tab.reorder`/`project.reorder` as `WireTabRef`-backed.
+    // `tab.dump` and `tab.dump_resolved` are too (Rust `messages.rs`'s
+    // `TabDumpParams`/`TabDumpResolvedParams`) and used a bare
+    // `Int64(raw)` decode until now — same bug, same fix
+    // (`decodeCanonicalStringInt64` in IPCHandlerImpl.swift). Both
+    // decode params before any tab lookup, so no tab needs to exist
+    // for these. `tab.capture_pty_input` is the third `WireTabRef`
+    // struct still fixed here, but it can't be unit-tested this way:
+    // it checks `RoostBackend.shared.testMode` (false in this test
+    // binary — see `capturePtyInputRequiresTestMode` above) and
+    // throws `not-enabled` before decode ever runs. That op's
+    // canonical-id coverage lives in
+    // `tools/roosttest/test_test_ops.py::test_capture_pty_input_refuses_a_non_canonical_id`
+    // instead, run with `ROOST_TEST_MODE=1` against a real socket.
+
+    @Test func tabDumpNonCanonicalIdWithLeadingPlusIsInvalidParam() async {
+        let handler = await makeHandler()
+        await expectError(
+            "invalid-param",
+            "tab.dump",
+            AnyCodable(["tab_id": "+4"] as [String: Any]),
+            on: handler
+        )
+    }
+
+    @Test func tabDumpNonCanonicalIdWithLeadingZeroIsInvalidParam() async {
+        let handler = await makeHandler()
+        await expectError(
+            "invalid-param",
+            "tab.dump",
+            AnyCodable(["tab_id": "04"] as [String: Any]),
+            on: handler
+        )
+    }
+
+    @Test func tabDumpResolvedNonCanonicalIdWithLeadingPlusIsInvalidParam() async {
+        let handler = await makeHandler()
+        await expectError(
+            "invalid-param",
+            "tab.dump_resolved",
+            AnyCodable(["tab_id": "+4"] as [String: Any]),
+            on: handler
+        )
+    }
+
+    @Test func tabDumpResolvedNonCanonicalIdWithLeadingZeroIsInvalidParam() async {
+        let handler = await makeHandler()
+        await expectError(
+            "invalid-param",
+            "tab.dump_resolved",
+            AnyCodable(["tab_id": "04"] as [String: Any]),
+            on: handler
+        )
+    }
+
     // MARK: happy-path encode/decode
 
     @Test func identifyEchoesProfile() async throws {
