@@ -758,12 +758,16 @@ let ipcProtocolVersion: UInt32 = 1
 ///
 /// At `5` every same-UID connection to a session became symmetric: no
 /// owner, no lease, no foreground. Effects fan out to every subscriber,
-/// `session.set_focus` is a per-connection statement about what that
-/// client is looking at, and the PTY is sized by the last interactor.
-/// `6` reshapes `session.set_agent_hooks`: it carries the agents a
-/// client's own `agent-hooks` key allows, and a client only ever
-/// *raises* the host's setting — `mode` and `skip` are gone, and a
-/// client that allows nothing sends no frame at all (plan 064 §3.3).
+/// and the PTY is sized by the last interactor. `6` reshapes
+/// `session.set_agent_hooks`: it carries the agents a client's own
+/// `agent-hooks` key allows, and a client only ever *raises* the host's
+/// setting — `mode` and `skip` are gone, and a client that allows
+/// nothing sends no frame at all (plan 064 §3.3). `6` also fans
+/// notifications out the way effects already were: a session suppresses
+/// nothing, and the client reading a tab answers its
+/// `notification.fired` with a generation-checked
+/// `tab.clear_notification` — the `session.set_focus` op that used to
+/// mute a tab for everyone is deleted (#474).
 ///
 /// The rule: a **session-socket change bumps this when a pre-bump peer
 /// could not refuse it meaningfully**, in either direction. A new event

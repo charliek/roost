@@ -947,7 +947,33 @@ unconditionally `none`. See
 Clears `Tab.has_notification` and emits the corresponding
 `tab.notification` event with `has_pending = false`.
 
-Request: `{"params": {"tab_id": "3"}}`. Response: `{}`.
+Request: `{"params": {"tab_id": "3"}}`.
+Response: `{"cleared": true}` — whether *this* call is what took a
+pending notification down. `false` for a tab with nothing pending, and
+for a superseded acknowledgement (below); both are ordinary answers, not
+errors. An unknown `tab_id` is `not-found`, so a client can still tell
+"gone" from "somebody got there first".
+
+**`generation` (optional) makes the clear an acknowledgement.** Supply
+the [`notification.fired`](#events) `generation` you are answering and
+the session clears **only if that raise is still the current one**:
+
+```json
+{"id": "9", "op": "tab.clear_notification", "params": {
+  "tab_id": "3", "generation": 7
+}}
+```
+
+Omit it — as a person clicking the tab does, and as `roostctl tab
+clear-notification` does — and the clear is unconditional: whatever is
+pending comes down.
+
+The check exists because a client that clears *automatically*, because
+it is already reading the tab ([Notifications fan
+out](#notifications-fan-out)), is answering one specific raise over a
+round trip. Without it: A fires, the viewing client acknowledges A, B
+fires, and A's acknowledgement lands afterwards and erases a
+notification nobody has seen.
 
 ### `tab.set_hook_active` *(deprecated — use `tab.agent_report`)*
 
@@ -2049,23 +2075,29 @@ of it, so every fence below it also expires); the answer either way is
 `replay-expired`, which is the designed fallback, not a failure — the
 client snapshots with `tab.list` and subscribes afresh.
 
-**Effects are live-only.** [`tab.effect`](#events) (bells, OSC 52
-clipboard writes — [DL-18](../development/vision.md#dl-18-hosts-ux-attach-on-focus-effects-theme-reseed-and-the-mac-gate-2026-08-29))
-is stripped before a batch ever enters the ring, so **no resumed stream
-ever receives one from its gap, for any subscriber**: replaying a
-clipboard write from thirty seconds ago is wrong regardless of who
-resumes into it. A commit whose only events were effects still occupies
-a revision and replays as the same empty `{"revision": N, "events": []}`
-batch the gap rule already requires. `notification.fired` is not an
-effect and **is replayed** — it is a workspace fact, and a watcher that
-blinked wants the one it missed.
+**Moments are live-only.** Three events are stripped before a batch
+ever enters the ring, so **no resumed stream ever receives one from its
+gap, for any subscriber**:
 
-[`workspace.durability_changed`](#events) is stripped from the ring for
-the neighbouring reason: it announces the *moment* a standing value
-moved, and that value is
-[`session.identify.persist_error`](#sessionidentify). Replaying it would
-raise a failure the session has since recovered from, so a client
-re-reads `session.identify` after a resync instead.
+- [`tab.effect`](#events) (bells, OSC 52 clipboard writes —
+  [DL-18](../development/vision.md#dl-18-hosts-ux-attach-on-focus-effects-theme-reseed-and-the-mac-gate-2026-08-29)),
+  because replaying a clipboard write from thirty seconds ago is wrong
+  regardless of who resumes into it;
+- [`workspace.durability_changed`](#events), because the standing value
+  is what a client resyncs against and replaying the moment it changed
+  would raise a failure the next write already fixed;
+- [`notification.fired`](#events), because a banner is a *moment* and
+  the acknowledgement that answers it may be sitting in the very same
+  gap — a resumed stream that replayed one would flash a banner and
+  then retire it.
+
+What each of them leaves behind is ordinary state and is recovered the
+ordinary way: the pending bit off [`tab.list`](#tablist), the durability
+error off [`session.identify.persist_error`](#sessionidentify), and a
+bell off nothing at all, because a bell leaves nothing behind. A commit
+whose only events were live-only still occupies a revision and replays
+as the same empty `{"revision": N, "events": []}` batch the gap rule
+already requires.
 
 Three properties made this lossless before the replay ring existed, and
 still do — the ring just means fewer clients ever need the third one:
@@ -2130,13 +2162,13 @@ There is no connect step, and no order the server enforces: a client
 dials, calls `session.identify` to run the compatibility gate (below),
 and from there every other op is available immediately, to every
 same-UID connection, in any order. What Roost's own client actually
-sends is `session.identify` → `session.set_theme` / `session.set_focus`
-→ `events.subscribe` / `tab.attach`, with `session.set_agent_hooks`
+sends is `session.identify` → `session.set_theme` →
+`events.subscribe` / `tab.attach`, with `session.set_agent_hooks`
 queued behind them — not because the wire requires that shape, but
 because each `set_*` op states something the session would otherwise
-guess wrong (its palette, whose window is looking at it, whether the
-user wants agent hooks on this machine), and each is re-stated whenever
-the client's own answer changes. A client that only wants to watch runs
+guess wrong (its palette, whether the user wants agent hooks on this
+machine), and each is re-stated whenever the client's own answer
+changes. A client that only wants to watch runs
 a shorter sequence — `session.identify` → `events.subscribe` →
 `tab.list` — and never calls the `set_*` ops or `tab.attach` at all;
 nothing distinguishes that client from any other at the wire level, it
@@ -2342,10 +2374,12 @@ the "needs restart" path would have had nothing left to reach.
 Protocol generations 1 through 4 required a client to claim an
 **interactive lease** before it could drive a session: a
 `session.connect` op minted a bearer token that decided whose
-`events.subscribe` stream received `tab.effect`, whose
-`session.set_focus` was the one a session suppressed notifications
-against, and which connection the `session.set_theme` /
-`session.set_agent_hooks` / `session.put_file` ops would accept.
+`events.subscribe` stream received `tab.effect`, whose reported focus
+was the one a session suppressed notifications against (through a
+`session.set_focus` op, itself retired at generation 6 — see
+[Notifications fan out](#notifications-fan-out)), and which connection
+the `session.set_theme` / `session.set_agent_hooks` /
+`session.put_file` ops would accept.
 Reconnecting was always a takeover — the same op, with `takeover: true`,
 displaced whoever held the lease — and what that did to the displaced
 client's connections changed within the generation. Through protocol 2
@@ -2362,6 +2396,47 @@ same-UID connection is symmetric, as [`session.identify`](#sessionidentify)
 states and every section below describes. See CHANGELOG for the
 protocol-5 migration entry and [Versioning](#versioning) for the
 generation history.
+
+### Notifications fan out
+
+**A session suppresses nothing.** An agent's attention on any tab raises
+`Tab.has_notification` and pushes both
+[`tab.notification`](#events) and [`notification.fired`](#events) to
+every subscriber, always. A session is headless — it has no window and
+no screen — so the only thing that can say "somebody is already looking
+at this tab" is a client, about itself.
+
+**Each client decides for its own window.** On `notification.fired` for
+tab T, a client that is showing T *and* has window focus raises no
+banner and instead sends
+[`tab.clear_notification`](#tabclear_notification) with that event's
+`generation` — the automatic form of the acknowledgement that selecting
+a tab already performs. That clear takes the dot down on **every**
+client rather than muting one. Every other client banners as it always
+did.
+
+Until protocol 6 this was a `session.set_focus` op: each connection told
+the session what it was looking at and the session muted a tab while
+**any** connection claimed it. That op is **gone** — it answers
+`unknown-op` — because a union mutes the wrong people: a phone left open
+on a tab silenced the laptop, with no dot, no banner and no event
+(#474).
+
+What that costs, stated plainly, because it is the design and not a
+defect:
+
+- **Other clients may show the dot for one round trip**, until the
+  acknowledging client's clear lands. The client that is looking never
+  paints it: it filters its own viewed tab out of both attention
+  surfaces.
+- **Two focused viewers both acknowledge the same raise.** The second is
+  answered `cleared: false`.
+- **Regaining window focus does not clear.** Only selecting the tab
+  does, which is parity with a local window: focus alone has never
+  acknowledged anything.
+- **Another client's clear retires an inbox row, not a banner already
+  shown.** A desktop banner that has been put in front of a person is
+  theirs to dismiss.
 
 ### `session.set_theme`
 
@@ -2382,36 +2457,6 @@ Response: `{"tabs": 3}` — the number of live tabs whose server Terminal was re
 `palette` must carry exactly 256 `#rrggbb` entries; a short or long array is `invalid-param` rather than a partial application. The parser takes either case, and roost writes lowercase — the same spelling [`tab.dump_resolved`](#tabdump_resolved) uses — so the vectors have one spelling to agree about. Only the long form is accepted: `#abc` would be a second spelling of one color.
 
 A client sends this **right after connecting and before its first `tab.attach`** — attaching before the theme lands would paint the session's factory colors for one frame — and again whenever its own theme changes thereafter. Concurrent callers are last-writer-wins by design: the theme store mints a generation on every apply, so a `set_theme` racing a tab spawn is caught up at promotion rather than silently lost, and interleaved fan-outs converge on the newest theme instead of whichever send landed last — including between two different clients' palettes.
-
-Answers `shutting-down` once `session.stop` has latched.
-
-### `session.set_focus`
-
-Tell the session which of its tabs *this connection* is actually looking at. Same-UID, no gate: any connection may state its own focus, and a tab is muted while **any** connection is looking at it (union muting) — see [DL-26](../development/vision.md#dl-26-there-is-no-lease-2026-09-12).
-
-Request:
-```json
-{"id": "9", "op": "session.set_focus", "params": {
-  "focused_tab_id": "5"
-}}
-```
-
-Response: `{}` — nothing to report beyond "applied".
-
-**Why it exists.** A session is headless: it has no window, so nothing tells it which tab a connected client's terminal widget is actually showing. Without this op the session cannot suppress a notification for the tab you are looking at, so an agent's attention would always fire even while you watch it happen. With it, each connected client states the truth for itself, and the session suppresses a tab's notification while **any** connection says it is looking at that tab — `tab_is_being_watched(tab) = (window_focused && active_tab_id == tab) || viewing.values().any(|t| *t == tab)`, where the first clause is the local UI's own window-focus rule and the second is every session connection's stated focus, unioned. Two clients on two different tabs therefore both get muted, correctly, with no coordination between them and no further traffic once each has stated its own tab.
-
-**`focused_tab_id` is required, and nullable.** `null` means "this connection is looking at nothing on this session" — the client's window lost focus, or its selection moved to another host or to a local tab. An **omitted** field is not the same statement and is refused with `missing-param`: a client that forgot to say is exactly the one that must not be guessed for, since guessing "focused" re-creates the mute this op exists to fix.
-
-**Validation order**, for the same reason `tab.attach` pins one — each failure names a different thing to fix:
-
-1. `missing-param` / `invalid-param` — the field is absent, or is neither a decimal-string tab id nor null.
-2. `not-found` — a tab id this session does not have.
-
-`not-found` leaves **nothing** applied: a client naming a tab that just closed must not flip its own focus statement onto whatever tab happened to be active. **This op moves nothing else.** It records only this connection's own viewing statement — the session's active selection and persisted selection are untouched, and move only through [`tab.focus`](#tabfocus). Two symmetric clients focusing different tabs therefore never fight over which tab is "the" active one; each simply mutes its own. It does **not** acknowledge the tab's notification either — the client sends [`tab.clear_notification`](#tabclear_notification) for that. Re-stating a focus that is already current is a no-op.
-
-**A connection's focus does not outlive the connection.** The session forgets this connection's statement — reverting its slot in the union to "not looking" — when this same connection sends `focused_tab_id: null`, or when the connection itself closes. Nothing else clears it: another client connecting, focusing a different tab, or disconnecting changes nothing about this connection's own statement.
-
-A client therefore states its focus right after connecting, and again whenever its own window focus or selection moves. A session one release older answers `unknown-op`, which is a refusal like any other: the connection is unaffected and the client keeps the older behavior (the attached tab suppresses its own notifications, headless-default-focused).
 
 Answers `shutting-down` once `session.stop` has latched.
 
@@ -3152,7 +3197,7 @@ See [`events.subscribe`](#eventssubscribe) for the full envelope shape.
 * `tabs.reordered`    — `{"project_id": "<id>", "tab_ids": ["<id>", ...]}`. The full post-reorder display order for that project, not a diff.
 * `projects.reordered` — `{"project_ids": ["<id>", ...]}`. The full post-reorder sidebar order.
 * `hook_active.changed` — `{"tab_id": "<id>", "active": <bool>}`.
-* `notification.fired` — `{"tab_id": "<id>", "title": "<string>", "body": "<string>"}`. Mirrors the legacy proto's `NotificationEvent`; useful for tools that mirror notifications elsewhere.
+* `notification.fired` — `{"tab_id": "<id>", "title": "<string>", "body": "<string>", "generation": <int>}`. Mirrors the legacy proto's `NotificationEvent`; useful for tools that mirror notifications elsewhere. `generation` numbers the raises on that tab, counting from one; a client acknowledging this raise sends it back on [`tab.clear_notification`](#tabclear_notification) — see [Notifications fan out](#notifications-fan-out). Live-only on a session's event stream: never replayed into a resume.
 * `agent_report.changed` — `{"tab_id": "<id>", "shell_state": "<ShellState>", "agent_lifecycle": "<AgentLifecycle>", "ownership": "<Ownership, omitted when unowned>", "state": "<TabState>", "hook_active": <bool>}`.
   Fires whenever an accepted `tab.agent_report` or an OSC 133 shell
   mark changes the agent record. `tab.state_changed` and

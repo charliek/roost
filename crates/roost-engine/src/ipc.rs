@@ -42,17 +42,18 @@ use roost_ipc::messages::{
     ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
     ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
     SelectionDumpResult, SelectionSetParams, SessionIdentify, SessionIdentifyParams,
-    SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams, SessionSetFocusParams,
-    SessionSetThemeParams, SessionStopParams, SessionStopResult, SidebarDumpParams,
-    SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult, TabAttachParams,
-    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams, TabCloseParams,
-    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
-    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
-    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
-    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams,
-    TabSendFileResult, TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams,
-    TabWriteParams, WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef,
-    WireTabRef, MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
+    SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams, SessionSetThemeParams,
+    SessionStopParams, SessionStopResult, SidebarDumpParams, SidebarDumpResult,
+    SidebarSetWidthParams, TabAgentReportResult, TabAttachParams, TabCapturePtyInputParams,
+    TabCapturePtyInputResult, TabClearNotificationParams, TabClearNotificationResult,
+    TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams,
+    TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams,
+    TabExpandSelectionAtResult, TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams,
+    TabFocusResult, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
+    TabSendFileParams, TabSendFileResult, TabSetHookActiveParams, TabSetStateParams,
+    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
+    WindowResizeParams, WireProjectRef, WireTabRef, MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES,
+    SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{SessionSetThemeResult, TabAttachResult};
@@ -1571,7 +1572,6 @@ pub fn is_mutating_op(op: &str) -> bool {
             | ops::PROJECT_REORDER
             | ops::NOTIFICATION_CREATE
             | ops::SESSION_SET_THEME
-            | ops::SESSION_SET_FOCUS
             // Not workspace state, but authority-bearing all the same:
             // it writes hook entries into the session user's dotfiles,
             // pointing them at a `roostctl` that reports to a socket
@@ -1798,20 +1798,14 @@ impl Handler for IpcHandler {
         })
     }
 
-    /// The other half of `session.set_focus`'s lifetime rule: a focus a
-    /// client reported is only true while that client is still there.
-    /// Only this connection's statement is retired — everyone else is
-    /// still looking at whatever they said they were. A UI socket has no
-    /// session registry and does nothing here.
-    ///
-    /// Subscribers are pruned here too, and so are the attach tickets this
-    /// connection minted.
+    /// Retire everything keyed to one connection: its subscriber slot
+    /// and the attach tickets it minted. A UI socket has no session
+    /// registry and does nothing here.
     fn connection_ended(&self, conn_id: u64) {
         let Some(session) = self.session.as_ref() else {
             return;
         };
         session.forget_connection(conn_id);
-        self.workspace.forget_viewer(conn_id);
     }
 
     /// A data connection is a session's business only. Without a
@@ -2343,14 +2337,6 @@ async fn dispatch_outcome(
         return session_set_theme(h, p).await.map(HandlerOutcome::Reply);
     }
 
-    // Connection-scoped, which `dispatch` cannot see: what the op states
-    // — "I am looking at this tab" — is true only for as long as the
-    // connection that said it is open.
-    if op == ops::SESSION_SET_FOCUS {
-        let p: SessionSetFocusParams = decode(params)?;
-        return session_set_focus(h, ctx, &p).map(HandlerOutcome::Reply);
-    }
-
     if op == ops::SESSION_SET_AGENT_HOOKS {
         let p: SessionSetAgentHooksParams = decode(params)?;
         return session_set_agent_hooks(h, p)
@@ -2589,28 +2575,6 @@ async fn session_set_theme(
     _p: SessionSetThemeParams,
 ) -> Result<serde_json::Value, HandlerError> {
     Err(no_server_vt())
-}
-
-/// `session.set_focus`: take one connected client's real focus (plan 038
-/// §C6).
-///
-/// A session's workspace has no window of its own, so the only thing
-/// that can say a tab is being looked at is a client that does — and
-/// several may be, each at a different tab, which is why the statement
-/// is keyed by connection ([`Workspace::set_viewed_tab`]).
-///
-/// Unlike its two neighbours there is no `server-vt` twin: nothing here
-/// touches a server terminal, and a featureless build's notification
-/// routing is the same routing.
-fn session_set_focus(
-    h: &IpcHandler,
-    ctx: &ConnCtx,
-    p: &SessionSetFocusParams,
-) -> Result<serde_json::Value, HandlerError> {
-    h.workspace
-        .set_viewed_tab(ctx.conn_id, p.focused_tab_id)
-        .map_err(ws_err)?;
-    Ok(serde_json::json!({}))
 }
 
 /// `session.set_agent_hooks`: raise the host's `agent-hooks` key to at
@@ -3343,10 +3307,11 @@ async fn dispatch(
         }
         ops::TAB_CLEAR_NOTIFICATION => {
             let p: TabClearNotificationParams = decode(params)?;
-            h.workspace
-                .set_tab_has_notification(p.tab_id, false)
+            let cleared = h
+                .workspace
+                .clear_notification(p.tab_id, p.generation)
                 .map_err(ws_err)?;
-            Ok(serde_json::json!({}))
+            encode(&TabClearNotificationResult { cleared })
         }
         ops::TAB_SET_HOOK_ACTIVE => {
             // Deprecated alias for `tab.agent_report` — claim/release as

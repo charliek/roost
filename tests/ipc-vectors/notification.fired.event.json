@@ -1,0 +1,9 @@
+{
+  "event": "notification.fired",
+  "data": {
+    "tab_id": "5",
+    "title": "Claude Code",
+    "body": "Needs your permission to run a command",
+    "generation": 7
+  }
+}

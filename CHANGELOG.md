@@ -709,7 +709,8 @@ on macOS._
   connection closing all revert the session to "nobody is looking" — so
   a stale claim can never linger past the client that made it. A session
   one release older answers `unknown-op` and keeps HS-2's behavior. See
-  [`docs/reference/ipc.md`](docs/reference/ipc.md#sessionset_focus).
+  [`docs/reference/ipc.md`](docs/reference/ipc.md). (Retired at protocol
+  6 — see the Unreleased protocol entry.)
 - **The iced UI attaches to host sessions (HS-2, #374)** — closing Roost
   no longer has to kill what is running in it. Save a `roost-session`
   socket as a **host** (`roostctl host add` or the palette's **Add

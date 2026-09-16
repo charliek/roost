@@ -850,7 +850,12 @@ async fn main() -> Result<()> {
             client
                 .call::<_, serde_json::Value>(
                     ops::TAB_CLEAR_NOTIFICATION,
-                    TabClearNotificationParams { tab_id },
+                    // No `generation`: a person at a CLI is answering the
+                    // tab, not one raise on it.
+                    TabClearNotificationParams {
+                        tab_id,
+                        generation: None,
+                    },
                 )
                 .await?;
         }

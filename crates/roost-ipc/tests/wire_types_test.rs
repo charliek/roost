@@ -20,14 +20,15 @@ use roost_ipc::messages::{
     ops, AgentHooksOutcome, AgentSetHooksAgents, AgentSetHooksParams, AgentSetHooksResult,
     AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode, AttachPayloadKind,
     ClipboardEffectTarget, ClipboardWriteParams, DurabilityChangedEvent, EventBatch, EventEnvelope,
-    EventsSubscribeParams, EventsSubscribeResult, IdentifyResult, ProjectReorderParams,
-    ResponseError, RetrySchedule, SentFile, SessionBinaryIdentity, SessionIdentify,
-    SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams,
-    SessionSetFocusParams, SessionSetThemeParams, SessionSetThemeResult, SessionStopParams,
+    EventsSubscribeParams, EventsSubscribeResult, IdentifyResult, NotificationFiredEvent,
+    ProjectReorderParams, ResponseError, RetrySchedule, SentFile, SessionBinaryIdentity,
+    SessionIdentify, SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult,
+    SessionSetAgentHooksParams, SessionSetThemeParams, SessionSetThemeResult, SessionStopParams,
     SessionStopResult, SessionStoppingEvent, SkippedFile, TabAttachParams, TabAttachResult,
-    TabDumpCursor, TabDumpParams, TabDumpResult, TabEffect, TabEffectEvent, TabReorderParams,
-    TabSendFileParams, TabSendFileResult, TabWriteParams, WireProjectRef, WireTabRef,
-    MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
+    TabClearNotificationParams, TabClearNotificationResult, TabDumpCursor, TabDumpParams,
+    TabDumpResult, TabEffect, TabEffectEvent, TabReorderParams, TabSendFileParams,
+    TabSendFileResult, TabWriteParams, WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES,
+    SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -145,13 +146,6 @@ fn a_request_carrying_a_lease_is_refused_by_every_op_that_took_one() {
                 "palette": vec!["#000000"; 256],
             },
         }))
-        .map(drop),
-    );
-    refused(
-        ops::SESSION_SET_FOCUS,
-        serde_json::from_value::<SessionSetFocusParams>(
-            serde_json::json!({"lease": "l", "focused_tab_id": "5"}),
-        )
         .map(drop),
     );
     refused(
@@ -1141,97 +1135,97 @@ fn session_set_theme_params_reject_unknown_fields() {
 }
 
 // ---------------------------------------------------------------------------
-// session.set_focus (plan 038 C6)
+// tab.clear_notification + notification.fired (#474)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn session_set_focus_vectors_decode_into_their_typed_shapes() {
-    let raw = read_vector("session.set_focus.request.json");
+fn clear_notification_vectors_decode_into_their_typed_shapes() {
+    let raw = read_vector("tab.clear_notification.request.json");
     let request: roost_ipc::messages::RawRequest =
         serde_json::from_str(&raw).expect("decode request envelope");
-    assert_eq!(request.op, roost_ipc::messages::ops::SESSION_SET_FOCUS);
-    let params: SessionSetFocusParams =
-        serde_json::from_value(request.params).expect("decode set_focus params");
-    // The wire spelling is `string_int64`, like every other tab id.
-    assert_eq!(params.focused_tab_id, Some(5));
+    assert_eq!(request.op, ops::TAB_CLEAR_NOTIFICATION);
+    let params: TabClearNotificationParams =
+        serde_json::from_value(request.params).expect("decode clear params");
+    assert_eq!(params.tab_id, 3);
+    assert_eq!(
+        params.generation, None,
+        "the plain form is a person answering the tab"
+    );
     round_trip(&params);
 
-    let raw = read_vector("session.set_focus.none.request.json");
+    let raw = read_vector("tab.clear_notification.generation.request.json");
     let request: roost_ipc::messages::RawRequest =
         serde_json::from_str(&raw).expect("decode request envelope");
-    let params: SessionSetFocusParams =
-        serde_json::from_value(request.params).expect("decode a null focus");
-    assert_eq!(params.focused_tab_id, None);
+    let params: TabClearNotificationParams =
+        serde_json::from_value(request.params).expect("decode an acknowledgement");
+    assert_eq!(params.tab_id, 3);
+    assert_eq!(params.generation, Some(7));
     round_trip(&params);
 
-    // The result is an empty object, not `null`: the op reports nothing
-    // beyond "applied".
-    let raw = read_vector("session.set_focus.response.json");
+    let raw = read_vector("tab.clear_notification.response.json");
     let resp: roost_ipc::messages::Response =
         serde_json::from_str(&raw).expect("decode response envelope");
     assert!(resp.ok);
-    assert_eq!(resp.result, Some(serde_json::json!({})));
+    let result: TabClearNotificationResult =
+        serde_json::from_value(resp.result.expect("a result")).expect("decode the result");
+    assert!(result.cleared);
 }
 
-/// `focused_tab_id` is REQUIRED and nullable, and the two are not the
-/// same thing: `null` says "nothing on this session is focused", while
-/// an omitted field is a client that never said — and defaulting that to
-/// either answer would silently re-create the mute this op exists to
-/// fix.
+/// `generation` is omit-when-unset, which is what makes it additive: a
+/// clear from a peer that predates it is the unconditional form, and
+/// nothing in the encoder can emit a `null` a strict decoder would have
+/// to have a rule for.
 #[test]
-fn session_set_focus_requires_the_field_it_lets_be_null() {
-    let null: SessionSetFocusParams = serde_json::from_value(serde_json::json!({
-        "focused_tab_id": null,
-    }))
-    .expect("an explicit null is a statement");
-    assert_eq!(null.focused_tab_id, None);
-
-    let missing = serde_json::from_value::<SessionSetFocusParams>(serde_json::json!({}))
-        .expect_err("an omitted focused_tab_id must not decode");
-    assert!(
-        missing.to_string().contains("missing field"),
-        "the refusal has to name the missing field so the server answers \
-         `missing-param`: {missing}"
-    );
-
-    // Serialization keeps the field present in both shapes, so a client
-    // built from this type cannot emit the omission either.
-    assert_eq!(
-        serde_json::to_value(&null).expect("serialize"),
-        serde_json::json!({"focused_tab_id": null}),
-    );
-    let some = SessionSetFocusParams {
-        focused_tab_id: Some(7),
+fn a_clear_without_a_generation_omits_the_field_entirely() {
+    let bare = TabClearNotificationParams {
+        tab_id: 3,
+        generation: None,
     };
     assert_eq!(
-        serde_json::to_value(&some).expect("serialize"),
-        serde_json::json!({"focused_tab_id": "7"}),
+        serde_json::to_value(&bare).expect("serialize"),
+        serde_json::json!({"tab_id": "3"}),
     );
+    let named = TabClearNotificationParams {
+        tab_id: 3,
+        generation: Some(7),
+    };
+    assert_eq!(
+        serde_json::to_value(&named).expect("serialize"),
+        serde_json::json!({"tab_id": "3", "generation": 7}),
+    );
+
+    // And the omission decodes back to the unconditional form rather
+    // than being refused, which is the other half of "additive".
+    let decoded: TabClearNotificationParams =
+        serde_json::from_value(serde_json::json!({"tab_id": "3"})).expect("decode");
+    assert_eq!(decoded.generation, None);
 }
 
-/// Strict like its siblings, and a non-numeric id is a refusal rather
-/// than a zero.
 #[test]
-fn session_set_focus_params_reject_unknown_fields_and_junk_ids() {
-    assert!(
-        serde_json::from_value::<SessionSetFocusParams>(serde_json::json!({
-            "focused_tab_id": "5",
-            "project_id": "1",
-        }))
-        .is_err()
-    );
-    assert!(
-        serde_json::from_value::<SessionSetFocusParams>(serde_json::json!({
-            "focused_tab_id": "h3.7",
-        }))
-        .is_err()
-    );
-    assert!(
-        serde_json::from_value::<SessionSetFocusParams>(serde_json::json!({
-            "focused_tab_id": 5,
-        }))
-        .is_err()
-    );
+fn notification_fired_vector_decodes_with_its_generation() {
+    let raw = read_vector("notification.fired.event.json");
+    let envelope: roost_ipc::messages::EventEnvelope =
+        serde_json::from_str(&raw).expect("decode event envelope");
+    assert_eq!(envelope.event, ops::EVENT_NOTIFICATION_FIRED);
+    let fired: NotificationFiredEvent =
+        serde_json::from_value(envelope.data).expect("decode notification.fired");
+    assert_eq!(fired.tab_id, 5);
+    assert_eq!(fired.generation, 7);
+    round_trip(&fired);
+}
+
+/// A peer that predates the field decodes to generation `0` — a value
+/// no raise ever mints — so its acknowledgements are ignored rather
+/// than mis-applied to whatever is current.
+#[test]
+fn a_fired_notification_without_a_generation_decodes_to_zero() {
+    let fired: NotificationFiredEvent = serde_json::from_value(serde_json::json!({
+        "tab_id": "5",
+        "title": "Claude Code",
+        "body": "Turn complete",
+    }))
+    .expect("decode a pre-generation event");
+    assert_eq!(fired.generation, 0);
 }
 
 // ---------------------------------------------------------------------------

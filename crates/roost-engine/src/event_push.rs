@@ -196,12 +196,14 @@ pub fn envelope(event: &WorkspaceEvent) -> Option<EventEnvelope> {
             tab_id,
             title,
             body,
+            generation,
         } => (
             ops::EVENT_NOTIFICATION_FIRED,
             to_value(NotificationFiredEvent {
                 tab_id: *tab_id,
                 title: title.clone(),
                 body: body.clone(),
+                generation: *generation,
             }),
         ),
         WorkspaceEvent::TabsReordered {
@@ -524,6 +526,7 @@ mod tests {
                     tab_id: 5,
                     title: "t".into(),
                     body: "b".into(),
+                    generation: 1,
                 },
             ],
         };

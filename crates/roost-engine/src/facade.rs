@@ -61,6 +61,12 @@ pub enum CommandResult {
         accepted: bool,
         tab: Tab,
     },
+    /// Whether [`EngineCommand::TabClearNotification`] is what took the
+    /// tab's pending notification down — see
+    /// [`crate::workspace::Workspace::clear_notification`].
+    ClearedNotification {
+        cleared: bool,
+    },
 }
 
 /// Complete UI-recoverable engine state. It owns all data and can replace a
@@ -296,8 +302,8 @@ impl Engine {
                 Ok(CommandResult::Ack)
             }
             EngineCommand::TabClearNotification(p) => {
-                self.workspace.set_tab_has_notification(p.tab_id, false)?;
-                Ok(CommandResult::Ack)
+                let cleared = self.workspace.clear_notification(p.tab_id, p.generation)?;
+                Ok(CommandResult::ClearedNotification { cleared })
             }
             EngineCommand::TabAgentReport(p) => {
                 let (accepted, tab) = self.workspace.agent_report(&p)?;

@@ -24,7 +24,7 @@
 //!   is drained it also backs `snapshot_for_persist`, so a bootstrap
 //!   that never hydrates cannot write the saved tabs away.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -106,6 +106,14 @@ struct TabRow {
     /// plan does not put it there (plan 002 §2.6).
     agent: AgentTabState,
     has_notification: bool,
+    /// How many notifications this tab has actually fired, counting from
+    /// zero (#474). Stamped onto every [`WorkspaceEvent::NotificationFired`]
+    /// so a client's automatic acknowledgement can name the raise it
+    /// answers; see [`Workspace::clear_notification`] for what naming it
+    /// buys. Bumped only when one *fires* — a raise nobody was told
+    /// about is not one anybody can acknowledge. Not persisted, like
+    /// `has_notification`.
+    notification_generation: u64,
     user_titled: bool,
     position: i32,
     created_at: i64,
@@ -149,12 +157,12 @@ struct Inner {
     /// notification-suppression predicate (plan §3.5); reported by the
     /// UI via [`Workspace::set_window_focused`]. Never persisted — focus
     /// is a property of the running session, not of the layout.
+    ///
+    /// A headless `roost-session` never reports one, so it stays down
+    /// for that workspace's whole life and the predicate is permanently
+    /// false there — which is the point of #474: a session suppresses
+    /// nothing and every client decides for itself.
     window_focused: bool,
-    /// The tab each connected client says it is viewing, by connection
-    /// id — the other half of the suppression predicate, and the half a
-    /// session has (its own window flag is nobody's). Never persisted,
-    /// like [`Inner::window_focused`].
-    viewing: HashMap<u64, i64>,
     /// Monotonic commit counter, bumped each time a persistable
     /// snapshot is taken (under this lock). Tags each snapshot so
     /// `persist()` can drop stale out-of-order writes (#80).
@@ -202,7 +210,6 @@ impl Default for Inner {
             // unfocused would route every notification the opposite way
             // from a real window. [`Workspace::open`] overrides it.
             window_focused: true,
-            viewing: HashMap::new(),
             persist_seq: 0,
             revision: 0,
             replay: VecDeque::new(),
@@ -367,11 +374,17 @@ pub enum WorkspaceEvent {
         tab_id: i64,
         agent: AgentTabState,
     },
+    /// A notification the user has not seen — the banner half. Live-only
+    /// (see [`Self::is_live_only`]); the pending bit that rides beside
+    /// it in [`Self::TabNotification`] is the state half and is replayed.
     NotificationFired {
         #[serde(with = "roost_ipc::messages::string_int64")]
         tab_id: i64,
         title: String,
         body: String,
+        /// Which raise on this tab this is — see
+        /// [`roost_ipc::messages::NotificationFiredEvent::generation`].
+        generation: u64,
     },
     /// Fired after `reorder_tabs`. `tab_ids` is the post-reorder
     /// display order — the supplied prefix followed by any
@@ -389,6 +402,7 @@ pub enum WorkspaceEvent {
     /// something that happened, and it rides the commit stream so an
     /// attached client sees it in order with everything else. Minted
     /// only by `tab_task`, so a UI's own workspace never emits one.
+    /// Live-only; see [`Self::is_live_only`].
     TabEffect {
         #[serde(with = "roost_ipc::messages::string_int64")]
         tab_id: i64,
@@ -399,8 +413,8 @@ pub enum WorkspaceEvent {
     /// one landed. Emitted on a *change of value* only, so a session
     /// that cannot write does not repeat itself once per mutation.
     ///
-    /// Live-only, like [`Self::TabEffect`]: the standing value is what a
-    /// client resyncs against (`identify`/`session.identify` report
+    /// Live-only (see [`Self::is_live_only`]): the standing value is what
+    /// a client resyncs against (`identify`/`session.identify` report
     /// `persist_error`), so replaying the moment it changed would raise
     /// a failure that has since been fixed.
     DurabilityChanged {
@@ -419,6 +433,32 @@ pub enum WorkspaceEvent {
     /// carries its live tabs; the active tab is the one with
     /// `is_active == true`.
     Resync(Vec<Project>),
+}
+
+impl WorkspaceEvent {
+    /// Whether this event is a *moment* rather than *state*, and so is
+    /// stripped before a batch enters the replay ring.
+    ///
+    /// The rule, stated once for all three: replaying one of these tells
+    /// a resuming client that something is happening which stopped
+    /// happening while it was away — a clipboard write from thirty
+    /// seconds ago, a save failure the next write already fixed, a
+    /// banner whose acknowledgement is in the same gap. What each of
+    /// them *leaves behind* is ordinary state and is recovered the
+    /// ordinary way: the pending bit off `tab.list`, the durability
+    /// error off `session.identify`, and a bell off nothing at all,
+    /// because a bell leaves nothing behind.
+    ///
+    /// A batch whose events were all live-only still enters the ring,
+    /// empty — the revision is what the client's gap check reads.
+    fn is_live_only(&self) -> bool {
+        matches!(
+            self,
+            Self::TabEffect { .. }
+                | Self::DurabilityChanged { .. }
+                | Self::NotificationFired { .. }
+        )
+    }
 }
 
 /// One commit's worth of workspace events, tagged under the
@@ -1378,6 +1418,7 @@ impl Workspace {
             cwd,
             agent: AgentTabState::default(),
             has_notification: false,
+            notification_generation: 0,
             // Always start with user_titled=false. The caller-
             // supplied `title` is a placeholder (e.g. UI's
             // "roost-mac N" / CLI's "roostctl" default) that
@@ -1428,7 +1469,6 @@ impl Workspace {
             .remove(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
         let project_id = row.project_id;
-        inner.viewing.retain(|_, viewed| *viewed != tab_id);
 
         // Last tab in the project? Cascade-close the project. Inlined
         // rather than calling `delete_project` so the event order is
@@ -1617,23 +1657,9 @@ impl Workspace {
         if watched {
             return Ok(false);
         }
-        row.has_notification = true;
+        let events = raise_notification(row, title.to_string(), body.to_string());
         // Notification state isn't in the persisted snapshot — emit only.
-        self.commit(
-            inner,
-            vec![
-                WorkspaceEvent::TabNotification {
-                    tab_id,
-                    has_pending: true,
-                },
-                WorkspaceEvent::NotificationFired {
-                    tab_id,
-                    title: title.to_string(),
-                    body: body.to_string(),
-                },
-            ],
-            Persist::Skip,
-        );
+        self.commit(inner, events, Persist::Skip);
         Ok(true)
     }
 
@@ -1810,18 +1836,7 @@ impl Workspace {
                 title,
                 body,
                 severity: _,
-            } if !watched => {
-                row.has_notification = true;
-                events.push(WorkspaceEvent::TabNotification {
-                    tab_id,
-                    has_pending: true,
-                });
-                events.push(WorkspaceEvent::NotificationFired {
-                    tab_id,
-                    title,
-                    body,
-                });
-            }
+            } if !watched => events.extend(raise_notification(row, title, body)),
             AttentionEffect::Set { .. } => {}
             AttentionEffect::Clear => {
                 row.has_notification = false;
@@ -1861,6 +1876,49 @@ impl Workspace {
         Ok(())
     }
 
+    /// `tab.clear_notification` — take a tab's pending notification
+    /// down, reporting whether this call is what took it down.
+    ///
+    /// `generation` is the acknowledgement's whole point (#474). A
+    /// client that clears *because it is already reading the tab* is
+    /// answering one specific raise, and a raise it never saw must
+    /// survive its answer: without the check, "A fires → the viewing
+    /// client acknowledges A → B fires → the acknowledgement lands"
+    /// erases B. `None` is the other caller — a click, `roostctl` — and
+    /// means "whatever is up, take it down", which is unconditional
+    /// because a person answering a tab is answering all of it.
+    ///
+    /// Committing unconditionally on the `None` path is deliberate and
+    /// is what it has always done: the edge is how an attached client
+    /// retires its own inbox row, and a client whose row a session does
+    /// not agree about is exactly the one that needs telling.
+    pub fn clear_notification(
+        &self,
+        tab_id: i64,
+        generation: Option<u64>,
+    ) -> Result<bool, WorkspaceError> {
+        let mut inner = self.inner.lock().unwrap();
+        let row = inner
+            .tabs
+            .get_mut(&tab_id)
+            .ok_or(WorkspaceError::TabNotFound(tab_id))?;
+        if generation.is_some_and(|named| named != row.notification_generation) {
+            return Ok(false);
+        }
+        let cleared = row.has_notification;
+        row.has_notification = false;
+        // Notification flag isn't in the persisted snapshot — emit only.
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::TabNotification {
+                tab_id,
+                has_pending: false,
+            }],
+            Persist::Skip,
+        );
+        Ok(cleared)
+    }
+
     pub fn focus_tab(&self, tab_id: i64) -> Result<(i64, i64), WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
         let (prev, now) = inner.select_tab(tab_id)?;
@@ -1893,48 +1951,6 @@ impl Workspace {
         }
         self.commit(inner, events, persist);
         Ok(prev)
-    }
-
-    /// One connection stating what it is looking at (host sessions,
-    /// HS-3's `session.set_focus`). `Some(tab)` records that statement,
-    /// `None` withdraws it.
-    ///
-    /// It records the statement and **nothing else** — no selection, no
-    /// event, no write. Connections are symmetric, so a `set_focus` that
-    /// moved the persisted selection would fan an `ActiveChanged` to
-    /// every other subscriber, each of which would then find the session
-    /// disagreeing with its own claim and re-state it: two clients on
-    /// two tabs ping-pong forever, a workspace write per round. The
-    /// selection moves only through `tab.focus`. It also stops short of
-    /// the rest of [`Self::focus_tab`] for the older reason: saying what
-    /// you are looking at does not acknowledge the tab's notification —
-    /// the attached client sends `tab.clear_notification` for that.
-    ///
-    /// Atomic in the sense the caller needs: an unknown tab is refused
-    /// with **nothing** applied, so a client that names a tab which just
-    /// closed does not silently mute some other one.
-    pub fn set_viewed_tab(
-        &self,
-        conn_id: u64,
-        focused_tab_id: Option<i64>,
-    ) -> Result<(), WorkspaceError> {
-        let mut inner = self.inner.lock().unwrap();
-        let Some(tab_id) = focused_tab_id else {
-            inner.viewing.remove(&conn_id);
-            return Ok(());
-        };
-        if !inner.tabs.contains_key(&tab_id) {
-            return Err(WorkspaceError::TabNotFound(tab_id));
-        }
-        inner.viewing.insert(conn_id, tab_id);
-        Ok(())
-    }
-
-    /// One connection is gone: drop its statement, like
-    /// [`Self::set_viewed_tab`] with `None`. Idempotent, so a close
-    /// need not know whether there was one.
-    pub fn forget_viewer(&self, conn_id: u64) {
-        self.inner.lock().unwrap().viewing.remove(&conn_id);
     }
 
     pub fn reorder_tabs(&self, project_id: i64, tab_ids: &[i64]) -> Result<(), WorkspaceError> {
@@ -2187,26 +2203,14 @@ impl Workspace {
             Persist::Write => Some(inner.snapshot_for_persist()),
         };
         if let Some(bounds) = self.replay_bounds {
-            // Effects are live-only: replaying a clipboard write from
-            // thirty seconds ago is wrong in itself, and a 256 KiB one
-            // would burn the byte budget for nothing.
-            // [`WorkspaceEvent::DurabilityChanged`] is stripped for the
-            // reason stated on it. A batch whose events were all
-            // live-only is still retained — empty — because the revision
-            // is what the client's gap check reads. A clone and a
-            // `VecDeque` push are non-blocking, which is what this lock
-            // permits.
+            // A clone and a `VecDeque` push are non-blocking, which is
+            // what this lock permits. What gets dropped and why is on
+            // [`WorkspaceEvent::is_live_only`].
             let stripped = VersionedWorkspaceEvent {
                 revision,
                 events: events
                     .iter()
-                    .filter(|ev| {
-                        !matches!(
-                            ev,
-                            WorkspaceEvent::TabEffect { .. }
-                                | WorkspaceEvent::DurabilityChanged { .. }
-                        )
-                    })
+                    .filter(|ev| !ev.is_live_only())
                     .cloned()
                     .collect(),
             };
@@ -2336,15 +2340,24 @@ impl Inner {
     /// user is actively looking at is considered seen, so it raises no
     /// banner, no badge, and no inbox row.
     ///
-    /// A **union**, not an election — this workspace's own window plus
-    /// every connection's stated tab — so a tab is muted while *anyone*
-    /// is looking at it and a second client can never un-mute the
-    /// first's. Only attention runs through here; `publish_tab_effect`
+    /// **This window and no other.** It reads only the state of the
+    /// workspace's own UI, which is the only screen this process can
+    /// speak for; a connected client's screen is that client's to
+    /// answer for, and it does, by acknowledging the raise it receives
+    /// (#474). A headless session therefore never suppresses — its
+    /// `window_focused` is down for life — which is what stops a phone
+    /// left open on a tab from silencing the laptop.
+    ///
+    /// The same one-line rule lives in the iced client as
+    /// `host_focus_claim`. Deliberately not lifted into a shared crate:
+    /// `roost-engine` does not depend on `roost-ui-model`, and each side
+    /// pins its own copy with a table test.
+    ///
+    /// Only attention runs through here; `publish_tab_effect`
     /// deliberately does not, so effects still reach every subscriber
     /// whatever is muted.
     fn tab_is_being_watched(&self, tab_id: i64) -> bool {
-        (self.window_focused && self.active_tab_id == tab_id)
-            || self.viewing.values().any(|t| *t == tab_id)
+        self.window_focused && self.active_tab_id == tab_id
     }
 
     fn alloc_id(&mut self) -> i64 {
@@ -2562,6 +2575,33 @@ fn wire_tab(row: &TabRow, is_active: bool) -> Tab {
         agent_lifecycle: row.agent.lifecycle,
         ownership: row.agent.ownership.clone(),
     }
+}
+
+/// Raise a tab's pending notification and return the events it implies.
+///
+/// One call, not an open-coded sequence per fire site: the bit, the
+/// generation and [`WorkspaceEvent::NotificationFired`] are one fact,
+/// and that event is the only place a client ever learns the number it
+/// will acknowledge with.
+///
+/// Suppression is the caller's ([`Inner::tab_is_being_watched`]) — a
+/// raise that reaches here is one that fires.
+fn raise_notification(row: &mut TabRow, title: String, body: String) -> Vec<WorkspaceEvent> {
+    let tab_id = row.id;
+    row.has_notification = true;
+    row.notification_generation += 1;
+    vec![
+        WorkspaceEvent::TabNotification {
+            tab_id,
+            has_pending: true,
+        },
+        WorkspaceEvent::NotificationFired {
+            tab_id,
+            title,
+            body,
+            generation: row.notification_generation,
+        },
+    ]
 }
 
 /// Swap a tab's agent record and return the events the swap implies.
@@ -3490,12 +3530,11 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Client-reported focus (host sessions, plan 038 C6)
+    // #474 — this window decides, and nobody else's
     // ------------------------------------------------------------------
 
     /// A two-tab workspace standing in for a session's: no window of its
-    /// own, so its own focus flag is down and everything it mutes comes
-    /// from what a connection said.
+    /// own, so its focus flag is down and it suppresses nothing.
     fn session_like_ws() -> (Workspace, i64, i64) {
         let ws = Workspace::new();
         ws.set_window_focused(false);
@@ -3511,8 +3550,60 @@ mod tests {
             .unwrap()
     }
 
-    /// A workspace a session opens has no window, so it mutes nothing
-    /// until a connection says it is looking.
+    /// The generation the last raise on `tab` carried, read off the
+    /// event rather than the row — an acknowledgement only ever knows
+    /// what the wire told it.
+    fn fired_generation(events: &[WorkspaceEvent], tab: i64) -> u64 {
+        events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                WorkspaceEvent::NotificationFired {
+                    tab_id, generation, ..
+                } if *tab_id == tab => Some(*generation),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no notification.fired for tab {tab} in {events:?}"))
+    }
+
+    /// The whole predicate, as a table: this workspace's own window and
+    /// its own selection, and nothing else can reach it. The iced
+    /// client's `host_focus_claim` pins the same two-term rule on its
+    /// side.
+    #[test]
+    fn only_this_windows_own_focus_and_selection_suppress() {
+        let (ws, first, second) = session_like_ws();
+        for focused in [true, false] {
+            for selected in [first, second] {
+                ws.set_window_focused(focused);
+                ws.focus_tab(selected).unwrap();
+                for tab in [first, second] {
+                    let suppressed = focused && tab == selected;
+                    assert_eq!(
+                        !raises(&ws, tab),
+                        suppressed,
+                        "focused={focused} selected={selected} tab={tab}"
+                    );
+                    ws.clear_notification(tab, None).unwrap();
+                }
+            }
+        }
+    }
+
+    /// The #474 outcome stated on its own: a workspace with no window
+    /// fires for every tab, always. This is what stops a phone left open
+    /// on a tab from silencing the laptop — the session no longer has
+    /// any way to be told that somebody, somewhere, is looking.
+    #[test]
+    fn a_windowless_workspace_suppresses_nothing() {
+        let (ws, first, second) = session_like_ws();
+        assert_eq!(ws.active().1, first, "one of them is even selected");
+        assert!(raises(&ws, first));
+        assert!(raises(&ws, second));
+    }
+
+    /// A workspace a session opens starts unfocused and stays that way:
+    /// `roost-session` never calls `set_window_focused`.
     #[test]
     fn an_opened_workspace_starts_unfocused() {
         let dir = tempfile::tempdir().unwrap();
@@ -3524,74 +3615,136 @@ mod tests {
         assert!(raises(&ws, tab));
     }
 
-    /// The whole point of the op: the connection says what it is looking
-    /// at, that tab and only that tab is muted, and the selection does
-    /// not budge.
+    /// Every raise that reaches a client carries the next generation, so
+    /// an acknowledgement has something to name.
     #[test]
-    fn client_focus_mutes_its_tab_and_leaves_the_selection_alone() {
-        let (ws, first, second) = session_like_ws();
-
-        ws.set_viewed_tab(7, Some(second)).unwrap();
-        assert_eq!(ws.active().1, first, "the selection must not move");
-        assert!(!raises(&ws, second));
-        assert!(raises(&ws, first));
-    }
-
-    /// A null focus withdraws the statement and nothing else: the
-    /// selection is where the client left it, so a reconnect restores the
-    /// same tab.
-    #[test]
-    fn a_null_client_focus_unmutes_without_moving_the_selection() {
-        let (ws, first, _second) = session_like_ws();
-        ws.set_viewed_tab(7, Some(first)).unwrap();
-
-        ws.set_viewed_tab(7, None).unwrap();
-        assert_eq!(ws.active().1, first, "the selection must not move");
-        assert!(raises(&ws, first));
-    }
-
-    /// Atomic: an unknown tab is refused with nothing applied. A partial
-    /// apply here would leave this connection muting some other tab.
-    #[test]
-    fn an_unknown_tab_leaves_the_reported_focus_untouched() {
-        let (ws, first, second) = session_like_ws();
-        ws.set_viewed_tab(7, Some(second)).unwrap();
-
-        let refused = ws.set_viewed_tab(7, Some(9_999)).unwrap_err();
-        assert!(matches!(refused, WorkspaceError::TabNotFound(9_999)));
-        assert_eq!(ws.active().1, first, "the selection must not have moved");
-        assert!(!raises(&ws, second), "the standing claim still holds");
-    }
-
-    /// A focus statement never commits: it is not persisted state and no
-    /// event carries it, so re-stating one — which every reconnect does —
-    /// cannot make every attached client re-render.
-    #[test]
-    fn a_client_focus_never_commits() {
+    fn every_fire_carries_the_next_generation() {
         let (ws, first, second) = session_like_ws();
         let mut rx = ws.subscribe();
 
-        ws.set_viewed_tab(7, Some(second)).unwrap();
-        ws.set_viewed_tab(7, Some(second)).unwrap();
-        ws.set_viewed_tab(7, None).unwrap();
-        ws.set_viewed_tab(7, Some(first)).unwrap();
-        assert!(drain(&mut rx).is_empty());
+        assert!(raises(&ws, first));
+        assert!(raises(&ws, second));
+        assert!(raises(&ws, first));
+        let events = drain(&mut rx);
+
+        let firsts: Vec<u64> = events
+            .iter()
+            .filter_map(|event| match event {
+                WorkspaceEvent::NotificationFired {
+                    tab_id, generation, ..
+                } if *tab_id == first => Some(*generation),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(firsts, vec![1, 2], "counted per tab, from one");
+        assert_eq!(fired_generation(&events, second), 1);
     }
 
-    /// Two connections on the *same* tab: it stays muted until the last
-    /// of them stops looking, so one client's close cannot un-mute a tab
-    /// another is still showing.
+    /// A suppressed raise mints nothing. The counter numbers the raises
+    /// a client was *told* about, so a generation it never saw cannot
+    /// leave a gap that makes its acknowledgement stale.
     #[test]
-    fn a_tab_two_connections_view_is_muted_until_both_leave() {
+    fn a_suppressed_raise_does_not_mint_a_generation() {
         let (ws, first, _second) = session_like_ws();
-        ws.set_viewed_tab(1, Some(first)).unwrap();
-        ws.set_viewed_tab(2, Some(first)).unwrap();
+        ws.set_window_focused(true);
+        let mut rx = ws.subscribe();
 
-        ws.set_viewed_tab(1, None).unwrap();
-        assert!(!raises(&ws, first));
-
-        ws.forget_viewer(2);
+        assert!(!raises(&ws, first), "the selected tab of a focused window");
+        ws.set_window_focused(false);
         assert!(raises(&ws, first));
+
+        assert_eq!(fired_generation(&drain(&mut rx), first), 1);
+    }
+
+    /// The acknowledgement in its ordinary form: the client names the
+    /// raise it read, the engine agrees it is current, the bit goes down
+    /// and the edge fans out to everyone else.
+    #[test]
+    fn a_current_generation_clears_and_says_so() {
+        let (ws, first, _second) = session_like_ws();
+        let mut rx = ws.subscribe();
+        assert!(raises(&ws, first));
+        let generation = fired_generation(&drain(&mut rx), first);
+
+        assert!(ws.clear_notification(first, Some(generation)).unwrap());
+        assert!(!ws.tab(first).unwrap().has_notification);
+        assert!(drain(&mut rx).iter().any(|event| matches!(
+            event,
+            WorkspaceEvent::TabNotification {
+                tab_id,
+                has_pending: false,
+            } if *tab_id == first
+        )));
+    }
+
+    /// The race #474's panel review named: A fires, the viewing client
+    /// acknowledges A, B fires, and A's acknowledgement lands afterwards.
+    /// It must not erase B — the user has not seen B.
+    #[test]
+    fn a_stale_generation_leaves_the_newer_notification_standing() {
+        let (ws, first, _second) = session_like_ws();
+        let mut rx = ws.subscribe();
+
+        assert!(raises(&ws, first));
+        let stale = fired_generation(&drain(&mut rx), first);
+        assert!(ws.clear_notification(first, Some(stale)).unwrap());
+        assert!(raises(&ws, first), "and a second one arrives");
+        let _ = drain(&mut rx);
+
+        assert!(
+            !ws.clear_notification(first, Some(stale)).unwrap(),
+            "the late acknowledgement answers a raise that is over"
+        );
+        assert!(
+            ws.tab(first).unwrap().has_notification,
+            "so the notification nobody has seen is still standing"
+        );
+        assert!(
+            drain(&mut rx).is_empty(),
+            "and a refused acknowledgement commits nothing at all"
+        );
+    }
+
+    /// Two clients looking at the same tab both acknowledge the same
+    /// raise. Both are current; the second is simply told it arrived
+    /// second, which is an answer and not an error.
+    #[test]
+    fn a_second_acknowledgement_of_one_raise_answers_cleared_false() {
+        let (ws, first, _second) = session_like_ws();
+        let mut rx = ws.subscribe();
+        assert!(raises(&ws, first));
+        let generation = fired_generation(&drain(&mut rx), first);
+
+        assert!(ws.clear_notification(first, Some(generation)).unwrap());
+        assert!(!ws.clear_notification(first, Some(generation)).unwrap());
+    }
+
+    /// Without a generation the clear is unconditional — a person
+    /// clicking the tab, or `roostctl`, is answering the tab rather than
+    /// one raise on it. It still reports whether it is what took the
+    /// notification down.
+    #[test]
+    fn a_clear_with_no_generation_is_unconditional() {
+        let (ws, first, _second) = session_like_ws();
+        assert!(raises(&ws, first));
+        assert!(raises(&ws, first), "two raises deep");
+
+        assert!(ws.clear_notification(first, None).unwrap());
+        assert!(!ws.tab(first).unwrap().has_notification);
+        assert!(
+            !ws.clear_notification(first, None).unwrap(),
+            "nothing left to take down"
+        );
+    }
+
+    /// An unknown tab is refused rather than answered `cleared: false`:
+    /// a client naming a tab that just closed needs to tell "gone" from
+    /// "somebody got there first".
+    #[test]
+    fn clearing_an_unknown_tab_is_refused() {
+        let (ws, _first, _second) = session_like_ws();
+        let refused = ws.clear_notification(9_999, None).unwrap_err();
+        assert!(matches!(refused, WorkspaceError::TabNotFound(9_999)));
     }
 
     /// Structured attention is NEVER gated on agent ownership (plan
@@ -4883,11 +5036,16 @@ mod tests {
         assert!(cut.replay[0].events.is_empty());
     }
 
-    /// Effects are the driving client's live side-channel and are never
-    /// replayed — not even to the driver. `notification.fired` is a
-    /// workspace fact and is.
+    /// Moments do not replay; the state they leave behind does (#474).
+    ///
+    /// A bell, a save failure and a banner are all things that
+    /// *happened*; a resuming client that is handed one is told about a
+    /// present tense that is over — most sharply for a notification,
+    /// whose acknowledgement may be sitting in the very same gap. The
+    /// pending bit committed beside the banner is state and stays, which
+    /// is what a resumed client rebuilds the dot from.
     #[test]
-    fn the_ring_strips_effects_and_keeps_a_fired_notification() {
+    fn the_ring_strips_every_moment_and_keeps_the_state_beside_it() {
         let ws = replaying(REPLAY_WINDOW, REPLAY_BUDGET_BYTES);
         let project = ws.create_project("p", "/").unwrap().id;
         let tab = ws.open_tab(project, "/", "watched").unwrap().id;
@@ -4914,11 +5072,21 @@ mod tests {
             "an effects-only commit replays as an empty batch, revision and all"
         );
         assert!(
-            batch(fired)
+            !batch(fired)
                 .events
                 .iter()
                 .any(|event| matches!(event, WorkspaceEvent::NotificationFired { .. })),
-            "a watcher resumes to catch exactly the notification it missed"
+            "a banner is a moment and never replays"
+        );
+        assert!(
+            batch(fired).events.iter().any(|event| matches!(
+                event,
+                WorkspaceEvent::TabNotification {
+                    has_pending: true,
+                    ..
+                }
+            )),
+            "the pending bit rode the same commit and is state"
         );
     }
 

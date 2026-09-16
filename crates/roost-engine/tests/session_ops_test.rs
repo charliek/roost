@@ -138,7 +138,6 @@ async fn a_ui_socket_does_not_know_the_session_ops() {
     for op in [
         ops::SESSION_IDENTIFY,
         ops::SESSION_STOP,
-        ops::SESSION_SET_FOCUS,
         ops::SESSION_SET_AGENT_HOOKS,
         ops::SESSION_PUT_FILE,
     ] {
@@ -312,19 +311,10 @@ async fn session_stop_reaps_latches_and_finalizes() {
     .expect_err("project.create after stop");
     assert_eq!(err.code, "shutting-down");
 
-    let err = call(
-        &f.handler,
-        ops::SESSION_SET_FOCUS,
-        serde_json::json!({"focused_tab_id": null}),
-    )
-    .await
-    .expect_err("session.set_focus after stop");
-    assert_eq!(err.code, "shutting-down");
-
-    // Same latch, and this one matters more than a focus: the entries it
-    // writes point at a `roostctl` reporting to a socket this session is
-    // about to unlink, so a wiring that lands after the stop is a wiring
-    // nothing on the far side can honour.
+    // The latch covers the world-changing ops, and this one matters
+    // most: the entries it writes point at a `roostctl` reporting to a
+    // socket this session is about to unlink, so a wiring that lands
+    // after the stop is a wiring nothing on the far side can honour.
     let err = call(
         &f.handler,
         ops::SESSION_SET_AGENT_HOOKS,
@@ -498,11 +488,10 @@ async fn a_session_socket_serves_a_plain_tab_write() {
     read_until(&mut output, b"TYPED!", "a session socket write").await;
 }
 
-/// Two connections, and neither one is privileged: both write, and both
-/// may state what they are looking at. A second connection arriving is
-/// not an event the first one has to survive.
+/// Two connections, and neither one is privileged: both write. A second
+/// connection arriving is not an event the first one has to survive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_connections_both_write_and_both_report_a_focus() {
+async fn two_connections_both_write_and_neither_displaces_the_other() {
     let f = fixture(true);
     let first = conn(1);
     let second = conn(2);
@@ -514,15 +503,6 @@ async fn two_connections_both_write_and_both_report_a_focus() {
             .await
             .expect("every connection writes");
         read_until(&mut output, b"TYPED!", "a write on either connection").await;
-
-        f.handler
-            .handle(
-                ctx,
-                ops::SESSION_SET_FOCUS,
-                serde_json::json!({"focused_tab_id": null}),
-            )
-            .await
-            .expect("either connection may report what it is viewing");
     }
 }
 

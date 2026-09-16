@@ -316,7 +316,6 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ("session.identify", OpClass::SessionOnly),
     ("session.stop", OpClass::SessionOnly),
     ("session.set_theme", OpClass::SessionOnly),
-    ("session.set_focus", OpClass::SessionOnly),
     ("session.set_agent_hooks", OpClass::SessionOnly),
     ("session.put_file", OpClass::SessionOnly),
     ("tab.opened", OpClass::Event),

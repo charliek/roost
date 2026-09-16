@@ -128,7 +128,7 @@ async fn a_second_client_gates_nothing_and_deposes_nobody() {
     let (handle, _seen) = recording_backend();
     let f = fixture_with(Some(handle));
     let project = f.workspace.create_project("p", "/tmp").unwrap();
-    let tab = f.workspace.open_tab(project.id, "/tmp", "sh").unwrap().id;
+    f.workspace.open_tab(project.id, "/tmp", "sh").unwrap();
 
     let first = conn(1);
     let stream = conn(2);
@@ -145,14 +145,6 @@ async fn a_second_client_gates_nothing_and_deposes_nobody() {
     );
     assert_eq!(stream.watch.reason(), None);
 
-    f.handler
-        .handle(
-            &first.ctx,
-            ops::SESSION_SET_FOCUS,
-            serde_json::json!({"focused_tab_id": tab.to_string()}),
-        )
-        .await
-        .expect("session.set_focus");
     f.handler
         .handle(
             &first.ctx,
@@ -360,10 +352,6 @@ async fn session_connect_and_a_lease_bearing_request_are_both_refused() {
         (
             ops::SESSION_SET_THEME,
             serde_json::json!({"lease": "l", "osc_colors": {"palette": vec!["#000000"; 256], "foreground": "#ffffff", "background": "#000000", "cursor": "#ffffff"}}),
-        ),
-        (
-            ops::SESSION_SET_FOCUS,
-            serde_json::json!({"lease": "l", "focused_tab_id": tab.to_string()}),
         ),
         (
             ops::SESSION_SET_AGENT_HOOKS,

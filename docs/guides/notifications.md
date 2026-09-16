@@ -41,6 +41,24 @@ When it holds, the notification is dropped **before** it's recorded anywhere —
 
 The three surfaces are coupled on purpose. Inbox membership *is* the tab's pending-notification bit — the same `has_notification` flag that drives the badge — so "suppress the banner and badge but keep the inbox row" isn't expressible without tracking notification history separately from pending state. That's a durable-notification-history feature, and it's explicitly out of scope; rather than smuggle half of it in, the three stay coherently coupled: a notification for the tab you are actively looking at is considered seen.
 
+### On a host session, the window decides — not the session
+
+The predicate above reads *one window*, and a [host session](host-sessions.md) has none. So a session suppresses nothing: every raise sets the pending bit and is pushed to every connected client. **Each window then answers for itself**, applying exactly the same predicate to its own focus and its own selection:
+
+- The window showing that tab, with the focus, **shows no banner** and sends a quiet acknowledgement, which takes the badge and the inbox row down on *every* client — not just its own. It also never paints the tab as pending in the meantime, so nothing flashes at the person who is already looking.
+- Every other window banners as usual, and keeps the badge until somebody clears it or selects the tab.
+
+This matters even with one machine: on a fresh install your own tabs run in a session, so this is your laptop's own path and not only the multi-device one.
+
+Because the answer now travels, four things are true that were not when the session made the decision:
+
+- **Another window may show the badge for the moment the acknowledgement takes to arrive.** The window that is looking never does.
+- **Two windows on the same tab both acknowledge.** The second one is simply told it arrived second; nothing breaks, and nothing is cleared twice.
+- **Bringing a window back to the front does not clear a badge.** Focus alone has never acknowledged anything — locally or on a host. Selecting the tab does.
+- **A desktop banner already on your screen stays until you dismiss it**, even when another client clears the tab. The badge and the inbox row go; the banner is yours.
+
+The badge is *state* and is rebuilt from the session's tab list whenever a client resyncs. The banner is a *moment* and is never replayed — a client that resumes after a gap does not get a banner for something that has since been answered.
+
 The **sticky agent-state indicator is the one exception** — it is never focus-cleared. That is what covers "I walked away and came back": even though the badge and inbox row for an earlier notification are long gone, the dot still shows `needs_input` (or the failed/red state) for a tab that wants you.
 
 ## Triaging across projects

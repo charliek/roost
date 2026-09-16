@@ -42,7 +42,7 @@ import session as sessionlib
 from client import Roost, RoostError, scaled_timeout
 from dataplane import DataPlane
 from eventstream import EventStream
-from test_session_effects import set_focus, theme
+from test_session_effects import clear_notification, theme
 
 pytestmark = pytest.mark.session_daemon
 
@@ -380,9 +380,10 @@ def test_a_second_client_changes_nothing_for_the_first(env):
         tab = quiet_tab(first, project, env.launch_cwd)
 
         # Client B, doing the loudest thing the wire still carries: it
-        # reads the session and states a focus of its own.
+        # reads the session and answers a notification on the same tab.
         second.tabs()
-        set_focus(second, tab)
+        second.notify(tab, "from the second client")
+        assert clear_notification(second, tab) is True
 
         first.call("session.set_theme", {"osc_colors": theme()})
         wired = first.call(
@@ -401,7 +402,8 @@ def test_a_second_client_changes_nothing_for_the_first(env):
         )
         assert landed["bytes"] == 2, landed
 
-        set_focus(first, tab)
+        first.notify(tab, "and from the first")
+        assert clear_notification(first, tab) is True
 
         conn, reply, _ticket = attached(env, first, tab)
         assert reply.ok, reply.raw

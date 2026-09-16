@@ -1,7 +1,0 @@
-{
-  "id": "9",
-  "op": "session.set_focus",
-  "params": {
-    "focused_tab_id": "5"
-  }
-}

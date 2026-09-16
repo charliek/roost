@@ -938,10 +938,11 @@ thing roost measures itself against ships today.
 **What the lease still means.** Being the foreground is exactly four
 things: the connection's `events.subscribe` stream is classified driver
 and receives `tab.effect` (bells, OSC 52 clipboard writes); its
-`session.set_focus` is the one that mutes notifications;
+reported focus is the one that mutes notifications;
 `session.driver_changed` names it; and the session-wide settings and
 upload ops — `session.set_theme`, `session.set_agent_hooks`,
-`session.put_file`, `session.set_focus` — accept only its lease. It
+`session.put_file`, and the since-deleted `session.set_focus` — accept
+only its lease. It
 never again gates `tab.write` or `tab.attach`. `session.connect
 {takeover}` itself is unchanged: one holder, takeover invalidates and
 tombstones the old one, `already-connected` without `takeover` — what
@@ -1016,9 +1017,9 @@ a coordination problem that turned out not to need a single answer.
 you are viewing from gets the notifications; other connected clients
 may get them too. That is "deliver to every subscriber, and each
 client applies an effect to the tab it is viewing" — not an election.
-The one thing that genuinely needs a single answer — which tab is
-muted because someone is looking at it — is a **union** over
-connections, not a claim.
+The one thing that looked like it needed a single answer — which tab is
+muted because someone is looking at it — turned out not to need an
+answer at the session at all (see rule 2).
 
 **Two rules replace the lease, in full:**
 
@@ -1028,11 +1029,18 @@ connections, not a claim.
    the tab that client is actually viewing, independent of window
    focus. There is no "driver" stream and no `session.driver_changed`
    — every stream is the same stream.
-2. **Focus is a union.** `session.set_focus` is a per-connection
-   viewing statement that moves nothing else; a tab is muted while
-   **any** connection says it is looking at it. Two clients on two
-   different tabs both get muted correctly, with no re-election and no
-   ping-pong between them.
+2. **Notifications fan out; each client answers for its own window.**
+   A session suppresses nothing — it has no window, so it has nothing
+   to suppress *with*. Every raise sets the pending bit and pushes
+   `tab.notification` and `notification.fired` to every subscriber; the
+   client that is showing that tab, focused, raises no banner and sends
+   a generation-checked `tab.clear_notification`, which takes the dot
+   down everywhere. *Amended 2026-09-15 (#474):* this rule first read
+   "focus is a union" — each connection stated what it was viewing via
+   a `session.set_focus` op and a tab was muted while any connection
+   claimed it. A union mutes the wrong people: a phone left open on a
+   tab silenced the laptop. The op is deleted; the predicate it fed now
+   reads only the workspace's own window.
 
 Session protocol `5` retires `session.connect`, the `lease` field on
 every op, `session.driver_changed`, and the four retired refusal codes

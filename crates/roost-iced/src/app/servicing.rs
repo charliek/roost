@@ -984,6 +984,24 @@ pub(super) fn view_incarnation(incarnation: Option<HostId>) -> HostId {
     incarnation.unwrap_or(HostId::LOCAL)
 }
 
+/// Whether this window answers a `notification.fired` itself, and with
+/// which generation — `None` means it banners instead (#474).
+///
+/// A session fires for every client because only a client knows what its
+/// own window is showing; the one already reading the tab answers for
+/// all of them, and its `tab.clear_notification` takes the dot down
+/// wherever it is up rather than each client deciding separately what it
+/// can see.
+///
+/// The answer carries **the generation of the raise it read**, never the
+/// tab's latest. Over the round trip a second raise can land, and an
+/// acknowledgement that named the tab rather than the raise would erase
+/// a notification nobody has seen — see
+/// `TabClearNotificationParams::generation`.
+fn acknowledged_generation(viewed: Option<TabKey>, fired: TabKey, generation: u64) -> Option<u64> {
+    (viewed == Some(fired)).then_some(generation)
+}
+
 /// Drop the pending bit from the one tab this window is reading (#474).
 ///
 /// Applied where a mirror's rows become UI state, which is the single
@@ -1696,17 +1714,11 @@ impl App {
                 }
                 HostEnvelopeAction::Notify(fired) => {
                     let key = TabKey::new(host, fired.tab_id);
-                    // #474's client rule. A session fires for every
-                    // client because only a client knows what its window
-                    // is showing; the one already reading the tab
-                    // answers for all of them, and its
-                    // `tab.clear_notification` takes the dot down
-                    // wherever it is up rather than each client deciding
-                    // separately what it can see.
-                    if self.viewed_host_tab() == Some(key) {
-                        self.send_host_clear_notification(key);
-                    } else {
-                        self.fire_notification(key, fired.title, fired.body);
+                    match acknowledged_generation(self.viewed_host_tab(), key, fired.generation) {
+                        Some(generation) => {
+                            self.send_host_clear_notification(key, Some(generation))
+                        }
+                        None => self.fire_notification(key, fired.title, fired.body),
                     }
                 }
                 HostEnvelopeAction::ClearNotification(tab_id) => {
@@ -2337,6 +2349,11 @@ impl App {
                 tab_id,
                 title,
                 body,
+                // The in-process engine has already applied this
+                // window's focus rule — a raise that reaches here is one
+                // nobody was looking at — so there is nothing to
+                // acknowledge and no generation to name.
+                generation: _,
             } => {
                 // The workspace broadcast is one backend's id-space.
                 let tab = self.backend.tab_key(tab_id);
@@ -5132,6 +5149,39 @@ mod tests {
         let mut elsewhere = pending();
         clear_viewed_pending(&mut elsewhere, HostId::new(9), Some(TabKey::new(host, 7)));
         assert!(elsewhere[0].tabs[0].has_notification);
+    }
+
+    /// #474's answer half: who acknowledges, and with what.
+    ///
+    /// The generation is the load-bearing part. It is the one the *fire*
+    /// carried, not the tab's latest — an acknowledgement that named the
+    /// tab instead would erase a raise that landed while it was in
+    /// flight, which is the race the field exists to close.
+    #[test]
+    fn the_window_reading_a_tab_acknowledges_the_raise_it_read() {
+        let host = HostId::new(3);
+        let read = TabKey::new(host, 7);
+
+        assert_eq!(
+            acknowledged_generation(Some(read), read, 9),
+            Some(9),
+            "the window reading the tab answers, naming that raise"
+        );
+        assert_eq!(
+            acknowledged_generation(Some(TabKey::new(host, 8)), read, 9),
+            None,
+            "a window reading another tab banners instead"
+        );
+        assert_eq!(
+            acknowledged_generation(Some(TabKey::new(HostId::new(9), 7)), read, 9),
+            None,
+            "and so does the same bare number on another incarnation"
+        );
+        assert_eq!(
+            acknowledged_generation(None, read, 9),
+            None,
+            "an unfocused window, or one on a local tab, claims nothing"
+        );
     }
 
     /// A malformed payload is reported as undecodable rather than

@@ -1320,11 +1320,39 @@ pub struct TabSetStateParams {
     pub state: TabState,
 }
 
+/// [`ops::TAB_CLEAR_NOTIFICATION`] params: take a tab's pending
+/// notification down.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabClearNotificationParams {
     #[serde(with = "string_int64")]
     pub tab_id: i64,
+    /// The [`NotificationFiredEvent::generation`] this clear
+    /// acknowledges, or `None` for "take it down whatever it is".
+    ///
+    /// Two different callers, two different meanings. A person clicking
+    /// the tab, or `roostctl tab clear-notification`, is answering the
+    /// tab and omits this: whatever is up comes down. A client clearing
+    /// *automatically* because it is already reading the tab (#474) is
+    /// answering one raise, and names it — otherwise the race is real:
+    /// A fires, the viewing client acknowledges A, B fires, and A's
+    /// acknowledgement lands afterwards and erases a notification
+    /// nobody has seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+}
+
+/// [`ops::TAB_CLEAR_NOTIFICATION`] reply.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabClearNotificationResult {
+    /// Whether this call is what took a pending notification down.
+    ///
+    /// `false` for a clear on a tab with nothing pending and for one
+    /// whose `generation` names a raise that has been superseded — both
+    /// are ordinary answers, not errors. Two clients looking at the
+    /// same tab both acknowledge the same raise; the second is told it
+    /// arrived second.
+    pub cleared: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1807,6 +1835,21 @@ pub struct NotificationFiredEvent {
     pub title: String,
     #[serde(default)]
     pub body: String,
+    /// Which raise on this tab this is — a per-tab counter the engine
+    /// bumps every time a notification actually fires (#474).
+    ///
+    /// It exists so an acknowledgement can name the thing it answers.
+    /// A client that clears on its own behalf sends this value back in
+    /// [`TabClearNotificationParams::generation`], and a clear that
+    /// names a superseded raise is refused rather than erasing the
+    /// newer one it never saw.
+    ///
+    /// Defaulted for the same reason every other additive field is: a
+    /// peer that predates it decodes to `0`, which is a generation no
+    /// raise ever mints, so its acknowledgements are simply ignored
+    /// rather than mis-applied.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// `agent_report.changed` — the full agent record after an accepted
@@ -1850,13 +1893,15 @@ pub struct AgentReportChangedEvent {
 /// owner, no lease and no foreground: reading, typing, attaching and
 /// every `session.set_*` op are open to all of them, last writer wins.
 /// [`ops::EVENT_TAB_EFFECT`] fans out to every subscriber, and each
-/// client decides what to do with it. [`ops::SESSION_SET_FOCUS`] is a
-/// per-connection statement about what that client is looking at — a
-/// tab is muted while *any* connection views it — and the PTY is sized
-/// by whoever interacted with it last. [`ops::SESSION_SET_AGENT_HOOKS`]
-/// is a **raise, never a lower**: a client widens the host's own
-/// `agent-hooks` key with its own allow-list and can only ever add to
-/// it (plan 064 §3.3).
+/// client decides what to do with it. So does
+/// [`ops::EVENT_NOTIFICATION_FIRED`]: a session suppresses nothing,
+/// because only a client knows what its own window is showing, and the
+/// client already reading the tab answers for all of them with a
+/// generation-checked [`ops::TAB_CLEAR_NOTIFICATION`] (#474). The PTY is
+/// sized by whoever interacted with it last.
+/// [`ops::SESSION_SET_AGENT_HOOKS`] is a **raise, never a lower**: a
+/// client widens the host's own `agent-hooks` key with its own
+/// allow-list and can only ever add to it (plan 064 §3.3).
 ///
 /// # The versioning rule
 ///
@@ -2682,32 +2727,6 @@ pub struct SessionSetThemeResult {
     pub tabs: u32,
 }
 
-/// [`ops::SESSION_SET_FOCUS`] params: what the connected client is
-/// actually looking at.
-///
-/// A session's own workspace has no window, so nothing it can see tells
-/// it which tab a user has on screen and every agent would raise into a
-/// surface nobody is reading. This op is how a client that *does* have a
-/// window states it. Per connection and unioned: a tab is muted while
-/// any client says it is looking at it, and the statement moves nothing
-/// else — not the session's selection, which only `tab.focus` moves.
-///
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SessionSetFocusParams {
-    /// The session tab the client is looking at, or `null` for "nothing
-    /// on this session is being looked at" (the window lost focus, or
-    /// the selection moved to another host or to a local tab).
-    ///
-    /// **Required, and null is not the same as absent.** An omitted
-    /// field is a client that forgot to say, and guessing on its behalf
-    /// is how the mute this op exists to fix would come back; it is
-    /// refused instead ([`option_string_int64`] has no serde default, so
-    /// the missing field fails the decode).
-    #[serde(with = "option_string_int64")]
-    pub focused_tab_id: Option<i64>,
-}
-
 /// [`ops::SESSION_SET_AGENT_HOOKS`] params: raise the host's `agent-hooks`
 /// key to (at least) the connected client's own allow-list.
 ///
@@ -3074,13 +3093,6 @@ pub mod ops {
     /// theme palette, and remember it for the tabs opened next.
     /// Last-writer-wins between concurrent clients.
     pub const SESSION_SET_THEME: &str = "session.set_theme";
-    /// Push this connection's real focus — which of this session's tabs
-    /// it is looking at, or none — so the session's own
-    /// notification-suppression predicate reads a client's window
-    /// instead of a headless default. Per connection and unioned: a tab
-    /// is muted while any connection views it, and a connection's
-    /// statement dies with it.
-    pub const SESSION_SET_FOCUS: &str = "session.set_focus";
     /// Bring the host's agent hook entries in line with the connected
     /// client's `agent-hooks` configuration — wiring them, refreshing
     /// them, or taking them back out. Served only by a session that was
@@ -3337,36 +3349,6 @@ pub mod string_int64 {
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<i64, D::Error> {
         let raw = String::deserialize(de)?;
         raw.parse::<i64>()
-            .map_err(|_| serde::de::Error::custom(format!("invalid int64 string: {raw}")))
-    }
-}
-
-/// [`string_int64`] for a field that is **required but nullable**:
-/// `"5"` or `null`, never absent.
-///
-/// The distinction is the point. `Option<i64>` with the usual
-/// `#[serde(default)]` would decode an omitted field and an explicit
-/// `null` to the same `None`, and for a field whose null carries meaning
-/// ("nothing is focused") that silently promotes a client's omission
-/// into a statement it never made. Used through `#[serde(with = ...)]`
-/// **without** a `default`, so serde's own missing-field error is what
-/// refuses the omission.
-pub mod option_string_int64 {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(value: &Option<i64>, ser: S) -> Result<S::Ok, S::Error> {
-        match value {
-            Some(value) => ser.serialize_str(&value.to_string()),
-            None => ser.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<i64>, D::Error> {
-        let Some(raw) = Option::<String>::deserialize(de)? else {
-            return Ok(None);
-        };
-        raw.parse::<i64>()
-            .map(Some)
             .map_err(|_| serde::de::Error::custom(format!("invalid int64 string: {raw}")))
     }
 }

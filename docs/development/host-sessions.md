@@ -87,7 +87,7 @@ flowchart LR
   AnyClient(("any same-UID<br/>connection")) -- "tab.write, tab.attach,<br/>tab.list, tab.open, ..." --> Live["reads + writes flow —<br/>no gate, ever"]
   Commit(("a workspace commit")) -- "events.subscribe" --> Batch["every subscriber's<br/>stream gets the<br/>same EventBatch"]
   Effect(("tab.effect<br/>(bell / OSC 52)")) -- "fanned out<br/>unfiltered" --> EachClient["each client applies it<br/>by its own policy:<br/>bell → mark the tab;<br/>clipboard → only if viewed"]
-  Focus(("session.set_focus<br/>(per connection)")) -- "unions into" --> Mute["a tab is muted while<br/>ANY connection views it"]
+  Notify(("notification.fired<br/>(every raise)")) -- "fanned out<br/>unfiltered" --> EachWindow["each client decides:<br/>viewing + focused → no banner,<br/>ack with the generation;<br/>otherwise → banner"]
   Size(("tab.attach / tab.write /<br/>INPUT / RESIZE")) -- "last one wins" --> PtySize["the tab's PTY size"]
   Stop(("session.stop<br/>(any client)")) --> Stopping["latches stopping;<br/>every control/data/event<br/>connection labeled + closed"]
   Stopping --> StoppingS["session.stopping<br/>{reason: stop}<br/>(terminal, on every stream)"]
@@ -108,19 +108,33 @@ tmux behaves. A client attached to a different tab, or not attached at
 all, simply never sees its own clipboard touched by somebody else's
 paste.
 
-**Focus is a union, not an election.** `session.set_focus` is a plain
-per-connection statement — "this connection is looking at tab N" — and
-moves nothing else: the session's active selection and persisted
-selection move only through `tab.focus`. A tab is muted while **any**
-connection says it is looking at that tab
-(`tab_is_being_watched(tab) = (window_focused && active_tab_id
-== tab) || viewing.values().any(|t| *t == tab)`); a connection's
-statement is forgotten the moment it restates `null` or the connection
-closes, and nothing else clears it. Two clients on two different tabs
-therefore both get muted correctly, with zero further coordination
-traffic once each has said its own tab once — there is no re-push to
-answer, because nothing about one connection's statement can disagree
-with another's.
+**Notifications fan out; each client answers for its own window**
+([#474](https://github.com/charliek/roost/issues/474), plan 065 §3.2).
+A session suppresses nothing. Its watch predicate reads its own
+workspace and nothing else —
+`tab_is_being_watched(tab) = window_focused && active_tab_id == tab` —
+and a headless session's `window_focused` is down for life, so every
+raise sets `has_notification` and pushes both `tab.notification` and
+`notification.fired` to every subscriber. The client showing that tab,
+focused, raises no banner and sends `tab.clear_notification` carrying
+the event's `generation`, which takes the dot down on every client at
+once; every other client banners as before.
+
+This replaced a union. Until protocol 6 each connection stated what it
+was viewing through a `session.set_focus` op and a tab was muted while
+**any** connection claimed it — which mutes the wrong people: a phone
+left open on a tab silenced the laptop entirely, no dot and no banner.
+The op is deleted (it answers `unknown-op`) and the second clause of the
+predicate with it. The same one-line rule now lives twice, once in
+`Inner::tab_is_being_watched` and once in the iced client's
+`host_focus_claim`, each with its own table test; it was deliberately
+not lifted into a shared crate, because `roost-engine` does not depend
+on `roost-ui-model` and the expression is one boolean.
+
+The generation is what makes the acknowledgement safe over a round trip:
+without it, "A fires → the viewing client acks A → B fires → the ack
+lands" erases a notification nobody has seen. A stale generation is
+answered `cleared: false` and changes nothing.
 
 **Geometry is last-interactor** ([DL-25](vision.md#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08)),
 unchanged by this plan: whichever connection last sent a geometry-
@@ -154,7 +168,7 @@ Two small additions ride the existing events stream as new event types — addit
 
 See [`reference/ipc.md`](../reference/ipc.md#events) for the full event catalog and [`session.set_theme`](../reference/ipc.md#sessionset_theme)'s wire shape.
 
-HS-3 adds one more in the same spirit — [`session.set_focus`](../reference/ipc.md#sessionset_focus), the client's real focus (window focus + which tab is selected), pushed down so the session suppresses notifications for the tab the user is actually looking at rather than for whichever tab its headless workspace defaulted to. Any same-UID connection may send it, and it is deliberately short-lived: the connection that reported it closing, or that same connection restating `null`, reverts *that connection's* slot in the union to "nobody is looking" — because a focus is a statement about a window that may no longer exist, and it is scoped to the connection that made it (see [Multiple clients](#the-leasetakeover-lifecycle)). An older session answers `unknown-op` and keeps the HS-2 behavior described under [Known limitations](#known-limitations).
+HS-3 added one more in the same spirit — `session.set_focus`, the client's real focus (window focus + which tab is selected), pushed down so the session suppressed notifications for the tab the user was actually looking at rather than for whichever tab its headless workspace defaulted to. It is **gone at protocol 6**: the union it fed muted a tab for *every* client while any one of them looked at it, so a phone left open on a tab silenced the laptop. A session now fires unconditionally and each client answers for its own window — see [Multiple clients](#the-leasetakeover-lifecycle) above and [Notifications fan out](../reference/ipc.md#notifications-fan-out) for the wire.
 
 ## Reordering a host's sidebar section
 
@@ -389,7 +403,7 @@ Each of the five pytest lanes needs a UI **and** a daemon, so none of them rides
 
 ## Known limitations
 
-- **A host tab's own attention doesn't reach a client on an older session.** Closed for current sessions by HS-3's [`session.set_focus`](../reference/ipc.md#sessionset_focus): the client pushes its real focus (window focus + selection) down at every edge that moves it, so the session's suppression rule reads the same focus the user has, and the reported focus is forgotten the moment that connection closes. There is no longer an older-session case beneath it: protocol 5's compatibility gate tests exact equality, so a session too old to serve the op never reaches a connected state to exhibit HS-2's behaviour — it lands in `NeedsRestart` with the update or restart offer instead.
+- **A host tab's own attention doesn't reach a client on an older session.** Closed, and since protocol 6 closed the other way round: a session no longer tries to decide what any window can see. It fires every raise to every subscriber and the client showing that tab acknowledges it with a generation-checked [`tab.clear_notification`](../reference/ipc.md#tabclear_notification) — see [Notifications fan out](../reference/ipc.md#notifications-fan-out). There is no older-session case beneath it: protocol 5's compatibility gate tests exact equality, so a session too old to speak this wire never reaches a connected state at all — it lands in `NeedsRestart` with the update or restart offer instead.
 - **Kitty images render blank after attach.** The snapshot payload doesn't currently carry Kitty graphics protocol state (architecture §5).
 - **Missed-while-detached effects still are not replayed; notifications within the replay window now are.** A `tab.effect` (bell, clipboard write) that fired while nobody was attached is still gone, by design (non-goal, not a bug). But a reconnect to the same `session_id` that lands inside the session's bounded replay ring (`ROOST_SESSION_REPLAY_WINDOW`) now *resumes* `events.subscribe` from the last-applied revision instead of re-snapshotting, so any `notification.fired` committed during the gap replays onto the carried mirror and its inbox row appears — the once-only replay and the no-effect rule are the server's existing contract (R5, #440), inherited here rather than changed. A reconnect that falls outside the window, or that the session refuses for any other reason (`replay-expired`, `revision-ahead`, `session-mismatch`), falls back to the ordinary fresh subscribe + `tab.list` snapshot — never fatal, just back to *current* state, exactly as before R11.
 - **One attached tab per host at a time from this client — a client policy, not a server limit.** As of R15 (plan 057) the server itself admits any number of data connections to one tab (bounded only by the outstanding-token quota per TTL plus the concurrent-snapshot cap, both named in [`ipc.md`](../reference/ipc.md)); a second window or a phone can attach to the same tab this client has open and both type, with neither displacing the other. What is unchanged is this client's own attach-on-focus policy: it dials a tab's data connection only while that tab is focused and detaches on blur, so it never itself holds more than one live data connection at a time. Multi-attach *from one client* (a warm pool of several tabs' connections at once) is still explicit future work.

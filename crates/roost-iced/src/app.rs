@@ -1509,7 +1509,11 @@ fn host_selection_detach(
 /// "The window is unfocused" and "the selection moved to another host"
 /// therefore both have to read as *no* claim rather than as a stale one.
 /// Only host tabs appear here — a local selection is `None`, because the
-/// in-process backend evaluates the same rule inside the engine.
+/// in-process backend evaluates the same rule inside the engine
+/// (`Inner::tab_is_being_watched`). The two copies are deliberate:
+/// `roost-engine` does not depend on this crate, and the rule is one
+/// boolean each, so each side pins its own with a table test rather than
+/// sharing a function across a dependency edge that does not exist.
 fn host_focus_claim(window_focused: bool, selection: Option<HostSelection>) -> Option<TabKey> {
     selection.filter(|_| window_focused).map(|it| it.tab)
 }
@@ -6523,7 +6527,9 @@ impl App {
         // The bell half is ours alone: the session kept no flag for it,
         // so nothing coming back over the wire would ever retire it.
         self.host_bells.remove(&tab);
-        self.send_host_clear_notification(tab);
+        // No generation: the person clicked the tab, which answers
+        // whatever is pending on it rather than one raise.
+        self.send_host_clear_notification(tab, None);
     }
 
     /// The op half of a clear, without the client-local bell.
@@ -6531,6 +6537,9 @@ impl App {
     /// #474's automatic acknowledgement answers one `notification.fired`
     /// and nothing else: a bell this window has not shown the user yet is
     /// not something a session's notification may retire on their behalf.
+    /// It names that raise's `generation` for the same reason — see
+    /// `TabClearNotificationParams::generation` for the race a bare
+    /// clear loses.
     ///
     /// Fire-and-forget, and **event-confirmed**: the session answers by
     /// committing `tab.notification { has_pending: false }`, and that
@@ -6538,10 +6547,17 @@ impl App {
     /// §3.9's no-optimistic-rows rule). Clearing here as well would take
     /// the row down before the host agreed, and put it back on the next
     /// reconcile if the op was refused.
-    fn send_host_clear_notification(&mut self, tab: TabKey) {
+    fn send_host_clear_notification(&mut self, tab: TabKey, generation: Option<u64>) {
+        // Built through the params type so the omit-when-unset spelling
+        // is the one the wire pins, not one this call site restates.
+        let params = serde_json::to_value(roost_ipc::messages::TabClearNotificationParams {
+            tab_id: tab.tab,
+            generation,
+        })
+        .expect("clear-notification params serialize");
         let intent = crate::host_conn::HostIntent::new(
             roost_ipc::messages::ops::TAB_CLEAR_NOTIFICATION,
-            serde_json::json!({ "tab_id": tab.tab.to_string() }),
+            params,
         );
         if self.hosts.send_at(tab.host, intent).is_err() {
             tracing::debug!(%tab, "could not clear the attention marker on a host tab");
