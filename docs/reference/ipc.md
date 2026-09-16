@@ -2857,7 +2857,10 @@ is the ticket form, where `attach` is the single-use token
 [`tab.attach`](#tabattach) minted and nothing else is negotiated here.
 The presence of `kinds` is the discriminator — never whether `attach`
 parses as a number, because a 32-hex token can be all digits by
-accident.
+accident, and never whether `kinds` held anything: `"kinds": null` is
+an inline handshake stating no kind, which is a `parse-error` naming
+the term. Either form ends in the same admission, so a ticket is no way
+around `too-many-attaches`.
 
 **Scope:** this sniff exists on Rust-served sockets only. The Mac UI's
 Swift IPC server has no data plane and is untouched — a handshake line
@@ -2886,13 +2889,13 @@ the bytes after it are frames:
 | `protocol-mismatch` | wrong `protocol_version`. Checked **first**, on the raw line: the two ends disagree about what every other term means, and naming one of those would send the client hunting for the wrong bug. |
 | `session-mismatch` | `session_id` is not this session's. |
 | `invalid-token` | ticket form only: unknown, expired, already-used, or minted by a control connection that has since gone away (see [`tab.attach`](#tabattach)). |
-| `not-found` | the tab has no live terminal, or was respawned between the handshake and the fence. |
+| `not-found` | the tab has no live terminal, or was respawned around the hand-off this attach was admitted for — the tab task reports which generation actually served it, so a stream from a replaced terminal is refused rather than painted under the old tab's identity. |
 | `unsupported-kind` | no `kinds` entry is one this session advertises. |
 | `build-mismatch` | the only servable kind needs the same libghostty on both ends. |
 | `invalid-param` | `attach` is not a tab id, or the grid is zero-sized. |
 | `too-many-attaches` | this session already serves `MAX_DATA_CONNS_PER_SESSION` (32) data connections. One buggy same-UID client can hold all of them; that is accepted under the same-UID boundary this socket already draws. |
 | `snapshot-failed` | the terminal could not be encoded right now. Re-attach is the recovery — it is about this instant, not about the client. For `vt` this also covers a terminal whose VT parser sits mid-sequence with no retained continuation for the whole attach budget: the encode is parked and retried after each further chunk rather than emitting a payload that would desync the client, and the budget is what bounds that wait. |
-| `shutting-down` | `session.stop` has latched. |
+| `shutting-down` | `session.stop` has latched. Read before the tab is looked up, so a stop that already reaped the tab still answers this and not `not-found`: what went away is the session, not one tab, and a client that removed the tab from its UI over a `not-found` would be acting on the wrong news. |
 | `parse-error` | the handshake line did not decode. |
 | `not-supported` | this socket serves no data connections. |
 

@@ -676,7 +676,9 @@ fn sample_handshake_terms() -> AttachHandshakeTerms {
 /// The discriminator is the presence of `kinds`, never whether `attach`
 /// parses as a number: a token is hex and could be all digits by
 /// accident, and a tab id read as a token would be refused as a
-/// credential nobody minted.
+/// credential nobody minted. Nor is it whether `kinds` held anything —
+/// `null` is a key that is *there*, so the line is an inline handshake
+/// stating no kind, and the decode says so.
 #[test]
 fn the_presence_of_kinds_is_what_makes_a_handshake_inline() {
     let all_digits: AttachHandshake =
@@ -684,6 +686,16 @@ fn the_presence_of_kinds_is_what_makes_a_handshake_inline() {
     assert!(
         all_digits.terms.is_none(),
         "an all-digit token stays the ticket form"
+    );
+
+    let error = serde_json::from_str::<AttachHandshake>(concat!(
+        r#"{"attach":"7","protocol_version":6,"session_id":"s","kinds":null,"#,
+        r#""cols":80,"rows":24,"libghostty_build":"b","focus":false}"#,
+    ))
+    .expect_err("a null `kinds` is an inline handshake with no kinds");
+    assert!(
+        error.to_string().contains("kinds"),
+        "the error names the term: {error}"
     );
 
     let inline: AttachHandshake = serde_json::from_str(concat!(

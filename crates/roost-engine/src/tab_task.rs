@@ -133,10 +133,44 @@ impl ServerVtWorkspace for crate::Workspace {
     }
 }
 
+/// A test seam: whoever reaches the point this is installed at
+/// announces itself and waits to be let go.
+///
+/// An attach has two windows a respawn of its tab can fall into, and
+/// neither can be entered from outside: between the admission that
+/// captured the tab's identity and the resize that acts on it, and
+/// between the forwarder's lookup and the tab task's own turn at the
+/// hand-off. The tests that have to stand inside one park it here and
+/// do the respawn themselves. Nothing but a test ever builds one.
+pub struct AttachPause(mpsc::UnboundedSender<oneshot::Sender<()>>);
+
+/// What a test holds to let parked attaches through, one at a time.
+pub type AttachReleases = mpsc::UnboundedReceiver<oneshot::Sender<()>>;
+
+impl AttachPause {
+    #[must_use]
+    pub fn new() -> (Self, AttachReleases) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Self(tx), rx)
+    }
+
+    /// Announce arrival and wait to be let go. A dropped receiver is not
+    /// a wait: a test that has stopped holding the seam open is one
+    /// everything runs through.
+    async fn wait(&self) {
+        let (release_tx, release_rx) = oneshot::channel();
+        if self.0.send(release_tx).is_ok() {
+            let _ = release_rx.await;
+        }
+    }
+}
+
 /// Runtime configuration for [`crate::PtySupervisor::enable_server_vt`].
 pub struct ServerVtConfig {
     workspace: Arc<dyn ServerVtWorkspace>,
     capture_pty_input: bool,
+    handoff_pause: Option<AttachPause>,
+    admission_pause: Option<AttachPause>,
 }
 
 impl ServerVtConfig {
@@ -144,7 +178,26 @@ impl ServerVtConfig {
         Self {
             workspace,
             capture_pty_input: false,
+            handoff_pause: None,
+            admission_pause: None,
         }
+    }
+
+    /// Park every snapshot and resume hand-off, on the tab task, at
+    /// [`AttachPause`].
+    #[must_use]
+    pub fn with_handoff_pause(mut self, pause: AttachPause) -> Self {
+        self.handoff_pause = Some(pause);
+        self
+    }
+
+    /// Park every admitted data connection at [`AttachPause`] before it
+    /// acts on the tab — after the registration, ahead of the focused
+    /// resize.
+    #[must_use]
+    pub fn with_admission_pause(mut self, pause: AttachPause) -> Self {
+        self.admission_pause = Some(pause);
+        self
     }
 
     /// Retain every byte the task queues toward the PTY writer so
@@ -164,6 +217,10 @@ impl ServerVtConfig {
 pub(crate) struct ServerVtState {
     workspace: Arc<dyn ServerVtWorkspace>,
     capture_pty_input: bool,
+    /// See [`AttachPause`]. Both are `None` everywhere but the tests
+    /// that have to stand inside an attach.
+    handoff_pause: Option<AttachPause>,
+    admission_pause: Option<AttachPause>,
     /// One random value per `enable_server_vt` call. A restarted server
     /// mints a fresh one, which is what makes a stale client stream
     /// unresumable by construction rather than by policy (D6).
@@ -189,6 +246,8 @@ impl ServerVtState {
         Self {
             workspace: config.workspace,
             capture_pty_input: config.capture_pty_input,
+            handoff_pause: config.handoff_pause,
+            admission_pause: config.admission_pause,
             server_epoch: random_epoch(),
             next_generation: AtomicU64::new(1),
             snapshot_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_SNAPSHOTS)),
@@ -198,6 +257,19 @@ impl ServerVtState {
 
     pub(crate) fn server_epoch(&self) -> u64 {
         self.server_epoch
+    }
+
+    /// See [`AttachPause`]. Both are no-ops unless a test installed one.
+    async fn pause_handoff(&self) {
+        if let Some(pause) = self.handoff_pause.as_ref() {
+            pause.wait().await;
+        }
+    }
+
+    pub(crate) async fn pause_admission(&self) {
+        if let Some(pause) = self.admission_pause.as_ref() {
+            pause.wait().await;
+        }
     }
 
     /// Record the session-wide theme every tab opened from now on is
@@ -254,6 +326,12 @@ pub struct ResumeAt {
     pub slice: Vec<(u64, Vec<u8>)>,
     pub receiver: broadcast::Receiver<PtyOutputEvent>,
     pub last_assigned: u64,
+    /// The generation that actually served this hand-off, read on the
+    /// task itself — a fact, where the caller's own lookup is only an
+    /// inference about which task was going to answer. Its twin is
+    /// [`SnapshotAt::tab_generation`], and the forwarder measures both
+    /// against the generation the attach was admitted for.
+    pub tab_generation: u64,
     /// Set once the tab has exited, so a late resume still ends in EXIT.
     pub stored_exit: Option<(u64, i32)>,
     /// The tab's grid at the handoff, read on the task in the same turn
@@ -1200,6 +1278,7 @@ impl TabTask {
                 self.take_replies();
             }
             TabCmd::Snapshot { kind, reply } => {
+                self.vt.state.pause_handoff().await;
                 let seq = self.last_byte_seq;
                 // Bounds aggregate encode memory across tabs. Held only
                 // around the encode, which is synchronous by C-API
@@ -1221,6 +1300,7 @@ impl TabTask {
                 }
             }
             TabCmd::Resume { from_seq, reply } => {
+                self.vt.state.pause_handoff().await;
                 let _ = reply.send(self.resume(from_seq));
             }
             TabCmd::Dump { scrollback, reply } => {
@@ -1269,6 +1349,7 @@ impl TabTask {
             slice,
             receiver: self.tee.subscribe(),
             last_assigned,
+            tab_generation: self.vt.tab_generation,
             stored_exit: self.stored_exit,
             cols: self.vt.geometry.cols,
             rows: self.vt.geometry.rows,

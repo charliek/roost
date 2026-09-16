@@ -639,7 +639,22 @@ impl PtySupervisor {
         Some(reseeded)
     }
 
-    /// A live tab's `tab_generation`, or `None` as above.
+    /// See [`crate::tab_task::AttachPause`]. A no-op in every build a
+    /// test did not configure a seam into.
+    #[cfg(feature = "server-vt")]
+    pub(crate) async fn pause_attach_admission(&self) {
+        if let Some(state) = self.server_vt.get() {
+            state.pause_admission().await;
+        }
+    }
+
+    /// Which pipeline this tab id names **right now**, or `None` when it
+    /// names none — a tab that exited, or one this supervisor never had.
+    ///
+    /// The attach forwarder reads the two apart: a tab with no pipeline
+    /// at all is one whose stream ends in `EXIT`, while a tab naming a
+    /// *different* generation than the one that served a hand-off is a
+    /// second terminal wearing the first's id.
     #[cfg(feature = "server-vt")]
     pub fn tab_generation(&self, tab_id: i64) -> Option<u64> {
         self.tab_task_handle(tab_id)

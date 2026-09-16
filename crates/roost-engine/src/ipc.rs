@@ -1211,19 +1211,27 @@ pub(crate) struct AttachTerms {
 }
 
 /// What an admission settled, handed to the forwarder.
-#[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
+#[cfg(feature = "server-vt")]
 #[derive(Debug, Clone)]
 pub(crate) struct AdmittedAttach {
     pub(crate) tab_id: i64,
     pub(crate) tab_generation: u64,
     pub(crate) terms: AttachTerms,
-    /// Whether the forwarder still owes this tab the focused resize.
+    /// The tab task the forwarder still owes the focused resize, or
+    /// `None` when it owes none.
     ///
-    /// True only on the inline path: the ticket form's `tab.attach`
-    /// already awaited it on the control connection, before this
+    /// The channel is the one the admission read `tab_generation` off,
+    /// under the same lock, and never a fresh lookup: a respawn between
+    /// the two would send the geometry to the **replacement** tab — and
+    /// the generation check that follows then refuses the attach, having
+    /// resized somebody else's terminal on the way out. A rejected
+    /// operation leaves no side effect.
+    ///
+    /// Only ever set on the inline path: the ticket form's `tab.attach`
+    /// already awaited the resize on the control connection, before this
     /// connection was dialed, so doing it again would resize a tab
     /// whoever typed last may have legitimately moved.
-    pub(crate) resize_first: bool,
+    pub(crate) resize_first: Option<tokio::sync::mpsc::Sender<crate::tab_task::TabCmd>>,
 }
 
 impl Connections {
@@ -1366,15 +1374,21 @@ impl Connections {
     /// connections.
     ///
     /// The whole admission is one step under one lock — consume, stop
-    /// latch, register — so two connections presenting the same token
-    /// produce exactly one forwarder.
+    /// latch, bound, register — so two connections presenting the same
+    /// token produce exactly one forwarder.
     ///
-    /// The order of the two refusals is the contract, not an accident:
-    /// each names a different thing for the client to fix, so a token
-    /// this session never issued must answer `invalid-token` even during
-    /// a stop — telling such a client `shutting-down` would send it
+    /// The order of the refusals is the contract, not an accident: each
+    /// names a different thing for the client to fix, so a token this
+    /// session never issued must answer `invalid-token` even during a
+    /// stop — telling such a client `shutting-down` would send it
     /// reconnecting with a credential that was never going to work.
-    #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
+    ///
+    /// Past the token, the admission is the inline path's: a ticket buys
+    /// no exemption from [`MAX_DATA_CONNS_PER_SESSION`]. A consumed
+    /// ticket returns to the token quota, so a bound enforced on one of
+    /// two live admission forms is no bound at all — the same client
+    /// mints another batch and keeps growing.
+    #[cfg(feature = "server-vt")]
     fn admit_attach(
         &mut self,
         token: &str,
@@ -1390,31 +1404,25 @@ impl Connections {
             ));
         };
         let ticket = self.tokens.remove(index);
-        // Checked only once the ticket is known good, and still under
-        // this lock: the stop latches first and sweeps this registry
-        // second, so a data connection admitted past the latch but
-        // registered after the sweep would be one no closer can reach.
-        if stopping {
-            return Err(shutting_down());
-        }
-        let conns = self.data_conns.entry(ticket.tab_id).or_default();
-        conns.retain(|(id, closer)| *id != ctx.conn_id && !closer.is_closed());
-        conns.push((ctx.conn_id, ctx.closer.clone()));
+        self.register_data_conn(ticket.tab_id, ctx, stopping)?;
         Ok(AdmittedAttach {
             tab_id: ticket.tab_id,
             tab_generation: ticket.tab_generation,
             terms: ticket.terms,
-            resize_first: false,
+            resize_first: None,
         })
     }
 
-    /// Register one inline data connection, under the same lock the
-    /// ticket path's admission takes.
+    /// The stop latch, the session bound and the registration — the one
+    /// step **both** admission forms end in.
     ///
     /// The stop latch is read first and the bound second: a session on
     /// its way out has nothing to serve whatever its occupancy is, and
     /// "we are full" would send that client retrying against a socket
-    /// about to be unlinked.
+    /// about to be unlinked. Checked under this lock rather than before
+    /// it: the stop latches first and sweeps this registry second, so a
+    /// data connection admitted past the latch but registered after the
+    /// sweep would be one no closer can reach.
     #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
     fn register_data_conn(
         &mut self,
@@ -1574,11 +1582,11 @@ impl SessionState {
             .map_or(ATTACH_TOKEN_TTL, Duration::from_millis)
     }
 
-    /// The data plane's single admission point. See
+    /// The ticket path's admission point. See
     /// [`Connections::admit_attach`], which takes the latch's value
     /// rather than reading it first, so the refusals stay in the order
     /// the client can act on.
-    #[cfg_attr(not(feature = "server-vt"), allow(dead_code))]
+    #[cfg(feature = "server-vt")]
     fn admit_attach(&self, token: &str, ctx: &ConnCtx) -> Result<AdmittedAttach, HandlerError> {
         let mut guard = lock(&self.conns);
         let stopping = self.stopping.load(Ordering::Acquire);
@@ -1953,6 +1961,17 @@ impl IpcHandler {
     /// awaited resize, the fence and the snapshot are the forwarder's
     /// (steps 10–13) — deliberately outside this function, because
     /// nothing after the registration may run under the registry lock.
+    ///
+    /// The stop latch is read **twice**: once here, before the tab
+    /// lookup, and again under the registry lock at step 8. The second
+    /// is what closes the race with the stop sweep and cannot move. The
+    /// first is what makes the answer usable: a stop reaps the tabs, so
+    /// a latch read only at step 8 would answer a post-stop attach
+    /// `not-found`, which a client can reasonably read as "that tab was
+    /// deleted" and act on by dropping the tab from its UI — where
+    /// `shutting-down` says the whole session went away. The ticket path
+    /// has the same early read for free, in `tab.attach`'s mutating-op
+    /// barrier.
     fn admit_inline(
         &self,
         session: &Arc<SessionState>,
@@ -1975,13 +1994,20 @@ impl IpcHandler {
             ));
         }
 
+        // 3'. The stop latch, early — see this function's doc.
+        if session.stopping.load(Ordering::Acquire) {
+            return Err(shutting_down());
+        }
+
         // 4. The tab, as `string_int64` like every other id on this
-        // wire. One lookup for the generation the forwarder re-checks
-        // after it subscribes.
+        // wire. Channel and generation come out of one lookup and are
+        // both carried forward: everything this attach does to the tab
+        // goes to the pipeline whose generation was admitted, not to
+        // whatever the id names by the time it runs.
         let tab_id: i64 = attach
             .parse()
             .map_err(|_| HandlerError::invalid_param(format!("{attach:?} is not a tab id")))?;
-        let (_commands, tab_generation) =
+        let (commands, tab_generation) =
             self.supervisor.tab_task_handle(tab_id).ok_or_else(|| {
                 HandlerError::not_found(format!("tab {tab_id} has no live terminal to attach"))
             })?;
@@ -1992,13 +2018,13 @@ impl IpcHandler {
         // 7. The grid.
         let geometry = attach_geometry(terms.cols, terms.rows, terms.cell_w_px, terms.cell_h_px)?;
 
-        // 8. The latch and the registration together.
+        // 8. The latch, the bound and the registration together.
         session.register_data_conn(tab_id, ctx)?;
         Ok(AdmittedAttach {
             tab_id,
             tab_generation,
             terms: AttachTerms { kind, geometry },
-            resize_first: terms.focus,
+            resize_first: terms.focus.then_some(commands),
         })
     }
 

@@ -76,16 +76,14 @@ use roost_ipc::messages::{
     AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode, AttachPayloadKind,
     ResponseError,
 };
-use roost_ipc::{
-    CloseReason, ConnCloseWatch, ConnCtx, DataConn, HandlerError, CLOSE_LABEL_DEADLINE,
-};
+use roost_ipc::{CloseReason, ConnCloseWatch, ConnCtx, DataConn, CLOSE_LABEL_DEADLINE};
 use tokio::io::AsyncWriteExt;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, warn};
 
-use crate::ipc::{await_attach_resize, tab_gone, AdmittedAttach, IpcHandler};
+use crate::ipc::{await_attach_resize, AdmittedAttach, IpcHandler};
 use crate::pty::{Geometry, PtyOutputEvent};
 use crate::tab_task::{SnapshotAt, TabCmd, TabError};
 
@@ -175,6 +173,11 @@ pub(crate) async fn serve_attach(
     };
 
     let tab_id = admitted.tab_id;
+    // Test seam only (`AttachPause`), and a no-op without one: the
+    // window between the admission that captured this tab's identity
+    // and the first thing done with it, which a test stands inside to
+    // respawn the tab there.
+    h.supervisor.pause_attach_admission().await;
     let outcome = attach_tab(h, &admitted, &handshake, reader, writer, close);
     // Registered by the admission; deregistered here however the
     // forwarder ended, so a tab that is attached and detached repeatedly
@@ -206,8 +209,8 @@ async fn attach_tab(
     // lock, because a tab parked behind `MAX_CONCURRENT_SNAPSHOTS` must
     // not stall every other session op. Detach never resizes back
     // (roadmap D7).
-    if admitted.resize_first {
-        if let Err(error) = resize_for_attach(h, admitted).await {
+    if let Some(commands) = admitted.resize_first.as_ref() {
+        if let Err(error) = await_attach_resize(commands, tab_id, admitted.terms.geometry).await {
             reject(&mut writer, &error.code, &error.message).await;
             return;
         }
@@ -304,17 +307,6 @@ async fn attach_tab(
     debug!(tab_id, ?mode, ?ending, "attach data connection ended");
 }
 
-/// Step 10: give the tab this connection's geometry and wait for both
-/// halves to take it. `Err` carries the rejection the client is owed.
-async fn resize_for_attach(h: &IpcHandler, admitted: &AdmittedAttach) -> Result<(), HandlerError> {
-    let tab_id = admitted.tab_id;
-    let commands = h
-        .supervisor
-        .tab_commands(tab_id)
-        .ok_or_else(|| tab_gone(tab_id))?;
-    await_attach_resize(&commands, tab_id, admitted.terms.geometry).await
-}
-
 /// A tab pinned for one attach: the live tee, the fence every byte that
 /// follows is measured against, and whichever catch-up the client is
 /// owed — an encoded snapshot (`mode: "snapshot"`) or the ring records it
@@ -373,11 +365,13 @@ async fn fence_tab(
         .supervisor
         .subscribe_output(tab_id)
         .ok_or_else(no_terminal)?;
-    // Channel and generation in one lock acquisition, so the task this
-    // snapshots is provably the task whose generation is checked. A
-    // respawn between the subscribe above and this read gives a new
+    // Channel and generation in one lock acquisition, so the channel
+    // this snapshot is asked on belongs to the generation checked here.
+    // A respawn between the subscribe above and this read gives a new
     // generation, which the check below turns into a clean `not-found`
-    // rather than a tee and a snapshot from two different terminals.
+    // rather than a tee and a snapshot from two different terminals. A
+    // respawn *after* it is settled by [`generation_holds`], on what the
+    // task reports having served.
     let (commands, live_generation) = h
         .supervisor
         .tab_task_handle(tab_id)
@@ -385,7 +379,7 @@ async fn fence_tab(
     if live_generation != tab_generation {
         return Err((
             "not-found",
-            "that tab was respawned after the attach token was issued".to_string(),
+            "that tab was respawned after this attach was admitted".to_string(),
         ));
     }
 
@@ -398,14 +392,14 @@ async fn fence_tab(
             other => ("not-found", other.to_string()),
         })?;
 
-    // The token named a tab pipeline, not just a tab id. A respawn
-    // between `tab.attach` and here is a different terminal with a
-    // different seq space, and streaming it under the old identity is
-    // exactly what the generation exists to prevent.
-    if snapshot.tab_generation != tab_generation {
+    // The attach named a tab pipeline, not just a tab id: a respawn is a
+    // different terminal with a different seq space, and streaming it
+    // under the old identity is exactly what the generation exists to
+    // prevent.
+    if !generation_holds(h, tab_id, snapshot.tab_generation, tab_generation) {
         return Err((
             "not-found",
-            "that tab was respawned after the attach token was issued".to_string(),
+            "that tab was respawned while its snapshot was being taken".to_string(),
         ));
     }
 
@@ -446,6 +440,29 @@ async fn fence_tab(
     })
 }
 
+/// Whether the pipeline that just served a hand-off is still the one
+/// this attach was admitted for.
+///
+/// `served` is reported by the tab task itself, in the turn it cut the
+/// hand-off: which task answered is a **fact** there, where the lookup
+/// before the send is only an inference about which one was going to.
+/// `admitted` is the generation the attach was let in for. The
+/// supervisor's current generation closes the other half of the window:
+/// a respawn that lands while the command is queued leaves the old task
+/// serving a terminal this tab id no longer names, and the client would
+/// be handed the dead terminal's backlog and its EXIT instead of the
+/// replacement.
+///
+/// A tab with **no** pipeline at all is not a mismatch. It exited, and a
+/// stream that ends in EXIT is the truth about the terminal this client
+/// asked for.
+fn generation_holds(h: &IpcHandler, tab_id: i64, served: u64, admitted: u64) -> bool {
+    served == admitted
+        && h.supervisor
+            .tab_generation(tab_id)
+            .is_none_or(|live| live == served)
+}
+
 /// The resume handoff (D6), or `None` for every reason it cannot be
 /// honored — a stale epoch, a respawned tab, a seq outside the ring, a
 /// tab task that is gone. Never an error: the caller serves a full
@@ -476,15 +493,12 @@ async fn resume_tab(
     if handshake.server_epoch != Some(server_epoch) {
         return None;
     }
-    // Channel and generation under one lock, so the pipeline that
-    // answers `Resume` is provably the one whose identity was just
-    // checked — against what the client claims AND against what the
-    // token was minted for. The second half of that has no test: it
-    // needs the same `tab_id` respawned between `tab.attach` and the
-    // handshake, and ids are never reused. It is the resume twin of the
-    // snapshot path's own generation re-check, and it stays for the same
-    // reason: streaming a second terminal's seq space under the first's
-    // identity is the exact thing the generation exists to prevent.
+    // Channel and generation under one lock, so the client's claim is
+    // checked against the pipeline this send is aimed at. It is not yet
+    // a check on the pipeline that will *answer*: the command queues,
+    // and a respawn can land behind it while the cloned sender keeps the
+    // old task alive. That half is settled after the reply, by
+    // [`generation_holds`].
     let (commands, live_generation) = h.supervisor.tab_task_handle(tab_id)?;
     if handshake.tab_generation != Some(live_generation) || live_generation != tab_generation {
         return None;
@@ -505,6 +519,19 @@ async fn resume_tab(
             return None;
         }
     };
+    // Which pipeline served the hand-off, not which one the lookup
+    // above found. A respawn between the two would otherwise stream the
+    // old terminal's ring and live tail — usually straight into its
+    // EXIT — to a client whose tab id now names the replacement.
+    if !generation_holds(h, tab_id, resumed.tab_generation, tab_generation) {
+        debug!(
+            tab_id,
+            from_seq,
+            served = resumed.tab_generation,
+            "the tab was respawned around the resume handoff; falling back to a snapshot"
+        );
+        return None;
+    }
 
     Some(Attached {
         tee: resumed.receiver,
@@ -512,7 +539,7 @@ async fn resume_tab(
         mode: AttachMode::Resume,
         seq: from_seq - 1,
         server_epoch,
-        tab_generation: live_generation,
+        tab_generation: resumed.tab_generation,
         snapshot: Vec::new(),
         // The tab's size at the handoff, cut from the same turn of the
         // task as the ring slice: a client that was away can have had

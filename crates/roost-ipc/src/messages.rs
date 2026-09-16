@@ -2272,8 +2272,17 @@ struct RawAttachHandshake {
     protocol_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    kinds: Option<Vec<AttachPayloadKind>>,
+    /// The discriminator, and the one field here that has to tell
+    /// "absent" from "present and null" — `Option` alone spells both
+    /// `None`, and `{"kinds": null}` would then be read as a ticket and
+    /// the inline tab id beside it as a bearer token. The outer
+    /// `Option` is presence, which only [`present`] can produce.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    kinds: Option<Option<Vec<AttachPayloadKind>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cols: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2294,19 +2303,33 @@ struct RawAttachHandshake {
     tab_generation: Option<u64>,
 }
 
+/// Decode a field as "was the key there at all", one level above what it
+/// held: `None` when the key is absent (through `#[serde(default)]`),
+/// `Some(None)` for an explicit `null`.
+fn present<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(de).map(Some)
+}
+
 impl TryFrom<RawAttachHandshake> for AttachHandshake {
     type Error = String;
 
     fn try_from(raw: RawAttachHandshake) -> Result<Self, String> {
-        // `kinds` is the discriminator — never whether `attach` parses
-        // as a number, which a token could do by accident.
+        // The PRESENCE of `kinds` is the discriminator — never whether
+        // `attach` parses as a number, which a token could do by
+        // accident, and never whether `kinds` held anything, which would
+        // read `{"kinds": null}` as a ticket and the tab id beside it as
+        // a bearer token.
         let terms = match raw.kinds {
             None => None,
             Some(kinds) => Some(AttachHandshakeTerms {
                 session_id: raw
                     .session_id
                     .ok_or("an inline attach handshake is missing `session_id`")?,
-                kinds,
+                kinds: kinds.ok_or("an inline attach handshake is missing `kinds`")?,
                 cols: raw
                     .cols
                     .ok_or("an inline attach handshake is missing `cols`")?,
@@ -2349,7 +2372,7 @@ impl From<AttachHandshake> for RawAttachHandshake {
         };
         if let Some(t) = h.terms {
             raw.session_id = Some(t.session_id);
-            raw.kinds = Some(t.kinds);
+            raw.kinds = Some(Some(t.kinds));
             raw.cols = Some(t.cols);
             raw.rows = Some(t.rows);
             raw.cell_w_px = Some(t.cell_w_px);
