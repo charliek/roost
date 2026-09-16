@@ -161,6 +161,58 @@ struct IPCHandlerDispatchTests {
         )
     }
 
+    // MARK: #402 — non-canonical ids are refused, not normalized
+    //
+    // `StringInt64`/`StringInt64Array` round-trip-check the decoded
+    // int64 against the original text (`String(v) == raw`), mirroring
+    // the Rust `WireTabRef::parse`/`WireProjectRef::parse` narrowing.
+    // Swift's `Int64("+4")` and `Int64("04")` both succeed, so without
+    // the round-trip check these would silently normalize to `4`
+    // instead of failing `invalid-param` like the iced/session sockets.
+    // The failure surfaces as `invalid-param` because `decodeParams`
+    // wraps every JSONDecoder error the same way, regardless of which
+    // wrapper threw it.
+
+    @Test func tabReorderNonCanonicalProjectIdWithLeadingPlusIsInvalidParam() async {
+        let handler = await makeHandler()
+        await expectError(
+            "invalid-param",
+            "tab.reorder",
+            AnyCodable(["project_id": "+4", "tab_ids": ["1"]] as [String: Any]),
+            on: handler
+        )
+    }
+
+    @Test func tabReorderNonCanonicalTabIdWithLeadingZeroIsInvalidParam() async {
+        let handler = await makeHandler()
+        await expectError(
+            "invalid-param",
+            "tab.reorder",
+            AnyCodable(["project_id": "1", "tab_ids": ["04"]] as [String: Any]),
+            on: handler
+        )
+    }
+
+    @Test func projectReorderNonCanonicalIdWithLeadingPlusIsInvalidParam() async {
+        let handler = await makeHandler()
+        await expectError(
+            "invalid-param",
+            "project.reorder",
+            AnyCodable(["project_ids": ["+4"]] as [String: Any]),
+            on: handler
+        )
+    }
+
+    @Test func projectReorderNonCanonicalIdWithLeadingZeroIsInvalidParam() async {
+        let handler = await makeHandler()
+        await expectError(
+            "invalid-param",
+            "project.reorder",
+            AnyCodable(["project_ids": ["04"]] as [String: Any]),
+            on: handler
+        )
+    }
+
     // MARK: happy-path encode/decode
 
     @Test func identifyEchoesProfile() async throws {
