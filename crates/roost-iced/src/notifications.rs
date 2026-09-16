@@ -1,8 +1,12 @@
 //! Native desktop notifications.
 //!
-//! The engine already decides whether a notification is warranted — a
-//! focused window on the active tab emits no `NotificationFired` at all —
-//! so every event that reaches this adapter fires.
+//! Whether a notification is warranted is settled before this adapter,
+//! and by whom depends on where the tab lives (#474). The in-process
+//! engine never raises one for a tab a focused window is showing. A host
+//! session raises one for every client, because only a client knows what
+//! its own window is showing, so that half of the rule runs in
+//! `servicing.rs`'s `notification.fired` arm. Either way, every event
+//! that reaches here fires.
 //!
 //! Invariant: backend I/O never runs on the UI thread or under an engine
 //! lock. [`DesktopNotifications::fire`] and [`DesktopNotifications::retire`]

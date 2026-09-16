@@ -72,11 +72,6 @@ pub(crate) type HostOpReply = oneshot::Sender<Result<serde_json::Value, HostOpEr
 pub(crate) struct HostIntent {
     pub(crate) op: Cow<'static, str>,
     pub(crate) params: serde_json::Value,
-    /// Suppress the "nobody listening" warning on failure. For the ops
-    /// whose refusal is an expected answer rather than a fault — a
-    /// session one release older refusing `session.set_focus` — where
-    /// the worker says it once per incarnation instead.
-    pub(crate) quiet: bool,
     /// The incarnation this intent was issued *for*, when the caller
     /// cared.
     ///
@@ -89,7 +84,7 @@ pub(crate) struct HostIntent {
     /// "1"}` would then delete a project the caller never named.
     ///
     /// `None` is the unfenced form every existing call site keeps —
-    /// administrative ops (`session.set_focus`, a theme push) that are
+    /// administrative ops (a theme push, an `agent-hooks` raise) that are
     /// about the connection rather than about a row on it, and are
     /// correct on whichever connection serves them.
     pub(crate) fence: Option<HostId>,
@@ -102,7 +97,6 @@ impl HostIntent {
         Self {
             op: op.into(),
             params,
-            quiet: false,
             fence: None,
             reply: None,
         }
@@ -112,12 +106,6 @@ impl HostIntent {
     /// [`Self::fence`].
     pub(crate) fn fenced_at(mut self, incarnation: HostId) -> Self {
         self.fence = Some(incarnation);
-        self
-    }
-
-    /// A failure on this op is not news. See [`Self::quiet`].
-    pub(crate) fn quiet(mut self) -> Self {
-        self.quiet = true;
         self
     }
 
@@ -138,11 +126,7 @@ impl HostIntent {
             }
             None => {
                 if let Err(error) = outcome {
-                    if self.quiet {
-                        tracing::debug!(%op, %error, "host op failed with nobody listening");
-                    } else {
-                        tracing::warn!(%op, %error, "host op failed with nobody listening");
-                    }
+                    tracing::warn!(%op, %error, "host op failed with nobody listening");
                 }
             }
         }

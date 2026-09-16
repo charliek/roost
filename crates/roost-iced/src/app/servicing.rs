@@ -589,10 +589,9 @@ fn notification_activation(
 /// plan 037 §4's non-goal; a connect mirrors current state, never a
 /// backlog.
 ///
-/// A session's own workspace has no window, so what it suppresses is
-/// decided by what its clients tell it: `session.set_focus` (plan 038
-/// §C6) states the tab this client is looking at, at every edge that
-/// moves it, and the session mutes a tab while any client says so.
+/// A session's own workspace has no window, so it suppresses nothing: it
+/// fires for every client and each one decides (#474). The deciding is
+/// [`App::apply_host_envelopes`]'s `Notify` arm.
 #[derive(Debug)]
 enum HostEnvelopeAction {
     Effect(roost_ipc::messages::TabEffectEvent),
@@ -983,6 +982,32 @@ fn paste_only_keybind(action: &str) -> Result<KeybindAction, String> {
 /// [`creation_route`](super::creation_route) exists to refuse.
 pub(super) fn view_incarnation(incarnation: Option<HostId>) -> HostId {
     incarnation.unwrap_or(HostId::LOCAL)
+}
+
+/// Drop the pending bit from the one tab this window is reading (#474).
+///
+/// Applied where a mirror's rows become UI state, which is the single
+/// place both attention surfaces are derived from: the sidebar and the
+/// tab strip paint the dot off these rows, and
+/// [`pending_notification_rows`] builds the inbox off the same ones. The
+/// mirror keeps the bit — it is the session's fact, and a resync must
+/// still read it back.
+///
+/// A client that is looking at the tab has already sent the
+/// acknowledgement that clears it everywhere, so painting it here would
+/// flash a dot and an inbox row on the one window that does not need
+/// telling, for exactly the round trip the ack takes. The in-process
+/// backend has no equivalent because its engine never sets the bit in
+/// this situation at all.
+fn clear_viewed_pending(projects: &mut [Project], host: HostId, viewed: Option<TabKey>) {
+    let Some(viewed) = viewed.filter(|tab| tab.host == host) else {
+        return;
+    };
+    for project in projects.iter_mut() {
+        for tab in project.tabs.iter_mut().filter(|tab| tab.id == viewed.tab) {
+            tab.has_notification = false;
+        }
+    }
 }
 
 /// The host half of plan 063 §D9's exit inputs, read off the bands and
@@ -1670,7 +1695,19 @@ impl App {
                     task = task.then(self.apply_host_effect(host, &effect));
                 }
                 HostEnvelopeAction::Notify(fired) => {
-                    self.fire_notification(TabKey::new(host, fired.tab_id), fired.title, fired.body)
+                    let key = TabKey::new(host, fired.tab_id);
+                    // #474's client rule. A session fires for every
+                    // client because only a client knows what its window
+                    // is showing; the one already reading the tab
+                    // answers for all of them, and its
+                    // `tab.clear_notification` takes the dot down
+                    // wherever it is up rather than each client deciding
+                    // separately what it can see.
+                    if self.viewed_host_tab() == Some(key) {
+                        self.send_host_clear_notification(key);
+                    } else {
+                        self.fire_notification(key, fired.title, fired.body);
+                    }
                 }
                 HostEnvelopeAction::ClearNotification(tab_id) => {
                     // The tab's id is kept, exactly as the local clear
@@ -2103,14 +2140,9 @@ impl App {
                             if let Err(error) = self.workspace.touch_host_connected(host) {
                                 tracing::debug!(%host, %error, "could not stamp last_connected");
                             }
-                            // A session mutes nothing until a client
-                            // says what it is looking at, and the
-                            // connect task cannot say — the selection is
-                            // the UI's. Told here, on the edge where the
-                            // queue is draining.
-                            self.push_host_focus();
-                            // Same edge, same reason. Every connect, with
-                            // this client's current config — see
+                            // On the edge where the queue is draining,
+                            // on every connect, with this client's
+                            // current config — see
                             // `HostConnSet::wire_agent_hooks`.
                             self.wire_host_agent_hooks(host);
                             // What this connect owed its landing (plan
@@ -2685,6 +2717,7 @@ impl App {
         // recents list taken at a different moment could offer back a
         // host the sidebar is already showing.
         self.recent_hosts = self.workspace.recent_hosts();
+        let viewed = self.viewed_host_tab();
         self.host_views = self
             .workspace
             .hosts()
@@ -2710,6 +2743,12 @@ impl App {
                 // Taken before `host.id` is moved into the view.
                 let reason = self.hosts.section_reason(&host.id).map(str::to_string);
                 let reduced_fidelity = self.hosts.reduced_fidelity(&host.id);
+                let view_host = view_incarnation(incarnation);
+                let mut projects = mirror
+                    .as_ref()
+                    .map(|mirror| mirror.projects.clone())
+                    .unwrap_or_default();
+                clear_viewed_pending(&mut projects, view_host, viewed);
                 super::HostView {
                     saved_id: host.id,
                     // The registry's label wins over the connection's:
@@ -2720,12 +2759,9 @@ impl App {
                     target: host.target,
                     reduced_fidelity,
                     reason,
-                    host: view_incarnation(incarnation),
+                    host: view_host,
                     state,
-                    projects: mirror
-                        .as_ref()
-                        .map(|mirror| mirror.projects.clone())
-                        .unwrap_or_default(),
+                    projects,
                     active_tab_id: mirror.as_ref().map_or(0, |mirror| mirror.active_tab_id),
                     agents: 0,
                 }
@@ -4958,6 +4994,41 @@ mod tests {
         ));
     }
 
+    /// One row of the shape a mirror or a local snapshot publishes, for
+    /// the derivations below. Only `id` and the pending bit vary — every
+    /// other field is what an attention rule never reads.
+    fn attention_tab(id: i64, has_notification: bool) -> roost_ipc::messages::Tab {
+        roost_ipc::messages::Tab {
+            id,
+            project_id: 4,
+            title: format!("tab-{id}"),
+            cwd: "/w/roost".into(),
+            state: roost_ipc::messages::TabState::None,
+            has_notification,
+            is_active: false,
+            user_titled: false,
+            position: 0,
+            created_at: 0,
+            last_active: 0,
+            hook_active: false,
+            shell_state: roost_ipc::agent::ShellState::default(),
+            agent_lifecycle: roost_ipc::agent::AgentLifecycle::default(),
+            ownership: None,
+        }
+    }
+
+    /// The project list [`attention_tab`]'s rows arrive in.
+    fn attention_projects(tabs: Vec<roost_ipc::messages::Tab>) -> Vec<Project> {
+        vec![Project {
+            id: 4,
+            name: "roost".into(),
+            cwd: "/w/roost".into(),
+            position: 0,
+            created_at: 0,
+            tabs,
+        }]
+    }
+
     /// The inbox derivation is one rule over both id-spaces, which is
     /// what makes a reconnect restore a host's attention rows: the
     /// mirror already says which tabs are pending, so the reconcile
@@ -4970,33 +5041,7 @@ mod tests {
     /// not look like two kinds of list.
     #[test]
     fn pending_rows_derive_identically_for_a_host_and_for_the_local_workspace() {
-        fn tab(id: i64, has_notification: bool) -> roost_ipc::messages::Tab {
-            roost_ipc::messages::Tab {
-                id,
-                project_id: 4,
-                title: format!("tab-{id}"),
-                cwd: "/w/roost".into(),
-                state: roost_ipc::messages::TabState::None,
-                has_notification,
-                is_active: false,
-                user_titled: false,
-                position: 0,
-                created_at: 0,
-                last_active: 0,
-                hook_active: false,
-                shell_state: roost_ipc::agent::ShellState::default(),
-                agent_lifecycle: roost_ipc::agent::AgentLifecycle::default(),
-                ownership: None,
-            }
-        }
-        let projects = vec![Project {
-            id: 4,
-            name: "roost".into(),
-            cwd: "/w/roost".into(),
-            position: 0,
-            created_at: 0,
-            tabs: vec![tab(7, true), tab(8, false)],
-        }];
+        let projects = attention_projects(vec![attention_tab(7, true), attention_tab(8, false)]);
 
         let host = HostId::new(3);
         let none = HashSet::new();
@@ -5021,33 +5066,7 @@ mod tests {
     /// not light the same number on another.
     #[test]
     fn a_bell_earns_a_row_the_reconcile_will_not_prune() {
-        fn tab(id: i64) -> roost_ipc::messages::Tab {
-            roost_ipc::messages::Tab {
-                id,
-                project_id: 4,
-                title: format!("tab-{id}"),
-                cwd: "/w/roost".into(),
-                state: roost_ipc::messages::TabState::None,
-                has_notification: false,
-                is_active: false,
-                user_titled: false,
-                position: 0,
-                created_at: 0,
-                last_active: 0,
-                hook_active: false,
-                shell_state: roost_ipc::agent::ShellState::default(),
-                agent_lifecycle: roost_ipc::agent::AgentLifecycle::default(),
-                ownership: None,
-            }
-        }
-        let projects = vec![Project {
-            id: 4,
-            name: "roost".into(),
-            cwd: "/w/roost".into(),
-            position: 0,
-            created_at: 0,
-            tabs: vec![tab(7), tab(8)],
-        }];
+        let projects = attention_projects(vec![attention_tab(7, false), attention_tab(8, false)]);
         let host = HostId::new(3);
 
         assert!(
@@ -5065,6 +5084,54 @@ mod tests {
             pending_notification_rows(HostId::new(9), &projects, &rung).is_empty(),
             "a bell is keyed at the host that heard it"
         );
+    }
+
+    /// #474's paint half: a window reading a tab shows nothing pending
+    /// for it, on either attention surface.
+    ///
+    /// Both are asserted off the one filtered slice because that is the
+    /// claim — the sidebar and the tab strip draw the dot from these
+    /// rows and [`pending_notification_rows`] derives the inbox from the
+    /// same ones, so one filter covers both and cannot drift into two.
+    /// Without it the acknowledgement's round trip flashes a dot and a
+    /// row at the one person who is already looking.
+    #[test]
+    fn a_window_reading_a_tab_paints_neither_its_dot_nor_its_inbox_row() {
+        let pending = || attention_projects(vec![attention_tab(7, true), attention_tab(8, true)]);
+
+        let host = HostId::new(3);
+        let none = HashSet::new();
+
+        // No claim — an unfocused window, or one selected elsewhere —
+        // and the session's bit is the whole answer.
+        let mut unclaimed = pending();
+        clear_viewed_pending(&mut unclaimed, host, None);
+        assert!(unclaimed[0].tabs[0].has_notification);
+        assert_eq!(
+            pending_notification_rows(host, &unclaimed, &none).len(),
+            2,
+            "a window that is not reading them banners and lists both"
+        );
+
+        let mut read = pending();
+        clear_viewed_pending(&mut read, host, Some(TabKey::new(host, 7)));
+        assert!(!read[0].tabs[0].has_notification, "no dot on the tab read");
+        assert!(
+            read[0].tabs[1].has_notification,
+            "and every other tab still says what the session said"
+        );
+        let rows = pending_notification_rows(host, &read, &none);
+        assert_eq!(
+            rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            vec![TabKey::new(host, 8)],
+            "and no inbox row either, from the very same rows"
+        );
+
+        // A claim on one incarnation says nothing about the same bare
+        // number on another.
+        let mut elsewhere = pending();
+        clear_viewed_pending(&mut elsewhere, HostId::new(9), Some(TabKey::new(host, 7)));
+        assert!(elsewhere[0].tabs[0].has_notification);
     }
 
     /// A malformed payload is reported as undecodable rather than

@@ -1499,16 +1499,17 @@ fn host_selection_detach(
     Some(previous.tab)
 }
 
-/// Which host tab this client is *looking at*, as `session.set_focus`
-/// states it: the selected host tab when the window has focus, and
-/// nothing otherwise.
+/// Which host tab this client is *looking at*: the selected host tab
+/// when the window has focus, and nothing otherwise.
 ///
-/// The whole edge computation, split out from [`App`] because it is the
-/// part worth pinning: a session mutes the tab it believes is focused,
-/// so "the window is unfocused" and "the selection moved to another
-/// host" both have to read as *no* claim rather than as a stale one.
-/// Only host tabs appear here — a local selection is `None`, which is
-/// how every connected host hears null.
+/// #474's client rule turns on it. A session fires for every client and
+/// says nothing about who is watching, so this is the whole of what this
+/// window knows: a notification for the tab named here is one the user
+/// is already reading, and it is acknowledged rather than bannered.
+/// "The window is unfocused" and "the selection moved to another host"
+/// therefore both have to read as *no* claim rather than as a stale one.
+/// Only host tabs appear here — a local selection is `None`, because the
+/// in-process backend evaluates the same rule inside the engine.
 fn host_focus_claim(window_focused: bool, selection: Option<HostSelection>) -> Option<TabKey> {
     selection.filter(|_| window_focused).map(|it| it.tab)
 }
@@ -4749,10 +4750,6 @@ impl App {
         }
         self.window_focused = focused;
         self.workspace.set_window_focused(focused);
-        // The same statement the local workspace just took, for whichever
-        // session owns the selected tab: unfocusing releases the claim,
-        // refocusing re-states it.
-        self.push_host_focus();
         if let Some(tab) = self.tabs.get(&self.active_tab_key()) {
             tab.set_window_focus(focused);
         }
@@ -6522,6 +6519,18 @@ impl App {
 
     /// The "and clear" half for a host tab — `focus_tab_in_core`'s
     /// counterpart, which is what the local path gets it from.
+    fn host_clear_notification(&mut self, tab: TabKey) {
+        // The bell half is ours alone: the session kept no flag for it,
+        // so nothing coming back over the wire would ever retire it.
+        self.host_bells.remove(&tab);
+        self.send_host_clear_notification(tab);
+    }
+
+    /// The op half of a clear, without the client-local bell.
+    ///
+    /// #474's automatic acknowledgement answers one `notification.fired`
+    /// and nothing else: a bell this window has not shown the user yet is
+    /// not something a session's notification may retire on their behalf.
     ///
     /// Fire-and-forget, and **event-confirmed**: the session answers by
     /// committing `tab.notification { has_pending: false }`, and that
@@ -6529,10 +6538,7 @@ impl App {
     /// §3.9's no-optimistic-rows rule). Clearing here as well would take
     /// the row down before the host agreed, and put it back on the next
     /// reconcile if the op was refused.
-    fn host_clear_notification(&mut self, tab: TabKey) {
-        // The bell half is ours alone: the session kept no flag for it,
-        // so nothing coming back over the wire would ever retire it.
-        self.host_bells.remove(&tab);
+    fn send_host_clear_notification(&mut self, tab: TabKey) {
         let intent = crate::host_conn::HostIntent::new(
             roost_ipc::messages::ops::TAB_CLEAR_NOTIFICATION,
             serde_json::json!({ "tab_id": tab.tab.to_string() }),
@@ -6737,26 +6743,16 @@ impl App {
         if let Some(tab) = released {
             self.host_detach_tab(tab);
         }
-        // Every selection move is a focus move as far as a session is
-        // concerned: the host that lost the selection hears null and the
-        // one that gained it hears the tab, so exactly one session
-        // believes it is being looked at.
-        self.push_host_focus();
     }
 
-    /// State this client's focus to every connected host — the one
-    /// caller of [`HostConnSet::set_focus`], so the value a session
-    /// holds is always derived from the same two fields rather than
-    /// assembled at each edge.
+    /// The host tab this window is looking at, by [`host_focus_claim`].
     ///
-    /// Called at the three edges that can move it: a host reaching
-    /// `Connected` (this connection has stated nothing yet), the
-    /// selection moving, and the window gaining or losing focus. The set
-    /// dedups, so calling it on a change that turns out not to move
-    /// anything costs nothing.
-    fn push_host_focus(&mut self) {
-        self.hosts
-            .set_focus(host_focus_claim(self.window_focused, self.host_selection));
+    /// The one read behind #474's client rule, so the two surfaces it
+    /// drives — the acknowledgement on `notification.fired` and the
+    /// never-pending filter over a mirror's rows — cannot disagree about
+    /// what "looking at it" means.
+    fn viewed_host_tab(&self) -> Option<TabKey> {
+        host_focus_claim(self.window_focused, self.host_selection)
     }
 
     /// The gated Connect: the sidebar's ↻ row, the stopped banner's
@@ -9630,10 +9626,10 @@ mod tests {
         assert_eq!(host_selection_detach(None, None), None);
     }
 
-    /// What each connected session is told it owns. A session mutes the
-    /// tab it believes is focused, so an unfocused window and a
-    /// selection on another host both have to read as *no* claim — the
-    /// per-host null falls out of that at the send site.
+    /// What this window is reading. A tab named here is one whose
+    /// notification the user is already looking at, so an unfocused
+    /// window and a selection on another host both have to read as *no*
+    /// claim — a stale one would swallow a banner that is owed.
     #[test]
     fn only_a_selected_host_tab_in_a_focused_window_claims_focus() {
         let host = HostId::new(4);

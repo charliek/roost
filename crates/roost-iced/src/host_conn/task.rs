@@ -457,64 +457,6 @@ impl Live {
     }
 }
 
-/// The ops an older session answers `unknown-op` to, and whether this
-/// *task* has been told about each yet.
-///
-/// `session.set_agent_hooks` predating a host used to have an entry
-/// here too (plan 046), but protocol equality (plan 061) retired it: a
-/// session too old to know the op is also too old to pass the
-/// `session-mismatch` protocol-version check at attach, so this task
-/// never reaches a live connection with it in the first place. That
-/// leaves `session.set_focus`, which really does predate some attached
-/// hosts (HS-2).
-///
-/// A session that predates one of these is not a fault: the client keeps
-/// sending (it has no other way to find out, and the refusal costs one
-/// round trip), the connection is unaffected, and one line is the whole
-/// story — a line per selection change is noise.
-///
-/// It deliberately outlives [`Live`]. `session.set_focus` is re-sent
-/// whenever the client's selection changes, and a localhost session
-/// that drops reconnects on a 250 ms ladder, so a flag rebuilt per
-/// connection would say the same sentence about the same unchanging
-/// session forever. The fact it latches is a property of the session,
-/// not of the wire to it, so [`connect_loop`] owns one for as long as
-/// it keeps dialling the same host.
-#[derive(Default)]
-struct Unsupported {
-    /// HS-2 sessions predate `session.set_focus`; their attached tab
-    /// suppresses its own notifications.
-    focus: bool,
-}
-
-impl Unsupported {
-    /// Note an `unknown-op` refusal, and say whether it is worth a line.
-    ///
-    /// `false` for every other kind of failure — a `shutting-down` is
-    /// not an old session, and swallowing it here would hide it — and
-    /// `false` the second time one op says it.
-    fn note(&mut self, op: &str, error: &HostOpError) -> Option<&'static str> {
-        if !matches!(
-            error,
-            HostOpError::Rejected {
-                code: ServerCode::UnknownOp,
-                ..
-            }
-        ) {
-            return None;
-        }
-        let (seen, note) = match op {
-            ops::SESSION_SET_FOCUS => (
-                &mut self.focus,
-                "this host session predates session.set_focus; its attached \
-                 tab suppresses its own notifications",
-            ),
-            _ => return None,
-        };
-        (!std::mem::replace(seen, true)).then_some(note)
-    }
-}
-
 /// The task body.
 ///
 /// Two halves, and the split is the queue contract: the connection loop
@@ -565,10 +507,6 @@ async fn connect_loop(
     let mut machine = HostStateMachine::new(config.transport.is_localhost());
     let mut previous: Option<HostId> = config.supersedes;
     let mut mode = config.mode;
-    // Task-scoped, not connection-scoped: what it latches is what this
-    // *session* cannot do, and reconnecting to it does not make an old
-    // session newer. See [`Unsupported`].
-    let mut unsupported = Unsupported::default();
     // This task's own checkpoint, taken from every attempt that reached
     // a session and preferred over the one the set seeded, which by then
     // describes a strictly older fence. It saves an in-task retry a trip
@@ -632,16 +570,7 @@ async fn connect_loop(
                     // that last one runs no code, which is why this is a
                     // `Drop` and not a line after the `await`.
                     let _lane = config.uploads.open(config.socket.clone());
-                    serve(
-                        config,
-                        incarnation,
-                        live,
-                        ops_rx,
-                        feed,
-                        shutdown,
-                        &mut unsupported,
-                    )
-                    .await
+                    serve(config, incarnation, live, ops_rx, feed, shutdown).await
                 }
             }
         };
@@ -1196,7 +1125,6 @@ async fn serve(
     ops_rx: &mut mpsc::Receiver<HostIntent>,
     feed: &EngineFeedSender,
     shutdown: &Shutdown,
-    unsupported: &mut Unsupported,
 ) -> ConnEnd {
     loop {
         tokio::select! {
@@ -1269,7 +1197,7 @@ async fn serve(
                 let Some(intent) = admit(incarnation, intent) else {
                     continue;
                 };
-                match run_intent(&mut live, unsupported, intent).await {
+                match run_intent(&mut live, intent).await {
                     IntentOutcome::Live => {}
                     IntentOutcome::Ends(end) => return end,
                 }
@@ -1336,14 +1264,7 @@ enum IntentOutcome {
 }
 
 /// Send one queued op through the control client and answer its caller.
-///
-/// `unsupported` is the task's, not this connection's: see
-/// [`Unsupported`].
-async fn run_intent(
-    live: &mut Live,
-    unsupported: &mut Unsupported,
-    mut intent: HostIntent,
-) -> IntentOutcome {
+async fn run_intent(live: &mut Live, mut intent: HostIntent) -> IntentOutcome {
     // Taken rather than cloned: the params are this intent's alone, and
     // `answer` never reads them.
     let params = std::mem::take(&mut intent.params);
@@ -1357,13 +1278,6 @@ async fn run_intent(
         }
         Ok(Err(error)) => {
             let (fault, surfaced) = queue::classify(&error);
-            // An older session refusing an op it never had is an
-            // ordinary `Surfaced` refusal — the connection is fine, and
-            // the client is not going to stop having a focus or a config
-            // to state — so it is said once and then let be.
-            if let Some(note) = unsupported.note(&op, &surfaced) {
-                tracing::info!("{note}");
-            }
             intent.answer(Err(surfaced));
             match fault {
                 OpFault::Surfaced => IntentOutcome::Live,
@@ -2161,7 +2075,7 @@ mod tests {
 
         // And an unfenced administrative op is correct on whichever
         // connection serves it, so it is admitted either way.
-        let _push = ops.call("session.set_focus", serde_json::json!({}));
+        let _push = ops.call(ops::SESSION_SET_THEME, serde_json::json!({}));
         let intent = ops_rx.recv().await.expect("the third intent");
         assert!(admit(HostId::new(9), intent).is_some());
     }
@@ -2220,51 +2134,6 @@ mod tests {
             message: "nope".into(),
         });
         assert!(matches!(other, AttemptError::Transport(_)));
-    }
-
-    fn refused(code: ServerCode) -> HostOpError {
-        HostOpError::Rejected {
-            code,
-            message: "no such op: whatever".into(),
-        }
-    }
-
-    /// The latch itself: one sentence per op, never repeated.
-    #[test]
-    fn a_refusal_is_noted_once_per_op_and_never_again() {
-        let mut flags = Unsupported::default();
-
-        let first = flags
-            .note(ops::SESSION_SET_FOCUS, &refused(ServerCode::UnknownOp))
-            .expect("the first refusal is worth saying");
-        assert!(first.contains("session.set_focus"), "{first}");
-        assert!(
-            flags
-                .note(ops::SESSION_SET_FOCUS, &refused(ServerCode::UnknownOp))
-                .is_none(),
-            "every reconnect re-sends it; only the first refusal is news"
-        );
-    }
-
-    /// Only `unknown-op` is an old session. Folding anything else in
-    /// here would silence a real refusal — a `shutting-down` says the
-    /// session is going away, which is the opposite of "this is fine".
-    #[test]
-    fn any_other_refusal_is_not_an_old_session() {
-        let mut flags = Unsupported::default();
-        for error in [
-            refused(ServerCode::ShuttingDown),
-            refused(ServerCode::Internal),
-            HostOpError::Transport("the wire died".into()),
-            HostOpError::Disconnected,
-        ] {
-            assert!(flags.note(ops::SESSION_SET_FOCUS, &error).is_none());
-        }
-        // And the latch was never spent, so the real thing still gets
-        // its line.
-        assert!(flags
-            .note(ops::SESSION_SET_FOCUS, &refused(ServerCode::UnknownOp))
-            .is_some());
     }
 
     /// The op that runs a five-agent install on a possibly NFS-mounted
@@ -3409,7 +3278,7 @@ mod tests {
             .is_ok());
         assert!(tokio::time::timeout(
             Duration::from_secs(10),
-            host.ops.call(ops::SESSION_SET_FOCUS, serde_json::json!({}))
+            host.ops.call(ops::SESSION_SET_THEME, serde_json::json!({}))
         )
         .await
         .expect("and the queue keeps draining afterwards")
