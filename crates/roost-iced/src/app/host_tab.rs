@@ -36,7 +36,7 @@ use tokio::sync::mpsc;
 
 use super::tab_backend::HostDataMsg;
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
-use crate::host_conn::queue::{HostOpError, HostOps};
+use crate::host_conn::queue::{AttachPermit, HostOpError, HostOps};
 use crate::host_conn::state::CLIENT_PAYLOAD_KINDS;
 
 /// History pages stepped per feed-drain pass. Bounds main-thread work so
@@ -434,8 +434,8 @@ impl HostAttach {
             kinds: CLIENT_PAYLOAD_KINDS.map(AttachPayloadKind::from).to_vec(),
             cols: geometry.cols,
             rows: geometry.rows,
-            cell_w_px: geometry.cell_w as u16,
-            cell_h_px: geometry.cell_h as u16,
+            cell_w_px: cell_px(geometry.cell_w),
+            cell_h_px: cell_px(geometry.cell_h),
             libghostty_build: libghostty_build.to_string(),
             // Attach is on-focus in this client, so the claim is always
             // true.
@@ -445,9 +445,10 @@ impl HostAttach {
             socket,
             handshake: choose_handshake(key.tab, terms, resume),
         };
-        // Fenced at this tab's own incarnation: a permit released after
-        // the connection dropped must not send an attach to whatever
-        // replaced it.
+        // Fenced at this tab's own incarnation, in the queue and again
+        // for the dial it releases: an attach must not reach whatever
+        // replaced the connection it was asked of, nor the connection
+        // itself once this client has lost it.
         let permit = ops.attach_permit(key.host);
         let input_rx = Arc::clone(&self.input_rx);
         let task = tokio::spawn(run_attempt(
@@ -1009,6 +1010,25 @@ fn frame_attempt(frame: &HostTabFrame) -> u64 {
     }
 }
 
+/// One measured cell metric, narrowed to what the handshake carries.
+///
+/// The UI measures in `u32` and nothing upstream bounds it: a configured
+/// font size is deliberately not capped at the interactive zoom limit,
+/// and the renderer accepts any finite cell of at least one pixel. So
+/// the narrowing is real, and a bare `as` is the one thing it must not
+/// be — 65536 truncates to `0`, which the session reads as "this client
+/// has no pixel metrics", and anything above wraps to a small, plausible
+/// lie.
+///
+/// Clamped rather than refused: the number is advisory. It is what the
+/// child reports for mode 2048 and nothing is rendered from it, so a
+/// font or zoom that somehow measured a cell wider than 65535 px should
+/// cost a wrong pixel report, not a tab that cannot attach at all. Zero
+/// passes through unchanged — that is the wire's own "unknown".
+fn cell_px(measured: u32) -> u16 {
+    u16::try_from(measured).unwrap_or(u16::MAX)
+}
+
 /// The line this attempt opens with: the tab, the terms, and the resume
 /// identity when there is one to hand back.
 ///
@@ -1059,11 +1079,14 @@ fn reason_for(code: Option<&ServerCode>, message: String) -> FailReason {
 /// What a refused queue permit means for the attach.
 ///
 /// Two rows, because a permit is refused in exactly two ways, and they
-/// say the same thing: the host connection owns this, not the tab.
+/// say the same thing: the host connection owns this, not the tab. A
+/// permit refused *after* the grant, by the fence it was granted under
+/// ([`AttachPermit::guarding`]), is the first row and no new one — the
+/// connection went away, which is what `Disconnected` means.
 fn classify_permit_failure(error: &HostOpError) -> FailReason {
     match error {
-        // The queue was flushed: the connection left `Connected` before
-        // the permit came up.
+        // The queue was flushed before the permit came up, or the
+        // connection it was granted for ended before the dial.
         HostOpError::Disconnected
         // The queue was full, or its worker is already gone.
         | HostOpError::Unavailable
@@ -1102,7 +1125,7 @@ struct Dial {
 async fn run_attempt(
     key: TabKey,
     attempt: u64,
-    permit: impl std::future::Future<Output = Result<(), HostOpError>>,
+    permit: impl std::future::Future<Output = Result<AttachPermit, HostOpError>>,
     dial: Dial,
     input_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<HostDataMsg>>>,
     feed: EngineFeedSender,
@@ -1114,9 +1137,10 @@ async fn run_attempt(
             HostTabFrame::Failed { attempt, reason },
         ));
     };
-    if let Err(error) = permit.await {
-        return fail(classify_permit_failure(&error), &feed);
-    }
+    let permit = match permit.await {
+        Ok(permit) => permit,
+        Err(error) => return fail(classify_permit_failure(&error), &feed),
+    };
     // Bounded, on the same budget a control leg gets. `DataConnection::dial`
     // has no timeout of its own, and the socket it dials is not always a
     // local one: over the ssh transport it is a bridge whose accept is a
@@ -1125,21 +1149,34 @@ async fn run_attempt(
     // timeout is a failed dial like any other — retryable, and the
     // re-attach backoff decides what happens next.
     let budget = crate::host_conn::leg_budget();
-    let (accepted, conn) =
-        match tokio::time::timeout(budget, DataConnection::dial(&socket, &handshake)).await {
-            Ok(Ok(accepted)) => accepted,
-            Ok(Err(error)) => return fail(classify_failure(&error), &feed),
-            Err(_elapsed) => {
-                return fail(
-                    FailReason::Retryable(format!(
-                        "attaching to {} timed out after {}s",
-                        socket.display(),
-                        budget.as_secs().max(1)
-                    )),
-                    &feed,
-                )
-            }
-        };
+    // Through the permit, never beside it: the grant said where the
+    // queue stood, and the connection it was granted for can end before
+    // this opens anything ([`AttachPermit::guarding`]).
+    let dialed = permit
+        .guarding(tokio::time::timeout(
+            budget,
+            DataConnection::dial(&socket, &handshake),
+        ))
+        .await;
+    let (accepted, conn) = match dialed {
+        Ok(Ok(Ok(accepted))) => accepted,
+        Ok(Ok(Err(error))) => return fail(classify_failure(&error), &feed),
+        Ok(Err(_elapsed)) => {
+            return fail(
+                FailReason::Retryable(format!(
+                    "attaching to {} timed out after {}s",
+                    socket.display(),
+                    budget.as_secs().max(1)
+                )),
+                &feed,
+            )
+        }
+        // The connection this attach was admitted for is gone. Same two
+        // rows, same meaning as a refused permit: the host connection
+        // owns the recovery, and re-attaching is its job, not this
+        // attempt's.
+        Err(error) => return fail(classify_permit_failure(&error), &feed),
+    };
     let kind = match negotiated_kind(&accepted.kind) {
         Ok(kind) => kind,
         Err(message) => return fail(FailReason::Retryable(message), &feed),
@@ -1281,8 +1318,8 @@ mod tests {
             kinds: CLIENT_PAYLOAD_KINDS.map(AttachPayloadKind::from).to_vec(),
             cols: GEOMETRY.cols,
             rows: GEOMETRY.rows,
-            cell_w_px: GEOMETRY.cell_w as u16,
-            cell_h_px: GEOMETRY.cell_h as u16,
+            cell_w_px: cell_px(GEOMETRY.cell_w),
+            cell_h_px: cell_px(GEOMETRY.cell_h),
             libghostty_build: "gb".into(),
             focus: true,
         }
@@ -2046,6 +2083,23 @@ mod tests {
         );
     }
 
+    /// A measured cell the wire's `u16` cannot hold clamps; it never
+    /// wraps, and it never becomes the `0` the session reads as "this
+    /// client has no pixel metrics at all".
+    ///
+    /// Nothing upstream bounds the measurement: a configured font size
+    /// is deliberately not capped at the interactive zoom limit, and the
+    /// renderer accepts any finite cell of at least one pixel.
+    #[test]
+    fn a_cell_too_wide_for_the_wire_clamps_rather_than_wrapping() {
+        assert_eq!(cell_px(0), 0, "the wire's own 'unknown' passes through");
+        assert_eq!(cell_px(9), 9);
+        assert_eq!(cell_px(u16::MAX as u32), u16::MAX);
+        assert_eq!(cell_px(u16::MAX as u32 + 1), u16::MAX, "not 0");
+        assert_eq!(cell_px(70_000), u16::MAX, "not 4464");
+        assert_eq!(cell_px(u32::MAX), u16::MAX);
+    }
+
     /// The accepted kind decides the decoder, and a kind this client
     /// never offered is refused rather than guessed at.
     #[test]
@@ -2063,131 +2117,177 @@ mod tests {
         );
     }
 
-    /// What one op arriving at the stand-in session looked like: its
-    /// name and, for a permit, the incarnation it was fenced at.
-    type Arrival = (String, Option<HostId>);
-    type Arrivals = Arc<std::sync::Mutex<Vec<Arrival>>>;
-
-    /// How long the stand-in takes to answer a wire op. Long enough that
-    /// a dial which did not wait its turn would be observed first, short
-    /// enough to keep the case a unit test.
-    const STAND_IN_ROUND_TRIP: Duration = Duration::from_millis(25);
-
-    fn arrived(log: &Arrivals) -> Vec<Arrival> {
-        log.lock().unwrap().clone()
-    }
-
-    fn note(log: &Arrivals, what: &str, fence: Option<HostId>) {
-        log.lock().unwrap().push((what.to_string(), fence));
-    }
-
-    /// A stand-in session on the far end of a `HostOps` queue, shaped
-    /// like the real worker: strictly FIFO, each wire op awaited inline,
-    /// and the ordering barrier answered where it stands.
+    /// The client's half of the permit, with the test standing in for
+    /// the connection task at both ends of it: it takes the barrier off
+    /// the queue, and it holds the serving fence that decides whether a
+    /// granted permit may still dial.
     ///
-    /// A wire op is recorded *after* it is answered, so its entry means
-    /// "this caller has its reply"; the barrier is recorded before it is
-    /// granted, so nothing it releases can be recorded ahead of it.
-    fn stand_in_session(
-        mut rx: mpsc::Receiver<HostIntent>,
-        log: Arrivals,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            while let Some(intent) = rx.recv().await {
-                if intent.barrier {
-                    note(&log, &intent.op, intent.fence);
-                    intent.answer(Ok(serde_json::Value::Null));
-                    continue;
-                }
-                let op = intent.op.to_string();
-                tokio::time::sleep(STAND_IN_ROUND_TRIP).await;
-                intent.answer(Ok(serde_json::json!({})));
-                note(&log, &op, None);
+    /// What the *worker* does with a barrier — grants it in line, never
+    /// on the wire, and serves through it — is pinned against the
+    /// production drain loop in
+    /// [`crate::host_conn::task`], not here.
+    struct StandIn {
+        _dir: tempfile::TempDir,
+        socket: std::path::PathBuf,
+        ops: HostOps,
+        ops_rx: mpsc::Receiver<HostIntent>,
+        dialed: tokio::sync::oneshot::Receiver<()>,
+        data_plane: tokio::task::JoinHandle<()>,
+    }
+
+    impl StandIn {
+        /// A data plane that accepts the dial, says so, and then says
+        /// nothing at all — an attach parked mid-handshake.
+        fn new() -> StandIn {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("roost.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+            let (dialed_tx, dialed) = tokio::sync::oneshot::channel();
+            let data_plane = tokio::spawn(async move {
+                let (held, _) = listener.accept().await.expect("accept");
+                let _ = dialed_tx.send(());
+                std::future::pending::<()>().await;
+                drop(held);
+            });
+            let (ops, ops_rx) = HostOps::channel();
+            StandIn {
+                _dir: dir,
+                socket,
+                ops,
+                ops_rx,
+                dialed,
+                data_plane,
             }
-        })
+        }
+
+        /// The barrier [`HostAttach::begin`] enqueued, checked for the
+        /// two things the queue promises about it.
+        async fn barrier(&mut self) -> HostIntent {
+            let intent = tokio::time::timeout(Duration::from_secs(5), self.ops_rx.recv())
+                .await
+                .expect("the attach enqueued its permit")
+                .expect("on an open queue");
+            assert!(intent.barrier, "it is a barrier, not a wire op");
+            assert_eq!(
+                intent.fence,
+                Some(key().host),
+                "fenced at this tab's own incarnation"
+            );
+            intent
+        }
+
+        /// Nothing has been dialed, and stays undialed for long enough
+        /// that a dial which ignored the permit would have been seen.
+        async fn nothing_dialed(&mut self, why: &str) {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), &mut self.dialed)
+                    .await
+                    .is_err(),
+                "{why}"
+            );
+        }
     }
 
-    /// **`session.set_theme` is answered before the data connection
-    /// dials, and the queue worker is never the thing waiting on it**
-    /// (plan 065 §3.10).
+    /// **No socket is opened until the permit is granted** (plan 065
+    /// §3.10). The attach's ordering device is its place in the host's
+    /// op queue, and this is the client's whole share of it: `begin`
+    /// dials nothing until the barrier it enqueued has been answered.
     ///
-    /// Both halves matter, and a design that got only the first would be
-    /// worse than the bug: until #473 the attach's ticket mint was a
-    /// queued op, which ordered the dial behind the theme for free — and
-    /// would order every *later* control op behind the whole attach,
-    /// for as long as the attach timeout. The permit buys the order
-    /// without buying that: the worker answers it where it stands and
-    /// moves on, so `tab.close` below lands while the dial is still
-    /// parked mid-handshake.
-    ///
-    /// The stand-in is a fake because there is no seam to slow a real
-    /// `set_theme` down, and a `set_theme` that answers instantly would
-    /// pass whether or not anything ordered it.
+    /// Until #473 the ticket mint was a queued op and the order came for
+    /// free. With the handshake inline there is no control leg left, so
+    /// the position has to be taken deliberately — and a dial that ran
+    /// ahead of it would compose a snapshot with the palette
+    /// `session.set_theme` had not installed yet.
     #[tokio::test]
-    async fn the_theme_lands_before_the_dial_and_the_worker_serves_through_it() {
-        use roost_ipc::messages::ops;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let socket = dir.path().join("roost.sock");
-        let log: Arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
-
-        // A data plane that accepts the dial, records it, and then says
-        // nothing at all — an attach parked mid-handshake, which is the
-        // state the second half of this case needs to observe.
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
-        let (dialed_tx, dialed_rx) = tokio::sync::oneshot::channel();
-        let dial_log = Arc::clone(&log);
-        let data_plane = tokio::spawn(async move {
-            let (held, _) = listener.accept().await.expect("accept");
-            note(&dial_log, "dial", None);
-            let _ = dialed_tx.send(());
-            std::future::pending::<()>().await;
-            drop(held);
-        });
-
-        let (ops, ops_rx) = HostOps::channel();
-        let worker = stand_in_session(ops_rx, Arc::clone(&log));
+    async fn the_attach_dials_nothing_until_its_permit_is_granted() {
+        let mut stand_in = StandIn::new();
+        // The connection task's other half: this incarnation is the one
+        // being served, so a permit granted for it may dial.
+        let _serving = stand_in.ops.serving().open(key().host);
 
         let (feed_tx, _feed_rx) = engine_feed::channel();
         let mut attach = HostAttach::new(key(), GEOMETRY);
-        // Enqueued before the attach asks for its permit, which is the
-        // only ordering this client controls.
-        let theme = ops.call(ops::SESSION_SET_THEME, serde_json::json!({}));
-        attach.begin(&ops, Some("sess-1"), socket.clone(), "gb", &feed_tx);
-
-        tokio::time::timeout(Duration::from_secs(5), dialed_rx)
-            .await
-            .expect("the attach dialed")
-            .expect("the data plane accepted");
-        assert_eq!(
-            arrived(&log),
-            vec![
-                (ops::SESSION_SET_THEME.to_string(), None),
-                ("attach-permit".to_string(), Some(key().host)),
-                ("dial".to_string(), None),
-            ],
-            "the theme is answered, then the permit is granted, then the dial happens"
+        attach.begin(
+            &stand_in.ops,
+            Some("sess-1"),
+            stand_in.socket.clone(),
+            "gb",
+            &feed_tx,
         );
-        assert!(theme.await.is_ok(), "the theme op was answered");
 
-        // The dial is still parked. A control op enqueued now must not
-        // be waiting behind it.
-        let closed = tokio::time::timeout(
-            Duration::from_secs(5),
-            ops.call(ops::TAB_CLOSE, serde_json::json!({})),
-        )
-        .await
-        .expect("the worker is still serving while the attach is in flight");
-        assert!(closed.is_ok());
-        assert_eq!(
-            arrived(&log).last().map(|(op, _)| op.as_str()),
-            Some(ops::TAB_CLOSE),
-            "a later op is answered while the dial is still mid-handshake"
+        let barrier = stand_in.barrier().await;
+        stand_in
+            .nothing_dialed("nothing is dialed while the permit is still in the queue")
+            .await;
+
+        barrier.answer(Ok(serde_json::Value::Null));
+        tokio::time::timeout(Duration::from_secs(5), stand_in.dialed)
+            .await
+            .expect("the dial follows the grant")
+            .expect("the data plane accepted");
+
+        attach.abort_tasks();
+        stand_in.data_plane.abort();
+    }
+
+    /// **A grant is not a licence that outlives its connection.** The
+    /// permit is answered where the worker stands and everything after
+    /// it happens on a socket of its own, so the connection it was
+    /// granted for can end before the dial. It must not dial anyway: the
+    /// session process is often still listening — only the control or
+    /// event leg died — so its `session_id` would match, and a focused
+    /// attach would resize the tab for a connection this client has
+    /// already lost.
+    #[tokio::test]
+    async fn an_attach_whose_connection_ended_after_the_grant_never_dials() {
+        let mut stand_in = StandIn::new();
+        let serving = stand_in.ops.serving().open(key().host);
+
+        let (feed_tx, mut feed_rx) = engine_feed::channel();
+        let mut attach = HostAttach::new(key(), GEOMETRY);
+        attach.begin(
+            &stand_in.ops,
+            Some("sess-1"),
+            stand_in.socket.clone(),
+            "gb",
+            &feed_tx,
+        );
+
+        let barrier = stand_in.barrier().await;
+        // Exactly the window F3 lives in: the connection ends, and the
+        // barrier it already dequeued is no longer on the queue to be
+        // flushed with the rest.
+        drop(serving);
+        barrier.answer(Ok(serde_json::Value::Null));
+
+        stand_in
+            .nothing_dialed("a permit granted for a connection that has ended opens nothing")
+            .await;
+        assert!(
+            matches!(next_failure(&mut feed_rx).await, FailReason::HostGone(_),),
+            "and the tab is told the host connection owns the recovery"
         );
 
         attach.abort_tasks();
-        data_plane.abort();
-        worker.abort();
+        stand_in.data_plane.abort();
+    }
+
+    /// Take the reason off the first `Failed` frame the attempt puts on
+    /// the feed.
+    async fn next_failure(feed_rx: &mut EngineFeedReceiver) -> FailReason {
+        let mut batch = crate::engine_feed::EngineBatch::default();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                while let Some(item) = feed_rx.try_next(&mut batch) {
+                    if let EngineFeed::HostTab(_, HostTabFrame::Failed { reason, .. }) = item {
+                        return reason;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the attempt reported a failure")
     }
 
     /// A resize that runs out of patience during a `vt` payload

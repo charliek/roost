@@ -18,11 +18,12 @@
 //! *position*, which is what [`HostOps::attach_permit`] takes.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use roost_ipc::client::{ClientError, ServerCode};
 use roost_ipc::messages::SessionPutFileResult;
 use roost_ui_model::keys::HostId;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use super::upload::{UploadSource, Uploads};
 
@@ -33,6 +34,10 @@ use super::upload::{UploadSource, Uploads};
 /// without bound. Overflow surfaces as an error on the intent, which is
 /// the honest outcome: the mutation did not happen.
 const QUEUE_DEPTH: usize = 256;
+
+/// The label a barrier carries in the worker's logs. Not a wire op —
+/// see [`HostIntent::barrier`].
+pub(crate) const BARRIER_OP: &str = "attach-permit";
 
 /// Why an intent did not produce a result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,7 +125,7 @@ impl HostIntent {
     fn barrier() -> Self {
         Self {
             barrier: true,
-            ..Self::new("attach-permit", serde_json::Value::Null)
+            ..Self::new(BARRIER_OP, serde_json::Value::Null)
         }
     }
 
@@ -155,6 +160,104 @@ impl HostIntent {
     }
 }
 
+/// Which incarnation this host's connection task is serving right now,
+/// or `None` between connections.
+///
+/// [`HostIntent::fence`] covers an intent only while it is *waiting* in
+/// the queue. A permit is different: it is answered where it stands and
+/// everything it releases — dial, handshake, snapshot — happens later,
+/// on a socket of its own, with the worker already on to the next op. So
+/// the fence has to outlive the answer, and this is where it lives. See
+/// [`AttachPermit::guarding`].
+#[derive(Debug, Clone)]
+pub(crate) struct Serving(Arc<watch::Sender<Option<HostId>>>);
+
+impl Default for Serving {
+    fn default() -> Self {
+        Serving(Arc::new(watch::channel(None).0))
+    }
+}
+
+impl Serving {
+    /// Name `incarnation` as the one being served, for as long as the
+    /// returned hold lives — the connection task opens one at its
+    /// `Connected` edge and drops it on every way out, exactly as it
+    /// does the upload lane ([`Uploads::open`]).
+    pub(crate) fn open(&self, incarnation: HostId) -> Hold {
+        self.0.send_replace(Some(incarnation));
+        Hold {
+            serving: self.clone(),
+            incarnation,
+        }
+    }
+}
+
+/// One incarnation's hold on [`Serving`].
+pub(crate) struct Hold {
+    serving: Serving,
+    incarnation: HostId,
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        // Only if it still names *mine*: a hold can outlive the install
+        // of its successor — the connection loop's next attempt starts
+        // whether or not the last one has finished unwinding — so an
+        // unconditional clear would unfence the incarnation after this
+        // one (the hazard [`Uploads::close`] guards the same way).
+        self.serving.0.send_if_modified(|held| {
+            let mine = *held == Some(self.incarnation);
+            if mine {
+                *held = None;
+            }
+            mine
+        });
+    }
+}
+
+/// A granted queue permit: the attach's place in line, and its licence
+/// to dial.
+///
+/// The dial goes *through* the permit rather than beside it, because the
+/// grant is a statement about where the queue stood and not a promise
+/// about the future. The worker answers a barrier and moves on, so the
+/// connection the permit was granted for can end before the socket is
+/// even opened — and if that session's process is still listening (only
+/// the control or event leg died, say), the handshake's `session_id`
+/// matches and the stale attach is accepted, resizing the tab for a
+/// connection this client has already lost. Dialing through the permit
+/// is what makes that impossible to forget.
+#[derive(Debug)]
+#[must_use = "a permit is only good for the dial it guards"]
+pub(crate) struct AttachPermit {
+    incarnation: HostId,
+    serving: watch::Receiver<Option<HostId>>,
+}
+
+impl AttachPermit {
+    /// Run `dial` only while the connection this permit was granted for
+    /// is still the one being served, and abandon it the moment that
+    /// stops being true.
+    pub(crate) async fn guarding<T>(
+        mut self,
+        dial: impl std::future::Future<Output = T>,
+    ) -> Result<T, HostOpError> {
+        let mine = self.incarnation;
+        tokio::select! {
+            // Biased so the fence is read before the dial is polled: a
+            // permit whose connection has already gone opens nothing at
+            // all. `wait_for` checks the current value before it waits,
+            // and a sender that went away resolves it too — nothing is
+            // being served if there is nobody left to say so.
+            biased;
+            _ = self.serving.wait_for(|held| *held != Some(mine)) => {
+                Err(HostOpError::Disconnected)
+            }
+            dialed = dial => Ok(dialed),
+        }
+    }
+}
+
 /// The UI-side handle. Cloneable, cheap, and never blocks: enqueuing
 /// happens on the main thread, so a full queue is refused rather than
 /// awaited.
@@ -168,6 +271,8 @@ pub(crate) struct HostOps {
     /// The upload lane, which shares nothing with the queue above but
     /// the handle that reaches it. See [`upload`].
     uploads: Uploads,
+    /// What a granted permit is fenced against. See [`Serving`].
+    serving: Serving,
 }
 
 impl HostOps {
@@ -183,6 +288,7 @@ impl HostOps {
             HostOps {
                 tx,
                 uploads: Uploads::default(),
+                serving: Serving::default(),
             },
             rx,
         )
@@ -191,6 +297,12 @@ impl HostOps {
     /// The slot the connection task fills at its `Connected` edge.
     pub(crate) fn uploads(&self) -> Uploads {
         self.uploads.clone()
+    }
+
+    /// The fence the connection task holds open across a `Connected`
+    /// incarnation. See [`Serving`].
+    pub(crate) fn serving(&self) -> Serving {
+        self.serving.clone()
     }
 
     /// Send one file to the host, and wait for the path it landed at.
@@ -266,15 +378,27 @@ impl HostOps {
     /// every later control op for the whole attach timeout, which is the
     /// same reason uploads are not on it either ([`Self::put_file`]).
     ///
-    /// Fenced at `incarnation`, because a permit is a statement about
-    /// one connection: an attach released after a drop must not dial the
-    /// session that replaced it.
+    /// Fenced at `incarnation` twice over, because a permit is a
+    /// statement about one connection: [`HostIntent::fence`] while it
+    /// waits in the queue, and [`AttachPermit::guarding`] for everything
+    /// it releases afterwards. An attach must not dial the session that
+    /// replaced the connection it was asked of, whether the replacement
+    /// happened before the grant or after it.
     pub(crate) fn attach_permit(
         &self,
         incarnation: HostId,
-    ) -> impl std::future::Future<Output = Result<(), HostOpError>> + Send + 'static {
+    ) -> impl std::future::Future<Output = Result<AttachPermit, HostOpError>> + Send + 'static {
         let granted = self.dispatch(HostIntent::barrier().fenced_at(incarnation));
-        async move { granted.await.map(|_| ()) }
+        // Subscribed before the wait, so a connection that ends between
+        // the grant and the first read is still seen.
+        let serving = self.serving.0.subscribe();
+        async move {
+            granted.await?;
+            Ok(AttachPermit {
+                incarnation,
+                serving,
+            })
+        }
     }
 
     /// [`Self::call`] bound to the incarnation it was issued for — see
@@ -501,9 +625,104 @@ mod tests {
             queued,
             vec![
                 ("session.set_theme".to_string(), false),
-                ("attach-permit".to_string(), true),
+                (BARRIER_OP.to_string(), true),
                 ("tab.close".to_string(), false),
             ]
+        );
+    }
+
+    /// Grant a permit the way the worker does: take the barrier off the
+    /// queue and answer it where it stands.
+    async fn granted(
+        ops: &HostOps,
+        rx: &mut mpsc::Receiver<HostIntent>,
+        incarnation: HostId,
+    ) -> AttachPermit {
+        let waiting = ops.attach_permit(incarnation);
+        let intent = rx.recv().await.expect("the barrier was enqueued");
+        assert!(intent.barrier, "and it is a barrier");
+        intent.answer(Ok(serde_json::Value::Null));
+        waiting.await.expect("the grant")
+    }
+
+    /// **A permit does not outlive the connection that granted it.**
+    ///
+    /// The grant says where the queue stood, not what is still true when
+    /// the dial finally happens — and the handshake's `session_id` does
+    /// not cover this, because the session process it names may well
+    /// still be listening.
+    #[tokio::test]
+    async fn a_granted_permit_only_dials_for_the_connection_it_was_granted_for() {
+        let (ops, mut rx) = HostOps::channel();
+        let first = HostId::new(1);
+
+        let held = ops.serving().open(first);
+        let permit = granted(&ops, &mut rx, first).await;
+        assert_eq!(
+            permit.guarding(std::future::ready("dialed")).await,
+            Ok("dialed"),
+            "a permit whose connection is still the one being served dials"
+        );
+
+        // The connection ended between the grant and the dial.
+        let permit = granted(&ops, &mut rx, first).await;
+        drop(held);
+        assert_eq!(
+            permit.guarding(std::future::ready("dialed")).await,
+            Err(HostOpError::Disconnected),
+            "an ended connection refuses before anything is opened"
+        );
+
+        // And a replacement is not a continuation of it.
+        let held = ops.serving().open(first);
+        let permit = granted(&ops, &mut rx, first).await;
+        let _next = ops.serving().open(HostId::new(2));
+        drop(held);
+        assert_eq!(
+            permit.guarding(std::future::ready("dialed")).await,
+            Err(HostOpError::Disconnected),
+            "the session that replaced it is not the one this attach was asked of"
+        );
+    }
+
+    /// The same fence mid-flight: a dial is abandoned the moment its
+    /// connection stops being the one served, rather than landing an
+    /// attach — and a focused attach's resize — on a session this client
+    /// has already lost.
+    #[tokio::test]
+    async fn a_dial_in_flight_is_abandoned_when_its_connection_ends() {
+        let (ops, mut rx) = HostOps::channel();
+        let first = HostId::new(1);
+        let held = ops.serving().open(first);
+        let permit = granted(&ops, &mut rx, first).await;
+
+        let dialing = tokio::spawn(permit.guarding(std::future::pending::<()>()));
+        drop(held);
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), dialing)
+                .await
+                .expect("the dial is abandoned rather than parked")
+                .expect("and its task does not panic"),
+            Err(HostOpError::Disconnected)
+        );
+    }
+
+    /// A hold can outlive the install of its successor — the connection
+    /// loop's next attempt starts whether or not the last one has
+    /// finished unwinding — so dropping the old one must not unfence the
+    /// new one.
+    #[tokio::test]
+    async fn a_late_hold_drop_does_not_unfence_the_incarnation_after_it() {
+        let (ops, mut rx) = HostOps::channel();
+        let first = ops.serving().open(HostId::new(1));
+        let _second = ops.serving().open(HostId::new(2));
+        drop(first);
+
+        let permit = granted(&ops, &mut rx, HostId::new(2)).await;
+        assert_eq!(
+            permit.guarding(std::future::ready("dialed")).await,
+            Ok("dialed")
         );
     }
 
@@ -515,14 +734,14 @@ mod tests {
         let (ops, mut rx) = HostOps::channel();
         let flushed = ops.attach_permit(HostId::new(1));
         flush(&mut rx, &HostOpError::Disconnected);
-        assert_eq!(flushed.await, Err(HostOpError::Disconnected));
+        assert_eq!(flushed.await.unwrap_err(), HostOpError::Disconnected);
 
         for _ in 0..QUEUE_DEPTH {
             ops.send(intent("fill")).unwrap();
         }
         assert_eq!(
-            ops.attach_permit(HostId::new(1)).await,
-            Err(HostOpError::Unavailable)
+            ops.attach_permit(HostId::new(1)).await.unwrap_err(),
+            HostOpError::Unavailable
         );
     }
 

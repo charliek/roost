@@ -1080,6 +1080,7 @@ impl HostConnSet {
             client_build: self.client_build.clone(),
             theme: Arc::clone(&self.theme),
             uploads: ops.uploads(),
+            serving: ops.serving(),
         };
         // Detached on purpose: the task owns its own shutdown, bounds it
         // (`task::SHUTDOWN_GRACE`), and answers its queue on the way

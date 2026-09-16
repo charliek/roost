@@ -199,6 +199,10 @@ pub(crate) struct ConnectionConfig {
     /// `Connected` edge and emptied on every way out of one — see
     /// [`Uploads::open`] and [`serve`].
     pub(crate) uploads: Uploads,
+    /// What fences a granted attach permit once the worker has moved on.
+    /// Held open across exactly the same edge as the lane above — see
+    /// [`queue::Serving`].
+    pub(crate) serving: queue::Serving,
 }
 
 /// The scale every budget in this module is stretched by, read once.
@@ -572,6 +576,12 @@ async fn connect_loop(
                     // that last one runs no code, which is why this is a
                     // `Drop` and not a line after the `await`.
                     let _lane = config.uploads.open(config.socket.clone());
+                    // The same edge, for the same reason: a permit this
+                    // incarnation's worker grants releases a dial that
+                    // happens after the answer, and dropping this hold
+                    // is what refuses one that arrives too late
+                    // ([`queue::AttachPermit::guarding`]).
+                    let _serving = config.serving.open(incarnation);
                     serve(config, incarnation, live, ops_rx, feed, shutdown).await
                 }
             }
@@ -1938,6 +1948,7 @@ mod tests {
             client_build: "gb".into(),
             theme: Arc::new(Mutex::new(super::super::blank_theme())),
             uploads: Uploads::default(),
+            serving: queue::Serving::default(),
         }
     }
 
@@ -2312,6 +2323,9 @@ mod tests {
         /// Every `events.subscribe` this session was sent, in order.
         /// The record "did this reconnect resume?" is read off.
         subscribes: Arc<Mutex<Vec<EventsSubscribeParams>>>,
+        /// Every op name this session was sent, in order — the only way
+        /// to say "and *this* one never reached the wire".
+        seen: Arc<Mutex<Vec<String>>>,
         /// How many `tab.list` snapshots it has been asked for. A
         /// resumed reconnect takes none, which is the whole of R11.
         tab_lists: Arc<AtomicUsize>,
@@ -2352,6 +2366,7 @@ mod tests {
                 subscribe: Subscribe::Serve,
                 resume_drops: Arc::new(AtomicUsize::new(0)),
                 subscribes: Arc::new(Mutex::new(Vec::new())),
+                seen: Arc::new(Mutex::new(Vec::new())),
                 tab_lists: Arc::new(AtomicUsize::new(0)),
                 streams_ended: Arc::new(AtomicUsize::new(0)),
                 persist_error: Arc::new(Mutex::new(None)),
@@ -2418,6 +2433,14 @@ mod tests {
             self.subscribes()
                 .len()
                 .saturating_sub(self.streams_ended.load(Ordering::Acquire))
+        }
+
+        /// Every op this session was sent, in arrival order.
+        fn seen(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         }
 
         fn subscribes(&self) -> Vec<EventsSubscribeParams> {
@@ -2521,6 +2544,10 @@ mod tests {
                 let request: serde_json::Value = serde_json::from_str(&line).expect("a request");
                 let id = request["id"].clone();
                 let op = request["op"].as_str().unwrap_or_default().to_string();
+                self.seen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(op.clone());
                 if self.stall == Some(op.as_str()) && armed(&self.stall_skips) {
                     self.stalled.request();
                     self.release.requested().await;
@@ -2696,14 +2723,21 @@ mod tests {
     /// Every host state the task has published, drained as it goes,
     /// with the connect facts and applied revisions that rode behind
     /// them.
+    /// The fourth is every incarnation that reached `Connected`, which
+    /// is the only way a test learns the id the task minted.
     #[derive(Default)]
-    struct States(Vec<HostConnState>, Vec<ConnectFacts>, Vec<u64>);
+    struct States(Vec<HostConnState>, Vec<ConnectFacts>, Vec<u64>, Vec<HostId>);
 
     impl States {
         fn drain(&mut self, rx: &mut crate::engine_feed::EngineFeedReceiver) {
             for item in feed_items(rx) {
                 match item {
-                    EngineFeed::HostState(_, state) => self.0.push(state),
+                    EngineFeed::HostState(id, state) => {
+                        if state.is_connected() {
+                            self.3.push(id);
+                        }
+                        self.0.push(state)
+                    }
                     EngineFeed::HostConnectFacts(_, facts) => self.1.push(facts),
                     EngineFeed::HostWorkspace(_, HostWorkspaceEvent::Applied { revision, .. }) => {
                         self.2.push(revision)
@@ -2715,6 +2749,11 @@ mod tests {
 
         fn connections(&self) -> usize {
             self.0.iter().filter(|state| state.is_connected()).count()
+        }
+
+        /// The incarnation of the connection that is up.
+        fn incarnation(&self) -> HostId {
+            *self.3.last().expect("a connected task published an id")
         }
 
         fn last(&self) -> &HostConnState {
@@ -2772,6 +2811,7 @@ mod tests {
             let (ops, ops_rx) = super::super::HostOps::channel();
             let mut config = config(socket, transport, ConnectMode::Dial);
             config.uploads = ops.uploads();
+            config.serving = ops.serving();
             config.resume = resume;
             let (feed, rx) = crate::engine_feed::channel();
             let shutdown = Arc::new(Shutdown::default());
@@ -3336,6 +3376,114 @@ mod tests {
 
         let states = host.stop().await;
         assert_eq!(states.connections(), 1, "one incarnation throughout");
+    }
+
+    /// **The permit's two halves, against the worker that grants it**
+    /// (plan 065 §3.10). The barrier is answered where it stands — after
+    /// everything enqueued before it, and without ever reaching the
+    /// session — and the loop moves straight on, so an attach still
+    /// holding its permit blocks no later control op.
+    ///
+    /// Driven through the production drain loop on purpose. This is what
+    /// [`queue::HostOps::attach_permit`] promises and what the client
+    /// leans on for "the theme lands before the dial"; a stand-in worker
+    /// that re-implemented the barrier arm would assert nothing about
+    /// the real one.
+    #[tokio::test]
+    async fn the_worker_grants_a_permit_in_line_and_never_on_the_wire() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("permit.sock");
+        // One skip: the prologue seeds the palette, and a connection
+        // that stalled on *that* would never be made.
+        let fake = Fake::new(PutFile::Land).stalling_after(ops::SESSION_SET_THEME, 1);
+        fake.serve(&socket);
+        let host = Connected::start(socket, HostTransport::UnixSocket).await;
+        let incarnation = host.states.incarnation();
+
+        // Both enqueued before the worker can have woken: enqueuing is
+        // synchronous, so the permit is genuinely *behind* the theme in
+        // line rather than merely later in wall-clock time — which is
+        // what makes the wait below a statement about the queue.
+        let theme = tokio::spawn(host.ops.call(ops::SESSION_SET_THEME, serde_json::json!({})));
+        let mut permit = tokio::spawn(host.ops.attach_permit(incarnation));
+        // Read by the session and unanswered: the worker is parked
+        // inside the theme, which is where the permit has to wait.
+        cued(&fake.stalled, "the session read the theme").await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut permit)
+                .await
+                .is_err(),
+            "a permit is not granted while an op enqueued before it is still in flight"
+        );
+
+        fake.release.request();
+        assert!(theme.await.expect("the theme task").is_ok());
+        let permit = tokio::time::timeout(Duration::from_secs(10), permit)
+            .await
+            .expect("the permit is granted once the op ahead of it is answered")
+            .expect("and its task does not panic")
+            .expect("and the connection it names is still the one serving");
+        assert!(
+            !fake.seen().iter().any(|op| op == queue::BARRIER_OP),
+            "the barrier is answered where it stands, never put on the wire: {:?}",
+            fake.seen()
+        );
+
+        // The permit is held and nothing has been dialed with it. The
+        // worker must be somewhere else entirely.
+        assert!(tokio::time::timeout(
+            Duration::from_secs(10),
+            host.ops.call(ops::TAB_CLOSE, serde_json::json!({})),
+        )
+        .await
+        .expect("the worker never awaits the attach a permit released")
+        .is_ok());
+
+        drop(permit);
+        assert_eq!(
+            host.stop().await.connections(),
+            1,
+            "one incarnation throughout"
+        );
+    }
+
+    /// **A permit does not outlive the connection that granted it.**
+    ///
+    /// The grant is a fact about where the queue stood, not a promise
+    /// about the future: once the connection it named has ended, the
+    /// dial it would have released is refused. Nothing else refuses it —
+    /// the session process may still be listening, in which case the
+    /// handshake's `session_id` matches and a focused attach would
+    /// resize the tab for a connection this client has already lost.
+    #[tokio::test]
+    async fn a_permit_cannot_dial_for_a_connection_that_has_ended() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("stale-permit.sock");
+        let fake = Fake::new(PutFile::Land).cutting(1);
+        fake.serve(&socket);
+        let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
+        let incarnation = host.states.incarnation();
+
+        let permit =
+            tokio::time::timeout(Duration::from_secs(10), host.ops.attach_permit(incarnation))
+                .await
+                .expect("the permit is granted")
+                .expect("while the connection is up");
+
+        // Only the event stream goes; the session itself is still
+        // listening on the same socket under the same id.
+        fake.cut.request();
+        until_state(&mut host, "the connection to drop", |state| {
+            matches!(state, HostConnState::Disconnected(_))
+        })
+        .await;
+
+        assert_eq!(
+            permit.guarding(std::future::ready("dialed")).await,
+            Err(HostOpError::Disconnected),
+            "the attach the permit released is refused rather than dialed"
+        );
+        host.stop().await;
     }
 
     /// Cancelling an attempt mid-snapshot retires its pump.
