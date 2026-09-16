@@ -2079,8 +2079,15 @@ mod tests {
     #[test]
     fn a_write_lands_on_the_file_its_lock_covers_past_the_hop_limit() {
         let tmp = tempfile::tempdir().unwrap();
-        let near = tmp.path().join("near");
-        let far = tmp.path().join("far");
+        // Canonical, because every hop below stores an *absolute* target and
+        // macOS puts its temp dirs under a symlinked `/var`: resolving each
+        // hop would re-traverse that link, costing two of the OS's symlink
+        // budget per hop and hitting its limit of 32 at exactly this chain
+        // length. The hop limit under test is `follow_links`', not the
+        // kernel's.
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let near = root.join("near");
+        let far = root.join("far");
         fs::create_dir_all(&near).unwrap();
         fs::create_dir_all(&far).unwrap();
         let real = far.join("config.conf");
