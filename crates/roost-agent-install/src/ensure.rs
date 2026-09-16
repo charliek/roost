@@ -680,24 +680,44 @@ fn union(hooks: &AgentHooks, agents: &[Agent]) -> AgentHooks {
 /// uninstall and not a total one.
 ///
 /// A *partial* narrowing keeps what this build cannot name — the user
-/// took one agent out, not every agent a newer Roost knows. Narrowing to
-/// nothing does not: an `off` key carrying names beside it would not
-/// parse back as `off`.
+/// took one agent out, not every agent a newer Roost knows. A **total**
+/// one drops those names with the rest: an `off` key carrying names
+/// beside it would not parse back as `off`, and "take every agent out"
+/// is an answer about all of them.
 fn narrowed(hooks: &AgentHooks, agents: &[Agent]) -> Option<AgentHooks> {
     if ALL_AGENTS.iter().all(|agent| agents.contains(agent)) {
         return Some(AgentHooks::Off);
     }
-    let AgentHooks::Allow { agents: names, .. } = hooks else {
+    let AgentHooks::Allow {
+        agents: names,
+        unknown,
+    } = hooks
+    else {
         return None;
     };
     let kept: Vec<Agent> = allowed_from(names)
         .into_iter()
         .filter(|agent| !agents.contains(agent))
         .collect();
-    Some(if kept.is_empty() {
-        AgentHooks::Off
-    } else {
-        allowing(hooks, &kept)
+    if !kept.is_empty() {
+        return Some(allowing(hooks, &kept));
+    }
+    if unknown.is_empty() {
+        return Some(AgentHooks::Off);
+    }
+    // The last name this build knows is gone, but the user asked about
+    // *that* agent — not about the one a newer Roost put here — so the
+    // unknown names are written on their own rather than replaced by
+    // `off`, which would erase them (#486's data loss, one layer down).
+    //
+    // The cost is deliberate: an all-unknown value parses back as `Ask`,
+    // not `Allow`, so the consent dialog raises again. That is the honest
+    // reading of the state it describes — this build now allows nothing
+    // and is holding a name it cannot wire — and a newer build that
+    // knows the name still finds it.
+    Some(AgentHooks::Allow {
+        agents: Vec::new(),
+        unknown: unknown.clone(),
     })
 }
 
@@ -1069,6 +1089,40 @@ mod tests {
             narrowed(&AgentHooks::Ask, &ALL_AGENTS),
             Some(AgentHooks::Off)
         );
+    }
+
+    /// #486's data loss, one layer down: taking the last name this build
+    /// *can* wire out of `claude, gemini` must not take `gemini` with it.
+    /// Naming every agent is the one uninstall that does.
+    #[test]
+    fn a_partial_uninstall_keeps_a_name_this_build_cannot_wire() {
+        let newer = AgentHooks::Allow {
+            agents: vec!["claude".into()],
+            unknown: vec!["gemini".into()],
+        };
+        assert_eq!(
+            narrowed(&newer, &[Agent::Claude])
+                .and_then(|hooks| hooks.to_config_value())
+                .as_deref(),
+            Some("gemini"),
+            "the uninstall erased a name it was not asked about"
+        );
+        assert_eq!(narrowed(&newer, &ALL_AGENTS), Some(AgentHooks::Off));
+    }
+
+    /// The same, through the verb the user types, ending on disk.
+    #[test]
+    fn an_uninstall_leaves_a_name_this_build_cannot_wire_in_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = a_home(dir.path());
+        roost_ui_model::config::set_key(home.config_path(), "agent-hooks", "claude, gemini")
+            .unwrap();
+        install(&home, &[Agent::Claude], "local", Guard::PERMITTED).expect("install");
+
+        uninstall(&home, &[Agent::Claude], Guard::PERMITTED).expect("uninstall");
+
+        let text = std::fs::read_to_string(home.config_path()).expect("config");
+        assert!(text.contains("agent-hooks = gemini"), "{text}");
     }
 
     fn claude_row(home: &Home, mode: &Mode) -> Status {

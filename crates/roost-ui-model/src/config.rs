@@ -185,11 +185,15 @@ const RESERVED_WORDS: [&str; 7] = ["off", "false", "no", "auto", "on", "true", "
 /// is re-emitted verbatim by [`AgentHooks::to_config_value`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum AgentHooks {
-    /// `agents` is never empty: a value naming nothing this build knows
-    /// is [`AgentHooks::Ask`], so `unknown` only ever rides alongside a
-    /// real allow-list. That is what makes `to_config_value` round-trip
-    /// through `parse` — a value spelling only unknown tokens would come
-    /// back as `Ask` and put the consent dialog up again.
+    /// [`AgentHooks::parse`] never leaves `agents` empty: a value naming
+    /// nothing this build knows is [`AgentHooks::Ask`], so `unknown`
+    /// only ever rides alongside a real allow-list. That is what makes
+    /// `to_config_value` round-trip through `parse` — a value spelling
+    /// only unknown tokens comes back as `Ask` and puts the consent
+    /// dialog up again. One writer builds that value on purpose and
+    /// wants exactly that reading: a *partial* uninstall taking the last
+    /// known name out of a key that still holds an unknown one
+    /// (`roost_agent_install::ensure::narrowed`, where the why is).
     Allow {
         agents: Vec<String>,
         unknown: Vec<String>,
@@ -200,16 +204,39 @@ pub enum AgentHooks {
 }
 
 impl AgentHooks {
-    /// An allow-list with nothing unknown in it — what a caller that
-    /// built the list itself (a dialog, a test) has.
+    /// An allow-list a caller built itself — a dialog, a wire list, a
+    /// test — normalised exactly as [`AgentHooks::parse`] normalises the
+    /// same names: the known ones in [`ALL_AGENTS`] order, anything else
+    /// lower-cased into `unknown`.
+    ///
+    /// Canonical *here*, and not only in [`AgentHooks::to_config_value`],
+    /// because this type's round-trip property is what stops a redundant
+    /// write: a wire list spelled `codex, claude` serialises as `claude,
+    /// codex`, so a value built from it that kept source order would
+    /// compare unequal to the key already on disk saying the same thing,
+    /// and rewrite the user's config to the bytes it already holds.
     pub fn allow<I, S>(agents: I) -> AgentHooks
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        let mut known: Vec<Agent> = Vec::new();
+        let mut unknown: Vec<String> = Vec::new();
+        for name in agents {
+            let name = name.into();
+            match Agent::parse(&name) {
+                Some(agent) => known.push(agent),
+                None => {
+                    let name = name.to_ascii_lowercase();
+                    if !unknown.contains(&name) {
+                        unknown.push(name);
+                    }
+                }
+            }
+        }
         AgentHooks::Allow {
-            agents: agents.into_iter().map(Into::into).collect(),
-            unknown: Vec::new(),
+            agents: ordered_names(&known),
+            unknown,
         }
     }
 
@@ -1527,6 +1554,24 @@ mod tests {
         assert_eq!(AgentHooks::Ask.to_config_value(), None);
     }
 
+    /// …and all the way back. A list handed in wire order has to *be*
+    /// the value it serialises to, or a caller comparing what it built
+    /// against the key already on disk rewrites a config that says
+    /// exactly this.
+    #[test]
+    fn agent_hooks_allow_is_canonical_whatever_order_it_is_given() {
+        let hooks = AgentHooks::allow(["codex", "claude"]);
+        let value = hooks.to_config_value().expect("an allow-list has a value");
+        assert_eq!(value, "claude, codex");
+        assert_eq!(AgentHooks::parse(&value), Some(hooks));
+
+        // A name this build cannot wire rides along, normalised the way
+        // the parser would have left it.
+        let mixed = AgentHooks::allow(["Banana", "codex"]);
+        assert_eq!(mixed.to_config_value().as_deref(), Some("codex, banana"));
+        assert_eq!(AgentHooks::parse("codex, banana"), Some(mixed));
+    }
+
     /// The retired `agent-hooks-skip` key now parses as an ignored
     /// unknown key — `RoostConfig` no longer has a field for it, and it
     /// must not disturb `agent-hooks` on the same line set.
@@ -1974,6 +2019,31 @@ mod tests {
         let cfg = RoostConfig::load_from(&config);
         assert_eq!(cfg.font_size, Some(17.0));
         assert_eq!(cfg.theme_name.as_deref(), Some("roost-dark"));
+    }
+
+    /// The degenerate half of that path, pinned on both sides: this is
+    /// the table `Config.swift`'s `configLockPath` is tested against, and
+    /// a config path with no parent directory is where the two resolvers
+    /// can silently pick different files.
+    #[test]
+    fn the_lock_path_table_the_swift_twin_mirrors() {
+        for (config, lock) in [
+            ("/", "./config.lock"),
+            ("//", "./config.lock"),
+            ("", "./config.lock"),
+            ("config.conf", "./config.lock"),
+            ("./config.conf", "./config.lock"),
+            ("a/", "./config.lock"),
+            ("/config.conf", "/config.lock"),
+            ("/a/", "/config.lock"),
+            ("/a/b/config.conf", "/a/b/config.lock"),
+        ] {
+            assert_eq!(
+                super::lock_beside(Path::new(config)),
+                Path::new(lock),
+                "{config}"
+            );
+        }
     }
 
     /// The lock follows the config, so `$ROOST_CONFIG` and a dotfiles

@@ -50,9 +50,19 @@ func followConfigLinks(_ path: String) -> String {
 
 /// `config.lock` beside `resolved` — mirrors `lock_beside`. `resolved`
 /// must already have been through `followConfigLinks`.
-private func configLockPath(beside resolved: String) -> String {
-    let dir = (resolved as NSString).deletingLastPathComponent
-    return dir.isEmpty ? "./config.lock" : dir + "/config.lock"
+///
+/// A root path is the one input where the two sides' idea of a parent
+/// directory diverges: Rust's `Path::parent` answers `None` for `/`,
+/// which `lock_beside` maps to `.` exactly like the empty parent of a
+/// bare filename, where `deletingLastPathComponent` answers `/` and
+/// would put the lock at `//config.lock`. Both are real files, and they
+/// are not the same one — which is the one failure `flock` cannot
+/// report, since neither writer ever waits.
+func configLockPath(beside resolved: String) -> String {
+    let parent = (resolved as NSString).deletingLastPathComponent
+    let isRoot = !resolved.isEmpty && resolved.allSatisfy { $0 == "/" }
+    let dir = (isRoot || parent.isEmpty) ? "." : parent
+    return dir.hasSuffix("/") ? dir + "config.lock" : dir + "/config.lock"
 }
 
 /// Advisory lock every writer of one `config.conf` goes through — the
@@ -532,11 +542,32 @@ struct RoostConfig: Sendable {
     ) -> Error? {
         do {
             let lock = try ConfigLock.acquire(configPath: path.path, deadline: lockDeadline)
-            return writeKeyLocked(at: URL(fileURLWithPath: lock.configPath), key: key, value: value)
+            // ARC is free to release an object right after its last
+            // *use*, and the guard's last use is the path read below —
+            // so without this the `deinit` that unlocks and closes the
+            // fd can run before the write it covers has begun, handing
+            // the file to the Rust side mid-read-modify-write. A lock
+            // that dies early is worse than no lock: it reads as correct.
+            return withExtendedLifetime(lock) {
+                writeKeyLocked(at: URL(fileURLWithPath: lock.configPath), key: key, value: value)
+            }
         } catch {
             return error
         }
     }
+
+    /// The one queue `setKeyAsync` writes on, and it is **serial**.
+    ///
+    /// `ConfigLock` decides that two writers take turns; it says nothing
+    /// about whose turn comes first. Dispatched concurrently, two writes
+    /// of the same key can therefore take the lock in the opposite order
+    /// and leave the *older* value on disk — two font-size taps landing
+    /// as the first size, a double sidebar toggle landing as the first
+    /// toggle. The Rust side serialises for the same reason
+    /// (`ConfigWriter`, an `mpsc` drained by a single task, plan 065
+    /// §3.5), so both UIs write in request order.
+    static let writeQueue = DispatchQueue(
+        label: "ai.stridelabs.Roost.config-write", qos: .userInitiated)
 
     /// `setKey`, off the calling thread, with the result delivered on
     /// the main actor. No UI thread may wait on `ConfigLock.acquire` —
@@ -548,7 +579,7 @@ struct RoostConfig: Sendable {
         _ key: String, value: String, at path: URL = defaultPath(),
         completion: @escaping @MainActor (Error?) -> Void
     ) {
-        DispatchQueue.global(qos: .userInitiated).async {
+        writeQueue.async {
             let error = setKey(key, value: value, at: path)
             Task { @MainActor in completion(error) }
         }
