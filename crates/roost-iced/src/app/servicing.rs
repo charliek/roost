@@ -5,6 +5,8 @@ use roost_ipc::messages::{SentFile, SkippedFile, TabSendFileResult};
 use roost_ui_model::file_transfer::{status, Refusal, Skipped, Target};
 use roost_ui_model::keys::HostId;
 
+use crate::host_conn::HostConnState;
+
 use super::file_transfer::{GestureOutcome, SentSource};
 use super::interactions::{host_reorder_call, ReorderTarget};
 use super::*;
@@ -651,6 +653,60 @@ fn host_envelope_action(envelope: &roost_ipc::messages::EventEnvelope) -> HostEn
                 HostEnvelopeAction::Durability(event.error)
             }),
         _ => HostEnvelopeAction::Ignore,
+    }
+}
+
+/// What a local workspace event leaves the `Local` durability line
+/// holding (#481): `None` for an event that says nothing about it, and
+/// otherwise the value it is now.
+///
+/// Two events move it, and they move it for opposite reasons.
+/// `DurabilityChanged` carries the new value. `Resync` carries none —
+/// it is what a *lagged* broadcast becomes, and `DurabilityChanged` is
+/// live-only, so whatever it announced during the gap is simply gone.
+/// The standing value is on the workspace, so a resync reads it back:
+/// the local analogue of the `session.identify` a host's resync re-runs.
+/// Without it a missed failure stays invisible and a missed recovery
+/// leaves the failure line standing for the rest of the session.
+fn local_durability_update(
+    event: &WorkspaceEvent,
+    workspace: &Workspace,
+) -> Option<Option<String>> {
+    match event {
+        WorkspaceEvent::DurabilityChanged { error } => Some(error.clone()),
+        WorkspaceEvent::Resync(_) => Some(workspace.persist_error()),
+        _ => None,
+    }
+}
+
+/// Retire a host's standing durability line — but only once the host is
+/// genuinely gone (#481).
+///
+/// A connection that drops says nothing about the remote disk: "on
+/// {host}: last save failed" is still true, and erasing it on the
+/// `Connecting` edge would take a real failure off the screen because
+/// the *transport* blinked, for the whole of a prolonged reconnect.
+/// While an attempt is in flight or scheduled the line stays and the
+/// next `session.identify` re-decides it. A settled disconnect, a
+/// stopped session or a build mismatch is the end of the ladder:
+/// nothing is going to re-read it, and a failure on a host that is gone
+/// is not one the user can act on. (An explicit removal retires it in
+/// `host_remove_requested`.)
+fn retire_host_durability(
+    host: &str,
+    state: Option<&HostConnState>,
+    durability: &mut BTreeMap<DurabilitySource, String>,
+) {
+    let retrying = match state {
+        Some(HostConnState::Connecting { .. }) => true,
+        Some(HostConnState::Disconnected(dropped)) => dropped.retry_in.is_some(),
+        Some(
+            HostConnState::Connected | HostConnState::Stopped | HostConnState::NeedsRestart(_),
+        )
+        | None => false,
+    };
+    if !retrying {
+        durability.remove(&DurabilitySource::Host(host.to_string()));
     }
 }
 
@@ -2062,11 +2118,13 @@ impl App {
                             // spent exactly once per connect.
                             task = task.then(self.settle_connect_purpose(host));
                         } else {
-                            // Nothing left to recover from: a failure on
-                            // a host that is gone is not one the user
-                            // can act on, and the next connect re-reads
-                            // it from `session.identify` (#481).
-                            self.set_durability(DurabilitySource::Host(host.clone()), None);
+                            // #481. Kept while the ladder is still
+                            // climbing — see `retire_host_durability`.
+                            retire_host_durability(
+                                host,
+                                self.hosts.state(host),
+                                &mut self.durability,
+                            );
                             if !matches!(
                                 self.hosts.state(host),
                                 Some(crate::host_conn::HostConnState::Connecting { .. })
@@ -2236,6 +2294,12 @@ impl App {
     }
 
     fn apply_workspace_event(&mut self, event: WorkspaceEvent) {
+        // Decided ahead of the match because two events reach the same
+        // line by different routes, one of them carrying no value at all
+        // (#481).
+        if let Some(error) = local_durability_update(&event, &self.workspace) {
+            self.set_durability(DurabilitySource::Local, error);
+        }
         match event {
             WorkspaceEvent::NotificationFired {
                 tab_id,
@@ -2269,20 +2333,17 @@ impl App {
             // active is still a focus intent, and it must win the window
             // back from the host row (`Workspace::focus_tab` emits this
             // unconditionally, which is what makes it a reliable seam).
-            // #481. The local backend's own layout is not reaching
-            // disk, or is again.
-            WorkspaceEvent::DurabilityChanged { error } => {
-                self.set_durability(DurabilitySource::Local, error)
-            }
             WorkspaceEvent::ActiveChanged { .. } => self.set_host_selection(None),
             WorkspaceEvent::ProjectDeleted { project_id } => {
                 self.retire_project_notifications(ProjectKey::new(self.backend.host(), project_id));
             }
             // The bridge turns a lagged broadcast into a full-snapshot
             // resync; the batch's reconcile is the recovery, so there is
-            // nothing incremental left to apply here. Event-carried
-            // notification bodies are still the only casualty of lag —
-            // reconcile_notification_inbox rebuilds the rows themselves.
+            // nothing incremental left to apply here (the durability
+            // line, which no snapshot carries, was re-read above).
+            // Event-carried notification bodies are still the only
+            // casualty of lag — reconcile_notification_inbox rebuilds
+            // the rows themselves.
             WorkspaceEvent::Resync(_) => {}
             _ => {}
         }
@@ -4715,6 +4776,162 @@ mod tests {
             host_envelope_action(&envelope(op, serde_json::json!({"error": null}))),
             HostEnvelopeAction::Durability(None)
         ));
+    }
+
+    /// Restores the mode whatever the test does, so a failed assertion
+    /// cannot leave a `chmod 500` directory behind for a later lane.
+    struct ReadOnlyDir {
+        path: std::path::PathBuf,
+        restore: u32,
+    }
+
+    impl ReadOnlyDir {
+        fn seal(path: &std::path::Path) -> ReadOnlyDir {
+            use std::os::unix::fs::PermissionsExt;
+            let restore = std::fs::metadata(path).unwrap().permissions().mode();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
+            ReadOnlyDir {
+                path: path.to_path_buf(),
+                restore,
+            }
+        }
+
+        fn unseal(&self) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &self.path,
+                std::fs::Permissions::from_mode(self.restore & 0o7777),
+            )
+            .unwrap();
+        }
+    }
+
+    impl Drop for ReadOnlyDir {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &self.path,
+                std::fs::Permissions::from_mode(self.restore & 0o7777),
+            );
+        }
+    }
+
+    /// **#481.** A lagged broadcast is a gap, and the only event that
+    /// announces durability is live-only — so both halves of the news
+    /// can be lost in one, and both are recovered off the workspace.
+    ///
+    /// Driven with a real `Workspace` on a real sealed directory: the
+    /// claim is that the resync *reads what is standing there*, and a
+    /// stub would only prove the match arm exists.
+    #[test]
+    fn a_local_resync_re_reads_what_the_gap_swallowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path().join("state.json"));
+        let project = workspace.create_project("p", "/").unwrap().id;
+        let resync = WorkspaceEvent::Resync(Vec::new());
+
+        let sealed = ReadOnlyDir::seal(dir.path());
+        let tab = workspace.open_tab(project, "/one", "a").unwrap().id;
+        let error = workspace.persist_error().expect("the write failed");
+
+        // The failure the client was too far behind to be told about.
+        assert_eq!(
+            local_durability_update(&resync, &workspace),
+            Some(Some(error)),
+            "a missed failure is learned from the standing value"
+        );
+
+        sealed.unseal();
+        workspace.set_tab_title(tab, "b").unwrap();
+
+        // And the recovery, which is the half that would otherwise leave
+        // the failure line up for the rest of the session.
+        assert_eq!(
+            local_durability_update(&resync, &workspace),
+            Some(None),
+            "a missed recovery retires it — a resync always states the line, \
+             because a gap explains nothing"
+        );
+
+        // Everything else is silent, and the carried event still wins on
+        // its own value rather than on a re-read.
+        assert_eq!(
+            local_durability_update(
+                &WorkspaceEvent::DurabilityChanged {
+                    error: Some("disk full".into())
+                },
+                &workspace
+            ),
+            Some(Some("disk full".to_string()))
+        );
+        assert_eq!(
+            local_durability_update(
+                &WorkspaceEvent::ActiveChanged {
+                    project_id: 1,
+                    tab_id: 1
+                },
+                &workspace
+            ),
+            None
+        );
+    }
+
+    /// **#481.** The remote disk and the wire to it are two different
+    /// facts. A transport drop puts the host on the ladder; nothing
+    /// about its last save changed, so the line stays until the ladder
+    /// ends.
+    #[test]
+    fn a_retrying_host_keeps_its_standing_failure_and_a_settled_one_retires_it() {
+        use crate::host_conn::state::Disconnected;
+        use std::time::Duration;
+
+        let failing = || {
+            BTreeMap::from([(
+                DurabilitySource::Host("alpha".into()),
+                "No space left on device".to_string(),
+            )])
+        };
+        let retrying = [
+            HostConnState::Connecting { previous: None },
+            HostConnState::Disconnected(Disconnected {
+                reason: "connection reset".into(),
+                detail: None,
+                retry_in: Some(Duration::from_secs(4)),
+            }),
+        ];
+        for state in &retrying {
+            let mut durability = failing();
+            retire_host_durability("alpha", Some(state), &mut durability);
+            assert_eq!(
+                durability,
+                failing(),
+                "{state:?} is the wire blinking, not the remote disk"
+            );
+        }
+
+        let over = [
+            HostConnState::Disconnected(Disconnected {
+                reason: "session ended".into(),
+                detail: Some("the daemon exited".into()),
+                retry_in: None,
+            }),
+            HostConnState::Stopped,
+        ];
+        for state in &over {
+            let mut durability = failing();
+            retire_host_durability("alpha", Some(state), &mut durability);
+            assert!(durability.is_empty(), "{state:?} is the end of the ladder");
+        }
+
+        // A host the set no longer knows is gone by definition.
+        let mut durability = failing();
+        retire_host_durability("alpha", None, &mut durability);
+        assert!(durability.is_empty());
+
+        // And it only ever touches its own host.
+        let mut durability = failing();
+        retire_host_durability("beta", None, &mut durability);
+        assert_eq!(durability, failing());
     }
 
     /// The retiring edges a host owes, and the reason they are here at

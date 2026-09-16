@@ -230,9 +230,13 @@ pub(crate) struct ConnectFacts {
     /// The session's standing durability failure, from
     /// `session.identify` (#481).
     ///
-    /// Re-read and re-published after a resync, unlike everything else
-    /// here: `workspace.durability_changed` is live-only, so the one
-    /// change a gap can swallow is exactly this one.
+    /// Read *after* the subscription rather than off the identify gate
+    /// that opens the prologue, and re-read after a resync — unlike
+    /// everything else here, which the gate settles once.
+    /// `workspace.durability_changed` is live-only and never replayed,
+    /// so the one change a gap can swallow is exactly this one, and both
+    /// gaps (the prologue's and a lagged stream's) are closed the same
+    /// way.
     pub(crate) persist_error: Option<String>,
 }
 

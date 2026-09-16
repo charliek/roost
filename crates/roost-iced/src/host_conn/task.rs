@@ -836,6 +836,17 @@ async fn attempt(
     let (events, pump, mirror) =
         subscribe_prologue(&config.socket, &mut control, &mut facts, resume).await?;
 
+    // 4. Re-read the one fact steps 1–3 can have swallowed, in the order
+    //    `resync` already uses: subscribe, then identify.
+    //    `workspace.durability_changed` is live-only and never replayed,
+    //    so a change between the gating identify and the subscription is
+    //    announced to nobody — the gate's answer predates it and the
+    //    stream did not exist yet. The identify gate itself cannot move:
+    //    it is what decides compatibility and hands over the `session_id`
+    //    the subscribe is fenced on, so the recovery is a second read
+    //    rather than a reordering (#481).
+    facts.persist_error = session_identify(&mut control).await?.persist_error;
+
     let live = Live {
         control,
         events,
@@ -2392,6 +2403,11 @@ mod tests {
         /// mid-connection so a test can make the standing value move
         /// while the only event that announces it is being lost.
         persist_error: Arc<Mutex<Option<String>>>,
+        /// A failure this session starts reporting the moment it has
+        /// answered one `session.identify` — the prologue's own gap,
+        /// between the gate and the subscription that would have carried
+        /// the announcement.
+        fails_after_identify: Arc<Mutex<Option<String>>>,
     }
 
     impl Fake {
@@ -2420,6 +2436,7 @@ mod tests {
                 tab_lists: Arc::new(AtomicUsize::new(0)),
                 streams_ended: Arc::new(AtomicUsize::new(0)),
                 persist_error: Arc::new(Mutex::new(None)),
+                fails_after_identify: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -2453,6 +2470,17 @@ mod tests {
 
         fn identifies(&self) -> usize {
             self.identifies.load(Ordering::Acquire)
+        }
+
+        /// This session starts failing to save once it has answered one
+        /// `session.identify` — i.e. inside the prologue, after the gate
+        /// and before the subscription.
+        fn saving_fails_after_the_gate(self, error: &str) -> Fake {
+            *self
+                .fails_after_identify
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.to_string());
+            self
         }
 
         /// From now on, this session says it cannot write its layout.
@@ -2600,6 +2628,14 @@ mod tests {
                             .clone();
                         if let Some(error) = persist_error {
                             result["persist_error"] = serde_json::json!(error);
+                        }
+                        if let Some(later) = self
+                            .fails_after_identify
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take()
+                        {
+                            self.saving_fails(&later);
                         }
                         serde_json::json!({"id": id, "ok": true, "result": result})
                     }
@@ -3079,6 +3115,44 @@ mod tests {
         assert_eq!(resumed(&host.stop().await), None);
     }
 
+    /// **#481.** The prologue has a gap of its own: the identify gate
+    /// answers before there is a subscription, and
+    /// `workspace.durability_changed` is live-only, so a failure that
+    /// starts in between is announced to nobody. The connect re-reads
+    /// after subscribing for exactly that reason.
+    ///
+    /// Without the re-read the client connects believing the session is
+    /// saving fine and stays wrong until the *next* change of value —
+    /// which, for a disk that simply stays full, never comes.
+    #[tokio::test]
+    async fn a_connect_learns_a_failure_that_started_inside_the_prologue() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("prologue.sock");
+        let fake = Fake::new(PutFile::Land)
+            .saving_fails_after_the_gate("No space left on device (os error 28)");
+        fake.serve(&socket);
+
+        let host = Connected::start(socket, HostTransport::UnixSocket).await;
+
+        assert_eq!(
+            host.states
+                .1
+                .last()
+                .expect("the prologue filed facts")
+                .persist_error
+                .as_deref(),
+            Some("No space left on device (os error 28)"),
+            "the gate's answer predates the failure; only a read after the \
+             subscription can carry it"
+        );
+        assert_eq!(
+            fake.identifies(),
+            2,
+            "the gate, and the re-read the subscription fences"
+        );
+        host.stop().await;
+    }
+
     /// **#481.** A resync re-reads `session.identify` and republishes
     /// the facts, which is the whole of the recovery
     /// [`ConnectFacts::persist_error`] describes.
@@ -3090,7 +3164,8 @@ mod tests {
         fake.serve(&socket);
 
         let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
-        assert_eq!(fake.identifies(), 1);
+        // The gate, and the re-read after the subscription.
+        assert_eq!(fake.identifies(), 2);
         assert_eq!(
             host.states
                 .1
@@ -3129,9 +3204,10 @@ mod tests {
             Some("Read-only file system (os error 30)"),
             "the state a live-only event could not carry is read off session.identify"
         );
-        assert!(
-            fake.identifies() >= 2,
-            "the resync must have identified again"
+        assert_eq!(
+            fake.identifies(),
+            3,
+            "the resync identifies again, on top of the prologue's two"
         );
         host.stop().await;
     }

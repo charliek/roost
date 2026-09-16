@@ -2072,8 +2072,20 @@ impl Workspace {
     /// moves under `persist_guard`, in `seq` order, so an older
     /// completion can never clear a newer failure. A change of value
     /// (and only a change) emits [`WorkspaceEvent::DurabilityChanged`]
-    /// after the guard drops: a repeated identical failure is the same
-    /// news twice.
+    /// **while that same guard is still held**, so the announcement is
+    /// published in the order the state moved: releasing first would let
+    /// a newer writer's recovery overtake an older writer's failure, and
+    /// a subscriber left holding a failure that is already fixed would
+    /// hold it forever — every later success compares `None` against
+    /// `None` and says nothing. A repeated identical failure is the same
+    /// news twice and is not emitted at all.
+    ///
+    /// Taking `inner` while holding `persist_guard` closes no cycle,
+    /// because nothing anywhere takes `persist_guard` while holding
+    /// `inner`: `commit` drops `inner` before it reaches this function,
+    /// `flush` snapshots under `inner` in a scope of its own and
+    /// persists after it, and `commit(Persist::Skip)` — the only commit
+    /// made from here — produces no snapshot and never persists.
     fn persist(&self, seq: u64, snapshot: &SnapshotFile, sync: bool) -> PersistOutcome {
         // Frozen by `flush()` on clean exit: ignore any later write so
         // a teardown cascade can't overwrite the flushed layout.
@@ -2083,31 +2095,28 @@ impl Workspace {
         let Some(path) = self.state_path.clone() else {
             return PersistOutcome::InMemory; // in-memory variant; no persistence
         };
-        let (error, changed) = {
-            let mut state = self.persist_guard.lock().unwrap();
-            if seq <= state.last_seq {
-                // A newer commit already persisted; this write is stale,
-                // and so is whatever it would have had to say about the
-                // disk.
-                return PersistOutcome::Superseded;
+        let mut state = self.persist_guard.lock().unwrap();
+        if seq <= state.last_seq {
+            // A newer commit already persisted; this write is stale,
+            // and so is whatever it would have had to say about the
+            // disk.
+            return PersistOutcome::Superseded;
+        }
+        let error = match persist_state(&path, snapshot, sync) {
+            Ok(()) => None,
+            Err(err) => {
+                warn!(?err, "failed to persist state.json");
+                Some(err.to_string())
             }
-            let error = match persist_state(&path, snapshot, sync) {
-                Ok(()) => None,
-                Err(err) => {
-                    warn!(?err, "failed to persist state.json");
-                    Some(err.to_string())
-                }
-            };
-            let changed = error != state.error;
-            state.error = error.clone();
-            // Advance past this seq even on write failure: an older
-            // snapshot must never win, and there is no retry of `seq`.
-            state.last_seq = seq;
-            (error, changed)
         };
+        let changed = error != state.error;
+        state.error = error.clone();
+        // Advance past this seq even on write failure: an older
+        // snapshot must never win, and there is no retry of `seq`.
+        state.last_seq = seq;
         if changed {
-            // Safe in this order because `commit` drops `inner` before it
-            // ever reaches `persist_guard`, so no thread holds both.
+            #[cfg(test)]
+            run_persist_emit_seam();
             let inner = self.inner.lock().unwrap();
             self.commit(
                 inner,
@@ -2269,6 +2278,28 @@ struct PersistState {
     last_seq: u64,
     /// That attempt's error, or `None` if it landed.
     error: Option<String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: a one-shot hook run on the writer's own thread at the
+    /// instant `persist` has decided a change of durability and is about
+    /// to publish it.
+    ///
+    /// It exists because that instant is the whole of the ordering rule
+    /// and is microseconds wide otherwise: the only way to interleave
+    /// two writers there deterministically is to hold one of them at it.
+    static PERSIST_EMIT_SEAM: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_persist_emit_seam() {
+    // Taken, not borrowed across the call: the hook blocks, and a live
+    // `RefCell` borrow would outlive it.
+    if let Some(seam) = PERSIST_EMIT_SEAM.with(|seam| seam.borrow_mut().take()) {
+        seam();
+    }
 }
 
 impl Default for Workspace {
@@ -5114,6 +5145,79 @@ mod tests {
             durability_events(&mut events),
             vec![Some(error)],
             "a superseded write announces nothing at all"
+        );
+    }
+
+    /// The *announcement* is ordered too, not just the state behind it.
+    ///
+    /// Two writers, interleaved on purpose: seq 1 fails, seq 2 lands.
+    /// Publishing after `persist_guard` drops lets seq 2's recovery
+    /// overtake seq 1's failure, and a subscriber that ends on
+    /// `Some(error)` is stuck there — the disk is fine, and every write
+    /// that lands from now on compares `None` to `None` and says
+    /// nothing.
+    ///
+    /// The seam holds writer A at the instant it is about to publish.
+    /// The wait for B is a *must-not-happen* wait, not a race: with the
+    /// guard held across the publish B cannot get past
+    /// `persist_guard.lock()` at all, and without it B's write is a
+    /// handful of microseconds.
+    #[test]
+    fn two_writers_publish_durability_in_persistence_order() {
+        use std::sync::{mpsc, Arc};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let ws = Arc::new(Workspace::open(path));
+        let mut events = ws.subscribe();
+
+        let (at_emit, reached_emit) = mpsc::channel::<()>();
+        let (release, released) = mpsc::channel::<()>();
+        let sealed = ReadOnlyDir::seal(dir.path());
+
+        let a = {
+            let ws = Arc::clone(&ws);
+            std::thread::spawn(move || {
+                PERSIST_EMIT_SEAM.with(|seam| {
+                    *seam.borrow_mut() = Some(Box::new(move || {
+                        at_emit.send(()).unwrap();
+                        released.recv().unwrap();
+                    }));
+                });
+                ws.persist(1, &SnapshotFile::default(), false)
+            })
+        };
+        reached_emit
+            .recv()
+            .expect("the failing writer reached the publish");
+        sealed.unseal();
+
+        let (b_done, b_returned) = mpsc::channel::<()>();
+        let b = {
+            let ws = Arc::clone(&ws);
+            std::thread::spawn(move || {
+                let outcome = ws.persist(2, &SnapshotFile::default(), false);
+                b_done.send(()).unwrap();
+                outcome
+            })
+        };
+        let overtook = b_returned
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_ok();
+        release.send(()).unwrap();
+
+        let PersistOutcome::Failed(error) = a.join().unwrap() else {
+            panic!("the sealed directory must have refused seq 1");
+        };
+        assert_eq!(b.join().unwrap(), PersistOutcome::Written);
+        assert_eq!(
+            durability_events(&mut events),
+            vec![Some(error), None],
+            "the failure is announced before the recovery that replaced it"
+        );
+        assert!(
+            !overtook,
+            "seq 2 persisted while seq 1 was still holding the publish"
         );
     }
 
