@@ -115,6 +115,7 @@ final class KeyEncoder {
 
         let key = Self.ghosttyKey(forKeyCode: nsEvent.keyCode)
         let mods = Self.ghosttyMods(forFlags: nsEvent.modifierFlags)
+        let chord = Self.controlChordUTF8(for: nsEvent, key: key)
         let action: GhosttyKeyAction = nsEvent.isARepeat
             ? GHOSTTY_KEY_ACTION_REPEAT
             : GHOSTTY_KEY_ACTION_PRESS
@@ -136,9 +137,14 @@ final class KeyEncoder {
         // full modifier set. That's what leaves Shift+Enter encoding as
         // CSI 13;2u. If that C0 filter ever goes away, this consumed-mods
         // value starts applying to those keys too.
+        //
+        // A recovered chord reports nothing consumed: its utf8 is our own
+        // synthesis (the platform handed us a C0), so no modifier went into
+        // producing it, and subtracting Option would clear the effective alt
+        // that puts the ESC meta-prefix on ctrl+option chords.
         ghostty_key_event_set_consumed_mods(
             event,
-            Self.consumedMods(forFlags: nsEvent.modifierFlags)
+            chord == nil ? Self.consumedMods(forFlags: nsEvent.modifierFlags) : 0
         )
         // The unshifted base-layout codepoint (Ctrl+A → "a" = 97). Under
         // the Kitty keyboard protocol the encoder needs this to build a
@@ -168,7 +174,7 @@ final class KeyEncoder {
         // received "l" or "s" but the empty-line Enter still made it
         // through (Enter's "\r" gets filtered to empty UTF-8 and the
         // encoder derives from key alone, so it wasn't affected).
-        let utf8 = Self.printableUTF8(for: nsEvent)
+        let utf8 = chord ?? Self.printableUTF8(for: nsEvent)
         return utf8.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Data in
             if let base = raw.bindMemory(to: CChar.self).baseAddress, raw.count > 0 {
                 ghostty_key_event_set_utf8(event, base, raw.count)
@@ -227,6 +233,89 @@ final class KeyEncoder {
         }
         if filtered.isEmpty { return Data() }
         return Data(String(String.UnicodeScalarView(filtered)).utf8)
+    }
+
+    /// The printable character behind a control-transformed press, or nil
+    /// when this press is not a chord whose C0 byte inverts unambiguously.
+    ///
+    /// macOS applies the control transform itself, so `NSEvent.characters`
+    /// for ctrl+[ is ESC, for ctrl+i is TAB and for ctrl+m is CR. libghostty
+    /// keys its control-sequence table on the *printable* byte and leaves
+    /// `[`, `i` and `m` out of it on purpose (fixterms: applications must be
+    /// able to tell ctrl+[ from Escape, ctrl+i from Tab, ctrl+m from Enter),
+    /// so those three fall through to CSI-u — which needs one codepoint of
+    /// utf8 to build an entry from. Stripping the C0 left it with nothing and
+    /// all three chords reached the PTY as no bytes at all (#343). Forwarding
+    /// the printable instead is what the iced UI does, so both UIs now emit
+    /// CSI 91/105/109 ; 5 u (`crates/roost-iced/src/input.rs::control_chord`).
+    ///
+    /// Only writing-system keys qualify. ctrl+Return, ctrl+Escape and
+    /// ctrl+Tab present a lone C0 of their own — the very bytes ctrl+m,
+    /// ctrl+[ and ctrl+i fold into — and inverting those would retype three
+    /// of the most common keys on the board as letters.
+    private static func controlChordUTF8(for e: NSEvent, key: GhosttyKey) -> Data? {
+        guard e.modifierFlags.contains(.control),
+              Self.isWritingSystemKey(key),
+              let c0 = Self.soleScalar(e.characters),
+              let canonical = Self.controlInverse(c0)
+        else { return nil }
+        // `charactersIgnoringModifiers` is the press with every modifier but
+        // control applied, and the table is keyed on the character the layout
+        // actually typed — ctrl+shift+- has to arrive as `_` to fold into
+        // 0x1F. The canonical inverse is the layout-blind fallback that still
+        // recovers a non-Latin layout, where the typed character can't
+        // confirm the C0 (ctrl+ф → `a`).
+        let typed = Self.soleScalar(e.charactersIgnoringModifiers)
+        let text = typed.flatMap { Self.controlTransform($0) == c0 ? $0 : nil } ?? canonical
+        return Data(String(Character(text)).utf8)
+    }
+
+    /// libghostty enumerates W3C UI Events codes and groups "Writing System
+    /// Keys" (§ 3.1.1) contiguously, from BACKQUOTE through SLASH. That block
+    /// is the Mac spelling of the `Key::Character(_)` gate iced puts on chord
+    /// recovery: everything after it is a functional, control-pad, arrow,
+    /// numpad or media key, which owns its own encoding.
+    private static func isWritingSystemKey(_ key: GhosttyKey) -> Bool {
+        key.rawValue >= GHOSTTY_KEY_BACKQUOTE.rawValue
+            && key.rawValue <= GHOSTTY_KEY_SLASH.rawValue
+    }
+
+    /// The printable character a control transform folded into `c0`, for the
+    /// chords that invert unambiguously: the letters and `[ \ ] _`. NUL
+    /// (ctrl+space, ctrl+shift+2), RS (ctrl+shift+6) and DEL keep today's
+    /// encoding — more than one key folds onto each of those.
+    private static func controlInverse(_ c0: Unicode.Scalar) -> Unicode.Scalar? {
+        guard let byte = UInt8(exactly: c0.value) else { return nil }
+        switch byte {
+        case 0x01...0x1A: return Unicode.Scalar(UInt8(ascii: "a") + byte - 1)
+        case 0x1B: return Unicode.Scalar(UInt8(ascii: "["))
+        case 0x1C: return Unicode.Scalar(UInt8(ascii: "\\"))
+        case 0x1D: return Unicode.Scalar(UInt8(ascii: "]"))
+        case 0x1F: return Unicode.Scalar(UInt8(ascii: "_"))
+        default: return nil
+        }
+    }
+
+    /// The C0 byte the platform produces for control plus this character,
+    /// for the chords `controlInverse` can invert.
+    private static func controlTransform(_ value: Unicode.Scalar) -> Unicode.Scalar? {
+        guard let byte = UInt8(exactly: value.value) else { return nil }
+        switch byte {
+        case UInt8(ascii: "a")...UInt8(ascii: "z"):
+            return Unicode.Scalar(byte - UInt8(ascii: "a") + 1)
+        case UInt8(ascii: "A")...UInt8(ascii: "Z"):
+            return Unicode.Scalar(byte - UInt8(ascii: "A") + 1)
+        case UInt8(ascii: "["), UInt8(ascii: "{"): return Unicode.Scalar(0x1B as UInt8)
+        case UInt8(ascii: "\\"), UInt8(ascii: "|"): return Unicode.Scalar(0x1C as UInt8)
+        case UInt8(ascii: "]"), UInt8(ascii: "}"): return Unicode.Scalar(0x1D as UInt8)
+        case UInt8(ascii: "_"): return Unicode.Scalar(0x1F as UInt8)
+        default: return nil
+        }
+    }
+
+    private static func soleScalar(_ value: String?) -> Unicode.Scalar? {
+        guard let scalars = value?.unicodeScalars, scalars.count == 1 else { return nil }
+        return scalars.first
     }
 
     /// The unshifted base-layout codepoint for `e` — the character the

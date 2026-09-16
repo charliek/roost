@@ -245,6 +245,124 @@ func ctrl_shifted_punctuation_drops_shift_in_legacy_fixterms() {
     }
 }
 
+// MARK: - Control chords libghostty routes through CSI-u (#343)
+
+// `[`, `i` and `m` are deliberately absent from libghostty's ctrl-sequence
+// table — fixterms keeps them out so applications can tell ctrl+[ from
+// Escape, ctrl+i from Tab and ctrl+m from Enter — so all three fall through
+// to CSI-u, which needs one codepoint of utf8. macOS hands us only the C0 it
+// already folded them into, and stripping that left the encoder with nothing
+// to build from: the three chords reached the PTY as NO bytes at all.
+// `crates/roost-iced/src/input.rs` carries the twin assertions
+// (`control_bracket_left_reports_the_bracket_not_the_escape_codepoint`,
+// `control_transformed_logical_keys_encode_the_same_bytes`); the bytes must
+// agree across the two UIs.
+
+private let fixtermsChords: [(keyCode: Int, c0: String, base: String, expected: String)] = [
+    (kVK_ANSI_LeftBracket, "\u{1B}", "[", "\u{1B}[91;5u"),
+    (kVK_ANSI_I, "\u{09}", "i", "\u{1B}[105;5u"),
+    (kVK_ANSI_M, "\u{0D}", "m", "\u{1B}[109;5u"),
+]
+
+@MainActor
+@Test
+func fixterms_control_chords_report_their_base_character_in_legacy() {
+    withEncoder { encoder in
+        for chord in fixtermsChords {
+            let event = keyEvent(
+                keyCode: UInt16(chord.keyCode),
+                chars: chord.c0,
+                charsIgnoringModifiers: chord.base,
+                modifiers: [.control]
+            )
+            #expect(encoder.encode(event) == Data(chord.expected.utf8), "ctrl+\(chord.base)")
+        }
+    }
+}
+
+@MainActor
+@Test
+func fixterms_control_chords_report_their_base_character_under_kitty() {
+    withKittyEncoder { encoder in
+        for chord in fixtermsChords {
+            let event = keyEvent(
+                keyCode: UInt16(chord.keyCode),
+                chars: chord.c0,
+                charsIgnoringModifiers: chord.base,
+                modifiers: [.control]
+            )
+            #expect(encoder.encode(event) == Data(chord.expected.utf8), "ctrl+\(chord.base)")
+        }
+    }
+}
+
+// MARK: - The writing-system-key guard on chord recovery
+
+// Enter, Escape and Tab present a lone C0 of their own — CR, ESC and TAB,
+// the very bytes ctrl+m, ctrl+[ and ctrl+i fold into. Recovery is gated on
+// libghostty's "Writing System Keys" block so these keep the encoding they
+// own; without that gate ctrl+Return types `m` under the Kitty protocol and
+// reports ctrl+m's CSI-u entry in legacy mode. iced pins the same exclusion
+// from the named-key side (`control_chord_recovery_is_limited_to_invertible_chords`).
+
+@MainActor
+@Test
+func ctrl_functional_keys_keep_their_own_encoding_in_legacy() {
+    withEncoder { encoder in
+        for (keyCode, chars, expected, name) in [
+            (kVK_Return, "\r", "\u{1B}[27;5;13~", "ctrl+Return"),
+            (kVK_Escape, "\u{1B}", "\u{1B}[27;5;27~", "ctrl+Escape"),
+            (kVK_Tab, "\t", "\u{1B}[27;5;9~", "ctrl+Tab"),
+        ] {
+            let event = keyEvent(
+                keyCode: UInt16(keyCode),
+                chars: chars,
+                modifiers: [.control]
+            )
+            #expect(encoder.encode(event) == Data(expected.utf8), "\(name)")
+        }
+    }
+}
+
+@MainActor
+@Test
+func ctrl_functional_keys_keep_their_own_encoding_under_kitty() {
+    withKittyEncoder { encoder in
+        for (keyCode, chars, expected, name) in [
+            (kVK_Return, "\r", "\u{1B}[13;5u", "ctrl+Return"),
+            (kVK_Escape, "\u{1B}", "\u{1B}[27;5u", "ctrl+Escape"),
+            (kVK_Tab, "\t", "\u{1B}[9;5u", "ctrl+Tab"),
+        ] {
+            let event = keyEvent(
+                keyCode: UInt16(keyCode),
+                chars: chars,
+                modifiers: [.control]
+            )
+            #expect(encoder.encode(event) == Data(expected.utf8), "\(name)")
+        }
+    }
+}
+
+@MainActor
+@Test
+func ctrl_option_chord_keeps_its_escape_prefix() {
+    // Recovery hands libghostty the first non-empty utf8 this encoder has
+    // ever reported for a control press, which is what puts the consumed-mods
+    // heuristic in play for chords. Subtracting Option there would clear the
+    // effective alt the legacy C0 path consults and drop the ESC meta-prefix
+    // readline reads as Meta-Ctrl-A. iced pins the same invariant in
+    // `ctrl_alt_shift_chords_keep_their_legacy_bytes`.
+    withEncoder { encoder in
+        let event = keyEvent(
+            keyCode: UInt16(kVK_ANSI_A),
+            chars: "\u{01}",
+            charsIgnoringModifiers: "a",
+            modifiers: [.control, .option]
+        )
+        #expect(encoder.encode(event) == Data([0x1B, 0x01]))
+    }
+}
+
 // MARK: - Control-key conventions
 
 @MainActor
