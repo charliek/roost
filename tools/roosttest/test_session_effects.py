@@ -22,8 +22,8 @@ terminal without owning the terminal:
   raise nobody has seen survives an answer to the one before it. The op
   a session used to be told what to mute with, `session.set_focus`, is
   gone.
-* **`ROOST_SESSION_FAKE_BUILD`** — the test seam that makes
-  `tab.attach`'s build-mismatch refusal reproducible without building a
+* **`ROOST_SESSION_FAKE_BUILD`** — the test seam that makes the attach
+  handshake's build-mismatch refusal reproducible without building a
   second binary against a second Ghostty pin. Strictly test-mode.
 
 Everything here drives a REAL daemon over a real Unix socket (per-test
@@ -42,9 +42,11 @@ import base64
 import re
 from pathlib import Path
 
+import dataplane
 import pytest
 import session as sessionlib
 from client import Roost, RoostError
+from dataplane import DataPlane
 from eventstream import EventStream
 from util import drain, drain_until_match
 
@@ -478,8 +480,8 @@ def test_a_fake_build_is_reported_and_enforced_at_attach(env):
     negotiation follows it.
 
     A session and a client whose libghostty pins differ cannot exchange
-    a snapshot, and `tab.attach` says so by name rather than letting the
-    mismatch surface as a corrupt screen. That refusal drives the
+    a snapshot, and the handshake says so by name rather than letting
+    the mismatch surface as a corrupt screen. That refusal drives the
     client's upgrade/restart flow, and reproducing it otherwise takes a
     second binary built against a second Ghostty pin — which no CI lane
     can produce.
@@ -493,29 +495,24 @@ def test_a_fake_build_is_reported_and_enforced_at_attach(env):
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
 
-        def attach(build: str):
-            return client.call(
-                "tab.attach",
-                {
-                    "tab_id": str(tab),
-                    "kinds": ["ghostty-snapshot"],
-                    "cols": COLS,
-                    "rows": ROWS,
-                    "cell_w_px": 0,
-                    "cell_h_px": 0,
-                    "libghostty_build": build,
-                    "focus": True,
-                },
-            )
+        def attach(build: str) -> dataplane.Reply:
+            with DataPlane(env.socket) as conn:
+                return conn.attach(
+                    tab,
+                    identity["session_id"],
+                    build,
+                    cols=COLS,
+                    rows=ROWS,
+                )
 
-        with pytest.raises(RoostError) as mismatch:
-            attach("ghostty-1111111111111111+snapshot.v1")
-        assert mismatch.value.code == "build-mismatch", mismatch.value
+        mismatch = attach("ghostty-1111111111111111+snapshot.v1")
+        assert mismatch.ok is False, mismatch
+        assert mismatch.code == "build-mismatch", mismatch
 
         # The same string identify reported is the one attach accepts:
         # the seam moves the negotiation, not just the report, so the
         # two can never disagree.
-        assert attach(FAKE_BUILD)["attach_token"], "the fake build negotiates with itself"
+        assert attach(FAKE_BUILD).ok, "the fake build negotiates with itself"
 
         client.call("session.stop")
 

@@ -629,19 +629,16 @@ pub enum ServerCode {
     BuildMismatch,
     /// No payload kind in common.
     UnsupportedKind,
-    /// 16 unconsumed attach tokens already exist.
-    TooManyTokens,
     /// This session already serves `MAX_DATA_CONNS_PER_SESSION` data
     /// connections. Detach something before attaching again.
     TooManyAttaches,
-    /// No such tab, or it was respawned between the ticket and the dial.
+    /// No such tab, or it was respawned between the handshake's
+    /// admission and the hand-off that serves it.
     NotFound,
     /// Malformed parameter.
     InvalidParam,
     /// The handshake's `protocol_version` is not this session's.
     ProtocolMismatch,
-    /// Unknown, expired, or already-used attach token.
-    InvalidToken,
     /// The terminal could not be encoded right now. Re-attach.
     SnapshotFailed,
     /// This socket serves no data connections (a UI socket), or the
@@ -692,12 +689,10 @@ impl ServerCode {
             "session-mismatch" => ServerCode::SessionMismatch,
             "build-mismatch" => ServerCode::BuildMismatch,
             "unsupported-kind" => ServerCode::UnsupportedKind,
-            "too-many-tokens" => ServerCode::TooManyTokens,
             "too-many-attaches" => ServerCode::TooManyAttaches,
             "not-found" => ServerCode::NotFound,
             "invalid-param" => ServerCode::InvalidParam,
             "protocol-mismatch" => ServerCode::ProtocolMismatch,
-            "invalid-token" => ServerCode::InvalidToken,
             "snapshot-failed" => ServerCode::SnapshotFailed,
             "not-supported" => ServerCode::NotSupported,
             "too-large" => ServerCode::TooLarge,
@@ -724,12 +719,10 @@ impl ServerCode {
             ServerCode::SessionMismatch => "session-mismatch",
             ServerCode::BuildMismatch => "build-mismatch",
             ServerCode::UnsupportedKind => "unsupported-kind",
-            ServerCode::TooManyTokens => "too-many-tokens",
             ServerCode::TooManyAttaches => "too-many-attaches",
             ServerCode::NotFound => "not-found",
             ServerCode::InvalidParam => "invalid-param",
             ServerCode::ProtocolMismatch => "protocol-mismatch",
-            ServerCode::InvalidToken => "invalid-token",
             ServerCode::SnapshotFailed => "snapshot-failed",
             ServerCode::NotSupported => "not-supported",
             ServerCode::TooLarge => "too-large",
@@ -818,11 +811,10 @@ mod tests {
             "shutting-down",
             "build-mismatch",
             "unsupported-kind",
-            "too-many-tokens",
+            "too-many-attaches",
             "not-found",
             "invalid-param",
             "protocol-mismatch",
-            "invalid-token",
             "snapshot-failed",
             "not-supported",
             "too-large",

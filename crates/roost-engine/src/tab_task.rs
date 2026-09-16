@@ -75,9 +75,9 @@ const PENDING_FLUSH_RETRY: std::time::Duration = std::time::Duration::from_milli
 ///
 /// Bounded because the winsize shares one FIFO with client input (#80),
 /// and a child that has stopped reading can hold that FIFO open
-/// indefinitely — an unbounded wait would turn a wedged shell into a
-/// `tab.attach` that never answers. Generous because everything short of
-/// that case is one `ioctl` away.
+/// indefinitely — an unbounded wait would turn a wedged shell into an
+/// attach that never answers. Generous because everything short of that
+/// case is one `ioctl` away.
 const WINSIZE_ACK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 /// Why a parked `vt` encode gives up: nothing more will be ingested, so
 /// the parser can never leave the sequence it is stuck inside.
@@ -418,9 +418,9 @@ pub enum TabCmd {
     /// `ack` fires once the server terminal AND the PTY winsize have
     /// both been given the new geometry — and reports the failure of
     /// either half, including the child's, which happens on the PTY
-    /// writer's own task. `tab.attach` waits on it so the snapshot it
-    /// mints a ticket for cannot be encoded at the old size; every other
-    /// caller passes `None` and stays fire-and-forget.
+    /// writer's own task. A focused attach waits on it so the snapshot
+    /// it is about to take cannot be encoded at the old size; every
+    /// other caller passes `None` and stays fire-and-forget.
     Resize {
         geometry: Geometry,
         ack: Option<oneshot::Sender<Result<(), TabError>>>,
@@ -447,9 +447,9 @@ pub enum TabCmd {
     /// a fresh one can never roll a terminal's colors back.
     SetTheme(OscColorSnapshot, u64),
     /// Encode this tab's terminal as the attach payload `kind`, fenced
-    /// at the last assigned PTY seq. The kind is the one `tab.attach`
-    /// negotiated and rides on the attach ticket, so the encode and the
-    /// handshake reply cannot disagree about what was produced.
+    /// at the last assigned PTY seq. The kind is the one the handshake
+    /// negotiated, carried straight from the admission, so the encode
+    /// and the handshake reply cannot disagree about what was produced.
     Snapshot {
         kind: AttachPayloadKind,
         reply: oneshot::Sender<Result<SnapshotAt, TabError>>,

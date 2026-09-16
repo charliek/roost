@@ -2067,82 +2067,14 @@ pub struct EventBatch {
     pub events: Vec<EventEnvelope>,
 }
 
-/// [`ops::TAB_ATTACH`] params — the control-plane half of an attach.
-///
-/// `kinds` is the client's preference order; the server serves the
-/// first one it supports. `libghostty_build` must match the session's
-/// own build string exactly for [`AttachPayloadKind::GHOSTTY_SNAPSHOT`]
-/// — two libghostty builds that disagree cannot exchange a snapshot.
-/// The cell-pixel geometry is optional (a headless client has no cell
-/// metrics to report); `cols`/`rows` are not.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TabAttachParams {
-    #[serde(with = "string_int64")]
-    pub tab_id: i64,
-    pub kinds: Vec<AttachPayloadKind>,
-    pub cols: u16,
-    pub rows: u16,
-    #[serde(default)]
-    pub cell_w_px: u16,
-    #[serde(default)]
-    pub cell_h_px: u16,
-    pub libghostty_build: String,
-    /// Whether this attach claims the tab's geometry.
-    ///
-    /// `true` resizes the tab to `cols`/`rows` during negotiation, which
-    /// is what an attach has always done. `false` attaches at whatever
-    /// size the tab already is, so a client that is only watching cannot
-    /// shrink the one that is typing; its geometry still applies the
-    /// moment it sends an `INPUT` or `RESIZE` frame, which is why the
-    /// grid must be non-zero either way.
-    ///
-    /// Required and always serialized. Protocol 4 let it be omitted to
-    /// mean `true`, so a client could address a peer that predated the
-    /// field; at 5 there is no such peer, and an omitted `focus` is a
-    /// malformed request rather than a claim.
-    pub focus: bool,
-}
-
-/// Hand-written because a derived `Default` would make `focus` false, and
-/// a caller filling the rest of the struct with `..Default::default()`
-/// would silently ask for an unfocused attach.
-impl Default for TabAttachParams {
-    fn default() -> Self {
-        TabAttachParams {
-            tab_id: 0,
-            kinds: Vec::new(),
-            cols: 0,
-            rows: 0,
-            cell_w_px: 0,
-            cell_h_px: 0,
-            libghostty_build: String::new(),
-            focus: true,
-        }
-    }
-}
-
-/// [`ops::TAB_ATTACH`] result — a single-use ticket for one data
-/// connection, plus the identity that scopes every seq on it.
-///
-/// `server_epoch` is random per session process and `tab_generation`
-/// counts tab pipelines within it; a client that resumes must hand both
-/// back, which is what makes a stale stream from a restarted server
-/// unresumable by construction rather than by luck.
-///
-/// `attach_token` is a credential: never log it, never print it in a
-/// test failure dump.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TabAttachResult {
-    pub attach_token: String,
-    pub kind: AttachPayloadKind,
-    pub server_epoch: u64,
-    pub tab_generation: u64,
-}
-
 /// The first line of a data connection: not a request envelope, which
 /// is exactly how the server tells the two apart (an object with
 /// `attach` and no `op`).
+///
+/// The whole negotiation rides this line — there is no control-plane
+/// half and no ticket. `attach` names the tab as a `string_int64` like
+/// every other id on this wire, and [`AttachHandshake::terms`] carries
+/// what the connection is offering to be served.
 ///
 /// Permissive on decode — a newer client may carry fields this build
 /// has never heard of, and refusing the whole handshake over one would
@@ -2153,38 +2085,27 @@ pub struct TabAttachResult {
 /// triple is all-or-nothing in practice: `resume_from_seq` without a
 /// matching `server_epoch` + `tab_generation` falls back to snapshot
 /// mode rather than erroring.
-///
-/// Two forms share the line, told apart by **the presence of `kinds`**
-/// and never by whether `attach` parses as a number:
-///
-/// * with `kinds`, the inline form — `attach` names the tab as a
-///   `string_int64` and [`AttachHandshake::terms`] carries everything
-///   the control op used to negotiate;
-/// * without it, the transitional ticket form — `attach` is the
-///   single-use token [`ops::TAB_ATTACH`] minted.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawAttachHandshake", into = "RawAttachHandshake")]
 pub struct AttachHandshake {
-    /// The tab id (inline form) or the attach token (ticket form).
+    /// The tab, as a `string_int64`.
     pub attach: String,
     pub protocol_version: u32,
-    /// Everything the inline form negotiates on the data connection
-    /// itself. `None` is the ticket form.
-    pub terms: Option<AttachHandshakeTerms>,
+    pub terms: AttachHandshakeTerms,
     pub resume_from_seq: Option<u64>,
     pub server_epoch: Option<u64>,
     pub tab_generation: Option<u64>,
 }
 
-/// What an inline handshake negotiates, decoded as a unit: either all
-/// of it is there or the line is a `parse-error` naming the field that
-/// is missing.
+/// What the handshake negotiates, decoded as a unit: either all of it
+/// is there or the line is a `parse-error` naming the field that is
+/// missing.
 ///
 /// `session_id` is the value [`ops::SESSION_IDENTIFY`] reported. It is
-/// required because the ticket used to bind an attach to the session
-/// that minted it: without it a dial released after a drop could land
-/// on a **replacement** session listening at the same socket path and
-/// stream a tab the client never asked for.
+/// required because it is what binds an attach to the session the
+/// client negotiated with: without it a dial released after a drop
+/// could land on a **replacement** session listening at the same socket
+/// path and stream a tab the client never asked for.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachHandshakeTerms {
     pub session_id: String,
@@ -2205,12 +2126,14 @@ pub struct AttachHandshakeTerms {
 }
 
 impl AttachHandshake {
-    /// A fresh attach: the ticket [`ops::TAB_ATTACH`] minted, and a
-    /// full snapshot stream behind it.
-    pub fn snapshot(attach_token: impl Into<String>) -> Self {
+    /// A fresh attach: the tab, the terms, and a full snapshot stream
+    /// behind them. No round trip — the data connection is the whole
+    /// negotiation.
+    pub fn snapshot(tab_id: i64, terms: AttachHandshakeTerms) -> Self {
         AttachHandshake {
-            attach: attach_token.into(),
+            attach: tab_id.to_string(),
             protocol_version: SESSION_PROTOCOL_VERSION,
+            terms,
             ..AttachHandshake::default()
         }
     }
@@ -2222,32 +2145,6 @@ impl AttachHandshake {
     /// tolerates its absence: a miss on any of the three is answered
     /// with `mode: "snapshot"` in the same reply, never an error.
     pub fn resume(
-        attach_token: impl Into<String>,
-        from_seq: u64,
-        server_epoch: u64,
-        tab_generation: u64,
-    ) -> Self {
-        AttachHandshake {
-            resume_from_seq: Some(from_seq),
-            server_epoch: Some(server_epoch),
-            tab_generation: Some(tab_generation),
-            ..AttachHandshake::snapshot(attach_token)
-        }
-    }
-
-    /// The inline form of [`AttachHandshake::snapshot`]: no ticket, no
-    /// round trip — the data connection states the tab and the terms.
-    pub fn inline_snapshot(tab_id: i64, terms: AttachHandshakeTerms) -> Self {
-        AttachHandshake {
-            attach: tab_id.to_string(),
-            protocol_version: SESSION_PROTOCOL_VERSION,
-            terms: Some(terms),
-            ..AttachHandshake::default()
-        }
-    }
-
-    /// The inline form of [`AttachHandshake::resume`].
-    pub fn inline_resume(
         tab_id: i64,
         terms: AttachHandshakeTerms,
         from_seq: u64,
@@ -2258,31 +2155,23 @@ impl AttachHandshake {
             resume_from_seq: Some(from_seq),
             server_epoch: Some(server_epoch),
             tab_generation: Some(tab_generation),
-            ..AttachHandshake::inline_snapshot(tab_id, terms)
+            ..AttachHandshake::snapshot(tab_id, terms)
         }
     }
 }
 
-/// Flat mirror of [`AttachHandshake`] — the inline terms ride the same
-/// JSON object as the rest of the line, and "all of them or none of
-/// them" is a rule serde cannot state on a nested `Option`.
+/// Flat mirror of [`AttachHandshake`] — the terms ride the same JSON
+/// object as the rest of the line, and "all of them or none of them" is
+/// a rule serde cannot state on a nested struct while still naming the
+/// field that is missing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RawAttachHandshake {
     attach: String,
     protocol_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_id: Option<String>,
-    /// The discriminator, and the one field here that has to tell
-    /// "absent" from "present and null" — `Option` alone spells both
-    /// `None`, and `{"kinds": null}` would then be read as a ticket and
-    /// the inline tab id beside it as a bearer token. The outer
-    /// `Option` is presence, which only [`present`] can produce.
-    #[serde(
-        default,
-        deserialize_with = "present",
-        skip_serializing_if = "Option::is_none"
-    )]
-    kinds: Option<Option<Vec<AttachPayloadKind>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kinds: Option<Vec<AttachPayloadKind>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cols: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2303,51 +2192,25 @@ struct RawAttachHandshake {
     tab_generation: Option<u64>,
 }
 
-/// Decode a field as "was the key there at all", one level above what it
-/// held: `None` when the key is absent (through `#[serde(default)]`),
-/// `Some(None)` for an explicit `null`.
-fn present<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::deserialize(de).map(Some)
-}
-
 impl TryFrom<RawAttachHandshake> for AttachHandshake {
     type Error = String;
 
     fn try_from(raw: RawAttachHandshake) -> Result<Self, String> {
-        // The PRESENCE of `kinds` is the discriminator — never whether
-        // `attach` parses as a number, which a token could do by
-        // accident, and never whether `kinds` held anything, which would
-        // read `{"kinds": null}` as a ticket and the tab id beside it as
-        // a bearer token.
-        let terms = match raw.kinds {
-            None => None,
-            Some(kinds) => Some(AttachHandshakeTerms {
-                session_id: raw
-                    .session_id
-                    .ok_or("an inline attach handshake is missing `session_id`")?,
-                kinds: kinds.ok_or("an inline attach handshake is missing `kinds`")?,
-                cols: raw
-                    .cols
-                    .ok_or("an inline attach handshake is missing `cols`")?,
-                rows: raw
-                    .rows
-                    .ok_or("an inline attach handshake is missing `rows`")?,
-                // A headless client has no cell metrics to report, so
-                // these two are the only terms an inline handshake may
-                // leave out.
-                cell_w_px: raw.cell_w_px.unwrap_or(0),
-                cell_h_px: raw.cell_h_px.unwrap_or(0),
-                libghostty_build: raw
-                    .libghostty_build
-                    .ok_or("an inline attach handshake is missing `libghostty_build`")?,
-                focus: raw
-                    .focus
-                    .ok_or("an inline attach handshake is missing `focus`")?,
-            }),
+        let terms = AttachHandshakeTerms {
+            session_id: raw
+                .session_id
+                .ok_or("an attach handshake is missing `session_id`")?,
+            kinds: raw.kinds.ok_or("an attach handshake is missing `kinds`")?,
+            cols: raw.cols.ok_or("an attach handshake is missing `cols`")?,
+            rows: raw.rows.ok_or("an attach handshake is missing `rows`")?,
+            // A headless client has no cell metrics to report, so these
+            // two are the only terms a handshake may leave out.
+            cell_w_px: raw.cell_w_px.unwrap_or(0),
+            cell_h_px: raw.cell_h_px.unwrap_or(0),
+            libghostty_build: raw
+                .libghostty_build
+                .ok_or("an attach handshake is missing `libghostty_build`")?,
+            focus: raw.focus.ok_or("an attach handshake is missing `focus`")?,
         };
         Ok(AttachHandshake {
             attach: raw.attach,
@@ -2362,25 +2225,22 @@ impl TryFrom<RawAttachHandshake> for AttachHandshake {
 
 impl From<AttachHandshake> for RawAttachHandshake {
     fn from(h: AttachHandshake) -> Self {
-        let mut raw = RawAttachHandshake {
+        let t = h.terms;
+        RawAttachHandshake {
             attach: h.attach,
             protocol_version: h.protocol_version,
+            session_id: Some(t.session_id),
+            kinds: Some(t.kinds),
+            cols: Some(t.cols),
+            rows: Some(t.rows),
+            cell_w_px: Some(t.cell_w_px),
+            cell_h_px: Some(t.cell_h_px),
+            libghostty_build: Some(t.libghostty_build),
+            focus: Some(t.focus),
             resume_from_seq: h.resume_from_seq,
             server_epoch: h.server_epoch,
             tab_generation: h.tab_generation,
-            ..RawAttachHandshake::default()
-        };
-        if let Some(t) = h.terms {
-            raw.session_id = Some(t.session_id);
-            raw.kinds = Some(Some(t.kinds));
-            raw.cols = Some(t.cols);
-            raw.rows = Some(t.rows);
-            raw.cell_w_px = Some(t.cell_w_px);
-            raw.cell_h_px = Some(t.cell_h_px);
-            raw.libghostty_build = Some(t.libghostty_build);
-            raw.focus = Some(t.focus);
         }
-        raw
     }
 }
 
@@ -2446,8 +2306,7 @@ pub enum AttachHandshakeReply {
     /// `parse-error`, `session-mismatch`, `not-found`,
     /// `unsupported-kind`, `build-mismatch`, `invalid-param`,
     /// `shutting-down`, `too-many-attaches`, `snapshot-failed`,
-    /// `internal` — and `invalid-token` while the ticket form is still
-    /// served.
+    /// `internal`.
     Rejected(ResponseError),
 }
 
@@ -2944,8 +2803,8 @@ pub struct OscColorsParams {
 ///
 /// Open to every same-UID connection, last writer wins. Applies to the
 /// tabs that exist now **and** is remembered for tabs the session opens
-/// later, so a client sends it once on connecting (before the first
-/// `tab.attach`) and again whenever its theme changes.
+/// later, so a client sends it once on connecting (before it dials its
+/// first data connection) and again whenever its theme changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSetThemeParams {
@@ -3338,11 +3197,6 @@ pub mod ops {
     /// `not-supported`, and a UI socket `unknown-op` like every other
     /// session op. The leg underneath [`TAB_SEND_FILE`].
     pub const SESSION_PUT_FILE: &str = "session.put_file";
-    /// Ask for a ticket to open a data connection for one tab. The
-    /// control-plane half of an attach: it negotiates payload kind,
-    /// build identity, and geometry on stable JSON, and hands back a
-    /// single-use token the binary handshake presents.
-    pub const TAB_ATTACH: &str = "tab.attach";
     /// Raise + focus the running UI window. Sent by a second launch
     /// that loses the single-instance flock; takes no params (#6).
     pub const APP_ACTIVATE: &str = "app.activate";

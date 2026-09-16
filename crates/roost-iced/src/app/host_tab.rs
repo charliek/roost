@@ -295,7 +295,7 @@ impl Hydration {
 const MAX_DEFERRED_BYTES: usize = 8 * 1024 * 1024;
 
 enum Phase {
-    /// Token mint + dial in flight on the attempt's task.
+    /// Permit + dial in flight on the attempt's task.
     Requesting,
     /// Boxed for the variant-size lint: a `Phase` lives in every attach
     /// entry, and only hydration carries the decoder's bulk.
@@ -1024,14 +1024,10 @@ fn choose_handshake(
     resume: Option<ResumePoint>,
 ) -> AttachHandshake {
     match resume {
-        Some(r) => AttachHandshake::inline_resume(
-            tab_id,
-            terms,
-            r.next_seq,
-            r.server_epoch,
-            r.tab_generation,
-        ),
-        None => AttachHandshake::inline_snapshot(tab_id, terms),
+        Some(r) => {
+            AttachHandshake::resume(tab_id, terms, r.next_seq, r.server_epoch, r.tab_generation)
+        }
+        None => AttachHandshake::snapshot(tab_id, terms),
     }
 }
 
@@ -1511,9 +1507,9 @@ mod tests {
         ));
     }
 
-    /// The line a data connection opens with: the tab id where the
-    /// ticket used to be, every negotiated term inline, and the resume
-    /// identity only when this tab has one to hand back.
+    /// The line a data connection opens with: the tab, every negotiated
+    /// term beside it, and the resume identity only when this tab has
+    /// one to hand back.
     #[test]
     fn the_handshake_states_the_tab_the_terms_and_any_resume_point() {
         let fresh = choose_handshake(7, terms(), None);
@@ -1521,7 +1517,7 @@ mod tests {
         assert_eq!(fresh.resume_from_seq, None);
         assert_eq!(fresh.server_epoch, None);
         assert_eq!(fresh.tab_generation, None);
-        let stated = fresh.terms.expect("the inline form states its terms");
+        let stated = &fresh.terms;
         assert_eq!(stated.session_id, "sess-1");
         assert_eq!(
             stated.kinds,
@@ -1544,8 +1540,7 @@ mod tests {
         assert_eq!(resumed.server_epoch, Some(11));
         assert_eq!(resumed.tab_generation, Some(2));
         assert_eq!(
-            resumed.terms.map(|terms| terms.session_id).as_deref(),
-            Some("sess-1"),
+            resumed.terms.session_id, "sess-1",
             "a resume states the same terms as a snapshot"
         );
     }

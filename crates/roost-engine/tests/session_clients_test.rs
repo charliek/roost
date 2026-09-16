@@ -345,11 +345,6 @@ async fn session_connect_and_a_lease_bearing_request_are_both_refused() {
             serde_json::json!({"tab_id_filter": "0", "lease": "l"}),
         ),
         (
-            ops::TAB_ATTACH,
-            serde_json::json!({"lease": "l", "tab_id": tab.to_string(), "kinds": ["vt"],
-                               "cols": 80, "rows": 24, "libghostty_build": "b"}),
-        ),
-        (
             ops::SESSION_SET_THEME,
             serde_json::json!({"lease": "l", "osc_colors": {"palette": vec!["#000000"; 256], "foreground": "#ffffff", "background": "#000000", "cursor": "#ffffff"}}),
         ),

@@ -205,36 +205,66 @@ final class IPCSessionTypesTests: XCTestCase {
 
     // MARK: - Attach
 
-    func testTabAttachVectorsDecode() throws {
-        let requestRaw = try Data(contentsOf: vectorURL("tab.attach.request.json"))
-        let request = try XCTUnwrap(
-            try JSONSerialization.jsonObject(with: requestRaw) as? [String: Any])
-        XCTAssertEqual(request["op"] as? String, "tab.attach")
-        let params = try XCTUnwrap(request["params"] as? [String: Any])
-        // The id encoding is the part that silently breaks across
-        // languages: tab ids are strings, geometry is numbers.
-        XCTAssertEqual(params["tab_id"] as? String, "5")
-        XCTAssertEqual(params["cols"] as? Int, 120)
-        XCTAssertEqual(params["rows"] as? Int, 40)
-        XCTAssertEqual(params["kinds"] as? [String], ["ghostty-snapshot"])
+    /// The attach handshake, which is the whole of an attach now that
+    /// `tab.attach` is gone. This app dials no data connection, so there
+    /// is no Swift type to decode into — what the corpus is loaded for
+    /// here is the wire shape, which is exactly the part that silently
+    /// breaks across languages.
+    func testAttachHandshakeVectorsDecode() throws {
+        for name in [
+            "attach.handshake.request.json",
+            "attach.handshake.vt.request.json",
+            "attach.handshake.resume.request.json",
+            "attach.handshake.unfocused.request.json",
+        ] {
+            let raw = try Data(contentsOf: vectorURL(name))
+            let line = try XCTUnwrap(
+                try JSONSerialization.jsonObject(with: raw) as? [String: Any])
+            // No `op`: this is a data connection's first line, and the
+            // absence of `op` is exactly how a server tells the two
+            // apart.
+            XCTAssertNil(line["op"], name)
+            // Tab ids are strings, geometry is numbers.
+            XCTAssertEqual(line["attach"] as? String, "5", name)
+            XCTAssertEqual(line["cols"] as? Int, 120, name)
+            XCTAssertEqual(line["rows"] as? Int, 40, name)
+            XCTAssertEqual(line["protocol_version"] as? Int, 6, name)
+            XCTAssertNotNil(line["session_id"] as? String, name)
+            XCTAssertNotNil(line["kinds"] as? [String], name)
+            XCTAssertNotNil(line["focus"] as? Bool, name)
+        }
 
-        let raw = try Data(contentsOf: vectorURL("tab.attach.response.json"))
-        let response = try JSONDecoder().decode(IPCResponse.self, from: raw)
-        XCTAssertTrue(response.ok)
-        let body = try JSONSerialization.data(
-            withJSONObject: try XCTUnwrap(response.result).value)
-        let result = try JSONDecoder().decode(IPCTabAttachResult.self, from: body)
-
-        XCTAssertEqual(result.attachToken, "1a0be5c37d924f68b1c05e3a7f2d8496")
-        XCTAssertEqual(result.kind, IPCAttachPayloadKind.ghosttySnapshot)
+        let resumeRaw = try Data(contentsOf: vectorURL("attach.handshake.resume.request.json"))
+        let resume = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: resumeRaw) as? [String: Any])
+        XCTAssertEqual(resume["resume_from_seq"] as? Int, 901)
         // Past 2^53 and still exact: the epoch is a bare u64 number, so
         // a Swift side that routed it through a Double would drift.
-        XCTAssertEqual(result.serverEpoch, 6_032_428_321_756_423_947)
-        XCTAssertEqual(result.tabGeneration, 3)
+        XCTAssertEqual(resume["server_epoch"] as? Int, 6_032_428_321_756_423_947)
 
-        let reencoded = try JSONEncoder().encode(result)
+        let unfocusedRaw = try Data(contentsOf: vectorURL("attach.handshake.unfocused.request.json"))
+        let unfocused = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: unfocusedRaw) as? [String: Any])
         XCTAssertEqual(
-            try JSONDecoder().decode(IPCTabAttachResult.self, from: reencoded), result)
+            unfocused["focus"] as? Bool, false,
+            "the unfocused vector is the one that claims no geometry")
+
+        let acceptedRaw = try Data(contentsOf: vectorURL("attach.handshake.accepted.json"))
+        let accepted = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: acceptedRaw) as? [String: Any])
+        XCTAssertEqual(accepted["ok"] as? Bool, true)
+        XCTAssertEqual(accepted["kind"] as? String, IPCAttachPayloadKind.ghosttySnapshot.value)
+        XCTAssertEqual(accepted["mode"] as? String, "snapshot")
+        XCTAssertEqual(accepted["server_epoch"] as? Int, 6_032_428_321_756_423_947)
+        XCTAssertEqual(accepted["snapshot_cols"] as? Int, 120)
+        XCTAssertEqual(accepted["snapshot_rows"] as? Int, 40)
+
+        let rejectedRaw = try Data(contentsOf: vectorURL("attach.handshake.rejected.json"))
+        let rejected = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: rejectedRaw) as? [String: Any])
+        XCTAssertEqual(rejected["ok"] as? Bool, false)
+        let error = try XCTUnwrap(rejected["error"] as? [String: Any])
+        XCTAssertEqual(error["code"] as? String, "session-mismatch")
     }
 
     func testSessionStoppingVectorDecodesAsAnEventEnvelope() throws {

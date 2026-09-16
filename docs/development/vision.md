@@ -543,7 +543,7 @@ non-obvious enough to relitigate otherwise:
   switch-away; a background host tab stays current through the events
   mirror alone (titles, agent state), with its scrollback living
   server-side. This bounds client memory and live data connections at
-  one per host, nowhere near the server's own 16-token quota, at the
+  one per host, nowhere near the server's own 32-connection cap, at the
   cost of a small per-focus round trip that resume makes cheap.
 - **Effects + theme reseed.** The two open questions
   [DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28)
@@ -822,7 +822,7 @@ for the user-facing shape.
 
 Plan 049 (R1, [#418](https://github.com/charliek/roost/issues/418))
 found the lease gating the wrong axis. HS-1b put `events.subscribe` and
-`tab.attach` behind it and left `tab.write` open to anything that could
+attach behind it and left `tab.write` open to anything that could
 reach the socket — a phone watching a session the desktop drives is
 exactly backwards from that: the read was locked and the write was
 wide open. Every multi-client story past this point needs
@@ -943,7 +943,7 @@ reported focus is the one that mutes notifications;
 upload ops — `session.set_theme`, `session.set_agent_hooks`,
 `session.put_file`, and the since-deleted `session.set_focus` — accept
 only its lease. It
-never again gates `tab.write` or `tab.attach`. `session.connect
+never again gates `tab.write` or attach. `session.connect
 {takeover}` itself is unchanged: one holder, takeover invalidates and
 tombstones the old one, `already-connected` without `takeover` — what
 changed is what holding the lease is *for*, not how it changes hands.
@@ -1051,7 +1051,7 @@ nothing built on this wire had shipped past v0.0.19's protocol `2`
 (see CHANGELOG). Geometry stays last-interactor
 ([DL-25](#dl-25-raw-input-is-open-to-every-same-uid-client-the-lease-is-the-foreground-2026-09-08)) —
 that rule never depended on the lease and needed no change. `roostctl`,
-same-UID access, and the attach ticket are unchanged; only the
+same-UID access, and the attach path are unchanged; only the
 authority layer on top of them is gone.
 
 See [`reference/ipc.md`](../reference/ipc.md#sessionconnect) for the

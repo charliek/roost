@@ -54,11 +54,28 @@ async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
 async fn dial(stub: &Stub) -> DataConnection {
     within(
         "the dial",
-        DataConnection::dial(stub.path(), &AttachHandshake::snapshot("t")),
+        DataConnection::dial(stub.path(), &AttachHandshake::snapshot(7, terms())),
     )
     .await
     .expect("accepted")
     .1
+}
+
+/// The terms every dial in this file offers. Their content is beside
+/// the point here — this file is about what the *transport* does — so
+/// they are stated once and the tab id carries what a test needs to
+/// recognize.
+fn terms() -> roost_ipc::messages::AttachHandshakeTerms {
+    roost_ipc::messages::AttachHandshakeTerms {
+        session_id: "01K3S8TQ4F0Q9YB2K6WZ5D7XN".into(),
+        kinds: vec![AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT)],
+        cols: 80,
+        rows: 24,
+        cell_w_px: 0,
+        cell_h_px: 0,
+        libghostty_build: "ghostty-1a2b3c4d5e6f7a8b+snapshot.v1".into(),
+        focus: true,
+    }
 }
 
 fn rejected(code: &str) -> ResponseError {
@@ -380,10 +397,10 @@ async fn a_refused_subscribe_is_a_typed_refusal() {
 /// through the identical seam.
 #[tokio::test]
 async fn a_refused_op_is_a_typed_refusal() {
-    let stub = Stub::start(Plan::new().refuse(ops::TAB_ATTACH, "build-mismatch", "…")).await;
+    let stub = Stub::start(Plan::new().refuse(ops::SESSION_SET_THEME, "build-mismatch", "…")).await;
     let mut client = IpcClient::connect(stub.path()).await.expect("dial");
     let error = client
-        .call_raw(ops::TAB_ATTACH, serde_json::json!({}))
+        .call_raw(ops::SESSION_SET_THEME, serde_json::json!({}))
         .await
         .expect_err("refused");
     assert_eq!(error.server_code(), Some(ServerCode::BuildMismatch));
@@ -415,7 +432,7 @@ async fn the_dial_negotiates_and_then_reads_frames() {
     )
     .await;
 
-    let request = AttachHandshake::snapshot("1a0be5c3");
+    let request = AttachHandshake::snapshot(4242, terms());
     let (accepted, mut data) = within("the dial", DataConnection::dial(stub.path(), &request))
         .await
         .expect("the handshake is accepted");
@@ -449,7 +466,7 @@ async fn the_dial_negotiates_and_then_reads_frames() {
     // build speaks.
     let handshakes = stub.recorded().handshakes();
     assert_eq!(handshakes.len(), 1);
-    assert_eq!(handshakes[0].attach, "1a0be5c3");
+    assert_eq!(handshakes[0].attach, "4242");
     assert_eq!(handshakes[0].protocol_version, SESSION_PROTOCOL_VERSION);
     assert_eq!(handshakes[0].resume_from_seq, None);
 }
@@ -462,7 +479,7 @@ async fn the_dial_negotiates_and_then_reads_frames() {
 async fn a_refused_handshake_is_typed_and_never_turns_binary() {
     for (code, want) in [
         ("protocol-mismatch", ServerCode::ProtocolMismatch),
-        ("invalid-token", ServerCode::InvalidToken),
+        ("session-mismatch", ServerCode::SessionMismatch),
         ("not-found", ServerCode::NotFound),
         ("snapshot-failed", ServerCode::SnapshotFailed),
         ("shutting-down", ServerCode::ShuttingDown),
@@ -479,7 +496,7 @@ async fn a_refused_handshake_is_typed_and_never_turns_binary() {
         .await;
         let error = within(
             "the refusal",
-            DataConnection::dial(stub.path(), &AttachHandshake::snapshot("t")),
+            DataConnection::dial(stub.path(), &AttachHandshake::snapshot(7, terms())),
         )
         .await
         .err()
@@ -518,7 +535,7 @@ async fn the_line_reader_residue_carries_into_the_frame_reader() {
     let (accepted, mut data) = DataConnection::handshake(
         wire.as_slice(),
         sent,
-        &AttachHandshake::resume("t", 101, STUB_EPOCH, 3),
+        &AttachHandshake::resume(7, terms(), 101, STUB_EPOCH, 3),
     )
     .await
     .expect("accepted");
@@ -581,7 +598,7 @@ async fn a_mismatched_resume_identity_is_visible_on_both_sides() {
     };
     let stub = Stub::start(Plan::new().handshake(Handshake::Accept(wrong.clone()))).await;
 
-    let asked = AttachHandshake::resume("t", 512, STUB_EPOCH, 3);
+    let asked = AttachHandshake::resume(7, terms(), 512, STUB_EPOCH, 3);
     let (accepted, _data) = DataConnection::dial(stub.path(), &asked)
         .await
         .expect("accepted");
@@ -761,7 +778,7 @@ async fn a_wrong_preamble_is_refused() {
     match DataConnection::handshake(
         wire.as_slice(),
         Vec::<u8>::new(),
-        &AttachHandshake::snapshot("t"),
+        &AttachHandshake::snapshot(7, terms()),
     )
     .await
     {

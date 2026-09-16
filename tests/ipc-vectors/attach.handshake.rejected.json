@@ -1,0 +1,7 @@
+{
+  "ok": false,
+  "error": {
+    "code": "session-mismatch",
+    "message": "this session is \"01K3S8TQ4F0Q9YB2K6WZ5D7XN\"; the client attached to \"01K2OLDSESSION00000000000\""
+  }
+}

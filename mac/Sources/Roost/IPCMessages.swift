@@ -450,25 +450,6 @@ struct IPCSessionIdentify: Codable, Equatable, Sendable {
     }
 }
 
-/// `tab.attach` result — a single-use ticket for one data connection,
-/// plus the identity that scopes every seq on it. `serverEpoch` is
-/// random per session process and `tabGeneration` counts tab pipelines
-/// within it, so a resume against a restarted server can never be
-/// silently accepted. Mirrors Rust's `TabAttachResult`.
-struct IPCTabAttachResult: Codable, Equatable, Sendable {
-    var attachToken: String
-    var kind: IPCAttachPayloadKind
-    var serverEpoch: UInt64
-    var tabGeneration: UInt64
-
-    enum CodingKeys: String, CodingKey {
-        case attachToken = "attach_token"
-        case kind
-        case serverEpoch = "server_epoch"
-        case tabGeneration = "tab_generation"
-    }
-}
-
 /// `data` of the `session.stopping` envelope — the one frame on an
 /// events connection that is not an `IPCEventBatch`. `reason` is
 /// `"stop"`, and the stream is over. Mirrors Rust's

@@ -23,7 +23,7 @@ pub use roost_ipc::session_launch::{
 ///
 /// Read **only** when `ROOST_TEST_MODE=1`. The build string is the
 /// attach negotiation's identity check: a client whose libghostty pin
-/// differs cannot decode this session's snapshots, and `tab.attach`
+/// differs cannot decode this session's snapshots, and the handshake
 /// refuses it with `build-mismatch`. That refusal drives a whole
 /// user-facing flow (the upgrade/restart dialog), and reproducing it
 /// otherwise takes a second binary built against a second Ghostty pin —

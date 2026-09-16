@@ -180,8 +180,7 @@ pub enum OpClass {
     /// local workspace id at all.
     UiOwned,
     /// Not served on a UI socket, before this mode and after it —
-    /// `events.subscribe` (`not-implemented`) and `tab.attach`
-    /// (`unknown-op`; a UI socket mints no tickets).
+    /// `events.subscribe` (`not-implemented`).
     Unsupported,
     /// A host-session socket's own op. A UI socket answers `unknown-op`,
     /// which is how a client tells the two sockets apart.
@@ -305,14 +304,12 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ("host.connect", OpClass::UiOwned),
     ("host.disconnect", OpClass::UiOwned),
     ("host.status", OpClass::UiOwned),
-    // Deliberately not forwarded even though the slot would serve them.
+    // Deliberately not forwarded even though the slot would serve it.
     // A subscription handed out here would be a stream this socket
     // cannot fence (`tab.list`'s `revision` is stripped for the same
-    // reason), and a ticket is authority over a connection this socket
-    // does not own. A client that wants either dials
-    // `identify.local_session_socket`.
+    // reason). A client that wants one dials
+    // `identify.local_session_socket` instead.
     ("events.subscribe", OpClass::Unsupported),
-    ("tab.attach", OpClass::Unsupported),
     ("session.identify", OpClass::SessionOnly),
     ("session.stop", OpClass::SessionOnly),
     ("session.set_theme", OpClass::SessionOnly),
@@ -647,7 +644,6 @@ mod tests {
                 "{op} is a rewrite row"
             );
         }
-        assert_eq!(classify("tab.attach"), Some(OpClass::Unsupported));
         assert_eq!(classify("events.subscribe"), Some(OpClass::Unsupported));
         for op in [
             "identify",

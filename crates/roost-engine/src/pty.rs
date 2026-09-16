@@ -112,10 +112,6 @@ impl PtyOutputEvent {
 /// metrics, compared as a whole. libghostty's mode-2048 in-band size
 /// reports quote the pixel dimensions, so the same grid at a different
 /// cell size is a different viewport and has to be applied.
-///
-/// It lives here rather than beside the tab task because an attach
-/// ticket carries it and the client registry compiles without the
-/// `server-vt` feature that gates that module.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Geometry {
     pub cols: u16,
@@ -445,7 +441,7 @@ pub(crate) enum WriterCmd {
     /// task: without it a failed `TIOCSWINSZ` was logged and swallowed,
     /// and the waiter resumed as though the child had been told.
     /// `None` for the fire-and-forget callers, which is all of them but
-    /// `tab.attach`.
+    /// a focused attach.
     Resize(PtySize, Option<oneshot::Sender<Result<(), String>>>),
 }
 
@@ -574,9 +570,9 @@ impl PtySupervisor {
     /// tab has no live PTY or server-VT is off.
     ///
     /// One acquisition is the point: a respawn between two reads would
-    /// otherwise let a caller resize one pipeline, stamp a token with a
-    /// second's generation, and snapshot a third. Every caller that
-    /// needs both must come through here.
+    /// otherwise let a caller resize one pipeline, admit an attach
+    /// against a second's generation, and snapshot a third. Every
+    /// caller that needs both must come through here.
     #[cfg(feature = "server-vt")]
     pub fn tab_task_handle(
         &self,

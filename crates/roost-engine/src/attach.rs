@@ -165,8 +165,6 @@ pub(crate) async fn serve_attach(
     let admitted = match h.admit_attach(&handshake, ctx) {
         Ok(admitted) => admitted,
         Err(error) => {
-            // The token is never echoed: it is a bearer credential, and
-            // an error message is a log line waiting to happen.
             reject(&mut writer, &error.code, &error.message).await;
             return;
         }
@@ -197,7 +195,7 @@ async fn attach_tab(
 ) {
     let tab_id = admitted.tab_id;
     let tab_generation = admitted.tab_generation;
-    let kind = &admitted.terms.kind;
+    let kind = &admitted.kind;
     // Started before the snapshot is asked for, not after it arrives:
     // the encode queues behind `MAX_CONCURRENT_SNAPSHOTS` and is exactly
     // the part of an attach the time budget exists to bound.
@@ -210,7 +208,7 @@ async fn attach_tab(
     // not stall every other session op. Detach never resizes back
     // (roadmap D7).
     if let Some(commands) = admitted.resize_first.as_ref() {
-        if let Err(error) = await_attach_resize(commands, tab_id, admitted.terms.geometry).await {
+        if let Err(error) = await_attach_resize(commands, tab_id, admitted.geometry).await {
             reject(&mut writer, &error.code, &error.message).await;
             return;
         }
@@ -265,9 +263,9 @@ async fn attach_tab(
     // for. Sending it costs a client that already agrees nothing: it
     // hydrates at a size it is already at.
     let accepted = AttachHandshakeReply::Accepted(AttachAccepted {
-        // Restated rather than assumed: an inline handshake stated a
-        // preference order and a ticket stated nothing at all, so the
-        // reply is the one place either client hears what it got.
+        // Restated rather than assumed: the handshake states a
+        // preference order, so the reply is the one place the client
+        // hears which entry it got.
         kind: kind.clone(),
         mode,
         seq: fence,
@@ -289,7 +287,7 @@ async fn attach_tab(
     let ending = Pump {
         tab_id,
         commands,
-        geometry: admitted.terms.geometry,
+        geometry: admitted.geometry,
         tee,
         writer,
         close,
@@ -589,7 +587,7 @@ async fn take_snapshot(
 struct Pump {
     tab_id: i64,
     commands: mpsc::Sender<TabCmd>,
-    /// What this connection says its viewport is: the `tab.attach`
+    /// What this connection says its viewport is: the handshake's
     /// geometry until a `RESIZE` frame moves it. Every `INPUT` frame
     /// carries it, which is how the PTY follows whoever typed last.
     geometry: Geometry,
@@ -980,7 +978,7 @@ impl Pump {
                     cell_w: u32::from(read(4)),
                     cell_h: u32::from(read(6)),
                 };
-                // Dropped rather than applied or fatal: `tab.attach`
+                // Dropped rather than applied or fatal: the handshake
                 // refuses a zero-sized grid, and the two paths state one
                 // client's geometry, so they have to agree about what a
                 // grid is.

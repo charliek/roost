@@ -47,16 +47,15 @@ import dataplane
 import pytest
 import session as sessionlib
 from client import Roost, scaled_timeout
-from dataplane import DataPlane
 from eventstream import EventStream
 
 # The prologue is the session lane's, unchanged: same daemon, same test
-# mode, same ticket vocabulary. Only the socket a client dials is
-# different here, which is the whole point of the module.
+# mode, same handshake. Only the socket a client dials is different
+# here, which is the whole point of the module.
 from test_session_attach import (
     COLS,
     ROWS,
-    attach_ticket,
+    dial,
     first_project,
     pty_payload,
     quiet_tab,
@@ -384,9 +383,8 @@ def test_a_full_attach_streams_and_echoes_through_the_bridge(env, bridge):
             argv=["/bin/sh", "-c", 'read line; printf "ECHO:%s\\r\\n" "$line"; exit 0'],
         )
 
-        ticket = attach_ticket(client, tab)
-        with DataPlane(bridge.path) as conn:
-            reply = conn.handshake(ticket["attach_token"])
+        conn, reply = dial(env, client, tab, socket_path=bridge.path)
+        with conn:
             assert reply.ok, (reply.code, reply.message)
             assert reply.kind == dataplane.GHOSTTY_SNAPSHOT
             # SNAP → READY → FINISH, in that order, is the snapshot
@@ -421,9 +419,8 @@ def test_a_killed_bridge_child_leaves_no_wedged_state(env, bridge):
     with bridge.client() as client:
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
-        ticket = attach_ticket(client, tab)
-        conn = DataPlane(bridge.path)
-        assert conn.handshake(ticket["attach_token"]).ok
+        conn, reply = dial(env, client, tab, socket_path=bridge.path)
+        assert reply.ok, (reply.code, reply.message)
         conn.read_until_ready()
 
         assert bridge.kill_children(), "nothing was live to kill"
@@ -437,9 +434,9 @@ def test_a_killed_bridge_child_leaves_no_wedged_state(env, bridge):
     # does not have to: the next connection is just another connection.
     with bridge.client() as revived:
         assert tab in {int(row["id"]) for row in revived.tabs()}
-        ticket = attach_ticket(revived, tab)
-        with DataPlane(bridge.path) as conn:
-            assert conn.handshake(ticket["attach_token"]).ok
+        conn, reply = dial(env, revived, tab, socket_path=bridge.path)
+        with conn:
+            assert reply.ok, (reply.code, reply.message)
             conn.read_until_ready()
         assert revived.dump(tab)["rows_text"] is not None
 
@@ -482,9 +479,8 @@ def test_each_half_close_ends_the_chain_cleanly(env, bridge):
 
         # (b) the far end goes away: `session.stop` while a data
         #     connection is attached through the bridge.
-        ticket = attach_ticket(after, tab)
-        conn = DataPlane(bridge.path)
-        assert conn.handshake(ticket["attach_token"]).ok
+        conn, reply = dial(env, after, tab, socket_path=bridge.path)
+        assert reply.ok, (reply.code, reply.message)
         conn.read_until_ready()
         attached_child = bridge.children[-1]
 

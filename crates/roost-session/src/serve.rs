@@ -259,12 +259,12 @@ pub async fn serve(
         started_at: identity::rfc3339_utc(std::time::SystemTime::now()),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         // Both answered for real now that every tab has a server
-        // terminal behind it. The list is what `tab.attach` negotiates
+        // terminal behind it. The list is what an attach negotiates
         // against, in preference order; `identity::payload_kinds` is
         // the one place it is decided.
         payload_kinds: identity::payload_kinds(config.legacy_payload_kinds, test_mode),
         // One string, both uses: what `session.identify` reports and
-        // what `tab.attach` compares a GHOSTSNP offer against. A
+        // what an attach compares a GHOSTSNP offer against. A
         // test-mode override therefore makes a build mismatch
         // reproducible end to end without a second binary (plan 037
         // §3.7) — and cannot make the two disagree, which would be a

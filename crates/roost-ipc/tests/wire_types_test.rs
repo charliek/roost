@@ -1,5 +1,5 @@
 //! Host-session wire types: `SessionIdentify`, `EventBatch`,
-//! `AttachPayloadKind`, the `tab.attach` shapes, the attach handshake
+//! `AttachPayloadKind`, the attach handshake
 //! and its reply, and `SESSION_PROTOCOL_VERSION`.
 //!
 //! What pins their shape is this file plus the golden vectors under
@@ -24,9 +24,9 @@ use roost_ipc::messages::{
     NotificationFiredEvent, ProjectReorderParams, ResponseError, RetrySchedule, SentFile,
     SessionBinaryIdentity, SessionIdentify, SessionIdentifyParams, SessionPutFileParams,
     SessionPutFileResult, SessionSetAgentHooksParams, SessionSetThemeParams, SessionSetThemeResult,
-    SessionStopParams, SessionStopResult, SessionStoppingEvent, SkippedFile, TabAttachParams,
-    TabAttachResult, TabClearNotificationParams, TabClearNotificationResult, TabDumpCursor,
-    TabDumpParams, TabDumpResult, TabEffect, TabEffectEvent, TabReorderParams, TabSendFileParams,
+    SessionStopParams, SessionStopResult, SessionStoppingEvent, SkippedFile,
+    TabClearNotificationParams, TabClearNotificationResult, TabDumpCursor, TabDumpParams,
+    TabDumpResult, TabEffect, TabEffectEvent, TabReorderParams, TabSendFileParams,
     TabSendFileResult, TabWriteParams, WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES,
     SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
 };
@@ -126,14 +126,6 @@ fn a_request_carrying_a_lease_is_refused_by_every_op_that_took_one() {
         ops::EVENTS_SUBSCRIBE,
         serde_json::from_str::<EventsSubscribeParams>(r#"{"tab_id_filter":"0","lease":"l"}"#)
             .map(drop),
-    );
-    refused(
-        ops::TAB_ATTACH,
-        serde_json::from_str::<TabAttachParams>(
-            r#"{"lease":"l","tab_id":"7","kinds":["vt"],"cols":80,"rows":24,
-                "libghostty_build":"b"}"#,
-        )
-        .map(drop),
     );
     refused(
         ops::SESSION_SET_THEME,
@@ -463,169 +455,12 @@ fn session_stop_vector_decodes_into_its_typed_result() {
 // Attach
 // ============================================================================
 
-const TOKEN: &str = "1a0be5c37d924f68b1c05e3a7f2d8496";
 const EPOCH: u64 = 6_032_428_321_756_423_947;
 
-fn sample_attach_params() -> TabAttachParams {
-    TabAttachParams {
-        tab_id: 5,
-        kinds: vec![AttachPayloadKind::GHOSTTY_SNAPSHOT.into()],
-        cols: 120,
-        rows: 40,
-        cell_w_px: 9,
-        cell_h_px: 18,
-        libghostty_build: "ghostty-3f6b1c9a4d2e5f80+snapshot.v1".into(),
-        focus: true,
-    }
-}
-
-fn sample_attach_result() -> TabAttachResult {
-    TabAttachResult {
-        attach_token: TOKEN.into(),
-        kind: AttachPayloadKind::GHOSTTY_SNAPSHOT.into(),
-        server_epoch: EPOCH,
-        tab_generation: 3,
-    }
-}
-
+/// The whole negotiation on one line: `attach` names the tab as a
+/// `string_int64` and the terms ride beside it.
 #[test]
-fn tab_attach_params_match_their_golden_json() {
-    const GOLDEN: &str = concat!(
-        r#"{"tab_id":"5","kinds":["ghostty-snapshot"],"cols":120,"rows":40,"#,
-        r#""cell_w_px":9,"cell_h_px":18,"#,
-        r#""libghostty_build":"ghostty-3f6b1c9a4d2e5f80+snapshot.v1","focus":true}"#,
-    );
-
-    let value = sample_attach_params();
-    round_trip(&value);
-    assert_eq!(serde_json::to_string(&value).unwrap(), GOLDEN);
-    let decoded: TabAttachParams = serde_json::from_str(GOLDEN).unwrap();
-    assert_eq!(decoded, value);
-}
-
-/// A headless client has no cell metrics to report, so the pixel
-/// geometry defaults away — but `cols`/`rows` do not, because a zero
-/// viewport is not a thing a tab can be resized to.
-#[test]
-fn tab_attach_params_default_the_pixel_geometry_only() {
-    let decoded: TabAttachParams = serde_json::from_str(
-        r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,
-            "libghostty_build":"b","focus":true}"#,
-    )
-    .unwrap();
-    assert_eq!((decoded.cell_w_px, decoded.cell_h_px), (0, 0));
-    assert_eq!(decoded.tab_id, 7);
-
-    assert!(serde_json::from_str::<TabAttachParams>(
-        r#"{"tab_id":"7","kinds":[],"rows":24,"libghostty_build":"b","focus":true}"#
-    )
-    .is_err());
-}
-
-/// `focus` is a plain bool: required on the wire, always serialized, and
-/// an absent key is a malformed request.
-///
-/// Protocol 4 let it be omitted to mean `true`, so a client could address
-/// a peer predating the field. At 5 there is no such peer, and the
-/// omit-when-true shim is gone — which this refuses to let back in,
-/// because a serde default would make every one of these decode again.
-#[test]
-fn tab_attach_params_require_focus_and_always_spell_it_out() {
-    const NO_FOCUS_KEY: &str =
-        r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"libghostty_build":"b"}"#;
-
-    let error = serde_json::from_str::<TabAttachParams>(NO_FOCUS_KEY)
-        .expect_err("an absent `focus` is refused at 5");
-    assert!(
-        error.to_string().contains("focus"),
-        "the refusal must name the missing field: {error}"
-    );
-
-    let decoded: TabAttachParams = serde_json::from_str(
-        r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"libghostty_build":"b",
-            "focus":true}"#,
-    )
-    .expect("an explicit true");
-    assert!(decoded.focus);
-    assert_eq!(
-        serde_json::to_string(&decoded).unwrap(),
-        concat!(
-            r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"cell_w_px":0,"cell_h_px":0,"#,
-            r#""libghostty_build":"b","focus":true}"#
-        )
-    );
-
-    let decoded: TabAttachParams = serde_json::from_str(
-        r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"libghostty_build":"b",
-            "focus":false}"#,
-    )
-    .expect("an explicit false");
-    assert!(!decoded.focus);
-    assert_eq!(
-        serde_json::to_string(&decoded).unwrap(),
-        concat!(
-            r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"cell_w_px":0,"cell_h_px":0,"#,
-            r#""libghostty_build":"b","focus":false}"#
-        )
-    );
-
-    // The Rust default has to agree with the serde one, or filling the
-    // rest of the struct with `..Default::default()` would quietly ask
-    // for an unfocused attach.
-    assert!(TabAttachParams::default().focus);
-}
-
-#[test]
-fn tab_attach_result_matches_its_golden_json() {
-    const GOLDEN: &str = concat!(
-        r#"{"attach_token":"1a0be5c37d924f68b1c05e3a7f2d8496","#,
-        r#""kind":"ghostty-snapshot","server_epoch":6032428321756423947,"#,
-        r#""tab_generation":3}"#,
-    );
-
-    let value = sample_attach_result();
-    round_trip(&value);
-    assert_eq!(serde_json::to_string(&value).unwrap(), GOLDEN);
-    let decoded: TabAttachResult = serde_json::from_str(GOLDEN).unwrap();
-    assert_eq!(decoded, value);
-    // Past 2^53 and a bare JSON number, like every other counter on
-    // this wire (`EventBatch.revision`), not a string-encoded id — so
-    // the golden above is also a precision guard.
-    const _: () = assert!(EPOCH > (1u64 << 53));
-}
-
-#[test]
-fn attach_handshake_matches_its_golden_json() {
-    const SNAPSHOT: &str = r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":6}"#;
-    const RESUME: &str = concat!(
-        r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":6,"#,
-        r#""resume_from_seq":901,"server_epoch":6032428321756423947,"#,
-        r#""tab_generation":3}"#,
-    );
-
-    let fresh = AttachHandshake {
-        attach: TOKEN.into(),
-        protocol_version: SESSION_PROTOCOL_VERSION,
-        ..AttachHandshake::default()
-    };
-    round_trip(&fresh);
-    assert_eq!(serde_json::to_string(&fresh).unwrap(), SNAPSHOT);
-
-    let resuming = AttachHandshake::resume(TOKEN, 901, EPOCH, 3);
-    round_trip(&resuming);
-    assert_eq!(serde_json::to_string(&resuming).unwrap(), RESUME);
-    assert_eq!(
-        serde_json::from_str::<AttachHandshake>(RESUME).unwrap(),
-        resuming
-    );
-}
-
-/// The inline form: `attach` names the tab as `string_int64` and the
-/// terms that used to ride the ticket ride the line instead. `kinds` is
-/// the discriminator, so this and the ticket form above are the two
-/// shapes the server tells apart.
-#[test]
-fn an_inline_attach_handshake_matches_its_golden_json() {
+fn an_attach_handshake_matches_its_golden_json() {
     const SNAPSHOT: &str = concat!(
         r#"{"attach":"7","protocol_version":6,"#,
         r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","kinds":["ghostty-snapshot","vt"],"#,
@@ -640,7 +475,7 @@ fn an_inline_attach_handshake_matches_its_golden_json() {
         r#""resume_from_seq":901,"server_epoch":6032428321756423947,"tab_generation":3}"#,
     );
 
-    let fresh = AttachHandshake::inline_snapshot(7, sample_handshake_terms());
+    let fresh = AttachHandshake::snapshot(7, sample_handshake_terms());
     round_trip(&fresh);
     assert_eq!(serde_json::to_string(&fresh).unwrap(), SNAPSHOT);
     assert_eq!(
@@ -648,7 +483,7 @@ fn an_inline_attach_handshake_matches_its_golden_json() {
         fresh
     );
 
-    let resuming = AttachHandshake::inline_resume(7, sample_handshake_terms(), 901, EPOCH, 3);
+    let resuming = AttachHandshake::resume(7, sample_handshake_terms(), 901, EPOCH, 3);
     round_trip(&resuming);
     assert_eq!(serde_json::to_string(&resuming).unwrap(), RESUME);
     assert_eq!(
@@ -673,58 +508,24 @@ fn sample_handshake_terms() -> AttachHandshakeTerms {
     }
 }
 
-/// The discriminator is the presence of `kinds`, never whether `attach`
-/// parses as a number: a token is hex and could be all digits by
-/// accident, and a tab id read as a token would be refused as a
-/// credential nobody minted. Nor is it whether `kinds` held anything —
-/// `null` is a key that is *there*, so the line is an inline handshake
-/// stating no kind, and the decode says so.
+/// A handshake is all-or-nothing, and the decode error names the term
+/// that is missing — a client that forgot one must not be left reading
+/// "invalid JSON".
+///
+/// `kinds` is in the loop like any other term now. It used to be the
+/// discriminator between the inline form and a ticket, so a line
+/// without it was a *different shape* rather than a malformed one;
+/// there is one shape left and a missing `kinds` is simply missing.
 #[test]
-fn the_presence_of_kinds_is_what_makes_a_handshake_inline() {
-    let all_digits: AttachHandshake =
-        serde_json::from_str(r#"{"attach":"12345","protocol_version":6}"#).unwrap();
-    assert!(
-        all_digits.terms.is_none(),
-        "an all-digit token stays the ticket form"
-    );
-
-    let error = serde_json::from_str::<AttachHandshake>(concat!(
-        r#"{"attach":"7","protocol_version":6,"session_id":"s","kinds":null,"#,
-        r#""cols":80,"rows":24,"libghostty_build":"b","focus":false}"#,
-    ))
-    .expect_err("a null `kinds` is an inline handshake with no kinds");
-    assert!(
-        error.to_string().contains("kinds"),
-        "the error names the term: {error}"
-    );
-
-    let inline: AttachHandshake = serde_json::from_str(concat!(
-        r#"{"attach":"7","protocol_version":6,"session_id":"s","kinds":["vt"],"#,
-        r#""cols":80,"rows":24,"libghostty_build":"b","focus":false}"#,
-    ))
-    .unwrap();
-    assert_eq!(
-        inline.terms.map(|t| t.kinds),
-        Some(vec![AttachPayloadKind::VT.into()])
-    );
-}
-
-/// An inline handshake is all-or-nothing, and the decode error names
-/// the term that is missing — a client that forgot one must not be left
-/// reading "invalid JSON".
-#[test]
-fn an_inline_handshake_missing_a_required_term_names_it() {
-    let error = serde_json::from_str::<AttachHandshake>(concat!(
-        r#"{"attach":"7","protocol_version":6,"kinds":["vt"],"#,
-        r#""cols":80,"rows":24,"libghostty_build":"b","focus":false}"#,
-    ))
-    .expect_err("session_id is required on the inline form");
-    assert!(
-        error.to_string().contains("session_id"),
-        "the error names the missing term: {error}"
-    );
-
-    for missing in ["cols", "rows", "libghostty_build", "focus"] {
+fn a_handshake_missing_a_required_term_names_it() {
+    for missing in [
+        "session_id",
+        "kinds",
+        "cols",
+        "rows",
+        "libghostty_build",
+        "focus",
+    ] {
         let mut line = serde_json::json!({
             "attach": "7",
             "protocol_version": 6,
@@ -737,7 +538,7 @@ fn an_inline_handshake_missing_a_required_term_names_it() {
         });
         line.as_object_mut().unwrap().remove(missing);
         let error = serde_json::from_value::<AttachHandshake>(line)
-            .expect_err("every inline term but the cell metrics is required");
+            .expect_err("every term but the cell metrics is required");
         assert!(
             error.to_string().contains(missing),
             "the error names {missing}: {error}"
@@ -747,14 +548,13 @@ fn an_inline_handshake_missing_a_required_term_names_it() {
 
 /// The two terms a headless client genuinely has nothing to say about.
 #[test]
-fn an_inline_handshake_may_omit_its_cell_metrics() {
+fn a_handshake_may_omit_its_cell_metrics() {
     let decoded: AttachHandshake = serde_json::from_str(concat!(
         r#"{"attach":"7","protocol_version":6,"session_id":"s","kinds":["vt"],"#,
         r#""cols":80,"rows":24,"libghostty_build":"b","focus":true}"#,
     ))
     .expect("a headless client reports no cell metrics");
-    let terms = decoded.terms.expect("the inline form");
-    assert_eq!((terms.cell_w_px, terms.cell_h_px), (0, 0));
+    assert_eq!((decoded.terms.cell_w_px, decoded.terms.cell_h_px), (0, 0));
 }
 
 /// The handshake is the one line a client of a *newer* build might send
@@ -763,11 +563,12 @@ fn an_inline_handshake_may_omit_its_cell_metrics() {
 #[test]
 fn attach_handshake_tolerates_unknown_fields() {
     let decoded: AttachHandshake = serde_json::from_str(
-        r#"{"attach":"t","protocol_version":2,"resume_from_seq":5,
-            "viewport_hint":{"top":0},"future_field":true}"#,
+        r#"{"attach":"7","protocol_version":2,"session_id":"s","kinds":["vt"],
+            "cols":80,"rows":24,"libghostty_build":"b","focus":true,
+            "resume_from_seq":5,"viewport_hint":{"top":0},"future_field":true}"#,
     )
     .unwrap();
-    assert_eq!(decoded.attach, "t");
+    assert_eq!(decoded.attach, "7");
     assert_eq!(decoded.resume_from_seq, Some(5));
     assert_eq!(decoded.server_epoch, None);
 }
@@ -779,8 +580,10 @@ fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
         r#""server_epoch":6032428321756423947,"tab_generation":3,"#,
         r#""snapshot_cols":100,"snapshot_rows":30}"#,
     );
-    const REJECTED: &str =
-        r#"{"ok":false,"error":{"code":"invalid-token","message":"unknown or expired token"}}"#;
+    const REJECTED: &str = concat!(
+        r#"{"ok":false,"error":{"code":"session-mismatch","#,
+        r#""message":"this session is \"a\"; the client attached to \"b\""}}"#,
+    );
 
     let accepted = AttachHandshakeReply::Accepted(AttachAccepted {
         kind: AttachPayloadKind::GHOSTTY_SNAPSHOT.into(),
@@ -798,7 +601,10 @@ fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
         accepted
     );
 
-    let rejected = AttachHandshakeReply::rejected("invalid-token", "unknown or expired token");
+    let rejected = AttachHandshakeReply::rejected(
+        "session-mismatch",
+        r#"this session is "a"; the client attached to "b""#,
+    );
     round_trip(&rejected);
     assert_eq!(serde_json::to_string(&rejected).unwrap(), REJECTED);
     assert_eq!(
@@ -808,8 +614,8 @@ fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
     assert_eq!(
         rejected,
         AttachHandshakeReply::Rejected(ResponseError {
-            code: "invalid-token".into(),
-            message: "unknown or expired token".into(),
+            code: "session-mismatch".into(),
+            message: r#"this session is "a"; the client attached to "b""#.into(),
         })
     );
 }
@@ -876,61 +682,6 @@ fn attach_mode_is_a_lowercase_string() {
         AttachMode::Resume
     );
     assert!(serde_json::from_str::<AttachMode>(r#""Snapshot""#).is_err());
-}
-
-#[test]
-fn tab_attach_vectors_decode_into_their_typed_shapes() {
-    let raw = read_vector("tab.attach.request.json");
-    let request: roost_ipc::messages::RawRequest =
-        serde_json::from_str(&raw).expect("decode request envelope");
-    assert_eq!(request.op, roost_ipc::messages::ops::TAB_ATTACH);
-    let params: TabAttachParams =
-        serde_json::from_value(request.params).expect("decode attach params");
-    assert_eq!(params, sample_attach_params());
-
-    let raw = read_vector("tab.attach.response.json");
-    let resp: roost_ipc::messages::Response =
-        serde_json::from_str(&raw).expect("decode response envelope");
-    assert!(resp.ok);
-    let result: TabAttachResult =
-        serde_json::from_value(resp.result.expect("result body")).expect("decode attach result");
-    assert_eq!(result, sample_attach_result());
-}
-
-/// The other end of the negotiation: a client offering both kinds, and
-/// the reply that settled on `vt`.
-#[test]
-fn tab_attach_vt_vectors_decode_into_their_typed_shapes() {
-    let raw = read_vector("tab.attach.vt.request.json");
-    let request: roost_ipc::messages::RawRequest =
-        serde_json::from_str(&raw).expect("decode request envelope");
-    assert_eq!(request.op, roost_ipc::messages::ops::TAB_ATTACH);
-    let params: TabAttachParams =
-        serde_json::from_value(request.params).expect("decode attach params");
-    assert_eq!(
-        params,
-        TabAttachParams {
-            kinds: vec![
-                AttachPayloadKind::GHOSTTY_SNAPSHOT.into(),
-                AttachPayloadKind::VT.into(),
-            ],
-            ..sample_attach_params()
-        }
-    );
-
-    let raw = read_vector("tab.attach.vt.response.json");
-    let resp: roost_ipc::messages::Response =
-        serde_json::from_str(&raw).expect("decode response envelope");
-    assert!(resp.ok);
-    let result: TabAttachResult =
-        serde_json::from_value(resp.result.expect("result body")).expect("decode attach result");
-    assert_eq!(
-        result,
-        TabAttachResult {
-            kind: AttachPayloadKind::VT.into(),
-            ..sample_attach_result()
-        }
-    );
 }
 
 #[test]

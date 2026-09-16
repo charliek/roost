@@ -899,8 +899,8 @@ async fn a_resize_drains_the_in_band_size_report() {
 /// writer's FIFO: a grid-only resize queues its own winsize with no ack,
 /// so a waiter arriving at the same tuple would otherwise be told the
 /// child was sized while that `ioctl` was still queued, and a focused
-/// `tab.attach` is exactly such a waiter. **What this pins is that the
-/// extra write cannot strand the waiter** — the ordering it buys is not
+/// attach is exactly such a waiter. **What this pins is that the extra
+/// write cannot strand the waiter** — the ordering it buys is not
 /// observable from here, because forcing the writer to lag needs a child
 /// that has stopped reading and an assertion on an ack that does *not*
 /// fire. Stated rather than tested, deliberately.
@@ -1017,7 +1017,7 @@ async fn a_grid_resize_keeps_the_cell_metrics_the_tab_holds() {
 /// keystrokes at one size must not pay for a terminal resize per frame —
 /// and that is precisely why the recording has to come *after* the
 /// apply. Stored first, a refused resize would make every retry of that
-/// size a silent no-op: `tab.attach` would answer `invalid-param`, the
+/// size a silent no-op: the attach would be refused `invalid-param`, the
 /// client would retry the same attach, the second one would succeed, and
 /// the snapshot would be encoded at the old grid while `tab.dump` and
 /// `SnapshotAt` reported the size that was never taken.
@@ -1086,7 +1086,7 @@ async fn a_refused_resize_leaves_the_geometry_retryable() {
 
 /// The acked resize means **both** halves (review F9).
 ///
-/// `TabCmd::Resize`'s reply exists so `tab.attach` cannot snapshot a tab
+/// `TabCmd::Resize`'s reply exists so an attach cannot snapshot a tab
 /// whose child has not been told, and the child's `TIOCSWINSZ` happens
 /// on the PTY writer's own task — one FIFO shared with client input, so
 /// the winsize can only land once everything queued ahead of it has
@@ -1218,7 +1218,7 @@ async fn an_acked_resize_waits_for_the_childs_winsize() {
 /// there forever with its `oneshot::Sender` inside it — neither sent
 /// nor dropped, the one shape the wait cannot resolve. It spent the
 /// whole `WINSIZE_ACK_BUDGET` and then reported the opposite of the
-/// truth, which a focused `tab.attach` turns into a refused attach five
+/// truth, which a focused attach turns into a refused attach five
 /// seconds late.
 ///
 /// The *first* resize after the writer's death was never the bug: its

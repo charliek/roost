@@ -40,7 +40,7 @@ not.
 Two triggers revisit that decision:
 
 * the wire settles — R1 (the lease re-cut) through R5, and R15 (plan
-  057, the lease re-cut *again*, opening `tab.write`/`tab.attach` back
+  057, the lease re-cut *again*, opening `tab.write` and attach back
   up) are the changes currently expected to move it; once they have
   landed and the shape has stopped moving, git tags per protocol
   generation are the natural next step, and cheap;
@@ -92,7 +92,7 @@ another — the Rust API is the usual offender.
 |---|---|
 | **UI-socket JSON wire** | Governed by `PROTOCOL_VERSION` and the matrix below. Additive changes are free; a breaking change bumps the integer |
 | **Session-socket JSON wire** | Governed by `SESSION_PROTOCOL_VERSION` and the same matrix. Conforming clients gate on it exactly, so mixed generations fail closed at the handshake rather than misbehaving later |
-| **Binary data plane** (attach streams; see [Data plane](ipc.md#data-plane)) | Rides the session generation. The attach handshake carries the same integer and refuses a mismatch before it looks at the token; snapshot payloads additionally require an exact `libghostty_build` match |
+| **Binary data plane** (attach streams; see [Data plane](ipc.md#data-plane)) | Rides the session generation. The attach handshake carries the same integer and refuses a mismatch before it reads any other term; snapshot payloads additionally require an exact `libghostty_build` match |
 | **Fixture corpus** (`tests/ipc-vectors/`) | Pinnable and append-mostly — see [Fixtures are the contract](#fixtures-are-the-contract) |
 | **Rust crate API** | **No stability promise.** See below |
 
@@ -153,7 +153,7 @@ merely a new vector:
 * `ClipboardEffectTarget` — the [`tab.effect`](ipc.md#events) envelope's
   target; a two-value set (`system`/`selection`) with no growth
   pressure;
-* `AttachMode` — the [`tab.attach`](ipc.md#tabattach) mode;
+* `AttachMode` — the [attach handshake](ipc.md#the-handshake)'s mode;
 * the agent enums — `AgentLifecycle` and the `ownership_action`,
   `attention`, and `severity` values on
   [`tab.agent_report`](ipc.md#tabagent_report).
@@ -203,8 +203,8 @@ is: a **client-side** guarantee of the shipped connection sequence. The
 JSON server does not require `session.identify` before anything else, so
 a client that skips the handshake is not stopped — it simply gets
 undefined behavior it asked for. The attach handshake on the data plane
-carries the same integer and does enforce it server-side, before it looks
-at the token.
+carries the same integer and does enforce it server-side, before it
+reads any other term.
 
 **Everything optional is capability-detected.** `payload_kinds` is the
 worked example: the client reads the list, keeps the entries it does not

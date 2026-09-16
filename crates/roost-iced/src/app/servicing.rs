@@ -4412,7 +4412,7 @@ mod tests {
             "shutting-down",
             "replay-expired",
             "session-mismatch",
-            "too-many-tokens",
+            "too-many-attaches",
             "a-code-from-a-newer-session",
         ] {
             let failure = host_op_failure(&rejected(code));

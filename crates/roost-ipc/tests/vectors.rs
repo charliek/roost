@@ -111,12 +111,19 @@ fn every_vector_round_trips_through_serde_json() {
 /// Each request file must declare an `id` (string-wrapped int64) and
 /// an `op` (dotted-lowercase string). Lightweight schema check that
 /// catches accidental copy-paste between fixtures.
+///
+/// The attach handshake is the one request on this wire that is not a
+/// request *envelope* — it is the first line of a data connection, and
+/// the server tells it apart from an op precisely by its having no
+/// `op`. Its vectors are checked against their typed shape in
+/// [`the_attach_handshake_vectors_decode_into_their_typed_shapes`]
+/// instead.
 #[test]
 fn request_vectors_have_required_envelope_shape() {
     let dir = vectors_dir();
     for path in collect_vectors(&dir) {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if !stem.ends_with(".request") {
+        if !stem.ends_with(".request") || stem.starts_with(HANDSHAKE_PREFIX) {
             continue;
         }
         let raw =
@@ -208,47 +215,107 @@ fn agent_report_vector_decodes_into_its_typed_params() {
     assert_eq!(result.tab.hook_active, roost_ipc::agent::is_live(&agent));
 }
 
-/// `tab.attach`'s request vectors, decoded into the typed params rather
+/// The stem every attach-handshake vector shares. Named once because
+/// two tests key off it: the envelope check skips them, and the typed
+/// decode below owns them.
+const HANDSHAKE_PREFIX: &str = "attach.handshake.";
+
+/// The attach handshake's vectors, decoded into the typed shapes rather
 /// than round-tripped as a `Value`.
 ///
-/// `focus` is why this exists. At protocol 4 it carried a serde default,
-/// so a vector could omit it and still decode — which is exactly what
-/// both vectors did, and generic round-tripping cannot see a struct field
-/// that is not there. At 5 it is required and always serialized, so an
-/// omission is a malformed request; this is what refuses one.
+/// Worth the typed pass because the handshake is permissive on decode:
+/// a misspelled term does not fail, it silently lands in the "a newer
+/// client sent something we have never heard of" bucket and the rest of
+/// the line decodes around it. Only asserting on the decoded struct
+/// catches that.
 #[test]
-fn the_attach_request_vectors_decode_into_their_typed_params() {
-    use roost_ipc::messages::{ops, AttachPayloadKind, RawRequest, TabAttachParams};
+fn the_attach_handshake_vectors_decode_into_their_typed_shapes() {
+    use roost_ipc::messages::{
+        AttachHandshake, AttachHandshakeReply, AttachMode, AttachPayloadKind,
+        SESSION_PROTOCOL_VERSION,
+    };
 
-    for name in ["tab.attach.request.json", "tab.attach.vt.request.json"] {
+    let read = |name: &str| {
         let mut path = vectors_dir();
         path.push(name);
-        let raw = fs::read_to_string(&path).expect("read attach request vector");
-        let req: RawRequest = serde_json::from_str(&raw).expect("decode envelope");
-        assert_eq!(req.op, ops::TAB_ATTACH, "{name}");
-        let params: TabAttachParams = serde_json::from_value(req.params.clone())
-            .unwrap_or_else(|error| panic!("{name} must decode as TabAttachParams: {error}"));
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {name}: {e}"))
+    };
+    let handshake = |name: &str| -> AttachHandshake {
+        serde_json::from_str(&read(name))
+            .unwrap_or_else(|error| panic!("{name} must decode as AttachHandshake: {error}"))
+    };
+
+    for name in [
+        "attach.handshake.request.json",
+        "attach.handshake.vt.request.json",
+        "attach.handshake.resume.request.json",
+        "attach.handshake.unfocused.request.json",
+    ] {
+        let h = handshake(name);
+        assert_eq!(h.protocol_version, SESSION_PROTOCOL_VERSION, "{name}");
+        assert_eq!(h.attach, "5", "{name}: the tab rides as a string_int64");
         assert!(
-            params.focus,
-            "{name}: an attach vector must state its geometry claim, not lean on a default",
+            !h.terms.session_id.is_empty(),
+            "{name}: the session binding is required"
         );
         assert!(
-            req.params
-                .get("focus")
-                .is_some_and(serde_json::Value::is_boolean),
-            "{name}: `focus` must be present on the wire, spelled as a bool",
-        );
-        assert_eq!(
-            params.kinds.first().map(AttachPayloadKind::as_str),
-            Some(AttachPayloadKind::GHOSTTY_SNAPSHOT),
-            "{name}: the snapshot kind stays first in every preference list, got {:?}",
-            params.kinds,
-        );
-        assert!(
-            params.cols > 0 && params.rows > 0,
+            h.terms.cols > 0 && h.terms.rows > 0,
             "{name}: the grid is non-zero"
         );
+        assert_eq!(
+            h.terms.kinds.first().map(AttachPayloadKind::as_str),
+            Some(AttachPayloadKind::GHOSTTY_SNAPSHOT),
+            "{name}: the snapshot kind stays first in every preference list",
+        );
     }
+
+    assert_eq!(
+        handshake("attach.handshake.vt.request.json")
+            .terms
+            .kinds
+            .last()
+            .map(AttachPayloadKind::as_str),
+        Some(AttachPayloadKind::VT),
+        "the vt vector is the one that offers a second kind",
+    );
+
+    let resuming = handshake("attach.handshake.resume.request.json");
+    assert_eq!(resuming.resume_from_seq, Some(901));
+    assert!(resuming.server_epoch.is_some() && resuming.tab_generation.is_some());
+    assert_eq!(
+        handshake("attach.handshake.request.json").resume_from_seq,
+        None,
+        "the plain vector asks for a snapshot",
+    );
+
+    assert!(handshake("attach.handshake.request.json").terms.focus);
+    assert!(
+        !handshake("attach.handshake.unfocused.request.json")
+            .terms
+            .focus,
+        "the unfocused vector is the one that claims no geometry",
+    );
+
+    let accepted: AttachHandshakeReply =
+        serde_json::from_str(&read("attach.handshake.accepted.json"))
+            .expect("the accepted reply decodes");
+    let AttachHandshakeReply::Accepted(accepted) = accepted else {
+        panic!("attach.handshake.accepted.json is the accepted arm");
+    };
+    assert_eq!(accepted.mode, AttachMode::Snapshot);
+    assert_eq!(
+        (accepted.snapshot_cols, accepted.snapshot_rows),
+        (120, 40),
+        "the geometry the bytes were written for rides every accepted reply",
+    );
+
+    let rejected: AttachHandshakeReply =
+        serde_json::from_str(&read("attach.handshake.rejected.json"))
+            .expect("the rejected reply decodes");
+    let AttachHandshakeReply::Rejected(error) = rejected else {
+        panic!("attach.handshake.rejected.json is the rejected arm");
+    };
+    assert_eq!(error.code, "session-mismatch");
 }
 
 /// `app.sidebar_dump` is the newest read-only UI-state op; generic

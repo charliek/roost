@@ -915,7 +915,7 @@ pub struct RecordedFailure {
 /// **Spawn-per-connection is the pinned shape.** Every accepted
 /// connection gets its own task and its own `ssh` exec over the shared
 /// master, so a client that opens an events connection and holds it for
-/// the session's lifetime cannot keep the next `tab.attach` waiting.
+/// the session's lifetime cannot keep the next attach waiting.
 /// Serializing connections through one task would deadlock exactly
 /// there, and that is the failure mode this design exists to avoid.
 pub struct SshTunnel {
