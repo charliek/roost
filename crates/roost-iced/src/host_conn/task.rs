@@ -2080,6 +2080,44 @@ mod tests {
         assert!(admit(HostId::new(9), intent).is_some());
     }
 
+    /// #474: an acknowledgement belongs to the incarnation that minted
+    /// the generation it names, and to no other.
+    ///
+    /// The window is the same one above — the queue outlives the
+    /// connection — and the damage is specific to this op. A replacement
+    /// session counts its raises from one again, so the clear the UI
+    /// built for the session that died matches an *unseen* raise on its
+    /// successor and takes it down. The unconditional form a click
+    /// enqueues is worse rather than safer: it matches without even
+    /// looking.
+    #[tokio::test]
+    async fn a_clear_built_against_one_incarnation_never_lands_on_its_replacement() {
+        let (ops, mut ops_rx) = super::super::queue::HostOps::channel();
+        let dead = HostId::new(4);
+        let tab = roost_ui_model::keys::TabKey::new(dead, 3);
+
+        // Both forms: the automatic acknowledgement naming a raise, and
+        // the click that names none.
+        for generation in [Some(1), None] {
+            assert!(ops
+                .send(crate::app::clear_notification_intent(tab, generation))
+                .is_ok());
+            let intent = ops_rx.recv().await.expect("the clear is on the queue");
+            assert_eq!(intent.op, ops::TAB_CLEAR_NOTIFICATION);
+            assert!(
+                admit(HostId::new(5), intent).is_none(),
+                "the replacement session must never serve a clear built for its predecessor"
+            );
+        }
+
+        // The incarnation it was built for still runs it.
+        assert!(ops
+            .send(crate::app::clear_notification_intent(tab, Some(1)))
+            .is_ok());
+        let intent = ops_rx.recv().await.expect("the third clear");
+        assert!(admit(dead, intent).is_some());
+    }
+
     /// The disconnect contract end to end, and what lets `HostConn::drop`
     /// signal instead of aborting: the task ends, and everything on its
     /// queue is *answered* rather than dropped with its reply channel.

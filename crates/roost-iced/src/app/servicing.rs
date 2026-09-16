@@ -984,22 +984,31 @@ pub(super) fn view_incarnation(incarnation: Option<HostId>) -> HostId {
     incarnation.unwrap_or(HostId::LOCAL)
 }
 
-/// Whether this window answers a `notification.fired` itself, and with
-/// which generation — `None` means it banners instead (#474).
+/// Whether this window answers a `notification.fired` itself, rather
+/// than bannering it (#474).
 ///
 /// A session fires for every client because only a client knows what its
 /// own window is showing; the one already reading the tab answers for
 /// all of them, and its `tab.clear_notification` takes the dot down
 /// wherever it is up rather than each client deciding separately what it
 /// can see.
+fn acknowledges(viewed: Option<TabKey>, fired: TabKey) -> bool {
+    viewed == Some(fired)
+}
+
+/// Which raise an acknowledgement names, given the one the fire carried.
 ///
 /// The answer carries **the generation of the raise it read**, never the
 /// tab's latest. Over the round trip a second raise can land, and an
 /// acknowledgement that named the tab rather than the raise would erase
 /// a notification nobody has seen — see
 /// `TabClearNotificationParams::generation`.
-fn acknowledged_generation(viewed: Option<TabKey>, fired: TabKey, generation: u64) -> Option<u64> {
-    (viewed == Some(fired)).then_some(generation)
+///
+/// `None` is the unconditional form, which is also what a fire carrying
+/// no generation at all gets: `0` is the wire's absence, not a raise —
+/// see [`roost_ipc::messages::NotificationFiredEvent::generation`].
+fn acknowledged_generation(generation: u64) -> Option<u64> {
+    (generation != 0).then_some(generation)
 }
 
 /// Drop the pending bit from the one tab this window is reading (#474).
@@ -1714,11 +1723,13 @@ impl App {
                 }
                 HostEnvelopeAction::Notify(fired) => {
                     let key = TabKey::new(host, fired.tab_id);
-                    match acknowledged_generation(self.viewed_host_tab(), key, fired.generation) {
-                        Some(generation) => {
-                            self.send_host_clear_notification(key, Some(generation))
-                        }
-                        None => self.fire_notification(key, fired.title, fired.body),
+                    if acknowledges(self.viewed_host_tab(), key) {
+                        self.send_host_clear_notification(
+                            key,
+                            acknowledged_generation(fired.generation),
+                        );
+                    } else {
+                        self.fire_notification(key, fired.title, fired.body);
                     }
                 }
                 HostEnvelopeAction::ClearNotification(tab_id) => {
@@ -5162,25 +5173,53 @@ mod tests {
         let host = HostId::new(3);
         let read = TabKey::new(host, 7);
 
-        assert_eq!(
-            acknowledged_generation(Some(read), read, 9),
-            Some(9),
-            "the window reading the tab answers, naming that raise"
+        assert!(
+            acknowledges(Some(read), read),
+            "the window reading the tab answers"
         );
         assert_eq!(
-            acknowledged_generation(Some(TabKey::new(host, 8)), read, 9),
-            None,
+            acknowledged_generation(9),
+            Some(9),
+            "and names that raise, not the tab"
+        );
+        assert!(
+            !acknowledges(Some(TabKey::new(host, 8)), read),
             "a window reading another tab banners instead"
         );
-        assert_eq!(
-            acknowledged_generation(Some(TabKey::new(HostId::new(9), 7)), read, 9),
-            None,
+        assert!(
+            !acknowledges(Some(TabKey::new(HostId::new(9), 7)), read),
             "and so does the same bare number on another incarnation"
         );
-        assert_eq!(
-            acknowledged_generation(None, read, 9),
-            None,
+        assert!(
+            !acknowledges(None, read),
             "an unfocused window, or one on a local tab, claims nothing"
+        );
+    }
+
+    /// #474: a fire that carried no generation is acknowledged
+    /// **unconditionally**, with the field off the wire entirely.
+    ///
+    /// The absence decodes as `0`, which no raise ever mints. Naming it
+    /// would ask the session for a match that can never come: the clear
+    /// takes nothing down, this window stops painting the dot anyway,
+    /// and every other client keeps the raise up forever.
+    #[test]
+    fn a_fire_without_a_generation_is_acknowledged_with_no_generation_on_the_wire() {
+        let HostEnvelopeAction::Notify(fired) = host_envelope_action(&envelope(
+            roost_ipc::messages::ops::EVENT_NOTIFICATION_FIRED,
+            serde_json::json!({"tab_id": "7", "title": "Claude Code", "body": "done"}),
+        )) else {
+            panic!("a fire decodes as a notification");
+        };
+        let read = TabKey::new(HostId::new(3), fired.tab_id);
+        assert!(acknowledges(Some(read), read));
+
+        let intent =
+            crate::app::clear_notification_intent(read, acknowledged_generation(fired.generation));
+        assert_eq!(
+            intent.params,
+            serde_json::json!({"tab_id": "7"}),
+            "the acknowledgement has no raise to name, so it names none"
         );
     }
 

@@ -1215,8 +1215,9 @@ fn notification_fired_vector_decodes_with_its_generation() {
 }
 
 /// A peer that predates the field decodes to generation `0` — a value
-/// no raise ever mints — so its acknowledgements are ignored rather
-/// than mis-applied to whatever is current.
+/// no raise ever mints, so it reads as "this fire named none" and is
+/// acknowledged unconditionally rather than with a number the engine
+/// could never match.
 #[test]
 fn a_fired_notification_without_a_generation_decodes_to_zero() {
     let fired: NotificationFiredEvent = serde_json::from_value(serde_json::json!({

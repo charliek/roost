@@ -1375,6 +1375,36 @@ fn host_tab_open_params(
     })
 }
 
+/// One clear on a host tab, as a queued intent **fenced at the
+/// incarnation the key names** (#474).
+///
+/// A generation is only meaningful inside the session incarnation that
+/// minted it: every replacement counts its raises from one again, so a
+/// clear built against the session that died and served by its successor
+/// matches a raise it has nothing to do with, and takes down a
+/// notification this window has never seen. The unconditional form is
+/// worse rather than safer — it needs no match at all. Neither
+/// `HostConnSet::send_at` nor the queue can catch that: the queue
+/// outlives a connection and the main thread goes on believing the dead
+/// incarnation is live until it drains the drop off the feed, so the
+/// fence is the only thing that refuses it
+/// ([`crate::host_conn::queue::HostIntent::fence`]).
+///
+/// Built through the params type so the omit-when-unset spelling is the
+/// one the wire pins, not one a call site restates.
+pub(crate) fn clear_notification_intent(
+    tab: TabKey,
+    generation: Option<u64>,
+) -> crate::host_conn::HostIntent {
+    let params = serde_json::to_value(roost_ipc::messages::TabClearNotificationParams {
+        tab_id: tab.tab,
+        generation,
+    })
+    .expect("clear-notification params serialize");
+    crate::host_conn::HostIntent::new(roost_ipc::messages::ops::TAB_CLEAR_NOTIFICATION, params)
+        .fenced_at(tab.host)
+}
+
 /// The one tab-open op behind every route that opens one: the new-tab
 /// button, keybind and palette row, the launcher's command rows, and
 /// create-project's seed tab.
@@ -6548,18 +6578,11 @@ impl App {
     /// the row down before the host agreed, and put it back on the next
     /// reconcile if the op was refused.
     fn send_host_clear_notification(&mut self, tab: TabKey, generation: Option<u64>) {
-        // Built through the params type so the omit-when-unset spelling
-        // is the one the wire pins, not one this call site restates.
-        let params = serde_json::to_value(roost_ipc::messages::TabClearNotificationParams {
-            tab_id: tab.tab,
-            generation,
-        })
-        .expect("clear-notification params serialize");
-        let intent = crate::host_conn::HostIntent::new(
-            roost_ipc::messages::ops::TAB_CLEAR_NOTIFICATION,
-            params,
-        );
-        if self.hosts.send_at(tab.host, intent).is_err() {
+        if self
+            .hosts
+            .send_at(tab.host, clear_notification_intent(tab, generation))
+            .is_err()
+        {
             tracing::debug!(%tab, "could not clear the attention marker on a host tab");
         }
     }

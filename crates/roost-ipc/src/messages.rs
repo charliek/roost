@@ -1844,10 +1844,16 @@ pub struct NotificationFiredEvent {
     /// names a superseded raise is refused rather than erasing the
     /// newer one it never saw.
     ///
-    /// Defaulted for the same reason every other additive field is: a
-    /// peer that predates it decodes to `0`, which is a generation no
-    /// raise ever mints, so its acknowledgements are simply ignored
-    /// rather than mis-applied.
+    /// Defaulted for the same reason every other additive field is, and
+    /// **`0` is the absence, not a raise**: the counter is bumped before
+    /// it stamps, so a real generation counts from one. A peer that does
+    /// not send the field has given the acknowledgement nothing to name,
+    /// and the answer is then the unconditional one
+    /// ([`TabClearNotificationParams::generation`] omitted). Sending `0`
+    /// back would ask for a match that can never come — the clear would
+    /// take nothing down while the acknowledging window stopped painting
+    /// the dot anyway, leaving the raise up on every other client
+    /// forever.
     #[serde(default)]
     pub generation: u64,
 }
