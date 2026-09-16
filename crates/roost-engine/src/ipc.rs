@@ -4624,8 +4624,18 @@ mod tests {
     fn every_dispatched_op_is_classified() {
         // The scan finds identifiers; the table is keyed by the wire
         // strings, so the bridge is `messages.rs`'s own declarations —
-        // read the same way, for the same reason.
+        // read the same way, for the same reason. Scoped to the `ops`
+        // module's own body: every name this scan looks up came from an
+        // `ops::` path, so its declaration lives there too, and a
+        // whole-file search would resolve to whichever same-named
+        // constant happens to appear first — true since plan 065 §3.4
+        // gave `TabEffect` its own `CLIPBOARD_WRITE` with a different
+        // wire spelling than `ops::CLIPBOARD_WRITE`.
         let declared = include_str!("../../roost-ipc/src/messages.rs");
+        let ops_mod_start = declared
+            .find("pub mod ops {")
+            .expect("messages.rs declares `pub mod ops`");
+        let declared = &declared[ops_mod_start..];
         let unclassified: Vec<_> = ops_this_dispatcher_names()
             .into_iter()
             .filter_map(|name| {

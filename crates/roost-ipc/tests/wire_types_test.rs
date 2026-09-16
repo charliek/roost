@@ -933,18 +933,17 @@ fn event_batch_vector_decodes_into_its_typed_shape() {
 // HS-2 server additions (plan 037 §3.6): effects + theme reseed
 // ============================================================================
 
-/// The two effect spellings a client switches on. Kebab-case is not
-/// serde's default rendering, so the wire strings are stated here rather
-/// than inferred — renaming a variant must break this file, not a
-/// client.
+/// The two effect spellings a client switches on. The constants are the
+/// wire strings verbatim (`TabEffect` is a transparent newtype), so
+/// renaming a constant must break this file, not a client.
 #[test]
 fn tab_effect_names_are_their_wire_strings() {
     assert_eq!(
-        serde_json::to_string(&TabEffect::Bell).unwrap(),
+        serde_json::to_string(&TabEffect::from(TabEffect::BELL)).unwrap(),
         r#""bell""#
     );
     assert_eq!(
-        serde_json::to_string(&TabEffect::ClipboardWrite).unwrap(),
+        serde_json::to_string(&TabEffect::from(TabEffect::CLIPBOARD_WRITE)).unwrap(),
         r#""clipboard-write""#
     );
     assert_eq!(
@@ -955,10 +954,23 @@ fn tab_effect_names_are_their_wire_strings() {
         serde_json::to_string(&ClipboardEffectTarget::Selection).unwrap(),
         r#""selection""#
     );
-    // An effect this build has never heard of fails to decode rather
-    // than landing on a default: a client that cannot tell what happened
-    // must ignore the envelope, and the decode is how it finds out.
-    assert!(serde_json::from_str::<TabEffect>(r#""pointer-shape""#).is_err());
+}
+
+/// `TabEffect` is an open list (#188, #364), not a closed enum: a
+/// session ahead of this build can name an effect this build has never
+/// heard of, and the client's job is to ignore it, not refuse the whole
+/// envelope. Decoding an unknown value must succeed and preserve it —
+/// the opposite of the old closed-enum contract, which failed the
+/// decode outright.
+#[test]
+fn an_unknown_effect_decodes_as_an_opaque_value_instead_of_failing() {
+    let decoded: TabEffect =
+        serde_json::from_str(r#""pointer-shape""#).expect("unknown effect must still decode");
+    assert_eq!(decoded, TabEffect::from("pointer-shape"));
+    assert_eq!(decoded.as_str(), "pointer-shape");
+    // Still routes: a known effect is unaffected by the type opening up.
+    let bell: TabEffect = serde_json::from_str(r#""bell""#).expect("decode bell");
+    assert_eq!(bell, TabEffect::from(TabEffect::BELL));
 }
 
 /// A bell carries no payload at all — the optional fields are absent
@@ -969,7 +981,7 @@ fn tab_effect_names_are_their_wire_strings() {
 fn a_bell_effect_omits_its_payload_fields() {
     let bell = TabEffectEvent {
         tab_id: 5,
-        effect: TabEffect::Bell,
+        effect: TabEffect::BELL.into(),
         data: None,
         target: None,
     };
@@ -990,7 +1002,7 @@ fn tab_effect_vector_decodes_into_its_typed_shape() {
         data,
         TabEffectEvent {
             tab_id: 5,
-            effect: TabEffect::ClipboardWrite,
+            effect: TabEffect::CLIPBOARD_WRITE.into(),
             // base64 of "hello": the payload rides encoded like every
             // other bytes field on this wire.
             data: Some("aGVsbG8=".into()),

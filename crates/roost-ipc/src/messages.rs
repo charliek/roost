@@ -2622,26 +2622,58 @@ pub mod host_state {
 
 /// Which client-directed effect a [`TabEffectEvent`] carries.
 ///
-/// Deliberately short: HS-2 ships **bell** and **OSC 52 clipboard
-/// writes** only. Every other client-local OSC effect (pointer shape,
-/// today) stays dropped + debug-logged in the tab task — an envelope
-/// design invites "just one more effect", so the set is pinned rather
-/// than open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TabEffect {
+/// An open string, not a closed enum (#188, #364): a client must be
+/// able to decode an envelope naming an effect it predates, and a
+/// closed enum would turn "one more effect" into a decode error instead
+/// of the inert no-op an unhandled effect should be. HS-2 ships
+/// **bell** and **OSC 52 clipboard writes** only — every other
+/// client-local OSC effect (pointer shape, today) stays dropped +
+/// debug-logged in the tab task rather than added to this envelope —
+/// but a future addition costs a new constant, not a protocol
+/// generation. A client that receives a value it has no handler for
+/// debug-logs and ignores it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TabEffect(pub String);
+
+impl TabEffect {
     /// A BEL byte reached the tab's terminal outside any escape
     /// sequence. Carries no `data`.
-    Bell,
+    pub const BELL: &str = "bell";
     /// An OSC 52 clipboard write. `data` is the decoded payload,
     /// base64-encoded per the wire's bytes convention.
-    ClipboardWrite,
+    pub const CLIPBOARD_WRITE: &str = "clipboard-write";
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
-/// Which selection an [`TabEffect::ClipboardWrite`] targets. Mirrors
+impl From<&str> for TabEffect {
+    fn from(s: &str) -> Self {
+        TabEffect(s.to_string())
+    }
+}
+
+impl From<String> for TabEffect {
+    fn from(s: String) -> Self {
+        TabEffect(s)
+    }
+}
+
+impl std::fmt::Display for TabEffect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Which selection a [`TabEffect::CLIPBOARD_WRITE`] targets. Mirrors
 /// `roost_osc::ClipboardTarget`: OSC 52's `c` selector (and the empty
 /// default) is [`System`](Self::System), `p`/`s` is
 /// [`Selection`](Self::Selection).
+///
+/// Stays closed: a two-value set with no growth pressure, unlike
+/// [`TabEffect`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ClipboardEffectTarget {
@@ -2653,7 +2685,7 @@ pub enum ClipboardEffectTarget {
 /// `tab.effect` event data — one client-local effect a session's tab
 /// produced, for the attached client to apply.
 ///
-/// `data` is present only for [`TabEffect::ClipboardWrite`], where it
+/// `data` is present only for [`TabEffect::CLIPBOARD_WRITE`], where it
 /// carries the decoded clipboard text base64-encoded (standard
 /// alphabet, like every other bytes field). The server caps it at
 /// [`CLIPBOARD_EFFECT_MAX_BYTES`] decoded and drops anything larger, so
@@ -2674,7 +2706,7 @@ pub struct TabEffectEvent {
     pub target: Option<ClipboardEffectTarget>,
 }
 
-/// Decoded-size cap on a [`TabEffect::ClipboardWrite`] payload. The
+/// Decoded-size cap on a [`TabEffect::CLIPBOARD_WRITE`] payload. The
 /// OSC 52 scanner already bounds a body at 1 MiB; this is the smaller,
 /// policy bound on what a session will fan out to a client
 /// (architecture §6's bounded-size rule). Oversized writes are dropped

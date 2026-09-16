@@ -226,13 +226,13 @@ pub fn envelope(event: &WorkspaceEvent) -> Option<EventEnvelope> {
             to_value(match effect {
                 TabEffectKind::Bell => TabEffectEvent {
                     tab_id: *tab_id,
-                    effect: TabEffect::Bell,
+                    effect: TabEffect::from(TabEffect::BELL),
                     data: None,
                     target: None,
                 },
                 TabEffectKind::ClipboardWrite { text, target } => TabEffectEvent {
                     tab_id: *tab_id,
-                    effect: TabEffect::ClipboardWrite,
+                    effect: TabEffect::from(TabEffect::CLIPBOARD_WRITE),
                     data: Some(bytes_base64::encode(text.as_bytes())),
                     target: Some(*target),
                 },

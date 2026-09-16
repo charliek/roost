@@ -150,12 +150,24 @@ merely a new vector:
   [the compatibility contract](ipc.md#tabstate-hook_active-derived-and-the-compatibility-contract)
   for why `agent_lifecycle: "failed"` projects onto an existing value
   instead of adding a fifth;
-* `TabEffect` and `ClipboardEffectTarget` — the
-  [`tab.effect`](ipc.md#events) envelope's kind and target;
+* `ClipboardEffectTarget` — the [`tab.effect`](ipc.md#events) envelope's
+  target; a two-value set (`system`/`selection`) with no growth
+  pressure;
 * `AttachMode` — the [`tab.attach`](ipc.md#tabattach) mode;
 * the agent enums — `AgentLifecycle` and the `ownership_action`,
   `attention`, and `severity` values on
   [`tab.agent_report`](ipc.md#tabagent_report).
+
+`TabEffect` — the same envelope's `effect` kind — was in this list
+through generation 6's design but was **opened** before release (plan
+065 §3.4): #188 and #364 would each have forced a bump to add a new
+effect, and generation 6 was still unshipped when that cost was
+noticed, so it was paid now instead of later. It is a
+`#[serde(transparent)]` newtype over `String`, the same shape as
+`payload_kinds` below: `bell` and `clipboard-write` are constants, not
+variants, and a client that receives a value it has no handler for
+ignores it (the transparent encoding means the wire bytes for the two
+known effects are unchanged by the type opening up).
 
 ### The no-bump extension channels
 
@@ -171,7 +183,9 @@ touching the protocol integer:
   [`session.identify`](ipc.md#sessionidentify) is the model: a list, not
   an enum, where a client preserves values it does not recognize and
   negotiates on the ones it does. `source` on `tab.agent_report` is an
-  open string for the same reason.
+  open string for the same reason, and `TabEffect` above follows the
+  same shape for a single value rather than a list: a client ignores
+  what it does not recognize instead of preserving it forward.
 
 When a change can be expressed through one of these channels, it should
 be. A protocol generation is expensive; a map key is not.

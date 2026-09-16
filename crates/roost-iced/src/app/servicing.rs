@@ -709,6 +709,29 @@ fn retire_host_durability(
     }
 }
 
+/// What [`App::apply_host_effect`] does with a `tab.effect` value, split
+/// out from the string match so the "an effect this build has no
+/// handler for is inert" contract is unit-testable without a live
+/// `App`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabEffectAction {
+    Bell,
+    ClipboardWrite,
+    /// `TabEffect` is an open list (#188, #364): a session ahead of
+    /// this build can name an effect this build has never heard of, and
+    /// the client's job is to ignore it, not refuse the envelope or
+    /// misroute it onto a handler it happens to resemble.
+    Ignored,
+}
+
+fn classify_tab_effect(effect: &str) -> TabEffectAction {
+    match effect {
+        roost_ipc::messages::TabEffect::BELL => TabEffectAction::Bell,
+        roost_ipc::messages::TabEffect::CLIPBOARD_WRITE => TabEffectAction::ClipboardWrite,
+        _ => TabEffectAction::Ignored,
+    }
+}
+
 /// Queue a host tab's OSC 52 write, if it is addressed to the tab this
 /// client is looking at. Split out from the `App` so the rule can be
 /// driven without one.
@@ -1822,14 +1845,14 @@ impl App {
         effect: &roost_ipc::messages::TabEffectEvent,
     ) -> UiTask {
         let key = TabKey::new(host, effect.tab_id);
-        match effect.effect {
-            roost_ipc::messages::TabEffect::Bell => {
+        match classify_tab_effect(effect.effect.as_str()) {
+            TabEffectAction::Bell => {
                 if self.host_bells.insert(key) {
                     self.reconcile_notification_inbox();
                 }
                 UiTask::None
             }
-            roost_ipc::messages::TabEffect::ClipboardWrite => {
+            TabEffectAction::ClipboardWrite => {
                 let viewed = self.active_tab_key();
                 if apply_host_clipboard_effect(
                     &mut self.clipboard,
@@ -1842,6 +1865,14 @@ impl App {
                 } else {
                     UiTask::None
                 }
+            }
+            // TabEffect is an open list (#188, #364): a session ahead of
+            // this build can name an effect it has no handler for, and
+            // the contract is that it is inert here, not a decode
+            // failure or a silent misroute.
+            TabEffectAction::Ignored => {
+                tracing::debug!(%key, effect = %effect.effect, "unhandled tab effect; ignored");
+                UiTask::None
             }
         }
     }
@@ -4249,6 +4280,27 @@ mod tests {
         assert_eq!(reduced[0].fidelity.as_deref(), Some("restart"));
     }
 
+    /// `TabEffect` is an open list (#188, #364): the known effects still
+    /// route to their own handler, and a value this build has never
+    /// heard of is `Ignored` rather than misrouted or refused. This is
+    /// the exhaustiveness pin the closed-enum version of this test used
+    /// to hold, carried over to the open-string shape.
+    #[test]
+    fn classify_tab_effect_routes_known_effects_and_ignores_the_rest() {
+        assert_eq!(
+            classify_tab_effect(roost_ipc::messages::TabEffect::BELL),
+            TabEffectAction::Bell
+        );
+        assert_eq!(
+            classify_tab_effect(roost_ipc::messages::TabEffect::CLIPBOARD_WRITE),
+            TabEffectAction::ClipboardWrite
+        );
+        assert_eq!(
+            classify_tab_effect("pointer-shape"),
+            TabEffectAction::Ignored
+        );
+    }
+
     /// Under fan-out every client receives every effect, so the
     /// clipboard asks *this* client's own question: is the tab the copy
     /// came from the one I am showing?
@@ -4258,7 +4310,9 @@ mod tests {
         let viewed = TabKey::new(host, 1);
         let copy = |tab: TabKey| roost_ipc::messages::TabEffectEvent {
             tab_id: tab.tab,
-            effect: roost_ipc::messages::TabEffect::ClipboardWrite,
+            effect: roost_ipc::messages::TabEffect::from(
+                roost_ipc::messages::TabEffect::CLIPBOARD_WRITE,
+            ),
             data: Some(roost_ipc::messages::bytes_base64::encode(b"copied")),
             target: Some(roost_ipc::messages::ClipboardEffectTarget::System),
         };
