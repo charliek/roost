@@ -334,6 +334,13 @@ struct IPCIdentifyResult: Codable, Sendable {
     var appID: String
     var uiVersion: String
     var protocolVersion: UInt32
+    /// Why the last attempt to write `state.json` failed, absent while
+    /// the layout is landing (#481) — the Mac twin of Rust's
+    /// `IdentifyResult.persist_error`. `encodeIfPresent` keeps the key
+    /// off the wire entirely when there's no error, matching Rust's
+    /// `skip_serializing_if = "Option::is_none"` so existing golden
+    /// vectors still decode unchanged.
+    var persistError: String?
 
     enum CodingKeys: String, CodingKey {
         case socketPath = "socket_path"
@@ -344,13 +351,15 @@ struct IPCIdentifyResult: Codable, Sendable {
         case appID = "app_id"
         case uiVersion = "ui_version"
         case protocolVersion = "protocol_version"
+        case persistError = "persist_error"
     }
 
     init(
         socketPath: String, pid: Int32,
         activeProjectID: Int64, activeTabID: Int64,
         appLabel: String, appID: String,
-        uiVersion: String, protocolVersion: UInt32
+        uiVersion: String, protocolVersion: UInt32,
+        persistError: String? = nil
     ) {
         self.socketPath = socketPath
         self.pid = pid
@@ -360,6 +369,7 @@ struct IPCIdentifyResult: Codable, Sendable {
         self.appID = appID
         self.uiVersion = uiVersion
         self.protocolVersion = protocolVersion
+        self.persistError = persistError
     }
 
     init(from decoder: Decoder) throws {
@@ -372,6 +382,7 @@ struct IPCIdentifyResult: Codable, Sendable {
         self.appID = try c.decode(String.self, forKey: .appID)
         self.uiVersion = try c.decode(String.self, forKey: .uiVersion)
         self.protocolVersion = try c.decode(UInt32.self, forKey: .protocolVersion)
+        self.persistError = try c.decodeIfPresent(String.self, forKey: .persistError)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -384,6 +395,7 @@ struct IPCIdentifyResult: Codable, Sendable {
         try c.encode(appID, forKey: .appID)
         try c.encode(uiVersion, forKey: .uiVersion)
         try c.encode(protocolVersion, forKey: .protocolVersion)
+        try c.encodeIfPresent(persistError, forKey: .persistError)
     }
 }
 

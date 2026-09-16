@@ -184,7 +184,8 @@ actor IPCHandlerImpl: IPCHandler {
             appLabel: appLabel,
             appID: appID,
             uiVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0",
-            protocolVersion: ipcProtocolVersion
+            protocolVersion: ipcProtocolVersion,
+            persistError: client.workspace.persistError
         )
     }
 

@@ -157,6 +157,13 @@ final class Workspace {
     /// overwrite the flushed layout with an empty one. Mirrors the
     /// Rust `shutting_down`.
     private var shuttingDown = false
+    /// Set when the most recent real write attempt failed, cleared by
+    /// the next one that succeeds — the Rust twin's `persist_error`
+    /// (#481). `identify` reports it; ops still succeed even while
+    /// this is set (a full disk must not block opening a tab), so this
+    /// is the whole of the Mac's durability surface — there's no
+    /// toast surface on the Mac to put it on.
+    private(set) var persistError: String?
 
     // MARK: Init
 
@@ -1030,8 +1037,11 @@ final class Workspace {
         )
         do {
             try Self.write(snapshot: snapshot, to: statePath, sync: sync)
+            persistError = nil
         } catch {
-            NSLog("workspace: failed to persist state.json: \(error)")
+            let message = "\(error)"
+            RoostLogger.shared.error("workspace: failed to persist state.json: \(message)")
+            persistError = message
         }
     }
 

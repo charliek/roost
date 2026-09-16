@@ -171,6 +171,36 @@ struct IPCHandlerDispatchTests {
         #expect(dict?["app_id"] as? String == "ai.stridelabs.Roost.test")
         #expect((dict?["protocol_version"] as? NSNumber)?.intValue == Int(ipcProtocolVersion))
         #expect(dict?["socket_path"] as? String == socket)
+        // `makeHandler`'s workspace is in-memory (no statePath), so
+        // persist() never runs and `persistError` stays nil — the key
+        // must be absent from the wire entirely, not present as null
+        // (#481; mirrors Rust's `skip_serializing_if`).
+        #expect(dict?.keys.contains("persist_error") == false)
+    }
+
+    // #481: `IPCIdentifyResult.persistError` mirrors Rust's
+    // `IdentifyResult.persist_error` — `encodeIfPresent` must drop the
+    // key entirely when there's no error (not encode it as `null`),
+    // so `identify.response.json` still decodes unchanged, and must
+    // put the exact error text on the wire when there is one.
+    @Test func identifyResultOmitsPersistErrorWhenNilButIncludesItWhenSet() throws {
+        let clean = IPCIdentifyResult(
+            socketPath: "/tmp/x.sock", pid: 1,
+            activeProjectID: 1, activeTabID: 1,
+            appLabel: "Roost", appID: "ai.stridelabs.Roost",
+            uiVersion: "0.0.0", protocolVersion: 1
+        )
+        let cleanJSON = String(decoding: try JSONEncoder().encode(clean), as: UTF8.self)
+        #expect(!cleanJSON.contains("persist_error"), "absent, not null, when there is no error")
+
+        var failing = clean
+        failing.persistError = "Read-only file system (os error 30)"
+        let failingData = try JSONEncoder().encode(failing)
+        let failingJSON = String(decoding: failingData, as: UTF8.self)
+        #expect(failingJSON.contains(#""persist_error":"Read-only file system (os error 30)""#))
+
+        let decoded = try JSONDecoder().decode(IPCIdentifyResult.self, from: failingData)
+        #expect(decoded.persistError == failing.persistError)
     }
 
     @Test func projectCreateThenListRoundTrips() async throws {

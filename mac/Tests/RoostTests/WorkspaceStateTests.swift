@@ -711,6 +711,17 @@ struct WorkspaceStatePersistenceTests {
         return (dir as NSString).appendingPathComponent(name)
     }
 
+    /// A dedicated directory (not the shared system tmp root) so a
+    /// test can `chmod` it read-only without touching anything else.
+    private func tempDir() -> String {
+        let dir = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("roost-persist-test-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(
+            atPath: dir, withIntermediateDirectories: true
+        )
+        return dir
+    }
+
     @Test func projectsAndNextIDSurviveReopen() async throws {
         let path = tempPath()
         defer { try? FileManager.default.removeItem(atPath: path) }
@@ -933,6 +944,42 @@ struct WorkspaceStatePersistenceTests {
         #expect(
             restore.projects.first?.tabs.first?.cwd == "/flushed",
             "a post-flush mutation must not have reached disk"
+        )
+    }
+
+    /// The Mac twin of #481: a write that can't reach disk still lets
+    /// the op through (a full disk must not block opening a tab), and
+    /// says so via `persistError` until a write actually lands again.
+    /// Restoring the directory's mode in `defer` (rather than only at
+    /// the end of the test body) keeps a panicking assertion from
+    /// leaving an unwritable directory for a later test to trip on.
+    @Test func persistErrorSetsOnFailureAndClearsOnRecovery() async throws {
+        let dir = tempDir()
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700], ofItemAtPath: dir
+            )
+            try? FileManager.default.removeItem(atPath: dir)
+        }
+        let path = (dir as NSString).appendingPathComponent("state.json")
+
+        let ws = await Workspace(statePath: path)
+        let p = await ws.createProject(name: "p", cwd: "/")
+        #expect(await ws.persistError == nil, "the setup wrote fine")
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o500], ofItemAtPath: dir
+        )
+        let t = try await ws.openTab(projectID: p.id, cwd: "/one", title: "a")
+        #expect(await ws.persistError != nil, "the op still succeeds, but the write failed")
+
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700], ofItemAtPath: dir
+        )
+        try await ws.setTabCwd(t.id, cwd: "/two")
+        #expect(
+            await ws.persistError == nil,
+            "the next write that lands clears it"
         )
     }
 
