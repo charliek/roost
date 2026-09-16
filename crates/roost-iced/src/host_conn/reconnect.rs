@@ -100,7 +100,7 @@ pub(crate) enum Decision {
 /// | `HostKeyUnknown` | no | Needs a person to review and accept a key. |
 /// | `ChangedHostKey` | never | Retrying a possible machine-in-the-middle in a loop is a security misfeature. |
 /// | `NotFound` | no | Nothing to exec, and a retry cannot install it. |
-/// | `NoSession` | no | Auto-reconnect never auto-spawns. |
+/// | `NoSession` | yes | The far side may simply be restarting (a deploy, a reboot under a supervised unit); the ladder re-dials until one answers or the budget runs out. Auto-reconnect still never *spawns* one itself — a host that is truly gone just settles at attempt ten instead of attempt one (#387). |
 /// | `Establish(family: None)` | no | `SshTunnelError::Local`: no `ssh` binary, an unwritable scratch dir, a bridge that would not bind. |
 ///
 /// This is the ssh half. The localhost spawn ladder's equivalent
@@ -149,7 +149,7 @@ pub(crate) fn retryable(input: DropInput<'_>, truncated: bool) -> bool {
         SshFailure::HostKeyUnknown => false,
         SshFailure::ChangedHostKey => false,
         SshFailure::NotFound => false,
-        SshFailure::NoSession => false,
+        SshFailure::NoSession => true,
     }
 }
 
@@ -298,7 +298,7 @@ mod tests {
             (Some(&SshFailure::HostKeyUnknown), false),
             (Some(&SshFailure::ChangedHostKey), false),
             (Some(&SshFailure::NotFound), false),
-            (Some(&SshFailure::NoSession), false),
+            (Some(&SshFailure::NoSession), true),
         ];
         for (family, expected) in session_cases {
             let input = DropInput::Session(family);
@@ -312,7 +312,7 @@ mod tests {
             (Some(SshFailure::HostKeyUnknown), false),
             (Some(SshFailure::ChangedHostKey), false),
             (Some(SshFailure::NotFound), false),
-            (Some(SshFailure::NoSession), false),
+            (Some(SshFailure::NoSession), true),
         ];
         for (family, expected) in establish_cases {
             let failure = establish(family);

@@ -194,6 +194,17 @@ def transport_copy(target: str) -> str:
     return f"connecting to {target} failed: {UNREACHABLE_STDERR}"
 
 
+def no_session_copy(target: str) -> str:
+    """`SshFailure::NoSession`'s copy, rendered for `target` — the
+    family §3.3 (#387) moved onto the retryable side of the table,
+    restated here for the reason the constants above are.
+    """
+    return (
+        f"{target} is reachable but has no roost session running. Run "
+        "`roostctl session start` on that machine, then try again."
+    )
+
+
 def sh_quote(raw: str) -> str:
     return "'" + raw.replace("'", "'\\''") + "'"
 
@@ -981,6 +992,62 @@ def test_a_host_that_stays_down_climbs_the_ladder_and_then_settles(ssh_host, roo
     rows = host_row_ids(roost)
     assert f"host:connect:{ssh_host.saved_id}" in rows, rows
     assert f"host:disconnect:{ssh_host.saved_id}" not in rows, rows
+
+
+def test_a_restarting_daemon_is_retried_rather_than_settled(roost, session_env):
+    """AC (§3.3, #387): `NoSession` joins the retryable side of the
+    table. A daemon that is merely *restarting* — a deploy, a crash a
+    supervised unit relaunches — answers every local connect attempt in
+    the gap with the same `client-bridge: no session is listening…`
+    stderr a genuinely gone session would, and until this fix that was
+    enough to settle the ladder on the very first sighting of it
+    (`NoSession` was never-retry) rather than waiting the gap out.
+
+    SIGKILL rather than `session.stop`: the latter is a clean shutdown
+    the client reads as "the session ended" — a different, terminal
+    banner (the user guide's troubleshooting entry) — not a drop the
+    ladder retries at all. A SIGKILLed daemon leaves its socket stale on
+    disk instead (`test_session.py`'s
+    `test_a_restart_recovers_from_a_sigkilled_session`), and
+    `client-bridge` reads a stale socket exactly the way it reads a
+    missing one — so one signal both severs the live bridge (an
+    ordinary bare EOF, the drop shape the ladder always retries) and
+    guarantees every attempt that follows sees `NoSession` for as long
+    as the daemon stays down, with no race between the two.
+
+    `ROOST_SSH_RECONNECT_ATTEMPTS=4` (this module's shared test-mode
+    override, set once at import) is exactly sized for the shape this
+    test needs: three `NoSession` answers spend attempts 1-3, and the
+    fourth — the budget's last rung, with nothing to spare for a fourth
+    failure — has to land once the daemon is back. It is restarted the
+    moment the third `NoSession` answer is observed (rung 4 armed),
+    which leaves that rung's own delay (1.6-3.2s, unjittered-to-jittered)
+    to bring a fresh daemon up before it fires.
+    """
+    launch = start_session(session_env)
+    with an_ssh_host(roost, session_env) as ssh_host:
+        connect_and_wait(ssh_host)
+        before = status(ssh_host)["generation"]
+
+        os.kill(launch.verdict.pid, signal.SIGKILL)
+        session_env.wait_pid_gone(launch.verdict.pid)
+        assert session_env.socket.exists(), "SIGKILL should leave the socket stale, not gone"
+
+        armed = wait_for_a_live_retry(ssh_host, through=4)
+        reason = armed["retry"].get("reason")
+        assert reason == no_session_copy(armed["target"]), armed
+        budget = armed["retry"]["budget"]
+        assert armed["generation"] == before + budget - 1, (
+            "three attempts must already have answered NoSession",
+            armed,
+        )
+
+        start_session(session_env)
+        ssh_host.wait_connected(60.0)
+
+        rows = host_row_ids(roost)
+        assert f"host:disconnect:{ssh_host.saved_id}" in rows, rows
+        assert f"host:connect:{ssh_host.saved_id}" not in rows, rows
 
 
 def test_a_changed_host_key_ends_the_ladder_instead_of_advancing_it(ssh_host, roost):
