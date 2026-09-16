@@ -34,7 +34,7 @@
 //! The attach data plane. A host tab's bytes and snapshot payloads are
 //! C5's, because the decoder and the hydrated `Terminal` are
 //! main-thread-only; C4 stops at handing C5 a live control client with
-//! an ordered queue to mint `tab.attach` tokens on, and a
+//! an ordered queue for an attach to take its place in, and a
 //! mirror that already knows which tabs exist.
 //!
 //! # How C5/C6/C7 consume this
@@ -2430,6 +2430,19 @@ impl HostConnSet {
     pub(crate) fn endpoint_for(&self, incarnation: HostId) -> Option<std::path::PathBuf> {
         let host = self.owner_of(incarnation)?;
         self.endpoint(&host).map(|(socket, _)| socket.to_path_buf())
+    }
+
+    /// The session id a live incarnation's data connections state in
+    /// their attach handshake (#473), so the session can refuse one
+    /// meant for the process it replaced.
+    ///
+    /// `None` for a stale incarnation — same contract as
+    /// [`Self::ops_for`] — and also for the window between this
+    /// connection publishing `Connected` and publishing its
+    /// [`ConnectFacts`], which the attach treats as "not yet".
+    pub(crate) fn session_id_for(&self, incarnation: HostId) -> Option<&str> {
+        let host = self.owner_of(incarnation)?;
+        Some(self.facts(&host)?.session_id.as_str())
     }
 
     /// The theme changed. The slot every task re-reads on reconnect is

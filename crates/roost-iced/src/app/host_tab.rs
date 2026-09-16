@@ -1,8 +1,8 @@
-//! The focused host tab's attach: token mint → data dial → hydration →
-//! live, with resume across refocus (host-sessions plan 037 §3.4).
+//! The focused host tab's attach: queue permit → data dial → hydration
+//! → live, with resume across refocus (host-sessions plan 037 §3.4).
 //!
 //! Ownership is split the way the threading rules demand (CLAUDE.md):
-//! background tasks only move bytes — the dial task mints the token and
+//! background tasks only move bytes — the dial task takes the permit and
 //! runs the handshake, a reader task turns data-plane frames into
 //! [`HostTabFrame`]s on the engine feed, a writer task drains the tab's
 //! input queue onto the wire — while the [`Hydrator`] and both terminals
@@ -29,14 +29,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use roost_ipc::client::{ClientError, DataConnection, ServerCode, ServerFrame};
-use roost_ipc::messages::{ops, AttachHandshake, AttachPayloadKind, TabAttachResult};
+use roost_ipc::messages::{AttachHandshake, AttachHandshakeTerms, AttachPayloadKind};
 use roost_ui_model::keys::TabKey;
 use roost_vt::{HistoryStep, ReadyState, SnapshotDecodeOptions, SnapshotDecoder, Terminal};
 use tokio::sync::mpsc;
 
 use super::tab_backend::HostDataMsg;
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
-use crate::host_conn::queue::HostOps;
+use crate::host_conn::queue::{HostOpError, HostOps};
 use crate::host_conn::state::CLIENT_PAYLOAD_KINDS;
 
 /// History pages stepped per feed-drain pass. Bounds main-thread work so
@@ -95,11 +95,11 @@ impl PayloadKind {
     }
 }
 
-/// Where a detached tab can pick its stream back up: the resume identity
-/// from `tab.attach` plus the next seq this client has not applied. Kept
-/// per tab across detach — refocus hands it back and the wire answers
-/// `mode: "resume"` when the ring still covers it, or falls back to a
-/// fresh snapshot in the same reply.
+/// Where a detached tab can pick its stream back up: the stream identity
+/// the last accepted handshake reported plus the next seq this client
+/// has not applied. Kept per tab across detach — refocus hands it back
+/// and the wire answers `mode: "resume"` when the ring still covers it,
+/// or falls back to a fresh snapshot in the same reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ResumePoint {
     pub(crate) server_epoch: u64,
@@ -393,12 +393,19 @@ impl HostAttach {
 
     /// Start (or restart) an attach attempt. Must be called inside the
     /// app runtime (`Runtime::enter`) — every task binds to the ambient
-    /// runtime. `ops` is the host's op queue (token minting rides it so
-    /// it cannot interleave with `session.set_theme`), `socket` the
-    /// host's endpoint.
+    /// runtime. `ops` is the host's op queue, which the attempt takes a
+    /// permit from so the dial cannot overtake `session.set_theme`;
+    /// `session_id` is the session the handshake binds itself to and
+    /// `socket` the host's endpoint.
+    ///
+    /// `session_id` is `None` only in the window between a connection
+    /// publishing `Connected` and publishing its facts, which is a
+    /// "not yet", not a refusal — the attempt fails retryably and the
+    /// ordinary backoff picks it up.
     pub(super) fn begin(
         &mut self,
         ops: &HostOps,
+        session_id: Option<&str>,
         socket: std::path::PathBuf,
         libghostty_build: &str,
         feed: &EngineFeedSender,
@@ -410,30 +417,44 @@ impl HostAttach {
         let key = self.key;
         let geometry = self.geometry;
         let resume = self.resume;
-        let attach_call = ops.call(
-            ops::TAB_ATTACH,
-            serde_json::json!({
-                "tab_id": key.tab.to_string(),
-                "kinds": CLIENT_PAYLOAD_KINDS,
-                "cols": geometry.cols,
-                "rows": geometry.rows,
-                "cell_w_px": geometry.cell_w,
-                "cell_h_px": geometry.cell_h,
-                "libghostty_build": libghostty_build,
-                // Attach is on-focus in this client, so the claim is
-                // always true. Stated rather than omitted: protocol 5
-                // requires the field, and the omit-when-true shim that
-                // used to cover this is gone.
-                "focus": true,
-            }),
-        );
+        let Some(session_id) = session_id else {
+            feed.send(EngineFeed::HostTab(
+                key,
+                HostTabFrame::Failed {
+                    attempt,
+                    reason: FailReason::Retryable(
+                        "the host connection has not reported its session id yet".into(),
+                    ),
+                },
+            ));
+            return;
+        };
+        let terms = AttachHandshakeTerms {
+            session_id: session_id.to_string(),
+            kinds: CLIENT_PAYLOAD_KINDS.map(AttachPayloadKind::from).to_vec(),
+            cols: geometry.cols,
+            rows: geometry.rows,
+            cell_w_px: geometry.cell_w as u16,
+            cell_h_px: geometry.cell_h as u16,
+            libghostty_build: libghostty_build.to_string(),
+            // Attach is on-focus in this client, so the claim is always
+            // true.
+            focus: true,
+        };
+        let dial = Dial {
+            socket,
+            handshake: choose_handshake(key.tab, terms, resume),
+        };
+        // Fenced at this tab's own incarnation: a permit released after
+        // the connection dropped must not send an attach to whatever
+        // replaced it.
+        let permit = ops.attach_permit(key.host);
         let input_rx = Arc::clone(&self.input_rx);
         let task = tokio::spawn(run_attempt(
             key,
             attempt,
-            attach_call,
-            socket,
-            resume,
+            permit,
+            dial,
             input_rx,
             feed.clone(),
         ));
@@ -988,45 +1009,42 @@ fn frame_attempt(frame: &HostTabFrame) -> u64 {
     }
 }
 
-/// Pick the handshake: hand the resume identity back only when it
-/// matches this session process — a stale epoch or generation would
-/// just round-trip to a snapshot fallback anyway, but not asking is
-/// clearer than asking wrong.
-fn choose_handshake(result: &TabAttachResult, resume: Option<ResumePoint>) -> AttachHandshake {
+/// The line this attempt opens with: the tab, the terms, and the resume
+/// identity when there is one to hand back.
+///
+/// A resume point is asked for whenever one survives. Nothing here
+/// pre-checks it: there is no control leg left to check it against, and
+/// a miss on the epoch or the generation is answered with
+/// `mode: "snapshot"` in the accepted line rather than an error. A point
+/// from a *different* session cannot reach this at all — it is keyed by
+/// connection incarnation and purged with it.
+fn choose_handshake(
+    tab_id: i64,
+    terms: AttachHandshakeTerms,
+    resume: Option<ResumePoint>,
+) -> AttachHandshake {
     match resume {
-        Some(r)
-            if r.server_epoch == result.server_epoch
-                && r.tab_generation == result.tab_generation =>
-        {
-            AttachHandshake::resume(
-                &result.attach_token,
-                r.next_seq,
-                r.server_epoch,
-                r.tab_generation,
-            )
-        }
-        _ => AttachHandshake::snapshot(&result.attach_token),
+        Some(r) => AttachHandshake::inline_resume(
+            tab_id,
+            terms,
+            r.next_seq,
+            r.server_epoch,
+            r.tab_generation,
+        ),
+        None => AttachHandshake::inline_snapshot(tab_id, terms),
     }
 }
 
 /// What the payload that is about to arrive will be decoded as.
 ///
-/// The data connection's own `AttachAccepted.kind` is the authority: it
-/// rides the ticket the server admitted, and the bytes behind it are
-/// what that server composed. `tab.attach`'s reply must have said the
-/// same thing — two different answers to one negotiation is a protocol
-/// error, and picking either of them would be guessing which one the
-/// stream honors. Re-attaching is the recovery, as it is for every other
-/// stream this client cannot trust.
-fn negotiated_kind(
-    control: &AttachPayloadKind,
-    accepted: &AttachPayloadKind,
-) -> Result<PayloadKind, String> {
-    if control != accepted {
-        return Err(format!(
-            "tab.attach negotiated {control}, the data connection accepted {accepted}"
-        ));
-    }
+/// The accepted line is the authority: the server picks from the kinds
+/// the handshake offered, and the bytes behind it are what that server
+/// composed. It can still name something this client cannot decode —
+/// `AttachPayloadKind` is an open string so a newer session's list is
+/// readable — and decoding by guess is how a corrupt screen ships.
+/// Re-attaching is the recovery, as it is for every other stream this
+/// client cannot trust.
+fn negotiated_kind(accepted: &AttachPayloadKind) -> Result<PayloadKind, String> {
     PayloadKind::from_wire(accepted)
         .ok_or_else(|| format!("the session accepted {accepted}, which this client never offered"))
 }
@@ -1042,19 +1060,26 @@ fn reason_for(code: Option<&ServerCode>, message: String) -> FailReason {
     }
 }
 
-/// Classify a token-mint refusal off the op queue.
-fn classify_op_failure(error: &crate::host_conn::queue::HostOpError) -> FailReason {
-    use crate::host_conn::queue::HostOpError;
+/// What a refused queue permit means for the attach.
+///
+/// Two rows, because a permit is refused in exactly two ways, and they
+/// say the same thing: the host connection owns this, not the tab.
+fn classify_permit_failure(error: &HostOpError) -> FailReason {
     match error {
-        HostOpError::Rejected { code, .. } => reason_for(Some(code), error.to_string()),
-        // `Local` is the upload lane's own refusal and cannot reach a
-        // token mint at all; grouped with the two that do not retry
-        // because an unexplained client-side refusal is not something a
-        // second attach attempt would fix either.
-        HostOpError::Disconnected | HostOpError::Unavailable | HostOpError::Local(_) => {
-            FailReason::HostGone(error.to_string())
-        }
-        HostOpError::Transport(_) => FailReason::Retryable(error.to_string()),
+        // The queue was flushed: the connection left `Connected` before
+        // the permit came up.
+        HostOpError::Disconnected
+        // The queue was full, or its worker is already gone.
+        | HostOpError::Unavailable
+        // Nothing else can reach a barrier — it is answered by the
+        // worker itself and never put on the wire, so there is no
+        // session refusal, no dead wire and no upload error to sort. Not
+        // given arms of their own, because the answer would be the same:
+        // whatever refused the permit, this attach is not the thing that
+        // recovers from it.
+        | HostOpError::Rejected { .. }
+        | HostOpError::Transport(_)
+        | HostOpError::Local(_) => FailReason::HostGone(error.to_string()),
     }
 }
 
@@ -1064,43 +1089,38 @@ fn classify_failure(error: &ClientError) -> FailReason {
     reason_for(error.server_code().as_ref(), error.to_string())
 }
 
-/// The background half of one attempt: mint the ticket through the op
-/// queue, dial the data connection, then split into a reader loop
-/// (frames → feed) and a writer loop (input queue → wire). Every await
-/// lives out here; the main thread only ever sees feed items.
+/// Where an attempt's data connection goes and the line it opens with.
+struct Dial {
+    socket: std::path::PathBuf,
+    handshake: AttachHandshake,
+}
+
+/// The background half of one attempt: take the queue permit, dial the
+/// data connection, then split into a reader loop (frames → feed) and a
+/// writer loop (input queue → wire). Every await lives out here; the
+/// main thread only ever sees feed items.
+///
+/// The permit is the *only* thing this takes from the op queue — see
+/// [`HostOps::attach_permit`]. Everything after it happens on a socket
+/// of its own, so a slow session delays this tab and nothing else.
 async fn run_attempt(
     key: TabKey,
     attempt: u64,
-    attach_call: impl std::future::Future<
-        Output = Result<serde_json::Value, crate::host_conn::queue::HostOpError>,
-    >,
-    socket: std::path::PathBuf,
-    resume: Option<ResumePoint>,
+    permit: impl std::future::Future<Output = Result<(), HostOpError>>,
+    dial: Dial,
     input_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<HostDataMsg>>>,
     feed: EngineFeedSender,
 ) {
+    let Dial { socket, handshake } = dial;
     let fail = |reason: FailReason, feed: &EngineFeedSender| {
         feed.send(EngineFeed::HostTab(
             key,
             HostTabFrame::Failed { attempt, reason },
         ));
     };
-    let result = match attach_call.await {
-        Ok(value) => value,
-        Err(error) => {
-            return fail(classify_op_failure(&error), &feed);
-        }
-    };
-    let result: TabAttachResult = match serde_json::from_value(result) {
-        Ok(result) => result,
-        Err(error) => {
-            return fail(
-                FailReason::Retryable(format!("tab.attach reply did not decode: {error}")),
-                &feed,
-            );
-        }
-    };
-    let handshake = choose_handshake(&result, resume);
+    if let Err(error) = permit.await {
+        return fail(classify_permit_failure(&error), &feed);
+    }
     // Bounded, on the same budget a control leg gets. `DataConnection::dial`
     // has no timeout of its own, and the socket it dials is not always a
     // local one: over the ssh transport it is a bridge whose accept is a
@@ -1124,7 +1144,7 @@ async fn run_attempt(
                 )
             }
         };
-    let kind = match negotiated_kind(&result.kind, &accepted.kind) {
+    let kind = match negotiated_kind(&accepted.kind) {
         Ok(kind) => kind,
         Err(message) => return fail(FailReason::Retryable(message), &feed),
     };
@@ -1238,11 +1258,13 @@ fn lift_frame(attempt: u64, frame: ServerFrame) -> HostTabFrame {
 
 #[cfg(test)]
 mod tests {
+    use roost_ui_model::keys::HostId;
     use roost_vt::{Terminal, TerminalOptions};
 
     use super::*;
     use crate::app::terminal_tab::TerminalTab;
     use crate::engine_feed::{self, EngineFeedReceiver};
+    use crate::host_conn::queue::HostIntent;
 
     const GEOMETRY: Geometry = Geometry {
         cols: 80,
@@ -1252,7 +1274,22 @@ mod tests {
     };
 
     fn key() -> TabKey {
-        TabKey::new(roost_ui_model::keys::HostId::new(3), 7)
+        TabKey::new(HostId::new(3), 7)
+    }
+
+    /// The terms [`HostAttach::begin`] assembles, for the cases that
+    /// read the handshake rather than build one.
+    fn terms() -> AttachHandshakeTerms {
+        AttachHandshakeTerms {
+            session_id: "sess-1".into(),
+            kinds: CLIENT_PAYLOAD_KINDS.map(AttachPayloadKind::from).to_vec(),
+            cols: GEOMETRY.cols,
+            rows: GEOMETRY.rows,
+            cell_w_px: GEOMETRY.cell_w as u16,
+            cell_h_px: GEOMETRY.cell_h as u16,
+            libghostty_build: "gb".into(),
+            focus: true,
+        }
     }
 
     /// A machine plus the tab it drives and the feed its timers write to.
@@ -1474,46 +1511,43 @@ mod tests {
         ));
     }
 
-    /// A stale identity is not handed back: the handshake downgrades to
-    /// a plain snapshot request when epoch or generation moved.
+    /// The line a data connection opens with: the tab id where the
+    /// ticket used to be, every negotiated term inline, and the resume
+    /// identity only when this tab has one to hand back.
     #[test]
-    fn a_stale_resume_identity_asks_for_a_snapshot() {
-        let result = TabAttachResult {
-            attach_token: "t".into(),
-            kind: AttachPayloadKind::GHOSTTY_SNAPSHOT.into(),
-            server_epoch: 11,
-            tab_generation: 2,
-        };
-        let stale_epoch = choose_handshake(
-            &result,
-            Some(ResumePoint {
-                server_epoch: 10,
-                tab_generation: 2,
-                next_seq: 42,
-            }),
-        );
-        assert_eq!(stale_epoch.resume_from_seq, None, "stale epoch: snapshot");
-        let stale_generation = choose_handshake(
-            &result,
-            Some(ResumePoint {
-                server_epoch: 11,
-                tab_generation: 1,
-                next_seq: 42,
-            }),
-        );
+    fn the_handshake_states_the_tab_the_terms_and_any_resume_point() {
+        let fresh = choose_handshake(7, terms(), None);
+        assert_eq!(fresh.attach, "7", "the tab id, as a string_int64");
+        assert_eq!(fresh.resume_from_seq, None);
+        assert_eq!(fresh.server_epoch, None);
+        assert_eq!(fresh.tab_generation, None);
+        let stated = fresh.terms.expect("the inline form states its terms");
+        assert_eq!(stated.session_id, "sess-1");
         assert_eq!(
-            stale_generation.resume_from_seq, None,
-            "stale generation: snapshot"
+            stated.kinds,
+            CLIENT_PAYLOAD_KINDS.map(AttachPayloadKind::from),
+            "in this client's preference order"
         );
-        let hit = choose_handshake(
-            &result,
+        assert_eq!((stated.cols, stated.rows), (80, 24));
+        assert!(stated.focus, "this client only attaches what it shows");
+
+        let resumed = choose_handshake(
+            7,
+            terms(),
             Some(ResumePoint {
                 server_epoch: 11,
                 tab_generation: 2,
                 next_seq: 42,
             }),
         );
-        assert_eq!(hit.resume_from_seq, Some(42), "matching identity resumes");
+        assert_eq!(resumed.resume_from_seq, Some(42));
+        assert_eq!(resumed.server_epoch, Some(11));
+        assert_eq!(resumed.tab_generation, Some(2));
+        assert_eq!(
+            resumed.terms.map(|terms| terms.session_id).as_deref(),
+            Some("sess-1"),
+            "a resume states the same terms as a snapshot"
+        );
     }
 
     /// EOF mid-hydration (before FINISH) abandons the decoder and
@@ -2017,31 +2051,148 @@ mod tests {
         );
     }
 
-    /// The data connection's `AttachAccepted.kind` is the authority, and
-    /// `tab.attach`'s reply must have agreed with it: two answers to one
-    /// negotiation is a protocol error, not a coin toss.
+    /// The accepted kind decides the decoder, and a kind this client
+    /// never offered is refused rather than guessed at.
     #[test]
-    fn a_handshake_that_contradicts_the_control_reply_is_refused() {
+    fn an_accepted_kind_this_client_cannot_decode_is_refused() {
         let snapshot = AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT);
         let vt = AttachPayloadKind::from(AttachPayloadKind::VT);
-        assert_eq!(
-            negotiated_kind(&snapshot, &snapshot),
-            Ok(PayloadKind::GhosttySnapshot)
-        );
-        assert_eq!(negotiated_kind(&vt, &vt), Ok(PayloadKind::Vt));
-
-        let disagreed = negotiated_kind(&snapshot, &vt).unwrap_err();
-        assert!(
-            disagreed.contains(AttachPayloadKind::GHOSTTY_SNAPSHOT)
-                && disagreed.contains(AttachPayloadKind::VT),
-            "the refusal names both answers: {disagreed}"
-        );
+        assert_eq!(negotiated_kind(&snapshot), Ok(PayloadKind::GhosttySnapshot));
+        assert_eq!(negotiated_kind(&vt), Ok(PayloadKind::Vt));
 
         let unoffered = AttachPayloadKind::from("sixel-mosaic");
+        let refused = negotiated_kind(&unoffered).unwrap_err();
         assert!(
-            negotiated_kind(&unoffered, &unoffered).is_err(),
-            "a kind this client never offered is not one it can decode"
+            refused.contains("sixel-mosaic"),
+            "the refusal names what it could not decode: {refused}"
         );
+    }
+
+    /// What one op arriving at the stand-in session looked like: its
+    /// name and, for a permit, the incarnation it was fenced at.
+    type Arrival = (String, Option<HostId>);
+    type Arrivals = Arc<std::sync::Mutex<Vec<Arrival>>>;
+
+    /// How long the stand-in takes to answer a wire op. Long enough that
+    /// a dial which did not wait its turn would be observed first, short
+    /// enough to keep the case a unit test.
+    const STAND_IN_ROUND_TRIP: Duration = Duration::from_millis(25);
+
+    fn arrived(log: &Arrivals) -> Vec<Arrival> {
+        log.lock().unwrap().clone()
+    }
+
+    fn note(log: &Arrivals, what: &str, fence: Option<HostId>) {
+        log.lock().unwrap().push((what.to_string(), fence));
+    }
+
+    /// A stand-in session on the far end of a `HostOps` queue, shaped
+    /// like the real worker: strictly FIFO, each wire op awaited inline,
+    /// and the ordering barrier answered where it stands.
+    ///
+    /// A wire op is recorded *after* it is answered, so its entry means
+    /// "this caller has its reply"; the barrier is recorded before it is
+    /// granted, so nothing it releases can be recorded ahead of it.
+    fn stand_in_session(
+        mut rx: mpsc::Receiver<HostIntent>,
+        log: Arrivals,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Some(intent) = rx.recv().await {
+                if intent.barrier {
+                    note(&log, &intent.op, intent.fence);
+                    intent.answer(Ok(serde_json::Value::Null));
+                    continue;
+                }
+                let op = intent.op.to_string();
+                tokio::time::sleep(STAND_IN_ROUND_TRIP).await;
+                intent.answer(Ok(serde_json::json!({})));
+                note(&log, &op, None);
+            }
+        })
+    }
+
+    /// **`session.set_theme` is answered before the data connection
+    /// dials, and the queue worker is never the thing waiting on it**
+    /// (plan 065 §3.10).
+    ///
+    /// Both halves matter, and a design that got only the first would be
+    /// worse than the bug: until #473 the attach's ticket mint was a
+    /// queued op, which ordered the dial behind the theme for free — and
+    /// would order every *later* control op behind the whole attach,
+    /// for as long as the attach timeout. The permit buys the order
+    /// without buying that: the worker answers it where it stands and
+    /// moves on, so `tab.close` below lands while the dial is still
+    /// parked mid-handshake.
+    ///
+    /// The stand-in is a fake because there is no seam to slow a real
+    /// `set_theme` down, and a `set_theme` that answers instantly would
+    /// pass whether or not anything ordered it.
+    #[tokio::test]
+    async fn the_theme_lands_before_the_dial_and_the_worker_serves_through_it() {
+        use roost_ipc::messages::ops;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("roost.sock");
+        let log: Arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // A data plane that accepts the dial, records it, and then says
+        // nothing at all — an attach parked mid-handshake, which is the
+        // state the second half of this case needs to observe.
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let (dialed_tx, dialed_rx) = tokio::sync::oneshot::channel();
+        let dial_log = Arc::clone(&log);
+        let data_plane = tokio::spawn(async move {
+            let (held, _) = listener.accept().await.expect("accept");
+            note(&dial_log, "dial", None);
+            let _ = dialed_tx.send(());
+            std::future::pending::<()>().await;
+            drop(held);
+        });
+
+        let (ops, ops_rx) = HostOps::channel();
+        let worker = stand_in_session(ops_rx, Arc::clone(&log));
+
+        let (feed_tx, _feed_rx) = engine_feed::channel();
+        let mut attach = HostAttach::new(key(), GEOMETRY);
+        // Enqueued before the attach asks for its permit, which is the
+        // only ordering this client controls.
+        let theme = ops.call(ops::SESSION_SET_THEME, serde_json::json!({}));
+        attach.begin(&ops, Some("sess-1"), socket.clone(), "gb", &feed_tx);
+
+        tokio::time::timeout(Duration::from_secs(5), dialed_rx)
+            .await
+            .expect("the attach dialed")
+            .expect("the data plane accepted");
+        assert_eq!(
+            arrived(&log),
+            vec![
+                (ops::SESSION_SET_THEME.to_string(), None),
+                ("attach-permit".to_string(), Some(key().host)),
+                ("dial".to_string(), None),
+            ],
+            "the theme is answered, then the permit is granted, then the dial happens"
+        );
+        assert!(theme.await.is_ok(), "the theme op was answered");
+
+        // The dial is still parked. A control op enqueued now must not
+        // be waiting behind it.
+        let closed = tokio::time::timeout(
+            Duration::from_secs(5),
+            ops.call(ops::TAB_CLOSE, serde_json::json!({})),
+        )
+        .await
+        .expect("the worker is still serving while the attach is in flight");
+        assert!(closed.is_ok());
+        assert_eq!(
+            arrived(&log).last().map(|(op, _)| op.as_str()),
+            Some(ops::TAB_CLOSE),
+            "a later op is answered while the dial is still mid-handshake"
+        );
+
+        attach.abort_tasks();
+        data_plane.abort();
+        worker.abort();
     }
 
     /// A resize that runs out of patience during a `vt` payload

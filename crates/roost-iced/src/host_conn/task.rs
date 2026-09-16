@@ -10,19 +10,21 @@
 //! The order of the prologue is the wire contract, not a preference
 //! (`ipc.md` #session-sockets): `session.identify` → the compatibility
 //! gate → `session.set_theme` → subscribe → `tab.list`. The theme lands
-//! **before any `tab.attach`** (plan 037 §3.6) and the snapshot is taken
-//! **after** the subscribe so the ack's revision is a floor the snapshot
-//! can be fenced against.
+//! **before any attach** (plan 037 §3.6) — see
+//! [`super::queue::HostOps::attach_permit`] for how a dial that has no
+//! control leg of its own still lands behind it — and the snapshot is
+//! taken **after** the subscribe so the ack's revision is a floor the
+//! snapshot can be fenced against.
 //!
 //! ## The seam C5 fills
 //!
-//! Attaching a tab is a *fourth* connection per attached tab —
-//! `tab.attach` (an intent on this task's queue, which is why token
-//! minting rides the same queue) followed by
-//! [`roost_ipc::client::DataConnection`]. C4 deliberately builds none of
-//! it: the decoder is main-thread-only, so the data path's shape is
-//! C5's to choose. What C4 guarantees it is a live control client, an
-//! ordered queue to mint tokens on, and a mirror that already knows
+//! Attaching a tab is a *fourth* connection per attached tab: a
+//! [`roost_ipc::client::DataConnection`] that negotiates itself, taking
+//! only a place in this task's queue on the way
+//! ([`super::queue::HostOps::attach_permit`]). C4 deliberately builds
+//! none of it: the decoder is main-thread-only, so the data path's shape
+//! is C5's to choose. What C4 guarantees it is a live control client, an
+//! ordered queue to take that place in, and a mirror that already knows
 //! which tabs exist.
 
 use std::path::{Path, PathBuf};
@@ -1197,6 +1199,16 @@ async fn serve(
                 let Some(intent) = admit(incarnation, intent) else {
                     continue;
                 };
+                if intent.barrier {
+                    // Answered where it stands and never put on the
+                    // wire: reaching it *is* what the caller waits for,
+                    // because everything enqueued before it has been
+                    // answered by now. Awaiting the attach it releases
+                    // would park this loop for the attach timeout, which
+                    // is the one thing `attach_permit` exists to avoid.
+                    intent.answer(Ok(serde_json::Value::Null));
+                    continue;
+                }
                 match run_intent(&mut live, intent).await {
                     IntentOutcome::Live => {}
                     IntentOutcome::Ends(end) => return end,

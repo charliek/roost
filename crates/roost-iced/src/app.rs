@@ -1351,8 +1351,8 @@ async fn open_host_tab_flow(
 /// `tab.open` params for a host, geometry included.
 ///
 /// The same defaults the local path opens with: the tab is resized to
-/// the window's real grid at attach (`tab.attach` carries the geometry
-/// and the server resizes there), so this only has to be a legal
+/// the window's real grid at attach (the attach handshake carries the
+/// geometry and the server resizes there), so this only has to be a legal
 /// starting size, not the right one.
 ///
 /// `title` + `argv` are empty for an ordinary new tab and carry the

@@ -12,8 +12,8 @@ use std::time::Duration;
 use roost_ipc::messages::{AttachPayloadKind, SessionIdentify, SESSION_PROTOCOL_VERSION};
 use roost_ui_model::keys::HostId;
 
-/// The payload kinds this client can decode, in the order it offers
-/// them to `tab.attach`. A session that advertises none of them has
+/// The payload kinds this client can decode, in the order its attach
+/// handshake offers them. A session that advertises none of them has
 /// nothing to hand us, whatever else it supports.
 ///
 /// `ghostty-snapshot` leads because it carries what `vt` cannot (the
@@ -52,7 +52,7 @@ pub(crate) enum MismatchKind {
 /// What the gate found when it did not refuse.
 ///
 /// It reports the *fact* it established, not a decision: which kind an
-/// attach ends up on is `tab.attach`'s to negotiate, per attach, and
+/// attach ends up on is the handshake's to negotiate, per attach, and
 /// nothing here predicts it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Compatibility {
@@ -664,7 +664,7 @@ mod tests {
         );
         // And neither is a session that serves only `vt` — one kind this
         // client can decode is the whole requirement. The gate does not
-        // predict which one `tab.attach` will land on.
+        // predict which one an attach will land on.
         let vt_only = identity(SESSION_PROTOCOL_VERSION, &["vt"], "gb-1");
         assert_eq!(
             check_compatibility(&vt_only, "gb-1", RestartAction::RestartLocal),

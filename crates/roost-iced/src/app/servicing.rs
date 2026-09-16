@@ -1554,9 +1554,10 @@ impl App {
                         // blank while its snapshot filled up. The local
                         // attach does exactly this for the same reason.
                         // The resize half is a no-op on the wire: this
-                        // geometry is what `tab.attach` already asked
-                        // for, and a host handle drops `send_resize`
-                        // anyway (the attach machine owns that).
+                        // geometry is what the attach handshake already
+                        // asked for, and a host handle drops
+                        // `send_resize` anyway (the attach machine owns
+                        // that).
                         match tab.apply_geometry(
                             cols,
                             rows,
@@ -1669,8 +1670,15 @@ impl App {
             self.host_attach.remove(&key);
             return;
         };
+        let session_id = self.hosts.session_id_for(key.host);
         let _guard = self.runtime.enter();
-        attach.begin(ops, socket, &roost_vt::libghostty_build(), &self.feed_tx);
+        attach.begin(
+            ops,
+            session_id,
+            socket,
+            &roost_vt::libghostty_build(),
+            &self.feed_tx,
+        );
     }
 
     fn apply_host_tab_frame(

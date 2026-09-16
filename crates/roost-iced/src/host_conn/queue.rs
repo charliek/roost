@@ -1,14 +1,21 @@
 //! The per-host op queue (plan 037 §3.9).
 //!
 //! `IpcClient` is strictly sequential, so every control-plane op a host
-//! needs — the workspace mutations C6/C7 route here, `tab.attach` token
-//! minting, `session.set_theme` — has to go through one place in one
-//! order. UI intents enqueue on a bounded channel; the connection task
-//! is the single worker that drains it.
+//! needs — the workspace mutations C6/C7 route here, `session.set_theme`
+//! — has to go through one place in one order. UI intents enqueue on a
+//! bounded channel; the connection task is the single worker that drains
+//! it.
 //!
 //! One connection, one order, no interleaving hazards. And because the
 //! queue is bounded, a wedged session costs a bounded amount of memory
 //! and a `Full` intent is refused at the enqueue rather than swallowed.
+//!
+//! Two things deliberately do **not** ride the queue, and for the same
+//! reason: the worker awaits each op inline, so anything slow on it
+//! blocks every later control op. Uploads go to a lane of their own
+//! ([`HostOps::put_file`]), and an attach dials a data connection of its
+//! own. What the attach needs from the queue is not service but
+//! *position*, which is what [`HostOps::attach_permit`] takes.
 
 use std::borrow::Cow;
 
@@ -89,6 +96,11 @@ pub(crate) struct HostIntent {
     /// correct on whichever connection serves them.
     pub(crate) fence: Option<HostId>,
     pub(crate) reply: Option<HostOpReply>,
+    /// The ordering barrier: the worker answers this item itself, where
+    /// it stands, instead of putting it on the wire. Reaching it *is*
+    /// the answer — see [`HostOps::attach_permit`], which is the only
+    /// thing that makes one.
+    pub(crate) barrier: bool,
 }
 
 impl HostIntent {
@@ -99,6 +111,16 @@ impl HostIntent {
             params,
             fence: None,
             reply: None,
+            barrier: false,
+        }
+    }
+
+    /// A queue position and nothing else. See [`Self::barrier`]; the
+    /// `op` is a label for the worker's logs, not a wire op.
+    fn barrier() -> Self {
+        Self {
+            barrier: true,
+            ..Self::new("attach-permit", serde_json::Value::Null)
         }
     }
 
@@ -223,6 +245,36 @@ impl HostOps {
     ) -> impl std::future::Future<Output = Result<serde_json::Value, HostOpError>> + Send + 'static
     {
         self.dispatch(HostIntent::new(op, params))
+    }
+
+    /// Take a place in this host's queue and wait for the worker to
+    /// reach it. The attach's ordering device (plan 065 §3.10).
+    ///
+    /// A data connection is a socket of its own, so nothing about
+    /// dialing it is ordered against the control ops the UI has already
+    /// asked for — `session.set_theme` most of all, whose colors the
+    /// session needs *before* it composes a snapshot. Until #473 the
+    /// attach's ticket mint was itself a queued op and the order came
+    /// for free; the inline handshake has no control leg, so the order
+    /// has to be taken deliberately.
+    ///
+    /// The permit restores it without putting the attach on the queue:
+    /// the worker answers this item the moment it reaches it — which is
+    /// the moment every item enqueued before it has been answered — and
+    /// moves straight on to the next one. It never awaits the dial, the
+    /// handshake or the snapshot. An attach on the queue would block
+    /// every later control op for the whole attach timeout, which is the
+    /// same reason uploads are not on it either ([`Self::put_file`]).
+    ///
+    /// Fenced at `incarnation`, because a permit is a statement about
+    /// one connection: an attach released after a drop must not dial the
+    /// session that replaced it.
+    pub(crate) fn attach_permit(
+        &self,
+        incarnation: HostId,
+    ) -> impl std::future::Future<Output = Result<(), HostOpError>> + Send + 'static {
+        let granted = self.dispatch(HostIntent::barrier().fenced_at(incarnation));
+        async move { granted.await.map(|_| ()) }
     }
 
     /// [`Self::call`] bound to the incarnation it was issued for — see
@@ -401,7 +453,7 @@ mod tests {
     #[tokio::test]
     async fn a_reply_channel_dropped_unanswered_reads_as_disconnected() {
         let (ops, mut rx) = HostOps::channel();
-        let waiting = ops.call("tab.attach", serde_json::json!({}));
+        let waiting = ops.call("tab.open", serde_json::json!({}));
 
         // Exactly what an aborted task leaves behind: the intent taken
         // off the queue and then dropped with its reply unsent.
@@ -431,6 +483,47 @@ mod tests {
         }
         let overflow = ops.call("tab.open", serde_json::json!({}));
         assert_eq!(overflow.await, Err(HostOpError::Unavailable));
+    }
+
+    /// The permit takes its place in line like anything else — which is
+    /// the whole of what it does.
+    #[tokio::test]
+    async fn a_permit_queues_behind_the_ops_enqueued_before_it() {
+        let (ops, mut rx) = HostOps::channel();
+        ops.send(intent("session.set_theme")).unwrap();
+        let _permit = ops.attach_permit(HostId::new(1));
+        ops.send(intent("tab.close")).unwrap();
+
+        let queued: Vec<(String, bool)> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|intent| (intent.op.into_owned(), intent.barrier))
+            .collect();
+        assert_eq!(
+            queued,
+            vec![
+                ("session.set_theme".to_string(), false),
+                ("attach-permit".to_string(), true),
+                ("tab.close".to_string(), false),
+            ]
+        );
+    }
+
+    /// The two ways a permit is refused, and they are the only two: a
+    /// barrier never reaches the wire, so it cannot be rejected by a
+    /// session or die with a transport.
+    #[tokio::test]
+    async fn a_permit_is_refused_by_a_drop_and_by_a_full_queue() {
+        let (ops, mut rx) = HostOps::channel();
+        let flushed = ops.attach_permit(HostId::new(1));
+        flush(&mut rx, &HostOpError::Disconnected);
+        assert_eq!(flushed.await, Err(HostOpError::Disconnected));
+
+        for _ in 0..QUEUE_DEPTH {
+            ops.send(intent("fill")).unwrap();
+        }
+        assert_eq!(
+            ops.attach_permit(HostId::new(1)).await,
+            Err(HostOpError::Unavailable)
+        );
     }
 
     /// A caller that awaits a reply must never wait forever, including

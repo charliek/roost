@@ -331,7 +331,7 @@ async fn put_file(wire: Wire, name: String, source: UploadSource) -> UploadResul
 
 /// Dial the host's socket afresh and send the one op.
 ///
-/// A connection per upload, the `tab.attach` precedent: the control
+/// A connection per upload, the attach precedent: the control
 /// client is serial and busy, and the session registers every connection
 /// that sends an op, so a `session.stop` closes this one too — as a
 /// per-upload failure.
