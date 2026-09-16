@@ -17,7 +17,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use roost_engine::ipc::{
-    IpcHandler, SessionInfo, StopHandle, MAX_OUTSTANDING_TOKENS, MAX_TOKENS_PER_CONNECTION,
+    IpcHandler, SessionInfo, StopHandle, MAX_DATA_CONNS_PER_SESSION, MAX_OUTSTANDING_TOKENS,
+    MAX_TOKENS_PER_CONNECTION,
 };
 use roost_engine::tab_task::{ServerVtConfig, ServerVtWorkspace};
 use roost_engine::{PtySupervisor, Workspace};
@@ -31,7 +32,7 @@ use roost_ipc::messages::{
     SessionStopParams, SessionStopResult, TabAttachParams, TabAttachResult,
     TabCapturePtyInputParams, TabCapturePtyInputResult, TabCloseParams, TabDumpParams,
     TabDumpResult, TabFeedPtyBytesParams, TabOpenParams, TabOpenResult, TabResizeParams,
-    WireTabRef, SESSION_PROTOCOL_VERSION,
+    TabWriteParams, WireTabRef, SESSION_PROTOCOL_VERSION,
 };
 use roost_ipc::{IpcClient, IpcServer};
 use tempfile::TempDir;
@@ -56,7 +57,12 @@ const TAG_FINISH: u16 = 6;
 struct Harness {
     socket: PathBuf,
     workspace: Arc<Workspace>,
-    _dir: TempDir,
+    /// The session's own identity, which every inline handshake has to
+    /// name, and the registry the release-on-reject cases read.
+    session_id: String,
+    handler: Arc<IpcHandler>,
+    serving: tokio::task::AbortHandle,
+    dir: TempDir,
 }
 
 /// The workspace seam a session hands the tab tasks. The real one is
@@ -71,22 +77,33 @@ impl ServerVtWorkspace for NoopWorkspace {
     fn tab_effect(&self, _tab_id: i64, _effect: roost_engine::TabEffectKind) {}
 }
 
-/// A session advertising both payload kinds, the way a shipped
-/// `roost-session` does.
+const SESSION_ID: &str = "01K3S8TQ4F0Q9YB2K6WZ5D7XN";
+
+/// What a shipped `roost-session` advertises.
+const BOTH_KINDS: [&str; 2] = [AttachPayloadKind::GHOSTTY_SNAPSHOT, AttachPayloadKind::VT];
+
+/// A session advertising both payload kinds.
 async fn harness() -> Harness {
-    harness_advertising(&[AttachPayloadKind::GHOSTTY_SNAPSHOT, AttachPayloadKind::VT]).await
+    harness_advertising(&BOTH_KINDS).await
 }
 
 /// The same, stating what `session.identify` advertises — the pre-`vt`
 /// daemon shape is one entry, and negotiation is defined against the
 /// advertisement, not against what the code can encode.
 async fn harness_advertising(payload_kinds: &[&str]) -> Harness {
+    let dir = tempfile::tempdir().expect("tempdir");
+    harness_in(dir, SESSION_ID, payload_kinds).await
+}
+
+/// Bind a session into an existing directory under a stated identity —
+/// what a restart at the same socket path looks like from a client's
+/// side.
+async fn harness_in(dir: TempDir, session_id: &str, payload_kinds: &[&str]) -> Harness {
     let payload_kinds: Vec<AttachPayloadKind> = payload_kinds
         .iter()
         .copied()
         .map(AttachPayloadKind::from)
         .collect();
-    let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join("roost.sock");
     let workspace = Arc::new(Workspace::open(dir.path().join("state.json")));
     let supervisor = Arc::new(PtySupervisor::new());
@@ -106,7 +123,7 @@ async fn harness_advertising(payload_kinds: &[&str]) -> Harness {
     )
     .with_session(
         SessionInfo {
-            session_id: "01K3S8TQ4F0Q9YB2K6WZ5D7XN".into(),
+            session_id: session_id.into(),
             started_at: "2026-08-27T14:03:11Z".into(),
             app_version: "9.9.9".into(),
             payload_kinds,
@@ -118,19 +135,76 @@ async fn harness_advertising(payload_kinds: &[&str]) -> Harness {
     );
 
     let server = IpcServer::bind(&socket, handler).await.expect("bind");
-    tokio::spawn(async move {
+    let handler = Arc::clone(server.handler());
+    let serving = tokio::spawn(async move {
         let _ = server.run().await;
-    });
+    })
+    .abort_handle();
     Harness {
         socket,
         workspace,
-        _dir: dir,
+        session_id: session_id.to_string(),
+        handler,
+        serving,
+        dir,
     }
 }
 
 impl Harness {
     async fn control(&self) -> IpcClient {
         IpcClient::connect(&self.socket).await.expect("connect")
+    }
+
+    /// The inline handshake this session would accept for `tab_id`,
+    /// spelled out as JSON so a test can lie about exactly one term.
+    fn inline(&self, tab_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "attach": tab_id.to_string(),
+            "protocol_version": SESSION_PROTOCOL_VERSION,
+            "session_id": self.session_id,
+            "kinds": [AttachPayloadKind::GHOSTTY_SNAPSHOT],
+            "cols": 80,
+            "rows": 24,
+            "libghostty_build": roost_vt::libghostty_build(),
+            "focus": true,
+        })
+    }
+
+    /// Stop serving and bind a replacement session at the same socket
+    /// path — a restart, from a client's side.
+    async fn restart(self) -> Harness {
+        let Harness { serving, dir, .. } = self;
+        serving.abort();
+        // The abort leaves the socket file behind; `bind` probes it,
+        // finds nothing listening and unlinks it.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        harness_in(dir, "01K9RESTARTED0000000000000", &BOTH_KINDS).await
+    }
+
+    /// Poll the session's data-connection registry until it reads
+    /// `want`. A count is the server's own bookkeeping and moves on the
+    /// forwarder's task, so it is waited for rather than asserted at an
+    /// instant the test cannot pin.
+    async fn wait_for_data_conns(&self, want: usize) {
+        let deadline = Instant::now() + BUDGET;
+        loop {
+            let live = self.handler.data_conn_count();
+            if live == want {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the session held {live} data connections, not {want}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A control connection plus a tab running a real shell at an
+    /// explicit geometry — the one child that can be asked what size it
+    /// thinks it is.
+    async fn shell_tab(&self, cols: u32, rows: u32) -> (IpcClient, i64) {
+        self.open_tab(cols, rows, vec!["/bin/sh".into()]).await
     }
 
     /// A control connection plus a live tab parked on `cat` — a child
@@ -144,6 +218,15 @@ impl Harness {
     /// size follows, so the one test that needs a multi-frame snapshot
     /// asks for a wide tab rather than trying to type its way there.
     async fn live_tab_sized(&self, cols: u32, rows: u32) -> (IpcClient, i64) {
+        self.open_tab(
+            cols,
+            rows,
+            vec!["/bin/sh".into(), "-c".into(), "exec cat".into()],
+        )
+        .await
+    }
+
+    async fn open_tab(&self, cols: u32, rows: u32, argv: Vec<String>) -> (IpcClient, i64) {
         let mut client = self.control().await;
         let project = self
             .workspace
@@ -155,7 +238,7 @@ impl Harness {
                 TabOpenParams {
                     project_id: project.id,
                     cwd: "/tmp".into(),
-                    argv: vec!["/bin/sh".into(), "-c".into(), "exec cat".into()],
+                    argv,
                     cols,
                     rows,
                     title: String::new(),
@@ -464,6 +547,21 @@ async fn feed(client: &mut IpcClient, tab_id: i64, data: Vec<u8>) {
         )
         .await
         .expect("tab.feed_pty_bytes");
+}
+
+/// Bytes into the tab from the CONTROL plane, which states no geometry
+/// of its own — the only way to reach a child without also sizing it.
+async fn write_tab(client: &mut IpcClient, tab_id: i64, data: &[u8]) {
+    client
+        .call::<_, serde_json::Value>(
+            ops::TAB_WRITE,
+            TabWriteParams {
+                tab_id,
+                data: data.to_vec(),
+            },
+        )
+        .await
+        .expect("tab.write");
 }
 
 async fn resize(client: &mut IpcClient, tab_id: i64, cols: u32, rows: u32) {
@@ -1320,17 +1418,14 @@ async fn an_unfocused_attach_never_resizes_and_reports_the_snapshot_geometry() {
         .await;
     assert_eq!(
         (desktop.snapshot_cols, desktop.snapshot_rows),
-        (Some(100), Some(30)),
+        (100, 30),
         "the size the payload was encoded at, which here is what was asked for"
     );
 
     let (phone, _b) = h
         .attached_at(&mut client, tab_id, (60, 20), (8, 16), false)
         .await;
-    assert_eq!(
-        (phone.snapshot_cols, phone.snapshot_rows),
-        (Some(100), Some(30))
-    );
+    assert_eq!((phone.snapshot_cols, phone.snapshot_rows), (100, 30));
     let d = dump(&mut client, tab_id).await;
     assert_eq!(
         (d.cols, d.rows),
@@ -1382,7 +1477,7 @@ async fn a_focused_attach_reports_the_size_it_was_actually_encoded_at() {
     data.read_snapshot().await;
     assert_eq!(
         (accepted.snapshot_cols, accepted.snapshot_rows),
-        (Some(60), Some(20)),
+        (60, 20),
         "the reply names the geometry the encode used, not the one asked for"
     );
 }
@@ -1750,7 +1845,7 @@ async fn a_resume_reports_the_geometry_the_ring_was_written_at() {
     assert_eq!(accepted.mode, AttachMode::Resume);
     assert_eq!(
         (accepted.snapshot_cols, accepted.snapshot_rows),
-        (Some(60), Some(20)),
+        (60, 20),
         "a resume names the grid its records were written at, not the one asked for"
     );
 }
@@ -2030,4 +2125,390 @@ async fn a_resumed_connection_replays_its_slice_then_exits() {
     let final_seq = u64::from_le_bytes(exit.payload[..8].try_into().unwrap());
     assert_eq!(final_seq, last_seq + 1);
     assert!(data.next().await.is_none(), "EXIT is the last frame");
+}
+
+// ---------------------------------------------------------------------
+// The inline handshake — the data connection negotiates for itself
+// ---------------------------------------------------------------------
+
+/// One connection, no ticket: the terms `tab.attach` used to settle ride
+/// the handshake line and the reply names what was negotiated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_inline_handshake_attaches_with_no_control_round_trip() {
+    let h = harness().await;
+    let (_client, tab_id) = h.live_tab().await;
+
+    let (accepted, mut data) = dial(&h.socket, h.inline(tab_id))
+        .await
+        .expect("the inline handshake is accepted");
+    assert_eq!(accepted.kind.as_str(), AttachPayloadKind::GHOSTTY_SNAPSHOT);
+    assert_eq!(accepted.mode, AttachMode::Snapshot);
+    assert_eq!((accepted.snapshot_cols, accepted.snapshot_rows), (80, 24));
+    let (snapshot, _pty) = data.read_snapshot().await;
+    assert!(has_tag(&snapshot, TAG_READY), "the payload carries READY");
+}
+
+/// The two forms are told apart by the presence of `kinds` and never by
+/// whether `attach` parses as a number — a 32-hex token can be all
+/// digits, and a tab id read as a token would be refused as a credential
+/// nobody minted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_presence_of_kinds_is_what_picks_the_inline_form() {
+    let h = harness().await;
+    let (mut client, tab_id) = h.live_tab().await;
+
+    // No `kinds`, and an `attach` that is a perfectly good tab id: the
+    // ticket form, so it is read as a token nobody minted.
+    let ticketish = dial(
+        &h.socket,
+        serde_json::json!({
+            "attach": tab_id.to_string(),
+            "protocol_version": SESSION_PROTOCOL_VERSION,
+        }),
+    )
+    .await
+    .expect_err("a tab id is not a ticket");
+    assert_eq!(ticketish.code, "invalid-token");
+
+    // `kinds` present, and an `attach` that is a perfectly good token:
+    // the inline form, so it is read as a tab id.
+    let ticket = attach(&mut client, tab_id).await;
+    let mut inlineish = h.inline(tab_id);
+    inlineish["attach"] = serde_json::Value::String(ticket.attach_token.clone());
+    let error = dial(&h.socket, inlineish)
+        .await
+        .expect_err("a token is not a tab id");
+    assert_eq!(error.code, "invalid-param");
+
+    // And the ticket it minted still serves, on the same session.
+    let (_accepted, _data) = dial(&h.socket, handshake(&ticket.attach_token))
+        .await
+        .expect("the transitional ticket path is untouched");
+}
+
+/// The generation check runs on the raw line, ahead of the typed decode:
+/// two ends that disagree about the generation disagree about what every
+/// other field means, so naming a malformed term first would send a
+/// version-skewed client chasing the wrong bug.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wrong_protocol_wins_over_malformed_terms() {
+    let h = harness().await;
+    let (_client, tab_id) = h.live_tab().await;
+
+    let mut both_wrong = h.inline(tab_id);
+    both_wrong["protocol_version"] = serde_json::json!(1);
+    both_wrong["cols"] = serde_json::json!("eighty");
+    both_wrong.as_object_mut().unwrap().remove("session_id");
+
+    let error = dial(&h.socket, both_wrong)
+        .await
+        .expect_err("a stale protocol is refused");
+    assert_eq!(error.code, "protocol-mismatch");
+    assert!(
+        error
+            .message
+            .contains(&SESSION_PROTOCOL_VERSION.to_string()),
+        "the message names the version this session speaks: {}",
+        error.message
+    );
+}
+
+/// An inline handshake is all-or-nothing, and a term it left out is a
+/// `parse-error` that names the term.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_inline_handshake_missing_a_term_is_a_parse_error_naming_it() {
+    let h = harness().await;
+    let (_client, tab_id) = h.live_tab().await;
+
+    let mut no_session = h.inline(tab_id);
+    no_session.as_object_mut().unwrap().remove("session_id");
+    let error = dial(&h.socket, no_session)
+        .await
+        .expect_err("session_id is required");
+    assert_eq!(error.code, "parse-error");
+    assert!(
+        error.message.contains("session_id"),
+        "the rejection names the missing term: {}",
+        error.message
+    );
+}
+
+/// A newer client's extra term is tolerated: the handshake is the one
+/// permissive request on this wire, which is what makes a future term
+/// additive instead of a generation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_inline_handshake_tolerates_a_term_this_build_never_heard_of() {
+    let h = harness().await;
+    let (_client, tab_id) = h.live_tab().await;
+
+    let mut newer = h.inline(tab_id);
+    newer["viewport_hint"] = serde_json::json!({"top": 0});
+    let (accepted, _data) = dial(&h.socket, newer)
+        .await
+        .expect("an unknown term is not a refusal");
+    assert_eq!(accepted.kind.as_str(), AttachPayloadKind::GHOSTTY_SNAPSHOT);
+}
+
+/// The identity the ticket used to carry. Without it a dial released
+/// after a drop could land on a replacement session listening at the
+/// same socket path — so the check runs before anything is registered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_restarted_under_the_socket_refuses_the_old_identity() {
+    let first = harness().await;
+    let (_client, tab_id) = first.live_tab().await;
+    // Prepared against the session that was there, the way a client's
+    // queued dial is.
+    let prepared = first.inline(tab_id);
+
+    let replacement = first.restart().await;
+    let (_client, live_tab) = replacement.live_tab().await;
+
+    // Re-aimed at a tab the replacement really has, so the session
+    // identity is the only thing left that can refuse it.
+    let mut prepared = prepared;
+    prepared["attach"] = serde_json::Value::String(live_tab.to_string());
+    let error = dial(&replacement.socket, prepared)
+        .await
+        .expect_err("a dial prepared for the session that went away");
+    assert_eq!(error.code, "session-mismatch");
+    replacement.wait_for_data_conns(0).await;
+}
+
+/// Negotiation moved onto the data connection unchanged: the client's
+/// preference order is walked and the first entry that is both
+/// advertised and eligible wins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_inline_handshake_negotiates_the_same_way_the_control_op_did() {
+    let h = harness().await;
+    let (_client, tab_id) = h.live_tab().await;
+    let skewed = "ghostty-0000000000000000+snapshot.v1";
+
+    let mut both = h.inline(tab_id);
+    both["kinds"] = serde_json::json!([AttachPayloadKind::GHOSTTY_SNAPSHOT, AttachPayloadKind::VT]);
+    let (accepted, _data) = dial(&h.socket, both.clone()).await.expect("accepted");
+    assert_eq!(
+        accepted.kind.as_str(),
+        AttachPayloadKind::GHOSTTY_SNAPSHOT,
+        "GHOSTSNP is preferred whenever it is eligible"
+    );
+
+    let mut skewed_both = both.clone();
+    skewed_both["libghostty_build"] = serde_json::json!(skewed);
+    let (accepted, _data) = dial(&h.socket, skewed_both).await.expect("accepted");
+    assert_eq!(
+        accepted.kind.as_str(),
+        AttachPayloadKind::VT,
+        "an ineligible first choice must not refuse an eligible second one"
+    );
+
+    let mut ghostsnp_only = h.inline(tab_id);
+    ghostsnp_only["libghostty_build"] = serde_json::json!(skewed);
+    assert_eq!(
+        dial(&h.socket, ghostsnp_only)
+            .await
+            .expect_err("nowhere to fall back to")
+            .code,
+        "build-mismatch"
+    );
+
+    let mut mystery = h.inline(tab_id);
+    mystery["kinds"] = serde_json::json!(["sixel-mosaic-v9"]);
+    assert_eq!(
+        dial(&h.socket, mystery)
+            .await
+            .expect_err("this session serves no such kind")
+            .code,
+        "unsupported-kind"
+    );
+}
+
+/// The refusal order, top to bottom: each code names a different thing
+/// for the client to fix, so an earlier failure must never be masked by
+/// a later one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_inline_refusals_keep_their_order() {
+    let h = harness().await;
+    let (_client, tab_id) = h.live_tab().await;
+
+    // Wrong session AND a missing tab AND an unservable kind: identity
+    // first.
+    let mut wrong_session = h.inline(tab_id + 9_999);
+    wrong_session["session_id"] = serde_json::json!("01KSOMEBODYELSE0000000000");
+    wrong_session["kinds"] = serde_json::json!(["sixel-mosaic-v9"]);
+    assert_eq!(
+        dial(&h.socket, wrong_session).await.unwrap_err().code,
+        "session-mismatch"
+    );
+
+    // A missing tab AND an unservable kind: the tab first.
+    let mut missing_tab = h.inline(tab_id + 9_999);
+    missing_tab["kinds"] = serde_json::json!(["sixel-mosaic-v9"]);
+    assert_eq!(
+        dial(&h.socket, missing_tab).await.unwrap_err().code,
+        "not-found"
+    );
+
+    // An unservable kind AND a zero grid: the kind first.
+    let mut unservable = h.inline(tab_id);
+    unservable["kinds"] = serde_json::json!(["sixel-mosaic-v9"]);
+    unservable["rows"] = serde_json::json!(0);
+    assert_eq!(
+        dial(&h.socket, unservable).await.unwrap_err().code,
+        "unsupported-kind"
+    );
+
+    // A build skew AND a zero grid: the build first.
+    let mut skewed = h.inline(tab_id);
+    skewed["libghostty_build"] = serde_json::json!("ghostty-0000000000000000+snapshot.v1");
+    skewed["rows"] = serde_json::json!(0);
+    assert_eq!(
+        dial(&h.socket, skewed).await.unwrap_err().code,
+        "build-mismatch"
+    );
+
+    // And then the grid, which is checked for an unfocused attach too:
+    // it is still the geometry this connection's first frame applies.
+    for focus in [true, false] {
+        let mut zero_grid = h.inline(tab_id);
+        zero_grid["rows"] = serde_json::json!(0);
+        zero_grid["focus"] = serde_json::json!(focus);
+        assert_eq!(
+            dial(&h.socket, zero_grid).await.unwrap_err().code,
+            "invalid-param"
+        );
+    }
+    h.wait_for_data_conns(0).await;
+}
+
+/// After a stop there is nothing left to stream from, and nothing is
+/// registered on the way to saying so.
+///
+/// The code is `not-found` rather than `shutting-down`: the stop reaped
+/// this tab before it answered, and the tab lookup is step 4 while the
+/// latch is read at step 8, under the registry lock, where it has to be
+/// for the sweep not to race a registration. A dial that gets in ahead
+/// of the reap hears `shutting-down` from that latch instead; both are
+/// refusals, and neither leaves a slot behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_inline_attach_after_a_stop_is_refused() {
+    let h = harness().await;
+    let (mut client, tab_id) = h.live_tab().await;
+    let prepared = h.inline(tab_id);
+
+    let report: SessionStopResult = client
+        .call(ops::SESSION_STOP, SessionStopParams {})
+        .await
+        .expect("session.stop");
+    assert!(
+        report.reaped.contains(&tab_id),
+        "the stop accounted for the tab before this dial"
+    );
+
+    let error = dial(&h.socket, prepared)
+        .await
+        .expect_err("a stopped session serves no new attach");
+    assert_eq!(error.code, "not-found");
+    h.wait_for_data_conns(0).await;
+}
+
+/// The bound on live data connections, now that no ticket quota stands
+/// in front of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_session_serves_only_so_many_data_connections() {
+    let h = harness().await;
+    let (_client, tab_id) = h.live_tab().await;
+
+    let mut held = Vec::new();
+    for nth in 0..MAX_DATA_CONNS_PER_SESSION {
+        let (_accepted, data) = dial(&h.socket, h.inline(tab_id))
+            .await
+            .unwrap_or_else(|error| panic!("attach {nth} was refused: {}", error.code));
+        held.push(data);
+    }
+    h.wait_for_data_conns(MAX_DATA_CONNS_PER_SESSION).await;
+
+    let error = dial(&h.socket, h.inline(tab_id))
+        .await
+        .expect_err("one past the bound");
+    assert_eq!(error.code, "too-many-attaches");
+
+    // And a slot freed by a departing client is a slot the next one
+    // gets: the bound is on what is live, not on what ever attached.
+    held.pop();
+    h.wait_for_data_conns(MAX_DATA_CONNS_PER_SESSION - 1).await;
+    let (_accepted, _data) = dial(&h.socket, h.inline(tab_id))
+        .await
+        .expect("the freed slot is usable");
+}
+
+/// The registration happens before the fence, and every rejection past
+/// it hands the slot back — otherwise a session would leak its way to
+/// `too-many-attaches` on nothing but failed attaches.
+///
+/// The park is a `vt` encode with nothing to carry: the parser sits
+/// inside an unfinished DCS longer than the retained continuation, so
+/// the snapshot cannot answer until something closes it. Closing the tab
+/// instead is what turns the parked fence into a rejection — the
+/// sequence can never be closed now, which is exactly `snapshot-failed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rejection_after_registration_releases_the_slot() {
+    let h = harness().await;
+    let (mut client, tab_id) = h.live_tab().await;
+
+    let mut unfinished = Vec::from(&b"\x1bP"[..]);
+    unfinished.extend(std::iter::repeat_n(b'x', 2 * 1024 * 1024));
+    feed(&mut client, tab_id, unfinished).await;
+
+    let mut parked = h.inline(tab_id);
+    parked["kinds"] = serde_json::json!([AttachPayloadKind::VT]);
+    let socket = h.socket.clone();
+    let dialing = tokio::spawn(async move { dial(&socket, parked).await });
+
+    // Registered at step 8, long before the fence it is now stuck in.
+    h.wait_for_data_conns(1).await;
+
+    client
+        .call::<_, serde_json::Value>(ops::TAB_CLOSE, TabCloseParams { tab_id })
+        .await
+        .expect("tab.close");
+
+    let error = timeout(BUDGET, dialing)
+        .await
+        .expect("the parked fence answers once its tab is gone")
+        .expect("join")
+        .expect_err("a snapshot from a tab that no longer exists");
+    assert_eq!(error.code, "snapshot-failed");
+    h.wait_for_data_conns(0).await;
+}
+
+/// What the focused resize is actually for, measured on the **child**:
+/// a program in the tab reads the geometry the handshake stated, not the
+/// one the tab had when the connection was dialed.
+///
+/// The prompt is written from the CONTROL connection (`tab.write` states
+/// no geometry, so it cannot size anything itself) — an INPUT frame from
+/// this data connection would carry the handshake's geometry with it and
+/// resize the tab on its own, which would make the assertion true
+/// whatever the handshake did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_focused_inline_attach_sizes_the_child_before_it_can_be_read() {
+    let h = harness().await;
+    let (mut client, tab_id) = h.shell_tab(80, 24).await;
+
+    let mut wide = h.inline(tab_id);
+    wide["cols"] = serde_json::json!(100);
+    wide["rows"] = serde_json::json!(30);
+    let (accepted, mut data) = dial(&h.socket, wide).await.expect("accepted");
+    assert_eq!((accepted.snapshot_cols, accepted.snapshot_rows), (100, 30));
+
+    let (_snapshot, pty) = data.read_snapshot().await;
+    let after = pty.last().map_or(accepted.seq, |(seq, _)| *seq);
+
+    write_tab(&mut client, tab_id, b"stty size\n").await;
+    let (_last, text) = data.read_pty_until(after, b"30 100").await;
+    assert!(
+        contains(&text, b"30 100"),
+        "the child reported the handshake's rows and cols: {:?}",
+        String::from_utf8_lossy(&text)
+    );
 }

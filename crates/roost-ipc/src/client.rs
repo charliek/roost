@@ -631,6 +631,9 @@ pub enum ServerCode {
     UnsupportedKind,
     /// 16 unconsumed attach tokens already exist.
     TooManyTokens,
+    /// This session already serves `MAX_DATA_CONNS_PER_SESSION` data
+    /// connections. Detach something before attaching again.
+    TooManyAttaches,
     /// No such tab, or it was respawned between the ticket and the dial.
     NotFound,
     /// Malformed parameter.
@@ -690,6 +693,7 @@ impl ServerCode {
             "build-mismatch" => ServerCode::BuildMismatch,
             "unsupported-kind" => ServerCode::UnsupportedKind,
             "too-many-tokens" => ServerCode::TooManyTokens,
+            "too-many-attaches" => ServerCode::TooManyAttaches,
             "not-found" => ServerCode::NotFound,
             "invalid-param" => ServerCode::InvalidParam,
             "protocol-mismatch" => ServerCode::ProtocolMismatch,
@@ -721,6 +725,7 @@ impl ServerCode {
             ServerCode::BuildMismatch => "build-mismatch",
             ServerCode::UnsupportedKind => "unsupported-kind",
             ServerCode::TooManyTokens => "too-many-tokens",
+            ServerCode::TooManyAttaches => "too-many-attaches",
             ServerCode::NotFound => "not-found",
             ServerCode::InvalidParam => "invalid-param",
             ServerCode::ProtocolMismatch => "protocol-mismatch",

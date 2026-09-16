@@ -1137,9 +1137,7 @@ async fn run_attempt(
             fence: accepted.seq,
             server_epoch: accepted.server_epoch,
             tab_generation: accepted.tab_generation,
-            // Both or neither: the pair names one geometry, and half of
-            // one is not a size to build a terminal at.
-            snapshot_size: accepted.snapshot_cols.zip(accepted.snapshot_rows),
+            snapshot_size: Some((accepted.snapshot_cols, accepted.snapshot_rows)),
         },
     ));
     let (mut reader, mut writer) = conn.into_split();

@@ -623,6 +623,97 @@ def test_a_refused_handshake_is_one_json_line_and_a_close(env):
     env.stop_over_the_wire()
 
 
+def test_an_inline_handshake_attaches_and_resumes_with_no_ticket(env):
+    """The shipped form: one connection states the tab and the terms.
+
+    The whole round trip through a real daemon — negotiate, read the
+    payload, drop, come back with the identity the accepted reply
+    stated — because the inline handshake is the only thing standing
+    between a client and a tab now that no control op mints anything.
+    """
+    started(env)
+
+    with env.client() as client:
+        project = first_project(client)
+        tab = quiet_tab(client, project, env.launch_cwd)
+        who = client.call("session.identify")
+
+        with DataPlane(env.socket) as conn:
+            reply = conn.attach(
+                tab,
+                who["session_id"],
+                who["libghostty_build"],
+                cols=COLS,
+                rows=ROWS,
+            )
+            assert reply.ok, (reply.code, reply.message)
+            assert reply.mode == "snapshot", reply
+            assert (reply.snapshot_cols, reply.snapshot_rows) == (COLS, ROWS), reply
+            conn.read_until_finish()
+            fence = conn.last_seq or reply.seq
+            identity = (reply.server_epoch, reply.tab_generation)
+
+        with DataPlane(env.socket) as again:
+            resumed = again.attach(
+                tab,
+                who["session_id"],
+                who["libghostty_build"],
+                cols=COLS,
+                rows=ROWS,
+                resume_from_seq=fence + 1,
+                server_epoch=identity[0],
+                tab_generation=identity[1],
+            )
+            assert resumed.ok, (resumed.code, resumed.message)
+            assert resumed.mode == "resume", resumed
+            assert resumed.seq == fence, resumed
+
+        # The identity the ticket used to carry: a dial prepared for
+        # another session must not be served by this one.
+        with DataPlane(env.socket) as elsewhere:
+            reply = elsewhere.attach(
+                tab, "01KSOMEBODYELSE0000000000", who["libghostty_build"]
+            )
+            assert reply.ok is False, reply
+            assert reply.code == "session-mismatch", reply
+            assert elsewhere.trailing == b"", elsewhere.trailing
+
+        # The generation check runs on the raw line, ahead of the typed
+        # decode, so it wins over terms that would not decode at all.
+        with DataPlane(env.socket) as ancient:
+            reply = ancient.send_handshake(
+                {
+                    "attach": str(tab),
+                    "protocol_version": 1,
+                    "kinds": [dataplane.GHOSTTY_SNAPSHOT],
+                    "cols": "eighty",
+                }
+            )
+            assert reply.ok is False, reply
+            assert reply.code == "protocol-mismatch", reply
+            assert ancient.trailing == b"", ancient.trailing
+
+        # And a term left out is named rather than reported as "bad
+        # JSON".
+        with DataPlane(env.socket) as partial:
+            reply = partial.send_handshake(
+                {
+                    "attach": str(tab),
+                    "protocol_version": dataplane.SESSION_PROTOCOL_VERSION,
+                    "kinds": [dataplane.GHOSTTY_SNAPSHOT],
+                    "cols": COLS,
+                    "rows": ROWS,
+                    "libghostty_build": who["libghostty_build"],
+                    "focus": True,
+                }
+            )
+            assert reply.ok is False, reply
+            assert reply.code == "parse-error", reply
+            assert "session_id" in reply.message, reply.message
+
+    env.stop_over_the_wire()
+
+
 def test_an_expired_token_is_refused(env):
     """The TTL, tested in milliseconds.
 

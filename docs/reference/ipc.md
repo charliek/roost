@@ -2819,16 +2819,45 @@ the first line only, so a request stream can never be diverted
 mid-flight by a payload that happens to look like a handshake.
 
 ```json
-{"attach": "1a0be5c37d924f68b1c05e3a7f2d8496", "protocol_version": 3,
+{"attach": "7", "protocol_version": 6,
+ "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
+ "kinds": ["ghostty-snapshot", "vt"], "cols": 100, "rows": 30,
+ "cell_w_px": 8, "cell_h_px": 16,
+ "libghostty_build": "ghostty-1a2b3c4d5e6f7a8b+snapshot.v1",
+ "focus": true,
  "resume_from_seq": 8814, "server_epoch": 6032428321756423947,
  "tab_generation": 3}
 ```
 
-`attach` and `protocol_version` are required; the resume triple is
-optional and all-or-nothing in practice (see [Resume](#resume) below).
+The connection negotiates for itself: `attach` names the tab as a
+`string_int64` and the terms ride the same line. `session_id` is the
+value [`session.identify`](#sessionidentify) reported and is
+**required** — it is what stops a dial prepared for one session from
+landing on a replacement listening at the same socket path, and a
+mismatch is `session-mismatch` before anything is registered. The cell
+metrics may be omitted (a headless client has none); every other term
+is required, and a missing one is a `parse-error` that names it. The
+resume triple is optional and all-or-nothing in practice (see
+[Resume](#resume) below).
+
 Decode is **permissive** — a newer client may carry fields this build
 has never heard of, and refusing the whole handshake over one would
-turn an additive change into a hard incompatibility.
+turn an additive change into a hard incompatibility. Every session
+*params* struct is strict; this handshake is the one permissive request
+on the wire, which is exactly what makes a future handshake term
+additive instead of a generation.
+
+`protocol_version` is checked on the **raw** line, ahead of the typed
+decode, so a version-skewed client hears `protocol-mismatch` rather
+than a complaint about terms the two ends no longer agree on the
+meaning of.
+
+A transitional second form is still served: a line **without** `kinds`
+is the ticket form, where `attach` is the single-use token
+[`tab.attach`](#tabattach) minted and nothing else is negotiated here.
+The presence of `kinds` is the discriminator — never whether `attach`
+parses as a number, because a 32-hex token can be all digits by
+accident.
 
 **Scope:** this sniff exists on Rust-served sockets only. The Mac UI's
 Swift IPC server has no data plane and is untouched — a handshake line
@@ -2840,7 +2869,8 @@ The reply is one JSON line. Accepted:
 
 ```json
 {"ok": true, "kind": "ghostty-snapshot", "mode": "snapshot",
- "seq": 8813, "server_epoch": 6032428321756423947, "tab_generation": 3}
+ "seq": 8813, "server_epoch": 6032428321756423947, "tab_generation": 3,
+ "snapshot_cols": 100, "snapshot_rows": 30}
 ```
 
 Rejected — then the connection closes, and **nothing binary is ever
@@ -2853,9 +2883,14 @@ the bytes after it are frames:
 
 | Code | Meaning |
 |---|---|
-| `protocol-mismatch` | wrong `protocol_version`. Checked **before** the token: the two ends disagree about what a token even is, and `invalid-token` would send the client hunting for the wrong bug. |
-| `invalid-token` | unknown, expired, already-used, or minted by a control connection that has since gone away (see [`tab.attach`](#tabattach)). |
-| `not-found` | the tab has no live terminal, or was respawned between `tab.attach` and this handshake. |
+| `protocol-mismatch` | wrong `protocol_version`. Checked **first**, on the raw line: the two ends disagree about what every other term means, and naming one of those would send the client hunting for the wrong bug. |
+| `session-mismatch` | `session_id` is not this session's. |
+| `invalid-token` | ticket form only: unknown, expired, already-used, or minted by a control connection that has since gone away (see [`tab.attach`](#tabattach)). |
+| `not-found` | the tab has no live terminal, or was respawned between the handshake and the fence. |
+| `unsupported-kind` | no `kinds` entry is one this session advertises. |
+| `build-mismatch` | the only servable kind needs the same libghostty on both ends. |
+| `invalid-param` | `attach` is not a tab id, or the grid is zero-sized. |
+| `too-many-attaches` | this session already serves `MAX_DATA_CONNS_PER_SESSION` (32) data connections. One buggy same-UID client can hold all of them; that is accepted under the same-UID boundary this socket already draws. |
 | `snapshot-failed` | the terminal could not be encoded right now. Re-attach is the recovery — it is about this instant, not about the client. For `vt` this also covers a terminal whose VT parser sits mid-sequence with no retained continuation for the whole attach budget: the encode is parked and retried after each further chunk rather than emitting a payload that would desync the client, and the budget is what bounds that wait. |
 | `shutting-down` | `session.stop` has latched. |
 | `parse-error` | the handshake line did not decode. |
@@ -2866,24 +2901,21 @@ client has everything up to and including it, and the first `PTY` frame
 carries `seq + 1`. In snapshot mode the fence is the snapshot's own
 encode point; in resume mode it is `resume_from_seq - 1`.
 
-`kind` is the kind [`tab.attach`](#tabattach) actually negotiated,
-carried here on the token rather than assumed — **this reply is the
-authoritative one**, and it is what a client selects its decoder from.
-The control-plane `TabAttachResult.kind` must agree; a client that sees
-them disagree treats it as `protocol-error` and re-attaches rather than
-guessing which to believe.
+`kind` is the kind the handshake settled on out of the `kinds` the
+client offered — **this reply is the authoritative one**, and it is
+what a client selects its decoder from.
 
 `snapshot_cols` and `snapshot_rows` name **the size the bytes that
 follow were written for** — the snapshot's own encode geometry in
 `"snapshot"` mode, the tab's grid at the handoff in `"resume"` mode —
-and are present on every accepted reply, `focus: true` included, because
-a focused attach resizes the tab from the control connection and any
-other client may resize it again before the encode or the handoff runs.
-A `vt` client builds its terminal at that size before replaying, then
-resizes it to its own; a resuming client replays the ring into the
-terminal it kept, and the geometry it was away for may not be the one it
-left. See [`tab.attach`](#tabattach). Absent only from a reply a session
-predating `open_input` writes.
+and are present on **every** accepted reply, `focus: true` included,
+because raw input is open and any other client may resize the tab
+between this connection's own resize and the encode. A `vt` client
+builds its terminal at that size before replaying, then resizes it to
+its own; a resuming client replays the ring into the terminal it kept,
+and the geometry it was away for may not be the one it left. An
+accepted reply that states no geometry is a truncated reply, and a
+client refuses it.
 
 #### Preamble and frames
 

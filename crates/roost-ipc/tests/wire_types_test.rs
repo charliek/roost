@@ -18,15 +18,15 @@ use std::path::PathBuf;
 
 use roost_ipc::messages::{
     ops, AgentHooksOutcome, AgentSetHooksAgents, AgentSetHooksParams, AgentSetHooksResult,
-    AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode, AttachPayloadKind,
-    ClipboardEffectTarget, ClipboardWriteParams, DurabilityChangedEvent, EventBatch, EventEnvelope,
-    EventsSubscribeParams, EventsSubscribeResult, IdentifyResult, NotificationFiredEvent,
-    ProjectReorderParams, ResponseError, RetrySchedule, SentFile, SessionBinaryIdentity,
-    SessionIdentify, SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult,
-    SessionSetAgentHooksParams, SessionSetThemeParams, SessionSetThemeResult, SessionStopParams,
-    SessionStopResult, SessionStoppingEvent, SkippedFile, TabAttachParams, TabAttachResult,
-    TabClearNotificationParams, TabClearNotificationResult, TabDumpCursor, TabDumpParams,
-    TabDumpResult, TabEffect, TabEffectEvent, TabReorderParams, TabSendFileParams,
+    AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachHandshakeTerms, AttachMode,
+    AttachPayloadKind, ClipboardEffectTarget, ClipboardWriteParams, DurabilityChangedEvent,
+    EventBatch, EventEnvelope, EventsSubscribeParams, EventsSubscribeResult, IdentifyResult,
+    NotificationFiredEvent, ProjectReorderParams, ResponseError, RetrySchedule, SentFile,
+    SessionBinaryIdentity, SessionIdentify, SessionIdentifyParams, SessionPutFileParams,
+    SessionPutFileResult, SessionSetAgentHooksParams, SessionSetThemeParams, SessionSetThemeResult,
+    SessionStopParams, SessionStopResult, SessionStoppingEvent, SkippedFile, TabAttachParams,
+    TabAttachResult, TabClearNotificationParams, TabClearNotificationResult, TabDumpCursor,
+    TabDumpParams, TabDumpResult, TabEffect, TabEffectEvent, TabReorderParams, TabSendFileParams,
     TabSendFileResult, TabWriteParams, WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES,
     SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
 };
@@ -611,19 +611,138 @@ fn attach_handshake_matches_its_golden_json() {
     round_trip(&fresh);
     assert_eq!(serde_json::to_string(&fresh).unwrap(), SNAPSHOT);
 
-    let resuming = AttachHandshake {
-        attach: TOKEN.into(),
-        protocol_version: SESSION_PROTOCOL_VERSION,
-        resume_from_seq: Some(901),
-        server_epoch: Some(EPOCH),
-        tab_generation: Some(3),
-    };
+    let resuming = AttachHandshake::resume(TOKEN, 901, EPOCH, 3);
     round_trip(&resuming);
     assert_eq!(serde_json::to_string(&resuming).unwrap(), RESUME);
     assert_eq!(
         serde_json::from_str::<AttachHandshake>(RESUME).unwrap(),
         resuming
     );
+}
+
+/// The inline form: `attach` names the tab as `string_int64` and the
+/// terms that used to ride the ticket ride the line instead. `kinds` is
+/// the discriminator, so this and the ticket form above are the two
+/// shapes the server tells apart.
+#[test]
+fn an_inline_attach_handshake_matches_its_golden_json() {
+    const SNAPSHOT: &str = concat!(
+        r#"{"attach":"7","protocol_version":6,"#,
+        r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","kinds":["ghostty-snapshot","vt"],"#,
+        r#""cols":100,"rows":30,"cell_w_px":8,"cell_h_px":16,"#,
+        r#""libghostty_build":"ghostty-1a2b3c4d5e6f7a8b+snapshot.v1","focus":true}"#,
+    );
+    const RESUME: &str = concat!(
+        r#"{"attach":"7","protocol_version":6,"#,
+        r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","kinds":["ghostty-snapshot","vt"],"#,
+        r#""cols":100,"rows":30,"cell_w_px":8,"cell_h_px":16,"#,
+        r#""libghostty_build":"ghostty-1a2b3c4d5e6f7a8b+snapshot.v1","focus":true,"#,
+        r#""resume_from_seq":901,"server_epoch":6032428321756423947,"tab_generation":3}"#,
+    );
+
+    let fresh = AttachHandshake::inline_snapshot(7, sample_handshake_terms());
+    round_trip(&fresh);
+    assert_eq!(serde_json::to_string(&fresh).unwrap(), SNAPSHOT);
+    assert_eq!(
+        serde_json::from_str::<AttachHandshake>(SNAPSHOT).unwrap(),
+        fresh
+    );
+
+    let resuming = AttachHandshake::inline_resume(7, sample_handshake_terms(), 901, EPOCH, 3);
+    round_trip(&resuming);
+    assert_eq!(serde_json::to_string(&resuming).unwrap(), RESUME);
+    assert_eq!(
+        serde_json::from_str::<AttachHandshake>(RESUME).unwrap(),
+        resuming
+    );
+}
+
+fn sample_handshake_terms() -> AttachHandshakeTerms {
+    AttachHandshakeTerms {
+        session_id: "01K3S8TQ4F0Q9YB2K6WZ5D7XN".into(),
+        kinds: vec![
+            AttachPayloadKind::GHOSTTY_SNAPSHOT.into(),
+            AttachPayloadKind::VT.into(),
+        ],
+        cols: 100,
+        rows: 30,
+        cell_w_px: 8,
+        cell_h_px: 16,
+        libghostty_build: "ghostty-1a2b3c4d5e6f7a8b+snapshot.v1".into(),
+        focus: true,
+    }
+}
+
+/// The discriminator is the presence of `kinds`, never whether `attach`
+/// parses as a number: a token is hex and could be all digits by
+/// accident, and a tab id read as a token would be refused as a
+/// credential nobody minted.
+#[test]
+fn the_presence_of_kinds_is_what_makes_a_handshake_inline() {
+    let all_digits: AttachHandshake =
+        serde_json::from_str(r#"{"attach":"12345","protocol_version":6}"#).unwrap();
+    assert!(
+        all_digits.terms.is_none(),
+        "an all-digit token stays the ticket form"
+    );
+
+    let inline: AttachHandshake = serde_json::from_str(concat!(
+        r#"{"attach":"7","protocol_version":6,"session_id":"s","kinds":["vt"],"#,
+        r#""cols":80,"rows":24,"libghostty_build":"b","focus":false}"#,
+    ))
+    .unwrap();
+    assert_eq!(
+        inline.terms.map(|t| t.kinds),
+        Some(vec![AttachPayloadKind::VT.into()])
+    );
+}
+
+/// An inline handshake is all-or-nothing, and the decode error names
+/// the term that is missing — a client that forgot one must not be left
+/// reading "invalid JSON".
+#[test]
+fn an_inline_handshake_missing_a_required_term_names_it() {
+    let error = serde_json::from_str::<AttachHandshake>(concat!(
+        r#"{"attach":"7","protocol_version":6,"kinds":["vt"],"#,
+        r#""cols":80,"rows":24,"libghostty_build":"b","focus":false}"#,
+    ))
+    .expect_err("session_id is required on the inline form");
+    assert!(
+        error.to_string().contains("session_id"),
+        "the error names the missing term: {error}"
+    );
+
+    for missing in ["cols", "rows", "libghostty_build", "focus"] {
+        let mut line = serde_json::json!({
+            "attach": "7",
+            "protocol_version": 6,
+            "session_id": "s",
+            "kinds": ["vt"],
+            "cols": 80,
+            "rows": 24,
+            "libghostty_build": "b",
+            "focus": false,
+        });
+        line.as_object_mut().unwrap().remove(missing);
+        let error = serde_json::from_value::<AttachHandshake>(line)
+            .expect_err("every inline term but the cell metrics is required");
+        assert!(
+            error.to_string().contains(missing),
+            "the error names {missing}: {error}"
+        );
+    }
+}
+
+/// The two terms a headless client genuinely has nothing to say about.
+#[test]
+fn an_inline_handshake_may_omit_its_cell_metrics() {
+    let decoded: AttachHandshake = serde_json::from_str(concat!(
+        r#"{"attach":"7","protocol_version":6,"session_id":"s","kinds":["vt"],"#,
+        r#""cols":80,"rows":24,"libghostty_build":"b","focus":true}"#,
+    ))
+    .expect("a headless client reports no cell metrics");
+    let terms = decoded.terms.expect("the inline form");
+    assert_eq!((terms.cell_w_px, terms.cell_h_px), (0, 0));
 }
 
 /// The handshake is the one line a client of a *newer* build might send
@@ -645,7 +764,8 @@ fn attach_handshake_tolerates_unknown_fields() {
 fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
     const ACCEPTED: &str = concat!(
         r#"{"ok":true,"kind":"ghostty-snapshot","mode":"snapshot","seq":900,"#,
-        r#""server_epoch":6032428321756423947,"tab_generation":3}"#,
+        r#""server_epoch":6032428321756423947,"tab_generation":3,"#,
+        r#""snapshot_cols":100,"snapshot_rows":30}"#,
     );
     const REJECTED: &str =
         r#"{"ok":false,"error":{"code":"invalid-token","message":"unknown or expired token"}}"#;
@@ -656,8 +776,8 @@ fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
         seq: 900,
         server_epoch: EPOCH,
         tab_generation: 3,
-        snapshot_cols: None,
-        snapshot_rows: None,
+        snapshot_cols: 100,
+        snapshot_rows: 30,
     });
     round_trip(&accepted);
     assert_eq!(serde_json::to_string(&accepted).unwrap(), ACCEPTED);
@@ -682,13 +802,11 @@ fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
     );
 }
 
-/// The snapshot geometry rides the accepted arm only when the server
-/// has something to report — an unfocused attach, whose payload is at
-/// the tab's size and not the client's. Both directions are additive:
-/// an old client ignores the keys, and a new client decoding a reply
-/// that has none reads `None`.
+/// The snapshot geometry rides **every** accepted arm: under protocol
+/// equality there is no session that leaves it out, so a reply without
+/// it is a truncated reply and not an older peer.
 #[test]
-fn an_accepted_handshake_reply_round_trips_with_and_without_the_snapshot_geometry() {
+fn an_accepted_handshake_reply_without_the_snapshot_geometry_is_refused() {
     const WITH: &str = concat!(
         r#"{"ok":true,"kind":"vt","mode":"snapshot","seq":900,"#,
         r#""server_epoch":6032428321756423947,"tab_generation":3,"#,
@@ -701,8 +819,8 @@ fn an_accepted_handshake_reply_round_trips_with_and_without_the_snapshot_geometr
         seq: 900,
         server_epoch: EPOCH,
         tab_generation: 3,
-        snapshot_cols: Some(100),
-        snapshot_rows: Some(30),
+        snapshot_cols: 100,
+        snapshot_rows: 30,
     });
     round_trip(&sized);
     assert_eq!(serde_json::to_string(&sized).unwrap(), WITH);
@@ -711,16 +829,15 @@ fn an_accepted_handshake_reply_round_trips_with_and_without_the_snapshot_geometr
         sized
     );
 
-    let AttachHandshakeReply::Accepted(bare) =
-        serde_json::from_str::<AttachHandshakeReply>(concat!(
-            r#"{"ok":true,"kind":"vt","mode":"snapshot","seq":900,"#,
-            r#""server_epoch":6032428321756423947,"tab_generation":3}"#,
-        ))
-        .expect("a reply from a session that never heard of the keys")
-    else {
-        panic!("the accepted arm");
-    };
-    assert_eq!((bare.snapshot_cols, bare.snapshot_rows), (None, None));
+    let error = serde_json::from_str::<AttachHandshakeReply>(concat!(
+        r#"{"ok":true,"kind":"vt","mode":"snapshot","seq":900,"#,
+        r#""server_epoch":6032428321756423947,"tab_generation":3}"#,
+    ))
+    .expect_err("an accepted reply that states no geometry is truncated");
+    assert!(
+        error.to_string().contains("snapshot_cols"),
+        "the error names the missing field: {error}"
+    );
 }
 
 /// `ok` is the discriminant, so an accepted arm missing a field it

@@ -74,16 +74,18 @@ use roost_ipc::dataframe::{
 use roost_ipc::framing::write_frame;
 use roost_ipc::messages::{
     AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode, AttachPayloadKind,
-    ResponseError, SESSION_PROTOCOL_VERSION,
+    ResponseError,
 };
-use roost_ipc::{CloseReason, ConnCloseWatch, ConnCtx, DataConn, CLOSE_LABEL_DEADLINE};
+use roost_ipc::{
+    CloseReason, ConnCloseWatch, ConnCtx, DataConn, HandlerError, CLOSE_LABEL_DEADLINE,
+};
 use tokio::io::AsyncWriteExt;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, warn};
 
-use crate::ipc::{AdmittedAttach, IpcHandler};
+use crate::ipc::{await_attach_resize, tab_gone, AdmittedAttach, IpcHandler};
 use crate::pty::{Geometry, PtyOutputEvent};
 use crate::tab_task::{SnapshotAt, TabCmd, TabError};
 
@@ -159,24 +161,10 @@ pub(crate) async fn serve_attach(
         return;
     }
 
-    // Before the token is even looked at: a version mismatch means the
-    // two ends disagree about what a token *is*, and answering
-    // `invalid-token` would send the client hunting for the wrong bug.
-    if handshake.protocol_version != SESSION_PROTOCOL_VERSION {
-        reject(
-            &mut writer,
-            "protocol-mismatch",
-            &format!(
-                "this session speaks session protocol {SESSION_PROTOCOL_VERSION}; \
-                 the client offered {}",
-                handshake.protocol_version
-            ),
-        )
-        .await;
-        return;
-    }
-
-    let admitted = match h.admit_attach(&handshake.attach, ctx) {
+    // The generation check already ran on the raw line, in the IPC
+    // server, so nothing here can be reached by a client that disagrees
+    // about what these fields mean.
+    let admitted = match h.admit_attach(&handshake, ctx) {
         Ok(admitted) => admitted,
         Err(error) => {
             // The token is never echoed: it is a bearer credential, and
@@ -211,6 +199,19 @@ async fn attach_tab(
     // the encode queues behind `MAX_CONCURRENT_SNAPSHOTS` and is exactly
     // the part of an attach the time budget exists to bound.
     let started = Instant::now();
+
+    // A focused attach is a geometry-bearing interaction, so the tab
+    // takes this client's size before anything is encoded from it. It
+    // runs here, on the forwarder's own task and under no session-state
+    // lock, because a tab parked behind `MAX_CONCURRENT_SNAPSHOTS` must
+    // not stall every other session op. Detach never resizes back
+    // (roadmap D7).
+    if admitted.resize_first {
+        if let Err(error) = resize_for_attach(h, admitted).await {
+            reject(&mut writer, &error.code, &error.message).await;
+            return;
+        }
+    }
     // Resume first, and only ever as an optimization: everything it
     // cannot honor comes back `None` and is served as a full attach
     // under the same reply (D6).
@@ -254,24 +255,23 @@ async fn attach_tab(
 
     // Reported on every accepted reply, snapshot or resume, focused or
     // not. A focused attach did resize the tab to its own geometry — but
-    // on the *control* connection, before this one was dialed, and a
-    // `vt` encode can defer and retry inside the attach budget. Any
-    // other client's geometry-bearing INPUT landing in that window
-    // resizes the tab again, and this is the only place that says what
-    // the bytes to follow were actually written for. Sending it costs a
-    // client that already agrees nothing: it hydrates at a size it is
-    // already at.
+    // raw input is open and a `vt` encode can defer and retry inside the
+    // attach budget, so any other client's geometry-bearing INPUT
+    // landing in that window resizes the tab again, and this is the only
+    // place that says what the bytes to follow were actually written
+    // for. Sending it costs a client that already agrees nothing: it
+    // hydrates at a size it is already at.
     let accepted = AttachHandshakeReply::Accepted(AttachAccepted {
-        // What `tab.attach` negotiated, carried here on the ticket: the
-        // data connection presents only a token, and a client that
-        // decoded the reply is entitled to hear the same answer twice.
+        // Restated rather than assumed: an inline handshake stated a
+        // preference order and a ticket stated nothing at all, so the
+        // reply is the one place either client hears what it got.
         kind: kind.clone(),
         mode,
         seq: fence,
         server_epoch,
         tab_generation: live_generation,
-        snapshot_cols: Some(reported_size.0),
-        snapshot_rows: Some(reported_size.1),
+        snapshot_cols: reported_size.0,
+        snapshot_rows: reported_size.1,
     });
     let Ok(body) = serde_json::to_vec(&accepted) else {
         return;
@@ -302,6 +302,17 @@ async fn attach_tab(
     .run(reader)
     .await;
     debug!(tab_id, ?mode, ?ending, "attach data connection ended");
+}
+
+/// Step 10: give the tab this connection's geometry and wait for both
+/// halves to take it. `Err` carries the rejection the client is owed.
+async fn resize_for_attach(h: &IpcHandler, admitted: &AdmittedAttach) -> Result<(), HandlerError> {
+    let tab_id = admitted.tab_id;
+    let commands = h
+        .supervisor
+        .tab_commands(tab_id)
+        .ok_or_else(|| tab_gone(tab_id))?;
+    await_attach_resize(&commands, tab_id, admitted.terms.geometry).await
 }
 
 /// A tab pinned for one attach: the live tee, the fence every byte that

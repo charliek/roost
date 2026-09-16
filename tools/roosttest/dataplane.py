@@ -461,12 +461,11 @@ class Reply:
     seq: int = 0
     server_epoch: int = 0
     tab_generation: int = 0
-    #: The geometry the bytes that follow were written for, when the
-    #: server said — every accepted reply, either mode, focused or not:
-    #: a focused attach resizes from the control connection, and anything
-    #: else may resize the tab again before the encode or the resume
-    #: handoff runs. `None` only from a session predating `open_input`,
-    #: so an absent pair is an answer rather than a missing field.
+    #: The geometry the bytes that follow were written for. On every
+    #: accepted reply, either mode, focused or not: raw input is open,
+    #: so anything may resize the tab between the handshake's own resize
+    #: and the encode, and this is the only statement of what the bytes
+    #: say.
     snapshot_cols: int | None = None
     snapshot_rows: int | None = None
     code: str = ""
@@ -489,7 +488,8 @@ class Ending:
 class DataPlane:
     """One attach data connection.
 
-    Open it, [`handshake`] with a ticket `tab.attach` handed out, then
+    Open it, [`attach`] with the tab and the session's identity (or
+    [`handshake`] with a ticket, while that form is still served), then
     read frames. Contiguity, the payload accounting, and the
     terminal-frame bookkeeping all happen as frames arrive, so a test
     asserts on the *conclusion* rather than re-deriving it.
@@ -571,7 +571,70 @@ class DataPlane:
         tab_generation: int | None = None,
         timeout: float = 30.0,
     ) -> Reply:
-        """Send the handshake line and read the answer.
+        """The transitional ticket form: `attach` is the token
+        `tab.attach` minted, and nothing else is negotiated here.
+
+        See [`attach`] for the inline form, which is what a client
+        sends.
+        """
+        request: dict = {"attach": token, "protocol_version": protocol_version}
+        if resume_from_seq is not None:
+            request["resume_from_seq"] = resume_from_seq
+        if server_epoch is not None:
+            request["server_epoch"] = server_epoch
+        if tab_generation is not None:
+            request["tab_generation"] = tab_generation
+        return self.send_handshake(request, timeout=timeout)
+
+    def attach(
+        self,
+        tab_id: int,
+        session_id: str,
+        libghostty_build: str,
+        *,
+        kinds: list[str] | None = None,
+        cols: int = 80,
+        rows: int = 24,
+        cell_w_px: int = 0,
+        cell_h_px: int = 0,
+        focus: bool = True,
+        protocol_version: int = SESSION_PROTOCOL_VERSION,
+        resume_from_seq: int | None = None,
+        server_epoch: int | None = None,
+        tab_generation: int | None = None,
+        timeout: float = 30.0,
+    ) -> Reply:
+        """The inline form: one connection, no ticket.
+
+        `attach` names the tab as a `string_int64` and the terms
+        `tab.attach` used to settle ride the line. `session_id` is the
+        value `session.identify` reported and is required — it is what
+        stops a dial prepared for one session from landing on a
+        replacement listening at the same socket path. The presence of
+        `kinds` is what makes this the inline form.
+        """
+        request: dict = {
+            "attach": str(tab_id),
+            "protocol_version": protocol_version,
+            "session_id": session_id,
+            "kinds": kinds if kinds is not None else [self.kind],
+            "cols": cols,
+            "rows": rows,
+            "cell_w_px": cell_w_px,
+            "cell_h_px": cell_h_px,
+            "libghostty_build": libghostty_build,
+            "focus": focus,
+        }
+        if resume_from_seq is not None:
+            request["resume_from_seq"] = resume_from_seq
+        if server_epoch is not None:
+            request["server_epoch"] = server_epoch
+        if tab_generation is not None:
+            request["tab_generation"] = tab_generation
+        return self.send_handshake(request, timeout=timeout)
+
+    def send_handshake(self, request: dict, *, timeout: float = 30.0) -> Reply:
+        """Send a handshake line verbatim and read the answer.
 
         Returns the [`Reply`] rather than raising on refusal: which code
         came back *is* the assertion in most of the rejection cases, and
@@ -587,14 +650,11 @@ class DataPlane:
         connection's own handshake is the authoritative statement of
         what was negotiated (plan 053 §3.3), so a client that guessed
         would be reading a format nobody promised it.
+
+        Takes the request as a dict so a test can hand-build a line that
+        no constructor would produce — a malformed term, a missing one,
+        a wrong generation.
         """
-        request: dict = {"attach": token, "protocol_version": protocol_version}
-        if resume_from_seq is not None:
-            request["resume_from_seq"] = resume_from_seq
-        if server_epoch is not None:
-            request["server_epoch"] = server_epoch
-        if tab_generation is not None:
-            request["tab_generation"] = tab_generation
         self._sock.sendall((json.dumps(request) + "\n").encode())
 
         deadline = time.monotonic() + scaled_timeout(timeout)
