@@ -4,12 +4,15 @@
 //! # Why this never dials the UI socket
 //!
 //! Every other `roostctl` subcommand resolves a *UI* target and dials
-//! it. A session is not a UI and is deliberately not reachable by
-//! `--target` / `ROOST_BUNDLE_PROFILE` / auto-detect (the HS-0 fences in
-//! `roost_ipc::target` pin that). These three verbs address the session
-//! profile's socket directly, and `start` must work when nothing is
-//! listening at all — so like `doctor` and `claude-hook` they are served
-//! before `main.rs` ever builds its `UiSocket`.
+//! it. These three verbs are the pre-connect exception: they address
+//! the session profile's socket directly and ignore `--target` /
+//! `ROOST_BUNDLE_PROFILE` / auto-detect entirely, because `start` must
+//! work when nothing is listening at all — so like `doctor` and
+//! `claude-hook` they are served before `main.rs` ever builds its
+//! `UiSocket`. A *generic* op can reach a session too, but only
+//! explicitly — `--target session` or `--socket` (#475, HS-1 in
+//! `roost_ipc::target`); `ROOST_BUNDLE_PROFILE=session` and
+//! auto-detect stay refused (the HS-0 fence in `roost_ipc::target`).
 //!
 //! # Why `start` confirms rather than trusting the verdict
 //!

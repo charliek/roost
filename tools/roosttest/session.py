@@ -1,11 +1,13 @@
 """Spawn, isolate, and drive a headless `roost-session` daemon.
 
 The UI harness (`ui.py`) is deliberately not involved. A host session is
-not a UI: it has no window, it is never a `roostctl --target`, and it
-owns its own bundle profile (`BundleProfileKind::Session`). So this
-module is a parallel, much smaller launcher — it builds the daemon's
-*environment*, spawns the binary, and reads the one readiness line the
-launch contract promises (`roost_ipc::session_launch`).
+not a UI: it has no window, it is reachable through `roostctl` only
+explicitly (`--target session` or `--socket` — #475, never auto-detect
+or `ROOST_BUNDLE_PROFILE`), and it owns its own bundle profile
+(`BundleProfileKind::Session`). So this module is a parallel, much
+smaller launcher — it builds the daemon's *environment*, spawns the
+binary, and reads the one readiness line the launch contract promises
+(`roost_ipc::session_launch`).
 
 # Isolation
 

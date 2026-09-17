@@ -45,14 +45,17 @@
 //! Target selection (which UI socket to dial):
 //!   --socket PATH           (highest precedence)
 //!   ROOST_SOCKET env var
-//!   --target {mac,linux,iced} (resolves to that profile's canonical socket)
-//!   ROOST_BUNDLE_PROFILE    (same effect as --target)
-//!   auto-detect             (probes all distinct paths; fails on ambiguity)
+//!   --target {mac,linux,iced,session} (resolves to that profile's canonical socket)
+//!   ROOST_BUNDLE_PROFILE    (same effect as --target, `mac`/`linux`/`iced` only)
+//!   auto-detect             (probes all distinct UI paths; fails on ambiguity)
 //!
-//! See `crates/roost-ipc/src/target.rs` for resolution logic. The
-//! headless session is **not** a target on that ladder: `session …`
-//! addresses its socket directly (see [`session`]), and a generic op
-//! reaches a session only through an explicit `--socket`.
+//! See `crates/roost-ipc/src/target.rs` for resolution logic. `session`
+//! is explicit-only (#475): it never rides `ROOST_BUNDLE_PROFILE` and
+//! auto-detect never probes its socket. `session start|stop|status`
+//! (see [`session`]) still bypass this ladder entirely and address the
+//! session profile's socket directly, since `start` must work when
+//! nothing is listening yet. Any other op reaches a session either via
+//! `--target session` or an explicit `--socket`.
 
 mod agent_install;
 mod doctor;
@@ -164,7 +167,11 @@ struct Args {
     /// Which Roost UI to talk to when auto-detect would otherwise
     /// be ambiguous. `--socket` and `ROOST_SOCKET` both win over
     /// this; passing `--target` short-circuits the auto-detect
-    /// probe so the call is also faster when you know.
+    /// probe so the call is also faster when you know. `session`
+    /// addresses a headless `roost-session` daemon and is explicit
+    /// only: auto-detect never probes it and `ROOST_BUNDLE_PROFILE`
+    /// does not accept it — only `--target session` (or `--socket`
+    /// pointed at its path) reaches one (#475).
     #[arg(long, value_enum)]
     target: Option<TargetArg>,
 
@@ -183,6 +190,11 @@ enum TargetArg {
     Mac,
     Linux,
     Iced,
+    /// The headless `roost-session` daemon (#475). Explicit only —
+    /// unlike the other three, this value has no `ROOST_BUNDLE_PROFILE`
+    /// equivalent and is never a candidate for auto-detect; naming it
+    /// here is the only way in besides `--socket`.
+    Session,
 }
 
 impl From<TargetArg> for BundleProfileKind {
@@ -191,6 +203,7 @@ impl From<TargetArg> for BundleProfileKind {
             TargetArg::Mac => BundleProfileKind::Mac,
             TargetArg::Linux => BundleProfileKind::Linux,
             TargetArg::Iced => BundleProfileKind::Iced,
+            TargetArg::Session => BundleProfileKind::Session,
         }
     }
 }
@@ -894,10 +907,11 @@ async fn run(args: Args, tab_env: Option<&str>, cwd_env: Option<&str>) -> Result
         // An agent reads the skill to learn how to find a Roost, so it
         // must print with none running.
         Cmd::Skill => write_skill(&mut std::io::stdout().lock(), json),
-        // `session` addresses the session profile's own socket, which no
-        // target selector resolves (and must not — see
-        // `roost_ipc::target`'s HS-0 fences). `start` also has to work
-        // with nothing listening at all.
+        // `session start|stop|status` address the session profile's own
+        // socket directly and never go through `selector` (unlike a
+        // generic op, which can now also reach a session via
+        // `--target session` — #475). `start` has to work with nothing
+        // listening at all, which a target-selector dial cannot promise.
         Cmd::Session(cmd) => session::run(&cmd, json).await,
         // doctor exists to report "no UI is running", so it must not
         // dial through [`UiSocket`], which fails on exactly that
@@ -2685,22 +2699,39 @@ mod tests {
             BundleProfileKind::from(TargetArg::Iced),
             BundleProfileKind::Iced
         ));
+        assert!(matches!(
+            BundleProfileKind::from(TargetArg::Session),
+            BundleProfileKind::Session
+        ));
     }
 
-    /// HS-0 fence: `BundleProfileKind::Session` exists, but `roostctl`
-    /// cannot be pointed at a session. HS-1 defines session targeting;
-    /// until then `--target session` must be rejected outright.
+    /// `--target session` (#475): explicit-only targeting of the
+    /// headless `roost-session` daemon. Unlike the other three values,
+    /// `session` has no `ROOST_BUNDLE_PROFILE` equivalent (pinned by
+    /// `roost_ipc::target`'s HS-0 fence,
+    /// `session_is_not_a_roostctl_target`, which stays unchanged) and is
+    /// never an auto-detect candidate — naming it here is the only way
+    /// in besides `--socket`.
     #[test]
-    fn session_is_not_a_target_flag_value() {
+    fn session_is_an_explicit_target_flag_value() {
         use clap::ValueEnum;
-        assert!(TargetArg::from_str("session", true).is_err());
+        assert!(TargetArg::from_str("session", true).is_ok());
         assert_eq!(
             TargetArg::value_variants()
                 .iter()
                 .filter_map(|v| v.to_possible_value().map(|p| p.get_name().to_string()))
                 .collect::<Vec<_>>(),
-            vec!["mac", "linux", "iced"]
+            vec!["mac", "linux", "iced", "session"]
         );
+    }
+
+    /// `roostctl --target session tab list` parses: clap accepts
+    /// `session` ahead of any subcommand, same as `mac`/`linux`/`iced`.
+    #[test]
+    fn target_session_flag_parses_ahead_of_a_subcommand() {
+        let args = Args::try_parse_from(["roostctl", "--target", "session", "tab", "list"])
+            .expect("--target session parses");
+        assert!(matches!(args.target, Some(TargetArg::Session)));
     }
 
     /// The two hook verbs, as the installed configs spell them.

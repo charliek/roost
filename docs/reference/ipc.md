@@ -18,8 +18,8 @@ The socket path is the bundle profile's `socket_path` (see
 * Iced dev build on Linux (XDG):    `$XDG_RUNTIME_DIR/roost-iced/roost.sock`
 * Linux fallback:             `/tmp/roost[-iced]-<uid>/roost.sock`
 
-`roostctl --target mac|linux|iced` selects a profile explicitly. Without an
-explicit selector, `roostctl` probes every distinct profile socket; if more
+`roostctl --target mac|linux|iced` selects a UI profile explicitly. Without an
+explicit selector, `roostctl` probes every distinct UI profile socket; if more
 than one is live, it reports the actual candidates and requires selection.
 (The `linux` profile also resolves on macOS, as `~/Library/Caches/Roost-linux/`,
 but nothing ships or launches it there.)
@@ -28,14 +28,21 @@ A fifth socket path, `Session` (`~/Library/Caches/RoostSession/roost.sock`
 on macOS, `$XDG_RUNTIME_DIR/roost-session/roost.sock` on Linux), is served
 by the headless `roost-session` daemon (HS-1a, plan 035) — see
 [Session sockets](#session-sockets) and [`paths.md`](paths.md#session-profile).
-It is **not** a `roostctl --target` value and `roostctl` never auto-probes
-it: `roostctl session start|stop|status` address the session profile's
-socket directly (a pre-connect carve-out, since `start` must work when
-nothing is listening yet), and any other op reaches a session only
-through an explicit `--socket`. A UI socket answers `unknown-op` for
-every `session.*` op. It serves `events.subscribe` only while it runs
-its tabs in-process, and only live — see
-[On a UI socket](#on-a-ui-socket).
+A session is reachable only **explicitly**: `roostctl --target session` (or
+`--socket` pointed at its path) — never by auto-detect, and never by
+`ROOST_BUNDLE_PROFILE`, which still refuses `session` like any other
+unrecognized value (#475). `roostctl session start|stop|status` keep their
+own carve-out ahead of that ladder: they address the session profile's
+socket directly, since `start` must work when nothing is listening yet.
+An op a session does not serve fails with the server's own error for that
+op, not a session-specific one: `unknown-op` for `host.*` and
+`agent.set_hooks` (client-side UI state a session doesn't keep), `internal:
+no UI attached` for `app.*` window/UI ops. [`identify`](#identify) (on a UI
+socket) and [`session.identify`](#sessionidentify) (on a session) each list
+what that socket serves right now in `ops`. A UI socket, symmetrically,
+answers `unknown-op` for every `session.*` op, and serves
+`events.subscribe` only while it runs its tabs in-process, and only live —
+see [On a UI socket](#on-a-ui-socket).
 
 The Swift Mac app (`Roost.app`) does not do three things this page
 describes for agent tooling: it answers `unknown-op` to
@@ -2598,10 +2605,13 @@ session.
 
 `roostctl session start|stop|status` address this socket directly; they
 are a pre-connect carve-out (`session start` has to work when nothing is
-listening at all) and are deliberately **not** reachable through
+listening at all) and stay deliberately **not** reachable through
 `--target` / `ROOST_BUNDLE_PROFILE` / auto-detect. Any other op reaches a
-session only via an explicit `--socket <path>`. See [`cli.md`](cli.md)
-for the verb-level contract (exit codes, `ROOST_SESSION_BIN`).
+session explicitly — `roostctl --target session` or `--socket <path>`
+(#475) — never through `ROOST_BUNDLE_PROFILE` (`session` is refused
+there like any other unrecognized value) or auto-detect (a session is
+never a candidate). See [`cli.md`](cli.md) for the verb-level contract
+(exit codes, `ROOST_SESSION_BIN`).
 
 A session's default tab size is `120x40` (`DEFAULT_TAB_COLS` /
 `DEFAULT_TAB_ROWS`) for both restored and freshly-opened tabs, since

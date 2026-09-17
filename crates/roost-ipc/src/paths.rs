@@ -64,10 +64,12 @@ pub enum BundleProfileKind {
     /// including on Linux.
     Iced,
     /// The headless `roost-session` daemon. App id:
-    /// `ai.stridelabs.Roost.session`. Not a UI and never a `roostctl`
-    /// target — HS-1 defines how sessions get addressed. Its directory
-    /// names carry a `-dev`/`Dev` suffix in debug builds so a dev
-    /// session can never collide with a real one.
+    /// `ai.stridelabs.Roost.session`. Not a UI, and reachable through
+    /// `roostctl`'s target ladder only explicitly — `--target session`
+    /// or `--socket` (#475); it has no `ROOST_BUNDLE_PROFILE` spelling
+    /// and auto-detect never probes it. Its directory names carry a
+    /// `-dev`/`Dev` suffix in debug builds so a dev session can never
+    /// collide with a real one.
     Session,
 }
 

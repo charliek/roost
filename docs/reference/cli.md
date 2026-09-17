@@ -15,7 +15,7 @@ Crate: `crates/roost-cli` (binary `roostctl`).
 ## Usage
 
 ```text
-roostctl [--socket <PATH>] [--target <mac|linux|iced>] [--json] <COMMAND>
+roostctl [--socket <PATH>] [--target <mac|linux|iced|session>] [--json] <COMMAND>
 ```
 
 | Command | Purpose |
@@ -43,9 +43,16 @@ roostctl [--socket <PATH>] [--target <mac|linux|iced>] [--json] <COMMAND>
 
 `--socket` overrides `ROOST_SOCKET`; one of the two must resolve to the running UI's socket. A
 session is not a UI: `session start|stop|status` address the session profile's own socket
-directly and ignore `--target` / `--socket` / `ROOST_BUNDLE_PROFILE` entirely — any other op
-reaches a running session only via an explicit `--socket <path>` (see
-[`session` subcommands](#session-subcommands)).
+directly and ignore `--target` / `--socket` / `ROOST_BUNDLE_PROFILE` entirely (see
+[`session` subcommands](#session-subcommands)). Any other op reaches a running session only
+explicitly — `--target session` or `--socket <path>` (#475) — never by `ROOST_BUNDLE_PROFILE`
+(`session` is refused there like any other unrecognized value) or auto-detect (a session is
+never a candidate). An op the session does not serve fails with the server's own error for
+that op — `unknown-op` for `host.*` and `agent.set_hooks`, `internal: no UI attached` for
+`app.*` window/UI ops — not a session-specific one; see
+[`ipc.md`](ipc.md#session-sockets) for the wire-level contract and
+[`identify`](ipc.md#identify) / [`session.identify`](ipc.md#sessionidentify) for what each
+socket serves.
 
 ### JSON output
 
@@ -231,7 +238,7 @@ roostctl tab dump --tab 5 --scrollback 200   # 200 rows of history, then the vie
 
 These compose: `--after-tab X --focus -- <cmd>` is the "open a command in a tab right here and switch to it" primitive that providers and other scripts use. (`--after-tab`/`--focus` are CLI orchestration over `tab.reorder` / `tab.focus`; `-- <cmd>` fills the `tab.open` op's `argv` — see [ipc.md](ipc.md).)
 
-**`tab send` needs no credential.** A write needs none on a UI socket (`--target mac|linux|iced`) or a **host session's own socket** (reached with `--socket <path>`, e.g. one a `roostctl session start` daemon owns) alike: same-UID access to the socket is the whole boundary, and there is no authority layer above it to present anything to. There is deliberately no `--lease` flag and never was one worth adding back — argv leaks through shell history and `ps`, and there is nothing on this wire a flag like that could still mean.
+**`tab send` needs no credential.** A write needs none on a UI socket (`--target mac|linux|iced`) or a **host session's own socket** (reached with `--target session` or `--socket <path>`, e.g. one a `roostctl session start` daemon owns) alike: same-UID access to the socket is the whole boundary, and there is no authority layer above it to present anything to. There is deliberately no `--lease` flag and never was one worth adding back — argv leaks through shell history and `ps`, and there is nothing on this wire a flag like that could still mean.
 
 `tab dump` reads the tab's live terminal viewport as text — the determinism backbone for tests: assert on exact content instead of matching pixels. Plain output is one line per visible row (trailing blanks trimmed); `--json` adds dimensions and cursor. Backed by the `tab.dump` IPC op — see [ipc.md](ipc.md).
 
@@ -659,8 +666,14 @@ These three verbs are a deliberate carve-out: a session is not a UI, so
 they never go through `--target` / `ROOST_BUNDLE_PROFILE` / auto-detect
 — they resolve the `Session` bundle profile's socket directly, and
 `start` has to work when nothing is listening at all. Any other op
-(`tab.list`, `tab.open`, …) reaches a running session only through an
-explicit `roostctl --socket <path> <op>` pointed at that same socket.
+(`tab.list`, `tab.open`, …) reaches a running session explicitly —
+`roostctl --target session <op>` or `roostctl --socket <path> <op>`
+pointed at that same socket (#475) — never by `ROOST_BUNDLE_PROFILE`
+(`session` is refused there like any other unrecognized value) or
+auto-detect, which never probes it. An op the session does not serve
+answers with the server's own error for that op, not a
+session-specific one: `unknown-op` for `host.*` and `agent.set_hooks`,
+`internal: no UI attached` for `app.*` window/UI ops.
 
 `session start` spawns `roost-session start`, which daemonizes and
 seeds its first project from the calling shell's cwd on a fresh state
@@ -959,7 +972,7 @@ flag.
 | `ROOST_SESSION_BIN` | Overrides where `session start` looks for the `roost-session` binary (default: next to `roostctl`, then `PATH`) |
 | `ROOST_SSH_BIN` | Overrides the `ssh` binary a host's SSH transport execs (default: `ssh` on `PATH`) — read by `host add --verify` against an SSH target and by the UI's own tunnel. See [`paths.md`](paths.md#ssh-scratch-directories). |
 
-`ROOST_SOCKET` / `ROOST_TAB_ID` / `ROOST_AGENT_HOOK` are auto-set by the UI when it spawns a tab's shell. Set them by hand only when invoking the CLI from outside a Roost tab (e.g. a CI runner). The UI side also honors `ROOST_CONFIG` (config path) and `ROOST_BUNDLE_PROFILE` (`mac` / `linux` / `iced`) — see [Paths & Environment](paths.md). `roostctl` reads `ROOST_BUNDLE_PROFILE` too, as the env-var form of `--target`; an unrecognized value is a hard error there ("unknown ROOST_BUNDLE_PROFILE value … expected `mac`, `linux`, or `iced`") rather than the UI's warn-and-fall-back.
+`ROOST_SOCKET` / `ROOST_TAB_ID` / `ROOST_AGENT_HOOK` are auto-set by the UI when it spawns a tab's shell. Set them by hand only when invoking the CLI from outside a Roost tab (e.g. a CI runner). The UI side also honors `ROOST_CONFIG` (config path) and `ROOST_BUNDLE_PROFILE` (`mac` / `linux` / `iced`) — see [Paths & Environment](paths.md). `roostctl` reads `ROOST_BUNDLE_PROFILE` too, as the env-var form of `--target`; an unrecognized value is a hard error there ("unknown ROOST_BUNDLE_PROFILE value … expected `mac`, `linux`, or `iced`") rather than the UI's warn-and-fall-back. `--target` alone additionally accepts `session` (#475) — `ROOST_BUNDLE_PROFILE=session` is one of the values that hard error names as unrecognized, by design: a session is reachable only explicitly.
 
 ## Exit codes
 

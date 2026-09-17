@@ -1219,3 +1219,87 @@ def test_roostctl_events_and_wait_read_a_session_named_by_socket(env):
         line["data"] for line in lines if line["event"] == "tab.state_changed"
     ], lines
     assert all(line["data"].get("tab_id") == str(watched) for line in lines[:-1]), lines
+
+
+# ---------------------------------------------------------------------------
+# 17. `--target session` (#475): the same explicit route as `--socket`
+# ---------------------------------------------------------------------------
+#
+# `env.roostctl(...)` already runs against `env.command_env()` — the
+# jailed `HOME` / `XDG_RUNTIME_DIR` this env's daemon itself resolved its
+# socket from (`session.py`'s `make_env`). `--target session` reads that
+# same environment to resolve `BundleProfile::session()`'s socket path,
+# so a call through it lands on exactly the daemon `started()` brought
+# up, with no `--socket` in sight — that convergence is what each case
+# below checks before asserting anything about the op it ran.
+
+
+def test_target_session_reaches_identify_tab_list_and_open(env):
+    """Plan 066 §3.2 (C14, #475): `--target session` is explicit-only —
+    no auto-detect, no `ROOST_BUNDLE_PROFILE` (the HS-0 fence in
+    `roost_ipc::target` pins both) — and resolves to the same socket
+    `--socket <path>` already proved out above
+    (`test_open_against_a_session_creates_a_project_and_a_tab`,
+    `test_rpc_matches_the_named_verb_and_reports_errors_through_the_envelope`).
+    `identify` answers with no `instance_id` and its `ops`; `tab list`
+    and `open` (`project.ensure`, served here) work through it too."""
+    started(env)
+
+    identify = env.roostctl("--target", "session", "identify", "--json")
+    assert identify.returncode == 0, identify.stdout + identify.stderr
+    identity = json.loads(identify.stdout)
+    assert identity["ops"], identity
+    assert "instance_id" not in identity, identity
+    # The convergence check: this call landed on `env`'s own daemon, not
+    # some other socket `--target session` might have resolved to. The
+    # bare `identify` op (unlike `session.identify`) carries no
+    # `session_id`, so `socket_path` is the field that pins it.
+    assert identity["socket_path"] == str(env.socket), identity
+
+    listed = env.roostctl("--target", "session", "tab", "list", "--json")
+    assert listed.returncode == 0, listed.stdout + listed.stderr
+    assert "projects" in json.loads(listed.stdout)
+
+    name = f"e2e-session-target-{uuid.uuid4().hex[:8]}"
+    opened = env.roostctl(
+        "--target", "session", "open", "--project", name, "--cwd", str(env.launch_cwd),
+        "--json",
+    )
+    assert opened.returncode == 0, opened.stdout + opened.stderr
+    made = json.loads(opened.stdout)
+    assert made["created"] is True, made
+    pid = int(made["project"]["id"])
+    tab_id = int(made["tab"]["id"])
+    with env.client() as client:
+        assert client.project(pid) is not None, "the ensured project is on this session"
+        assert tab_id in client.project_tab_ids(pid), "the opened tab is in that project"
+
+
+def test_target_session_refuses_a_host_op_with_the_servers_unknown_op(env):
+    """`host.*` is client-side UI state a session does not keep
+    (`crates/roost-engine/src/ipc.rs`'s session dispatch refuses the
+    whole family with `HandlerError::unknown_op`) — `roostctl` surfaces
+    that verbatim, not a session-specific refusal."""
+    started(env)
+    result = env.roostctl("--target", "session", "host", "list", "--json")
+    assert result.returncode == 1, result.stdout + result.stderr
+    error = json.loads(result.stderr)
+    assert error["error"]["code"] == "unknown-op", result.stderr
+    assert "host.list" in error["error"]["message"], result.stderr
+
+
+def test_target_session_refuses_an_app_op_with_no_ui_attached(env):
+    """`app.*` ops need a window; a session has none, so `ui_call`
+    answers `internal: no UI attached` (`crates/roost-engine/src/ipc.rs`)
+    and `roostctl` passes that through unchanged — not `unknown-op`,
+    since the op exists, there is just nothing behind the socket to
+    serve it."""
+    started(env)
+    out_path = env.root / "target-session-screenshot.png"
+    result = env.roostctl(
+        "--target", "session", "screenshot", "--out", str(out_path), "--json",
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    error = json.loads(result.stderr)
+    assert error["error"] == {"code": "internal", "message": "no UI attached"}, result.stderr
+    assert not out_path.exists(), "a failed screenshot must not write a file"
