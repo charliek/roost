@@ -1,0 +1,15 @@
+{
+  "id": "41",
+  "ok": true,
+  "result": {
+    "project": {
+      "id": "7",
+      "name": "review",
+      "cwd": "/home/u/review",
+      "position": 2,
+      "created_at": 1700000000,
+      "tabs": []
+    },
+    "created": false
+  }
+}

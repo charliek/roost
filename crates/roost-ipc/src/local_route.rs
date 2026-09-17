@@ -212,6 +212,7 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ("tab.write", OpClass::Forward),
     ("tab.resize", OpClass::Forward),
     ("project.create", OpClass::Forward),
+    ("project.ensure", OpClass::Forward),
     ("project.rename", OpClass::Forward),
     ("project.delete", OpClass::Forward),
     ("tab.set_title", OpClass::Forward),

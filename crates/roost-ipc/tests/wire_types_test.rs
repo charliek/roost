@@ -21,14 +21,14 @@ use roost_ipc::messages::{
     AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachHandshakeTerms, AttachMode,
     AttachPayloadKind, ClipboardEffectTarget, ClipboardWriteParams, DurabilityChangedEvent,
     EventBatch, EventEnvelope, EventsSubscribeParams, EventsSubscribeResult, IdentifyResult,
-    NotificationFiredEvent, ProjectReorderParams, ResponseError, RetrySchedule, SentFile,
-    SessionBinaryIdentity, SessionIdentify, SessionIdentifyParams, SessionPutFileParams,
-    SessionPutFileResult, SessionSetAgentHooksParams, SessionSetThemeParams, SessionSetThemeResult,
-    SessionStopParams, SessionStopResult, SessionStoppingEvent, SkippedFile,
-    TabClearNotificationParams, TabClearNotificationResult, TabDumpCursor, TabDumpParams,
-    TabDumpResult, TabEffect, TabEffectEvent, TabReorderParams, TabSendFileParams,
-    TabSendFileResult, TabWriteParams, WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES,
-    SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
+    NotificationFiredEvent, ProjectEnsureParams, ProjectEnsureResult, ProjectReorderParams,
+    ResponseError, RetrySchedule, SentFile, SessionBinaryIdentity, SessionIdentify,
+    SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams,
+    SessionSetThemeParams, SessionSetThemeResult, SessionStopParams, SessionStopResult,
+    SessionStoppingEvent, SkippedFile, TabClearNotificationParams, TabClearNotificationResult,
+    TabDumpCursor, TabDumpParams, TabDumpResult, TabEffect, TabEffectEvent, TabReorderParams,
+    TabSendFileParams, TabSendFileResult, TabWriteParams, WireProjectRef, WireTabRef,
+    MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -1878,4 +1878,38 @@ fn events_subscribe_error_vector_decodes_as_replay_expired() {
         "the message must say how far back a resume can reach: {}",
         error.message
     );
+}
+
+// ---------------------------------------------------------------------------
+// project.ensure (plan 066)
+// ---------------------------------------------------------------------------
+
+/// `project.ensure`'s request and both of its answers, decoded into the
+/// typed shapes: `created` is the one field a caller branches on, so a
+/// vector that spelled it wrong or dropped it would otherwise pass.
+#[test]
+fn project_ensure_vectors_decode_into_their_typed_shapes() {
+    let result = |name: &str| -> ProjectEnsureResult {
+        let resp: roost_ipc::messages::Response =
+            serde_json::from_str(&read_vector(name)).expect("decode response envelope");
+        serde_json::from_value(resp.result.expect("result body"))
+            .unwrap_or_else(|error| panic!("{name} must decode as ProjectEnsureResult: {error}"))
+    };
+
+    let req: roost_ipc::messages::RawRequest =
+        serde_json::from_str(&read_vector("project.ensure.request.json")).expect("decode envelope");
+    assert_eq!(req.op, ops::PROJECT_ENSURE);
+    let params: ProjectEnsureParams =
+        serde_json::from_value(req.params).expect("decode project.ensure params");
+    assert_eq!(params.name, "review");
+    assert_eq!(params.cwd.as_deref(), Some("/home/u/review"));
+
+    let found = result("project.ensure.response.json");
+    assert!(!found.created);
+    assert_eq!(found.project.id, 7);
+    assert_eq!(found.project.name, params.name);
+
+    let made = result("project.ensure.created.response.json");
+    assert!(made.created);
+    assert_eq!(made.project.name, params.name);
 }

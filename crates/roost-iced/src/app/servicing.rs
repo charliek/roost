@@ -132,11 +132,13 @@ fn slot_unavailable(message: &str) -> Result<serde_json::Value, HostOpFailure> {
 /// Only a project creation is `Create`, matching the local dispatches:
 /// §D6 and §D9 both ask "is a creation owed?" as its own clause, and a
 /// forwarded `tab.open` is no more a creation than the ⌘T that reaches
-/// `open_host_tab_flow`.
+/// `open_host_tab_flow`. `project.ensure` counts because it may create,
+/// and nothing on this side knows whether it will until it answers.
 fn forwarded_op_kind(op: &str) -> local_backend::HostOpKind {
-    match op == roost_ipc::messages::ops::PROJECT_CREATE {
-        true => local_backend::HostOpKind::Create,
-        false => local_backend::HostOpKind::Other,
+    use roost_ipc::messages::ops;
+    match op {
+        ops::PROJECT_CREATE | ops::PROJECT_ENSURE => local_backend::HostOpKind::Create,
+        _ => local_backend::HostOpKind::Other,
     }
 }
 
@@ -4084,14 +4086,17 @@ mod tests {
     use super::*;
 
     /// Plan 063 §D10: a forwarded mutation is registered by what it does
-    /// to the slot, and only a project creation is a creation.
+    /// to the slot, and only an op that can create a project is a creation.
     #[test]
-    fn a_forwarded_project_create_is_the_only_creation() {
+    fn only_an_op_that_can_create_a_project_is_a_creation() {
         use roost_ipc::messages::ops;
-        assert_eq!(
-            forwarded_op_kind(ops::PROJECT_CREATE),
-            local_backend::HostOpKind::Create
-        );
+        for op in [ops::PROJECT_CREATE, ops::PROJECT_ENSURE] {
+            assert_eq!(
+                forwarded_op_kind(op),
+                local_backend::HostOpKind::Create,
+                "{op}"
+            );
+        }
         for op in [
             ops::TAB_OPEN,
             ops::TAB_CLOSE,

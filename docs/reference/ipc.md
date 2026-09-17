@@ -302,11 +302,12 @@ by name if one is ever added without a row:
   reply is returned unchanged (including its error code and message).
   A bare id therefore *means* the slot's id. Every workspace mutation is
   here — `tab.open`, `tab.close`, `tab.list`, `tab.write`, `tab.resize`,
-  `project.create`, `project.rename`, `project.delete`, `tab.set_title`,
-  `tab.set_state`, `tab.clear_notification`, `tab.set_hook_active`,
-  `tab.agent_report`, `notification.create`. (`tab.open`'s `project_id:
-  "0"` special case forwards verbatim too, so it is the *slot* that
-  mints a default project when there is none — not this socket.)
+  `project.create`, `project.ensure`, `project.rename`, `project.delete`,
+  `tab.set_title`, `tab.set_state`, `tab.clear_notification`,
+  `tab.set_hook_active`, `tab.agent_report`, `notification.create`.
+  (`tab.open`'s `project_id: "0"` special case forwards verbatim too,
+  so it is the *slot* that mints a default project when there is none
+  — not this socket.)
 - **Rewrite.** The UI answers it here, after rewriting any bare id in
   the request to the slot's `h<n>.<id>` form first; a ref that already
   arrived host-qualified is left exactly as it was, so an explicit
@@ -811,6 +812,41 @@ Request: `{"params": {"name": "", "cwd": "/tmp"}}`. `name` empty means
 the server picks `"Untitled <n>"`.
 
 Response: `{"project": <Project>}` — `tabs` is empty.
+
+### `project.ensure`
+
+Find the project with this exact name, or create it. Served by the iced
+UI and by a host session; the Swift Mac app has no case for this op and
+answers `unknown-op`.
+
+Request:
+```json
+{"id": "41", "op": "project.ensure",
+ "params": {"name": "review", "cwd": "/home/u/review"}}
+```
+
+Response: `{"project": <Project>, "created": <bool>}`.
+
+The match is on the exact name (no trimming, case-sensitive), and the
+find and the create are one step: callers racing on a name get one
+project between them, and at most one of them sees `created: true`.
+Project names are not unique, so when several share the name the one
+with the lowest `position` (the first in display order) is returned. That
+pick is stable but arbitrary, and `created: false` says nothing about
+duplicates. Key on `project.id` from then on, not on the name.
+
+- `cwd` is read only on the create path. It may be omitted when the
+  project exists, and a found project's `cwd` is never updated.
+- A found project comes back as `tab.list` shows it, `tabs` included.
+  A created one has empty `tabs`.
+- Neither path changes the active selection (like `project.create`).
+- `project.created` fires only when the call creates. A find commits
+  nothing and emits nothing.
+
+Errors: `invalid-param` for a `name` that is empty or only whitespace,
+and for an empty or whitespace-only (or omitted) `cwd` when no project
+has the name. A missing `name` is `missing-param`, and an unknown key is
+`unknown-field`.
 
 ### `project.rename`
 

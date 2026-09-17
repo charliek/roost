@@ -1383,8 +1383,14 @@ def test_bare_ids_on_the_ui_socket_act_on_the_session(lane: Lane):
     project = roost.create_project(name="forwarded", cwd="/tmp")
     tab = roost.open_tab(project, cwd="/tmp", title="forwarded-tab")
 
+    # `project.ensure` finds the slot's project and creates on the slot.
+    found = roost.ensure_project("forwarded")
+    assert (found["created"], int(found["project"]["id"])) == (False, project), found
+    assert roost.ensure_project("ensured", cwd="/tmp")["created"] is True
+
     on_the_session = lane.session_projects()
     assert "forwarded" in [p["name"] for p in on_the_session]
+    assert "ensured" in [p["name"] for p in on_the_session]
     assert [p["name"] for p in roost.list()] == [p["name"] for p in on_the_session], (
         "the UI socket's tab.list is the session's list"
     )

@@ -39,21 +39,21 @@ use roost_ipc::messages::{
     IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
     PaletteDismissParams, PaletteOpenParams, PalettePresentParams, PalettePresentResult,
     PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
-    ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
-    ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
-    SelectionDumpResult, SelectionSetParams, SessionIdentify, SessionIdentifyParams,
-    SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams, SessionSetThemeParams,
-    SessionStopParams, SessionStopResult, SidebarDumpParams, SidebarDumpResult,
-    SidebarSetWidthParams, TabAgentReportResult, TabCapturePtyInputParams,
-    TabCapturePtyInputResult, TabClearNotificationParams, TabClearNotificationResult,
-    TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams,
-    TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams,
-    TabExpandSelectionAtResult, TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams,
-    TabFocusResult, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
-    TabSendFileParams, TabSendFileResult, TabSetHookActiveParams, TabSetStateParams,
-    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
-    WindowResizeParams, WireProjectRef, WireTabRef, MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES,
-    SESSION_PROTOCOL_VERSION,
+    ProjectCreateResult, ProjectDeleteParams, ProjectEnsureParams, ProjectEnsureResult,
+    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
+    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
+    SessionIdentify, SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult,
+    SessionSetAgentHooksParams, SessionSetThemeParams, SessionStopParams, SessionStopResult,
+    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams,
+    TabClearNotificationResult, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
+    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
+    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
+    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
+    TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams, TabSendFileResult,
+    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
+    WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef, WireTabRef,
+    MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{AttachHandshake, SessionSetThemeResult};
@@ -1396,6 +1396,7 @@ pub fn is_mutating_op(op: &str) -> bool {
             | ops::TAB_AGENT_REPORT
             | ops::TAB_REORDER
             | ops::PROJECT_CREATE
+            | ops::PROJECT_ENSURE
             | ops::PROJECT_RENAME
             | ops::PROJECT_DELETE
             | ops::PROJECT_REORDER
@@ -3027,6 +3028,14 @@ async fn dispatch(
             let project = h.workspace.create_project(&p.name, &cwd).map_err(ws_err)?;
             encode(&ProjectCreateResult { project })
         }
+        ops::PROJECT_ENSURE => {
+            let p: ProjectEnsureParams = decode(params)?;
+            let (project, created) = h
+                .workspace
+                .ensure_project(&p.name, p.cwd.as_deref().unwrap_or_default())
+                .map_err(ws_err)?;
+            encode(&ProjectEnsureResult { project, created })
+        }
         ops::PROJECT_RENAME => {
             let p: ProjectRenameParams = decode(params)?;
             h.workspace
@@ -3980,7 +3989,9 @@ fn ws_err(e: WorkspaceError) -> HandlerError {
         WorkspaceError::HostNotFound(_) => HandlerError::not_found(e.to_string()),
         WorkspaceError::HostLabelEmpty
         | WorkspaceError::HostLabelReserved
-        | WorkspaceError::HostLabelTaken(_) => HandlerError::invalid_param(e.to_string()),
+        | WorkspaceError::HostLabelTaken(_)
+        | WorkspaceError::ProjectNameBlank
+        | WorkspaceError::ProjectCwdRequired(_) => HandlerError::invalid_param(e.to_string()),
     }
 }
 
@@ -4580,6 +4591,65 @@ mod tests {
         .await
         .expect("in-process serves it from the local workspace");
         assert_eq!(h.workspace.snapshot().len(), before + 1);
+    }
+
+    /// `project.ensure` forwards both of its outcomes: the hidden
+    /// workspace already holds a `p`, so a find answered here would
+    /// succeed, and a create answered here would land a `ghost`.
+    #[tokio::test]
+    async fn a_bare_project_ensure_under_session_never_touches_the_local_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = forwarding_handler(dir.path(), Some(2));
+        let before = h.workspace.snapshot();
+        for name in ["p", "ghost"] {
+            let error = dispatch(
+                &h,
+                ops::PROJECT_ENSURE,
+                serde_json::json!({"name": name, "cwd": "/tmp"}),
+            )
+            .await
+            .expect_err("there is no UI to forward to");
+            assert_eq!(error.code, "internal", "{name}: {error:?}");
+        }
+        assert_eq!(h.workspace.snapshot(), before);
+    }
+
+    #[tokio::test]
+    async fn project_ensure_on_the_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path());
+        let active = h.workspace.active();
+        let ensure = |params: serde_json::Value| dispatch(&h, ops::PROJECT_ENSURE, params);
+
+        for params in [
+            serde_json::json!({"name": " ", "cwd": "/tmp"}),
+            serde_json::json!({"name": "new"}),
+            serde_json::json!({"name": "new", "cwd": ""}),
+        ] {
+            let error = ensure(params.clone()).await.expect_err("refused");
+            assert_eq!(error.code, "invalid-param", "{params}: {error:?}");
+        }
+        let error = ensure(serde_json::json!({"name": "p", "activate": true}))
+            .await
+            .expect_err("strict params");
+        assert_eq!(error.code, "unknown-field", "{error:?}");
+
+        let found: ProjectEnsureResult =
+            serde_json::from_value(ensure(serde_json::json!({"name": "p"})).await.unwrap())
+                .unwrap();
+        assert!(!found.created);
+        assert_eq!(found.project.cwd, "/tmp");
+        assert_eq!(found.project.tabs.len(), 1, "a find carries its tabs");
+
+        let made: ProjectEnsureResult = serde_json::from_value(
+            ensure(serde_json::json!({"name": "new", "cwd": "/var"}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(made.created);
+        assert_eq!(made.project.cwd, "/var");
+        assert_eq!(h.workspace.active(), active);
     }
 
     /// §D10's ordering clause. A host-qualified reorder must reach the

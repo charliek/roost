@@ -1240,6 +1240,23 @@ pub struct ProjectCreateResult {
     pub project: Project,
 }
 
+/// `project.ensure`: find the project with this exact name, or create it.
+/// `cwd` is read only on the create path, so a caller that knows the
+/// project exists may omit it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectEnsureParams {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectEnsureResult {
+    pub project: Project,
+    pub created: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectRenameParams {
@@ -3149,6 +3166,7 @@ pub mod ops {
     pub const TAB_RESIZE: &str = "tab.resize";
     pub const TAB_DUMP: &str = "tab.dump";
     pub const PROJECT_CREATE: &str = "project.create";
+    pub const PROJECT_ENSURE: &str = "project.ensure";
     pub const PROJECT_RENAME: &str = "project.rename";
     pub const PROJECT_DELETE: &str = "project.delete";
     pub const TAB_REORDER: &str = "tab.reorder";

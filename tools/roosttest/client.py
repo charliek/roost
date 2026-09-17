@@ -105,6 +105,13 @@ class Roost:
     def create_project(self, name: str = "", cwd: str = "") -> int:
         return int(self.call("project.create", {"name": name, "cwd": cwd})["project"]["id"])
 
+    def ensure_project(self, name: str, cwd: str | None = None) -> dict:
+        """`project.ensure`'s whole result: `project` and `created`."""
+        params = {"name": name}
+        if cwd is not None:
+            params["cwd"] = cwd
+        return self.call("project.ensure", params)
+
     def delete_project(self, project_id: int) -> None:
         self.call("project.delete", {"project_id": str(project_id)})
 

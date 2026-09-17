@@ -131,6 +131,38 @@ def test_project_create_appears_untitled_and_does_not_activate(roost):
         _cleanup_project(roost, pid)
 
 
+# -- project.ensure -------------------------------------------------------
+
+
+def test_project_ensure_creates_once_then_finds_without_activating(roost, target):
+    """A missing name is created at `cwd`; asking again, with no `cwd`,
+    answers that same project with `created: false` and its cwd as it
+    was. Neither call moves the active selection."""
+    if target == "mac":
+        pytest.skip("the Mac app has no project.ensure: it answers unknown-op")
+
+    with pytest.raises(RoostError) as refused:
+        roost.ensure_project("  ", cwd="/tmp")
+    assert refused.value.code == "invalid-param", refused.value
+
+    name = f"pytest-ensure-{uuid.uuid4().hex[:8]}"
+    before_active = roost.identify()["active_project_id"]
+    made = roost.ensure_project(name, cwd="/tmp")
+    pid = int(made["project"]["id"])
+    try:
+        assert made["created"] is True, made
+
+        found = roost.ensure_project(name)
+        assert found["created"] is False, found
+        assert int(found["project"]["id"]) == pid
+        assert found["project"]["cwd"] == "/tmp"
+
+        assert [int(p["id"]) for p in roost.list() if p["name"] == name] == [pid]
+        assert roost.identify()["active_project_id"] == before_active
+    finally:
+        _cleanup_project(roost, pid)
+
+
 # -- tab.open cwd default (#266) -------------------------------------------
 
 

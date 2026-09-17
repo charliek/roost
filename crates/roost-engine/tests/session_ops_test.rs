@@ -311,6 +311,15 @@ async fn session_stop_reaps_latches_and_finalizes() {
     .expect_err("project.create after stop");
     assert_eq!(err.code, "shutting-down");
 
+    let err = call(
+        &f.handler,
+        ops::PROJECT_ENSURE,
+        serde_json::json!({"name": "late", "cwd": "/tmp"}),
+    )
+    .await
+    .expect_err("project.ensure after stop");
+    assert_eq!(err.code, "shutting-down");
+
     // The latch covers the world-changing ops, and this one matters
     // most: the entries it writes point at a `roostctl` reporting to a
     // socket this session is about to unlink, so a wiring that lands
