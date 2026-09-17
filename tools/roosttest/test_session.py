@@ -27,6 +27,7 @@ synchronization.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 import signal
@@ -1108,3 +1109,31 @@ def test_roostctl_session_start_status_stop(env):
 
     status = env.roostctl("session", "status")
     assert status.returncode == 3, status.stdout + status.stderr
+
+
+def test_rpc_matches_the_named_verb_and_reports_errors_through_the_envelope(env):
+    """Plan 066 §3.2 AC2: `rpc` is a thin, id-agnostic pass-through to
+    the same op a named verb calls — `rpc tab.list`'s result must be
+    JSON-equal to `tab list --json`'s — and its failures still go
+    through the one `CliError` envelope every other verb uses."""
+    started(env)
+    with env.client() as client:
+        project = first_project(client)
+        client.open_tab(project, cwd=str(env.launch_cwd), title="rpc-check")
+
+    socket = str(env.socket)
+
+    rpc = env.roostctl("--socket", socket, "rpc", "tab.list")
+    assert rpc.returncode == 0, rpc.stdout + rpc.stderr
+    direct = env.roostctl("--socket", socket, "tab", "list", "--json")
+    assert direct.returncode == 0, direct.stdout + direct.stderr
+    assert json.loads(rpc.stdout) == json.loads(direct.stdout)
+
+    unknown = env.roostctl("--socket", socket, "--json", "rpc", "no.such.op")
+    assert unknown.returncode == 1, unknown.stdout + unknown.stderr
+    error = json.loads(unknown.stderr)
+    assert error["error"]["code"] == "unknown-op", unknown.stderr
+
+    bad_params = env.roostctl("--socket", socket, "rpc", "tab.write", "[1,2,3]")
+    assert bad_params.returncode == 2, bad_params.stdout + bad_params.stderr
+    assert "usage" in bad_params.stderr, bad_params.stderr

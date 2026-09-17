@@ -35,6 +35,7 @@ roostctl [--socket <PATH>] [--target <mac|linux|iced>] [--json] <COMMAND>
 | `claude-hook` | Internal: invoked by Claude on each hook event (kept for settings files an earlier Roost wrote) |
 | `doctor` | Read-only diagnosis of the Roost integration (target, socket, shell, tab, agent hooks) |
 | `session start` / `stop` / `status` | Start, stop, or inspect the headless `roost-session` daemon |
+| `rpc <op> [params]` | Call any IPC op directly by name, bypassing every named verb |
 
 `--socket` overrides `ROOST_SOCKET`; one of the two must resolve to the running UI's socket. A
 session is not a UI: `session start|stop|status` address the session profile's own socket
@@ -62,6 +63,7 @@ stdout:
 | `session stop` | `{"socket", "session_id", "reap"}` — `session_id` and `reap` are `null` when nothing was running |
 | `session status` | `{"socket", "identity", "projects", "tabs"}` |
 | `agent-hook`, `claude-hook` | Nothing different: they ignore the flag and always answer `{}` and exit 0, because a decision hook must never be blocked by a CLI error |
+| `rpc` | Not affected by the flag at all — see [`rpc`](#rpc) below |
 
 Without `--json`, every command prints what it always has. An error is
 never written to stdout either way — see [Exit codes](#exit-codes).
@@ -549,6 +551,44 @@ roostctl host status --id 3f9a2b7c1d4e4f5a --json
 There is no `roostctl host stop`: the palette's **Stop Session** verb goes straight onto the host's own connection as an ordinary `session.stop`, not through a client-side `host.*` op, so there is nothing yet for a CLI verb to drive. The fidelity fix-it verbs (`host:update:<id>` on an ssh host, `host:restart:<id>` on `localhost`) are the same story: **UI-only, deliberately, with no `roostctl` twin.** Plan 039 §3.5's rule is that a machine is never prompted by a connect it did not ask for; these verbs exist only on a person's already-connected, reduced-fidelity host, and their first remote activity is a consent card (ssh) or a restart confirmation (`localhost`) — exactly the shape Stop Session already set. No new IPC op backs either one.
 
 **Swift Mac app note:** `roostctl host *` against `--target mac` answers `unknown-op` — a documented, permanent boundary, not a gap. Host sessions are iced-only (the Linux `roost` build and the experimental Roost-Iced Mac app); the Swift `Roost.app` never grows this surface.
+
+## `rpc`
+
+Call any IPC op directly, by name — the escape hatch for an op that has
+no verb of its own yet, or for a script that would rather speak the wire
+format straight through.
+
+```bash
+roostctl rpc tab.list
+roostctl rpc tab.write '{"tab_id":"4","data":"bHM="}'
+echo '{"tab_id":"4","data":"bHM="}' | roostctl rpc tab.write -   # params from stdin
+```
+
+| Argument | Description |
+|---|---|
+| `<op>` | The op name, passed through **verbatim** — no local validation against the ops this build knows. An op the server does not serve answers the server's own `unknown-op`, passed through the same way. |
+| `[params]` | The op's params as a JSON **object** literal, or `-` to read one from stdin. Omitted ⇒ `{}`. Anything that is not valid JSON, or that parses to something other than an object (an array, a string, a number), is refused with `usage` (exit 2) **before** the socket is dialled. |
+
+See [ipc.md](ipc.md#operations) for op names and their params, and
+`roostctl identify --json`'s `ops` field for exactly which ops the Roost
+this socket reaches serves right now.
+
+`rpc` is always JSON, with or without `--json` on the command line: the
+op's result object, pretty-printed on stdout — the same shape every
+other IPC-backed verb prints under `--json`. A failure still goes
+through the one [`CliError`](#exit-codes) envelope every verb uses:
+`roostctl: <code>: <message>` on stderr normally, or
+`{"error":{"code","message"}}` when `--json` is also given.
+
+**It bypasses the tab policy.** `rpc` is not in the list of verbs
+[Which tab a command acts on](#which-tab-a-command-acts-on) governs, and
+it does not read `ROOST_TAB_ID` either — the caller writes whatever ids
+`params` needs directly, so there is no `--tab` for this verb to
+resolve. That also means `rpc` is **not a way around `--tab`**: a verb
+that needs `--tab` or `ROOST_TAB_ID` to guard a mutation (`tab close`,
+`tab send`, …) stays that named verb: `rpc tab.write` with a hand-picked
+`tab_id` skips none of that verb's own checks, it just skips the CLI's
+tab-resolution convenience.
 
 ## `doctor`
 

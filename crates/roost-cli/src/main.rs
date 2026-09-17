@@ -31,6 +31,7 @@
 //!   roostctl session {start,stop,status}
 //!   roostctl host {add,list,remove,connect,disconnect}
 //!     add: --label, --target, [--verify]; the last three: --id
+//!   roostctl rpc <op> [params]
 //!
 //! `--json` is global: every verb but the two hooks prints one JSON
 //! document with it, and every failure goes through [`CliError`]'s one
@@ -347,6 +348,27 @@ enum Cmd {
     /// session daemon's own workspace.
     #[command(subcommand)]
     Host(host::HostCmd),
+    /// Call an op directly, by name: `roostctl rpc tab.list`,
+    /// `roostctl rpc tab.write '{"tab_id":"4","data":"bHM="}'`. `params`
+    /// is a JSON object literal, or `-` to read one from stdin; omitted
+    /// ⇒ `{}`. Always prints the result as one JSON document, with or
+    /// without `--json`; a failure goes through the same
+    /// `roostctl: <code>: <message>` / `{"error":…}` envelope as every
+    /// other verb, and an op this socket does not serve answers the
+    /// server's own `unknown-op` verbatim.
+    ///
+    /// Bypasses the target policy [`MUTATING_TAB_VERBS`] enforces on the
+    /// named verbs, and does not read `ROOST_TAB_ID`: the caller writes
+    /// ids straight into `params`, so there is no `--tab` for this verb
+    /// to resolve — and it is **not** a way around `--tab` for a verb
+    /// that needs it; that verb stays the named one.
+    Rpc {
+        /// The op name, passed through verbatim (e.g. `tab.list`).
+        op: String,
+        /// The op's params as a JSON object, or `-` to read them from
+        /// stdin. Omitted ⇒ `{}`.
+        params: Option<String>,
+    },
     /// Diagnose the Roost integration: target resolution, socket, UI
     /// identity, shell-integration contract, the selected tab's four
     /// agent axes, and the Claude hook install. Read-only — it reports
@@ -1411,6 +1433,11 @@ async fn run_on_ui(
             }
             // Dismissed → print nothing; exit 0 either way.
         }
+        Cmd::Rpc { op, params } => {
+            let value = rpc_params(params)?;
+            let result: serde_json::Value = ui.call(&op, value).await?;
+            print_json(&result)?;
+        }
         Cmd::Host(cmd) => return host::run(&cmd, ui, json).await,
         Cmd::Agent(cmd) => return agent_install::run_over_ipc(&cmd, ui, json).await,
         Cmd::ClaudeHook { .. }
@@ -1457,6 +1484,29 @@ fn parse_present_items(raw: &str) -> Result<Vec<PaletteItemView>, CliError> {
         return Err(CliError::Usage("items list is empty".into()));
     }
     Ok(items)
+}
+
+/// `rpc`'s params: the positional argument, `-` for stdin, or `{}` when
+/// omitted. Parsed and object-checked before anything is dialled — the
+/// same posture [`require_tab`] takes toward a mutating verb's `--tab`.
+fn rpc_params(raw: Option<String>) -> Result<serde_json::Value, CliError> {
+    let raw = match raw {
+        None => return Ok(serde_json::json!({})),
+        Some(s) if s == "-" => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|e| CliError::Failed(format!("read params from stdin: {e}")))?;
+            buf
+        }
+        Some(s) => s,
+    };
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| CliError::Usage(format!("parse params json: {e}")))?;
+    if !value.is_object() {
+        return Err(CliError::Usage("params must be a JSON object".into()));
+    }
+    Ok(value)
 }
 
 /// Render a [`PaletteStateResult`] for the terminal: a header line, then
@@ -2841,6 +2891,7 @@ mod tests {
         &["host", "remove", "--id", "a"],
         &["host", "connect", "--id", "a"],
         &["host", "disconnect", "--id", "a"],
+        &["rpc", "tab.list"],
         &["doctor"],
     ];
 
@@ -3213,6 +3264,118 @@ mod tests {
         let sent = ui.take();
         assert_eq!(sent.len(), 1, "{sent:?}");
         assert_eq!(sent[0].1["tab_id"], "9");
+    }
+
+    // ------------------------------------------------------------------
+    // `rpc`
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn rpc_argv_parses_with_and_without_params() {
+        let bare = parse(&["rpc", "tab.list"]).expect("no params");
+        match bare.command {
+            Cmd::Rpc { op, params } => {
+                assert_eq!(op, "tab.list");
+                assert_eq!(params, None);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let with_params =
+            parse(&["rpc", "tab.write", r#"{"tab_id":"4"}"#]).expect("params argument");
+        match with_params.command {
+            Cmd::Rpc { op, params } => {
+                assert_eq!(op, "tab.write");
+                assert_eq!(params.as_deref(), Some(r#"{"tab_id":"4"}"#));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let from_stdin = parse(&["rpc", "tab.write", "-"]).expect("dash for stdin");
+        assert!(
+            matches!(&from_stdin.command, Cmd::Rpc { params: Some(p), .. } if p == "-"),
+            "{:?}",
+            from_stdin.command
+        );
+
+        for spelled in [
+            vec!["--json", "rpc", "tab.list"],
+            vec!["rpc", "tab.list", "--json"],
+        ] {
+            let args = parse(&spelled).unwrap_or_else(|e| panic!("{spelled:?}: {e}"));
+            assert!(args.json, "{spelled:?}");
+            assert!(matches!(args.command, Cmd::Rpc { .. }), "{spelled:?}");
+        }
+    }
+
+    /// Params that don't parse as JSON, or that parse as something other
+    /// than an object, are refused before the socket is dialled — the
+    /// same "checked before it's dialled" posture [`require_tab`] takes,
+    /// proven the same way: nothing is listening at `socket`, so a verb
+    /// that dialled first would fail `connection`, never `usage`.
+    #[tokio::test]
+    async fn rpc_params_must_be_a_json_object() {
+        let socket = nowhere("rpc-bad-params");
+        for bad in ["[1,2,3]", "\"a string\"", "42", "not json", ""] {
+            let refused = run_argv(&["--socket", &socket, "rpc", "tab.list", bad], None)
+                .await
+                .expect_err(bad);
+            assert!(matches!(refused, CliError::Usage(_)), "{bad}: {refused:?}");
+            assert_eq!(refused.exit_code(), 2, "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_sends_the_op_verbatim_with_params_or_an_empty_object() {
+        let ui = FakeUi::start("rpc-ok", |_| Ok(serde_json::json!({"ok": true})));
+
+        assert_eq!(
+            run_argv(&["--socket", &ui.socket, "rpc", "tab.list"], None).await,
+            Ok(0)
+        );
+        assert_eq!(
+            ui.take(),
+            vec![("tab.list".to_string(), serde_json::json!({}))]
+        );
+
+        assert_eq!(
+            run_argv(
+                &[
+                    "--socket",
+                    &ui.socket,
+                    "rpc",
+                    "tab.write",
+                    r#"{"tab_id":"4"}"#,
+                ],
+                None,
+            )
+            .await,
+            Ok(0)
+        );
+        assert_eq!(
+            ui.take(),
+            vec![("tab.write".to_string(), serde_json::json!({"tab_id": "4"}))]
+        );
+    }
+
+    /// The server's own `unknown-op` reaches the caller verbatim — `rpc`
+    /// validates nothing about the op name itself.
+    #[tokio::test]
+    async fn rpc_passes_an_unknown_op_through_to_the_servers_refusal() {
+        let ui = FakeUi::start("rpc-unknown-op", |_| {
+            Err(("unknown-op", "no such op: no.such.op"))
+        });
+        let error = run_argv(&["--socket", &ui.socket, "rpc", "no.such.op"], None)
+            .await
+            .expect_err("the server refused");
+        assert_eq!(
+            error,
+            CliError::Server {
+                code: "unknown-op".into(),
+                message: "no such op: no.such.op".into(),
+            }
+        );
+        assert_eq!(error.exit_code(), 1);
     }
 
     /// `require_tab`'s call sites are the policy; the const is what a
