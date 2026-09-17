@@ -51,8 +51,12 @@ pub(crate) enum HostOpError {
     Rejected { code: ServerCode, message: String },
     /// The wire died mid-op. The connection is going down with it.
     Transport(String),
-    /// The queue was full, or the connection task is already gone.
-    Unavailable,
+    /// The queue was full: the worker is alive but not keeping up, a
+    /// state it can leave.
+    QueueFull,
+    /// Nothing is left to serve the queue — the connection task has
+    /// ended, or the host this was addressed to has no connection.
+    WorkerGone,
     /// **This client** refused it: an upload's file could not be read,
     /// or the session's answer was not one the client can use (plan 047
     /// §3.1's reply re-check). Nothing is wrong with the connection, and
@@ -69,7 +73,8 @@ impl std::fmt::Display for HostOpError {
                 write!(f, "{}: {message}", code.as_str())
             }
             HostOpError::Transport(error) => write!(f, "connection lost: {error}"),
-            HostOpError::Unavailable => f.write_str("the host is not accepting operations"),
+            HostOpError::QueueFull => f.write_str("the host has too many operations queued"),
+            HostOpError::WorkerGone => f.write_str("the host connection is gone"),
             HostOpError::Local(message) => f.write_str(message),
         }
     }
@@ -333,12 +338,12 @@ impl HostOps {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(intent)) => {
                 tracing::warn!(op = %intent.op, "host op queue is full");
-                intent.answer(Err(HostOpError::Unavailable));
-                Err(HostOpError::Unavailable)
+                intent.answer(Err(HostOpError::QueueFull));
+                Err(HostOpError::QueueFull)
             }
             Err(mpsc::error::TrySendError::Closed(intent)) => {
-                intent.answer(Err(HostOpError::Unavailable));
-                Err(HostOpError::Unavailable)
+                intent.answer(Err(HostOpError::WorkerGone));
+                Err(HostOpError::WorkerGone)
             }
         }
     }
@@ -451,7 +456,7 @@ pub(crate) fn flush(rx: &mut mpsc::Receiver<HostIntent>, error: &HostOpError) {
 /// `close` first means no further send can land, so the drain that
 /// follows is exhaustive; a sender that races it gets
 /// [`mpsc::error::TrySendError::Closed`], which [`HostOps::send`] already
-/// answers as [`HostOpError::Unavailable`].
+/// answers as [`HostOpError::WorkerGone`].
 pub(crate) fn close_and_flush(rx: &mut mpsc::Receiver<HostIntent>, error: &HostOpError) {
     rx.close();
     flush(rx, error);
@@ -566,7 +571,7 @@ mod tests {
         // The window the race lived in: a send *after* the drain.
         assert_eq!(
             ops.call("tab.open", serde_json::json!({})).await,
-            Err(HostOpError::Unavailable),
+            Err(HostOpError::WorkerGone),
             "a closed queue refuses at the enqueue rather than swallowing"
         );
         assert!(rx.try_recv().is_err());
@@ -606,7 +611,7 @@ mod tests {
             ops.send(intent("fill")).unwrap();
         }
         let overflow = ops.call("tab.open", serde_json::json!({}));
-        assert_eq!(overflow.await, Err(HostOpError::Unavailable));
+        assert_eq!(overflow.await, Err(HostOpError::QueueFull));
     }
 
     /// The permit takes its place in line like anything else — which is
@@ -726,9 +731,9 @@ mod tests {
         );
     }
 
-    /// The two ways a permit is refused, and they are the only two: a
-    /// barrier never reaches the wire, so it cannot be rejected by a
-    /// session or die with a transport.
+    /// A permit is refused by the queue and never by the wire: a barrier
+    /// never reaches it, so it cannot be rejected by a session or die
+    /// with a transport.
     #[tokio::test]
     async fn a_permit_is_refused_by_a_drop_and_by_a_full_queue() {
         let (ops, mut rx) = HostOps::channel();
@@ -741,7 +746,7 @@ mod tests {
         }
         assert_eq!(
             ops.attach_permit(HostId::new(1)).await.unwrap_err(),
-            HostOpError::Unavailable
+            HostOpError::QueueFull
         );
     }
 
@@ -752,7 +757,7 @@ mod tests {
         let (ops, rx) = HostOps::channel();
         drop(rx);
         let outcome = ops.call("tab.open", serde_json::json!({})).await;
-        assert_eq!(outcome, Err(HostOpError::Unavailable));
+        assert_eq!(outcome, Err(HostOpError::WorkerGone));
     }
 
     #[test]

@@ -2177,7 +2177,7 @@ mod tests {
             .expect("and does not panic");
         assert_eq!(
             ops.call("tab.open", serde_json::json!({})).await,
-            Err(HostOpError::Unavailable),
+            Err(HostOpError::WorkerGone),
             "the closed queue refuses rather than swallowing"
         );
     }

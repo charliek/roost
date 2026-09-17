@@ -4162,6 +4162,18 @@ mod tests {
         let dropped = forwarded_failure(&crate::host_conn::HostOpError::Disconnected);
         assert_eq!(dropped.code, roost_ipc::local_route::SLOT_UNAVAILABLE_CODE);
         assert_eq!(dropped.message, "the host disconnected before this ran");
+        for unserved in [
+            crate::host_conn::HostOpError::QueueFull,
+            crate::host_conn::HostOpError::WorkerGone,
+        ] {
+            let failure = forwarded_failure(&unserved);
+            assert_eq!(
+                failure.code,
+                roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
+                "{unserved:?}"
+            );
+            assert_eq!(failure.message, unserved.to_string());
+        }
     }
 
     /// Both refusals a forward can answer keep the UI socket's own
@@ -4424,13 +4436,14 @@ mod tests {
             );
         }
 
-        // The three that are this connection failing rather than the
+        // The ones that are this connection failing rather than the
         // session answering: one code, and `HostOpError`'s own words —
         // the sentence the drag gesture's status banner shows.
         for error in [
             HostOpError::Disconnected,
             HostOpError::Transport("broken pipe".into()),
-            HostOpError::Unavailable,
+            HostOpError::QueueFull,
+            HostOpError::WorkerGone,
         ] {
             let expected = error.to_string();
             let failure = host_op_failure(&error);
