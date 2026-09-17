@@ -2067,7 +2067,9 @@ fn send_file_budget(paths: usize, scale: f64) -> Duration {
 
 /// What a verb's `--tab` holds: a bare local id, or a [`WireTabRef`] that
 /// can also name a connected host's tab. `ROOST_TAB_ID` is read into the
-/// same type, so the env reaches both kinds of verb alike.
+/// same type, so the env reaches both kinds of verb alike — and a local id
+/// in it must be positive, as [`parse_tab_id`] (the hooks' and doctor's
+/// reading) requires, or a mutating verb would send `0` rather than refuse.
 trait TabRef: Sized {
     fn from_env(raw: &str) -> Option<Self>;
     fn local(id: i64) -> Self;
@@ -2075,7 +2077,7 @@ trait TabRef: Sized {
 
 impl TabRef for i64 {
     fn from_env(raw: &str) -> Option<Self> {
-        raw.parse().ok()
+        parse_tab_id(raw)
     }
 
     fn local(id: i64) -> Self {
@@ -2085,7 +2087,10 @@ impl TabRef for i64 {
 
 impl TabRef for WireTabRef {
     fn from_env(raw: &str) -> Option<Self> {
-        WireTabRef::parse(raw)
+        WireTabRef::parse(raw).filter(|tab| match tab {
+            WireTabRef::Local(id) => *id > 0,
+            WireTabRef::Host { .. } => true,
+        })
     }
 
     fn local(id: i64) -> Self {
@@ -3160,12 +3165,14 @@ mod tests {
             vec!["--socket", socket.as_str(), "tab", "close"],
             vec!["--socket", socket.as_str(), "tab", "focus"],
         ] {
-            let refused = run_argv(&argv, Some("seven")).await.expect_err("refused");
-            assert_eq!(
-                refused,
-                CliError::Usage("ROOST_TAB_ID=seven is not a tab id".into()),
-                "{argv:?}"
-            );
+            for raw in ["seven", "0", "-3"] {
+                let refused = run_argv(&argv, Some(raw)).await.expect_err("refused");
+                assert_eq!(
+                    refused,
+                    CliError::Usage(format!("ROOST_TAB_ID={raw} is not a tab id")),
+                    "{argv:?}"
+                );
+            }
         }
     }
 
