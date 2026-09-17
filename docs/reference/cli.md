@@ -30,7 +30,8 @@ roostctl [--socket <PATH>] [--target <mac|linux|iced>] [--json] <COMMAND>
 | `wait` | Block until a tab reaches a state, shows a string, or closes |
 | `events` | Print the event stream, one JSON line per event |
 | `tab open` / `close` / `send` / `resize` / `reorder` | Tab lifecycle + I/O |
-| `project list` / `create` / `rename` / `delete` / `reorder` | Project lifecycle |
+| `project list` / `create` / `ensure` / `rename` / `delete` / `reorder` | Project lifecycle |
+| `open` | Find-or-create a project by name, then open a tab in it — one call, atomic on the server |
 | `agent ensure` / `set` / `install` / `uninstall` / `status` | Wire Roost's hook entries into the supported agents' own configs |
 | `agent-hook <agent>` | Internal: the one hook entrypoint every supported agent invokes |
 | `claude install` | Alias of `agent install claude` |
@@ -65,6 +66,8 @@ stdout:
 | `session stop` | `{"socket", "session_id", "reap"}` — `session_id` and `reap` are `null` when nothing was running |
 | `session status` | `{"socket", "identity", "projects", "tabs"}` |
 | `agent-hook`, `claude-hook` | Nothing different: they ignore the flag and always answer `{}` and exit 0, because a decision hook must never be blocked by a CLI error |
+| `project ensure` | `{"project", "created"}` — always, `--json` or not; see [`project ensure`](#project-subcommands) |
+| `open` | `{"project", "tab", "created"}` — always, `--json` or not: an agent verb, not a human-typed one; see [`open`](#open) |
 | `rpc` | Not affected by the flag at all — see [`rpc`](#rpc) below |
 | `events` | Not affected either: always one JSON line per event — see [`events`](#events) |
 
@@ -413,12 +416,61 @@ through the one [error envelope](#exit-codes).
 ```bash
 roostctl project list
 roostctl project create --name "scratch" --cwd ~
+roostctl project ensure --name "scratch"                 # --cwd defaults to $PWD
+roostctl project ensure --name "scratch" --cwd ~/scratch
 roostctl project rename --project-id 1 --name "main"
 roostctl project delete --project-id 2
 roostctl project reorder --order 1,3,2
 ```
 
 `project delete` cascades to the project's tabs. `project reorder` is the same shape as `tab reorder` — any id not in `--order` keeps its prior position.
+
+`project ensure` finds the project with this **exact** name, or creates
+it at `--cwd` (defaulting to `$PWD`) if none exists — atomic on the
+server, so two callers racing the same name converge on one project
+(#221) rather than each creating their own — and never activates it.
+Always prints `{"project", "created"}` (the `project.ensure` wire
+result), **with or without `--json`**: `project create` is the only
+other `project` verb with a one-line human form, and
+`rename`/`delete`/`reorder` print nothing without the flag, so there is
+no single convention `ensure` could join instead.
+
+Refuses `unsupported` (exit 1) against a server whose `identify --json`
+`ops` field doesn't list `project.ensure` — the Swift Mac app today.
+The refusal names the manual route — `project list --json` to find an
+existing project by name, `project create` to make one — rather than
+falling back to it itself: a list-then-create fallback inside `ensure`
+would reopen the very race (#221) it exists to close.
+
+## `open`
+
+```bash
+roostctl open --project "review" --cwd "$PWD" -- bash -lc 'make test'
+roostctl open --project "review" --title "review" --focus -- vim
+roostctl open --project "review" --hold -- make test   # keep the tab open after it exits
+```
+
+The one-shot agent verb: `project.ensure` (find-or-create, by exact
+name) followed by `tab.open` in the ensured project, composed the same
+way `roostctl open --project "review" ...` would if you wrote the two
+calls yourself — except atomic *per call*, closing the list-then-create
+race (#221) a hand-written version would reopen. `--cwd` defaults to
+`$PWD` and is used for **both** calls: the project (if this call creates
+it) and the new tab. Without `-- cmd…` the tab opens the default shell,
+same as [`tab open`](#tab-open-close-send-resize-reorder-dump);
+`--hold` and `--focus` compose exactly as they do there.
+
+Always prints `{"project", "tab", "created"}` — the ensured project, the
+opened tab, and whether the project was just created — **with or
+without `--json`**: this is an agent verb, not a human-typed one.
+
+**Refusals:**
+
+| Exit | `code` | When |
+|---|---|---|
+| 1 | `unsupported` | This server's `identify --json` `ops` doesn't list `project.ensure` (the Mac app today) — names the manual route (`project list --json` + `tab open --project-id`) rather than racing it itself (#221) |
+| 2 | `usage` | `identify --json`'s `local_backend_switch` shows a backend switch in progress — the project set is mid-flight, so a name resolved against it may not hold; retry once it settles |
+| 1 | *the server's own* | `tab.open`'s own refusal, verbatim — most notably `not-found` if the ensured project vanished between the two calls (a backend switch landing in that window, say). **The two calls are not atomic with each other**, only each is atomic on the server, so this is possible even though `ensure` itself never races another `ensure` |
 
 ## `screenshot`
 

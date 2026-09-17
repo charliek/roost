@@ -20,11 +20,9 @@ pub enum CliError {
     Connection(String),
     /// The server refused; `code` is the server's own, verbatim.
     Server { code: String, message: String },
-    /// The server does not serve an op the verb needs.
-    //
-    // No verb asks a server what it serves yet; the row exists because
-    // the table is the contract, not the set of today's producers.
-    #[allow(dead_code)]
+    /// The server does not serve an op the verb needs — `open` and
+    /// `project ensure` when `identify.ops` lacks `project.ensure`
+    /// (plan 066 §3.2).
     Unsupported(String),
     /// `doctor` found a failing check. The report is on stdout.
     ChecksFailed(String),

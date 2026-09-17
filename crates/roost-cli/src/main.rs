@@ -21,7 +21,8 @@
 //!   roostctl tab resize [--tab ID] --cols N --rows N
 //!   roostctl tab reorder --project-id N --order id1,id2,id3
 //!   roostctl tab clear-notification [--tab ID]
-//!   roostctl project {list,create,rename,delete,reorder}
+//!   roostctl project {list,create,ensure,rename,delete,reorder}
+//!   roostctl open --project NAME [--cwd …] [--title T] [--focus] [--hold] [-- <cmd…>]
 //!   roostctl palette {open,state,query,activate,dismiss}
 //!   roostctl screenshot [--out PATH] [--scale 1|2]
 //!   roostctl render-stats [--reset]
@@ -80,11 +81,12 @@ use roost_ipc::messages::{
     AppRenderStatsParams, AppRenderStatsResult, IdentifyParams, IdentifyResult,
     NotificationCreateParams, PaletteActivateParams, PaletteItemView, PaletteOpenParams,
     PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateResult,
-    ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams,
-    ProjectReorderParams, ScreenshotParams, ScreenshotResult, TabClearNotificationParams,
-    TabCloseParams, TabDumpParams, TabDumpResult, TabFocusParams, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams, TabSendFileResult,
-    TabSetStateParams, TabSetTitleParams, TabState, TabWriteParams, WireProjectRef, WireTabRef,
+    ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectEnsureParams,
+    ProjectEnsureResult, ProjectRenameParams, ProjectReorderParams, ScreenshotParams,
+    ScreenshotResult, TabClearNotificationParams, TabCloseParams, TabDumpParams, TabDumpResult,
+    TabFocusParams, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
+    TabSendFileParams, TabSendFileResult, TabSetStateParams, TabSetTitleParams, TabState,
+    TabWriteParams, WireProjectRef, WireTabRef,
 };
 use roost_ipc::paths::BundleProfileKind;
 use roost_ipc::session_launch::timeout_scale;
@@ -267,6 +269,59 @@ enum Cmd {
     /// `local-backend = session` they are the local session's projects.
     #[command(subcommand)]
     Project(ProjectCmd),
+    /// Find-or-create a project by exact name, then open a tab in it —
+    /// `project.ensure` followed by `tab.open` (plan 066 §3.2). The
+    /// one-shot verb an agent skill reaches for instead of composing
+    /// `project list` + `project create` by hand, which races another
+    /// caller doing the same thing (#221): the two calls this makes are
+    /// **not atomic** with each other, but each is atomic on the server,
+    /// so two concurrent `open`s with the same `--project` converge on
+    /// one project either way.
+    ///
+    /// Always prints `{"project","tab","created"}` — the ensured
+    /// project, the opened tab, and whether the project was just
+    /// created — with or without `--json`: this is an agent verb, not a
+    /// human-typed one. `--cwd` defaults to `$PWD`, for both the ensure
+    /// and the open. Without `-- cmd…` the tab opens the default shell,
+    /// same as `tab open`; `--hold` and `--focus` compose exactly as
+    /// they do there — `--focus` runs a follow-up `tab.focus` and
+    /// nothing else ever does, so a caller that didn't ask never steals
+    /// the window.
+    ///
+    /// Refuses `unsupported` (exit 1) against a server whose
+    /// `identify.ops` doesn't list `project.ensure` — the Mac app today
+    /// — naming the manual route (`project list --json` +
+    /// `tab open --project-id`) rather than falling back to it itself,
+    /// which would reopen the same race. Refuses `usage` (exit 2) while
+    /// `identify.local_backend_switch` shows a switch in progress: the
+    /// project set is mid-flight, so a name resolved against it may not
+    /// hold. A `not-found` from the `tab.open` half (the project vanished
+    /// between the two calls — a switch landing in that window, say)
+    /// reaches the caller as the server's own refusal, unchanged.
+    Open {
+        /// The project's exact name. Created at `--cwd` if no project
+        /// has it; found otherwise.
+        #[arg(long)]
+        project: String,
+        /// Working directory for both the ensured project (if created)
+        /// and the new tab. Defaults to `$PWD`.
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long, default_value = "roostctl")]
+        title: String,
+        /// Focus (activate) the new tab after opening.
+        #[arg(long, default_value_t = false)]
+        focus: bool,
+        /// Keep the tab open after the command exits, dropping to an
+        /// interactive shell (mirrors `tab open --hold`). Only
+        /// meaningful with a command.
+        #[arg(long, default_value_t = false)]
+        hold: bool,
+        /// Command + args to run in the tab, after `--`. Empty ⇒ the
+        /// default shell.
+        #[arg(last = true)]
+        argv: Vec<String>,
+    },
     /// Command-palette subcommands: drive the overlay (open, inspect,
     /// filter, activate a row, dismiss). Activating a row runs the same
     /// command its keybind would — so this is also a command-dispatch
@@ -425,6 +480,32 @@ enum ProjectCmd {
         name: String,
         #[arg(long, default_value = "")]
         cwd: String,
+    },
+    /// Find the project with this exact name, or create it at `--cwd` —
+    /// atomic on the server, so two callers racing the same name
+    /// converge on one project (#221) rather than each creating their
+    /// own. Never activates it. `--cwd` defaults to `$PWD`: the op needs
+    /// a directory on the create path, and this verb always sends one
+    /// rather than leaving it to the server's "caller already knows this
+    /// project exists" omission.
+    ///
+    /// Always prints `{"project","created"}` — the wire result — with or
+    /// without `--json`: `project create`/`rename`/`delete`/`reorder`
+    /// print nothing without the flag, so there is no single human form
+    /// this verb could match instead.
+    ///
+    /// Refuses `unsupported` (exit 1) against a server whose
+    /// `identify.ops` doesn't list `project.ensure` — the Mac app today
+    /// — naming the manual route (`project list --json` + `project
+    /// create`) rather than racing it with a list-then-create fallback.
+    Ensure {
+        /// The project's exact name.
+        #[arg(long)]
+        name: String,
+        /// Working directory to create the project at, if it doesn't
+        /// already exist. Defaults to `$PWD`.
+        #[arg(long)]
+        cwd: Option<String>,
     },
     /// Rename a project.
     Rename {
@@ -696,7 +777,17 @@ async fn main() {
     };
     let json = args.json;
     let tab_env = std::env::var("ROOST_TAB_ID").ok();
-    let code = match run(args, tab_env.as_deref()).await {
+    // `$PWD` as `open` / `project ensure` default `--cwd` to. Falls back to
+    // the process's own working directory when the shell variable is
+    // unset (a non-interactive launcher, say) — resolved once here, never
+    // inside `run`, so a test can inject an arbitrary string without a
+    // real directory or a process-wide `chdir` to back it.
+    let cwd_env = std::env::var("PWD").ok().or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.display().to_string())
+    });
+    let code = match run(args, tab_env.as_deref(), cwd_env.as_deref()).await {
         Ok(code) => code,
         Err(error) => report(&error, json),
     };
@@ -748,10 +839,12 @@ fn asks_for_json(argv: &[OsString]) -> bool {
 /// Every verb, after parsing: its exit code, or its failure for `main`
 /// to render.
 ///
-/// `tab_env` is `ROOST_TAB_ID` as `main` read it — a parameter so the
-/// target policy is tested without writing to the process environment
-/// every other test in this binary reads.
-async fn run(args: Args, tab_env: Option<&str>) -> Result<i32, CliError> {
+/// `tab_env` is `ROOST_TAB_ID`, `cwd_env` is `$PWD` (falling back to the
+/// process cwd), both as `main` read them — parameters so the target
+/// policy and `open`/`project ensure`'s `--cwd` default are tested
+/// without writing to the process environment every other test in this
+/// binary reads.
+async fn run(args: Args, tab_env: Option<&str>, cwd_env: Option<&str>) -> Result<i32, CliError> {
     let json = args.json;
     let selector = selector(&args);
     match args.command {
@@ -798,7 +891,16 @@ async fn run(args: Args, tab_env: Option<&str>) -> Result<i32, CliError> {
             verbose,
             color,
         } => run_doctor(&selector, tab, json, verbose, color).await,
-        command => run_on_ui(command, &mut UiSocket::new(&selector), tab_env, json).await,
+        command => {
+            run_on_ui(
+                command,
+                &mut UiSocket::new(&selector),
+                tab_env,
+                cwd_env,
+                json,
+            )
+            .await
+        }
     }
 }
 
@@ -895,6 +997,7 @@ async fn run_on_ui(
     command: Cmd,
     ui: &mut UiSocket<'_>,
     tab_env: Option<&str>,
+    cwd_env: Option<&str>,
     json: bool,
 ) -> Result<i32, CliError> {
     match command {
@@ -1020,6 +1123,25 @@ async fn run_on_ui(
                 );
             }
         }
+        Cmd::Project(ProjectCmd::Ensure { name, cwd }) => {
+            require_project_ensure(ui).await?;
+            let cwd = resolve_cwd(cwd, cwd_env)?;
+            let resp: ProjectEnsureResult = ui
+                .call(
+                    ops::PROJECT_ENSURE,
+                    ProjectEnsureParams {
+                        name,
+                        cwd: Some(cwd),
+                    },
+                )
+                .await?;
+            // Always the wire result, `--json` or not: `create` is the
+            // only other `project` verb with a one-line human form, and
+            // `rename`/`delete`/`reorder` print nothing without the
+            // flag, so there is no single convention this could join
+            // instead of just always answering in JSON.
+            print_json(&resp)?;
+        }
         Cmd::Project(ProjectCmd::Rename { id, name }) => {
             ui.ack(
                 ops::PROJECT_RENAME,
@@ -1124,6 +1246,71 @@ async fn run_on_ui(
                 // contract; script-friendly for `id=$(roostctl tab open …)`).
                 println!("{new_id}");
             }
+        }
+        Cmd::Open {
+            project,
+            cwd,
+            title,
+            focus,
+            hold,
+            argv,
+        } => {
+            let identity = require_project_ensure(ui).await?;
+            if identity.local_backend_switch.is_some() {
+                return Err(CliError::Usage(
+                    "a backend switch is in progress; retry".into(),
+                ));
+            }
+            let cwd = resolve_cwd(cwd, cwd_env)?;
+            let ensured: ProjectEnsureResult = ui
+                .call(
+                    ops::PROJECT_ENSURE,
+                    ProjectEnsureParams {
+                        name: project,
+                        cwd: Some(cwd.clone()),
+                    },
+                )
+                .await?;
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            // Same `--hold` composition `tab open --hold` uses — see its
+            // handler above; not duplicated as a shared helper because
+            // this is the entire use of the local `argv` binding here.
+            let argv = if hold && !argv.is_empty() {
+                held_argv(&shell, &argv)
+            } else {
+                argv
+            };
+            let client = ui.client().await?;
+            let opened: TabOpenResult = client
+                .call(
+                    ops::TAB_OPEN,
+                    TabOpenParams {
+                        project_id: ensured.project.id,
+                        cwd,
+                        argv,
+                        cols: 80,
+                        rows: 24,
+                        title,
+                    },
+                )
+                .await?;
+            if focus {
+                client
+                    .call::<_, serde_json::Value>(
+                        ops::TAB_FOCUS,
+                        TabFocusParams {
+                            tab_id: WireTabRef::Local(opened.tab.id),
+                        },
+                    )
+                    .await?;
+            }
+            // Always JSON, `--json` or not — an agent verb, not a
+            // human-typed one.
+            print_json(&serde_json::json!({
+                "project": ensured.project,
+                "tab": opened.tab,
+                "created": ensured.created,
+            }))?;
         }
         Cmd::Tab(TabCmd::Close { tab }) => {
             let tab_id = require_tab("tab close", tab, tab_env)?;
@@ -1498,6 +1685,45 @@ async fn identify(client: &mut IpcClient) -> Result<IdentifyResult, CliError> {
 
 async fn list_tabs(client: &mut IpcClient) -> Result<TabListResult, CliError> {
     Ok(client.call(ops::TAB_LIST, serde_json::json!({})).await?)
+}
+
+/// `identify`, refusing `unsupported` (exit 1) if this server's `ops`
+/// doesn't list `project.ensure` — an absent field (an older server, or
+/// the Swift Mac app) and a list without the name both mean "not
+/// served" (plan 066 §3.1). Named for the manual route rather than
+/// falling back to it: a list-then-create fallback here would reopen the
+/// #221 race `project.ensure` exists to close, so `open` and `project
+/// ensure` refuse instead of ever sending `project.list`/`project.create`
+/// themselves.
+async fn require_project_ensure(ui: &mut UiSocket<'_>) -> Result<IdentifyResult, CliError> {
+    let identity = identify(ui.client().await?).await?;
+    let supported = identity
+        .ops
+        .as_deref()
+        .is_some_and(|served| served.iter().any(|op| op == ops::PROJECT_ENSURE));
+    if !supported {
+        return Err(CliError::Unsupported(format!(
+            "this Roost does not serve {}; find the project with `roostctl project list \
+             --json` and open the tab directly with `roostctl tab open --project-id`",
+            ops::PROJECT_ENSURE
+        )));
+    }
+    Ok(identity)
+}
+
+/// `--cwd`, or `cwd_env` (`$PWD` as `main` resolved it) when the flag is
+/// absent. `open` and `project ensure` both need an actual directory —
+/// `project.ensure` only reads `cwd` on the create path, but neither verb
+/// knows in advance whether this call creates, so both always send one
+/// rather than leaving it to the op's own omit-if-you-already-know-it
+/// allowance.
+fn resolve_cwd(explicit: Option<String>, cwd_env: Option<&str>) -> Result<String, CliError> {
+    if let Some(cwd) = explicit {
+        return Ok(cwd);
+    }
+    cwd_env
+        .map(str::to_string)
+        .ok_or_else(|| CliError::Failed("no --cwd, and $PWD could not be resolved".into()))
 }
 
 /// Claude Code hook dispatch. Reads the JSON payload from stdin
@@ -2810,9 +3036,11 @@ mod tests {
         &["tab", "reorder", "--project-id", "1", "--order", "1,2"],
         &["project", "list"],
         &["project", "create"],
+        &["project", "ensure", "--name", "n"],
         &["project", "rename", "--id", "1", "--name", "n"],
         &["project", "delete", "--id", "1"],
         &["project", "reorder", "--order", "1,2"],
+        &["open", "--project", "n"],
         &["palette", "open"],
         &["palette", "state"],
         &["palette", "query", "q"],
@@ -2976,9 +3204,22 @@ mod tests {
     }
 
     async fn run_argv(argv: &[&str], tab_env: Option<&str>) -> Result<i32, CliError> {
+        run_argv_env(argv, tab_env, None).await
+    }
+
+    /// [`run_argv`] plus an injected `$PWD` — the `open` / `project
+    /// ensure` `--cwd` default, tested the same way [`run_argv`] tests
+    /// `ROOST_TAB_ID`: a parameter, never a real `chdir` or a dependency
+    /// on the test runner's own working directory.
+    async fn run_argv_env(
+        argv: &[&str],
+        tab_env: Option<&str>,
+        cwd_env: Option<&str>,
+    ) -> Result<i32, CliError> {
         run(
             parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}")),
             tab_env,
+            cwd_env,
         )
         .await
     }
@@ -3214,6 +3455,379 @@ mod tests {
         let sent = ui.take();
         assert_eq!(sent.len(), 1, "{sent:?}");
         assert_eq!(sent[0].1["tab_id"], "9");
+    }
+
+    // ------------------------------------------------------------------
+    // `open` / `project ensure` (plan 066 §3.2)
+    // ------------------------------------------------------------------
+
+    /// `identify.ops` advertising `project.ensure` (and the rest `open`
+    /// needs), with no backend switch in flight.
+    fn fake_identify_supports_ensure() -> serde_json::Value {
+        let mut identity = fake_identify(0);
+        identity["ops"] =
+            serde_json::json!(["identify", "project.ensure", "tab.open", "tab.focus",]);
+        identity
+    }
+
+    /// The same, with a backend switch reported in progress.
+    fn fake_identify_ensure_mid_switch() -> serde_json::Value {
+        let mut identity = fake_identify_supports_ensure();
+        identity["local_backend_switch"] = serde_json::json!("attach_remote");
+        identity
+    }
+
+    fn fake_project(id: i64, cwd: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id.to_string(),
+            "name": "proj",
+            "cwd": cwd,
+            "position": 0,
+            "created_at": 0,
+        })
+    }
+
+    fn fake_project_ensure_result() -> serde_json::Value {
+        serde_json::json!({"project": fake_project(42, "/ensured/cwd"), "created": true})
+    }
+
+    fn fake_tab(id: i64, project_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id.to_string(),
+            "project_id": project_id.to_string(),
+            "title": "roostctl",
+            "cwd": "/ensured/cwd",
+            "state": "none",
+            "has_notification": false,
+            "is_active": false,
+            "user_titled": false,
+            "position": 0,
+            "created_at": 0,
+            "last_active": 0,
+            "hook_active": false,
+        })
+    }
+
+    fn fake_tab_open_result() -> serde_json::Value {
+        serde_json::json!({"tab": fake_tab(99, 42)})
+    }
+
+    fn answer_ensure_and_open(op: &str) -> Result<serde_json::Value, (&'static str, &'static str)> {
+        match op {
+            "identify" => Ok(fake_identify_supports_ensure()),
+            "project.ensure" => Ok(fake_project_ensure_result()),
+            "tab.open" => Ok(fake_tab_open_result()),
+            "tab.focus" => Ok(serde_json::json!({})),
+            _ => Err(("unknown-op", "not faked")),
+        }
+    }
+
+    #[test]
+    fn open_argv_parses_the_project_command_and_json_either_side() {
+        let parsed = parse(&["open", "--project", "X", "--", "cmd", "a", "b"]).expect("parses");
+        match parsed.command {
+            Cmd::Open {
+                project,
+                argv,
+                hold,
+                focus,
+                ..
+            } => {
+                assert_eq!(project, "X");
+                assert_eq!(argv, vec!["cmd", "a", "b"]);
+                assert!(!hold);
+                assert!(!focus);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        for spelled in [
+            vec!["--json", "open", "--project", "X"],
+            vec!["open", "--project", "X", "--json"],
+        ] {
+            let args = parse(&spelled).unwrap_or_else(|e| panic!("{spelled:?}: {e}"));
+            assert!(args.json, "{spelled:?}");
+            assert!(matches!(args.command, Cmd::Open { .. }), "{spelled:?}");
+        }
+    }
+
+    #[test]
+    fn project_ensure_argv_parses() {
+        let parsed = parse(&["project", "ensure", "--name", "X"]).expect("parses");
+        match parsed.command {
+            Cmd::Project(ProjectCmd::Ensure { name, cwd }) => {
+                assert_eq!(name, "X");
+                assert_eq!(cwd, None);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn open_and_project_ensure_default_cwd_to_the_injected_pwd() {
+        let ui = FakeUi::start("cwd-default", answer_ensure_and_open);
+
+        assert_eq!(
+            run_argv_env(
+                &["--socket", &ui.socket, "project", "ensure", "--name", "proj"],
+                None,
+                Some("/injected/pwd"),
+            )
+            .await,
+            Ok(0)
+        );
+        let sent = ui.take();
+        assert_eq!(sent[1].0, ops::PROJECT_ENSURE, "{sent:?}");
+        assert_eq!(sent[1].1["cwd"], "/injected/pwd", "{sent:?}");
+
+        assert_eq!(
+            run_argv_env(
+                &["--socket", &ui.socket, "open", "--project", "proj"],
+                None,
+                Some("/injected/pwd"),
+            )
+            .await,
+            Ok(0)
+        );
+        let sent = ui.take();
+        assert_eq!(
+            (sent[1].0.as_str(), &sent[1].1["cwd"]),
+            (ops::PROJECT_ENSURE, &"/injected/pwd".into())
+        );
+        assert_eq!(
+            (sent[2].0.as_str(), &sent[2].1["cwd"]),
+            (ops::TAB_OPEN, &"/injected/pwd".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn open_sequences_ensure_then_tab_open_and_focuses_only_with_the_flag() {
+        let ui = FakeUi::start("open-sequence", answer_ensure_and_open);
+
+        assert_eq!(
+            run_argv_env(
+                &[
+                    "--socket",
+                    &ui.socket,
+                    "open",
+                    "--project",
+                    "proj",
+                    "--cwd",
+                    "/ensured/cwd",
+                ],
+                None,
+                None,
+            )
+            .await,
+            Ok(0)
+        );
+        let sent = ui.take();
+        let seen: Vec<&str> = sent.iter().map(|(op, _)| op.as_str()).collect();
+        assert_eq!(
+            seen,
+            [ops::IDENTIFY, ops::PROJECT_ENSURE, ops::TAB_OPEN],
+            "{sent:?}"
+        );
+        assert_eq!(sent[1].1["name"], "proj");
+        assert_eq!(
+            sent[2].1["project_id"], "42",
+            "must use the ensured project's id"
+        );
+
+        assert_eq!(
+            run_argv_env(
+                &[
+                    "--socket",
+                    &ui.socket,
+                    "open",
+                    "--project",
+                    "proj",
+                    "--cwd",
+                    "/ensured/cwd",
+                    "--focus",
+                ],
+                None,
+                None,
+            )
+            .await,
+            Ok(0)
+        );
+        let sent = ui.take();
+        let seen: Vec<&str> = sent.iter().map(|(op, _)| op.as_str()).collect();
+        assert_eq!(
+            seen,
+            [
+                ops::IDENTIFY,
+                ops::PROJECT_ENSURE,
+                ops::TAB_OPEN,
+                ops::TAB_FOCUS
+            ],
+            "{sent:?}"
+        );
+        assert_eq!(sent[3].1["tab_id"], "99", "focuses the newly opened tab");
+    }
+
+    #[tokio::test]
+    async fn open_hold_rewrites_argv_like_tab_open_does() {
+        let ui = FakeUi::start("open-hold", answer_ensure_and_open);
+        assert_eq!(
+            run_argv_env(
+                &[
+                    "--socket",
+                    &ui.socket,
+                    "open",
+                    "--project",
+                    "proj",
+                    "--cwd",
+                    "/x",
+                    "--hold",
+                    "--",
+                    "make",
+                    "test",
+                ],
+                None,
+                None,
+            )
+            .await,
+            Ok(0)
+        );
+        let sent = ui.take();
+        let opened = sent
+            .iter()
+            .find(|(op, _)| op == ops::TAB_OPEN)
+            .expect("tab.open sent");
+        let argv: Vec<String> = serde_json::from_value(opened.1["argv"].clone()).unwrap();
+        assert_eq!(
+            argv,
+            held_argv(
+                &std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+                &["make".to_string(), "test".to_string()]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_when_identify_has_no_ops_field_sends_nothing_else() {
+        let ui = FakeUi::start("no-ops-field", |op| match op {
+            "identify" => Ok(fake_identify(0)), // no `ops` field at all
+            _ => Err(("unknown-op", "not faked")),
+        });
+        for argv in [
+            vec![
+                "--socket",
+                ui.socket.as_str(),
+                "project",
+                "ensure",
+                "--name",
+                "x",
+            ],
+            vec!["--socket", ui.socket.as_str(), "open", "--project", "x"],
+        ] {
+            let error = run_argv(&argv, None).await.expect_err(&format!("{argv:?}"));
+            assert_eq!(error.code(), "unsupported", "{argv:?}: {error:?}");
+            assert_eq!(error.exit_code(), 1, "{argv:?}");
+            let sent = ui.take();
+            assert_eq!(
+                sent.iter().map(|(op, _)| op.as_str()).collect::<Vec<_>>(),
+                vec![ops::IDENTIFY],
+                "{argv:?}: {sent:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_when_ops_lacks_project_ensure_sends_nothing_else() {
+        let ui = FakeUi::start("ops-without-ensure", |op| match op {
+            "identify" => {
+                let mut identity = fake_identify(0);
+                identity["ops"] = serde_json::json!(["identify", "tab.open", "tab.list"]);
+                Ok(identity)
+            }
+            _ => Err(("unknown-op", "not faked")),
+        });
+        for argv in [
+            vec![
+                "--socket",
+                ui.socket.as_str(),
+                "project",
+                "ensure",
+                "--name",
+                "x",
+            ],
+            vec!["--socket", ui.socket.as_str(), "open", "--project", "x"],
+        ] {
+            let error = run_argv(&argv, None).await.expect_err(&format!("{argv:?}"));
+            assert_eq!(error.code(), "unsupported", "{argv:?}: {error:?}");
+            let sent = ui.take();
+            assert_eq!(
+                sent.iter().map(|(op, _)| op.as_str()).collect::<Vec<_>>(),
+                vec![ops::IDENTIFY],
+                "{argv:?}: {sent:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn open_refuses_usage_during_a_backend_switch_before_project_ensure() {
+        let ui = FakeUi::start("switch-in-progress", |op| match op {
+            "identify" => Ok(fake_identify_ensure_mid_switch()),
+            _ => Err(("unknown-op", "not faked")),
+        });
+        let error = run_argv(
+            &[
+                "--socket",
+                &ui.socket,
+                "open",
+                "--project",
+                "x",
+                "--cwd",
+                "/x",
+            ],
+            None,
+        )
+        .await
+        .expect_err("a switch is in progress");
+        assert_eq!(
+            error,
+            CliError::Usage("a backend switch is in progress; retry".into())
+        );
+        let sent = ui.take();
+        assert_eq!(
+            sent.iter().map(|(op, _)| op.as_str()).collect::<Vec<_>>(),
+            vec![ops::IDENTIFY],
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_passes_through_a_not_found_from_tab_open_verbatim() {
+        let ui = FakeUi::start("open-not-found", |op| match op {
+            "identify" => Ok(fake_identify_supports_ensure()),
+            "project.ensure" => Ok(fake_project_ensure_result()),
+            "tab.open" => Err(("not-found", "project 42 is gone")),
+            _ => Err(("unknown-op", "not faked")),
+        });
+        let error = run_argv(
+            &[
+                "--socket",
+                &ui.socket,
+                "open",
+                "--project",
+                "x",
+                "--cwd",
+                "/x",
+            ],
+            None,
+        )
+        .await
+        .expect_err("the project vanished between the two calls");
+        assert_eq!(
+            error,
+            CliError::Server {
+                code: "not-found".into(),
+                message: "project 42 is gone".into(),
+            }
+        );
     }
 
     // ------------------------------------------------------------------

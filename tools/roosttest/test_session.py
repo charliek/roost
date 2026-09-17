@@ -34,6 +34,7 @@ import signal
 import stat
 import subprocess
 import threading
+import uuid
 
 import pytest
 import session as sessionlib
@@ -1139,6 +1140,32 @@ def test_rpc_matches_the_named_verb_and_reports_errors_through_the_envelope(env)
     bad_params = env.roostctl("--socket", socket, "rpc", "tab.write", "[1,2,3]")
     assert bad_params.returncode == 2, bad_params.stdout + bad_params.stderr
     assert "usage" in bad_params.stderr, bad_params.stderr
+
+
+def test_open_against_a_session_creates_a_project_and_a_tab(env):
+    """Plan 066 §3.2 (C10): `open` needs no UI. `project.ensure` is
+    served by the shared engine both UIs and `roost-session` embed
+    (`served_ops` withholds it from neither — see `roost-engine::ipc`),
+    so a session reached through `--socket` answers `open` the same way
+    a UI socket does — unlike the Mac app, which is a UI-only gap this
+    module doesn't cover."""
+    started(env)
+    socket = str(env.socket)
+    name = f"e2e-session-open-{uuid.uuid4().hex[:8]}"
+
+    opened = env.roostctl(
+        "--socket", socket, "open", "--project", name, "--cwd", str(env.launch_cwd),
+        "--json",
+    )
+    assert opened.returncode == 0, opened.stdout + opened.stderr
+    made = json.loads(opened.stdout)
+    assert made["created"] is True, made
+    pid = int(made["project"]["id"])
+    tab_id = int(made["tab"]["id"])
+
+    with env.client() as client:
+        assert client.project(pid) is not None, "the ensured project is on the session"
+        assert tab_id in client.project_tab_ids(pid), "the opened tab is in that project"
 
 
 def test_roostctl_events_and_wait_read_a_session_named_by_socket(env):
