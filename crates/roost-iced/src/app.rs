@@ -3561,27 +3561,43 @@ impl App {
         for failure in &done.outcome.errors {
             tracing::warn!(agent = %failure.agent, error = %failure.error, "agent hooks");
         }
+        let key = done
+            .key
+            .to_config_value()
+            .unwrap_or_else(|| "ask".to_string());
+        // The key is taken **whatever the ticket says**, and whether or
+        // not the run failed after it (#491). This message exists only
+        // for an apply that got past `set_hooks`' first step, which
+        // writes the key and fails the whole run if it cannot — so the
+        // file holds `done.key`, and the running UI's copy has to say the
+        // same or every later fallback read answers with something that
+        // is not on disk. Dropping a superseded one because "the newer
+        // apply already wrote the file" assumes the newer apply *lands*;
+        // it may yet refuse without writing anything (a `config.lock` it
+        // never gets), and then the newest thing on disk is this one.
+        // Ordering is safe to lean on: one worker drains the queue and
+        // one FIFO feed carries the answers, so results arrive in ticket
+        // order and the last key taken is the last key written.
+        self.config.agent_hooks = done.key;
+        if let Some(error) = done.error {
+            // Its caller was already answered with this error; the log
+            // is for a dialog nobody was watching. Nothing was wired, so
+            // there is no receipt.
+            tracing::warn!(
+                ticket = done.ticket,
+                key,
+                %error,
+                "agent.set_hooks failed after writing the key"
+            );
+            return;
+        }
         tracing::info!(
             ticket = done.ticket,
-            key = %done.key.to_config_value().unwrap_or_else(|| "ask".to_string()),
+            key,
             unannounced = done.unnoticed.len(),
             errors = done.outcome.errors.len(),
             "agent.set_hooks applied"
         );
-        // The key is taken **whatever the ticket says**. This message
-        // exists only for an apply that got past `set_hooks`' first
-        // step, which writes the key and fails the whole run if it
-        // cannot — so the file holds `done.key`, and the running UI's
-        // copy has to say the same or every later fallback read answers
-        // with something that is not on disk. Dropping a superseded one
-        // because "the newer apply already wrote the file" assumes the
-        // newer apply *lands*; it may yet refuse without writing
-        // anything (a `config.lock` it never gets), and then the newest
-        // thing on disk is this one. Ordering is safe to lean on: one
-        // worker drains the queue and one FIFO feed carries the answers,
-        // so results arrive in ticket order and the last key taken is
-        // the last key written.
-        self.config.agent_hooks = done.key;
         // The receipt is the opposite rule (#490): it answers the user's
         // latest gesture, so a choice they have already replaced says
         // nothing. The `agent_hooks_surveyed` rule, for the same reason.

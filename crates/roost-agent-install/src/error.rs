@@ -47,6 +47,21 @@ pub enum InstallError {
         paths: Vec<PathBuf>,
     },
 
+    /// A run that failed **after** it wrote the `agent-hooks` key.
+    ///
+    /// The key is written first so that a failed reconcile still leaves
+    /// the user's answer durable — which means an `Err` from those runs
+    /// no longer implies nothing changed. `key` is the value as
+    /// `config.conf` now spells it: a caller holding the key in memory
+    /// has to take it on this path too, and one that can only pass a
+    /// message on carries it in the text.
+    #[error("{source}; the agent-hooks key `{key}` is already on disk")]
+    AfterKey {
+        key: String,
+        #[source]
+        source: Box<InstallError>,
+    },
+
     #[error("{}: not writable", .path.display())]
     ReadOnly { path: PathBuf },
 

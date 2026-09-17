@@ -376,8 +376,13 @@ pub fn raise(
 ) -> Result<Outcome, InstallError> {
     guard.check()?;
     let lock = home.config_lock()?;
-    let (mode, wrote) = widen(home, agents, &lock)?;
-    let mut outcome = wire_locked(home, &mode, by, guard, Notice::Here, &lock)?;
+    let (key, wrote) = widen(home, agents, &lock)?;
+    let mode = Mode::Allow(key.as_ref().map(allowed_in).unwrap_or_default());
+    let mut outcome =
+        wire_locked(home, &mode, by, guard, Notice::Here, &lock).map_err(|source| match &key {
+            Some(key) => after_key(key, source),
+            None => source,
+        })?;
     outcome.wrote |= wrote;
     Ok(outcome)
 }
@@ -390,7 +395,7 @@ pub fn raise(
 /// ensure` retries what failed), where a key written afterwards would be
 /// lost by every failure and by any concurrent [`raise`]. A key that
 /// cannot be written is an error and nothing else happens — no agent
-/// file is touched.
+/// file is touched. A failure after it is [`InstallError::AfterKey`].
 pub fn set_hooks(
     home: &Home,
     mode: &Mode,
@@ -403,10 +408,26 @@ pub fn set_hooks(
     // a token this build cannot name goes with the rest of the old value.
     // That is the difference between an explicit local answer and a
     // raise — the user is looking at the list they just chose.
-    let wrote = write_hooks(home, &read_hooks(home)?, &mode.to_config(), &lock)?;
-    let mut outcome = reconcile_locked(home, mode, by, guard, &lock)?;
+    let desired = mode.to_config();
+    let wrote = write_hooks(home, &read_hooks(home)?, &desired, &lock)?;
+    let mut outcome = reconcile_locked(home, mode, by, guard, &lock)
+        .map_err(|source| after_key(&desired, source))?;
     outcome.wrote |= wrote;
     Ok(outcome)
+}
+
+/// `source`, from a run whose key write had already returned `Ok` —
+/// including one that found the key already saying `key` and wrote
+/// nothing, because the key is on disk either way.
+fn after_key(key: &AgentHooks, source: InstallError) -> InstallError {
+    match key.to_config_value() {
+        Some(key) => InstallError::AfterKey {
+            key,
+            source: Box::new(source),
+        },
+        // `Ask` has no spelling, so there is no key on disk to name.
+        None => source,
+    }
 }
 
 fn wire_locked(
@@ -638,8 +659,13 @@ fn write_hooks(
 
 /// The `agent-hooks` key widened by `agents` and written back — the
 /// shared half of [`raise`] and [`install`], and the reason both are
-/// additive.
-fn widen(home: &Home, agents: &[Agent], lock: &ConfigLock) -> Result<(Mode, bool), InstallError> {
+/// additive. Returns the key the write step settled on (`None` when
+/// there was nothing to write) and whether the file changed.
+fn widen(
+    home: &Home,
+    agents: &[Agent],
+    lock: &ConfigLock,
+) -> Result<(Option<AgentHooks>, bool), InstallError> {
     let current = read_hooks(home)?;
     let widened = union(&current, agents);
     // A union that allows nothing writes nothing. Widening is the only
@@ -647,13 +673,11 @@ fn widen(home: &Home, agents: &[Agent], lock: &ConfigLock) -> Result<(Mode, bool
     // only mean the key allowed nothing and nothing was asked for —
     // writing then would spell that as `off`, which is a *lowering* of
     // an unanswered key nobody requested.
-    let allowed = allowed_in(&widened);
-    let wrote = if allowed.is_empty() {
-        false
-    } else {
-        write_hooks(home, &current, &widened, lock)?
-    };
-    Ok((Mode::Allow(allowed), wrote))
+    if allowed_in(&widened).is_empty() {
+        return Ok((None, false));
+    }
+    let wrote = write_hooks(home, &current, &widened, lock)?;
+    Ok((Some(widened), wrote))
 }
 
 /// `hooks` widened by `agents`, in [`ALL_AGENTS`] order.
@@ -928,6 +952,101 @@ mod tests {
         assert_eq!(done.wired, vec![Agent::Claude]);
         assert_eq!(done.unnoticed, vec![Agent::Claude]);
         assert_eq!(read_hooks(&home).unwrap(), AgentHooks::allow(["claude"]));
+    }
+
+    /// A directory where the state record belongs. Nothing reads the
+    /// record before the key is written, so a run fails on it only once
+    /// the key has landed (#491).
+    fn break_the_record(home: &Home) -> String {
+        std::fs::create_dir_all(home.record_path()).unwrap();
+        home.record_path().display().to_string()
+    }
+
+    /// The key a failed run names, taken apart: it is the key on disk,
+    /// and the rendered error carries both it and the failure itself.
+    fn assert_names_the_key_on_disk(home: &Home, failed: &InstallError, record: &str) {
+        let InstallError::AfterKey { key, source } = failed else {
+            panic!("a failure after the key write was not wrapped: {failed:?}");
+        };
+        assert!(source.to_string().contains(record), "{source}");
+        assert_eq!(
+            read_hooks(home).unwrap().to_config_value().as_deref(),
+            Some(key.as_str()),
+            "the key named is not the key on disk"
+        );
+        let rendered = failed.to_string();
+        assert!(rendered.contains(&source.to_string()), "{rendered}");
+        assert!(rendered.contains(&format!("`{key}`")), "{rendered}");
+    }
+
+    /// #491: `set_hooks` failing after its key write says which key it
+    /// left on disk — and says so again when the key already held that
+    /// value and nothing was rewritten.
+    #[test]
+    fn a_set_that_fails_after_the_key_names_the_key_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = a_home(dir.path());
+        let record = break_the_record(&home);
+        let mode = Mode::Allow(vec![Agent::Codex, Agent::Claude]);
+
+        for attempt in ["the write", "the unchanged key"] {
+            let failed = set_hooks(&home, &mode, "local", Guard::PERMITTED)
+                .expect_err("the record is unreadable");
+            assert!(
+                failed.to_string().contains("`claude, codex`"),
+                "{attempt}: {failed}"
+            );
+            assert_names_the_key_on_disk(&home, &failed, &record);
+        }
+    }
+
+    /// The same for `raise`, whose key is the union — so the name it
+    /// reports keeps what this build cannot wire, exactly as the file
+    /// does.
+    #[test]
+    fn a_raise_that_fails_after_the_key_names_the_key_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = a_home(dir.path());
+        roost_ui_model::config::set_key(home.config_path(), "agent-hooks", "grok, gemini").unwrap();
+        let record = break_the_record(&home);
+
+        let failed = raise(&home, &[Agent::Claude], "remote", Guard::PERMITTED)
+            .expect_err("the record is unreadable");
+        assert!(
+            failed.to_string().contains("`claude, grok, gemini`"),
+            "{failed}"
+        );
+        assert_names_the_key_on_disk(&home, &failed, &record);
+    }
+
+    /// A run refused before it reached the key is not wrapped: there is
+    /// no new key on disk to name.
+    #[test]
+    fn a_run_refused_before_the_key_write_is_not_wrapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = a_home(dir.path());
+        break_the_record(&home);
+        let fenced = Guard {
+            test_mode: true,
+            forced: false,
+        };
+        assert!(matches!(
+            set_hooks(&home, &all(), "local", fenced),
+            Err(InstallError::TestModeRefused)
+        ));
+        assert!(matches!(
+            raise(&home, &[Agent::Claude], "remote", fenced),
+            Err(InstallError::TestModeRefused)
+        ));
+
+        // A config Roost cannot read fails the key write's own read.
+        std::fs::create_dir_all(home.config_path()).unwrap();
+        for failed in [
+            set_hooks(&home, &all(), "local", Guard::PERMITTED),
+            raise(&home, &[Agent::Claude], "remote", Guard::PERMITTED),
+        ] {
+            assert!(matches!(failed, Err(InstallError::Io { .. })), "{failed:?}");
+        }
     }
 
     /// The `noticed` flip happens in the run's own record write, so the
