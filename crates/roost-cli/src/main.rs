@@ -2997,6 +2997,22 @@ mod tests {
     /// explicit force leaves the file exactly where it is — the install
     /// engine's own guard never sees this file, so nothing else would
     /// stop it.
+    /// A unique directory for a test socket, under `/tmp` rather than
+    /// `temp_dir()`: macOS's `$TMPDIR` is long enough that a socket path
+    /// under it overruns `SUN_LEN` (104 bytes) and `bind` refuses it.
+    fn short_socket_dir(tag: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tag: String = tag.chars().take(12).collect();
+        let dir = PathBuf::from("/tmp").join(format!(
+            "rctl-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     /// A unique scratch directory, the same way `session::tests` makes
     /// one: this crate has no tempdir dependency, and one test file is
     /// not a reason to take one.
@@ -3280,7 +3296,7 @@ mod tests {
 
     /// A socket path in a fresh scratch directory that nothing listens on.
     fn nowhere(tag: &str) -> String {
-        scratch(tag).join("nothing.sock").display().to_string()
+        short_socket_dir(tag).join("nothing.sock").display().to_string()
     }
 
     async fn run_argv(argv: &[&str], tab_env: Option<&str>) -> Result<i32, CliError> {
@@ -3330,7 +3346,7 @@ mod tests {
             use roost_ipc::messages::{RawRequest, Response};
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-            let socket = scratch(tag).join("ui.sock");
+            let socket = short_socket_dir(tag).join("ui.sock");
             let listener = tokio::net::UnixListener::bind(&socket).expect("bind the fake UI");
             let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let seen = requests.clone();
