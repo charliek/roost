@@ -12,6 +12,7 @@
     "protocol_version": 1,
     "ops": [
       "identify",
+      "events.subscribe",
       "tab.open",
       "tab.close",
       "tab.list",

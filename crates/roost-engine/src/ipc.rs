@@ -1689,6 +1689,14 @@ impl IpcHandler {
         };
         served_ops(socket, test_mode, self.has_ui())
             .into_iter()
+            // `served_ops` is the socket's shape; these two also depend on
+            // what the daemon built this handler with, and without it each
+            // answers `not-supported` on every call.
+            .filter(|op| match *op {
+                ops::SESSION_PUT_FILE => self.files.is_some(),
+                ops::SESSION_SET_AGENT_HOOKS => self.agent_hooks.is_some(),
+                _ => true,
+            })
             .map(str::to_string)
             .collect()
     }
@@ -5498,12 +5506,33 @@ mod tests {
     #[tokio::test]
     async fn a_session_names_what_it_serves_and_no_instance_id() {
         let dir = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
         let h = identify_handler(dir.path())
-            .with_session(session_state().info, StopHandle::new(|| async {}));
+            .with_session(session_state().info, StopHandle::new(|| async {}))
+            .with_file_store(FileStore::new(store.path().to_path_buf()).unwrap())
+            .with_agent_hooks(AgentHooksHandle::new(|_| async {
+                Ok(AgentHooksOutcome::default())
+            }));
         let session_identify = reply_of(&h, ops::SESSION_IDENTIFY).await;
         assert_eq!(
             ops_in(&session_identify),
             sorted(&[SESSION, with_server_vt(SESSION_SERVER_VT)])
+        );
+
+        // Built without a file store or an agent-hooks handle, a session
+        // answers both ops `not-supported`, so it does not name them.
+        let bare_dir = tempfile::tempdir().unwrap();
+        let bare = identify_handler(bare_dir.path())
+            .with_session(session_state().info, StopHandle::new(|| async {}));
+        let bare_ops = ops_in(&reply_of(&bare, ops::SESSION_IDENTIFY).await);
+        let unbuilt = ["session.put_file", "session.set_agent_hooks"];
+        assert!(
+            bare_ops.iter().all(|op| !unbuilt.contains(&op.as_str())),
+            "{bare_ops:?}"
+        );
+        assert_eq!(
+            bare_ops.len(),
+            ops_in(&session_identify).len() - unbuilt.len()
         );
         assert!(session_identify.get("instance_id").is_none());
 
@@ -5517,7 +5546,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut info = session_state().info;
         info.test_mode = true;
-        let h = identify_handler(dir.path()).with_session(info, StopHandle::new(|| async {}));
+        let h = identify_handler(dir.path())
+            .with_session(info, StopHandle::new(|| async {}))
+            .with_file_store(FileStore::new(store.path().join("seams")).unwrap())
+            .with_agent_hooks(AgentHooksHandle::new(|_| async {
+                Ok(AgentHooksOutcome::default())
+            }));
         let seams: &[&str] = &["tab.capture_pty_input", "tab.feed_pty_bytes"];
         assert_eq!(
             ops_in(&reply_of(&h, ops::SESSION_IDENTIFY).await),
