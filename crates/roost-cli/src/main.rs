@@ -3296,7 +3296,10 @@ mod tests {
 
     /// A socket path in a fresh scratch directory that nothing listens on.
     fn nowhere(tag: &str) -> String {
-        short_socket_dir(tag).join("nothing.sock").display().to_string()
+        short_socket_dir(tag)
+            .join("nothing.sock")
+            .display()
+            .to_string()
     }
 
     async fn run_argv(argv: &[&str], tab_env: Option<&str>) -> Result<i32, CliError> {
