@@ -903,7 +903,6 @@ def _ensure_mac_bundle(app: Path, mac_dir: Path, *, runner=subprocess.run) -> No
     global _MAC_BUNDLED_ONCE
     if _MAC_BUNDLED_ONCE:
         return
-    _MAC_BUNDLED_ONCE = True
     if os.environ.get("ROOST_MAC_NO_BUNDLE") == "1":
         if not app.is_dir():
             raise FileNotFoundError(
@@ -912,6 +911,9 @@ def _ensure_mac_bundle(app: Path, mac_dir: Path, *, runner=subprocess.run) -> No
             )
     else:
         runner(["./scripts/bundle.sh", "debug"], cwd=mac_dir, check=True)
+    # Only once the step succeeded: a failed build must not leave a later
+    # relaunch in this process running the old bundle unchecked.
+    _MAC_BUNDLED_ONCE = True
     _warn_if_mac_bundle_stale(app, mac_dir)
 
 

@@ -124,6 +124,18 @@ class MacBundleStalenessTests(unittest.TestCase):
             ui._ensure_mac_bundle(app, mac_dir, runner=runner)
         runner.assert_called_once()
 
+    def test_a_failed_build_is_retried_by_the_next_launch(self) -> None:
+        app = _make_bundle(self._root, time.time())
+        mac_dir = _make_mac_dir(self._root, time.time() - 1000)
+        runner = Mock(side_effect=[RuntimeError("swift build failed"), None])
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ROOST_MAC_NO_BUNDLE", None)
+            with self.assertRaises(RuntimeError):
+                ui._ensure_mac_bundle(app, mac_dir, runner=runner)
+            with redirect_stderr(io.StringIO()):
+                ui._ensure_mac_bundle(app, mac_dir, runner=runner)
+        self.assertEqual(runner.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

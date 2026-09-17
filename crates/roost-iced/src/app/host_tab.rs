@@ -57,7 +57,7 @@ const BACKOFF_CAP: Duration = Duration::from_secs(5);
 /// The first rung of the ladder whose delay is [`BACKOFF_CAP`].
 const BACKOFF_CAP_STEP: u32 = {
     let mut step = 0;
-    while BACKOFF_BASE.as_millis() << step < BACKOFF_CAP.as_millis() {
+    while BACKOFF_BASE.as_nanos() << step < BACKOFF_CAP.as_nanos() {
         step += 1;
     }
     step
