@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -105,6 +106,10 @@ _UI_ENV_SANITIZE = (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Set once a mac launch in this process has run (or skipped) the bundle
+# step, so a mid-test relaunch never re-runs `bundle.sh` (#493).
+_MAC_BUNDLED_ONCE = False
 
 
 @dataclass(frozen=True)
@@ -853,6 +858,63 @@ def _answering_pid(target: str) -> int | None:
         return None
 
 
+def _mac_bundle_binary(app: Path) -> Path:
+    return app / "Contents" / "MacOS" / TARGET_SPECS["mac"].mac_label
+
+
+def _newest_mac_source_mtime(mac_dir: Path) -> float:
+    """Latest mtime under `mac_dir`, skipping `build`/`.build` (bundle.sh's
+    own output and SwiftPM's build cache) so the bundle step never makes
+    itself look stale by touching its own output tree."""
+    skip = {"build", ".build"}
+    newest = 0.0
+    for root, dirs, files in os.walk(mac_dir):
+        dirs[:] = [d for d in dirs if d not in skip]
+        for name in files:
+            try:
+                newest = max(newest, (Path(root) / name).stat().st_mtime)
+            except OSError:
+                continue
+    return newest
+
+
+def _warn_if_mac_bundle_stale(app: Path, mac_dir: Path) -> None:
+    binary_mtime = _mac_bundle_binary(app).stat().st_mtime
+    source_mtime = _newest_mac_source_mtime(mac_dir)
+    print(
+        f"mac bundle binary mtime={binary_mtime:.0f}, "
+        f"newest mac/ source mtime={source_mtime:.0f} (excluding mac/build)",
+        file=sys.stderr,
+    )
+    # A warning rather than a print: pytest hides a green run's captured
+    # stderr, and its warnings summary is what a lane's reader sees.
+    if source_mtime > binary_mtime:
+        warnings.warn("stale Roost.app: sources are newer than the bundle", stacklevel=2)
+
+
+def _ensure_mac_bundle(app: Path, mac_dir: Path, *, runner=subprocess.run) -> None:
+    """Rebuild `Roost.app` via `bundle.sh` unless `ROOST_MAC_NO_BUNDLE=1`
+    (SwiftPM is incremental, so the default path is cheap on a no-op
+    rebuild). At most once per process — see `_MAC_BUNDLED_ONCE` — so a
+    mid-test relaunch reuses what the first launch already did. Either way,
+    logs the bundle binary's mtime against the newest source mtime and
+    warns when the bundle is older.
+    """
+    global _MAC_BUNDLED_ONCE
+    if _MAC_BUNDLED_ONCE:
+        return
+    _MAC_BUNDLED_ONCE = True
+    if os.environ.get("ROOST_MAC_NO_BUNDLE") == "1":
+        if not app.is_dir():
+            raise FileNotFoundError(
+                f"ROOST_MAC_NO_BUNDLE=1 but no bundle at {app}; run "
+                "./mac/scripts/bundle.sh debug first"
+            )
+    else:
+        runner(["./scripts/bundle.sh", "debug"], cwd=mac_dir, check=True)
+    _warn_if_mac_bundle_stale(app, mac_dir)
+
+
 def launch(
     target: str,
     *,
@@ -897,8 +959,7 @@ def launch(
         if platform.system() != "Darwin":
             raise RuntimeError("mac target requires macOS")
         app = REPO_ROOT / "mac/build/Roost.app"
-        if not app.is_dir():
-            subprocess.run(["./scripts/bundle.sh", "debug"], cwd=REPO_ROOT / "mac", check=True)
+        _ensure_mac_bundle(app, REPO_ROOT / "mac")
         _launch_mac(app, state_dir=state_dir)
     elif target == "iced" and (bundle_app := iced_bundle_app()) is not None:
         _launch_iced_bundle(bundle_app, state_dir=state_dir)

@@ -43,6 +43,13 @@ test-mode-gated ops (`ROOST_TEST_MODE=1`) and force a fresh harness-owned
 instance (`--roost-fresh`), so you run the *same set CI does* rather than
 silently skipping ~30 mode-gated tests. See "Hermetic / fresh mode" below.
 
+Every mac launch (the first one per process; a mid-test relaunch reuses it)
+runs `./mac/scripts/bundle.sh debug` — SwiftPM is incremental, so a no-op
+rebuild is cheap — and logs the bundle binary's mtime against the newest
+`mac/` source mtime, warning `stale Roost.app: sources are newer than the
+bundle` when the bundle is older. Set `ROOST_MAC_NO_BUNDLE=1` to skip the
+rebuild (still logs/warns); it errors if no bundle exists yet.
+
 ## Layout
 
 | File | What |
