@@ -1,15 +1,15 @@
 //! `roostctl session` — start, stop, and inspect the headless host
 //! session daemon (`roost-session`).
 //!
-//! # Why this never goes through the connect prologue
+//! # Why this never dials the UI socket
 //!
 //! Every other `roostctl` subcommand resolves a *UI* target and dials
 //! it. A session is not a UI and is deliberately not reachable by
 //! `--target` / `ROOST_BUNDLE_PROFILE` / auto-detect (the HS-0 fences in
 //! `roost_ipc::target` pin that). These three verbs address the session
 //! profile's socket directly, and `start` must work when nothing is
-//! listening at all — so they run as a pre-connect carve-out alongside
-//! `doctor` and `claude-hook`.
+//! listening at all — so like `doctor` and `claude-hook` they are served
+//! before `main.rs` ever builds its `UiSocket`.
 //!
 //! # Why `start` confirms rather than trusting the verdict
 //!
@@ -29,9 +29,9 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
 use clap::Subcommand;
 
+use crate::error::CliError;
 use roost_ipc::messages::{ops, SessionIdentify, SessionStopResult, TabListResult};
 use roost_ipc::paths::{derived_session_state_dir, BundleProfile, STATE_DIR_ENV};
 use roost_ipc::session_launch::{
@@ -39,7 +39,6 @@ use roost_ipc::session_launch::{
     spawn_and_read_verdict, stop_session, timeout_scale, FirstProject, Verdict, BIN_ENV, BIN_NAME,
     IPC_TIMEOUT,
 };
-use roost_ipc::IpcClient;
 
 /// How long to wait for the spawned `roost-session start` to print its
 /// verdict line, and how long to poll before declaring the verdict a
@@ -57,7 +56,7 @@ const STOP_GONE_TIMEOUT: Duration = session_launch::DEFAULT_STOP_GONE_BUDGET;
 /// what a status verb is *for* — `systemctl status` exits 3 on a
 /// stopped unit, and a script asking "is my session up?" should be able
 /// to branch on the status code alone.
-const STATUS_NOT_RUNNING_EXIT: i32 = 3;
+pub const STATUS_NOT_RUNNING_EXIT: i32 = 3;
 
 /// Scale every budget above by [`timeout_scale`] — the same reader
 /// `roost-session` uses, so a loaded CI runner widens the driver's
@@ -80,24 +79,17 @@ pub enum SessionCmd {
     /// Stopping something that is not running succeeds.
     Stop,
     /// Print the running session's identity and workspace size, or
-    /// report that none is running (exit 3).
+    /// report that none is running (exit 3, `not-running`).
     Status,
 }
 
-/// Run a `session` verb. Returns the process exit code rather than
-/// exiting, so the caller keeps one exit point.
-pub async fn run(cmd: &SessionCmd) -> i32 {
-    let result = match cmd {
-        SessionCmd::Start => start().await,
-        SessionCmd::Stop => stop().await,
-        SessionCmd::Status => status().await,
-    };
-    match result {
-        Ok(code) => code,
-        Err(error) => {
-            eprintln!("roostctl session: {error:#}");
-            1
-        }
+/// Run a `session` verb, returning its exit code or its failure to the
+/// caller's one renderer.
+pub async fn run(cmd: &SessionCmd, json: bool) -> Result<i32, CliError> {
+    match cmd {
+        SessionCmd::Start => start(json).await,
+        SessionCmd::Stop => stop(json).await,
+        SessionCmd::Status => status(json).await,
     }
 }
 
@@ -136,14 +128,18 @@ pub fn classify_verdict(verdict: &Verdict) -> StartStep {
     }
 }
 
-async fn start() -> Result<i32> {
+async fn start(json: bool) -> Result<i32, CliError> {
     let bin = locate_session_binary(
         std::env::var_os(BIN_ENV).as_deref(),
         std::env::current_exe().ok().as_deref(),
         std::env::var_os("PATH").as_deref(),
-    )?;
-    let cwd =
-        std::env::current_dir().context("read the working directory to tell the session about")?;
+    )
+    .map_err(CliError::failed)?;
+    let cwd = std::env::current_dir().map_err(|e| {
+        CliError::Failed(format!(
+            "read the working directory to tell the session about: {e}"
+        ))
+    })?;
 
     // Said before the spawn, and phrased for what is true at that
     // moment: this start may yet fail, or find an `already-running`
@@ -170,28 +166,34 @@ async fn start() -> Result<i32> {
             FirstProject::Seed,
             scaled(VERDICT_TIMEOUT),
         )
-        .await?;
+        .await
+        .map_err(CliError::failed)?;
     let (pid, fresh) = match classify_verdict(&verdict) {
         StartStep::Confirm { pid, fresh } => (pid, fresh),
-        StartStep::Failed(message) => {
-            eprintln!("roostctl session: {message}");
-            return Ok(1);
-        }
+        StartStep::Failed(message) => return Err(CliError::Failed(message)),
     };
 
-    let socket = BundleProfile::session()
-        .context("resolve the session socket path")?
-        .socket_path;
+    let socket = session_socket()?;
     let identity = confirm_serving(&socket, scaled(CONFIRM_TIMEOUT))
         .await
-        .with_context(|| {
-            format!(
-                "{BIN_NAME} reported `{verdict}` but no session answered at {}",
+        .map_err(|e| {
+            CliError::Connection(format!(
+                "{BIN_NAME} reported `{verdict}` but no session answered at {}: {e:#}",
                 socket.display()
-            )
+            ))
         })?;
 
-    println!("{}", if fresh { "started" } else { "already-running" });
+    let outcome = if fresh { "started" } else { "already-running" };
+    if json {
+        crate::print_json(&serde_json::json!({
+            "outcome": outcome,
+            "socket": socket.display().to_string(),
+            "identity": identity,
+            "launcher_reported_pid": pid,
+        }))?;
+        return Ok(0);
+    }
+    println!("{outcome}");
     print_identity(&identity, &socket);
     if let Some(pid) = pid {
         // Deliberately not `pid=`. The confirmation above asks the
@@ -209,20 +211,31 @@ async fn start() -> Result<i32> {
 // stop
 // ============================================================================
 
-async fn stop() -> Result<i32> {
-    let socket = BundleProfile::session()
-        .context("resolve the session socket path")?
-        .socket_path;
+async fn stop(json: bool) -> Result<i32, CliError> {
+    let socket = session_socket()?;
 
-    let Some(report) = stop_session(&socket, scaled(STOP_CALL_TIMEOUT)).await? else {
+    let Some(report) = stop_session(&socket, scaled(STOP_CALL_TIMEOUT))
+        .await
+        .map_err(CliError::connection)?
+    else {
         // Stop of a stopped session is a success, `systemctl stop`
         // style: the caller asked for a state, and it holds.
+        if json {
+            crate::print_json(&serde_json::json!({
+                "socket": socket.display().to_string(),
+                "session_id": null,
+                "reap": null,
+            }))?;
+            return Ok(0);
+        }
         println!("not running (no session at {})", socket.display());
         return Ok(0);
     };
 
-    println!("stopping session {}", report.identity.session_id);
-    print_reap_report(&report.reap);
+    if !json {
+        println!("stopping session {}", report.identity.session_id);
+        print_reap_report(&report.reap);
+    }
 
     // The socket is unlinked by a finalizer that runs *after* the reply
     // above, so the session is only really gone once this poll says so.
@@ -231,7 +244,16 @@ async fn stop() -> Result<i32> {
         &report.identity.session_id,
         scaled(STOP_GONE_TIMEOUT),
     )
-    .await?;
+    .await
+    .map_err(CliError::failed)?;
+    if json {
+        crate::print_json(&serde_json::json!({
+            "socket": socket.display().to_string(),
+            "session_id": report.identity.session_id,
+            "reap": report.reap,
+        }))?;
+        return Ok(0);
+    }
     println!("stopped");
     Ok(0)
 }
@@ -265,37 +287,55 @@ fn join_ids(ids: &[i64]) -> String {
 // status
 // ============================================================================
 
-async fn status() -> Result<i32> {
-    let socket = BundleProfile::session()
-        .context("resolve the session socket path")?
-        .socket_path;
+async fn status(json: bool) -> Result<i32, CliError> {
+    let socket = session_socket()?;
 
     if probe_gone(&socket).await {
-        println!("not running (no session at {})", socket.display());
-        return Ok(STATUS_NOT_RUNNING_EXIT);
+        // The line stays on stdout as the status report it has always
+        // been; the error is what carries the exit code.
+        if !json {
+            println!("not running (no session at {})", socket.display());
+        }
+        return Err(not_running(&socket));
     }
 
-    let mut client = connect(&socket).await?;
-    let identity = match identify_on(&mut client).await {
-        Ok(identity) => identity,
-        Err(error) => {
-            // A socket that will not answer is a real fault, not a
-            // clean "stopped" — say so and exit 1, not 3.
-            return Err(error.context(format!(
-                "a socket exists at {} but no session answered",
-                socket.display()
-            )));
-        }
-    };
-
-    let list: TabListResult = call(&mut client, ops::TAB_LIST, serde_json::json!({}))
+    let leg = scaled(IPC_TIMEOUT);
+    let mut client = session_launch::dial(&socket, leg)
         .await
-        .context("tab.list")?;
+        .map_err(CliError::connection)?;
+    // A socket that will not answer is a real fault, not a clean
+    // "stopped" — say so and exit 1, not 3.
+    let identity = session_launch::identify_on(&mut client, leg)
+        .await
+        .map_err(|e| {
+            CliError::Connection(format!(
+                "a socket exists at {} but no session answered: {e:#}",
+                socket.display()
+            ))
+        })?;
+
+    let list: TabListResult =
+        tokio::time::timeout(leg, client.call(ops::TAB_LIST, serde_json::json!({})))
+            .await
+            .map_err(|_| CliError::Connection(format!("{} timed out", ops::TAB_LIST)))??;
     let tabs: usize = list.projects.iter().map(|p| p.tabs.len()).sum();
 
+    if json {
+        crate::print_json(&serde_json::json!({
+            "socket": socket.display().to_string(),
+            "identity": identity,
+            "projects": list.projects.len(),
+            "tabs": tabs,
+        }))?;
+        return Ok(0);
+    }
     print_identity(&identity, &socket);
     println!("projects={}\ntabs={tabs}", list.projects.len());
     Ok(0)
+}
+
+fn not_running(socket: &Path) -> CliError {
+    CliError::NotRunning(format!("no session at {}", socket.display()))
 }
 
 /// Everything here comes from the session that answered on the socket —
@@ -311,27 +351,10 @@ fn print_identity(identity: &SessionIdentify, socket: &Path) {
     );
 }
 
-// ============================================================================
-// Thin IPC
-// ============================================================================
-
-async fn connect(socket: &Path) -> Result<IpcClient> {
-    session_launch::dial(socket, scaled(IPC_TIMEOUT)).await
-}
-
-async fn call<P: serde::Serialize, R: serde::de::DeserializeOwned>(
-    client: &mut IpcClient,
-    op: &str,
-    params: P,
-) -> Result<R> {
-    tokio::time::timeout(scaled(IPC_TIMEOUT), client.call(op, params))
-        .await
-        .map_err(|_| anyhow!("{op} timed out"))?
-        .map_err(Into::into)
-}
-
-async fn identify_on(client: &mut IpcClient) -> Result<SessionIdentify> {
-    session_launch::identify_on(client, scaled(IPC_TIMEOUT)).await
+fn session_socket() -> Result<std::path::PathBuf, CliError> {
+    BundleProfile::session()
+        .map(|profile| profile.socket_path)
+        .map_err(|e| CliError::Failed(format!("resolve the session socket path: {e:#}")))
 }
 
 #[cfg(test)]
@@ -678,6 +701,19 @@ mod tests {
         }
     }
 
+    /// `session status` with nothing listening: exit 3 through the
+    /// shared renderer, naming the socket it looked at.
+    #[test]
+    fn no_session_is_not_running_with_its_own_exit_code() {
+        let error = not_running(Path::new("/run/roost/roost-session.sock"));
+        assert_eq!(error.exit_code(), 3);
+        assert_eq!(error.code(), "not-running");
+        assert_eq!(
+            error.render(false),
+            "roostctl: not-running: no session at /run/roost/roost-session.sock\n"
+        );
+    }
+
     #[test]
     fn reap_ids_render_as_a_comma_list() {
         assert_eq!(join_ids(&[3, 1, 2]), "3,1,2");
@@ -772,7 +808,7 @@ mod tests {
     /// below the 30s the scripts sleep for.
     const HANG_TRIPWIRE: Duration = Duration::from_secs(15);
 
-    async fn run_launcher(tag: &str, body: &str) -> (Result<Verdict>, Duration) {
+    async fn run_launcher(tag: &str, body: &str) -> (anyhow::Result<Verdict>, Duration) {
         let dir = scratch(tag);
         let bin = fake_launcher(&dir, body);
         let started = std::time::Instant::now();

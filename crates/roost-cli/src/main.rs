@@ -9,13 +9,13 @@
 //!   roostctl set-title --title TITLE [--tab ID]
 //!   roostctl identify
 //!   roostctl tab focus [--tab ID]
-//!   roostctl tab list [--json]
+//!   roostctl tab list
 //!   roostctl tab set-state --state STATE [--tab ID]
 //!   roostctl tab open --project-id N [--cwd …] [--after-tab ID] [--focus] [--hold] [-- <cmd…>]
 //!   roostctl tab close [--tab ID]
 //!   roostctl tab send [--tab ID] --bytes 'echo hi\n' [--raw]
 //!   roostctl tab send [--tab ID] --bytes-base64 BASE64
-//!   roostctl tab send-file --tab ID PATH… [--json]
+//!   roostctl tab send-file --tab ID PATH…
 //!   roostctl tab resize [--tab ID] --cols N --rows N
 //!   roostctl tab reorder --project-id N --order id1,id2,id3
 //!   roostctl tab clear-notification [--tab ID]
@@ -32,6 +32,11 @@
 //!   roostctl host {add,list,remove,connect,disconnect}
 //!     add: --label, --target, [--verify]; the last three: --id
 //!
+//! `--json` is global: every verb but the two hooks prints one JSON
+//! document with it, and every failure goes through [`CliError`]'s one
+//! renderer. `[--tab ID]` falls back to `ROOST_TAB_ID`; a verb in
+//! [`MUTATING_TAB_VERBS`] refuses without either.
+//!
 //! Target selection (which UI socket to dial):
 //!   --socket PATH           (highest precedence)
 //!   ROOST_SOCKET env var
@@ -46,16 +51,19 @@
 
 mod agent_install;
 mod doctor;
+mod error;
 mod host;
 mod session;
 
+use std::ffi::OsString;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
 use base64::prelude::*;
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 use roost_agent::claude::{canonical_hook_event, claude_event_to_reports};
 use roost_agent::hook::{self, hook_payload, parse_tab_id, payload_event_name};
@@ -75,10 +83,39 @@ use roost_ipc::messages::{
 };
 use roost_ipc::paths::BundleProfileKind;
 use roost_ipc::session_launch::timeout_scale;
-use roost_ipc::target::{ResolvedTarget, TargetError, TargetSelector};
+use roost_ipc::target::TargetSelector;
 use roost_ipc::IpcClient;
 
+use crate::error::CliError;
+
 const CLIENT_NAME: &str = "roostctl";
+
+/// The verbs that change a tab, spelled the way a user types them.
+///
+/// Each takes its tab from `--tab` or `ROOST_TAB_ID` and otherwise exits
+/// 2 `usage` before dialling ([`require_tab`]): the UI's active tab is
+/// whatever a person last clicked, which is no answer for a command that
+/// writes to it. The read-only `tab dump` and `wait` keep that fallback
+/// ([`resolve_tab_or_active`]).
+///
+/// `tab send-file` is not listed because clap itself requires its
+/// `--tab`. Neither are `agent-hook` and `claude-hook`: they take no
+/// `--tab`, and the id their reports carry in the payload comes from
+/// `ROOST_TAB_ID` alone — a hook without one sends nothing and still
+/// answers `{}`.
+const MUTATING_TAB_VERBS: &[&str] = &[
+    "notify",
+    "set-title",
+    "tab set-state",
+    "tab clear-notification",
+    "tab close",
+    "tab send",
+    "tab resize",
+    "tab focus",
+];
+
+const NO_TAB: &str = "no --tab and ROOST_TAB_ID is unset; refusing to guess the active tab for \
+                      a command that changes it — `roostctl tab list` shows ids";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -89,11 +126,19 @@ const CLIENT_NAME: &str = "roostctl";
                   Bare tab and project ids mean whichever backend the UI \
                   runs its own tabs on. With `local-backend = session` the \
                   UI hands those ops to the local `roost-session` and \
-                  answers with the session's reply, so `--tab 7` and the \
-                  no-flag active tab both name a session tab; `--tab \
-                  h<n>.<id>` still names a saved host's tab and is never \
-                  re-addressed. `roostctl identify` prints the backend and \
-                  the session socket."
+                  answers with the session's reply, so `--tab 7` names a \
+                  session tab, and so does the active tab `tab dump` and \
+                  `wait` fall back to; `--tab h<n>.<id>` still names a saved \
+                  host's tab and is never re-addressed. `roostctl identify` \
+                  prints the backend and the session socket.\n\n\
+                  A command that changes a tab (notify, set-title, tab \
+                  set-state, tab clear-notification, tab close, tab send, \
+                  tab resize, tab focus) needs --tab or ROOST_TAB_ID, which \
+                  every Roost tab sets; without either it exits 2.\n\n\
+                  Exit codes: 0 ok, 1 failed, 2 usage, 3 `session status` \
+                  found no session, 4 `wait` timed out. A failure prints \
+                  `roostctl: <code>: <message>` on stderr, or \
+                  {\"error\":{\"code\",\"message\"}} under --json."
 )]
 struct Args {
     /// Explicit socket path. Highest precedence; overrides
@@ -107,6 +152,12 @@ struct Args {
     /// probe so the call is also faster when you know.
     #[arg(long, value_enum)]
     target: Option<TargetArg>,
+
+    /// Print the result as one JSON document on stdout, and a failure as
+    /// `{"error":{"code","message"}}` on stderr. Accepted before or after
+    /// the subcommand. `agent-hook` and `claude-hook` ignore it.
+    #[arg(long, global = true)]
+    json: bool,
 
     #[command(subcommand)]
     command: Cmd,
@@ -132,19 +183,27 @@ impl From<TargetArg> for BundleProfileKind {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Fire a notification on a tab.
+    ///
+    /// Needs `--tab` or `ROOST_TAB_ID`: it never falls back to the UI's
+    /// active tab.
     Notify {
         #[arg(long)]
         title: String,
         #[arg(long, default_value = "")]
         body: String,
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
+        #[arg(long)]
         tab: Option<i64>,
     },
     /// Rename a tab (locks it from OSC overwrites).
+    ///
+    /// Needs `--tab` or `ROOST_TAB_ID`: it never falls back to the UI's
+    /// active tab.
     SetTitle {
         #[arg(long)]
         title: String,
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
+        #[arg(long)]
         tab: Option<i64>,
     },
     /// Print the running UI's identity (socket, pid, active tab,
@@ -153,11 +212,12 @@ enum Cmd {
     /// Block until a tab reaches a condition, then exit 0 — the
     /// no-`sleep` synchronization primitive for scripts + tests. Polls
     /// the running UI on an interval (event-driven `events.subscribe` is
-    /// a planned upgrade behind this same interface). Exits non-zero if
-    /// `--timeout` elapses first. At least one of `--state` / `--text` /
+    /// a planned upgrade behind this same interface). Exits 4 (`timeout`)
+    /// if `--timeout` elapses first. At least one of `--state` / `--text` /
     /// `--gone` is required; when several are given, all must hold.
     Wait {
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`, then the UI's active tab.
+        #[arg(long)]
         tab: Option<i64>,
         /// Wait until the tab's agent state equals this.
         #[arg(long, value_parser = ["none", "running", "needs_input", "idle"])]
@@ -181,9 +241,11 @@ enum Cmd {
     },
     /// Tab subcommands.
     ///
-    /// A bare `--tab` (and the active tab used when the flag is
-    /// omitted) names a tab on whichever backend the UI runs its own
-    /// tabs on — see `roostctl --help`. `events.subscribe` is not
+    /// A bare `--tab` (and the active tab `tab dump` falls back to when
+    /// the flag and `ROOST_TAB_ID` are both absent) names a tab on
+    /// whichever backend the UI runs its own tabs on — see `roostctl
+    /// --help`. Every verb here that changes a tab needs `--tab` or
+    /// `ROOST_TAB_ID` and exits 2 without either. `events.subscribe` is not
     /// served on a UI socket either way; a client that wants the event
     /// stream dials `identify`'s `local_session_socket`.
     #[command(subcommand)]
@@ -202,7 +264,8 @@ enum Cmd {
     Palette(PaletteCmd),
     /// Capture a PNG of the running UI's whole window (sidebar, tabs,
     /// active terminal), rendered in-process. Writes to `--out` if
-    /// given, otherwise raw PNG bytes to stdout.
+    /// given, otherwise raw PNG bytes to stdout. `--json` needs `--out`
+    /// and prints `{"out","bytes"}`.
     Screenshot {
         /// File to write the PNG to. Omit to stream raw bytes to stdout.
         #[arg(long)]
@@ -287,20 +350,19 @@ enum Cmd {
     /// Diagnose the Roost integration: target resolution, socket, UI
     /// identity, shell-integration contract, the selected tab's four
     /// agent axes, and the Claude hook install. Read-only — it reports
-    /// and links, it never repairs. Exits 1 if any check fails.
+    /// and links, it never repairs. Exits 1 (`checks-failed`) if any
+    /// check fails; the report is on stdout either way.
     Doctor {
         /// Inspect this tab instead of `$ROOST_TAB_ID` / the UI's active
         /// tab.
-        ///
-        /// Deliberately NOT `env = "ROOST_TAB_ID"` like every other
-        /// per-tab command: clap would turn an unparseable env value
-        /// into exit 2 instead of a diagnostic, and erase the difference
-        /// between "the user passed --tab" and "clap read the env".
-        /// Doctor reads the env var itself.
+        //
+        // Doctor reads the env var itself rather than through
+        // [`named_tab`] like every other per-tab command: that turns an
+        // unparseable value into exit 2 where doctor owes a diagnostic,
+        // and erases the difference between "the user passed --tab" and
+        // "the env named a tab".
         #[arg(long)]
         tab: Option<i64>,
-        #[arg(long, default_value_t = false)]
-        json: bool,
         /// Print the full per-check report instead of one line per
         /// section. Ignored by `--json`, which always carries everything.
         #[arg(short, long, default_value_t = false)]
@@ -357,9 +419,11 @@ enum ProjectCmd {
 #[derive(Subcommand, Debug)]
 enum TabCmd {
     /// Focus a tab. `--tab` takes a bare id, or the `h<host>.<id>`
-    /// spelling to select (and attach) a connected host's tab.
+    /// spelling to select (and attach) a connected host's tab. Needs
+    /// `--tab` or `ROOST_TAB_ID`.
     Focus {
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
+        #[arg(long)]
         tab: Option<String>,
     },
     /// Send local files to a tab: upload them to the tab's host and
@@ -379,8 +443,6 @@ enum TabCmd {
         tab: String,
         #[arg(required = true)]
         paths: Vec<PathBuf>,
-        #[arg(long, default_value_t = false)]
-        json: bool,
     },
     /// List projects + their tabs. `--json` emits the machine-readable
     /// workspace snapshot (the `tab.list` result) instead of plain text.
@@ -389,10 +451,7 @@ enum TabCmd {
     /// stream it fences: a UI running its tabs in-process does, and a UI
     /// under `local-backend = session` does not, though its answer came
     /// from the local session.
-    List {
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
+    List,
     /// Set the tab's agent-lifecycle axis by claiming ownership as
     /// `manual` (plan 002 §3.7). This **supersedes a live agent's
     /// ownership** — if Claude (or another agent) currently owns the
@@ -411,11 +470,15 @@ enum TabCmd {
         /// with that lifecycle.
         #[arg(long, value_parser = ["none", "running", "needs_input", "idle"])]
         state: String,
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
+        #[arg(long)]
         tab: Option<i64>,
     },
+    /// Clear a tab's pending notification. Needs `--tab` or
+    /// `ROOST_TAB_ID`.
     ClearNotification {
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
+        #[arg(long)]
         tab: Option<i64>,
     },
     /// Open a new tab in the given project. `--cwd` defaults to
@@ -457,9 +520,10 @@ enum TabCmd {
         argv: Vec<String>,
     },
     /// Close a tab. The UI closes the PTY (if live) and emits
-    /// `tab.closed`.
+    /// `tab.closed`. Needs `--tab` or `ROOST_TAB_ID`.
     Close {
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
+        #[arg(long)]
         tab: Option<i64>,
     },
     /// Write bytes into a tab's PTY without attaching a
@@ -468,9 +532,11 @@ enum TabCmd {
     /// `not-found` otherwise. `--bytes` is treated as a
     /// Rust-style escaped string (`\n`, `\r`, `\t`, `\x1b`, etc.)
     /// unless `--raw` is set. For binary fidelity (arbitrary
-    /// bytes, not UTF-8) use `--bytes-base64` instead.
+    /// bytes, not UTF-8) use `--bytes-base64` instead. Needs `--tab` or
+    /// `ROOST_TAB_ID`.
     Send {
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
+        #[arg(long)]
         tab: Option<i64>,
         #[arg(
             long,
@@ -487,10 +553,11 @@ enum TabCmd {
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
-    /// Resize a tab's PTY. Same constraint as `tab send` —
-    /// needs an existing live PTY.
+    /// Resize a tab's PTY. Same constraints as `tab send` —
+    /// needs an existing live PTY, and `--tab` or `ROOST_TAB_ID`.
     Resize {
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
+        #[arg(long)]
         tab: Option<i64>,
         #[arg(long)]
         cols: u32,
@@ -504,11 +571,9 @@ enum TabCmd {
     /// `h<host>.<id>` spelling of an attached host tab's client-side
     /// terminal (host-sessions §3.4).
     Dump {
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`, then the UI's active tab.
+        #[arg(long)]
         tab: Option<String>,
-        /// Emit the structured JSON result instead of plain text rows.
-        #[arg(long, default_value_t = false)]
-        json: bool,
         /// History rows above the viewport to include. Printed before
         /// the viewport rows with no separator, so `| grep` keeps
         /// working over the larger window. Server-side clamped, so
@@ -542,20 +607,13 @@ enum PaletteCmd {
         /// `custom`, or `agents`.
         #[arg(long, default_value = "commands")]
         kind: String,
-        #[arg(long, default_value_t = false)]
-        json: bool,
     },
     /// Print the current palette state (open?, frame, query, rows).
-    State {
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
+    State,
     /// Set the current frame's filter (as if typed), print the result.
     Query {
         /// The filter text.
         query: String,
-        #[arg(long, default_value_t = false)]
-        json: bool,
     },
     /// Activate the row with this item id — the same dispatch as its
     /// keybind. Errors `not-found` if no palette is open or no row
@@ -564,14 +622,9 @@ enum PaletteCmd {
         /// The item id (a KeybindAction id like `new_tab`, or a sub-frame
         /// row id like a theme name).
         id: String,
-        #[arg(long, default_value_t = false)]
-        json: bool,
     },
     /// Dismiss any open palette.
-    Dismiss {
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
+    Dismiss,
     /// Present a caller-supplied list and block until the user picks a
     /// row or dismisses, then print the chosen id (nothing on dismiss).
     /// Items come from `--items <json>` or stdin: a JSON array
@@ -586,13 +639,11 @@ enum PaletteCmd {
         /// The items JSON. When omitted, read from stdin (dmenu-style).
         #[arg(long)]
         items: Option<String>,
-        #[arg(long, default_value_t = false)]
-        json: bool,
     },
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     // Diagnostics to stderr, because stdout is this binary's *data*
     // channel: `--json` on any verb, `tab dump`, and the hook payloads
     // are all decoded by something. The config parser warns about a key
@@ -606,127 +657,241 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let args = Args::parse();
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    let args = match Args::try_parse_from(&argv) {
+        Ok(args) => args,
+        Err(error) => std::process::exit(refuse_command_line(&error, &argv)),
+    };
+    let json = args.json;
+    let tab_env = std::env::var("ROOST_TAB_ID").ok();
+    let code = match run(args, tab_env.as_deref()).await {
+        Ok(code) => code,
+        Err(error) => report(&error, json),
+    };
+    std::process::exit(code);
+}
 
-    // Both hook verbs are fire-and-forget — any failure path must exit
-    // 0 with `{}` on stdout, written fallibly: Rust ignores SIGPIPE, so
-    // a `println!` into a pipe whose reader has gone would panic with
-    // 101 and no JSON at all, which a decision hook may read as a block.
-    // Split them out before resolving the target so an offline UI
-    // doesn't make the hook itself fail.
-    //
-    // `claude-hook EVENT` is the alias `agent-hook claude` grew out of:
-    // it takes its event from argv instead of the payload, which is what
-    // every already-installed `claude-settings.json` writes.
-    if let Cmd::ClaudeHook { event } = &args.command {
-        let _ = run_claude_hook(event, &args).await;
-        return hook_answer();
+/// Write a failure to stderr and hand back its exit code. Fallible for
+/// the reason [`hook_answer`] is: `eprintln!` panics on a closed stderr,
+/// which would trade this exit code for 101.
+fn report(error: &CliError, json: bool) -> i32 {
+    let _ = std::io::stderr()
+        .lock()
+        .write_all(error.render(json).as_bytes());
+    error.exit_code()
+}
+
+/// A command line clap would not accept, rendered like every other
+/// failure. `--help` and `--version` are not failures and still print to
+/// stdout; a missing subcommand prints clap's help unchanged, because
+/// that help is the usage text.
+fn refuse_command_line(error: &clap::Error, argv: &[OsString]) -> i32 {
+    use clap::error::ErrorKind;
+    if matches!(
+        error.kind(),
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+    ) {
+        error.exit();
     }
-    if let Cmd::AgentHook { agent } = &args.command {
-        let _ = run_agent_hook(agent, &args).await;
-        return hook_answer();
+    let usage = CliError::from_clap(error);
+    let json = asks_for_json(argv);
+    if !json && error.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
+        let _ = error.print();
+        return usage.exit_code();
     }
+    report(&usage, json)
+}
 
-    // The `agent` verbs write dotfiles and never dial a UI, so they run
-    // before the connect prologue — wiring an agent has to work with
-    // nothing running, which is exactly when a user reaches for it. The
-    // one shape `dials_the_ui` names falls through to the prologue
-    // instead, and is served after it.
-    if let Cmd::Agent(cmd) = &args.command {
-        if !agent_install::dials_the_ui(cmd) {
-            std::process::exit(agent_install::run(cmd));
-        }
-    }
+/// Whether argv carries `--json` — read off the raw words because a
+/// command line clap refused has no parsed flag to ask. Stops at `--`:
+/// every word past it belongs to the command `tab open` runs.
+fn asks_for_json(argv: &[OsString]) -> bool {
+    argv.iter()
+        .skip(1)
+        .map(|arg| arg.to_str())
+        .take_while(|arg| *arg != Some("--"))
+        .any(|arg| arg == Some("--json"))
+}
 
-    // `claude install` doesn't dial the UI either — it is a bare alias
-    // of `agent install claude`, which only reads and writes dotfiles.
-    if let Cmd::Claude(ClaudeCmd::Install) = args.command {
-        std::process::exit(claude_install());
-    }
-
-    // `session` addresses the session profile's own socket, which no
-    // target selector resolves (and must not — see `roost_ipc::target`'s
-    // HS-0 fences). `start` also has to work with nothing listening at
-    // all, so like doctor it runs before the connect prologue.
-    if let Cmd::Session(cmd) = &args.command {
-        std::process::exit(session::run(cmd).await);
-    }
-
-    // doctor exists to report "no UI is running", so it must not go
-    // through the connect prologue below, which `?`-exits on exactly
-    // that condition before any match arm runs.
-    //
-    // Destructuring by value moves out of `args`, so `selector(&args)`
-    // below only compiles while every field here is `Copy` — which is
-    // why `--color` is a `Copy` `ValueEnum` rather than a `String`.
-    if let Cmd::Doctor {
-        tab,
-        json,
-        verbose,
-        color,
-    } = args.command
-    {
-        // The three impure probes live here, in the thin I/O layer;
-        // `color_enabled` itself stays pure so its precedence is
-        // table-testable.
-        let no_color = std::env::var("NO_COLOR").ok();
-        let term = std::env::var("TERM").ok();
-        let style = doctor::Style {
-            color: doctor::color_enabled(
-                color,
-                std::io::stdout().is_terminal(),
-                no_color.as_deref(),
-                term.as_deref(),
-            ),
-        };
-        let report = doctor::evaluate(&doctor::collect(&selector(&args), tab).await);
-        {
-            let mut stdout = std::io::stdout().lock();
-            write!(stdout, "{}", doctor::render(&report, json, style, verbose)?)?;
-            stdout.flush()?;
-        }
-        std::process::exit(report.exit_code());
-    }
-
-    // Everything else needs a live UI socket.
-    let target = resolve_target(&args, /*probe_alive=*/ true).await?;
-    let mut client = IpcClient::connect(&target.socket_path).await?;
-
+/// Every verb, after parsing: its exit code, or its failure for `main`
+/// to render.
+///
+/// `tab_env` is `ROOST_TAB_ID` as `main` read it — a parameter so the
+/// target policy is tested without writing to the process environment
+/// every other test in this binary reads.
+async fn run(args: Args, tab_env: Option<&str>) -> Result<i32, CliError> {
+    let json = args.json;
+    let selector = selector(&args);
     match args.command {
+        // Both hook verbs are fire-and-forget — any failure path must
+        // exit 0 with `{}` on stdout, written fallibly: Rust ignores
+        // SIGPIPE, so a `println!` into a pipe whose reader has gone
+        // would panic with 101 and no JSON at all, which a decision hook
+        // may read as a block. They never reach [`UiSocket`], so an
+        // offline UI doesn't make the hook itself fail, and they ignore
+        // `--json`: `{}` is already the only answer they give.
+        //
+        // `claude-hook EVENT` is the alias `agent-hook claude` grew out
+        // of: it takes its event from argv instead of the payload, which
+        // is what every already-installed `claude-settings.json` writes.
+        Cmd::ClaudeHook { event } => {
+            run_claude_hook(&event, &selector, tab_env).await;
+            hook_answer();
+            Ok(0)
+        }
+        Cmd::AgentHook { agent } => {
+            run_agent_hook(&agent, &selector, tab_env).await;
+            hook_answer();
+            Ok(0)
+        }
+        // The `agent` verbs write dotfiles and never dial a UI — wiring
+        // an agent has to work with nothing running, which is exactly
+        // when a user reaches for it. The one shape `dials_the_ui` names
+        // is served over the UI socket instead.
+        Cmd::Agent(cmd) if !agent_install::dials_the_ui(&cmd) => agent_install::run(&cmd, json),
+        // `claude install` doesn't dial the UI either — it is a bare
+        // alias of `agent install claude`, which only reads and writes
+        // dotfiles.
+        Cmd::Claude(ClaudeCmd::Install) => claude_install(json),
+        // `session` addresses the session profile's own socket, which no
+        // target selector resolves (and must not — see
+        // `roost_ipc::target`'s HS-0 fences). `start` also has to work
+        // with nothing listening at all.
+        Cmd::Session(cmd) => session::run(&cmd, json).await,
+        // doctor exists to report "no UI is running", so it must not
+        // dial through [`UiSocket`], which fails on exactly that
+        // condition before the verb's own code runs.
+        Cmd::Doctor {
+            tab,
+            verbose,
+            color,
+        } => run_doctor(&selector, tab, json, verbose, color).await,
+        command => run_on_ui(command, &mut UiSocket::new(&selector), tab_env, json).await,
+    }
+}
+
+async fn run_doctor(
+    selector: &TargetSelector,
+    tab: Option<i64>,
+    json: bool,
+    verbose: bool,
+    color: doctor::ColorMode,
+) -> Result<i32, CliError> {
+    // The three impure probes live here, in the thin I/O layer;
+    // `color_enabled` itself stays pure so its precedence is
+    // table-testable.
+    let no_color = std::env::var("NO_COLOR").ok();
+    let term = std::env::var("TERM").ok();
+    let style = doctor::Style {
+        color: doctor::color_enabled(
+            color,
+            std::io::stdout().is_terminal(),
+            no_color.as_deref(),
+            term.as_deref(),
+        ),
+    };
+    let report = doctor::evaluate(&doctor::collect(selector, tab).await);
+    let rendered = doctor::render(&report, json, style, verbose).map_err(CliError::failed)?;
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(rendered.as_bytes())
+        .and_then(|()| stdout.flush())
+        .map_err(|e| CliError::Failed(format!("write the report: {e}")))?;
+    report.verdict()
+}
+
+/// The UI socket a verb talks to, dialled the first time the verb asks
+/// for it — so a verb that refuses its own arguments has dialled nothing.
+struct UiSocket<'a> {
+    selector: &'a TargetSelector,
+    client: Option<IpcClient>,
+}
+
+impl<'a> UiSocket<'a> {
+    fn new(selector: &'a TargetSelector) -> Self {
+        Self {
+            selector,
+            client: None,
+        }
+    }
+
+    async fn client(&mut self) -> Result<&mut IpcClient, CliError> {
+        let client = match self.client.take() {
+            Some(client) => client,
+            None => {
+                let target = self.selector.resolve(true).await?;
+                IpcClient::connect(&target.socket_path).await.map_err(|e| {
+                    CliError::Connection(format!("{}: {e}", target.socket_path.display()))
+                })?
+            }
+        };
+        Ok(self.client.insert(client))
+    }
+
+    async fn call<P: Serialize, R: DeserializeOwned>(
+        &mut self,
+        op: &str,
+        params: P,
+    ) -> Result<R, CliError> {
+        Ok(self.client().await?.call(op, params).await?)
+    }
+
+    /// A verb that prints nothing on success: under `--json`, the op's reply.
+    async fn ack<P: Serialize>(&mut self, op: &str, params: P, json: bool) -> Result<(), CliError> {
+        let reply: serde_json::Value = self.call(op, params).await?;
+        if json {
+            print_json(&reply)?;
+        }
+        Ok(())
+    }
+}
+
+/// The verbs served over the UI socket.
+async fn run_on_ui(
+    command: Cmd,
+    ui: &mut UiSocket<'_>,
+    tab_env: Option<&str>,
+    json: bool,
+) -> Result<i32, CliError> {
+    match command {
         Cmd::Notify { title, body, tab } => {
-            let tab_id = resolve_tab(&mut client, tab).await?;
-            client
-                .call::<_, serde_json::Value>(
-                    ops::NOTIFICATION_CREATE,
-                    NotificationCreateParams {
-                        tab_id,
-                        title,
-                        body,
-                    },
-                )
-                .await?;
+            let tab_id = require_tab("notify", tab, tab_env)?;
+            ui.ack(
+                ops::NOTIFICATION_CREATE,
+                NotificationCreateParams {
+                    tab_id,
+                    title,
+                    body,
+                },
+                json,
+            )
+            .await?;
         }
         Cmd::SetTitle { title, tab } => {
-            let tab_id = resolve_tab(&mut client, tab).await?;
-            client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_SET_TITLE,
-                    TabSetTitleParams { tab_id, title },
-                )
-                .await?;
+            let tab_id = require_tab("set-title", tab, tab_env)?;
+            ui.ack(
+                ops::TAB_SET_TITLE,
+                TabSetTitleParams { tab_id, title },
+                json,
+            )
+            .await?;
         }
         Cmd::Identify => {
-            let resp = identify(&mut client).await?;
-            println!(
-                "socket={}\npid={}\nactive_project={}\nactive_tab={}\nui_version={}\nproto_version={}\napp_id={}",
-                resp.socket_path,
-                resp.pid,
-                resp.active_project_id,
-                resp.active_tab_id,
-                resp.ui_version,
-                resp.protocol_version,
-                resp.app_id
-            );
+            let resp = identify(ui.client().await?).await?;
+            if json {
+                print_json(&resp)?;
+            } else {
+                println!(
+                    "socket={}\npid={}\nactive_project={}\nactive_tab={}\nui_version={}\nproto_version={}\napp_id={}",
+                    resp.socket_path,
+                    resp.pid,
+                    resp.active_project_id,
+                    resp.active_tab_id,
+                    resp.ui_version,
+                    resp.protocol_version,
+                    resp.app_id
+                );
+            }
         }
         Cmd::Wait {
             tab,
@@ -737,20 +902,25 @@ async fn main() -> Result<()> {
             interval_ms,
         } => {
             if state.is_none() && text.is_none() && !gone {
-                anyhow::bail!("wait needs at least one of --state, --text, or --gone");
+                return Err(CliError::Usage(
+                    "wait needs at least one of --state, --text, or --gone".into(),
+                ));
             }
             // `--gone` (tab must NOT exist) contradicts --state/--text
             // (tab must exist); reject the combination up front rather
             // than silently letting --gone win.
             if gone && (state.is_some() || text.is_some()) {
-                anyhow::bail!("--gone cannot be combined with --state or --text");
+                return Err(CliError::Usage(
+                    "--gone cannot be combined with --state or --text".into(),
+                ));
             }
-            let tab_id = resolve_tab(&mut client, tab).await?;
+            let tab_id = resolve_tab_or_active(ui, tab, tab_env).await?;
+            let client = ui.client().await?;
             let deadline =
                 std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout.max(0.0));
             let interval = std::time::Duration::from_millis(interval_ms.max(10));
             loop {
-                let list = list_tabs(&mut client).await?;
+                let list = list_tabs(client).await?;
                 let exists = list
                     .projects
                     .iter()
@@ -806,21 +976,29 @@ async fn main() -> Result<()> {
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
-                    anyhow::bail!("timed out after {timeout}s waiting for tab {tab_id}");
+                    return Err(CliError::Timeout(format!(
+                        "timed out after {timeout}s waiting for tab {tab_id}"
+                    )));
                 }
                 tokio::time::sleep(interval).await;
             }
+            if json {
+                print_json(&serde_json::json!({}))?;
+            }
         }
         Cmd::Tab(TabCmd::Focus { tab }) => {
-            let tab_id = wire_tab_ref(&mut client, tab.as_deref()).await?;
-            client
-                .call::<_, serde_json::Value>(ops::TAB_FOCUS, TabFocusParams { tab_id })
+            let tab_id = require_tab(
+                "tab focus",
+                tab.as_deref().map(parse_tab_flag).transpose()?,
+                tab_env,
+            )?;
+            ui.ack(ops::TAB_FOCUS, TabFocusParams { tab_id }, json)
                 .await?;
         }
-        Cmd::Tab(TabCmd::List { json }) => {
-            let resp = list_tabs(&mut client).await?;
+        Cmd::Tab(TabCmd::List) => {
+            let resp = list_tabs(ui.client().await?).await?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
+                print_json(&resp)?;
             } else {
                 for project in resp.projects {
                     println!("project {} — {}", project.id, project.name);
@@ -837,81 +1015,89 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Tab(TabCmd::SetState { state, tab }) => {
-            let tab_id = resolve_tab(&mut client, tab).await?;
+            let tab_id = require_tab("tab set-state", tab, tab_env)?;
             let state = parse_state(&state)?;
-            client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_SET_STATE,
-                    TabSetStateParams { tab_id, state },
-                )
-                .await?;
+            ui.ack(
+                ops::TAB_SET_STATE,
+                TabSetStateParams { tab_id, state },
+                json,
+            )
+            .await?;
         }
         Cmd::Tab(TabCmd::ClearNotification { tab }) => {
-            let tab_id = resolve_tab(&mut client, tab).await?;
-            client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_CLEAR_NOTIFICATION,
-                    // No `generation`: a person at a CLI is answering the
-                    // tab, not one raise on it.
-                    TabClearNotificationParams {
-                        tab_id,
-                        generation: None,
-                    },
-                )
-                .await?;
+            let tab_id = require_tab("tab clear-notification", tab, tab_env)?;
+            ui.ack(
+                ops::TAB_CLEAR_NOTIFICATION,
+                // No `generation`: a person at a CLI is answering the
+                // tab, not one raise on it.
+                TabClearNotificationParams {
+                    tab_id,
+                    generation: None,
+                },
+                json,
+            )
+            .await?;
         }
         Cmd::Project(ProjectCmd::List) => {
-            let resp = list_tabs(&mut client).await?;
-            for p in resp.projects {
-                println!(
-                    "project {} — {}  cwd={}  tabs={}",
-                    p.id,
-                    p.name,
-                    p.cwd,
-                    p.tabs.len()
-                );
+            let resp = list_tabs(ui.client().await?).await?;
+            if json {
+                print_json(&resp)?;
+            } else {
+                for p in resp.projects {
+                    println!(
+                        "project {} — {}  cwd={}  tabs={}",
+                        p.id,
+                        p.name,
+                        p.cwd,
+                        p.tabs.len()
+                    );
+                }
             }
         }
         Cmd::Project(ProjectCmd::Create { name, cwd }) => {
-            let resp: ProjectCreateResult = client
+            let resp: ProjectCreateResult = ui
                 .call(ops::PROJECT_CREATE, ProjectCreateParams { name, cwd })
                 .await?;
-            println!(
-                "created project {} — {}",
-                resp.project.id, resp.project.name
-            );
+            if json {
+                print_json(&resp)?;
+            } else {
+                println!(
+                    "created project {} — {}",
+                    resp.project.id, resp.project.name
+                );
+            }
         }
         Cmd::Project(ProjectCmd::Rename { id, name }) => {
-            client
-                .call::<_, serde_json::Value>(
-                    ops::PROJECT_RENAME,
-                    ProjectRenameParams {
-                        project_id: id,
-                        name,
-                    },
-                )
-                .await?;
+            ui.ack(
+                ops::PROJECT_RENAME,
+                ProjectRenameParams {
+                    project_id: id,
+                    name,
+                },
+                json,
+            )
+            .await?;
         }
         Cmd::Project(ProjectCmd::Delete { id }) => {
-            client
-                .call::<_, serde_json::Value>(
-                    ops::PROJECT_DELETE,
-                    ProjectDeleteParams { project_id: id },
-                )
-                .await?;
+            ui.ack(
+                ops::PROJECT_DELETE,
+                ProjectDeleteParams { project_id: id },
+                json,
+            )
+            .await?;
         }
         Cmd::Project(ProjectCmd::Reorder { order }) => {
-            client
-                .call::<_, serde_json::Value>(
-                    ops::PROJECT_REORDER,
-                    ProjectReorderParams {
-                        // The CLI's ids are numbers; the host-qualified
-                        // wire form is reachable through the op, not
-                        // through this verb (plan 044 §4).
-                        project_ids: order.into_iter().map(WireProjectRef::Local).collect(),
-                    },
-                )
-                .await?;
+            ui.ack(
+                ops::PROJECT_REORDER,
+                ProjectReorderParams {
+                    // The CLI's ids are numbers; the host-qualified
+                    // wire form is reachable through the op, not
+                    // through this verb (plan 044 §4).
+                    project_ids: order.into_iter().map(WireProjectRef::Local).collect(),
+                },
+                json,
+            )
+            .await?;
         }
         Cmd::Tab(TabCmd::Open {
             project_id,
@@ -933,6 +1119,7 @@ async fn main() -> Result<()> {
             } else {
                 argv
             };
+            let client = ui.client().await?;
             let resp: TabOpenResult = client
                 .call(
                     ops::TAB_OPEN,
@@ -950,7 +1137,7 @@ async fn main() -> Result<()> {
             // `--after-tab`: place the new tab right after that one via a
             // reorder over the project's current order.
             if let Some(after) = after_tab {
-                let snapshot = list_tabs(&mut client).await?;
+                let snapshot = list_tabs(client).await?;
                 if let Some(project) = snapshot.projects.iter().find(|p| p.id == project_id) {
                     let ids: Vec<i64> = project.tabs.iter().map(|t| t.id).collect();
                     client
@@ -977,14 +1164,17 @@ async fn main() -> Result<()> {
                     )
                     .await?;
             }
-            // Print just the new tab id (matches the documented contract;
-            // script-friendly for `id=$(roostctl tab open …)`).
-            println!("{new_id}");
+            if json {
+                print_json(&resp)?;
+            } else {
+                // Print just the new tab id (matches the documented
+                // contract; script-friendly for `id=$(roostctl tab open …)`).
+                println!("{new_id}");
+            }
         }
         Cmd::Tab(TabCmd::Close { tab }) => {
-            let tab_id = resolve_tab(&mut client, tab).await?;
-            client
-                .call::<_, serde_json::Value>(ops::TAB_CLOSE, TabCloseParams { tab_id })
+            let tab_id = require_tab("tab close", tab, tab_env)?;
+            ui.ack(ops::TAB_CLOSE, TabCloseParams { tab_id }, json)
                 .await?;
         }
         Cmd::Tab(TabCmd::Send {
@@ -993,29 +1183,29 @@ async fn main() -> Result<()> {
             bytes_base64,
             raw,
         }) => {
-            let tab_id = resolve_tab(&mut client, tab).await?;
+            let tab_id = require_tab("tab send", tab, tab_env)?;
             let data = if let Some(b64) = bytes_base64 {
                 BASE64_STANDARD
                     .decode(b64.as_bytes())
-                    .map_err(|e| anyhow!("--bytes-base64 decode failed: {e}"))?
+                    .map_err(|e| CliError::Usage(format!("--bytes-base64 decode failed: {e}")))?
             } else {
-                let s =
-                    bytes.ok_or_else(|| anyhow!("tab send requires --bytes or --bytes-base64"))?;
+                let s = bytes.ok_or_else(|| {
+                    CliError::Usage("tab send requires --bytes or --bytes-base64".into())
+                })?;
                 if raw {
                     s.into_bytes()
                 } else {
                     decode_escapes(&s)
                 }
             };
-            client
-                .call::<_, serde_json::Value>(ops::TAB_WRITE, TabWriteParams { tab_id, data })
+            ui.ack(ops::TAB_WRITE, TabWriteParams { tab_id, data }, json)
                 .await?;
         }
-        Cmd::Tab(TabCmd::SendFile { tab, paths, json }) => {
-            let tab_id = wire_tab_ref(&mut client, Some(tab.as_str())).await?;
+        Cmd::Tab(TabCmd::SendFile { tab, paths }) => {
+            let tab_id = parse_tab_flag(&tab)?;
             let paths = canonicalize_for_send_file(&paths)?;
             let budget = send_file_budget(paths.len(), timeout_scale());
-            let call = client.call(
+            let call = ui.client().await?.call(
                 ops::TAB_SEND_FILE,
                 TabSendFileParams {
                     tab: tab_id.to_string(),
@@ -1024,37 +1214,34 @@ async fn main() -> Result<()> {
             );
             let result: TabSendFileResult =
                 tokio::time::timeout(budget, call).await.map_err(|_| {
-                    anyhow!(
+                    CliError::Connection(format!(
                         "tab send-file gave up after {}s; the paste may still land in the tab",
                         budget.as_secs()
-                    )
+                    ))
                 })??;
             if json {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                print_json(&result)?;
             } else {
                 println!("{}", result.pasted);
             }
         }
         Cmd::Tab(TabCmd::Resize { tab, cols, rows }) => {
-            let tab_id = resolve_tab(&mut client, tab).await?;
-            client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_RESIZE,
-                    TabResizeParams { tab_id, cols, rows },
-                )
-                .await?;
+            let tab_id = require_tab("tab resize", tab, tab_env)?;
+            ui.ack(
+                ops::TAB_RESIZE,
+                TabResizeParams { tab_id, cols, rows },
+                json,
+            )
+            .await?;
         }
-        Cmd::Tab(TabCmd::Dump {
-            tab,
-            json,
-            scrollback,
-        }) => {
-            let tab_id = wire_tab_ref(&mut client, tab.as_deref()).await?;
-            let result: TabDumpResult = client
+        Cmd::Tab(TabCmd::Dump { tab, scrollback }) => {
+            let flag = tab.as_deref().map(parse_tab_flag).transpose()?;
+            let tab_id = resolve_tab_or_active(ui, flag, tab_env).await?;
+            let result: TabDumpResult = ui
                 .call(ops::TAB_DUMP, TabDumpParams { tab_id, scrollback })
                 .await?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                print_json(&result)?;
             } else {
                 // Plain text: history rows then viewport rows, no
                 // separator between them, reconstructing the screen for
@@ -1070,47 +1257,64 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Tab(TabCmd::Reorder { project_id, order }) => {
-            client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_REORDER,
-                    TabReorderParams {
-                        project_id: WireProjectRef::Local(project_id),
-                        tab_ids: order.into_iter().map(WireTabRef::Local).collect(),
-                    },
-                )
-                .await?;
+            ui.ack(
+                ops::TAB_REORDER,
+                TabReorderParams {
+                    project_id: WireProjectRef::Local(project_id),
+                    tab_ids: order.into_iter().map(WireTabRef::Local).collect(),
+                },
+                json,
+            )
+            .await?;
         }
         Cmd::Screenshot { out, scale } => {
+            if json && out.is_none() {
+                return Err(CliError::Usage(
+                    "--json needs --out: the PNG and the JSON would share stdout".into(),
+                ));
+            }
             // `scale` range is enforced by clap's value_parser (exit 2).
-            let resp: ScreenshotResult = client
-                .call(ops::SCREENSHOT, ScreenshotParams { scale })
-                .await?;
+            let resp: ScreenshotResult =
+                ui.call(ops::SCREENSHOT, ScreenshotParams { scale }).await?;
             match out {
                 Some(path) => {
                     std::fs::write(&path, &resp.png)
-                        .map_err(|e| anyhow!("write {}: {e}", path.display()))?;
-                    eprintln!(
-                        "wrote {} ({}x{} @ {}x, {} bytes)",
-                        path.display(),
-                        resp.width,
-                        resp.height,
-                        resp.scale,
-                        resp.png.len()
-                    );
+                        .map_err(|e| CliError::Failed(format!("write {}: {e}", path.display())))?;
+                    if json {
+                        print_json(&serde_json::json!({
+                            "out": path.display().to_string(),
+                            "bytes": resp.png.len(),
+                        }))?;
+                    } else {
+                        eprintln!(
+                            "wrote {} ({}x{} @ {}x, {} bytes)",
+                            path.display(),
+                            resp.width,
+                            resp.height,
+                            resp.scale,
+                            resp.png.len()
+                        );
+                    }
                 }
                 None => {
                     // Raw PNG to stdout — never `println!`, which would
                     // append a newline and corrupt the binary stream.
                     let mut stdout = std::io::stdout().lock();
-                    stdout.write_all(&resp.png)?;
-                    stdout.flush()?;
+                    stdout
+                        .write_all(&resp.png)
+                        .and_then(|()| stdout.flush())
+                        .map_err(|e| CliError::Failed(format!("write the PNG to stdout: {e}")))?;
                 }
             }
         }
         Cmd::RenderStats { reset } => {
-            let stats: AppRenderStatsResult = client
+            let stats: AppRenderStatsResult = ui
                 .call(ops::APP_RENDER_STATS, AppRenderStatsParams { reset })
                 .await?;
+            if json {
+                print_json(&stats)?;
+                return Ok(0);
+            }
             let per = |total: i64, calls: i64| {
                 if calls > 0 {
                     (total / calls).to_string()
@@ -1146,53 +1350,51 @@ async fn main() -> Result<()> {
                 per(stats.elide_nanos, stats.elide_calls)
             );
         }
-        Cmd::Palette(PaletteCmd::Open { kind, json }) => {
-            let state: PaletteStateResult = client
+        Cmd::Palette(PaletteCmd::Open { kind }) => {
+            let state: PaletteStateResult = ui
                 .call(ops::PALETTE_OPEN, PaletteOpenParams { kind })
                 .await?;
             print_palette(&state, json)?;
         }
-        Cmd::Palette(PaletteCmd::State { json }) => {
-            let state: PaletteStateResult = client
-                .call(ops::PALETTE_STATE, serde_json::json!({}))
-                .await?;
+        Cmd::Palette(PaletteCmd::State) => {
+            let state: PaletteStateResult =
+                ui.call(ops::PALETTE_STATE, serde_json::json!({})).await?;
             print_palette(&state, json)?;
         }
-        Cmd::Palette(PaletteCmd::Query { query, json }) => {
-            let state: PaletteStateResult = client
+        Cmd::Palette(PaletteCmd::Query { query }) => {
+            let state: PaletteStateResult = ui
                 .call(ops::PALETTE_QUERY, PaletteQueryParams { query })
                 .await?;
             print_palette(&state, json)?;
         }
-        Cmd::Palette(PaletteCmd::Activate { id, json }) => {
-            let state: PaletteStateResult = client
+        Cmd::Palette(PaletteCmd::Activate { id }) => {
+            let state: PaletteStateResult = ui
                 .call(ops::PALETTE_ACTIVATE, PaletteActivateParams { id })
                 .await?;
             print_palette(&state, json)?;
         }
-        Cmd::Palette(PaletteCmd::Dismiss { json }) => {
-            let state: PaletteStateResult = client
-                .call(ops::PALETTE_DISMISS, serde_json::json!({}))
-                .await?;
+        Cmd::Palette(PaletteCmd::Dismiss) => {
+            let state: PaletteStateResult =
+                ui.call(ops::PALETTE_DISMISS, serde_json::json!({})).await?;
             print_palette(&state, json)?;
         }
         Cmd::Palette(PaletteCmd::Present {
             title,
             placeholder,
             items,
-            json,
         }) => {
             let raw = match items {
                 Some(s) => s,
                 None => {
-                    use std::io::Read;
                     let mut buf = String::new();
-                    std::io::stdin().read_to_string(&mut buf)?;
+                    std::io::stdin()
+                        .read_to_string(&mut buf)
+                        .map_err(|e| CliError::Failed(format!("read items from stdin: {e}")))?;
                     buf
                 }
             };
             let parsed = parse_present_items(&raw)?;
-            let result: PalettePresentResult = client
+            let result: PalettePresentResult = ui
                 .call(
                     ops::PALETTE_PRESENT,
                     PalettePresentParams {
@@ -1203,28 +1405,28 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                print_json(&result)?;
             } else if let Some(id) = &result.selected_id {
                 println!("{id}");
             }
             // Dismissed → print nothing; exit 0 either way.
         }
-        Cmd::Host(cmd) => {
-            std::process::exit(host::run(&cmd, &mut client).await);
-        }
-        Cmd::Agent(cmd) => {
-            std::process::exit(agent_install::run_over_ipc(&cmd, &mut client).await);
-        }
-        // Already handled above before client connect.
+        Cmd::Host(cmd) => return host::run(&cmd, ui, json).await,
+        Cmd::Agent(cmd) => return agent_install::run_over_ipc(&cmd, ui, json).await,
         Cmd::ClaudeHook { .. }
         | Cmd::AgentHook { .. }
         | Cmd::Claude(_)
         | Cmd::Doctor { .. }
-        | Cmd::Session(_) => {
-            unreachable!()
-        }
+        | Cmd::Session(_) => unreachable!("`run` serves these without the UI socket"),
     }
+    Ok(0)
+}
 
+/// `--json`'s output: one pretty-printed document on stdout.
+fn print_json<T: Serialize + ?Sized>(value: &T) -> Result<(), CliError> {
+    let body = serde_json::to_string_pretty(value)
+        .map_err(|e| CliError::Failed(format!("encode the result as JSON: {e}")))?;
+    println!("{body}");
     Ok(())
 }
 
@@ -1233,24 +1435,26 @@ async fn main() -> Result<()> {
 /// provider prints), so a script can pipe either form. Rejects an
 /// empty/blank payload so the user gets a clear error instead of an
 /// `invalid-param` from the daemon.
-fn parse_present_items(raw: &str) -> Result<Vec<PaletteItemView>> {
+fn parse_present_items(raw: &str) -> Result<Vec<PaletteItemView>, CliError> {
     let raw = raw.trim();
     if raw.is_empty() {
-        anyhow::bail!("no items: pass --items <json> or pipe a JSON array on stdin");
+        return Err(CliError::Usage(
+            "no items: pass --items <json> or pipe a JSON array on stdin".into(),
+        ));
     }
     let value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("parse items json: {e}"))?;
+        serde_json::from_str(raw).map_err(|e| CliError::Usage(format!("parse items json: {e}")))?;
     let items_value = if value.is_array() {
         value
     } else {
         value.get("items").cloned().ok_or_else(|| {
-            anyhow::anyhow!("items json must be an array or have an `items` array")
+            CliError::Usage("items json must be an array or have an `items` array".into())
         })?
     };
-    let items: Vec<PaletteItemView> =
-        serde_json::from_value(items_value).map_err(|e| anyhow::anyhow!("decode items: {e}"))?;
+    let items: Vec<PaletteItemView> = serde_json::from_value(items_value)
+        .map_err(|e| CliError::Usage(format!("decode items: {e}")))?;
     if items.is_empty() {
-        anyhow::bail!("items list is empty");
+        return Err(CliError::Usage("items list is empty".into()));
     }
     Ok(items)
 }
@@ -1258,10 +1462,9 @@ fn parse_present_items(raw: &str) -> Result<Vec<PaletteItemView>> {
 /// Render a [`PaletteStateResult`] for the terminal: a header line, then
 /// one row per item with `>` marking the highlighted selection. `--json`
 /// emits the structured result verbatim instead.
-fn print_palette(state: &PaletteStateResult, json: bool) -> Result<()> {
+fn print_palette(state: &PaletteStateResult, json: bool) -> Result<(), CliError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(state)?);
-        return Ok(());
+        return print_json(state);
     }
     if !state.open {
         println!("palette: closed");
@@ -1297,18 +1500,7 @@ fn selector(args: &Args) -> TargetSelector {
     }
 }
 
-/// Resolve the CLI args to a concrete socket path. `probe_alive`
-/// controls whether the auto-detect step actually dials candidate
-/// sockets; pass `false` for fire-and-forget commands (claude-hook) that
-/// no-op when the UI is offline.
-async fn resolve_target(args: &Args, probe_alive: bool) -> Result<ResolvedTarget> {
-    selector(args)
-        .resolve(probe_alive)
-        .await
-        .map_err(|e: TargetError| anyhow!(e))
-}
-
-async fn identify(client: &mut IpcClient) -> Result<IdentifyResult> {
+async fn identify(client: &mut IpcClient) -> Result<IdentifyResult, CliError> {
     Ok(client
         .identify(IdentifyParams {
             client_name: CLIENT_NAME.into(),
@@ -1317,16 +1509,16 @@ async fn identify(client: &mut IpcClient) -> Result<IdentifyResult> {
         .await?)
 }
 
-async fn list_tabs(client: &mut IpcClient) -> Result<TabListResult> {
+async fn list_tabs(client: &mut IpcClient) -> Result<TabListResult, CliError> {
     Ok(client.call(ops::TAB_LIST, serde_json::json!({})).await?)
 }
 
 /// Claude Code hook dispatch. Reads the JSON payload from stdin
 /// (Claude's contract), maps the event to the reports
 /// `roost-agent`'s pure adapter derives, and sends each as a
-/// `tab.agent_report`. Best-effort — failures don't surface to Claude
-/// (caller wraps in `let _ = ...` and always exits 0).
-async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
+/// `tab.agent_report`. Best-effort — failures don't surface to Claude,
+/// and the caller always exits 0.
+async fn run_claude_hook(event: &str, selector: &TargetSelector, tab_env: Option<&str>) {
     // Drained first and unconditionally, exactly as in
     // [`run_agent_hook`]: Claude is writing into this pipe right now,
     // and returning on an unset `ROOST_TAB_ID` without consuming a byte
@@ -1334,18 +1526,14 @@ async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
     // invisible.
     let stdin_buf = drain_stdin();
 
-    let Some(tab_id) = std::env::var("ROOST_TAB_ID")
-        .ok()
-        .as_deref()
-        .and_then(parse_tab_id)
-    else {
-        return Ok(());
+    let Some(tab_id) = tab_env.and_then(parse_tab_id) else {
+        return;
     };
     let Some(payload) = hook_payload(&stdin_buf, tab_id) else {
         hook_debug(&format!(
             "claude-hook: unparseable payload for event: {event}"
         ));
-        return Ok(());
+        return;
     };
 
     let reports = canonical_hook_event(event)
@@ -1353,7 +1541,7 @@ async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
         .unwrap_or_default();
     if reports.is_empty() {
         hook_debug(&format!("claude-hook: no reports for event: {event}"));
-        return Ok(());
+        return;
     }
 
     // `claude install` writes a `PermissionRequest` entry on this verb,
@@ -1365,11 +1553,10 @@ async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
     // (`docs/development/claude-testing.md`) that is driven outside a
     // Roost tab, where the default profile path is the only answer
     // there is.
-    let Ok(target) = resolve_target(args, false).await else {
-        return Ok(());
+    let Ok(target) = selector.resolve(false).await else {
+        return;
     };
     deliver_reports(reports, &target.socket_path).await;
-    Ok(())
 }
 
 /// Read stdin to the shared cap **and keep reading past it**.
@@ -1394,10 +1581,9 @@ fn drain_stdin() -> Vec<u8> {
 /// SIGPIPE, so `println!` turns a reader that has already gone into a
 /// panic — exit 101 with no JSON, which is precisely the shape a
 /// decision hook may read as a block.
-fn hook_answer() -> Result<()> {
+fn hook_answer() {
     let mut stdout = std::io::stdout().lock();
     let _ = stdout.write_all(b"{}\n").and_then(|()| stdout.flush());
-    Ok(())
 }
 
 /// The generic agent hook entrypoint: `roostctl agent-hook <agent>`.
@@ -1413,7 +1599,7 @@ fn hook_answer() -> Result<()> {
 /// contract of this path is exit 0 with `{}` on stdout — a hook that
 /// reports its own trouble to a decision dialog may be read as a block —
 /// so the only diagnostic channel is `ROOST_DEBUG` on stderr.
-async fn run_agent_hook(agent: &str, args: &Args) -> Result<()> {
+async fn run_agent_hook(agent: &str, selector: &TargetSelector, tab_env: Option<&str>) {
     // Drained first and unconditionally: the agent is writing into this
     // pipe right now, and every early return below would otherwise leave
     // it with an EPIPE from a hook that is supposed to be invisible.
@@ -1421,45 +1607,40 @@ async fn run_agent_hook(agent: &str, args: &Args) -> Result<()> {
 
     let Some(adapter) = Agent::parse(agent) else {
         hook_debug(&format!("agent-hook: no adapter for agent: {agent}"));
-        return Ok(());
+        return;
     };
-    let Some(tab_id) = std::env::var("ROOST_TAB_ID")
-        .ok()
-        .as_deref()
-        .and_then(parse_tab_id)
-    else {
-        return Ok(());
+    let Some(tab_id) = tab_env.and_then(parse_tab_id) else {
+        return;
     };
-    let Some(socket) = agent_hook_socket(args) else {
+    let Some(socket) = agent_hook_socket(selector) else {
         hook_debug(&format!("agent-hook {agent}: no ROOST_SOCKET"));
-        return Ok(());
+        return;
     };
     let Some(payload) = hook_payload(&stdin_buf, tab_id) else {
         hook_debug(&format!("agent-hook {agent}: unparseable payload"));
-        return Ok(());
+        return;
     };
 
     let event = payload_event_name(&payload);
     if event.is_empty() {
         hook_debug(&format!("agent-hook {agent}: payload names no event"));
-        return Ok(());
+        return;
     }
     let reports = adapter.event_to_reports(event, &payload, tab_id);
     if reports.is_empty() {
         hook_debug(&format!(
             "agent-hook {agent}: no reports for event: {event}"
         ));
-        return Ok(());
+        return;
     }
 
     deliver_reports(reports, &socket).await;
-    Ok(())
 }
 
 /// The socket `agent-hook` reports into — `ROOST_SOCKET` and nothing
 /// else, with `--socket` as the one explicit override.
 ///
-/// Deliberately **not** [`resolve_target`]. That ladder falls back to
+/// Deliberately **not** [`TargetSelector::resolve`]. That ladder falls back to
 /// the bundle profile's default path, and this verb runs inside a tab
 /// whose `ROOST_TAB_ID` is only meaningful to the Roost that spawned it:
 /// with the variable stripped (`env -i`, a sanitized launcher) but the
@@ -1471,8 +1652,8 @@ async fn run_agent_hook(agent: &str, args: &Args) -> Result<()> {
 /// as a by-hand debugging verb driven from outside a tab
 /// (`docs/development/claude-testing.md`), where the default path is the
 /// only answer there is.
-fn agent_hook_socket(args: &Args) -> Option<PathBuf> {
-    args.socket.clone().or_else(|| {
+fn agent_hook_socket(selector: &TargetSelector) -> Option<PathBuf> {
+    selector.socket_override.clone().or_else(|| {
         std::env::var_os("ROOST_SOCKET")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
@@ -1532,8 +1713,8 @@ fn hook_debug(message: &str) {
 /// `~/.config/roost/claude-settings.json` instead — `doctor`'s
 /// `agent.claude.legacy_settings` check is what still knows about that
 /// retired path.
-fn claude_settings_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME").map_err(|_| anyhow!("$HOME not set"))?;
+fn claude_settings_path() -> anyhow::Result<PathBuf> {
+    let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("$HOME not set"))?;
     let dir = std::env::var("CLAUDE_CONFIG_DIR")
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -1553,8 +1734,8 @@ fn claude_settings_path() -> Result<PathBuf> {
 /// Kept as its own function (rather than inlining the join) so
 /// `agent.claude.legacy_settings` and `legacy_claude_uninstall` cannot
 /// spell it two ways.
-fn legacy_claude_settings_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME").map_err(|_| anyhow!("$HOME not set"))?;
+fn legacy_claude_settings_path() -> anyhow::Result<PathBuf> {
+    let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("$HOME not set"))?;
     Ok(PathBuf::from(home)
         .join(".config")
         .join("roost")
@@ -1568,16 +1749,19 @@ fn legacy_claude_settings_path() -> Result<PathBuf> {
 /// left for a shell alias to route. Exit code follows `agent install`:
 /// 0 whether this run wired Claude or found it already wired, matching
 /// every other agent verb's "explicit wins" idempotency.
-fn claude_install() -> i32 {
+fn claude_install(json: bool) -> Result<i32, CliError> {
     eprintln!(
         "roostctl claude install: alias of `roostctl agent install claude` — it no longer \
          writes ~/.config/roost/claude-settings.json or prints a shell alias. Run `roostctl \
          agent status` to see what is wired, or `roostctl agent uninstall claude` to remove it."
     );
-    agent_install::run(&agent_install::AgentCmd::Install {
-        agent: Some("claude".to_string()),
-        all: false,
-    })
+    agent_install::run(
+        &agent_install::AgentCmd::Install {
+            agent: Some("claude".to_string()),
+            all: false,
+        },
+        json,
+    )
 }
 
 /// Test-only now: production code stopped writing quoted commands when
@@ -1859,18 +2043,6 @@ fn decode_escapes(s: &str) -> Vec<u8> {
     out
 }
 
-/// A `--tab` argument as the wire wants it: a bare id, the
-/// `h<host>.<id>` spelling of a connected host's tab, or — when the flag
-/// is absent — the UI's own active tab, which is always local.
-async fn wire_tab_ref(client: &mut IpcClient, explicit: Option<&str>) -> Result<WireTabRef> {
-    match explicit {
-        Some(raw) => {
-            WireTabRef::parse(raw).ok_or_else(|| anyhow::anyhow!("invalid --tab reference: {raw}"))
-        }
-        None => Ok(WireTabRef::Local(resolve_tab(client, None).await?)),
-    }
-}
-
 /// `tab.send_file`'s paths as the op wants them: absolute and existing.
 ///
 /// Canonicalized in **roostctl's** cwd, because that is where the
@@ -1878,17 +2050,17 @@ async fn wire_tab_ref(client: &mut IpcClient, explicit: Option<&str>) -> Result<
 /// relative path for exactly that reason. A path that is not there is
 /// this side's error, naming the path, rather than a wire round-trip
 /// that comes back saying the same thing later.
-fn canonicalize_for_send_file(paths: &[PathBuf]) -> Result<Vec<String>> {
+fn canonicalize_for_send_file(paths: &[PathBuf]) -> Result<Vec<String>, CliError> {
     paths
         .iter()
         .map(|path| {
             let resolved = std::fs::canonicalize(path)
-                .map_err(|e| anyhow!("cannot send {}: {e}", path.display()))?;
+                .map_err(|e| CliError::Usage(format!("cannot send {}: {e}", path.display())))?;
             resolved.into_os_string().into_string().map_err(|bad| {
-                anyhow!(
+                CliError::Usage(format!(
                     "cannot send {}: the resolved path is not valid UTF-8",
                     Path::new(&bad).display()
-                )
+                ))
             })
         })
         .collect()
@@ -1906,32 +2078,93 @@ fn send_file_budget(paths: usize, scale: f64) -> Duration {
     Duration::from_secs(60 + 300 * paths as u64).mul_f64(scale)
 }
 
-/// Resolve the tab id for a per-tab command. Falls back to the
-/// running UI's active tab via `identify` when neither `--tab` nor
-/// `ROOST_TAB_ID` is set. Errors with a clear message when the UI
-/// has no active tab either — better than sending `tab_id = 0` and
-/// getting a confusing `not-found` back.
-async fn resolve_tab(client: &mut IpcClient, explicit: Option<i64>) -> Result<i64> {
-    if let Some(id) = explicit {
-        return Ok(id);
-    }
-    let resp = identify(client).await?;
-    if resp.active_tab_id == 0 {
-        anyhow::bail!(
-            "no --tab specified and the UI reports no active tab; \
-             pass --tab or set ROOST_TAB_ID"
-        );
-    }
-    Ok(resp.active_tab_id)
+/// What a verb's `--tab` holds: a bare local id, or a [`WireTabRef`] that
+/// can also name a connected host's tab. `ROOST_TAB_ID` is read into the
+/// same type, so the env reaches both kinds of verb alike.
+trait TabRef: Sized {
+    fn from_env(raw: &str) -> Option<Self>;
+    fn local(id: i64) -> Self;
 }
 
-fn parse_state(s: &str) -> Result<TabState> {
+impl TabRef for i64 {
+    fn from_env(raw: &str) -> Option<Self> {
+        raw.parse().ok()
+    }
+
+    fn local(id: i64) -> Self {
+        id
+    }
+}
+
+impl TabRef for WireTabRef {
+    fn from_env(raw: &str) -> Option<Self> {
+        WireTabRef::parse(raw)
+    }
+
+    fn local(id: i64) -> Self {
+        WireTabRef::Local(id)
+    }
+}
+
+/// `--tab`, else `ROOST_TAB_ID` (empty counts as unset), else nothing.
+fn named_tab<T: TabRef>(flag: Option<T>, tab_env: Option<&str>) -> Result<Option<T>, CliError> {
+    match (flag, tab_env.filter(|raw| !raw.is_empty())) {
+        (Some(tab), _) => Ok(Some(tab)),
+        (None, Some(raw)) => T::from_env(raw)
+            .map(Some)
+            .ok_or_else(|| CliError::Usage(format!("ROOST_TAB_ID={raw} is not a tab id"))),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The tab a verb in [`MUTATING_TAB_VERBS`] acts on — never the UI's
+/// active tab. Pure, so the refusal comes before anything is dialled.
+fn require_tab<T: TabRef>(
+    verb: &str,
+    flag: Option<T>,
+    tab_env: Option<&str>,
+) -> Result<T, CliError> {
+    debug_assert!(
+        MUTATING_TAB_VERBS.contains(&verb),
+        "{verb} requires a tab but is missing from MUTATING_TAB_VERBS"
+    );
+    named_tab(flag, tab_env)?.ok_or_else(|| CliError::Usage(NO_TAB.to_string()))
+}
+
+/// The tab a read-only verb reads: `--tab`, `ROOST_TAB_ID`, or else the
+/// UI's active tab — which is always local. A UI with no active tab is
+/// refused here rather than sent `tab_id = 0` for a confusing
+/// `not-found`.
+async fn resolve_tab_or_active<T: TabRef>(
+    ui: &mut UiSocket<'_>,
+    flag: Option<T>,
+    tab_env: Option<&str>,
+) -> Result<T, CliError> {
+    if let Some(tab) = named_tab(flag, tab_env)? {
+        return Ok(tab);
+    }
+    let resp = identify(ui.client().await?).await?;
+    if resp.active_tab_id == 0 {
+        return Err(CliError::Usage(
+            "no --tab, ROOST_TAB_ID is unset, and the UI reports no active tab; pass --tab".into(),
+        ));
+    }
+    Ok(T::local(resp.active_tab_id))
+}
+
+/// A `--tab` given as text: a bare id or `h<host>.<id>`, checked before
+/// anything is dialled.
+fn parse_tab_flag(raw: &str) -> Result<WireTabRef, CliError> {
+    WireTabRef::parse(raw).ok_or_else(|| CliError::Usage(format!("invalid --tab reference: {raw}")))
+}
+
+fn parse_state(s: &str) -> Result<TabState, CliError> {
     Ok(match s {
         "none" => TabState::None,
         "running" => TabState::Running,
         "needs_input" => TabState::NeedsInput,
         "idle" => TabState::Idle,
-        other => anyhow::bail!("unknown state '{other}'"),
+        other => return Err(CliError::Usage(format!("unknown state '{other}'"))),
     })
 }
 
@@ -2014,16 +2247,10 @@ mod tests {
     fn dump_scrollback_defaults_to_zero_and_otherwise_parses_through() {
         let args = Args::try_parse_from(["roostctl", "tab", "dump", "--tab", "7"])
             .expect("a bare tab id parses");
-        let Cmd::Tab(TabCmd::Dump {
-            tab,
-            json,
-            scrollback,
-        }) = args.command
-        else {
+        let Cmd::Tab(TabCmd::Dump { tab, scrollback }) = args.command else {
             panic!("expected tab dump")
         };
         assert_eq!(tab.as_deref(), Some("7"));
-        assert!(!json);
         assert_eq!(scrollback, 0);
 
         let args = Args::try_parse_from([
@@ -2048,12 +2275,11 @@ mod tests {
     fn send_file_requires_a_tab_and_at_least_one_path() {
         let args = Args::try_parse_from(["roostctl", "tab", "send-file", "--tab", "h2.7", "a.png"])
             .expect("a tab and a path parse");
-        let Cmd::Tab(TabCmd::SendFile { tab, paths, json }) = args.command else {
+        let Cmd::Tab(TabCmd::SendFile { tab, paths }) = args.command else {
             panic!("expected tab send-file")
         };
         assert_eq!(tab, "h2.7");
         assert_eq!(paths, vec![PathBuf::from("a.png")]);
-        assert!(!json);
 
         assert!(
             Args::try_parse_from(["roostctl", "tab", "send-file", "a.png"]).is_err(),
@@ -2092,9 +2318,10 @@ mod tests {
             let error = canonicalize_for_send_file(std::slice::from_ref(&missing))
                 .expect_err("a path that is not there is our error, not the wire's");
             assert!(
-                error.to_string().contains(&missing.display().to_string()),
-                "{error}"
+                error.message().contains(&missing.display().to_string()),
+                "{error:?}"
             );
+            assert_eq!(error.code(), "usage");
         }
     }
 
@@ -2559,5 +2786,473 @@ mod tests {
                 "{canonical} should map to a report"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Global `--json`, the error contract, and the target policy
+    // ------------------------------------------------------------------
+
+    /// Representative argv for every leaf verb — the least each needs to
+    /// parse. [`every_verb_takes_json_before_and_after_itself`] fails when
+    /// a verb is missing, so a new one cannot skip the global flag.
+    const EVERY_VERB: &[&[&str]] = &[
+        &["notify", "--title", "t"],
+        &["set-title", "--title", "t"],
+        &["identify"],
+        &["wait", "--state", "idle"],
+        &["tab", "focus"],
+        &["tab", "send-file", "--tab", "7", "a.png"],
+        &["tab", "list"],
+        &["tab", "set-state", "--state", "idle"],
+        &["tab", "clear-notification"],
+        &["tab", "open", "--project-id", "1"],
+        &["tab", "close"],
+        &["tab", "send", "--bytes", "x"],
+        &["tab", "resize", "--cols", "80", "--rows", "24"],
+        &["tab", "dump"],
+        &["tab", "reorder", "--project-id", "1", "--order", "1,2"],
+        &["project", "list"],
+        &["project", "create"],
+        &["project", "rename", "--id", "1", "--name", "n"],
+        &["project", "delete", "--id", "1"],
+        &["project", "reorder", "--order", "1,2"],
+        &["palette", "open"],
+        &["palette", "state"],
+        &["palette", "query", "q"],
+        &["palette", "activate", "new_tab"],
+        &["palette", "dismiss"],
+        &["palette", "present", "--items", "[]"],
+        &["screenshot", "--out", "shot.png"],
+        &["render-stats"],
+        &["claude-hook", "Stop"],
+        &["agent-hook", "claude"],
+        &["agent", "ensure"],
+        &["agent", "set", "claude"],
+        &["agent", "install", "claude"],
+        &["agent", "uninstall", "claude"],
+        &["agent", "status"],
+        &["claude", "install"],
+        &["session", "start"],
+        &["session", "stop"],
+        &["session", "status"],
+        &["host", "add", "--label", "l", "--target", "t"],
+        &["host", "list"],
+        &["host", "status"],
+        &["host", "remove", "--id", "a"],
+        &["host", "connect", "--id", "a"],
+        &["host", "disconnect", "--id", "a"],
+        &["doctor"],
+    ];
+
+    /// Every leaf verb as a user types it (`tab send`), with its clap
+    /// command.
+    fn leaf_verbs() -> Vec<(String, clap::Command)> {
+        use clap::CommandFactory;
+        let mut leaves = Vec::new();
+        for sub in Args::command().get_subcommands() {
+            if sub.has_subcommands() {
+                for leaf in sub.get_subcommands() {
+                    leaves.push((
+                        format!("{} {}", sub.get_name(), leaf.get_name()),
+                        leaf.clone(),
+                    ));
+                }
+            } else {
+                leaves.push((sub.get_name().to_string(), sub.clone()));
+            }
+        }
+        leaves
+    }
+
+    fn verb_name(argv: &[&str]) -> String {
+        use clap::CommandFactory;
+        let root = Args::command();
+        let first = root.find_subcommand(argv[0]).expect("a verb");
+        if first.has_subcommands() {
+            format!("{} {}", argv[0], argv[1])
+        } else {
+            argv[0].to_string()
+        }
+    }
+
+    fn parse(argv: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(std::iter::once("roostctl").chain(argv.iter().copied()))
+    }
+
+    /// A propagated name declared twice panics when clap builds the
+    /// command, which is at every startup — so this is the test that the
+    /// per-verb `--json` flags are really gone.
+    #[test]
+    fn the_command_line_definition_is_well_formed() {
+        use clap::CommandFactory;
+        Args::command().debug_assert();
+    }
+
+    #[test]
+    fn every_verb_takes_json_before_and_after_itself() {
+        let mut tabled: Vec<String> = EVERY_VERB.iter().map(|argv| verb_name(argv)).collect();
+        tabled.sort();
+        let mut leaves: Vec<String> = leaf_verbs().into_iter().map(|(name, _)| name).collect();
+        leaves.sort();
+        assert_eq!(
+            tabled, leaves,
+            "EVERY_VERB must name every leaf verb exactly once"
+        );
+
+        for argv in EVERY_VERB {
+            let bare = parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert!(!bare.json, "{argv:?}");
+
+            let before: Vec<&str> = std::iter::once("--json")
+                .chain(argv.iter().copied())
+                .collect();
+            let after: Vec<&str> = argv.iter().copied().chain(["--json"]).collect();
+            for spelled in [before, after] {
+                let args = parse(&spelled).unwrap_or_else(|e| panic!("{spelled:?}: {e}"));
+                assert!(args.json, "{spelled:?}");
+            }
+        }
+    }
+
+    /// The Mac app spawns these and decodes their stdout; there is no
+    /// Linux lane that runs the spawn, so the argv is pinned here.
+    #[test]
+    fn the_argv_the_mac_app_spawns_still_parses() {
+        let args = Args::try_parse_from(["roostctl", "agent", "ensure", "--json"])
+            .expect("the Mac app's agent ensure argv");
+        assert!(args.json);
+        assert!(matches!(
+            args.command,
+            Cmd::Agent(agent_install::AgentCmd::Ensure { startup: false })
+        ));
+
+        for argv in [
+            &["roostctl", "agent", "ensure", "--startup", "--json"][..],
+            &["roostctl", "agent", "status", "--json"],
+            &["roostctl", "agent", "set", "--local", "claude", "--json"],
+        ] {
+            let args = Args::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert!(args.json, "{argv:?}");
+            assert!(matches!(args.command, Cmd::Agent(_)), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_refused_command_line_reads_json_off_the_raw_argv() {
+        let argv: Vec<OsString> = ["roostctl", "--json", "tab", "list", "--bogus"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let error = Args::try_parse_from(&argv).expect_err("--bogus is refused");
+        assert!(asks_for_json(&argv));
+        let usage = CliError::from_clap(&error);
+        assert_eq!(usage.code(), "usage");
+        let rendered: serde_json::Value =
+            serde_json::from_str(&usage.render(true)).expect("one JSON document");
+        assert_eq!(rendered["error"]["code"], "usage");
+        assert!(
+            rendered["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("--bogus")),
+            "{rendered}"
+        );
+        assert_eq!(refuse_command_line(&error, &argv), 2);
+
+        let plain: Vec<OsString> = ["roostctl", "tab", "list", "--bogus"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        assert!(!asks_for_json(&plain));
+
+        // Past `--` the words are the command `tab open` runs.
+        let separated: Vec<OsString> = ["roostctl", "tab", "open", "--", "jq", "--json"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        assert!(!asks_for_json(&separated));
+    }
+
+    /// A socket path in a fresh scratch directory that nothing listens on.
+    fn nowhere(tag: &str) -> String {
+        scratch(tag).join("nothing.sock").display().to_string()
+    }
+
+    async fn run_argv(argv: &[&str], tab_env: Option<&str>) -> Result<i32, CliError> {
+        run(
+            parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}")),
+            tab_env,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn no_ui_listening_is_a_connection_failure() {
+        let socket = nowhere("no-ui");
+        let error = run_argv(&["--socket", &socket, "tab", "list"], None)
+            .await
+            .expect_err("nothing is listening");
+        assert!(matches!(error, CliError::Connection(_)), "{error:?}");
+        assert_eq!(error.exit_code(), 1);
+        assert!(error.message().contains(&socket), "{error:?}");
+    }
+
+    /// A stand-in UI on a real socket. It answers each request through
+    /// `answer` and records what it was asked, so a test can say what
+    /// `roostctl` sent.
+    struct FakeUi {
+        socket: String,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    type Answer = fn(&str) -> Result<serde_json::Value, (&'static str, &'static str)>;
+
+    impl FakeUi {
+        fn start(tag: &str, answer: Answer) -> Self {
+            use roost_ipc::messages::{RawRequest, Response};
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+            let socket = scratch(tag).join("ui.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).expect("bind the fake UI");
+            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = requests.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let seen = seen.clone();
+                    tokio::spawn(async move {
+                        let (read, mut write) = stream.into_split();
+                        let mut lines = BufReader::new(read).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let request: RawRequest =
+                                serde_json::from_str(&line).expect("a request frame");
+                            seen.lock()
+                                .unwrap()
+                                .push((request.op.clone(), request.params.clone()));
+                            let response = match answer(&request.op) {
+                                Ok(result) => Response::ok(request.id, result),
+                                Err((code, message)) => Response::err(request.id, code, message),
+                            };
+                            let mut frame = serde_json::to_vec(&response).unwrap();
+                            frame.push(b'\n');
+                            if write.write_all(&frame).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                socket: socket.display().to_string(),
+                requests,
+            }
+        }
+
+        fn take(&self) -> Vec<(String, serde_json::Value)> {
+            std::mem::take(&mut self.requests.lock().unwrap())
+        }
+    }
+
+    fn fake_identify(active_tab_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "socket_path": "/tmp/fake.sock",
+            "pid": 1,
+            "active_project_id": "1",
+            "active_tab_id": active_tab_id.to_string(),
+            "app_label": "Roost",
+            "app_id": "test",
+            "ui_version": "0",
+            "protocol_version": 1,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_server_refusal_reaches_the_caller_verbatim() {
+        let ui = FakeUi::start("server-refusal", |_| Err(("not-found", "no tab 7")));
+        let error = run_argv(
+            &["--socket", &ui.socket, "tab", "close", "--tab", "7"],
+            None,
+        )
+        .await
+        .expect_err("the server refused");
+        assert_eq!(
+            error,
+            CliError::Server {
+                code: "not-found".into(),
+                message: "no tab 7".into()
+            }
+        );
+        assert_eq!(error.exit_code(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_wait_that_never_holds_times_out_with_exit_4() {
+        let ui = FakeUi::start("wait-timeout", |op| match op {
+            "tab.list" => Ok(serde_json::json!({"projects": []})),
+            _ => Err(("unknown-op", "not faked")),
+        });
+        let error = run_argv(
+            &[
+                "--socket",
+                &ui.socket,
+                "wait",
+                "--tab",
+                "7",
+                "--state",
+                "idle",
+                "--timeout",
+                "0",
+            ],
+            None,
+        )
+        .await
+        .expect_err("tab 7 never appears");
+        assert!(matches!(error, CliError::Timeout(_)), "{error:?}");
+        assert_eq!(error.exit_code(), 4);
+        assert_eq!(error.code(), "timeout");
+    }
+
+    fn mutating_argv(verb: &str) -> Vec<&'static str> {
+        EVERY_VERB
+            .iter()
+            .find(|argv| verb_name(argv) == verb)
+            .unwrap_or_else(|| panic!("{verb} is in MUTATING_TAB_VERBS with no argv in EVERY_VERB"))
+            .to_vec()
+    }
+
+    /// Refused against a socket nothing listens on, so a verb that dialled
+    /// before checking its tab would fail `connection`, never `usage`.
+    #[tokio::test]
+    async fn a_mutating_verb_with_no_tab_refuses_before_dialling() {
+        let socket = nowhere("refuse");
+        for verb in MUTATING_TAB_VERBS {
+            let argv: Vec<&str> = ["--socket", socket.as_str()]
+                .into_iter()
+                .chain(mutating_argv(verb))
+                .collect();
+            for unset in [None, Some("")] {
+                let refused = run_argv(&argv, unset).await.expect_err(verb);
+                assert_eq!(refused, CliError::Usage(NO_TAB.into()), "{verb} {unset:?}");
+                assert_eq!(refused.exit_code(), 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn roost_tab_id_or_the_flag_satisfies_a_mutating_verb() {
+        let ui = FakeUi::start("satisfied", |_| Ok(serde_json::json!({})));
+        for verb in MUTATING_TAB_VERBS {
+            let argv: Vec<&str> = ["--socket", ui.socket.as_str()]
+                .into_iter()
+                .chain(mutating_argv(verb))
+                .collect();
+            assert_eq!(run_argv(&argv, Some("7")).await, Ok(0), "{verb}");
+            let flagged: Vec<&str> = argv.iter().copied().chain(["--tab", "8"]).collect();
+            assert_eq!(run_argv(&flagged, Some("7")).await, Ok(0), "{verb}");
+
+            let sent = ui.take();
+            let tab_ids: Vec<&serde_json::Value> =
+                sent.iter().map(|(_, params)| &params["tab_id"]).collect();
+            assert_eq!(tab_ids, ["7", "8"], "{verb}: {sent:?}");
+            assert!(
+                sent.iter().all(|(op, _)| op != ops::IDENTIFY),
+                "{verb} asked for the active tab: {sent:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unusable_roost_tab_id_is_usage() {
+        let socket = nowhere("bad-env");
+        for argv in [
+            vec!["--socket", socket.as_str(), "tab", "close"],
+            vec!["--socket", socket.as_str(), "tab", "focus"],
+        ] {
+            let refused = run_argv(&argv, Some("seven")).await.expect_err("refused");
+            assert_eq!(
+                refused,
+                CliError::Usage("ROOST_TAB_ID=seven is not a tab id".into()),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_read_only_verbs_fall_back_to_the_active_tab() {
+        let ui = FakeUi::start("fallback", |op| match op {
+            "identify" => Ok(fake_identify(5)),
+            "tab.list" => Ok(serde_json::json!({"projects": []})),
+            "tab.dump" => Ok(serde_json::json!({"cols": 80, "rows": 1, "rows_text": [""]})),
+            _ => Err(("unknown-op", "not faked")),
+        });
+
+        assert_eq!(
+            run_argv(&["--socket", &ui.socket, "tab", "dump"], None).await,
+            Ok(0)
+        );
+        let sent = ui.take();
+        assert_eq!(sent[0].0, ops::IDENTIFY, "{sent:?}");
+        assert_eq!(
+            (sent[1].0.as_str(), &sent[1].1["tab_id"]),
+            (ops::TAB_DUMP, &"5".into())
+        );
+
+        assert_eq!(
+            run_argv(
+                &["--socket", &ui.socket, "wait", "--gone", "--timeout", "0"],
+                None
+            )
+            .await,
+            Ok(0)
+        );
+        assert_eq!(ui.take()[0].0, ops::IDENTIFY);
+
+        // `ROOST_TAB_ID` still comes before the active tab.
+        assert_eq!(
+            run_argv(&["--socket", &ui.socket, "tab", "dump"], Some("9")).await,
+            Ok(0)
+        );
+        let sent = ui.take();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].1["tab_id"], "9");
+    }
+
+    /// `require_tab`'s call sites are the policy; the const is what a
+    /// reader (and the skill) sees of it. Read off this file's own source
+    /// so a handler cannot refuse without being listed, nor be listed
+    /// without refusing.
+    #[test]
+    fn the_mutating_list_names_exactly_the_verbs_that_call_require_tab() {
+        let source = include_str!("main.rs");
+        let needle = concat!("require", "_tab(");
+        let mut called: Vec<&str> = source
+            .match_indices(needle)
+            .filter_map(|(at, _)| {
+                let rest = source[at + needle.len()..].trim_start().strip_prefix('"')?;
+                Some(&rest[..rest.find('"')?])
+            })
+            .collect();
+        called.sort_unstable();
+        let mut listed = MUTATING_TAB_VERBS.to_vec();
+        listed.sort_unstable();
+        assert_eq!(called, listed);
+    }
+
+    /// A new verb that takes `--tab` has to be put on one side or the
+    /// other, so it cannot pick up the active-tab fallback by omission.
+    #[test]
+    fn every_verb_that_takes_a_tab_is_mutating_or_a_known_reader() {
+        const READERS: &[&str] = &["wait", "tab dump", "tab send-file", "doctor"];
+        let mut with_tab: Vec<String> = leaf_verbs()
+            .into_iter()
+            .filter(|(_, cmd)| cmd.get_arguments().any(|arg| arg.get_id() == "tab"))
+            .map(|(name, _)| name)
+            .collect();
+        with_tab.sort();
+        let mut classified: Vec<String> = MUTATING_TAB_VERBS
+            .iter()
+            .chain(READERS)
+            .map(|verb| verb.to_string())
+            .collect();
+        classified.sort();
+        assert_eq!(with_tab, classified);
     }
 }

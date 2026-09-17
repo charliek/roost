@@ -40,6 +40,8 @@ Building from source instead? See [Installation](getting-started/installation.md
 roostctl notify --title "Build done" --body "tests pass"
 ```
 
+Outside a Roost tab there is no `ROOST_TAB_ID` to name the tab, so pass `--tab <id>` (`roostctl tab list` shows ids) — `notify` never guesses.
+
 If the tab is not currently focused you'll see:
 
 - A `needs attention` indicator on the tab in Roost.

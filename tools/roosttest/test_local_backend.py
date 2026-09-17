@@ -1372,8 +1372,8 @@ def session_ui(lane: Lane, **launch) -> Roost:
     """A UI up on `session`, its slot connected and its tab selected.
 
     The selection wait is not politeness: `identify.active_*` reporting
-    the slot's pair is §D1's half of §D10, and it is what makes
-    `roostctl` with no `--tab` address anything at all.
+    the slot's pair is §D1's half of §D10, and it is what a read-only
+    `roostctl` verb with no `--tab` (`tab dump`, `wait`) falls back to.
     """
     roost = lane.start("session", **launch)
     wait_until(
@@ -1389,19 +1389,24 @@ def session_ui(lane: Lane, **launch) -> Roost:
     return roost
 
 
-def roostctl(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess:
+def roostctl(
+    *args: str, timeout: float = 60.0, tab_env: str | None = None
+) -> subprocess.CompletedProcess:
     """`roostctl` as a user with no Roost environment runs it.
 
     `ROOST_SOCKET` and `ROOST_TAB_ID` are removed rather than left
     alone, which is the whole claim of AC8's "no `--tab`, profile
-    route": the target is resolved from the bundle profile and the tab
-    from `identify`.
+    route": the target is resolved from the bundle profile, and a
+    read-only verb's tab from `identify`. `tab_env` puts `ROOST_TAB_ID`
+    back, the way every shell inside a Roost tab has it.
     """
     env = {
         key: value
         for key, value in os.environ.items()
         if key not in ("ROOST_SOCKET", "ROOST_TAB_ID")
     }
+    if tab_env is not None:
+        env["ROOST_TAB_ID"] = tab_env
     return subprocess.run(
         [util.roostctl_path(), "--target", "iced", *args],
         capture_output=True,
@@ -1478,18 +1483,29 @@ def test_bare_ids_on_the_ui_socket_act_on_the_session(lane: Lane):
     )
 
 
-def test_roostctl_with_no_tab_flag_drives_the_session(lane: Lane):
-    """AC8's `roostctl tab list/send/set-state` clause.
+def test_roostctl_reads_the_session_bare_and_changes_it_only_when_told_which_tab(
+    lane: Lane,
+):
+    """AC8's `roostctl tab list/dump/send/set-state` clause, as plan 066
+    reversed its mutating half.
 
-    No `--tab`, no `ROOST_SOCKET`: the socket comes from the bundle
-    profile and the tab from `identify.active_tab_id`, which under
-    `session` is the slot's pair. Before §D10 that field answered `0`
-    and every one of these exited non-zero with "no active tab".
+    Reading needs no `--tab` and no `ROOST_SOCKET`: the socket comes from
+    the bundle profile, and a bare `tab dump` reads
+    `identify.active_tab_id`, which under `session` is the slot's pair —
+    so it shows the session tab's own output. Before §D10 that field
+    answered `0` and the dump exited non-zero with "no active tab".
+
+    Changing a tab is refused without `--tab` or `ROOST_TAB_ID`: `tab send`
+    and `tab set-state` exit 2 `usage` **before dialling**. `--socket`
+    aims at a path nothing listens on, where a dial fails `connection`
+    (asserted, so the refusal cannot be passing on a socket that happens
+    to answer). With `ROOST_TAB_ID` naming the session's tab — as it does
+    in every shell inside a Roost tab — both land on the session.
     """
     roost = session_ui(lane)
     active = roost.identify()["active_tab_id"]
     assert active in session_tab_ids(lane), (
-        "the active tab roostctl will resolve is one of the session's"
+        "the active tab a bare read resolves is one of the session's"
     )
 
     listed = roostctl("tab", "list", "--json")
@@ -1500,8 +1516,36 @@ def test_roostctl_with_no_tab_flag_drives_the_session(lane: Lane):
         p["name"] for p in lane.session_projects()
     ]
 
+    shown = token()
+    with lane.session() as c:
+        c.send(active, f"echo {shown}\n")
+        wait_until(
+            lambda: shown in c.dump_text(active),
+            scaled_timeout(30.0),
+            "the token to reach the session's tab",
+        )
+    wait_until(
+        lambda: shown in roostctl("tab", "dump").stdout,
+        scaled_timeout(30.0),
+        "a bare `roostctl tab dump` to show the session tab it resolved",
+    )
+
+    nowhere = str(lane.state_dir / "nothing-listens.sock")
+    dialled = roostctl("--socket", nowhere, "tab", "dump", "--json")
+    assert dialled.returncode == 1, dialled
+    assert json.loads(dialled.stderr)["error"]["code"] == "connection", dialled
+
     printed = token()
-    sent = roostctl("tab", "send", "--bytes", f"echo {printed}\\n")
+    for verb in (
+        ("tab", "send", "--bytes", f"echo {printed}\\n"),
+        ("tab", "set-state", "--state", "needs_input"),
+    ):
+        refused = roostctl("--socket", nowhere, *verb, "--json")
+        assert refused.returncode == 2, (verb, refused)
+        assert refused.stdout == "", (verb, refused)
+        assert json.loads(refused.stderr)["error"]["code"] == "usage", (verb, refused)
+
+    sent = roostctl("tab", "send", "--bytes", f"echo {printed}\\n", tab_env=str(active))
     assert sent.returncode == 0, sent
     with lane.session() as c:
         wait_until(
@@ -1510,7 +1554,7 @@ def test_roostctl_with_no_tab_flag_drives_the_session(lane: Lane):
             "roostctl's write to reach the session's shell",
         )
 
-    stated = roostctl("tab", "set-state", "--state", "needs_input")
+    stated = roostctl("tab", "set-state", "--state", "needs_input", tab_env=str(active))
     assert stated.returncode == 0, stated
     with lane.session() as c:
         assert c.agent_lifecycle(active) == "waiting", c.tab(active)

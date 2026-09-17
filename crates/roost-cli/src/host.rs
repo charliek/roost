@@ -12,13 +12,11 @@
 //!
 //! Unlike `session`, a saved host is **client-side UI state**
 //! (`Workspace::hosts`), not the session daemon's own workspace — so
-//! these verbs address the ordinary UI socket the caller already
-//! resolved and connected (`main.rs`'s ordinary target-selector
-//! prologue), never the session profile.
+//! these verbs address the ordinary UI socket (`main.rs`'s `UiSocket`,
+//! through the ordinary target selector), never the session profile.
 
 use std::collections::HashMap;
 
-use anyhow::Result;
 use clap::Subcommand;
 
 use roost_ipc::messages::{
@@ -26,7 +24,10 @@ use roost_ipc::messages::{
     HostDisconnectParams, HostListResult, HostRemoveParams, HostStatus, HostStatusParams,
     HostStatusResult,
 };
-use roost_ipc::{ssh, IpcClient};
+use roost_ipc::ssh;
+
+use crate::error::CliError;
+use crate::UiSocket;
 
 #[derive(Subcommand, Debug)]
 pub enum HostCmd {
@@ -62,10 +63,7 @@ pub enum HostCmd {
     /// listing, because the registry is what this verb promised.
     /// `--json` stays the registry alone — a script that wants state
     /// asks the op that owns it, `host status --json`.
-    List {
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
+    List,
     /// Report every saved host's live connection state — the settled
     /// answer `host connect` is too early to give.
     ///
@@ -76,8 +74,6 @@ pub enum HostCmd {
     Status {
         #[arg(long)]
         id: Option<String>,
-        #[arg(long, default_value_t = false)]
-        json: bool,
     },
     /// Forget a saved host by id.
     Remove {
@@ -100,58 +96,49 @@ pub enum HostCmd {
     },
 }
 
-/// Run a `host` verb against an already-connected UI socket client.
-/// Returns the process exit code rather than exiting, matching
-/// `session::run`'s shape.
-pub async fn run(cmd: &HostCmd, client: &mut IpcClient) -> i32 {
-    let result = match cmd {
+/// Run a `host` verb against the UI socket.
+pub async fn run(cmd: &HostCmd, ui: &mut UiSocket<'_>, json: bool) -> Result<i32, CliError> {
+    match cmd {
         HostCmd::Add {
             label,
             target,
             verify,
-        } => add(client, label, target, *verify).await,
-        HostCmd::List { json } => list(client, *json).await,
-        HostCmd::Status { id, json } => status(client, id.as_deref(), *json).await,
-        HostCmd::Remove { id } => remove(client, id).await,
+        } => add(ui, label, target, *verify, json).await,
+        HostCmd::List => list(ui, json).await,
+        HostCmd::Status { id } => status(ui, id.as_deref(), json).await,
+        HostCmd::Remove { id } => remove(ui, id, json).await,
         HostCmd::Connect { id } | HostCmd::Disconnect { id } => {
-            connection(client, op_for(cmd), id).await
-        }
-    };
-    match result {
-        Ok(code) => code,
-        Err(error) => {
-            eprintln!("roostctl host: {error:#}");
-            1
+            connection(ui, op_for(cmd), id, json).await
         }
     }
 }
 
-async fn add(client: &mut IpcClient, label: &str, target: &str, verify: bool) -> Result<i32> {
+async fn add(
+    ui: &mut UiSocket<'_>,
+    label: &str,
+    target: &str,
+    verify: bool,
+    json: bool,
+) -> Result<i32, CliError> {
     // Before anything is dialed and before anything is saved: a target
     // the classifier cannot read is not a host that is merely down, it
     // is a string nothing will ever connect to. The refusal is its own
     // message, written for this reader (`host:22`, a leading `-`, an
     // empty target) — the same one the Add Host dialog shows.
-    let transport = match ssh::classify(target) {
-        Ok(transport) => transport,
-        Err(error) => {
-            eprintln!("roostctl host add: {error:#}");
-            return Ok(1);
-        }
-    };
-    // Reached directly — this is the session, not the UI socket the
-    // caller is already connected to. `verify_transport` is the same
-    // call the Add Host dialog's "Add & Connect" makes, so `--verify`
-    // cannot promise a different bar than the dialog does (plan 037
-    // §3.5), and it is bounded either way it goes, so an unreachable
-    // target fails rather than hanging `roostctl`.
+    let transport =
+        ssh::classify(target).map_err(|error| CliError::Usage(format!("host add: {error:#}")))?;
+    // Reached directly — this is the session, not the UI socket.
+    // `verify_transport` is the same call the Add Host dialog's "Add &
+    // Connect" makes, so `--verify` cannot promise a different bar than
+    // the dialog does (plan 037 §3.5), and it is bounded either way it
+    // goes, so an unreachable target fails rather than hanging
+    // `roostctl`.
     if verify {
-        if let Err(err) = ssh::verify_transport(&transport).await {
-            eprintln!("roostctl host add: {target} did not verify: {err:#}");
-            return Ok(1);
-        }
+        ssh::verify_transport(&transport).await.map_err(|err| {
+            CliError::Connection(format!("host add: {target} did not verify: {err:#}"))
+        })?;
     }
-    let resp: HostAddResult = client
+    let resp: HostAddResult = ui
         .call(
             ops::HOST_ADD,
             HostAddParams {
@@ -160,6 +147,10 @@ async fn add(client: &mut IpcClient, label: &str, target: &str, verify: bool) ->
             },
         )
         .await?;
+    if json {
+        crate::print_json(&resp)?;
+        return Ok(0);
+    }
     println!(
         "added host {} — {} -> {}",
         resp.host.id, resp.host.label, resp.host.target
@@ -167,13 +158,13 @@ async fn add(client: &mut IpcClient, label: &str, target: &str, verify: bool) ->
     Ok(0)
 }
 
-async fn list(client: &mut IpcClient, json: bool) -> Result<i32> {
-    let resp: HostListResult = client.call(ops::HOST_LIST, serde_json::json!({})).await?;
+async fn list(ui: &mut UiSocket<'_>, json: bool) -> Result<i32, CliError> {
+    let resp: HostListResult = ui.call(ops::HOST_LIST, serde_json::json!({})).await?;
     if json {
         // Deliberately the registry alone: two ops' answers merged
         // under one key would leave a script unable to say which one
         // it read. `host status --json` is where state lives.
-        println!("{}", serde_json::to_string_pretty(&resp)?);
+        crate::print_json(&resp)?;
         return Ok(0);
     }
     if resp.hosts.is_empty() {
@@ -183,7 +174,7 @@ async fn list(client: &mut IpcClient, json: bool) -> Result<i32> {
     // Best-effort, and only for the human form: a UI too old for the op,
     // or an engine answering headless, still owes the reader the
     // registry it asked for.
-    let states: HashMap<String, String> = client
+    let states: HashMap<String, String> = ui
         .call::<_, HostStatusResult>(ops::HOST_STATUS, HostStatusParams::default())
         .await
         .map(|status| status.hosts.into_iter().map(|h| (h.id, h.state)).collect())
@@ -205,8 +196,8 @@ async fn list(client: &mut IpcClient, json: bool) -> Result<i32> {
 /// same contract the functional harness asserts on over the wire: a CLI
 /// that reshaped it would be a second wire format to keep in step. The
 /// human form is the four fields a person reads off the sidebar.
-async fn status(client: &mut IpcClient, id: Option<&str>, json: bool) -> Result<i32> {
-    let resp: HostStatusResult = client
+async fn status(ui: &mut UiSocket<'_>, id: Option<&str>, json: bool) -> Result<i32, CliError> {
+    let resp: HostStatusResult = ui
         .call(
             ops::HOST_STATUS,
             HostStatusParams {
@@ -215,7 +206,7 @@ async fn status(client: &mut IpcClient, id: Option<&str>, json: bool) -> Result<
         )
         .await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&resp)?);
+        crate::print_json(&resp)?;
     } else if resp.hosts.is_empty() {
         println!("no saved hosts");
     } else {
@@ -277,11 +268,15 @@ fn status_lines(h: &HostStatus) -> Vec<String> {
     lines
 }
 
-async fn remove(client: &mut IpcClient, id: &str) -> Result<i32> {
-    client
-        .call::<_, serde_json::Value>(ops::HOST_REMOVE, HostRemoveParams { id: id.to_string() })
+async fn remove(ui: &mut UiSocket<'_>, id: &str, json: bool) -> Result<i32, CliError> {
+    let result: serde_json::Value = ui
+        .call(ops::HOST_REMOVE, HostRemoveParams { id: id.to_string() })
         .await?;
-    println!("removed host {id}");
+    if json {
+        crate::print_json(&result)?;
+    } else {
+        println!("removed host {id}");
+    }
     Ok(0)
 }
 
@@ -297,7 +292,7 @@ async fn remove(client: &mut IpcClient, id: &str) -> Result<i32> {
 fn op_for(cmd: &HostCmd) -> &'static str {
     match cmd {
         HostCmd::Add { .. } => ops::HOST_ADD,
-        HostCmd::List { .. } => ops::HOST_LIST,
+        HostCmd::List => ops::HOST_LIST,
         HostCmd::Status { .. } => ops::HOST_STATUS,
         HostCmd::Remove { .. } => ops::HOST_REMOVE,
         HostCmd::Connect { .. } => ops::HOST_CONNECT,
@@ -314,23 +309,30 @@ fn op_for(cmd: &HostCmd) -> &'static str {
 /// test-only field, `HostDisconnectParams` is `deny_unknown_fields`, and
 /// serializing the former for the latter made `host disconnect` work
 /// only for as long as that field kept a `skip_serializing_if`.
-async fn connection(client: &mut IpcClient, op: &str, id: &str) -> Result<i32> {
+async fn connection(
+    ui: &mut UiSocket<'_>,
+    op: &str,
+    id: &str,
+    json: bool,
+) -> Result<i32, CliError> {
     let resp: HostConnectionResult = if op == ops::HOST_DISCONNECT {
-        client
-            .call(op, HostDisconnectParams { id: id.to_string() })
+        ui.call(op, HostDisconnectParams { id: id.to_string() })
             .await?
     } else {
-        client
-            .call(
-                op,
-                HostConnectParams {
-                    id: id.to_string(),
-                    ..Default::default()
-                },
-            )
-            .await?
+        ui.call(
+            op,
+            HostConnectParams {
+                id: id.to_string(),
+                ..Default::default()
+            },
+        )
+        .await?
     };
-    println!("{}  {}  {}", resp.host.id, resp.host.label, resp.state);
+    if json {
+        crate::print_json(&resp)?;
+    } else {
+        println!("{}  {}  {}", resp.host.id, resp.host.label, resp.state);
+    }
     Ok(0)
 }
 
@@ -391,17 +393,10 @@ mod tests {
     /// form — the one a harness polls — unreachable.
     #[test]
     fn status_narrows_only_when_asked() {
-        assert!(matches!(
-            parse(&["status"]),
-            HostCmd::Status {
-                id: None,
-                json: false
-            },
-        ));
-        match parse(&["status", "--id", "3f9a2b7c1d4e4f5a", "--json"]) {
-            HostCmd::Status { id, json } => {
+        assert!(matches!(parse(&["status"]), HostCmd::Status { id: None }));
+        match parse(&["status", "--id", "3f9a2b7c1d4e4f5a"]) {
+            HostCmd::Status { id } => {
                 assert_eq!(id.as_deref(), Some("3f9a2b7c1d4e4f5a"));
-                assert!(json);
             }
             other => panic!("expected status, got {other:?}"),
         }

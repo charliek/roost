@@ -136,8 +136,10 @@ def run_doctor(
     context instead of a bare JSON decode error:
       * the exit status is one of doctor's own two documented outcomes —
         a clap usage error (exit 2) or a panic must fail loudly;
-      * stderr is empty — doctor's only output is the report, so a
-        warning printed alongside otherwise-valid JSON is a break.
+      * stderr is empty on exit 0, and on exit 1 exactly the one
+        `checks-failed` error envelope every `roostctl --json` failure
+        prints — so a warning printed alongside otherwise-valid JSON is
+        still a break.
     """
     argv = [roostctl_path(), *argv_prefix, "doctor", "--json"]
     proc = subprocess.run(argv, capture_output=True, env=env, timeout=timeout)
@@ -145,9 +147,13 @@ def run_doctor(
         f"{' '.join(argv)} exited {proc.returncode}: "
         f"{proc.stderr.decode(errors='replace')}"
     )
-    assert proc.stderr == b"", (
-        f"{' '.join(argv)} wrote to stderr: {proc.stderr.decode(errors='replace')}"
-    )
+    stderr = proc.stderr.decode(errors="replace")
+    if proc.returncode == 0:
+        assert stderr == "", f"{' '.join(argv)} wrote to stderr: {stderr}"
+    else:
+        lines = stderr.splitlines()
+        assert len(lines) == 1, f"{' '.join(argv)} wrote more than its error: {stderr}"
+        assert json.loads(lines[0])["error"]["code"] == "checks-failed", stderr
     return proc.returncode, json.loads(proc.stdout)
 
 
