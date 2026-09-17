@@ -8,6 +8,8 @@
 //!   roostctl notify --title TITLE [--body BODY] [--tab ID]
 //!   roostctl set-title --title TITLE [--tab ID]
 //!   roostctl identify
+//!   roostctl wait [--tab ID] {--state S | --text T | --gone} [--timeout SECS | --no-timeout]
+//!   roostctl events [--tab ID]
 //!   roostctl tab focus [--tab ID]
 //!   roostctl tab list
 //!   roostctl tab set-state --state STATE [--tab ID]
@@ -53,8 +55,10 @@
 mod agent_install;
 mod doctor;
 mod error;
+mod events;
 mod host;
 mod session;
+mod wait;
 
 use std::ffi::OsString;
 use std::io::{IsTerminal, Read, Write};
@@ -211,34 +215,42 @@ enum Cmd {
     /// version).
     Identify,
     /// Block until a tab reaches a condition, then exit 0 — the
-    /// no-`sleep` synchronization primitive for scripts + tests. Polls
-    /// the running UI on an interval (event-driven `events.subscribe` is
-    /// a planned upgrade behind this same interface). Exits 4 (`timeout`)
-    /// if `--timeout` elapses first. At least one of `--state` / `--text` /
-    /// `--gone` is required; when several are given, all must hold.
-    Wait {
-        /// The tab. Defaults to `$ROOST_TAB_ID`, then the UI's active tab.
+    /// no-`sleep` synchronization primitive for scripts and tests. At least
+    /// one of `--state` / `--text` / `--gone` is required; when several are
+    /// given, all must hold. Exits 4 (`timeout`) if `--timeout` elapses
+    /// first.
+    ///
+    /// Event-driven where the tabs' socket streams its events: an
+    /// in-process UI, or the local session `identify` names under
+    /// `local-backend = session`. `--text` also re-reads the viewport every
+    /// `--interval-ms`, since no event carries a tab's output. Against a
+    /// server with no stream (the Mac app, an older Roost) it polls at
+    /// `--interval-ms` instead. A lost stream is resolved again once, and
+    /// the wait carries on only if the same process answers: tab ids do not
+    /// carry across a local-backend switch or a restart, so either exits 1
+    /// (`connection`), as do a second loss and a session that stops.
+    ///
+    /// `--json` prints `tab_id`, `satisfied` (`state`, `text` and `gone`,
+    /// each `null` unless its flag was given) and `after_ms`.
+    Wait(wait::Args),
+    /// Print the event stream, one JSON line per event, until it ends.
+    ///
+    /// Each line is an event envelope, `{"event","data","revision"}` —
+    /// the events of one commit share a `revision`, in order, and a commit
+    /// with no events prints nothing. The stream's last line is its
+    /// terminal envelope, `session.stopping` or `stream.ended` (no
+    /// `revision`), and then it exits 0. A stream that drops or skips a
+    /// revision exits 1 (`connection`); a server that does not serve the
+    /// stream (the Mac app, an older Roost) exits 1 with its own refusal.
+    /// Always JSON, with or without `--json`.
+    ///
+    /// Reads the same source `wait` does: the UI's in-process stream, or
+    /// the local session under `local-backend = session`.
+    Events {
+        /// Print only the events that name this tab (a bare id). Takes no
+        /// default from `$ROOST_TAB_ID`: without it every event prints.
         #[arg(long)]
-        tab: Option<i64>,
-        /// Wait until the tab's agent state equals this.
-        #[arg(long, value_parser = ["none", "running", "needs_input", "idle"])]
-        state: Option<String>,
-        /// Wait until the tab's terminal viewport (via `tab.dump`)
-        /// contains this substring — e.g. a command's expected output.
-        /// Note: the shell echoes the command you `tab send`, so pick a
-        /// needle that appears in the OUTPUT, not in the command text
-        /// itself (else it matches immediately).
-        #[arg(long)]
-        text: Option<String>,
-        /// Wait until the tab no longer exists (closed).
-        #[arg(long, default_value_t = false)]
-        gone: bool,
-        /// Give up after this many seconds.
-        #[arg(long, default_value_t = 5.0)]
-        timeout: f64,
-        /// Poll interval in milliseconds.
-        #[arg(long, default_value_t = 100)]
-        interval_ms: u64,
+        tab: Option<String>,
     },
     /// Tab subcommands.
     ///
@@ -246,9 +258,7 @@ enum Cmd {
     /// the flag and `ROOST_TAB_ID` are both absent) names a tab on
     /// whichever backend the UI runs its own tabs on — see `roostctl
     /// --help`. Every verb here that changes a tab needs `--tab` or
-    /// `ROOST_TAB_ID` and exits 2 without either. `events.subscribe` is not
-    /// served on a UI socket either way; a client that wants the event
-    /// stream dials `identify`'s `local_session_socket`.
+    /// `ROOST_TAB_ID` and exits 2 without either.
     #[command(subcommand)]
     Tab(TabCmd),
     /// Project subcommands.
@@ -827,6 +837,7 @@ async fn run_doctor(
 struct UiSocket<'a> {
     selector: &'a TargetSelector,
     client: Option<IpcClient>,
+    path: PathBuf,
 }
 
 impl<'a> UiSocket<'a> {
@@ -834,6 +845,7 @@ impl<'a> UiSocket<'a> {
         Self {
             selector,
             client: None,
+            path: PathBuf::new(),
         }
     }
 
@@ -842,12 +854,22 @@ impl<'a> UiSocket<'a> {
             Some(client) => client,
             None => {
                 let target = self.selector.resolve(true).await?;
-                IpcClient::connect(&target.socket_path).await.map_err(|e| {
-                    CliError::Connection(format!("{}: {e}", target.socket_path.display()))
-                })?
+                let client = dial(&target.socket_path).await?;
+                self.path = target.socket_path;
+                client
             }
         };
         Ok(self.client.insert(client))
+    }
+
+    /// The socket [`Self::client`] dialled; empty before it has.
+    fn socket_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Hang up, so the next [`Self::client`] resolves and dials afresh.
+    fn redial(&mut self) {
+        self.client = None;
     }
 
     async fn call<P: Serialize, R: DeserializeOwned>(
@@ -915,99 +937,8 @@ async fn run_on_ui(
                 );
             }
         }
-        Cmd::Wait {
-            tab,
-            state,
-            text,
-            gone,
-            timeout,
-            interval_ms,
-        } => {
-            if state.is_none() && text.is_none() && !gone {
-                return Err(CliError::Usage(
-                    "wait needs at least one of --state, --text, or --gone".into(),
-                ));
-            }
-            // `--gone` (tab must NOT exist) contradicts --state/--text
-            // (tab must exist); reject the combination up front rather
-            // than silently letting --gone win.
-            if gone && (state.is_some() || text.is_some()) {
-                return Err(CliError::Usage(
-                    "--gone cannot be combined with --state or --text".into(),
-                ));
-            }
-            let tab_id = resolve_tab_or_active(ui, tab, tab_env).await?;
-            let client = ui.client().await?;
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout.max(0.0));
-            let interval = std::time::Duration::from_millis(interval_ms.max(10));
-            loop {
-                let list = list_tabs(client).await?;
-                let exists = list
-                    .projects
-                    .iter()
-                    .flat_map(|p| &p.tabs)
-                    .any(|t| t.id == tab_id);
-                // `--gone` is checked alone (it contradicts state/text,
-                // which both require the tab to exist). Otherwise the
-                // tab must exist and every requested condition must hold.
-                let satisfied = if gone {
-                    !exists
-                } else if !exists {
-                    false
-                } else {
-                    let state_ok = match &state {
-                        Some(want) => list
-                            .projects
-                            .iter()
-                            .flat_map(|p| &p.tabs)
-                            .find(|t| t.id == tab_id)
-                            .map(|t| format_state(t.state) == want)
-                            .unwrap_or(false),
-                        None => true,
-                    };
-                    let text_ok = match &text {
-                        Some(needle) => {
-                            match client
-                                .call::<_, TabDumpResult>(
-                                    ops::TAB_DUMP,
-                                    TabDumpParams {
-                                        tab_id: WireTabRef::Local(tab_id),
-                                        ..Default::default()
-                                    },
-                                )
-                                .await
-                            {
-                                Ok(dump) => dump.rows_text.join("\n").contains(needle.as_str()),
-                                // The tab closed between the list check
-                                // and the dump — not satisfied yet; keep
-                                // polling rather than failing the wait.
-                                Err(roost_ipc::ClientError::Server { code, .. })
-                                    if code == "not-found" =>
-                                {
-                                    false
-                                }
-                                Err(e) => return Err(e.into()),
-                            }
-                        }
-                        None => true,
-                    };
-                    state_ok && text_ok
-                };
-                if satisfied {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Err(CliError::Timeout(format!(
-                        "timed out after {timeout}s waiting for tab {tab_id}"
-                    )));
-                }
-                tokio::time::sleep(interval).await;
-            }
-            if json {
-                print_json(&serde_json::json!({}))?;
-            }
-        }
+        Cmd::Wait(args) => return wait::run(ui, args, tab_env, json).await,
+        Cmd::Events { tab } => return events::run(ui, tab).await,
         Cmd::Tab(TabCmd::Focus { tab }) => {
             let tab_id = require_tab(
                 "tab focus",
@@ -1548,6 +1479,12 @@ fn selector(args: &Args) -> TargetSelector {
         socket_override: args.socket.clone(),
         kind_override: args.target.map(BundleProfileKind::from),
     }
+}
+
+async fn dial(socket: &Path) -> Result<IpcClient, CliError> {
+    IpcClient::connect(socket)
+        .await
+        .map_err(|e| CliError::Connection(format!("{}: {e}", socket.display())))
 }
 
 async fn identify(client: &mut IpcClient) -> Result<IdentifyResult, CliError> {
@@ -2182,9 +2119,7 @@ fn require_tab<T: TabRef>(
 }
 
 /// The tab a read-only verb reads: `--tab`, `ROOST_TAB_ID`, or else the
-/// UI's active tab — which is always local. A UI with no active tab is
-/// refused here rather than sent `tab_id = 0` for a confusing
-/// `not-found`.
+/// UI's active tab — which is always local.
 async fn resolve_tab_or_active<T: TabRef>(
     ui: &mut UiSocket<'_>,
     flag: Option<T>,
@@ -2194,12 +2129,18 @@ async fn resolve_tab_or_active<T: TabRef>(
         return Ok(tab);
     }
     let resp = identify(ui.client().await?).await?;
-    if resp.active_tab_id == 0 {
+    active_tab(&resp).map(T::local)
+}
+
+/// The UI's active tab, refused when it has none rather than sent
+/// `tab_id = 0` for a confusing `not-found`.
+fn active_tab(identify: &IdentifyResult) -> Result<i64, CliError> {
+    if identify.active_tab_id == 0 {
         return Err(CliError::Usage(
             "no --tab, ROOST_TAB_ID is unset, and the UI reports no active tab; pass --tab".into(),
         ));
     }
-    Ok(T::local(resp.active_tab_id))
+    Ok(identify.active_tab_id)
 }
 
 /// A `--tab` given as text: a bare id or `h<host>.<id>`, checked before
@@ -2850,6 +2791,7 @@ mod tests {
         &["set-title", "--title", "t"],
         &["identify"],
         &["wait", "--state", "idle"],
+        &["events"],
         &["tab", "focus"],
         &["tab", "send-file", "--tab", "7", "a.png"],
         &["tab", "list"],
@@ -3137,6 +3079,7 @@ mod tests {
     #[tokio::test]
     async fn a_wait_that_never_holds_times_out_with_exit_4() {
         let ui = FakeUi::start("wait-timeout", |op| match op {
+            "identify" => Ok(fake_identify(0)),
             "tab.list" => Ok(serde_json::json!({"projects": []})),
             _ => Err(("unknown-op", "not faked")),
         });
@@ -3403,7 +3346,7 @@ mod tests {
     /// other, so it cannot pick up the active-tab fallback by omission.
     #[test]
     fn every_verb_that_takes_a_tab_is_mutating_or_a_known_reader() {
-        const READERS: &[&str] = &["wait", "tab dump", "tab send-file", "doctor"];
+        const READERS: &[&str] = &["wait", "events", "tab dump", "tab send-file", "doctor"];
         let mut with_tab: Vec<String> = leaf_verbs()
             .into_iter()
             .filter(|(_, cmd)| cmd.get_arguments().any(|arg| arg.get_id() == "tab"))

@@ -94,6 +94,7 @@ atexit.register(shutil.rmtree, _ROOT, ignore_errors=True)
 import ui  # noqa: E402
 from client import Roost, RoostError, scaled_timeout  # noqa: E402
 from eventstream import ENDED_EVENT, EventStream  # noqa: E402
+from relay import Relay  # noqa: E402
 from session import wait_until  # noqa: E402
 from test_host_local_spawn import roostctl_session, running_session_id  # noqa: E402
 
@@ -1389,6 +1390,14 @@ def session_ui(lane: Lane, **launch) -> Roost:
     return roost
 
 
+def _without_roost_env() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ("ROOST_SOCKET", "ROOST_TAB_ID")
+    }
+
+
 def roostctl(
     *args: str, timeout: float = 60.0, tab_env: str | None = None
 ) -> subprocess.CompletedProcess:
@@ -1400,11 +1409,7 @@ def roostctl(
     read-only verb's tab from `identify`. `tab_env` puts `ROOST_TAB_ID`
     back, the way every shell inside a Roost tab has it.
     """
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in ("ROOST_SOCKET", "ROOST_TAB_ID")
-    }
+    env = _without_roost_env()
     if tab_env is not None:
         env["ROOST_TAB_ID"] = tab_env
     return subprocess.run(
@@ -1713,6 +1718,210 @@ def test_a_host_qualified_ref_is_never_re_addressed_to_the_slot(lane: Lane):
         roost.call("tab.focus", {"tab_id": "h9999.%d" % bare})
     assert focus.value.code == "not-found", focus.value
     assert roost.identify()["active_tab_id"] == bare
+
+
+# ---------------------------------------------------------------------------
+# 6b. Plan 066 §3.2: `roostctl wait` and `events` on the stream
+# ---------------------------------------------------------------------------
+#
+# Each case puts a recording relay (`relay.py`) between `roostctl` and the
+# socket it dials, so what the CLI *did* — which ops, on which connection —
+# is asserted, not inferred from timing. A `forced_poll` relay answers
+# `identify` the way the Mac app does, which is the forced-poll lane: the
+# same `wait`, against the same UI, taking its poll loop.
+
+
+def roostctl_in_background(*args: str) -> subprocess.Popen:
+    """`roostctl` started and left running, with the environment
+    [`roostctl`] gives it."""
+    return subprocess.Popen(
+        [util.roostctl_path(), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_without_roost_env(),
+    )
+
+
+def finished(proc: subprocess.Popen, timeout: float = 60.0) -> tuple[str, str]:
+    try:
+        return proc.communicate(timeout=scaled_timeout(timeout))
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+        raise AssertionError(f"{proc.args} never exited: {out!r} / {err!r}") from None
+
+
+def reap(*procs: subprocess.Popen | None) -> None:
+    for proc in procs:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+
+
+def test_a_wait_on_the_stream_never_dumps_and_the_forced_poll_lane_passes_the_same_wait(
+    lane: Lane,
+):
+    """AC2: `wait --state` on an in-process UI's stream makes no `tab.dump`
+    call, and the same wait through a forced-poll relay polls `tab.list`
+    and passes too. Each lane then checks `--timeout 0` once: satisfied
+    exits 0, not satisfied exits 4 at once."""
+    roost = lane.start("in-process")
+    tab = roost.open_tab(int(roost.list()[0]["id"]), cwd="/tmp")
+    for lane_name, forced_poll in (("stream", False), ("poll", True)):
+        roost.set_state(tab, "running")
+        path = _ROOT / f"relay-{lane_name}.sock"
+        with Relay(ui.socket_path(lane.target), path, forced_poll=forced_poll) as relay:
+            waiting = roostctl_in_background(
+                "--socket", relay.path, "wait", "--tab", str(tab),
+                "--state", "idle", "--timeout", "60", "--json",
+            )
+            # Armed: the wait holds a snapshot that says `running`.
+            relay.wait_for_response("tab.list")
+            roost.set_state(tab, "idle")
+            out, err = finished(waiting)
+            assert waiting.returncode == 0, (lane_name, out, err)
+            answer = json.loads(out)
+            assert answer["tab_id"] == str(tab), answer
+            assert answer["satisfied"] == {"state": "idle", "text": None, "gone": None}, answer
+            assert isinstance(answer["after_ms"], int), answer
+
+            asked = relay.requests()
+            if forced_poll:
+                assert "events.subscribe" not in asked, asked
+                assert asked.count("tab.list") >= 2, asked
+            else:
+                assert "events.subscribe" in asked, asked
+                assert "tab.dump" not in asked, asked
+
+            once = ["--socket", relay.path, "wait", "--tab", str(tab), "--timeout", "0"]
+            held = roostctl(*once, "--state", "idle")
+            assert held.returncode == 0, (lane_name, held)
+            started = time.monotonic()
+            unheld = roostctl(*once, "--state", "needs_input", "--json")
+            assert unheld.returncode == 4, (lane_name, unheld)
+            assert json.loads(unheld.stderr)["error"]["code"] == "timeout", unheld
+            assert time.monotonic() - started < scaled_timeout(10.0), lane_name
+
+
+def test_a_wait_on_the_stream_sees_a_change_before_a_polling_wait_does(lane: Lane):
+    """AC1: an in-process UI-socket subscriber has the `tab.state_changed`
+    before a forced-poll control observes the change.
+
+    Both waits are armed on a `running` snapshot, the control with an
+    interval far longer than a stream needs. When the stream wait returns,
+    the control has still asked `tab.list` exactly once — the answer it is
+    sleeping on predates the change, so it has not observed it."""
+    roost = lane.start("in-process")
+    tab = roost.open_tab(int(roost.list()[0]["id"]), cwd="/tmp")
+    roost.set_state(tab, "running")
+    interval = scaled_timeout(8.0)
+    argv = ["wait", "--tab", str(tab), "--state", "idle", "--timeout", "120"]
+    socket = ui.socket_path(lane.target)
+    with (
+        Relay(socket, _ROOT / "relay-stream.sock") as streamed,
+        Relay(socket, _ROOT / "relay-poll.sock", forced_poll=True) as polled,
+    ):
+        polling = roostctl_in_background(
+            "--socket", polled.path, *argv, "--interval-ms", str(int(interval * 1000))
+        )
+        streaming = roostctl_in_background("--socket", streamed.path, *argv)
+        try:
+            polled.wait_for_response("tab.list")
+            streamed.wait_for_response("tab.list")
+            changed = time.monotonic()
+            roost.set_state(tab, "idle")
+            out, err = finished(streaming)
+            took = time.monotonic() - changed
+            assert streaming.returncode == 0, (out, err)
+            assert polling.poll() is None, "the poll control finished first"
+            assert polled.requests().count("tab.list") == 1, (
+                f"the poll control asked again before the stream wait returned: "
+                f"{polled.requests()}"
+            )
+            assert took < interval, took
+        finally:
+            reap(polling)
+
+
+def test_a_wait_across_a_backend_switch_ends_rather_than_reading_the_sessions_ids(lane: Lane):
+    """A switch replays the tabs onto the session under the session's own
+    ids, so the tab a wait was asked about has no id there. The wait sees
+    `stream.ended`, resolves the session, finds a different process, and
+    exits 1 `connection` saying so — where `--gone` read off the session's
+    snapshot would have exited 0 for a tab that was never closed."""
+    roost = lane.start("in-process")
+    lane.start_daemon()
+    lane.empty_the_session()
+    tab = roost.open_tab(int(roost.list()[0]["id"]), cwd="/tmp")
+    with Relay(ui.socket_path(lane.target), _ROOT / "relay-switch.sock") as relay:
+        waiting = roostctl_in_background(
+            "--socket", relay.path, "wait", "--tab", str(tab), "--gone", "--timeout", "120", "--json"
+        )
+        try:
+            relay.wait_for_response("tab.list")
+            switch(roost, USE_SESSION, "session")
+            out, err = finished(waiting, timeout=120.0)
+        finally:
+            reap(waiting)
+    assert waiting.returncode == 1, (out, err)
+    assert out == "", out
+    error = json.loads(err)["error"]
+    assert error["code"] == "connection", error
+    assert f"the Roost serving tab {tab} changed" in error["message"], error
+    assert "tab ids do not carry across" in error["message"], error
+
+
+def test_under_session_mode_wait_and_events_read_the_session_directly(lane: Lane):
+    """The stream verbs under `local-backend = session`: `identify` on the UI
+    socket resolves the tab — a bare `wait` takes the active tab, which is
+    the slot's — and both legs then go to `local_session_socket` with the
+    same id. `events --tab N` prints N's `tab.state_changed` and exits 0 on
+    the session's `session.stopping`.
+
+    The UI relay reroutes `local_session_socket` through a second relay, so
+    the session legs are recorded: the subscribe on one connection, the
+    identity check and the snapshot on another, in that order."""
+    roost = session_ui(lane)
+    active = roost.identify()["active_tab_id"]
+    with lane.session() as c:
+        c.set_state(active, "running")
+    session_socket = roost.identify()["local_session_socket"]
+    with (
+        Relay(session_socket, _ROOT / "relay-slot.sock") as slot,
+        Relay(ui.socket_path(lane.target), _ROOT / "relay-ui.sock", session_socket=slot.path) as front,
+    ):
+        waiting = roostctl_in_background(
+            "--socket", front.path, "wait", "--state", "needs_input", "--timeout", "60", "--json"
+        )
+        watching = None
+        try:
+            slot.wait_for_response("tab.list")
+            watching = roostctl_in_background("--socket", front.path, "events", "--tab", str(active))
+            slot.wait_for_response("session.identify", count=2)
+            with lane.session() as c:
+                c.set_state(active, "needs_input")
+
+            out, err = finished(waiting)
+            assert waiting.returncode == 0, (out, err)
+            answer = json.loads(out)
+            assert answer["tab_id"] == str(active), answer
+            assert answer["satisfied"]["state"] == "needs_input", answer
+            assert front.requests() == ["identify", "identify"], front.requests()
+            legs = list(slot.by_connection().values())
+            assert legs[:2] == [["events.subscribe"], ["session.identify", "tab.list"]], legs
+
+            lane.stop_daemon()
+            out, err = finished(watching)
+            assert watching.returncode == 0, (out, err)
+            lines = [json.loads(line) for line in out.splitlines()]
+            assert lines[-1] == {"event": "session.stopping", "data": {"reason": "stop"}}, lines
+            changed = [line for line in lines if line["event"] == "tab.state_changed"]
+            assert changed and changed[-1]["data"] == {"tab_id": str(active), "state": "needs_input"}, lines
+            assert isinstance(changed[-1]["revision"], int), lines
+            assert all(line["data"].get("tab_id") == str(active) for line in lines[:-1]), lines
+        finally:
+            reap(waiting, watching)
 
 
 # ---------------------------------------------------------------------------

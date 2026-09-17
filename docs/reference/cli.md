@@ -27,6 +27,8 @@ roostctl [--socket <PATH>] [--target <mac|linux|iced>] [--json] <COMMAND>
 | `tab list` | List every tab grouped by project |
 | `tab set-state` | Set the per-tab agent state |
 | `tab clear-notification` | Clear a tab's pending-attention flag |
+| `wait` | Block until a tab reaches a state, shows a string, or closes |
+| `events` | Print the event stream, one JSON line per event |
 | `tab open` / `close` / `send` / `resize` / `reorder` | Tab lifecycle + I/O |
 | `project list` / `create` / `rename` / `delete` / `reorder` | Project lifecycle |
 | `agent ensure` / `set` / `install` / `uninstall` / `status` | Wire Roost's hook entries into the supported agents' own configs |
@@ -57,13 +59,14 @@ stdout:
 | `tab list`, `project list` | The `tab.list` result |
 | `host list`, `host status`, `agent status`, `agent ensure`, `doctor` | The same JSON these printed with their own `--json` before it became global |
 | `agent install` / `uninstall` / `set --local` | The outcome `agent ensure --json` prints |
-| `wait` | `{}` once the condition holds |
+| `wait` | `{"tab_id", "satisfied": {"state", "text", "gone"}, "after_ms"}` once the condition holds — see [`wait`](#wait) |
 | `screenshot` | `{"out": "<path>", "bytes": N}` — and it needs `--out`, since the PNG and the JSON would otherwise share stdout |
 | `session start` | `{"outcome", "socket", "identity", "launcher_reported_pid"}`, `outcome` being `started` or `already-running` |
 | `session stop` | `{"socket", "session_id", "reap"}` — `session_id` and `reap` are `null` when nothing was running |
 | `session status` | `{"socket", "identity", "projects", "tabs"}` |
 | `agent-hook`, `claude-hook` | Nothing different: they ignore the flag and always answer `{}` and exit 0, because a decision hook must never be blocked by a CLI error |
 | `rpc` | Not affected by the flag at all — see [`rpc`](#rpc) below |
+| `events` | Not affected either: always one JSON line per event — see [`events`](#events) |
 
 Without `--json`, every command prints what it always has. An error is
 never written to stdout either way — see [Exit codes](#exit-codes).
@@ -87,6 +90,8 @@ last clicked, which is no answer for a command that writes to a tab.
 
 The read-only `tab dump` and `wait` still fall back to the UI's active
 tab when `ROOST_TAB_ID` is unset too. `tab send-file` has always required `--tab`.
+`events --tab` is a filter, not a target, so it reads neither: without the
+flag every event prints.
 A `ROOST_TAB_ID` that is not a tab id is refused the same way (exit 2).
 
 ### Where `roostctl` lives
@@ -285,22 +290,123 @@ still land.
 
 ## `wait`
 
-Block until a tab reaches a condition, then exit `0` — the no-`sleep` synchronization primitive for scripts and tests. Polls the running UI on an interval; exits **4** (`timeout`) if `--timeout` elapses first — before this it exited 1, which a script could not tell from a failed connection. At least one condition is required; when several are given, all must hold.
+Block until a tab reaches a condition, then exit `0` — the no-`sleep`
+synchronization primitive for scripts, tests and agents. At least one
+condition is required; when several are given, all must hold.
 
 ```bash
 roostctl wait --tab 5 --state idle            # until the agent state is idle
 roostctl wait --tab 5 --text 'BUILD OK'       # until the viewport contains a string
 roostctl wait --tab 5 --gone                  # until the tab is closed
+roostctl wait --tab 5 --state idle --no-timeout --json
 ```
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--state` | string | — | Wait until the tab's agent state equals this (`none`/`running`/`needs_input`/`idle`) |
 | `--text` | string | — | Wait until the viewport (via `tab.dump`) contains this substring. Pick a needle from command *output*, not the echoed command |
-| `--gone` | flag | `false` | Wait until the tab no longer exists |
-| `--timeout` | float | `5.0` | Give up after this many seconds |
-| `--interval-ms` | int | `100` | Poll interval |
-| `--tab` | int | `$ROOST_TAB_ID`, then the UI's active tab | Target tab id |
+| `--gone` | flag | `false` | Wait until the tab no longer exists. Cannot be combined with `--state` or `--text` |
+| `--timeout` | float | `5.0` | Give up after this many seconds. `0` checks once: exit `0` if the condition already holds, `4` if not |
+| `--no-timeout` | flag | `false` | Wait for as long as it takes. Cannot be combined with `--timeout` (exit 2) |
+| `--interval-ms` | int | `100` | The poll interval where there is no stream, and how often `--text` re-reads the viewport where there is |
+| `--tab` | bare id | `$ROOST_TAB_ID`, then the UI's active tab | Target tab. A host tab (`h<host>.<id>`) is refused with `usage` (exit 2): the stream is the local workspace's |
+
+**Where it listens.** `wait` asks the UI's `identify` which socket owns
+the tabs, and follows that socket's [event stream](ipc.md#eventssubscribe)
+instead of polling:
+
+| `identify` says | `wait` reads |
+|---|---|
+| `local_session_socket` is present (`local-backend = session`) | The local session: both connections dial that socket |
+| `ops` names `events.subscribe` (the iced UI, in-process) | The UI socket itself |
+| Neither — the Swift Mac app, or a Roost older than this | The poll loop: `tab.list` (and `tab.dump` for `--text`) every `--interval-ms`, as `wait` always did |
+
+On a stream it subscribes on one connection, then — on a second —
+checks that `identify.instance_id` (or, on a session,
+`session.identify.session_id`) is the one the subscription acked, and takes
+a `tab.list` snapshot. Batches the snapshot already holds are discarded;
+`--state` and `--gone` are then decided by `tab.state_changed` and
+`tab.closed` as they arrive, with no `tab.dump` at all. No event carries a
+tab's output, so `--text` re-reads the viewport on every event for the tab
+and every `--interval-ms`. A bare `--tab` id means the same tab on the UI
+socket and on the session under `local-backend = session`, so the id (or the
+active tab) is resolved on the UI and used on the session unchanged.
+
+**When the stream goes away.** A stream that closes without a label, skips
+a revision, or ends with `stream.ended`, or whose second connection drops,
+is resolved again from `identify` once, after any local-backend switch in
+flight has settled. The wait carries on **only if the new stream is the
+same process** — the same `instance_id` or `session_id` its first
+subscription acked — as it is for a subscriber the server cut for falling
+behind. Anything else exits 1 `connection`: "the Roost serving tab N
+changed … tab ids do not carry across — re-resolve the tab and wait again".
+Tab ids belong to the process that minted them: a switch replays the tabs
+onto its destination under new ids, and a restart mints new ones, so tab N
+over there is some other tab or none, and `--gone` read off its snapshot
+would be wrong. `stream.ended` is a switch, so a wait across one normally
+ends that way. A second loss exits 1 `connection` too. A session that stops
+(`session.stopping`) exits 1 `connection` at once, with that reason. If the
+two connections of one subscription keep reaching different processes (the
+server restarting between them), the sequence is retried three times and
+then exits 1 `connection`.
+
+**Exits.** `0` once the condition holds; **4** (`timeout`) if `--timeout`
+elapses first — before plan 066 it exited 1, which a script could not tell
+from a failed connection; 2 `usage` for a bad command line; 1 for
+everything in [Exit codes](#exit-codes).
+
+With `--json`, success prints:
+
+```json
+{"tab_id": "5", "satisfied": {"state": "idle", "text": null, "gone": null}, "after_ms": 812}
+```
+
+Each `satisfied` field is `null` unless its flag was given: `state` is the
+state the tab was seen in, `text` the needle that was found, `gone` is
+`true`. `after_ms` counts from the command's start, dialling included.
+
+## `events`
+
+Print the event stream as a line protocol: one compact JSON document per
+line, flushed as it arrives, until the stream ends.
+
+```bash
+roostctl events                       # every event
+roostctl events --tab 5               # only the events that name tab 5
+roostctl events | jq -c 'select(.event == "tab.state_changed")'
+```
+
+Each line is one [event envelope](ipc.md#events) with the revision of the
+commit it rode in:
+
+```json
+{"event":"tab.state_changed","data":{"tab_id":"5","state":"idle"},"revision":42}
+```
+
+Events of one commit share a `revision` and keep their order; a commit
+with no events prints nothing. The stream's last line is its terminal
+envelope, which carries no `revision`:
+`{"event":"session.stopping","data":{"reason":"stop"}}` from a session, or
+`{"event":"stream.ended","data":{"reason":"backend-switch"}}` from a UI whose
+local backend is switching.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--tab` | — | Keep only the events that name this tab — by `data.tab_id`, or `data.tab.id` for `tab.opened` — and drop the rest, event by event: a commit touching several tabs keeps just this tab's lines. Events that name no tab (`project.*`, `projects.reordered`, `workspace.durability_changed`) are dropped. The terminal envelope always prints. A bare id only; a host tab is refused with `usage`. Not read from `ROOST_TAB_ID` |
+
+It reads the same socket [`wait`](#wait) does — the in-process UI, or the
+local session under `local-backend = session` — with the same identity check,
+and no snapshot. There is no poll fallback.
+
+| Exit | When |
+|---|---|
+| 0 | The terminal envelope arrived (printed as the last line), or the reader of stdout went away (`events \| head -n1`) |
+| 1 `connection` | The stream closed without a label or skipped a revision — nothing is resolved again; run it again |
+| 1 *the server's own* | The server does not serve the stream: the Swift Mac app, an older Roost. Its refusal is passed through verbatim (`not-implemented`, `unknown-op`) |
+| 2 `usage` | A bad command line, including a host `--tab` |
+
+`events` is always JSON, with or without `--json`; a failure still goes
+through the one [error envelope](#exit-codes).
 
 ## `project` subcommands
 
@@ -803,7 +909,7 @@ failed), the line is a JSON envelope instead:
 | 2 | `usage` | A bad command line, including a command that changes a tab given no `--tab` and no `ROOST_TAB_ID`. A parser error keeps clap's usage text in the message; `--help` and `--version` print to stdout and exit 0 |
 | 1 | `no-target` | Auto-detect found nothing listening at any known socket |
 | 1 | `ambiguous-target` | Several Roost UIs are running; pass `--target` |
-| 1 | `connection` | Dialing, reading or writing the socket failed, or the stream dropped |
+| 1 | `connection` | Dialing, reading or writing the socket failed, or the stream dropped (`wait` after a second loss or a stopping session; `events` on any drop or gap) |
 | 1 | *the server's own* | The server refused the request; its code is passed through verbatim (`not-found`, `invalid-param`, `unknown-op`, …) |
 | 1 | `unsupported` | This server does not serve an op the command needs |
 | 1 | `checks-failed` | `doctor` found a failing check; the report itself is on stdout |

@@ -2261,6 +2261,41 @@ the same catalog — with these differences:
   identify.local_session_socket`: that session serves the stream, with
   resume, and its own `tab.list` fences it.
 
+#### Waiting on a condition
+
+How a raw-socket client waits for a tab to change without polling — and
+what `roostctl wait` does:
+
+1. **Pick the socket.** Call [`identify`](#identify) on the UI socket. If
+   `local_session_socket` is present, use that socket for everything
+   below; else, if `ops` names `events.subscribe`, use the UI socket;
+   else the server has no stream (the Swift Mac app, an older Roost):
+   poll `tab.list`.
+2. **Subscribe first**, on connection A. Keep the ack's `revision` and
+   `session_id`.
+3. **Then, on connection B**, check the process: `identify.instance_id`
+   on a UI socket, `session.identify.session_id` on a session socket, must
+   equal the ack's `session_id`. If not, the server restarted between the
+   two — revisions restarted with it — so close both and start again. Then
+   take the snapshot: `tab.list`, whose `revision` is at or past the ack's.
+4. **Evaluate the snapshot, then the stream.** Discard every batch whose
+   `revision` is `<=` the snapshot's; apply the rest in order
+   (`tab.state_changed`, `tab.closed`, …) and re-evaluate after each.
+   Nothing on the stream carries a tab's output, so a condition on the
+   viewport re-reads `tab.dump` on connection B.
+
+The order is the whole trick: every commit after the subscribe is on the
+stream, so a snapshot taken after it can only be newer. Snapshot first
+and a commit landing between the two legs is in neither. A bare EOF or a
+revision gap means start again from step 1, and so does `stream.ended` —
+but a tab id means something only to the process that minted it. A
+local-backend switch replays the tabs onto its destination under new ids,
+and a restart mints new ones, so if the fresh ack's `session_id` is not the
+one the wait began with, the tab being waited on has to be found again
+(by title, cwd, or whatever the client knew it by) before anything is read
+off the new snapshot — a tab missing there is not a tab that closed.
+`session.stopping` means the session is going away.
+
 ## Session ops
 
 Served **only by a host session** (`roost-session`), never by a UI

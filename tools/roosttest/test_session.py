@@ -32,12 +32,14 @@ import os
 import re
 import signal
 import stat
+import subprocess
 import threading
 
 import pytest
 import session as sessionlib
 from client import RoostError
 from eventstream import EventStream
+from relay import Relay
 
 # The resume cases below are effect cases too — a resumed stream must
 # never carry an effect out of its gap — so they borrow the helpers that
@@ -1137,3 +1139,56 @@ def test_rpc_matches_the_named_verb_and_reports_errors_through_the_envelope(env)
     bad_params = env.roostctl("--socket", socket, "rpc", "tab.write", "[1,2,3]")
     assert bad_params.returncode == 2, bad_params.stdout + bad_params.stderr
     assert "usage" in bad_params.stderr, bad_params.stderr
+
+
+def test_roostctl_events_and_wait_read_a_session_named_by_socket(env):
+    """Plan 066 §3.2 on a session reached through `--socket`: its `identify`
+    carries the stream in `ops` and no `instance_id`, so `roostctl` checks
+    the stream's incarnation with `session.identify`. `events --tab N`
+    prints N's `tab.state_changed` and no other tab's, then the session's
+    `session.stopping` as its last line, and exits 0; `wait --timeout 0`
+    checks once either way."""
+    started(env)
+    with env.client() as client:
+        project = first_project(client)
+        watched = client.open_tab(project, cwd=str(env.launch_cwd), title="watched")
+        other = client.open_tab(project, cwd=str(env.launch_cwd), title="other")
+        client.set_state(watched, "running")
+
+    with Relay(env.socket, env.root / "relay.sock") as relay:
+        events = subprocess.Popen(
+            [sessionlib.roostctl_binary(), "--socket", relay.path, "events", "--tab", str(watched)],
+            env=env.command_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            relay.wait_for_response("session.identify")
+            assert list(relay.by_connection().values()) == [
+                ["identify"],
+                ["events.subscribe"],
+                ["session.identify"],
+            ], relay.by_connection()
+
+            once = ["--socket", relay.path, "wait", "--tab", str(watched), "--timeout", "0"]
+            assert env.roostctl(*once, "--state", "running").returncode == 0
+            unheld = env.roostctl(*once, "--state", "idle")
+            assert unheld.returncode == 4, unheld.stdout + unheld.stderr
+
+            with env.client() as client:
+                client.set_state(other, "idle")
+                client.set_state(watched, "needs_input")
+            env.stop_over_the_wire()
+            out, err = events.communicate(timeout=sessionlib.scaled_timeout(60.0))
+        finally:
+            if events.poll() is None:
+                events.kill()
+                events.communicate()
+    assert events.returncode == 0, out + err
+    lines = [json.loads(line) for line in out.splitlines()]
+    assert lines[-1] == {"event": "session.stopping", "data": {"reason": "stop"}}, lines
+    assert {"tab_id": str(watched), "state": "needs_input"} in [
+        line["data"] for line in lines if line["event"] == "tab.state_changed"
+    ], lines
+    assert all(line["data"].get("tab_id") == str(watched) for line in lines[:-1]), lines
