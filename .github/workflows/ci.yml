@@ -119,6 +119,10 @@ jobs:
             docnav:
               - 'zensical.toml'
               - 'docs/**'
+              # Same class: roost-cli `include_str!`s skills/roost/SKILL.md
+              # (its recipe-parity tests) and its tests read .claude-plugin/.
+              - 'skills/**'
+              - '.claude-plugin/**'
             # examples/ipc-consumer is its own workspace, outside
             # `rustcore`'s `crates/**` anchor on purpose (it proves
             # roost-ipc buildable with no other workspace crate) — a
