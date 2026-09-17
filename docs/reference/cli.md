@@ -240,7 +240,7 @@ These compose: `--after-tab X --focus -- <cmd>` is the "open a command in a tab 
 
 **`tab send` needs no credential.** A write needs none on a UI socket (`--target mac|linux|iced`) or a **host session's own socket** (reached with `--target session` or `--socket <path>`, e.g. one a `roostctl session start` daemon owns) alike: same-UID access to the socket is the whole boundary, and there is no authority layer above it to present anything to. There is deliberately no `--lease` flag and never was one worth adding back — argv leaks through shell history and `ps`, and there is nothing on this wire a flag like that could still mean.
 
-`tab dump` reads the tab's live terminal viewport as text — the determinism backbone for tests: assert on exact content instead of matching pixels. Plain output is one line per visible row (trailing blanks trimmed); `--json` adds dimensions and cursor. Backed by the `tab.dump` IPC op — see [ipc.md](ipc.md).
+`tab dump` reads the tab's live terminal viewport as text — the determinism backbone for tests: assert on exact content instead of matching pixels. Plain output is one line per visible row (trailing blanks trimmed); `--json` adds dimensions and cursor. Backed by the `tab.dump` IPC op — see [ipc.md](ipc.md). Under `local-backend = session` a bare id (from `--tab`, `ROOST_TAB_ID`, or the active tab) is read from the session `identify.local_session_socket` names, as [`wait`](#wait) reads it, because the UI holds a terminal only for the tab it is showing; an `h<host>.<id>` still reads the UI's.
 
 **`--scrollback <N>`** widens the read to `N` rows of history above the viewport. In plain mode the history rows print **first, with no separator**, so `roostctl tab dump --scrollback 200 --tab 5 | grep …` keeps working over the larger window rather than needing a new parse; `--json` carries them as `scrollback_text` beside a `scrollback_rows` count of everything that was available. The rows are anchored on the viewport that was dumped, so the last history row is always the one directly above the first visible row, even on a tab the user has scrolled up. Asking for more than exists — or more than the server's 10 000-row cap — is **clamped, not refused**: `--scrollback 1000000` is a legitimate way to say "all of it".
 
@@ -752,7 +752,10 @@ echo '{"tab_id":"4","data":"bHM="}' | roostctl rpc tab.write -   # params from s
 
 See [ipc.md](ipc.md#operations) for op names and their params, and
 `roostctl identify --json`'s `ops` field for exactly which ops the Roost
-this socket reaches serves right now.
+this socket reaches serves right now. `rpc` never re-routes: under
+`local-backend = session` a raw op goes to the socket you dialled, not to
+the session that [`tab dump`](#tab-open-close-send-resize-reorder-dump),
+[`wait`](#wait) and [`events`](#events) read from.
 
 `rpc` is always JSON, with or without `--json` on the command line: the
 op's result object, pretty-printed on stdout — the same shape every

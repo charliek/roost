@@ -108,10 +108,11 @@ shape and exit codes.
 ### `rpc`
 
 Call an operation by name when no verb covers it yet — the escape
-hatch, not the everyday path:
+hatch, not the everyday path. The line below only illustrates the
+call's shape, on an op the `identify` verb already covers:
 
 ```bash roost-recipe
-roostctl rpc tab.dump '{"tab_id":"'"$ROOST_TAB_ID"'","scrollback":50}'
+roostctl rpc identify '{}'
 ```
 
 `rpc` bypasses the target policy below and does not read
@@ -147,11 +148,13 @@ events` already implement it for you.
 
 Never pass `--focus` or run `tab focus` unless the user (or the task)
 actually asked to switch tabs — it raises the window and steals
-attention from whatever the person is doing. This matters independent
-of `open`/`tab open`'s own behavior: opening a tab makes it the active
-tab regardless of `--focus` (#503), so `--focus` only changes whether
-the window is raised and switched to, not whether the new tab becomes
-the active one in the sidebar.
+attention from whatever the person is doing. Opening a tab can make it
+the active tab even without `--focus`, so open tabs only when asked. An
+in-process Roost always makes the new tab active (#503), so there
+`--focus` only changes whether the window is raised and switched to,
+not whether the new tab becomes the active one in the sidebar. Under
+`local-backend = session` the window stays on the tab it was showing,
+although `open`'s reply still marks the new tab `is_active`.
 
 ## Target policy: which tab a command acts on
 

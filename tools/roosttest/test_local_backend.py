@@ -1565,6 +1565,42 @@ def test_roostctl_reads_the_session_bare_and_changes_it_only_when_told_which_tab
         assert c.agent_lifecycle(active) == "waiting", c.tab(active)
 
 
+def test_roostctl_dumps_a_session_tab_the_window_is_not_showing(lane: Lane):
+    """`roostctl tab dump --tab N` from outside any tab, for a session tab
+    the window has not attached.
+
+    The UI socket answers `tab.dump` off its own client-side terminal,
+    which exists only for the tab it shows, so for this tab its own answer
+    is `not-found … has no live terminal` — asserted first, so the dump
+    cannot be passing on a tab the window happened to attach. `roostctl`
+    reads a bare id where `wait` does, off `identify.local_session_socket`.
+    The typed line splits the token with quotes, so only the shell's output
+    can show it whole.
+    """
+    roost = session_ui(lane)
+    shown = roost.identify()["active_tab_id"]
+    printed = token()
+    head, tail = printed.split("-", 1)
+    with lane.session() as c:
+        project = int(c.list()[0]["id"])
+        hidden = c.open_tab(project, cwd="/tmp", title="hidden")
+        c.send(hidden, f'echo {head}""-{tail}\n')
+        wait_until(
+            lambda: printed in c.dump_text(hidden),
+            scaled_timeout(30.0),
+            "the token to reach the hidden session tab",
+        )
+    assert hidden in session_tab_ids(lane) and hidden != shown
+    assert roost.identify()["active_tab_id"] == shown, "the window stayed on its tab"
+    with pytest.raises(RoostError) as unattached:
+        roost.call("tab.dump", {"tab_id": str(hidden)})
+    assert "no live terminal" in unattached.value.message, unattached.value
+
+    dumped = roostctl("tab", "dump", "--tab", str(hidden))
+    assert dumped.returncode == 0, dumped
+    assert printed in dumped.stdout, dumped
+
+
 def test_a_forwarded_refusal_is_the_sessions_own_verdict(lane: Lane):
     """AC8's error-parity clause, on a refusal only the session can give.
 

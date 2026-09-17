@@ -115,7 +115,7 @@ roostctl tab list --json | jq --arg id N '.projects[].tabs[] | select(.id == $id
 
 ```bash roost-recipe
 set -o pipefail
-timeout 30 roostctl events --tab N | jq -c 'select(.event == "notification.fired" or .data.state == "needs_input")'
+timeout 30 roostctl events --tab N | jq -c 'select(.event == "notification.fired" or (.event == "tab.state_changed" and .data.state == "needs_input"))'
 ```
 
 With `pipefail` the exit tells the endings apart: 124 when `timeout` stopped the stream, 0 when the stream ended on its own (Roost switched its local backend, or a session stopped), and `roostctl`'s own code when it failed. Where `timeout` is missing, or to block until one tab needs input, `roostctl wait --tab N --state needs_input --timeout 300` is the portable bound; `wait` gives up after 5 seconds when you leave out `--timeout`.
@@ -131,17 +131,17 @@ roostctl notify --tab "$ROOST_TAB_ID" --title 'Review ready' --body 'Findings ar
 
 ### Call an op no verb covers
 
-`rpc` calls an operation by name, with its params as a JSON object, and prints the result as JSON. It is for an op that `identify --json`'s `ops` lists and this `roostctl` has no verb for, such as one a newer Roost added. Today every op an agent needs has a verb, so prefer the verb. The line below only illustrates the call's shape, on an op `tab dump` already covers; the wire format is at <https://charliek.github.io/roost/reference/ipc/>:
+`rpc` calls an operation by name, with its params as a JSON object, and prints the result as JSON. It is for an op that `identify --json`'s `ops` lists and this `roostctl` has no verb for, such as one a newer Roost added. Today every op an agent needs has a verb, so prefer the verb. The line below only illustrates the call's shape, on an op the `identify` verb already covers; the wire format is at <https://charliek.github.io/roost/reference/ipc/>:
 
 ```bash roost-recipe
-roostctl rpc tab.dump '{"tab_id":"N","scrollback":50}'
+roostctl rpc identify '{}'
 ```
 
 ## Rules
 
 - Always pass `--tab`. Without it, `notify`, `set-title`, `tab set-state`, `tab clear-notification`, `tab close`, `tab send`, `tab resize`, and `tab focus` act on `ROOST_TAB_ID`, which inside Roost is your own tab, and exit 2 when it is unset or empty. `tab dump` and `wait` also use `ROOST_TAB_ID` first, but when it is unset or empty they fall back to the UI's active tab, whichever tab the user last clicked.
 - Parse ids from `--json` output. Never derive them from sidebar order, tab titles, or examples.
-- Never pass `--focus` or run `tab focus` unless the user asked to switch tabs. Opening a tab makes it the active tab even without `--focus`, so only open tabs when the user asked for something to run in Roost.
+- Never pass `--focus` or run `tab focus` unless the user asked to switch tabs. Opening a tab can make it the active tab even without `--focus` (an in-process Roost always does), so only open tabs when the user asked for something to run in Roost.
 - Never close a tab or delete a project you did not open, unless the user explicitly asked.
 - A `wait` timeout does not prove the input was not delivered or the command did not run. Read the tab with `tab dump` before sending anything again.
 - `rpc` is not a way around `--tab`. Use the named verb for anything a verb covers, and only put ids in `rpc` params that you parsed from JSON.

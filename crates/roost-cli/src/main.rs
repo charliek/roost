@@ -107,7 +107,7 @@ const CLIENT_NAME: &str = "roostctl";
 /// 2 `usage` before dialling ([`require_tab`]): the UI's active tab is
 /// whatever a person last clicked, which is no answer for a command that
 /// writes to it. The read-only `tab dump` and `wait` keep that fallback
-/// ([`resolve_tab_or_active`]).
+/// ([`active_tab`]).
 ///
 /// `tab send-file` is not listed because clap itself requires its
 /// `--tab`. Neither are `agent-hook` and `claude-hook`: they take no
@@ -1406,10 +1406,7 @@ async fn run_on_ui(
         }
         Cmd::Tab(TabCmd::Dump { tab, scrollback }) => {
             let flag = tab.as_deref().map(parse_tab_flag).transpose()?;
-            let tab_id = resolve_tab_or_active(ui, flag, tab_env).await?;
-            let result: TabDumpResult = ui
-                .call(ops::TAB_DUMP, TabDumpParams { tab_id, scrollback })
-                .await?;
+            let result = dump_tab(ui, flag, tab_env, scrollback).await?;
             if json {
                 print_json(&result)?;
             } else {
@@ -2351,16 +2348,11 @@ fn send_file_budget(paths: usize, scale: f64) -> Duration {
 /// reading) requires, or a mutating verb would send `0` rather than refuse.
 trait TabRef: Sized {
     fn from_env(raw: &str) -> Option<Self>;
-    fn local(id: i64) -> Self;
 }
 
 impl TabRef for i64 {
     fn from_env(raw: &str) -> Option<Self> {
         parse_tab_id(raw)
-    }
-
-    fn local(id: i64) -> Self {
-        id
     }
 }
 
@@ -2370,10 +2362,6 @@ impl TabRef for WireTabRef {
             WireTabRef::Local(id) => *id > 0,
             WireTabRef::Host { .. } => true,
         })
-    }
-
-    fn local(id: i64) -> Self {
-        WireTabRef::Local(id)
     }
 }
 
@@ -2402,18 +2390,39 @@ fn require_tab<T: TabRef>(
     named_tab(flag, tab_env)?.ok_or_else(|| CliError::Usage(NO_TAB.to_string()))
 }
 
-/// The tab a read-only verb reads: `--tab`, `ROOST_TAB_ID`, or else the
-/// UI's active tab — which is always local.
-async fn resolve_tab_or_active<T: TabRef>(
+/// `tab dump` of `--tab`, `ROOST_TAB_ID`, or else the UI's active tab.
+///
+/// A bare id is read off the socket that owns the tabs, the one `wait`
+/// reads ([`events::resolve`]): under `local-backend = session` the UI
+/// keeps a terminal only for the tab it is showing, and refuses the rest
+/// `not-found`. An `h<host>.<id>` names that client-side terminal itself,
+/// so it stays on the UI socket.
+async fn dump_tab(
     ui: &mut UiSocket<'_>,
-    flag: Option<T>,
+    flag: Option<WireTabRef>,
     tab_env: Option<&str>,
-) -> Result<T, CliError> {
-    if let Some(tab) = named_tab(flag, tab_env)? {
-        return Ok(tab);
+    scrollback: u32,
+) -> Result<TabDumpResult, CliError> {
+    let named = named_tab(flag, tab_env)?;
+    if let Some(tab_id @ WireTabRef::Host { .. }) = named {
+        return ui
+            .call(ops::TAB_DUMP, TabDumpParams { tab_id, scrollback })
+            .await;
     }
-    let resp = identify(ui.client().await?).await?;
-    active_tab(&resp).map(T::local)
+    let identify = identify(ui.client().await?).await?;
+    let tab_id = match named {
+        Some(tab) => tab,
+        None => WireTabRef::Local(active_tab(&identify)?),
+    };
+    let params = TabDumpParams { tab_id, scrollback };
+    let source = events::resolve(ui.socket_path(), &identify);
+    if source.socket == ui.socket_path() {
+        return ui.call(ops::TAB_DUMP, params).await;
+    }
+    Ok(dial(&source.socket)
+        .await?
+        .call(ops::TAB_DUMP, params)
+        .await?)
 }
 
 /// The UI's active tab, refused when it has none rather than sent
@@ -3314,10 +3323,10 @@ mod tests {
         requests: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
     }
 
-    type Answer = fn(&str) -> Result<serde_json::Value, (&'static str, &'static str)>;
+    type Answer = Result<serde_json::Value, (&'static str, &'static str)>;
 
     impl FakeUi {
-        fn start(tag: &str, answer: Answer) -> Self {
+        fn start(tag: &str, answer: impl Fn(&str) -> Answer + Send + Sync + 'static) -> Self {
             use roost_ipc::messages::{RawRequest, Response};
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -3325,9 +3334,11 @@ mod tests {
             let listener = tokio::net::UnixListener::bind(&socket).expect("bind the fake UI");
             let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let seen = requests.clone();
+            let answer = std::sync::Arc::new(answer);
             tokio::spawn(async move {
                 while let Ok((stream, _)) = listener.accept().await {
                     let seen = seen.clone();
+                    let answer = answer.clone();
                     tokio::spawn(async move {
                         let (read, mut write) = stream.into_split();
                         let mut lines = BufReader::new(read).lines();
@@ -3524,8 +3535,83 @@ mod tests {
             Ok(0)
         );
         let sent = ui.take();
-        assert_eq!(sent.len(), 1, "{sent:?}");
-        assert_eq!(sent[0].1["tab_id"], "9");
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[1].1["tab_id"], "9");
+    }
+
+    /// `tab dump` of a bare id — named, from `ROOST_TAB_ID`, or the active
+    /// tab — goes, with that id, to `identify.local_session_socket` when
+    /// the UI names one, and to the UI socket when it does not. An
+    /// `h<host>.<id>` stays on the UI either way.
+    #[tokio::test]
+    async fn tab_dump_reads_a_bare_id_off_the_session_the_ui_names() {
+        fn dumped(op: &str) -> Answer {
+            match op {
+                "tab.dump" => Ok(serde_json::json!({"cols": 80, "rows": 1, "rows_text": [""]})),
+                _ => Err(("unknown-op", "not faked")),
+            }
+        }
+        let asked = |tab_id: &str| {
+            vec![(
+                ops::TAB_DUMP.to_string(),
+                serde_json::json!({ "tab_id": tab_id }),
+            )]
+        };
+        let session = FakeUi::start("dump-session", dumped);
+        let session_socket = session.socket.clone();
+        let on_session = FakeUi::start("dump-session-ui", move |op| match op {
+            "identify" => {
+                let mut identify = fake_identify(5);
+                identify["local_session_socket"] = serde_json::json!(session_socket);
+                Ok(identify)
+            }
+            other => dumped(other),
+        });
+        let in_process = FakeUi::start("dump-in-process-ui", |op| match op {
+            "identify" => Ok(fake_identify(5)),
+            other => dumped(other),
+        });
+
+        for (tab, tab_env, tab_id) in [
+            (Some("7"), None, "7"),
+            (None, Some("9"), "9"),
+            (None, None, "5"),
+        ] {
+            for ui in [&on_session, &in_process] {
+                let mut argv = vec!["--socket", ui.socket.as_str(), "tab", "dump"];
+                argv.extend(tab.map(|tab| ["--tab", tab]).into_iter().flatten());
+                assert_eq!(
+                    run_argv(&argv, tab_env).await,
+                    Ok(0),
+                    "{argv:?} {tab_env:?}"
+                );
+            }
+            let sent = on_session.take();
+            let named: Vec<&str> = sent.iter().map(|(op, _)| op.as_str()).collect();
+            assert_eq!(named, [ops::IDENTIFY], "{tab:?} {tab_env:?}");
+            assert_eq!(session.take(), asked(tab_id), "{tab:?} {tab_env:?}");
+            let sent = in_process.take();
+            assert_eq!(sent.first().map(|(op, _)| op.as_str()), Some(ops::IDENTIFY));
+            assert_eq!(sent[1..], asked(tab_id), "{tab:?} {tab_env:?}");
+        }
+
+        assert_eq!(
+            run_argv(
+                &[
+                    "--socket",
+                    &on_session.socket,
+                    "tab",
+                    "dump",
+                    "--tab",
+                    "h1.7"
+                ],
+                None
+            )
+            .await,
+            Ok(0)
+        );
+        assert_eq!(on_session.take(), asked("h1.7"));
+        assert!(session.take().is_empty());
     }
 
     // ------------------------------------------------------------------
