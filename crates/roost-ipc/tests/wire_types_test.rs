@@ -58,6 +58,7 @@ fn sample_identify() -> SessionIdentify {
         session_id: "01K3S8TQ4F0Q9YB2K6WZ5D7XN".into(),
         started_at: "2026-08-27T14:03:11Z".into(),
         persist_error: None,
+        ops: None,
     }
 }
 
@@ -971,6 +972,54 @@ fn identify_carries_a_persist_error_only_when_there_is_one() {
             .persist_error
             .as_deref(),
         Some("Read-only file system (os error 30)")
+    );
+}
+
+/// Plan 066 §3.1's two fields are additive in the same way: the plain
+/// vectors — an older server's shape, and the Swift app's — decode with
+/// both absent, and the variants carry them.
+#[test]
+fn identify_carries_ops_and_an_instance_id_only_where_a_server_sends_them() {
+    fn result(name: &str) -> IdentifyResult {
+        let raw = read_vector(name);
+        let resp: roost_ipc::messages::Response =
+            serde_json::from_str(&raw).expect("decode response envelope");
+        serde_json::from_value(resp.result.expect("result body")).expect("decode identify result")
+    }
+
+    let plain = result("identify.response.json");
+    assert_eq!(plain.ops, None);
+    assert_eq!(plain.instance_id, None);
+    let json = serde_json::to_value(&plain).unwrap();
+    assert!(json.get("ops").is_none() && json.get("instance_id").is_none());
+
+    let served = result("identify.ops.response.json");
+    let ops = served.ops.as_deref().expect("an ops list");
+    assert!(ops
+        .iter()
+        .any(|op| op == roost_ipc::messages::ops::PROJECT_ENSURE));
+    assert!(!ops
+        .iter()
+        .any(|op| op == roost_ipc::messages::ops::SESSION_IDENTIFY));
+    assert_eq!(served.instance_id.as_deref(), Some("5d0c7e21a9f3b846"));
+    round_trip(&served);
+
+    let session = decode_identify_vector(&format!(
+        "session.identify.ops.response.v{SESSION_PROTOCOL_VERSION}.json"
+    ));
+    let ops = session.ops.clone().expect("an ops list");
+    assert!(ops
+        .iter()
+        .any(|op| op == roost_ipc::messages::ops::SESSION_STOP));
+    assert!(!ops
+        .iter()
+        .any(|op| op == roost_ipc::messages::ops::HOST_ADD));
+    assert_eq!(
+        SessionIdentify {
+            ops: None,
+            ..session
+        },
+        sample_identify()
     );
 }
 

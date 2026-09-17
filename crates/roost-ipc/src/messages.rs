@@ -277,6 +277,16 @@ pub struct IdentifyResult {
     /// this field is the whole of its durability surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persist_error: Option<String>,
+    /// The ops this socket would dispatch right now (plan 066 §3.1).
+    /// `None` — an older server, or the Swift app — and a list without
+    /// the name both mean "not served".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ops: Option<Vec<String>>,
+    /// This UI process's identity, minted once at launch. Absent from a
+    /// session socket, whose identity is `session.identify.session_id`,
+    /// and from the Swift app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
 }
 
 // ============================================================================
@@ -2030,6 +2040,10 @@ pub struct SessionIdentify {
     /// again after a resync.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persist_error: Option<String>,
+    /// The ops this session would dispatch right now — `identify.ops`,
+    /// for this socket. Absent from an older session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ops: Option<Vec<String>>,
 }
 
 /// `session.identify` params — empty today, a struct (not a bare
@@ -4950,5 +4964,10 @@ mod tests {
         // Swift shape, so a recorded vector stays byte-identical.
         assert_eq!(parsed.local_backend_switch, None);
         assert!(json.get("local_backend_switch").is_none());
+        // And for plan 066's two: absent, not empty.
+        assert_eq!(parsed.ops, None);
+        assert_eq!(parsed.instance_id, None);
+        assert!(json.get("ops").is_none());
+        assert!(json.get("instance_id").is_none());
     }
 }

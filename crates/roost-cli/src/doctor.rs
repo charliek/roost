@@ -3765,6 +3765,8 @@ mod tests {
             local_session_socket: None,
             local_backend_switch: None,
             persist_error: None,
+            ops: None,
+            instance_id: None,
         }
     }
 

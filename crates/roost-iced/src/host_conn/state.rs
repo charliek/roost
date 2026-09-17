@@ -572,6 +572,7 @@ mod tests {
             session_id: "sess-1".into(),
             started_at: "2026-08-29T00:00:00Z".into(),
             persist_error: None,
+            ops: None,
         }
     }
 

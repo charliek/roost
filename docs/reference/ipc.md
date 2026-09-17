@@ -36,6 +36,12 @@ through an explicit `--socket`. A UI socket answers `unknown-op` for
 every `session.*` op and `not-implemented` for `events.subscribe`,
 byte-identical to before `roost-session` existed.
 
+The Swift Mac app (`Roost.app`) does not do three things this page
+describes for agent tooling: it answers `unknown-op` to
+[`project.ensure`](#projectensure), its [`identify`](#identify) reply
+has no `ops` and no `instance_id`, and it answers `not-implemented` to
+[`events.subscribe`](#eventssubscribe).
+
 A session socket also carries a second, **binary** protocol on its own
 connections — the per-tab attach stream a client renders a remote
 terminal from. It shares the socket path but not the framing; see
@@ -252,9 +258,36 @@ Response:
   "protocol_version": 1,
   "local_backend": "in-process",
   "local_session_socket": null,
-  "local_backend_switch": null
+  "local_backend_switch": null,
+  "ops": ["identify", "tab.open", "tab.list", "project.ensure", "…"],
+  "instance_id": "5d0c7e21a9f3b846"
 }}
 ```
+
+`ops` lists the ops this socket **would dispatch right now** — worked
+out per request, so it follows the live `local_backend` and test mode.
+An op is left out when this socket would answer it with `unknown-op`
+(`session.*` here; `host.*` and `agent.set_hooks` on a session socket's
+`identify`), with `not-implemented` (`events.subscribe`; the six
+macOS-only test ops off macOS), with `not-enabled` (a gated test op
+without `ROOST_TEST_MODE=1`), or with `no UI attached` (an op that needs
+a window, on a socket with none behind it). Under `local-backend =
+session` the Unsupported ops in [the table
+below](#a-ui-socket-under-local-backend-session) are left out too, and
+the Forward and Rewrite ops are listed: they reach the slot. **A UI
+launched with `ROOST_TEST_MODE=1` lists its test seams** —
+`tab.feed_pty_bytes`, `app.dialog_answer` and the rest — which are
+harness drivers, not a surface an agent should use. Read the list for
+membership: a name that is absent means this server does not serve that
+op, and a reply with no `ops` field at all is an older server or the
+Swift Mac app, which a client treats the same way. The contents are not
+a compatibility promise.
+
+`instance_id` names this UI process: 63 random bits as 16 lowercase hex
+digits, minted once at launch, so a restarted UI has a new one. A
+session socket's `identify` omits it — a session's identity is
+[`session.identify.session_id`](#sessionidentify) — and so does the
+Swift Mac app.
 
 `persist_error` is present only when the last attempt to write
 `state.json` failed — the message of that write, and absent otherwise.
@@ -2325,9 +2358,18 @@ Params: `{}`. Response:
   "payload_kinds": ["ghostty-snapshot", "vt"],
   "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
   "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
-  "started_at": "2026-08-27T14:03:11Z"
+  "started_at": "2026-08-27T14:03:11Z",
+  "ops": ["identify", "tab.open", "events.subscribe", "session.stop", "…"]
 }
 ```
+
+`ops` is [`identify.ops`](#identify) for this socket: the ops this
+session would dispatch right now. A headless session never lists an op
+that needs a window, nor `host.*` and `agent.set_hooks` (`unknown-op`
+here), and lists `tab.feed_pty_bytes` and `tab.capture_pty_input` only
+when it was started with `ROOST_TEST_MODE=1`. Absent from an older
+session. It is discovery, not negotiation — the generation check below
+still comes first — and its contents are not a compatibility promise.
 
 An optional `persist_error` rides beside them, present only when the
 last attempt to write `state.json` failed, carrying that write's

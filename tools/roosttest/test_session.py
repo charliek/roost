@@ -165,6 +165,21 @@ def test_daemonized_start_identify_stop(env):
     assert env.state() is not None, "a clean stop must leave state.json behind"
 
 
+def test_a_session_names_the_ops_it_serves(env):
+    """Plan 066 §3.1 against a real daemon: no window op and no host
+    registry op, and no UI `instance_id` on either identify reply."""
+    started(env)
+    identity = env.identify()
+    ops = set(identity["ops"])
+    assert {"session.stop", "events.subscribe", "tab.open", "tab.dump"} <= ops, sorted(ops)
+    assert not ops & {"host.add", "agent.set_hooks", "app.screenshot", "palette.open"}, sorted(ops)
+    assert "instance_id" not in identity
+    with env.client() as client:
+        plain = client.call("identify")
+    assert set(plain["ops"]) == ops
+    assert "instance_id" not in plain
+
+
 # ---------------------------------------------------------------------------
 # 2. SIGTERM takes the same path as `session.stop`
 # ---------------------------------------------------------------------------

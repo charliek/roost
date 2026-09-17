@@ -6,6 +6,7 @@ docs/development/claude-testing.md.
 
 from __future__ import annotations
 
+import os
 import uuid
 
 import pytest
@@ -73,6 +74,22 @@ def test_the_suite_runs_against_the_in_process_backend(roost, target):
     if target == "mac":
         pytest.skip("Swift omits local_backend: the Mac app is in-process by construction")
     assert roost.identify()["local_backend"] == "in-process"
+
+
+def test_identify_names_what_this_socket_serves_and_which_process_it_is(roost, target):
+    """Plan 066 §3.1. The test seams are listed exactly when the UI was
+    launched with ROOST_TEST_MODE=1 — the one input to `identify.ops`
+    only a running app wires."""
+    if target == "mac":
+        pytest.skip("Swift omits identify.ops and identify.instance_id")
+    first = roost.identify()
+    ops = set(first["ops"])
+    assert {"identify", "tab.open", "project.ensure", "host.status"} <= ops, sorted(ops)
+    assert not ops & {"session.identify", "session.stop", "events.subscribe"}, sorted(ops)
+    test_mode = os.environ.get("ROOST_TEST_MODE") == "1"
+    assert ("tab.feed_pty_bytes" in ops) == test_mode, sorted(ops)
+    assert len(first["instance_id"]) == 16, first["instance_id"]
+    assert roost.identify()["instance_id"] == first["instance_id"]
 
 
 def test_focus_sets_active_tab(roost, project):

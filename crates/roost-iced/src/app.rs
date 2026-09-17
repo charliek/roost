@@ -2931,6 +2931,7 @@ impl App {
             local_backend::SlotSelection::default(),
             local_backend::SwitchState::Idle,
         )));
+        let test_mode = std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1");
         let handler = IpcHandler::new(
             Arc::clone(&workspace),
             Arc::clone(&supervisor),
@@ -2939,7 +2940,8 @@ impl App {
             profile.app_id,
         )
         .with_ui(ui_tx)
-        .with_local_route(Arc::clone(&local_route));
+        .with_local_route(Arc::clone(&local_route))
+        .with_test_mode(test_mode);
         let server = runtime
             .block_on(IpcServer::bind(&profile.socket_path, handler))
             .context("bind Iced IPC server")?;
@@ -2949,7 +2951,6 @@ impl App {
             }
         });
 
-        let test_mode = std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1");
         let mut app = Self {
             workspace,
             // The engine keeps its direct supervisor reference (the

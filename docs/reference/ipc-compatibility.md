@@ -226,6 +226,10 @@ for what moved. If a capability needs feature-detecting again before
 the next generation exists to carry it, that channel is the thing to
 resurrect — not something to route around with version sniffing.
 
+`identify.ops`, `session.identify.ops` and `identify.instance_id` (plan
+066) are additive result fields; the contents of `ops` are not a
+compatibility promise.
+
 **Absence of a mandatory capability is a legitimate refusal.** Capability
 detection governs optional features; it does not mean every negotiation
 is soft. A client that can only render `ghostty-snapshot` and finds no

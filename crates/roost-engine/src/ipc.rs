@@ -1461,6 +1461,14 @@ pub struct IpcHandler {
     /// session's — so `identify` on a session socket keeps answering
     /// exactly what it always has.
     local_route: Option<Arc<LocalBackendCell>>,
+    /// Whether the UI driving this socket was launched with
+    /// `ROOST_TEST_MODE=1`, passed in for the reason
+    /// [`SessionInfo::test_mode`] is. A session reads its own from there.
+    test_mode: bool,
+    /// `identify.instance_id`: minted with the handler, which a UI
+    /// process builds once. A session never reports it — its identity is
+    /// `session_id`.
+    instance_id: String,
 }
 
 impl IpcHandler {
@@ -1483,6 +1491,8 @@ impl IpcHandler {
             agent_hooks: None,
             files: None,
             local_route: None,
+            test_mode: false,
+            instance_id: mint_instance_id(),
         }
     }
 
@@ -1527,6 +1537,15 @@ impl IpcHandler {
     #[must_use]
     pub fn with_local_route(mut self, cell: Arc<LocalBackendCell>) -> Self {
         self.local_route = Some(cell);
+        self
+    }
+
+    /// Tell a UI socket whether its app was launched with
+    /// `ROOST_TEST_MODE=1`, which decides whether `identify.ops` lists
+    /// the gated test seams.
+    #[must_use]
+    pub fn with_test_mode(mut self, test_mode: bool) -> Self {
+        self.test_mode = test_mode;
         self
     }
 
@@ -1577,6 +1596,19 @@ impl IpcHandler {
     /// UI-only and lets `ui_call` answer `no UI attached`.
     fn has_ui(&self) -> bool {
         self.ui_tx.is_some()
+    }
+
+    /// `identify.ops` / `session.identify.ops`: [`served_ops`] for this
+    /// socket under `route`.
+    fn serves(&self, route: &LocalRoute) -> Vec<String> {
+        let (socket, test_mode) = match &self.session {
+            Some(session) => (SocketKind::Session, session.info.test_mode),
+            None => (SocketKind::Ui(route.mode), self.test_mode),
+        };
+        served_ops(socket, test_mode, self.has_ui())
+            .into_iter()
+            .map(str::to_string)
+            .collect()
     }
 
     /// Hand a request-reply [`UiRequest`] to the UI adapter's main thread
@@ -2180,6 +2212,7 @@ async fn dispatch_outcome(
                 session_id: session.info.session_id.clone(),
                 started_at: session.info.started_at.clone(),
                 persist_error: h.workspace.persist_error(),
+                ops: Some(h.serves(&h.local_route())),
             };
             return encode(&result).map(HandlerOutcome::Reply);
         }
@@ -2898,6 +2931,8 @@ async fn dispatch(
                 local_session_socket: local_session_socket(route.mode),
                 local_backend_switch: route.switch.map(str::to_string),
                 persist_error: h.workspace.persist_error(),
+                ops: Some(h.serves(&route)),
+                instance_id: h.session.is_none().then(|| h.instance_id.clone()),
             };
             encode(&result)
         }
@@ -3868,6 +3903,185 @@ async fn dispatch(
     }
 }
 
+/// Which socket a [`served_ops`] answer describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketKind {
+    /// A UI socket, running its own local tabs on this backend.
+    Ui(LocalBackendMode),
+    /// A host session's socket.
+    Session,
+}
+
+/// Why a dispatched op is left out of `identify.ops`, named for what the
+/// socket answers instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Withheld {
+    /// `unknown-op` on a UI socket: a host session's own op.
+    SessionOnly,
+    /// `unknown-op` on a session: the host registry and this machine's
+    /// own `agent-hooks` key are client state a session does not keep.
+    UiSocketOnly,
+    /// `not-implemented` on a UI socket running its tabs in-process.
+    NotImplementedInProcess,
+    /// `internal: no UI attached` with no app behind the socket — or,
+    /// for the fire-and-forget `app.activate` and `clipboard.write`,
+    /// nothing at all.
+    NeedsUi,
+    /// [`Self::NeedsUi`], except on a session built with `server-vt`,
+    /// which answers from the tab's own server terminal.
+    NeedsATerminal,
+    /// `not-enabled` unless the process was launched with
+    /// `ROOST_TEST_MODE=1`.
+    TestMode,
+    /// `not-implemented` off macOS: the Dock, the native menu bar,
+    /// Sparkle and `UNUserNotificationCenter` are macOS iced's alone.
+    MacosOnly,
+    /// `unsupported-kind` on a session built without `server-vt`: there
+    /// is no server terminal to recolor.
+    ServerVt,
+}
+
+impl Withheld {
+    fn applies(self, socket: SocketKind, test_mode: bool, has_ui: bool) -> bool {
+        match self {
+            Self::SessionOnly => matches!(socket, SocketKind::Ui(_)),
+            Self::UiSocketOnly => socket == SocketKind::Session,
+            Self::NotImplementedInProcess => socket == SocketKind::Ui(LocalBackendMode::InProcess),
+            Self::NeedsUi => !has_ui,
+            Self::NeedsATerminal => {
+                !has_ui && !(socket == SocketKind::Session && cfg!(feature = "server-vt"))
+            }
+            Self::TestMode => !test_mode,
+            Self::MacosOnly => !cfg!(target_os = "macos"),
+            Self::ServerVt => !cfg!(feature = "server-vt"),
+        }
+    }
+}
+
+/// One row per op `dispatch_outcome` and `dispatch` have an arm for, with
+/// what keeps it out of `identify.ops` and where; an empty list is an op
+/// every socket serves. A test parses both dispatchers' arms against it.
+const DISPATCHED_OPS: &[(&str, &[Withheld])] = {
+    use Withheld::{
+        MacosOnly, NeedsATerminal, NeedsUi, NotImplementedInProcess, ServerVt, SessionOnly,
+        TestMode, UiSocketOnly,
+    };
+    &[
+        (ops::IDENTIFY, &[]),
+        (ops::TAB_OPEN, &[]),
+        (ops::TAB_CLOSE, &[]),
+        (ops::TAB_LIST, &[]),
+        (ops::TAB_WRITE, &[]),
+        (ops::TAB_RESIZE, &[]),
+        (ops::TAB_DUMP, &[NeedsATerminal]),
+        (ops::PROJECT_CREATE, &[]),
+        (ops::PROJECT_ENSURE, &[]),
+        (ops::PROJECT_RENAME, &[]),
+        (ops::PROJECT_DELETE, &[]),
+        (ops::TAB_REORDER, &[]),
+        (ops::PROJECT_REORDER, &[]),
+        (ops::TAB_FOCUS, &[]),
+        (ops::TAB_SEND_FILE, &[NeedsUi]),
+        (ops::TAB_SET_TITLE, &[]),
+        (ops::TAB_SET_STATE, &[]),
+        (ops::TAB_CLEAR_NOTIFICATION, &[]),
+        (ops::TAB_SET_HOOK_ACTIVE, &[]),
+        (ops::TAB_AGENT_REPORT, &[]),
+        (ops::NOTIFICATION_CREATE, &[]),
+        (ops::APP_ACTIVATE, &[NeedsUi]),
+        (ops::SCREENSHOT, &[NeedsUi]),
+        (ops::WINDOW_METRICS, &[NeedsUi]),
+        (ops::APP_RENDER_STATS, &[NeedsUi]),
+        (ops::SIDEBAR_DUMP, &[NeedsUi]),
+        (ops::PALETTE_OPEN, &[NeedsUi]),
+        (ops::PALETTE_STATE, &[NeedsUi]),
+        (ops::PALETTE_QUERY, &[NeedsUi]),
+        (ops::PALETTE_ACTIVATE, &[NeedsUi]),
+        (ops::PALETTE_DISMISS, &[NeedsUi]),
+        (ops::PALETTE_PRESENT, &[NeedsUi]),
+        (ops::SELECTION_SET, &[NeedsUi]),
+        (ops::SELECTION_CLEAR, &[NeedsUi]),
+        (ops::SELECTION_DUMP, &[NeedsUi]),
+        (ops::CLIPBOARD_DUMP, &[NeedsUi]),
+        (ops::CLIPBOARD_WRITE, &[NeedsUi]),
+        (ops::TAB_FEED_PTY_BYTES, &[NeedsATerminal, TestMode]),
+        (ops::TAB_CAPTURE_PTY_INPUT, &[NeedsATerminal, TestMode]),
+        (ops::TAB_EXPAND_SELECTION_AT, &[NeedsUi, TestMode]),
+        (ops::TAB_FEED_IME, &[NeedsUi, TestMode]),
+        (ops::WINDOW_RESIZE, &[NeedsUi, TestMode]),
+        (ops::SIDEBAR_SET_WIDTH, &[NeedsUi, TestMode]),
+        (ops::TAB_DUMP_RESOLVED, &[NeedsATerminal]),
+        (ops::TAB_DISPATCH_MOUSE_EVENT, &[NeedsUi, TestMode]),
+        (ops::APP_SET_WINDOW_FOCUS, &[NeedsUi, TestMode]),
+        (ops::APP_CURSOR_SHAPE, &[NeedsUi]),
+        (ops::APP_ACTIVE_TERMINAL_FOCUSED, &[NeedsUi]),
+        (ops::APP_SELECTED_TAB_ID, &[NeedsUi]),
+        (ops::APP_DOCK_BADGE, &[NeedsUi, TestMode, MacosOnly]),
+        (ops::APP_MENU_DUMP, &[NeedsUi, TestMode, MacosOnly]),
+        (ops::APP_MENU_ACTIVATE, &[NeedsUi, TestMode, MacosOnly]),
+        (ops::APP_DIALOG_DUMP, &[NeedsUi, TestMode]),
+        (ops::APP_DIALOG_ANSWER, &[NeedsUi, TestMode]),
+        (ops::APP_KEYBIND_DISPATCH, &[NeedsUi, TestMode]),
+        (ops::APP_UPDATE_STATUS, &[NeedsUi, TestMode, MacosOnly]),
+        (ops::APP_UPDATE_CHECK, &[NeedsUi, TestMode, MacosOnly]),
+        (
+            ops::APP_NOTIFICATION_STATUS,
+            &[NeedsUi, TestMode, MacosOnly],
+        ),
+        (ops::EVENTS_SUBSCRIBE, &[NotImplementedInProcess]),
+        (ops::AGENT_SET_HOOKS, &[UiSocketOnly, NeedsUi]),
+        (ops::HOST_ADD, &[UiSocketOnly]),
+        (ops::HOST_REMOVE, &[UiSocketOnly]),
+        (ops::HOST_CONNECT, &[UiSocketOnly, NeedsUi]),
+        (ops::HOST_DISCONNECT, &[UiSocketOnly, NeedsUi]),
+        (ops::HOST_LIST, &[UiSocketOnly]),
+        (ops::HOST_STATUS, &[UiSocketOnly, NeedsUi]),
+        (ops::SESSION_IDENTIFY, &[SessionOnly]),
+        (ops::SESSION_STOP, &[SessionOnly]),
+        (ops::SESSION_SET_THEME, &[SessionOnly, ServerVt]),
+        (ops::SESSION_SET_AGENT_HOOKS, &[SessionOnly]),
+        (ops::SESSION_PUT_FILE, &[SessionOnly]),
+    ]
+};
+
+/// The ops a socket would dispatch right now (plan 066 §3.1).
+///
+/// A capability that can never succeed is not one, so an op that could
+/// only answer `internal: no UI attached` is withheld as surely as one
+/// answering `unknown-op`. Pure — no handler, no I/O — so what a socket
+/// claims can be tested without executing anything.
+fn served_ops(socket: SocketKind, test_mode: bool, has_ui: bool) -> Vec<&'static str> {
+    DISPATCHED_OPS
+        .iter()
+        .filter(|(op, withheld)| {
+            !withheld
+                .iter()
+                .any(|reason| reason.applies(socket, test_mode, has_ui))
+                && !(socket == SocketKind::Ui(LocalBackendMode::Session)
+                    && withheld_from_the_slot(op, has_ui))
+        })
+        .map(|(op, _)| *op)
+        .collect()
+}
+
+/// A UI socket under `local-backend = session` refuses what plan 063
+/// §D10 classes `Unsupported`, and reaches the slot for a `Forward` or
+/// `Rewrite` op only through the app.
+fn withheld_from_the_slot(op: &str, has_ui: bool) -> bool {
+    match roost_ipc::local_route::classify(op) {
+        Some(roost_ipc::OpClass::Unsupported) => true,
+        Some(roost_ipc::OpClass::Forward | roost_ipc::OpClass::Rewrite(_)) => !has_ui,
+        _ => false,
+    }
+}
+
+/// 63 random bits as 16 lowercase hex digits.
+fn mint_instance_id() -> String {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).expect("the OS random source must be available");
+    format!("{:016x}", u64::from_le_bytes(bytes) & (i64::MAX as u64))
+}
+
 /// `persistence::HostSnapshot` (storage) → `messages::Host` (wire).
 /// `Host` is foreign to this crate, but the orphan rule still allows the
 /// impl here because `HostSnapshot` — the trait's type parameter — is
@@ -4044,6 +4258,7 @@ fn parse_clipboard_op(s: &str) -> Result<ClipboardOp, HandlerError> {
 mod tests {
     use super::*;
     use roost_ipc::paths::BundleProfile;
+    use std::collections::BTreeSet;
 
     fn session_state() -> SessionState {
         SessionState {
@@ -4762,5 +4977,419 @@ mod tests {
         let mut without = serde_json::json!({"projects": []});
         strip_ui_socket_fence(ops::TAB_LIST, &mut without);
         assert_eq!(without, serde_json::json!({"projects": []}));
+    }
+
+    // ── plan 066 §3.1: what a socket says it serves ─────────────────
+
+    /// A UI socket with an app behind it, outside test mode — in-process
+    /// and under `local-backend = session` alike, for as long as
+    /// `events.subscribe` is served in neither.
+    const UI: &[&str] = &[
+        "agent.set_hooks",
+        "app.activate",
+        "app.active_terminal_focused",
+        "app.cursor_shape",
+        "app.render_stats",
+        "app.screenshot",
+        "app.selected_tab_id",
+        "app.sidebar_dump",
+        "app.window_metrics",
+        "clipboard.dump",
+        "clipboard.write",
+        "host.add",
+        "host.connect",
+        "host.disconnect",
+        "host.list",
+        "host.remove",
+        "host.status",
+        "identify",
+        "notification.create",
+        "palette.activate",
+        "palette.dismiss",
+        "palette.open",
+        "palette.present",
+        "palette.query",
+        "palette.state",
+        "project.create",
+        "project.delete",
+        "project.ensure",
+        "project.rename",
+        "project.reorder",
+        "selection.clear",
+        "selection.dump",
+        "selection.set",
+        "tab.agent_report",
+        "tab.clear_notification",
+        "tab.close",
+        "tab.dump",
+        "tab.dump_resolved",
+        "tab.focus",
+        "tab.list",
+        "tab.open",
+        "tab.reorder",
+        "tab.resize",
+        "tab.send_file",
+        "tab.set_hook_active",
+        "tab.set_state",
+        "tab.set_title",
+        "tab.write",
+    ];
+
+    /// What `ROOST_TEST_MODE=1` adds to [`UI`].
+    const UI_TEST_SEAMS: &[&str] = &[
+        "app.dialog_answer",
+        "app.dialog_dump",
+        "app.keybind_dispatch",
+        "app.set_window_focus",
+        "sidebar.set_width",
+        "tab.capture_pty_input",
+        "tab.dispatch_mouse_event",
+        "tab.expand_selection_at",
+        "tab.feed_ime",
+        "tab.feed_pty_bytes",
+        "window.resize",
+    ];
+
+    /// What test mode adds on macOS only.
+    const MACOS_TEST_SEAMS: &[&str] = &[
+        "app.dock_badge",
+        "app.menu_activate",
+        "app.menu_dump",
+        "app.notification_status",
+        "app.update_check",
+        "app.update_status",
+    ];
+
+    /// A headless session outside test mode.
+    const SESSION: &[&str] = &[
+        "events.subscribe",
+        "identify",
+        "notification.create",
+        "project.create",
+        "project.delete",
+        "project.ensure",
+        "project.rename",
+        "project.reorder",
+        "session.identify",
+        "session.put_file",
+        "session.set_agent_hooks",
+        "session.stop",
+        "tab.agent_report",
+        "tab.clear_notification",
+        "tab.close",
+        "tab.focus",
+        "tab.list",
+        "tab.open",
+        "tab.reorder",
+        "tab.resize",
+        "tab.set_hook_active",
+        "tab.set_state",
+        "tab.set_title",
+        "tab.write",
+    ];
+
+    /// What a session built with `server-vt` — every shipped one — adds.
+    const SESSION_SERVER_VT: &[&str] = &["session.set_theme", "tab.dump", "tab.dump_resolved"];
+
+    fn on_this_platform(seams: &'static [&'static str]) -> &'static [&'static str] {
+        if cfg!(target_os = "macos") {
+            seams
+        } else {
+            &[]
+        }
+    }
+
+    fn with_server_vt(extra: &'static [&'static str]) -> &'static [&'static str] {
+        if cfg!(feature = "server-vt") {
+            extra
+        } else {
+            &[]
+        }
+    }
+
+    fn sorted(parts: &[&[&str]]) -> Vec<String> {
+        let mut ops: Vec<String> = parts.concat().into_iter().map(str::to_string).collect();
+        ops.sort_unstable();
+        ops
+    }
+
+    fn every_configuration() -> impl Iterator<Item = (SocketKind, bool, bool)> {
+        [
+            SocketKind::Ui(LocalBackendMode::InProcess),
+            SocketKind::Ui(LocalBackendMode::Session),
+            SocketKind::Session,
+        ]
+        .into_iter()
+        .flat_map(|socket| {
+            [(false, false), (false, true), (true, false), (true, true)]
+                .map(|(test_mode, has_ui)| (socket, test_mode, has_ui))
+        })
+    }
+
+    /// The op constants `dispatch_outcome` and `dispatch` match on, read
+    /// out of this file: `ops::X =>` arms, their `|` alternations on one
+    /// line or several, and the `if op == ops::X` checks
+    /// `dispatch_outcome` makes under the barrier.
+    fn dispatcher_arm_names() -> Vec<String> {
+        let source = include_str!("ipc.rs");
+        let mut names: Vec<String> = Vec::new();
+        for signature in ["\nasync fn dispatch_outcome(", "\nasync fn dispatch("] {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("ipc.rs declares {signature:?}"));
+            let body = &source[start + 1..];
+            let body = &body[..body.find("\n}\n").expect("the dispatcher closes")];
+            for line in body.lines().map(str::trim) {
+                let pattern = match line.strip_prefix("if op == ") {
+                    Some(guard) => guard.trim_end_matches(" {"),
+                    None => {
+                        let line = line.trim_start_matches("| ");
+                        line.split_once(" =>").map_or(line, |(pattern, _)| pattern)
+                    }
+                };
+                let alternatives: Option<Vec<&str>> = pattern
+                    .split(" | ")
+                    .map(|alternative| {
+                        alternative.strip_prefix("ops::").filter(|name| {
+                            !name.is_empty()
+                                && name.chars().all(|c| {
+                                    c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'
+                                })
+                        })
+                    })
+                    .collect();
+                for name in alternatives.into_iter().flatten() {
+                    if !names.iter().any(|seen| seen == name) {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+        assert!(
+            names.len() > 60,
+            "only {} dispatcher arms parsed out of ipc.rs - the scan has \
+             drifted and would pass vacuously",
+            names.len()
+        );
+        names
+    }
+
+    /// Every `(NAME, "value")` in `messages.rs`'s `ops` module.
+    fn ops_declared() -> Vec<(String, String)> {
+        let source = include_str!("../../roost-ipc/src/messages.rs");
+        let start = source
+            .find("\npub mod ops {\n")
+            .expect("messages.rs declares `pub mod ops`");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("the ops module closes")];
+        body.lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("pub const ")?;
+                let (name, rest) = rest.split_once(": &str = ")?;
+                let value = rest.strip_prefix('"')?.strip_suffix("\";")?;
+                Some((name.to_string(), value.to_string()))
+            })
+            .collect()
+    }
+
+    /// Parsed rather than walked: a walk of [`DISPATCHED_OPS`] would agree
+    /// with itself about an arm somebody added without a row.
+    #[test]
+    fn every_dispatcher_arm_is_served_somewhere_or_withheld_by_name() {
+        let declared = ops_declared();
+        let value_of = |name: &str| {
+            declared
+                .iter()
+                .find(|(declared, _)| declared == name)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| panic!("ops::{name} is not declared in messages.rs"))
+        };
+        let arms: BTreeSet<String> = dispatcher_arm_names()
+            .iter()
+            .map(|name| value_of(name))
+            .collect();
+        let served_somewhere: BTreeSet<&str> = every_configuration()
+            .flat_map(|(socket, test_mode, has_ui)| served_ops(socket, test_mode, has_ui))
+            .collect();
+        let withheld_by_name: BTreeSet<&str> = DISPATCHED_OPS
+            .iter()
+            .filter(|(_, withheld)| !withheld.is_empty())
+            .map(|(op, _)| *op)
+            .collect();
+        let accounted = |op: &str| served_somewhere.contains(op) || withheld_by_name.contains(op);
+
+        let unaccounted: Vec<_> = arms.iter().filter(|arm| !accounted(arm)).collect();
+        assert!(
+            unaccounted.is_empty(),
+            "dispatcher arms served_ops never returns and names no reason for: \
+             {unaccounted:?}. Give each a DISPATCHED_OPS row."
+        );
+
+        let rowless: Vec<_> = DISPATCHED_OPS
+            .iter()
+            .map(|(op, _)| *op)
+            .filter(|op| !arms.contains(*op))
+            .collect();
+        assert!(
+            rowless.is_empty(),
+            "DISPATCHED_OPS rows no dispatcher arm answers: {rowless:?}"
+        );
+        assert_eq!(
+            DISPATCHED_OPS.len(),
+            arms.len(),
+            "one row per arm, and no duplicates"
+        );
+
+        let undispatched: Vec<_> = declared
+            .iter()
+            .filter(|(_, value)| {
+                roost_ipc::local_route::classify(value) != Some(roost_ipc::OpClass::Event)
+                    && !accounted(value)
+            })
+            .map(|(name, value)| format!("ops::{name} ({value:?})"))
+            .collect();
+        assert!(
+            undispatched.is_empty(),
+            "op constants neither served nor withheld: {}",
+            undispatched.join(", ")
+        );
+    }
+
+    #[test]
+    fn the_four_configurations_serve_their_checked_in_lists() {
+        let served =
+            |socket, test_mode, has_ui| sorted(&[served_ops(socket, test_mode, has_ui).as_slice()]);
+        assert_eq!(
+            served(SocketKind::Ui(LocalBackendMode::InProcess), false, true),
+            sorted(&[UI]),
+            "UI in-process"
+        );
+        assert_eq!(
+            served(SocketKind::Ui(LocalBackendMode::Session), false, true),
+            sorted(&[UI]),
+            "UI under local-backend = session"
+        );
+        assert_eq!(
+            served(SocketKind::Session, false, false),
+            sorted(&[SESSION, with_server_vt(SESSION_SERVER_VT)]),
+            "a headless session"
+        );
+        assert_eq!(
+            served(SocketKind::Ui(LocalBackendMode::InProcess), true, true),
+            sorted(&[UI, UI_TEST_SEAMS, on_this_platform(MACOS_TEST_SEAMS)]),
+            "UI with ROOST_TEST_MODE=1"
+        );
+    }
+
+    /// A handler with an app behind it: a channel nothing drains, which
+    /// `identify` never sends on.
+    fn with_a_ui(h: IpcHandler) -> (IpcHandler, tokio::sync::mpsc::UnboundedReceiver<UiRequest>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (h.with_ui(tx), rx)
+    }
+
+    async fn reply_of(h: &IpcHandler, op: &str) -> serde_json::Value {
+        let (ctx, _watch) = ConnCtx::new(1);
+        match h.handle(&ctx, op, serde_json::json!({})).await {
+            Ok(HandlerOutcome::Reply(value)) => value,
+            Ok(HandlerOutcome::ReplyThen { .. }) => panic!("{op} answered with an action"),
+            Err(error) => panic!("{op}: {error:?}"),
+        }
+    }
+
+    fn ops_in(reply: &serde_json::Value) -> Vec<String> {
+        let mut ops: Vec<String> =
+            serde_json::from_value(reply["ops"].clone()).expect("an ops list");
+        ops.sort_unstable();
+        ops
+    }
+
+    #[tokio::test]
+    async fn a_ui_sockets_identify_names_what_it_serves_and_which_process_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, _ui) = with_a_ui(identify_handler(dir.path()));
+        let reply = reply_of(&h, ops::IDENTIFY).await;
+        assert_eq!(ops_in(&reply), sorted(&[UI]));
+        let instance_id = reply["instance_id"].as_str().expect("an instance_id");
+        assert_eq!(instance_id.len(), 16, "{instance_id}");
+        assert!(
+            instance_id
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "{instance_id}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (h, _ui) = with_a_ui(identify_handler(dir.path()).with_test_mode(true));
+        assert_eq!(
+            ops_in(&reply_of(&h, ops::IDENTIFY).await),
+            sorted(&[UI, UI_TEST_SEAMS, on_this_platform(MACOS_TEST_SEAMS)])
+        );
+    }
+
+    #[tokio::test]
+    async fn under_session_mode_identify_names_what_reaches_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, _ui) = with_a_ui(forwarding_handler(dir.path(), Some(2)));
+        let reply = reply_of(&h, ops::IDENTIFY).await;
+        assert_eq!(ops_in(&reply), sorted(&[UI]));
+        assert!(reply["instance_id"].is_string(), "{reply}");
+
+        // With no app to carry them, a forward and a rewrite reach
+        // nothing, where in-process the same two are answered here.
+        let dir = tempfile::tempdir().unwrap();
+        let headless =
+            ops_in(&reply_of(&forwarding_handler(dir.path(), Some(2)), ops::IDENTIFY).await);
+        let dir = tempfile::tempdir().unwrap();
+        let in_process = ops_in(&reply_of(&identify_handler(dir.path()), ops::IDENTIFY).await);
+        for op in [ops::TAB_OPEN, ops::TAB_FOCUS] {
+            assert!(!headless.iter().any(|served| served == op), "{op}");
+            assert!(in_process.iter().any(|served| served == op), "{op}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_names_what_it_serves_and_no_instance_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path())
+            .with_session(session_state().info, StopHandle::new(|| async {}));
+        let session_identify = reply_of(&h, ops::SESSION_IDENTIFY).await;
+        assert_eq!(
+            ops_in(&session_identify),
+            sorted(&[SESSION, with_server_vt(SESSION_SERVER_VT)])
+        );
+        assert!(session_identify.get("instance_id").is_none());
+
+        let identify = reply_of(&h, ops::IDENTIFY).await;
+        assert_eq!(ops_in(&identify), ops_in(&session_identify));
+        assert!(
+            identify.get("instance_id").is_none(),
+            "a session's identity is its session_id: {identify}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut info = session_state().info;
+        info.test_mode = true;
+        let h = identify_handler(dir.path()).with_session(info, StopHandle::new(|| async {}));
+        let seams: &[&str] = &["tab.capture_pty_input", "tab.feed_pty_bytes"];
+        assert_eq!(
+            ops_in(&reply_of(&h, ops::SESSION_IDENTIFY).await),
+            sorted(&[
+                SESSION,
+                with_server_vt(SESSION_SERVER_VT),
+                with_server_vt(seams)
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_instance_id_is_minted_once_per_handler() {
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let a = identify_handler(dir_a.path());
+        let first = reply_of(&a, ops::IDENTIFY).await["instance_id"].clone();
+        assert!(first.is_string(), "{first}");
+        assert_eq!(reply_of(&a, ops::IDENTIFY).await["instance_id"], first);
+        let b = identify_handler(dir_b.path());
+        assert_ne!(reply_of(&b, ops::IDENTIFY).await["instance_id"], first);
     }
 }
