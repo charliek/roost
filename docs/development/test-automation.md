@@ -39,10 +39,10 @@ measures *cost* on a sibling axis rather than correctness.
   trigger it without synthetic input.
 - **No test ever calls `sleep`.** Wait on a condition: `roostctl wait`
   (`--state`, `--text`, `--gone`) or the harness's `wait_*` helpers.
-  `events.subscribe` is still `not-implemented` on both UI sockets
-  (only a host session pushes), so `wait` is poll-backed today — the
-  *interface* is what tests depend on, so swapping in wire events later
-  changes no test.
+  `wait` is poll-backed today even though an in-process iced UI socket
+  now serves `events.subscribe` (the Mac's still answers
+  `not-implemented`) — the *interface* is what tests depend on, so
+  swapping in wire events later changes no test.
 - **Content as text, pixels only when targeted.** Assert with
   `tab.dump`, not OCR or whole-window image diffs. Layer-2 checks are
   targeted color probes ("this cell is amber `#f0a040`"), never golden

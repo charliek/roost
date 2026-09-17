@@ -44,7 +44,7 @@ use crate::framing::{write_frame, FrameReader};
 use crate::messages::{
     ops, AttachAccepted, AttachHandshake, AttachHandshakeReply, EventBatch, EventsSubscribeParams,
     EventsSubscribeResult, IdentifyParams, IdentifyResult, RawRequest, Response, ResponseError,
-    SessionStoppingEvent, SESSION_STOPPING_EVENT,
+    SessionStoppingEvent, StreamEndedEvent, SESSION_STOPPING_EVENT, STREAM_ENDED_EVENT,
 };
 use crate::Error;
 
@@ -219,6 +219,7 @@ impl IpcClient {
             session_id: ack.session_id,
             next_revision: ack.revision.saturating_add(1),
             stopping: None,
+            ended: None,
         })
     }
 }
@@ -241,6 +242,9 @@ pub enum EventFrame {
     /// The stream is over and says why. Always the last frame before
     /// the close.
     Stopping(SessionStoppingEvent),
+    /// A UI socket ended its in-process stream on purpose. Always the
+    /// last frame before the close, like [`Self::Stopping`].
+    Ended(StreamEndedEvent),
 }
 
 /// A subscribed connection, reading the server's push stream.
@@ -262,6 +266,7 @@ pub struct EventStream {
     session_id: String,
     next_revision: u64,
     stopping: Option<SessionStoppingEvent>,
+    ended: Option<StreamEndedEvent>,
 }
 
 impl EventStream {
@@ -292,20 +297,27 @@ impl EventStream {
         self.stopping.as_ref().map(|s| s.reason.as_str())
     }
 
+    /// Why a UI socket ended the stream, once its `stream.ended` envelope
+    /// has arrived. `"backend-switch"` — the UI's tabs are moving to
+    /// another local backend.
+    pub fn ended_reason(&self) -> Option<&str> {
+        self.ended.as_ref().map(|e| e.reason.as_str())
+    }
+
     /// The next pushed frame, or `Ok(None)` when the server closed the
     /// stream.
     ///
     /// A close is itself a documented signal — it is how the session
     /// says "resync" — so it is not an error. Check
-    /// [`Self::stopping_reason`] to tell a labeled goodbye from a bare
-    /// EOF; both mean reconnect, the label says whether it is worth
-    /// trying.
+    /// [`Self::stopping_reason`] or [`Self::ended_reason`] to tell a
+    /// labeled goodbye from a bare EOF; both mean reconnect, the label
+    /// says whether it is worth trying.
     pub async fn next(&mut self) -> Result<Option<EventFrame>, ClientError> {
         // The terminal envelope latches: it is defined as the last frame,
         // so a peer that keeps the socket open (or writes more) after it
         // must not have this reader block on — or worse, yield —
         // post-terminal frames.
-        if self.stopping.is_some() {
+        if self.stopping.is_some() || self.ended.is_some() {
             return Ok(None);
         }
         loop {
@@ -320,26 +332,26 @@ impl EventStream {
             // that never was one.
             if value.get("revision").is_none() || value.get("events").is_none() {
                 let name = value.get("event").and_then(|e| e.as_str()).unwrap_or("");
+                if name != SESSION_STOPPING_EVENT && name != STREAM_ENDED_EVENT {
+                    tracing::debug!(event = %name, "ignoring an unrecognized push envelope");
+                    continue;
+                }
+                let reason = terminal_reason(&value)?;
+                // A labeled goodbye with no label is not one: fall
+                // through to the bare-EOF path the contract already
+                // prescribes for an unlabeled close.
+                if reason.is_empty() {
+                    tracing::debug!(event = %name, "terminal envelope without a reason; treating as EOF");
+                    continue;
+                }
                 if name == SESSION_STOPPING_EVENT {
-                    let stopping: SessionStoppingEvent = value
-                        .get("data")
-                        .cloned()
-                        .map(serde_json::from_value)
-                        .transpose()
-                        .map_err(Error::from)?
-                        .unwrap_or_default();
-                    // A labeled goodbye with no label is not one: fall
-                    // through to the bare-EOF path the contract already
-                    // prescribes for an unlabeled close.
-                    if stopping.reason.is_empty() {
-                        tracing::debug!("session.stopping without a reason; treating as EOF");
-                        continue;
-                    }
+                    let stopping = SessionStoppingEvent { reason };
                     self.stopping = Some(stopping.clone());
                     return Ok(Some(EventFrame::Stopping(stopping)));
                 }
-                tracing::debug!(event = %name, "ignoring an unrecognized push envelope");
-                continue;
+                let ended = StreamEndedEvent { reason };
+                self.ended = Some(ended.clone());
+                return Ok(Some(EventFrame::Ended(ended)));
             }
             let batch: EventBatch = serde_json::from_value(value).map_err(Error::from)?;
             if batch.revision != self.next_revision {
@@ -355,6 +367,19 @@ impl EventStream {
             return Ok(Some(EventFrame::Batch(batch)));
         }
     }
+}
+
+/// The `data.reason` of a terminal envelope; empty when it has none.
+///
+/// Both terminal envelopes carry exactly this one field, so one decode
+/// serves them.
+fn terminal_reason(value: &serde_json::Value) -> Result<String, Error> {
+    let data: Option<SessionStoppingEvent> = value
+        .get("data")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?;
+    Ok(data.unwrap_or_default().reason)
 }
 
 // ============================================================================

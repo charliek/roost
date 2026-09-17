@@ -351,6 +351,48 @@ async fn the_stream_latches_closed_after_the_stopping_envelope() {
     );
 }
 
+/// A UI socket's `stream.ended` is a typed goodbye, recognised the way
+/// `session.stopping` is rather than skipped as an unknown envelope: the
+/// consumer learns why, and the stream latches — the batch the stub
+/// writes after it is never yielded.
+#[tokio::test]
+async fn the_stream_ended_envelope_is_a_typed_terminal_frame() {
+    let stub = Stub::start(
+        Plan::new()
+            .subscribe(Subscribe::Ack(4))
+            .push(Push::empty(5))
+            .push(Push::Raw(serde_json::json!({
+                "event": roost_ipc::messages::STREAM_ENDED_EVENT,
+                "data": {"reason": "backend-switch"},
+            })))
+            .push(Push::empty(6))
+            .after_push(End::Hold),
+    )
+    .await;
+
+    let mut stream = EventStream::connect(stub.path()).await.expect("subscribed");
+    match within("the batch", stream.next()).await.expect("a frame") {
+        Some(EventFrame::Batch(batch)) => assert_eq!(batch.revision, 5),
+        other => panic!("expected batch 5, got {other:?}"),
+    }
+    match within("the envelope", stream.next())
+        .await
+        .expect("a frame")
+    {
+        Some(EventFrame::Ended(ended)) => assert_eq!(ended.reason, "backend-switch"),
+        other => panic!("expected stream.ended, got {other:?}"),
+    }
+    assert_eq!(stream.ended_reason(), Some("backend-switch"));
+    assert_eq!(stream.stopping_reason(), None);
+    assert!(
+        within("the latch", stream.next())
+            .await
+            .expect("latched, not blocked")
+            .is_none(),
+        "nothing after the terminal envelope is ever yielded"
+    );
+}
+
 /// A `session.stopping` with no decodable reason is not a labeled
 /// goodbye — the client falls through to the bare-EOF path the contract
 /// prescribes for an unlabeled close.

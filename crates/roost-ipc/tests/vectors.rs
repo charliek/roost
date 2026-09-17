@@ -502,10 +502,11 @@ fn event_vectors_have_required_envelope_shape() {
 ///
 /// Three things generic round-tripping cannot see: `revision` is a JSON
 /// *number* on both (revisions are counters, not ids, so the
-/// string-int64 convention deliberately does not apply); the UI-socket
-/// vector has no `revision` key at all rather than a `null`; and the
-/// session-socket vector decodes into the same `TabListResult` an older
-/// client would use.
+/// string-int64 convention deliberately does not apply); the unfenced
+/// vector — what a socket serving no stream answers: a UI under
+/// `local-backend = session`, or the Swift Mac app — has no `revision`
+/// key at all rather than a `null`; and the fenced vector decodes into
+/// the same `TabListResult` an older client would use.
 #[test]
 fn the_revision_fence_vectors_decode_into_their_typed_results() {
     use roost_ipc::messages::{EventsSubscribeResult, Response, TabListResult};
@@ -538,7 +539,7 @@ fn the_revision_fence_vectors_decode_into_their_typed_results() {
             .as_object()
             .expect("result object")
             .contains_key("revision"),
-        "a UI socket's tab.list must not carry the key at all"
+        "an unfenced tab.list must not carry the key at all"
     );
     let plain: TabListResult = serde_json::from_value(body).expect("decode result");
     assert_eq!(plain.revision, None);

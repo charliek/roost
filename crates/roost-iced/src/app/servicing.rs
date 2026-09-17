@@ -3860,7 +3860,7 @@ impl App {
         };
         let mutating = roost_engine::ipc::is_mutating_op(&op);
         if mutating && self.switch_in_flight() {
-            let _ = reply.send(slot_unavailable(local_backend::SWITCH_BUSY));
+            let _ = reply.send(slot_unavailable(roost_ipc::local_route::SWITCH_BUSY));
             return UiTask::None;
         }
         // A read mints an id too, so the dispatch has one shape; only a
@@ -4186,7 +4186,7 @@ mod tests {
     #[test]
     fn a_refused_forward_says_which_of_the_two_reasons_it_was() {
         let down = slot_unavailable(roost_ipc::local_route::SLOT_UNAVAILABLE).unwrap_err();
-        let busy = slot_unavailable(local_backend::SWITCH_BUSY).unwrap_err();
+        let busy = slot_unavailable(roost_ipc::local_route::SWITCH_BUSY).unwrap_err();
         // The typed code this socket already documents, not a new one.
         assert_eq!(down.code, HOST_UNAVAILABLE);
         assert_eq!(busy.code, down.code);

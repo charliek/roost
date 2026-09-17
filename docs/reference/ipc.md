@@ -33,8 +33,9 @@ it: `roostctl session start|stop|status` address the session profile's
 socket directly (a pre-connect carve-out, since `start` must work when
 nothing is listening yet), and any other op reaches a session only
 through an explicit `--socket`. A UI socket answers `unknown-op` for
-every `session.*` op and `not-implemented` for `events.subscribe`,
-byte-identical to before `roost-session` existed.
+every `session.*` op. It serves `events.subscribe` only while it runs
+its tabs in-process, and only live — see
+[On a UI socket](#on-a-ui-socket).
 
 The Swift Mac app (`Roost.app`) does not do three things this page
 describes for agent tooling: it answers `unknown-op` to
@@ -69,8 +70,9 @@ terminal from. It shares the socket path but not the framing; see
   `{"event": "<dotted-name>", "data": {...}}` — no `id`, no response
   expected. Pushed inside an `EventBatch` on a connection that ran
   [`events.subscribe`](#eventssubscribe), which host-session sockets
-  serve and UI sockets do not. The one exception is the terminal
-  `session.stopping` control envelope, which rides bare (no batch, no
+  serve and an in-process UI socket serves live. The one exception is
+  the terminal control envelope — `session.stopping` from a session,
+  `stream.ended` from a UI socket — which rides bare (no batch, no
   revision) as the last frame on the stream. Catalog:
   [Events](#events) below.
 * **Bytes payloads** (e.g. `tab.write.data`, and any future binary
@@ -268,8 +270,8 @@ Response:
 out per request, so it follows the live `local_backend` and test mode.
 An op is left out when this socket would answer it with `unknown-op`
 (`session.*` here; `host.*` and `agent.set_hooks` on a session socket's
-`identify`), with `not-implemented` (`events.subscribe`; the six
-macOS-only test ops off macOS), with `not-enabled` (a gated test op
+`identify`), with `not-implemented` (the six macOS-only test ops off
+macOS), with `not-enabled` (a gated test op
 without `ROOST_TEST_MODE=1`), or with `no UI attached` (an op that needs
 a window, on a socket with none behind it). Under `local-backend =
 session` the Unsupported ops in [the table
@@ -291,10 +293,9 @@ Swift Mac app.
 
 `persist_error` is present only when the last attempt to write
 `state.json` failed — the message of that write, and absent otherwise.
-A UI socket serves no event stream, so this field is the whole of its
-durability surface; see
-[`workspace.durability_changed`](#events) for the session's live
-counterpart and what the value means.
+It is the standing value; an in-process subscriber also sees
+[`workspace.durability_changed`](#events) live, and that event's entry
+says what the value means.
 
 `local_backend` (plan 063 §D1) is `"in-process"` or `"session"` — which
 backend this UI's own local tabs run on, the [`local-backend` config
@@ -302,9 +303,9 @@ key](config.md#local-backend)'s live value. Absent from a Swift Mac
 reply, which decodes to `"in-process"`: Swift always runs its tabs
 in-process and never reads the key. `local_session_socket` is the local
 `roost-session`'s own socket path, present only under `session` — a
-client that wants the event stream a UI socket cannot serve
-(`events.subscribe` stays [`not-implemented` here](#eventssubscribe))
-dials that socket instead. Under `session`, `active_project_id` and
+client that wants the event stream this socket does not serve under
+`session` (`events.subscribe` answers
+[`not-implemented` there](#on-a-ui-socket)) dials that socket instead. Under `session`, `active_project_id` and
 `active_tab_id` name **the slot's** own UI-selected pair rather than
 this socket's own (empty) workspace, which is what lets `roostctl tab
 write` / `send` / `state` with no `--tab` still have something to act
@@ -360,9 +361,10 @@ by name if one is ever added without a row:
   `app.render_stats`, `window.resize`, `clipboard.*`, and the rest of
   the `app.*` surface all stay exactly as documented elsewhere on this
   page.
-- **Unsupported.** Not served on a UI socket before this mode or after
-  it: `events.subscribe` (`not-implemented` — dial
-  `identify.local_session_socket` instead).
+- **Unsupported.** Refused under this mode, though the same socket
+  serves it in-process: `events.subscribe` (`not-implemented`, its
+  message ending `dial identify.local_session_socket`). The workspace
+  this socket would stream is the hidden one.
 - **Session-only / event.** `session.*` ops and every `tab.*`/`project.*`
   event name answer `unknown-op` on a UI socket exactly as they always
   have; the mode plays no part.
@@ -382,8 +384,8 @@ this socket's.
 
 `tab.list`'s `revision` field is **stripped** at this boundary before
 the reply reaches the caller: [`revision`](#tablist) is the fence a
-client pairs with `events.subscribe`, and a UI socket serves no event
-stream to fence — a caller that wants it dials
+client pairs with `events.subscribe`, and under this mode the UI socket
+serves no event stream to fence — a caller that wants both legs dials
 `identify.local_session_socket` and asks the session directly.
 
 ### `tab.open`
@@ -427,14 +429,16 @@ Snapshot of the workspace. Same shape as the legacy
 
 Response: `{"projects": [<Project>, ...]}`.
 
-On a **host-session socket** the response also carries
-`"revision": <u64>` — the commit the snapshot was taken at, read under
-the same lock as the projects. It is the fence a client pairs with
-[`events.subscribe`](#eventssubscribe): discard every `EventBatch`
-whose `revision` is `<=` this one, apply the rest, and the first batch
-it keeps is exactly `revision + 1`. A UI socket omits the key entirely
-(not `null`) — it serves no event stream, so there would be nothing to
-fence against.
+On a **host-session socket**, and on a **UI socket running its tabs
+in-process**, the response also carries `"revision": <u64>` — the
+commit the snapshot was taken at, read under the same lock as the
+projects. It is the fence a client pairs with
+[`events.subscribe`](#eventssubscribe) on the same socket: discard
+every `EventBatch` whose `revision` is `<=` this one, apply the rest,
+and the first batch it keeps is exactly `revision + 1`. A UI socket
+under `local-backend = session` omits the key entirely (not `null`),
+and so does the Swift Mac app: neither serves an event stream, so there
+would be nothing to fence against.
 
 ### `tab.write`
 
@@ -2029,7 +2033,9 @@ Every optional field is omitted rather than `null`, so a host that has never con
 ### `events.subscribe`
 
 Turn this connection into a one-way event stream. **Served by a
-host-session socket only.** Every subscriber receives every event —
+host-session socket**, and — live only, with the differences
+[On a UI socket](#on-a-ui-socket) lists — by a UI socket running its
+tabs in-process. Every subscriber receives every event —
 there is no per-connection classification of the stream, and there
 never needs to be: reading is not authority, so a client that only
 wants to watch and one that also types get the same feed.
@@ -2117,10 +2123,11 @@ the stream:
 ```
 
 `reason` is always `"stop"` — the session is shutting down, the only
-way this wire ever ends a stream deliberately. It carries **no
+way a session ever ends a stream deliberately. It carries **no
 `revision`** and is exempt from the gap check below: it is not a
 commit, it is the stream saying why it is over, and it is always the
-last frame before the close.
+last frame before the close. A UI socket's counterpart is
+[`stream.ended`](#on-a-ui-socket).
 
 The catalog of batch envelopes is [Events](#events) below.
 
@@ -2177,10 +2184,10 @@ still do — the ring just means fewer clients ever need the third one:
   out of the stream. A close is still the resync signal: reconnect, and
   either re-subscribe fresh and re-pull `tab.list`, or — with a fence and
   a `session_id` in hand — resume, and let the replay window catch up
-  what the gap cost instead of re-snapshotting. Exactly two things ask
-  for the close on this wire — `session.stopping`, and an EOF —
-  and `session.stopping` only says *why* the stream that is already
-  ending ended.
+  what the gap cost instead of re-snapshotting. Exactly three things
+  ask for the close on this wire — `session.stopping`, a UI socket's
+  `stream.ended`, and an EOF — and the two envelopes only say *why* the
+  stream that is already ending ended.
 
 After the flip the connection answers nothing. Frames a client writes
 on it are read and discarded (so the server still notices a peer that
@@ -2205,11 +2212,54 @@ leaseless subscribe opened an observer stream with `tab.effect` stripped
 The history of how this op's shape moved across earlier generations is
 in [Versioning](#versioning) and CHANGELOG.
 
-On a **UI socket** the op is still unimplemented: it answers
-`{"ok": false, "error": {"code": "not-implemented", "message":
-"events.subscribe is not yet implemented"}}` rather than a false ACK,
-because a UI process pushes nothing. Callers there poll `tab.list` /
-`tab.dump` instead. A UI-side stream lands with its first consumer.
+#### On a UI socket
+
+A UI socket running its tabs **in-process** serves the same live
+stream over its own workspace — the same batches, the same gap rule,
+the same catalog — with these differences:
+
+* **The ack's `session_id` is the UI's
+  [`identify.instance_id`](#identify)**, since a UI process has no
+  session. A client compares the two to know its stream and its
+  snapshot came from the same process: a UI that restarted between a
+  client's `identify` and its subscribe has a new `instance_id`, and
+  revisions restart with it.
+* **Live only.** A UI keeps no replay ring, so `from_revision` is
+  refused `invalid-param`: "resume is a session-socket feature:
+  subscribe live and snapshot with tab.list". A `session_id` that is
+  not this UI's `instance_id` is refused `invalid-param` too, and a
+  non-zero `tab_id_filter` gets the same `invalid-param` a session gives.
+* **The snapshot fence takes a second connection.** Subscribe first,
+  then call [`tab.list`](#tablist) — whose `revision` an in-process UI
+  socket carries — on **another** connection, because a connection that
+  flipped to push answers nothing more. Discard every batch with
+  `revision <=` that `tab.list.revision` and apply the rest.
+* **A slow subscriber cannot hold the UI up.** The bounds above are the
+  same: a subscriber that stops reading is closed once its queue or its
+  socket write stays stuck past the stall budget, and one that falls
+  behind the workspace broadcast is closed at once — the UI never waits
+  on a subscriber.
+* **How it ends.** Lag, a stall, or an internal resync closes it with a
+  bare EOF — the resync signal: subscribe again and re-pull `tab.list`.
+  A [local-backend switch](#a-ui-socket-under-local-backend-session)
+  ends every in-process stream deliberately, with one last envelope and
+  then the close:
+
+  ```json
+  {"event": "stream.ended", "data": {"reason": "backend-switch"}}
+  ```
+
+  `reason` is always `"backend-switch"`: the workspace this stream reads
+  is about to stop being the one on screen. Like `session.stopping` it
+  carries no `revision`, is exempt from the gap check, never enters a
+  replay, and is always the last frame.
+* **Refusals around a switch.** While a switch is in flight a subscribe
+  is refused `host-unavailable` with `busy: a local-backend switch is
+  in progress` — the same answer a mutation gets then — rather than
+  handed a stream nothing would end. Under `local-backend = session`
+  the op answers `not-implemented`, the message ending `dial
+  identify.local_session_socket`: that session serves the stream, with
+  resume, and its own `tab.list` fences it.
 
 ## Session ops
 
@@ -3172,8 +3222,8 @@ supported pattern.
 
 ## Events
 
-Server-push only, delivered on a host-session socket after
-[`events.subscribe`](#eventssubscribe). Each envelope is a
+Server-push only, delivered on a host-session socket or an in-process
+UI socket after [`events.subscribe`](#eventssubscribe). Each envelope is a
 `{"event": "<name>", "data": {...}}` object inside an `EventBatch`;
 several envelopes can share one batch, which is what makes a commit
 atomic on the wire. The set below is exhaustive — the serializer
@@ -3181,11 +3231,13 @@ atomic on the wire. The set below is exhaustive — the serializer
 workspace's event enum, so a new event cannot ship without a name
 here.
 
-`session.stopping` is deliberately **not** in this set: it is not a
-workspace event, it carries no `revision`, and it never rides inside a
-batch — it is the connection's own terminal control envelope, delivered
-outside the batch discipline, the last frame before the stream closes.
-See [`events.subscribe`](#eventssubscribe) for the full envelope shape.
+`session.stopping` and `stream.ended` are deliberately **not** in this
+set: neither is a workspace event, neither carries a `revision`, and
+neither ever rides inside a batch or enters a replay — each is the
+connection's own terminal control envelope, delivered outside the batch
+discipline, the last frame before the stream closes. See
+[`events.subscribe`](#eventssubscribe) for `session.stopping` and
+[On a UI socket](#on-a-ui-socket) for `stream.ended`.
 
 * `tab.opened` — `{"tab": <Tab>}`.
 * `tab.closed` — `{"tab_id": "<id>"}`.

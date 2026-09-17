@@ -187,10 +187,9 @@ impl Response {
 
 /// Server-push event, delivered inside an [`EventBatch`].
 ///
-/// Delivered on **host-session sockets only**: `events.subscribe`
-/// starts the stream there, while a UI socket still answers the op
-/// `not-implemented` rather than a false ACK (see the
-/// `ops::EVENTS_SUBSCRIBE` arm in `roost-engine/src/ipc.rs`). The
+/// Delivered after `events.subscribe` on a host-session socket, and on
+/// a UI socket running its tabs in-process (live only there — see
+/// `dispatch_outcome` in `roost-engine/src/ipc.rs`). The
 /// serializer that mints these from the workspace's own event enum
 /// lives in `roost-engine/src/event_push.rs`; the exhaustive name
 /// catalog is the `EVENT_*` constants in [`ops`].
@@ -207,15 +206,15 @@ pub struct EventEnvelope {
     pub data: serde_json::Value,
 }
 
-/// The one envelope a subscriber sees that is **not** carried inside an
-/// [`EventBatch`]: the terminal control frame a host session writes
-/// immediately before it closes a push connection.
+/// One of the two envelopes a subscriber sees that are **not** carried
+/// inside an [`EventBatch`]: the terminal control frame a host session
+/// writes immediately before it closes a push connection.
 ///
-/// It is not in the `EVENT_*` catalogue in [`ops`] on purpose — those
-/// name workspace facts that ride a batch under a revision, and this
-/// one names a transport decision. It carries no revision and is exempt
-/// from the client's gap check; it is always the last frame on the
-/// connection.
+/// Neither is in the `EVENT_*` catalogue in [`ops`] on purpose — those
+/// name workspace facts that ride a batch under a revision, and these
+/// name a transport decision. Each carries no revision, is exempt from
+/// the client's gap check, never enters a replay, and is always the
+/// last frame on the connection.
 pub const SESSION_STOPPING_EVENT: &str = "session.stopping";
 
 /// `data` of the [`SESSION_STOPPING_EVENT`] envelope.
@@ -224,6 +223,21 @@ pub const SESSION_STOPPING_EVENT: &str = "session.stopping";
 /// connection is over.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionStoppingEvent {
+    pub reason: String,
+}
+
+/// The other terminal control frame, written by a UI socket that ends
+/// an in-process `events.subscribe` stream on purpose — see
+/// [`SESSION_STOPPING_EVENT`] for what the two share.
+pub const STREAM_ENDED_EVENT: &str = "stream.ended";
+
+/// `data` of the [`STREAM_ENDED_EVENT`] envelope.
+///
+/// `reason` is `"backend-switch"`: the UI is moving its tabs to another
+/// local backend, and the workspace this stream reads is about to stop
+/// being the one on screen.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamEndedEvent {
     pub reason: String,
 }
 
@@ -329,10 +343,12 @@ pub struct TabListResult {
     /// client pairs with an [`EventBatch`] stream: discard every batch
     /// whose `revision` is `<=` this, apply the rest.
     ///
-    /// Present **only on a host-session socket**, where the snapshot and
-    /// the revision are read under one lock. A UI socket omits the key
-    /// entirely; it serves no event stream, so a fence would be a number
-    /// with nothing to fence against.
+    /// Present wherever the same socket serves that stream — a
+    /// host-session socket, and a UI socket running its tabs in-process —
+    /// read under one lock with the snapshot. A UI socket under
+    /// `local-backend = session` omits the key entirely: it serves no
+    /// stream there, so a fence would be a number with nothing to fence
+    /// against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<u64>,
 }

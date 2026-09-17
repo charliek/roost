@@ -1107,6 +1107,12 @@ impl Workspace {
         self.versioned_events.subscribe()
     }
 
+    /// How many versioned receivers are alive — one per live event
+    /// relay. Test-only today: it is how a test sees a relay let go.
+    pub fn versioned_receiver_count(&self) -> usize {
+        self.versioned_events.receiver_count()
+    }
+
     /// Start a subscription at the current revision — see [`ResumeCut`].
     pub fn subscribe_live(&self) -> ResumeCut {
         let inner = self.inner.lock().unwrap();

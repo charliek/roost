@@ -179,7 +179,7 @@ pub enum OpClass {
     /// The UI answers, and the mode changes nothing: the op carries no
     /// local workspace id at all.
     UiOwned,
-    /// Not served on a UI socket, before this mode and after it —
+    /// Refused under this mode, though the UI serves it in-process —
     /// `events.subscribe` (`not-implemented`).
     Unsupported,
     /// A host-session socket's own op. A UI socket answers `unknown-op`,
@@ -350,6 +350,16 @@ pub const SLOT_UNAVAILABLE_CODE: &str = "host-unavailable";
 /// Its sentence. One spelling, because the engine's handler and the UI's
 /// forward arm both answer it and a client matches on it.
 pub const SLOT_UNAVAILABLE: &str = "local session is not connected";
+
+/// What every local-backend mutation is answered with while a switch is
+/// in flight (plan 063 §D8a), under [`SLOT_UNAVAILABLE_CODE`].
+///
+/// One string, because it is a contract: a `roostctl`/`palette.activate`
+/// caller has to be able to tell "the UI is mid-switch, try again" from
+/// a real refusal, and a per-call-site wording could not be matched on.
+/// Here rather than beside the switch because the engine's handler
+/// answers it too, for a subscribe the switch would otherwise never end.
+pub const SWITCH_BUSY: &str = "busy: a local-backend switch is in progress";
 
 /// The row for `op`, or `None` for a name no row covers.
 ///

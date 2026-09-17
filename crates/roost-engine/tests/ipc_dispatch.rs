@@ -133,11 +133,11 @@ async fn unknown_op_returns_unknown_op_error() {
     }
 }
 
-/// #80/#9: `events.subscribe` returns `not-implemented` rather than a
-/// false `{}` ACK — the server never pushes events yet, so a client
-/// must learn it can't subscribe and fall back (e.g. poll tab.list).
+/// Under `local-backend = session` a UI socket's own workspace is the
+/// hidden one, so `events.subscribe` there is `not-implemented` rather
+/// than a stream of it — and the refusal says where the stream is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn events_subscribe_returns_not_implemented() {
+async fn events_subscribe_under_session_mode_points_at_the_session_socket() {
     let dir = tempdir().unwrap();
     let socket_path = dir.path().join("roost.sock");
 
@@ -149,7 +149,13 @@ async fn events_subscribe_returns_not_implemented() {
         socket_path.clone(),
         "Roost-test",
         "ai.stridelabs.Roost.test",
-    );
+    )
+    .with_local_route(Arc::new(roost_ipc::LocalBackendCell::new(
+        roost_ipc::LocalRoute {
+            mode: roost_ipc::LocalBackendMode::Session,
+            ..roost_ipc::LocalRoute::default()
+        },
+    )));
 
     let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
     let server_socket = server.socket_path().to_path_buf();
@@ -162,7 +168,13 @@ async fn events_subscribe_returns_not_implemented() {
         .await
         .expect_err("expected error");
     match err {
-        roost_ipc::ClientError::Server { code, .. } => assert_eq!(code, "not-implemented"),
+        roost_ipc::ClientError::Server { code, message } => {
+            assert_eq!(code, "not-implemented");
+            assert!(
+                message.ends_with("dial identify.local_session_socket"),
+                "{message}"
+            );
+        }
         other => panic!("expected Server error, got {other:?}"),
     }
 }

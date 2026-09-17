@@ -1152,6 +1152,11 @@ async fn serve(
                     Some(Ok(EventFrame::Stopping(stopping))) => {
                         return ConnEnd::Stopping(stopping.reason);
                     }
+                    // A UI socket's envelope, never a session's; should one
+                    // arrive, it is a closed stream like any other.
+                    Some(Ok(EventFrame::Ended(ended))) => {
+                        return ConnEnd::Dropped(format!("the event stream ended: {}", ended.reason));
+                    }
                     Some(Err(error)) => {
                         // A revision gap is loss and nothing else, and
                         // the contract's answer to loss is a resync —

@@ -1,4 +1,5 @@
-"""Read a host session's server-push event stream.
+"""Read a server-push event stream: a host session's, or an in-process
+UI socket's (live only there).
 
 `client.IpcClient`'s request path is strictly one-request-one-response,
 and `events.subscribe` breaks that shape on purpose: the ack is the last
@@ -17,10 +18,12 @@ Two things every subscriber has to know about:
 * the stream is **symmetric**: anyone who can reach the socket may
   subscribe, and every subscriber receives every event — workspace
   batches, `notification.fired` and `tab.effect` alike.
-* every frame is a batch EXCEPT one, which carries no `revision` and is
-  exempt from the gap check:
-  `{"event": "session.stopping", "data": {"reason": ...}}`, terminal and
-  naming why the stream is ending. [`recv_stopping`] reads it.
+* every frame is a batch EXCEPT the terminal control envelope, which
+  carries no `revision` and is exempt from the gap check:
+  `{"event": "session.stopping", "data": {"reason": ...}}` from a session,
+  or `{"event": "stream.ended", "data": {"reason": "backend-switch"}}` from
+  a UI socket whose local backend is switching. [`recv_stopping`] reads
+  the first; [`recv_to_close`] returns everything up to the close.
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ from client import RoostError, scaled_timeout
 
 
 STOPPING_EVENT = "session.stopping"
+ENDED_EVENT = "stream.ended"
 
 
 class EventStream:
@@ -49,8 +53,8 @@ class EventStream:
         # The incarnation that answered the subscribe, which a client
         # compares with the one `session.identify` returned (#458).
         self.session_id: str | None = None
-        # Set when the terminal control envelope arrives; a close after
-        # it is the session saying goodbye, not a dropped stream.
+        # Set when `session.stopping` arrives; a close after it is the
+        # session saying goodbye, not a dropped stream.
         self.stopping_reason: str | None = None
 
     # -- lifecycle --------------------------------------------------------
@@ -141,21 +145,31 @@ class EventStream:
         makes the write impossible), but a session stopping a healthy
         connection must produce it, so its absence is a failure here.
         """
+        self.recv_to_close(timeout)
+        if self.stopping_reason is None:
+            raise AssertionError(
+                f"the stream at {self.path} closed with no {STOPPING_EVENT} envelope"
+            )
+        return self.stopping_reason
+
+    def recv_to_close(self, timeout: float = 10.0) -> list[dict]:
+        """Every frame up to the close, in order.
+
+        `timeout` bounds the whole read; a stream that never closes is a
+        `TimeoutError`, not an empty list.
+        """
         deadline = time.monotonic() + scaled_timeout(timeout)
+        frames: list[dict] = []
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(f"the stream at {self.path} never ended within its budget")
+                raise TimeoutError(f"the stream at {self.path} never closed within its budget")
             try:
-                self._recv_within(remaining)
+                frames.append(self._recv_within(remaining))
             except RoostError as error:
                 if error.code != "disconnected":
                     raise
-                if self.stopping_reason is None:
-                    raise AssertionError(
-                        f"the stream at {self.path} closed with no {STOPPING_EVENT} envelope"
-                    ) from error
-                return self.stopping_reason
+                return frames
 
     def recv_until(
         self, event: str, timeout: float = 10.0, max_batches: int = 512
@@ -187,8 +201,7 @@ class EventStream:
                 # The only non-batch frame is the terminal envelope, and
                 # it means `event` is never coming.
                 raise RoostError(
-                    "disconnected",
-                    f"the session stopped ({self.stopping_reason}) before {event!r} arrived",
+                    "disconnected", f"the stream ended ({frame}) before {event!r} arrived"
                 )
             batches.append(frame)
             if len(batches) > max_batches:

@@ -25,10 +25,11 @@ use roost_ipc::messages::{
     ResponseError, RetrySchedule, SentFile, SessionBinaryIdentity, SessionIdentify,
     SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams,
     SessionSetThemeParams, SessionSetThemeResult, SessionStopParams, SessionStopResult,
-    SessionStoppingEvent, SkippedFile, TabClearNotificationParams, TabClearNotificationResult,
-    TabDumpCursor, TabDumpParams, TabDumpResult, TabEffect, TabEffectEvent, TabReorderParams,
-    TabSendFileParams, TabSendFileResult, TabWriteParams, WireProjectRef, WireTabRef,
-    MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
+    SessionStoppingEvent, SkippedFile, StreamEndedEvent, TabClearNotificationParams,
+    TabClearNotificationResult, TabDumpCursor, TabDumpParams, TabDumpResult, TabEffect,
+    TabEffectEvent, TabReorderParams, TabSendFileParams, TabSendFileResult, TabWriteParams,
+    WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
+    SESSION_STOPPING_EVENT, STREAM_ENDED_EVENT,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -788,6 +789,24 @@ fn session_stopping_vector_decodes_into_its_typed_shape() {
         serde_json::from_value(envelope.data).expect("decode stopping data");
     assert_eq!(data.reason, "stop");
     round_trip(&data);
+}
+
+/// The UI socket's terminal envelope, and the server's own spelling of
+/// it: a push loop writes `CloseReason::BackendSwitch` from
+/// `push_envelope`, so that pair is what the vector has to be.
+#[test]
+fn stream_ended_vector_decodes_into_its_typed_shape() {
+    let raw = read_vector("stream.ended.event.json");
+    let envelope: EventEnvelope = serde_json::from_str(&raw).expect("decode event envelope");
+    assert_eq!(envelope.event, STREAM_ENDED_EVENT);
+    let data: StreamEndedEvent =
+        serde_json::from_value(envelope.data).expect("decode stream.ended data");
+    assert_eq!(data.reason, "backend-switch");
+    round_trip(&data);
+    assert_eq!(
+        roost_ipc::CloseReason::BackendSwitch.push_envelope(),
+        (envelope.event.as_str(), data.reason.as_str())
+    );
 }
 
 #[test]
@@ -1904,6 +1923,36 @@ fn events_subscribe_resume_matches_its_vector() {
     let typed: EventsSubscribeParams = serde_json::from_value(plain).expect("typed plain params");
     assert_eq!(typed.from_revision, None);
     assert_eq!(typed.session_id, None);
+}
+
+/// A UI socket's subscribe is the plain request, and its ack names the
+/// UI process where a session's names the session: the same value
+/// `identify.instance_id` carries, which is the identity check a client
+/// makes.
+#[test]
+fn events_subscribe_ui_vectors_decode_into_their_typed_shapes() {
+    let params = decode_request_vector("events.subscribe.ui.request.json");
+    let typed: EventsSubscribeParams = serde_json::from_value(params).expect("typed params");
+    assert_eq!(typed.tab_id_filter, 0);
+    assert_eq!(typed.from_revision, None, "a UI stream is live only");
+    assert_eq!(typed.session_id, None);
+
+    let raw = read_vector("events.subscribe.ui.response.json");
+    let response: roost_ipc::messages::Response =
+        serde_json::from_str(&raw).expect("decode response envelope");
+    let ack: EventsSubscribeResult =
+        serde_json::from_value(response.result.expect("a result")).expect("typed ack");
+    assert_eq!(ack.revision, 42);
+
+    let raw = read_vector("identify.ops.response.json");
+    let response: roost_ipc::messages::Response =
+        serde_json::from_str(&raw).expect("decode response envelope");
+    let identify: IdentifyResult =
+        serde_json::from_value(response.result.expect("a result")).expect("typed identify");
+    assert_eq!(
+        identify.instance_id.as_deref(),
+        Some(ack.session_id.as_str())
+    );
 }
 
 /// The refusal a client feature-detects on: it is answered on the ack,

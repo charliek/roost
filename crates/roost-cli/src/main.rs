@@ -385,9 +385,10 @@ enum TabCmd {
     /// List projects + their tabs. `--json` emits the machine-readable
     /// workspace snapshot (the `tab.list` result) instead of plain text.
     ///
-    /// Never carries a `revision`: that fence only means something on a
-    /// socket that also serves the event stream, which a UI socket does
-    /// not — including when the answer came from the local session.
+    /// Carries `revision` exactly where the socket also serves the event
+    /// stream it fences: a UI running its tabs in-process does, and a UI
+    /// under `local-backend = session` does not, though its answer came
+    /// from the local session.
     List {
         #[arg(long, default_value_t = false)]
         json: bool,

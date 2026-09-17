@@ -1,0 +1,7 @@
+{
+  "id": "13",
+  "op": "events.subscribe",
+  "params": {
+    "tab_id_filter": "0"
+  }
+}

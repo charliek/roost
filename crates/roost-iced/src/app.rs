@@ -2520,6 +2520,9 @@ pub struct App {
     /// What the IPC handler answers `identify` from. Written only by
     /// [`Self::publish_local_route`].
     local_route: Arc<LocalBackendCell>,
+    /// The IPC socket's in-process event streams, which a local-backend
+    /// switch ends.
+    in_process_streams: Arc<roost_engine::ipc::InProcessStreams>,
     /// The local-backend switch in flight (plan 063 §D8), or `None`.
     /// [`local_backend::SwitchState::Idle`] is spelled as the absence of
     /// a run, so nothing can be mid-phase with no phase data.
@@ -2942,6 +2945,7 @@ impl App {
         .with_ui(ui_tx)
         .with_local_route(Arc::clone(&local_route))
         .with_test_mode(test_mode);
+        let in_process_streams = handler.in_process_streams();
         let server = runtime
             .block_on(IpcServer::bind(&profile.socket_path, handler))
             .context("bind Iced IPC server")?;
@@ -2998,6 +3002,7 @@ impl App {
             config,
             local_backend: backend_mode,
             local_route,
+            in_process_streams,
             switch: None,
             pending_migration,
             pending_dest_cleanup: resumed.delete_dest,

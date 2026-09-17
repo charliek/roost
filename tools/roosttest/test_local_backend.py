@@ -93,12 +93,13 @@ atexit.register(shutil.rmtree, _ROOT, ignore_errors=True)
 
 import ui  # noqa: E402
 from client import Roost, RoostError, scaled_timeout  # noqa: E402
+from eventstream import ENDED_EVENT, EventStream  # noqa: E402
 from session import wait_until  # noqa: E402
 from test_host_local_spawn import roostctl_session, running_session_id  # noqa: E402
 
 pytestmark = pytest.mark.host_client
 
-#: `crates/roost-iced/src/app/local_backend.rs`'s `SWITCH_BUSY`.
+#: `crates/roost-ipc/src/local_route.rs`'s `SWITCH_BUSY`.
 BUSY = "busy: a local-backend switch is in progress"
 USE_SESSION = "local:use_session"
 USE_IN_PROCESS = "local:use_in_process"
@@ -902,6 +903,55 @@ def test_a_switch_in_flight_hides_its_verb_and_refuses_local_mutations(lane: Lan
         # ladder; the stub is `sleep`, so it is bounded either way.
         ui.quit(lane.target)
         subprocess.run(["pkill", "-f", str(stub)], check=False)
+
+
+def test_a_switch_ends_the_in_process_event_stream_and_refuses_a_new_one(lane: Lane):
+    """Plan 066 §3.1: a stream of the in-process workspace ends with the
+    switch that is about to hide it — exactly one `stream.ended`, then
+    the close — and while the switch is in flight a fresh subscribe is
+    refused rather than handed a stream nothing would end.
+
+    Held in `preparing` the way the quiescence case above holds it.
+    """
+    stub = _ROOT / "slow-session-stream"
+    stub.write_text("#!/bin/sh\nexec sleep 120\n")
+    stub.chmod(0o755)
+    roost = lane.start("in-process", extra_env={"ROOST_SESSION_BIN": str(stub)})
+    stream = EventStream(ui.socket_path(lane.target))
+    try:
+        fence = stream.subscribe()
+        assert stream.session_id == roost.identify()["instance_id"]
+
+        raise_switch(roost, USE_SESSION)
+        roost.call("app.dialog_answer", {"action": "confirm"})
+        frames = stream.recv_to_close(timeout=60.0)
+        assert [f for f in frames if f.get("event") == ENDED_EVENT] == frames[-1:], frames
+        assert frames[-1] == {"event": ENDED_EVENT, "data": {"reason": "backend-switch"}}, frames
+        stream.expect_contiguous(frames[:-1], fence)
+
+        assert roost.identify().get("local_backend_switch") == "preparing"
+        with EventStream(ui.socket_path(lane.target)) as late:
+            with pytest.raises(RoostError) as refused:
+                late.subscribe()
+        assert refused.value.code == "host-unavailable", refused.value
+        assert refused.value.message == BUSY, refused.value
+    finally:
+        stream.close()
+        ui.quit(lane.target)
+        subprocess.run(["pkill", "-f", str(stub)], check=False)
+
+
+def test_under_session_mode_the_ui_socket_points_a_subscriber_at_the_session(lane: Lane):
+    """Plan 063 §D10's `Unsupported`, as plan 066 left it: the in-process
+    workspace is the hidden one, so the UI socket serves no stream of it
+    and says where the stream is instead."""
+    roost = lane.start("session", extra_env=NO_SESSION)
+    assert "events.subscribe" not in roost.identify()["ops"]
+    with EventStream(ui.socket_path(lane.target)) as stream:
+        with pytest.raises(RoostError) as refused:
+            stream.subscribe()
+    assert refused.value.code == "not-implemented", refused.value
+    assert refused.value.message.endswith("dial identify.local_session_socket"), refused.value
 
 
 # ---------------------------------------------------------------------------

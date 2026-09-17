@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use roost_ipc::local_route::SWITCH_BUSY;
 use roost_ipc::messages::Project;
 use roost_ipc::{LocalBackendMode, LocalRoute};
 use roost_ui_model::config::RoostConfig;
@@ -654,14 +655,6 @@ pub(crate) fn route_snapshot(
 }
 
 // ── the switch (plan 063 §D8) ───────────────────────────────────────
-
-/// What every local-backend mutation is answered with while a switch is
-/// in flight (plan 063 §D8a).
-///
-/// One string, because it is a contract: a `roostctl`/`palette.activate`
-/// caller has to be able to tell "the UI is mid-switch, try again" from
-/// a real refusal, and a per-call-site wording could not be matched on.
-pub(crate) const SWITCH_BUSY: &str = "busy: a local-backend switch is in progress";
 
 /// Which way a switch is going.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1810,6 +1803,7 @@ impl super::App {
         // reconciles the phases trigger from auto-removing an emptied
         // slot or closing the window over an emptied source.
         self.publish_local_route();
+        self.in_process_streams.end_for_backend_switch();
         tracing::info!(?direction, "local-backend switch started");
     }
 
