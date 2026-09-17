@@ -37,7 +37,8 @@ socket directly, since `start` must work when nothing is listening yet.
 An op a session does not serve fails with the server's own error for that
 op, not a session-specific one: `unknown-op` for `host.*` and
 `agent.set_hooks` (client-side UI state a session doesn't keep), `internal:
-no UI attached` for `app.*` window/UI ops. [`identify`](#identify) (on a UI
+no UI attached` for `app.*` window/UI ops (except
+[`app.activate`](#appactivate), which answers `{}` and does nothing). [`identify`](#identify) (on a UI
 socket) and [`session.identify`](#sessionidentify) (on a session) each list
 what that socket serves right now in `ops`. A UI socket, symmetrically,
 answers `unknown-op` for every `session.*` op, and serves

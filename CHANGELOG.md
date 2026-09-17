@@ -330,9 +330,12 @@ release workflow asserts they agree).
   or, for Claude Code, `/plugin marketplace add charliek/roost` then
   `/plugin install roost@roost` — teaches an agent the rules this
   surface implies (the target policy, the exit-code table, when to
-  focus a tab); `roostctl skill` prints the exact same file the
-  installers use, `--json` included, so the binary and the published
-  skill cannot disagree. See the new [Automation](docs/guides/automation.md)
+  focus a tab); `roostctl skill` prints the copy built into the
+  binary, `--json` included, so the skill that matches your installed
+  `roostctl` is always one command away. `roostctl --target session`
+  reaches a host session explicitly (#475) — never by auto-detect or
+  `ROOST_BUNDLE_PROFILE` — and an op a session does not serve answers
+  with the server's own error. See the new [Automation](docs/guides/automation.md)
   and [Agent Skill](docs/guides/agent-skill.md) guides, and
   [`ipc.md`](docs/reference/ipc.md) — which now carries a contract
   section for every operation, a gap a test now enforces.

@@ -49,7 +49,7 @@ explicitly — `--target session` or `--socket <path>` (#475) — never by `ROOS
 (`session` is refused there like any other unrecognized value) or auto-detect (a session is
 never a candidate). An op the session does not serve fails with the server's own error for
 that op — `unknown-op` for `host.*` and `agent.set_hooks`, `internal: no UI attached` for
-`app.*` window/UI ops — not a session-specific one; see
+`app.*` window/UI ops (`app.activate` alone answers `{}` and does nothing) — not a session-specific one; see
 [`ipc.md`](ipc.md#session-sockets) for the wire-level contract and
 [`identify`](ipc.md#identify) / [`session.identify`](ipc.md#sessionidentify) for what each
 socket serves.
@@ -673,7 +673,8 @@ pointed at that same socket (#475) — never by `ROOST_BUNDLE_PROFILE`
 auto-detect, which never probes it. An op the session does not serve
 answers with the server's own error for that op, not a
 session-specific one: `unknown-op` for `host.*` and `agent.set_hooks`,
-`internal: no UI attached` for `app.*` window/UI ops.
+`internal: no UI attached` for `app.*` window/UI ops, except `app.activate`,
+which answers `{}` and does nothing.
 
 `session start` spawns `roost-session start`, which daemonizes and
 seeds its first project from the calling shell's cwd on a fresh state

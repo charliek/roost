@@ -20,8 +20,10 @@ starting Roost or guessing a socket path.
 
 ## Install
 
-Two routes install the same skill — `roostctl skill` prints it, so the
-binary and whichever route you used cannot disagree.
+Two routes install the same skill. `roostctl skill` prints the copy
+built into your `roostctl`, which matches that release; an install
+route fetches the repository's current copy, so after upgrading Roost,
+update the installed skill too.
 
 **The general route** ([`skills`](https://skills.sh)) installs into
 Claude Code, GitHub Copilot, OpenCode, and other agents:

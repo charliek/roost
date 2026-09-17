@@ -133,7 +133,7 @@ a session through `roostctl --target session` or an explicit `roostctl
 --socket <path>`; an op the session does not serve fails with the
 server's own error for that op — `unknown-op` for `host.*` and
 `agent.set_hooks`, `internal: no UI attached` for `app.*` window/UI ops
-— not a session-specific one. Debug builds substitute `RoostSessionDev`
+(`app.activate` alone answers `{}` and does nothing) — not a session-specific one. Debug builds substitute `RoostSessionDev`
 / `roost-session-dev` for the directory name in **all** of the paths
 below (socket, state, logs, and the upload store), so a dev session can
 never collide with a real one.
