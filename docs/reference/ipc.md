@@ -843,6 +843,84 @@ tab. Implemented by the iced UI only; the Swift Mac app has no case for
 this op and answers `unknown-op` (it does support IME input, via AppKit's
 own `interpretKeyEvents` — there is just no IPC op to drive it).
 
+### `tab.expand_selection_at` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Drives the same double-/
+triple-click word/line expansion the production `handle_click_count` /
+`handleClickCount` path runs from a real mouse press, then commits the
+resulting span as the tab's selection — so the e2e suite can pin
+word/line expansion without a synthetic mouse sequence. Same gate as
+`tab.feed_pty_bytes`.
+
+Request:
+```json
+{"params": {"tab_id": "3", "col": 12, "row": 4, "click_count": 2}}
+```
+
+`click_count` is `2` for a double-click (word) or `3`+ for a
+triple-click (line); a value below `2` is `invalid-param`, checked
+before the gate. Response:
+
+```json
+{"col0": 8, "col1": 15, "text": "example"}
+```
+
+`col0` / `col1` are the expanded span's inclusive start/end columns on
+`row`; `text` is the selected text, or `null` for a span that resolved
+to nothing (never an error by itself).
+
+Errors: `not-found` — either the tab has no live terminal, or `(col,
+row)` has no word/line span (whitespace under a double-click, or a row
+out of range). The iced UI reports these as two distinct messages under
+the same code; the Swift app reports one combined message.
+
+`tab_id` is a bare `string_int64`, not the `h<host>.<id>` wire spelling
+`tab.dump` accepts — under `local-backend = session` the UI resolves it
+against the slot itself rather than needing a host-qualified id; see [A
+UI socket under `local-backend =
+session`](#a-ui-socket-under-local-backend-session).
+
+Implemented by both UIs.
+
+### `tab.dispatch_mouse_event` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Drives a synthetic mouse
+event into the UI's mouse-routing handler at cell-grid coordinates —
+the same path a real `NSEvent` / iced `GestureClick` takes, including
+gating on the negotiated mouse-tracking mode, encoder choice, and the
+SGR/X10/pixel report formats, so the op exercises exactly what
+production does rather than a shortcut around it. Same gate as
+`tab.feed_pty_bytes`.
+
+Request:
+```json
+{"params": {"tab_id": "3", "kind": "press", "button": "left",
+            "cell_x": 10, "cell_y": 4, "mods": 0}}
+```
+
+`kind` is `"press" | "release" | "motion"`; `button` is `"left" |
+"right" | "middle" | "wheel_up" | "wheel_down" | "none"` (`"none"` for a
+plain hover motion). `cell_x` / `cell_y` are 0-based terminal cell
+coordinates. `mods` defaults to `0` and matches the key encoder's
+`Mods` bit layout: shift(0), ctrl(1), alt(2), cmd/super(3).
+
+Response: `{}`. Errors: `invalid-param` for an unrecognized `kind` or
+`button`.
+
+On the iced UI, `mods` also decides whether the *link* modifier is
+held, so a left press on a hyperlink opens it through the UI's own
+launcher exactly as a real click does — a Linux-only effect in
+practice, since the Mac UI drives the mouse-tracking encoder alone and
+does not run this path (`TerminalView.emitMouseTracking`).
+
+`tab_id` is a bare `string_int64`; under `local-backend = session` it
+resolves against the slot the same way [`tab.expand_selection_at`
+above](#tabexpand_selection_at-test-only-gated) does.
+
+Implemented by both UIs.
+
 ### `project.create`
 
 Request: `{"params": {"name": "", "cwd": "/tmp"}}`. `name` empty means
@@ -1181,6 +1259,33 @@ Request:
 
 Response: `{}`.
 
+### `app.activate`
+
+Raise + focus the running UI window. Sent by a second launch that loses
+the single-instance flock (#6) — the running Roost's window comes
+forward instead of a second instance starting — so a user who
+double-clicks the Dock icon or reruns the binary while Roost is already
+up gets the existing window rather than a launch failure. Nothing else
+sends this op today; `roostctl` has no verb for it.
+
+Request: `{"params": {}}`. Response: `{}`.
+
+Takes no params — the envelope is declared empty and strict
+(`deny_unknown_fields`), so an unexpected key is `unknown-field` rather
+than silently ignored.
+
+Unlike every other `app.*` op, the handler does **not** go through the
+usual `ui_call` (which answers `internal: no UI attached` with nothing
+wired up). It checks the engine's UI channel directly and, if there is
+none — a headless embedder, or a session with no UI attached — sends
+nothing and still answers `{}`: a fire-and-forget no-op rather than an
+error.
+
+Implemented only by the iced UI (`crates/roost-iced/src/main.rs`'s
+second-launch path is the only sender); the Swift Mac app has no case
+for this op and answers `unknown-op` — its own single-instance path
+does not dial the socket.
+
 ### `app.screenshot`
 
 Render the running UI's whole window (sidebar + tab bar + active
@@ -1345,6 +1450,97 @@ classic single sticky `PROJECTS` header instead of a strip:
 the same absent-tolerant contract `hosts` uses, for the same reason.
 
 Ungated, read-only — always available, matching `app.window_metrics`.
+
+### `app.set_window_focus` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Drives the focus-tracking
+emit path without moving real OS focus — the *whole* production
+window-focus route, not just the emit half: on the iced UI this runs
+`window_opened` first and the focus change second, the same re-entry a
+real focus change takes, because the once-per-process latches that hang
+off `window_opened` (the agent-hooks startup ensure, plan 064's consent
+card) only exist because a focus change re-enters it. An op that skipped
+that half could not fail when a latch was removed, which is the same as
+not testing it.
+
+Request: `{"params": {"focus": true}}`. Response: `{}`.
+
+When mode 1004 (focus reporting) is negotiated, the UI writes `\x1b[I`
+(focused) / `\x1b[O` (unfocused) onto the active tab's PTY-input
+channel; tests pick it up via
+[`tab.capture_pty_input`](#tabcapture_pty_input-test-only-gated).
+
+**The two UIs disagree with no active tab.** The iced UI still applies
+every other side effect of a focus change (workspace state, drag/IME/
+rename teardown) and answers `{}` regardless; the Swift app answers
+`not-found` ("no active tab to drive focus on"). A harness driving both
+UIs should open a tab before calling this op.
+
+Implemented by both UIs.
+
+### `app.cursor_shape`
+
+Ungated read of the active tab's current W3C cursor name — the latest
+OSC 22 payload the terminal program requested, or `"default"` if none
+has landed yet (and `"default"` for OSC 22's empty-string reset form
+too, so callers can always assert against a non-empty name). A
+transient UI-owned link hover can override the last-requested shape
+while the pointer sits over a hyperlink.
+
+Request: `{"params": {}}`. Response:
+
+```json
+{"shape": "pointer"}
+```
+
+Reads the *active* tab implicitly — there is no `tab_id` param, and the
+params envelope is empty and strict. `internal: no UI attached` with no
+UI behind the socket. Used by the e2e suite to assert an OSC 22 request
+actually applied.
+
+Implemented by both UIs.
+
+### `app.active_terminal_focused`
+
+Ungated read of whether the active tab's terminal currently owns the
+UI's *logical* keyboard route. Deliberately independent of native
+toplevel or compositor focus: an in-app overlay (the palette, a modal)
+can hold real OS focus while this reads `false`, because the overlay
+owns the keyboard route instead.
+
+Request: `{"params": {}}`. Response:
+
+```json
+{"focused": true}
+```
+
+`internal: no UI attached` with no UI behind the socket.
+
+Implemented only by the iced UI; the Swift Mac app has no case for this
+op and answers `unknown-op`.
+
+### `app.selected_tab_id`
+
+Ungated read of the active project's on-screen selected tab id — UI
+truth, for asserting the core and the displayed tab agree.
+`"0"` when nothing is selected.
+
+Request: `{"params": {}}`. Response:
+
+```json
+{"tab_id": "7"}
+```
+
+Under `local-backend = session` this reads the slot's own on-screen
+selected tab — the same UI-owned reading
+[`identify.active_tab_id`](#identify), the title bar, and the tab strip
+take (plan 063 §D10); see [A UI socket under `local-backend =
+session`](#a-ui-socket-under-local-backend-session). `internal: no UI
+attached` with no UI behind the socket.
+
+Implemented only by the iced UI; the Swift Mac app has no case for this
+op and answers `unknown-op`.
 
 ### `app.render_stats` *(iced UI only)*
 
@@ -1614,6 +1810,34 @@ this `true`; the real prompt/click is the morning checklist (#285).
 Implemented by both UIs, macOS only — unlike `app.menu_dump` above and
 the other macOS-gated ops around it, which are iced only and have no
 Swift counterpart.
+
+### `window.resize` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Programmatically set the
+running UI window's logical size — the harness driver behind the
+sidebar-layout regression suite (`tools/roosttest`), so a resize can be
+pinned without a real pointer or window-manager event.
+
+Request: `{"params": {"width": 1100.0, "height": 700.0}}`. Response: `{}`.
+
+`width` / `height` are the window's logical **content** size (matches
+iced's `set_inner_size`; the Mac handler converts to the outer frame so
+both UIs land on the same content rect for the same call). Both must be
+finite and `> 0` — `invalid-param` otherwise, checked before the gate,
+so a malformed size is rejected the same way whether or not test mode
+is on.
+
+Some Wayland compositors retain authority over toplevel size and may
+ignore the request outright; the iced UI applies the requested geometry
+to its own state immediately regardless, and a compositor `Resized`
+event afterward remains authoritative if one arrives.
+
+Under `local-backend = session` this stays UI-owned — the window
+belongs to this process, not the slot; see [A UI socket under
+`local-backend = session`](#a-ui-socket-under-local-backend-session).
+
+Implemented by both UIs.
 
 ### `sidebar.set_width` *(test-only — gated)*
 
