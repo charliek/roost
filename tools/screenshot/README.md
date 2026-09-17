@@ -34,6 +34,13 @@ isolates them:
 Both UIs can run side by side on macOS; their profiles keep sockets,
 locks, logs, and state distinct.
 
+**The GL fallback renderer.** Under the GLES/GL fallback (rather than
+Vulkan/Metal), `roostctl screenshot` can return geometry without text
+and a frozen frame (#496). Check which renderer is live from the iced
+UI log's `Selected: AdapterInfo { … backend: … }` line
+(`RUST_LOG=info` or above); use `tools/wayland/weston-run.sh`
+(headless weston) for a capture you can trust the renderer of.
+
 ## Quick start
 
 ```bash

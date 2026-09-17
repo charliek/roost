@@ -51,7 +51,11 @@ roostctl --socket "$ROOST_SOCKET" set-title --tab "$ROOST_TAB_ID" --title "build
 ```
 
 See the [CLI reference](../reference/cli.md) and the
-[IPC wire format](../reference/ipc.md) for the full op set.
+[IPC wire format](../reference/ipc.md) for the full op set. The
+[Automation](automation.md) guide covers the fuller picture for a
+script or an agent driving Roost this way — the model, the target
+policy, `wait`/`events`, and the two-connection recipe for a raw-socket
+client that wants to follow events instead of polling.
 
 ---
 

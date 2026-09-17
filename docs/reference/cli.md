@@ -39,6 +39,7 @@ roostctl [--socket <PATH>] [--target <mac|linux|iced>] [--json] <COMMAND>
 | `doctor` | Read-only diagnosis of the Roost integration (target, socket, shell, tab, agent hooks) |
 | `session start` / `stop` / `status` | Start, stop, or inspect the headless `roost-session` daemon |
 | `rpc <op> [params]` | Call any IPC op directly by name, bypassing every named verb |
+| `skill` | Print the agent skill (`skills/roost/SKILL.md`), byte for byte as the plugin installs it |
 
 `--socket` overrides `ROOST_SOCKET`; one of the two must resolve to the running UI's socket. A
 session is not a UI: `session start|stop|status` address the session profile's own socket
@@ -70,6 +71,7 @@ stdout:
 | `open` | `{"project", "tab", "created"}` — always, `--json` or not: an agent verb, not a human-typed one; see [`open`](#open) |
 | `rpc` | Not affected by the flag at all — see [`rpc`](#rpc) below |
 | `events` | Not affected either: always one JSON line per event — see [`events`](#events) |
+| `skill` | `{"topic": "roost", "format": "markdown", "content": "…"}` — always the same skill `--json` or not; see [`skill`](#skill) |
 
 Without `--json`, every command prints what it always has. An error is
 never written to stdout either way — see [Exit codes](#exit-codes).
@@ -754,6 +756,25 @@ that needs `--tab` or `ROOST_TAB_ID` to guard a mutation (`tab close`,
 `tab send`, …) stays that named verb: `rpc tab.write` with a hand-picked
 `tab_id` skips none of that verb's own checks, it just skips the CLI's
 tab-resolution convenience.
+
+## `skill`
+
+Print the agent skill — the same `skills/roost/SKILL.md` the [Claude
+Code plugin and `npx skills add`](../guides/agent-skill.md#install)
+install, byte for byte, so the binary and the published skill cannot
+disagree:
+
+```bash
+roostctl skill              # the skill as markdown, on stdout
+roostctl skill --json       # {"topic","format","content"}
+```
+
+Needs no running Roost — an agent reads the skill to learn how to find
+one. `--json` prints `{"topic": "roost", "format": "markdown",
+"content": "<the skill's markdown>"}`; without it, the raw markdown
+goes to stdout. See the [Agent Skill](../guides/agent-skill.md) guide
+for what the skill covers and how it relates to [Agent
+Hooks](../guides/agents.md).
 
 ## `doctor`
 

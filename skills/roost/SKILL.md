@@ -48,6 +48,7 @@ Do not bake syntax from memory or from the examples below; read `--help` before 
 Every verb accepts `--json`, before or after the verb, and then prints its result as JSON on stdout. A failure goes to stderr as `{"error":{"code","message"}}` under `--json`, and as `roostctl: <code>: <message>` without it. `open`, `project ensure`, `events`, and `rpc` always print JSON. The hook-writing verbs `agent ensure`, `agent set`, `agent install`, and `agent uninstall` differ: when part of their work fails they exit 1 with their report on stdout and no error envelope.
 
 The full reference is <https://charliek.github.io/roost/reference/cli/>.
+The automation guide is <https://charliek.github.io/roost/guides/automation/>.
 
 ## Understand projects, tabs, and state
 
