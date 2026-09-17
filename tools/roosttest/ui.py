@@ -903,14 +903,19 @@ def _ensure_mac_bundle(app: Path, mac_dir: Path, *, runner=subprocess.run) -> No
     global _MAC_BUNDLED_ONCE
     if _MAC_BUNDLED_ONCE:
         return
-    if os.environ.get("ROOST_MAC_NO_BUNDLE") == "1":
-        if not app.is_dir():
-            raise FileNotFoundError(
-                f"ROOST_MAC_NO_BUNDLE=1 but no bundle at {app}; run "
-                "./mac/scripts/bundle.sh debug first"
-            )
-    else:
+    opted_out = os.environ.get("ROOST_MAC_NO_BUNDLE") == "1"
+    if not opted_out:
         runner(["./scripts/bundle.sh", "debug"], cwd=mac_dir, check=True)
+    # The executable, not the directory: a partial bundle has the one
+    # without the other, and nothing can launch or stat it.
+    binary = _mac_bundle_binary(app)
+    if not binary.is_file():
+        raise FileNotFoundError(
+            f"ROOST_MAC_NO_BUNDLE=1 but no bundle executable at {binary}; run "
+            "./mac/scripts/bundle.sh debug first"
+            if opted_out
+            else f"bundle.sh finished but left no executable at {binary}"
+        )
     # Only once the step succeeded: a failed build must not leave a later
     # relaunch in this process running the old bundle unchecked.
     _MAC_BUNDLED_ONCE = True

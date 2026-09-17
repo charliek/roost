@@ -12,6 +12,7 @@ import uuid
 import pytest
 from client import RoostError
 from eventstream import EventStream
+import ui
 
 
 EXPECTED_APP_IDS = {
@@ -90,8 +91,11 @@ def test_identify_names_what_this_socket_serves_and_which_process_it_is(roost, t
         sorted(ops)
     )
     assert not ops & {"session.identify", "session.stop"}, sorted(ops)
-    test_mode = os.environ.get("ROOST_TEST_MODE") == "1"
-    assert ("tab.feed_pty_bytes" in ops) == test_mode, sorted(ops)
+    # Only a UI this harness launched carries this process's
+    # ROOST_TEST_MODE; a reused one could have been started either way.
+    if ui.session_state_dir() is not None:
+        test_mode = os.environ.get("ROOST_TEST_MODE") == "1"
+        assert ("tab.feed_pty_bytes" in ops) == test_mode, sorted(ops)
     assert len(first["instance_id"]) == 16, first["instance_id"]
     assert roost.identify()["instance_id"] == first["instance_id"]
 

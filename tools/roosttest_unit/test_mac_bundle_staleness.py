@@ -136,6 +136,21 @@ class MacBundleStalenessTests(unittest.TestCase):
                 ui._ensure_mac_bundle(app, mac_dir, runner=runner)
         self.assertEqual(runner.call_count, 2)
 
+    def test_a_bundle_without_its_executable_is_refused_every_time(self) -> None:
+        mac_dir = _make_mac_dir(self._root, time.time())
+        partial = self._root / "Roost.app"
+        (partial / "Contents" / "MacOS").mkdir(parents=True)
+        runner = Mock()
+        with patch.dict(os.environ, {"ROOST_MAC_NO_BUNDLE": "1"}):
+            for _ in range(2):
+                with self.assertRaisesRegex(FileNotFoundError, "ROOST_MAC_NO_BUNDLE=1"):
+                    ui._ensure_mac_bundle(partial, mac_dir, runner=runner)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ROOST_MAC_NO_BUNDLE", None)
+            with self.assertRaisesRegex(FileNotFoundError, "left no executable"):
+                ui._ensure_mac_bundle(partial, mac_dir, runner=runner)
+        runner.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
