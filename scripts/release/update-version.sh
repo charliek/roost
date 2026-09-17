@@ -4,6 +4,8 @@
 # Single source of truth is [workspace.package].version in Cargo.toml.
 # Cargo.lock is regenerated so the per-member entries match (every
 # workspace member crate inherits via `version.workspace = true`).
+# `.claude-plugin/plugin.json` carries the same version for the Claude
+# Code plugin that ships `skills/roost`.
 #
 # `pyproject.toml` in this repo is for the test harness only — it has
 # its own version cadence and is NOT touched by releases.
@@ -88,4 +90,19 @@ if ! grep -q "^version = \"$V\"" Cargo.lock; then
   exit 1
 fi
 
-echo "Bumped Cargo.toml + Cargo.lock to $V"
+# 5. Bump the Claude Code plugin manifest, which Claude Code reads at
+#    install/update time to decide whether the skill changed. Anchored to
+#    the two-space indent so only the top-level `version` key can match —
+#    a nested one would be indented deeper.
+PLUGIN_JSON=.claude-plugin/plugin.json
+sed -i.bak -E 's/^(  "version"[[:space:]]*:[[:space:]]*")[^"]*"/\1'"$V"'"/' "$PLUGIN_JSON"
+rm -f "$PLUGIN_JSON.bak"
+
+# 6. Verify it, for the reason step 2 verifies Cargo.toml: a sed that
+#    matches nothing still exits 0.
+if ! grep -q "^  \"version\": \"$V\",\$" "$PLUGIN_JSON"; then
+  echo "error: $PLUGIN_JSON's top-level \"version\" did not update to $V." >&2
+  exit 1
+fi
+
+echo "Bumped Cargo.toml + Cargo.lock + $PLUGIN_JSON to $V"

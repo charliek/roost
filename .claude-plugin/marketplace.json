@@ -1,0 +1,15 @@
+{
+  "name": "roost",
+  "description": "Roost skills for driving the Roost terminal multiplexer from your agent.",
+  "owner": {
+    "name": "Charlie Knudsen",
+    "url": "https://github.com/charliek"
+  },
+  "plugins": [
+    {
+      "name": "roost",
+      "source": "./",
+      "description": "Guidance for driving Roost, the terminal multiplexer for coding agents, through roostctl: open project tabs, send input, read a tab's screen, wait on tab state, watch events, and notify the user."
+    }
+  ]
+}

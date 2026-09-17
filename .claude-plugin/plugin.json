@@ -1,0 +1,13 @@
+{
+  "name": "roost",
+  "version": "0.0.19",
+  "description": "Guidance for driving Roost, the terminal multiplexer for coding agents, through roostctl: open project tabs, send input, read a tab's screen, wait on tab state, watch events, and notify the user.",
+  "author": {
+    "name": "Charlie Knudsen",
+    "url": "https://github.com/charliek"
+  },
+  "homepage": "https://github.com/charliek/roost",
+  "repository": "https://github.com/charliek/roost",
+  "license": "MIT",
+  "keywords": ["roost", "skills", "terminal", "multiplexer", "agents"]
+}

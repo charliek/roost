@@ -35,6 +35,7 @@
 //!   roostctl host {add,list,remove,connect,disconnect}
 //!     add: --label, --target, [--verify]; the last three: --id
 //!   roostctl rpc <op> [params]
+//!   roostctl skill
 //!
 //! `--json` is global: every verb but the two hooks prints one JSON
 //! document with it, and every failure goes through [`CliError`]'s one
@@ -121,6 +122,11 @@ const MUTATING_TAB_VERBS: &[&str] = &[
     "tab focus",
 ];
 
+/// The agent skill `roostctl skill` prints: the repo's `skills/roost/SKILL.md`,
+/// which the Claude Code plugin and `npx skills add` also install, so the
+/// binary and the published skill cannot disagree.
+const SKILL: &str = include_str!("../../../skills/roost/SKILL.md");
+
 const NO_TAB: &str = "no --tab and ROOST_TAB_ID is unset; refusing to guess the active tab for \
                       a command that changes it — `roostctl tab list` shows ids";
 
@@ -145,7 +151,9 @@ const NO_TAB: &str = "no --tab and ROOST_TAB_ID is unset; refusing to guess the 
                   Exit codes: 0 ok, 1 failed, 2 usage, 3 `session status` \
                   found no session, 4 `wait` timed out. A failure prints \
                   `roostctl: <code>: <message>` on stderr, or \
-                  {\"error\":{\"code\",\"message\"}} under --json."
+                  {\"error\":{\"code\",\"message\"}} under --json.",
+    after_help = "Driving Roost from an agent? `roostctl skill` prints the skill; \
+                  docs: https://charliek.github.io/roost/guides/automation/"
 )]
 struct Args {
     /// Explicit socket path. Highest precedence; overrides
@@ -434,6 +442,11 @@ enum Cmd {
         /// stdin. Omitted ⇒ `{}`.
         params: Option<String>,
     },
+    /// Print the agent skill: the `SKILL.md` that teaches a coding agent
+    /// to drive Roost with this CLI, byte for byte as the plugin installs
+    /// it. Needs no running Roost. `--json` prints
+    /// `{"topic":"roost","format":"markdown","content"}`.
+    Skill,
     /// Diagnose the Roost integration: target resolution, socket, UI
     /// identity, shell-integration contract, the selected tab's four
     /// agent axes, and the Claude hook install. Read-only — it reports
@@ -878,6 +891,9 @@ async fn run(args: Args, tab_env: Option<&str>, cwd_env: Option<&str>) -> Result
         // alias of `agent install claude`, which only reads and writes
         // dotfiles.
         Cmd::Claude(ClaudeCmd::Install) => claude_install(json),
+        // An agent reads the skill to learn how to find a Roost, so it
+        // must print with none running.
+        Cmd::Skill => write_skill(&mut std::io::stdout().lock(), json),
         // `session` addresses the session profile's own socket, which no
         // target selector resolves (and must not — see
         // `roost_ipc::target`'s HS-0 fences). `start` also has to work
@@ -1561,10 +1577,33 @@ async fn run_on_ui(
         Cmd::ClaudeHook { .. }
         | Cmd::AgentHook { .. }
         | Cmd::Claude(_)
+        | Cmd::Skill
         | Cmd::Doctor { .. }
         | Cmd::Session(_) => unreachable!("`run` serves these without the UI socket"),
     }
     Ok(0)
+}
+
+/// `skill`'s output. A reader that hung up (`roostctl skill | head`) got
+/// what it wanted, so that is success, as it is for `events`.
+fn write_skill(out: &mut impl Write, json: bool) -> Result<i32, CliError> {
+    let body = if json {
+        let value = serde_json::json!({
+            "topic": "roost",
+            "format": "markdown",
+            "content": SKILL,
+        });
+        serde_json::to_string_pretty(&value)
+            .map_err(|e| CliError::Failed(format!("encode the skill as JSON: {e}")))?
+            + "\n"
+    } else {
+        SKILL.to_string()
+    };
+    match out.write_all(body.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => Ok(0),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(0),
+        Err(e) => Err(CliError::Failed(format!("write the skill: {e}"))),
+    }
 }
 
 /// `--json`'s output: one pretty-printed document on stdout.
@@ -3067,6 +3106,7 @@ mod tests {
         &["host", "connect", "--id", "a"],
         &["host", "disconnect", "--id", "a"],
         &["rpc", "tab.list"],
+        &["skill"],
         &["doctor"],
     ];
 
@@ -3981,5 +4021,419 @@ mod tests {
             .collect();
         classified.sort();
         assert_eq!(with_tab, classified);
+    }
+
+    // `roostctl skill` and the SKILL.md it embeds (plan 066 §3.3).
+
+    /// The executable fence marker; a harness replays exactly these.
+    const RECIPE_FENCE: &str = "```bash roost-recipe";
+
+    /// Each ` ```bash roost-recipe ` fence as its logical lines — a
+    /// trailing `\` joins the next line — with the SKILL.md line number
+    /// each starts on.
+    fn recipe_fences(doc: &str) -> Vec<Vec<(usize, String)>> {
+        let mut fences = Vec::new();
+        let mut open: Option<Vec<(usize, String)>> = None;
+        let mut continued: Option<(usize, String)> = None;
+        for (index, line) in doc.lines().enumerate() {
+            let number = index + 1;
+            let Some(fence) = open.as_mut() else {
+                if line.trim_end() == RECIPE_FENCE {
+                    open = Some(Vec::new());
+                } else {
+                    assert!(
+                        !(line.starts_with("```") && line.contains("roost-recipe")),
+                        "SKILL.md:{number}: a misspelt recipe fence would be skipped: {line}"
+                    );
+                }
+                continue;
+            };
+            if line.trim_end() == "```" {
+                assert!(
+                    continued.is_none(),
+                    "SKILL.md:{number}: a fence ends on `\\`"
+                );
+                if let Some(fence) = open.take() {
+                    fences.push(fence);
+                }
+                continue;
+            }
+            let (start, mut text) = continued.take().unwrap_or((number, String::new()));
+            match line.strip_suffix('\\') {
+                Some(head) => {
+                    text.push_str(head);
+                    continued = Some((start, text));
+                }
+                None => {
+                    text.push_str(line);
+                    fence.push((start, text));
+                }
+            }
+        }
+        assert!(open.is_none(), "SKILL.md ends inside a recipe fence");
+        fences
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum ShellToken {
+        Word(String),
+        /// `|`, `;`, `&`, `$(`, `)`, a redirection: whatever ends a command.
+        Operator,
+    }
+
+    /// `"$PWD"` → `/tmp`; any other variable (`$tab`, `$ROOST_TAB_ID`) → a
+    /// tab id, which is also a valid string for every other flag.
+    fn expand_variable(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+        let braced = chars.next_if_eq(&'{').is_some();
+        let mut name = String::new();
+        while let Some(c) = chars.next_if(|c| c.is_ascii_alphanumeric() || *c == '_') {
+            name.push(c);
+        }
+        if braced {
+            assert_eq!(
+                chars.next(),
+                Some('}'),
+                "only a plain ${{name}} is expanded"
+            );
+        }
+        if name.is_empty() {
+            return "$".into();
+        }
+        if name == "PWD" {
+            "/tmp".into()
+        } else {
+            "7".into()
+        }
+    }
+
+    /// Split one recipe line the way `sh` would, as far as recovering each
+    /// `roostctl` argv needs: quotes, escapes, variables, comments, and the
+    /// operators that end a command. A construct it does not model panics
+    /// rather than being skipped.
+    fn shell_tokens(line: &str) -> Vec<ShellToken> {
+        let mut tokens = Vec::new();
+        let mut word: Option<String> = None;
+        let mut chars = line.chars().peekable();
+        fn end(word: &mut Option<String>, tokens: &mut Vec<ShellToken>) {
+            tokens.extend(word.take().map(ShellToken::Word));
+        }
+        while let Some(c) = chars.next() {
+            match c {
+                c if c.is_whitespace() => end(&mut word, &mut tokens),
+                '#' if word.is_none() => break,
+                '\'' => {
+                    let text = word.get_or_insert_with(String::new);
+                    loop {
+                        match chars.next().expect("an unclosed single quote") {
+                            '\'' => break,
+                            c => text.push(c),
+                        }
+                    }
+                }
+                '"' => {
+                    let text = word.get_or_insert_with(String::new);
+                    loop {
+                        match chars.next().expect("an unclosed double quote") {
+                            '"' => break,
+                            '\\' => {
+                                let next = chars.next().expect("a trailing backslash");
+                                if !matches!(next, '"' | '\\' | '$' | '`') {
+                                    text.push('\\');
+                                }
+                                text.push(next);
+                            }
+                            '$' => {
+                                assert!(
+                                    chars.peek() != Some(&'('),
+                                    "unparsed: $( inside quotes in `{line}`"
+                                );
+                                text.push_str(&expand_variable(&mut chars));
+                            }
+                            '`' => panic!("unparsed: a backtick in `{line}`"),
+                            c => text.push(c),
+                        }
+                    }
+                }
+                '\\' => {
+                    let next = chars.next().expect("a trailing backslash");
+                    word.get_or_insert_with(String::new).push(next);
+                }
+                '$' if chars.peek() == Some(&'(') => {
+                    chars.next();
+                    end(&mut word, &mut tokens);
+                    tokens.push(ShellToken::Operator);
+                }
+                '$' => {
+                    let value = expand_variable(&mut chars);
+                    word.get_or_insert_with(String::new).push_str(&value);
+                }
+                '`' => panic!("unparsed: a backtick in `{line}`"),
+                '|' | ';' | '&' | '(' | ')' | '<' | '>' => {
+                    end(&mut word, &mut tokens);
+                    tokens.push(ShellToken::Operator);
+                }
+                c => word.get_or_insert_with(String::new).push(c),
+            }
+        }
+        end(&mut word, &mut tokens);
+        tokens
+    }
+
+    /// Every `roostctl` a recipe line runs, as the argv after the program
+    /// name, with the placeholders `N` and `X` given real values.
+    fn roostctl_argvs(line: &str) -> Vec<Vec<String>> {
+        let tokens = shell_tokens(line);
+        tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| **token == ShellToken::Word("roostctl".into()))
+            .map(|(at, _)| {
+                tokens[at + 1..]
+                    .iter()
+                    .map_while(|token| match token {
+                        ShellToken::Word(word) => Some(match word.as_str() {
+                            "N" => "7".to_string(),
+                            "X" => "review".to_string(),
+                            _ => word.clone(),
+                        }),
+                        ShellToken::Operator => None,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The splitter is what the parity test trusts, so it is pinned on the
+    /// shapes the recipes use.
+    #[test]
+    fn the_recipe_splitter_recovers_each_roostctl_argv() {
+        let strings = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            roostctl_argvs(
+                r#"tab=$(roostctl open --project X --cwd "$PWD" --json -- sh -c 'a; echo "b $?"' | jq -r .tab.id)"#
+            ),
+            vec![strings(&[
+                "open",
+                "--project",
+                "review",
+                "--cwd",
+                "/tmp",
+                "--json",
+                "--",
+                "sh",
+                "-c",
+                r#"a; echo "b $?""#,
+            ])]
+        );
+        assert_eq!(
+            roostctl_argvs("timeout 30 roostctl events --tab N | jq -c . # watch"),
+            vec![strings(&["events", "--tab", "7"])]
+        );
+        assert_eq!(
+            roostctl_argvs(
+                r#"roostctl wait --tab "$tab" --text 'a b'; roostctl tab dump --tab ${tab}"#
+            ),
+            vec![
+                strings(&["wait", "--tab", "7", "--text", "a b"]),
+                strings(&["tab", "dump", "--tab", "7"]),
+            ]
+        );
+        assert_eq!(
+            roostctl_argvs(
+                r#"roostctl tab send --tab N --bytes 'echo "x "y $?\n' && roostctl identify"#
+            ),
+            vec![
+                strings(&["tab", "send", "--tab", "7", "--bytes", r#"echo "x "y $?\n"#]),
+                strings(&["identify"]),
+            ]
+        );
+        assert!(roostctl_argvs("# roostctl identify").is_empty());
+    }
+
+    /// Every `roostctl` in every executable fence parses through clap, so
+    /// a recipe pins its options and not only its verb names.
+    #[test]
+    fn every_skill_recipe_parses_as_a_roostctl_command_line() {
+        let fences = recipe_fences(SKILL);
+        assert!(!fences.is_empty(), "SKILL.md has no `{RECIPE_FENCE}` fence");
+        for fence in &fences {
+            let mut invocations = 0;
+            for (number, line) in fence {
+                let argvs = roostctl_argvs(line);
+                if line.contains("roostctl") {
+                    assert!(
+                        !argvs.is_empty(),
+                        "SKILL.md:{number}: `{line}` names roostctl but runs none"
+                    );
+                }
+                for argv in argvs {
+                    invocations += 1;
+                    let full = std::iter::once("roostctl".to_string()).chain(argv.iter().cloned());
+                    if let Err(error) = Args::try_parse_from(full) {
+                        panic!("SKILL.md:{number}: `{line}` does not parse as {argv:?}:\n{error}");
+                    }
+                }
+            }
+            let first = fence.first().map_or(0, |(number, _)| *number);
+            assert!(
+                invocations > 0,
+                "the recipe fence at SKILL.md:{first} runs no roostctl"
+            );
+        }
+    }
+
+    /// The skill's rule about `--tab` is the agent-facing copy of
+    /// [`MUTATING_TAB_VERBS`], so a verb added there must be named here.
+    #[test]
+    fn the_skill_tab_rule_names_every_mutating_verb() {
+        let (_, rules) = SKILL.split_once("\n## Rules\n").expect("a Rules section");
+        let rules = rules.split("\n## ").next().unwrap_or(rules);
+        let mut items: Vec<String> = Vec::new();
+        let mut in_item = false;
+        for line in rules.lines() {
+            if let Some(start) = line.strip_prefix("- ") {
+                items.push(start.to_string());
+                in_item = true;
+            } else if line.trim().is_empty() || line.starts_with('|') {
+                in_item = false;
+            } else if in_item {
+                let item = items.last_mut().expect("a continued item");
+                item.push(' ');
+                item.push_str(line.trim());
+            }
+        }
+        let items: Vec<String> = items
+            .iter()
+            .map(|item| item.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect();
+        let rule = items
+            .iter()
+            .find(|item| item.contains("`--tab`"))
+            .expect("a Rules item about `--tab`");
+        assert!(rule.starts_with("Always pass `--tab`"), "{rule}");
+        for verb in MUTATING_TAB_VERBS {
+            assert!(
+                rule.contains(&format!("`{verb}`")),
+                "the --tab rule does not name `{verb}`: {rule}"
+            );
+        }
+    }
+
+    /// AC3: what `skill` prints is the file the plugin installs, read from
+    /// disk rather than through the same `include_str!`.
+    #[test]
+    fn skill_prints_skill_md_byte_for_byte() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/roost/SKILL.md");
+        let on_disk = std::fs::read_to_string(&path).expect("skills/roost/SKILL.md");
+
+        let mut printed = Vec::new();
+        assert_eq!(write_skill(&mut printed, false), Ok(0));
+        assert!(
+            printed == on_disk.as_bytes(),
+            "`roostctl skill` printed {} bytes, SKILL.md has {}",
+            printed.len(),
+            on_disk.len()
+        );
+
+        let mut printed = Vec::new();
+        assert_eq!(write_skill(&mut printed, true), Ok(0));
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&printed).expect("one JSON document");
+        assert_eq!(
+            envelope,
+            serde_json::json!({"topic": "roost", "format": "markdown", "content": on_disk})
+        );
+    }
+
+    #[test]
+    fn a_reader_that_hangs_up_on_skill_is_not_a_failure() {
+        struct Refuses(std::io::ErrorKind);
+        impl Write for Refuses {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(self.0.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(
+            write_skill(&mut Refuses(std::io::ErrorKind::BrokenPipe), false),
+            Ok(0)
+        );
+        let error = write_skill(&mut Refuses(std::io::ErrorKind::StorageFull), false)
+            .expect_err("a full disk is a failure");
+        assert_eq!(error.code(), "failed");
+    }
+
+    #[test]
+    fn the_skill_frontmatter_names_roost_and_says_when_to_use_it() {
+        let rest = SKILL
+            .strip_prefix("---\n")
+            .expect("SKILL.md opens with frontmatter");
+        let (front, _) = rest.split_once("\n---\n").expect("the frontmatter closes");
+        let field = |key: &str| {
+            front
+                .lines()
+                .find_map(|line| line.strip_prefix(key)?.strip_prefix(": "))
+        };
+        assert_eq!(field("name"), Some("roost"));
+        let description = field("description").expect("a description");
+        // Quoted: it holds `: `, which bare YAML would read as a mapping.
+        let text = description
+            .strip_prefix('"')
+            .and_then(|d| d.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("the description is not double-quoted: {description}"));
+        assert!(text.contains("Roost"), "{text}");
+    }
+
+    #[test]
+    fn the_plugin_manifests_carry_proxs_fields_at_the_workspace_version() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |rel: &str| {
+            std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+        };
+        let cargo = read("Cargo.toml");
+        let (_, package) = cargo
+            .split_once("\n[workspace.package]\n")
+            .expect("a [workspace.package] table");
+        let version = package
+            .lines()
+            .take_while(|line| !line.starts_with('['))
+            .find_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                (key.trim() == "version").then(|| value.trim().trim_matches('"'))
+            })
+            .expect("[workspace.package] version");
+
+        let plugin: serde_json::Value =
+            serde_json::from_str(&read(".claude-plugin/plugin.json")).expect("plugin.json");
+        assert_eq!(plugin["name"], "roost");
+        assert_eq!(plugin["version"], version);
+        assert_eq!(plugin["repository"], "https://github.com/charliek/roost");
+        for key in ["description", "homepage", "license"] {
+            assert!(
+                plugin[key].as_str().is_some_and(|value| !value.is_empty()),
+                "plugin.json {key}"
+            );
+        }
+        assert!(
+            plugin["author"]["name"]
+                .as_str()
+                .is_some_and(|name| !name.is_empty()),
+            "plugin.json author.name"
+        );
+        assert!(
+            plugin["keywords"]
+                .as_array()
+                .is_some_and(|keywords| keywords.iter().any(|k| k == "roost")),
+            "plugin.json keywords"
+        );
+
+        let marketplace: serde_json::Value =
+            serde_json::from_str(&read(".claude-plugin/marketplace.json"))
+                .expect("marketplace.json");
+        assert_eq!(marketplace["name"], "roost");
+        assert_eq!(marketplace["plugins"][0]["name"], "roost");
+        assert_eq!(marketplace["plugins"][0]["source"], "./");
     }
 }
