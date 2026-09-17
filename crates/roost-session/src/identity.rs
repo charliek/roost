@@ -105,7 +105,7 @@ pub(crate) fn legacy_kinds_env(test_mode: bool) -> bool {
 }
 
 /// What a running session advertises as `session.identify.payload_kinds`
-/// — every kind `tab.attach` can negotiate, in the order this session
+/// — every kind an attach can negotiate, in the order this session
 /// prefers them.
 ///
 /// GHOSTSNP first: it carries both screens, soft-wrap flags and per-cell

@@ -40,6 +40,7 @@ from pathlib import Path
 import pytest
 
 from client import RoostError, Timeout
+from conftest import skip_on_live_wayland_desktop
 from test_agent_palette import _seed
 from test_sidebar_agents import _agent_row, _set_agents_visible
 from test_sidebar_collapse_persistence import _toggle_to_visible
@@ -47,6 +48,10 @@ from util import BARE_SHELL_ARGV
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "screenshot"))
 import pngtool  # noqa: E402  — pure stdlib PNG decoder, imported not shelled out
+
+# This module's one test reads pixels off a real capture, so it needs
+# the harness's controlled compositor (issue #488).
+_skip_wayland = skip_on_live_wayland_desktop()
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 

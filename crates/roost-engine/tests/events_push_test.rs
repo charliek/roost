@@ -777,9 +777,10 @@ fn every_workspace_event_has_a_wire_name() {
                 tab_id: 5,
                 title: "t".into(),
                 body: "b".into(),
+                generation: 7,
             },
             ops::EVENT_NOTIFICATION_FIRED,
-            vec!["body", "tab_id", "title"],
+            vec!["body", "generation", "tab_id", "title"],
         ),
         (
             WorkspaceEvent::TabsReordered {

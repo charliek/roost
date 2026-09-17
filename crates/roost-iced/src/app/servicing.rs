@@ -5,6 +5,8 @@ use roost_ipc::messages::{SentFile, SkippedFile, TabSendFileResult};
 use roost_ui_model::file_transfer::{status, Refusal, Skipped, Target};
 use roost_ui_model::keys::HostId;
 
+use crate::host_conn::HostConnState;
+
 use super::file_transfer::{GestureOutcome, SentSource};
 use super::interactions::{host_reorder_call, ReorderTarget};
 use super::*;
@@ -587,10 +589,9 @@ fn notification_activation(
 /// plan 037 §4's non-goal; a connect mirrors current state, never a
 /// backlog.
 ///
-/// A session's own workspace has no window, so what it suppresses is
-/// decided by what its clients tell it: `session.set_focus` (plan 038
-/// §C6) states the tab this client is looking at, at every edge that
-/// moves it, and the session mutes a tab while any client says so.
+/// A session's own workspace has no window, so it suppresses nothing: it
+/// fires for every client and each one decides (#474). The deciding is
+/// [`App::apply_host_envelopes`]'s `Notify` arm.
 #[derive(Debug)]
 enum HostEnvelopeAction {
     Effect(roost_ipc::messages::TabEffectEvent),
@@ -601,6 +602,8 @@ enum HostEnvelopeAction {
     TabClosed(i64),
     /// The project is gone: retire every row under it.
     ProjectDeleted(i64),
+    /// The session's layout stopped — or started — reaching disk (#481).
+    Durability(Option<String>),
     /// A workspace fact the mirror already folded in, or an event from a
     /// newer session this client does not know. Both are silent by
     /// contract (`ipc.md` #versioning: old clients ignore new events).
@@ -610,7 +613,8 @@ enum HostEnvelopeAction {
 
 fn host_envelope_action(envelope: &roost_ipc::messages::EventEnvelope) -> HostEnvelopeAction {
     use roost_ipc::messages::{
-        ops, NotificationFiredEvent, ProjectDeletedEvent, TabClosedEvent, TabNotificationEvent,
+        ops, DurabilityChangedEvent, NotificationFiredEvent, ProjectDeletedEvent, TabClosedEvent,
+        TabNotificationEvent,
     };
     use serde::Deserialize;
     // Read out of the borrowed payload: `serde_json` deserializes from
@@ -643,7 +647,88 @@ fn host_envelope_action(envelope: &roost_ipc::messages::EventEnvelope) -> HostEn
             .map_or_else(HostEnvelopeAction::Undecodable, |event| {
                 HostEnvelopeAction::ProjectDeleted(event.project_id)
             }),
+        ops::EVENT_WORKSPACE_DURABILITY_CHANGED => decode::<DurabilityChangedEvent>(envelope)
+            .map_or_else(HostEnvelopeAction::Undecodable, |event| {
+                HostEnvelopeAction::Durability(event.error)
+            }),
         _ => HostEnvelopeAction::Ignore,
+    }
+}
+
+/// What a local workspace event leaves the `Local` durability line
+/// holding (#481): `None` for an event that says nothing about it, and
+/// otherwise the value it is now.
+///
+/// Two events move it, and they move it for opposite reasons.
+/// `DurabilityChanged` carries the new value. `Resync` carries none —
+/// it is what a *lagged* broadcast becomes, and `DurabilityChanged` is
+/// live-only, so whatever it announced during the gap is simply gone.
+/// The standing value is on the workspace, so a resync reads it back:
+/// the local analogue of the `session.identify` a host's resync re-runs.
+/// Without it a missed failure stays invisible and a missed recovery
+/// leaves the failure line standing for the rest of the session.
+fn local_durability_update(
+    event: &WorkspaceEvent,
+    workspace: &Workspace,
+) -> Option<Option<String>> {
+    match event {
+        WorkspaceEvent::DurabilityChanged { error } => Some(error.clone()),
+        WorkspaceEvent::Resync(_) => Some(workspace.persist_error()),
+        _ => None,
+    }
+}
+
+/// Retire a host's standing durability line — but only once the host is
+/// genuinely gone (#481).
+///
+/// A connection that drops says nothing about the remote disk: "on
+/// {host}: last save failed" is still true, and erasing it on the
+/// `Connecting` edge would take a real failure off the screen because
+/// the *transport* blinked, for the whole of a prolonged reconnect.
+/// While an attempt is in flight or scheduled the line stays and the
+/// next `session.identify` re-decides it. A settled disconnect, a
+/// stopped session or a build mismatch is the end of the ladder:
+/// nothing is going to re-read it, and a failure on a host that is gone
+/// is not one the user can act on. (An explicit removal retires it in
+/// `host_remove_requested`.)
+fn retire_host_durability(
+    host: &str,
+    state: Option<&HostConnState>,
+    durability: &mut BTreeMap<DurabilitySource, String>,
+) {
+    let retrying = match state {
+        Some(HostConnState::Connecting { .. }) => true,
+        Some(HostConnState::Disconnected(dropped)) => dropped.retry_in.is_some(),
+        Some(
+            HostConnState::Connected | HostConnState::Stopped | HostConnState::NeedsRestart(_),
+        )
+        | None => false,
+    };
+    if !retrying {
+        durability.remove(&DurabilitySource::Host(host.to_string()));
+    }
+}
+
+/// What [`App::apply_host_effect`] does with a `tab.effect` value, split
+/// out from the string match so the "an effect this build has no
+/// handler for is inert" contract is unit-testable without a live
+/// `App`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabEffectAction {
+    Bell,
+    ClipboardWrite,
+    /// `TabEffect` is an open list (#188, #364): a session ahead of
+    /// this build can name an effect this build has never heard of, and
+    /// the client's job is to ignore it, not refuse the envelope or
+    /// misroute it onto a handler it happens to resemble.
+    Ignored,
+}
+
+fn classify_tab_effect(effect: &str) -> TabEffectAction {
+    match effect {
+        roost_ipc::messages::TabEffect::BELL => TabEffectAction::Bell,
+        roost_ipc::messages::TabEffect::CLIPBOARD_WRITE => TabEffectAction::ClipboardWrite,
+        _ => TabEffectAction::Ignored,
     }
 }
 
@@ -920,6 +1005,59 @@ fn paste_only_keybind(action: &str) -> Result<KeybindAction, String> {
 /// [`creation_route`](super::creation_route) exists to refuse.
 pub(super) fn view_incarnation(incarnation: Option<HostId>) -> HostId {
     incarnation.unwrap_or(HostId::LOCAL)
+}
+
+/// Whether this window answers a `notification.fired` itself, rather
+/// than bannering it (#474).
+///
+/// A session fires for every client because only a client knows what its
+/// own window is showing; the one already reading the tab answers for
+/// all of them, and its `tab.clear_notification` takes the dot down
+/// wherever it is up rather than each client deciding separately what it
+/// can see.
+fn acknowledges(viewed: Option<TabKey>, fired: TabKey) -> bool {
+    viewed == Some(fired)
+}
+
+/// Which raise an acknowledgement names, given the one the fire carried.
+///
+/// The answer carries **the generation of the raise it read**, never the
+/// tab's latest. Over the round trip a second raise can land, and an
+/// acknowledgement that named the tab rather than the raise would erase
+/// a notification nobody has seen — see
+/// `TabClearNotificationParams::generation`.
+///
+/// `None` is the unconditional form, which is also what a fire carrying
+/// no generation at all gets: `0` is the wire's absence, not a raise —
+/// see [`roost_ipc::messages::NotificationFiredEvent::generation`].
+fn acknowledged_generation(generation: u64) -> Option<u64> {
+    (generation != 0).then_some(generation)
+}
+
+/// Drop the pending bit from the one tab this window is reading (#474).
+///
+/// Applied where a mirror's rows become UI state, which is the single
+/// place both attention surfaces are derived from: the sidebar and the
+/// tab strip paint the dot off these rows, and
+/// [`pending_notification_rows`] builds the inbox off the same ones. The
+/// mirror keeps the bit — it is the session's fact, and a resync must
+/// still read it back.
+///
+/// A client that is looking at the tab has already sent the
+/// acknowledgement that clears it everywhere, so painting it here would
+/// flash a dot and an inbox row on the one window that does not need
+/// telling, for exactly the round trip the ack takes. The in-process
+/// backend has no equivalent because its engine never sets the bit in
+/// this situation at all.
+fn clear_viewed_pending(projects: &mut [Project], host: HostId, viewed: Option<TabKey>) {
+    let Some(viewed) = viewed.filter(|tab| tab.host == host) else {
+        return;
+    };
+    for project in projects.iter_mut() {
+        for tab in project.tabs.iter_mut().filter(|tab| tab.id == viewed.tab) {
+            tab.has_notification = false;
+        }
+    }
 }
 
 /// The host half of plan 063 §D9's exit inputs, read off the bands and
@@ -1416,9 +1554,10 @@ impl App {
                         // blank while its snapshot filled up. The local
                         // attach does exactly this for the same reason.
                         // The resize half is a no-op on the wire: this
-                        // geometry is what `tab.attach` already asked
-                        // for, and a host handle drops `send_resize`
-                        // anyway (the attach machine owns that).
+                        // geometry is what the attach handshake already
+                        // asked for, and a host handle drops
+                        // `send_resize` anyway (the attach machine owns
+                        // that).
                         match tab.apply_geometry(
                             cols,
                             rows,
@@ -1531,8 +1670,15 @@ impl App {
             self.host_attach.remove(&key);
             return;
         };
+        let session_id = self.hosts.session_id_for(key.host);
         let _guard = self.runtime.enter();
-        attach.begin(ops, socket, &roost_vt::libghostty_build(), &self.feed_tx);
+        attach.begin(
+            ops,
+            session_id,
+            socket,
+            &roost_vt::libghostty_build(),
+            &self.feed_tx,
+        );
     }
 
     fn apply_host_tab_frame(
@@ -1607,7 +1753,15 @@ impl App {
                     task = task.then(self.apply_host_effect(host, &effect));
                 }
                 HostEnvelopeAction::Notify(fired) => {
-                    self.fire_notification(TabKey::new(host, fired.tab_id), fired.title, fired.body)
+                    let key = TabKey::new(host, fired.tab_id);
+                    if acknowledges(self.viewed_host_tab(), key) {
+                        self.send_host_clear_notification(
+                            key,
+                            acknowledged_generation(fired.generation),
+                        );
+                    } else {
+                        self.fire_notification(key, fired.title, fired.body);
+                    }
                 }
                 HostEnvelopeAction::ClearNotification(tab_id) => {
                     // The tab's id is kept, exactly as the local clear
@@ -1627,6 +1781,11 @@ impl App {
                 }
                 HostEnvelopeAction::ProjectDeleted(project_id) => {
                     self.retire_project_notifications(ProjectKey::new(host, project_id));
+                }
+                HostEnvelopeAction::Durability(error) => {
+                    if let Some(name) = self.hosts.owner_of(host) {
+                        self.set_durability(DurabilitySource::Host(name), error);
+                    }
                 }
                 HostEnvelopeAction::Undecodable(error) => tracing::debug!(
                     ?host, event = %envelope.event, %error,
@@ -1694,14 +1853,14 @@ impl App {
         effect: &roost_ipc::messages::TabEffectEvent,
     ) -> UiTask {
         let key = TabKey::new(host, effect.tab_id);
-        match effect.effect {
-            roost_ipc::messages::TabEffect::Bell => {
+        match classify_tab_effect(effect.effect.as_str()) {
+            TabEffectAction::Bell => {
                 if self.host_bells.insert(key) {
                     self.reconcile_notification_inbox();
                 }
                 UiTask::None
             }
-            roost_ipc::messages::TabEffect::ClipboardWrite => {
+            TabEffectAction::ClipboardWrite => {
                 let viewed = self.active_tab_key();
                 if apply_host_clipboard_effect(
                     &mut self.clipboard,
@@ -1714,6 +1873,14 @@ impl App {
                 } else {
                     UiTask::None
                 }
+            }
+            // TabEffect is an open list (#188, #364): a session ahead of
+            // this build can name an effect it has no handler for, and
+            // the contract is that it is inert here, not a decode
+            // failure or a silent misroute.
+            TabEffectAction::Ignored => {
+                tracing::debug!(%key, effect = %effect.effect, "unhandled tab effect; ignored");
+                UiTask::None
             }
         }
     }
@@ -2035,35 +2202,40 @@ impl App {
                             if let Err(error) = self.workspace.touch_host_connected(host) {
                                 tracing::debug!(%host, %error, "could not stamp last_connected");
                             }
-                            // A session mutes nothing until a client
-                            // says what it is looking at, and the
-                            // connect task cannot say — the selection is
-                            // the UI's. Told here, on the edge where the
-                            // queue is draining.
-                            self.push_host_focus();
-                            // Same edge, same reason. Every connect, with
-                            // this client's current config — see
+                            // On the edge where the queue is draining,
+                            // on every connect, with this client's
+                            // current config — see
                             // `HostConnSet::wire_agent_hooks`.
                             self.wire_host_agent_hooks(host);
                             // What this connect owed its landing (plan
                             // 063 §D12). Drained on the edge, so it is
                             // spent exactly once per connect.
                             task = task.then(self.settle_connect_purpose(host));
-                        } else if !matches!(
-                            self.hosts.state(host),
-                            Some(crate::host_conn::HostConnState::Connecting { .. })
-                        ) {
-                            // The attempt ended somewhere other than
-                            // `Connected` and nothing is retrying: a
-                            // purpose parked against a landing that is
-                            // not going to happen would otherwise fire
-                            // on some later connect nobody asked it for.
-                            if let Some(purpose) = self.connect_purposes.remove(host) {
-                                tracing::debug!(
-                                    %host,
-                                    ?purpose,
-                                    "dropping what a failed connect was going to do"
-                                );
+                        } else {
+                            // #481. Kept while the ladder is still
+                            // climbing — see `retire_host_durability`.
+                            retire_host_durability(
+                                host,
+                                self.hosts.state(host),
+                                &mut self.durability,
+                            );
+                            if !matches!(
+                                self.hosts.state(host),
+                                Some(crate::host_conn::HostConnState::Connecting { .. })
+                            ) {
+                                // The attempt ended somewhere other than
+                                // `Connected` and nothing is retrying: a
+                                // purpose parked against a landing that
+                                // is not going to happen would otherwise
+                                // fire on some later connect nobody
+                                // asked it for.
+                                if let Some(purpose) = self.connect_purposes.remove(host) {
+                                    tracing::debug!(
+                                        %host,
+                                        ?purpose,
+                                        "dropping what a failed connect was going to do"
+                                    );
+                                }
                             }
                         }
                         // Attributed (not a stale task's publication): the
@@ -2083,6 +2255,14 @@ impl App {
                     // the batch for the reconcile that rebuilds them.
                 }
                 EngineFeed::HostConnectFacts(host, facts) => {
+                    // The connect (and every resync) re-reads
+                    // `session.identify`, which is the only place a
+                    // client learns a durability failure it was not
+                    // connected for (#481).
+                    if let Some(name) = self.hosts.owner_of(host) {
+                        let error = facts.persist_error.clone();
+                        self.set_durability(DurabilitySource::Host(name), error);
+                    }
                     self.hosts.note_connect_facts(host, facts)
                 }
                 EngineFeed::ReconnectDue { host, request } => {
@@ -2107,6 +2287,9 @@ impl App {
                 EngineFeed::AgentHooksSet(done) => self.agent_hooks_applied(*done),
                 EngineFeed::AgentHooksSurvey(survey) => self.agent_hooks_surveyed(*survey),
                 EngineFeed::AgentHooksApplyFailed(error) => self.set_status(error),
+                EngineFeed::ConfigWriteFailed { key, error } => {
+                    self.set_status(format!("couldn't save {key}: {error}"))
+                }
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
                 EngineFeed::NotificationActivated { tab } => {
@@ -2205,11 +2388,22 @@ impl App {
     }
 
     fn apply_workspace_event(&mut self, event: WorkspaceEvent) {
+        // Decided ahead of the match because two events reach the same
+        // line by different routes, one of them carrying no value at all
+        // (#481).
+        if let Some(error) = local_durability_update(&event, &self.workspace) {
+            self.set_durability(DurabilitySource::Local, error);
+        }
         match event {
             WorkspaceEvent::NotificationFired {
                 tab_id,
                 title,
                 body,
+                // The in-process engine has already applied this
+                // window's focus rule — a raise that reaches here is one
+                // nobody was looking at — so there is nothing to
+                // acknowledge and no generation to name.
+                generation: _,
             } => {
                 // The workspace broadcast is one backend's id-space.
                 let tab = self.backend.tab_key(tab_id);
@@ -2244,9 +2438,11 @@ impl App {
             }
             // The bridge turns a lagged broadcast into a full-snapshot
             // resync; the batch's reconcile is the recovery, so there is
-            // nothing incremental left to apply here. Event-carried
-            // notification bodies are still the only casualty of lag —
-            // reconcile_notification_inbox rebuilds the rows themselves.
+            // nothing incremental left to apply here (the durability
+            // line, which no snapshot carries, was re-read above).
+            // Event-carried notification bodies are still the only
+            // casualty of lag — reconcile_notification_inbox rebuilds
+            // the rows themselves.
             WorkspaceEvent::Resync(_) => {}
             _ => {}
         }
@@ -2588,6 +2784,7 @@ impl App {
         // recents list taken at a different moment could offer back a
         // host the sidebar is already showing.
         self.recent_hosts = self.workspace.recent_hosts();
+        let viewed = self.viewed_host_tab();
         self.host_views = self
             .workspace
             .hosts()
@@ -2613,6 +2810,12 @@ impl App {
                 // Taken before `host.id` is moved into the view.
                 let reason = self.hosts.section_reason(&host.id).map(str::to_string);
                 let reduced_fidelity = self.hosts.reduced_fidelity(&host.id);
+                let view_host = view_incarnation(incarnation);
+                let mut projects = mirror
+                    .as_ref()
+                    .map(|mirror| mirror.projects.clone())
+                    .unwrap_or_default();
+                clear_viewed_pending(&mut projects, view_host, viewed);
                 super::HostView {
                     saved_id: host.id,
                     // The registry's label wins over the connection's:
@@ -2623,12 +2826,9 @@ impl App {
                     target: host.target,
                     reduced_fidelity,
                     reason,
-                    host: view_incarnation(incarnation),
+                    host: view_host,
                     state,
-                    projects: mirror
-                        .as_ref()
-                        .map(|mirror| mirror.projects.clone())
-                        .unwrap_or_default(),
+                    projects,
                     active_tab_id: mirror.as_ref().map_or(0, |mirror| mirror.active_tab_id),
                     agents: 0,
                 }
@@ -4088,6 +4288,27 @@ mod tests {
         assert_eq!(reduced[0].fidelity.as_deref(), Some("restart"));
     }
 
+    /// `TabEffect` is an open list (#188, #364): the known effects still
+    /// route to their own handler, and a value this build has never
+    /// heard of is `Ignored` rather than misrouted or refused. This is
+    /// the exhaustiveness pin the closed-enum version of this test used
+    /// to hold, carried over to the open-string shape.
+    #[test]
+    fn classify_tab_effect_routes_known_effects_and_ignores_the_rest() {
+        assert_eq!(
+            classify_tab_effect(roost_ipc::messages::TabEffect::BELL),
+            TabEffectAction::Bell
+        );
+        assert_eq!(
+            classify_tab_effect(roost_ipc::messages::TabEffect::CLIPBOARD_WRITE),
+            TabEffectAction::ClipboardWrite
+        );
+        assert_eq!(
+            classify_tab_effect("pointer-shape"),
+            TabEffectAction::Ignored
+        );
+    }
+
     /// Under fan-out every client receives every effect, so the
     /// clipboard asks *this* client's own question: is the tab the copy
     /// came from the one I am showing?
@@ -4097,7 +4318,9 @@ mod tests {
         let viewed = TabKey::new(host, 1);
         let copy = |tab: TabKey| roost_ipc::messages::TabEffectEvent {
             tab_id: tab.tab,
-            effect: roost_ipc::messages::TabEffect::ClipboardWrite,
+            effect: roost_ipc::messages::TabEffect::from(
+                roost_ipc::messages::TabEffect::CLIPBOARD_WRITE,
+            ),
             data: Some(roost_ipc::messages::bytes_base64::encode(b"copied")),
             target: Some(roost_ipc::messages::ClipboardEffectTarget::System),
         };
@@ -4189,7 +4412,7 @@ mod tests {
             "shutting-down",
             "replay-expired",
             "session-mismatch",
-            "too-many-tokens",
+            "too-many-attaches",
             "a-code-from-a-newer-session",
         ] {
             let failure = host_op_failure(&rejected(code));
@@ -4666,6 +4889,177 @@ mod tests {
         }
     }
 
+    /// Both directions route: a failure, and the `null` that retires it
+    /// (#481).
+    #[test]
+    fn a_hosts_durability_change_routes_in_both_directions() {
+        let op = roost_ipc::messages::ops::EVENT_WORKSPACE_DURABILITY_CHANGED;
+        assert!(matches!(
+            host_envelope_action(&envelope(op, serde_json::json!({"error": "disk full"}))),
+            HostEnvelopeAction::Durability(Some(error)) if error == "disk full"
+        ));
+        assert!(matches!(
+            host_envelope_action(&envelope(op, serde_json::json!({"error": null}))),
+            HostEnvelopeAction::Durability(None)
+        ));
+    }
+
+    /// Restores the mode whatever the test does, so a failed assertion
+    /// cannot leave a `chmod 500` directory behind for a later lane.
+    struct ReadOnlyDir {
+        path: std::path::PathBuf,
+        restore: u32,
+    }
+
+    impl ReadOnlyDir {
+        fn seal(path: &std::path::Path) -> ReadOnlyDir {
+            use std::os::unix::fs::PermissionsExt;
+            let restore = std::fs::metadata(path).unwrap().permissions().mode();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
+            ReadOnlyDir {
+                path: path.to_path_buf(),
+                restore,
+            }
+        }
+
+        fn unseal(&self) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &self.path,
+                std::fs::Permissions::from_mode(self.restore & 0o7777),
+            )
+            .unwrap();
+        }
+    }
+
+    impl Drop for ReadOnlyDir {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &self.path,
+                std::fs::Permissions::from_mode(self.restore & 0o7777),
+            );
+        }
+    }
+
+    /// **#481.** A lagged broadcast is a gap, and the only event that
+    /// announces durability is live-only — so both halves of the news
+    /// can be lost in one, and both are recovered off the workspace.
+    ///
+    /// Driven with a real `Workspace` on a real sealed directory: the
+    /// claim is that the resync *reads what is standing there*, and a
+    /// stub would only prove the match arm exists.
+    #[test]
+    fn a_local_resync_re_reads_what_the_gap_swallowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path().join("state.json"));
+        let project = workspace.create_project("p", "/").unwrap().id;
+        let resync = WorkspaceEvent::Resync(Vec::new());
+
+        let sealed = ReadOnlyDir::seal(dir.path());
+        let tab = workspace.open_tab(project, "/one", "a").unwrap().id;
+        let error = workspace.persist_error().expect("the write failed");
+
+        // The failure the client was too far behind to be told about.
+        assert_eq!(
+            local_durability_update(&resync, &workspace),
+            Some(Some(error)),
+            "a missed failure is learned from the standing value"
+        );
+
+        sealed.unseal();
+        workspace.set_tab_title(tab, "b").unwrap();
+
+        // And the recovery, which is the half that would otherwise leave
+        // the failure line up for the rest of the session.
+        assert_eq!(
+            local_durability_update(&resync, &workspace),
+            Some(None),
+            "a missed recovery retires it — a resync always states the line, \
+             because a gap explains nothing"
+        );
+
+        // Everything else is silent, and the carried event still wins on
+        // its own value rather than on a re-read.
+        assert_eq!(
+            local_durability_update(
+                &WorkspaceEvent::DurabilityChanged {
+                    error: Some("disk full".into())
+                },
+                &workspace
+            ),
+            Some(Some("disk full".to_string()))
+        );
+        assert_eq!(
+            local_durability_update(
+                &WorkspaceEvent::ActiveChanged {
+                    project_id: 1,
+                    tab_id: 1
+                },
+                &workspace
+            ),
+            None
+        );
+    }
+
+    /// **#481.** The remote disk and the wire to it are two different
+    /// facts. A transport drop puts the host on the ladder; nothing
+    /// about its last save changed, so the line stays until the ladder
+    /// ends.
+    #[test]
+    fn a_retrying_host_keeps_its_standing_failure_and_a_settled_one_retires_it() {
+        use crate::host_conn::state::Disconnected;
+        use std::time::Duration;
+
+        let failing = || {
+            BTreeMap::from([(
+                DurabilitySource::Host("alpha".into()),
+                "No space left on device".to_string(),
+            )])
+        };
+        let retrying = [
+            HostConnState::Connecting { previous: None },
+            HostConnState::Disconnected(Disconnected {
+                reason: "connection reset".into(),
+                detail: None,
+                retry_in: Some(Duration::from_secs(4)),
+            }),
+        ];
+        for state in &retrying {
+            let mut durability = failing();
+            retire_host_durability("alpha", Some(state), &mut durability);
+            assert_eq!(
+                durability,
+                failing(),
+                "{state:?} is the wire blinking, not the remote disk"
+            );
+        }
+
+        let over = [
+            HostConnState::Disconnected(Disconnected {
+                reason: "session ended".into(),
+                detail: Some("the daemon exited".into()),
+                retry_in: None,
+            }),
+            HostConnState::Stopped,
+        ];
+        for state in &over {
+            let mut durability = failing();
+            retire_host_durability("alpha", Some(state), &mut durability);
+            assert!(durability.is_empty(), "{state:?} is the end of the ladder");
+        }
+
+        // A host the set no longer knows is gone by definition.
+        let mut durability = failing();
+        retire_host_durability("alpha", None, &mut durability);
+        assert!(durability.is_empty());
+
+        // And it only ever touches its own host.
+        let mut durability = failing();
+        retire_host_durability("beta", None, &mut durability);
+        assert_eq!(durability, failing());
+    }
+
     /// The retiring edges a host owes, and the reason they are here at
     /// all: an attention row nothing takes down outlives the tab it
     /// names. The local workspace already retires both surfaces on
@@ -4690,6 +5084,41 @@ mod tests {
         ));
     }
 
+    /// One row of the shape a mirror or a local snapshot publishes, for
+    /// the derivations below. Only `id` and the pending bit vary — every
+    /// other field is what an attention rule never reads.
+    fn attention_tab(id: i64, has_notification: bool) -> roost_ipc::messages::Tab {
+        roost_ipc::messages::Tab {
+            id,
+            project_id: 4,
+            title: format!("tab-{id}"),
+            cwd: "/w/roost".into(),
+            state: roost_ipc::messages::TabState::None,
+            has_notification,
+            is_active: false,
+            user_titled: false,
+            position: 0,
+            created_at: 0,
+            last_active: 0,
+            hook_active: false,
+            shell_state: roost_ipc::agent::ShellState::default(),
+            agent_lifecycle: roost_ipc::agent::AgentLifecycle::default(),
+            ownership: None,
+        }
+    }
+
+    /// The project list [`attention_tab`]'s rows arrive in.
+    fn attention_projects(tabs: Vec<roost_ipc::messages::Tab>) -> Vec<Project> {
+        vec![Project {
+            id: 4,
+            name: "roost".into(),
+            cwd: "/w/roost".into(),
+            position: 0,
+            created_at: 0,
+            tabs,
+        }]
+    }
+
     /// The inbox derivation is one rule over both id-spaces, which is
     /// what makes a reconnect restore a host's attention rows: the
     /// mirror already says which tabs are pending, so the reconcile
@@ -4702,33 +5131,7 @@ mod tests {
     /// not look like two kinds of list.
     #[test]
     fn pending_rows_derive_identically_for_a_host_and_for_the_local_workspace() {
-        fn tab(id: i64, has_notification: bool) -> roost_ipc::messages::Tab {
-            roost_ipc::messages::Tab {
-                id,
-                project_id: 4,
-                title: format!("tab-{id}"),
-                cwd: "/w/roost".into(),
-                state: roost_ipc::messages::TabState::None,
-                has_notification,
-                is_active: false,
-                user_titled: false,
-                position: 0,
-                created_at: 0,
-                last_active: 0,
-                hook_active: false,
-                shell_state: roost_ipc::agent::ShellState::default(),
-                agent_lifecycle: roost_ipc::agent::AgentLifecycle::default(),
-                ownership: None,
-            }
-        }
-        let projects = vec![Project {
-            id: 4,
-            name: "roost".into(),
-            cwd: "/w/roost".into(),
-            position: 0,
-            created_at: 0,
-            tabs: vec![tab(7, true), tab(8, false)],
-        }];
+        let projects = attention_projects(vec![attention_tab(7, true), attention_tab(8, false)]);
 
         let host = HostId::new(3);
         let none = HashSet::new();
@@ -4753,33 +5156,7 @@ mod tests {
     /// not light the same number on another.
     #[test]
     fn a_bell_earns_a_row_the_reconcile_will_not_prune() {
-        fn tab(id: i64) -> roost_ipc::messages::Tab {
-            roost_ipc::messages::Tab {
-                id,
-                project_id: 4,
-                title: format!("tab-{id}"),
-                cwd: "/w/roost".into(),
-                state: roost_ipc::messages::TabState::None,
-                has_notification: false,
-                is_active: false,
-                user_titled: false,
-                position: 0,
-                created_at: 0,
-                last_active: 0,
-                hook_active: false,
-                shell_state: roost_ipc::agent::ShellState::default(),
-                agent_lifecycle: roost_ipc::agent::AgentLifecycle::default(),
-                ownership: None,
-            }
-        }
-        let projects = vec![Project {
-            id: 4,
-            name: "roost".into(),
-            cwd: "/w/roost".into(),
-            position: 0,
-            created_at: 0,
-            tabs: vec![tab(7), tab(8)],
-        }];
+        let projects = attention_projects(vec![attention_tab(7, false), attention_tab(8, false)]);
         let host = HostId::new(3);
 
         assert!(
@@ -4796,6 +5173,115 @@ mod tests {
         assert!(
             pending_notification_rows(HostId::new(9), &projects, &rung).is_empty(),
             "a bell is keyed at the host that heard it"
+        );
+    }
+
+    /// #474's paint half: a window reading a tab shows nothing pending
+    /// for it, on either attention surface.
+    ///
+    /// Both are asserted off the one filtered slice because that is the
+    /// claim — the sidebar and the tab strip draw the dot from these
+    /// rows and [`pending_notification_rows`] derives the inbox from the
+    /// same ones, so one filter covers both and cannot drift into two.
+    /// Without it the acknowledgement's round trip flashes a dot and a
+    /// row at the one person who is already looking.
+    #[test]
+    fn a_window_reading_a_tab_paints_neither_its_dot_nor_its_inbox_row() {
+        let pending = || attention_projects(vec![attention_tab(7, true), attention_tab(8, true)]);
+
+        let host = HostId::new(3);
+        let none = HashSet::new();
+
+        // No claim — an unfocused window, or one selected elsewhere —
+        // and the session's bit is the whole answer.
+        let mut unclaimed = pending();
+        clear_viewed_pending(&mut unclaimed, host, None);
+        assert!(unclaimed[0].tabs[0].has_notification);
+        assert_eq!(
+            pending_notification_rows(host, &unclaimed, &none).len(),
+            2,
+            "a window that is not reading them banners and lists both"
+        );
+
+        let mut read = pending();
+        clear_viewed_pending(&mut read, host, Some(TabKey::new(host, 7)));
+        assert!(!read[0].tabs[0].has_notification, "no dot on the tab read");
+        assert!(
+            read[0].tabs[1].has_notification,
+            "and every other tab still says what the session said"
+        );
+        let rows = pending_notification_rows(host, &read, &none);
+        assert_eq!(
+            rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            vec![TabKey::new(host, 8)],
+            "and no inbox row either, from the very same rows"
+        );
+
+        // A claim on one incarnation says nothing about the same bare
+        // number on another.
+        let mut elsewhere = pending();
+        clear_viewed_pending(&mut elsewhere, HostId::new(9), Some(TabKey::new(host, 7)));
+        assert!(elsewhere[0].tabs[0].has_notification);
+    }
+
+    /// #474's answer half: who acknowledges, and with what.
+    ///
+    /// The generation is the load-bearing part. It is the one the *fire*
+    /// carried, not the tab's latest — an acknowledgement that named the
+    /// tab instead would erase a raise that landed while it was in
+    /// flight, which is the race the field exists to close.
+    #[test]
+    fn the_window_reading_a_tab_acknowledges_the_raise_it_read() {
+        let host = HostId::new(3);
+        let read = TabKey::new(host, 7);
+
+        assert!(
+            acknowledges(Some(read), read),
+            "the window reading the tab answers"
+        );
+        assert_eq!(
+            acknowledged_generation(9),
+            Some(9),
+            "and names that raise, not the tab"
+        );
+        assert!(
+            !acknowledges(Some(TabKey::new(host, 8)), read),
+            "a window reading another tab banners instead"
+        );
+        assert!(
+            !acknowledges(Some(TabKey::new(HostId::new(9), 7)), read),
+            "and so does the same bare number on another incarnation"
+        );
+        assert!(
+            !acknowledges(None, read),
+            "an unfocused window, or one on a local tab, claims nothing"
+        );
+    }
+
+    /// #474: a fire that carried no generation is acknowledged
+    /// **unconditionally**, with the field off the wire entirely.
+    ///
+    /// The absence decodes as `0`, which no raise ever mints. Naming it
+    /// would ask the session for a match that can never come: the clear
+    /// takes nothing down, this window stops painting the dot anyway,
+    /// and every other client keeps the raise up forever.
+    #[test]
+    fn a_fire_without_a_generation_is_acknowledged_with_no_generation_on_the_wire() {
+        let HostEnvelopeAction::Notify(fired) = host_envelope_action(&envelope(
+            roost_ipc::messages::ops::EVENT_NOTIFICATION_FIRED,
+            serde_json::json!({"tab_id": "7", "title": "Claude Code", "body": "done"}),
+        )) else {
+            panic!("a fire decodes as a notification");
+        };
+        let read = TabKey::new(HostId::new(3), fired.tab_id);
+        assert!(acknowledges(Some(read), read));
+
+        let intent =
+            crate::app::clear_notification_intent(read, acknowledged_generation(fired.generation));
+        assert_eq!(
+            intent.params,
+            serde_json::json!({"tab_id": "7"}),
+            "the acknowledgement has no raise to name, so it names none"
         );
     }
 

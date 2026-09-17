@@ -1137,9 +1137,11 @@ mod tests {
     /// unshifted codepoint — the shape the now-removed GTK UI produced
     /// too, and what
     /// `roost-vt/tests/key_encoder_test.rs::ctrl_a_under_kitty_exact_bytes`
-    /// pins from the other side. The Swift app zeroes the codepoint for a
-    /// C0 press instead; plan 026 D3 accepts that divergence because the
-    /// legacy bytes agree.
+    /// pins from the other side. The Swift app agreed on the legacy bytes
+    /// but zeroed this codepoint until plan 065 §3.8 gave it the same
+    /// recovery; `KeyEncoderTests.recovered_chord_names_its_key_not_the_
+    /// layout_char_under_kitty` now pins the Mac to these same numbers,
+    /// so plan 026 D3's accepted divergence is closed.
     #[test]
     fn mac_control_chords_under_kitty_report_the_letter_codepoint() {
         let (mut encoder, terminal) = kitty_encoder_pair();

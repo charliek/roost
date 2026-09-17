@@ -58,12 +58,21 @@ from pathlib import Path
 import pytest
 
 from client import Timeout
+from conftest import skip_on_live_wayland_desktop
 from test_sidebar_collapse_persistence import _toggle_to_collapsed, _toggle_to_visible
 from test_sidebar_pixels import COLOR_TOL, _blobs, _capture, _pixel
 from util import BARE_SHELL_ARGV
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "screenshot"))
 import pngtool  # noqa: E402  — pure stdlib PNG decoder, imported not shelled out
+
+# Only these two are in scope for issue #488's self-skip (plan 065 §3.9);
+# `test_sidebar_divider_hairline_only_while_expanded` is a separate pixel
+# test this ticket does not cover.
+_skip_wayland = skip_on_live_wayland_desktop(
+    "test_overflowing_tab_strip_paints_no_scrollbar_band",
+    "test_notification_dots_paint_the_accent",
+)
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 

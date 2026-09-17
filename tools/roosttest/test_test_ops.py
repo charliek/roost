@@ -19,7 +19,7 @@ import time
 
 import pytest
 
-from client import scaled_timeout
+from client import RoostError, scaled_timeout
 from util import wait_tab_attached
 
 
@@ -117,3 +117,23 @@ class TestTestOps:
         # `#RRGGBB` format — six lowercase hex digits.
         assert re.fullmatch(r"#[0-9a-f]{6}", sample["fg"]), sample["fg"]
         assert re.fullmatch(r"#[0-9a-f]{6}", sample["bg"]), sample["bg"]
+
+    def test_capture_pty_input_refuses_a_non_canonical_id(self, roost, project):
+        """`tab.capture_pty_input` is `WireTabRef`-backed on the wire
+        (Rust `TabCapturePtyInputParams`), so the same #402 narrowing
+        that `tab.reorder`/`project.reorder`/`tab.dump`/
+        `tab.dump_resolved` got applies here too — see
+        `test_project_lifecycle.py::test_dump_ops_refuse_a_non_canonical_id`
+        for the ungated twins. This one has to live behind the
+        `TEST_MODE` skip (this class) rather than there: outside
+        `ROOST_TEST_MODE=1` the handler answers `not-enabled` before
+        it ever reaches decode (see `capturePtyInputRequiresTestMode`
+        in `IPCHandlerTests.swift`), which would make an
+        `invalid-param` assertion fail for the wrong reason.
+        """
+        for bad_id in ("+4", "04"):
+            with pytest.raises(RoostError) as exc:
+                roost.tab_capture_pty_input(bad_id)
+            assert exc.value.code == "invalid-param", (
+                f"tab.capture_pty_input with non-canonical id {bad_id!r}: {exc.value}"
+            )

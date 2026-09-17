@@ -30,11 +30,11 @@
 use std::time::Duration;
 
 use roost_ipc::messages::{
-    bytes_base64, ops, ActiveChangedEvent, AgentReportChangedEvent, EventBatch, EventEnvelope,
-    HookActiveChangedEvent, NotificationFiredEvent, ProjectCreatedEvent, ProjectDeletedEvent,
-    ProjectRenamedEvent, ProjectsReorderedEvent, TabClosedEvent, TabCwdChangedEvent, TabEffect,
-    TabEffectEvent, TabNotificationEvent, TabOpenedEvent, TabStateChangedEvent,
-    TabTitleChangedEvent, TabsReorderedEvent,
+    bytes_base64, ops, ActiveChangedEvent, AgentReportChangedEvent, DurabilityChangedEvent,
+    EventBatch, EventEnvelope, HookActiveChangedEvent, NotificationFiredEvent, ProjectCreatedEvent,
+    ProjectDeletedEvent, ProjectRenamedEvent, ProjectsReorderedEvent, TabClosedEvent,
+    TabCwdChangedEvent, TabEffect, TabEffectEvent, TabNotificationEvent, TabOpenedEvent,
+    TabStateChangedEvent, TabTitleChangedEvent, TabsReorderedEvent,
 };
 use roost_ipc::PushSource;
 use tokio::sync::broadcast::error::RecvError;
@@ -196,12 +196,14 @@ pub fn envelope(event: &WorkspaceEvent) -> Option<EventEnvelope> {
             tab_id,
             title,
             body,
+            generation,
         } => (
             ops::EVENT_NOTIFICATION_FIRED,
             to_value(NotificationFiredEvent {
                 tab_id: *tab_id,
                 title: title.clone(),
                 body: body.clone(),
+                generation: *generation,
             }),
         ),
         WorkspaceEvent::TabsReordered {
@@ -224,16 +226,25 @@ pub fn envelope(event: &WorkspaceEvent) -> Option<EventEnvelope> {
             to_value(match effect {
                 TabEffectKind::Bell => TabEffectEvent {
                     tab_id: *tab_id,
-                    effect: TabEffect::Bell,
+                    effect: TabEffect::from(TabEffect::BELL),
                     data: None,
                     target: None,
                 },
                 TabEffectKind::ClipboardWrite { text, target } => TabEffectEvent {
                     tab_id: *tab_id,
-                    effect: TabEffect::ClipboardWrite,
+                    effect: TabEffect::from(TabEffect::CLIPBOARD_WRITE),
                     data: Some(bytes_base64::encode(text.as_bytes())),
                     target: Some(*target),
                 },
+            }),
+        ),
+        // #481. A session has no view, so what it owes a client is the
+        // fact that its layout is not reaching disk; the client decides
+        // how to say so.
+        WorkspaceEvent::DurabilityChanged { error } => (
+            ops::EVENT_WORKSPACE_DURABILITY_CHANGED,
+            to_value(DurabilityChangedEvent {
+                error: error.clone(),
             }),
         ),
         WorkspaceEvent::ProjectsReordered { project_ids } => (
@@ -515,6 +526,7 @@ mod tests {
                     tab_id: 5,
                     title: "t".into(),
                     body: "b".into(),
+                    generation: 1,
                 },
             ],
         };

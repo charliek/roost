@@ -49,7 +49,7 @@ async fn a_session_serves_identifies_reaps_and_stops_clean() {
             AttachPayloadKind::from(AttachPayloadKind::VT),
         ],
         "both kinds, GHOSTSNP first: it is the higher-fidelity one, and \
-         `tab.attach` walks the client's offer against this order"
+         the handshake walks the client's offer against this order"
     );
     assert!(
         session.libghostty_build.starts_with("ghostty-"),

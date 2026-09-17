@@ -334,6 +334,13 @@ struct IPCIdentifyResult: Codable, Sendable {
     var appID: String
     var uiVersion: String
     var protocolVersion: UInt32
+    /// Why the last attempt to write `state.json` failed, absent while
+    /// the layout is landing (#481) — the Mac twin of Rust's
+    /// `IdentifyResult.persist_error`. `encodeIfPresent` keeps the key
+    /// off the wire entirely when there's no error, matching Rust's
+    /// `skip_serializing_if = "Option::is_none"` so existing golden
+    /// vectors still decode unchanged.
+    var persistError: String?
 
     enum CodingKeys: String, CodingKey {
         case socketPath = "socket_path"
@@ -344,13 +351,15 @@ struct IPCIdentifyResult: Codable, Sendable {
         case appID = "app_id"
         case uiVersion = "ui_version"
         case protocolVersion = "protocol_version"
+        case persistError = "persist_error"
     }
 
     init(
         socketPath: String, pid: Int32,
         activeProjectID: Int64, activeTabID: Int64,
         appLabel: String, appID: String,
-        uiVersion: String, protocolVersion: UInt32
+        uiVersion: String, protocolVersion: UInt32,
+        persistError: String? = nil
     ) {
         self.socketPath = socketPath
         self.pid = pid
@@ -360,6 +369,7 @@ struct IPCIdentifyResult: Codable, Sendable {
         self.appID = appID
         self.uiVersion = uiVersion
         self.protocolVersion = protocolVersion
+        self.persistError = persistError
     }
 
     init(from decoder: Decoder) throws {
@@ -372,6 +382,7 @@ struct IPCIdentifyResult: Codable, Sendable {
         self.appID = try c.decode(String.self, forKey: .appID)
         self.uiVersion = try c.decode(String.self, forKey: .uiVersion)
         self.protocolVersion = try c.decode(UInt32.self, forKey: .protocolVersion)
+        self.persistError = try c.decodeIfPresent(String.self, forKey: .persistError)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -384,6 +395,7 @@ struct IPCIdentifyResult: Codable, Sendable {
         try c.encode(appID, forKey: .appID)
         try c.encode(uiVersion, forKey: .uiVersion)
         try c.encode(protocolVersion, forKey: .protocolVersion)
+        try c.encodeIfPresent(persistError, forKey: .persistError)
     }
 }
 
@@ -435,25 +447,6 @@ struct IPCSessionIdentify: Codable, Equatable, Sendable {
         case libghosttyBuild = "libghostty_build"
         case sessionID = "session_id"
         case startedAt = "started_at"
-    }
-}
-
-/// `tab.attach` result — a single-use ticket for one data connection,
-/// plus the identity that scopes every seq on it. `serverEpoch` is
-/// random per session process and `tabGeneration` counts tab pipelines
-/// within it, so a resume against a restarted server can never be
-/// silently accepted. Mirrors Rust's `TabAttachResult`.
-struct IPCTabAttachResult: Codable, Equatable, Sendable {
-    var attachToken: String
-    var kind: IPCAttachPayloadKind
-    var serverEpoch: UInt64
-    var tabGeneration: UInt64
-
-    enum CodingKeys: String, CodingKey {
-        case attachToken = "attach_token"
-        case kind
-        case serverEpoch = "server_epoch"
-        case tabGeneration = "tab_generation"
     }
 }
 
@@ -746,12 +739,16 @@ let ipcProtocolVersion: UInt32 = 1
 ///
 /// At `5` every same-UID connection to a session became symmetric: no
 /// owner, no lease, no foreground. Effects fan out to every subscriber,
-/// `session.set_focus` is a per-connection statement about what that
-/// client is looking at, and the PTY is sized by the last interactor.
-/// `6` reshapes `session.set_agent_hooks`: it carries the agents a
-/// client's own `agent-hooks` key allows, and a client only ever
-/// *raises* the host's setting — `mode` and `skip` are gone, and a
-/// client that allows nothing sends no frame at all (plan 064 §3.3).
+/// and the PTY is sized by the last interactor. `6` reshapes
+/// `session.set_agent_hooks`: it carries the agents a client's own
+/// `agent-hooks` key allows, and a client only ever *raises* the host's
+/// setting — `mode` and `skip` are gone, and a client that allows
+/// nothing sends no frame at all (plan 064 §3.3). `6` also fans
+/// notifications out the way effects already were: a session suppresses
+/// nothing, and the client reading a tab answers its
+/// `notification.fired` with a generation-checked
+/// `tab.clear_notification` — the `session.set_focus` op that used to
+/// mute a tab for everyone is deleted (#474).
 ///
 /// The rule: a **session-socket change bumps this when a pre-bump peer
 /// could not refuse it meaningfully**, in either direction. A new event

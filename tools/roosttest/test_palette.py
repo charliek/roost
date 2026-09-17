@@ -17,7 +17,7 @@ import uuid
 import pytest
 import ui
 from client import RoostError
-from util import BARE_SHELL_ARGV, wait_tab_attached
+from util import BARE_SHELL_ARGV, wait_for_config_line, wait_tab_attached
 
 # The shared `palette` fixture (drive from closed, leave closed) lives in
 # conftest.py so the notification + launcher suites reuse it.
@@ -222,14 +222,6 @@ def _default_background(roost, tab_id: int) -> str:
     return cells[0]["bg"]
 
 
-def _theme_lines(path) -> list[str]:
-    return [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.partition("=")[0].strip() == "theme"
-    ]
-
-
 def test_theme_preview_reverts_and_confirm_persists_for_all_tabs(
     roost, project, palette
 ):
@@ -301,7 +293,7 @@ def test_theme_preview_reverts_and_confirm_persists_for_all_tabs(
             5.0,
             "confirmed theme reaches both existing tabs",
         )
-        assert _theme_lines(config_path) == [f"theme = {target['id']}"]
+        wait_for_config_line(config_path, "theme", f"theme = {target['id']}")
         assert ui.SEED_CONFIG.read_bytes() == seed_before
 
         third = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
@@ -322,5 +314,5 @@ def test_theme_preview_reverts_and_confirm_persists_for_all_tabs(
             5.0,
             "theme cleanup restores every fixture tab",
         )
-        assert _theme_lines(config_path) == [f"theme = {original['id']}"]
+        wait_for_config_line(config_path, "theme", f"theme = {original['id']}")
         assert ui.SEED_CONFIG.read_bytes() == seed_before

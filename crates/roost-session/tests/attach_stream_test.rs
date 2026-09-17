@@ -2,8 +2,8 @@
 //!
 //! Everything here runs against a live `serve()` — the same session a
 //! `roostctl session start` produces, minus the fork — and dials it the
-//! way a host client will: `tab.attach`, a second connection carrying
-//! the JSON handshake, the preamble, and then binary
+//! way a host client will: one data connection carrying the JSON
+//! handshake, the preamble, and then binary
 //! frames. The SNAP payload goes into plan 034's [`SnapshotDecoder`] and
 //! the decoded terminal is walked through the same densifier the session
 //! itself dumps from, so a passing assertion means the client and the
@@ -33,10 +33,10 @@ use std::time::{Duration, Instant};
 use roost_ipc::client::{ClientError, DataConnection};
 use roost_ipc::dataframe::{DataFrame, FRAME_EXIT, FRAME_INPUT, FRAME_PTY, FRAME_SNAP};
 use roost_ipc::messages::{
-    ops, AttachAccepted, AttachHandshake, AttachMode, AttachPayloadKind, ResolvedCell,
-    TabAttachParams, TabAttachResult, TabCapturePtyInputParams, TabCapturePtyInputResult,
-    TabCloseParams, TabDumpCursor, TabDumpResolvedResult, TabDumpResult, TabFeedPtyBytesParams,
-    TabWriteParams, WireTabRef,
+    ops, AttachAccepted, AttachHandshake, AttachHandshakeTerms, AttachMode, AttachPayloadKind,
+    ResolvedCell, TabCapturePtyInputParams, TabCapturePtyInputResult, TabCloseParams,
+    TabDumpCursor, TabDumpResolvedResult, TabDumpResult, TabFeedPtyBytesParams, TabWriteParams,
+    WireTabRef,
 };
 use roost_ipc::IpcClient;
 use roost_vt::{
@@ -49,7 +49,7 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 
 /// The viewport every test opens, resizes and attaches at — one
-/// geometry throughout, so `tab.attach` never reflows a tab out from
+/// geometry throughout, so an attach never reflows a tab out from
 /// under content the test just laid down.
 const COLS: u16 = 80;
 const ROWS: u16 = 24;
@@ -85,6 +85,9 @@ struct Session {
     served: tokio::task::JoinHandle<anyhow::Result<()>>,
     control: IpcClient,
     project_id: i64,
+    /// What every handshake has to name. A client reads it from
+    /// `session.identify`, and so does this.
+    session_id: String,
 }
 
 impl Session {
@@ -93,11 +96,13 @@ impl Session {
         let served = layout.spawn();
         let mut control = support::connect(&layout.socket_path()).await;
         let project_id = support::tabs(&mut control).await[0].project_id;
+        let session_id = support::session_identify(&mut control).await.session_id;
         Self {
             layout,
             served,
             control,
             project_id,
+            session_id,
         }
     }
 
@@ -106,7 +111,7 @@ impl Session {
     }
 
     /// A tab at [`COLS`]×[`ROWS`] parked on a child that produces
-    /// nothing. Sized here rather than at `tab.attach` so the attach
+    /// nothing. Sized here rather than at the handshake so the attach
     /// geometry is a no-op and the snapshot is taken at the same size
     /// the seeded content was laid out at.
     async fn quiet_tab(&mut self) -> i64 {
@@ -201,32 +206,43 @@ impl Session {
         .await;
     }
 
-    async fn attach(&mut self, tab_id: i64) -> TabAttachResult {
-        self.attach_as(tab_id, AttachPayloadKind::GHOSTTY_SNAPSHOT, COLS)
-            .await
+    /// The handshake a client sends for this tab: one line, one
+    /// connection — the terms ride the data connection.
+    fn handshake(&self, tab_id: i64) -> AttachHandshake {
+        self.handshake_as(tab_id, AttachPayloadKind::GHOSTTY_SNAPSHOT, COLS)
     }
 
     /// Attach offering exactly one payload kind, so the negotiation has
     /// nothing to choose between and the stream under test is the one
     /// the case names. `cols` is the tab's own width — an attach at any
     /// other geometry would reflow the content the test just laid down.
-    async fn attach_as(&mut self, tab_id: i64, kind: &str, cols: u16) -> TabAttachResult {
-        self.control
-            .call(
-                ops::TAB_ATTACH,
-                TabAttachParams {
-                    tab_id,
-                    kinds: vec![AttachPayloadKind::from(kind)],
-                    cols,
-                    rows: ROWS,
-                    cell_w_px: 0,
-                    cell_h_px: 0,
-                    libghostty_build: roost_vt::libghostty_build(),
-                    focus: true,
-                },
-            )
-            .await
-            .expect("tab.attach")
+    fn handshake_as(&self, tab_id: i64, kind: &str, cols: u16) -> AttachHandshake {
+        AttachHandshake::snapshot(tab_id, self.terms(kind, cols))
+    }
+
+    /// Ask for the stream from `from_seq` on, under the identity the
+    /// last accepted reply stated — the only place a client learns it.
+    fn resume(&self, tab_id: i64, identity: &AttachAccepted, from_seq: u64) -> AttachHandshake {
+        AttachHandshake::resume(
+            tab_id,
+            self.terms(AttachPayloadKind::GHOSTTY_SNAPSHOT, COLS),
+            from_seq,
+            identity.server_epoch,
+            identity.tab_generation,
+        )
+    }
+
+    fn terms(&self, kind: &str, cols: u16) -> AttachHandshakeTerms {
+        AttachHandshakeTerms {
+            session_id: self.session_id.clone(),
+            kinds: vec![AttachPayloadKind::from(kind)],
+            cols,
+            rows: ROWS,
+            cell_w_px: 0,
+            cell_h_px: 0,
+            libghostty_build: roost_vt::libghostty_build(),
+            focus: true,
+        }
     }
 
     /// Poll `tab.dump` until a row carries `needle`, and hand back that
@@ -284,19 +300,6 @@ impl Session {
 /// framing are all the library's — running the real session against the
 /// same code a host client uses is the point.
 struct DataClient<R>(DataConnection<R, OwnedWriteHalf>);
-
-fn handshake(token: &str) -> AttachHandshake {
-    AttachHandshake::snapshot(token)
-}
-
-fn resume_handshake(ticket: &TabAttachResult, from_seq: u64) -> AttachHandshake {
-    AttachHandshake::resume(
-        &ticket.attach_token,
-        from_seq,
-        ticket.server_epoch,
-        ticket.tab_generation,
-    )
-}
 
 /// Dial a data connection and run the handshake: one JSON line out, one
 /// JSON line back, then the preamble and binary for the rest of its life.
@@ -847,8 +850,7 @@ async fn fidelity_at_the_fence() {
     let server = session.dump_showing(tab_id, "SGR_FENCE").await;
     let server_resolved = support::tab_dump_resolved(&mut session.control, tab_id).await;
 
-    let ticket = session.attach(tab_id).await;
-    let (accepted, mut data) = dial(&session.socket(), handshake(&ticket.attach_token))
+    let (accepted, mut data) = dial(&session.socket(), session.handshake(tab_id))
         .await
         .expect("the handshake is accepted");
     assert_eq!(accepted.mode, AttachMode::Snapshot);
@@ -915,8 +917,7 @@ async fn continuation_round_trip() {
     session.feed(tab_id, b"CONT_HEAD \x1b[38;2;10;20").await;
     session.dump_showing(tab_id, "CONT_HEAD").await;
 
-    let ticket = session.attach(tab_id).await;
-    let (accepted, mut data) = dial(&session.socket(), handshake(&ticket.attach_token))
+    let (accepted, mut data) = dial(&session.socket(), session.handshake(tab_id))
         .await
         .expect("accepted");
     let (mut decoded, trace) =
@@ -975,9 +976,8 @@ async fn one_byte_at_a_time() {
     let server = session.dump_showing(tab_id, "SGR_FENCE").await;
     let server_resolved = support::tab_dump_resolved(&mut session.control, tab_id).await;
 
-    let ticket = session.attach(tab_id).await;
     let (accepted, mut data) =
-        dial_one_byte_at_a_time(&session.socket(), handshake(&ticket.attach_token))
+        dial_one_byte_at_a_time(&session.socket(), session.handshake(tab_id))
             .await
             .expect("accepted");
 
@@ -1035,8 +1035,7 @@ async fn input_echo_and_replies() {
     // confuse the accounting below.
     assert!(session.captured_input(tab_id).await.is_empty());
 
-    let ticket = session.attach(tab_id).await;
-    let (accepted, mut data) = dial(&session.socket(), handshake(&ticket.attach_token))
+    let (accepted, mut data) = dial(&session.socket(), session.handshake(tab_id))
         .await
         .expect("accepted");
     let (mut decoded, trace) =
@@ -1145,12 +1144,11 @@ async fn resume_ring_hit_and_miss() {
     session.feed(tab_id, &seed_bytes(30)).await;
     session.dump_showing(tab_id, "SGR_FENCE").await;
 
-    let ticket = session.attach(tab_id).await;
-    let (accepted, mut data) = dial(&session.socket(), handshake(&ticket.attach_token))
+    let (identity, mut data) = dial(&session.socket(), session.handshake(tab_id))
         .await
         .expect("accepted");
     let (mut decoded, trace) =
-        drain_until_finish(&mut data, accepted.seq, DecodeOpts::default()).await;
+        drain_until_finish(&mut data, identity.seq, DecodeOpts::default()).await;
     let mut last_seq = trace.last_seq;
     drop(data);
 
@@ -1158,10 +1156,12 @@ async fn resume_ring_hit_and_miss() {
     session.feed(tab_id, b"RESUME_MISSED\r\n").await;
     session.dump_showing(tab_id, "RESUME_MISSED").await;
     let stale = last_seq;
-    let ticket = session.attach(tab_id).await;
-    let (accepted, mut data) = dial(&session.socket(), resume_handshake(&ticket, last_seq + 1))
-        .await
-        .expect("accepted");
+    let (accepted, mut data) = dial(
+        &session.socket(),
+        session.resume(tab_id, &identity, last_seq + 1),
+    )
+    .await
+    .expect("accepted");
     assert_eq!(accepted.mode, AttachMode::Resume);
     assert_eq!(accepted.seq, last_seq, "the fence is resume_from_seq - 1");
     apply_pty_until(
@@ -1191,10 +1191,12 @@ async fn resume_ring_hit_and_miss() {
     session.feed(tab_id, &flood).await;
     session.dump_showing(tab_id, "RING_TAIL").await;
 
-    let ticket = session.attach(tab_id).await;
-    let (accepted, mut data) = dial(&session.socket(), resume_handshake(&ticket, stale + 1))
-        .await
-        .expect("accepted");
+    let (accepted, mut data) = dial(
+        &session.socket(),
+        session.resume(tab_id, &identity, stale + 1),
+    )
+    .await
+    .expect("accepted");
     assert_eq!(
         accepted.mode,
         AttachMode::Snapshot,
@@ -1237,8 +1239,7 @@ async fn exit_during_attach() {
     session.feed(tab_id, &seed_bytes(HISTORY_LINES)).await;
     let server = session.dump_showing(tab_id, "SGR_FENCE").await;
 
-    let ticket = session.attach(tab_id).await;
-    let (accepted, mut data) = dial(&session.socket(), handshake(&ticket.attach_token))
+    let (accepted, mut data) = dial(&session.socket(), session.handshake(tab_id))
         .await
         .expect("accepted");
     // Between the handshake and the first frame the test reads, so the
@@ -1320,8 +1321,7 @@ async fn resize_mid_history() {
     session.feed(tab_id, &seed_bytes(HISTORY_LINES)).await;
     session.dump_showing(tab_id, "SGR_FENCE").await;
 
-    let ticket = session.attach(tab_id).await;
-    let (accepted, mut data) = dial(&session.socket(), handshake(&ticket.attach_token))
+    let (accepted, mut data) = dial(&session.socket(), session.handshake(tab_id))
         .await
         .expect("accepted");
     let (decoded, trace) = drain_until_finish(
@@ -1503,16 +1503,17 @@ async fn vt_fidelity_at_the_fence() {
     let server_history = support::tab_dump_scrollback(&mut session.control, tab_id, u32::MAX).await;
     let server_resolved = support::tab_dump_resolved(&mut session.control, tab_id).await;
 
-    let ticket = session.attach_as(tab_id, AttachPayloadKind::VT, COLS).await;
-    assert_eq!(ticket.kind.as_str(), AttachPayloadKind::VT);
-    let (accepted, mut data) = dial(&session.socket(), handshake(&ticket.attach_token))
-        .await
-        .expect("the handshake is accepted");
+    let (accepted, mut data) = dial(
+        &session.socket(),
+        session.handshake_as(tab_id, AttachPayloadKind::VT, COLS),
+    )
+    .await
+    .expect("the handshake is accepted");
     assert_eq!(accepted.mode, AttachMode::Snapshot);
     assert_eq!(
         accepted.kind.as_str(),
         AttachPayloadKind::VT,
-        "the data connection reports what tab.attach negotiated"
+        "the accepted line reports what the handshake negotiated"
     );
 
     let payload = drain_vt_payload(&mut data, accepted.seq).await;
@@ -1593,10 +1594,9 @@ async fn a_vt_encode_waits_for_a_carryable_parser_state() {
     unfinished.extend(std::iter::repeat_n(b'x', 2 * 1024 * 1024));
     session.feed(tab_id, &unfinished).await;
 
-    let ticket = session.attach_as(tab_id, AttachPayloadKind::VT, COLS).await;
+    let asked = session.handshake_as(tab_id, AttachPayloadKind::VT, COLS);
     let socket = session.socket();
-    let token = ticket.attach_token.clone();
-    let mut dialing = tokio::spawn(async move { dial(&socket, handshake(&token)).await });
+    let mut dialing = tokio::spawn(async move { dial(&socket, asked).await });
     // A negative claim cannot be a poll: the only way to state "this has
     // not answered" is to give it a window and see it elapse.
     assert!(
@@ -1670,12 +1670,12 @@ async fn a_vt_payload_always_ends_in_one_empty_snap() {
     let flooded = session.quiet_tab_sized(WIDE_COLS).await;
     session.feed(flooded, &wide_seed_bytes(WIDE_LINES)).await;
     session.dump_showing(flooded, "WIDE_FENCE").await;
-    let ticket = session
-        .attach_as(flooded, AttachPayloadKind::VT, WIDE_COLS)
-        .await;
-    let (accepted, mut data) = dial(&session.socket(), handshake(&ticket.attach_token))
-        .await
-        .expect("accepted");
+    let (accepted, mut data) = dial(
+        &session.socket(),
+        session.handshake_as(flooded, AttachPayloadKind::VT, WIDE_COLS),
+    )
+    .await
+    .expect("accepted");
     // Seeded and confirmed landed before a single frame is read, so the
     // forwarder is provably still mid-payload with a tee record in hand.
     session.feed(flooded, b"VT_AFTER_TERMINATOR\r\n").await;
@@ -1710,12 +1710,12 @@ async fn a_vt_payload_always_ends_in_one_empty_snap() {
     let dying = session.tab(&["/bin/sh", "-c", "read _"], WIDE_COLS).await;
     session.feed(dying, &wide_seed_bytes(WIDE_LINES)).await;
     session.dump_showing(dying, "WIDE_FENCE").await;
-    let ticket = session
-        .attach_as(dying, AttachPayloadKind::VT, WIDE_COLS)
-        .await;
-    let (accepted, mut data) = dial(&session.socket(), handshake(&ticket.attach_token))
-        .await
-        .expect("accepted");
+    let (accepted, mut data) = dial(
+        &session.socket(),
+        session.handshake_as(dying, AttachPayloadKind::VT, WIDE_COLS),
+    )
+    .await
+    .expect("accepted");
     session.write_tab(dying, b"\n").await;
     session.wait_for_exit(dying).await;
     let payload = drain_vt_payload(&mut data, accepted.seq).await;
@@ -1740,10 +1740,12 @@ async fn a_vt_payload_always_ends_in_one_empty_snap() {
     drop(data);
 
     let fresh = session.quiet_tab().await;
-    let ticket = session.attach_as(fresh, AttachPayloadKind::VT, COLS).await;
-    let (accepted, mut data) = dial(&session.socket(), handshake(&ticket.attach_token))
-        .await
-        .expect("accepted");
+    let (accepted, mut data) = dial(
+        &session.socket(),
+        session.handshake_as(fresh, AttachPayloadKind::VT, COLS),
+    )
+    .await
+    .expect("accepted");
     let payload = drain_vt_payload(&mut data, accepted.seq).await;
     assert_eq!(
         payload.frames, 1,

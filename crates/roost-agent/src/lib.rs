@@ -60,6 +60,22 @@ pub enum Agent {
     Opencode,
 }
 
+/// Every agent Roost can wire, in the order `roostctl agent status`,
+/// `ensure` and the consent dialog report them, and the order the
+/// `agent-hooks` key is serialised in.
+///
+/// One table, here, because this is the smallest crate both the config
+/// parser and the install engine already link — a second copy kept in
+/// step by a parity test is how a name ends up supported by one half of
+/// Roost and invisible to the other.
+pub const ALL_AGENTS: [Agent; 5] = [
+    Agent::Claude,
+    Agent::Codex,
+    Agent::Grok,
+    Agent::Cursor,
+    Agent::Opencode,
+];
+
 impl Agent {
     /// Resolve the name `roostctl agent-hook <agent>` was given. Case
     /// and separators are normalized away, matching how every adapter

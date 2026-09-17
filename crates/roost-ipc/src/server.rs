@@ -27,7 +27,7 @@ use crate::dataframe::DataFrameReader;
 use crate::framing::{write_frame, FrameReader};
 use crate::messages::{
     AttachHandshake, AttachHandshakeReply, EventEnvelope, RawRequest, Response,
-    SessionStoppingEvent, SESSION_STOPPING_EVENT,
+    SessionStoppingEvent, SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
 };
 use crate::socket_state::{self, SocketState};
 use crate::Error;
@@ -442,6 +442,13 @@ pub struct IpcServer<H: Handler> {
 }
 
 impl<H: Handler> IpcServer<H> {
+    /// The handler this server dispatches to. Handler state with no
+    /// wire surface — the data-connection registry, for one — is only
+    /// observable through here.
+    pub fn handler(&self) -> &Arc<H> {
+        &self.handler
+    }
+
     /// Bind a fresh server at `socket_path`. Removes a stale socket
     /// at the same path (only if it actually is a socket — refuses to
     /// silently delete a regular file).
@@ -844,7 +851,9 @@ async fn serve_connection<H: Handler>(
 /// malformed first line is answered with the same `{"ok": false,
 /// error}` shape a rejected handshake gets and the connection closes.
 /// The alternative — routing an undecodable handshake in as an error
-/// path — buys the handler nothing it can act on.
+/// path — buys the handler nothing it can act on. The generation check
+/// runs ahead of that decode, on the raw JSON, for the reason spelled
+/// out at the check itself.
 /// The one line a refused data connection gets: an
 /// [`AttachHandshakeReply::Rejected`], which is the same shape an
 /// accepted handshake's reply has with `ok: false`. Both refusal sites
@@ -867,6 +876,32 @@ async fn serve_data<H: Handler>(
     mut close_watch: ConnCloseWatch,
     line: &[u8],
 ) -> Result<(), Error> {
+    // The protocol check runs on the RAW line, before the typed decode:
+    // two ends that disagree about the generation disagree about what
+    // every other field means, so `protocol-mismatch` has to win over
+    // whatever the typed decode would say about them. An absent or
+    // non-integer `protocol_version` is left to the decode below, which
+    // names the field.
+    if let Some(offered) = serde_json::from_slice::<serde_json::Value>(line)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("protocol_version"))
+        .and_then(serde_json::Value::as_u64)
+    {
+        if offered != u64::from(SESSION_PROTOCOL_VERSION) {
+            write_handshake_rejection(
+                &mut w,
+                "protocol-mismatch",
+                format!(
+                    "this session speaks session protocol {SESSION_PROTOCOL_VERSION}; \
+                     the client offered {offered}"
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
     let handshake: AttachHandshake = match serde_json::from_slice(line) {
         Ok(h) => h,
         Err(e) => {

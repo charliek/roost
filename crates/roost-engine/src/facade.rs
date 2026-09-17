@@ -61,6 +61,12 @@ pub enum CommandResult {
         accepted: bool,
         tab: Tab,
     },
+    /// Whether [`EngineCommand::TabClearNotification`] is what took the
+    /// tab's pending notification down — see
+    /// [`crate::workspace::Workspace::clear_notification`].
+    ClearedNotification {
+        cleared: bool,
+    },
 }
 
 /// Complete UI-recoverable engine state. It owns all data and can replace a
@@ -296,8 +302,8 @@ impl Engine {
                 Ok(CommandResult::Ack)
             }
             EngineCommand::TabClearNotification(p) => {
-                self.workspace.set_tab_has_notification(p.tab_id, false)?;
-                Ok(CommandResult::Ack)
+                let cleared = self.workspace.clear_notification(p.tab_id, p.generation)?;
+                Ok(CommandResult::ClearedNotification { cleared })
             }
             EngineCommand::TabAgentReport(p) => {
                 let (accepted, tab) = self.workspace.agent_report(&p)?;
@@ -309,7 +315,9 @@ impl Engine {
             }
             EngineCommand::TabResize(p) => self.resize_tab(p).await.map(|()| CommandResult::Ack),
             EngineCommand::Shutdown => {
-                self.workspace.flush();
+                if let Err(error) = self.workspace.flush() {
+                    tracing::error!(%error, "the workspace layout could not be written on shutdown");
+                }
                 for project in self.workspace.snapshot() {
                     for tab in project.tabs {
                         self.supervisor.close(tab.id);

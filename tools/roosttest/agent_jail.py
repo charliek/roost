@@ -31,7 +31,7 @@ from pathlib import Path
 
 import ui
 from client import Roost, RoostError, scaled_timeout
-from util import REPO_ROOT
+from util import REPO_ROOT, config_value
 
 
 # Agent name → the environment variable that relocates its config dir.
@@ -137,13 +137,8 @@ class Jail:
 
     def read_key(self) -> "str | None":
         """This jail's `agent-hooks` value, or `None` if the key is
-        absent. Last-wins, matching the parser."""
-        found = None
-        for line in self.config.read_text().splitlines():
-            key, _, value = line.partition("=")
-            if key.strip() == "agent-hooks":
-                found = value.strip()
-        return found
+        absent."""
+        return config_value(self.config, "agent-hooks")
 
     def assert_jailed(self, env: dict) -> None:
         """Every jail variable is set, absolute, and inside this root.
@@ -180,7 +175,7 @@ class Jail:
         return [Path(p) for p in self.read_record()[agent]["files"]]
 
 
-def jailed_ui_env(jail: Jail, *, force: bool = True) -> dict:
+def jailed_ui_env(jail: Jail, *, force: bool = True, extra: "dict | None" = None) -> dict:
     """The environment a jailed UI launch gets: the agent jail, XDG dirs
     inside it (so the socket, the log and the caches land there too), and
     the two variables that let the install engine run under
@@ -189,7 +184,12 @@ def jailed_ui_env(jail: Jail, *, force: bool = True) -> dict:
     `force=False` drops `ROOST_AGENT_HOOKS_FORCE`, leaving the harness
     fence in force — the shape every OTHER lane in this suite runs in,
     and the one case that has to prove a test-mode UI asks nothing and
-    writes nothing."""
+    writes nothing.
+
+    `extra` carries a case's own test-mode seams. Applied last, but it
+    may not touch a jail variable — `assert_jailed` runs on the result
+    at every spawn, so an escape would be caught, and this says it
+    plainly here rather than leaving it to that."""
     env = {**os.environ}
     # Same list `ui.launch` strips, and for the same reason: per-tab
     # values Roost injects itself, plus the selectors set explicitly
@@ -216,6 +216,9 @@ def jailed_ui_env(jail: Jail, *, force: bool = True) -> dict:
         env["ROOST_AGENT_HOOKS_FORCE"] = "1"
     else:
         env.pop("ROOST_AGENT_HOOKS_FORCE", None)
+    for key, value in (extra or {}).items():
+        assert key not in JAIL_ENV_KEYS, f"{key} is the jail's to set, not a case's"
+        env[key] = value
     return env
 
 
@@ -230,7 +233,7 @@ def jailed_socket(jail: Jail) -> Path:
 
 
 @contextlib.contextmanager
-def jailed_ui(jail: Jail, *, force: bool = True):
+def jailed_ui(jail: Jail, *, force: bool = True, extra_env: "dict | None" = None):
     """Launch a jailed iced UI, yield `(process, log path)`, and stop it.
 
     Teardown waits for the process to *exit* before the caller's
@@ -248,7 +251,7 @@ def jailed_ui(jail: Jail, *, force: bool = True):
             pytest.skip(f"explicit iced binary does not exist: {binary}")
         subprocess.run(["cargo", "build", "-p", "roost-iced"], cwd=REPO_ROOT, check=True)
 
-    env = jailed_ui_env(jail, force=force)
+    env = jailed_ui_env(jail, force=force, extra=extra_env)
     jail.assert_jailed(env)
     log = jail.root / f"ui-{jail.launches}.log"
     jail.launches += 1

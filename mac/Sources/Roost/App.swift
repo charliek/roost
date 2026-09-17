@@ -2151,9 +2151,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         if name != activeThemeName {
             setActiveTheme(Theme.loadBundled(name: name), name: name)
         }
-        if let err = writeBackTheme(name) {
-            NSLog("roost-mac: failed to persist theme to config.conf: %@", "\(err)")
-        }
+        writeBackTheme(name)
     }
 
     @MainActor
@@ -2208,9 +2206,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             return
         }
         setActiveFontFamily(name)
-        if let err = writeBackFontFamily(name) {
-            NSLog("roost-mac: failed to persist font-family to config.conf: %@", "\(err)")
-        }
+        writeBackFontFamily(name)
     }
 
     /// Apply `family` (nil = system monospace) at the current size.
@@ -2227,44 +2223,59 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Persist `theme = <name>` to the user's config file. Returns
-    /// the error to the caller (which logs once at the user-action
-    /// boundary), per the repo convention "return errors rather
-    /// than logging-and-swallowing them; log at the boundary that
-    /// handles the error". A failed write must not crash the UI;
-    /// the in-memory selection still works for the rest of the
-    /// session.
+    /// Persist `theme = <name>` to the user's config file. `setKey` now
+    /// takes `ConfigLock` (plan 065 §3.5), whose hold can run seconds
+    /// against another writer, so the write goes through
+    /// `setKeyAsync` off this thread; the error is logged once here,
+    /// on return to the main actor, per the repo convention "return
+    /// errors rather than logging-and-swallowing them". A failed
+    /// write must not crash the UI; the in-memory selection still
+    /// works for the rest of the session.
     @MainActor
-    @discardableResult
-    private func writeBackTheme(_ name: String) -> Error? {
-        RoostConfig.setKey("theme", value: name)
+    private func writeBackTheme(_ name: String) {
+        RoostConfig.setKeyAsync("theme", value: name) { error in
+            if let error {
+                NSLog("roost-mac: failed to persist theme to config.conf: %@", "\(error)")
+            }
+        }
     }
 
     /// Persist `font-family = "<name>"` to config. The value is
     /// wrapped in double quotes since family names commonly contain
     /// spaces ("JetBrains Mono"); the parser strips them on read.
     @MainActor
-    @discardableResult
-    private func writeBackFontFamily(_ name: String) -> Error? {
-        RoostConfig.setKey("font-family", value: "\"\(name)\"")
+    private func writeBackFontFamily(_ name: String) {
+        RoostConfig.setKeyAsync("font-family", value: "\"\(name)\"") { error in
+            if let error {
+                NSLog("roost-mac: failed to persist font-family to config.conf: %@", "\(error)")
+            }
+        }
     }
 
     /// Persist `font-size = <pt>` to config. Whole values render as
     /// integers ("14") rather than floats ("14.0").
     @MainActor
-    @discardableResult
-    private func writeBackFontSize(_ size: CGFloat) -> Error? {
-        RoostConfig.setKey("font-size", value: formatFontSize(size))
+    private func writeBackFontSize(_ size: CGFloat) {
+        RoostConfig.setKeyAsync("font-size", value: formatFontSize(size)) { error in
+            if let error {
+                NSLog("roost-mac: failed to persist font-size to config.conf: %@", "\(error)")
+            }
+        }
     }
 
     /// Persist `show-sidebar-agents = true|false` to config. Same
-    /// error-return contract as `writeBackTheme` — the caller logs
-    /// once at the toggle boundary; a failed write leaves the live
-    /// `showSidebarAgents` value changed for the rest of the session.
+    /// async / error-logging contract as `writeBackTheme` — a failed
+    /// write leaves the live `showSidebarAgents` value changed for the
+    /// rest of the session.
     @MainActor
-    @discardableResult
-    private func writeBackShowSidebarAgents(_ value: Bool) -> Error? {
-        RoostConfig.setKey("show-sidebar-agents", value: value ? "true" : "false")
+    private func writeBackShowSidebarAgents(_ value: Bool) {
+        RoostConfig.setKeyAsync("show-sidebar-agents", value: value ? "true" : "false") { error in
+            if let error {
+                NSLog(
+                    "roost-mac: failed to persist show-sidebar-agents to config.conf: %@",
+                    "\(error)")
+            }
+        }
     }
 
     /// `toggle_sidebar_agents` action handler (plan 007 §3.7).
@@ -2276,9 +2287,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func toggleSidebarAgents(_ sender: Any?) {
         showSidebarAgents.toggle()
         refreshSidebarAgentRows()
-        if let err = writeBackShowSidebarAgents(showSidebarAgents) {
-            NSLog("roost-mac: failed to persist show-sidebar-agents to config.conf: %@", "\(err)")
-        }
+        writeBackShowSidebarAgents(showSidebarAgents)
     }
 
     /// Format a font size for the config file. Whole numbers render
@@ -4845,9 +4854,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // distinction like theme + font-family have), so persist
         // unconditionally here. The atomic tmp+rename keeps repeated
         // Cmd+= presses cheap.
-        if let err = writeBackFontSize(size) {
-            NSLog("roost-mac: failed to persist font-size to config.conf: %@", "\(err)")
-        }
+        writeBackFontSize(size)
     }
 
     /// Resolve the same default socket path as `roost-common`'s Mac

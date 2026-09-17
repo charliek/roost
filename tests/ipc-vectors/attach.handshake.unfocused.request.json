@@ -1,0 +1,14 @@
+{
+  "attach": "5",
+  "protocol_version": 6,
+  "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
+  "kinds": [
+    "ghostty-snapshot"
+  ],
+  "cols": 120,
+  "rows": 40,
+  "cell_w_px": 9,
+  "cell_h_px": 18,
+  "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
+  "focus": false
+}

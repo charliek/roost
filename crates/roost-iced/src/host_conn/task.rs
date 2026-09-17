@@ -10,19 +10,21 @@
 //! The order of the prologue is the wire contract, not a preference
 //! (`ipc.md` #session-sockets): `session.identify` → the compatibility
 //! gate → `session.set_theme` → subscribe → `tab.list`. The theme lands
-//! **before any `tab.attach`** (plan 037 §3.6) and the snapshot is taken
-//! **after** the subscribe so the ack's revision is a floor the snapshot
-//! can be fenced against.
+//! **before any attach** (plan 037 §3.6) — see
+//! [`super::queue::HostOps::attach_permit`] for how a dial that has no
+//! control leg of its own still lands behind it — and the snapshot is
+//! taken **after** the subscribe so the ack's revision is a floor the
+//! snapshot can be fenced against.
 //!
 //! ## The seam C5 fills
 //!
-//! Attaching a tab is a *fourth* connection per attached tab —
-//! `tab.attach` (an intent on this task's queue, which is why token
-//! minting rides the same queue) followed by
-//! [`roost_ipc::client::DataConnection`]. C4 deliberately builds none of
-//! it: the decoder is main-thread-only, so the data path's shape is
-//! C5's to choose. What C4 guarantees it is a live control client, an
-//! ordered queue to mint tokens on, and a mirror that already knows
+//! Attaching a tab is a *fourth* connection per attached tab: a
+//! [`roost_ipc::client::DataConnection`] that negotiates itself, taking
+//! only a place in this task's queue on the way
+//! ([`super::queue::HostOps::attach_permit`]). C4 deliberately builds
+//! none of it: the decoder is main-thread-only, so the data path's shape
+//! is C5's to choose. What C4 guarantees it is a live control client, an
+//! ordered queue to take that place in, and a mirror that already knows
 //! which tabs exist.
 
 use std::path::{Path, PathBuf};
@@ -197,6 +199,10 @@ pub(crate) struct ConnectionConfig {
     /// `Connected` edge and emptied on every way out of one — see
     /// [`Uploads::open`] and [`serve`].
     pub(crate) uploads: Uploads,
+    /// What fences a granted attach permit once the worker has moved on.
+    /// Held open across exactly the same edge as the lane above — see
+    /// [`queue::Serving`].
+    pub(crate) serving: queue::Serving,
 }
 
 /// The scale every budget in this module is stretched by, read once.
@@ -457,64 +463,6 @@ impl Live {
     }
 }
 
-/// The ops an older session answers `unknown-op` to, and whether this
-/// *task* has been told about each yet.
-///
-/// `session.set_agent_hooks` predating a host used to have an entry
-/// here too (plan 046), but protocol equality (plan 061) retired it: a
-/// session too old to know the op is also too old to pass the
-/// `session-mismatch` protocol-version check at attach, so this task
-/// never reaches a live connection with it in the first place. That
-/// leaves `session.set_focus`, which really does predate some attached
-/// hosts (HS-2).
-///
-/// A session that predates one of these is not a fault: the client keeps
-/// sending (it has no other way to find out, and the refusal costs one
-/// round trip), the connection is unaffected, and one line is the whole
-/// story — a line per selection change is noise.
-///
-/// It deliberately outlives [`Live`]. `session.set_focus` is re-sent
-/// whenever the client's selection changes, and a localhost session
-/// that drops reconnects on a 250 ms ladder, so a flag rebuilt per
-/// connection would say the same sentence about the same unchanging
-/// session forever. The fact it latches is a property of the session,
-/// not of the wire to it, so [`connect_loop`] owns one for as long as
-/// it keeps dialling the same host.
-#[derive(Default)]
-struct Unsupported {
-    /// HS-2 sessions predate `session.set_focus`; their attached tab
-    /// suppresses its own notifications.
-    focus: bool,
-}
-
-impl Unsupported {
-    /// Note an `unknown-op` refusal, and say whether it is worth a line.
-    ///
-    /// `false` for every other kind of failure — a `shutting-down` is
-    /// not an old session, and swallowing it here would hide it — and
-    /// `false` the second time one op says it.
-    fn note(&mut self, op: &str, error: &HostOpError) -> Option<&'static str> {
-        if !matches!(
-            error,
-            HostOpError::Rejected {
-                code: ServerCode::UnknownOp,
-                ..
-            }
-        ) {
-            return None;
-        }
-        let (seen, note) = match op {
-            ops::SESSION_SET_FOCUS => (
-                &mut self.focus,
-                "this host session predates session.set_focus; its attached \
-                 tab suppresses its own notifications",
-            ),
-            _ => return None,
-        };
-        (!std::mem::replace(seen, true)).then_some(note)
-    }
-}
-
 /// The task body.
 ///
 /// Two halves, and the split is the queue contract: the connection loop
@@ -565,10 +513,6 @@ async fn connect_loop(
     let mut machine = HostStateMachine::new(config.transport.is_localhost());
     let mut previous: Option<HostId> = config.supersedes;
     let mut mode = config.mode;
-    // Task-scoped, not connection-scoped: what it latches is what this
-    // *session* cannot do, and reconnecting to it does not make an old
-    // session newer. See [`Unsupported`].
-    let mut unsupported = Unsupported::default();
     // This task's own checkpoint, taken from every attempt that reached
     // a session and preferred over the one the set seeded, which by then
     // describes a strictly older fence. It saves an in-task retry a trip
@@ -632,16 +576,13 @@ async fn connect_loop(
                     // that last one runs no code, which is why this is a
                     // `Drop` and not a line after the `await`.
                     let _lane = config.uploads.open(config.socket.clone());
-                    serve(
-                        config,
-                        incarnation,
-                        live,
-                        ops_rx,
-                        feed,
-                        shutdown,
-                        &mut unsupported,
-                    )
-                    .await
+                    // The same edge, for the same reason: a permit this
+                    // incarnation's worker grants releases a dial that
+                    // happens after the answer, and dropping this hold
+                    // is what refuses one that arrives too late
+                    // ([`queue::AttachPermit::guarding`]).
+                    let _serving = config.serving.open(incarnation);
+                    serve(config, incarnation, live, ops_rx, feed, shutdown).await
                 }
             }
         };
@@ -739,14 +680,7 @@ async fn open_control(
 ) -> Result<(IpcClient, ConnectFacts), AttemptError> {
     ensure_socket(config, mode).await?;
     let mut control = dial_control(config, mode).await?;
-    let raw = call(
-        &mut control,
-        ops::SESSION_IDENTIFY,
-        serde_json::json!(SessionIdentifyParams {}),
-    )
-    .await?;
-    let identity: SessionIdentify =
-        serde_json::from_value(raw).map_err(|error| undecodable(ops::SESSION_IDENTIFY, &error))?;
+    let identity = session_identify(&mut control).await?;
     let compatibility = check_compatibility(
         &identity,
         &config.client_build,
@@ -842,6 +776,17 @@ async fn attempt(
     //    guaranteed to be at or past.
     let (events, pump, mirror) =
         subscribe_prologue(&config.socket, &mut control, &mut facts, resume).await?;
+
+    // 4. Re-read the one fact steps 1–3 can have swallowed, in the order
+    //    `resync` already uses: subscribe, then identify.
+    //    `workspace.durability_changed` is live-only and never replayed,
+    //    so a change between the gating identify and the subscription is
+    //    announced to nobody — the gate's answer predates it and the
+    //    stream did not exist yet. The identify gate itself cannot move:
+    //    it is what decides compatibility and hands over the `session_id`
+    //    the subscribe is fenced on, so the recovery is a second read
+    //    rather than a reordering (#481).
+    facts.persist_error = session_identify(&mut control).await?.persist_error;
 
     let live = Live {
         control,
@@ -1192,7 +1137,6 @@ async fn serve(
     ops_rx: &mut mpsc::Receiver<HostIntent>,
     feed: &EngineFeedSender,
     shutdown: &Shutdown,
-    unsupported: &mut Unsupported,
 ) -> ConnEnd {
     loop {
         tokio::select! {
@@ -1222,7 +1166,8 @@ async fn serve(
                                     feed,
                                     incarnation,
                                     HostWorkspaceEvent::Reset(Arc::clone(&live.mirror)),
-                                ) {
+                                ) || !publish_facts(feed, incarnation, live.facts.clone())
+                                {
                                     return ConnEnd::FeedClosed;
                                 }
                             }
@@ -1264,7 +1209,17 @@ async fn serve(
                 let Some(intent) = admit(incarnation, intent) else {
                     continue;
                 };
-                match run_intent(&mut live, unsupported, intent).await {
+                if intent.barrier {
+                    // Answered where it stands and never put on the
+                    // wire: reaching it *is* what the caller waits for,
+                    // because everything enqueued before it has been
+                    // answered by now. Awaiting the attach it releases
+                    // would park this loop for the attach timeout, which
+                    // is the one thing `attach_permit` exists to avoid.
+                    intent.answer(Ok(serde_json::Value::Null));
+                    continue;
+                }
+                match run_intent(&mut live, intent).await {
                     IntentOutcome::Live => {}
                     IntentOutcome::Ends(end) => return end,
                 }
@@ -1331,14 +1286,7 @@ enum IntentOutcome {
 }
 
 /// Send one queued op through the control client and answer its caller.
-///
-/// `unsupported` is the task's, not this connection's: see
-/// [`Unsupported`].
-async fn run_intent(
-    live: &mut Live,
-    unsupported: &mut Unsupported,
-    mut intent: HostIntent,
-) -> IntentOutcome {
+async fn run_intent(live: &mut Live, mut intent: HostIntent) -> IntentOutcome {
     // Taken rather than cloned: the params are this intent's alone, and
     // `answer` never reads them.
     let params = std::mem::take(&mut intent.params);
@@ -1352,13 +1300,6 @@ async fn run_intent(
         }
         Ok(Err(error)) => {
             let (fault, surfaced) = queue::classify(&error);
-            // An older session refusing an op it never had is an
-            // ordinary `Surfaced` refusal — the connection is fine, and
-            // the client is not going to stop having a focus or a config
-            // to state — so it is said once and then let be.
-            if let Some(note) = unsupported.note(&op, &surfaced) {
-                tracing::info!("{note}");
-            }
             intent.answer(Err(surfaced));
             match fault {
                 OpFault::Surfaced => IntentOutcome::Live,
@@ -1383,7 +1324,22 @@ async fn resync(config: &ConnectionConfig, live: &mut Live) -> Result<(), Attemp
     let plan = SubscribePlan::resuming(&resume);
     let (events, pump, subscribed) = subscribe(&config.socket, &mut live.control, plan).await?;
     reseat(live, events, pump, subscribed);
+    // The one fact a closed gap can have swallowed — see
+    // [`ConnectFacts::persist_error`] (#481).
+    live.facts.persist_error = session_identify(&mut live.control).await?.persist_error;
     Ok(())
+}
+
+/// Ask the session who it is. The gate at connect, and what a resync
+/// re-reads the standing durability state off.
+async fn session_identify(control: &mut IpcClient) -> Result<SessionIdentify, AttemptError> {
+    let raw = call(
+        control,
+        ops::SESSION_IDENTIFY,
+        serde_json::json!(SessionIdentifyParams {}),
+    )
+    .await?;
+    serde_json::from_value(raw).map_err(|error| undecodable(ops::SESSION_IDENTIFY, &error))
 }
 
 /// Fold a batch in and publish the wake. `false` means the feed is gone.
@@ -1992,6 +1948,7 @@ mod tests {
             client_build: "gb".into(),
             theme: Arc::new(Mutex::new(super::super::blank_theme())),
             uploads: Uploads::default(),
+            serving: queue::Serving::default(),
         }
     }
 
@@ -2141,9 +2098,47 @@ mod tests {
 
         // And an unfenced administrative op is correct on whichever
         // connection serves it, so it is admitted either way.
-        let _push = ops.call("session.set_focus", serde_json::json!({}));
+        let _push = ops.call(ops::SESSION_SET_THEME, serde_json::json!({}));
         let intent = ops_rx.recv().await.expect("the third intent");
         assert!(admit(HostId::new(9), intent).is_some());
+    }
+
+    /// #474: an acknowledgement belongs to the incarnation that minted
+    /// the generation it names, and to no other.
+    ///
+    /// The window is the same one above — the queue outlives the
+    /// connection — and the damage is specific to this op. A replacement
+    /// session counts its raises from one again, so the clear the UI
+    /// built for the session that died matches an *unseen* raise on its
+    /// successor and takes it down. The unconditional form a click
+    /// enqueues is worse rather than safer: it matches without even
+    /// looking.
+    #[tokio::test]
+    async fn a_clear_built_against_one_incarnation_never_lands_on_its_replacement() {
+        let (ops, mut ops_rx) = super::super::queue::HostOps::channel();
+        let dead = HostId::new(4);
+        let tab = roost_ui_model::keys::TabKey::new(dead, 3);
+
+        // Both forms: the automatic acknowledgement naming a raise, and
+        // the click that names none.
+        for generation in [Some(1), None] {
+            assert!(ops
+                .send(crate::app::clear_notification_intent(tab, generation))
+                .is_ok());
+            let intent = ops_rx.recv().await.expect("the clear is on the queue");
+            assert_eq!(intent.op, ops::TAB_CLEAR_NOTIFICATION);
+            assert!(
+                admit(HostId::new(5), intent).is_none(),
+                "the replacement session must never serve a clear built for its predecessor"
+            );
+        }
+
+        // The incarnation it was built for still runs it.
+        assert!(ops
+            .send(crate::app::clear_notification_intent(tab, Some(1)))
+            .is_ok());
+        let intent = ops_rx.recv().await.expect("the third clear");
+        assert!(admit(dead, intent).is_some());
     }
 
     /// The disconnect contract end to end, and what lets `HostConn::drop`
@@ -2200,51 +2195,6 @@ mod tests {
             message: "nope".into(),
         });
         assert!(matches!(other, AttemptError::Transport(_)));
-    }
-
-    fn refused(code: ServerCode) -> HostOpError {
-        HostOpError::Rejected {
-            code,
-            message: "no such op: whatever".into(),
-        }
-    }
-
-    /// The latch itself: one sentence per op, never repeated.
-    #[test]
-    fn a_refusal_is_noted_once_per_op_and_never_again() {
-        let mut flags = Unsupported::default();
-
-        let first = flags
-            .note(ops::SESSION_SET_FOCUS, &refused(ServerCode::UnknownOp))
-            .expect("the first refusal is worth saying");
-        assert!(first.contains("session.set_focus"), "{first}");
-        assert!(
-            flags
-                .note(ops::SESSION_SET_FOCUS, &refused(ServerCode::UnknownOp))
-                .is_none(),
-            "every reconnect re-sends it; only the first refusal is news"
-        );
-    }
-
-    /// Only `unknown-op` is an old session. Folding anything else in
-    /// here would silence a real refusal — a `shutting-down` says the
-    /// session is going away, which is the opposite of "this is fine".
-    #[test]
-    fn any_other_refusal_is_not_an_old_session() {
-        let mut flags = Unsupported::default();
-        for error in [
-            refused(ServerCode::ShuttingDown),
-            refused(ServerCode::Internal),
-            HostOpError::Transport("the wire died".into()),
-            HostOpError::Disconnected,
-        ] {
-            assert!(flags.note(ops::SESSION_SET_FOCUS, &error).is_none());
-        }
-        // And the latch was never spent, so the real thing still gets
-        // its line.
-        assert!(flags
-            .note(ops::SESSION_SET_FOCUS, &refused(ServerCode::UnknownOp))
-            .is_some());
     }
 
     /// The op that runs a five-agent install on a possibly NFS-mounted
@@ -2373,12 +2323,24 @@ mod tests {
         /// Every `events.subscribe` this session was sent, in order.
         /// The record "did this reconnect resume?" is read off.
         subscribes: Arc<Mutex<Vec<EventsSubscribeParams>>>,
+        /// Every op name this session was sent, in order — the only way
+        /// to say "and *this* one never reached the wire".
+        seen: Arc<Mutex<Vec<String>>>,
         /// How many `tab.list` snapshots it has been asked for. A
         /// resumed reconnect takes none, which is the whole of R11.
         tab_lists: Arc<AtomicUsize>,
         /// Subscribed connections whose peer has hung up. Read through
         /// [`Self::held_streams`].
         streams_ended: Arc<AtomicUsize>,
+        /// What `session.identify` reports as `persist_error`, settable
+        /// mid-connection so a test can make the standing value move
+        /// while the only event that announces it is being lost.
+        persist_error: Arc<Mutex<Option<String>>>,
+        /// A failure this session starts reporting the moment it has
+        /// answered one `session.identify` — the prologue's own gap,
+        /// between the gate and the subscription that would have carried
+        /// the announcement.
+        fails_after_identify: Arc<Mutex<Option<String>>>,
     }
 
     impl Fake {
@@ -2404,8 +2366,11 @@ mod tests {
                 subscribe: Subscribe::Serve,
                 resume_drops: Arc::new(AtomicUsize::new(0)),
                 subscribes: Arc::new(Mutex::new(Vec::new())),
+                seen: Arc::new(Mutex::new(Vec::new())),
                 tab_lists: Arc::new(AtomicUsize::new(0)),
                 streams_ended: Arc::new(AtomicUsize::new(0)),
+                persist_error: Arc::new(Mutex::new(None)),
+                fails_after_identify: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -2441,6 +2406,25 @@ mod tests {
             self.identifies.load(Ordering::Acquire)
         }
 
+        /// This session starts failing to save once it has answered one
+        /// `session.identify` — i.e. inside the prologue, after the gate
+        /// and before the subscription.
+        fn saving_fails_after_the_gate(self, error: &str) -> Fake {
+            *self
+                .fails_after_identify
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.to_string());
+            self
+        }
+
+        /// From now on, this session says it cannot write its layout.
+        fn saving_fails(&self, error: &str) {
+            *self
+                .persist_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.to_string());
+        }
+
         /// Subscribed connections whose peer is still on the other end.
         /// Only an event pump reads an event stream, and it holds the
         /// connection for as long as it lives — so zero is the proof that
@@ -2449,6 +2433,14 @@ mod tests {
             self.subscribes()
                 .len()
                 .saturating_sub(self.streams_ended.load(Ordering::Acquire))
+        }
+
+        /// Every op this session was sent, in arrival order.
+        fn seen(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         }
 
         fn subscribes(&self) -> Vec<EventsSubscribeParams> {
@@ -2552,6 +2544,10 @@ mod tests {
                 let request: serde_json::Value = serde_json::from_str(&line).expect("a request");
                 let id = request["id"].clone();
                 let op = request["op"].as_str().unwrap_or_default().to_string();
+                self.seen
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(op.clone());
                 if self.stall == Some(op.as_str()) && armed(&self.stall_skips) {
                     self.stalled.request();
                     self.release.requested().await;
@@ -2570,11 +2566,24 @@ mod tests {
                     _ if refused.is_some() => refused.expect("just checked"),
                     ops::SESSION_IDENTIFY => {
                         self.identifies.fetch_add(1, Ordering::AcqRel);
-                        serde_json::json!({
-                            "id": id,
-                            "ok": true,
-                            "result": identify_result(self.session_id),
-                        })
+                        let mut result = identify_result(self.session_id);
+                        let persist_error = self
+                            .persist_error
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        if let Some(error) = persist_error {
+                            result["persist_error"] = serde_json::json!(error);
+                        }
+                        if let Some(later) = self
+                            .fails_after_identify
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take()
+                        {
+                            self.saving_fails(&later);
+                        }
+                        serde_json::json!({"id": id, "ok": true, "result": result})
                     }
                     ops::TAB_LIST => {
                         self.tab_lists.fetch_add(1, Ordering::AcqRel);
@@ -2714,14 +2723,21 @@ mod tests {
     /// Every host state the task has published, drained as it goes,
     /// with the connect facts and applied revisions that rode behind
     /// them.
+    /// The fourth is every incarnation that reached `Connected`, which
+    /// is the only way a test learns the id the task minted.
     #[derive(Default)]
-    struct States(Vec<HostConnState>, Vec<ConnectFacts>, Vec<u64>);
+    struct States(Vec<HostConnState>, Vec<ConnectFacts>, Vec<u64>, Vec<HostId>);
 
     impl States {
         fn drain(&mut self, rx: &mut crate::engine_feed::EngineFeedReceiver) {
             for item in feed_items(rx) {
                 match item {
-                    EngineFeed::HostState(_, state) => self.0.push(state),
+                    EngineFeed::HostState(id, state) => {
+                        if state.is_connected() {
+                            self.3.push(id);
+                        }
+                        self.0.push(state)
+                    }
                     EngineFeed::HostConnectFacts(_, facts) => self.1.push(facts),
                     EngineFeed::HostWorkspace(_, HostWorkspaceEvent::Applied { revision, .. }) => {
                         self.2.push(revision)
@@ -2733,6 +2749,11 @@ mod tests {
 
         fn connections(&self) -> usize {
             self.0.iter().filter(|state| state.is_connected()).count()
+        }
+
+        /// The incarnation of the connection that is up.
+        fn incarnation(&self) -> HostId {
+            *self.3.last().expect("a connected task published an id")
         }
 
         fn last(&self) -> &HostConnState {
@@ -2790,6 +2811,7 @@ mod tests {
             let (ops, ops_rx) = super::super::HostOps::channel();
             let mut config = config(socket, transport, ConnectMode::Dial);
             config.uploads = ops.uploads();
+            config.serving = ops.serving();
             config.resume = resume;
             let (feed, rx) = crate::engine_feed::channel();
             let shutdown = Arc::new(Shutdown::default());
@@ -3052,6 +3074,103 @@ mod tests {
         assert_eq!(resumed(&host.stop().await), None);
     }
 
+    /// **#481.** The prologue has a gap of its own: the identify gate
+    /// answers before there is a subscription, and
+    /// `workspace.durability_changed` is live-only, so a failure that
+    /// starts in between is announced to nobody. The connect re-reads
+    /// after subscribing for exactly that reason.
+    ///
+    /// Without the re-read the client connects believing the session is
+    /// saving fine and stays wrong until the *next* change of value —
+    /// which, for a disk that simply stays full, never comes.
+    #[tokio::test]
+    async fn a_connect_learns_a_failure_that_started_inside_the_prologue() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("prologue.sock");
+        let fake = Fake::new(PutFile::Land)
+            .saving_fails_after_the_gate("No space left on device (os error 28)");
+        fake.serve(&socket);
+
+        let host = Connected::start(socket, HostTransport::UnixSocket).await;
+
+        assert_eq!(
+            host.states
+                .1
+                .last()
+                .expect("the prologue filed facts")
+                .persist_error
+                .as_deref(),
+            Some("No space left on device (os error 28)"),
+            "the gate's answer predates the failure; only a read after the \
+             subscription can carry it"
+        );
+        assert_eq!(
+            fake.identifies(),
+            2,
+            "the gate, and the re-read the subscription fences"
+        );
+        host.stop().await;
+    }
+
+    /// **#481.** A resync re-reads `session.identify` and republishes
+    /// the facts, which is the whole of the recovery
+    /// [`ConnectFacts::persist_error`] describes.
+    #[tokio::test]
+    async fn a_resync_re_reads_the_hosts_durability_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("durability.sock");
+        let fake = Fake::new(PutFile::Land);
+        fake.serve(&socket);
+
+        let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
+        // The gate, and the re-read after the subscription.
+        assert_eq!(fake.identifies(), 2);
+        assert_eq!(
+            host.states
+                .1
+                .last()
+                .expect("the prologue filed facts")
+                .persist_error,
+            None
+        );
+
+        // The session stops saving while this client is not being told:
+        // a batch that skips revisions is the loss the resync answers.
+        fake.saving_fails("Read-only file system (os error 30)");
+        fake.next_emit
+            .store(SESSION_REVISION + 5, Ordering::Release);
+        fake.emit_batch();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                host.states.drain(&mut host.feed);
+                if host.states.1.len() >= 2 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the resync republishes this host's facts");
+
+        assert_eq!(
+            host.states
+                .1
+                .last()
+                .expect("the resync filed facts")
+                .persist_error
+                .as_deref(),
+            Some("Read-only file system (os error 30)"),
+            "the state a live-only event could not carry is read off session.identify"
+        );
+        assert_eq!(
+            fake.identifies(),
+            3,
+            "the resync identifies again, on top of the prologue's two"
+        );
+        host.stop().await;
+    }
+
     // ---- one subscribe, one incarnation (#458) --------------------------
 
     /// A session that answers the control leg and is then replaced, with
@@ -3249,7 +3368,7 @@ mod tests {
             .is_ok());
         assert!(tokio::time::timeout(
             Duration::from_secs(10),
-            host.ops.call(ops::SESSION_SET_FOCUS, serde_json::json!({}))
+            host.ops.call(ops::SESSION_SET_THEME, serde_json::json!({}))
         )
         .await
         .expect("and the queue keeps draining afterwards")
@@ -3257,6 +3376,114 @@ mod tests {
 
         let states = host.stop().await;
         assert_eq!(states.connections(), 1, "one incarnation throughout");
+    }
+
+    /// **The permit's two halves, against the worker that grants it**
+    /// (plan 065 §3.10). The barrier is answered where it stands — after
+    /// everything enqueued before it, and without ever reaching the
+    /// session — and the loop moves straight on, so an attach still
+    /// holding its permit blocks no later control op.
+    ///
+    /// Driven through the production drain loop on purpose. This is what
+    /// [`queue::HostOps::attach_permit`] promises and what the client
+    /// leans on for "the theme lands before the dial"; a stand-in worker
+    /// that re-implemented the barrier arm would assert nothing about
+    /// the real one.
+    #[tokio::test]
+    async fn the_worker_grants_a_permit_in_line_and_never_on_the_wire() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("permit.sock");
+        // One skip: the prologue seeds the palette, and a connection
+        // that stalled on *that* would never be made.
+        let fake = Fake::new(PutFile::Land).stalling_after(ops::SESSION_SET_THEME, 1);
+        fake.serve(&socket);
+        let host = Connected::start(socket, HostTransport::UnixSocket).await;
+        let incarnation = host.states.incarnation();
+
+        // Both enqueued before the worker can have woken: enqueuing is
+        // synchronous, so the permit is genuinely *behind* the theme in
+        // line rather than merely later in wall-clock time — which is
+        // what makes the wait below a statement about the queue.
+        let theme = tokio::spawn(host.ops.call(ops::SESSION_SET_THEME, serde_json::json!({})));
+        let mut permit = tokio::spawn(host.ops.attach_permit(incarnation));
+        // Read by the session and unanswered: the worker is parked
+        // inside the theme, which is where the permit has to wait.
+        cued(&fake.stalled, "the session read the theme").await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut permit)
+                .await
+                .is_err(),
+            "a permit is not granted while an op enqueued before it is still in flight"
+        );
+
+        fake.release.request();
+        assert!(theme.await.expect("the theme task").is_ok());
+        let permit = tokio::time::timeout(Duration::from_secs(10), permit)
+            .await
+            .expect("the permit is granted once the op ahead of it is answered")
+            .expect("and its task does not panic")
+            .expect("and the connection it names is still the one serving");
+        assert!(
+            !fake.seen().iter().any(|op| op == queue::BARRIER_OP),
+            "the barrier is answered where it stands, never put on the wire: {:?}",
+            fake.seen()
+        );
+
+        // The permit is held and nothing has been dialed with it. The
+        // worker must be somewhere else entirely.
+        assert!(tokio::time::timeout(
+            Duration::from_secs(10),
+            host.ops.call(ops::TAB_CLOSE, serde_json::json!({})),
+        )
+        .await
+        .expect("the worker never awaits the attach a permit released")
+        .is_ok());
+
+        drop(permit);
+        assert_eq!(
+            host.stop().await.connections(),
+            1,
+            "one incarnation throughout"
+        );
+    }
+
+    /// **A permit does not outlive the connection that granted it.**
+    ///
+    /// The grant is a fact about where the queue stood, not a promise
+    /// about the future: once the connection it named has ended, the
+    /// dial it would have released is refused. Nothing else refuses it —
+    /// the session process may still be listening, in which case the
+    /// handshake's `session_id` matches and a focused attach would
+    /// resize the tab for a connection this client has already lost.
+    #[tokio::test]
+    async fn a_permit_cannot_dial_for_a_connection_that_has_ended() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("stale-permit.sock");
+        let fake = Fake::new(PutFile::Land).cutting(1);
+        fake.serve(&socket);
+        let mut host = Connected::start(socket, HostTransport::UnixSocket).await;
+        let incarnation = host.states.incarnation();
+
+        let permit =
+            tokio::time::timeout(Duration::from_secs(10), host.ops.attach_permit(incarnation))
+                .await
+                .expect("the permit is granted")
+                .expect("while the connection is up");
+
+        // Only the event stream goes; the session itself is still
+        // listening on the same socket under the same id.
+        fake.cut.request();
+        until_state(&mut host, "the connection to drop", |state| {
+            matches!(state, HostConnState::Disconnected(_))
+        })
+        .await;
+
+        assert_eq!(
+            permit.guarding(std::future::ready("dialed")).await,
+            Err(HostOpError::Disconnected),
+            "the attach the permit released is refused rather than dialed"
+        );
+        host.stop().await;
     }
 
     /// Cancelling an attempt mid-snapshot retires its pump.

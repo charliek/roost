@@ -27,7 +27,7 @@ import time
 import uuid
 from pathlib import Path
 
-from client import RoostError, Timeout, scaled_timeout
+from client import Roost, RoostError, Timeout, scaled_timeout
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -43,6 +43,25 @@ def _pytest():
     import pytest
 
     return pytest
+
+
+def is_live_wayland_desktop(wayland_display: str | None) -> bool:
+    """True when `wayland_display` names a live desktop compositor socket
+    rather than the harness's own throwaway one.
+
+    `tools/wayland/weston-run.sh` mints `wayland-roost-$$` for its
+    headless compositor (`weston-run.sh:43`); a live desktop session
+    (COSMIC, GNOME, ...) uses `wayland-0`, `wayland-1`, etc. Pixel and
+    render-stat captures (`app.screenshot` / `app.render_stats`) are
+    reliable only under the harness's controlled compositor — a live
+    desktop's own window decorations and output scaling perturb them.
+    Pure and pytest-free so `roosttest_unit` can pin it directly
+    (issue #488).
+    """
+    if not wayland_display:
+        return False
+    return not wayland_display.startswith("wayland-roost-")
+
 
 # A shell with NO startup files, therefore no Roost shell integration,
 # therefore no OSC 133 marks the test didn't feed itself. Any tab whose
@@ -194,6 +213,35 @@ def precondition(ok: bool, reason: str) -> None:
     if is_fresh():
         _pytest().fail(f"precondition failed in fresh (harness-owned) mode: {reason}")
     _pytest().skip(reason)
+
+
+def config_lines(path, key: str) -> list[str]:
+    """Every line of a `config.conf` that sets `key`, stripped."""
+    return [
+        line.strip()
+        for line in Path(path).read_text(encoding="utf-8").splitlines()
+        if line.partition("=")[0].strip() == key
+    ]
+
+
+def config_value(path, key: str) -> str | None:
+    """`key`'s value in a `config.conf`, last-wins like the parser, or
+    `None` when the key is absent."""
+    lines = config_lines(path, key)
+    return lines[-1].partition("=")[2].strip() if lines else None
+
+
+def wait_for_config_line(path, key: str, want: str) -> None:
+    """Block until `config.conf` holds exactly `want` for `key`.
+
+    The UI applies a setting live and **queues** the file write on its
+    background config writer (plan 065 §3.5), so the value is on screen
+    before it is on disk. A condition wait, not a settle."""
+    Roost._wait(
+        lambda: config_lines(path, key) == [want],
+        5.0,
+        f"the UI's `{key}` write to land as {want!r}",
+    )
 
 
 def cwd_reaches(roost, tab_id: int, want: str, timeout: float = 3.0) -> bool:

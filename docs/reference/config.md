@@ -254,9 +254,13 @@ agent-hooks = claude, codex   # a list, off, or absent (nobody has answered yet)
 **Names normalise.** Each token is trimmed and lowercased; duplicates
 collapse; the result is reordered into `claude, codex, grok, cursor,
 opencode` regardless of the order written. A token that names none of
-the five is dropped with a warning, and the rest of the list still
+the five wires nothing and warns, and the rest of the list still
 resolves — one typo shouldn't turn into "nothing is wired and nothing
-says why." A value that names *no* recognised agent at all, or mixes a
+says why." It is **kept in the key**, though, and written back
+unchanged: a newer Roost that supports more agents writes its name here,
+and an older one that erased it on the next launch would silently undo
+that answer. `roostctl agent status` lists it as `unknown to this
+build`. A value that names *no* recognised agent at all, or mixes a
 reserved word (`off`/`false`/`no`, or the retired `auto`/`on`/`true`/
 `yes`) with anything else, resolves to **unanswered** with a warning —
 the retired spellings no longer mean "wire everything"; they mean

@@ -882,7 +882,7 @@ fn collect_agent_status_blocking() -> AgentStatusResult {
     // The same resolution `roostctl agent status` prints: doctor renders
     // those rows, and two answers to "is this agent allowed" would be two
     // diagnoses of one machine.
-    let mode = crate::agent_install::resolved_or_nothing();
+    let (_, mode) = crate::agent_install::resolved_or_nothing();
     let (status, status_error) = match roost_agent_install::status(&home, &mode) {
         Ok(rows) => (rows, None),
         Err(e) => (Vec::new(), Some(e.to_string())),
@@ -3764,6 +3764,7 @@ mod tests {
             local_backend: LocalBackendMode::InProcess,
             local_session_socket: None,
             local_backend_switch: None,
+            persist_error: None,
         }
     }
 

@@ -143,7 +143,7 @@ pub(crate) fn note(agent: Agent) -> Option<&'static str> {
 fn prefill(key: &AgentHooks, status: &Status) -> bool {
     match key {
         AgentHooks::Ask => status.present,
-        AgentHooks::Off | AgentHooks::Allow(_) => status.allowed,
+        AgentHooks::Off | AgentHooks::Allow { .. } => status.allowed,
     }
 }
 
@@ -512,7 +512,7 @@ mod tests {
         let mut statuses = all();
         statuses[1].entries_on_disk = true;
         statuses[1].wired = Some(3);
-        let key = AgentHooks::Allow(vec!["claude".to_string()]);
+        let key = AgentHooks::allow(["claude"]);
         statuses[0].allowed = true;
         let rows = rows(CardMode::Preferences, &key, &statuses);
         assert!(rows[0].on, "the key names claude");
@@ -758,7 +758,7 @@ mod tests {
 
     #[test]
     fn a_first_run_survey_stands_down_for_an_answer_given_while_it_ran() {
-        let allow = AgentHooks::Allow(vec!["claude".to_string()]);
+        let allow = AgentHooks::allow(["claude"]);
         for key in [AgentHooks::Off, allow] {
             assert_eq!(
                 survey_verdict(CardMode::FirstRun, true, &key, false),

@@ -12,7 +12,146 @@
 // chunk of the shortcut config surface — land as a follow-up slice;
 // the compiled-in defaults already cover the common Mac bindings.
 
+import Darwin
 import Foundation
+
+// `@_silgen_name` sidesteps the same importer collision documented in
+// `SingleInstance.swift` (the `flock(int,int)` function vs. the
+// `struct flock` fcntl lock-spec both resolve into scope, and Swift
+// picks the struct's no-arg initializer over the call).
+@_silgen_name("flock")
+private func roost_config_flock(_ fd: Int32, _ op: Int32) -> Int32
+
+/// `path` with its own symlink chain followed, lexically — the Swift
+/// twin of `roost_ui_model::config::follow_links`
+/// (`crates/roost-ui-model/src/config.rs`). Lexical, not
+/// `realpath`/`URL.resolvingSymlinksInPath`: a link whose target does
+/// not exist yet is exactly the case those cannot answer, and this is
+/// the path a symlinked `config.conf` takes before its target has ever
+/// been written. Stops after 16 hops and returns whatever was reached,
+/// matching Rust's `MAX_HOPS` exactly — [`ConfigLock`] and `setKey`
+/// must resolve identically or they contend on different files.
+func followConfigLinks(_ path: String) -> String {
+    let maxHops = 16
+    var current = path
+    for _ in 0..<maxHops {
+        guard let link = try? FileManager.default.destinationOfSymbolicLink(atPath: current) else {
+            break
+        }
+        if link.hasPrefix("/") {
+            current = link
+        } else {
+            let dir = (current as NSString).deletingLastPathComponent
+            current = dir.isEmpty ? link : dir + "/" + link
+        }
+    }
+    return current
+}
+
+/// `config.lock` beside `resolved` — mirrors `lock_beside`. `resolved`
+/// must already have been through `followConfigLinks`.
+///
+/// A root path is the one input where the two sides' idea of a parent
+/// directory diverges: Rust's `Path::parent` answers `None` for `/`,
+/// which `lock_beside` maps to `.` exactly like the empty parent of a
+/// bare filename, where `deletingLastPathComponent` answers `/` and
+/// would put the lock at `//config.lock`. Both are real files, and they
+/// are not the same one — which is the one failure `flock` cannot
+/// report, since neither writer ever waits.
+func configLockPath(beside resolved: String) -> String {
+    let parent = (resolved as NSString).deletingLastPathComponent
+    let isRoot = !resolved.isEmpty && resolved.allSatisfy { $0 == "/" }
+    let dir = (isRoot || parent.isEmpty) ? "." : parent
+    return dir.hasSuffix("/") ? dir + "config.lock" : dir + "/config.lock"
+}
+
+/// Advisory lock every writer of one `config.conf` goes through — the
+/// Swift twin of `roost_ui_model::config::ConfigLock`. Both take
+/// `flock(LOCK_EX|LOCK_NB)` on the same resolved `config.lock` path
+/// (Rust's `File::try_lock` is that same syscall on Unix), so
+/// `roostctl`, a host session's agent-hooks writer, and this app never
+/// silently lose one another's write.
+///
+/// **Never acquired on the main actor.** A held lock can span a whole
+/// agent-hooks ensure on the other end (read the key, union it, write
+/// up to five agent files, write the key back) — seconds on a
+/// network-mounted `$HOME`. See `RoostConfig.setKeyAsync`.
+final class ConfigLock {
+    /// How long `acquire` waits for the current holder before it
+    /// reports busy. Matches Rust's `LOCK_DEADLINE`.
+    static let deadline: TimeInterval = 10
+    /// How often a waiter re-asks. Matches Rust's `LOCK_POLL`.
+    private static let poll: TimeInterval = 0.025
+
+    private let fd: Int32
+    /// The resolved config path this guard covers — what `setKey`
+    /// writes through.
+    let configPath: String
+
+    private init(fd: Int32, configPath: String) {
+        self.fd = fd
+        self.configPath = configPath
+    }
+
+    deinit {
+        // `flock` belongs to the open file description, so a forked
+        // child holding an inherited fd would keep it past our close
+        // (same defect + fix as `SingleInstance`) — unlock explicitly
+        // rather than relying on that.
+        _ = roost_config_flock(fd, LOCK_UN)
+        Darwin.close(fd)
+    }
+
+    enum LockError: Error, CustomStringConvertible {
+        /// Another writer held the lock for the whole deadline.
+        case busy(path: String, waited: TimeInterval)
+        case io(path: String, errno: Int32)
+
+        var description: String {
+            switch self {
+            case .busy(let path, let waited):
+                return "\(path): another Roost held this config lock for " +
+                    "\(String(format: "%.0f", waited))s; nothing was written"
+            case .io(let path, let errno):
+                return "\(path): I/O error (errno \(errno))"
+            }
+        }
+    }
+
+    /// Take `path`'s lock, waiting at most `deadline`. `path` is
+    /// resolved through `followConfigLinks` first — the same
+    /// resolution `setKey` writes through, so the guard and the write
+    /// can never disagree about which file is covered.
+    static func acquire(configPath path: String, deadline: TimeInterval = ConfigLock.deadline) throws -> ConfigLock {
+        let resolved = followConfigLinks(path)
+        let lockPath = configLockPath(beside: resolved)
+        let dir = (lockPath as NSString).deletingLastPathComponent
+        if !dir.isEmpty {
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+        let fd = open(lockPath, O_RDWR | O_CREAT, 0o600)
+        guard fd >= 0 else {
+            throw LockError.io(path: lockPath, errno: errno)
+        }
+        let started = Date()
+        while true {
+            if roost_config_flock(fd, LOCK_EX | LOCK_NB) == 0 {
+                return ConfigLock(fd: fd, configPath: resolved)
+            }
+            let lockErrno = errno
+            guard lockErrno == EWOULDBLOCK || lockErrno == EAGAIN else {
+                Darwin.close(fd)
+                throw LockError.io(path: lockPath, errno: lockErrno)
+            }
+            let waited = Date().timeIntervalSince(started)
+            if waited >= deadline {
+                Darwin.close(fd)
+                throw LockError.busy(path: lockPath, waited: deadline)
+            }
+            Thread.sleep(forTimeInterval: min(poll, deadline - waited))
+        }
+    }
+}
 
 /// Resolved user config. All fields optional so the caller can
 /// fall back to compiled-in defaults when the user hasn't set a
@@ -103,7 +242,7 @@ enum AgentHooks: Sendable, Equatable {
     /// The agents Roost knows how to wire, canonical spelling, in the
     /// order `configValue` serialises them and the order the consent
     /// dialog (plan 064) lists its rows. Mirrors
-    /// `crates/roost-ui-model/src/config.rs::AGENT_NAMES`.
+    /// `crates/roost-agent/src/lib.rs::ALL_AGENTS`.
     static let agentNames: [String] = ["claude", "codex", "grok", "cursor", "opencode"]
 
     /// Reserved words that are never agent names: the two documented
@@ -146,7 +285,11 @@ enum AgentHooks: Sendable, Equatable {
     /// A value with at least one recognised name and some unrecognised
     /// ones (`claude, banana`) still resolves — to the recognised subset
     /// — but logs once from here, since the caller's nil path never runs
-    /// for it. Mirrors `AgentHooks::parse` in the Rust config parser.
+    /// for it. Mirrors `AgentHooks::parse` in the Rust config parser,
+    /// minus its `unknown` list: that exists so a *writer* can put an
+    /// unrecognised name back, and this app never writes this key — it
+    /// shells out to `roostctl agent set --local`, which does (plan 065
+    /// §3.1).
     static func parse(_ s: String) -> AgentHooks? {
         let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return .ask }
@@ -378,9 +521,73 @@ struct RoostConfig: Sendable {
     /// `show-sidebar-agents`).
     ///
     /// Mirrors `crates/roost-ui-model/src/config.rs::set_key` (shared
-    /// by iced).
+    /// by iced): takes `ConfigLock` first, same 25 ms poll / 10 s
+    /// deadline, then writes through the lock's **resolved** path —
+    /// which means a `config.conf` reached via a symlink is now
+    /// followed on write, where this used to write the link path
+    /// itself. The lock and the write must agree on one resolution
+    /// (`follow_links` is not idempotent past its hop limit — see
+    /// `write_atomic`'s doc on the Rust side), so this is the one
+    /// place that answer is computed.
+    ///
+    /// `lockDeadline` defaults to `ConfigLock.deadline`; tests inject a
+    /// short one so a busy-lock case doesn't sit for 10 real seconds.
+    ///
+    /// Blocks for as long as the lock is held — never call this from
+    /// the main actor; see `setKeyAsync`.
     @discardableResult
-    static func setKey(_ key: String, value: String, at path: URL = defaultPath()) -> Error? {
+    static func setKey(
+        _ key: String, value: String, at path: URL = defaultPath(),
+        lockDeadline: TimeInterval = ConfigLock.deadline
+    ) -> Error? {
+        do {
+            let lock = try ConfigLock.acquire(configPath: path.path, deadline: lockDeadline)
+            // ARC is free to release an object right after its last
+            // *use*, and the guard's last use is the path read below —
+            // so without this the `deinit` that unlocks and closes the
+            // fd can run before the write it covers has begun, handing
+            // the file to the Rust side mid-read-modify-write. A lock
+            // that dies early is worse than no lock: it reads as correct.
+            return withExtendedLifetime(lock) {
+                writeKeyLocked(at: URL(fileURLWithPath: lock.configPath), key: key, value: value)
+            }
+        } catch {
+            return error
+        }
+    }
+
+    /// The one queue `setKeyAsync` writes on, and it is **serial**.
+    ///
+    /// `ConfigLock` decides that two writers take turns; it says nothing
+    /// about whose turn comes first. Dispatched concurrently, two writes
+    /// of the same key can therefore take the lock in the opposite order
+    /// and leave the *older* value on disk — two font-size taps landing
+    /// as the first size, a double sidebar toggle landing as the first
+    /// toggle. The Rust side serialises for the same reason
+    /// (`ConfigWriter`, an `mpsc` drained by a single task, plan 065
+    /// §3.5), so both UIs write in request order.
+    static let writeQueue = DispatchQueue(
+        label: "ai.stridelabs.Roost.config-write", qos: .userInitiated)
+
+    /// `setKey`, off the calling thread, with the result delivered on
+    /// the main actor. No UI thread may wait on `ConfigLock.acquire` —
+    /// its hold can span seconds against a network-mounted `$HOME` —
+    /// so every UI write goes through this rather than `setKey`
+    /// directly. Same shape as `App.applyAgentHooks`.
+    @MainActor
+    static func setKeyAsync(
+        _ key: String, value: String, at path: URL = defaultPath(),
+        completion: @escaping @MainActor (Error?) -> Void
+    ) {
+        writeQueue.async {
+            let error = setKey(key, value: value, at: path)
+            Task { @MainActor in completion(error) }
+        }
+    }
+
+    /// `setKey`'s body against an already-resolved path, with the lock
+    /// already held.
+    private static func writeKeyLocked(at path: URL, key: String, value: String) -> Error? {
         // Distinguish "file doesn't exist" (treat as empty, the
         // common bootstrap case) from "file exists but is
         // unreadable" (permissions, decode error, etc.) — silently

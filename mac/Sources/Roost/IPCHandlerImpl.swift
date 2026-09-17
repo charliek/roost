@@ -184,7 +184,8 @@ actor IPCHandlerImpl: IPCHandler {
             appLabel: appLabel,
             appID: appID,
             uiVersion: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0",
-            protocolVersion: ipcProtocolVersion
+            protocolVersion: ipcProtocolVersion,
+            persistError: client.workspace.persistError
         )
     }
 
@@ -1607,18 +1608,24 @@ private struct IPCProjectReorderParams: Codable {
 /// Codable wrapper for the wire's string-encoded int64 ids (JSON numbers
 /// lose precision past 2^53). `@StringInt64 var tabID: Int64` + a
 /// `CodingKeys` remap replaces the per-struct hand-rolled string↔Int64
-/// decode/encode. Mirrors the Rust `string_int64` serde module.
+/// decode/encode. Mirrors the Rust `string_int64` serde module, including
+/// its round-trip narrowing: `Int64(String)` accepts non-canonical
+/// spellings like `"+4"` and `"04"` that `Int64.description` never
+/// produces, so a decode that doesn't reprint as the original text is
+/// refused rather than silently normalized (#402 — this used to diverge
+/// from the Rust and iced sockets, which both refuse those spellings via
+/// `WireTabRef::parse`/`WireProjectRef::parse`).
 @propertyWrapper
 struct StringInt64: Codable {
     var wrappedValue: Int64
     init(wrappedValue: Int64) { self.wrappedValue = wrappedValue }
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
-        guard let v = Int64(raw) else {
+        guard let v = Int64(raw), String(v) == raw else {
             throw DecodingError.dataCorrupted(
                 .init(
                     codingPath: decoder.codingPath,
-                    debugDescription: "expected string int64, got \"\(raw)\""
+                    debugDescription: "expected canonical string int64, got \"\(raw)\""
                 ))
         }
         self.wrappedValue = v
@@ -1630,7 +1637,8 @@ struct StringInt64: Codable {
 }
 
 /// Same, for the wire's `[String]` id arrays (`tab_ids`, `project_ids`).
-/// Mirrors the Rust `vec_string_int64` serde module.
+/// Mirrors the Rust `vec_string_int64` serde module, including its
+/// round-trip narrowing (see `StringInt64` above).
 @propertyWrapper
 struct StringInt64Array: Codable {
     var wrappedValue: [Int64]
@@ -1638,11 +1646,11 @@ struct StringInt64Array: Codable {
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode([String].self)
         self.wrappedValue = try raw.map { s in
-            guard let v = Int64(s) else {
+            guard let v = Int64(s), String(v) == s else {
                 throw DecodingError.dataCorrupted(
                     .init(
                         codingPath: decoder.codingPath,
-                        debugDescription: "expected string int64, got \"\(s)\""
+                        debugDescription: "expected canonical string int64, got \"\(s)\""
                     ))
             }
             return v
@@ -1652,6 +1660,31 @@ struct StringInt64Array: Codable {
         var c = encoder.singleValueContainer()
         try c.encode(wrappedValue.map { String($0) })
     }
+}
+
+/// Free-function twin of `StringInt64.init(from:)`'s round-trip
+/// narrowing, for structs whose custom `init(from:)` needs a plain
+/// `Int64` alongside other custom-decoded fields (a default value,
+/// a derived field) rather than a property-wrapper-backed one.
+/// Unlike `decodeStringInt64` (IPCMessages.swift), which stays
+/// permissive on purpose for fields that mirror Rust's plain
+/// `string_int64` (`tab.write`, `notification.create`, envelope
+/// ids, …), this backs the `WireTabRef`-typed fields on
+/// `tab.dump`/`tab.capture_pty_input`/`tab.dump_resolved` (#402) —
+/// same contract as `StringInt64` above.
+private func decodeCanonicalStringInt64<K: CodingKey>(
+    _ c: KeyedDecodingContainer<K>,
+    _ key: K
+) throws -> Int64 {
+    let raw = try c.decode(String.self, forKey: key)
+    guard let v = Int64(raw), String(v) == raw else {
+        throw DecodingError.dataCorrupted(
+            .init(
+                codingPath: c.codingPath + [key],
+                debugDescription: "expected canonical string int64, got \"\(raw)\""
+            ))
+    }
+    return v
 }
 
 private struct IPCTabFocusParams: Codable {
@@ -1688,7 +1721,7 @@ private struct IPCTabDumpParams: Codable {
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        self.tabID = try decodeStringInt64(c, .tabID)
+        self.tabID = try decodeCanonicalStringInt64(c, .tabID)
         self.scrollback = try c.decodeIfPresent(UInt32.self, forKey: .scrollback) ?? 0
     }
     func encode(to encoder: Encoder) throws {
@@ -2107,13 +2140,7 @@ private struct IPCTabCapturePtyInputParams: Codable {
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        let raw = try c.decode(String.self, forKey: .tabID)
-        guard let v = Int64(raw) else {
-            throw DecodingError.dataCorruptedError(
-                forKey: .tabID, in: c, debugDescription: "tab_id must be string int64"
-            )
-        }
-        self.tabID = v
+        self.tabID = try decodeCanonicalStringInt64(c, .tabID)
         // `drain` defaults to false so a caller can omit it (peek
         // semantics). Matches the Rust `#[serde(default)] pub drain:
         // bool` shape in `TabCapturePtyInputParams`.
@@ -2153,13 +2180,7 @@ private struct IPCTabDumpResolvedParams: Codable {
     enum CodingKeys: String, CodingKey { case tabID = "tab_id" }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        let raw = try c.decode(String.self, forKey: .tabID)
-        guard let v = Int64(raw) else {
-            throw DecodingError.dataCorruptedError(
-                forKey: .tabID, in: c, debugDescription: "tab_id must be string int64"
-            )
-        }
-        self.tabID = v
+        self.tabID = try decodeCanonicalStringInt64(c, .tabID)
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)

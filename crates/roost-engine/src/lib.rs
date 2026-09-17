@@ -78,9 +78,9 @@ pub use tab_task::{
     SERVER_VT_SCROLLBACK, TAB_CHANNEL_CHUNKS, TAB_CMD_CAPACITY,
 };
 pub use workspace::{
-    AttentionSource, ReplayBounds, RestoreLayout, RestoreProject, RestoreTab, ResumeCut,
-    ResumeError, TabEffectKind, VersionedWorkspaceEvent, Workspace, WorkspaceError, WorkspaceEvent,
-    SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    AttentionSource, PersistOutcome, ReplayBounds, RestoreLayout, RestoreProject, RestoreTab,
+    ResumeCut, ResumeError, TabEffectKind, VersionedWorkspaceEvent, Workspace, WorkspaceError,
+    WorkspaceEvent, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
 
 #[cfg(test)]

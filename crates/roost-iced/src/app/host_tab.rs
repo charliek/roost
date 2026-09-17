@@ -1,8 +1,8 @@
-//! The focused host tab's attach: token mint → data dial → hydration →
-//! live, with resume across refocus (host-sessions plan 037 §3.4).
+//! The focused host tab's attach: queue permit → data dial → hydration
+//! → live, with resume across refocus (host-sessions plan 037 §3.4).
 //!
 //! Ownership is split the way the threading rules demand (CLAUDE.md):
-//! background tasks only move bytes — the dial task mints the token and
+//! background tasks only move bytes — the dial task takes the permit and
 //! runs the handshake, a reader task turns data-plane frames into
 //! [`HostTabFrame`]s on the engine feed, a writer task drains the tab's
 //! input queue onto the wire — while the [`Hydrator`] and both terminals
@@ -29,14 +29,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use roost_ipc::client::{ClientError, DataConnection, ServerCode, ServerFrame};
-use roost_ipc::messages::{ops, AttachHandshake, AttachPayloadKind, TabAttachResult};
+use roost_ipc::messages::{AttachHandshake, AttachHandshakeTerms, AttachPayloadKind};
 use roost_ui_model::keys::TabKey;
 use roost_vt::{HistoryStep, ReadyState, SnapshotDecodeOptions, SnapshotDecoder, Terminal};
 use tokio::sync::mpsc;
 
 use super::tab_backend::HostDataMsg;
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
-use crate::host_conn::queue::HostOps;
+use crate::host_conn::queue::{AttachPermit, HostOpError, HostOps};
 use crate::host_conn::state::CLIENT_PAYLOAD_KINDS;
 
 /// History pages stepped per feed-drain pass. Bounds main-thread work so
@@ -95,11 +95,11 @@ impl PayloadKind {
     }
 }
 
-/// Where a detached tab can pick its stream back up: the resume identity
-/// from `tab.attach` plus the next seq this client has not applied. Kept
-/// per tab across detach — refocus hands it back and the wire answers
-/// `mode: "resume"` when the ring still covers it, or falls back to a
-/// fresh snapshot in the same reply.
+/// Where a detached tab can pick its stream back up: the stream identity
+/// the last accepted handshake reported plus the next seq this client
+/// has not applied. Kept per tab across detach — refocus hands it back
+/// and the wire answers `mode: "resume"` when the ring still covers it,
+/// or falls back to a fresh snapshot in the same reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ResumePoint {
     pub(crate) server_epoch: u64,
@@ -295,7 +295,7 @@ impl Hydration {
 const MAX_DEFERRED_BYTES: usize = 8 * 1024 * 1024;
 
 enum Phase {
-    /// Token mint + dial in flight on the attempt's task.
+    /// Permit + dial in flight on the attempt's task.
     Requesting,
     /// Boxed for the variant-size lint: a `Phase` lives in every attach
     /// entry, and only hydration carries the decoder's bulk.
@@ -393,12 +393,19 @@ impl HostAttach {
 
     /// Start (or restart) an attach attempt. Must be called inside the
     /// app runtime (`Runtime::enter`) — every task binds to the ambient
-    /// runtime. `ops` is the host's op queue (token minting rides it so
-    /// it cannot interleave with `session.set_theme`), `socket` the
-    /// host's endpoint.
+    /// runtime. `ops` is the host's op queue, which the attempt takes a
+    /// permit from so the dial cannot overtake `session.set_theme`;
+    /// `session_id` is the session the handshake binds itself to and
+    /// `socket` the host's endpoint.
+    ///
+    /// `session_id` is `None` only in the window between a connection
+    /// publishing `Connected` and publishing its facts, which is a
+    /// "not yet", not a refusal — the attempt fails retryably and the
+    /// ordinary backoff picks it up.
     pub(super) fn begin(
         &mut self,
         ops: &HostOps,
+        session_id: Option<&str>,
         socket: std::path::PathBuf,
         libghostty_build: &str,
         feed: &EngineFeedSender,
@@ -410,30 +417,45 @@ impl HostAttach {
         let key = self.key;
         let geometry = self.geometry;
         let resume = self.resume;
-        let attach_call = ops.call(
-            ops::TAB_ATTACH,
-            serde_json::json!({
-                "tab_id": key.tab.to_string(),
-                "kinds": CLIENT_PAYLOAD_KINDS,
-                "cols": geometry.cols,
-                "rows": geometry.rows,
-                "cell_w_px": geometry.cell_w,
-                "cell_h_px": geometry.cell_h,
-                "libghostty_build": libghostty_build,
-                // Attach is on-focus in this client, so the claim is
-                // always true. Stated rather than omitted: protocol 5
-                // requires the field, and the omit-when-true shim that
-                // used to cover this is gone.
-                "focus": true,
-            }),
-        );
+        let Some(session_id) = session_id else {
+            feed.send(EngineFeed::HostTab(
+                key,
+                HostTabFrame::Failed {
+                    attempt,
+                    reason: FailReason::Retryable(
+                        "the host connection has not reported its session id yet".into(),
+                    ),
+                },
+            ));
+            return;
+        };
+        let terms = AttachHandshakeTerms {
+            session_id: session_id.to_string(),
+            kinds: CLIENT_PAYLOAD_KINDS.map(AttachPayloadKind::from).to_vec(),
+            cols: geometry.cols,
+            rows: geometry.rows,
+            cell_w_px: cell_px(geometry.cell_w),
+            cell_h_px: cell_px(geometry.cell_h),
+            libghostty_build: libghostty_build.to_string(),
+            // Attach is on-focus in this client, so the claim is always
+            // true.
+            focus: true,
+        };
+        let dial = Dial {
+            socket,
+            handshake: choose_handshake(key.tab, terms, resume),
+        };
+        // Fenced at this tab's own incarnation, in the queue and again
+        // for the dial it releases: an attach must not reach whatever
+        // replaced the connection it was asked of, nor the connection
+        // itself once this client has lost it.
+        let permit = ops.attach_permit(key.host);
         let input_rx = Arc::clone(&self.input_rx);
         let task = tokio::spawn(run_attempt(
             key,
             attempt,
-            attach_call,
-            socket,
-            resume,
+            permit,
+            dial,
             input_rx,
             feed.clone(),
         ));
@@ -988,45 +1010,57 @@ fn frame_attempt(frame: &HostTabFrame) -> u64 {
     }
 }
 
-/// Pick the handshake: hand the resume identity back only when it
-/// matches this session process — a stale epoch or generation would
-/// just round-trip to a snapshot fallback anyway, but not asking is
-/// clearer than asking wrong.
-fn choose_handshake(result: &TabAttachResult, resume: Option<ResumePoint>) -> AttachHandshake {
+/// One measured cell metric, narrowed to what the handshake carries.
+///
+/// The UI measures in `u32` and nothing upstream bounds it: a configured
+/// font size is deliberately not capped at the interactive zoom limit,
+/// and the renderer accepts any finite cell of at least one pixel. So
+/// the narrowing is real, and a bare `as` is the one thing it must not
+/// be — 65536 truncates to `0`, which the session reads as "this client
+/// has no pixel metrics", and anything above wraps to a small, plausible
+/// lie.
+///
+/// Clamped rather than refused: the number is advisory. It is what the
+/// child reports for mode 2048 and nothing is rendered from it, so a
+/// font or zoom that somehow measured a cell wider than 65535 px should
+/// cost a wrong pixel report, not a tab that cannot attach at all. Zero
+/// passes through unchanged — that is the wire's own "unknown".
+fn cell_px(measured: u32) -> u16 {
+    u16::try_from(measured).unwrap_or(u16::MAX)
+}
+
+/// The line this attempt opens with: the tab, the terms, and the resume
+/// identity when there is one to hand back.
+///
+/// A resume point is asked for whenever one survives. Nothing here
+/// pre-checks it: there is no control leg left to check it against, and
+/// a miss on the epoch or the generation is answered with
+/// `mode: "snapshot"` in the accepted line rather than an error. A point
+/// from a *different* session cannot reach this at all — it is keyed by
+/// connection incarnation and purged with it.
+fn choose_handshake(
+    tab_id: i64,
+    terms: AttachHandshakeTerms,
+    resume: Option<ResumePoint>,
+) -> AttachHandshake {
     match resume {
-        Some(r)
-            if r.server_epoch == result.server_epoch
-                && r.tab_generation == result.tab_generation =>
-        {
-            AttachHandshake::resume(
-                &result.attach_token,
-                r.next_seq,
-                r.server_epoch,
-                r.tab_generation,
-            )
+        Some(r) => {
+            AttachHandshake::resume(tab_id, terms, r.next_seq, r.server_epoch, r.tab_generation)
         }
-        _ => AttachHandshake::snapshot(&result.attach_token),
+        None => AttachHandshake::snapshot(tab_id, terms),
     }
 }
 
 /// What the payload that is about to arrive will be decoded as.
 ///
-/// The data connection's own `AttachAccepted.kind` is the authority: it
-/// rides the ticket the server admitted, and the bytes behind it are
-/// what that server composed. `tab.attach`'s reply must have said the
-/// same thing — two different answers to one negotiation is a protocol
-/// error, and picking either of them would be guessing which one the
-/// stream honors. Re-attaching is the recovery, as it is for every other
-/// stream this client cannot trust.
-fn negotiated_kind(
-    control: &AttachPayloadKind,
-    accepted: &AttachPayloadKind,
-) -> Result<PayloadKind, String> {
-    if control != accepted {
-        return Err(format!(
-            "tab.attach negotiated {control}, the data connection accepted {accepted}"
-        ));
-    }
+/// The accepted line is the authority: the server picks from the kinds
+/// the handshake offered, and the bytes behind it are what that server
+/// composed. It can still name something this client cannot decode —
+/// `AttachPayloadKind` is an open string so a newer session's list is
+/// readable — and decoding by guess is how a corrupt screen ships.
+/// Re-attaching is the recovery, as it is for every other stream this
+/// client cannot trust.
+fn negotiated_kind(accepted: &AttachPayloadKind) -> Result<PayloadKind, String> {
     PayloadKind::from_wire(accepted)
         .ok_or_else(|| format!("the session accepted {accepted}, which this client never offered"))
 }
@@ -1042,19 +1076,29 @@ fn reason_for(code: Option<&ServerCode>, message: String) -> FailReason {
     }
 }
 
-/// Classify a token-mint refusal off the op queue.
-fn classify_op_failure(error: &crate::host_conn::queue::HostOpError) -> FailReason {
-    use crate::host_conn::queue::HostOpError;
+/// What a refused queue permit means for the attach.
+///
+/// Two rows, because a permit is refused in exactly two ways, and they
+/// say the same thing: the host connection owns this, not the tab. A
+/// permit refused *after* the grant, by the fence it was granted under
+/// ([`AttachPermit::guarding`]), is the first row and no new one — the
+/// connection went away, which is what `Disconnected` means.
+fn classify_permit_failure(error: &HostOpError) -> FailReason {
     match error {
-        HostOpError::Rejected { code, .. } => reason_for(Some(code), error.to_string()),
-        // `Local` is the upload lane's own refusal and cannot reach a
-        // token mint at all; grouped with the two that do not retry
-        // because an unexplained client-side refusal is not something a
-        // second attach attempt would fix either.
-        HostOpError::Disconnected | HostOpError::Unavailable | HostOpError::Local(_) => {
-            FailReason::HostGone(error.to_string())
-        }
-        HostOpError::Transport(_) => FailReason::Retryable(error.to_string()),
+        // The queue was flushed before the permit came up, or the
+        // connection it was granted for ended before the dial.
+        HostOpError::Disconnected
+        // The queue was full, or its worker is already gone.
+        | HostOpError::Unavailable
+        // Nothing else can reach a barrier — it is answered by the
+        // worker itself and never put on the wire, so there is no
+        // session refusal, no dead wire and no upload error to sort. Not
+        // given arms of their own, because the answer would be the same:
+        // whatever refused the permit, this attach is not the thing that
+        // recovers from it.
+        | HostOpError::Rejected { .. }
+        | HostOpError::Transport(_)
+        | HostOpError::Local(_) => FailReason::HostGone(error.to_string()),
     }
 }
 
@@ -1064,43 +1108,39 @@ fn classify_failure(error: &ClientError) -> FailReason {
     reason_for(error.server_code().as_ref(), error.to_string())
 }
 
-/// The background half of one attempt: mint the ticket through the op
-/// queue, dial the data connection, then split into a reader loop
-/// (frames → feed) and a writer loop (input queue → wire). Every await
-/// lives out here; the main thread only ever sees feed items.
+/// Where an attempt's data connection goes and the line it opens with.
+struct Dial {
+    socket: std::path::PathBuf,
+    handshake: AttachHandshake,
+}
+
+/// The background half of one attempt: take the queue permit, dial the
+/// data connection, then split into a reader loop (frames → feed) and a
+/// writer loop (input queue → wire). Every await lives out here; the
+/// main thread only ever sees feed items.
+///
+/// The permit is the *only* thing this takes from the op queue — see
+/// [`HostOps::attach_permit`]. Everything after it happens on a socket
+/// of its own, so a slow session delays this tab and nothing else.
 async fn run_attempt(
     key: TabKey,
     attempt: u64,
-    attach_call: impl std::future::Future<
-        Output = Result<serde_json::Value, crate::host_conn::queue::HostOpError>,
-    >,
-    socket: std::path::PathBuf,
-    resume: Option<ResumePoint>,
+    permit: impl std::future::Future<Output = Result<AttachPermit, HostOpError>>,
+    dial: Dial,
     input_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<HostDataMsg>>>,
     feed: EngineFeedSender,
 ) {
+    let Dial { socket, handshake } = dial;
     let fail = |reason: FailReason, feed: &EngineFeedSender| {
         feed.send(EngineFeed::HostTab(
             key,
             HostTabFrame::Failed { attempt, reason },
         ));
     };
-    let result = match attach_call.await {
-        Ok(value) => value,
-        Err(error) => {
-            return fail(classify_op_failure(&error), &feed);
-        }
+    let permit = match permit.await {
+        Ok(permit) => permit,
+        Err(error) => return fail(classify_permit_failure(&error), &feed),
     };
-    let result: TabAttachResult = match serde_json::from_value(result) {
-        Ok(result) => result,
-        Err(error) => {
-            return fail(
-                FailReason::Retryable(format!("tab.attach reply did not decode: {error}")),
-                &feed,
-            );
-        }
-    };
-    let handshake = choose_handshake(&result, resume);
     // Bounded, on the same budget a control leg gets. `DataConnection::dial`
     // has no timeout of its own, and the socket it dials is not always a
     // local one: over the ssh transport it is a bridge whose accept is a
@@ -1109,22 +1149,35 @@ async fn run_attempt(
     // timeout is a failed dial like any other — retryable, and the
     // re-attach backoff decides what happens next.
     let budget = crate::host_conn::leg_budget();
-    let (accepted, conn) =
-        match tokio::time::timeout(budget, DataConnection::dial(&socket, &handshake)).await {
-            Ok(Ok(accepted)) => accepted,
-            Ok(Err(error)) => return fail(classify_failure(&error), &feed),
-            Err(_elapsed) => {
-                return fail(
-                    FailReason::Retryable(format!(
-                        "attaching to {} timed out after {}s",
-                        socket.display(),
-                        budget.as_secs().max(1)
-                    )),
-                    &feed,
-                )
-            }
-        };
-    let kind = match negotiated_kind(&result.kind, &accepted.kind) {
+    // Through the permit, never beside it: the grant said where the
+    // queue stood, and the connection it was granted for can end before
+    // this opens anything ([`AttachPermit::guarding`]).
+    let dialed = permit
+        .guarding(tokio::time::timeout(
+            budget,
+            DataConnection::dial(&socket, &handshake),
+        ))
+        .await;
+    let (accepted, conn) = match dialed {
+        Ok(Ok(Ok(accepted))) => accepted,
+        Ok(Ok(Err(error))) => return fail(classify_failure(&error), &feed),
+        Ok(Err(_elapsed)) => {
+            return fail(
+                FailReason::Retryable(format!(
+                    "attaching to {} timed out after {}s",
+                    socket.display(),
+                    budget.as_secs().max(1)
+                )),
+                &feed,
+            )
+        }
+        // The connection this attach was admitted for is gone. Same two
+        // rows, same meaning as a refused permit: the host connection
+        // owns the recovery, and re-attaching is its job, not this
+        // attempt's.
+        Err(error) => return fail(classify_permit_failure(&error), &feed),
+    };
+    let kind = match negotiated_kind(&accepted.kind) {
         Ok(kind) => kind,
         Err(message) => return fail(FailReason::Retryable(message), &feed),
     };
@@ -1137,9 +1190,7 @@ async fn run_attempt(
             fence: accepted.seq,
             server_epoch: accepted.server_epoch,
             tab_generation: accepted.tab_generation,
-            // Both or neither: the pair names one geometry, and half of
-            // one is not a size to build a terminal at.
-            snapshot_size: accepted.snapshot_cols.zip(accepted.snapshot_rows),
+            snapshot_size: Some((accepted.snapshot_cols, accepted.snapshot_rows)),
         },
     ));
     let (mut reader, mut writer) = conn.into_split();
@@ -1240,11 +1291,13 @@ fn lift_frame(attempt: u64, frame: ServerFrame) -> HostTabFrame {
 
 #[cfg(test)]
 mod tests {
+    use roost_ui_model::keys::HostId;
     use roost_vt::{Terminal, TerminalOptions};
 
     use super::*;
     use crate::app::terminal_tab::TerminalTab;
     use crate::engine_feed::{self, EngineFeedReceiver};
+    use crate::host_conn::queue::HostIntent;
 
     const GEOMETRY: Geometry = Geometry {
         cols: 80,
@@ -1254,7 +1307,22 @@ mod tests {
     };
 
     fn key() -> TabKey {
-        TabKey::new(roost_ui_model::keys::HostId::new(3), 7)
+        TabKey::new(HostId::new(3), 7)
+    }
+
+    /// The terms [`HostAttach::begin`] assembles, for the cases that
+    /// read the handshake rather than build one.
+    fn terms() -> AttachHandshakeTerms {
+        AttachHandshakeTerms {
+            session_id: "sess-1".into(),
+            kinds: CLIENT_PAYLOAD_KINDS.map(AttachPayloadKind::from).to_vec(),
+            cols: GEOMETRY.cols,
+            rows: GEOMETRY.rows,
+            cell_w_px: cell_px(GEOMETRY.cell_w),
+            cell_h_px: cell_px(GEOMETRY.cell_h),
+            libghostty_build: "gb".into(),
+            focus: true,
+        }
     }
 
     /// A machine plus the tab it drives and the feed its timers write to.
@@ -1476,46 +1544,42 @@ mod tests {
         ));
     }
 
-    /// A stale identity is not handed back: the handshake downgrades to
-    /// a plain snapshot request when epoch or generation moved.
+    /// The line a data connection opens with: the tab, every negotiated
+    /// term beside it, and the resume identity only when this tab has
+    /// one to hand back.
     #[test]
-    fn a_stale_resume_identity_asks_for_a_snapshot() {
-        let result = TabAttachResult {
-            attach_token: "t".into(),
-            kind: AttachPayloadKind::GHOSTTY_SNAPSHOT.into(),
-            server_epoch: 11,
-            tab_generation: 2,
-        };
-        let stale_epoch = choose_handshake(
-            &result,
-            Some(ResumePoint {
-                server_epoch: 10,
-                tab_generation: 2,
-                next_seq: 42,
-            }),
-        );
-        assert_eq!(stale_epoch.resume_from_seq, None, "stale epoch: snapshot");
-        let stale_generation = choose_handshake(
-            &result,
-            Some(ResumePoint {
-                server_epoch: 11,
-                tab_generation: 1,
-                next_seq: 42,
-            }),
-        );
+    fn the_handshake_states_the_tab_the_terms_and_any_resume_point() {
+        let fresh = choose_handshake(7, terms(), None);
+        assert_eq!(fresh.attach, "7", "the tab id, as a string_int64");
+        assert_eq!(fresh.resume_from_seq, None);
+        assert_eq!(fresh.server_epoch, None);
+        assert_eq!(fresh.tab_generation, None);
+        let stated = &fresh.terms;
+        assert_eq!(stated.session_id, "sess-1");
         assert_eq!(
-            stale_generation.resume_from_seq, None,
-            "stale generation: snapshot"
+            stated.kinds,
+            CLIENT_PAYLOAD_KINDS.map(AttachPayloadKind::from),
+            "in this client's preference order"
         );
-        let hit = choose_handshake(
-            &result,
+        assert_eq!((stated.cols, stated.rows), (80, 24));
+        assert!(stated.focus, "this client only attaches what it shows");
+
+        let resumed = choose_handshake(
+            7,
+            terms(),
             Some(ResumePoint {
                 server_epoch: 11,
                 tab_generation: 2,
                 next_seq: 42,
             }),
         );
-        assert_eq!(hit.resume_from_seq, Some(42), "matching identity resumes");
+        assert_eq!(resumed.resume_from_seq, Some(42));
+        assert_eq!(resumed.server_epoch, Some(11));
+        assert_eq!(resumed.tab_generation, Some(2));
+        assert_eq!(
+            resumed.terms.session_id, "sess-1",
+            "a resume states the same terms as a snapshot"
+        );
     }
 
     /// EOF mid-hydration (before FINISH) abandons the decoder and
@@ -2019,31 +2083,211 @@ mod tests {
         );
     }
 
-    /// The data connection's `AttachAccepted.kind` is the authority, and
-    /// `tab.attach`'s reply must have agreed with it: two answers to one
-    /// negotiation is a protocol error, not a coin toss.
+    /// A measured cell the wire's `u16` cannot hold clamps; it never
+    /// wraps, and it never becomes the `0` the session reads as "this
+    /// client has no pixel metrics at all".
+    ///
+    /// Nothing upstream bounds the measurement: a configured font size
+    /// is deliberately not capped at the interactive zoom limit, and the
+    /// renderer accepts any finite cell of at least one pixel.
     #[test]
-    fn a_handshake_that_contradicts_the_control_reply_is_refused() {
+    fn a_cell_too_wide_for_the_wire_clamps_rather_than_wrapping() {
+        assert_eq!(cell_px(0), 0, "the wire's own 'unknown' passes through");
+        assert_eq!(cell_px(9), 9);
+        assert_eq!(cell_px(u16::MAX as u32), u16::MAX);
+        assert_eq!(cell_px(u16::MAX as u32 + 1), u16::MAX, "not 0");
+        assert_eq!(cell_px(70_000), u16::MAX, "not 4464");
+        assert_eq!(cell_px(u32::MAX), u16::MAX);
+    }
+
+    /// The accepted kind decides the decoder, and a kind this client
+    /// never offered is refused rather than guessed at.
+    #[test]
+    fn an_accepted_kind_this_client_cannot_decode_is_refused() {
         let snapshot = AttachPayloadKind::from(AttachPayloadKind::GHOSTTY_SNAPSHOT);
         let vt = AttachPayloadKind::from(AttachPayloadKind::VT);
-        assert_eq!(
-            negotiated_kind(&snapshot, &snapshot),
-            Ok(PayloadKind::GhosttySnapshot)
-        );
-        assert_eq!(negotiated_kind(&vt, &vt), Ok(PayloadKind::Vt));
-
-        let disagreed = negotiated_kind(&snapshot, &vt).unwrap_err();
-        assert!(
-            disagreed.contains(AttachPayloadKind::GHOSTTY_SNAPSHOT)
-                && disagreed.contains(AttachPayloadKind::VT),
-            "the refusal names both answers: {disagreed}"
-        );
+        assert_eq!(negotiated_kind(&snapshot), Ok(PayloadKind::GhosttySnapshot));
+        assert_eq!(negotiated_kind(&vt), Ok(PayloadKind::Vt));
 
         let unoffered = AttachPayloadKind::from("sixel-mosaic");
+        let refused = negotiated_kind(&unoffered).unwrap_err();
         assert!(
-            negotiated_kind(&unoffered, &unoffered).is_err(),
-            "a kind this client never offered is not one it can decode"
+            refused.contains("sixel-mosaic"),
+            "the refusal names what it could not decode: {refused}"
         );
+    }
+
+    /// The client's half of the permit, with the test standing in for
+    /// the connection task at both ends of it: it takes the barrier off
+    /// the queue, and it holds the serving fence that decides whether a
+    /// granted permit may still dial.
+    ///
+    /// What the *worker* does with a barrier — grants it in line, never
+    /// on the wire, and serves through it — is pinned against the
+    /// production drain loop in
+    /// [`crate::host_conn::task`], not here.
+    struct StandIn {
+        _dir: tempfile::TempDir,
+        socket: std::path::PathBuf,
+        ops: HostOps,
+        ops_rx: mpsc::Receiver<HostIntent>,
+        dialed: tokio::sync::oneshot::Receiver<()>,
+        data_plane: tokio::task::JoinHandle<()>,
+    }
+
+    impl StandIn {
+        /// A data plane that accepts the dial, says so, and then says
+        /// nothing at all — an attach parked mid-handshake.
+        fn new() -> StandIn {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("roost.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+            let (dialed_tx, dialed) = tokio::sync::oneshot::channel();
+            let data_plane = tokio::spawn(async move {
+                let (held, _) = listener.accept().await.expect("accept");
+                let _ = dialed_tx.send(());
+                std::future::pending::<()>().await;
+                drop(held);
+            });
+            let (ops, ops_rx) = HostOps::channel();
+            StandIn {
+                _dir: dir,
+                socket,
+                ops,
+                ops_rx,
+                dialed,
+                data_plane,
+            }
+        }
+
+        /// The barrier [`HostAttach::begin`] enqueued, checked for the
+        /// two things the queue promises about it.
+        async fn barrier(&mut self) -> HostIntent {
+            let intent = tokio::time::timeout(Duration::from_secs(5), self.ops_rx.recv())
+                .await
+                .expect("the attach enqueued its permit")
+                .expect("on an open queue");
+            assert!(intent.barrier, "it is a barrier, not a wire op");
+            assert_eq!(
+                intent.fence,
+                Some(key().host),
+                "fenced at this tab's own incarnation"
+            );
+            intent
+        }
+
+        /// Nothing has been dialed, and stays undialed for long enough
+        /// that a dial which ignored the permit would have been seen.
+        async fn nothing_dialed(&mut self, why: &str) {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), &mut self.dialed)
+                    .await
+                    .is_err(),
+                "{why}"
+            );
+        }
+    }
+
+    /// **No socket is opened until the permit is granted** (plan 065
+    /// §3.10). The attach's ordering device is its place in the host's
+    /// op queue, and this is the client's whole share of it: `begin`
+    /// dials nothing until the barrier it enqueued has been answered.
+    ///
+    /// Until #473 the ticket mint was a queued op and the order came for
+    /// free. With the handshake inline there is no control leg left, so
+    /// the position has to be taken deliberately — and a dial that ran
+    /// ahead of it would compose a snapshot with the palette
+    /// `session.set_theme` had not installed yet.
+    #[tokio::test]
+    async fn the_attach_dials_nothing_until_its_permit_is_granted() {
+        let mut stand_in = StandIn::new();
+        // The connection task's other half: this incarnation is the one
+        // being served, so a permit granted for it may dial.
+        let _serving = stand_in.ops.serving().open(key().host);
+
+        let (feed_tx, _feed_rx) = engine_feed::channel();
+        let mut attach = HostAttach::new(key(), GEOMETRY);
+        attach.begin(
+            &stand_in.ops,
+            Some("sess-1"),
+            stand_in.socket.clone(),
+            "gb",
+            &feed_tx,
+        );
+
+        let barrier = stand_in.barrier().await;
+        stand_in
+            .nothing_dialed("nothing is dialed while the permit is still in the queue")
+            .await;
+
+        barrier.answer(Ok(serde_json::Value::Null));
+        tokio::time::timeout(Duration::from_secs(5), stand_in.dialed)
+            .await
+            .expect("the dial follows the grant")
+            .expect("the data plane accepted");
+
+        attach.abort_tasks();
+        stand_in.data_plane.abort();
+    }
+
+    /// **A grant is not a licence that outlives its connection.** The
+    /// permit is answered where the worker stands and everything after
+    /// it happens on a socket of its own, so the connection it was
+    /// granted for can end before the dial. It must not dial anyway: the
+    /// session process is often still listening — only the control or
+    /// event leg died — so its `session_id` would match, and a focused
+    /// attach would resize the tab for a connection this client has
+    /// already lost.
+    #[tokio::test]
+    async fn an_attach_whose_connection_ended_after_the_grant_never_dials() {
+        let mut stand_in = StandIn::new();
+        let serving = stand_in.ops.serving().open(key().host);
+
+        let (feed_tx, mut feed_rx) = engine_feed::channel();
+        let mut attach = HostAttach::new(key(), GEOMETRY);
+        attach.begin(
+            &stand_in.ops,
+            Some("sess-1"),
+            stand_in.socket.clone(),
+            "gb",
+            &feed_tx,
+        );
+
+        let barrier = stand_in.barrier().await;
+        // Exactly the window F3 lives in: the connection ends, and the
+        // barrier it already dequeued is no longer on the queue to be
+        // flushed with the rest.
+        drop(serving);
+        barrier.answer(Ok(serde_json::Value::Null));
+
+        stand_in
+            .nothing_dialed("a permit granted for a connection that has ended opens nothing")
+            .await;
+        assert!(
+            matches!(next_failure(&mut feed_rx).await, FailReason::HostGone(_),),
+            "and the tab is told the host connection owns the recovery"
+        );
+
+        attach.abort_tasks();
+        stand_in.data_plane.abort();
+    }
+
+    /// Take the reason off the first `Failed` frame the attempt puts on
+    /// the feed.
+    async fn next_failure(feed_rx: &mut EngineFeedReceiver) -> FailReason {
+        let mut batch = crate::engine_feed::EngineBatch::default();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                while let Some(item) = feed_rx.try_next(&mut batch) {
+                    if let EngineFeed::HostTab(_, HostTabFrame::Failed { reason, .. }) = item {
+                        return reason;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the attempt reported a failure")
     }
 
     /// A resize that runs out of patience during a `vt` payload

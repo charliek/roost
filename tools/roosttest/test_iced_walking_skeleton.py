@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from client import Roost, scaled_timeout
+from conftest import skip_on_live_wayland_desktop
 import ui
 from test_sidebar_collapse_persistence import _toggle_to_collapsed, _toggle_to_visible
 from util import drain_until_match, wait_tab_attached, wait_tab_quiet
@@ -35,6 +36,14 @@ ORIGIN_MARKER = (17, 201, 93)
 def _iced_only(target):
     if target != "iced":
         pytest.skip("Iced walking-skeleton milestone is specific to the iced adapter")
+
+
+# Only the renderer-geometry test below reads pixels; the other three in
+# this module assert over IPC/log state and are unaffected by the
+# compositor (issue #488).
+_skip_wayland = skip_on_live_wayland_desktop(
+    "test_iced_terminal_widget_uses_its_layout_origin_and_full_extent"
+)
 
 
 def test_iced_identity_and_real_pty(roost, project, target):

@@ -161,6 +161,114 @@ struct IPCHandlerDispatchTests {
         )
     }
 
+    // MARK: #402 — non-canonical ids are refused, not normalized
+    //
+    // `StringInt64`/`StringInt64Array` round-trip-check the decoded
+    // int64 against the original text (`String(v) == raw`), mirroring
+    // the Rust `WireTabRef::parse`/`WireProjectRef::parse` narrowing.
+    // Swift's `Int64("+4")` and `Int64("04")` both succeed, so without
+    // the round-trip check these would silently normalize to `4`
+    // instead of failing `invalid-param` like the iced/session sockets.
+    // The failure surfaces as `invalid-param` because `decodeParams`
+    // wraps every JSONDecoder error the same way, regardless of which
+    // wrapper threw it.
+
+    @Test func tabReorderNonCanonicalProjectIdWithLeadingPlusIsInvalidParam() async {
+        let handler = await makeHandler()
+        await expectError(
+            "invalid-param",
+            "tab.reorder",
+            AnyCodable(["project_id": "+4", "tab_ids": ["1"]] as [String: Any]),
+            on: handler
+        )
+    }
+
+    @Test func tabReorderNonCanonicalTabIdWithLeadingZeroIsInvalidParam() async {
+        let handler = await makeHandler()
+        await expectError(
+            "invalid-param",
+            "tab.reorder",
+            AnyCodable(["project_id": "1", "tab_ids": ["04"]] as [String: Any]),
+            on: handler
+        )
+    }
+
+    @Test func projectReorderNonCanonicalIdWithLeadingPlusIsInvalidParam() async {
+        let handler = await makeHandler()
+        await expectError(
+            "invalid-param",
+            "project.reorder",
+            AnyCodable(["project_ids": ["+4"]] as [String: Any]),
+            on: handler
+        )
+    }
+
+    @Test func projectReorderNonCanonicalIdWithLeadingZeroIsInvalidParam() async {
+        let handler = await makeHandler()
+        await expectError(
+            "invalid-param",
+            "project.reorder",
+            AnyCodable(["project_ids": ["04"]] as [String: Any]),
+            on: handler
+        )
+    }
+
+    // The plan 065 discovery record that added the tests above named
+    // only `tab.reorder`/`project.reorder` as `WireTabRef`-backed.
+    // `tab.dump` and `tab.dump_resolved` are too (Rust `messages.rs`'s
+    // `TabDumpParams`/`TabDumpResolvedParams`) and used a bare
+    // `Int64(raw)` decode until now — same bug, same fix
+    // (`decodeCanonicalStringInt64` in IPCHandlerImpl.swift). Both
+    // decode params before any tab lookup, so no tab needs to exist
+    // for these. `tab.capture_pty_input` is the third `WireTabRef`
+    // struct still fixed here, but it can't be unit-tested this way:
+    // it checks `RoostBackend.shared.testMode` (false in this test
+    // binary — see `capturePtyInputRequiresTestMode` above) and
+    // throws `not-enabled` before decode ever runs. That op's
+    // canonical-id coverage lives in
+    // `tools/roosttest/test_test_ops.py::test_capture_pty_input_refuses_a_non_canonical_id`
+    // instead, run with `ROOST_TEST_MODE=1` against a real socket.
+
+    @Test func tabDumpNonCanonicalIdWithLeadingPlusIsInvalidParam() async {
+        let handler = await makeHandler()
+        await expectError(
+            "invalid-param",
+            "tab.dump",
+            AnyCodable(["tab_id": "+4"] as [String: Any]),
+            on: handler
+        )
+    }
+
+    @Test func tabDumpNonCanonicalIdWithLeadingZeroIsInvalidParam() async {
+        let handler = await makeHandler()
+        await expectError(
+            "invalid-param",
+            "tab.dump",
+            AnyCodable(["tab_id": "04"] as [String: Any]),
+            on: handler
+        )
+    }
+
+    @Test func tabDumpResolvedNonCanonicalIdWithLeadingPlusIsInvalidParam() async {
+        let handler = await makeHandler()
+        await expectError(
+            "invalid-param",
+            "tab.dump_resolved",
+            AnyCodable(["tab_id": "+4"] as [String: Any]),
+            on: handler
+        )
+    }
+
+    @Test func tabDumpResolvedNonCanonicalIdWithLeadingZeroIsInvalidParam() async {
+        let handler = await makeHandler()
+        await expectError(
+            "invalid-param",
+            "tab.dump_resolved",
+            AnyCodable(["tab_id": "04"] as [String: Any]),
+            on: handler
+        )
+    }
+
     // MARK: happy-path encode/decode
 
     @Test func identifyEchoesProfile() async throws {
@@ -171,6 +279,36 @@ struct IPCHandlerDispatchTests {
         #expect(dict?["app_id"] as? String == "ai.stridelabs.Roost.test")
         #expect((dict?["protocol_version"] as? NSNumber)?.intValue == Int(ipcProtocolVersion))
         #expect(dict?["socket_path"] as? String == socket)
+        // `makeHandler`'s workspace is in-memory (no statePath), so
+        // persist() never runs and `persistError` stays nil — the key
+        // must be absent from the wire entirely, not present as null
+        // (#481; mirrors Rust's `skip_serializing_if`).
+        #expect(dict?.keys.contains("persist_error") == false)
+    }
+
+    // #481: `IPCIdentifyResult.persistError` mirrors Rust's
+    // `IdentifyResult.persist_error` — `encodeIfPresent` must drop the
+    // key entirely when there's no error (not encode it as `null`),
+    // so `identify.response.json` still decodes unchanged, and must
+    // put the exact error text on the wire when there is one.
+    @Test func identifyResultOmitsPersistErrorWhenNilButIncludesItWhenSet() throws {
+        let clean = IPCIdentifyResult(
+            socketPath: "/tmp/x.sock", pid: 1,
+            activeProjectID: 1, activeTabID: 1,
+            appLabel: "Roost", appID: "ai.stridelabs.Roost",
+            uiVersion: "0.0.0", protocolVersion: 1
+        )
+        let cleanJSON = String(decoding: try JSONEncoder().encode(clean), as: UTF8.self)
+        #expect(!cleanJSON.contains("persist_error"), "absent, not null, when there is no error")
+
+        var failing = clean
+        failing.persistError = "Read-only file system (os error 30)"
+        let failingData = try JSONEncoder().encode(failing)
+        let failingJSON = String(decoding: failingData, as: UTF8.self)
+        #expect(failingJSON.contains(#""persist_error":"Read-only file system (os error 30)""#))
+
+        let decoded = try JSONDecoder().decode(IPCIdentifyResult.self, from: failingData)
+        #expect(decoded.persistError == failing.persistError)
     }
 
     @Test func projectCreateThenListRoundTrips() async throws {

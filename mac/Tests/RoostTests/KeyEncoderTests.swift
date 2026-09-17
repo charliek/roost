@@ -245,6 +245,203 @@ func ctrl_shifted_punctuation_drops_shift_in_legacy_fixterms() {
     }
 }
 
+// MARK: - Control chords libghostty routes through CSI-u (#343)
+
+// `[`, `i` and `m` are deliberately absent from libghostty's ctrl-sequence
+// table — fixterms keeps them out so applications can tell ctrl+[ from
+// Escape, ctrl+i from Tab and ctrl+m from Enter — so all three fall through
+// to CSI-u, which needs one codepoint of utf8. macOS hands us only the C0 it
+// already folded them into, and stripping that left the encoder with nothing
+// to build from: the three chords reached the PTY as NO bytes at all.
+// `crates/roost-iced/src/input.rs` carries the twin assertions
+// (`control_bracket_left_reports_the_bracket_not_the_escape_codepoint`,
+// `control_transformed_logical_keys_encode_the_same_bytes`); the bytes must
+// agree across the two UIs.
+
+private let fixtermsChords: [(keyCode: Int, c0: String, base: String, expected: String)] = [
+    (kVK_ANSI_LeftBracket, "\u{1B}", "[", "\u{1B}[91;5u"),
+    (kVK_ANSI_I, "\u{09}", "i", "\u{1B}[105;5u"),
+    (kVK_ANSI_M, "\u{0D}", "m", "\u{1B}[109;5u"),
+]
+
+@MainActor
+@Test
+func fixterms_control_chords_report_their_base_character_in_legacy() {
+    withEncoder { encoder in
+        for chord in fixtermsChords {
+            let event = keyEvent(
+                keyCode: UInt16(chord.keyCode),
+                chars: chord.c0,
+                charsIgnoringModifiers: chord.base,
+                modifiers: [.control]
+            )
+            #expect(encoder.encode(event) == Data(chord.expected.utf8), "ctrl+\(chord.base)")
+        }
+    }
+}
+
+// Kitty was never the broken mode: its CSI-u entry for a letter or
+// punctuation key is built from the unshifted codepoint, which AppKit
+// reports correctly on a US layout whether or not the C0 is recovered. This
+// case therefore pins pre-existing Kitty behavior and its agreement with
+// iced — NOT the recovery the legacy twin above exercises. Deleting the
+// recovered utf8 leaves it green.
+// `recovered_chord_names_its_key_not_the_layout_char_under_kitty` below is
+// the Kitty case recovery does decide, through the key identity it supplies.
+@MainActor
+@Test
+func fixterms_control_chords_report_their_base_character_under_kitty() {
+    withKittyEncoder { encoder in
+        for chord in fixtermsChords {
+            let event = keyEvent(
+                keyCode: UInt16(chord.keyCode),
+                chars: chord.c0,
+                charsIgnoringModifiers: chord.base,
+                modifiers: [.control]
+            )
+            #expect(encoder.encode(event) == Data(chord.expected.utf8), "ctrl+\(chord.base)")
+        }
+    }
+}
+
+// MARK: - A recovered chord names its key, and never carries Command
+
+// Recovery answers with the character the C0 inverts to, so it must also
+// answer with the key that character belongs to. AppKit reports the ACTIVE
+// LAYOUT's character instead, and on a Cyrillic layout that is a different
+// key: ctrl+shift on the physical I types `Ш`, so the unshifted codepoint
+// arrives as U+0448 while the recovered text is `i`. iced identifies the same
+// press from the physical key (`Key::to_latin`) and emits ESC[105;6u in both
+// modes; these pin the Mac to those bytes.
+//
+// The live layout is the one input a synthetic NSEvent cannot fake —
+// `characters(byApplyingModifiers: [])` reads it from the keyCode, and the
+// machines that run this suite are US-ANSI, where every physical key types
+// exactly the Latin character its C0 inverts to (so kVK_ANSI_I can't
+// disagree with anything). The keyCode below therefore borrows another
+// physical key to make the layout disagree with the C0 the way U+0448 does
+// on a real Russian layout: without the fix the entry reads `g` (103).
+
+@MainActor
+@Test
+func recovered_chord_names_its_key_not_the_layout_char_under_kitty() {
+    withKittyEncoder { encoder in
+        let event = keyEvent(
+            keyCode: UInt16(kVK_ANSI_G),
+            chars: "\u{09}",
+            charsIgnoringModifiers: "Ш",
+            modifiers: [.control, .shift]
+        )
+        // The Kitty entry is the unshifted codepoint: `i` (105), not the
+        // layout's own character for this key.
+        #expect(encoder.encode(event) == Data("\u{1B}[105;6u".utf8))
+    }
+}
+
+@MainActor
+@Test
+func recovered_chord_names_its_key_not_the_layout_char_in_legacy() {
+    withEncoder { encoder in
+        let event = keyEvent(
+            keyCode: UInt16(kVK_ANSI_G),
+            chars: "\u{09}",
+            charsIgnoringModifiers: "Ш",
+            modifiers: [.control, .shift]
+        )
+        // fixterms keeps the shift bit only when the unshifted codepoint
+        // matches the text — a layout codepoint would look like the shift key
+        // produced the `i` and silently drop it to ESC[105;5u.
+        #expect(encoder.encode(event) == Data("\u{1B}[105;6u".utf8))
+    }
+}
+
+@MainActor
+@Test
+func command_chords_are_never_recovered() {
+    // Legacy CSI-u carries no Super bit, so a recovered ctrl+cmd+i would
+    // reach the PTY as ESC[105;5u — indistinguishable from ctrl+i, with
+    // Command erased. Encoding nothing is what the press did before recovery
+    // existed and what a menu equivalent should do.
+    withEncoder { encoder in
+        for chord in fixtermsChords {
+            let event = keyEvent(
+                keyCode: UInt16(chord.keyCode),
+                chars: chord.c0,
+                charsIgnoringModifiers: chord.base,
+                modifiers: [.control, .command]
+            )
+            #expect(encoder.encode(event) == Data(), "ctrl+cmd+\(chord.base)")
+        }
+    }
+}
+
+// MARK: - The writing-system-key guard on chord recovery
+
+// Enter, Escape and Tab present a lone C0 of their own — CR, ESC and TAB,
+// the very bytes ctrl+m, ctrl+[ and ctrl+i fold into. Recovery is gated on
+// libghostty's "Writing System Keys" block so these keep the encoding they
+// own; without that gate ctrl+Return types `m` under the Kitty protocol and
+// reports ctrl+m's CSI-u entry in legacy mode. iced pins the same exclusion
+// from the named-key side (`control_chord_recovery_is_limited_to_invertible_chords`).
+
+@MainActor
+@Test
+func ctrl_functional_keys_keep_their_own_encoding_in_legacy() {
+    withEncoder { encoder in
+        for (keyCode, chars, expected, name) in [
+            (kVK_Return, "\r", "\u{1B}[27;5;13~", "ctrl+Return"),
+            (kVK_Escape, "\u{1B}", "\u{1B}[27;5;27~", "ctrl+Escape"),
+            (kVK_Tab, "\t", "\u{1B}[27;5;9~", "ctrl+Tab"),
+        ] {
+            let event = keyEvent(
+                keyCode: UInt16(keyCode),
+                chars: chars,
+                modifiers: [.control]
+            )
+            #expect(encoder.encode(event) == Data(expected.utf8), "\(name)")
+        }
+    }
+}
+
+@MainActor
+@Test
+func ctrl_functional_keys_keep_their_own_encoding_under_kitty() {
+    withKittyEncoder { encoder in
+        for (keyCode, chars, expected, name) in [
+            (kVK_Return, "\r", "\u{1B}[13;5u", "ctrl+Return"),
+            (kVK_Escape, "\u{1B}", "\u{1B}[27;5u", "ctrl+Escape"),
+            (kVK_Tab, "\t", "\u{1B}[9;5u", "ctrl+Tab"),
+        ] {
+            let event = keyEvent(
+                keyCode: UInt16(keyCode),
+                chars: chars,
+                modifiers: [.control]
+            )
+            #expect(encoder.encode(event) == Data(expected.utf8), "\(name)")
+        }
+    }
+}
+
+@MainActor
+@Test
+func ctrl_option_chord_keeps_its_escape_prefix() {
+    // Recovery hands libghostty the first non-empty utf8 this encoder has
+    // ever reported for a control press, which is what puts the consumed-mods
+    // heuristic in play for chords. Subtracting Option there would clear the
+    // effective alt the legacy C0 path consults and drop the ESC meta-prefix
+    // readline reads as Meta-Ctrl-A. iced pins the same invariant in
+    // `ctrl_alt_shift_chords_keep_their_legacy_bytes`.
+    withEncoder { encoder in
+        let event = keyEvent(
+            keyCode: UInt16(kVK_ANSI_A),
+            chars: "\u{01}",
+            charsIgnoringModifiers: "a",
+            modifiers: [.control, .option]
+        )
+        #expect(encoder.encode(event) == Data([0x1B, 0x01]))
+    }
+}
+
 // MARK: - Control-key conventions
 
 @MainActor

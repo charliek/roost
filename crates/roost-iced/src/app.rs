@@ -1,7 +1,6 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -32,12 +31,12 @@ use roost_engine::{
 };
 use roost_ipc::agent;
 use roost_ipc::messages::{
-    AgentSetHooksAgents, AgentSetHooksHostOutcome, AgentSetHooksResult, AppMenuDumpResult,
-    AppNotificationStatusResult, AppRenderStatsResult, AppUpdateStatusResult, HostConnectStatus,
-    HostConnectionResult, HostStatus, HostStatusResult, PaletteItemView, PalettePresentResult,
-    PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpHost, SidebarDumpHostProject,
-    SidebarDumpHostTab, SidebarDumpProject, SidebarDumpResult, SidebarDumpSection,
-    WindowMetricsResult,
+    AgentHooksOutcome, AgentHooksSkipped, AgentSetHooksAgents, AgentSetHooksResult,
+    AppMenuDumpResult, AppNotificationStatusResult, AppRenderStatsResult, AppUpdateStatusResult,
+    HostConnectStatus, HostConnectionResult, HostStatus, HostStatusResult, PaletteItemView,
+    PalettePresentResult, PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpHost,
+    SidebarDumpHostProject, SidebarDumpHostTab, SidebarDumpProject, SidebarDumpResult,
+    SidebarDumpSection, WindowMetricsResult,
 };
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::{IpcServer, LocalBackendCell, LocalBackendMode};
@@ -176,6 +175,42 @@ impl StatusBanner {
     fn is_active(&self) -> bool {
         self.message.is_some()
     }
+}
+
+/// Whose `state.json` a durability failure belongs to (#481).
+///
+/// The variant order is the priority order: a local failure is this
+/// machine's own layout and is named first, then hosts alphabetically —
+/// derived from `Ord`, so the bottom line just reads the first entry.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DurabilitySource {
+    Local,
+    Host(String),
+}
+
+/// What the bottom-right line says: the transient toast while one is up,
+/// otherwise the first standing durability failure (#481).
+///
+/// The toast *covers* a failure rather than replacing it — a receipt or
+/// a PTY error is still seen, and the failure line comes back when the
+/// toast expires. Taking the first entry means one host recovering never
+/// uncovers silence where another failure still stands.
+///
+/// "last save failed" rather than "still failing": the value is a
+/// standing fact recovered on the next write that lands, and a client
+/// that reconnected mid-failure has no idea how long it has been true.
+fn bottom_line<'a>(
+    status: &'a StatusBanner,
+    durability: &'a BTreeMap<DurabilitySource, String>,
+) -> Option<Cow<'a, str>> {
+    if let Some(status) = status.message() {
+        return Some(Cow::Borrowed(status));
+    }
+    let (source, error) = durability.iter().next()?;
+    Some(Cow::Owned(match source {
+        DurabilitySource::Local => format!("Roost couldn't save your workspace: {error}"),
+        DurabilitySource::Host(host) => format!("on {host}: last save failed: {error}"),
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1316,8 +1351,8 @@ async fn open_host_tab_flow(
 /// `tab.open` params for a host, geometry included.
 ///
 /// The same defaults the local path opens with: the tab is resized to
-/// the window's real grid at attach (`tab.attach` carries the geometry
-/// and the server resizes there), so this only has to be a legal
+/// the window's real grid at attach (the attach handshake carries the
+/// geometry and the server resizes there), so this only has to be a legal
 /// starting size, not the right one.
 ///
 /// `title` + `argv` are empty for an ordinary new tab and carry the
@@ -1338,6 +1373,36 @@ fn host_tab_open_params(
         "title": title,
         "argv": argv,
     })
+}
+
+/// One clear on a host tab, as a queued intent **fenced at the
+/// incarnation the key names** (#474).
+///
+/// A generation is only meaningful inside the session incarnation that
+/// minted it: every replacement counts its raises from one again, so a
+/// clear built against the session that died and served by its successor
+/// matches a raise it has nothing to do with, and takes down a
+/// notification this window has never seen. The unconditional form is
+/// worse rather than safer — it needs no match at all. Neither
+/// `HostConnSet::send_at` nor the queue can catch that: the queue
+/// outlives a connection and the main thread goes on believing the dead
+/// incarnation is live until it drains the drop off the feed, so the
+/// fence is the only thing that refuses it
+/// ([`crate::host_conn::queue::HostIntent::fence`]).
+///
+/// Built through the params type so the omit-when-unset spelling is the
+/// one the wire pins, not one a call site restates.
+pub(crate) fn clear_notification_intent(
+    tab: TabKey,
+    generation: Option<u64>,
+) -> crate::host_conn::HostIntent {
+    let params = serde_json::to_value(roost_ipc::messages::TabClearNotificationParams {
+        tab_id: tab.tab,
+        generation,
+    })
+    .expect("clear-notification params serialize");
+    crate::host_conn::HostIntent::new(roost_ipc::messages::ops::TAB_CLEAR_NOTIFICATION, params)
+        .fenced_at(tab.host)
 }
 
 /// The one tab-open op behind every route that opens one: the new-tab
@@ -1464,16 +1529,21 @@ fn host_selection_detach(
     Some(previous.tab)
 }
 
-/// Which host tab this client is *looking at*, as `session.set_focus`
-/// states it: the selected host tab when the window has focus, and
-/// nothing otherwise.
+/// Which host tab this client is *looking at*: the selected host tab
+/// when the window has focus, and nothing otherwise.
 ///
-/// The whole edge computation, split out from [`App`] because it is the
-/// part worth pinning: a session mutes the tab it believes is focused,
-/// so "the window is unfocused" and "the selection moved to another
-/// host" both have to read as *no* claim rather than as a stale one.
-/// Only host tabs appear here — a local selection is `None`, which is
-/// how every connected host hears null.
+/// #474's client rule turns on it. A session fires for every client and
+/// says nothing about who is watching, so this is the whole of what this
+/// window knows: a notification for the tab named here is one the user
+/// is already reading, and it is acknowledged rather than bannered.
+/// "The window is unfocused" and "the selection moved to another host"
+/// therefore both have to read as *no* claim rather than as a stale one.
+/// Only host tabs appear here — a local selection is `None`, because the
+/// in-process backend evaluates the same rule inside the engine
+/// (`Inner::tab_is_being_watched`). The two copies are deliberate:
+/// `roost-engine` does not depend on this crate, and the rule is one
+/// boolean each, so each side pins its own with a table test rather than
+/// sharing a function across a dependency edge that does not exist.
 fn host_focus_claim(window_focused: bool, selection: Option<HostSelection>) -> Option<TabKey> {
     selection.filter(|_| window_focused).map(|it| it.tab)
 }
@@ -2374,6 +2444,16 @@ pub struct App {
     modifiers: keyboard::Modifiers,
     test_mode: bool,
     status: StatusBanner,
+    /// Standing "this workspace is not reaching disk" failures, one per
+    /// source (#481).
+    ///
+    /// Deliberately *not* in [`StatusBanner`]: that is a single slot on
+    /// a five-second timer, and a receipt toast landing in it would hide
+    /// a failure that is still true. Keyed per source so a local failure
+    /// and a host's coexist, and so one host recovering cannot clear
+    /// another's. `BTreeMap` so the first entry is the one
+    /// [`bottom_line`] names.
+    durability: BTreeMap<DurabilitySource, String>,
     /// The one startup agent-hooks ensure has been started (plan 046
     /// §3.7). `window_opened` also runs on every focus change, so this
     /// is what keeps a startup act from becoming a focus act.
@@ -2389,6 +2469,10 @@ pub struct App {
     /// may act; see [`agent_hooks::AgentHooksSurvey::id`].
     agent_hooks_survey: Option<u64>,
     agent_hooks_surveys: u64,
+    /// The last `agent.set_hooks` ticket issued — see
+    /// [`agent_hooks::AgentHooksApply`]. Only this one's answer is
+    /// applied to `config` and to the receipt toast.
+    agent_hooks_applies: u64,
     /// The agent-hooks toast, waiting for the end of the drain that
     /// produced it. Held rather than set on arrival so nothing later in
     /// the same batch — a PTY error, an OSC action — can replace it
@@ -2654,6 +2738,12 @@ pub struct App {
     /// task. Cheap and `Send`; dropping one is inert, so it takes no part
     /// in the ordering below.
     runtime_handle: tokio::runtime::Handle,
+    /// Every `config.conf` write this process makes, in request order
+    /// and off this thread — see [`crate::config_writer`].
+    config_writer: crate::config_writer::ConfigWriter,
+    /// Every `agent.set_hooks` apply, in request order and off this
+    /// thread — see [`agent_hooks::AgentHooksApply`].
+    agent_hooks_worker: agent_hooks::AgentHooksApplies,
     // Field order is intentional: terminal sessions and the engine feed
     // (whose receiver carries the wake every sender notifies on) are
     // dropped before the runtime — a dropped receiver is how the adapter
@@ -2882,10 +2972,12 @@ impl App {
             modifiers: keyboard::Modifiers::default(),
             test_mode,
             status: StatusBanner::default(),
+            durability: BTreeMap::new(),
             agent_hooks_started: false,
             agent_hooks_card_raised: false,
             agent_hooks_survey: None,
             agent_hooks_surveys: 0,
+            agent_hooks_applies: 0,
             pending_agent_hooks_toast: None,
             rename_editor: None,
             rename_input_id: Id::unique(),
@@ -2980,6 +3072,15 @@ impl App {
             host_views: Vec::new(),
             host_sections: Vec::new(),
             runtime_handle: runtime.handle().clone(),
+            config_writer: crate::config_writer::ConfigWriter::spawn(
+                runtime.handle(),
+                config::config_path(),
+                feed_tx.clone(),
+            ),
+            agent_hooks_worker: agent_hooks::AgentHooksApplies::spawn(
+                runtime.handle(),
+                feed_tx.clone(),
+            ),
             feed_rx,
             feed_tx,
             _restore_quit_signals: RestoreDefaultQuitSignalsOnDrop,
@@ -3380,12 +3481,29 @@ impl App {
         agents: &AgentSetHooksAgents,
         reply: HostOpReply<AgentSetHooksResult>,
     ) {
-        let mode = match agent_hooks::resolve_set(agents) {
-            Ok(mode) => mode,
+        let request = match agent_hooks::resolve_set(agents) {
+            Ok(request) => request,
             Err(message) => {
                 let _ = reply.send(Err(HostOpFailure::new("invalid-param", message)));
                 return;
             }
+        };
+        // Answered before the harness fence and before any host is
+        // chosen: a list naming only agents this build cannot wire has
+        // nothing to write, so there is no dotfile for the fence to
+        // protect and no local answer to propagate.
+        let Some(mode) = request.mode else {
+            let _ = reply.send(Ok(AgentSetHooksResult {
+                config_path: config::config_path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+                local: AgentHooksOutcome {
+                    skipped: AgentHooksSkipped::unknown(&request.unknown),
+                    ..AgentHooksOutcome::default()
+                },
+                hosts: Vec::new(),
+            }));
+            return;
         };
         let guard = roost_agent_install::Guard::from_env();
         if let Err(error) = guard.check() {
@@ -3416,54 +3534,21 @@ impl App {
         };
         let client = agent_hooks::client_label();
 
-        let feed = self.feed_tx.clone();
-        self.runtime_handle.spawn(async move {
-            let local = tokio::task::spawn_blocking(move || {
-                agent_hooks::set_hooks_blocking(&mode, guard)
-            })
-            .await
-            .unwrap_or_else(|error| Err(format!("the agent-hooks install did not finish: {error}")));
-            let done = match local {
-                Ok(done) => done,
-                Err(message) => {
-                    // Reported to the caller, which is the boundary that
-                    // handles it; the log line is for the launches where
-                    // the caller was a dialog nobody was watching.
-                    tracing::warn!(error = %message, "agent.set_hooks could not set this machine's agent hooks");
-                    let _ = reply.send(Err(HostOpFailure::new("internal", message)));
-                    return;
-                }
-            };
-            // Only now: this machine has recorded the user's answer, so
-            // it has something it is entitled to propagate. A local
-            // write that failed reaches no host at all.
-            let names = raise_names.unwrap_or_default();
-            let pending: Vec<_> = raises
-                .iter()
-                .map(|raise| (raise.label.clone(), raise.send(&names, &client)))
-                .collect();
-            let mut hosts = Vec::new();
-            for (label, outcome) in pending {
-                hosts.push(match outcome.await {
-                    Ok(result) => AgentSetHooksHostOutcome::Result {
-                        host: label,
-                        result,
-                    },
-                    // Never fatal, and never an error frame: this
-                    // machine's own key is set either way, and a host
-                    // that could not be asked is one line in the reply.
-                    Err(error) => AgentSetHooksHostOutcome::Error {
-                        host: label,
-                        error: error.to_string(),
-                    },
-                });
-            }
-            let _ = reply.send(Ok(AgentSetHooksResult {
-                config_path: done.config_path.clone(),
-                local: done.outcome.clone(),
-                hosts,
-            }));
-            feed.send(EngineFeed::AgentHooksSet(Box::new(done)));
+        // The ticket is taken **here**, on the main thread, at receipt —
+        // see `AgentHooksApply` for why the order cannot be left to the
+        // runtime.
+        self.agent_hooks_applies += 1;
+        let ticket = self.agent_hooks_applies;
+        tracing::info!(ticket, "agent.set_hooks queued");
+        self.agent_hooks_worker.send(agent_hooks::AgentHooksApply {
+            ticket,
+            mode,
+            unknown: request.unknown,
+            guard,
+            raise_names,
+            raises,
+            client,
+            reply,
         });
     }
 
@@ -3477,12 +3562,33 @@ impl App {
             tracing::warn!(agent = %failure.agent, error = %failure.error, "agent hooks");
         }
         tracing::info!(
+            ticket = done.ticket,
             key = %done.key.to_config_value().unwrap_or_else(|| "ask".to_string()),
             unannounced = done.unnoticed.len(),
             errors = done.outcome.errors.len(),
             "agent.set_hooks applied"
         );
+        // The key is taken **whatever the ticket says**. This message
+        // exists only for an apply that got past `set_hooks`' first
+        // step, which writes the key and fails the whole run if it
+        // cannot — so the file holds `done.key`, and the running UI's
+        // copy has to say the same or every later fallback read answers
+        // with something that is not on disk. Dropping a superseded one
+        // because "the newer apply already wrote the file" assumes the
+        // newer apply *lands*; it may yet refuse without writing
+        // anything (a `config.lock` it never gets), and then the newest
+        // thing on disk is this one. Ordering is safe to lean on: one
+        // worker drains the queue and one FIFO feed carries the answers,
+        // so results arrive in ticket order and the last key taken is
+        // the last key written.
         self.config.agent_hooks = done.key;
+        // The receipt is the opposite rule (#490): it answers the user's
+        // latest gesture, so a choice they have already replaced says
+        // nothing. The `agent_hooks_surveyed` rule, for the same reason.
+        // Failures above are still logged: they happened.
+        if done.ticket != self.agent_hooks_applies {
+            return;
+        }
         let Some(toast) = agent_hooks::wired_toast(&done.unnoticed, None) else {
             return;
         };
@@ -3930,6 +4036,23 @@ impl App {
 
     pub fn status_active(&self) -> bool {
         self.status.is_active()
+    }
+
+    fn bottom_line(&self) -> Option<Cow<'_, str>> {
+        bottom_line(&self.status, &self.durability)
+    }
+
+    /// Record or retire one source's durability failure.
+    fn set_durability(&mut self, source: DurabilitySource, error: Option<String>) {
+        match error {
+            Some(error) => {
+                tracing::error!(?source, %error, "a workspace could not be saved");
+                self.durability.insert(source, error);
+            }
+            None => {
+                self.durability.remove(&source);
+            }
+        }
     }
 
     pub fn palette_retry_pending(&self) -> bool {
@@ -4661,10 +4784,6 @@ impl App {
         }
         self.window_focused = focused;
         self.workspace.set_window_focused(focused);
-        // The same statement the local workspace just took, for whichever
-        // session owns the selected tab: unfocusing releases the claim,
-        // refocusing re-states it.
-        self.push_host_focus();
         if let Some(tab) = self.tabs.get(&self.active_tab_key()) {
             tab.set_window_focus(focused);
         }
@@ -5615,7 +5734,7 @@ impl App {
             )
             .into()
         };
-        let content: Element<'_, Message> = if let Some(status) = self.status.message() {
+        let content: Element<'_, Message> = if let Some(status) = self.bottom_line() {
             let toast = container(text(status).size(12).color(chrome::ERROR_TEXT))
                 .max_width(520)
                 .padding([8, 12])
@@ -5893,11 +6012,7 @@ impl App {
         } else {
             "false"
         };
-        if let Some(path) = config::config_path() {
-            if let Err(error) = config::set_key(&path, "show-sidebar-agents", value) {
-                self.set_status(format!("persist show-sidebar-agents: {error}"));
-            }
-        }
+        self.config_writer.set("show-sidebar-agents", value);
     }
 
     pub fn new_tab(&mut self) -> UiTask {
@@ -6438,6 +6553,23 @@ impl App {
 
     /// The "and clear" half for a host tab — `focus_tab_in_core`'s
     /// counterpart, which is what the local path gets it from.
+    fn host_clear_notification(&mut self, tab: TabKey) {
+        // The bell half is ours alone: the session kept no flag for it,
+        // so nothing coming back over the wire would ever retire it.
+        self.host_bells.remove(&tab);
+        // No generation: the person clicked the tab, which answers
+        // whatever is pending on it rather than one raise.
+        self.send_host_clear_notification(tab, None);
+    }
+
+    /// The op half of a clear, without the client-local bell.
+    ///
+    /// #474's automatic acknowledgement answers one `notification.fired`
+    /// and nothing else: a bell this window has not shown the user yet is
+    /// not something a session's notification may retire on their behalf.
+    /// It names that raise's `generation` for the same reason — see
+    /// `TabClearNotificationParams::generation` for the race a bare
+    /// clear loses.
     ///
     /// Fire-and-forget, and **event-confirmed**: the session answers by
     /// committing `tab.notification { has_pending: false }`, and that
@@ -6445,15 +6577,12 @@ impl App {
     /// §3.9's no-optimistic-rows rule). Clearing here as well would take
     /// the row down before the host agreed, and put it back on the next
     /// reconcile if the op was refused.
-    fn host_clear_notification(&mut self, tab: TabKey) {
-        // The bell half is ours alone: the session kept no flag for it,
-        // so nothing coming back over the wire would ever retire it.
-        self.host_bells.remove(&tab);
-        let intent = crate::host_conn::HostIntent::new(
-            roost_ipc::messages::ops::TAB_CLEAR_NOTIFICATION,
-            serde_json::json!({ "tab_id": tab.tab.to_string() }),
-        );
-        if self.hosts.send_at(tab.host, intent).is_err() {
+    fn send_host_clear_notification(&mut self, tab: TabKey, generation: Option<u64>) {
+        if self
+            .hosts
+            .send_at(tab.host, clear_notification_intent(tab, generation))
+            .is_err()
+        {
             tracing::debug!(%tab, "could not clear the attention marker on a host tab");
         }
     }
@@ -6653,26 +6782,16 @@ impl App {
         if let Some(tab) = released {
             self.host_detach_tab(tab);
         }
-        // Every selection move is a focus move as far as a session is
-        // concerned: the host that lost the selection hears null and the
-        // one that gained it hears the tab, so exactly one session
-        // believes it is being looked at.
-        self.push_host_focus();
     }
 
-    /// State this client's focus to every connected host — the one
-    /// caller of [`HostConnSet::set_focus`], so the value a session
-    /// holds is always derived from the same two fields rather than
-    /// assembled at each edge.
+    /// The host tab this window is looking at, by [`host_focus_claim`].
     ///
-    /// Called at the three edges that can move it: a host reaching
-    /// `Connected` (this connection has stated nothing yet), the
-    /// selection moving, and the window gaining or losing focus. The set
-    /// dedups, so calling it on a change that turns out not to move
-    /// anything costs nothing.
-    fn push_host_focus(&mut self) {
-        self.hosts
-            .set_focus(host_focus_claim(self.window_focused, self.host_selection));
+    /// The one read behind #474's client rule, so the two surfaces it
+    /// drives — the acknowledgement on `notification.fired` and the
+    /// never-pending filter over a mirror's rows — cannot disagree about
+    /// what "looking at it" means.
+    fn viewed_host_tab(&self) -> Option<TabKey> {
+        host_focus_claim(self.window_focused, self.host_selection)
     }
 
     /// The gated Connect: the sidebar's ↻ row, the stopped banner's
@@ -6880,6 +6999,10 @@ impl App {
         if let Some(incarnation) = self.hosts.remove(saved_id) {
             self.purge_host_incarnation(incarnation);
         }
+        // Keyed by name, so `purge_host_incarnation` cannot reach it:
+        // a forgotten host's last save is nothing the user can act on
+        // (#481).
+        self.set_durability(DurabilitySource::Host(saved_id.to_string()), None);
         let removed = self.workspace.remove_host(saved_id);
         self.reconcile();
         removed
@@ -8536,11 +8659,17 @@ impl Drop for App {
     fn drop(&mut self) {
         // Freeze and fsync the authoritative layout before PTY-exit tasks can
         // observe teardown and attempt a later persistence write.
-        self.workspace.flush();
+        //
         // The one observable proof that the run loop dropped `App` rather
         // than the process being killed under it — the exit-on-empty path
-        // depends on this running.
-        tracing::info!("workspace state flushed on shutdown");
+        // depends on this running. There is no surface left to raise a
+        // failure on, so the log is where it goes (#481).
+        match self.workspace.flush() {
+            Ok(()) => tracing::info!("workspace state flushed on shutdown"),
+            Err(error) => {
+                tracing::error!(%error, "the workspace layout could not be written on shutdown")
+            }
+        }
     }
 }
 
@@ -8627,6 +8756,11 @@ fn resume_switch_journal(
             (mode, delete_dest, Vec::new())
         }
     };
+    // The one `config.conf` write this process still makes inline. It
+    // runs during bootstrap, before the engine feed a `ConfigWriter`
+    // failure would travel on exists and before any window — so there is
+    // no UI thread here to keep responsive, and the launch genuinely
+    // cannot continue until the key says which backend it is resuming.
     let key_written = match config::config_path() {
         Some(config_path) => match config::set_key(&config_path, "local-backend", mode.as_str()) {
             Ok(()) => true,
@@ -9352,6 +9486,77 @@ mod tests {
         assert!(!status.is_active());
     }
 
+    fn durability(entries: &[(DurabilitySource, &str)]) -> BTreeMap<DurabilitySource, String> {
+        entries
+            .iter()
+            .map(|(source, error)| (source.clone(), (*error).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_host_recovering_leaves_the_other_hosts_failure_on_the_line() {
+        let quiet = StatusBanner::default();
+        let mut failing = durability(&[
+            (DurabilitySource::Host("alpha".into()), "disk full"),
+            (DurabilitySource::Host("beta".into()), "read-only"),
+        ]);
+        assert_eq!(
+            bottom_line(&quiet, &failing).as_deref(),
+            Some("on alpha: last save failed: disk full")
+        );
+
+        failing.remove(&DurabilitySource::Host("alpha".into()));
+        assert_eq!(
+            bottom_line(&quiet, &failing).as_deref(),
+            Some("on beta: last save failed: read-only")
+        );
+
+        failing.remove(&DurabilitySource::Host("beta".into()));
+        assert_eq!(bottom_line(&quiet, &failing), None);
+    }
+
+    /// A local failure and a host's are different workspaces on
+    /// different disks, so they coexist — and this machine's own is
+    /// named first.
+    #[test]
+    fn a_local_failure_is_named_before_a_hosts() {
+        let quiet = StatusBanner::default();
+        let mut failing = durability(&[
+            (DurabilitySource::Host("alpha".into()), "disk full"),
+            (DurabilitySource::Local, "read-only"),
+        ]);
+        assert_eq!(
+            bottom_line(&quiet, &failing).as_deref(),
+            Some("Roost couldn't save your workspace: read-only")
+        );
+
+        failing.remove(&DurabilitySource::Local);
+        assert_eq!(
+            bottom_line(&quiet, &failing).as_deref(),
+            Some("on alpha: last save failed: disk full"),
+            "the host's failure was never overwritten, only covered"
+        );
+    }
+
+    #[test]
+    fn a_transient_toast_covers_a_standing_failure_and_then_uncovers_it() {
+        let now = Instant::now();
+        let failing = durability(&[(DurabilitySource::Local, "read-only")]);
+        let mut status = StatusBanner::default();
+        status.set_at("agent hooks wired", now);
+
+        assert_eq!(
+            bottom_line(&status, &failing).as_deref(),
+            Some("agent hooks wired")
+        );
+
+        status.expire_at(now + STATUS_BANNER_DURATION);
+        assert_eq!(
+            bottom_line(&status, &failing).as_deref(),
+            Some("Roost couldn't save your workspace: read-only")
+        );
+    }
+
     #[test]
     fn tab_cycle_clamps_at_both_ends_instead_of_wrapping() {
         assert_eq!(clamped_tab_index(0, 3, -1), Some(0));
@@ -9460,10 +9665,10 @@ mod tests {
         assert_eq!(host_selection_detach(None, None), None);
     }
 
-    /// What each connected session is told it owns. A session mutes the
-    /// tab it believes is focused, so an unfocused window and a
-    /// selection on another host both have to read as *no* claim — the
-    /// per-host null falls out of that at the send site.
+    /// What this window is reading. A tab named here is one whose
+    /// notification the user is already looking at, so an unfocused
+    /// window and a selection on another host both have to read as *no*
+    /// claim — a stale one would swallow a banner that is owed.
     #[test]
     fn only_a_selected_host_tab_in_a_focused_window_claims_focus() {
         let host = HostId::new(4);
@@ -11450,6 +11655,7 @@ mod tests {
             skew: skew(),
             reduced_fidelity,
             resumed: None,
+            persist_error: None,
         }
     }
 

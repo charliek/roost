@@ -38,7 +38,7 @@ use roost_ipc::messages::{
     AgentSetHooksResult,
 };
 use roost_ipc::IpcClient;
-use roost_ui_model::config::RoostConfig;
+use roost_ui_model::config::{AgentHooks, RoostConfig};
 
 /// How this client identifies itself in the state record.
 const BY: &str = "local";
@@ -122,7 +122,12 @@ pub fn run(cmd: &AgentCmd) -> i32 {
 
     match cmd {
         AgentCmd::Ensure { json, startup } => match configured() {
-            Some(mode) if *startup => report(ensure(&home, &mode, BY, guard), *json),
+            // `--startup` passes no mode: `ensure` re-reads the key
+            // inside the lock. This read decides only whether there is
+            // an answer to act on at all — the Mac spawns exactly this
+            // at launch, and the key can be answered between its read
+            // and this process's write.
+            Some(_) if *startup => report(ensure(&home, BY, guard), *json),
             Some(mode) => report(reconcile(&home, &mode, BY, guard), *json),
             None => {
                 // `--json` is a machine contract — the Mac app spawns
@@ -199,16 +204,19 @@ pub fn run(cmd: &AgentCmd) -> i32 {
             }
             Err(code) => code,
         },
-        AgentCmd::Status { json } => match status(&home, &resolved_or_nothing()) {
-            Ok(rows) => {
-                print_status(&rows, *json);
-                0
+        AgentCmd::Status { json } => {
+            let (key, mode) = resolved_or_nothing();
+            match status(&home, &mode) {
+                Ok(rows) => {
+                    print_status(&rows, key.unknown(), *json);
+                    0
+                }
+                Err(e) => {
+                    eprintln!("roostctl agent status: {e}");
+                    1
+                }
             }
-            Err(e) => {
-                eprintln!("roostctl agent status: {e}");
-                1
-            }
-        },
+        }
     }
 }
 
@@ -350,17 +358,25 @@ fn print_wire_outcome(outcome: &AgentHooksOutcome) {
 /// The resolved `agent-hooks` key — `None` when nobody has answered the
 /// consent dialog yet (plan 064), which `Ensure` reports rather than
 /// wiring or unwiring anything.
-///
-/// `pub(crate)` for doctor, which renders the same rows `status` prints
-/// and must resolve the key the same way.
-pub(crate) fn configured() -> Option<Mode> {
+fn configured() -> Option<Mode> {
     Mode::from_config(&RoostConfig::load_default().agent_hooks)
 }
 
-/// The key for a *reader*: unanswered means nothing is allowed yet.
-/// Reading is never a reason to guess at a consent nobody gave.
-pub(crate) fn resolved_or_nothing() -> Mode {
-    configured().unwrap_or(Mode::Allow(Vec::new()))
+/// The key as it stands, and what a *reader* resolves it to: unanswered
+/// means nothing is allowed yet, because reading is never a reason to
+/// guess at a consent nobody gave.
+///
+/// Both halves, from one load: `status` prints a row for every name in
+/// the key this build has no adapter for, and parsing `config.conf` a
+/// second time to reach it would repeat every warning its other keys
+/// emit.
+///
+/// `pub(crate)` for doctor, which renders the same rows `status` prints
+/// and must resolve the key the same way.
+pub(crate) fn resolved_or_nothing() -> (AgentHooks, Mode) {
+    let key = RoostConfig::load_default().agent_hooks;
+    let mode = Mode::from_config(&key).unwrap_or(Mode::Allow(Vec::new()));
+    (key, mode)
 }
 
 /// Parse `agent set`'s argument: a comma list of agent names, or the
@@ -373,9 +389,14 @@ pub(crate) fn resolved_or_nothing() -> Mode {
 /// working. `set` is the opposite kind of call: a user command whose
 /// only job is recording consent has no honest partial answer, so an
 /// unknown name refuses the whole list rather than silently narrowing
-/// it. [`resolve_names`] already draws that line the same way for
-/// `session.set_agent_hooks` (`roost-session`'s `agent_hooks::resolve`),
+/// it — and it is refused here for **both** routes, the UI-routed form
+/// included ([`run_over_ipc`] parses the spec before it sends),
 /// so this reuses it instead of a third copy of the rule.
+///
+/// It stays that way after plan 065 §3.1 made the *wire* ops skip an
+/// unknown name instead of refusing it: those serve a peer that may know
+/// agents this binary does not, where this serves a person who has just
+/// typed one in.
 fn parse_set_spec(spec: &str) -> Result<Mode, String> {
     let trimmed = spec.trim();
     if trimmed.eq_ignore_ascii_case("off") {
@@ -503,7 +524,15 @@ fn print_outcome(outcome: &Outcome) {
     }
 }
 
-fn print_status(rows: &[Status], json: bool) {
+/// The status table, plus one row per `agent-hooks` name this build has
+/// no adapter for.
+///
+/// They are shown rather than filtered because they are the *only*
+/// evidence a user has that their key says something this binary cannot
+/// act on — the key itself keeps them (a newer Roost put them there), so
+/// a status that hid them would read as if the name had been thrown
+/// away.
+fn print_status(rows: &[Status], unknown: &[String], json: bool) {
     if json {
         let body: Vec<serde_json::Value> = rows
             .iter()
@@ -521,6 +550,11 @@ fn print_status(rows: &[Status], json: bool) {
                     "warnings": row.warnings.iter().map(ToString::to_string).collect::<Vec<_>>(),
                 })
             })
+            .chain(
+                unknown
+                    .iter()
+                    .map(|name| serde_json::json!({"agent": name, "unknown_to_this_build": true})),
+            )
             .collect();
         println!("{}", serde_json::Value::Array(body));
         return;
@@ -536,6 +570,9 @@ fn print_status(rows: &[Status], json: bool) {
         for warning in &row.warnings {
             println!("          warning: {warning}");
         }
+    }
+    for name in unknown {
+        println!("{name:<9} unknown to this build");
     }
 }
 
@@ -589,21 +626,6 @@ mod tests {
         Wrapper::try_parse_from(std::iter::once("agent").chain(args.iter().copied()))
             .unwrap()
             .cmd
-    }
-
-    /// `roost_ui_model::config::AGENT_NAMES` cannot depend on
-    /// `roost-agent-install` (it would pull the install engine into
-    /// every consumer of the config parser), so the dialog's row order
-    /// and the install engine's agent inventory are two separately
-    /// maintained tables. This crate is the one place both are already
-    /// linked, so it is where drift between them gets caught.
-    #[test]
-    fn the_config_name_table_matches_the_agent_inventory() {
-        let inventory: Vec<&str> = roost_agent_install::ALL_AGENTS
-            .iter()
-            .map(|a| a.source())
-            .collect();
-        assert_eq!(roost_ui_model::config::AGENT_NAMES.to_vec(), inventory);
     }
 
     #[test]

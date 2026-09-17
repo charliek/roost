@@ -424,6 +424,14 @@ class VtPayload:
         ]
 
 
+#: Open a connection without pinning what it will be served. For the
+#: negotiation probes, where WHICH kind came back is the assertion:
+#: naming it in the constructor would make the test's own assert
+#: unfailable, because the guard below would fire first. The accountant
+#: is chosen from the accepted reply either way.
+ANY_KIND = "any"
+
+
 def collector_for(kind: str):
     """The payload accountant for a negotiated kind."""
     if kind == VT:
@@ -461,12 +469,11 @@ class Reply:
     seq: int = 0
     server_epoch: int = 0
     tab_generation: int = 0
-    #: The geometry the bytes that follow were written for, when the
-    #: server said — every accepted reply, either mode, focused or not:
-    #: a focused attach resizes from the control connection, and anything
-    #: else may resize the tab again before the encode or the resume
-    #: handoff runs. `None` only from a session predating `open_input`,
-    #: so an absent pair is an answer rather than a missing field.
+    #: The geometry the bytes that follow were written for. On every
+    #: accepted reply, either mode, focused or not: raw input is open,
+    #: so anything may resize the tab between the handshake's own resize
+    #: and the encode, and this is the only statement of what the bytes
+    #: say.
     snapshot_cols: int | None = None
     snapshot_rows: int | None = None
     code: str = ""
@@ -489,7 +496,7 @@ class Ending:
 class DataPlane:
     """One attach data connection.
 
-    Open it, [`handshake`] with a ticket `tab.attach` handed out, then
+    Open it, [`attach`] with the tab and the session's identity, then
     read frames. Contiguity, the payload accounting, and the
     terminal-frame bookkeeping all happen as frames arrive, so a test
     asserts on the *conclusion* rather than re-deriving it.
@@ -498,7 +505,8 @@ class DataPlane:
     The handshake reply is what actually selects the accountant — it is
     the authoritative statement of what the server negotiated — and a
     reply naming a different kind than the caller asked for fails here
-    rather than being scanned as the wrong format.
+    rather than being scanned as the wrong format. [`ANY_KIND`] opts out
+    of that guard.
     """
 
     def __init__(self, socket_path, timeout: float = 15.0, kind: str = GHOSTTY_SNAPSHOT):
@@ -515,7 +523,7 @@ class DataPlane:
         #: be empty: a rejection is a JSON line and a close, never a
         #: preamble the client would then try to parse.
         self.trailing = b""
-        self.snap = collector_for(kind)
+        self.snap = None if kind == ANY_KIND else collector_for(kind)
         self.frames_read = 0
         self.pty_frames = 0
         self.pty_bytes = 0
@@ -561,17 +569,55 @@ class DataPlane:
         self.close()
 
     # -- handshake --------------------------------------------------------
-    def handshake(
+    def attach(
         self,
-        token: str,
+        tab_id: int,
+        session_id: str,
+        libghostty_build: str,
         *,
+        kinds: list[str] | None = None,
+        cols: int = 80,
+        rows: int = 24,
+        cell_w_px: int = 0,
+        cell_h_px: int = 0,
+        focus: bool = True,
         protocol_version: int = SESSION_PROTOCOL_VERSION,
         resume_from_seq: int | None = None,
         server_epoch: int | None = None,
         tab_generation: int | None = None,
         timeout: float = 30.0,
     ) -> Reply:
-        """Send the handshake line and read the answer.
+        """The handshake: one connection, one line, the whole
+        negotiation.
+
+        `attach` names the tab as a `string_int64` and the terms ride
+        beside it. `session_id` is the value `session.identify` reported
+        and is required — it is what stops a dial prepared for one
+        session from landing on a replacement listening at the same
+        socket path.
+        """
+        request: dict = {
+            "attach": str(tab_id),
+            "protocol_version": protocol_version,
+            "session_id": session_id,
+            "kinds": kinds if kinds is not None else [self.kind],
+            "cols": cols,
+            "rows": rows,
+            "cell_w_px": cell_w_px,
+            "cell_h_px": cell_h_px,
+            "libghostty_build": libghostty_build,
+            "focus": focus,
+        }
+        if resume_from_seq is not None:
+            request["resume_from_seq"] = resume_from_seq
+        if server_epoch is not None:
+            request["server_epoch"] = server_epoch
+        if tab_generation is not None:
+            request["tab_generation"] = tab_generation
+        return self.send_handshake(request, timeout=timeout)
+
+    def send_handshake(self, request: dict, *, timeout: float = 30.0) -> Reply:
+        """Send a handshake line verbatim and read the answer.
 
         Returns the [`Reply`] rather than raising on refusal: which code
         came back *is* the assertion in most of the rejection cases, and
@@ -587,14 +633,11 @@ class DataPlane:
         connection's own handshake is the authoritative statement of
         what was negotiated (plan 053 §3.3), so a client that guessed
         would be reading a format nobody promised it.
+
+        Takes the request as a dict so a test can hand-build a line that
+        no constructor would produce — a malformed term, a missing one,
+        a wrong generation.
         """
-        request: dict = {"attach": token, "protocol_version": protocol_version}
-        if resume_from_seq is not None:
-            request["resume_from_seq"] = resume_from_seq
-        if server_epoch is not None:
-            request["server_epoch"] = server_epoch
-        if tab_generation is not None:
-            request["tab_generation"] = tab_generation
         self._sock.sendall((json.dumps(request) + "\n").encode())
 
         deadline = time.monotonic() + scaled_timeout(timeout)
@@ -611,7 +654,7 @@ class DataPlane:
                 snapshot_cols=_optional_int(raw, "snapshot_cols"),
                 snapshot_rows=_optional_int(raw, "snapshot_rows"),
             )
-            assert reply.kind == self.kind, (
+            assert self.kind in (ANY_KIND, reply.kind), (
                 f"this connection was opened to read {self.kind!r} but the session "
                 f"served {reply.kind!r}"
             )

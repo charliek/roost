@@ -1,0 +1,8 @@
+{
+  "id": "9",
+  "op": "tab.clear_notification",
+  "params": {
+    "tab_id": "3",
+    "generation": 7
+  }
+}

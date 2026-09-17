@@ -569,6 +569,21 @@ def session_state_dir() -> Path | None:
     return _SESSION_STATE_DIR
 
 
+def test_mode_active() -> bool:
+    """Whether the UI this session is driving can be trusted to have
+    `ROOST_TEST_MODE=1` in its own process env — i.e. whether test-mode
+    ops like `tab.feed_pty_bytes` will actually work against it.
+
+    `launch()` forwards `ROOST_TEST_MODE` from the harness process into a
+    UI it spawns, so that only happens when the harness OWNS this session
+    (`session_state_dir()` non-None — see `start_session`, which returns
+    `False` and leaves `_SESSION_STATE_DIR` at `None` on the reuse path,
+    `:577-593`). A reused developer instance keeps whatever env it was
+    started with; the harness has no IPC op to read it back, so it is
+    never assumed to be in test mode (#483)."""
+    return os.environ.get("ROOST_TEST_MODE") == "1" and _SESSION_STATE_DIR is not None
+
+
 def start_session(target: str, *, fresh: bool) -> bool:
     """Ensure a UI is running for the test session. Returns True if the
     harness started (and therefore owns) it — the caller quits it at

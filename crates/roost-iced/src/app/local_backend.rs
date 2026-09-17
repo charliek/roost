@@ -18,6 +18,8 @@ use roost_ui_model::config::RoostConfig;
 use roost_ui_model::keybind::KeybindAction;
 use roost_ui_model::keys::{HostId, ProjectKey, TabKey};
 
+use crate::config_writer::ConfigWriter;
+
 /// What the effective-mode ladder concluded (plan 063 §D5 steps 2–4).
 ///
 /// Three outcomes rather than a bare mode, because the fresh-install one
@@ -1268,9 +1270,12 @@ pub(crate) fn rollback_is_still_ours(expected_tabs: Option<usize>, found_tabs: u
 /// Warned, not raised: the run is already failing, and the journal on
 /// disk still describes an uncommitted switch — so the next launch
 /// rewrites this key from [`journal_recovery`] whatever happens here.
-fn put_backend_key_back(config_path: &Path, mode: LocalBackendMode) {
-    if let Err(error) = roost_ui_model::config::set_key(config_path, "local-backend", mode.as_str())
-    {
+///
+/// Awaited rather than queued so the caller's next step sees the key it
+/// put back, which is the order the crash windows below are reasoned
+/// about in.
+async fn put_backend_key_back(writer: &ConfigWriter, mode: LocalBackendMode) {
+    if let Err(error) = writer.record("local-backend", mode.as_str()).await {
         tracing::warn!(%error, %mode, "could not put the local-backend key back");
     }
 }
@@ -1316,24 +1321,25 @@ fn retire_failed_journal(path: &Path, journal: &SwitchJournal) -> Vec<(i64, Opti
 /// undoing a completed switch behind the user's back. So it refuses,
 /// and puts the key back on its way out.
 ///
-/// Free of the app so the refusal can be driven directly.
-fn reverse_commit_record(
-    config_path: &Path,
+/// Free of the app so the refusal can be driven directly. Off the main
+/// thread because the key write takes `config.lock` — see
+/// [`crate::config_writer`].
+async fn reverse_commit_record(
+    writer: &ConfigWriter,
     journal_path: &Path,
     journal: &mut SwitchJournal,
 ) -> Result<(), String> {
-    if let Err(error) = roost_ui_model::config::set_key(
-        config_path,
-        "local-backend",
-        LocalBackendMode::InProcess.as_str(),
-    ) {
+    if let Err(error) = writer
+        .record("local-backend", LocalBackendMode::InProcess.as_str())
+        .await
+    {
         return Err(format!("could not record the local backend: {error}"));
     }
     let uncommitted = journal.phase;
     journal.phase = SwitchState::Committing;
     if let Err(error) = write_journal(journal_path, journal) {
         journal.phase = uncommitted;
-        put_backend_key_back(config_path, LocalBackendMode::Session);
+        put_backend_key_back(writer, LocalBackendMode::Session).await;
         return Err(format!("could not record the switch commit: {error}"));
     }
     Ok(())
@@ -1645,6 +1651,10 @@ pub(crate) enum SwitchStep {
     /// The reverse's in-process hydrate ran — a seed, a restore of the
     /// rows a session-mode launch retained, or both.
     Seeded(Result<(), String>),
+    /// The forward commit's two records landed, or did not (phase 4).
+    Committed(Result<(), String>),
+    /// The reverse commit's two records landed, or did not.
+    ReverseCommitted(Result<(), String>),
 }
 
 impl super::App {
@@ -2065,18 +2075,9 @@ impl super::App {
         //    rolls back, and the rollback rewrites the key. The reverse
         //    order would leave a journal claiming a commit that no key
         //    records.
-        let Some(config_path) = roost_ui_model::config::config_path() else {
-            self.forward_roll_back("there is no config file to record the local backend in");
-            return;
-        };
-        if let Err(error) = roost_ui_model::config::set_key(
-            &config_path,
-            "local-backend",
-            LocalBackendMode::Session.as_str(),
-        ) {
-            self.forward_roll_back(&format!("could not record the local backend: {error}"));
-            return;
-        }
+        let recorded = self
+            .config_writer
+            .record("local-backend", LocalBackendMode::Session.as_str());
         // 2. The journal says the destination is whole. **A refusal, not
         //    a log.** The source teardown below is the one irreversible
         //    thing this sequence does, and this write is what tells the
@@ -2087,21 +2088,44 @@ impl super::App {
         //    deleted, and unwinds through the ordinary rollback: the key
         //    goes back, the copy goes, and the source is exactly as the
         //    user left it.
+        //
+        //    Both records ride one background step, in that order: the
+        //    key write waits on `config.lock` and this is the event-loop
+        //    thread. The journal is written only once the key's outcome
+        //    is known, so the order above is the order on disk.
         let path = self.journal_path();
         let run = self.switch.as_mut().expect("a run");
         run.journal.phase = SwitchState::Committing;
         run.journal.created_dest_ids = run.created.iter().map(|made| made.project).collect();
         run.journal.deletable_sources = deletable_sources(&run.created);
-        if let Err(error) = write_journal(&path, &run.journal) {
-            self.forward_roll_back(&format!("could not record the switch commit: {error}"));
-            return;
-        }
+        let journal = run.journal.clone();
+        let generation = run.generation;
+        run.step_in_flight = true;
+        let feed = self.feed_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let recorded = match recorded.await {
+                Ok(()) => write_journal(&path, &journal)
+                    .map_err(|error| format!("could not record the switch commit: {error}")),
+                Err(error) => Err(format!("could not record the local backend: {error}")),
+            };
+            feed.send(crate::engine_feed::EngineFeed::LocalBackendSwitch(
+                Box::new(SwitchStepDone {
+                    generation,
+                    step: SwitchStep::Committed(recorded),
+                }),
+            ));
+        });
+    }
+
+    /// Phase 4's tail, once both records are on disk.
+    fn forward_committed(&mut self) {
         // 3. The commit point.
         // The source's active pair, mapped by position — and where that
         // pair did not land (its project failed, or that very tab is the
         // one that could not start), the first tab this switch did land.
         // A switch that moved the user's work and then selected nothing
         // leaves them looking at an empty pane.
+        let run = self.switch.as_mut().expect("a run");
         run.wanted = mapped_selection(&run.created, run.active_at);
         let generation = run.generation;
         let deletable = run.journal.deletable_sources.clone();
@@ -2230,11 +2254,7 @@ impl super::App {
             .switch
             .as_ref()
             .is_some_and(|run| run.journal.launch_migration);
-        if !launch_migration {
-            if let Some(config_path) = roost_ui_model::config::config_path() {
-                put_backend_key_back(&config_path, LocalBackendMode::InProcess);
-            }
-        }
+        let writer = (!launch_migration).then(|| self.config_writer.clone());
         // Paired with what the snapshot said each copy should hold, so
         // the deletion below can tell the copy from a project somebody
         // else has since worked in — `rollback_is_still_ours`. The
@@ -2263,7 +2283,23 @@ impl super::App {
             })
             .unwrap_or_default();
         if created.is_empty() {
-            self.fail_switch(why);
+            // Nothing reached the destination, so the key restore *is*
+            // the rollback — and `fail_switch`'s journal clear is the
+            // one thing that must not overtake it, so the two ride one
+            // ordered task. (Nothing created means nothing adopted
+            // either, which is all `fail_switch` would do beyond that
+            // clear — see `retire_failed_journal`.)
+            let path = self.journal_path();
+            match writer {
+                Some(writer) => {
+                    self.runtime_handle.spawn(async move {
+                        put_backend_key_back(&writer, LocalBackendMode::InProcess).await;
+                        clear_journal(&path);
+                    });
+                }
+                None => clear_journal(&path),
+            }
+            self.fail_switch_keeping_journal(why);
             return;
         }
         let Some(ops) = self
@@ -2275,7 +2311,13 @@ impl super::App {
             // Nothing to delete it with. The journal stays where it is,
             // so the next launch — which will have a connection — is the
             // one that cleans it up (§D8b's "a partial destination copy
-            // may remain").
+            // may remain"), and it is also what makes an unordered key
+            // restore safe on this arm alone: nothing here can clear it.
+            if let Some(writer) = writer {
+                self.runtime_handle.spawn(async move {
+                    put_backend_key_back(&writer, LocalBackendMode::InProcess).await;
+                });
+            }
             self.fail_switch_keeping_journal(why);
             return;
         };
@@ -2289,7 +2331,7 @@ impl super::App {
         // is bookkeeping they did not.
         self.set_status(format!("{why} — nothing was changed"));
         self.runtime_handle.spawn(async move {
-            let complete = delete_dest_projects(&ops, &created).await;
+            let complete = roll_back_destination(writer, &ops, &created).await;
             feed.send(crate::engine_feed::EngineFeed::LocalBackendSwitch(
                 Box::new(SwitchStepDone {
                     generation,
@@ -2316,20 +2358,30 @@ impl super::App {
 
     /// The commit point, and the demotion behind it.
     fn reverse_commit(&mut self) -> bool {
-        let Some(config_path) = roost_ui_model::config::config_path() else {
-            self.fail_switch("there is no config file to record the local backend in");
-            return false;
-        };
         let path = self.journal_path();
+        let writer = self.config_writer.clone();
         let run = self.switch.as_mut().expect("a run");
-        if let Err(why) = reverse_commit_record(&config_path, &path, &mut run.journal) {
-            // The journal is the only record of an adopted copy (§D8b),
-            // so it stays: the next launch resolves what is on disk —
-            // an uncommitted reverse — and deletes that copy.
-            self.fail_switch_keeping_journal(&why);
-            return false;
-        }
+        let mut journal = run.journal.clone();
+        let generation = run.generation;
+        run.step_in_flight = true;
+        let feed = self.feed_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let recorded = reverse_commit_record(&writer, &path, &mut journal).await;
+            feed.send(crate::engine_feed::EngineFeed::LocalBackendSwitch(
+                Box::new(SwitchStepDone {
+                    generation,
+                    step: SwitchStep::ReverseCommitted(recorded),
+                }),
+            ));
+        });
+        false
+    }
+
+    /// The commit point, once both records are on disk.
+    fn reverse_committed(&mut self) {
         let run = self.switch.as_mut().expect("a run");
+        // The record's own copy moved with the file it wrote.
+        run.journal.phase = SwitchState::Committing;
         run.phase(SwitchState::CleaningUp);
         self.local_backend = LocalBackendMode::InProcess;
         self.publish_local_route();
@@ -2341,7 +2393,6 @@ impl super::App {
         // in-process band rather than staying on a session tab.
         self.set_host_selection(None);
         tracing::info!("local-backend committed to in-process");
-        true
     }
 
     /// Bring the in-process band back (§D8's "or whatever the
@@ -2435,6 +2486,18 @@ impl super::App {
                 }
                 self.end_switch();
             }
+            SwitchStep::Committed(recorded) => match recorded {
+                Ok(()) => self.forward_committed(),
+                Err(why) => self.forward_roll_back(&why),
+            },
+            SwitchStep::ReverseCommitted(recorded) => match recorded {
+                Ok(()) => self.reverse_committed(),
+                // The journal is the only record of an adopted copy
+                // (§D8b), so it stays: the next launch resolves what is
+                // on disk — an uncommitted reverse — and deletes that
+                // copy.
+                Err(why) => self.fail_switch_keeping_journal(&why),
+            },
             SwitchStep::Seeded(result) => {
                 if let Err(error) = result {
                     // The mode has already moved, so this is a band that
@@ -2684,6 +2747,33 @@ async fn delete_source_projects(client: &roost_engine::LocalClient, ids: &[i64])
         }
     }
     left
+}
+
+/// The forward rollback's work on disk, in the one order that leaves it
+/// recoverable: the key first, then the destination copy.
+///
+/// **One task, not two.** The journal is the only record that tells the
+/// next launch to put this key back, and it is cleared the moment this
+/// returns `true` — so a restore running *beside* the deletion can still
+/// be in flight when that journal goes. A crash in that window leaves
+/// `local-backend = session` with nothing left to describe it, on a run
+/// that already told the user nothing was changed. Awaiting the key here
+/// is what makes "the journal outlives the key write" true rather than
+/// usually true.
+///
+/// `writer` is `None` for §D5's launch migration, which has no key to
+/// put back — see [`super::App::forward_roll_back`].
+///
+/// Free of the app so the ordering can be driven directly.
+async fn roll_back_destination(
+    writer: Option<ConfigWriter>,
+    ops: &crate::host_conn::HostOps,
+    created: &[(i64, Option<usize>)],
+) -> bool {
+    if let Some(writer) = writer {
+        put_backend_key_back(&writer, LocalBackendMode::InProcess).await;
+    }
+    delete_dest_projects(ops, created).await
 }
 
 /// The rollback's other half. `true` when the destination holds none of
@@ -3846,11 +3936,17 @@ mod switch_tests {
     /// what the next launch resolves as an *uncommitted* reverse — it
     /// puts `session` back, undoing a completed switch nobody was told
     /// had failed. So it stops, and the key goes back with it.
-    #[test]
-    fn a_reverse_commit_that_cannot_record_itself_refuses_and_puts_the_key_back() {
+    #[tokio::test]
+    async fn a_reverse_commit_that_cannot_record_itself_refuses_and_puts_the_key_back() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.conf");
         roost_ui_model::config::set_key(&config, "local-backend", "session").unwrap();
+        let (feed, _feed_rx) = crate::engine_feed::channel();
+        let writer = ConfigWriter::spawn(
+            &tokio::runtime::Handle::current(),
+            Some(config.clone()),
+            feed,
+        );
         let mut reverse = SwitchJournal::new(SwitchDirection::ToInProcess, Vec::new());
         reverse.inherited_dest = vec![InheritedDest {
             project: 7,
@@ -3861,7 +3957,7 @@ mod switch_tests {
         // and it moves both.
         let ok = journal_path(dir.path());
         assert_eq!(
-            reverse_commit_record(&config, &ok, &mut reverse.clone()),
+            reverse_commit_record(&writer, &ok, &mut reverse.clone()).await,
             Ok(())
         );
         assert_eq!(backend_key(&config), Some("in-process".to_string()));
@@ -3872,7 +3968,8 @@ mod switch_tests {
 
         roost_ui_model::config::set_key(&config, "local-backend", "session").unwrap();
         let blocked = an_unwritable_journal_path(dir.path());
-        let error = reverse_commit_record(&config, &blocked, &mut reverse)
+        let error = reverse_commit_record(&writer, &blocked, &mut reverse)
+            .await
             .expect_err("the commit journal could not be written");
         assert!(
             error.contains("could not record the switch commit"),
@@ -3889,6 +3986,87 @@ mod switch_tests {
             "and the run's own copy still says what is on disk, \
              so the adopted copy is still named by an uncommitted journal"
         );
+    }
+
+    /// **A forward rollback puts the key back before it reaches the
+    /// destination** (plan 063 §D8b).
+    ///
+    /// The ordering is not cosmetic: the journal is cleared the moment
+    /// the destination cleanup reports itself complete, so a key restore
+    /// running *beside* that cleanup can still be queued when the record
+    /// that would redo it is gone — and the next launch comes up on
+    /// `session` after a run that said nothing was changed. The
+    /// stand-in below answers nothing until it has read the key, so
+    /// "before" is observed rather than timed.
+    #[tokio::test]
+    async fn a_forward_rollback_restores_the_key_before_it_clears_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.conf");
+        roost_ui_model::config::set_key(&config, "local-backend", "session").unwrap();
+        let (feed, _feed_rx) = crate::engine_feed::channel();
+        let writer = ConfigWriter::spawn(
+            &tokio::runtime::Handle::current(),
+            Some(config.clone()),
+            feed,
+        );
+
+        let (ops, worker, seen) = a_slot_reading_the_key(&config);
+        assert!(roll_back_destination(Some(writer.clone()), &ops, &[(101, Some(1))]).await);
+        drop(ops);
+        worker.await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap().first().cloned(),
+            Some(Some("in-process".to_string())),
+            "the destination cleanup started while the key still said session"
+        );
+        assert_eq!(backend_key(&config), Some("in-process".to_string()));
+
+        // §D5's launch migration has no key to put back, and the copy
+        // still goes.
+        roost_ui_model::config::set_key(&config, "local-backend", "session").unwrap();
+        let (ops, worker, seen) = a_slot_reading_the_key(&config);
+        assert!(roll_back_destination(None, &ops, &[(101, Some(1))]).await);
+        drop(ops);
+        worker.await.unwrap();
+        assert_eq!(
+            backend_key(&config),
+            Some("session".to_string()),
+            "a launch migration started from `session`; there is no key to undo"
+        );
+        assert!(
+            !seen.lock().unwrap().is_empty(),
+            "the copy was never cleared"
+        );
+    }
+
+    /// A stand-in session that records what `local-backend` said on disk
+    /// as each op reached it — enough of one to answer the rollback's
+    /// `tab.list` and `project.delete`.
+    #[allow(clippy::type_complexity)]
+    fn a_slot_reading_the_key(
+        config: &Path,
+    ) -> (
+        crate::host_conn::HostOps,
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    ) {
+        use roost_ipc::messages::ops as wire;
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (ops, mut rx) = crate::host_conn::HostOps::channel();
+        let config = config.to_path_buf();
+        let recorded = seen.clone();
+        let worker = tokio::spawn(async move {
+            while let Some(intent) = rx.recv().await {
+                recorded.lock().unwrap().push(backend_key(&config));
+                let answer = match intent.op.as_ref() {
+                    wire::TAB_LIST => serde_json::json!({ "projects": [row(101, &[7])] }),
+                    _ => serde_json::json!({}),
+                };
+                intent.answer(Ok(answer));
+            }
+        });
+        (ops, worker, seen)
     }
 
     /// **A refused run never drops the journal that names an adopted

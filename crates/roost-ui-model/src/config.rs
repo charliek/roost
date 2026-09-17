@@ -12,6 +12,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use roost_agent::{Agent, ALL_AGENTS};
 use roost_ipc::LocalBackendMode;
 
 use crate::custom_command::{self, CustomCommand};
@@ -153,18 +154,6 @@ impl From<LocalBackend> for LocalBackendMode {
     }
 }
 
-/// The agents Roost knows how to wire, canonical spelling, in the order
-/// [`AgentHooks::to_config_value`] serialises them and the order the
-/// consent dialog (plan 064) lists its rows. This is
-/// `roost_agent_install::ALL_AGENTS` order — this crate cannot depend on
-/// `roost-agent-install` (it would pull the install engine into every
-/// consumer of `roost-ui-model`, including the CLI's config-only paths),
-/// so the two tables are kept in step by
-/// `crates/roost-cli/src/agent_install.rs`'s
-/// `the_config_name_table_matches_the_agent_inventory` parity test —
-/// that crate is the one place both are already linked.
-pub const AGENT_NAMES: [&str; 5] = ["claude", "codex", "grok", "cursor", "opencode"];
-
 /// Reserved words that are never agent names: the two documented
 /// spellings (`off`/`false`/`no`) plus the retired ones this key used to
 /// accept (`auto`/`on`/`true`/`yes`, plan 046). A reserved word is only
@@ -174,10 +163,11 @@ const RESERVED_WORDS: [&str; 7] = ["off", "false", "no", "auto", "on", "true", "
 /// Three-state `agent-hooks` policy (plan 064; supersedes plan 046's
 /// two-state `Auto`/`Off`).
 ///
-/// * `Allow(names)` — the agents the user has explicitly consented to,
-///   canonical names in [`AGENT_NAMES`] order. Every present one not
-///   listed is left alone; nothing is ever removed just for being
-///   absent from the list.
+/// * `Allow { agents, unknown }` — the agents the user has explicitly
+///   consented to, canonical names in [`ALL_AGENTS`] order, plus every
+///   token in the key this build has no [`Agent`] for. Every present
+///   agent not listed is left alone; nothing is ever removed just for
+///   being absent from the list.
 /// * `Off` — the UIs wire nothing at startup. It does not *remove*
 ///   anything on its own; an explicit `roostctl agent ensure` reads the
 ///   same key and takes Roost's entries back out, which is what the
@@ -186,15 +176,78 @@ const RESERVED_WORDS: [&str; 7] = ["off", "false", "no", "auto", "on", "true", "
 ///   has answered the consent dialog yet, so nothing is written into
 ///   another product's config file and nothing already wired is
 ///   touched. This is the state a fresh install starts in.
+///
+/// `unknown` is what keeps a *newer* Roost's answer intact when an older
+/// one writes the key: every write path here is a read-modify-write, so
+/// a token dropped on the way in is a name erased off disk the next time
+/// any binary touches it. Carrying it costs nothing — this build cannot
+/// wire what it cannot name, so an unknown token allows nothing — and it
+/// is re-emitted verbatim by [`AgentHooks::to_config_value`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum AgentHooks {
-    Allow(Vec<String>),
+    /// [`AgentHooks::parse`] never leaves `agents` empty: a value naming
+    /// nothing this build knows is [`AgentHooks::Ask`], so `unknown`
+    /// only ever rides alongside a real allow-list. That is what makes
+    /// `to_config_value` round-trip through `parse` — a value spelling
+    /// only unknown tokens comes back as `Ask` and puts the consent
+    /// dialog up again. One writer builds that value on purpose and
+    /// wants exactly that reading: a *partial* uninstall taking the last
+    /// known name out of a key that still holds an unknown one
+    /// (`roost_agent_install::ensure::narrowed`, where the why is).
+    Allow {
+        agents: Vec<String>,
+        unknown: Vec<String>,
+    },
     Off,
     #[default]
     Ask,
 }
 
 impl AgentHooks {
+    /// An allow-list a caller built itself — a dialog, a wire list, a
+    /// test — normalised exactly as [`AgentHooks::parse`] normalises the
+    /// same names: the known ones in [`ALL_AGENTS`] order, anything else
+    /// lower-cased into `unknown`.
+    ///
+    /// Canonical *here*, and not only in [`AgentHooks::to_config_value`],
+    /// because this type's round-trip property is what stops a redundant
+    /// write: a wire list spelled `codex, claude` serialises as `claude,
+    /// codex`, so a value built from it that kept source order would
+    /// compare unequal to the key already on disk saying the same thing,
+    /// and rewrite the user's config to the bytes it already holds.
+    pub fn allow<I, S>(agents: I) -> AgentHooks
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut known: Vec<Agent> = Vec::new();
+        let mut unknown: Vec<String> = Vec::new();
+        for name in agents {
+            let name = name.into();
+            match Agent::parse(&name) {
+                Some(agent) => known.push(agent),
+                None => {
+                    let name = name.to_ascii_lowercase();
+                    if !unknown.contains(&name) {
+                        unknown.push(name);
+                    }
+                }
+            }
+        }
+        AgentHooks::Allow {
+            agents: ordered_names(&known),
+            unknown,
+        }
+    }
+
+    /// The tokens in this key that name no agent this build can wire.
+    pub fn unknown(&self) -> &[String] {
+        match self {
+            AgentHooks::Allow { unknown, .. } => unknown,
+            AgentHooks::Off | AgentHooks::Ask => &[],
+        }
+    }
+
     /// Parse a config value.
     ///
     /// `None` means "could not be resolved at all" — the caller warns
@@ -203,9 +256,9 @@ impl AgentHooks {
     /// group: it is `Some(Ask)`, so the caller does not warn — a fresh
     /// install with the key never written must not look like a mistake.
     ///
-    /// The value is split on `,` and lowercased; each token that names
-    /// an agent in [`AGENT_NAMES`] is kept (order-independent, reordered
-    /// into `AGENT_NAMES` order on the way out, duplicates collapsed).
+    /// The value is split on `,` and lowercased; each token
+    /// [`Agent::parse`] answers is kept (order-independent, reordered
+    /// into [`ALL_AGENTS`] order on the way out, duplicates collapsed).
     /// `off`/`false`/`no` as the *entire* single-token value means
     /// `Off`. A reserved word ([`RESERVED_WORDS`]) anywhere else in the
     /// value — alone as one of the retired spellings, or beside a name —
@@ -215,9 +268,16 @@ impl AgentHooks {
     /// start with a stray word) cannot be told apart.
     ///
     /// A value with at least one recognised name and some unrecognised
-    /// ones (`claude, banana`) still resolves — to the recognised subset
-    /// — but warns once from here, since the caller's `None` path never
-    /// runs for it.
+    /// ones (`claude, banana`) resolves to the recognised subset and
+    /// **keeps the rest** in `unknown`, warning once from here since the
+    /// caller's `None` path never runs for it. The kept token is the
+    /// lower-cased one this function split out, not the user's original
+    /// spelling: the key is normalised on the way in and there is
+    /// nothing else left to preserve.
+    ///
+    /// A value with *no* recognised name is `None` — unparseable, so
+    /// `Ask`. Preserving it instead would make `agent-hooks = clade` a
+    /// typo that silently answers the consent question forever.
     pub fn parse(s: &str) -> Option<AgentHooks> {
         let trimmed = s.trim();
         if trimmed.is_empty() {
@@ -244,55 +304,61 @@ impl AgentHooks {
         if tokens.iter().any(|t| RESERVED_WORDS.contains(&t.as_str())) {
             return None;
         }
-        let mut known: Vec<String> = Vec::new();
-        let mut unrecognised: Vec<String> = Vec::new();
+        let mut known: Vec<Agent> = Vec::new();
+        let mut unknown: Vec<String> = Vec::new();
         for tok in &tokens {
-            if AGENT_NAMES.contains(&tok.as_str()) {
-                known.push(tok.clone());
-            } else {
-                unrecognised.push(tok.clone());
+            match Agent::parse(tok) {
+                Some(agent) => known.push(agent),
+                None => unknown.push(tok.clone()),
             }
         }
         if known.is_empty() {
             return None;
         }
-        if !unrecognised.is_empty() {
+        if !unknown.is_empty() {
             tracing::warn!(
                 value = trimmed,
-                unrecognised = unrecognised.join(", "),
-                "agent-hooks: unrecognised agent name(s); allowing the rest"
+                unknown = unknown.join(", "),
+                "agent-hooks: agent name(s) this build cannot wire; kept in the key, \
+                 allowing the rest"
             );
         }
-        let ordered: Vec<String> = AGENT_NAMES
-            .iter()
-            .copied()
-            .filter(|name| known.iter().any(|k| k.as_str() == *name))
-            .map(|name| name.to_string())
-            .collect();
-        Some(AgentHooks::Allow(ordered))
+        Some(AgentHooks::Allow {
+            agents: ordered_names(&known),
+            unknown,
+        })
     }
 
-    /// The `config.conf` value for this state, in [`AGENT_NAMES`] order.
-    /// `Ask` has none: it is the *absence* of a decision, not a value —
-    /// it is never written until the user answers the consent dialog.
+    /// The `config.conf` value for this state: the known names in
+    /// [`ALL_AGENTS`] order, then every unknown token verbatim. `Ask`
+    /// has none: it is the *absence* of a decision, not a value — it is
+    /// never written until the user answers the consent dialog.
     pub fn to_config_value(&self) -> Option<String> {
         match self {
-            AgentHooks::Allow(names) => {
+            AgentHooks::Allow { agents, unknown } => {
                 // Re-ordered defensively rather than joined as-is: a
                 // caller that hand-builds a `Vec` (a test, or a future
                 // dialog that lets the user reorder rows) must still
                 // serialise in canonical order.
-                let ordered: Vec<&str> = AGENT_NAMES
-                    .iter()
-                    .copied()
-                    .filter(|name| names.iter().any(|n| n.as_str() == *name))
-                    .collect();
-                Some(ordered.join(", "))
+                let known: Vec<Agent> = agents.iter().filter_map(|n| Agent::parse(n)).collect();
+                let mut out = ordered_names(&known);
+                out.extend(unknown.iter().cloned());
+                Some(out.join(", "))
             }
             AgentHooks::Off => Some("off".to_string()),
             AgentHooks::Ask => None,
         }
     }
+}
+
+/// `agents` as canonical names in [`ALL_AGENTS`] order, duplicates
+/// collapsed.
+fn ordered_names(agents: &[Agent]) -> Vec<String> {
+    ALL_AGENTS
+        .into_iter()
+        .filter(|agent| agents.contains(agent))
+        .map(|agent| agent.source().to_string())
+        .collect()
 }
 
 /// Two-state policy for OSC 52 program-initiated clipboard writes.
@@ -561,7 +627,195 @@ impl RoostConfig {
     }
 }
 
-/// Round-trip-safe edit of `~/.config/roost/config.conf`.
+/// `config.lock`, beside the **resolved** `config.conf`.
+///
+/// Resolved, because that is the file everything here actually writes
+/// (see [`write_atomic`]): a `config.conf` symlinked into a dotfiles
+/// repo is written in the repo, so two Roosts reaching it by different
+/// link paths have to contend on one file. `$ROOST_CONFIG` therefore
+/// moves the lock with the config, which is what lets a jailed harness
+/// — and a second profile — write without touching the developer's.
+///
+/// Public because Roost's Swift half resolves the same path in its own
+/// `setKey`, and `flock(2)` only serialises writers that agree on which
+/// file they are contending for.
+pub fn lock_path(config_path: &Path) -> PathBuf {
+    lock_beside(&follow_links(config_path))
+}
+
+/// [`lock_path`] for a caller that has already resolved, so the guard it
+/// builds and the file it locks come out of **one** resolution rather
+/// than two that a swapped symlink could disagree about.
+fn lock_beside(resolved: &Path) -> PathBuf {
+    let parent = match resolved.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    parent.join("config.lock")
+}
+
+/// How long [`ConfigLock::acquire`] waits for the current holder before
+/// it gives up.
+///
+/// Bounded rather than blocking, because of who waits behind it: an
+/// agent-hooks ensure on a host session runs holding that session's
+/// mutation barrier, and `session.stop` takes the same barrier for
+/// write — so an unbounded `flock` on a `$HOME` that may be
+/// network-mounted was a wedge that no client disconnect and no
+/// shutdown could clear. Ten seconds is far longer than an honest
+/// ensure (a key plus five small files) and comfortably shorter than
+/// the 15 s a client gives `session.set_agent_hooks`, so the caller
+/// hears [`LockError::Busy`] instead of timing out on the wire.
+pub const LOCK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often a waiter re-asks. Short enough that the normal hand-off is
+/// imperceptible, long enough that a full deadline is 400 syscalls
+/// rather than a spin.
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// A config file `0600` is created with, so a `config.lock` Roost makes
+/// is no more readable than the config beside it.
+const LOCK_MODE: u32 = 0o600;
+
+#[derive(Debug)]
+pub enum LockError {
+    /// Another writer held the lock for the whole deadline.
+    Busy {
+        path: PathBuf,
+        waited: std::time::Duration,
+    },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+}
+
+impl std::fmt::Display for LockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LockError::Busy { path, waited } => write!(
+                f,
+                "{}: another Roost held this config lock for {:.0?}; nothing was written",
+                path.display(),
+                waited
+            ),
+            LockError::Io { path, source } => write!(f, "{}: {source}", path.display()),
+        }
+    }
+}
+
+impl std::error::Error for LockError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LockError::Busy { .. } => None,
+            LockError::Io { source, .. } => Some(source),
+        }
+    }
+}
+
+impl From<LockError> for io::Error {
+    fn from(error: LockError) -> io::Error {
+        let kind = match &error {
+            LockError::Busy { .. } => io::ErrorKind::WouldBlock,
+            LockError::Io { source, .. } => source.kind(),
+        };
+        io::Error::new(kind, error.to_string())
+    }
+}
+
+/// The advisory lock every writer of one `config.conf` goes through.
+///
+/// An atomic rename stops a *torn* file but not a lost update: two
+/// readers, two renders built on the same pre-image, and the second
+/// rename silently discards the first's work. `config.conf` has four
+/// writers that can all run at once — this UI, the Swift app,
+/// `roostctl`, and a remote connect raising `agent-hooks` — so the
+/// rename alone was never enough.
+///
+/// **Never acquired on a UI thread.** The hold spans a whole
+/// agent-hooks ensure (read the key, union it, write up to five agent
+/// files, write the key back), which on a network-mounted `$HOME` is
+/// seconds.
+#[derive(Debug)]
+pub struct ConfigLock {
+    file: fs::File,
+    /// The resolved config path this guard covers — what
+    /// [`set_key_locked`] checks its target against.
+    config: PathBuf,
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        // `flock` belongs to the open file description, so a forked
+        // child holding an inherited fd would keep it past our close.
+        // Unlock explicitly rather than relying on that.
+        let _ = self.file.unlock();
+    }
+}
+
+impl ConfigLock {
+    /// Take `config_path`'s lock, waiting at most [`LOCK_DEADLINE`].
+    pub fn acquire(config_path: &Path) -> Result<ConfigLock, LockError> {
+        ConfigLock::acquire_within(config_path, LOCK_DEADLINE)
+    }
+
+    /// [`ConfigLock::acquire`] with the deadline stated, for the tests
+    /// that need a short one.
+    pub fn acquire_within(
+        config_path: &Path,
+        deadline: std::time::Duration,
+    ) -> Result<ConfigLock, LockError> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let config = follow_links(config_path);
+        let path = lock_beside(&config);
+        let dir = path.parent().unwrap_or(Path::new("."));
+        fs::create_dir_all(dir).map_err(|source| LockError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(LOCK_MODE)
+            .open(&path)
+            .map_err(|source| LockError::Io {
+                path: path.clone(),
+                source,
+            })?;
+
+        let started = std::time::Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(ConfigLock { file, config }),
+                // `flock` is per open file description, so this is
+                // reached by a second writer *in this process* too —
+                // which is what lets a test prove a write ran while the
+                // lock was held.
+                Err(fs::TryLockError::WouldBlock) => {}
+                Err(fs::TryLockError::Error(source)) => return Err(LockError::Io { path, source }),
+            }
+            let waited = started.elapsed();
+            if waited >= deadline {
+                return Err(LockError::Busy {
+                    path,
+                    waited: deadline,
+                });
+            }
+            std::thread::sleep(LOCK_POLL.min(deadline - waited));
+        }
+    }
+
+    /// The resolved config path this guard covers.
+    pub fn config_path(&self) -> &Path {
+        &self.config
+    }
+}
+
+/// Round-trip-safe edit of `~/.config/roost/config.conf`, under
+/// [`ConfigLock`].
 ///
 /// Replaces every line whose key (the text before the first `=`,
 /// trimmed) equals `key`. The parser is "last-wins" on duplicates, so
@@ -583,19 +837,74 @@ impl RoostConfig {
 /// `font-size = 14` do not). The write is atomic via tmp-file +
 /// rename in the same directory. The parent directory is created if
 /// missing.
+///
+/// This blocks for as long as the lock is held, so it belongs off any
+/// UI thread — see [`ConfigLock`].
 pub fn set_key(path: &Path, key: &str, value: &str) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
+    let lock = ConfigLock::acquire(path)?;
+    write_key(lock.config_path(), key, value)
+}
+
+/// [`set_key`] for a caller that already holds the lock.
+///
+/// `File::try_lock` is per open file description, so a nested
+/// *unlocked* [`set_key`] under a held guard would contend with its own
+/// holder and stall to the full [`LOCK_DEADLINE`]. Passing the guard is
+/// what makes that unwritable, and the guard carries the file it
+/// covers so aiming one at a different config is caught rather than
+/// waited on.
+pub fn set_key_locked(lock: &ConfigLock, path: &Path, key: &str, value: &str) -> io::Result<()> {
+    let target = follow_links(path);
+    if !same_config_file(lock.config_path(), &target) {
+        // Returned rather than panicked: this runs inside a long-lived
+        // session daemon, where a wrong guard must fail one op, not the
+        // process.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "config lock covers {} but the write targets {}; \
+                 passing a guard for another file is a programming error",
+                lock.config_path().display(),
+                target.display()
+            ),
+        ));
+    }
+    write_key(&target, key, value)
+}
+
+/// Whether an already-link-resolved guard path and write target name the
+/// same file.
+///
+/// Compared with `.` components dropped, so a caller's *spelling* cannot
+/// turn a legitimate write into a refusal. `Path`'s own equality already
+/// drops a `.` in the middle; a leading one it keeps, which is the
+/// spelling a relative config path produces. `..` is deliberately left
+/// alone — collapsing it lexically is unsound the moment a component is
+/// a symlink, and these paths have been through [`follow_links`] already.
+fn same_config_file(guard: &Path, target: &Path) -> bool {
+    let named = |path: &Path| -> PathBuf {
+        path.components()
+            .filter(|part| !matches!(part, std::path::Component::CurDir))
+            .collect()
+    };
+    named(guard) == named(target)
+}
+
+/// [`set_key`]'s body, against an already-resolved path and with the
+/// lock already held.
+fn write_key(target: &Path, key: &str, value: &str) -> io::Result<()> {
+    if let Some(parent) = target.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
     }
-    let existing = match fs::read_to_string(path) {
+    let existing = match fs::read_to_string(target) {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };
     let new_contents = render_set_key(&existing, key, value);
-    write_atomic(path, &new_contents)
+    write_atomic(target, &new_contents)
 }
 
 /// Write a config file that holds only `key = value`, failing if one
@@ -603,18 +912,18 @@ pub fn set_key(path: &Path, key: &str, value: &str) -> io::Result<()> {
 ///
 /// For the write a caller knows is a **create**, not an update — plan
 /// 063 §D5's fresh-install `local-backend` line is the one such caller.
-/// [`set_key`] cannot serve it: read-modify-write plus an atomic rename
-/// prevents a *torn* file, not a *lost update*, and nothing locks this
-/// path (`default_path()` has no profile component, so the per-profile
-/// instance locks do not cover it). Another profile, instance or editor
-/// creating `config.conf` between the caller's "no config" check and
-/// the rename would have its file replaced wholesale — including an
-/// explicit `local-backend = in-process` it had just written.
-/// `create_new` (`O_CREAT|O_EXCL`) makes that race an `AlreadyExists`
-/// the caller degrades on instead.
+/// [`set_key`] cannot serve it even under [`ConfigLock`]: the lock
+/// serialises Roost's own writers, not an editor or a `printf >>` the
+/// user runs, and read-modify-write plus an atomic rename would replace
+/// such a file wholesale — including an explicit `local-backend =
+/// in-process` it had just written. `create_new` (`O_CREAT|O_EXCL`)
+/// makes that race an `AlreadyExists` the caller degrades on instead.
+/// The lock is taken all the same, so this cannot land between another
+/// Roost's read and its rename.
 pub fn create_with_key(path: &Path, key: &str, value: &str) -> io::Result<()> {
     use std::io::Write;
 
+    let _lock = ConfigLock::acquire(path)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -687,6 +996,23 @@ fn line_key_matches(line: &str, target: &str) -> bool {
     trimmed[..eq].trim_end() == target
 }
 
+/// Replace `path`'s contents in one step: tmp file beside it, then
+/// rename.
+///
+/// **`path` is already link-resolved**, and resolving it here instead
+/// would be a bug rather than a belt-and-braces. Renaming onto the
+/// *link* would replace it with a regular file and silently orphan the
+/// target — someone whose `config.conf` is a link into a dotfiles repo
+/// would find Roost had stopped writing the file their repo tracks, and
+/// since plan 064 that write can happen with nobody at the keyboard (a
+/// connecting client raises this machine's `agent-hooks`) — so every
+/// caller resolves, and the [`ConfigLock`] it holds was taken beside
+/// that same answer. Resolving a second time here would break that
+/// pairing: [`follow_links`] stops at its hop limit and is therefore
+/// **not idempotent** over a longer chain, so the second answer can walk
+/// further down it than the first. The lock would sit beside one file
+/// while the rename landed on another — two locks over one config, which
+/// is the lost update the lock exists to prevent.
 fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -697,14 +1023,6 @@ fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
     // theme.set immediately followed by font-family.set).
     static NONCE: AtomicU64 = AtomicU64::new(0);
 
-    // Renaming onto the *link* would replace it with a regular file and
-    // silently orphan the target — someone whose `config.conf` is a link
-    // into a dotfiles repo would find Roost had stopped writing the file
-    // their repo tracks. Since plan 064 that write can happen with nobody
-    // at the keyboard (a connecting client raises this machine's
-    // `agent-hooks`), so the link has to survive it.
-    let path = follow_links(path);
-    let path = path.as_path();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let parent = if parent.as_os_str().is_empty() {
         Path::new(".")
@@ -1087,7 +1405,7 @@ mod tests {
     // `ConfigAgentHooksTests`.
 
     fn allow(names: &[&str]) -> AgentHooks {
-        AgentHooks::Allow(names.iter().map(|s| s.to_string()).collect())
+        AgentHooks::allow(names.iter().copied())
     }
 
     #[test]
@@ -1103,7 +1421,7 @@ mod tests {
             allow(&["claude", "codex"])
         );
         // Mixed case, extra whitespace, and codex-first input all
-        // normalise the same way: `AGENT_NAMES` order, not source order.
+        // normalise the same way: `ALL_AGENTS` order, not source order.
         assert_eq!(
             RoostConfig::parse(" agent-hooks = Codex , CLAUDE ").agent_hooks,
             allow(&["claude", "codex"])
@@ -1177,12 +1495,27 @@ mod tests {
 
     /// An unrecognised name beside a recognised one is not ambiguous the
     /// same way — the recognised name is the answer, and the unknown one
-    /// is dropped with a warning naming it.
+    /// is warned about but **kept**, so the round trip through
+    /// `to_config_value` cannot erase what a newer Roost wrote.
     #[test]
-    fn agent_hooks_drops_unrecognised_names_and_keeps_the_rest() {
+    fn agent_hooks_keeps_unrecognised_names_beside_the_rest() {
+        let key = RoostConfig::parse("agent-hooks = banana, claude").agent_hooks;
         assert_eq!(
-            RoostConfig::parse("agent-hooks = claude, banana").agent_hooks,
-            allow(&["claude"])
+            key,
+            AgentHooks::Allow {
+                agents: vec!["claude".to_string()],
+                unknown: vec!["banana".to_string()],
+            }
+        );
+        // Known names in `ALL_AGENTS` order first, then the unknown as
+        // the parser normalised it — which is lower-cased, because that
+        // is all there is left of the original spelling.
+        assert_eq!(
+            RoostConfig::parse("agent-hooks = Banana, CODEX, claude")
+                .agent_hooks
+                .to_config_value()
+                .unwrap(),
+            "claude, codex, banana"
         );
     }
 
@@ -1219,6 +1552,24 @@ mod tests {
         );
         assert_eq!(AgentHooks::Off.to_config_value().as_deref(), Some("off"));
         assert_eq!(AgentHooks::Ask.to_config_value(), None);
+    }
+
+    /// …and all the way back. A list handed in wire order has to *be*
+    /// the value it serialises to, or a caller comparing what it built
+    /// against the key already on disk rewrites a config that says
+    /// exactly this.
+    #[test]
+    fn agent_hooks_allow_is_canonical_whatever_order_it_is_given() {
+        let hooks = AgentHooks::allow(["codex", "claude"]);
+        let value = hooks.to_config_value().expect("an allow-list has a value");
+        assert_eq!(value, "claude, codex");
+        assert_eq!(AgentHooks::parse(&value), Some(hooks));
+
+        // A name this build cannot wire rides along, normalised the way
+        // the parser would have left it.
+        let mixed = AgentHooks::allow(["Banana", "codex"]);
+        assert_eq!(mixed.to_config_value().as_deref(), Some("codex, banana"));
+        assert_eq!(AgentHooks::parse("codex, banana"), Some(mixed));
     }
 
     /// The retired `agent-hooks-skip` key now parses as an ignored
@@ -1566,6 +1917,253 @@ mod tests {
         );
     }
 
+    /// The lock waits, and then stops waiting.
+    ///
+    /// Blocking forever was the defect, not the waiting: an agent-hooks
+    /// ensure on a host session runs holding that session's mutation
+    /// barrier, and `session.stop` takes the same barrier — so a holder
+    /// that never releases (a crashed writer, a stale `flock` on a
+    /// network home) meant the daemon never flushed, never reaped and
+    /// never answered. Both halves are asserted: a busy lock is still
+    /// waited for, and the wait ends in a named refusal rather than
+    /// never.
+    #[test]
+    fn a_lock_nobody_releases_is_refused_at_the_deadline() {
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.conf");
+        // `flock` belongs to the open file description, so a second
+        // holder in *this* process contends exactly like another one.
+        let held = super::ConfigLock::acquire(&config).expect("take the lock");
+
+        let started = Instant::now();
+        let refused = super::ConfigLock::acquire_within(&config, Duration::from_millis(200))
+            .expect_err("a lock that never frees must not be waited on forever");
+        let waited = started.elapsed();
+
+        assert!(
+            matches!(refused, super::LockError::Busy { .. }),
+            "{refused:?}"
+        );
+        assert!(refused.to_string().contains("config lock"), "{refused}");
+        assert!(waited >= Duration::from_millis(200), "{waited:?}");
+        // No upper bound on the elapsed wall clock: a suspended process
+        // would blow any figure picked here without a defect having
+        // happened. What is asserted instead is that the wait *ended* —
+        // which is the claim — and `LOCK_DEADLINE` is pinned by name in
+        // `the_default_deadline_stays_inside_the_op_budget`.
+
+        drop(held);
+        super::ConfigLock::acquire_within(&config, Duration::from_millis(200))
+            .expect("free again once the holder is gone");
+    }
+
+    /// The production default is the one the callers reason about: long
+    /// enough that an honest ensure never reaches it, short enough that
+    /// a client's own 15 s budget for `session.set_agent_hooks` is not
+    /// what gives up first.
+    #[test]
+    fn the_default_deadline_stays_inside_the_op_budget() {
+        assert_eq!(super::LOCK_DEADLINE, std::time::Duration::from_secs(10));
+    }
+
+    /// #487: the lost update, closed. A writer that finds the lock held
+    /// **waits** rather than building a render on a pre-image somebody
+    /// else is about to replace.
+    ///
+    /// Deterministic rather than probabilistic: the lock is held by the
+    /// test itself, so the writer is certainly contending, and the
+    /// 200 ms window is two orders of magnitude inside `LOCK_DEADLINE`.
+    ///
+    /// The writer says so before it starts. "Has not finished in 200 ms"
+    /// is also true of a thread the scheduler has not run at all, so on
+    /// a loaded runner it would pass over an implementation that takes
+    /// no lock; waiting for the signal first means the 200 ms is spent
+    /// inside `set_key` rather than possibly ahead of it.
+    #[test]
+    fn set_key_waits_for_a_held_lock_and_lands_on_release() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.conf");
+        fs::write(&config, "theme = roost-dark\n").unwrap();
+        let held = super::ConfigLock::acquire(&config).expect("take the lock");
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writing = config.clone();
+        let writer = std::thread::spawn(move || {
+            let _ = entered_tx.send(());
+            let outcome = super::set_key(&writing, "font-size", "17");
+            let _ = done_tx.send(());
+            outcome
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the writer thread to reach set_key");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "set_key returned while the lock was held: the write is not serialised"
+        );
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            "theme = roost-dark\n",
+            "the file moved while the lock was held"
+        );
+
+        drop(held);
+        writer.join().unwrap().expect("the write lands on release");
+        let cfg = RoostConfig::load_from(&config);
+        assert_eq!(cfg.font_size, Some(17.0));
+        assert_eq!(cfg.theme_name.as_deref(), Some("roost-dark"));
+    }
+
+    /// The degenerate half of that path, pinned on both sides: this is
+    /// the table `Config.swift`'s `configLockPath` is tested against, and
+    /// a config path with no parent directory is where the two resolvers
+    /// can silently pick different files.
+    #[test]
+    fn the_lock_path_table_the_swift_twin_mirrors() {
+        for (config, lock) in [
+            ("/", "./config.lock"),
+            ("//", "./config.lock"),
+            ("", "./config.lock"),
+            ("config.conf", "./config.lock"),
+            ("./config.conf", "./config.lock"),
+            ("a/", "./config.lock"),
+            ("/config.conf", "/config.lock"),
+            ("/a/", "/config.lock"),
+            ("/a/b/config.conf", "/a/b/config.lock"),
+        ] {
+            assert_eq!(
+                super::lock_beside(Path::new(config)),
+                Path::new(lock),
+                "{config}"
+            );
+        }
+    }
+
+    /// The lock follows the config, so `$ROOST_CONFIG` and a dotfiles
+    /// symlink both land two writers on the same file.
+    #[test]
+    fn the_lock_sits_beside_the_resolved_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("dotfiles");
+        fs::create_dir_all(&real).unwrap();
+        let target = real.join("config.conf");
+        fs::write(&target, "").unwrap();
+        let link = tmp.path().join("config.conf");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(super::lock_path(&link), real.join("config.lock"));
+        assert_eq!(super::lock_path(&target), real.join("config.lock"));
+        assert_eq!(
+            super::ConfigLock::acquire(&link).unwrap().config_path(),
+            target
+        );
+    }
+
+    /// #487, the other way a lock splits: a chain past
+    /// [`follow_links`]'s hop limit resolves to a *different* answer the
+    /// second time, so a write that re-resolved would land beside a lock
+    /// nobody else takes.
+    ///
+    /// Sixteen hops of chain in one directory, with the last link
+    /// pointing at the real file in another. The lock is taken beside
+    /// hop 16; a writer that resolved again would rename onto the real
+    /// file in the far directory, where the writer who reached it by its
+    /// own path holds a different lock.
+    #[test]
+    fn a_write_lands_on_the_file_its_lock_covers_past_the_hop_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Canonical, because every hop below stores an *absolute* target and
+        // macOS puts its temp dirs under a symlinked `/var`: resolving each
+        // hop would re-traverse that link, costing two of the OS's symlink
+        // budget per hop and hitting its limit of 32 at exactly this chain
+        // length. The hop limit under test is `follow_links`', not the
+        // kernel's.
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let near = root.join("near");
+        let far = root.join("far");
+        fs::create_dir_all(&near).unwrap();
+        fs::create_dir_all(&far).unwrap();
+        let real = far.join("config.conf");
+        fs::write(&real, "theme = far\n").unwrap();
+
+        let entry = near.join("config.conf");
+        let hop = |n: usize| near.join(format!("hop{n}"));
+        std::os::unix::fs::symlink(hop(1), &entry).unwrap();
+        for n in 1..16 {
+            std::os::unix::fs::symlink(hop(n + 1), hop(n)).unwrap();
+        }
+        std::os::unix::fs::symlink(&real, hop(16)).unwrap();
+
+        assert_eq!(
+            super::lock_path(&entry),
+            near.join("config.lock"),
+            "the chain is not long enough to split the two resolutions"
+        );
+        super::set_key(&entry, "theme", "roost-dark").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&real).unwrap(),
+            "theme = far\n",
+            "the write ran past the file its lock covers and landed on the far target"
+        );
+        assert_eq!(
+            RoostConfig::load_from(&entry).theme_name.as_deref(),
+            Some("roost-dark")
+        );
+    }
+
+    /// A guard covers a *file*, and two spellings of one file are not a
+    /// caller aiming at somebody else's config — see `same_config_file`.
+    #[test]
+    fn a_guard_is_matched_by_the_file_it_names_not_by_the_spelling() {
+        let same = |a: &str, b: &str| super::same_config_file(Path::new(a), Path::new(b));
+
+        // `Path`'s own equality already drops a `.` in the middle…
+        assert!(same("/cfg/config.conf", "/cfg/./config.conf"));
+        // …and keeps a leading one, which is the spelling this closes.
+        assert!(same("config.conf", "./config.conf"));
+        assert!(same("./cfg/config.conf", "cfg/config.conf"));
+
+        // The bug the guard exists for is still caught.
+        assert!(!same("/mine/config.conf", "/theirs/config.conf"));
+        // And `..` is left alone: with a symlink anywhere above it, the
+        // two spellings are genuinely different files.
+        assert!(!same("/cfg/config.conf", "/cfg/sub/../config.conf"));
+    }
+
+    /// A guard for another file is a bug in the caller, and it is said
+    /// so rather than waited on — see `set_key_locked`.
+    #[test]
+    fn set_key_locked_refuses_a_guard_for_another_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mine = tmp.path().join("mine/config.conf");
+        let theirs = tmp.path().join("theirs/config.conf");
+        let lock = super::ConfigLock::acquire(&mine).unwrap();
+
+        let refused = super::set_key_locked(&lock, &theirs, "theme", "roost-dark")
+            .expect_err("a guard for another file must not write");
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            refused.to_string().contains("mine/config.conf"),
+            "{refused}"
+        );
+        assert!(
+            refused.to_string().contains("theirs/config.conf"),
+            "{refused}"
+        );
+        assert!(!theirs.exists());
+
+        super::set_key_locked(&lock, &mine, "theme", "roost-dark").expect("its own file writes");
+        assert_eq!(fs::read_to_string(&mine).unwrap(), "theme = roost-dark\n");
+    }
+
     /// The fresh-install write is a create, and a config that appeared
     /// since the "no config" check must survive it byte for byte — the
     /// lost update `set_key`'s rename would have caused.
@@ -1591,7 +2189,10 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        assert_eq!(names, vec!["config.conf".to_string()]);
+        assert_eq!(
+            names,
+            vec!["config.conf".to_string(), "config.lock".to_string()]
+        );
     }
 
     /// The contrast that gives the test above its teeth: `set_key`,

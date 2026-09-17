@@ -30,6 +30,7 @@ from pathlib import Path
 
 import pytest
 
+import ui
 from client import RoostError, Timeout
 from test_agent_lifecycle import agent_tab, claude_hook
 from util import BARE_SHELL_ARGV, is_fresh, wait_tab_attached
@@ -94,6 +95,19 @@ def _seed(
     except Timeout:
         pass
     if TEST_MODE:
+        if not ui.test_mode_active():
+            # ROOST_TEST_MODE=1 is set for THIS process (`make e2e-iced`,
+            # #483), but the UI we're driving is a reused dev instance
+            # the harness did not launch — `launch()` only forwards the
+            # env var into a UI it spawns itself, so this reused instance
+            # may not actually have the test-mode op registered. Skip
+            # rather than fail confusingly on `tab.feed_pty_bytes`.
+            pytest.skip(
+                "ROOST_TEST_MODE=1 is set but this session is reusing an "
+                "already-running iced instance not launched in test mode "
+                "— quit your dev instance first, or run `make "
+                "e2e-iced-ci` (which always launches a fresh one)"
+            )
         # A bare shell emits no OSC 133 marks of its own, so `at_prompt`
         # has to come from us. Feed the A mark ourselves — same settled
         # end-state as a real prompt, deterministic, and it still

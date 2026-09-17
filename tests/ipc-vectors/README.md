@@ -26,6 +26,12 @@ envelope, or an event envelope. The naming convention is:
   integer, one file per generation it has carried (`session.identify`
   today). Tests build `<N>` from the constant; older generations stay.
 
+The `attach.handshake.*` files are the one set that carries no envelope:
+they are the first line of a data connection, which the server tells
+apart from an op precisely by its having no `op`. The `.request` files
+are handshake lines and `.accepted` / `.rejected` are the two arms of
+the single line that answers one.
+
 Both the Rust side (`cargo test -p roost-ipc`) and the Swift side
 (`swift test --package-path mac`, post-M4) load these files: every
 vector is round-tripped schema-agnostically, and selected vectors are

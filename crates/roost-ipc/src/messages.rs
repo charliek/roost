@@ -272,6 +272,11 @@ pub struct IdentifyResult {
     /// from "after".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_backend_switch: Option<String>,
+    /// Why the last attempt to write `state.json` failed, absent while
+    /// the layout is landing (#481). A UI serves no event stream, so
+    /// this field is the whole of its durability surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist_error: Option<String>,
 }
 
 // ============================================================================
@@ -1315,11 +1320,39 @@ pub struct TabSetStateParams {
     pub state: TabState,
 }
 
+/// [`ops::TAB_CLEAR_NOTIFICATION`] params: take a tab's pending
+/// notification down.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TabClearNotificationParams {
     #[serde(with = "string_int64")]
     pub tab_id: i64,
+    /// The [`NotificationFiredEvent::generation`] this clear
+    /// acknowledges, or `None` for "take it down whatever it is".
+    ///
+    /// Two different callers, two different meanings. A person clicking
+    /// the tab, or `roostctl tab clear-notification`, is answering the
+    /// tab and omits this: whatever is up comes down. A client clearing
+    /// *automatically* because it is already reading the tab (#474) is
+    /// answering one raise, and names it — otherwise the race is real:
+    /// A fires, the viewing client acknowledges A, B fires, and A's
+    /// acknowledgement lands afterwards and erases a notification
+    /// nobody has seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+}
+
+/// [`ops::TAB_CLEAR_NOTIFICATION`] reply.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabClearNotificationResult {
+    /// Whether this call is what took a pending notification down.
+    ///
+    /// `false` for a clear on a tab with nothing pending and for one
+    /// whose `generation` names a raise that has been superseded — both
+    /// are ordinary answers, not errors. Two clients looking at the
+    /// same tab both acknowledge the same raise; the second is told it
+    /// arrived second.
+    pub cleared: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1802,6 +1835,27 @@ pub struct NotificationFiredEvent {
     pub title: String,
     #[serde(default)]
     pub body: String,
+    /// Which raise on this tab this is — a per-tab counter the engine
+    /// bumps every time a notification actually fires (#474).
+    ///
+    /// It exists so an acknowledgement can name the thing it answers.
+    /// A client that clears on its own behalf sends this value back in
+    /// [`TabClearNotificationParams::generation`], and a clear that
+    /// names a superseded raise is refused rather than erasing the
+    /// newer one it never saw.
+    ///
+    /// Defaulted for the same reason every other additive field is, and
+    /// **`0` is the absence, not a raise**: the counter is bumped before
+    /// it stamps, so a real generation counts from one. A peer that does
+    /// not send the field has given the acknowledgement nothing to name,
+    /// and the answer is then the unconditional one
+    /// ([`TabClearNotificationParams::generation`] omitted). Sending `0`
+    /// back would ask for a match that can never come — the clear would
+    /// take nothing down while the acknowledging window stopped painting
+    /// the dot anyway, leaving the raise up on every other client
+    /// forever.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// `agent_report.changed` — the full agent record after an accepted
@@ -1845,13 +1899,15 @@ pub struct AgentReportChangedEvent {
 /// owner, no lease and no foreground: reading, typing, attaching and
 /// every `session.set_*` op are open to all of them, last writer wins.
 /// [`ops::EVENT_TAB_EFFECT`] fans out to every subscriber, and each
-/// client decides what to do with it. [`ops::SESSION_SET_FOCUS`] is a
-/// per-connection statement about what that client is looking at — a
-/// tab is muted while *any* connection views it — and the PTY is sized
-/// by whoever interacted with it last. [`ops::SESSION_SET_AGENT_HOOKS`]
-/// is a **raise, never a lower**: a client widens the host's own
-/// `agent-hooks` key with its own allow-list and can only ever add to
-/// it (plan 064 §3.3).
+/// client decides what to do with it. So does
+/// [`ops::EVENT_NOTIFICATION_FIRED`]: a session suppresses nothing,
+/// because only a client knows what its own window is showing, and the
+/// client already reading the tab answers for all of them with a
+/// generation-checked [`ops::TAB_CLEAR_NOTIFICATION`] (#474). The PTY is
+/// sized by whoever interacted with it last.
+/// [`ops::SESSION_SET_AGENT_HOOKS`] is a **raise, never a lower**: a
+/// client widens the host's own `agent-hooks` key with its own
+/// allow-list and can only ever add to it (plan 064 §3.3).
 ///
 /// # The versioning rule
 ///
@@ -1951,6 +2007,12 @@ pub struct SessionIdentify {
     pub libghostty_build: String,
     pub session_id: String,
     pub started_at: String,
+    /// Why the last attempt to write `state.json` failed, absent while
+    /// the layout is landing (#481). The standing value behind the
+    /// live-only [`DurabilityChangedEvent`], read here at connect and
+    /// again after a resync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persist_error: Option<String>,
 }
 
 /// `session.identify` params — empty today, a struct (not a bare
@@ -2005,108 +2067,73 @@ pub struct EventBatch {
     pub events: Vec<EventEnvelope>,
 }
 
-/// [`ops::TAB_ATTACH`] params — the control-plane half of an attach.
-///
-/// `kinds` is the client's preference order; the server serves the
-/// first one it supports. `libghostty_build` must match the session's
-/// own build string exactly for [`AttachPayloadKind::GHOSTTY_SNAPSHOT`]
-/// — two libghostty builds that disagree cannot exchange a snapshot.
-/// The cell-pixel geometry is optional (a headless client has no cell
-/// metrics to report); `cols`/`rows` are not.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TabAttachParams {
-    #[serde(with = "string_int64")]
-    pub tab_id: i64,
-    pub kinds: Vec<AttachPayloadKind>,
-    pub cols: u16,
-    pub rows: u16,
-    #[serde(default)]
-    pub cell_w_px: u16,
-    #[serde(default)]
-    pub cell_h_px: u16,
-    pub libghostty_build: String,
-    /// Whether this attach claims the tab's geometry.
-    ///
-    /// `true` resizes the tab to `cols`/`rows` during negotiation, which
-    /// is what an attach has always done. `false` attaches at whatever
-    /// size the tab already is, so a client that is only watching cannot
-    /// shrink the one that is typing; its geometry still applies the
-    /// moment it sends an `INPUT` or `RESIZE` frame, which is why the
-    /// grid must be non-zero either way.
-    ///
-    /// Required and always serialized. Protocol 4 let it be omitted to
-    /// mean `true`, so a client could address a peer that predated the
-    /// field; at 5 there is no such peer, and an omitted `focus` is a
-    /// malformed request rather than a claim.
-    pub focus: bool,
-}
-
-/// Hand-written because a derived `Default` would make `focus` false, and
-/// a caller filling the rest of the struct with `..Default::default()`
-/// would silently ask for an unfocused attach.
-impl Default for TabAttachParams {
-    fn default() -> Self {
-        TabAttachParams {
-            tab_id: 0,
-            kinds: Vec::new(),
-            cols: 0,
-            rows: 0,
-            cell_w_px: 0,
-            cell_h_px: 0,
-            libghostty_build: String::new(),
-            focus: true,
-        }
-    }
-}
-
-/// [`ops::TAB_ATTACH`] result — a single-use ticket for one data
-/// connection, plus the identity that scopes every seq on it.
-///
-/// `server_epoch` is random per session process and `tab_generation`
-/// counts tab pipelines within it; a client that resumes must hand both
-/// back, which is what makes a stale stream from a restarted server
-/// unresumable by construction rather than by luck.
-///
-/// `attach_token` is a credential: never log it, never print it in a
-/// test failure dump.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TabAttachResult {
-    pub attach_token: String,
-    pub kind: AttachPayloadKind,
-    pub server_epoch: u64,
-    pub tab_generation: u64,
-}
-
 /// The first line of a data connection: not a request envelope, which
 /// is exactly how the server tells the two apart (an object with
 /// `attach` and no `op`).
 ///
+/// The whole negotiation rides this line — there is no control-plane
+/// half and no ticket. `attach` names the tab as a `string_int64` like
+/// every other id on this wire, and [`AttachHandshake::terms`] carries
+/// what the connection is offering to be served.
+///
 /// Permissive on decode — a newer client may carry fields this build
 /// has never heard of, and refusing the whole handshake over one would
-/// turn an additive change into a hard incompatibility. The resume
+/// turn an additive change into a hard incompatibility. Every session
+/// *params* struct is `deny_unknown_fields`; this handshake is the one
+/// permissive request on the wire, which is exactly what makes a future
+/// handshake field additive instead of a generation. The resume
 /// triple is all-or-nothing in practice: `resume_from_seq` without a
 /// matching `server_epoch` + `tab_generation` falls back to snapshot
 /// mode rather than erroring.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawAttachHandshake", into = "RawAttachHandshake")]
 pub struct AttachHandshake {
+    /// The tab, as a `string_int64`.
     pub attach: String,
     pub protocol_version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terms: AttachHandshakeTerms,
     pub resume_from_seq: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_epoch: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_generation: Option<u64>,
 }
 
+/// What the handshake negotiates, decoded as a unit: either all of it
+/// is there or the line is a `parse-error` naming the field that is
+/// missing.
+///
+/// `session_id` is the value [`ops::SESSION_IDENTIFY`] reported. It is
+/// required because it is what binds an attach to the session the
+/// client negotiated with: without it a dial released after a drop
+/// could land on a **replacement** session listening at the same socket
+/// path and stream a tab the client never asked for.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachHandshakeTerms {
+    pub session_id: String,
+    /// The client's preference order; the server serves the first entry
+    /// that is both advertised and eligible.
+    pub kinds: Vec<AttachPayloadKind>,
+    pub cols: u16,
+    pub rows: u16,
+    /// Zero from a headless client, which has no cell metrics.
+    pub cell_w_px: u16,
+    pub cell_h_px: u16,
+    pub libghostty_build: String,
+    /// Whether this attach claims the tab's geometry. `true` resizes
+    /// the tab to `cols`/`rows` during the handshake; `false` attaches
+    /// at whatever size the tab already is, so a client that is only
+    /// watching cannot shrink the one that is typing.
+    pub focus: bool,
+}
+
 impl AttachHandshake {
-    /// A fresh attach: the ticket [`ops::TAB_ATTACH`] minted, and a
-    /// full snapshot stream behind it.
-    pub fn snapshot(attach_token: impl Into<String>) -> Self {
+    /// A fresh attach: the tab, the terms, and a full snapshot stream
+    /// behind them. No round trip — the data connection is the whole
+    /// negotiation.
+    pub fn snapshot(tab_id: i64, terms: AttachHandshakeTerms) -> Self {
         AttachHandshake {
-            attach: attach_token.into(),
+            attach: tab_id.to_string(),
             protocol_version: SESSION_PROTOCOL_VERSION,
+            terms,
             ..AttachHandshake::default()
         }
     }
@@ -2118,7 +2145,8 @@ impl AttachHandshake {
     /// tolerates its absence: a miss on any of the three is answered
     /// with `mode: "snapshot"` in the same reply, never an error.
     pub fn resume(
-        attach_token: impl Into<String>,
+        tab_id: i64,
+        terms: AttachHandshakeTerms,
         from_seq: u64,
         server_epoch: u64,
         tab_generation: u64,
@@ -2127,7 +2155,91 @@ impl AttachHandshake {
             resume_from_seq: Some(from_seq),
             server_epoch: Some(server_epoch),
             tab_generation: Some(tab_generation),
-            ..AttachHandshake::snapshot(attach_token)
+            ..AttachHandshake::snapshot(tab_id, terms)
+        }
+    }
+}
+
+/// Flat mirror of [`AttachHandshake`] — the terms ride the same JSON
+/// object as the rest of the line, and "all of them or none of them" is
+/// a rule serde cannot state on a nested struct while still naming the
+/// field that is missing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RawAttachHandshake {
+    attach: String,
+    protocol_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kinds: Option<Vec<AttachPayloadKind>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cols: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rows: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cell_w_px: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cell_h_px: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    libghostty_build: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    focus: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_from_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    server_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tab_generation: Option<u64>,
+}
+
+impl TryFrom<RawAttachHandshake> for AttachHandshake {
+    type Error = String;
+
+    fn try_from(raw: RawAttachHandshake) -> Result<Self, String> {
+        let terms = AttachHandshakeTerms {
+            session_id: raw
+                .session_id
+                .ok_or("an attach handshake is missing `session_id`")?,
+            kinds: raw.kinds.ok_or("an attach handshake is missing `kinds`")?,
+            cols: raw.cols.ok_or("an attach handshake is missing `cols`")?,
+            rows: raw.rows.ok_or("an attach handshake is missing `rows`")?,
+            // A headless client has no cell metrics to report, so these
+            // two are the only terms a handshake may leave out.
+            cell_w_px: raw.cell_w_px.unwrap_or(0),
+            cell_h_px: raw.cell_h_px.unwrap_or(0),
+            libghostty_build: raw
+                .libghostty_build
+                .ok_or("an attach handshake is missing `libghostty_build`")?,
+            focus: raw.focus.ok_or("an attach handshake is missing `focus`")?,
+        };
+        Ok(AttachHandshake {
+            attach: raw.attach,
+            protocol_version: raw.protocol_version,
+            terms,
+            resume_from_seq: raw.resume_from_seq,
+            server_epoch: raw.server_epoch,
+            tab_generation: raw.tab_generation,
+        })
+    }
+}
+
+impl From<AttachHandshake> for RawAttachHandshake {
+    fn from(h: AttachHandshake) -> Self {
+        let t = h.terms;
+        RawAttachHandshake {
+            attach: h.attach,
+            protocol_version: h.protocol_version,
+            session_id: Some(t.session_id),
+            kinds: Some(t.kinds),
+            cols: Some(t.cols),
+            rows: Some(t.rows),
+            cell_w_px: Some(t.cell_w_px),
+            cell_h_px: Some(t.cell_h_px),
+            libghostty_build: Some(t.libghostty_build),
+            focus: Some(t.focus),
+            resume_from_seq: h.resume_from_seq,
+            server_epoch: h.server_epoch,
+            tab_generation: h.tab_generation,
         }
     }
 }
@@ -2162,13 +2274,12 @@ pub enum AttachMode {
 ///
 /// Sent on **every** accepted reply — both modes, focused or not. A
 /// focused attach did resize the tab to its own geometry, and a resuming
-/// client did leave one behind — but the resize ran on the control
-/// connection, before this data connection was dialed, and raw input is
-/// open (plan 057 R15): any other client's geometry-bearing frame can
-/// land in between and resize the tab again, so "the client asked for
-/// it" is not evidence of what the bytes say. When the two agree the
-/// fields are a no-op. Absent only from a reply a session predating
-/// `open_input` writes.
+/// client did leave one behind — but raw input is open (plan 057 R15):
+/// any other client's geometry-bearing frame can land in between and
+/// resize the tab again, so "the client asked for it" is not evidence
+/// of what the bytes say. When the two agree the fields are a no-op.
+/// Never absent: under protocol equality every session that answers an
+/// accepted handshake states the geometry its bytes were written for.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachAccepted {
     pub kind: AttachPayloadKind,
@@ -2176,10 +2287,8 @@ pub struct AttachAccepted {
     pub seq: u64,
     pub server_epoch: u64,
     pub tab_generation: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshot_cols: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshot_rows: Option<u16>,
+    pub snapshot_cols: u16,
+    pub snapshot_rows: u16,
 }
 
 /// The one JSON line a data connection gets back before the wire turns
@@ -2193,8 +2302,11 @@ pub struct AttachAccepted {
 #[serde(try_from = "RawAttachHandshakeReply", into = "RawAttachHandshakeReply")]
 pub enum AttachHandshakeReply {
     Accepted(AttachAccepted),
-    /// Written, then the connection closes. Codes: `invalid-token`,
-    /// `protocol-mismatch`, `snapshot-failed`, `shutting-down`.
+    /// Written, then the connection closes. Codes: `protocol-mismatch`,
+    /// `parse-error`, `session-mismatch`, `not-found`,
+    /// `unsupported-kind`, `build-mismatch`, `invalid-param`,
+    /// `shutting-down`, `too-many-attaches`, `snapshot-failed`,
+    /// `internal`.
     Rejected(ResponseError),
 }
 
@@ -2250,8 +2362,12 @@ impl TryFrom<RawAttachHandshakeReply> for AttachHandshakeReply {
                 tab_generation: raw
                     .tab_generation
                     .ok_or("accepted handshake reply is missing `tab_generation`")?,
-                snapshot_cols: raw.snapshot_cols,
-                snapshot_rows: raw.snapshot_rows,
+                snapshot_cols: raw
+                    .snapshot_cols
+                    .ok_or("accepted handshake reply is missing `snapshot_cols`")?,
+                snapshot_rows: raw
+                    .snapshot_rows
+                    .ok_or("accepted handshake reply is missing `snapshot_rows`")?,
             }))
         } else {
             Ok(AttachHandshakeReply::Rejected(
@@ -2272,8 +2388,8 @@ impl From<AttachHandshakeReply> for RawAttachHandshakeReply {
                 seq: Some(a.seq),
                 server_epoch: Some(a.server_epoch),
                 tab_generation: Some(a.tab_generation),
-                snapshot_cols: a.snapshot_cols,
-                snapshot_rows: a.snapshot_rows,
+                snapshot_cols: Some(a.snapshot_cols),
+                snapshot_rows: Some(a.snapshot_rows),
                 error: None,
             },
             AttachHandshakeReply::Rejected(error) => RawAttachHandshakeReply {
@@ -2560,26 +2676,58 @@ pub mod host_state {
 
 /// Which client-directed effect a [`TabEffectEvent`] carries.
 ///
-/// Deliberately short: HS-2 ships **bell** and **OSC 52 clipboard
-/// writes** only. Every other client-local OSC effect (pointer shape,
-/// today) stays dropped + debug-logged in the tab task — an envelope
-/// design invites "just one more effect", so the set is pinned rather
-/// than open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TabEffect {
+/// An open string, not a closed enum (#188, #364): a client must be
+/// able to decode an envelope naming an effect it predates, and a
+/// closed enum would turn "one more effect" into a decode error instead
+/// of the inert no-op an unhandled effect should be. HS-2 ships
+/// **bell** and **OSC 52 clipboard writes** only — every other
+/// client-local OSC effect (pointer shape, today) stays dropped +
+/// debug-logged in the tab task rather than added to this envelope —
+/// but a future addition costs a new constant, not a protocol
+/// generation. A client that receives a value it has no handler for
+/// debug-logs and ignores it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TabEffect(pub String);
+
+impl TabEffect {
     /// A BEL byte reached the tab's terminal outside any escape
     /// sequence. Carries no `data`.
-    Bell,
+    pub const BELL: &str = "bell";
     /// An OSC 52 clipboard write. `data` is the decoded payload,
     /// base64-encoded per the wire's bytes convention.
-    ClipboardWrite,
+    pub const CLIPBOARD_WRITE: &str = "clipboard-write";
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
-/// Which selection an [`TabEffect::ClipboardWrite`] targets. Mirrors
+impl From<&str> for TabEffect {
+    fn from(s: &str) -> Self {
+        TabEffect(s.to_string())
+    }
+}
+
+impl From<String> for TabEffect {
+    fn from(s: String) -> Self {
+        TabEffect(s)
+    }
+}
+
+impl std::fmt::Display for TabEffect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Which selection a [`TabEffect::CLIPBOARD_WRITE`] targets. Mirrors
 /// `roost_osc::ClipboardTarget`: OSC 52's `c` selector (and the empty
 /// default) is [`System`](Self::System), `p`/`s` is
 /// [`Selection`](Self::Selection).
+///
+/// Stays closed: a two-value set with no growth pressure, unlike
+/// [`TabEffect`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ClipboardEffectTarget {
@@ -2591,7 +2739,7 @@ pub enum ClipboardEffectTarget {
 /// `tab.effect` event data — one client-local effect a session's tab
 /// produced, for the attached client to apply.
 ///
-/// `data` is present only for [`TabEffect::ClipboardWrite`], where it
+/// `data` is present only for [`TabEffect::CLIPBOARD_WRITE`], where it
 /// carries the decoded clipboard text base64-encoded (standard
 /// alphabet, like every other bytes field). The server caps it at
 /// [`CLIPBOARD_EFFECT_MAX_BYTES`] decoded and drops anything larger, so
@@ -2612,12 +2760,28 @@ pub struct TabEffectEvent {
     pub target: Option<ClipboardEffectTarget>,
 }
 
-/// Decoded-size cap on a [`TabEffect::ClipboardWrite`] payload. The
+/// Decoded-size cap on a [`TabEffect::CLIPBOARD_WRITE`] payload. The
 /// OSC 52 scanner already bounds a body at 1 MiB; this is the smaller,
 /// policy bound on what a session will fan out to a client
 /// (architecture §6's bounded-size rule). Oversized writes are dropped
 /// and debug-logged by size, never by content.
 pub const CLIPBOARD_EFFECT_MAX_BYTES: usize = 256 * 1024;
+
+/// `workspace.durability_changed` event data — the session's ability to
+/// write `state.json` changed (#481).
+///
+/// `error` is the write's message while it is failing and `null` the
+/// moment one lands again; the field is always present, because "no
+/// error" is the news half the time. Emitted on a change of value only,
+/// so a session on a full disk says it once, not once per mutation.
+///
+/// Live-only: it rides the event stream and is never replayed. The
+/// standing value is [`SessionIdentify::persist_error`], which is what a
+/// client re-reads after a resync.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurabilityChangedEvent {
+    pub error: Option<String>,
+}
 
 /// One full terminal palette, as the client's theme states it.
 ///
@@ -2639,8 +2803,8 @@ pub struct OscColorsParams {
 ///
 /// Open to every same-UID connection, last writer wins. Applies to the
 /// tabs that exist now **and** is remembered for tabs the session opens
-/// later, so a client sends it once on connecting (before the first
-/// `tab.attach`) and again whenever its theme changes.
+/// later, so a client sends it once on connecting (before it dials its
+/// first data connection) and again whenever its theme changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSetThemeParams {
@@ -2653,32 +2817,6 @@ pub struct SessionSetThemeParams {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSetThemeResult {
     pub tabs: u32,
-}
-
-/// [`ops::SESSION_SET_FOCUS`] params: what the connected client is
-/// actually looking at.
-///
-/// A session's own workspace has no window, so nothing it can see tells
-/// it which tab a user has on screen and every agent would raise into a
-/// surface nobody is reading. This op is how a client that *does* have a
-/// window states it. Per connection and unioned: a tab is muted while
-/// any client says it is looking at it, and the statement moves nothing
-/// else — not the session's selection, which only `tab.focus` moves.
-///
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SessionSetFocusParams {
-    /// The session tab the client is looking at, or `null` for "nothing
-    /// on this session is being looked at" (the window lost focus, or
-    /// the selection moved to another host or to a local tab).
-    ///
-    /// **Required, and null is not the same as absent.** An omitted
-    /// field is a client that forgot to say, and guessing on its behalf
-    /// is how the mute this op exists to fix would come back; it is
-    /// refused instead ([`option_string_int64`] has no serde default, so
-    /// the missing field fails the decode).
-    #[serde(with = "option_string_int64")]
-    pub focused_tab_id: Option<i64>,
 }
 
 /// [`ops::SESSION_SET_AGENT_HOOKS`] params: raise the host's `agent-hooks`
@@ -2701,8 +2839,10 @@ pub struct SessionSetFocusParams {
 #[serde(deny_unknown_fields)]
 pub struct SessionSetAgentHooksParams {
     /// The agents the client's own `agent-hooks` key allows. Never
-    /// empty and never a name the host does not recognise — both are
-    /// `invalid-param` refusals the server validates.
+    /// empty, and no element blank — both are `invalid-param` refusals
+    /// the server validates. A name the *host* does not recognise is
+    /// not: it comes back in `skipped` with reason `"unknown"`, and the
+    /// rest of the list is wired.
     pub agents: Vec<String>,
     /// Who is asking, for the host's state record and its log. Required:
     /// the record's `by` exists so two clients that disagree about
@@ -2715,14 +2855,34 @@ pub struct SessionSetAgentHooksParams {
 /// [`ops::AGENT_SET_HOOKS`] run did not act on, and why.
 ///
 /// `reason` is a free string for the client to show or log verbatim,
-/// not a code to match on: the raise rule means the only skip reason
-/// [`ops::SESSION_SET_AGENT_HOOKS`] can report now is "not allowed" (the
-/// agent's own consent did not name it) — the two-mode-era `"skip-list"`
-/// spelling this field used to carry is gone with the mode it named.
+/// not a code to match on. Two reach a client: `"not allowed"` (the
+/// machine's own consent did not name the agent) and `"unknown"` (the
+/// answering binary has no adapter for the name the client sent, plan
+/// 065 §3.1) — the two-mode-era `"skip-list"` spelling this field used
+/// to carry is gone with the mode it named.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentHooksSkipped {
     pub agent: String,
     pub reason: String,
+}
+
+impl AgentHooksSkipped {
+    /// `names` as the `"unknown"` skips both ops answer a name the
+    /// receiving binary has no adapter for with.
+    ///
+    /// Here rather than in either op, because the two are implemented in
+    /// different crates (`roost-session` for the host, `roost-iced` for
+    /// the local one) and a client that groups a reply by reason has
+    /// only this string to group on.
+    pub fn unknown(names: &[String]) -> Vec<AgentHooksSkipped> {
+        names
+            .iter()
+            .map(|name| AgentHooksSkipped {
+                agent: name.clone(),
+                reason: "unknown".to_string(),
+            })
+            .collect()
+    }
 }
 
 /// One agent the host tried and failed to wire. Reported, never
@@ -3025,13 +3185,6 @@ pub mod ops {
     /// theme palette, and remember it for the tabs opened next.
     /// Last-writer-wins between concurrent clients.
     pub const SESSION_SET_THEME: &str = "session.set_theme";
-    /// Push this connection's real focus — which of this session's tabs
-    /// it is looking at, or none — so the session's own
-    /// notification-suppression predicate reads a client's window
-    /// instead of a headless default. Per connection and unioned: a tab
-    /// is muted while any connection views it, and a connection's
-    /// statement dies with it.
-    pub const SESSION_SET_FOCUS: &str = "session.set_focus";
     /// Bring the host's agent hook entries in line with the connected
     /// client's `agent-hooks` configuration — wiring them, refreshing
     /// them, or taking them back out. Served only by a session that was
@@ -3044,11 +3197,6 @@ pub mod ops {
     /// `not-supported`, and a UI socket `unknown-op` like every other
     /// session op. The leg underneath [`TAB_SEND_FILE`].
     pub const SESSION_PUT_FILE: &str = "session.put_file";
-    /// Ask for a ticket to open a data connection for one tab. The
-    /// control-plane half of an attach: it negotiates payload kind,
-    /// build identity, and geometry on stable JSON, and hands back a
-    /// single-use token the binary handshake presents.
-    pub const TAB_ATTACH: &str = "tab.attach";
     /// Raise + focus the running UI window. Sent by a second launch
     /// that loses the single-instance flock; takes no params (#6).
     pub const APP_ACTIVATE: &str = "app.activate";
@@ -3243,6 +3391,12 @@ pub mod ops {
     /// these only mean anything to an attached client;
     /// [`crate::messages::TabEffectEvent`] is the payload.
     pub const EVENT_TAB_EFFECT: &str = "tab.effect";
+    /// The session could not write `state.json`, or can again (#481).
+    /// Carried on the session event stream only — a UI socket serves no
+    /// subscription, and the in-process UI reads the same change off its
+    /// own workspace. [`crate::messages::DurabilityChangedEvent`] is the
+    /// payload.
+    pub const EVENT_WORKSPACE_DURABILITY_CHANGED: &str = "workspace.durability_changed";
 
     /// Client-side saved-host registry and its connections
     /// (host-sessions HS-2, plan 037 §3.5). Every palette host verb has
@@ -3282,36 +3436,6 @@ pub mod string_int64 {
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<i64, D::Error> {
         let raw = String::deserialize(de)?;
         raw.parse::<i64>()
-            .map_err(|_| serde::de::Error::custom(format!("invalid int64 string: {raw}")))
-    }
-}
-
-/// [`string_int64`] for a field that is **required but nullable**:
-/// `"5"` or `null`, never absent.
-///
-/// The distinction is the point. `Option<i64>` with the usual
-/// `#[serde(default)]` would decode an omitted field and an explicit
-/// `null` to the same `None`, and for a field whose null carries meaning
-/// ("nothing is focused") that silently promotes a client's omission
-/// into a statement it never made. Used through `#[serde(with = ...)]`
-/// **without** a `default`, so serde's own missing-field error is what
-/// refuses the omission.
-pub mod option_string_int64 {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(value: &Option<i64>, ser: S) -> Result<S::Ok, S::Error> {
-        match value {
-            Some(value) => ser.serialize_str(&value.to_string()),
-            None => ser.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<i64>, D::Error> {
-        let Some(raw) = Option::<String>::deserialize(de)? else {
-            return Ok(None);
-        };
-        raw.parse::<i64>()
-            .map(Some)
             .map_err(|_| serde::de::Error::custom(format!("invalid int64 string: {raw}")))
     }
 }

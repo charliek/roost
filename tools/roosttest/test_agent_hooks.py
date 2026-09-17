@@ -39,11 +39,14 @@ before adding to them — nothing in this suite may reach a real dotfile.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import socket as socketlib
 import subprocess
+import threading
 import tempfile
+from pathlib import Path
 
 import pytest
 import ui
@@ -57,7 +60,7 @@ from agent_jail import (
 )
 from client import Roost, scaled_timeout
 from test_agent_lifecycle import agent_tab
-from util import HOOK_DEADLINE, REPO_ROOT, roostctl_path, run_hook
+from util import HOOK_DEADLINE, REPO_ROOT, config_value, roostctl_path, run_hook
 
 FIXTURES = REPO_ROOT / "crates/roost-agent/tests/fixtures"
 
@@ -721,15 +724,9 @@ def test_a_spawned_tab_carries_the_hook_entrypoint(roost, project):
 # ---------------------------------------------------------------------------
 
 
-def run_agent(jail: Jail, *args: str, force: bool = True, socket: str | None = None):
-    """`roostctl agent …` inside `jail`. Never `check=True`: several
-    cases assert on a non-zero exit, and a failure's stdout is the most
-    useful thing in the report.
-
-    `socket` is for the one verb that dials — bare `agent set`, the
-    UI-routed form — and must name a jailed UI's socket: pointing it at
-    the harness's own UI would ask a process whose `$HOME` is the
-    developer's to write agent files."""
+def agent_env(jail: Jail, *, force: bool, socket: str | None) -> dict:
+    """The environment a jailed `roostctl agent …` runs in. Assert it
+    with `Jail.assert_jailed` immediately before every spawn."""
     env = {**os.environ, **jail.env}
     env["ROOST_TEST_MODE"] = "1"
     if force:
@@ -743,6 +740,19 @@ def run_agent(jail: Jail, *args: str, force: bool = True, socket: str | None = N
     if socket is not None:
         env["ROOST_SOCKET"] = socket
     env["ROOST_CONFIG"] = str(jail.config)
+    return env
+
+
+def run_agent(jail: Jail, *args: str, force: bool = True, socket: str | None = None):
+    """`roostctl agent …` inside `jail`. Never `check=True`: several
+    cases assert on a non-zero exit, and a failure's stdout is the most
+    useful thing in the report.
+
+    `socket` is for the one verb that dials — bare `agent set`, the
+    UI-routed form — and must name a jailed UI's socket: pointing it at
+    the harness's own UI would ask a process whose `$HOME` is the
+    developer's to write agent files."""
+    env = agent_env(jail, force=force, socket=socket)
     jail.assert_jailed(env)
     return subprocess.run(
         [roostctl_path(), "agent", *args],
@@ -750,6 +760,20 @@ def run_agent(jail: Jail, *args: str, force: bool = True, socket: str | None = N
         capture_output=True,
         text=True,
         timeout=scaled_timeout(60),
+    )
+
+
+def run_agent_async(jail: Jail, *args: str, socket: str | None = None):
+    """[`run_agent`] left running, for the one case that has to send a
+    second request while the first is still in flight."""
+    env = agent_env(jail, force=True, socket=socket)
+    jail.assert_jailed(env)
+    return subprocess.Popen(
+        [roostctl_path(), "agent", *args],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
 
 
@@ -1195,3 +1219,281 @@ def test_agent_set_without_local_goes_through_the_running_ui(short_root, iced_on
     # grok is present in the jail but was never named: "exactly this
     # list" is the claim, not "everything installed".
     assert not any(jail.agent_dirs["grok"].iterdir()), "the UI wired an agent nobody named"
+
+
+def test_agent_set_hooks_skips_a_name_this_build_cannot_wire(short_root, iced_only):
+    """Plan 065 §3.1 on the UI socket, the sibling of the host op's rule.
+
+    Driven over IPC rather than through `roostctl agent set`, which
+    parses its spec locally and so can never put an unknown name on the
+    wire — only a newer client can, which is the case this exists for.
+
+    Two arms. A mixed list applies the half this build knows and reports
+    the rest; a list of *only* unknown names answers `ok` having written
+    nothing at all — no key, no dotfile — because an error there is a
+    client that can never grow past it.
+    """
+    jail = Jail(short_root, agent_hooks=None)
+    sock = jailed_socket(jail)
+
+    with jailed_ui(jail) as (proc, log):
+        wait_for_jailed_window(jail, proc, log)
+        with Roost(str(sock), timeout=scaled_timeout(30)) as roost:
+            alone = roost.call("agent.set_hooks", {"agents": ["gemini", "amp"]})
+            assert alone["local"]["wired"] == [], alone
+            assert alone["local"]["skipped"] == [
+                {"agent": "gemini", "reason": "unknown"},
+                {"agent": "amp", "reason": "unknown"},
+            ], alone
+            assert alone["hosts"] == [], alone
+            assert jail.read_key() is None, "an unknown-only list wrote the key"
+            assert not jail.record.exists(), "an unknown-only list wired something"
+
+            mixed = roost.call("agent.set_hooks", {"agents": ["claude", "gemini"]})
+            assert mixed["local"]["wired"] == ["claude"], mixed
+            assert {"agent": "gemini", "reason": "unknown"} in mixed["local"]["skipped"], mixed
+
+    # Read after the UI has exited, so nothing is still in flight. The
+    # key is what was applied: `agent.set_hooks` replaces it, so the name
+    # it could not act on is not carried into an answer the user gave.
+    assert jail.read_key() == "claude"
+    assert "ROOST_AGENT_HOOK" in (jail.agent_dirs["claude"] / "settings.json").read_text()
+
+
+def holds_open(pid: int, path: Path) -> bool:
+    """Whether `pid` has `path` open.
+
+    How a *contending* `ConfigLock` is observed. It opens the lock file
+    and then polls `flock(LOCK_EX|LOCK_NB)`, and a non-blocking flock
+    joins no queue — so a waiting writer never appears in `/proc/locks`
+    and an open descriptor on the lock file is the only evidence the
+    kernel offers that one got as far as the lock at all.
+    """
+    try:
+        fds = list(Path(f"/proc/{pid}/fd").iterdir())
+    except OSError:
+        return False
+    for fd in fds:
+        try:
+            if fd.resolve() == path:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def test_two_processes_writing_config_conf_share_one_lock(short_root, iced_only):
+    """#487: `config.conf` has more than one writer, and they all take
+    the same `config.lock`.
+
+    Two real processes, the pair a user actually produces: the UI
+    rewriting `show-sidebar-agents` from the palette and `roostctl agent
+    set --local` rewriting `agent-hooks`. Both are read-modify-write over
+    the whole file, so without one lock between them a render built on a
+    pre-image replaces the other's key wholesale — an atomic rename
+    prevents a torn file, not a lost update.
+
+    Contention is arranged rather than hoped for: this test holds
+    `config.lock` itself (the same `flock` Rust takes), and waits until
+    each writer has the lock file **open** before asserting that neither
+    has written. "It has not finished yet" is also true of a process the
+    scheduler has not run, so on a loaded machine that alone would pass
+    over a build that took no lock at all. The loop afterwards is the
+    same claim under real overlap.
+    """
+    if not Path("/proc/self/fd").is_dir():
+        pytest.skip("proving a writer reached config.lock needs /proc")
+    jail = Jail(short_root, agent_hooks="claude")
+    sock = jailed_socket(jail)
+    lock_path = jail.config.parent / "config.lock"
+    rounds = 6
+
+    with jailed_ui(jail) as (proc, log):
+        wait_for_jailed_window(jail, proc, log)
+        with Roost(str(sock), timeout=scaled_timeout(30)) as roost:
+
+            def toggle() -> None:
+                roost.palette_open()
+                roost.palette_activate("toggle_sidebar_agents")
+
+            handle = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                toggle()
+                roostctl = run_agent_async(jail, "set", "codex", "--local")
+                Roost._wait(
+                    lambda: holds_open(proc.pid, lock_path),
+                    30.0,
+                    "the UI's config writer to reach config.lock",
+                )
+                Roost._wait(
+                    lambda: holds_open(roostctl.pid, lock_path),
+                    30.0,
+                    "roostctl to reach config.lock",
+                )
+                # Both are at the lock; now the assertion that neither
+                # got past it.
+                with pytest.raises(subprocess.TimeoutExpired):
+                    roostctl.wait(timeout=scaled_timeout(2))
+                assert config_value(jail.config, "show-sidebar-agents") is None, (
+                    "the UI wrote config.conf while another process held config.lock:"
+                    f"\n{jail.config.read_text()}"
+                )
+                assert jail.read_key() == "claude", jail.config.read_text()
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+                os.close(handle)
+
+            done = roostctl.communicate(timeout=scaled_timeout(60))
+            assert roostctl.returncode == 0, done
+            Roost._wait(
+                lambda: config_value(jail.config, "show-sidebar-agents") is not None,
+                15.0,
+                "both held writers to land once the lock is free",
+            )
+            assert jail.read_key() == "codex", jail.config.read_text()
+
+            # And under real overlap, neither key is ever missing.
+            refused: list[str] = []
+
+            def loop() -> None:
+                for index in range(rounds):
+                    wrote = run_agent(
+                        jail, "set", "claude,codex" if index % 2 else "claude", "--local"
+                    )
+                    if wrote.returncode != 0:
+                        refused.append(wrote.stdout + wrote.stderr)
+                        return
+
+            writer = threading.Thread(target=loop)
+            writer.start()
+            try:
+                while writer.is_alive():
+                    toggle()
+                    assert jail.read_key() is not None, (
+                        f"the UI's write lost `agent-hooks`:\n{jail.config.read_text()}"
+                    )
+                    assert config_value(jail.config, "show-sidebar-agents") is not None, (
+                        f"roostctl's write lost `show-sidebar-agents`:"
+                        f"\n{jail.config.read_text()}"
+                    )
+            finally:
+                writer.join(timeout=scaled_timeout(120))
+            assert not refused, refused
+
+    # Read after the UI has exited, so nothing is still in flight.
+    text = jail.config.read_text()
+    assert jail.read_key() is not None, text
+    assert config_value(jail.config, "show-sidebar-agents") in ("true", "false"), text
+
+
+def test_two_overlapping_applies_land_in_request_order(short_root, iced_only):
+    """#490: the file holds the answer the user gave **last**, not the
+    one that finished last.
+
+    Both applies are in flight at once: the first is held before it
+    writes by the test-mode delay seam, and the second is sent while it
+    is held. Independently spawned tasks would run the second to
+    completion first and leave `claude` — the *older* answer — on disk.
+
+    The receipt is asserted too, and it is the other half of the same
+    rule: only the newest ticket reaches the banner, so the superseded
+    apply says nothing at all.
+    """
+    jail = Jail(short_root, agent_hooks=None)
+    sock = jailed_socket(jail)
+
+    with jailed_ui(jail, extra_env={"ROOST_TEST_AGENT_HOOKS_DELAY_MS": "3000"}) as (proc, log):
+        wait_for_jailed_window(jail, proc, log)
+        first = run_agent_async(jail, "set", "claude", socket=str(sock))
+        # A condition wait, not a sleep: the UI logs the ticket the
+        # moment it takes it, which is what makes "the second was sent
+        # while the first was in flight" true rather than likely.
+        wait_for_log_line(log, "agent.set_hooks queued", "the first apply to be queued")
+        second = run_agent(jail, "set", "codex", socket=str(sock))
+        assert second.returncode == 0, second.stdout + second.stderr
+        done = first.communicate(timeout=scaled_timeout(60))
+        assert first.returncode == 0, done
+
+        toast = wait_for_log_line(
+            log,
+            "agent hooks toast shown",
+            "the jailed UI to put the agent.set_hooks receipt on the banner",
+        )
+        assert "for codex" in toast, toast
+
+    assert jail.read_key() == "codex", jail.config.read_text()
+    assert any(jail.agent_dirs["codex"].iterdir()), "the winning apply wired nothing"
+    assert not any(jail.agent_dirs["claude"].iterdir()), (
+        "the superseded apply left claude wired"
+    )
+
+
+def wait_for_agent_hooks_card(roost: Roost) -> dict:
+    """Block until the preferences card is up, and return its dump.
+
+    A condition wait rather than a settle: the card is raised from the
+    engine feed, one status walk after the palette row was activated."""
+    seen: list[dict] = []
+
+    def carded() -> bool:
+        card = roost.call("app.dialog_dump", {})
+        if card.get("dialog") != "agent_hooks":
+            return False
+        seen.append(card)
+        return True
+
+    Roost._wait(carded, 30.0, "the agent-hooks card to open")
+    assert seen[0]["mode"] == "preferences", seen[0]
+    return seen[0]
+
+
+def test_a_superseded_apply_still_moves_the_running_key(short_root, iced_only):
+    """#490's other half: the UI's own `agent-hooks` value never lags the
+    file.
+
+    The apply that supersedes another can still *fail* — this one is
+    refused before it writes anything, the shape a `config.lock` it never
+    gets has — and then the newest answer on disk is the superseded one.
+    A UI that discarded it on the grounds that "the newer apply already
+    wrote the file" would hold the value it launched with while the file
+    holds `claude`.
+
+    The running value has exactly one surface: it is what the preferences
+    card falls back to when `config.conf` cannot be **read**. So the file
+    is made unreadable for the length of one card, which is the only way
+    to tell the UI's copy and the file apart.
+    """
+    jail = Jail(short_root, agent_hooks="off", present=("claude", "codex"))
+    sock = jailed_socket(jail)
+    seams = {
+        "ROOST_TEST_AGENT_HOOKS_DELAY_MS": "3000",
+        "ROOST_TEST_AGENT_HOOKS_REFUSE_TICKET": "2",
+    }
+
+    with jailed_ui(jail, extra_env=seams) as (proc, log):
+        wait_for_jailed_window(jail, proc, log)
+        first = run_agent_async(jail, "set", "claude", socket=str(sock))
+        wait_for_log_line(log, "agent.set_hooks queued", "the first apply to be queued")
+        second = run_agent(jail, "set", "codex", socket=str(sock))
+        assert second.returncode != 0, "the seam did not refuse the second apply"
+        done = first.communicate(timeout=scaled_timeout(60))
+        assert first.returncode == 0, done
+        assert jail.read_key() == "claude", jail.config.read_text()
+
+        jail.config.chmod(0o000)
+        try:
+            with Roost(str(sock), timeout=scaled_timeout(30)) as roost:
+                roost.palette_dismiss()
+                roost.palette_open()
+                roost.palette_activate("agent_hooks")
+                roost.palette_dismiss()
+                card = wait_for_agent_hooks_card(roost)
+        finally:
+            jail.config.chmod(0o600)
+
+    rows = {row["agent"]: row for row in card["rows"]}
+    assert rows["claude"]["on"] is True, (
+        f"the UI still holds the key it launched with, not the one on disk: {card}"
+    )
+    assert rows["codex"]["on"] is False, card

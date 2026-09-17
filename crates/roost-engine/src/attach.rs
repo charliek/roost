@@ -74,7 +74,7 @@ use roost_ipc::dataframe::{
 use roost_ipc::framing::write_frame;
 use roost_ipc::messages::{
     AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode, AttachPayloadKind,
-    ResponseError, SESSION_PROTOCOL_VERSION,
+    ResponseError,
 };
 use roost_ipc::{CloseReason, ConnCloseWatch, ConnCtx, DataConn, CLOSE_LABEL_DEADLINE};
 use tokio::io::AsyncWriteExt;
@@ -83,7 +83,7 @@ use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, warn};
 
-use crate::ipc::{AdmittedAttach, IpcHandler};
+use crate::ipc::{await_attach_resize, AdmittedAttach, IpcHandler};
 use crate::pty::{Geometry, PtyOutputEvent};
 use crate::tab_task::{SnapshotAt, TabCmd, TabError};
 
@@ -159,34 +159,23 @@ pub(crate) async fn serve_attach(
         return;
     }
 
-    // Before the token is even looked at: a version mismatch means the
-    // two ends disagree about what a token *is*, and answering
-    // `invalid-token` would send the client hunting for the wrong bug.
-    if handshake.protocol_version != SESSION_PROTOCOL_VERSION {
-        reject(
-            &mut writer,
-            "protocol-mismatch",
-            &format!(
-                "this session speaks session protocol {SESSION_PROTOCOL_VERSION}; \
-                 the client offered {}",
-                handshake.protocol_version
-            ),
-        )
-        .await;
-        return;
-    }
-
-    let admitted = match h.admit_attach(&handshake.attach, ctx) {
+    // The generation check already ran on the raw line, in the IPC
+    // server, so nothing here can be reached by a client that disagrees
+    // about what these fields mean.
+    let admitted = match h.admit_attach(&handshake, ctx) {
         Ok(admitted) => admitted,
         Err(error) => {
-            // The token is never echoed: it is a bearer credential, and
-            // an error message is a log line waiting to happen.
             reject(&mut writer, &error.code, &error.message).await;
             return;
         }
     };
 
     let tab_id = admitted.tab_id;
+    // Test seam only (`AttachPause`), and a no-op without one: the
+    // window between the admission that captured this tab's identity
+    // and the first thing done with it, which a test stands inside to
+    // respawn the tab there.
+    h.supervisor.pause_attach_admission().await;
     let outcome = attach_tab(h, &admitted, &handshake, reader, writer, close);
     // Registered by the admission; deregistered here however the
     // forwarder ended, so a tab that is attached and detached repeatedly
@@ -206,11 +195,24 @@ async fn attach_tab(
 ) {
     let tab_id = admitted.tab_id;
     let tab_generation = admitted.tab_generation;
-    let kind = &admitted.terms.kind;
+    let kind = &admitted.kind;
     // Started before the snapshot is asked for, not after it arrives:
     // the encode queues behind `MAX_CONCURRENT_SNAPSHOTS` and is exactly
     // the part of an attach the time budget exists to bound.
     let started = Instant::now();
+
+    // A focused attach is a geometry-bearing interaction, so the tab
+    // takes this client's size before anything is encoded from it. It
+    // runs here, on the forwarder's own task and under no session-state
+    // lock, because a tab parked behind `MAX_CONCURRENT_SNAPSHOTS` must
+    // not stall every other session op. Detach never resizes back
+    // (roadmap D7).
+    if let Some(commands) = admitted.resize_first.as_ref() {
+        if let Err(error) = await_attach_resize(commands, tab_id, admitted.geometry).await {
+            reject(&mut writer, &error.code, &error.message).await;
+            return;
+        }
+    }
     // Resume first, and only ever as an optimization: everything it
     // cannot honor comes back `None` and is served as a full attach
     // under the same reply (D6).
@@ -254,24 +256,23 @@ async fn attach_tab(
 
     // Reported on every accepted reply, snapshot or resume, focused or
     // not. A focused attach did resize the tab to its own geometry — but
-    // on the *control* connection, before this one was dialed, and a
-    // `vt` encode can defer and retry inside the attach budget. Any
-    // other client's geometry-bearing INPUT landing in that window
-    // resizes the tab again, and this is the only place that says what
-    // the bytes to follow were actually written for. Sending it costs a
-    // client that already agrees nothing: it hydrates at a size it is
-    // already at.
+    // raw input is open and a `vt` encode can defer and retry inside the
+    // attach budget, so any other client's geometry-bearing INPUT
+    // landing in that window resizes the tab again, and this is the only
+    // place that says what the bytes to follow were actually written
+    // for. Sending it costs a client that already agrees nothing: it
+    // hydrates at a size it is already at.
     let accepted = AttachHandshakeReply::Accepted(AttachAccepted {
-        // What `tab.attach` negotiated, carried here on the ticket: the
-        // data connection presents only a token, and a client that
-        // decoded the reply is entitled to hear the same answer twice.
+        // Restated rather than assumed: the handshake states a
+        // preference order, so the reply is the one place the client
+        // hears which entry it got.
         kind: kind.clone(),
         mode,
         seq: fence,
         server_epoch,
         tab_generation: live_generation,
-        snapshot_cols: Some(reported_size.0),
-        snapshot_rows: Some(reported_size.1),
+        snapshot_cols: reported_size.0,
+        snapshot_rows: reported_size.1,
     });
     let Ok(body) = serde_json::to_vec(&accepted) else {
         return;
@@ -286,7 +287,7 @@ async fn attach_tab(
     let ending = Pump {
         tab_id,
         commands,
-        geometry: admitted.terms.geometry,
+        geometry: admitted.geometry,
         tee,
         writer,
         close,
@@ -362,11 +363,13 @@ async fn fence_tab(
         .supervisor
         .subscribe_output(tab_id)
         .ok_or_else(no_terminal)?;
-    // Channel and generation in one lock acquisition, so the task this
-    // snapshots is provably the task whose generation is checked. A
-    // respawn between the subscribe above and this read gives a new
+    // Channel and generation in one lock acquisition, so the channel
+    // this snapshot is asked on belongs to the generation checked here.
+    // A respawn between the subscribe above and this read gives a new
     // generation, which the check below turns into a clean `not-found`
-    // rather than a tee and a snapshot from two different terminals.
+    // rather than a tee and a snapshot from two different terminals. A
+    // respawn *after* it is settled by [`generation_holds`], on what the
+    // task reports having served.
     let (commands, live_generation) = h
         .supervisor
         .tab_task_handle(tab_id)
@@ -374,7 +377,7 @@ async fn fence_tab(
     if live_generation != tab_generation {
         return Err((
             "not-found",
-            "that tab was respawned after the attach token was issued".to_string(),
+            "that tab was respawned after this attach was admitted".to_string(),
         ));
     }
 
@@ -387,14 +390,14 @@ async fn fence_tab(
             other => ("not-found", other.to_string()),
         })?;
 
-    // The token named a tab pipeline, not just a tab id. A respawn
-    // between `tab.attach` and here is a different terminal with a
-    // different seq space, and streaming it under the old identity is
-    // exactly what the generation exists to prevent.
-    if snapshot.tab_generation != tab_generation {
+    // The attach named a tab pipeline, not just a tab id: a respawn is a
+    // different terminal with a different seq space, and streaming it
+    // under the old identity is exactly what the generation exists to
+    // prevent.
+    if !generation_holds(h, tab_id, snapshot.tab_generation, tab_generation) {
         return Err((
             "not-found",
-            "that tab was respawned after the attach token was issued".to_string(),
+            "that tab was respawned while its snapshot was being taken".to_string(),
         ));
     }
 
@@ -435,6 +438,29 @@ async fn fence_tab(
     })
 }
 
+/// Whether the pipeline that just served a hand-off is still the one
+/// this attach was admitted for.
+///
+/// `served` is reported by the tab task itself, in the turn it cut the
+/// hand-off: which task answered is a **fact** there, where the lookup
+/// before the send is only an inference about which one was going to.
+/// `admitted` is the generation the attach was let in for. The
+/// supervisor's current generation closes the other half of the window:
+/// a respawn that lands while the command is queued leaves the old task
+/// serving a terminal this tab id no longer names, and the client would
+/// be handed the dead terminal's backlog and its EXIT instead of the
+/// replacement.
+///
+/// A tab with **no** pipeline at all is not a mismatch. It exited, and a
+/// stream that ends in EXIT is the truth about the terminal this client
+/// asked for.
+fn generation_holds(h: &IpcHandler, tab_id: i64, served: u64, admitted: u64) -> bool {
+    served == admitted
+        && h.supervisor
+            .tab_generation(tab_id)
+            .is_none_or(|live| live == served)
+}
+
 /// The resume handoff (D6), or `None` for every reason it cannot be
 /// honored — a stale epoch, a respawned tab, a seq outside the ring, a
 /// tab task that is gone. Never an error: the caller serves a full
@@ -465,15 +491,12 @@ async fn resume_tab(
     if handshake.server_epoch != Some(server_epoch) {
         return None;
     }
-    // Channel and generation under one lock, so the pipeline that
-    // answers `Resume` is provably the one whose identity was just
-    // checked — against what the client claims AND against what the
-    // token was minted for. The second half of that has no test: it
-    // needs the same `tab_id` respawned between `tab.attach` and the
-    // handshake, and ids are never reused. It is the resume twin of the
-    // snapshot path's own generation re-check, and it stays for the same
-    // reason: streaming a second terminal's seq space under the first's
-    // identity is the exact thing the generation exists to prevent.
+    // Channel and generation under one lock, so the client's claim is
+    // checked against the pipeline this send is aimed at. It is not yet
+    // a check on the pipeline that will *answer*: the command queues,
+    // and a respawn can land behind it while the cloned sender keeps the
+    // old task alive. That half is settled after the reply, by
+    // [`generation_holds`].
     let (commands, live_generation) = h.supervisor.tab_task_handle(tab_id)?;
     if handshake.tab_generation != Some(live_generation) || live_generation != tab_generation {
         return None;
@@ -494,6 +517,19 @@ async fn resume_tab(
             return None;
         }
     };
+    // Which pipeline served the hand-off, not which one the lookup
+    // above found. A respawn between the two would otherwise stream the
+    // old terminal's ring and live tail — usually straight into its
+    // EXIT — to a client whose tab id now names the replacement.
+    if !generation_holds(h, tab_id, resumed.tab_generation, tab_generation) {
+        debug!(
+            tab_id,
+            from_seq,
+            served = resumed.tab_generation,
+            "the tab was respawned around the resume handoff; falling back to a snapshot"
+        );
+        return None;
+    }
 
     Some(Attached {
         tee: resumed.receiver,
@@ -501,7 +537,7 @@ async fn resume_tab(
         mode: AttachMode::Resume,
         seq: from_seq - 1,
         server_epoch,
-        tab_generation: live_generation,
+        tab_generation: resumed.tab_generation,
         snapshot: Vec::new(),
         // The tab's size at the handoff, cut from the same turn of the
         // task as the ring slice: a client that was away can have had
@@ -551,7 +587,7 @@ async fn take_snapshot(
 struct Pump {
     tab_id: i64,
     commands: mpsc::Sender<TabCmd>,
-    /// What this connection says its viewport is: the `tab.attach`
+    /// What this connection says its viewport is: the handshake's
     /// geometry until a `RESIZE` frame moves it. Every `INPUT` frame
     /// carries it, which is how the PTY follows whoever typed last.
     geometry: Geometry,
@@ -942,7 +978,7 @@ impl Pump {
                     cell_w: u32::from(read(4)),
                     cell_h: u32::from(read(6)),
                 };
-                // Dropped rather than applied or fatal: `tab.attach`
+                // Dropped rather than applied or fatal: the handshake
                 // refuses a zero-sized grid, and the two paths state one
                 // client's geometry, so they have to agree about what a
                 // grid is.

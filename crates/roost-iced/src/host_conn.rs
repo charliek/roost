@@ -34,7 +34,7 @@
 //! The attach data plane. A host tab's bytes and snapshot payloads are
 //! C5's, because the decoder and the hydrated `Terminal` are
 //! main-thread-only; C4 stops at handing C5 a live control client with
-//! an ordered queue to mint `tab.attach` tokens on, and a
+//! an ordered queue for an attach to take its place in, and a
 //! mirror that already knows which tabs exist.
 //!
 //! # How C5/C6/C7 consume this
@@ -75,7 +75,7 @@ use roost_ipc::messages::{
     ops, AgentHooksOutcome, AttachPayloadKind, EventEnvelope, OscColorsParams, RetrySchedule,
 };
 use roost_ipc::ssh::{SshFailure, SshTunnel};
-use roost_ui_model::keys::{HostId, TabKey};
+use roost_ui_model::keys::HostId;
 use roost_ui_model::theme::Theme;
 use tokio::task::AbortHandle;
 
@@ -504,15 +504,6 @@ struct HostConn {
     /// reading [`RetainedSection`] gives an explicit disconnect.
     carried: Option<CarriedRows>,
     state: HostConnState,
-    /// The last client focus this connection was told, so an unchanged
-    /// one is not resent (`Some(None)` is "told: nothing here is
-    /// focused"; the outer `None` is "never told").
-    ///
-    /// Reset whenever the incarnation changes or the connection leaves
-    /// `Connected`, because a session that just came up believes its own
-    /// headless default — the dedup must never be what stops a fresh
-    /// incarnation from hearing the truth.
-    focus_sent: Option<Option<i64>>,
 }
 
 impl Drop for HostConn {
@@ -1089,6 +1080,7 @@ impl HostConnSet {
             client_build: self.client_build.clone(),
             theme: Arc::clone(&self.theme),
             uploads: ops.uploads(),
+            serving: ops.serving(),
         };
         // Detached on purpose: the task owns its own shutdown, bounds it
         // (`task::SHUTDOWN_GRACE`), and answers its queue on the way
@@ -1114,7 +1106,6 @@ impl HostConnSet {
             fidelity_announced: false,
             facts: None,
             carried,
-            focus_sent: None,
             // What the task is actually doing the moment it is spawned.
             // The feed's first `Connecting` replaces it — this is only
             // what a frame drawn in between reads, so it must not be a
@@ -2442,6 +2433,19 @@ impl HostConnSet {
         self.endpoint(&host).map(|(socket, _)| socket.to_path_buf())
     }
 
+    /// The session id a live incarnation's data connections state in
+    /// their attach handshake (#473), so the session can refuse one
+    /// meant for the process it replaced.
+    ///
+    /// `None` for a stale incarnation — same contract as
+    /// [`Self::ops_for`] — and also for the window between this
+    /// connection publishing `Connected` and publishing its
+    /// [`ConnectFacts`], which the attach treats as "not yet".
+    pub(crate) fn session_id_for(&self, incarnation: HostId) -> Option<&str> {
+        let host = self.owner_of(incarnation)?;
+        Some(self.facts(&host)?.session_id.as_str())
+    }
+
     /// The theme changed. The slot every task re-reads on reconnect is
     /// updated first, then every connected host is told — so a session
     /// that reconnects during the round trip still gets the new colors.
@@ -2473,11 +2477,11 @@ impl HostConnSet {
     /// client's own allow-list (plan 046 §3.4, plan 064 §3.3).
     ///
     /// **Queued, not chained.** It rides the ordinary op queue — the same
-    /// road `session.set_theme` and `session.set_focus` take — rather
-    /// than joining the connect chain in `task::attempt`, and the two
-    /// reasons are both about the attachment: an error there fails the
-    /// whole attempt, and a raise on a network-mounted `$HOME` would
-    /// hold hydration up behind file I/O this client is not waiting on.
+    /// road `session.set_theme` takes — rather than joining the connect
+    /// chain in `task::attempt`, and the two reasons are both about the
+    /// attachment: an error there fails the whole attempt, and a raise on
+    /// a network-mounted `$HOME` would hold hydration up behind file I/O
+    /// this client is not waiting on.
     /// So the reply comes back on the feed, where a failure costs a log
     /// line and a toast that does not appear.
     ///
@@ -2590,54 +2594,6 @@ impl HostConnSet {
         });
     }
 
-    /// Tell every connected host which of its tabs this client is
-    /// looking at — `claim` is the one host tab that is on screen in a
-    /// focused window, if any, so at most one host hears a tab and every
-    /// other hears null.
-    ///
-    /// Null is not silence: it *withdraws* this connection's claim, so
-    /// the host that just lost the selection has to hear it or it keeps
-    /// muting that tab. The dedup below is therefore only about the
-    /// *repeat* — the first statement to each incarnation always goes
-    /// out (`focus_sent` starts empty and is cleared with the
-    /// incarnation).
-    ///
-    /// Fire-and-forget and quiet: a session one release older answers
-    /// `unknown-op`, which the connection tolerates, and the task logs
-    /// once per incarnation rather than warning per call.
-    pub(crate) fn set_focus(&mut self, claim: Option<TabKey>) {
-        for conn in self
-            .entries
-            .values_mut()
-            .filter_map(|entry| entry.conn.as_mut())
-        {
-            let Some(incarnation) = conn.incarnation.filter(|_| conn.state.is_connected()) else {
-                continue;
-            };
-            let focused = claim
-                .filter(|tab| tab.host == incarnation)
-                .map(|tab| tab.tab);
-            if conn.focus_sent == Some(focused) {
-                continue;
-            }
-            let sent = conn.ops.send(
-                queue::HostIntent::new(
-                    ops::SESSION_SET_FOCUS,
-                    // A string id or JSON null — the field is required
-                    // on the wire, so an absent one would be refused.
-                    serde_json::json!({ "focused_tab_id": focused.map(|id| id.to_string()) }),
-                )
-                .quiet(),
-            );
-            // Recorded only once it is actually on the queue: an intent
-            // refused at the enqueue never reaches the session, and
-            // remembering it as sent would leave that host muted.
-            if sent.is_ok() {
-                conn.focus_sent = Some(focused);
-            }
-        }
-    }
-
     /// Drain one `EngineFeed::HostState`. Returns the saved host it
     /// belongs to, or `None` when the incarnation is stale — an item
     /// minted by a connection this set has since dropped.
@@ -2729,7 +2685,6 @@ impl HostConnSet {
             conn.payload_kind = None;
             conn.fidelity_announced = false;
             conn.facts = None;
-            conn.focus_sent = None;
         }
         conn.incarnation = Some(incarnation);
         conn.state = next;
@@ -5578,6 +5533,7 @@ mod tests {
             },
             reduced_fidelity: true,
             resumed: None,
+            persist_error: None,
         }
     }
 

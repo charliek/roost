@@ -1,5 +1,6 @@
 mod app;
 mod chrome;
+mod config_writer;
 mod engine_feed;
 mod focus_probe;
 mod font_registry;

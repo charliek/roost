@@ -9,18 +9,9 @@
 use std::path::{Path, PathBuf};
 
 use roost_agent::Agent;
+use roost_ui_model::config::ConfigLock;
 
 use crate::error::InstallError;
-
-/// Every agent Roost can wire, in the order status and ensure report
-/// them.
-pub const ALL_AGENTS: [Agent; 5] = [
-    Agent::Claude,
-    Agent::Codex,
-    Agent::Grok,
-    Agent::Cursor,
-    Agent::Opencode,
-];
 
 /// The environment variable that relocates `agent`'s config directory,
 /// as that agent itself documents it.
@@ -163,8 +154,8 @@ impl Home {
         self.agent_dir(agent).is_dir()
     }
 
-    /// Roost's own configuration directory — where the state record and
-    /// the ensure lock live.
+    /// Roost's own configuration directory — where the state record
+    /// lives.
     pub fn roost_config_dir(&self) -> PathBuf {
         self.home.join(".config/roost")
     }
@@ -172,11 +163,6 @@ impl Home {
     /// `<config dir>/roost/agent-hooks.json`.
     pub fn record_path(&self) -> PathBuf {
         self.roost_config_dir().join("agent-hooks.json")
-    }
-
-    /// `<config dir>/roost/agent-hooks.lock`.
-    pub fn lock_path(&self) -> PathBuf {
-        self.roost_config_dir().join("agent-hooks.lock")
     }
 
     /// `config.conf` — the file carrying the `agent-hooks` key this
@@ -187,11 +173,23 @@ impl Home {
     pub fn config_path(&self) -> &Path {
         &self.config
     }
+
+    /// The lock every writer in this crate runs under — one per
+    /// [`Home::config_path`], because the `agent-hooks` key and the
+    /// agent files it authorises have to move together.
+    ///
+    /// Named here rather than spelled out at each entry point so there
+    /// is one answer to "which file do Roost's writers contend on", and
+    /// so a `Home` built for a jail locks inside that jail.
+    pub fn config_lock(&self) -> Result<ConfigLock, InstallError> {
+        Ok(ConfigLock::acquire(self.config_path())?)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roost_agent::ALL_AGENTS;
     use std::collections::HashMap;
 
     fn env_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {

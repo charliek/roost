@@ -1,5 +1,5 @@
 //! Host-session wire types: `SessionIdentify`, `EventBatch`,
-//! `AttachPayloadKind`, the `tab.attach` shapes, the attach handshake
+//! `AttachPayloadKind`, the attach handshake
 //! and its reply, and `SESSION_PROTOCOL_VERSION`.
 //!
 //! What pins their shape is this file plus the golden vectors under
@@ -18,16 +18,17 @@ use std::path::PathBuf;
 
 use roost_ipc::messages::{
     ops, AgentHooksOutcome, AgentSetHooksAgents, AgentSetHooksParams, AgentSetHooksResult,
-    AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode, AttachPayloadKind,
-    ClipboardEffectTarget, ClipboardWriteParams, EventBatch, EventEnvelope, EventsSubscribeParams,
-    EventsSubscribeResult, ProjectReorderParams, ResponseError, RetrySchedule, SentFile,
+    AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachHandshakeTerms, AttachMode,
+    AttachPayloadKind, ClipboardEffectTarget, ClipboardWriteParams, DurabilityChangedEvent,
+    EventBatch, EventEnvelope, EventsSubscribeParams, EventsSubscribeResult, IdentifyResult,
+    NotificationFiredEvent, ProjectReorderParams, ResponseError, RetrySchedule, SentFile,
     SessionBinaryIdentity, SessionIdentify, SessionIdentifyParams, SessionPutFileParams,
-    SessionPutFileResult, SessionSetAgentHooksParams, SessionSetFocusParams, SessionSetThemeParams,
-    SessionSetThemeResult, SessionStopParams, SessionStopResult, SessionStoppingEvent, SkippedFile,
-    TabAttachParams, TabAttachResult, TabDumpCursor, TabDumpParams, TabDumpResult, TabEffect,
-    TabEffectEvent, TabReorderParams, TabSendFileParams, TabSendFileResult, TabWriteParams,
-    WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
-    SESSION_STOPPING_EVENT,
+    SessionPutFileResult, SessionSetAgentHooksParams, SessionSetThemeParams, SessionSetThemeResult,
+    SessionStopParams, SessionStopResult, SessionStoppingEvent, SkippedFile,
+    TabClearNotificationParams, TabClearNotificationResult, TabDumpCursor, TabDumpParams,
+    TabDumpResult, TabEffect, TabEffectEvent, TabReorderParams, TabSendFileParams,
+    TabSendFileResult, TabWriteParams, WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES,
+    SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -56,6 +57,7 @@ fn sample_identify() -> SessionIdentify {
         libghostty_build: "ghostty-3f6b1c9a4d2e5f80+snapshot.v1".into(),
         session_id: "01K3S8TQ4F0Q9YB2K6WZ5D7XN".into(),
         started_at: "2026-08-27T14:03:11Z".into(),
+        persist_error: None,
     }
 }
 
@@ -126,14 +128,6 @@ fn a_request_carrying_a_lease_is_refused_by_every_op_that_took_one() {
             .map(drop),
     );
     refused(
-        ops::TAB_ATTACH,
-        serde_json::from_str::<TabAttachParams>(
-            r#"{"lease":"l","tab_id":"7","kinds":["vt"],"cols":80,"rows":24,
-                "libghostty_build":"b"}"#,
-        )
-        .map(drop),
-    );
-    refused(
         ops::SESSION_SET_THEME,
         serde_json::from_value::<SessionSetThemeParams>(serde_json::json!({
             "lease": "l",
@@ -144,13 +138,6 @@ fn a_request_carrying_a_lease_is_refused_by_every_op_that_took_one() {
                 "palette": vec!["#000000"; 256],
             },
         }))
-        .map(drop),
-    );
-    refused(
-        ops::SESSION_SET_FOCUS,
-        serde_json::from_value::<SessionSetFocusParams>(
-            serde_json::json!({"lease": "l", "focused_tab_id": "5"}),
-        )
         .map(drop),
     );
     refused(
@@ -468,161 +455,35 @@ fn session_stop_vector_decodes_into_its_typed_result() {
 // Attach
 // ============================================================================
 
-const TOKEN: &str = "1a0be5c37d924f68b1c05e3a7f2d8496";
 const EPOCH: u64 = 6_032_428_321_756_423_947;
 
-fn sample_attach_params() -> TabAttachParams {
-    TabAttachParams {
-        tab_id: 5,
-        kinds: vec![AttachPayloadKind::GHOSTTY_SNAPSHOT.into()],
-        cols: 120,
-        rows: 40,
-        cell_w_px: 9,
-        cell_h_px: 18,
-        libghostty_build: "ghostty-3f6b1c9a4d2e5f80+snapshot.v1".into(),
-        focus: true,
-    }
-}
-
-fn sample_attach_result() -> TabAttachResult {
-    TabAttachResult {
-        attach_token: TOKEN.into(),
-        kind: AttachPayloadKind::GHOSTTY_SNAPSHOT.into(),
-        server_epoch: EPOCH,
-        tab_generation: 3,
-    }
-}
-
+/// The whole negotiation on one line: `attach` names the tab as a
+/// `string_int64` and the terms ride beside it.
 #[test]
-fn tab_attach_params_match_their_golden_json() {
-    const GOLDEN: &str = concat!(
-        r#"{"tab_id":"5","kinds":["ghostty-snapshot"],"cols":120,"rows":40,"#,
-        r#""cell_w_px":9,"cell_h_px":18,"#,
-        r#""libghostty_build":"ghostty-3f6b1c9a4d2e5f80+snapshot.v1","focus":true}"#,
+fn an_attach_handshake_matches_its_golden_json() {
+    const SNAPSHOT: &str = concat!(
+        r#"{"attach":"7","protocol_version":6,"#,
+        r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","kinds":["ghostty-snapshot","vt"],"#,
+        r#""cols":100,"rows":30,"cell_w_px":8,"cell_h_px":16,"#,
+        r#""libghostty_build":"ghostty-1a2b3c4d5e6f7a8b+snapshot.v1","focus":true}"#,
     );
-
-    let value = sample_attach_params();
-    round_trip(&value);
-    assert_eq!(serde_json::to_string(&value).unwrap(), GOLDEN);
-    let decoded: TabAttachParams = serde_json::from_str(GOLDEN).unwrap();
-    assert_eq!(decoded, value);
-}
-
-/// A headless client has no cell metrics to report, so the pixel
-/// geometry defaults away — but `cols`/`rows` do not, because a zero
-/// viewport is not a thing a tab can be resized to.
-#[test]
-fn tab_attach_params_default_the_pixel_geometry_only() {
-    let decoded: TabAttachParams = serde_json::from_str(
-        r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,
-            "libghostty_build":"b","focus":true}"#,
-    )
-    .unwrap();
-    assert_eq!((decoded.cell_w_px, decoded.cell_h_px), (0, 0));
-    assert_eq!(decoded.tab_id, 7);
-
-    assert!(serde_json::from_str::<TabAttachParams>(
-        r#"{"tab_id":"7","kinds":[],"rows":24,"libghostty_build":"b","focus":true}"#
-    )
-    .is_err());
-}
-
-/// `focus` is a plain bool: required on the wire, always serialized, and
-/// an absent key is a malformed request.
-///
-/// Protocol 4 let it be omitted to mean `true`, so a client could address
-/// a peer predating the field. At 5 there is no such peer, and the
-/// omit-when-true shim is gone — which this refuses to let back in,
-/// because a serde default would make every one of these decode again.
-#[test]
-fn tab_attach_params_require_focus_and_always_spell_it_out() {
-    const NO_FOCUS_KEY: &str =
-        r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"libghostty_build":"b"}"#;
-
-    let error = serde_json::from_str::<TabAttachParams>(NO_FOCUS_KEY)
-        .expect_err("an absent `focus` is refused at 5");
-    assert!(
-        error.to_string().contains("focus"),
-        "the refusal must name the missing field: {error}"
-    );
-
-    let decoded: TabAttachParams = serde_json::from_str(
-        r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"libghostty_build":"b",
-            "focus":true}"#,
-    )
-    .expect("an explicit true");
-    assert!(decoded.focus);
-    assert_eq!(
-        serde_json::to_string(&decoded).unwrap(),
-        concat!(
-            r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"cell_w_px":0,"cell_h_px":0,"#,
-            r#""libghostty_build":"b","focus":true}"#
-        )
-    );
-
-    let decoded: TabAttachParams = serde_json::from_str(
-        r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"libghostty_build":"b",
-            "focus":false}"#,
-    )
-    .expect("an explicit false");
-    assert!(!decoded.focus);
-    assert_eq!(
-        serde_json::to_string(&decoded).unwrap(),
-        concat!(
-            r#"{"tab_id":"7","kinds":["vt"],"cols":80,"rows":24,"cell_w_px":0,"cell_h_px":0,"#,
-            r#""libghostty_build":"b","focus":false}"#
-        )
-    );
-
-    // The Rust default has to agree with the serde one, or filling the
-    // rest of the struct with `..Default::default()` would quietly ask
-    // for an unfocused attach.
-    assert!(TabAttachParams::default().focus);
-}
-
-#[test]
-fn tab_attach_result_matches_its_golden_json() {
-    const GOLDEN: &str = concat!(
-        r#"{"attach_token":"1a0be5c37d924f68b1c05e3a7f2d8496","#,
-        r#""kind":"ghostty-snapshot","server_epoch":6032428321756423947,"#,
-        r#""tab_generation":3}"#,
-    );
-
-    let value = sample_attach_result();
-    round_trip(&value);
-    assert_eq!(serde_json::to_string(&value).unwrap(), GOLDEN);
-    let decoded: TabAttachResult = serde_json::from_str(GOLDEN).unwrap();
-    assert_eq!(decoded, value);
-    // Past 2^53 and a bare JSON number, like every other counter on
-    // this wire (`EventBatch.revision`), not a string-encoded id — so
-    // the golden above is also a precision guard.
-    const _: () = assert!(EPOCH > (1u64 << 53));
-}
-
-#[test]
-fn attach_handshake_matches_its_golden_json() {
-    const SNAPSHOT: &str = r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":6}"#;
     const RESUME: &str = concat!(
-        r#"{"attach":"1a0be5c37d924f68b1c05e3a7f2d8496","protocol_version":6,"#,
-        r#""resume_from_seq":901,"server_epoch":6032428321756423947,"#,
-        r#""tab_generation":3}"#,
+        r#"{"attach":"7","protocol_version":6,"#,
+        r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","kinds":["ghostty-snapshot","vt"],"#,
+        r#""cols":100,"rows":30,"cell_w_px":8,"cell_h_px":16,"#,
+        r#""libghostty_build":"ghostty-1a2b3c4d5e6f7a8b+snapshot.v1","focus":true,"#,
+        r#""resume_from_seq":901,"server_epoch":6032428321756423947,"tab_generation":3}"#,
     );
 
-    let fresh = AttachHandshake {
-        attach: TOKEN.into(),
-        protocol_version: SESSION_PROTOCOL_VERSION,
-        ..AttachHandshake::default()
-    };
+    let fresh = AttachHandshake::snapshot(7, sample_handshake_terms());
     round_trip(&fresh);
     assert_eq!(serde_json::to_string(&fresh).unwrap(), SNAPSHOT);
+    assert_eq!(
+        serde_json::from_str::<AttachHandshake>(SNAPSHOT).unwrap(),
+        fresh
+    );
 
-    let resuming = AttachHandshake {
-        attach: TOKEN.into(),
-        protocol_version: SESSION_PROTOCOL_VERSION,
-        resume_from_seq: Some(901),
-        server_epoch: Some(EPOCH),
-        tab_generation: Some(3),
-    };
+    let resuming = AttachHandshake::resume(7, sample_handshake_terms(), 901, EPOCH, 3);
     round_trip(&resuming);
     assert_eq!(serde_json::to_string(&resuming).unwrap(), RESUME);
     assert_eq!(
@@ -631,17 +492,83 @@ fn attach_handshake_matches_its_golden_json() {
     );
 }
 
+fn sample_handshake_terms() -> AttachHandshakeTerms {
+    AttachHandshakeTerms {
+        session_id: "01K3S8TQ4F0Q9YB2K6WZ5D7XN".into(),
+        kinds: vec![
+            AttachPayloadKind::GHOSTTY_SNAPSHOT.into(),
+            AttachPayloadKind::VT.into(),
+        ],
+        cols: 100,
+        rows: 30,
+        cell_w_px: 8,
+        cell_h_px: 16,
+        libghostty_build: "ghostty-1a2b3c4d5e6f7a8b+snapshot.v1".into(),
+        focus: true,
+    }
+}
+
+/// A handshake is all-or-nothing, and the decode error names the term
+/// that is missing — a client that forgot one must not be left reading
+/// "invalid JSON".
+///
+/// `kinds` is in the loop like any other term now. It used to be the
+/// discriminator between the inline form and a ticket, so a line
+/// without it was a *different shape* rather than a malformed one;
+/// there is one shape left and a missing `kinds` is simply missing.
+#[test]
+fn a_handshake_missing_a_required_term_names_it() {
+    for missing in [
+        "session_id",
+        "kinds",
+        "cols",
+        "rows",
+        "libghostty_build",
+        "focus",
+    ] {
+        let mut line = serde_json::json!({
+            "attach": "7",
+            "protocol_version": 6,
+            "session_id": "s",
+            "kinds": ["vt"],
+            "cols": 80,
+            "rows": 24,
+            "libghostty_build": "b",
+            "focus": false,
+        });
+        line.as_object_mut().unwrap().remove(missing);
+        let error = serde_json::from_value::<AttachHandshake>(line)
+            .expect_err("every term but the cell metrics is required");
+        assert!(
+            error.to_string().contains(missing),
+            "the error names {missing}: {error}"
+        );
+    }
+}
+
+/// The two terms a headless client genuinely has nothing to say about.
+#[test]
+fn a_handshake_may_omit_its_cell_metrics() {
+    let decoded: AttachHandshake = serde_json::from_str(concat!(
+        r#"{"attach":"7","protocol_version":6,"session_id":"s","kinds":["vt"],"#,
+        r#""cols":80,"rows":24,"libghostty_build":"b","focus":true}"#,
+    ))
+    .expect("a headless client reports no cell metrics");
+    assert_eq!((decoded.terms.cell_w_px, decoded.terms.cell_h_px), (0, 0));
+}
+
 /// The handshake is the one line a client of a *newer* build might send
 /// with fields this build has never heard of; refusing it over one
 /// would turn an additive change into a hard incompatibility.
 #[test]
 fn attach_handshake_tolerates_unknown_fields() {
     let decoded: AttachHandshake = serde_json::from_str(
-        r#"{"attach":"t","protocol_version":2,"resume_from_seq":5,
-            "viewport_hint":{"top":0},"future_field":true}"#,
+        r#"{"attach":"7","protocol_version":2,"session_id":"s","kinds":["vt"],
+            "cols":80,"rows":24,"libghostty_build":"b","focus":true,
+            "resume_from_seq":5,"viewport_hint":{"top":0},"future_field":true}"#,
     )
     .unwrap();
-    assert_eq!(decoded.attach, "t");
+    assert_eq!(decoded.attach, "7");
     assert_eq!(decoded.resume_from_seq, Some(5));
     assert_eq!(decoded.server_epoch, None);
 }
@@ -650,10 +577,13 @@ fn attach_handshake_tolerates_unknown_fields() {
 fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
     const ACCEPTED: &str = concat!(
         r#"{"ok":true,"kind":"ghostty-snapshot","mode":"snapshot","seq":900,"#,
-        r#""server_epoch":6032428321756423947,"tab_generation":3}"#,
+        r#""server_epoch":6032428321756423947,"tab_generation":3,"#,
+        r#""snapshot_cols":100,"snapshot_rows":30}"#,
     );
-    const REJECTED: &str =
-        r#"{"ok":false,"error":{"code":"invalid-token","message":"unknown or expired token"}}"#;
+    const REJECTED: &str = concat!(
+        r#"{"ok":false,"error":{"code":"session-mismatch","#,
+        r#""message":"this session is \"a\"; the client attached to \"b\""}}"#,
+    );
 
     let accepted = AttachHandshakeReply::Accepted(AttachAccepted {
         kind: AttachPayloadKind::GHOSTTY_SNAPSHOT.into(),
@@ -661,8 +591,8 @@ fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
         seq: 900,
         server_epoch: EPOCH,
         tab_generation: 3,
-        snapshot_cols: None,
-        snapshot_rows: None,
+        snapshot_cols: 100,
+        snapshot_rows: 30,
     });
     round_trip(&accepted);
     assert_eq!(serde_json::to_string(&accepted).unwrap(), ACCEPTED);
@@ -671,7 +601,10 @@ fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
         accepted
     );
 
-    let rejected = AttachHandshakeReply::rejected("invalid-token", "unknown or expired token");
+    let rejected = AttachHandshakeReply::rejected(
+        "session-mismatch",
+        r#"this session is "a"; the client attached to "b""#,
+    );
     round_trip(&rejected);
     assert_eq!(serde_json::to_string(&rejected).unwrap(), REJECTED);
     assert_eq!(
@@ -681,19 +614,17 @@ fn attach_handshake_reply_matches_its_golden_json_on_both_arms() {
     assert_eq!(
         rejected,
         AttachHandshakeReply::Rejected(ResponseError {
-            code: "invalid-token".into(),
-            message: "unknown or expired token".into(),
+            code: "session-mismatch".into(),
+            message: r#"this session is "a"; the client attached to "b""#.into(),
         })
     );
 }
 
-/// The snapshot geometry rides the accepted arm only when the server
-/// has something to report — an unfocused attach, whose payload is at
-/// the tab's size and not the client's. Both directions are additive:
-/// an old client ignores the keys, and a new client decoding a reply
-/// that has none reads `None`.
+/// The snapshot geometry rides **every** accepted arm: under protocol
+/// equality there is no session that leaves it out, so a reply without
+/// it is a truncated reply and not an older peer.
 #[test]
-fn an_accepted_handshake_reply_round_trips_with_and_without_the_snapshot_geometry() {
+fn an_accepted_handshake_reply_without_the_snapshot_geometry_is_refused() {
     const WITH: &str = concat!(
         r#"{"ok":true,"kind":"vt","mode":"snapshot","seq":900,"#,
         r#""server_epoch":6032428321756423947,"tab_generation":3,"#,
@@ -706,8 +637,8 @@ fn an_accepted_handshake_reply_round_trips_with_and_without_the_snapshot_geometr
         seq: 900,
         server_epoch: EPOCH,
         tab_generation: 3,
-        snapshot_cols: Some(100),
-        snapshot_rows: Some(30),
+        snapshot_cols: 100,
+        snapshot_rows: 30,
     });
     round_trip(&sized);
     assert_eq!(serde_json::to_string(&sized).unwrap(), WITH);
@@ -716,16 +647,15 @@ fn an_accepted_handshake_reply_round_trips_with_and_without_the_snapshot_geometr
         sized
     );
 
-    let AttachHandshakeReply::Accepted(bare) =
-        serde_json::from_str::<AttachHandshakeReply>(concat!(
-            r#"{"ok":true,"kind":"vt","mode":"snapshot","seq":900,"#,
-            r#""server_epoch":6032428321756423947,"tab_generation":3}"#,
-        ))
-        .expect("a reply from a session that never heard of the keys")
-    else {
-        panic!("the accepted arm");
-    };
-    assert_eq!((bare.snapshot_cols, bare.snapshot_rows), (None, None));
+    let error = serde_json::from_str::<AttachHandshakeReply>(concat!(
+        r#"{"ok":true,"kind":"vt","mode":"snapshot","seq":900,"#,
+        r#""server_epoch":6032428321756423947,"tab_generation":3}"#,
+    ))
+    .expect_err("an accepted reply that states no geometry is truncated");
+    assert!(
+        error.to_string().contains("snapshot_cols"),
+        "the error names the missing field: {error}"
+    );
 }
 
 /// `ok` is the discriminant, so an accepted arm missing a field it
@@ -752,61 +682,6 @@ fn attach_mode_is_a_lowercase_string() {
         AttachMode::Resume
     );
     assert!(serde_json::from_str::<AttachMode>(r#""Snapshot""#).is_err());
-}
-
-#[test]
-fn tab_attach_vectors_decode_into_their_typed_shapes() {
-    let raw = read_vector("tab.attach.request.json");
-    let request: roost_ipc::messages::RawRequest =
-        serde_json::from_str(&raw).expect("decode request envelope");
-    assert_eq!(request.op, roost_ipc::messages::ops::TAB_ATTACH);
-    let params: TabAttachParams =
-        serde_json::from_value(request.params).expect("decode attach params");
-    assert_eq!(params, sample_attach_params());
-
-    let raw = read_vector("tab.attach.response.json");
-    let resp: roost_ipc::messages::Response =
-        serde_json::from_str(&raw).expect("decode response envelope");
-    assert!(resp.ok);
-    let result: TabAttachResult =
-        serde_json::from_value(resp.result.expect("result body")).expect("decode attach result");
-    assert_eq!(result, sample_attach_result());
-}
-
-/// The other end of the negotiation: a client offering both kinds, and
-/// the reply that settled on `vt`.
-#[test]
-fn tab_attach_vt_vectors_decode_into_their_typed_shapes() {
-    let raw = read_vector("tab.attach.vt.request.json");
-    let request: roost_ipc::messages::RawRequest =
-        serde_json::from_str(&raw).expect("decode request envelope");
-    assert_eq!(request.op, roost_ipc::messages::ops::TAB_ATTACH);
-    let params: TabAttachParams =
-        serde_json::from_value(request.params).expect("decode attach params");
-    assert_eq!(
-        params,
-        TabAttachParams {
-            kinds: vec![
-                AttachPayloadKind::GHOSTTY_SNAPSHOT.into(),
-                AttachPayloadKind::VT.into(),
-            ],
-            ..sample_attach_params()
-        }
-    );
-
-    let raw = read_vector("tab.attach.vt.response.json");
-    let resp: roost_ipc::messages::Response =
-        serde_json::from_str(&raw).expect("decode response envelope");
-    assert!(resp.ok);
-    let result: TabAttachResult =
-        serde_json::from_value(resp.result.expect("result body")).expect("decode attach result");
-    assert_eq!(
-        result,
-        TabAttachResult {
-            kind: AttachPayloadKind::VT.into(),
-            ..sample_attach_result()
-        }
-    );
 }
 
 #[test]
@@ -938,18 +813,17 @@ fn event_batch_vector_decodes_into_its_typed_shape() {
 // HS-2 server additions (plan 037 §3.6): effects + theme reseed
 // ============================================================================
 
-/// The two effect spellings a client switches on. Kebab-case is not
-/// serde's default rendering, so the wire strings are stated here rather
-/// than inferred — renaming a variant must break this file, not a
-/// client.
+/// The two effect spellings a client switches on. The constants are the
+/// wire strings verbatim (`TabEffect` is a transparent newtype), so
+/// renaming a constant must break this file, not a client.
 #[test]
 fn tab_effect_names_are_their_wire_strings() {
     assert_eq!(
-        serde_json::to_string(&TabEffect::Bell).unwrap(),
+        serde_json::to_string(&TabEffect::from(TabEffect::BELL)).unwrap(),
         r#""bell""#
     );
     assert_eq!(
-        serde_json::to_string(&TabEffect::ClipboardWrite).unwrap(),
+        serde_json::to_string(&TabEffect::from(TabEffect::CLIPBOARD_WRITE)).unwrap(),
         r#""clipboard-write""#
     );
     assert_eq!(
@@ -960,10 +834,23 @@ fn tab_effect_names_are_their_wire_strings() {
         serde_json::to_string(&ClipboardEffectTarget::Selection).unwrap(),
         r#""selection""#
     );
-    // An effect this build has never heard of fails to decode rather
-    // than landing on a default: a client that cannot tell what happened
-    // must ignore the envelope, and the decode is how it finds out.
-    assert!(serde_json::from_str::<TabEffect>(r#""pointer-shape""#).is_err());
+}
+
+/// `TabEffect` is an open list (#188, #364), not a closed enum: a
+/// session ahead of this build can name an effect this build has never
+/// heard of, and the client's job is to ignore it, not refuse the whole
+/// envelope. Decoding an unknown value must succeed and preserve it —
+/// the opposite of the old closed-enum contract, which failed the
+/// decode outright.
+#[test]
+fn an_unknown_effect_decodes_as_an_opaque_value_instead_of_failing() {
+    let decoded: TabEffect =
+        serde_json::from_str(r#""pointer-shape""#).expect("unknown effect must still decode");
+    assert_eq!(decoded, TabEffect::from("pointer-shape"));
+    assert_eq!(decoded.as_str(), "pointer-shape");
+    // Still routes: a known effect is unaffected by the type opening up.
+    let bell: TabEffect = serde_json::from_str(r#""bell""#).expect("decode bell");
+    assert_eq!(bell, TabEffect::from(TabEffect::BELL));
 }
 
 /// A bell carries no payload at all — the optional fields are absent
@@ -974,7 +861,7 @@ fn tab_effect_names_are_their_wire_strings() {
 fn a_bell_effect_omits_its_payload_fields() {
     let bell = TabEffectEvent {
         tab_id: 5,
-        effect: TabEffect::Bell,
+        effect: TabEffect::BELL.into(),
         data: None,
         target: None,
     };
@@ -995,7 +882,7 @@ fn tab_effect_vector_decodes_into_its_typed_shape() {
         data,
         TabEffectEvent {
             tab_id: 5,
-            effect: TabEffect::ClipboardWrite,
+            effect: TabEffect::CLIPBOARD_WRITE.into(),
             // base64 of "hello": the payload rides encoded like every
             // other bytes field on this wire.
             data: Some("aGVsbG8=".into()),
@@ -1003,6 +890,88 @@ fn tab_effect_vector_decodes_into_its_typed_shape() {
         }
     );
     round_trip(&data);
+}
+
+/// `error` is deliberately **not** `skip_serializing_if` — see
+/// [`DurabilityChangedEvent`].
+#[test]
+fn a_durability_recovery_says_so_with_an_explicit_null() {
+    let recovered = DurabilityChangedEvent { error: None };
+    assert_eq!(
+        serde_json::to_string(&recovered).unwrap(),
+        r#"{"error":null}"#
+    );
+    round_trip(&recovered);
+}
+
+#[test]
+fn durability_vectors_decode_into_their_typed_shape() {
+    for (name, expected) in [
+        (
+            "workspace.durability_changed.event.json",
+            Some("Read-only file system (os error 30)".to_string()),
+        ),
+        ("workspace.durability_changed.recovered.event.json", None),
+    ] {
+        let raw = read_vector(name);
+        let envelope: EventEnvelope = serde_json::from_str(&raw).expect("decode event envelope");
+        assert_eq!(
+            envelope.event,
+            roost_ipc::messages::ops::EVENT_WORKSPACE_DURABILITY_CHANGED
+        );
+        let data: DurabilityChangedEvent =
+            serde_json::from_value(envelope.data).expect("decode durability data");
+        assert_eq!(data.error, expected, "{name}");
+        round_trip(&data);
+    }
+}
+
+/// The field is additive, which is exactly what the pair of vectors
+/// pins: the plain `v6` file has no `persist_error` and still decodes to
+/// this build's identity, and the variant carries one.
+#[test]
+fn session_identify_carries_a_persist_error_only_when_there_is_one() {
+    let plain = decode_identify_vector(&identify_vector_name(SESSION_PROTOCOL_VERSION));
+    assert_eq!(plain.persist_error, None);
+    assert!(
+        !serde_json::to_string(&plain)
+            .unwrap()
+            .contains("persist_error"),
+        "an absent durability failure is omitted, not null"
+    );
+
+    let failing = decode_identify_vector(&format!(
+        "session.identify.persist_error.response.v{SESSION_PROTOCOL_VERSION}.json"
+    ));
+    assert_eq!(
+        failing.persist_error.as_deref(),
+        Some("No space left on device (os error 28)")
+    );
+    assert_eq!(
+        SessionIdentify {
+            persist_error: None,
+            ..failing
+        },
+        sample_identify()
+    );
+}
+
+#[test]
+fn identify_carries_a_persist_error_only_when_there_is_one() {
+    fn result(name: &str) -> IdentifyResult {
+        let raw = read_vector(name);
+        let resp: roost_ipc::messages::Response =
+            serde_json::from_str(&raw).expect("decode response envelope");
+        serde_json::from_value(resp.result.expect("result body")).expect("decode identify result")
+    }
+
+    assert_eq!(result("identify.response.json").persist_error, None);
+    assert_eq!(
+        result("identify.persist_error.response.json")
+            .persist_error
+            .as_deref(),
+        Some("Read-only file system (os error 30)")
+    );
 }
 
 #[test]
@@ -1058,97 +1027,98 @@ fn session_set_theme_params_reject_unknown_fields() {
 }
 
 // ---------------------------------------------------------------------------
-// session.set_focus (plan 038 C6)
+// tab.clear_notification + notification.fired (#474)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn session_set_focus_vectors_decode_into_their_typed_shapes() {
-    let raw = read_vector("session.set_focus.request.json");
+fn clear_notification_vectors_decode_into_their_typed_shapes() {
+    let raw = read_vector("tab.clear_notification.request.json");
     let request: roost_ipc::messages::RawRequest =
         serde_json::from_str(&raw).expect("decode request envelope");
-    assert_eq!(request.op, roost_ipc::messages::ops::SESSION_SET_FOCUS);
-    let params: SessionSetFocusParams =
-        serde_json::from_value(request.params).expect("decode set_focus params");
-    // The wire spelling is `string_int64`, like every other tab id.
-    assert_eq!(params.focused_tab_id, Some(5));
+    assert_eq!(request.op, ops::TAB_CLEAR_NOTIFICATION);
+    let params: TabClearNotificationParams =
+        serde_json::from_value(request.params).expect("decode clear params");
+    assert_eq!(params.tab_id, 3);
+    assert_eq!(
+        params.generation, None,
+        "the plain form is a person answering the tab"
+    );
     round_trip(&params);
 
-    let raw = read_vector("session.set_focus.none.request.json");
+    let raw = read_vector("tab.clear_notification.generation.request.json");
     let request: roost_ipc::messages::RawRequest =
         serde_json::from_str(&raw).expect("decode request envelope");
-    let params: SessionSetFocusParams =
-        serde_json::from_value(request.params).expect("decode a null focus");
-    assert_eq!(params.focused_tab_id, None);
+    let params: TabClearNotificationParams =
+        serde_json::from_value(request.params).expect("decode an acknowledgement");
+    assert_eq!(params.tab_id, 3);
+    assert_eq!(params.generation, Some(7));
     round_trip(&params);
 
-    // The result is an empty object, not `null`: the op reports nothing
-    // beyond "applied".
-    let raw = read_vector("session.set_focus.response.json");
+    let raw = read_vector("tab.clear_notification.response.json");
     let resp: roost_ipc::messages::Response =
         serde_json::from_str(&raw).expect("decode response envelope");
     assert!(resp.ok);
-    assert_eq!(resp.result, Some(serde_json::json!({})));
+    let result: TabClearNotificationResult =
+        serde_json::from_value(resp.result.expect("a result")).expect("decode the result");
+    assert!(result.cleared);
 }
 
-/// `focused_tab_id` is REQUIRED and nullable, and the two are not the
-/// same thing: `null` says "nothing on this session is focused", while
-/// an omitted field is a client that never said — and defaulting that to
-/// either answer would silently re-create the mute this op exists to
-/// fix.
+/// `generation` is omit-when-unset, which is what makes it additive: a
+/// clear from a peer that predates it is the unconditional form, and
+/// nothing in the encoder can emit a `null` a strict decoder would have
+/// to have a rule for.
 #[test]
-fn session_set_focus_requires_the_field_it_lets_be_null() {
-    let null: SessionSetFocusParams = serde_json::from_value(serde_json::json!({
-        "focused_tab_id": null,
-    }))
-    .expect("an explicit null is a statement");
-    assert_eq!(null.focused_tab_id, None);
-
-    let missing = serde_json::from_value::<SessionSetFocusParams>(serde_json::json!({}))
-        .expect_err("an omitted focused_tab_id must not decode");
-    assert!(
-        missing.to_string().contains("missing field"),
-        "the refusal has to name the missing field so the server answers \
-         `missing-param`: {missing}"
-    );
-
-    // Serialization keeps the field present in both shapes, so a client
-    // built from this type cannot emit the omission either.
-    assert_eq!(
-        serde_json::to_value(&null).expect("serialize"),
-        serde_json::json!({"focused_tab_id": null}),
-    );
-    let some = SessionSetFocusParams {
-        focused_tab_id: Some(7),
+fn a_clear_without_a_generation_omits_the_field_entirely() {
+    let bare = TabClearNotificationParams {
+        tab_id: 3,
+        generation: None,
     };
     assert_eq!(
-        serde_json::to_value(&some).expect("serialize"),
-        serde_json::json!({"focused_tab_id": "7"}),
+        serde_json::to_value(&bare).expect("serialize"),
+        serde_json::json!({"tab_id": "3"}),
     );
+    let named = TabClearNotificationParams {
+        tab_id: 3,
+        generation: Some(7),
+    };
+    assert_eq!(
+        serde_json::to_value(&named).expect("serialize"),
+        serde_json::json!({"tab_id": "3", "generation": 7}),
+    );
+
+    // And the omission decodes back to the unconditional form rather
+    // than being refused, which is the other half of "additive".
+    let decoded: TabClearNotificationParams =
+        serde_json::from_value(serde_json::json!({"tab_id": "3"})).expect("decode");
+    assert_eq!(decoded.generation, None);
 }
 
-/// Strict like its siblings, and a non-numeric id is a refusal rather
-/// than a zero.
 #[test]
-fn session_set_focus_params_reject_unknown_fields_and_junk_ids() {
-    assert!(
-        serde_json::from_value::<SessionSetFocusParams>(serde_json::json!({
-            "focused_tab_id": "5",
-            "project_id": "1",
-        }))
-        .is_err()
-    );
-    assert!(
-        serde_json::from_value::<SessionSetFocusParams>(serde_json::json!({
-            "focused_tab_id": "h3.7",
-        }))
-        .is_err()
-    );
-    assert!(
-        serde_json::from_value::<SessionSetFocusParams>(serde_json::json!({
-            "focused_tab_id": 5,
-        }))
-        .is_err()
-    );
+fn notification_fired_vector_decodes_with_its_generation() {
+    let raw = read_vector("notification.fired.event.json");
+    let envelope: roost_ipc::messages::EventEnvelope =
+        serde_json::from_str(&raw).expect("decode event envelope");
+    assert_eq!(envelope.event, ops::EVENT_NOTIFICATION_FIRED);
+    let fired: NotificationFiredEvent =
+        serde_json::from_value(envelope.data).expect("decode notification.fired");
+    assert_eq!(fired.tab_id, 5);
+    assert_eq!(fired.generation, 7);
+    round_trip(&fired);
+}
+
+/// A peer that predates the field decodes to generation `0` — a value
+/// no raise ever mints, so it reads as "this fire named none" and is
+/// acknowledged unconditionally rather than with a number the engine
+/// could never match.
+#[test]
+fn a_fired_notification_without_a_generation_decodes_to_zero() {
+    let fired: NotificationFiredEvent = serde_json::from_value(serde_json::json!({
+        "tab_id": "5",
+        "title": "Claude Code",
+        "body": "Turn complete",
+    }))
+    .expect("decode a pre-generation event");
+    assert_eq!(fired.generation, 0);
 }
 
 // ---------------------------------------------------------------------------

@@ -14,15 +14,16 @@ terminal without owning the terminal:
   terminal answers itself carry the colors the user is actually looking
   at. It applies to the tabs that exist and is remembered for the ones
   opened next.
-* **`session.set_focus`** — one connected client's real focus, so the
-  session suppresses notifications for a tab somebody is actually
-  looking at rather than for whichever tab its windowless workspace
-  happens to have selected. Per connection and unioned: several clients
-  may be looking at several tabs, and each statement is forgotten when
-  the connection that made it closes, because a focus is a statement
-  about a window that may no longer exist.
-* **`ROOST_SESSION_FAKE_BUILD`** — the test seam that makes
-  `tab.attach`'s build-mismatch refusal reproducible without building a
+* **Notifications fan out** (#474) — a session has no window, so it
+  suppresses nothing: every raise sets the pending bit and pushes
+  `notification.fired` to every subscriber. The client that is showing
+  that tab answers for everyone with a generation-checked
+  `tab.clear_notification`; a stale acknowledgement is refused, so a
+  raise nobody has seen survives an answer to the one before it. The op
+  a session used to be told what to mute with, `session.set_focus`, is
+  gone.
+* **`ROOST_SESSION_FAKE_BUILD`** — the test seam that makes the attach
+  handshake's build-mismatch refusal reproducible without building a
   second binary against a second Ghostty pin. Strictly test-mode.
 
 Everything here drives a REAL daemon over a real Unix socket (per-test
@@ -41,9 +42,11 @@ import base64
 import re
 from pathlib import Path
 
+import dataplane
 import pytest
 import session as sessionlib
 from client import Roost, RoostError
+from dataplane import DataPlane
 from eventstream import EventStream
 from util import drain, drain_until_match
 
@@ -477,8 +480,8 @@ def test_a_fake_build_is_reported_and_enforced_at_attach(env):
     negotiation follows it.
 
     A session and a client whose libghostty pins differ cannot exchange
-    a snapshot, and `tab.attach` says so by name rather than letting the
-    mismatch surface as a corrupt screen. That refusal drives the
+    a snapshot, and the handshake says so by name rather than letting
+    the mismatch surface as a corrupt screen. That refusal drives the
     client's upgrade/restart flow, and reproducing it otherwise takes a
     second binary built against a second Ghostty pin — which no CI lane
     can produce.
@@ -492,29 +495,24 @@ def test_a_fake_build_is_reported_and_enforced_at_attach(env):
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
 
-        def attach(build: str):
-            return client.call(
-                "tab.attach",
-                {
-                    "tab_id": str(tab),
-                    "kinds": ["ghostty-snapshot"],
-                    "cols": COLS,
-                    "rows": ROWS,
-                    "cell_w_px": 0,
-                    "cell_h_px": 0,
-                    "libghostty_build": build,
-                    "focus": True,
-                },
-            )
+        def attach(build: str) -> dataplane.Reply:
+            with DataPlane(env.socket) as conn:
+                return conn.attach(
+                    tab,
+                    identity["session_id"],
+                    build,
+                    cols=COLS,
+                    rows=ROWS,
+                )
 
-        with pytest.raises(RoostError) as mismatch:
-            attach("ghostty-1111111111111111+snapshot.v1")
-        assert mismatch.value.code == "build-mismatch", mismatch.value
+        mismatch = attach("ghostty-1111111111111111+snapshot.v1")
+        assert mismatch.ok is False, mismatch
+        assert mismatch.code == "build-mismatch", mismatch
 
         # The same string identify reported is the one attach accepts:
         # the seam moves the negotiation, not just the report, so the
         # two can never disagree.
-        assert attach(FAKE_BUILD)["attach_token"], "the fake build negotiates with itself"
+        assert attach(FAKE_BUILD).ok, "the fake build negotiates with itself"
 
         client.call("session.stop")
 
@@ -537,19 +535,25 @@ def test_the_fake_build_override_is_ignored_outside_test_mode(env):
 
 
 # ---------------------------------------------------------------------------
-# 4. session.set_focus (HS-3)
+# 4. Notifications fan out; each client answers for itself (#474)
 # ---------------------------------------------------------------------------
 
 
-def set_focus(client: Roost, tab: int | None) -> None:
-    """State what the attached client is looking at. `None` is an
-    explicit JSON null — the field is required, and null is a statement
-    ("nothing here") rather than an omission."""
-    result = client.call(
-        "session.set_focus",
-        {"focused_tab_id": None if tab is None else str(tab)},
-    )
-    assert result == {}, result
+def clear_notification(client: Roost, tab: int, generation: int | None = None) -> bool:
+    """Acknowledge a tab's notification, returning whether this call is
+    what took it down.
+
+    With `generation` this is the automatic acknowledgement a client
+    sends because it is already reading the tab, and the session refuses
+    it if a newer raise has replaced the one it names. Without, it is the
+    unconditional form a click or `roostctl` sends.
+    """
+    params: dict = {"tab_id": str(tab)}
+    if generation is not None:
+        params["generation"] = generation
+    result = client.call("tab.clear_notification", params)
+    assert set(result) == {"cleared"}, result
+    return result["cleared"]
 
 
 def next_fired(stream: EventStream, timeout: float = 30.0) -> dict:
@@ -558,173 +562,12 @@ def next_fired(stream: EventStream, timeout: float = 30.0) -> dict:
     return envelope["data"]
 
 
-def wait_until_fires(stream: EventStream, client: Roost, tab: int) -> None:
-    """Raise on `tab` until one gets through.
+def test_the_op_a_session_muted_by_is_gone(env):
+    """`session.set_focus` is not served at any version of this wire.
 
-    The condition wait for a server-side edge nothing on the wire
-    announces: a closed socket is noticed by that connection's own task,
-    so the focus reset it triggers has no happens-before against the next
-    request. Re-raising is free (a suppressed raise emits nothing at all,
-    not even a pending bit) and the first one through ends the wait.
-    """
-
-    def fired() -> dict | None:
-        client.notify(tab, "waiting for the reset")
-        try:
-            return next_fired(stream, timeout=1.0)
-        except TimeoutError:
-            return None
-
-    data = sessionlib.wait_until(
-        fired, 30.0, "the session to forget the departed client's focus", interval=0.0
-    )
-    assert data["tab_id"] == str(tab), data
-
-
-def assert_muted(stream: EventStream, client: Roost, muted: int, heard: int) -> None:
-    """`muted` is suppressed and `heard` is not — asserted positively.
-
-    A suppressed raise emits **nothing at all** (no pending bit, no
-    events), so the only sound way to see it is to raise on both tabs and
-    watch which one arrives: reading until the sentinel is a positive
-    assertion about the dropped one rather than a timeout.
-    """
-    client.notify(muted, "muted")
-    client.notify(heard, "heard")
-    data = next_fired(stream)
-    assert data["tab_id"] == str(heard), (
-        f"tab {muted} was expected to be suppressed, but {data} arrived first"
-    )
-
-
-def test_set_focus_moves_which_tab_a_session_mutes(env):
-    """The gap HS-2 recorded, closed.
-
-    A session's workspace has no window, so nothing it can see tells it
-    which tab a user is looking at and its agents would raise into a
-    surface nobody is reading. The connected client is the only thing
-    that knows better, and this is how it says so.
-    """
-    started(env)
-
-    with env.client() as client:
-        project = first_project(client)
-        watched = quiet_tab(client, project, env.launch_cwd)
-        other = quiet_tab(client, project, env.launch_cwd)
-
-        with EventStream(env.socket) as stream:
-            stream.subscribe()
-
-            set_focus(client, watched)
-            assert_muted(stream, client, muted=watched, heard=other)
-
-            # Null is the other half of the statement: the window lost
-            # focus, or its selection moved off this session, and the tab
-            # that was muted goes back to raising.
-            set_focus(client, None)
-            client.notify(watched, "unmuted")
-            assert next_fired(stream)["tab_id"] == str(watched)
-
-            # And the mute follows the client's eye, tab for tab.
-            set_focus(client, other)
-            assert_muted(stream, client, muted=other, heard=watched)
-
-        client.call("session.stop")
-
-
-def test_a_reported_focus_does_not_outlive_the_client_that_reported_it(env):
-    """The load-bearing half: a focus is forgotten with the connection
-    that stated it.
-
-    It was a statement about a window that no longer exists. Left
-    standing, one `set_focus` would mute a tab for every client that
-    comes after, which is exactly the bug this op exists to fix, rebuilt
-    out of stale state.
-    """
-    started(env)
-
-    with env.client() as client:
-        project = first_project(client)
-        watched = quiet_tab(client, project, env.launch_cwd)
-        other = quiet_tab(client, project, env.launch_cwd)
-
-        with EventStream(env.socket) as stream:
-            stream.subscribe()
-            set_focus(client, watched)
-            assert_muted(stream, client, muted=watched, heard=other)
-
-    # Both of that client's connections are closed now: the control one
-    # (which sent the `set_focus`) and the subscriber. Nobody is looking
-    # at this session any more.
-    with env.client() as client:
-        with EventStream(env.socket) as stream:
-            stream.subscribe()
-
-            # The reset lands when the server notices the closed sockets,
-            # which nothing on this connection can be ordered against —
-            # hence the condition wait rather than one raise and a hope.
-            wait_until_fires(stream, client, watched)
-
-            # And a client coming back re-states it, which is what a
-            # reconnecting UI does the moment it reaches Connected.
-            set_focus(client, watched)
-            assert_muted(stream, client, muted=watched, heard=other)
-
-        client.call("session.stop")
-
-
-def test_two_clients_settle_with_no_focus_churn(env):
-    """Two clients on two tabs mute both tabs and then go quiet.
-
-    The mute is a union, so neither statement displaces the other, and
-    neither moves the session's selection (`Workspace::set_viewed_tab`
-    says why that would not settle).
-
-    Counted rather than timed: the sentinel notification is committed
-    after both statements, so every batch up to it is every batch they
-    produced.
-    """
-    started(env)
-
-    with env.client() as a, env.client() as b:
-        project = first_project(a)
-        watched_a = quiet_tab(a, project, env.launch_cwd)
-        watched_b = quiet_tab(a, project, env.launch_cwd)
-        loud = quiet_tab(a, project, env.launch_cwd)
-
-        with EventStream(env.socket) as stream:
-            fence = stream.subscribe()
-
-            set_focus(a, watched_a)
-            set_focus(b, watched_b)
-
-            a.notify(watched_a, "muted")
-            b.notify(watched_b, "muted")
-            a.notify(loud, "heard")
-            batches, envelope = stream.recv_until("notification.fired", timeout=30.0)
-            assert envelope["data"]["tab_id"] == str(loud), (
-                f"both viewed tabs must be suppressed, but {envelope} arrived first"
-            )
-            stream.expect_contiguous(batches, fence)
-
-            moved = [
-                event
-                for batch in batches
-                for event in batch.get("events", [])
-                if event.get("event") == "active.changed"
-            ]
-            assert moved == [], f"a focus statement moved the session's selection: {moved}"
-
-        a.call("session.stop")
-
-
-def test_set_focus_needs_a_tab_that_exists_and_a_field_that_is_present(env):
-    """A required-but-nullable field, and the op's only refusal.
-
-    `focused_tab_id` may be null but may not be missing: an omitted field
-    is a client that never said, and answering it with a guess is how the
-    mute comes back. Nothing else is asked of the caller — reporting a
-    view is not a privilege.
+    It is the deletion that makes the rest of this section true: while
+    the op existed, one client's statement muted a tab for every other
+    client, so a phone left open on a tab silenced the laptop.
     """
     started(env)
 
@@ -732,22 +575,160 @@ def test_set_focus_needs_a_tab_that_exists_and_a_field_that_is_present(env):
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
 
-        with pytest.raises(RoostError) as missing:
-            client.call("session.set_focus", {})
-        assert missing.value.code == "missing-param", missing.value
+        for params in ({"focused_tab_id": str(tab)}, {"focused_tab_id": None}, {}):
+            with pytest.raises(RoostError) as refused:
+                client.call("session.set_focus", params)
+            assert refused.value.code == "unknown-op", refused.value
 
-        with pytest.raises(RoostError) as gone:
-            client.call(
-                "session.set_focus", {"focused_tab_id": str(tab + 9999)}
-            )
-        assert gone.value.code == "not-found", gone.value
+        client.call("session.stop")
 
-        # And the refusal applied nothing: the tab that was already there
-        # still raises, which it would not if the flag had moved ahead of
-        # the validation.
+
+def test_a_session_fires_for_every_client_and_the_viewer_answers(env):
+    """The whole of #474, end to end.
+
+    Two clients are watching the same tab. The session fires to **both**
+    — it cannot know that either of them is looking — and the one that
+    is showing the tab acknowledges the raise it read. That
+    acknowledgement clears the bit for everybody, which is the half a
+    mute could never do: the other client's dot comes down too, rather
+    than its notification never existing.
+    """
+    started(env)
+
+    with env.client() as viewing, env.client() as watching:
+        project = first_project(viewing)
+        tab = quiet_tab(viewing, project, env.launch_cwd)
+
+        with EventStream(env.socket) as at_viewer, EventStream(env.socket) as at_watcher:
+            at_viewer.subscribe()
+            fence = at_watcher.subscribe()
+
+            viewing.notify(tab, "Claude Code", "Turn complete")
+
+            fired = next_fired(at_viewer)
+            assert fired["tab_id"] == str(tab), fired
+            generation = fired["generation"]
+            assert generation >= 1, fired
+
+            # The client that is NOT looking gets the same event, which
+            # is what it banners off. Nothing about the session's answer
+            # differs between the two.
+            batches, envelope = at_watcher.recv_until("notification.fired", timeout=30.0)
+            at_watcher.expect_contiguous(batches, fence)
+            fence = int(batches[-1]["revision"])
+            assert envelope["data"] == fired, (envelope, fired)
+            assert watching.has_notification(tab), "and the dot is up for both of them"
+
+            # The viewing client answers, naming the raise it read.
+            assert clear_notification(viewing, tab, generation) is True
+
+            # Every client's dot comes down — the edge is committed, so
+            # the watcher learns it on its own stream rather than by
+            # polling.
+            batches, envelope = at_watcher.recv_until("tab.notification", timeout=30.0)
+            at_watcher.expect_contiguous(batches, fence)
+            assert envelope["data"] == {"tab_id": str(tab), "has_pending": False}, envelope
+            assert not watching.has_notification(tab)
+
+        viewing.call("session.stop")
+
+
+def test_a_stale_acknowledgement_leaves_the_newer_notification_standing(env):
+    """The race the generation exists for.
+
+    A fires, the viewing client acknowledges A, B fires, and A's
+    acknowledgement lands afterwards — over a round trip that is an
+    ordinary interleaving, not a pathological one. B must survive it:
+    nobody has seen B.
+    """
+    started(env)
+
+    with env.client() as client:
+        project = first_project(client)
+        tab = quiet_tab(client, project, env.launch_cwd)
+
         with EventStream(env.socket) as stream:
             stream.subscribe()
-            client.notify(tab, "after a refused focus")
-            assert next_fired(stream)["tab_id"] == str(tab)
+
+            client.notify(tab, "first", "the one that gets answered")
+            stale = next_fired(stream)["generation"]
+            assert clear_notification(client, tab, stale) is True
+
+            client.notify(tab, "second", "the one nobody has seen")
+            current = next_fired(stream)["generation"]
+            assert current != stale, (current, stale)
+
+            assert clear_notification(client, tab, stale) is False
+            assert client.has_notification(tab), "the unseen notification is still up"
+
+            # And the acknowledgement that names the current raise works.
+            assert clear_notification(client, tab, current) is True
+            assert not client.has_notification(tab)
+
+        client.call("session.stop")
+
+
+def test_a_clear_with_no_generation_answers_the_whole_tab(env):
+    """The other caller: a click, or `roostctl tab clear-notification`.
+
+    A person answering a tab is answering all of it, so the
+    unconditional form stays exactly what it was — and still reports
+    whether it is what took something down.
+    """
+    started(env)
+
+    with env.client() as client:
+        project = first_project(client)
+        tab = quiet_tab(client, project, env.launch_cwd)
+
+        client.notify(tab, "one")
+        client.notify(tab, "two")
+        assert clear_notification(client, tab) is True
+        assert not client.has_notification(tab)
+        assert clear_notification(client, tab) is False, "nothing left to take down"
+
+        with pytest.raises(RoostError) as gone:
+            clear_notification(client, tab + 9999)
+        assert gone.value.code == "not-found", gone.value
+
+        client.call("session.stop")
+
+
+def test_a_resumed_subscription_replays_no_banner(env):
+    """A banner is a moment; the dot is state.
+
+    Replaying `notification.fired` into a gap raises a banner for
+    something whose acknowledgement may be sitting in the same gap. The
+    pending bit committed beside it is state and does replay, which is
+    what a resuming client rebuilds the dot from — asserted positively,
+    by reading through to that event and finding no banner among the
+    batches it took.
+    """
+    started(env)
+
+    with env.client() as client:
+        session_id = client.call("session.identify")["session_id"]
+        project = first_project(client)
+        tab = quiet_tab(client, project, env.launch_cwd)
+
+        with EventStream(env.socket) as before:
+            fence = before.subscribe()
+            client.notify(tab, "while you were away")
+            # Read it live, so the raise is known to have committed
+            # before the resume below cuts its replay.
+            assert next_fired(before)["tab_id"] == str(tab)
+
+        with EventStream(env.socket) as resumed:
+            assert resumed.subscribe(from_revision=fence, session_id=session_id) == fence
+
+            batches, envelope = resumed.recv_until("tab.notification", timeout=30.0)
+            assert envelope["data"] == {"tab_id": str(tab), "has_pending": True}, envelope
+            resumed.expect_contiguous(batches, fence)
+            replayed = [
+                event["event"] for batch in batches for event in batch.get("events", [])
+            ]
+            assert "notification.fired" not in replayed, replayed
+
+        assert client.has_notification(tab), "and the dot is still up to be rebuilt"
 
         client.call("session.stop")

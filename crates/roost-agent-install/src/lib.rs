@@ -60,8 +60,9 @@
 //!   replacement already written and synced, so the gap between looking
 //!   and renaming is one `rename(2)` wide. It is not zero and cannot be
 //!   made zero; a writer that lands inside it is a lost update this
-//!   crate does not detect. [`write::lock`] is what keeps Roost's own
-//!   writers out of that gap; nothing can keep a hand edit out of it.
+//!   crate does not detect. [`roost_ui_model::config::ConfigLock`] — the
+//!   one lock beside `config.conf` — is what keeps Roost's own writers
+//!   out of that gap; nothing can keep a hand edit out of it.
 //! * **Nothing is fire-and-forget.** Every path returns a typed error or
 //!   a named skip reason, and [`ensure`] hands both back — including a
 //!   rollback that could not put a file back
@@ -106,9 +107,15 @@ pub use ensure::{
     Outcome, Status,
 };
 pub use error::{AgentError, AgentSkip, AgentWarning, InstallError, SkipReason, Warning};
-pub use home::{Home, ALL_AGENTS};
+pub use home::Home;
 pub use plan::{apply, Applied, FileEdit, Guard, InstallPlan, Intent};
+pub use roost_agent::ALL_AGENTS;
 pub use state::mark_noticed;
+
+/// The lock every writer here runs under, and what [`Home::config_lock`]
+/// hands back — re-exported so a caller holding one while it drives this
+/// crate can name the type without taking `roost-ui-model` on itself.
+pub use roost_ui_model::config::ConfigLock;
 
 /// [`install`]'s counterpart for a named set of agents. Re-exported here
 /// rather than as `ensure::uninstall` so the verbs read alike.

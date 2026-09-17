@@ -1340,6 +1340,159 @@ def test_a_focused_attach_and_a_refocus_both_land_inside_the_budget(host, roost)
 # ---------------------------------------------------------------------------
 
 
+@contextlib.contextmanager
+def watching_fires(host: HostUnderTest):
+    """A scripted subscriber on the session, held open across a notify.
+
+    #474 moved the decision: the session fires for **every** client and
+    each one decides whether that is a banner, so "this client showed
+    nothing" is only a verdict once the event it would have shown is
+    proved to be on the wire. A session that fired nothing at all would
+    otherwise satisfy every assertion in these cases.
+    """
+    with EventStream(host.env.socket) as stream:
+        stream.subscribe()
+        yield stream
+
+
+def assert_fired(stream: EventStream, tab: int) -> None:
+    """The session really did fire for `tab`. See [`watching_fires`]."""
+    _batches, envelope = stream.recv_until("notification.fired", timeout=30.0)
+    assert envelope["data"]["tab_id"] == str(tab), envelope
+
+
+def test_a_client_reading_the_tab_acknowledges_it_instead_of_bannering(host, roost):
+    """#474's client rule: the one window that is already looking
+    answers for everybody.
+
+    The session cannot know whose screen its tab is on — that is the
+    whole defect the union had, where a phone left open on a tab
+    silenced the laptop. So it fires unconditionally and the client with
+    the tab selected in a focused window shows nothing and sends
+    `tab.clear_notification` instead. The clear is the interesting half:
+    it is not a local dismissal but the session's own marker coming
+    down, which is how the dot clears on **every** client rather than
+    only on this one. The session's `has_notification` is where
+    "everywhere" is observable from a single window.
+
+    The inbox assertion runs on every poll of that wait rather than once
+    after it, because the flash is exactly what the filter exists to
+    stop: the mirror carries the pending bit for the length of the
+    acknowledgement's round trip, and a client painting off the mirror
+    unfiltered would show a dot and a row for that whole window.
+    """
+    host.connect_and_wait()
+    with host.client() as session:
+        project = first_project(session)
+        tab = quiet_tab(session, project, host.env.launch_cwd)
+        # Focusing is the attach, and it is also this client stating it
+        # is reading the tab.
+        key = host_key(roost, tab)
+        roost.app_set_window_focus(focus=True)
+        row = f"notif:{key}"
+
+        with watching_fires(host) as fires:
+            session.notify(tab, "attention", "please")
+
+            def acknowledged() -> bool:
+                assert row not in inbox_ids(roost), (
+                    "a client reading the tab must never paint it as pending"
+                )
+                return not session.has_notification(tab)
+
+            wait_until(
+                acknowledged,
+                30.0,
+                "the reading client's acknowledgement to clear the marker on the SESSION",
+            )
+            assert_fired(fires, tab)
+
+
+def test_a_client_not_reading_the_tab_banners_and_leaves_the_dot_up(host, roost):
+    """The other half of the rule, in both of its spellings.
+
+    A window nobody can be reading the tab in banners, and the session's
+    marker stays up until somebody clears it. There are two ways to be
+    that window — selected elsewhere with the focus, or showing the tab
+    without it — and they are tested apart because they come from the
+    two different fields the predicate reads.
+
+    The tail is §3.2's accepted behaviour, stated as an assertion so it
+    cannot drift: regaining window focus is **not** an acknowledgement.
+    It matches the in-process rule, where a marker clears on `focus_tab`
+    and on nothing else, and it is what stops a window coming back from
+    the background from silently erasing what it missed for every other
+    client too.
+    """
+    host.connect_and_wait()
+    with host.client() as session:
+        project = first_project(session)
+        tab = quiet_tab(session, project, host.env.launch_cwd)
+        parked = quiet_tab(session, project, host.env.launch_cwd)
+        parked_key = host_key(roost, parked)
+        key = sibling_key(parked_key, tab)
+        roost.app_set_window_focus(focus=True)
+        row = f"notif:{key}"
+
+        # Focused, reading another tab.
+        with watching_fires(host) as fires:
+            session.notify(tab, "attention", "please")
+            wait_until(
+                lambda: row in inbox_ids(roost),
+                30.0,
+                "a tab this window is not reading to reach the inbox",
+            )
+            assert_fired(fires, tab)
+        assert session.has_notification(tab), (
+            "and the marker stays up: nobody acknowledged it"
+        )
+
+        # Cleared the ordinary way, so the second half starts clean.
+        focus(roost, key)
+        wait_until(
+            lambda: not session.has_notification(tab),
+            30.0,
+            "focusing the tab to clear its marker on the session",
+        )
+
+        # Reading the tab, with the window elsewhere.
+        roost.app_set_window_focus(focus=False)
+        with watching_fires(host) as fires:
+            session.notify(tab, "attention", "please")
+            wait_until(
+                lambda: row in inbox_ids(roost),
+                30.0,
+                "an unfocused window to banner the tab it is showing",
+            )
+            assert_fired(fires, tab)
+        assert session.has_notification(tab)
+
+        roost.app_set_window_focus(focus=True)
+        # Two halves, and they are the whole of "the dot is part of the
+        # UI": the session keeps the marker, so every other client keeps
+        # its dot, while this window — which is reading the tab again —
+        # paints none of it. This is also the steady state the
+        # never-pending filter is the only thing producing: no
+        # acknowledgement is owed here, so nothing else will ever take
+        # the row down.
+        wait_until(
+            lambda: row not in inbox_ids(roost),
+            30.0,
+            "the inbox row to retire on the window that is reading the tab",
+        )
+        deadline = time.monotonic() + scaled_timeout(2.0)
+        while time.monotonic() < deadline:
+            assert session.has_notification(tab), (
+                "regaining window focus must not acknowledge what fired while it was away"
+            )
+            assert row not in inbox_ids(roost), (
+                "and a window reading the tab paints nothing pending for it"
+            )
+            # Held, not spun: each pass drives the palette open and shut
+            # over IPC, and the window is what the assertion is about.
+            time.sleep(0.1)
+
+
 def test_focusing_a_host_tab_clears_its_marker_on_the_session(host, roost):
     """Clearing is event-confirmed, and the event comes from the session.
 
@@ -1424,7 +1577,8 @@ def test_closing_a_host_tab_or_its_project_retires_the_inbox_row(host, roost):
         project = first_project(session)
         tab = quiet_tab(session, project, host.env.launch_cwd)
         parked = quiet_tab(session, project, host.env.launch_cwd)
-        focus(roost, host_key(roost, parked))
+        parked_key = host_key(roost, parked)
+        focus(roost, parked_key)
 
         def host_rows() -> set[str]:
             return {row for row in inbox_ids(roost) if row.startswith("notif:h")}
@@ -1446,14 +1600,12 @@ def test_closing_a_host_tab_or_its_project_retires_the_inbox_row(host, roost):
         # The cascade: a project delete takes rows with it.
         second = session.create_project(name="doomed", cwd=str(host.env.launch_cwd))
         doomed = quiet_tab(session, second, host.env.launch_cwd)
-        # Opening a tab makes it the session's active row, and a session
-        # suppresses attention for whichever row it considers active.
-        # `session.set_focus` (HS-3) makes that row follow the client's
-        # selection, but only at the client's own edges — a tab this test
-        # opens on the session moves the session's active row underneath
-        # it. Move the selection back off the tab this half is about, or
-        # the notification below is dropped at the source.
-        session.focus(parked)
+        # A tab this client is reading is one it acknowledges rather than
+        # banners (#474), so the row below depends on the selection being
+        # somewhere else. It already is, but a project that arrived since
+        # is exactly the kind of thing that could move it — state the
+        # precondition rather than inherit it.
+        focus(roost, parked_key)
         session.notify(doomed, "attention", "please")
         wait_until(lambda: host_rows(), 30.0, "the doomed project's row to reach the inbox")
 
@@ -2270,27 +2422,78 @@ def test_a_host_whose_key_says_off_is_raised_anyway(session_env):
     assert "ROOST_AGENT_HOOK" in (jail.agent_dirs["claude"] / "settings.json").read_text()
 
 
-def test_an_empty_or_unknown_agent_list_is_refused(session_env):
+def test_an_empty_agent_list_is_refused(session_env):
     """`invalid-param`, before anything is written.
 
-    Under protocol equality both ends of this wire know the same five
-    agents, so a name that resolves to none of them is a bug in the
-    client rather than a newer Roost meeting an older host; and a client
-    with nothing to raise does not send the op at all, so an empty list
-    is a bug too. Filtering either out and reporting it as a skip would
-    leave the client believing it had raised something it had not.
+    A client with nothing to raise does not send the op at all, so an
+    empty list is a bug the host has to say out loud; a blank element is
+    the same bug in a different spelling. A *name* the host does not know
+    is not in this group — see the two tests below.
     """
     jail = start_jailed_session(session_env)
 
     with session_env.client() as scripted:
-        for agents in ([], ["banana"], ["claude", "banana"]):
+        for agents in ([], ["  "], ["claude", ""]):
             refusal = refused(raise_hooks, scripted, agents)
             assert refusal.code == "invalid-param", (agents, refusal)
 
     assert jail.read_key() is None, "a refused raise wrote the key"
     assert not jail.record.exists(), "a refused raise wired something"
-    assert not (jail.agent_dirs["claude"] / "settings.json").exists(), (
-        "`claude, banana` wired the half it recognised"
+    assert not (jail.agent_dirs["claude"] / "settings.json").exists()
+
+
+def test_a_name_the_host_does_not_know_is_skipped_not_refused(session_env):
+    """Plan 065 §3.1, the wire half: a name this host has no adapter for
+    comes back as `skipped/unknown` and the rest of the list is wired.
+
+    Protocol equality pins one wire *generation*, not one agent set — a
+    newer Roost can ship an adapter inside it — so refusing the whole
+    raise is what kept a newly supported agent switched off forever. The
+    unknown-only arm is the one that has to answer `ok`: there is nothing
+    for this host to write, and an error there is a client that can never
+    grow past it.
+    """
+    jail = start_jailed_session(session_env)
+
+    with session_env.client() as scripted:
+        mixed = raise_hooks(scripted, ["claude", "gemini"])
+        assert mixed["wired"] == ["claude"], mixed
+        assert {"agent": "gemini", "reason": "unknown"} in mixed["skipped"], mixed
+        assert jail.read_key() == "claude"
+        assert wired_agents(jail) == {"claude"}
+
+        alone = raise_hooks(scripted, ["gemini", "amp"])
+
+    assert alone["wired"] == [], alone
+    assert alone["errors"] == [], alone
+    assert alone["skipped"] == [
+        {"agent": "gemini", "reason": "unknown"},
+        {"agent": "amp", "reason": "unknown"},
+    ], alone
+    # Written by the `claude` raise above and by nothing since: an
+    # unknown-only list must not so much as touch the key.
+    assert jail.read_key() == "claude"
+    assert wired_agents(jail) == {"claude"}
+
+
+def test_a_raise_keeps_a_name_this_host_cannot_wire(session_env):
+    """The data-loss half of plan 065 §3.1, end to end.
+
+    The raise is a read-modify-write of the host's `agent-hooks`, so a
+    token the host's own parser could not resolve has to survive it —
+    otherwise the older of two Roosts erases the newer one's answer on
+    every connect, and it does so silently.
+    """
+    jail = start_jailed_session(session_env, agent_hooks="claude, gemini")
+
+    with session_env.client() as scripted:
+        raised = raise_hooks(scripted, ["codex"])
+
+    # Both, because the key already allowed claude and neither had been
+    # announced to any client yet — `wired` is the toast list.
+    assert sorted(raised["wired"]) == ["claude", "codex"], raised
+    assert jail.read_key() == "claude, codex, gemini", (
+        "the raise dropped a name this host cannot wire"
     )
 
 

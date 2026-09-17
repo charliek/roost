@@ -22,7 +22,7 @@ stand:
   "Semantic writes go through the agent's API" stands. "**Attach** is
   one client at a time, switched by takeover" and "**raw `tab.write`**
   follows attach" were reversed by R15 (#453, landed): a tab admits as
-  many data connections as clients dial, `tab.write` and `tab.attach`
+  many data connections as clients dial, and `tab.write` and attach
   take no lease at all. R20 (#468, landed) then removed the lease
   itself — there is no "foreground" and no takeover left to switch:
   every same-UID connection is symmetric, effects fan out to every
@@ -66,7 +66,7 @@ gh issue list -R charliek/roost --state open --search "in:title [R"
 | R12 | [#443](https://github.com/charliek/roost/issues/443) | RP/M6 | ~~autostart's first cut: a dev install repoints a release one, status cannot say whether it is enabled, reboot survival is two steps~~ — superseded by R16 |
 | R13 | [#444](https://github.com/charliek/roost/issues/444) | — | CI: `pty_shutdown_test` cannot allocate a PTY on macOS, failing `rust-build` on unrelated diffs |
 | R14 | [#447](https://github.com/charliek/roost/issues/447) | RP/M5 | a `vt` fallback is silent and unactionable: nothing in the UI says fidelity dropped, and a remote host has no in-app way to update its daemon |
-| R15 | [#453](https://github.com/charliek/roost/issues/453) | RP/M5 | open `tab.write` and `tab.attach` to every same-UID client, tmux/herdr style; the lease stays as the *foreground* (effects, focus, geometry), never as an input gate |
+| R15 | [#453](https://github.com/charliek/roost/issues/453) | RP/M5 | open `tab.write` and attach to every same-UID client, tmux/herdr style; the lease stays as the *foreground* (effects, focus, geometry), never as an input gate |
 | R16 | [#454](https://github.com/charliek/roost/issues/454) | RP/M6 | remove `roostctl session autostart`: sessions come up on demand from the connecting client; supersedes R12 |
 | R17 | [#462](https://github.com/charliek/roost/issues/462) | RP/M5 | R15's in-place foreground retake never runs over SSH — a reconnect rebuilds the bridge socket, so the remote case falls back to the reattach R15 exists to avoid |
 | R18 | [#463](https://github.com/charliek/roost/issues/463) | RP/M5 | `tab.resize` zeroes libghostty's cell metrics; R15's whole-tuple geometry compare made that reachable, so in-band size reports read `0x0` |

@@ -120,8 +120,8 @@ impl Guard {
 
 /// Perform a plan, or leave the disk exactly as it was.
 ///
-/// Callers hold [`crate::write::lock`] across `plan` **and** this, so
-/// two ensures cannot interleave a read and a write. The digest
+/// Callers hold [`roost_ui_model::config::ConfigLock`] across `plan`
+/// **and** this, so two ensures cannot interleave a read and a write. The digest
 /// re-check below is the second line: it turns whatever still slips
 /// through — another Roost on another machine sharing a synced
 /// directory, Claude rewriting its own settings — into a reported skip

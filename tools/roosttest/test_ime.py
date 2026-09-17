@@ -38,6 +38,7 @@ from pathlib import Path
 import pytest
 
 from client import RoostError, Roost, scaled_timeout
+from conftest import skip_on_live_wayland_desktop
 from util import BARE_SHELL_ARGV, drain, drain_until_match, wait_tab_quiet
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
@@ -52,6 +53,15 @@ IME_COMMIT_CASES = ["é", "é", "你好", "👍"]
 def _iced_only(target):
     if target != "iced":
         pytest.skip("tab.feed_ime is iced-only for now (plan 021)")
+
+
+# Only the two tests that capture screenshots need the controlled
+# compositor; the rest of the class asserts over PTY bytes/IPC errors
+# (issue #488).
+_skip_wayland = skip_on_live_wayland_desktop(
+    "test_ime_preedit_renders_and_clears_at_the_cursor",
+    "test_ime_clear_on_route_change",
+)
 
 
 def _ime_tab(roost, project) -> int:

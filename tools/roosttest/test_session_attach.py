@@ -20,9 +20,9 @@ into a tab's drain are indistinguishable from a busy child's, and they
 make "2000 lines of scrollback" a deterministic setup instead of a race
 with a shell.
 
-Condition waits only. The two exceptions are deliberate and marked at
-their call sites: an attach token's TTL and a soak's non-reading window
-are both *durations under test*, not synchronization.
+Condition waits only. The one exception is deliberate and marked at its
+call site: a soak's non-reading window is a *duration under test*, not
+synchronization.
 """
 
 from __future__ import annotations
@@ -42,14 +42,14 @@ import session as sessionlib
 from client import Roost, RoostError, scaled_timeout
 from dataplane import DataPlane
 from eventstream import EventStream
-from test_session_effects import set_focus, theme
+from test_session_effects import clear_notification, theme
 
 pytestmark = pytest.mark.session_daemon
 
 
 # The attach geometry every test uses. Tabs are opened at this size so
-# `tab.attach`'s resize is a no-op and a snapshot is encoded at the same
-# geometry its content was laid out at.
+# a focused handshake's resize is a no-op and a snapshot is encoded at
+# the same geometry its content was laid out at.
 COLS, ROWS = 80, 24
 
 # The geometry the `vt` terminator cases need, mirroring
@@ -109,63 +109,80 @@ def first_project(client: Roost) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Ticket helpers
+# Handshake helpers
 # ---------------------------------------------------------------------------
 
 
-def attach_ticket(
+def dial(
+    env,
     client: Roost,
     tab_id: int,
     cols: int = COLS,
     rows: int = ROWS,
     *,
     kinds: list[str] | None = None,
+    kind: str = dataplane.GHOSTTY_SNAPSHOT,
     libghostty_build: str | None = None,
+    session_id: str | None = None,
     focus: bool = True,
-) -> dict:
-    """`tab.attach` — a single-use ticket for one data connection.
-
-    `libghostty_build` defaults to whatever the session says it is:
-    the pin identity is the server's to state, and a literal here would
-    have to be updated every time `third_party/ghostty` moves. The
-    mismatch case mutates this value on purpose.
-
-    `focus` is always sent. Protocol 5 requires it — the omit-when-true
-    shim that let a caller say nothing is gone — so the default here is
-    the claim an ordinary attach makes rather than the wire's.
-    """
-    if libghostty_build is None:
-        libghostty_build = client.call("session.identify")["libghostty_build"]
-    params = {
-        "tab_id": str(tab_id),
-        "kinds": kinds if kinds is not None else [dataplane.GHOSTTY_SNAPSHOT],
-        "cols": cols,
-        "rows": rows,
-        "cell_w_px": 0,
-        "cell_h_px": 0,
-        "libghostty_build": libghostty_build,
-        "focus": focus,
-    }
-    return client.call("tab.attach", params)
-
-
-def dial(
-    env, ticket: dict, *, kind: str = dataplane.GHOSTTY_SNAPSHOT, **handshake
+    socket_path=None,
+    **handshake,
 ) -> tuple[DataPlane, dataplane.Reply]:
-    """Open a data connection and run the handshake with `ticket`'s token.
+    """Open a data connection and run the handshake for `tab_id`.
 
-    `kind` is what the connection reads the payload as; the handshake
-    fails loudly if the session serves anything else.
+    `socket_path` defaults to the session's own socket; the ssh lane
+    hands it a bridge path instead, which is the whole of what that lane
+    changes.
+
+    `session_id` and `libghostty_build` default to whatever the session
+    says they are: both are the server's to state, and a literal here
+    would have to be updated every time `third_party/ghostty` moves. The
+    mismatch cases override them on purpose.
+
+    `kind` is what the connection reads the payload as and `kinds` is
+    what it offers; they default to each other because most cases offer
+    exactly the one they expect.
+
+    `focus` is always sent — the omit-when-true shim that let a caller
+    say nothing is gone — so the default here is the claim an ordinary
+    attach makes rather than the wire's.
     """
-    conn = DataPlane(env.socket, kind=kind)
-    reply = conn.handshake(ticket["attach_token"], **handshake)
+    who = client.call("session.identify")
+    conn = DataPlane(env.socket if socket_path is None else socket_path, kind=kind)
+    reply = conn.attach(
+        tab_id,
+        who["session_id"] if session_id is None else session_id,
+        who["libghostty_build"] if libghostty_build is None else libghostty_build,
+        kinds=kinds if kinds is not None else [kind],
+        cols=cols,
+        rows=rows,
+        focus=focus,
+        **handshake,
+    )
     return conn, reply
+
+
+def negotiated(env, client: Roost, tab_id: int, **kw) -> dataplane.Reply:
+    """Dial, keep the reply, drop the connection.
+
+    For the negotiation matrix, where which kind — or which refusal —
+    came back is the whole assertion and nothing is read off the wire.
+    The connection is opened as [`dataplane.ANY_KIND`] so the reply's
+    own kind is the test's to assert rather than the helper's — which
+    is also why `kinds` defaults here rather than to that sentinel:
+    `ANY_KIND` describes what this connection will read, and offering it
+    on the wire would be asking for a payload kind nobody serves.
+    """
+    kw.setdefault("kinds", [dataplane.GHOSTTY_SNAPSHOT])
+    conn, reply = dial(env, client, tab_id, kind=dataplane.ANY_KIND, **kw)
+    conn.close()
+    return reply
 
 
 def attached(
     env, client: Roost, tab_id: int
-) -> tuple[DataPlane, dataplane.Reply, dict]:
-    """The whole happy prologue: ticket, dial, accepted handshake."""
+) -> tuple[DataPlane, dataplane.Reply]:
+    """The whole happy prologue: dial, accepted handshake."""
     return attached_as(env, client, tab_id, dataplane.GHOSTTY_SNAPSHOT)
 
 
@@ -178,19 +195,17 @@ def attached_as(
     rows: int = ROWS,
     *,
     focus: bool = True,
-) -> tuple[DataPlane, dataplane.Reply, dict]:
+) -> tuple[DataPlane, dataplane.Reply]:
     """The same prologue, offering exactly one kind.
 
     One kind on purpose: the negotiation then has nothing to choose
     between, so the stream under test is the one the case names.
     """
-    ticket = attach_ticket(
-        client, tab_id, cols=cols, rows=rows, kinds=[kind], focus=focus
+    conn, reply = dial(
+        env, client, tab_id, cols=cols, rows=rows, kind=kind, focus=focus
     )
-    assert ticket["kind"] == kind, ticket
-    conn, reply = dial(env, ticket, kind=kind)
     assert reply.ok, (reply.code, reply.message)
-    return conn, reply, ticket
+    return conn, reply
 
 
 # ---------------------------------------------------------------------------
@@ -380,9 +395,10 @@ def test_a_second_client_changes_nothing_for_the_first(env):
         tab = quiet_tab(first, project, env.launch_cwd)
 
         # Client B, doing the loudest thing the wire still carries: it
-        # reads the session and states a focus of its own.
+        # reads the session and answers a notification on the same tab.
         second.tabs()
-        set_focus(second, tab)
+        second.notify(tab, "from the second client")
+        assert clear_notification(second, tab) is True
 
         first.call("session.set_theme", {"osc_colors": theme()})
         wired = first.call(
@@ -401,9 +417,10 @@ def test_a_second_client_changes_nothing_for_the_first(env):
         )
         assert landed["bytes"] == 2, landed
 
-        set_focus(first, tab)
+        first.notify(tab, "and from the first")
+        assert clear_notification(first, tab) is True
 
-        conn, reply, _ticket = attached(env, first, tab)
+        conn, reply = attached(env, first, tab)
         assert reply.ok, reply.raw
         conn.read_until_ready()
         conn.close()
@@ -434,9 +451,9 @@ def test_two_clients_attached_to_one_tab_both_see_output_and_both_type(env):
         project = first_project(desktop)
         tab = echoing_tab(desktop, project, env.launch_cwd)
 
-        first, _reply, _ticket = attached(env, desktop, tab)
+        first, _reply = attached(env, desktop, tab)
         first.read_until_ready()
-        second, _reply, _ticket = attached(env, phone, tab)
+        second, _reply = attached(env, phone, tab)
         second.read_until_ready()
 
         # One child, so one announcement — and it goes to both.
@@ -493,9 +510,9 @@ def test_geometry_follows_the_last_client_that_interacted(env):
             )
 
         # 1. A focused attach claims the grid, as every attach used to.
-        # The resize is awaited inside `tab.attach`, so this is an
+        # The resize is awaited before the accepted line, so this is an
         # assertion rather than a wait.
-        big, big_reply, _ticket = attached_as(
+        big, big_reply = attached_as(
             env,
             desktop,
             tab,
@@ -514,7 +531,7 @@ def test_geometry_follows_the_last_client_that_interacted(env):
         big.read_until_ready()
 
         # 2. A watching one claims nothing — and is told what it got.
-        small, small_reply, _ticket = attached_as(
+        small, small_reply = attached_as(
             env,
             phone,
             tab,
@@ -576,7 +593,7 @@ def test_geometry_follows_the_last_client_that_interacted(env):
 
 
 def test_a_refused_handshake_is_one_json_line_and_a_close(env):
-    """Bad token, reused token, wrong protocol version.
+    """A tab that is not a tab, a wrong protocol, a wrong session.
 
     The shared assertion is [`DataPlane.trailing`]: a refusal writes one
     line and closes, so a client that mis-parses the error can never go
@@ -589,70 +606,132 @@ def test_a_refused_handshake_is_one_json_line_and_a_close(env):
     with env.client() as client:
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
+        who = client.call("session.identify")
 
-        # A token this session never issued.
+        # `attach` names a tab. It carried a bearer token until this
+        # generation, so a hex string is worth stating: it is a
+        # malformed id and not a credential this session goes looking
+        # for.
         with DataPlane(env.socket) as bogus:
-            reply = bogus.handshake("f" * 32)
+            reply = bogus.send_handshake(
+                {
+                    "attach": "f" * 32,
+                    "protocol_version": dataplane.SESSION_PROTOCOL_VERSION,
+                    "session_id": who["session_id"],
+                    "kinds": [dataplane.GHOSTTY_SNAPSHOT],
+                    "cols": COLS,
+                    "rows": ROWS,
+                    "libghostty_build": who["libghostty_build"],
+                    "focus": True,
+                }
+            )
             assert reply.ok is False, reply
-            assert reply.code == "invalid-token", reply
+            assert reply.code == "invalid-param", reply
             assert bogus.trailing == b"", bogus.trailing
 
-        # A token that was already spent. Single-use is what keeps a
-        # ticket from being a standing invitation.
-        ticket = attach_ticket(client, tab)
-        with DataPlane(env.socket) as first:
-            assert first.handshake(ticket["attach_token"]).ok
-            first.read_until_ready()
-        with DataPlane(env.socket) as replay:
-            reply = replay.handshake(ticket["attach_token"])
-            assert reply.ok is False, reply
-            assert reply.code == "invalid-token", reply
-            assert replay.trailing == b"", replay.trailing
-
-        # Checked BEFORE the token: two ends that disagree about the
-        # protocol disagree about what a token even is.
-        fresh = attach_ticket(client, tab)
-        with DataPlane(env.socket) as ancient:
-            reply = ancient.handshake(fresh["attach_token"], protocol_version=1)
+        # Checked BEFORE everything else: two ends that disagree about
+        # the protocol disagree about what every other term means.
+        conn, reply = dial(env, client, tab, protocol_version=1)
+        with conn:
             assert reply.ok is False, reply
             assert reply.code == "protocol-mismatch", reply
-            assert ancient.trailing == b"", ancient.trailing
+            assert conn.trailing == b"", conn.trailing
+
+        # The session binding: a dial prepared for one session must not
+        # be served by another listening at the same path.
+        conn, reply = dial(env, client, tab, session_id="01KSOMEBODYELSE0000000000")
+        with conn:
+            assert reply.ok is False, reply
+            assert reply.code == "session-mismatch", reply
+            assert conn.trailing == b"", conn.trailing
 
     env.stop_over_the_wire()
 
 
-def test_an_expired_token_is_refused(env):
-    """The TTL, tested in milliseconds.
+def test_a_handshake_attaches_and_resumes_on_one_connection(env):
+    """The whole of an attach: one connection states the tab and the
+    terms.
 
-    `ATTACH_TOKEN_TTL` is a 60-second protocol constant — not a test
-    wait, so it is deliberately not timeout-scaled — and the only way to
-    reach its expiry inside a test is the test-mode override the server
-    honors under `ROOST_TEST_MODE=1`.
-
-    The wait below is the one place this module sleeps: the elapsed
-    time IS the thing under test, and there is no state to poll for
-    "the token has aged out".
+    The whole round trip through a real daemon — negotiate, read the
+    payload, drop, come back with the identity the accepted reply
+    stated — because the handshake is the only thing standing between a
+    client and a tab.
     """
-    started(env, ROOST_SESSION_ATTACH_TTL_MS="50")
+    started(env)
 
     with env.client() as client:
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
-        ticket = attach_ticket(client, tab)
+        who = client.call("session.identify")
 
-        time.sleep(scaled_timeout(0.4))
+        with DataPlane(env.socket) as conn:
+            reply = conn.attach(
+                tab,
+                who["session_id"],
+                who["libghostty_build"],
+                cols=COLS,
+                rows=ROWS,
+            )
+            assert reply.ok, (reply.code, reply.message)
+            assert reply.mode == "snapshot", reply
+            assert (reply.snapshot_cols, reply.snapshot_rows) == (COLS, ROWS), reply
+            conn.read_until_finish()
+            fence = conn.last_seq or reply.seq
+            identity = (reply.server_epoch, reply.tab_generation)
 
-        with DataPlane(env.socket) as stale:
-            reply = stale.handshake(ticket["attach_token"])
+        with DataPlane(env.socket) as again:
+            resumed = again.attach(
+                tab,
+                who["session_id"],
+                who["libghostty_build"],
+                cols=COLS,
+                rows=ROWS,
+                resume_from_seq=fence + 1,
+                server_epoch=identity[0],
+                tab_generation=identity[1],
+            )
+            assert resumed.ok, (resumed.code, resumed.message)
+            assert resumed.mode == "resume", resumed
+            assert resumed.seq == fence, resumed
+
+        # The generation check runs on the raw line, ahead of the typed
+        # decode, so it wins over terms that would not decode at all.
+        with DataPlane(env.socket) as ancient:
+            reply = ancient.send_handshake(
+                {
+                    "attach": str(tab),
+                    "protocol_version": 1,
+                    "kinds": [dataplane.GHOSTTY_SNAPSHOT],
+                    "cols": "eighty",
+                }
+            )
             assert reply.ok is False, reply
-            assert reply.code == "invalid-token", reply
-            assert stale.trailing == b"", stale.trailing
+            assert reply.code == "protocol-mismatch", reply
+            assert ancient.trailing == b"", ancient.trailing
+
+        # And a term left out is named rather than reported as "bad
+        # JSON".
+        with DataPlane(env.socket) as partial:
+            reply = partial.send_handshake(
+                {
+                    "attach": str(tab),
+                    "protocol_version": dataplane.SESSION_PROTOCOL_VERSION,
+                    "kinds": [dataplane.GHOSTTY_SNAPSHOT],
+                    "cols": COLS,
+                    "rows": ROWS,
+                    "libghostty_build": who["libghostty_build"],
+                    "focus": True,
+                }
+            )
+            assert reply.ok is False, reply
+            assert reply.code == "parse-error", reply
+            assert "session_id" in reply.message, reply.message
 
     env.stop_over_the_wire()
 
 
-def test_tab_attach_refuses_what_it_cannot_serve(env):
-    """The control-plane half of the validation matrix.
+def test_a_handshake_refuses_what_it_cannot_serve(env):
+    """The validation matrix, on the one connection that runs it.
 
     Each code instructs differently — `unsupported-kind` and
     `build-mismatch` both mean "we cannot talk", `not-found` means "that
@@ -665,39 +744,38 @@ def test_tab_attach_refuses_what_it_cannot_serve(env):
         tab = quiet_tab(client, project, env.launch_cwd)
         build = client.call("session.identify")["libghostty_build"]
 
-        with pytest.raises(RoostError) as unknown:
-            attach_ticket(client, tab, kinds=["hologram", "sixel-mosaic"])
-        assert unknown.value.code == "unsupported-kind", unknown.value
+        unknown = negotiated(env, client, tab, kinds=["hologram", "sixel-mosaic"])
+        assert unknown.code == "unsupported-kind", unknown
 
         # A list that MIXES an unknown kind with a servable one is fine:
         # the client states a preference order and the first servable
         # entry wins.
-        mixed = attach_ticket(
-            client, tab, kinds=["sixel-mosaic", dataplane.GHOSTTY_SNAPSHOT]
+        mixed = negotiated(
+            env, client, tab, kinds=["sixel-mosaic", dataplane.GHOSTTY_SNAPSHOT]
         )
-        assert mixed["kind"] == dataplane.GHOSTTY_SNAPSHOT
+        assert mixed.kind == dataplane.GHOSTTY_SNAPSHOT, mixed
 
         # `ghostty-snapshot` alone: the one kind whose eligibility
         # depends on the build, so a skew has nothing left to fall back
         # to. (Offer `vt` beside it and it does — the case below.)
-        with pytest.raises(RoostError) as mismatch:
-            attach_ticket(client, tab, libghostty_build=SKEWED_BUILD)
-        assert mismatch.value.code == "build-mismatch", mismatch.value
+        mismatch = negotiated(
+            env, client, tab, kinds=[dataplane.GHOSTTY_SNAPSHOT],
+            libghostty_build=SKEWED_BUILD,
+        )
+        assert mismatch.code == "build-mismatch", mismatch
         # Both strings are named so a client can tell which side to move.
-        assert build in mismatch.value.message
-        assert SKEWED_BUILD in mismatch.value.message
+        assert build in mismatch.message
+        assert SKEWED_BUILD in mismatch.message
 
-        with pytest.raises(RoostError) as zero:
-            attach_ticket(client, tab, cols=0, rows=ROWS)
-        assert zero.value.code == "invalid-param", zero.value
+        zero = negotiated(env, client, tab, cols=0, rows=ROWS)
+        assert zero.code == "invalid-param", zero
 
         client.close_tab(tab)
         sessionlib.wait_until(
             lambda: tab not in tab_ids(client), 20.0, f"tab {tab} to close"
         )
-        with pytest.raises(RoostError) as gone:
-            attach_ticket(client, tab)
-        assert gone.value.code == "not-found", gone.value
+        gone = negotiated(env, client, tab)
+        assert gone.code == "not-found", gone
 
     env.stop_over_the_wire()
 
@@ -728,21 +806,19 @@ def test_a_matching_client_still_gets_ghostsnp_and_can_ask_for_vt(env):
 
         # Fidelity first: an unskewed client is served the snapshot,
         # which `vt` never displaces.
-        both = attach_ticket(
-            client, tab, kinds=[dataplane.GHOSTTY_SNAPSHOT, dataplane.VT]
+        both = negotiated(
+            env, client, tab, kinds=[dataplane.GHOSTTY_SNAPSHOT, dataplane.VT]
         )
-        assert both["kind"] == dataplane.GHOSTTY_SNAPSHOT, both
+        assert both.kind == dataplane.GHOSTTY_SNAPSHOT, both
 
         # And a client that asks for `vt` alone gets it whatever its
         # build says — the kind has no build requirement, so the string
         # is not consulted at all.
-        assert attach_ticket(client, tab, kinds=[dataplane.VT])["kind"] == (
-            dataplane.VT
+        assert negotiated(env, client, tab, kinds=[dataplane.VT]).kind == dataplane.VT
+        skewed = negotiated(
+            env, client, tab, kinds=[dataplane.VT], libghostty_build=SKEWED_BUILD
         )
-        skewed = attach_ticket(
-            client, tab, kinds=[dataplane.VT], libghostty_build=SKEWED_BUILD
-        )
-        assert skewed["kind"] == dataplane.VT, skewed
+        assert skewed.kind == dataplane.VT, skewed
 
     env.stop_over_the_wire()
 
@@ -769,31 +845,31 @@ def test_a_build_skew_lands_on_vt_unless_the_client_offers_nothing_else(env):
         # This client's own pin, which the session no longer matches.
         mine = "ghostty-1111111111111111+real.plan053"
 
-        fallback = attach_ticket(
+        fallback = negotiated(
+            env,
             client,
             tab,
             kinds=[dataplane.GHOSTTY_SNAPSHOT, dataplane.VT],
             libghostty_build=mine,
         )
-        assert fallback["kind"] == dataplane.VT, fallback
+        assert fallback.kind == dataplane.VT, fallback
 
-        with pytest.raises(RoostError) as refused:
-            attach_ticket(
-                client,
-                tab,
-                kinds=[dataplane.GHOSTTY_SNAPSHOT],
-                libghostty_build=mine,
-            )
-        assert refused.value.code == "build-mismatch", refused.value
+        refused = negotiated(
+            env,
+            client,
+            tab,
+            kinds=[dataplane.GHOSTTY_SNAPSHOT],
+            libghostty_build=mine,
+        )
+        assert refused.code == "build-mismatch", refused
 
         # Servable-but-ineligible and not-servable-at-all stay different
         # answers: one says "we cannot agree on a format", the other
         # "I have never heard of that one".
-        with pytest.raises(RoostError) as unknown:
-            attach_ticket(
-                client, tab, kinds=["sixel-mosaic"], libghostty_build=mine
-            )
-        assert unknown.value.code == "unsupported-kind", unknown.value
+        unknown = negotiated(
+            env, client, tab, kinds=["sixel-mosaic"], libghostty_build=mine
+        )
+        assert unknown.code == "unsupported-kind", unknown
 
     env.stop_over_the_wire()
 
@@ -820,23 +896,25 @@ def test_the_legacy_kinds_knob_restores_the_pre_vt_session(env):
 
         # Not advertised is not servable: `vt` is refused as a kind this
         # session has never heard of, not as one it declined to serve.
-        with pytest.raises(RoostError) as unknown:
-            attach_ticket(client, tab, kinds=[dataplane.VT])
-        assert unknown.value.code == "unsupported-kind", unknown.value
+        unknown = negotiated(env, client, tab, kinds=[dataplane.VT])
+        assert unknown.code == "unsupported-kind", unknown
 
-        assert attach_ticket(
-            client, tab, kinds=[dataplane.GHOSTTY_SNAPSHOT, dataplane.VT]
-        )["kind"] == dataplane.GHOSTTY_SNAPSHOT
+        assert (
+            negotiated(
+                env, client, tab, kinds=[dataplane.GHOSTTY_SNAPSHOT, dataplane.VT]
+            ).kind
+            == dataplane.GHOSTTY_SNAPSHOT
+        )
 
         # And the refusal the UI's restart prompt is raised from.
-        with pytest.raises(RoostError) as mismatch:
-            attach_ticket(
-                client,
-                tab,
-                kinds=[dataplane.GHOSTTY_SNAPSHOT, dataplane.VT],
-                libghostty_build=SKEWED_BUILD,
-            )
-        assert mismatch.value.code == "build-mismatch", mismatch.value
+        mismatch = negotiated(
+            env,
+            client,
+            tab,
+            kinds=[dataplane.GHOSTTY_SNAPSHOT, dataplane.VT],
+            libghostty_build=SKEWED_BUILD,
+        )
+        assert mismatch.code == "build-mismatch", mismatch
 
     env.stop_over_the_wire()
 
@@ -867,7 +945,7 @@ def test_ready_leads_the_snapshot_and_the_seqs_are_contiguous(env):
         seed(client, tab, seed_bytes(400))
         wait_dump_contains(client, tab, "seed-0399")
 
-        conn, reply, _ticket = attached(env, client, tab)
+        conn, reply = attached(env, client, tab)
         assert reply.mode == "snapshot", reply
         conn.read_until_finish()
 
@@ -923,7 +1001,7 @@ def test_finish_arrives_under_a_flooding_producer(env):
         # taken against a tab that is already spewing.
         wait_dump_contains(client, tab, "spam")
 
-        conn, reply, _ticket = attached(env, client, tab)
+        conn, reply = attached(env, client, tab)
         assert reply.mode == "snapshot", reply
         conn.read_frames_until(
             lambda f: conn.snap.finish_seen or f.frame_type == dataplane.FRAME_ERROR,
@@ -1014,7 +1092,7 @@ def test_a_vt_payload_always_ends_in_one_empty_snap(env):
             client, project, env.launch_cwd, ["/bin/sh", "-c", "exec sleep 300"]
         )
 
-        conn, reply, _ticket = attached_as(
+        conn, reply = attached_as(
             env, client, flooded, dataplane.VT, cols=WIDE_COLS
         )
         assert reply.mode == "snapshot", reply
@@ -1050,7 +1128,7 @@ def test_a_vt_payload_always_ends_in_one_empty_snap(env):
         client.close_tab(flooded)
 
         fresh = quiet_tab(client, project, env.launch_cwd)
-        conn, _reply, _ticket = attached_as(env, client, fresh, dataplane.VT)
+        conn, _reply = attached_as(env, client, fresh, dataplane.VT)
         conn.read_until_finish()
         assert conn.snap.terminator_frames == 1, conn.snap.terminator_frames
         assert conn.snap_frames == 2, (
@@ -1084,7 +1162,7 @@ def test_a_child_dying_inside_a_vt_payload_still_gets_exit_last(env):
             client, project, env.launch_cwd, ["/bin/sh", "-c", "read _"]
         )
 
-        conn, _reply, _ticket = attached_as(
+        conn, _reply = attached_as(
             env, client, dying, dataplane.VT, cols=WIDE_COLS
         )
         client.send(dying, b"\n")
@@ -1128,7 +1206,7 @@ def test_the_vt_payload_carries_a_row_for_every_row_the_dump_reports(env):
         seed(client, tab, seed_bytes(400))
         wait_dump_contains(client, tab, "seed-0399")
 
-        conn, _reply, _ticket = attached_as(env, client, tab, dataplane.VT)
+        conn, _reply = attached_as(env, client, tab, dataplane.VT)
         conn.read_until_finish()
         conn.close()
 
@@ -1178,7 +1256,7 @@ def test_resume_replays_the_ring_with_no_snapshot(env):
         seed(client, tab, seed_bytes(100))
         wait_dump_contains(client, tab, "seed-0099")
 
-        first, _reply, ticket = attached(env, client, tab)
+        first, identity = attached(env, client, tab)
         first.read_until_finish()
         resume_from = first.next_seq
         first.close()
@@ -1188,13 +1266,13 @@ def test_resume_replays_the_ring_with_no_snapshot(env):
         client.tab_feed_pty_bytes(tab, b"MISSED-WHILE-AWAY\r\n")
         wait_dump_contains(client, tab, "MISSED-WHILE-AWAY")
 
-        again = attach_ticket(client, tab)
         conn, resumed = dial(
             env,
-            again,
+            client,
+            tab,
             resume_from_seq=resume_from,
-            server_epoch=ticket["server_epoch"],
-            tab_generation=ticket["tab_generation"],
+            server_epoch=identity.server_epoch,
+            tab_generation=identity.tab_generation,
         )
         assert resumed.ok, (resumed.code, resumed.message)
         assert resumed.mode == "resume", resumed
@@ -1251,7 +1329,7 @@ def test_a_restarted_daemon_never_resumes_a_stale_stream(env):
         seed(client, tab, seed_bytes(50))
         wait_dump_contains(client, tab, "seed-0049")
 
-        conn, _reply, old_ticket = attached(env, client, tab)
+        conn, old_identity = attached(env, client, tab)
         conn.read_until_finish()
         conn.close()
 
@@ -1266,9 +1344,9 @@ def test_a_restarted_daemon_never_resumes_a_stale_stream(env):
         assert restored, client.tabs()
         tab = int(restored[0]["id"])
 
-        first, _reply, fresh_ticket = attached(env, client, tab)
+        first, fresh_identity = attached(env, client, tab)
         first.read_until_finish()
-        assert fresh_ticket["server_epoch"] != old_ticket["server_epoch"], (
+        assert fresh_identity.server_epoch != old_identity.server_epoch, (
             "a restarted session reused its predecessor's epoch"
         )
         first.close()
@@ -1283,10 +1361,11 @@ def test_a_restarted_daemon_never_resumes_a_stale_stream(env):
         # consume the ring, so the same seq is still covered below.
         honest, honest_reply = dial(
             env,
-            attach_ticket(client, tab),
+            client,
+            tab,
             resume_from_seq=resume_from,
-            server_epoch=fresh_ticket["server_epoch"],
-            tab_generation=fresh_ticket["tab_generation"],
+            server_epoch=fresh_identity.server_epoch,
+            tab_generation=fresh_identity.tab_generation,
         )
         assert honest_reply.ok, (honest_reply.code, honest_reply.message)
         assert honest_reply.mode == "resume", honest_reply
@@ -1296,10 +1375,11 @@ def test_a_restarted_daemon_never_resumes_a_stale_stream(env):
         # the dead process's, and that alone forces the full snapshot.
         stale, stale_reply = dial(
             env,
-            attach_ticket(client, tab),
+            client,
+            tab,
             resume_from_seq=resume_from,
-            server_epoch=old_ticket["server_epoch"],
-            tab_generation=old_ticket["tab_generation"],
+            server_epoch=old_identity.server_epoch,
+            tab_generation=old_identity.tab_generation,
         )
         assert stale_reply.ok, (stale_reply.code, stale_reply.message)
         assert stale_reply.mode == "snapshot", stale_reply
@@ -1334,7 +1414,7 @@ def test_exit_is_the_final_frame_on_a_natural_child_exit(env):
             ["/bin/sh", "-c", "read line; echo done; exit 0"],
         )
 
-        conn, _reply, _ticket = attached(env, client, tab)
+        conn, _reply = attached(env, client, tab)
         conn.read_until_finish()
 
         conn.send_input(b"go\n")
@@ -1369,7 +1449,7 @@ def test_a_disconnect_leaves_the_tab_running_but_a_stop_labels_it(env):
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
 
-        conn, _reply, _ticket = attached(env, client, tab)
+        conn, _reply = attached(env, client, tab)
         conn.read_until_ready()
         conn.close()
 
@@ -1378,7 +1458,7 @@ def test_a_disconnect_leaves_the_tab_running_but_a_stop_labels_it(env):
 
         # And the tab is still attachable, so nothing about the detach
         # left the pipeline in a half state.
-        conn, _reply, _ticket = attached(env, client, tab)
+        conn, _reply = attached(env, client, tab)
         conn.read_until_ready()
 
         # Mid-attach, from another connection: the stop runs while this
@@ -1412,7 +1492,7 @@ def test_a_sigkilled_daemon_drops_the_attach_and_a_restart_recovers(env):
     with env.client() as client:
         project = first_project(client)
         tab = quiet_tab(client, project, env.launch_cwd)
-        conn, _reply, _ticket = attached(env, client, tab)
+        conn, _reply = attached(env, client, tab)
         conn.read_until_ready()
 
     os.kill(launch.verdict.pid, signal.SIGKILL)
@@ -1569,15 +1649,15 @@ def test_tab_dump_serves_history_above_the_viewport(env):
 def measure_ready(env, client: Roost, tab: int) -> float:
     """Seconds from handshake-send to the READY tag landing.
 
-    The ticket is minted outside the window on purpose: what a user waits
-    for is the stream, and the control round trip that precedes it is
-    already covered by every other case here.
+    The terms are read before the window opens: `session.identify` is a
+    fixture detail, not part of what a user waits for, which is the
+    handshake and the stream behind it.
     """
-    ticket = attach_ticket(client, tab)
+    who = client.call("session.identify")
     conn = DataPlane(env.socket)
     try:
         started_at = time.monotonic()
-        reply = conn.handshake(ticket["attach_token"])
+        reply = conn.attach(tab, who["session_id"], who["libghostty_build"])
         assert reply.ok, (reply.code, reply.message)
         conn.read_until_ready(timeout=30.0)
         return time.monotonic() - started_at
@@ -1636,22 +1716,22 @@ def test_eight_concurrent_attaches_to_distinct_tabs_reach_ready(env):
         for index, tab in enumerate(tabs):
             wait_dump_contains(client, tab, f"t{index}-0199", timeout=60.0)
 
-        # Minted up front so the measured window is the data plane alone
+        # Read up front so the measured window is the data plane alone
         # and eight threads do not contend on one control connection.
-        # The connection stays open across the dials: a ticket is
-        # reclaimed when the connection that minted it closes.
-        tickets = [attach_ticket(client, tab) for tab in tabs]
+        who = client.call("session.identify")
 
         elapsed: dict[int, float] = {}
         failures: list[Exception] = []
-        barrier = threading.Barrier(len(tickets))
+        barrier = threading.Barrier(len(tabs))
 
-        def run(index: int, ticket: dict) -> None:
+        def run(index: int, tab: int) -> None:
             conn = DataPlane(env.socket)
             try:
                 barrier.wait(timeout=scaled_timeout(30.0))
                 started_at = time.monotonic()
-                reply = conn.handshake(ticket["attach_token"])
+                reply = conn.attach(
+                    tab, who["session_id"], who["libghostty_build"]
+                )
                 assert reply.ok, (reply.code, reply.message)
                 conn.read_until_ready(timeout=60.0)
                 elapsed[index] = time.monotonic() - started_at
@@ -1661,8 +1741,8 @@ def test_eight_concurrent_attaches_to_distinct_tabs_reach_ready(env):
                 conn.close()
 
         threads = [
-            threading.Thread(target=run, args=(index, ticket))
-            for index, ticket in enumerate(tickets)
+            threading.Thread(target=run, args=(index, tab))
+            for index, tab in enumerate(tabs)
         ]
         for thread in threads:
             thread.start()
@@ -1671,7 +1751,7 @@ def test_eight_concurrent_attaches_to_distinct_tabs_reach_ready(env):
             assert not thread.is_alive(), "a concurrent attach never finished"
 
     assert not failures, failures
-    assert len(elapsed) == len(tickets), elapsed
+    assert len(elapsed) == len(tabs), elapsed
     budget = scaled_timeout(CONCURRENT_READY_BUDGET)
     worst = max(elapsed.values())
     assert worst < budget, (
@@ -1699,7 +1779,7 @@ def test_input_latency_holds_up_under_dump_load(env):
     with env.client() as client:
         project = first_project(client)
         tab = open_tab(client, project, env.launch_cwd, ["/bin/sh", "-c", "exec cat"])
-        conn, _reply, _ticket = attached(env, client, tab)
+        conn, _reply = attached(env, client, tab)
         conn.read_until_finish()
         drain_pending(conn)
 
@@ -1823,7 +1903,7 @@ def test_a_slow_reader_is_cut_off_and_a_re_attach_succeeds(env):
         tab = flooding_tab(client, project, env.launch_cwd)
         wait_dump_contains(client, tab, "spam")
 
-        conn, reply, _ticket = attached(env, client, tab)
+        conn, reply = attached(env, client, tab)
         assert reply.ok
 
         # Read nothing while the producer runs. Sampling every 250 ms
@@ -1841,7 +1921,7 @@ def test_a_slow_reader_is_cut_off_and_a_re_attach_succeeds(env):
         conn.close()
 
         # No thrash loop: the very next attach is served normally.
-        again, reply, _ticket = attached(env, client, tab)
+        again, reply = attached(env, client, tab)
         assert reply.ok
         again.read_until_ready(timeout=60.0)
         again.close()

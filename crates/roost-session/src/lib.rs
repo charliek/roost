@@ -9,9 +9,9 @@
 //! # What makes it a session rather than a headless UI
 //!
 //! Two things. `IpcHandler::with_session` promotes the socket:
-//! `session.identify`, `session.stop` and `tab.attach` start answering,
-//! tab sizes default to this session's
-//! stated geometry rather than a window's, and every mutating op becomes
+//! `session.identify` and `session.stop` start answering, data
+//! connections are served, tab sizes default to this session's stated
+//! geometry rather than a window's, and every mutating op becomes
 //! gated on the stop latch. `PtySupervisor::enable_server_vt` gives
 //! every tab an authoritative server terminal, which is what makes a
 //! headless `tab.dump`, an answered device query, and an attach stream

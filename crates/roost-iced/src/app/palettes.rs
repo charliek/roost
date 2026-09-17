@@ -428,59 +428,6 @@ fn apply_theme_batch(
     Ok(())
 }
 
-fn persist_theme_selection_with(
-    config: &mut RoostConfig,
-    path: Option<&Path>,
-    name: &str,
-    write: impl FnOnce(&Path, &str, &str) -> io::Result<()>,
-) -> io::Result<()> {
-    config.theme_name = Some(name.to_string());
-    let Some(path) = path else {
-        return Ok(());
-    };
-    write(path, "theme", name)
-}
-
-fn persist_font_size_with(
-    config: &mut RoostConfig,
-    path: Option<&Path>,
-    size_pt: f64,
-    write: impl FnOnce(&Path, &str, &str) -> io::Result<()>,
-) -> io::Result<()> {
-    config.font_size = Some(size_pt);
-    let Some(path) = path else {
-        return Ok(());
-    };
-    write(path, "font-size", &typography::format_font_size(size_pt))
-}
-
-fn persist_font_family_with(
-    config: &mut RoostConfig,
-    path: Option<&Path>,
-    family: &str,
-    write: impl FnOnce(&Path, &str, &str) -> io::Result<()>,
-) -> io::Result<()> {
-    config.font_family = Some(family.to_string());
-    let Some(path) = path else {
-        return Ok(());
-    };
-    write(path, "font-family", &typography::quote_font_family(family))
-}
-
-fn finish_theme_confirmation(
-    palette: &mut Option<palette::PaletteState>,
-    theme_at_open: &mut Option<String>,
-    status: &mut StatusBanner,
-    persistence_error: Option<String>,
-    now: Instant,
-) {
-    *palette = None;
-    *theme_at_open = None;
-    if let Some(error) = persistence_error {
-        status.set_at(error, now);
-    }
-}
-
 fn font_palette_frame(registry: &FontRegistry, resolved: &str) -> palette::PaletteFrame {
     let names = registry.picker_names();
     let selection = names
@@ -752,9 +699,10 @@ impl App {
         self.apply_typography_candidate(candidate, metrics, "font size")?;
 
         let size_pt = self.typography.current_size_pt();
-        let path = config::config_path();
-        persist_font_size_with(&mut self.config, path.as_deref(), size_pt, config::set_key)
-            .map_err(|error| format!("persist font size: {error}"))
+        self.config.font_size = Some(size_pt);
+        self.config_writer
+            .set("font-size", &typography::format_font_size(size_pt));
+        Ok(())
     }
 
     fn apply_typography_candidate(
@@ -906,7 +854,7 @@ impl App {
         self.apply_font_family(Some(name.to_string()))
     }
 
-    fn commit_font_family(&mut self, name: &str) -> Result<Option<String>, String> {
+    fn commit_font_family(&mut self, name: &str) -> Result<(), String> {
         let opened = self
             .palette_family_at_open
             .clone()
@@ -923,14 +871,12 @@ impl App {
             FamilyApply::Set(family) => self.apply_font_family(family)?,
         }
         let Some(persist) = confirmation.persist else {
-            return Ok(None);
+            return Ok(());
         };
-        let path = config::config_path();
-        Ok(
-            persist_font_family_with(&mut self.config, path.as_deref(), &persist, config::set_key)
-                .err()
-                .map(|error| format!("persist font family: {error}")),
-        )
+        self.config.font_family = Some(persist.clone());
+        self.config_writer
+            .set("font-family", &typography::quote_font_family(&persist));
+        Ok(())
     }
 
     pub fn palette_query_changed(&mut self, query: &str) {
@@ -1576,23 +1522,17 @@ impl App {
                 dispatch = self.open_tab_here(command.title, argv);
             }
             "themes" => {
-                let persistence_error = self.commit_theme_name(&item.id)?;
-                finish_theme_confirmation(
-                    &mut self.palette,
-                    &mut self.palette_theme_at_open,
-                    &mut self.status,
-                    persistence_error,
-                    Instant::now(),
-                );
+                self.commit_theme_name(&item.id)?;
+                // A commit is a commit: the palette closes with no
+                // at-open value left for a later dismiss to revert to.
+                self.palette = None;
+                self.palette_theme_at_open = None;
                 self.palette_family_at_open = None;
                 self.palette_resolved_family_at_open = None;
             }
             "fonts" => {
-                let persistence_error = self.commit_font_family(&item.id)?;
+                self.commit_font_family(&item.id)?;
                 self.clear_palette_state();
-                if let Some(error) = persistence_error {
-                    self.set_status(error);
-                }
             }
             agent_palette::FRAME_ID => {
                 let tab = agent_palette::agent_tab_key(&item.id)
@@ -2049,7 +1989,7 @@ impl App {
         Ok(())
     }
 
-    fn commit_theme_name(&mut self, name: &str) -> Result<Option<String>, String> {
+    fn commit_theme_name(&mut self, name: &str) -> Result<(), String> {
         self.apply_theme_name(name)?;
         // Connected hosts re-seed their server terminals with the same
         // palette (`session.set_theme` rides each host's op queue), so
@@ -2064,12 +2004,9 @@ impl App {
         // theme the user rejected. A preview is local by nature: it
         // costs an in-process repaint here and nothing on the wire.
         self.hosts.set_theme(&Theme::load_bundled(name));
-        let path = config::config_path();
-        Ok(
-            persist_theme_selection_with(&mut self.config, path.as_deref(), name, config::set_key)
-                .err()
-                .map(|error| format!("persist theme: {error}")),
-        )
+        self.config.theme_name = Some(name.to_string());
+        self.config_writer.set("theme", name);
+        Ok(())
     }
 
     pub(super) fn palette_back_or_dismiss(&mut self) {
@@ -3331,140 +3268,6 @@ mod tests {
                 .expect("changed candidate");
         assert_eq!(candidate.0.current_size_pt(), 71.0);
         assert_eq!(current, before);
-    }
-
-    #[test]
-    fn font_size_persistence_handles_absence_success_and_failure() {
-        let mut absent = RoostConfig::default();
-        persist_font_size_with(&mut absent, None, 14.0, |_, _, _| {
-            panic!("absent path must not invoke the writer")
-        })
-        .expect("absent path is a silent success");
-        assert_eq!(absent.font_size, Some(14.0));
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("config.conf");
-        std::fs::write(&path, "# keep me\ntheme = roost-dark\n").expect("seed config");
-        let mut successful = RoostConfig::default();
-        persist_font_size_with(&mut successful, Some(&path), 14.5, config::set_key)
-            .expect("persist font size");
-        assert_eq!(successful.font_size, Some(14.5));
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("read persisted config"),
-            "# keep me\ntheme = roost-dark\nfont-size = 14.5\n"
-        );
-
-        let before = std::fs::read(&path).expect("read before failure");
-        let mut failed = RoostConfig::default();
-        let error = persist_font_size_with(&mut failed, Some(&path), 15.0, |_, _, _| {
-            Err(io::Error::other("injected writer failure"))
-        })
-        .expect_err("writer failure must be returned to the UI boundary");
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-        assert_eq!(failed.font_size, Some(15.0));
-        assert_eq!(std::fs::read(&path).expect("read after failure"), before);
-    }
-
-    #[test]
-    fn font_family_persistence_handles_absence_reload_and_failure() {
-        let mut absent = RoostConfig::default();
-        persist_font_family_with(&mut absent, None, "JetBrains Mono", |_, _, _| {
-            panic!("absent path must not invoke the writer")
-        })
-        .expect("absent path is a silent success");
-        assert_eq!(absent.font_family.as_deref(), Some("JetBrains Mono"));
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("config.conf");
-        std::fs::write(&path, "# keep me\nfont-size = 14\n").expect("seed config");
-        let mut successful = RoostConfig::default();
-        persist_font_family_with(
-            &mut successful,
-            Some(&path),
-            "JetBrains Mono",
-            config::set_key,
-        )
-        .expect("persist font family");
-        assert_eq!(successful.font_family.as_deref(), Some("JetBrains Mono"));
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("read persisted config"),
-            "# keep me\nfont-size = 14\nfont-family = \"JetBrains Mono\"\n"
-        );
-        assert_eq!(
-            RoostConfig::load_from(&path).font_family.as_deref(),
-            Some("JetBrains Mono"),
-            "the next bootstrap observes the exact committed family"
-        );
-
-        let before = std::fs::read(&path).expect("read before failure");
-        let mut failed = RoostConfig::default();
-        let error = persist_font_family_with(&mut failed, Some(&path), "SF Mono", |_, _, _| {
-            Err(io::Error::other("injected writer failure"))
-        })
-        .expect_err("writer failure must be returned to the UI boundary");
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-        assert_eq!(failed.font_family.as_deref(), Some("SF Mono"));
-        assert_eq!(std::fs::read(&path).expect("read after failure"), before);
-    }
-
-    #[test]
-    fn theme_persistence_handles_absence_success_and_failure() {
-        let mut absent = RoostConfig::default();
-        persist_theme_selection_with(&mut absent, None, "Oxocarbon", |_, _, _| {
-            panic!("absent path must not invoke the writer")
-        })
-        .expect("absent path is a silent success");
-        assert_eq!(absent.theme_name.as_deref(), Some("Oxocarbon"));
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("config.conf");
-        std::fs::write(&path, "# keep me\nfont-size = 14\n").expect("seed config");
-        let mut successful = RoostConfig::default();
-        persist_theme_selection_with(&mut successful, Some(&path), "Oxocarbon", config::set_key)
-            .expect("persist theme");
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("read persisted config"),
-            "# keep me\nfont-size = 14\ntheme = Oxocarbon\n"
-        );
-        assert_eq!(
-            RoostConfig::load_from(&path).theme_name.as_deref(),
-            Some("Oxocarbon"),
-            "the next bootstrap observes the committed theme"
-        );
-
-        let before = std::fs::read(&path).expect("read before failure");
-        let mut failed = RoostConfig::default();
-        let error = persist_theme_selection_with(&mut failed, Some(&path), "Atom", |_, _, _| {
-            Err(io::Error::other("injected writer failure"))
-        })
-        .expect_err("writer failure must be returned to the UI boundary");
-        assert_eq!(error.kind(), io::ErrorKind::Other);
-        assert_eq!(failed.theme_name.as_deref(), Some("Atom"));
-        assert_eq!(std::fs::read(&path).expect("read after failure"), before);
-    }
-
-    #[test]
-    fn theme_persistence_error_closes_before_status_and_cannot_revert() {
-        let mut palette = Some(palette::PaletteState::new(theme_palette_frame(
-            "roost-dark",
-        )));
-        let mut theme_at_open = Some("roost-dark".to_string());
-        let mut status = StatusBanner::default();
-        let now = Instant::now();
-        finish_theme_confirmation(
-            &mut palette,
-            &mut theme_at_open,
-            &mut status,
-            Some("persist theme: injected writer failure".to_string()),
-            now,
-        );
-        assert!(palette.is_none());
-        assert!(theme_at_open.is_none(), "dismiss cannot revert the commit");
-        assert_eq!(
-            status.message(),
-            Some("persist theme: injected writer failure")
-        );
-        assert_eq!(status.expires_at, Some(now + STATUS_BANNER_DURATION));
     }
 
     #[test]

@@ -115,6 +115,7 @@ final class KeyEncoder {
 
         let key = Self.ghosttyKey(forKeyCode: nsEvent.keyCode)
         let mods = Self.ghosttyMods(forFlags: nsEvent.modifierFlags)
+        let chord = Self.controlChord(for: nsEvent, key: key)
         let action: GhosttyKeyAction = nsEvent.isARepeat
             ? GHOSTTY_KEY_ACTION_REPEAT
             : GHOSTTY_KEY_ACTION_PRESS
@@ -136,9 +137,14 @@ final class KeyEncoder {
         // full modifier set. That's what leaves Shift+Enter encoding as
         // CSI 13;2u. If that C0 filter ever goes away, this consumed-mods
         // value starts applying to those keys too.
+        //
+        // A recovered chord reports nothing consumed: its utf8 is our own
+        // synthesis (the platform handed us a C0), so no modifier went into
+        // producing it, and subtracting Option would clear the effective alt
+        // that puts the ESC meta-prefix on ctrl+option chords.
         ghostty_key_event_set_consumed_mods(
             event,
-            Self.consumedMods(forFlags: nsEvent.modifierFlags)
+            chord == nil ? Self.consumedMods(forFlags: nsEvent.modifierFlags) : 0
         )
         // The unshifted base-layout codepoint (Ctrl+A → "a" = 97). Under
         // the Kitty keyboard protocol the encoder needs this to build a
@@ -147,7 +153,12 @@ final class KeyEncoder {
         // NOTHING for Ctrl+letter (Claude Code / opencode enable Kitty,
         // so every Ctrl+letter was silently dropped). Legacy mode derives
         // the C0 byte from the key alone and is unaffected either way.
-        ghostty_key_event_set_unshifted_codepoint(event, Self.unshiftedCodepoint(for: nsEvent))
+        //
+        // A recovered chord names its own key: see `ControlChord.key`.
+        ghostty_key_event_set_unshifted_codepoint(
+            event,
+            chord.flatMap(\.key)?.value ?? Self.unshiftedCodepoint(for: nsEvent)
+        )
         // IME composition is handled by NSResponder via interpretKeyEvents
         // → insertText (the path TerminalView doesn't currently wire);
         // when this method runs, we're past composition.
@@ -168,7 +179,7 @@ final class KeyEncoder {
         // received "l" or "s" but the empty-line Enter still made it
         // through (Enter's "\r" gets filtered to empty UTF-8 and the
         // encoder derives from key alone, so it wasn't affected).
-        let utf8 = Self.printableUTF8(for: nsEvent)
+        let utf8 = chord?.text ?? Self.printableUTF8(for: nsEvent)
         return utf8.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Data in
             if let base = raw.bindMemory(to: CChar.self).baseAddress, raw.count > 0 {
                 ghostty_key_event_set_utf8(event, base, raw.count)
@@ -227,6 +238,126 @@ final class KeyEncoder {
         }
         if filtered.isEmpty { return Data() }
         return Data(String(String.UnicodeScalarView(filtered)).utf8)
+    }
+
+    /// A control-transformed press, split into the two characters it stands
+    /// for: the text it would have typed and the key that typed it.
+    private struct ControlChord {
+        /// What libghostty receives as the press's utf8 — shift included,
+        /// since the control transform's own table is keyed on the character
+        /// the layout typed (ctrl+shift+- has to arrive as `_` to fold into
+        /// 0x1F).
+        let text: Data
+        /// The unshifted Latin character that identifies the key, or nil when
+        /// the C0 folds in more than one key and only the layout can say.
+        ///
+        /// AppKit reports the *active layout's* character for a press, which
+        /// on a non-Latin layout is not the key libghostty must name: ctrl on
+        /// a Russian I arrives as TAB while the layout says that key types
+        /// `ш`, and reporting U+0448 puts the Kitty entry on 1096 and drops
+        /// the shift bit off the legacy one. A recovered chord's C0 is
+        /// layout-blind and inverts to exactly one key for the letters and
+        /// `[ \ ]`, so here it names the key — the same identity iced derives
+        /// from the physical key (`crates/roost-iced/src/input.rs`, via
+        /// `Key::to_latin`).
+        let key: Unicode.Scalar?
+    }
+
+    /// The printable character behind a control-transformed press and the key
+    /// it came from, or nil when this press is not a chord whose C0 byte
+    /// inverts unambiguously.
+    ///
+    /// macOS applies the control transform itself, so `NSEvent.characters`
+    /// for ctrl+[ is ESC, for ctrl+i is TAB and for ctrl+m is CR. libghostty
+    /// keys its control-sequence table on the *printable* byte and leaves
+    /// `[`, `i` and `m` out of it on purpose (fixterms: applications must be
+    /// able to tell ctrl+[ from Escape, ctrl+i from Tab, ctrl+m from Enter),
+    /// so those three fall through to CSI-u — which needs one codepoint of
+    /// utf8 to build an entry from. Stripping the C0 left it with nothing and
+    /// all three chords reached the PTY as no bytes at all (#343). Forwarding
+    /// the printable instead is what the iced UI does, so both UIs now emit
+    /// CSI 91/105/109 ; 5 u (`crates/roost-iced/src/input.rs::control_chord`).
+    ///
+    /// Only writing-system keys qualify. ctrl+Return, ctrl+Escape and
+    /// ctrl+Tab present a lone C0 of their own — the very bytes ctrl+m,
+    /// ctrl+[ and ctrl+i fold into — and inverting those would retype three
+    /// of the most common keys on the board as letters.
+    ///
+    /// A Command chord never recovers. macOS treats it as a menu equivalent,
+    /// and libghostty's legacy CSI-u fallback has no Super bit to report
+    /// (`key_encode.zig`'s `CsiUMods`), so recovering ctrl+cmd+i would reach
+    /// the PTY as `ESC [ 105 ; 5 u` — a plain ctrl+i with Command erased.
+    /// With no utf8 the press encodes to nothing, which is what it did before
+    /// recovery existed.
+    private static func controlChord(for e: NSEvent, key: GhosttyKey) -> ControlChord? {
+        guard e.modifierFlags.contains(.control),
+              !e.modifierFlags.contains(.command),
+              Self.isWritingSystemKey(key),
+              let c0 = Self.soleScalar(e.characters),
+              let canonical = Self.controlInverse(c0)
+        else { return nil }
+        // `charactersIgnoringModifiers` is the press with every modifier but
+        // control applied, and the table is keyed on the character the layout
+        // actually typed — ctrl+shift+- has to arrive as `_` to fold into
+        // 0x1F. The canonical inverse is the layout-blind fallback that still
+        // recovers a non-Latin layout, where the typed character can't
+        // confirm the C0 (ctrl+ф → `a`).
+        let typed = Self.soleScalar(e.charactersIgnoringModifiers)
+        let text = typed.flatMap { Self.controlTransform($0) == c0 ? $0 : nil } ?? canonical
+        return ControlChord(
+            text: Data(String(Character(text)).utf8),
+            // macOS folds both ctrl+- and ctrl+/ onto 0x1F, so that one C0
+            // names no single key and the layout stays in charge of it.
+            key: canonical == "_" ? nil : canonical
+        )
+    }
+
+    /// libghostty enumerates W3C UI Events codes and groups "Writing System
+    /// Keys" (§ 3.1.1) contiguously, from BACKQUOTE through SLASH. That block
+    /// is the Mac spelling of the `Key::Character(_)` gate iced puts on chord
+    /// recovery: everything after it is a functional, control-pad, arrow,
+    /// numpad or media key, which owns its own encoding.
+    private static func isWritingSystemKey(_ key: GhosttyKey) -> Bool {
+        key.rawValue >= GHOSTTY_KEY_BACKQUOTE.rawValue
+            && key.rawValue <= GHOSTTY_KEY_SLASH.rawValue
+    }
+
+    /// The printable character a control transform folded into `c0`, for the
+    /// chords that invert unambiguously: the letters and `[ \ ] _`. NUL
+    /// (ctrl+space, ctrl+shift+2), RS (ctrl+shift+6) and DEL keep today's
+    /// encoding — more than one key folds onto each of those.
+    private static func controlInverse(_ c0: Unicode.Scalar) -> Unicode.Scalar? {
+        guard let byte = UInt8(exactly: c0.value) else { return nil }
+        switch byte {
+        case 0x01...0x1A: return Unicode.Scalar(UInt8(ascii: "a") + byte - 1)
+        case 0x1B: return Unicode.Scalar(UInt8(ascii: "["))
+        case 0x1C: return Unicode.Scalar(UInt8(ascii: "\\"))
+        case 0x1D: return Unicode.Scalar(UInt8(ascii: "]"))
+        case 0x1F: return Unicode.Scalar(UInt8(ascii: "_"))
+        default: return nil
+        }
+    }
+
+    /// The C0 byte the platform produces for control plus this character,
+    /// for the chords `controlInverse` can invert.
+    private static func controlTransform(_ value: Unicode.Scalar) -> Unicode.Scalar? {
+        guard let byte = UInt8(exactly: value.value) else { return nil }
+        switch byte {
+        case UInt8(ascii: "a")...UInt8(ascii: "z"):
+            return Unicode.Scalar(byte - UInt8(ascii: "a") + 1)
+        case UInt8(ascii: "A")...UInt8(ascii: "Z"):
+            return Unicode.Scalar(byte - UInt8(ascii: "A") + 1)
+        case UInt8(ascii: "["), UInt8(ascii: "{"): return Unicode.Scalar(0x1B as UInt8)
+        case UInt8(ascii: "\\"), UInt8(ascii: "|"): return Unicode.Scalar(0x1C as UInt8)
+        case UInt8(ascii: "]"), UInt8(ascii: "}"): return Unicode.Scalar(0x1D as UInt8)
+        case UInt8(ascii: "_"): return Unicode.Scalar(0x1F as UInt8)
+        default: return nil
+        }
+    }
+
+    private static func soleScalar(_ value: String?) -> Unicode.Scalar? {
+        guard let scalars = value?.unicodeScalars, scalars.count == 1 else { return nil }
+        return scalars.first
     }
 
     /// The unshifted base-layout codepoint for `e` — the character the

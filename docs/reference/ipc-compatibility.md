@@ -40,7 +40,7 @@ not.
 Two triggers revisit that decision:
 
 * the wire settles — R1 (the lease re-cut) through R5, and R15 (plan
-  057, the lease re-cut *again*, opening `tab.write`/`tab.attach` back
+  057, the lease re-cut *again*, opening `tab.write` and attach back
   up) are the changes currently expected to move it; once they have
   landed and the shape has stopped moving, git tags per protocol
   generation are the natural next step, and cheap;
@@ -92,7 +92,7 @@ another — the Rust API is the usual offender.
 |---|---|
 | **UI-socket JSON wire** | Governed by `PROTOCOL_VERSION` and the matrix below. Additive changes are free; a breaking change bumps the integer |
 | **Session-socket JSON wire** | Governed by `SESSION_PROTOCOL_VERSION` and the same matrix. Conforming clients gate on it exactly, so mixed generations fail closed at the handshake rather than misbehaving later |
-| **Binary data plane** (attach streams; see [Data plane](ipc.md#data-plane)) | Rides the session generation. The attach handshake carries the same integer and refuses a mismatch before it looks at the token; snapshot payloads additionally require an exact `libghostty_build` match |
+| **Binary data plane** (attach streams; see [Data plane](ipc.md#data-plane)) | Rides the session generation. The attach handshake carries the same integer and refuses a mismatch before it reads any other term; snapshot payloads additionally require an exact `libghostty_build` match |
 | **Fixture corpus** (`tests/ipc-vectors/`) | Pinnable and append-mostly — see [Fixtures are the contract](#fixtures-are-the-contract) |
 | **Rust crate API** | **No stability promise.** See below |
 
@@ -150,12 +150,24 @@ merely a new vector:
   [the compatibility contract](ipc.md#tabstate-hook_active-derived-and-the-compatibility-contract)
   for why `agent_lifecycle: "failed"` projects onto an existing value
   instead of adding a fifth;
-* `TabEffect` and `ClipboardEffectTarget` — the
-  [`tab.effect`](ipc.md#events) envelope's kind and target;
-* `AttachMode` — the [`tab.attach`](ipc.md#tabattach) mode;
+* `ClipboardEffectTarget` — the [`tab.effect`](ipc.md#events) envelope's
+  target; a two-value set (`system`/`selection`) with no growth
+  pressure;
+* `AttachMode` — the [attach handshake](ipc.md#the-handshake)'s mode;
 * the agent enums — `AgentLifecycle` and the `ownership_action`,
   `attention`, and `severity` values on
   [`tab.agent_report`](ipc.md#tabagent_report).
+
+`TabEffect` — the same envelope's `effect` kind — was in this list
+through generation 6's design but was **opened** before release (plan
+065 §3.4): #188 and #364 would each have forced a bump to add a new
+effect, and generation 6 was still unshipped when that cost was
+noticed, so it was paid now instead of later. It is a
+`#[serde(transparent)]` newtype over `String`, the same shape as
+`payload_kinds` below: `bell` and `clipboard-write` are constants, not
+variants, and a client that receives a value it has no handler for
+ignores it (the transparent encoding means the wire bytes for the two
+known effects are unchanged by the type opening up).
 
 ### The no-bump extension channels
 
@@ -171,7 +183,9 @@ touching the protocol integer:
   [`session.identify`](ipc.md#sessionidentify) is the model: a list, not
   an enum, where a client preserves values it does not recognize and
   negotiates on the ones it does. `source` on `tab.agent_report` is an
-  open string for the same reason.
+  open string for the same reason, and `TabEffect` above follows the
+  same shape for a single value rather than a list: a client ignores
+  what it does not recognize instead of preserving it forward.
 
 When a change can be expressed through one of these channels, it should
 be. A protocol generation is expensive; a map key is not.
@@ -189,8 +203,8 @@ is: a **client-side** guarantee of the shipped connection sequence. The
 JSON server does not require `session.identify` before anything else, so
 a client that skips the handshake is not stopped — it simply gets
 undefined behavior it asked for. The attach handshake on the data plane
-carries the same integer and does enforce it server-side, before it looks
-at the token.
+carries the same integer and does enforce it server-side, before it
+reads any other term.
 
 **Everything optional is capability-detected.** `payload_kinds` is the
 worked example: the client reads the list, keeps the entries it does not
@@ -313,6 +327,26 @@ the old wire and is gone from this one. `AgentHooksMode` is retired
 with the params it typed. No shim was left in either direction — a v5
 peer meeting a v6 build hits the ordinary `session-mismatch` refusal at
 the handshake, same as any other generation bump.
+
+**An unreleased generation is a special case of the rule above: with no
+consumer's lockfile ever able to sit on a commit between two of its
+breaking changes, it may be amended in place instead of bumped again
+per merge, and `6` was (Charlie, 2026-09-15).** `5` shipped in no
+release — `v0.0.19` still speaks `2` — so plan 065 folded three more
+breaking changes into `6` rather than counting to `9`: `tab.effect`
+opened from a closed enum into a string list ahead of #188 and #364,
+`session.set_focus` deleted in favor of a `notification.fired` every
+connection receives and a per-tab generation each acknowledges, and the
+attach ticket replaced by a `session_id`-bound handshake the data
+connection negotiates on its own first line (`tab.attach` retired).
+`session.set_agent_hooks`'s unknown-name behavior rode the same
+generation without spending a bump of its own — `skipped.reason` is
+already a free string, so refusing the whole call for an unrecognised
+name was a behavior choice, not a shape the wire had to change. Each
+change still gets its one CHANGELOG entry — a rewritten "Session
+protocol 2 → 6" bullet describing the resulting contract, not a bullet
+per step — and the fixtures below were re-cut once, at `6`, not once
+per absorbed step.
 
 ## Fixtures are the contract
 

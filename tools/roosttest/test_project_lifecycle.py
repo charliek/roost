@@ -323,6 +323,64 @@ def test_project_reorder_partial_list_prefixes_then_appends_rest(roost):
             _cleanup_project(roost, pid)
 
 
+# -- non-canonical ids are refused, not normalized (#402) ------------------
+
+
+def test_reorder_ops_refuse_a_non_canonical_id(roost, project):
+    """A non-canonical integer spelling (`"+4"`) is refused with
+    `invalid-param` on both `tab.reorder` and `project.reorder`, and on
+    both UI sockets.
+
+    Rust's `WireTabRef`/`WireProjectRef::parse` round-trip the decoded
+    id (`to_string() == text`) and refuse `"+4"`; Swift's plain
+    `Int64("+4")` succeeds, so before #402's fix the Mac socket silently
+    normalized `"+4"` to `4` instead of answering `invalid-param` like
+    iced (and a session socket). This is a parity test and deliberately
+    NOT target-gated — it must pass identically under `--roost-target
+    mac` and `--roost-target iced` (both are required CI gates), unlike
+    the iced-only tests above.
+    """
+    with pytest.raises(RoostError) as tab_exc:
+        roost.reorder_tabs(project, ["+4"])
+    assert tab_exc.value.code == "invalid-param", (
+        f"tab.reorder with a non-canonical id: {tab_exc.value}"
+    )
+
+    with pytest.raises(RoostError) as project_exc:
+        roost.reorder_projects(["+4"])
+    assert project_exc.value.code == "invalid-param", (
+        f"project.reorder with a non-canonical id: {project_exc.value}"
+    )
+
+
+def test_dump_ops_refuse_a_non_canonical_id(roost):
+    """`tab.dump` and `tab.dump_resolved` are `WireTabRef`-backed too
+    (Rust `messages.rs`'s `TabDumpParams`/`TabDumpResolvedParams`), so
+    the same #402 narrowing from the test above applies to them —
+    that plan's discovery record only named `tab.reorder`/
+    `project.reorder`, missing these two (and `tab.capture_pty_input`,
+    covered separately in `test_test_ops.py` since it's gated behind
+    `ROOST_TEST_MODE=1`).
+
+    Both handlers decode params before ever looking up the tab, so a
+    non-canonical id never needs a real tab to trip this — no `project`
+    fixture required. Parity test, not target-gated, like the one
+    above.
+    """
+    for bad_id in ("+4", "04"):
+        with pytest.raises(RoostError) as dump_exc:
+            roost.dump(bad_id)
+        assert dump_exc.value.code == "invalid-param", (
+            f"tab.dump with non-canonical id {bad_id!r}: {dump_exc.value}"
+        )
+
+        with pytest.raises(RoostError) as resolved_exc:
+            roost.tab_dump_resolved(bad_id)
+        assert resolved_exc.value.code == "invalid-param", (
+            f"tab.dump_resolved with non-canonical id {bad_id!r}: {resolved_exc.value}"
+        )
+
+
 # -- Iced-only: full UI dispatch path --------------------------------------
 
 

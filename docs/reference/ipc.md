@@ -33,9 +33,8 @@ it: `roostctl session start|stop|status` address the session profile's
 socket directly (a pre-connect carve-out, since `start` must work when
 nothing is listening yet), and any other op reaches a session only
 through an explicit `--socket`. A UI socket answers `unknown-op` for
-every `session.*` op and for [`tab.attach`](#tabattach), and
-`not-implemented` for `events.subscribe`, byte-identical to before
-`roost-session` existed.
+every `session.*` op and `not-implemented` for `events.subscribe`,
+byte-identical to before `roost-session` existed.
 
 A session socket also carries a second, **binary** protocol on its own
 connections — the per-tab attach stream a client renders a remote
@@ -119,10 +118,11 @@ terminal from. It shares the socket path but not the framing; see
   [`session.stop`](#sessionstop) latches, every mutating op answers it
   (reads still answer normally), and a second `session.stop` on the
   same session gets it too instead of a fresh reap report. Session
-  sockets add a further six: `too-many-tokens`, `unsupported-kind`,
-  `build-mismatch` from [`tab.attach`](#tabattach)'s negotiation, and
-  `replay-expired`, `revision-ahead`, `session-mismatch` from
-  [`events.subscribe`](#eventssubscribe)'s resume. Every same-UID
+  sockets add a further six: `unsupported-kind`, `build-mismatch` and
+  `too-many-attaches` from the [attach handshake](#the-handshake)'s
+  negotiation, and `replay-expired`, `revision-ahead`,
+  `session-mismatch` from [`events.subscribe`](#eventssubscribe)'s
+  resume. Every same-UID
   connection is otherwise symmetric — there is no per-connection
   authority code, because there is no per-connection authority.
 
@@ -256,6 +256,13 @@ Response:
 }}
 ```
 
+`persist_error` is present only when the last attempt to write
+`state.json` failed — the message of that write, and absent otherwise.
+A UI socket serves no event stream, so this field is the whole of its
+durability surface; see
+[`workspace.durability_changed`](#events) for the session's live
+counterpart and what the value means.
+
 `local_backend` (plan 063 §D1) is `"in-process"` or `"session"` — which
 backend this UI's own local tabs run on, the [`local-backend` config
 key](config.md#local-backend)'s live value. Absent from a Swift Mac
@@ -321,8 +328,7 @@ by name if one is ever added without a row:
   page.
 - **Unsupported.** Not served on a UI socket before this mode or after
   it: `events.subscribe` (`not-implemented` — dial
-  `identify.local_session_socket` instead) and `tab.attach`
-  (`unknown-op` — a UI socket mints no attach tickets).
+  `identify.local_session_socket` instead).
 - **Session-only / event.** `session.*` ops and every `tab.*`/`project.*`
   event name answer `unknown-op` on a UI socket exactly as they always
   have; the mode plays no part.
@@ -548,7 +554,7 @@ share one tab without either permanently shrinking the other. Four
 things carry geometry, and each one sizes the tab:
 
 * this op;
-* [`tab.attach`](#tabattach) with `focus: true` (the default), which
+* an [attach handshake](#the-handshake) with `focus: true`, which
   resizes during negotiation;
 * a data-plane `INPUT` frame, which applies its connection's declared
   geometry ahead of the bytes when it differs — typing is how a client
@@ -641,8 +647,8 @@ chunk. CLI: `roostctl tab dump --tab N --scrollback 50`.
 
 On a **host-session socket** this is answered from the tab's server
 Terminal instead of a UI's — same request, same response shape. It
-requires no `tab.attach`: a session's terminal is authoritative
-whether or not anybody is watching it.
+requires no attach: a session's terminal is authoritative whether or
+not anybody is watching it.
 
 On a **UI socket**, `tab_id` also accepts the host-qualified
 `h<host>.<id>` spelling (plan 037 §3.4) — `"h3.7"` reads tab `7` of
@@ -829,15 +835,8 @@ Order is leftmost first. Ids not belonging to `project_id` are rejected
 with `invalid-param`. Tabs in the project not listed keep their
 relative order after the listed ones. Ids are the **canonical**
 spelling: a non-canonical integer (`"+4"`, `"04"`) is refused rather
-than normalized. That holds on the **iced UI socket** and on a
-**session socket** — the two that parse a ref which may carry the
-`h<host>.<id>` form. The Swift Mac socket diverges, and it is
-documented rather than promised: it decodes both reorder ops through
-its plain string↔`Int64` codec (`@StringInt64` / `@StringInt64Array`),
-and Swift's `Int64(String)` accepts a leading `+` and leading zeros, so
-`"+4"` still normalizes there. Canonical traffic is byte-identical
-everywhere, which is what the vectors pin; a caller that wants one
-answer from both should send canonical ids.
+than normalized, on the iced UI socket, a session socket, and the
+Swift Mac socket alike.
 
 Response: `{}`.
 
@@ -940,7 +939,33 @@ unconditionally `none`. See
 Clears `Tab.has_notification` and emits the corresponding
 `tab.notification` event with `has_pending = false`.
 
-Request: `{"params": {"tab_id": "3"}}`. Response: `{}`.
+Request: `{"params": {"tab_id": "3"}}`.
+Response: `{"cleared": true}` — whether *this* call is what took a
+pending notification down. `false` for a tab with nothing pending, and
+for a superseded acknowledgement (below); both are ordinary answers, not
+errors. An unknown `tab_id` is `not-found`, so a client can still tell
+"gone" from "somebody got there first".
+
+**`generation` (optional) makes the clear an acknowledgement.** Supply
+the [`notification.fired`](#events) `generation` you are answering and
+the session clears **only if that raise is still the current one**:
+
+```json
+{"id": "9", "op": "tab.clear_notification", "params": {
+  "tab_id": "3", "generation": 7
+}}
+```
+
+Omit it — as a person clicking the tab does, and as `roostctl tab
+clear-notification` does — and the clear is unconditional: whatever is
+pending comes down.
+
+The check exists because a client that clears *automatically*, because
+it is already reading the tab ([Notifications fan
+out](#notifications-fan-out)), is answering one specific raise over a
+round trip. Without it: A fires, the viewing client acknowledges A, B
+fires, and A's acknowledgement lands afterwards and erases a
+notification nobody has seen.
 
 ### `tab.set_hook_active` *(deprecated — use `tab.agent_report`)*
 
@@ -1726,8 +1751,12 @@ Response:
 ```
 
 `agents` is either a JSON array of agent names or the literal string
-`"off"` — nothing else decodes. An empty array and a name outside the
-fixed set `agent-hooks` itself takes are both `invalid-param`. `local`
+`"off"` — nothing else decodes. An empty array, and an array with a
+blank element, are both `invalid-param`. A name this build has no
+adapter for is **skipped**, not refused: it comes back in
+`local.skipped` with reason `"unknown"` and the rest of the list is
+applied, and an array naming *only* such agents answers `ok` having
+written nothing at all — no key, no dotfile, no host raised. `local`
 is this machine's own install outcome, the same shape
 `session.set_agent_hooks` answers with; `removed` can be non-empty here
 (unlike the session op's), because this is an explicit local set, not a
@@ -1998,7 +2027,7 @@ its own decision, not the wire's — a bell is worth marking on any tab
 that owns one, while a clipboard write should land only on whatever tab
 that client is actually looking at, so a background watcher's own
 clipboard is never overwritten by a tab it merely subscribes to. See
-[`tab.attach`](#tabattach) and the guide's
+the [attach handshake](#the-handshake) and the guide's
 [Several windows on one session](../guides/host-sessions.md#several-windows-on-one-session)
 for that policy from the client side; the wire itself fans every effect
 out to every subscriber unfiltered.
@@ -2038,16 +2067,29 @@ of it, so every fence below it also expires); the answer either way is
 `replay-expired`, which is the designed fallback, not a failure — the
 client snapshots with `tab.list` and subscribes afresh.
 
-**Effects are live-only.** [`tab.effect`](#events) (bells, OSC 52
-clipboard writes — [DL-18](../development/vision.md#dl-18-hosts-ux-attach-on-focus-effects-theme-reseed-and-the-mac-gate-2026-08-29))
-is stripped before a batch ever enters the ring, so **no resumed stream
-ever receives one from its gap, for any subscriber**: replaying a
-clipboard write from thirty seconds ago is wrong regardless of who
-resumes into it. A commit whose only events were effects still occupies
-a revision and replays as the same empty `{"revision": N, "events": []}`
-batch the gap rule already requires. `notification.fired` is not an
-effect and **is replayed** — it is a workspace fact, and a watcher that
-blinked wants the one it missed.
+**Moments are live-only.** Three events are stripped before a batch
+ever enters the ring, so **no resumed stream ever receives one from its
+gap, for any subscriber**:
+
+- [`tab.effect`](#events) (bells, OSC 52 clipboard writes —
+  [DL-18](../development/vision.md#dl-18-hosts-ux-attach-on-focus-effects-theme-reseed-and-the-mac-gate-2026-08-29)),
+  because replaying a clipboard write from thirty seconds ago is wrong
+  regardless of who resumes into it;
+- [`workspace.durability_changed`](#events), because the standing value
+  is what a client resyncs against and replaying the moment it changed
+  would raise a failure the next write already fixed;
+- [`notification.fired`](#events), because a banner is a *moment* and
+  the acknowledgement that answers it may be sitting in the very same
+  gap — a resumed stream that replayed one would flash a banner and
+  then retire it.
+
+What each of them leaves behind is ordinary state and is recovered the
+ordinary way: the pending bit off [`tab.list`](#tablist), the durability
+error off [`session.identify.persist_error`](#sessionidentify), and a
+bell off nothing at all, because a bell leaves nothing behind. A commit
+whose only events were live-only still occupies a revision and replays
+as the same empty `{"revision": N, "events": []}` batch the gap rule
+already requires.
 
 Three properties made this lossless before the replay ring existed, and
 still do — the ring just means fewer clients ever need the third one:
@@ -2103,24 +2145,22 @@ because a UI process pushes nothing. Callers there poll `tab.list` /
 ## Session ops
 
 Served **only by a host session** (`roost-session`), never by a UI
-socket. A UI socket answers `unknown-op` for every one of them —
-including [`tab.attach`](#tabattach), which is a `tab.*` name but a
-session-only op — which is how a client tells the two kinds of socket
-apart.
+socket. A UI socket answers `unknown-op` for every one of them, which
+is how a client tells the two kinds of socket apart.
 
 There is no connect step, and no order the server enforces: a client
 dials, calls `session.identify` to run the compatibility gate (below),
 and from there every other op is available immediately, to every
 same-UID connection, in any order. What Roost's own client actually
-sends is `session.identify` → `session.set_theme` / `session.set_focus`
-→ `events.subscribe` / `tab.attach`, with `session.set_agent_hooks`
-queued behind them — not because the wire requires that shape, but
-because each `set_*` op states something the session would otherwise
-guess wrong (its palette, whose window is looking at it, whether the
-user wants agent hooks on this machine), and each is re-stated whenever
-the client's own answer changes. A client that only wants to watch runs
-a shorter sequence — `session.identify` → `events.subscribe` →
-`tab.list` — and never calls the `set_*` ops or `tab.attach` at all;
+sends is `session.identify` → `session.set_theme` →
+`events.subscribe`, dialing a [data connection](#data-plane) per tab it
+shows, with `session.set_agent_hooks` queued behind them — not because
+the wire requires that shape, but because each `set_*` op states
+something the session would otherwise guess wrong (its palette, whether
+the user wants agent hooks on this machine), and each is re-stated
+whenever the client's own answer changes. A client that only wants to
+watch runs a shorter sequence — `session.identify` → `events.subscribe` →
+`tab.list` — and never calls the `set_*` ops or attaches at all;
 nothing distinguishes that client from any other at the wire level, it
 simply chose to send less. `set_agent_hooks` is last and off the
 critical path on purpose: it is the only one that touches the
@@ -2228,9 +2268,9 @@ from construction. Three consequences a client can observe:
   [`tab.dump_resolved`](#tabdump_resolved) are served from it — and
   since plan 053 `tab.dump` reaches into those 2000 lines of history,
   not just the viewport.
-* **The terminal is streamable.** [`tab.attach`](#tabattach) plus a
-  [data connection](#data-plane) hand a client the whole terminal as a
-  snapshot and then keep it live.
+* **The terminal is streamable.** One [data connection](#data-plane)
+  hands a client the whole terminal as a snapshot and then keeps it
+  live.
 
 Flow control is the shape of the pipeline, not a policy on top of it:
 the PTY reader feeds the tab task over a bounded channel, so a tab that
@@ -2253,6 +2293,13 @@ Params: `{}`. Response:
 }
 ```
 
+An optional `persist_error` rides beside them, present only when the
+last attempt to write `state.json` failed, carrying that write's
+message. It is the **standing** value behind the live-only
+[`workspace.durability_changed`](#events) event, which is why a client
+re-reads it on connect and again after a resync. Its absence is not a
+capability signal — a session that is writing fine omits it.
+
 The handshake a client runs before anything binary exists, so every
 incompatibility is caught on stable JSON. `session_protocol` is
 `SESSION_PROTOCOL_VERSION` — deliberately separate from the
@@ -2264,7 +2311,7 @@ detect. **The compatibility rule is one comparison:** a conforming
 client checks `session_protocol` for exact equality against its own
 constant before anything else, and refuses to proceed on a mismatch —
 the [attach handshake](#data-plane) carries the same integer and
-enforces it server-side too, before it even looks at the token. Every
+enforces it server-side too, before it reads any other term. Every
 op on this page assumes that equality already holds; what came before
 `6` — the interactive lease, `session.connect`, per-connection
 classification, the `features` list that once carried intra-generation
@@ -2288,22 +2335,23 @@ compatibility gate reads first.
 `ghostty-<first 16 hex of the pinned SHA>+snapshot.v<format version>`.
 It is the negotiation for `ghostty-snapshot` **and for that kind
 only**: two libghostty builds that disagree cannot exchange a binary
-snapshot, so `tab.attach` requires an exact string match before it will
-serve one and refuses a mismatch by name (`build-mismatch`) rather than
-letting it surface later as a corrupt screen. `vt` has no such
-requirement — it is bytes any VT parser replays — so a session
-advertising it can still be attached to across a skew, at that
-payload's [documented fidelity](#payload-kinds). Both fields were empty
-in HS-1a, when there was nothing to attach to.
+snapshot, so the [attach handshake](#the-handshake) requires an exact
+string match before it will serve one and refuses a mismatch by name
+(`build-mismatch`) rather than letting it surface later as a corrupt
+screen. `vt` has no such requirement — it is bytes any VT parser
+replays — so a session advertising it can still be attached to across a
+skew, at that payload's [documented fidelity](#payload-kinds). Both
+fields were empty in HS-1a, when there was nothing to attach to.
 
 **Test seam:** with `ROOST_TEST_MODE=1` set, a session additionally
 reads `ROOST_SESSION_FAKE_BUILD` and reports *that* string as
-`libghostty_build` instead of its real one — and uses it for
-`tab.attach`'s check #4 too, so the two stay consistent. Reproducing a
-build/protocol mismatch otherwise needs a second binary built against a
-second Ghostty pin, which no CI lane can produce; this makes it a
-one-line fixture (plan 037 §3.7). Ignored entirely outside test mode,
-so a production daemon can never be made to lie about its own build.
+`libghostty_build` instead of its real one — and uses it for the
+handshake's eligibility check too, so the two stay consistent.
+Reproducing a build/protocol mismatch otherwise needs a second binary
+built against a second Ghostty pin, which no CI lane can produce; this
+makes it a one-line fixture (plan 037 §3.7). Ignored entirely outside
+test mode, so a production daemon can never be made to lie about its
+own build.
 
 A second variable under the same double gate, `ROOST_SESSION_LEGACY_KINDS=1`,
 makes the session advertise `["ghostty-snapshot"]` alone — the pre-053
@@ -2317,10 +2365,12 @@ the "needs restart" path would have had nothing left to reach.
 Protocol generations 1 through 4 required a client to claim an
 **interactive lease** before it could drive a session: a
 `session.connect` op minted a bearer token that decided whose
-`events.subscribe` stream received `tab.effect`, whose
-`session.set_focus` was the one a session suppressed notifications
-against, and which connection the `session.set_theme` /
-`session.set_agent_hooks` / `session.put_file` ops would accept.
+`events.subscribe` stream received `tab.effect`, whose reported focus
+was the one a session suppressed notifications against (through a
+`session.set_focus` op, itself retired at generation 6 — see
+[Notifications fan out](#notifications-fan-out)), and which connection
+the `session.set_theme` / `session.set_agent_hooks` /
+`session.put_file` ops would accept.
 Reconnecting was always a takeover — the same op, with `takeover: true`,
 displaced whoever held the lease — and what that did to the displaced
 client's connections changed within the generation. Through protocol 2
@@ -2337,6 +2387,47 @@ same-UID connection is symmetric, as [`session.identify`](#sessionidentify)
 states and every section below describes. See CHANGELOG for the
 protocol-5 migration entry and [Versioning](#versioning) for the
 generation history.
+
+### Notifications fan out
+
+**A session suppresses nothing.** An agent's attention on any tab raises
+`Tab.has_notification` and pushes both
+[`tab.notification`](#events) and [`notification.fired`](#events) to
+every subscriber, always. A session is headless — it has no window and
+no screen — so the only thing that can say "somebody is already looking
+at this tab" is a client, about itself.
+
+**Each client decides for its own window.** On `notification.fired` for
+tab T, a client that is showing T *and* has window focus raises no
+banner and instead sends
+[`tab.clear_notification`](#tabclear_notification) with that event's
+`generation` — the automatic form of the acknowledgement that selecting
+a tab already performs. That clear takes the dot down on **every**
+client rather than muting one. Every other client banners as it always
+did.
+
+Until protocol 6 this was a `session.set_focus` op: each connection told
+the session what it was looking at and the session muted a tab while
+**any** connection claimed it. That op is **gone** — it answers
+`unknown-op` — because a union mutes the wrong people: a phone left open
+on a tab silenced the laptop, with no dot, no banner and no event
+(#474).
+
+What that costs, stated plainly, because it is the design and not a
+defect:
+
+- **Other clients may show the dot for one round trip**, until the
+  acknowledging client's clear lands. The client that is looking never
+  paints it: it filters its own viewed tab out of both attention
+  surfaces.
+- **Two focused viewers both acknowledge the same raise.** The second is
+  answered `cleared: false`.
+- **Regaining window focus does not clear.** Only selecting the tab
+  does, which is parity with a local window: focus alone has never
+  acknowledged anything.
+- **Another client's clear retires an inbox row, not a banner already
+  shown.** A desktop banner that has been put in front of a person is
+  theirs to dismiss.
 
 ### `session.set_theme`
 
@@ -2356,37 +2447,7 @@ Response: `{"tabs": 3}` — the number of live tabs whose server Terminal was re
 
 `palette` must carry exactly 256 `#rrggbb` entries; a short or long array is `invalid-param` rather than a partial application. The parser takes either case, and roost writes lowercase — the same spelling [`tab.dump_resolved`](#tabdump_resolved) uses — so the vectors have one spelling to agree about. Only the long form is accepted: `#abc` would be a second spelling of one color.
 
-A client sends this **right after connecting and before its first `tab.attach`** — attaching before the theme lands would paint the session's factory colors for one frame — and again whenever its own theme changes thereafter. Concurrent callers are last-writer-wins by design: the theme store mints a generation on every apply, so a `set_theme` racing a tab spawn is caught up at promotion rather than silently lost, and interleaved fan-outs converge on the newest theme instead of whichever send landed last — including between two different clients' palettes.
-
-Answers `shutting-down` once `session.stop` has latched.
-
-### `session.set_focus`
-
-Tell the session which of its tabs *this connection* is actually looking at. Same-UID, no gate: any connection may state its own focus, and a tab is muted while **any** connection is looking at it (union muting) — see [DL-26](../development/vision.md#dl-26-there-is-no-lease-2026-09-12).
-
-Request:
-```json
-{"id": "9", "op": "session.set_focus", "params": {
-  "focused_tab_id": "5"
-}}
-```
-
-Response: `{}` — nothing to report beyond "applied".
-
-**Why it exists.** A session is headless: it has no window, so nothing tells it which tab a connected client's terminal widget is actually showing. Without this op the session cannot suppress a notification for the tab you are looking at, so an agent's attention would always fire even while you watch it happen. With it, each connected client states the truth for itself, and the session suppresses a tab's notification while **any** connection says it is looking at that tab — `tab_is_being_watched(tab) = (window_focused && active_tab_id == tab) || viewing.values().any(|t| *t == tab)`, where the first clause is the local UI's own window-focus rule and the second is every session connection's stated focus, unioned. Two clients on two different tabs therefore both get muted, correctly, with no coordination between them and no further traffic once each has stated its own tab.
-
-**`focused_tab_id` is required, and nullable.** `null` means "this connection is looking at nothing on this session" — the client's window lost focus, or its selection moved to another host or to a local tab. An **omitted** field is not the same statement and is refused with `missing-param`: a client that forgot to say is exactly the one that must not be guessed for, since guessing "focused" re-creates the mute this op exists to fix.
-
-**Validation order**, for the same reason `tab.attach` pins one — each failure names a different thing to fix:
-
-1. `missing-param` / `invalid-param` — the field is absent, or is neither a decimal-string tab id nor null.
-2. `not-found` — a tab id this session does not have.
-
-`not-found` leaves **nothing** applied: a client naming a tab that just closed must not flip its own focus statement onto whatever tab happened to be active. **This op moves nothing else.** It records only this connection's own viewing statement — the session's active selection and persisted selection are untouched, and move only through [`tab.focus`](#tabfocus). Two symmetric clients focusing different tabs therefore never fight over which tab is "the" active one; each simply mutes its own. It does **not** acknowledge the tab's notification either — the client sends [`tab.clear_notification`](#tabclear_notification) for that. Re-stating a focus that is already current is a no-op.
-
-**A connection's focus does not outlive the connection.** The session forgets this connection's statement — reverting its slot in the union to "not looking" — when this same connection sends `focused_tab_id: null`, or when the connection itself closes. Nothing else clears it: another client connecting, focusing a different tab, or disconnecting changes nothing about this connection's own statement.
-
-A client therefore states its focus right after connecting, and again whenever its own window focus or selection moves. A session one release older answers `unknown-op`, which is a refusal like any other: the connection is unaffected and the client keeps the older behavior (the attached tab suppresses its own notifications, headless-default-focused).
+A client sends this **right after connecting and before its first data connection** — attaching before the theme lands would paint the session's factory colors for one frame — and again whenever its own theme changes thereafter. Concurrent callers are last-writer-wins by design: the theme store mints a generation on every apply, so a `set_theme` racing a tab spawn is caught up at promotion rather than silently lost, and interleaved fan-outs converge on the newest theme instead of whichever send landed last — including between two different clients' palettes.
 
 Answers `shutting-down` once `session.stop` has latched.
 
@@ -2412,7 +2473,9 @@ Response:
 
 **This op only ever raises the key, never lowers it (plan 064 §3.3).** `agents` is unioned into whatever `agent-hooks` already says on the host — `off`, unanswered, or a narrower list — and the union is what gets wired. There is no wire spelling of "off" or "narrow this" here: a client whose own `agent-hooks` is `off`, or unconfigured, has no allow-list to raise a host with, so it sends this op **not at all**. Taking a host's entries back out stays a deliberate, local act — `roostctl agent ensure`/`uninstall`, run by hand on the host itself. `removed` is therefore always empty from this op; the field stays on the reply shape because [`agent.set_hooks`](#agentset_hooks) — an explicit local set, not a raise — can populate it for the *local* machine.
 
-`agents` must name at least one agent the host recognises; an empty list, or a name outside the fixed set `agent-hooks` itself takes, is `invalid-param`. Under [protocol equality](#versioning) both ends run the same build's agent set, so an unrecognised name here is a bug to surface, not a forward-compatibility case — unlike `skipped[].reason`, which remains free text for the client to show or log verbatim. `client` is required — it is recorded as `by` in the host's state record, which is what makes two clients of one host tellable apart.
+`agents` must be non-empty and carry no blank element; both are `invalid-param`. **A name the host does not recognise is not** — it comes back as `{"agent": "gemini", "reason": "unknown"}` in `skipped`, and the names the host *does* know are wired. [Protocol equality](#versioning) pins one wire generation, not one agent set: a newer Roost can ship an adapter inside the same generation, so refusing the whole raise on an unfamiliar name is what would keep a newly supported agent switched off forever. A list with **no** recognised name at all is a successful, empty run — everything `skipped`, `wired` empty, nothing written, including the key. `skipped[].reason` remains free text for the client to show or log verbatim. `client` is required — it is recorded as `by` in the host's state record, which is what makes two clients of one host tellable apart.
+
+**A name the host cannot wire still survives in its key.** The raise is a read-modify-write of `agent-hooks`, so an older host asked to widen a key a newer Roost wrote re-emits every token it could not resolve, verbatim, after the names it could: `claude, gemini` raised with `["codex"]` reads back `claude, codex, gemini`. Only an explicit local set — [`agent.set_hooks`](#agentset_hooks), `roostctl agent set` — replaces the key outright and drops them, because there the user is looking at the list they just chose. `roostctl agent status` on the host lists such a name as `unknown to this build`.
 
 **`wired` is the toast list, not this call's writes.** It names the agents this host has wired and has never announced to *any* client — the session flips its record's `noticed` for exactly what it reports here, in the same locked write that recorded the wiring, so the sentence "Roost wired agent hooks on ‹host›" appears at most once per agent per host even when two clients connect at the same moment, and including for a wiring done by `roostctl agent ensure` on the host itself. A reconnect, or a second client raising an already-covered list, gets an empty `wired`. `refreshed` *is* this call's writes; two clients raising different allow-lists both win, additively.
 
@@ -2526,170 +2589,6 @@ open its root answers `not-supported` rather than refusing to start —
 the session still serves everything else. A **UI socket answers
 `unknown-op`**, like every other `session.*` op.
 
-### `tab.attach`
-
-Negotiate a payload kind for one tab and get a single-use ticket for
-one [data connection](#data-plane). Session sockets only; a UI socket
-answers `unknown-op`.
-
-Request:
-```json
-{"id": "4", "op": "tab.attach", "params": {
-  "tab_id": "5",
-  "kinds": ["ghostty-snapshot", "vt"],
-  "cols": 120,
-  "rows": 40,
-  "cell_w_px": 9,
-  "cell_h_px": 18,
-  "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
-  "focus": true
-}}
-```
-
-Response:
-```json
-{"id": "4", "ok": true, "result": {
-  "attach_token": "1a0be5c37d924f68b1c05e3a7f2d8496",
-  "kind": "ghostty-snapshot",
-  "server_epoch": 6032428321756423947,
-  "tab_generation": 3
-}}
-```
-
-`kinds` is the client's preference order and the server serves the
-first entry that is both **servable** and **eligible**; a list mixing
-kinds this build has never heard of with one it serves is fine.
-*Servable* is what [`session.identify`](#sessionidentify) advertised in
-`payload_kinds` — the advertisement is the contract the client
-negotiated against, so a kind absent from it is never served even when
-the code could produce it. *Eligible* is the kind's own requirement,
-and only `ghostty-snapshot` has one: an exact `libghostty_build` match.
-`vt` requires nothing, so a client offering
-`["ghostty-snapshot", "vt"]` across a build skew lands on `vt` rather
-than on a refusal — which is the whole point of the fallback, decided
-server-side so a third-party client need not compare build strings
-itself. Reversing that preference order gets `vt` on a *matching*
-build too; nothing forces the binary format on a client that would
-rather replay bytes.
-
-**Validation order is part of the contract**, because each failure
-tells the client to fix a different thing and an earlier one must not
-be masked by a later one:
-
-| # | Check | Error |
-|---|---|---|
-| 1 | tab exists with a live terminal | `not-found` |
-| 2 | `kinds` contains something servable | `unsupported-kind` (message names both lists) |
-| 3 | the negotiated kind's own requirement holds | `build-mismatch` (message names both strings) |
-| 4 | `cols` and `rows` both non-zero | `invalid-param` |
-| 5 | the tab accepts the geometry (a focused attach only — an unfocused one resizes nothing) | `invalid-param` |
-| 6 | token quota not exhausted | `too-many-tokens` |
-
-**An attach takes no authority beyond the socket's own UID check.**
-`TabAttachParams` carries no lease or authority field at all: attaching
-is reading plus raw input, and both are open to every same-UID client,
-as many at a time as it likes.
-
-Checks 2 and 3 stay two separate walks over the offered list rather
-than one predicate, because a single pass cannot tell "nothing
-servable" from "nothing eligible" and those instruct the client
-differently: `unsupported-kind` means *offer something else*, while
-`build-mismatch` means *the one kind we could have served needs the
-same libghostty on both ends* — the answer a pre-`vt` client's whole
-restart flow hangs off. Since plan 053 the second is reachable only
-when the client offers no kind but `ghostty-snapshot`, or is talking to
-a session too old to advertise `vt`.
-
-Zero `cell_w_px` / `cell_h_px` are legal — a headless client has no
-cell metrics to report — but a zero-sized grid is not a grid. That
-holds for an unfocused attach too: `cols`/`rows` are this connection's
-**declared geometry** either way, and its first `INPUT` or `RESIZE`
-frame applies them.
-
-**`focus` says whether this attach claims the tab's geometry.** A
-focused attach is when the server resizes:
-between checks 4 and 6 the session resizes the tab (server terminal
-*and* `TIOCSWINSZ`) to the requested geometry and waits for that to
-land, so the snapshot the data connection is about to encode is already
-at client size and needs no post-READY resize. Detach never resizes
-back — the PTY keeps the last attached size, so a TUI agent does not
-get a `SIGWINCH` because somebody closed a laptop. This does not
-contradict that rule: attach is exactly when an in-process Roost
-resizes too.
-
-`focus: false` resizes **nothing** — the point of it is a client that
-wants to watch a tab without shrinking the one that is typing (a phone
-glancing at a desktop's session). Its geometry still counts the moment
-it interacts; see the sizing rule beside [`tab.resize`](#tabresize).
-
-**`focus` is required and always spelled out on the wire** — no
-default, no omit-when-true shim. `TabAttachParams` is strict, so an
-attach that leaves it out is a malformed request, not an unfocused one.
-
-**The accepted handshake reports the geometry its bytes were written
-for.** `snapshot_cols` / `snapshot_rows` on the [data
-connection's](#the-handshake) accepted reply name that size — the
-payload's encode geometry in snapshot mode, the tab's own grid at the
-handoff in resume mode — and are present on every accepted reply,
-focused or not, either mode. A focused attach did resize the tab, but on
-the control connection and before this data connection was dialed; raw
-input is open, so another client's geometry-bearing frame can land in
-between and resize the tab again, and only the server knows what the
-bytes ended up saying. A `vt` client needs the answer: that payload
-replays into a terminal *of the attach geometry*, and replaying it at
-another width wraps lines and misplaces absolute cursor moves, so such a
-client hydrates at this size and resizes its own terminal afterwards. A
-resuming client replays the ring into the terminal it kept, which has
-the same problem for the same reason. When the size matches what was
-asked for the fields change nothing. Both keys are additive — a client
-that has never heard of them ignores them, and one reading an older
-session's reply simply finds neither.
-
-`attach_token` is 32 hex characters of OS entropy — a **bearer
-credential**: never log it, never print it in a failure dump, never
-echo it in an error. It is:
-
-* **single-use** — consumed under the registry lock, so two connections
-  presenting one token admit exactly one;
-* **short-lived** — 60 s TTL (`ATTACH_TOKEN_TTL`), a protocol constant
-  that is *not* scaled by `ROOST_TEST_TIMEOUT_SCALE`. A session started
-  with `ROOST_TEST_MODE=1` honors `ROOST_SESSION_ATTACH_TTL_MS` to
-  shorten it, which is how the expiry case is tested in seconds; a
-  production daemon ignores that variable entirely;
-* **quota-bounded** — at most 16 unconsumed tokens
-  (`MAX_OUTSTANDING_TOKENS`) exist at once, and at most 8
-  (`MAX_TOKENS_PER_CONNECTION`) of them on any one control connection.
-  Past either bound, minting is refused with `too-many-tokens` rather
-  than evicting a token some other connection is about to present.
-  Reaching one means a client minted tickets inside one TTL and dialed
-  none of them; a healthy attach consumes its ticket within a round
-  trip. The per-connection share is what keeps a single looping client
-  from answering everybody else's attach with `too-many-tokens`;
-* **connection-bound** — reclaimed when the connection that minted it
-  closes, which is what keeps the quota above from being held for a
-  whole TTL by a client that minted its share and vanished. A token is
-  bound to the connection that minted it, never to anything else, so
-  nothing about another client connecting, or this one reconnecting,
-  purges it early;
-* **pipeline-bound** — stamped with the `tab_generation` below, so a
-  respawn in the same window is a clean `not-found` rather than a
-  stream from a different terminal under the old identity.
-
-`server_epoch` and `tab_generation` are the **resume identity**. The
-epoch is a random value minted once per session process; the generation
-counts tab pipelines within it. A client that later wants to resume a
-stream hands both back, and the randomness is what makes a restarted
-session's streams unresumable *by construction* rather than by luck — a
-monotonic counter would collide across a restart and silently accept a
-stale stream. Both ride as **bare JSON numbers**, not the
-string-wrapped int64 ids use: they are counters, not ids. Neither can
-exceed `i64::MAX` — the epoch is deliberately 63 random bits, not 64,
-because a top-bit-set value round-trips imprecisely through a decoder
-that falls back to `Double`, and the whole point of the field is an
-exact match.
-
-`tab.attach` answers `shutting-down` once `session.stop` has latched.
-
 ### `session.stop`
 
 Params: `{}`. Response: the reap report,
@@ -2754,16 +2653,105 @@ the first line only, so a request stream can never be diverted
 mid-flight by a payload that happens to look like a handshake.
 
 ```json
-{"attach": "1a0be5c37d924f68b1c05e3a7f2d8496", "protocol_version": 3,
+{"attach": "7", "protocol_version": 6,
+ "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
+ "kinds": ["ghostty-snapshot", "vt"], "cols": 100, "rows": 30,
+ "cell_w_px": 8, "cell_h_px": 16,
+ "libghostty_build": "ghostty-1a2b3c4d5e6f7a8b+snapshot.v1",
+ "focus": true,
  "resume_from_seq": 8814, "server_epoch": 6032428321756423947,
  "tab_generation": 3}
 ```
 
-`attach` and `protocol_version` are required; the resume triple is
-optional and all-or-nothing in practice (see [Resume](#resume) below).
+**This line is the whole of an attach.** There is no control-plane
+half and no ticket: `attach` names the tab as a `string_int64` and the
+terms ride the same line, so a client opens one connection and is
+either streaming or refused. `session_id` is the value
+[`session.identify`](#sessionidentify) reported and is **required** —
+it is what stops a dial prepared for one session from landing on a
+replacement listening at the same socket path, and a mismatch is
+`session-mismatch` before anything is registered. The cell metrics may
+be omitted (a headless client has none); every other term is required,
+and a missing one is a `parse-error` that names it. The resume triple
+is optional and all-or-nothing in practice (see [Resume](#resume)
+below).
+
 Decode is **permissive** — a newer client may carry fields this build
 has never heard of, and refusing the whole handshake over one would
-turn an additive change into a hard incompatibility.
+turn an additive change into a hard incompatibility. Every session
+*params* struct is strict; this handshake is the one permissive request
+on the wire, which is exactly what makes a future handshake term
+additive instead of a generation.
+
+`protocol_version` is checked on the **raw** line, ahead of the typed
+decode, so a version-skewed client hears `protocol-mismatch` rather
+than a complaint about terms the two ends no longer agree on the
+meaning of.
+
+**An attach takes no authority beyond the socket's own UID check.** The
+handshake carries no lease or authority term at all: attaching is
+reading plus raw input, and both are open to every same-UID client, as
+many at a time as it likes — bounded only by `MAX_DATA_CONNS_PER_SESSION`
+(see [Many connections per tab](#many-connections-per-tab)).
+
+`kinds` is the client's preference order and the server serves the
+first entry that is both **servable** and **eligible**; a list mixing
+kinds this build has never heard of with one it serves is fine.
+*Servable* is what [`session.identify`](#sessionidentify) advertised in
+`payload_kinds` — the advertisement is the contract the client
+negotiated against, so a kind absent from it is never served even when
+the code could produce it. *Eligible* is the kind's own requirement,
+and only `ghostty-snapshot` has one: an exact `libghostty_build` match.
+`vt` requires nothing, so a client offering
+`["ghostty-snapshot", "vt"]` across a build skew lands on `vt` rather
+than on a refusal — which is the whole point of the fallback, decided
+server-side so a third-party client need not compare build strings
+itself. Reversing that preference order gets `vt` on a *matching*
+build too; nothing forces the binary format on a client that would
+rather replay bytes.
+
+The two are separate walks over the offered list rather than one
+predicate, because a single pass cannot tell "nothing servable" from
+"nothing eligible" and those instruct the client differently:
+`unsupported-kind` means *offer something else*, while `build-mismatch`
+means *the one kind we could have served needs the same libghostty on
+both ends* — the answer a pre-`vt` client's whole restart flow hangs
+off. Since plan 053 the second is reachable only when the client offers
+no kind but `ghostty-snapshot`, or is talking to a session too old to
+advertise `vt`.
+
+Zero `cell_w_px` / `cell_h_px` are legal — a headless client has no
+cell metrics to report — but a zero-sized grid is not a grid. That
+holds for an unfocused attach too: `cols`/`rows` are this connection's
+**declared geometry** either way, and its first `INPUT` or `RESIZE`
+frame applies them.
+
+**`focus` says whether this attach claims the tab's geometry.** A
+focused attach is when the server resizes: once the connection is
+admitted and before anything is encoded, the session resizes the tab
+(server terminal *and* `TIOCSWINSZ`) to the requested geometry and
+waits for that to land, so the snapshot about to be encoded is already
+at client size and needs no post-READY resize. A geometry either half
+refuses comes back as `invalid-param`. Detach never resizes back — the
+PTY keeps the last attached size, so a TUI agent does not get a
+`SIGWINCH` because somebody closed a laptop. This does not contradict
+that rule: attach is exactly when an in-process Roost resizes too.
+
+`focus: false` resizes **nothing** — the point of it is a client that
+wants to watch a tab without shrinking the one that is typing (a phone
+glancing at a desktop's session). Its geometry still counts the moment
+it interacts; see the sizing rule beside [`tab.resize`](#tabresize).
+
+**`focus` is required and always spelled out on the wire** — no
+default, no omit-when-true shim. An attach that leaves it out is a
+malformed request, not an unfocused one.
+
+**Refusal order is part of the contract**, because each failure tells
+the client to fix a different thing and an earlier one must not be
+masked by a later one: protocol, then the typed decode, then
+`session_id`, then the stop latch, then the tab, then a servable kind,
+then an eligible one, then the grid, then the session's connection
+bound, and only then the focused resize.
 
 **Scope:** this sniff exists on Rust-served sockets only. The Mac UI's
 Swift IPC server has no data plane and is untouched — a handshake line
@@ -2775,7 +2763,8 @@ The reply is one JSON line. Accepted:
 
 ```json
 {"ok": true, "kind": "ghostty-snapshot", "mode": "snapshot",
- "seq": 8813, "server_epoch": 6032428321756423947, "tab_generation": 3}
+ "seq": 8813, "server_epoch": 6032428321756423947, "tab_generation": 3,
+ "snapshot_cols": 100, "snapshot_rows": 30}
 ```
 
 Rejected — then the connection closes, and **nothing binary is ever
@@ -2783,16 +2772,20 @@ written**, so a client that got a refusal never has to guess whether
 the bytes after it are frames:
 
 ```json
-{"ok": false, "error": {"code": "invalid-token", "message": "..."}}
+{"ok": false, "error": {"code": "session-mismatch", "message": "..."}}
 ```
 
 | Code | Meaning |
 |---|---|
-| `protocol-mismatch` | wrong `protocol_version`. Checked **before** the token: the two ends disagree about what a token even is, and `invalid-token` would send the client hunting for the wrong bug. |
-| `invalid-token` | unknown, expired, already-used, or minted by a control connection that has since gone away (see [`tab.attach`](#tabattach)). |
-| `not-found` | the tab has no live terminal, or was respawned between `tab.attach` and this handshake. |
+| `protocol-mismatch` | wrong `protocol_version`. Checked **first**, on the raw line: the two ends disagree about what every other term means, and naming one of those would send the client hunting for the wrong bug. |
+| `session-mismatch` | `session_id` is not this session's. |
+| `not-found` | the tab has no live terminal, or was respawned around the hand-off this attach was admitted for — the tab task reports which generation actually served it, so a stream from a replaced terminal is refused rather than painted under the old tab's identity. |
+| `unsupported-kind` | no `kinds` entry is one this session advertises. |
+| `build-mismatch` | the only servable kind needs the same libghostty on both ends. |
+| `invalid-param` | `attach` is not a tab id, the grid is zero-sized, or a focused attach asked for a geometry the tab refused. |
+| `too-many-attaches` | this session already serves `MAX_DATA_CONNS_PER_SESSION` (32) data connections. One buggy same-UID client can hold all of them; that is accepted under the same-UID boundary this socket already draws. |
 | `snapshot-failed` | the terminal could not be encoded right now. Re-attach is the recovery — it is about this instant, not about the client. For `vt` this also covers a terminal whose VT parser sits mid-sequence with no retained continuation for the whole attach budget: the encode is parked and retried after each further chunk rather than emitting a payload that would desync the client, and the budget is what bounds that wait. |
-| `shutting-down` | `session.stop` has latched. |
+| `shutting-down` | `session.stop` has latched. Read before the tab is looked up, so a stop that already reaped the tab still answers this and not `not-found`: what went away is the session, not one tab, and a client that removed the tab from its UI over a `not-found` would be acting on the wrong news. |
 | `parse-error` | the handshake line did not decode. |
 | `not-supported` | this socket serves no data connections. |
 
@@ -2801,24 +2794,35 @@ client has everything up to and including it, and the first `PTY` frame
 carries `seq + 1`. In snapshot mode the fence is the snapshot's own
 encode point; in resume mode it is `resume_from_seq - 1`.
 
-`kind` is the kind [`tab.attach`](#tabattach) actually negotiated,
-carried here on the token rather than assumed — **this reply is the
-authoritative one**, and it is what a client selects its decoder from.
-The control-plane `TabAttachResult.kind` must agree; a client that sees
-them disagree treats it as `protocol-error` and re-attaches rather than
-guessing which to believe.
+`kind` is the kind the handshake settled on out of the `kinds` the
+client offered — **this reply is the authoritative one**, and it is
+what a client selects its decoder from.
+
+`server_epoch` and `tab_generation` are the **resume identity**, and
+the accepted reply is the only place a client learns them. The epoch is
+a random value minted once per session process; the generation counts
+tab pipelines within it. A client that later wants to resume a stream
+hands both back, and the randomness is what makes a restarted session's
+streams unresumable *by construction* rather than by luck — a monotonic
+counter would collide across a restart and silently accept a stale
+stream. Both ride as **bare JSON numbers**, not the string-wrapped
+int64 ids use: they are counters, not ids. Neither can exceed
+`i64::MAX` — the epoch is deliberately 63 random bits, not 64, because
+a top-bit-set value round-trips imprecisely through a decoder that
+falls back to `Double`, and the whole point of the field is an exact
+match.
 
 `snapshot_cols` and `snapshot_rows` name **the size the bytes that
 follow were written for** — the snapshot's own encode geometry in
 `"snapshot"` mode, the tab's grid at the handoff in `"resume"` mode —
-and are present on every accepted reply, `focus: true` included, because
-a focused attach resizes the tab from the control connection and any
-other client may resize it again before the encode or the handoff runs.
-A `vt` client builds its terminal at that size before replaying, then
-resizes it to its own; a resuming client replays the ring into the
-terminal it kept, and the geometry it was away for may not be the one it
-left. See [`tab.attach`](#tabattach). Absent only from a reply a session
-predating `open_input` writes.
+and are present on **every** accepted reply, `focus: true` included,
+because raw input is open and any other client may resize the tab
+between this connection's own resize and the encode. A `vt` client
+builds its terminal at that size before replaying, then resizes it to
+its own; a resuming client replays the ring into the terminal it kept,
+and the geometry it was away for may not be the one it left. An
+accepted reply that states no geometry is a truncated reply, and a
+client refuses it.
 
 #### Preamble and frames
 
@@ -2871,8 +2875,9 @@ decoration: the server terminal's resize and mode-2048 size reports
 both need them, and they are part of the geometry the tab compares
 against (see [`tab.resize`](#tabresize)). A `RESIZE` naming zero cols
 or zero rows is **ignored**, not fatal and not applied —
-[`tab.attach`](#tabattach) refuses a zero-sized grid and the two state
-the same client's geometry, so they have to agree about what a grid is.
+the [handshake](#the-handshake) refuses a zero-sized grid and the two
+state the same client's geometry, so they have to agree about what a
+grid is.
 
 Both `INPUT` and `RESIZE` size the tab: a `RESIZE` applies and becomes
 the connection's declared geometry, and an `INPUT` applies that
@@ -2920,9 +2925,9 @@ a label is promised.
 
 #### Payload kinds
 
-Two, negotiated at [`tab.attach`](#tabattach) and stated back on the
-[handshake](#the-handshake). They differ in fidelity and in how a
-client knows the payload has ended.
+Two, negotiated on the [handshake](#the-handshake) and stated back on
+its accepted reply. They differ in fidelity and in how a client knows
+the payload has ended.
 
 **`ghostty-snapshot`** is libghostty's own binary format. Its record
 structure (GHOSTSNP: envelope, READY, history pages, FINISH) rides
@@ -3006,7 +3011,7 @@ degraded-but-equivalent one:
 A client that already holds a tab's stream up to some seq can ask for
 the rest instead of a whole new snapshot: send `resume_from_seq`
 together with the `server_epoch` and `tab_generation` the original
-`tab.attach` returned. On a hit the reply says `mode: "resume"`, no
+accepted reply stated. On a hit the reply says `mode: "resume"`, no
 `SNAP` frames are sent at all, and the tab's replay ring (2 MiB,
 oldest evicted) plays back as ordinary `PTY` frames ahead of the live
 ones — through the same contiguity walk, so a hole in the ring is as
@@ -3045,12 +3050,12 @@ beside [`tab.resize`](#tabresize): a client that only watches (attached
 with `focus: false`, never typing) never changes the size out from
 under the one that is working.
 
-What bounds the count is not a per-tab limit: it is the token quota (16
-unconsumed tickets per TTL window, 8 of them per control connection —
-see [`tab.attach`](#tabattach)) and the session's 4 concurrent snapshot
-encodes. Over time the number of
-admitted connections is open, which is the honest statement — the
-per-attach machinery is what keeps that affordable.
+What bounds the count is not a per-tab limit: it is
+`MAX_DATA_CONNS_PER_SESSION` (32 live data connections session-wide,
+answered `too-many-attaches` past it) and the session's 4 concurrent
+snapshot encodes. Within that the number of connections one tab admits
+is open, which is the honest statement — the per-attach machinery is
+what keeps that affordable.
 
 Client disconnect at any point simply aborts that one forwarder; the
 tab keeps running, the other connections keep streaming, and no partial
@@ -3125,7 +3130,7 @@ See [`events.subscribe`](#eventssubscribe) for the full envelope shape.
 * `tabs.reordered`    — `{"project_id": "<id>", "tab_ids": ["<id>", ...]}`. The full post-reorder display order for that project, not a diff.
 * `projects.reordered` — `{"project_ids": ["<id>", ...]}`. The full post-reorder sidebar order.
 * `hook_active.changed` — `{"tab_id": "<id>", "active": <bool>}`.
-* `notification.fired` — `{"tab_id": "<id>", "title": "<string>", "body": "<string>"}`. Mirrors the legacy proto's `NotificationEvent`; useful for tools that mirror notifications elsewhere.
+* `notification.fired` — `{"tab_id": "<id>", "title": "<string>", "body": "<string>", "generation": <int>}`. Mirrors the legacy proto's `NotificationEvent`; useful for tools that mirror notifications elsewhere. `generation` numbers the raises on that tab, counting from one; a client acknowledging this raise sends it back on [`tab.clear_notification`](#tabclear_notification) — see [Notifications fan out](#notifications-fan-out). Live-only on a session's event stream: never replayed into a resume.
 * `agent_report.changed` — `{"tab_id": "<id>", "shell_state": "<ShellState>", "agent_lifecycle": "<AgentLifecycle>", "ownership": "<Ownership, omitted when unowned>", "state": "<TabState>", "hook_active": <bool>}`.
   Fires whenever an accepted `tab.agent_report` or an OSC 133 shell
   mark changes the agent record. `tab.state_changed` and
@@ -3152,6 +3157,18 @@ See [`events.subscribe`](#eventssubscribe) for the full envelope shape.
   exactly these two effects — every other client-local OSC effect
   (pointer shape, today) stays dropped + debug-logged in the tab task
   rather than added to this envelope.
+* `workspace.durability_changed` — `{"error": "<string>" | null}`.
+  The session stopped — or started — writing `state.json`. `error` is
+  the write's message while it is failing and `null` the moment one
+  lands again; the key is always present, because recovery is the news
+  half the time. Emitted on a **change of value** only, so a session on a
+  full disk says it once rather than once per mutation, and **ops keep
+  succeeding** throughout: a workspace nobody can save is still a
+  workspace, and refusing `tab.open` on a full disk would be worse than
+  losing the layout. The event is
+  [live-only](#eventssubscribe) — the standing value is
+  [`session.identify.persist_error`](#sessionidentify), which a client
+  re-reads after a resync.
 
 ## Versioning
 
@@ -3163,7 +3180,8 @@ handshake gate. `session.identify.session_protocol` is the session
 sockets' — currently **`6`** (`roost_ipc::messages::SESSION_PROTOCOL_VERSION`),
 covering both the session JSON ops and the binary [data
 plane](#data-plane); conforming clients check it for equality before
-anything else and the [attach handshake](#tabattach) refuses a mismatch.
+anything else and the [attach handshake](#the-handshake) refuses a
+mismatch.
 
 **The rule, stated once:** an addition bumps the session integer only
 when a pre-bump peer could not refuse it meaningfully; everything else

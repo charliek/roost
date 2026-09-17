@@ -12,8 +12,8 @@ use std::time::Duration;
 use roost_ipc::messages::{AttachPayloadKind, SessionIdentify, SESSION_PROTOCOL_VERSION};
 use roost_ui_model::keys::HostId;
 
-/// The payload kinds this client can decode, in the order it offers
-/// them to `tab.attach`. A session that advertises none of them has
+/// The payload kinds this client can decode, in the order its attach
+/// handshake offers them. A session that advertises none of them has
 /// nothing to hand us, whatever else it supports.
 ///
 /// `ghostty-snapshot` leads because it carries what `vt` cannot (the
@@ -52,7 +52,7 @@ pub(crate) enum MismatchKind {
 /// What the gate found when it did not refuse.
 ///
 /// It reports the *fact* it established, not a decision: which kind an
-/// attach ends up on is `tab.attach`'s to negotiate, per attach, and
+/// attach ends up on is the handshake's to negotiate, per attach, and
 /// nothing here predicts it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Compatibility {
@@ -227,6 +227,17 @@ pub(crate) struct ConnectFacts {
     /// replayed from a carried fence, `None` when it took a fresh
     /// snapshot.
     pub(crate) resumed: Option<ResumeFacts>,
+    /// The session's standing durability failure, from
+    /// `session.identify` (#481).
+    ///
+    /// Read *after* the subscription rather than off the identify gate
+    /// that opens the prologue, and re-read after a resync — unlike
+    /// everything else here, which the gate settles once.
+    /// `workspace.durability_changed` is live-only and never replayed,
+    /// so the one change a gap can swallow is exactly this one, and both
+    /// gaps (the prologue's and a lagged stream's) are closed the same
+    /// way.
+    pub(crate) persist_error: Option<String>,
 }
 
 /// The two libghostty builds a reduced-fidelity connection sits between.
@@ -266,6 +277,7 @@ impl ConnectFacts {
             },
             reduced_fidelity: compatibility == Compatibility::BuildSkew,
             resumed: None,
+            persist_error: identity.persist_error.clone(),
         }
     }
 }
@@ -559,6 +571,7 @@ mod tests {
             libghostty_build: build.into(),
             session_id: "sess-1".into(),
             started_at: "2026-08-29T00:00:00Z".into(),
+            persist_error: None,
         }
     }
 
@@ -651,7 +664,7 @@ mod tests {
         );
         // And neither is a session that serves only `vt` — one kind this
         // client can decode is the whole requirement. The gate does not
-        // predict which one `tab.attach` will land on.
+        // predict which one an attach will land on.
         let vt_only = identity(SESSION_PROTOCOL_VERSION, &["vt"], "gb-1");
         assert_eq!(
             check_compatibility(&vt_only, "gb-1", RestartAction::RestartLocal),

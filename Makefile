@@ -286,7 +286,7 @@ e2e-iced:  ## Required functional E2E against Iced
 	@tests='$(ICED_E2E_TESTS)'; \
 	if [ -z "$${WAYLAND_DISPLAY:-}" ]; then tests="$$tests $(ICED_CLIPBOARD_TESTS)"; \
 	else echo "Iced/Wayland clipboard requires a focused seat/serial; running the documented non-clipboard renderer gate"; fi; \
-	uv run --group test pytest $$tests --roost-target iced
+	ROOST_TEST_MODE=1 uv run --group test pytest $$tests --roost-target iced
 
 e2e-iced-exit:  ## Iced exit-on-empty E2E in its own lane (DESTRUCTIVE: force-quits a running Iced UI, and the UI it launches exits)
 	ROOST_TEST_MODE=1 uv run --group test pytest $(ICED_EXIT_E2E_TESTS) --roost-target iced --roost-fresh
