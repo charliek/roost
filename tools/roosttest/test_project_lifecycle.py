@@ -170,16 +170,18 @@ def test_project_ensure_creates_once_then_finds_without_activating(roost, target
 
 
 def _open(target: str, *args: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
-    """`roostctl --socket <target's socket> open <args…> --json`, run as a
+    """`roostctl --socket <target's socket> --json open <args…>`, run as a
     subprocess — `open` is a CLI-level composition (`project.ensure` then
-    `tab.open`), not a raw IPC op `client.Roost` can drive directly."""
+    `tab.open`), not a raw IPC op `client.Roost` can drive directly.
+    `--json` goes before `open`: after a `-- cmd…` it would be part of the
+    tab's command."""
     argv = [
         roostctl_path(),
         "--socket",
         str(ui.socket_path(target)),
+        "--json",
         "open",
         *args,
-        "--json",
     ]
     return subprocess.run(
         argv, capture_output=True, text=True, timeout=scaled_timeout(timeout)

@@ -324,39 +324,46 @@ instead of polling:
 | `ops` names `events.subscribe` (the iced UI, in-process) | The UI socket itself |
 | Neither — the Swift Mac app, or a Roost older than this | The poll loop: `tab.list` (and `tab.dump` for `--text`) every `--interval-ms`, as `wait` always did |
 
-On a stream it subscribes on one connection, then — on a second —
-checks that `identify.instance_id` (or, on a session,
-`session.identify.session_id`) is the one the subscription acked, and takes
-a `tab.list` snapshot. Batches the snapshot already holds are discarded;
-`--state` and `--gone` are then decided by `tab.state_changed` and
-`tab.closed` as they arrive, with no `tab.dump` at all. No event carries a
-tab's output, so `--text` re-reads the viewport on every event for the tab
-and every `--interval-ms`. A bare `--tab` id means the same tab on the UI
-socket and on the session under `local-backend = session`, so the id (or the
-active tab) is resolved on the UI and used on the session unchanged.
+On a stream it subscribes on one connection, then — on a second — checks
+that `identify.instance_id` (or, on a session,
+`session.identify.session_id`) is the one the subscription acked, and only
+then takes a `tab.list` snapshot. Batches the snapshot already holds are
+discarded; a snapshot older than the subscription fences nothing and counts
+as a lost stream. `--state` and `--gone` are then decided by
+`tab.state_changed` and `tab.closed` as they arrive, with no `tab.dump` at
+all. No event carries a tab's output, so `--text` re-reads the viewport on
+every event for the tab and every `--interval-ms`. A bare `--tab` id means
+the same tab on the UI socket and on the session under
+`local-backend = session`, so the id (or the active tab) is resolved on the
+UI and used on the session unchanged.
 
-**When the stream goes away.** A stream that closes without a label, skips
-a revision, or ends with `stream.ended`, or whose second connection drops,
-is resolved again from `identify` once, after any local-backend switch in
-flight has settled. The wait carries on **only if the new stream is the
-same process** — the same `instance_id` or `session_id` its first
-subscription acked — as it is for a subscriber the server cut for falling
-behind. Anything else exits 1 `connection`: "the Roost serving tab N
-changed … tab ids do not carry across — re-resolve the tab and wait again".
-Tab ids belong to the process that minted them: a switch replays the tabs
-onto its destination under new ids, and a restart mints new ones, so tab N
-over there is some other tab or none, and `--gone` read off its snapshot
-would be wrong. `stream.ended` is a switch, so a wait across one normally
-ends that way. A second loss exits 1 `connection` too. A session that stops
-(`session.stopping`) exits 1 `connection` at once, with that reason. If the
-two connections of one subscription keep reaching different processes (the
-server restarting between them), the sequence is retried three times and
-then exits 1 `connection`.
+**When the stream goes away.** A stream that closes without a label, skips a
+revision, or ends with `stream.ended`, or whose second connection drops —
+while the subscription is still being opened, too — is resolved again from
+`identify` once, after any local-backend switch in flight has settled. The
+wait carries on **only if the new stream is the same process** — the same
+`instance_id` or `session_id` its first subscription acked — as it is for a
+subscriber the server cut for falling behind. Anything else exits 1
+`connection`: "the Roost serving tab N changed … tab ids do not carry across
+— re-resolve the tab and wait again". Tab ids belong to the process that
+minted them: a switch replays the tabs onto its destination under new ids,
+and a restart mints new ones, so tab N over there is some other tab or none,
+and `--gone` read off its snapshot would be wrong. `stream.ended` is a
+switch, so a wait across one normally ends that way. A second loss exits 1
+`connection` too, and so does a resolve that fails — no Roost found, or a
+server that refuses the subscribe — with that failure's own code and message
+inside the `connection` one. A session that stops (`session.stopping`) exits
+1 `connection` at once, with that reason. If the two connections of one
+subscription keep reaching different processes (the server restarting
+between them), the sequence is retried three times and then exits 1
+`connection`.
 
 **Exits.** `0` once the condition holds; **4** (`timeout`) if `--timeout`
-elapses first — before plan 066 it exited 1, which a script could not tell
-from a failed connection; 2 `usage` for a bad command line; 1 for
-everything in [Exit codes](#exit-codes).
+elapses first, including while a backend switch in flight holds the wait off
+(re-checked every `--interval-ms`, never past the deadline) — before plan
+066 it exited 1, which a script could not tell from a failed connection; 2
+`usage` for a bad command line; 1 for everything in [Exit
+codes](#exit-codes).
 
 With `--json`, success prints:
 
@@ -395,7 +402,7 @@ local backend is switching.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--tab` | — | Keep only the events that name this tab — by `data.tab_id`, or `data.tab.id` for `tab.opened` — and drop the rest, event by event: a commit touching several tabs keeps just this tab's lines. Events that name no tab (`project.*`, `projects.reordered`, `workspace.durability_changed`) are dropped. The terminal envelope always prints. A bare id only; a host tab is refused with `usage`. Not read from `ROOST_TAB_ID` |
+| `--tab` | — | Keep only the events that name this tab — by `data.tab_id` (for `active.changed`, the tab it made active), `data.tab.id` for `tab.opened`, or any of `data.tab_ids` for `tabs.reordered` — and drop the rest, event by event: a commit touching several tabs keeps just this tab's lines. Events that name no tab (`project.*`, `projects.reordered`, `workspace.durability_changed`) are dropped. The terminal envelope always prints. A bare id only; a host tab is refused with `usage`. Not read from `ROOST_TAB_ID` |
 
 It reads the same socket [`wait`](#wait) does — the in-process UI, or the
 local session under `local-backend = session` — with the same identity check,
@@ -450,14 +457,14 @@ roostctl open --project "review" --title "review" --focus -- vim
 roostctl open --project "review" --hold -- make test   # keep the tab open after it exits
 ```
 
-The one-shot agent verb: `project.ensure` (find-or-create, by exact
-name) followed by `tab.open` in the ensured project, composed the same
-way `roostctl open --project "review" ...` would if you wrote the two
-calls yourself — except atomic *per call*, closing the list-then-create
-race (#221) a hand-written version would reopen. `--cwd` defaults to
-`$PWD` and is used for **both** calls: the project (if this call creates
-it) and the new tab. Without `-- cmd…` the tab opens the default shell,
-same as [`tab open`](#tab-open-close-send-resize-reorder-dump);
+The one-shot agent verb: `project.ensure` (find-or-create, by exact name),
+then `tab.open` in the ensured project. It replaces composing those two
+calls by hand, and the older `project list`-then-`project create` recipe.
+Each call is atomic on the server, so unlike that recipe it cannot race
+another caller into a second project of the same name (#221). `--cwd`
+defaults to `$PWD` and is used for **both** calls: the project (if this call
+creates it) and the new tab. Without `-- cmd…` the tab opens the default
+shell, same as [`tab open`](#tab-open-close-send-resize-reorder-dump);
 `--hold` and `--focus` compose exactly as they do there.
 
 Always prints `{"project", "tab", "created"}` — the ensured project, the

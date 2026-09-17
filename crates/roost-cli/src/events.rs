@@ -82,6 +82,25 @@ pub(crate) struct Legs {
     pub tabs: Option<TabListResult>,
 }
 
+/// What [`open`] reached.
+pub(crate) enum Opened {
+    Legs(Box<Legs>),
+    /// The stream was acked, and then the second connection failed — its
+    /// dial, the identity call, or the snapshot. `acked` is the ack's
+    /// `session_id`, the process the stream was on.
+    Dropped {
+        acked: String,
+        error: CliError,
+    },
+}
+
+/// The second connection, once the stream is acked.
+enum Second {
+    Matched(IpcClient, Option<TabListResult>),
+    /// Named some other process, or none.
+    Other(Option<String>),
+}
+
 /// Subscribe on one connection, then identify (and snapshot) on another.
 ///
 /// The order is the fence: every commit after the subscribe's revision
@@ -89,25 +108,22 @@ pub(crate) struct Legs {
 /// newer, and a caller discards the batches that snapshot already holds.
 /// Two legs that name different processes mean it restarted in between,
 /// where revisions restart too; that is retried, and then refused.
-pub(crate) async fn open(source: &Source, snapshot: bool) -> Result<Legs, CliError> {
+pub(crate) async fn open(source: &Source, snapshot: bool) -> Result<Opened, CliError> {
     let mut named = Vec::new();
     for _ in 0..=IDENTITY_RETRIES {
         let stream = subscribe(&source.socket).await?;
-        let mut conn = crate::dial(&source.socket).await?;
-        let incarnation = incarnation(&mut conn, source.identity).await?;
-        let tabs = if snapshot {
-            Some(crate::list_tabs(&mut conn).await?)
-        } else {
-            None
-        };
-        if incarnation.as_deref() == Some(stream.session_id()) {
-            return Ok(Legs { stream, conn, tabs });
+        let acked = stream.session_id().to_string();
+        match second(source, &acked, snapshot).await {
+            Ok(Second::Matched(conn, tabs)) => {
+                return Ok(Opened::Legs(Box::new(Legs { stream, conn, tabs })))
+            }
+            Ok(Second::Other(incarnation)) => named.push(format!(
+                "{acked} then {}",
+                incarnation.as_deref().unwrap_or("nothing")
+            )),
+            Err(error @ CliError::Connection(_)) => return Ok(Opened::Dropped { acked, error }),
+            Err(refused) => return Err(refused),
         }
-        named.push(format!(
-            "{} then {}",
-            stream.session_id(),
-            incarnation.as_deref().unwrap_or("nothing")
-        ));
     }
     Err(CliError::Connection(format!(
         "{}: the stream and the second connection reached different processes on every \
@@ -115,6 +131,22 @@ pub(crate) async fn open(source: &Source, snapshot: bool) -> Result<Legs, CliErr
         source.socket.display(),
         named.join(", ")
     )))
+}
+
+async fn second(source: &Source, acked: &str, snapshot: bool) -> Result<Second, CliError> {
+    let mut conn = crate::dial(&source.socket).await?;
+    let incarnation = incarnation(&mut conn, source.identity).await?;
+    // Before the snapshot, which another process could not fence — and
+    // whose failure there would end the open instead of retrying it.
+    if incarnation.as_deref() != Some(acked) {
+        return Ok(Second::Other(incarnation));
+    }
+    let tabs = if snapshot {
+        Some(crate::list_tabs(&mut conn).await?)
+    } else {
+        None
+    };
+    Ok(Second::Matched(conn, tabs))
 }
 
 async fn subscribe(socket: &Path) -> Result<EventStream, CliError> {
@@ -146,18 +178,26 @@ pub(crate) fn local_tab(verb: &str, tab: WireTabRef) -> Result<i64, CliError> {
     }
 }
 
-/// Whether an event is about `tab_id`: its `tab_id`, or the `tab` a
-/// `tab.opened` carries.
+/// Whether an event is about `tab_id`. The catalog names a tab three ways:
+/// `tab_id` (every per-tab event, and `active.changed`'s newly active tab),
+/// the `tab` a `tab.opened` carries, and each of `tabs.reordered`'s
+/// `tab_ids`.
 pub(crate) fn names_tab(envelope: &EventEnvelope, tab_id: i64) -> bool {
-    let id = envelope
-        .data
-        .get("tab_id")
-        .or_else(|| envelope.data.get("tab").and_then(|tab| tab.get("id")));
-    match id {
-        Some(serde_json::Value::String(id)) => id.parse() == Ok(tab_id),
-        Some(serde_json::Value::Number(id)) => id.as_i64() == Some(tab_id),
+    let is_tab = |id: &serde_json::Value| match id {
+        serde_json::Value::String(id) => id.parse() == Ok(tab_id),
+        serde_json::Value::Number(id) => id.as_i64() == Some(tab_id),
         _ => false,
-    }
+    };
+    let data = &envelope.data;
+    data.get("tab_id").is_some_and(is_tab)
+        || data
+            .get("tab")
+            .and_then(|tab| tab.get("id"))
+            .is_some_and(is_tab)
+        || data
+            .get("tab_ids")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|ids| ids.iter().any(is_tab))
 }
 
 /// One line of `roostctl events`: an event envelope, with the revision of
@@ -190,7 +230,10 @@ async fn stream_to(
     // No poll fallback: a server without the stream refuses the subscribe
     // in its own words, and that refusal is the answer.
     let source = resolve(ui.socket_path(), &identify);
-    let Legs { mut stream, .. } = open(&source, false).await?;
+    let mut stream = match open(&source, false).await? {
+        Opened::Legs(legs) => legs.stream,
+        Opened::Dropped { error, .. } => return Err(error),
+    };
     loop {
         match stream.next().await {
             Ok(Some(EventFrame::Batch(batch))) => {
@@ -292,6 +335,15 @@ pub(crate) mod fake {
         Close,
     }
 
+    /// What a hook can have the fake do with a request instead of
+    /// answering it.
+    pub(crate) enum Instead {
+        /// Close the connection without a reply.
+        HangUp,
+        /// Refuse it with this code and message.
+        Refuse(&'static str, &'static str),
+    }
+
     pub(crate) struct World {
         pub revision: u64,
         /// Tab id → state, all in project 1.
@@ -304,6 +356,11 @@ pub(crate) mod fake {
         pub session_id: String,
         /// Every tab's viewport.
         pub dump: String,
+        /// How many revisions `tab.list` reports behind the workspace's.
+        pub snapshot_behind: u64,
+        /// Set by a [`Phase::Before`] hook: the request it ran for is not
+        /// answered.
+        pub instead: Option<Instead>,
         /// Every request, as `(connection, op)`.
         pub log: Vec<(u64, String)>,
         subscribers: Vec<mpsc::UnboundedSender<Push>>,
@@ -357,13 +414,20 @@ pub(crate) mod fake {
             self.log.iter().filter(|(_, logged)| logged == op).count()
         }
 
-        fn handle(&mut self, conn: u64, op: &str) -> Answer {
+        /// `None` hangs up.
+        fn handle(&mut self, conn: u64, op: &str) -> Option<Answer> {
             self.log.push((conn, op.to_string()));
             let mut hook = self.hook.take();
             if let Some(hook) = hook.as_mut() {
                 hook(self, op, Phase::Before);
             }
-            let answered = self.answer(op);
+            let answered = match self.instead.take() {
+                Some(Instead::HangUp) => None,
+                Some(Instead::Refuse(code, message)) => {
+                    Some((Err((code.into(), message.into())), None))
+                }
+                None => Some(self.answer(op)),
+            };
             if let Some(hook) = hook.as_mut() {
                 hook(self, op, Phase::After);
             }
@@ -406,7 +470,7 @@ pub(crate) mod fake {
                             "last_active": 0, "hook_active": false,
                         })).collect::<Vec<_>>(),
                     }],
-                    "revision": self.revision,
+                    "revision": self.revision - self.snapshot_behind,
                 })),
                 "tab.dump" => Ok(json!({ "cols": 80, "rows": 1, "rows_text": [self.dump] })),
                 other => Err(("unknown-op".into(), format!("not faked: {other}"))),
@@ -477,6 +541,8 @@ pub(crate) mod fake {
                 ack_id: id.to_string(),
                 session_id: id.to_string(),
                 dump: String::new(),
+                snapshot_behind: 0,
+                instead: None,
                 log: Vec::new(),
                 subscribers: Vec::new(),
                 hook: None,
@@ -535,7 +601,9 @@ pub(crate) mod fake {
         let mut lines = BufReader::new(read).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let request: RawRequest = serde_json::from_str(&line).expect("a request frame");
-            let (reply, pushes) = world.lock().unwrap().handle(conn, &request.op);
+            let Some((reply, pushes)) = world.lock().unwrap().handle(conn, &request.op) else {
+                return;
+            };
             let response = match reply {
                 Ok(result) => Response::ok(request.id, result),
                 Err((code, message)) => Response::err(request.id, code, message),
@@ -562,7 +630,7 @@ pub(crate) mod fake {
 
 #[cfg(test)]
 mod tests {
-    use super::fake::{Fake, Phase};
+    use super::fake::{Fake, Instead, Phase};
     use super::*;
     use roost_ipc::target::TargetSelector;
     use serde_json::json;
@@ -653,8 +721,28 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tab_keeps_a_reorder_that_lists_that_tab() {
+        let fake = Fake::ui("filter-reorder");
+        fake.on("events.subscribe", 1, Phase::After, |world| {
+            world.commit(&json!([
+                { "event": "tabs.reordered", "data": { "project_id": "1", "tab_ids": ["9", "7"] } },
+            ]));
+            world.commit(&json!([
+                { "event": "tabs.reordered", "data": { "project_id": "2", "tab_ids": ["70", "9"] } },
+            ]));
+            world.end_streams(Some(&stopping()));
+        });
+        let (exit, lines) = events(&fake, Some("7")).await;
+        assert_eq!(exit, Ok(0));
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0]["event"], "tabs.reordered");
+        assert_eq!(lines[0]["data"]["tab_ids"], json!(["9", "7"]));
+        assert_eq!(lines[1], stopping());
+    }
+
     #[test]
-    fn a_tab_is_named_by_its_tab_id_or_by_the_tab_an_open_carries() {
+    fn a_tab_is_named_by_its_tab_id_the_tab_an_open_carries_or_a_reorders_list() {
         let envelope = |event: &str, data| EventEnvelope {
             event: event.into(),
             data,
@@ -673,6 +761,27 @@ mod tests {
         ));
         assert!(!names_tab(
             &envelope("project.deleted", json!({ "project_id": "7" })),
+            7
+        ));
+        assert!(names_tab(
+            &envelope(
+                "active.changed",
+                json!({ "project_id": "1", "tab_id": "7" })
+            ),
+            7
+        ));
+        assert!(names_tab(
+            &envelope(
+                "tabs.reordered",
+                json!({ "project_id": "1", "tab_ids": ["9", "7"] })
+            ),
+            7
+        ));
+        assert!(!names_tab(
+            &envelope(
+                "tabs.reordered",
+                json!({ "project_id": "7", "tab_ids": ["70", "9"] })
+            ),
             7
         ));
     }
@@ -777,6 +886,33 @@ mod tests {
         assert_eq!(fake.with(|world| world.count("identify")), 4);
     }
 
+    /// The identity is compared before the snapshot is asked for, so a
+    /// process that hangs up on that snapshot is retried like any other
+    /// mismatch rather than ending the open.
+    #[tokio::test]
+    async fn a_mismatched_second_leg_is_never_asked_for_a_snapshot() {
+        let fake = Fake::ui("identity-before-list");
+        fake.with(|world| world.ack_id = "ui-0".into());
+        fake.hook(|world, op, phase| {
+            if op == "tab.list" && phase == Phase::Before {
+                world.instead = Some(Instead::HangUp);
+            }
+        });
+        let source = resolve(
+            &fake.socket,
+            &serde_json::from_value(fake.with(|w| w.identify.clone())).unwrap(),
+        );
+        let message = match open(&source, true).await {
+            Err(CliError::Connection(message)) => message,
+            Ok(Opened::Dropped { error, .. }) => panic!("ended on the hung-up snapshot: {error:?}"),
+            Ok(Opened::Legs(_)) => panic!("the identity never matched, and still opened"),
+            Err(error) => panic!("{error:?}"),
+        };
+        assert!(message.contains("different processes"), "{message}");
+        assert_eq!(fake.with(|world| world.count("events.subscribe")), 4);
+        assert_eq!(fake.with(|world| world.count("tab.list")), 0);
+    }
+
     #[tokio::test]
     async fn a_restart_between_the_legs_is_retried_against_the_new_process() {
         let fake = Fake::session("restart");
@@ -789,13 +925,14 @@ mod tests {
             &serde_json::from_value(fake.with(|w| w.identify.clone())).unwrap(),
         );
         assert_eq!(source.identity, Identity::Session);
-        let legs = open(&source, true)
-            .await
-            .expect("the second attempt matches");
+        let Ok(Opened::Legs(legs)) = open(&source, true).await else {
+            panic!("the second attempt matches");
+        };
         assert_eq!(legs.stream.session_id(), "session-1");
         assert_eq!(
             fake.with(|world| world.ops().join(" ")),
-            "events.subscribe session.identify tab.list events.subscribe session.identify tab.list"
+            "events.subscribe session.identify events.subscribe session.identify tab.list",
+            "no snapshot is asked of the attempt that reached another process"
         );
     }
 

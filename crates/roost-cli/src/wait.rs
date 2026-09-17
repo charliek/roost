@@ -14,7 +14,7 @@ use roost_ipc::messages::{
 use roost_ipc::{ClientError, IpcClient};
 
 use crate::error::CliError;
-use crate::events::{self, Legs, Source};
+use crate::events::{self, Legs, Opened, Source};
 use crate::UiSocket;
 
 #[derive(clap::Args, Debug)]
@@ -206,7 +206,22 @@ struct Waiting<'a> {
 /// lost.
 enum Watched {
     Held(Seen),
-    Lost(String),
+    Lost(Loss),
+}
+
+/// A lost stream: the process its subscription acked, and why.
+struct Loss {
+    incarnation: String,
+    why: String,
+}
+
+/// Where resolving the source got to.
+enum Reached {
+    /// No stream there: the poll loop.
+    Poll(Source),
+    Stream(Source, Box<Legs>),
+    /// Subscribed, and lost before the second connection was of any use.
+    Lost(Source, Loss),
 }
 
 impl Waiting<'_> {
@@ -218,44 +233,74 @@ impl Waiting<'_> {
     /// the destination under new ids, and a restart mints new ones, so on
     /// any other process tab N is some other tab, or none — and a `--gone`
     /// read off its snapshot would be a lie.
-    async fn run(
+    async fn run(&self, ui: &mut UiSocket<'_>, identify: IdentifyResult) -> Result<Seen, CliError> {
+        let lost = match self.reach(ui, identify).await? {
+            Reached::Poll(_) => return self.poll(ui.client().await?).await,
+            Reached::Stream(source, legs) => match self.watch(&source, *legs).await? {
+                Watched::Held(seen) => return Ok(seen),
+                Watched::Lost(lost) => lost,
+            },
+            Reached::Lost(_, lost) => lost,
+        };
+        let reached = match self.reach_again(ui).await {
+            Ok(reached) => reached,
+            Err(error) => return Err(after_loss(&lost, error)),
+        };
+        let (source, again) = match reached {
+            Reached::Poll(source) => return Err(self.changed(&source, &lost.why)),
+            Reached::Stream(source, legs) => {
+                if legs.stream.session_id() != lost.incarnation {
+                    return Err(self.changed(&source, &lost.why));
+                }
+                match self.watch(&source, *legs).await? {
+                    Watched::Held(seen) => return Ok(seen),
+                    Watched::Lost(again) => (source, again),
+                }
+            }
+            Reached::Lost(source, again) => {
+                if again.incarnation != lost.incarnation {
+                    return Err(self.changed(&source, &lost.why));
+                }
+                (source, again)
+            }
+        };
+        Err(CliError::Connection(format!(
+            "{}: the event stream was lost twice: {}; then {}",
+            source.socket.display(),
+            lost.why,
+            again.why
+        )))
+    }
+
+    /// Once no local-backend switch is in flight, the source `identify`
+    /// names, subscribed to where it serves a stream.
+    async fn reach(
         &self,
         ui: &mut UiSocket<'_>,
-        mut identify: IdentifyResult,
-    ) -> Result<Seen, CliError> {
-        // The incarnation the first stream was lost on, and why.
-        let mut lost: Option<(String, String)> = None;
-        loop {
-            identify = self.settled(ui, identify).await?;
-            let source = events::resolve(ui.socket_path(), &identify);
-            if !source.serves_stream {
-                if let Some((_, why)) = &lost {
-                    return Err(self.changed(&source, why));
-                }
-                return self.poll(ui.client().await?).await;
-            }
-            let legs = events::open(&source, true).await?;
-            let incarnation = legs.stream.session_id().to_string();
-            if let Some((first, why)) = &lost {
-                if *first != incarnation {
-                    return Err(self.changed(&source, why));
-                }
-            }
-            match self.watch(&source, legs).await? {
-                Watched::Held(seen) => return Ok(seen),
-                Watched::Lost(why) => {
-                    if let Some((_, first)) = lost {
-                        return Err(CliError::Connection(format!(
-                            "{}: the event stream was lost twice: {first}; then {why}",
-                            source.socket.display()
-                        )));
-                    }
-                    lost = Some((incarnation, why));
-                    ui.redial();
-                    identify = crate::identify(ui.client().await?).await?;
-                }
-            }
+        identify: IdentifyResult,
+    ) -> Result<Reached, CliError> {
+        let identify = self.settled(ui, identify).await?;
+        let source = events::resolve(ui.socket_path(), &identify);
+        if !source.serves_stream {
+            return Ok(Reached::Poll(source));
         }
+        Ok(match events::open(&source, true).await? {
+            Opened::Legs(legs) => Reached::Stream(source, legs),
+            Opened::Dropped { acked, error } => Reached::Lost(
+                source,
+                Loss {
+                    incarnation: acked,
+                    why: error.message().to_string(),
+                },
+            ),
+        })
+    }
+
+    /// [`Self::reach`] from a fresh dial and a fresh `identify`.
+    async fn reach_again(&self, ui: &mut UiSocket<'_>) -> Result<Reached, CliError> {
+        ui.redial();
+        let identify = crate::identify(ui.client().await?).await?;
+        self.reach(ui, identify).await
     }
 
     /// The refusal for a stream that came back from a different process.
@@ -279,7 +324,10 @@ impl Waiting<'_> {
     ) -> Result<IdentifyResult, CliError> {
         while identify.local_backend_switch.is_some() {
             self.check_deadline()?;
-            tokio::time::sleep(self.interval).await;
+            let wake = Instant::now() + self.interval;
+            tokio::time::sleep_until(self.deadline.map_or(wake, |deadline| deadline.min(wake)))
+                .await;
+            self.check_deadline()?;
             identify = crate::identify(ui.client().await?).await?;
         }
         Ok(identify)
@@ -305,6 +353,13 @@ impl Waiting<'_> {
             mut conn,
             tabs,
         } = legs;
+        let incarnation = stream.session_id().to_string();
+        let lost = |why: String| {
+            Ok(Watched::Lost(Loss {
+                incarnation: incarnation.clone(),
+                why,
+            }))
+        };
         let tabs = tabs.unwrap_or_default();
         let Some(fence) = tabs.revision else {
             return Err(CliError::Failed(format!(
@@ -313,14 +368,22 @@ impl Waiting<'_> {
                 source.socket.display()
             )));
         };
+        // Commits between the two would be on neither.
+        if fence < stream.revision() {
+            return lost(format!(
+                "the tab.list snapshot (revision {fence}) is older than the subscription \
+                 (revision {})",
+                stream.revision()
+            ));
+        }
         let mut seen = Seen::listed(&tabs, self.tab_id);
         let mut tick = tokio::time::interval_at(Instant::now() + self.interval, self.interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut reread = true;
         loop {
             if reread {
-                if let Some(lost) = self.dump(&mut conn, &mut seen).await? {
-                    return Ok(Watched::Lost(lost));
+                if let Some(dropped) = self.dump(&mut conn, &mut seen).await? {
+                    return lost(dropped);
                 }
                 tick.reset();
             }
@@ -345,10 +408,10 @@ impl Waiting<'_> {
                         )));
                     }
                     Ok(Some(EventFrame::Ended(ended))) => {
-                        return Ok(Watched::Lost(format!("the stream ended ({})", ended.reason)));
+                        return lost(format!("the stream ended ({})", ended.reason));
                     }
-                    Ok(None) => return Ok(Watched::Lost("the stream closed".into())),
-                    Err(error) => return Ok(Watched::Lost(error.to_string())),
+                    Ok(None) => return lost("the stream closed".into()),
+                    Err(error) => return lost(error.to_string()),
                 },
                 _ = tick.tick(), if self.want.text.is_some() => true,
             };
@@ -422,6 +485,22 @@ async fn dump_contains(
     }
 }
 
+/// A failure to resolve again after a lost stream: whatever the resolve's
+/// own code, the wait ended because its stream went away. A timeout is
+/// still a timeout.
+fn after_loss(lost: &Loss, error: CliError) -> CliError {
+    if matches!(error, CliError::Timeout(_)) {
+        return error;
+    }
+    CliError::Connection(format!(
+        "could not resolve the Roost again after the event stream was lost: {}: {} (the \
+         stream: {})",
+        error.code(),
+        error.message(),
+        lost.why
+    ))
+}
+
 async fn sleep_until(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -432,7 +511,7 @@ async fn sleep_until(deadline: Option<Instant>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::fake::{Fake, Phase};
+    use crate::events::fake::{Fake, Instead, Phase};
     use serde_json::json;
 
     async fn wait(fake: &Fake, argv: &[&str], tab_env: Option<&str>) -> Result<i32, CliError> {
@@ -517,6 +596,63 @@ mod tests {
         )
         .await;
         assert_eq!(exit, Ok(0));
+    }
+
+    /// The stream is acked by the process that is going away and the
+    /// second connection reaches its replacement, which hangs up on a
+    /// snapshot asked for under the old ack. Compared first, that is a
+    /// retry against the replacement, not a lost stream.
+    #[tokio::test]
+    async fn a_second_leg_on_another_process_is_retried_before_its_snapshot() {
+        let fake = Fake::ui("replaced");
+        fake.with(|world| {
+            world.ack_id = "ui-0".into();
+            world.tabs.insert(7, "idle");
+        });
+        fake.hook(|world, op, phase| {
+            if op == "tab.list" && phase == Phase::Before && world.ack_id == "ui-0" {
+                world.instead = Some(Instead::HangUp);
+            }
+        });
+        fake.on("events.subscribe", 2, Phase::Before, |world| {
+            world.ack_id = "ui-1".into();
+        });
+        let exit = wait(
+            &fake,
+            &["--tab", "7", "--state", "idle", "--timeout", "5"],
+            None,
+        )
+        .await;
+        assert_eq!(exit, Ok(0));
+        assert_eq!(
+            fake.with(|world| world.ops().join(" ")),
+            "identify events.subscribe identify events.subscribe identify tab.list"
+        );
+    }
+
+    /// A snapshot older than its subscription leaves the commits between
+    /// the two on neither, so it fences nothing — here, a `--gone` read off
+    /// a list that predates the tab.
+    #[tokio::test]
+    async fn a_snapshot_older_than_the_subscription_is_a_lost_stream() {
+        let fake = Fake::ui("behind");
+        fake.with(|world| {
+            world.revision = 42;
+            world.snapshot_behind = 2;
+            world.tabs.clear();
+        });
+        let exit = wait(&fake, &["--tab", "7", "--gone", "--timeout", "5"], None).await;
+        let Err(CliError::Connection(message)) = exit else {
+            panic!("{exit:?}")
+        };
+        assert!(
+            message.contains(
+                "the tab.list snapshot (revision 40) is older than the subscription (revision 42)"
+            ),
+            "{message}"
+        );
+        assert!(message.contains("lost twice"), "{message}");
+        assert_eq!(fake.with(|world| world.count("events.subscribe")), 2);
     }
 
     // ------------------------------------------------------------------
@@ -674,6 +810,92 @@ mod tests {
         assert_eq!(fake.with(|world| world.count("events.subscribe")), 2);
     }
 
+    /// A subscription whose second connection drops before its snapshot
+    /// is a lost stream like any other: resolved again once.
+    #[tokio::test]
+    async fn a_second_connection_dropped_while_opening_is_resolved_again_once() {
+        let once = Fake::ui("open-drop");
+        once.with(|world| world.tabs.insert(7, "idle"));
+        once.on("tab.list", 1, Phase::Before, |world| {
+            world.instead = Some(Instead::HangUp);
+        });
+        let argv = ["--tab", "7", "--state", "idle", "--timeout", "5"];
+        assert_eq!(wait(&once, &argv, None).await, Ok(0));
+        assert_eq!(
+            once.with(|world| world.ops().join(" ")),
+            "identify events.subscribe identify tab.list identify events.subscribe identify tab.list"
+        );
+
+        let twice = Fake::ui("open-drop-twice");
+        twice.hook(|world, op, phase| {
+            if op == "tab.list" && phase == Phase::Before {
+                world.instead = Some(Instead::HangUp);
+            }
+        });
+        let exit = wait(&twice, &argv, None).await;
+        let Err(CliError::Connection(message)) = exit else {
+            panic!("{exit:?}")
+        };
+        assert!(message.contains("lost twice"), "{message}");
+        assert_eq!(twice.with(|world| world.count("events.subscribe")), 2);
+    }
+
+    /// Resolving again is part of the wait's own recovery, so however it
+    /// fails, the wait failed on a lost stream: `connection`, carrying the
+    /// resolve's own code and message.
+    #[tokio::test]
+    async fn a_failed_resolve_after_a_loss_is_a_connection_failure_naming_why() {
+        let argv = ["--tab", "7", "--state", "idle", "--timeout", "5"];
+        let refused = Fake::ui("again-refused");
+        refused.on("events.subscribe", 1, Phase::After, |world| {
+            world.end_streams(None);
+        });
+        refused.on("events.subscribe", 2, Phase::Before, |world| {
+            world.instead = Some(Instead::Refuse("not-implemented", "no stream after all"));
+        });
+        let error = wait(&refused, &argv, None).await.unwrap_err();
+        assert_eq!(error.code(), "connection", "{error:?}");
+        assert!(
+            error
+                .message()
+                .contains("after the event stream was lost: not-implemented: no stream after all"),
+            "{error:?}"
+        );
+
+        let vanished = Fake::ui("again-vanished");
+        let socket = vanished.socket.clone();
+        vanished.on("tab.list", 1, Phase::After, move |world| {
+            std::fs::remove_file(&socket).expect("unlink the fake's socket");
+            world.end_streams(None);
+        });
+        let error = wait(&vanished, &argv, None).await.unwrap_err();
+        assert_eq!(error.code(), "connection", "{error:?}");
+        assert!(
+            error
+                .message()
+                .contains("after the event stream was lost: connection: "),
+            "{error:?}"
+        );
+
+        let lost = Loss {
+            incarnation: "ui-1".into(),
+            why: "the stream closed".into(),
+        };
+        let no_target = CliError::from(roost_ipc::target::TargetError::NoLiveTarget {
+            tried: vec!["/nothing.sock".into()],
+        });
+        let error = after_loss(&lost, no_target);
+        assert_eq!(error.code(), "connection", "{error:?}");
+        assert!(
+            error
+                .message()
+                .contains("after the event stream was lost: no-target: "),
+            "{error:?}"
+        );
+        let timeout = CliError::Timeout("5s".into());
+        assert_eq!(after_loss(&lost, timeout.clone()), timeout);
+    }
+
     #[tokio::test]
     async fn a_session_that_stops_ends_the_wait_with_its_reason() {
         let fake = Fake::session("stopping");
@@ -726,6 +948,42 @@ mod tests {
             fake.with(|world| world.ops().join(" ")),
             "identify identify identify events.subscribe identify tab.list"
         );
+    }
+
+    /// The hold-off sleeps no further than the deadline, and a deadline
+    /// that passed in it is a timeout — even for a switch that has settled
+    /// by then onto a tab already in the state asked for.
+    #[tokio::test]
+    async fn a_switch_that_outlasts_the_timeout_times_out_on_time() {
+        let fake = Fake::ui("settle-late");
+        fake.with(|world| {
+            world.identify["local_backend_switch"] = json!("preparing");
+            world.tabs.insert(7, "idle");
+        });
+        fake.on("identify", 2, Phase::Before, |world| {
+            world.identify["local_backend_switch"] = serde_json::Value::Null;
+        });
+        let argv = [
+            "--tab",
+            "7",
+            "--state",
+            "idle",
+            "--timeout",
+            "1",
+            "--interval-ms",
+            "60000",
+        ];
+        let started = std::time::Instant::now();
+        let exit = tokio::time::timeout(Duration::from_secs(5), wait(&fake, &argv, None))
+            .await
+            .expect("the hold-off slept past the deadline");
+        assert!(timed_out(&exit), "{exit:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(fake.with(|world| world.count("events.subscribe")), 0);
     }
 
     // ------------------------------------------------------------------
