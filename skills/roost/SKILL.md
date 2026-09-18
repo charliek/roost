@@ -96,7 +96,7 @@ roostctl wait --tab N --text "make-done-$run" --timeout 600
 roostctl tab prompt --tab N --timeout 600 'Summarize the failing tests in one paragraph.'
 ```
 
-`--timeout` is required unless you pass `--no-timeout`: a turn's length is not something this verb can guess. Two caveats. The gate is **temporal, not causal**: it only checks that the tab reached `running` after the prompt, not that this prompt is what caused it. And an agent whose hooks don't report to Roost never reaches `running`, so the gate times out by design — exit 4 `stalled` still means the text and Enter *were* written, so read the tab with `tab dump` before sending anything again.
+`--timeout` is required unless you pass `--no-timeout`: a turn's length is not something this verb can guess. Two caveats. The gate is **temporal, not causal**: it only checks that the tab reached `running` after the prompt, not that this prompt is what caused it. And a tab whose agent reports nothing to Roost — no hooks installed, and not one of the agents that report directly — never reaches `running`, so the gate times out by design — exit 4 `stalled` still means the text and Enter *were* written, so read the tab with `tab dump` before sending anything again.
 
 ### Read what happened
 
@@ -141,7 +141,7 @@ roostctl rpc identify '{}'
 
 - Always pass `--tab`. Without it, `notify`, `set-title`, `tab set-state`, `tab clear-notification`, `tab close`, `tab send`, `tab resize`, `tab focus`, `tab report`, and `tab prompt` act on `ROOST_TAB_ID`, which inside Roost is your own tab, and exit 2 when it is unset or empty. `tab dump` and `wait` also use `ROOST_TAB_ID` first, but when it is unset or empty they fall back to the UI's active tab, whichever tab the user last clicked.
 - Parse ids from `--json` output. Never derive them from sidebar order, tab titles, or examples.
-- Never pass `--focus` or run `tab focus` unless the user asked to switch tabs. Opening a tab with `--no-activate` leaves the user's selection where it was; without it, or on a server that refuses the flag, opening may select the tab.
+- Never pass `--focus` or run `tab focus` unless the user asked to switch tabs. Opening a tab with `--no-activate` leaves the user's selection where it was; without it, opening may select the tab. A server that does not know the flag (the macOS app) refuses the whole command — `unknown-field` from `tab open`, `unsupported` from `open` — and opens no tab at all, so re-read `tab list --json` rather than assuming one exists.
 - Never close a tab or delete a project you did not open, unless the user explicitly asked.
 - A `wait` timeout does not prove the input was not delivered or the command did not run. Read the tab with `tab dump` before sending anything again.
 - `rpc` is not a way around `--tab`. Use the named verb for anything a verb covers, and only put ids in `rpc` params that you parsed from JSON.

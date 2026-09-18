@@ -23,7 +23,8 @@ release workflow asserts they agree).
   required unless `--no-timeout` — a turn's length is not something the verb
   can guess, so it has no default. Exits 4 `stalled` if nothing starts
   within the gate; the gate is temporal, not causal, and a tab whose agent
-  has no hooks never reaches `running` and stalls by design. No event stream
+  reports nothing to Roost — no hooks, and not a direct reporter like
+  craze — never reaches `running` and stalls by design. No event stream
   (the Mac app today) exits 1 `unsupported` rather than polling. See
   [`cli.md#tab-prompt`](docs/reference/cli.md#tab-prompt).
 

@@ -3,7 +3,9 @@
 Roost drives the tab dot, the sidebar rollup, and the desktop banner for
 five coding agents — Claude Code, Codex, OpenCode, grok (and its fork
 gx), and cursor-agent — by wiring one hook entry per lifecycle event into
-each agent's own configuration file. Roost **asks before it wires
+each agent's own configuration file. A sixth, craze, needs no wiring at
+all: it reports its own state over the socket, which any agent can do
+([Reporting directly, without a hook](#reporting-directly-without-a-hook)). Roost **asks before it wires
 anything**: the first time the UI starts with no answer on file and at
 least one supported agent installed, a consent dialog opens naming
 what it found, and nothing is written into any agent's config until you
