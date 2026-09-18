@@ -3379,13 +3379,18 @@ mod tests {
     ];
 
     /// Every leaf verb as a user types it (`tab send`), with its clap
-    /// command.
+    /// command. A `hide`-marked subcommand is skipped at either level —
+    /// it has no user-facing spelling for a reference page to document.
+    /// None exists today; the filter is defensive for the day one does.
     fn leaf_verbs() -> Vec<(String, clap::Command)> {
         use clap::CommandFactory;
         let mut leaves = Vec::new();
-        for sub in Args::command().get_subcommands() {
+        for sub in Args::command()
+            .get_subcommands()
+            .filter(|sub| !sub.is_hide_set())
+        {
             if sub.has_subcommands() {
-                for leaf in sub.get_subcommands() {
+                for leaf in sub.get_subcommands().filter(|leaf| !leaf.is_hide_set()) {
                     leaves.push((
                         format!("{} {}", sub.get_name(), leaf.get_name()),
                         leaf.clone(),
@@ -5194,5 +5199,142 @@ mod tests {
         assert_eq!(marketplace["name"], "roost");
         assert_eq!(marketplace["plugins"][0]["name"], "roost");
         assert_eq!(marketplace["plugins"][0]["source"], "./");
+    }
+
+    // ------------------------------------------------------------------
+    // Verb coverage: every leaf verb has a documented spelling
+    // ------------------------------------------------------------------
+
+    /// `docs/reference/cli.md`, from this crate's manifest dir — same
+    /// two-pop walk `roost-ipc`'s `docs_name_every_op_test.rs` uses,
+    /// duplicated rather than shared because this crate is a binary
+    /// with no lib target a cross-crate `tests/*_test.rs` could link
+    /// against (CLAUDE.md), so the check has to live inline here.
+    fn cli_md_path() -> PathBuf {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert!(p.pop()); // pop "roost-cli"
+        assert!(p.pop()); // pop "crates"
+        p.push("docs");
+        p.push("reference");
+        p.push("cli.md");
+        p
+    }
+
+    /// `docs/reference/cli.md`'s text, or `None` with a loud `eprintln!`
+    /// when the source tree has no `docs/` directory (a packaged
+    /// build) — same shape as `docs_name_every_op_test.rs::read_ipc_md`.
+    fn read_cli_md() -> Option<String> {
+        read_cli_md_at(&cli_md_path())
+    }
+
+    fn read_cli_md_at(path: &Path) -> Option<String> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(err) => {
+                eprintln!(
+                    "SKIP: docs/reference/cli.md not found at {} ({err}) - this \
+                     looks like a packaged build with no `docs/` directory, so \
+                     the verb-coverage check is skipped.",
+                    path.display()
+                );
+                None
+            }
+        }
+    }
+
+    /// Every backtick code span in `doc`, fenced ```code blocks``` first
+    /// stripped out. A fenced block is a usage *example* — it shows a
+    /// verb, but does not document it the way an inline span or a
+    /// heading does, and counting it would let a verb mentioned only in
+    /// a `bash` block under `## Usage` pass without ever getting its own
+    /// section. A heading counts because a Markdown heading is still a
+    /// line of text carrying an inline code span, same as prose.
+    fn backtick_spans_outside_fences(doc: &str) -> Vec<String> {
+        let mut spans = Vec::new();
+        let mut in_fence = false;
+        for line in doc.lines() {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                continue;
+            }
+            if in_fence {
+                continue;
+            }
+            let mut rest = line;
+            while let Some(start) = rest.find('`') {
+                let after = &rest[start + 1..];
+                let Some(end) = after.find('`') else {
+                    break;
+                };
+                spans.push(after[..end].to_string());
+                rest = &after[end + 1..];
+            }
+        }
+        spans
+    }
+
+    /// A leaf path is documented when some span either *is* it
+    /// (`` `schema` ``) or *starts with* it followed by a space
+    /// (`` `tab open --project-id 1` ``, `` `agent install claude` ``) —
+    /// wide enough to accept a span carrying flags or a placeholder
+    /// after the verb, strict enough that a span merely containing the
+    /// words somewhere in the middle of a sentence does not count.
+    ///
+    /// The path itself never carries a `roostctl ` prefix: `leaf_verbs`
+    /// names each verb the way a user types it *after* `roostctl`
+    /// (`"tab report"`, not `"roostctl tab report"`), and that is also
+    /// how `cli.md` already spells every heading and inline mention —
+    /// `## \`tab report\``, `` `tab open` / `close` / … ``, and so on.
+    /// A grouped heading like that one only spells its *first* leaf in
+    /// full; `tab close`/`send`/`resize`/`reorder`/`dump` each need
+    /// their own span in the section's prose, which is what this test
+    /// enforces on them same as anywhere else.
+    fn leaf_is_documented(name: &str, spans: &[String]) -> bool {
+        spans
+            .iter()
+            .any(|span| span == name || span.starts_with(&format!("{name} ")))
+    }
+
+    /// AC9: every leaf `roostctl` verb has a spelled-out, backticked
+    /// mention on `cli.md` — the reference a reviewer or an agent reads
+    /// to find out a verb exists. Guarded at `> 20` leaves so a walk
+    /// that silently returned nothing (a clap upgrade that renames the
+    /// trait method, say) cannot pass vacuously.
+    #[test]
+    fn every_leaf_verb_is_documented_in_cli_md() {
+        let Some(doc) = read_cli_md() else {
+            return;
+        };
+        let leaves = leaf_verbs();
+        assert!(
+            leaves.len() > 20,
+            "only {} leaf verbs found by leaf_verbs() - the walk has \
+             drifted and this test would pass vacuously",
+            leaves.len()
+        );
+        let spans = backtick_spans_outside_fences(&doc);
+        let missing: Vec<String> = leaves
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| !leaf_is_documented(name, &spans))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "docs/reference/cli.md has no backtick code span for: {}. Every \
+             leaf verb needs one naming it exactly, or starting with it \
+             followed by a space - a heading counts, so does an inline \
+             mention in prose; a fenced bash usage example does not.",
+            missing.join(", ")
+        );
+    }
+
+    #[test]
+    fn read_cli_md_skips_loudly_over_a_missing_file() {
+        // Pins the skip path itself, same as
+        // `docs_name_every_op_test.rs`'s sibling test: point at a path
+        // that cannot exist and confirm `None`, so a future refactor of
+        // `read_cli_md_at` cannot quietly turn the skip into a panic.
+        let bogus = Path::new("/nonexistent/does-not-exist/cli.md");
+        assert!(read_cli_md_at(bogus).is_none());
     }
 }

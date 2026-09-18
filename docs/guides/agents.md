@@ -24,6 +24,7 @@ What differs is where each signal comes from:
 | grok / gx | `grok` | `$GROK_HOME/hooks/roost.json` (default `~/.grok`) — a file Roost owns outright | `Notification` `notificationType: permission_prompt` | `Stop` on its first fire; a fire with `stopHookActive: true` (a blocking Stop gate already continued the turn) keeps `working` instead, and the `idle_prompt` Notification settles it | `StopCancelled` |
 | cursor-agent | `cursor` | `~/.cursor/hooks.json` (or `$CURSOR_CONFIG_DIR`) — merged in beside your own hooks | none — an accepted gap, see [Per-agent caveats](#per-agent-caveats) | `stop` | `stop` (same event as turn-end; see caveats) |
 | OpenCode | `opencode` | `~/.config/opencode/plugins/roost-agent-state.js` (or `$OPENCODE_CONFIG_DIR`) — a plugin Roost owns outright, not a command hook | `permission.asked` / `question.asked` | `session.idle` | `session.error` |
+| craze | `craze` | none — craze reports directly, no hook install | a permission, question or plan card is open | turn end → `finished`, banner body "Turn complete" | Esc → `finished` with attention cleared |
 
 grok/gx's `StopFailure` maps to `failed`, its banner body carrying gx's
 `errorDetails` (or `error_details`) verbatim rather than just the
@@ -34,6 +35,113 @@ themselves (grok can be configured to, and cursor always does via its
 `claudeUserHooks`), so both adapters positively reject any payload that
 carries the other's telltale fields rather than relying on which file it
 came from — see [Per-agent caveats](#per-agent-caveats).
+
+[craze](https://github.com/charliek/craze) is the first entry that needs
+no hook install at all: it is the process driving the agent over ACP
+(cursor-agent, grok, or gx), so it calls `tab.agent_report` directly on
+every state change rather than being invoked as a hook. Behavior worth a
+sentence beside its row:
+
+- Ownership is keyed by the ACP session id. The first report of a
+  session claims the tab with `inactive` and metadata `model`,
+  `craze.provider` and `version`; exit releases it.
+- An errored turn reports `failed` with the error's first line as the
+  banner body.
+- craze removes `ROOST_AGENT_HOOK` from the environment of the agent it
+  spawns, so that agent's own installed Roost hooks stay inert inside
+  craze and cannot claim the tab out from under it — which is also why a
+  craze tab shows one agent rather than two.
+- Nothing is reported until craze's session is ready, so a restored
+  session never raises a spurious "Turn complete".
+
+See [Reporting directly, without a hook](#reporting-directly-without-a-hook)
+below for the rules craze itself follows, and for the wire shape any
+other agent driving `tab.agent_report` by hand needs.
+
+## Reporting directly, without a hook
+
+A TUI or script that *is* the process driving the coding agent — craze
+is the first, over ACP — has no separate hook to install: it calls
+[`tab.agent_report`](../reference/ipc.md#tabagent_report) itself, on
+every state change, the same op every installed hook ends up calling
+too. The rules below are what any such caller has to get right, stated
+once here rather than per integration. `roostctl tab report`
+([`cli.md`](../reference/cli.md#tab-report)) is the same op as a verb,
+for a script or an agent with no adapter of its own that would rather
+shell out than hand-build the JSON.
+
+- **Gate on `ROOST_SOCKET` plus a positive `ROOST_TAB_ID`, exactly as
+  every installed hook does.** Both are set only inside a Roost tab; a
+  process started outside one — or with its environment stripped by a
+  sanitizing launcher — has nothing to report to and no tab to claim.
+  Reading `ROOST_TAB_ID` with the variable gone (but the value cached
+  from a parent process) risks claiming, or reporting on, some other
+  Roost's tab entirely.
+- **Claim per session, preserve for state, release on every exit —
+  including `SIGHUP`.** `ownership_action` is required on every report
+  because "take the tab" and "I already own it" have opposite failure
+  modes: `claim` when a session starts, `preserve` for every state
+  update in between, `release` when it ends. Roost hangs up the tab's
+  tty when the tab closes, so a reporter that forked its agent into its
+  own process group has to catch `SIGHUP` itself and release from the
+  handler — the tty going away is not something the child necessarily
+  sees on its own stdin/stdout ([craze#22](https://github.com/charliek/craze/issues/22)
+  tracks this for craze).
+- **Never add a field the wire doesn't already name.** `TabAgentReportParams`
+  is `deny_unknown_fields`: a report carrying one field the server
+  doesn't recognize is rejected *whole* — not the field, the report —
+  which reads to the caller as nothing happening at all. Anything that
+  doesn't fit the existing axes belongs in `metadata` instead.
+- **`metadata` keys are namespaced.** A key a product defines itself is
+  prefixed `<product>.` (`craze.provider`, `gx.remote`); a key Roost
+  itself defines stays bare snake_case (`model`, `version`). See
+  [gx](#gx) below for the fuller statement of this rule.
+- **Pin to the oldest server you support, and validate against the
+  schema.** `identify.ops` says which *ops* a server serves, not which
+  *fields* of an op's params it accepts — a server can list
+  `tab.agent_report` and still reject a report carrying a field it
+  predates, the same `deny_unknown_fields` whole-report rejection as
+  above. There is no field-level capability channel to detect this at
+  runtime, so the answer is to know, ahead of time, the oldest server
+  version the integration supports and stay inside what that version's
+  schema accepts. `roostctl schema` ([`cli.md`](../reference/cli.md#schema))
+  prints the pinned [JSON Schema
+  bundle](../reference/ipc.md#machine-readable-schema) with no socket
+  and no running Roost, so this is checkable offline, against the exact
+  server version being targeted.
+- **`lifecycle_if` guards a reported lifecycle on the tab's current
+  one** — see [`tab.agent_report`](../reference/ipc.md#tabagent_report)
+  for the full semantics. It is absent from a server built before the
+  release that follows v0.0.19: sending it to one of those rejects the
+  whole report, `deny_unknown_fields` again, so an integration that
+  needs to support that generation has to guard the transition on its
+  own side instead, the way craze does today.
+
+**craze as a worked example.** craze keys ownership on the ACP session
+id, claims with `inactive` on session start and metadata `model`,
+`craze.provider` and `version`, reports `working`/`waiting`/`finished`/`failed`
+as the turn proceeds, and releases on exit — see [craze#25](https://github.com/charliek/craze/issues/25)
+for its own tracking issue and test plan for this integration. One
+minimal wire example, a claim, a mid-turn preserve, and a release, each
+validating against the pinned schema:
+
+```json
+{"tab_id": "7", "source": "craze", "session_id": "acp-9f2",
+ "ownership_action": "claim", "lifecycle": "working",
+ "metadata": {"craze.provider": "cursor-agent", "model": "claude-opus-4"}}
+```
+
+```json
+{"tab_id": "7", "source": "craze", "session_id": "acp-9f2",
+ "ownership_action": "preserve", "lifecycle": "waiting",
+ "attention": "set", "title": "Needs input",
+ "body": "approve the shell command?"}
+```
+
+```json
+{"tab_id": "7", "source": "craze", "session_id": "acp-9f2",
+ "ownership_action": "release"}
+```
 
 ## Roost asks once
 

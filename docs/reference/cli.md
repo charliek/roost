@@ -651,7 +651,7 @@ Prints one counter per line plus two derived averages (`ns_per_refresh`, `ns_per
 
 ## `palette` subcommands
 
-Drive the command-palette overlay: open it, inspect its rows, filter, activate a row, dismiss. Activating a row runs the **same** command its keybind would (a command row's id is its keybind action), so this is a command-dispatch surface, not just a UI poke. Each subcommand prints the resulting palette state (a `>` marks the highlighted row); `--json` emits the structured result.
+Drive the command-palette overlay: `palette open`, `palette state`, `palette query <text>`, `palette activate <id>`, `palette dismiss`, `palette present --items <json>`. Activating a row runs the **same** command its keybind would (a command row's id is its keybind action), so this is a command-dispatch surface, not just a UI poke. Each subcommand prints the resulting palette state (a `>` marks the highlighted row); `--json` emits the structured result.
 
 ```bash
 roostctl palette open                      # the command palette
@@ -716,7 +716,7 @@ files directly instead, the same way `ensure` does — with nothing
 running, and reaching no host at all, so a connected host's live session
 does not pick up the change until it reconnects.
 
-`install` and `uninstall` take an agent name or `--all`, and
+`agent install` and `agent uninstall` take an agent name or `--all`, and
 deliberately ignore `agent-hooks = off` — an explicit verb always wins.
 Both also *move* the key rather than leaving it alone: `install`
 unions the named agent(s) into it (so the next `ensure` does not treat

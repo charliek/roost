@@ -54,14 +54,45 @@ roostctl identify --json
 `identify.ops` lists the operations this socket serves *right now*.
 `open` and `project ensure` refuse `unsupported` when `ops` is missing
 `project.ensure` — today, the Swift Mac app; `wait` falls back to
-polling and `events` fails outright when `ops` lacks
+polling and `events` and `tab prompt` fail outright when `ops` lacks
 `events.subscribe` and there's no session backing the local tabs. See
 [the Mac paragraph](#the-mac-app) below for the concrete shape of
 that gap. `identify.instance_id` names the process: it changes on
 every restart, and a resumed `wait`/`events` connection checks it to
 tell "the same Roost, still running" from "a different one answered".
 
-## The four verbs
+`ops` is a list of *op names*, not fields — it says whether a server
+speaks `tab.agent_report` at all, not whether it accepts a field a
+newer release added to that op's params (`lifecycle_if`, say).
+`TabAgentReportParams` and every other request type is
+`deny_unknown_fields`, so a field a server predates rejects the whole
+request, not just that field. There is no runtime channel to detect
+this the way `ops` detects a missing op — an integration that has to
+work against more than one server version pins to the oldest one it
+supports and stays inside what that version's schema accepts. See
+[The wire's schema](#the-wires-schema) below.
+
+## The wire's schema
+
+`roostctl schema` prints [the pinned JSON Schema
+bundle](../reference/ipc.md#machine-readable-schema) — every op's
+params and result, every event's data, draft 2020-12 — with no socket
+and no running Roost:
+
+```bash
+roostctl schema | jq '.ops["tab.agent_report"].params'
+```
+
+That's the offline way to answer "does the server version I'm pinned
+to accept this field": check the shape by hand, or validate a request
+against it before sending, rather than finding out from a rejected
+report. See [`cli.md#schema`](../reference/cli.md#schema).
+
+## The verbs
+
+The everyday primitives: find-or-create-and-open, block-until, stream,
+call-by-name — plus two narrower ones for an agent turn specifically,
+`tab report` and `tab prompt`.
 
 ### `open`
 
@@ -75,9 +106,11 @@ out=$(roostctl open --project "review" --cwd "$PWD" --title "review" --json -- b
 tab=$(printf '%s' "$out" | jq -er .tab.id) || exit 1
 ```
 
-Prints `{"project","tab","created"}`, with or without `--json`. See
-[`cli.md#open`](../reference/cli.md#open) for `--hold`, `--focus`, and
-its refusals.
+Prints `{"project","tab","created"}`, with or without `--json`. Opening
+a tab selects it by default (in-process; see [The focus
+rule](#the-focus-rule)) — pass `--no-activate` when the new tab should
+not become the active one. See [`cli.md#open`](../reference/cli.md#open)
+for `--hold`, `--focus`, `--no-activate`, and its refusals.
 
 ### `wait`
 
@@ -120,6 +153,46 @@ roostctl rpc identify '{}'
 not a way around `--tab` for a verb that has one: use the named verb
 for anything a verb covers.
 
+### `tab prompt`
+
+Submit a prompt to the agent running in a tab and wait for the turn it
+starts — the race-free form of `tab send` followed by `wait --state
+running`, and the one verb that closes the gap between those two calls:
+
+```bash roost-recipe
+roostctl tab prompt --tab "$ROOST_TAB_ID" --timeout 600 'Summarize the failing tests.'
+```
+
+**Two caveats, both load-bearing.** The activity gate it waits on is
+**temporal, not causal** — it asks whether the tab reached `running`
+after the prompt was sent, not whether this prompt is what did it, so
+an unrelated turn starting in the window still satisfies it. And an
+agent with no hooks reporting to Roost never reaches `running` at all,
+so the gate times out by design (exit 4 `stalled`) — `tab prompt` needs
+[Agent Hooks](agents.md) wired, or an agent reporting directly (see
+[Reporting directly, without a hook](agents.md#reporting-directly-without-a-hook)),
+not a plain shell. See [`cli.md#tab-prompt`](../reference/cli.md#tab-prompt)
+for the full flag table and exit codes, including `--until` and
+`--activity-timeout`.
+
+### `tab report`
+
+Report an agent-hook event straight to
+[`tab.agent_report`](../reference/ipc.md#tabagent_report) — for a
+script, or an agent with no adapter of its own that would rather shell
+out than hand-build the request:
+
+```bash roost-recipe
+roostctl tab report --tab "$ROOST_TAB_ID" --source my-agent --session-id "$SESSION_ID" \
+  --claim --lifecycle working
+```
+
+See [`cli.md#tab-report`](../reference/cli.md#tab-report) for every
+flag, and [Reporting directly, without a
+hook](agents.md#reporting-directly-without-a-hook) for the rules that
+govern a caller driving this op by hand — ownership, `metadata`
+namespacing, and pinning to the oldest server you support.
+
 ## Waiting from a raw socket (not `roostctl`)
 
 A client that isn't `roostctl` and wants to follow events instead of
@@ -148,13 +221,19 @@ events` already implement it for you.
 
 Never pass `--focus` or run `tab focus` unless the user (or the task)
 actually asked to switch tabs — it raises the window and steals
-attention from whatever the person is doing. Opening a tab can make it
-the active tab even without `--focus`, so open tabs only when asked. An
-in-process Roost always makes the new tab active (#503), so there
-`--focus` only changes whether the window is raised and switched to,
-not whether the new tab becomes the active one in the sidebar. Under
-`local-backend = session` the window stays on the tab it was showing,
-although `open`'s reply still marks the new tab `is_active`.
+attention from whatever the person is doing. Opening a tab selects it
+by default, even without `--focus` — pass `--no-activate` (#503) when
+the new tab should not become the active one, so open tabs, with
+`--no-activate`, whenever the task doesn't call for switching to them.
+An in-process Roost that selects it — the default — makes `--focus`
+change only whether the window is raised and switched to, not whether
+the new tab becomes the active one in the sidebar; `--no-activate` is
+what actually keeps the *previous* tab active there. Under
+`local-backend = session` the window's own visible tab never follows a
+session-side `tab.open` either way, but `open`'s reply still marks the
+new tab `is_active` unless `--no-activate` was passed — `is_active` is
+what separates the two outcomes there, since the window's display
+doesn't.
 
 ## Target policy: which tab a command acts on
 
@@ -172,6 +251,24 @@ dump` and `wait` still fall back to the UI's active tab when
 [`cli.md`'s "Which tab a command acts on"](../reference/cli.md#which-tab-a-command-acts-on)
 for the exact list and the refusal text.
 
+## `busy`, and retrying across a mixed-version fleet
+
+A mutating op refused while a local-backend switch is in flight (see
+[Host Sessions](host-sessions.md#switching-the-local-backend)) answers
+`{"code":"busy","message":"a local-backend switch is in progress"}` —
+the one refusal worth retrying rather than surfacing. Poll `identify`
+until `local_backend_switch` is absent, then retry, re-reading any tab
+or project id first: a switch replays the workspace under new ids, so
+one held from before it may no longer resolve.
+
+**The mixed-version case.** A server older than `busy` answered the
+same condition `host-unavailable` instead, so on `host-unavailable`
+re-read `identify` too: a `local_backend_switch` still present there is
+that older server's spelling of `busy`; an absent one means the local
+session really is down, and `host-unavailable` keeps its ordinary
+meaning. A fleet with more than one Roost version in it — a host not
+yet upgraded, say — needs both checks, not just the code string.
+
 ## Exit codes
 
 Every failure prints one line on stderr — `roostctl: <code>: <message>`,
@@ -184,13 +281,14 @@ stable part to branch on:
 | 2 | `usage` | A bad command line, including a command that changes a tab given no `--tab` and no `ROOST_TAB_ID` |
 | 1 | `no-target` | Auto-detect found nothing listening at any known socket |
 | 1 | `ambiguous-target` | Several Roost UIs are running; pass `--target` |
-| 1 | `connection` | Dialing, reading or writing the socket failed, or the stream dropped |
-| 1 | *the server's own* | The server refused the request; its code is passed through verbatim (`not-found`, `invalid-param`, `unknown-op`, …) |
+| 1 | `connection` | Dialing, reading or writing the socket failed, or the stream dropped, or a call went unanswered past its ceiling (30s under `wait --timeout 0`/`--no-timeout`) |
+| 1 | *the server's own* | The server refused the request; its code is passed through verbatim (`not-found`, `invalid-param`, `unknown-op`, `busy`, …) |
 | 1 | `unsupported` | This server does not serve an op the command needs |
 | 1 | `checks-failed` | `doctor` found a failing check |
 | 1 | `failed` | Something on this machine outside the wire: a file, a binary, an unset `$HOME` |
 | 3 | `not-running` | `session status` found no session running |
-| 4 | `timeout` | `wait`'s condition did not hold before `--timeout` |
+| 4 | `timeout` | `wait`'s or `tab prompt`'s condition did not hold before `--timeout` |
+| 4 | `stalled` | `tab prompt` wrote the prompt and the tab never reached `running` within `--activity-timeout` — CLI-local, no server answers this code |
 
 The authoritative version of this table, including the partial-failure
 exception for the `agent` verbs, is
@@ -198,8 +296,15 @@ exception for the `agent` verbs, is
 
 ## The Mac app
 
-The Swift `Roost.app` omits `identify.ops` entirely, which every verb
-above treats the same as an `ops` list missing the op it needs
+**`roostctl` is not on `PATH`.** The `.dmg` ships it inside the bundle,
+at `Roost.app/Contents/Resources/bin/roostctl` (#261) — a
+Finder-launched app gets a minimal `PATH` that doesn't include it, so a
+script written against a bare `roostctl` needs a one-time symlink onto
+`PATH`, or the full path. See [`cli.md`'s "Where `roostctl`
+lives"](../reference/cli.md#where-roostctl-lives).
+
+The Swift `Roost.app` also omits `identify.ops` entirely, which every
+verb above treats the same as an `ops` list missing the op it needs
 (#510):
 
 - `open` and `project ensure` refuse `unsupported` — use `project
@@ -210,6 +315,15 @@ above treats the same as an `ops` list missing the op it needs
 - `events` fails outright with the server's own refusal (today,
   `not-implemented`) — there's no poll fallback for a continuous
   stream.
+- `tab prompt` needs the event stream `events` does, and there is no
+  polling fallback for it either (a poll can't see a turn that starts
+  and ends between two `tab.list` calls) — it refuses `unsupported` the
+  same way.
+
+**The Mac app predates `--no-activate`.** `tab open --no-activate` and
+`open --no-activate` answer `unknown-field` there — reported verbatim,
+same as any refusal from a server that doesn't recognize a field —
+rather than silently opening the tab active anyway.
 
 Everything else in this guide — `identify`, the target policy, `tab
 send`/`tab dump`/`notify`, the exit-code table — works the same on
