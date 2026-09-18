@@ -330,9 +330,12 @@ write` / `send` / `state` with no `--tab` still have something to act
 on. `local_backend_switch` names the phase of a local-backend switch in
 progress (plan 063 §D8a) — one of `"preparing"`, `"replaying"`,
 `"committing"`, `"cleaning-up"` — and is absent whenever the UI is idle;
-while it is present, every mutating op on a UI socket under `in-process`
-answers `busy` (reads keep answering), and one already under way when
-the switch began finishes before the switch copies anything. A mutation
+while it is present, every op that mutates the workspace on a UI socket
+under `in-process` answers `busy`, and one already under way when the
+switch began finishes before the switch copies anything. Reads keep
+answering, and so do the UI's own seams (the palette, the window, the
+clipboard, the selection), which act on the window rather than on the
+workspace the switch moves. A mutation
 refused `busy` can read this to see which phase is holding
 it up, and a test can tell
 "before the commit point" from "after" it, since `local_backend` itself

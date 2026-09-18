@@ -27,7 +27,7 @@ fn read_ipc_md() -> Option<String> {
     let path = repo_root().join("docs/reference/ipc.md");
     match std::fs::read_to_string(&path) {
         Ok(text) => Some(text),
-        Err(err) => {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
                 "SKIP: docs/reference/ipc.md not found at {} ({err}) - this looks like a \
                  packaged build with no `docs/` directory, so the error-code catalogue \
@@ -36,6 +36,7 @@ fn read_ipc_md() -> Option<String> {
             );
             None
         }
+        Err(err) => panic!("reading {}: {err}", path.display()),
     }
 }
 
