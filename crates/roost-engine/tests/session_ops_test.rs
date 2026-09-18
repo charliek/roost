@@ -425,7 +425,7 @@ async fn a_mutation_racing_stop_is_refused_or_reaped() {
 /// terminal rather than just the workspace record.
 ///
 async fn open_tab_reporting_size(f: &Fixture, size: Option<(u32, u32)>) -> (u16, u16) {
-    let project = f.workspace.ensure_default_project("/tmp");
+    let project = f.workspace.ensure_default_project("/tmp", true);
     let value = reply(
         call(
             &f.handler,
@@ -519,7 +519,7 @@ async fn two_connections_both_write_and_neither_displaces_the_other() {
 /// exits — so what the assertion reads is what the PTY actually
 /// received, not what the workspace recorded.
 async fn a_tab_reading_six_bytes(f: &Fixture) -> (i64, broadcast::Receiver<PtyOutputEvent>) {
-    let project = f.workspace.ensure_default_project("/tmp");
+    let project = f.workspace.ensure_default_project("/tmp", true);
     let opened: TabOpenResult = serde_json::from_value(reply(
         call(
             &f.handler,

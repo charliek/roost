@@ -21,7 +21,7 @@ fn fixture() -> (Workspace, PtySupervisor, PathBuf, Tab) {
         .create_project("p", "/tmp")
         .expect("create_project");
     let tab = workspace
-        .open_tab(project.id, "/tmp", "")
+        .open_tab(project.id, "/tmp", "", true)
         .expect("open_tab");
     (workspace, supervisor, socket, tab)
 }

@@ -218,6 +218,7 @@ roostctl tab open --project-id 1 --cwd ~/projects/roost
 roostctl tab open --project-id 1 -- htop                       # run a command in the tab
 roostctl tab open --project-id 1 --hold -- make test           # keep the tab open after it exits
 roostctl tab open --project-id 1 --after-tab 5 --focus -- vim   # next to tab 5, then focus it
+roostctl tab open --project-id 1 --no-activate -- make test     # open it without selecting it
 roostctl tab close --tab 5
 roostctl tab send --tab 5 --bytes 'ls -la\n'
 roostctl tab resize --tab 5 --cols 120 --rows 40
@@ -235,6 +236,7 @@ roostctl tab dump --tab 5 --scrollback 200   # 200 rows of history, then the vie
 | `--hold` | Keep the tab open after the command exits, dropping to an interactive shell (mirrors `command = … hold=true`). Only meaningful with a command. |
 | `--after-tab <id>` | Place the new tab immediately after that tab (same project) instead of at the end. Best-effort: if that tab is gone by the time the reorder lands, the new tab stays at the end. |
 | `--focus` | Focus (activate) the new tab after opening. |
+| `--no-activate` | Open the tab without selecting it: the active project and tab stay where they were (`tab.open`'s `activate: false`). Without it, opening a tab selects it. Refused beside `--focus` (exit 2 `usage`). A server that predates the field — the Mac app today — answers `unknown-field`, which is reported verbatim; nothing retries without the flag. |
 
 These compose: `--after-tab X --focus -- <cmd>` is the "open a command in a tab right here and switch to it" primitive that providers and other scripts use. (`--after-tab`/`--focus` are CLI orchestration over `tab.reorder` / `tab.focus`; `-- <cmd>` fills the `tab.open` op's `argv` — see [ipc.md](ipc.md).)
 
@@ -480,7 +482,9 @@ another caller into a second project of the same name (#221). `--cwd`
 defaults to `$PWD` and is used for **both** calls: the project (if this call
 creates it) and the new tab. Without `-- cmd…` the tab opens the default
 shell, same as [`tab open`](#tab-open-close-send-resize-reorder-dump);
-`--hold` and `--focus` compose exactly as they do there.
+`--hold`, `--focus` and `--no-activate` compose exactly as they do there
+(`--focus` with `--no-activate` is exit 2 `usage`, before anything is
+sent).
 
 Always prints `{"project", "tab", "created"}` — the ensured project, the
 opened tab, and whether the project was just created — **with or

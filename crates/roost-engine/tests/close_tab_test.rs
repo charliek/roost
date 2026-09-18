@@ -45,7 +45,7 @@ async fn a_live_tab_closes_cleanly_and_its_child_is_reaped() {
         .create_project("p", "/tmp")
         .expect("create_project");
     let tab = workspace
-        .open_tab(project.id, "/tmp", "")
+        .open_tab(project.id, "/tmp", "", true)
         .expect("open_tab");
     let _rx = supervisor
         .spawn(tab.id, "/tmp", &quiet_argv(), 80, 24, &socket)

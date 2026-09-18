@@ -13,8 +13,12 @@ use roost_engine::{Workspace, WorkspaceEvent};
 async fn focus_tab_clears_the_focused_tabs_notification_in_one_commit() {
     let workspace = Workspace::new();
     let project = workspace.create_project("p", "/tmp").unwrap();
-    let badged = workspace.open_tab(project.id, "/tmp", "badged").unwrap();
-    let other = workspace.open_tab(project.id, "/tmp", "other").unwrap();
+    let badged = workspace
+        .open_tab(project.id, "/tmp", "badged", true)
+        .unwrap();
+    let other = workspace
+        .open_tab(project.id, "/tmp", "other", true)
+        .unwrap();
     workspace.focus_tab(other.id).unwrap();
     workspace.set_tab_has_notification(badged.id, true).unwrap();
 
@@ -49,8 +53,8 @@ async fn focus_tab_clears_the_focused_tabs_notification_in_one_commit() {
 async fn refocusing_a_clear_tab_emits_no_notification_event() {
     let workspace = Workspace::new();
     let project = workspace.create_project("p", "/tmp").unwrap();
-    let one = workspace.open_tab(project.id, "/tmp", "one").unwrap();
-    let two = workspace.open_tab(project.id, "/tmp", "two").unwrap();
+    let one = workspace.open_tab(project.id, "/tmp", "one", true).unwrap();
+    let two = workspace.open_tab(project.id, "/tmp", "two", true).unwrap();
     workspace.focus_tab(two.id).unwrap();
 
     let mut events = workspace.subscribe_versioned();
@@ -76,7 +80,9 @@ async fn focusing_the_already_active_tab_still_acknowledges_its_notification() {
     // A notification raised while the window is unfocused is not
     // suppressed, so the active tab can wear a badge and the user can
     // click the pill it is already on.
-    let active = workspace.open_tab(project.id, "/tmp", "active").unwrap();
+    let active = workspace
+        .open_tab(project.id, "/tmp", "active", true)
+        .unwrap();
     workspace.focus_tab(active.id).unwrap();
     workspace.set_tab_has_notification(active.id, true).unwrap();
 
@@ -110,8 +116,12 @@ async fn focusing_the_already_active_tab_still_acknowledges_its_notification() {
 async fn closing_the_active_tab_does_not_acknowledge_the_fallback_tabs_notification() {
     let workspace = Workspace::new();
     let project = workspace.create_project("p", "/tmp").unwrap();
-    let fallback = workspace.open_tab(project.id, "/tmp", "fallback").unwrap();
-    let active = workspace.open_tab(project.id, "/tmp", "active").unwrap();
+    let fallback = workspace
+        .open_tab(project.id, "/tmp", "fallback", true)
+        .unwrap();
+    let active = workspace
+        .open_tab(project.id, "/tmp", "active", true)
+        .unwrap();
     workspace.focus_tab(active.id).unwrap();
     workspace
         .set_tab_has_notification(fallback.id, true)

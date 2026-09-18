@@ -10009,10 +10009,12 @@ mod tests {
     fn numeric_switch_helpers_follow_authoritative_snapshot_order() {
         let workspace = Workspace::new();
         let first = workspace.create_project("first", "/tmp").unwrap();
-        let first_tab = workspace.open_tab(first.id, "/tmp", "one").unwrap();
-        let second_tab = workspace.open_tab(first.id, "/tmp", "two").unwrap();
+        let first_tab = workspace.open_tab(first.id, "/tmp", "one", true).unwrap();
+        let second_tab = workspace.open_tab(first.id, "/tmp", "two", true).unwrap();
         let second = workspace.create_project("second", "/tmp").unwrap();
-        let second_project_tab = workspace.open_tab(second.id, "/tmp", "three").unwrap();
+        let second_project_tab = workspace
+            .open_tab(second.id, "/tmp", "three", true)
+            .unwrap();
 
         let local_ring = |projects: &[Project]| {
             vec![host_sidebar::RingSection {
@@ -10161,8 +10163,12 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let workspace = Arc::new(Workspace::new());
         let project = workspace.create_project("one", "/tmp").unwrap();
-        let sibling = workspace.open_tab(project.id, "/tmp", "sibling").unwrap();
-        let doomed = workspace.open_tab(project.id, "/tmp", "doomed").unwrap();
+        let sibling = workspace
+            .open_tab(project.id, "/tmp", "sibling", true)
+            .unwrap();
+        let doomed = workspace
+            .open_tab(project.id, "/tmp", "doomed", true)
+            .unwrap();
         workspace.focus_tab(doomed.id).unwrap();
         let client = LocalClient::new(
             Arc::clone(&workspace),
@@ -10190,7 +10196,9 @@ mod tests {
         assert!(workspace.tab(sibling.id).is_ok());
 
         let last_project = workspace.create_project("last", "/tmp").unwrap();
-        let last = workspace.open_tab(last_project.id, "/tmp", "last").unwrap();
+        let last = workspace
+            .open_tab(last_project.id, "/tmp", "last", true)
+            .unwrap();
         workspace.focus_tab(last.id).unwrap();
         assert_eq!(
             runtime.block_on(close_tab_by_id(&client, last.id)).unwrap(),
@@ -11174,8 +11182,8 @@ mod tests {
     fn confirm_delete_targets_only_projects_present_in_the_snapshot() {
         let workspace = Workspace::new();
         let project = workspace.create_project("doomed", "/tmp").unwrap();
-        workspace.open_tab(project.id, "/tmp", "one").unwrap();
-        workspace.open_tab(project.id, "/tmp", "two").unwrap();
+        workspace.open_tab(project.id, "/tmp", "one", true).unwrap();
+        workspace.open_tab(project.id, "/tmp", "two", true).unwrap();
         let snapshot = workspace.snapshot();
 
         assert_eq!(
@@ -11235,7 +11243,7 @@ mod tests {
     fn a_confirmation_keeps_the_key_it_was_asked_about() {
         let workspace = Workspace::new();
         let project = workspace.create_project("mirrored", "/tmp").unwrap();
-        workspace.open_tab(project.id, "/tmp", "t").unwrap();
+        workspace.open_tab(project.id, "/tmp", "t", true).unwrap();
         let rows = workspace.snapshot();
 
         let host = HostId::new(3);
@@ -11252,7 +11260,7 @@ mod tests {
     fn the_confirm_body_reads_exactly_as_the_mac_alert_does() {
         let workspace = Workspace::new();
         let project = workspace.create_project("polish", "/tmp").unwrap();
-        workspace.open_tab(project.id, "/tmp", "one").unwrap();
+        workspace.open_tab(project.id, "/tmp", "one", true).unwrap();
         let snapshot = workspace.snapshot();
         let confirm =
             confirm_delete_target(&snapshot, ProjectKey::local(project.id)).expect("target");
@@ -11271,8 +11279,8 @@ mod tests {
     fn a_confirm_whose_project_vanished_externally_is_auto_dismissed() {
         let workspace = Workspace::new();
         let project = workspace.create_project("doomed", "/tmp").unwrap();
-        let tab = workspace.open_tab(project.id, "/tmp", "one").unwrap();
-        workspace.open_tab(project.id, "/tmp", "two").unwrap();
+        let tab = workspace.open_tab(project.id, "/tmp", "one", true).unwrap();
+        workspace.open_tab(project.id, "/tmp", "two", true).unwrap();
         let snapshot = workspace.snapshot();
         let mut confirm = confirm_delete_target(&snapshot, ProjectKey::local(project.id));
 

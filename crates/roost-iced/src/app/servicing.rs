@@ -5002,7 +5002,7 @@ mod tests {
         let resync = WorkspaceEvent::Resync(Vec::new());
 
         let sealed = ReadOnlyDir::seal(dir.path());
-        let tab = workspace.open_tab(project, "/one", "a").unwrap().id;
+        let tab = workspace.open_tab(project, "/one", "a", true).unwrap().id;
         let error = workspace.persist_error().expect("the write failed");
 
         // The failure the client was too far behind to be told about.
@@ -5736,9 +5736,11 @@ mod tests {
     async fn a_stale_instances_items_survive_the_whole_drain_without_touching_the_local_tab() {
         let workspace = Workspace::new();
         let project = workspace.create_project("p", "/tmp").expect("project");
-        let live = workspace.open_tab(project.id, "/tmp", "live").expect("tab");
+        let live = workspace
+            .open_tab(project.id, "/tmp", "live", true)
+            .expect("tab");
         let other = workspace
-            .open_tab(project.id, "/tmp", "other")
+            .open_tab(project.id, "/tmp", "other", true)
             .expect("tab");
         workspace.focus_tab(other.id).expect("focus elsewhere");
         workspace
@@ -5931,8 +5933,12 @@ mod tests {
     fn a_banner_click_focuses_its_tab_clears_it_and_raises_the_window() {
         let workspace = Workspace::new();
         let project = workspace.create_project("p", "/tmp").expect("project");
-        let clicked = workspace.open_tab(project.id, "/tmp", "one").expect("tab");
-        let other = workspace.open_tab(project.id, "/tmp", "two").expect("tab");
+        let clicked = workspace
+            .open_tab(project.id, "/tmp", "one", true)
+            .expect("tab");
+        let other = workspace
+            .open_tab(project.id, "/tmp", "two", true)
+            .expect("tab");
         workspace
             .set_tab_has_notification(clicked.id, true)
             .expect("mark pending");
@@ -5980,8 +5986,12 @@ mod tests {
     fn a_banner_from_a_stale_instance_never_jumps_the_local_tab_of_that_id() {
         let workspace = Workspace::new();
         let project = workspace.create_project("p", "/tmp").expect("project");
-        let one = workspace.open_tab(project.id, "/tmp", "one").expect("tab");
-        let two = workspace.open_tab(project.id, "/tmp", "two").expect("tab");
+        let one = workspace
+            .open_tab(project.id, "/tmp", "one", true)
+            .expect("tab");
+        let two = workspace
+            .open_tab(project.id, "/tmp", "two", true)
+            .expect("tab");
         workspace
             .set_tab_has_notification(one.id, true)
             .expect("mark pending");

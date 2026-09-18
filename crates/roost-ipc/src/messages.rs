@@ -321,6 +321,10 @@ pub struct TabOpenParams {
     pub rows: u32,
     #[serde(default)]
     pub title: String,
+    /// `Some(false)` opens the tab without selecting it or its project.
+    /// Absent and `Some(true)` both select it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activate: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3975,6 +3979,31 @@ mod tests {
     fn tab_open_params_reject_unknown() {
         let bad = r#"{"project_id":"1","cols":100,"rows":30,"badfield":true}"#;
         assert!(serde_json::from_str::<TabOpenParams>(bad).is_err());
+    }
+
+    /// #503: absent, `activate` leaves the request the bytes it always was.
+    #[test]
+    fn tab_open_activate_is_on_the_wire_only_when_set() {
+        let mut params = TabOpenParams {
+            project_id: 17,
+            cwd: "/tmp".into(),
+            argv: vec!["/bin/zsh".into()],
+            cols: 120,
+            rows: 30,
+            title: String::new(),
+            activate: None,
+        };
+        let before = r#"{"project_id":"17","cwd":"/tmp","argv":["/bin/zsh"],"cols":120,"rows":30,"title":""}"#;
+        assert_eq!(serde_json::to_string(&params).unwrap(), before);
+        assert_eq!(
+            serde_json::from_str::<TabOpenParams>(before).unwrap(),
+            params
+        );
+
+        params.activate = Some(false);
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.ends_with(r#","title":"","activate":false}"#), "{json}");
+        round_trip(&params);
     }
 
     #[test]

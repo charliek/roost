@@ -437,6 +437,18 @@ word-splitting must pass `["sh", "-c", "..."]` explicitly. This `argv` is
 reachable from the CLI as `roostctl tab open -- <cmd…>` (see
 [cli.md](cli.md)).
 
+**`activate` (optional, #503).** `false` opens the tab without
+selecting it: the tab is appended at the end of its project, and the
+active project, the active tab and each project's remembered tab stay
+where they were, so `tab.opened` arrives with no `active.changed` after
+it. With `project_id: "0"` the default project is found or created
+without being selected either. Omitted or `true`, the new tab is
+selected, as it always has been; an omitted field is not sent, so
+those requests are the bytes they were before the field existed. The
+Swift Mac app and servers that predate the field answer
+`unknown-field`. From the CLI: `--no-activate` on `tab open` and
+`open`.
+
 Response: `{"tab": <Tab>}`.
 
 ### `tab.close`

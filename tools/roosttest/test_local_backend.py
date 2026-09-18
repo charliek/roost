@@ -1743,6 +1743,27 @@ def test_the_ui_reports_the_tab_it_is_showing_not_the_hidden_workspaces(lane: La
     assert roost.list() != [], "and the list it came from is the slot's"
 
 
+def test_an_unactivated_tab_open_on_the_ui_socket_selects_nothing(lane: Lane):
+    """#503 under `session`: `tab.open {activate: false}` is forwarded
+    verbatim and the session's own engine honours it. The window stays on
+    its tab, and the session did not select the new one either — the row's
+    `is_active` is the session's verdict, since `tab.list` here is the
+    session's list, and it is read on the session's own socket too."""
+    roost = session_ui(lane)
+    shown = roost.identify()["active_tab_id"]
+    assert roost.app_selected_tab_id() == shown
+    project = int(roost.list()[0]["id"])
+
+    quiet = roost.open_tab(project, cwd="/tmp", title="quiet", activate=False)
+
+    assert quiet in session_tab_ids(lane)
+    assert roost.identify()["active_tab_id"] == shown
+    assert roost.app_selected_tab_id() == shown
+    assert roost.tab(quiet)["is_active"] is False
+    with lane.session() as c:
+        assert c.tab(quiet)["is_active"] is False
+
+
 def test_a_forwarded_delete_of_the_last_project_is_answered_before_the_exit(lane: Lane):
     """AC7 on the far side of §D10: the deletion reply is written before
     the process goes.

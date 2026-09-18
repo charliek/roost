@@ -41,10 +41,37 @@ fn tab_open_request_envelope_uses_string_ids() {
         cols: 120,
         rows: 30,
         title: "".into(),
+        activate: None,
     };
     let json = serde_json::to_value(&params).unwrap();
     assert_eq!(json["project_id"], "17");
     assert_eq!(json["cols"], 120);
+}
+
+/// Both `tab.open` request vectors decode as the typed params and
+/// re-encode to their own params: the recorded one has no `activate` and
+/// keeps not having one (#503).
+#[test]
+fn tab_open_vectors_decode_with_and_without_activate() {
+    for (name, activate) in [
+        ("tab.open.request.json", None),
+        ("tab.open.activate-false.request.json", Some(false)),
+    ] {
+        let path = format!(
+            "{}/../../tests/ipc-vectors/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let request: RawRequest = serde_json::from_str(&raw).expect(name);
+        assert_eq!(request.op, ops::TAB_OPEN, "{name}");
+        let params: TabOpenParams = serde_json::from_value(request.params.clone()).expect(name);
+        assert_eq!(params.activate, activate, "{name}");
+        assert_eq!(
+            serde_json::to_value(&params).unwrap(),
+            request.params,
+            "{name}"
+        );
+    }
 }
 
 #[test]

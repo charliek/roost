@@ -15,7 +15,7 @@ fn projects_and_next_id_survive_reopen() {
     let (project_id, first_tab_id) = {
         let ws = Workspace::open(state_path.clone());
         let p = ws.create_project("Roost", "/tmp").unwrap();
-        let t = ws.open_tab(p.id, "/tmp", "shell").unwrap();
+        let t = ws.open_tab(p.id, "/tmp", "shell", true).unwrap();
         (p.id, t.id)
         // ws drops here; state.json should be on disk.
     };
@@ -49,7 +49,7 @@ fn projects_and_next_id_survive_reopen() {
     // against project_id alone wasn't strong enough — open_tab
     // already returns ids greater than any project id in practice,
     // so the meaningful invariant is "ids monotonically advance."
-    let next_tab = ws2.open_tab(project_id, "/", "").unwrap();
+    let next_tab = ws2.open_tab(project_id, "/", "", true).unwrap();
     assert!(
         next_tab.id > first_tab_id,
         "ids must advance past the previous tab ({}), got {}",
@@ -85,7 +85,7 @@ fn saved_hosts_survive_an_ordinary_rewrite() {
     {
         let ws = Workspace::open(state_path.clone());
         let p = ws.create_project("Roost", "/tmp").unwrap();
-        ws.open_tab(p.id, "/tmp", "shell").unwrap();
+        ws.open_tab(p.id, "/tmp", "shell", true).unwrap();
     }
 
     let back = read_state(&state_path).unwrap().expect("present");

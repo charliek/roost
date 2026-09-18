@@ -3230,14 +3230,15 @@ async fn dispatch(
         }
         ops::TAB_OPEN => {
             let p: TabOpenParams = decode(params)?;
+            let activate = p.activate != Some(false);
             let project_id = if p.project_id == 0 {
-                h.workspace.ensure_default_project(&p.cwd)
+                h.workspace.ensure_default_project(&p.cwd, activate)
             } else {
                 p.project_id
             };
             let tab = h
                 .workspace
-                .open_tab(project_id, &p.cwd, &p.title)
+                .open_tab(project_id, &p.cwd, &p.title, activate)
                 .map_err(ws_err)?;
             // Spawn the PTY. Use the tab's cwd, the requested argv,
             // and a sensible default winsize when the caller doesn't
@@ -4840,7 +4841,7 @@ mod tests {
         let workspace = Arc::new(Workspace::open(dir.join("state.json")));
         let project = workspace.create_project("p", "/tmp").expect("project");
         workspace
-            .open_tab(project.id, "/tmp", "t")
+            .open_tab(project.id, "/tmp", "t", true)
             .expect("open a tab");
         assert_ne!(workspace.active(), (0, 0), "the fixture needs a selection");
         IpcHandler::new(
@@ -5043,6 +5044,76 @@ mod tests {
             before,
             "the forward must not have created a project here"
         );
+    }
+
+    /// Hangs up every tab it holds when dropped, a failed assertion
+    /// included: the runtime otherwise waits out each child on the way
+    /// down.
+    struct HangUp(Arc<PtySupervisor>, Vec<i64>);
+
+    impl Drop for HangUp {
+        fn drop(&mut self) {
+            for tab in &self.1 {
+                self.0.close(*tab);
+            }
+        }
+    }
+
+    /// `tab.open`'s `activate` as the served arm reads it (#503): absent
+    /// and `true` select the new tab, `false` does not — and `false`
+    /// reaches the default-project step as well as the open.
+    #[tokio::test]
+    async fn tab_open_selects_unless_activate_is_false() {
+        async fn open(
+            h: &IpcHandler,
+            opened: &mut HangUp,
+            mut params: serde_json::Value,
+            activate: Option<bool>,
+        ) -> (roost_ipc::messages::Tab, bool) {
+            params["argv"] = serde_json::json!(["/bin/sh", "-c", "exec sleep 60"]);
+            if let Some(activate) = activate {
+                params["activate"] = activate.into();
+            }
+            let mut events = h.workspace.subscribe();
+            let result = dispatch(h, ops::TAB_OPEN, params).await.expect("tab.open");
+            let TabOpenResult { tab } = serde_json::from_value(result).expect("a tab");
+            opened.1.push(tab.id);
+            let moved = std::iter::from_fn(|| events.try_recv().ok())
+                .any(|event| matches!(event, crate::WorkspaceEvent::ActiveChanged { .. }));
+            (tab, moved)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path());
+        let mut opened = HangUp(h.supervisor.clone(), Vec::new());
+        let project = h.workspace.snapshot()[0].id;
+        for activate in [None, Some(true), Some(false)] {
+            let before = h.workspace.active();
+            let params = serde_json::json!({"project_id": project.to_string()});
+            let (tab, moved) = open(&h, &mut opened, params, activate).await;
+            if activate == Some(false) {
+                assert_eq!(h.workspace.active(), before, "{activate:?}");
+                assert!(!tab.is_active && !moved, "{activate:?}");
+            } else {
+                assert_eq!(h.workspace.active(), (project, tab.id), "{activate:?}");
+                assert!(tab.is_active && moved, "{activate:?}");
+            }
+        }
+
+        let empty = tempfile::tempdir().unwrap();
+        let bare = IpcHandler::new(
+            Arc::new(Workspace::open(empty.path().join("state.json"))),
+            Arc::new(PtySupervisor::new()),
+            empty.path().join("roost.sock"),
+            "Roost-test",
+            "ai.stridelabs.Roost.test",
+        );
+        let mut bare_opened = HangUp(bare.supervisor.clone(), Vec::new());
+        let params = serde_json::json!({"project_id": "0"});
+        let (tab, moved) = open(&bare, &mut bare_opened, params, Some(false)).await;
+        assert_eq!(bare.workspace.snapshot().len(), 1, "the default project");
+        assert_eq!(bare.workspace.active(), (0, 0));
+        assert!(!tab.is_active && !moved);
     }
 
     /// `project.create`'s twin, and the same assertion: nothing lands in

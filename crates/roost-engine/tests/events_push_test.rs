@@ -204,8 +204,8 @@ async fn the_ack_fences_the_stream_and_the_first_batch_is_the_next_commit() {
 async fn a_multi_event_commit_is_one_batch() {
     let h = harness(true, None).await;
     let project = h.workspace.create_project("p", "/tmp").unwrap();
-    let a = h.workspace.open_tab(project.id, "/tmp", "a").unwrap();
-    let b = h.workspace.open_tab(project.id, "/tmp", "b").unwrap();
+    let a = h.workspace.open_tab(project.id, "/tmp", "a", true).unwrap();
+    let b = h.workspace.open_tab(project.id, "/tmp", "b", true).unwrap();
 
     let (mut reader, _w, fence) = h.subscribe().await;
     h.workspace.delete_project(project.id).unwrap();
@@ -234,10 +234,10 @@ async fn an_empty_commit_pushes_an_empty_batch() {
     let h = harness(true, None).await;
     // Seed the default project *and* the active selection, so the
     // second call has nothing left to change.
-    h.workspace.ensure_default_project("/tmp");
+    h.workspace.ensure_default_project("/tmp", true);
 
     let (mut reader, _w, fence) = h.subscribe().await;
-    h.workspace.ensure_default_project("/tmp");
+    h.workspace.ensure_default_project("/tmp", true);
 
     let batch = read_batch(&mut reader).await;
     assert_eq!(batch.revision, fence + 1, "no revision gap");
@@ -301,7 +301,7 @@ async fn a_subscriber_that_stops_draining_is_closed_and_can_heal() {
     };
     let h = harness(true, Some(limits)).await;
     let project = h.workspace.create_project("p", "/tmp").unwrap();
-    let tab = h.workspace.open_tab(project.id, "/tmp", "t").unwrap();
+    let tab = h.workspace.open_tab(project.id, "/tmp", "t", true).unwrap();
     let (mut reader, w, _fence) = h.subscribe().await;
 
     // Commit far faster than a client that never reads can absorb. Which
@@ -521,7 +521,10 @@ async fn every_stream_receives_the_same_effect() {
 
     let h = harness(true, None).await;
     let project = h.workspace.create_project("p", "/tmp").unwrap();
-    let tab = h.workspace.open_tab(project.id, "/tmp", "sh").unwrap();
+    let tab = h
+        .workspace
+        .open_tab(project.id, "/tmp", "sh", true)
+        .unwrap();
 
     let (mut holder, mut hw) = h.dial().await;
     request(&mut hw, 1, ops::EVENTS_SUBSCRIBE, serde_json::json!({})).await;
@@ -555,11 +558,13 @@ async fn every_stream_receives_the_same_effect() {
 async fn a_notification_reaches_a_subscriber() {
     let h = harness(true, None).await;
     let project = h.workspace.create_project("p", "/tmp").unwrap();
-    let tab = h.workspace.open_tab(project.id, "/tmp", "t").unwrap();
+    let tab = h.workspace.open_tab(project.id, "/tmp", "t", true).unwrap();
     // A second tab takes the selection: a focused, *active* tab
     // suppresses its own notification, which would make this pass or
     // fail on which tab happened to be selected rather than on routing.
-    h.workspace.open_tab(project.id, "/tmp", "other").unwrap();
+    h.workspace
+        .open_tab(project.id, "/tmp", "other", true)
+        .unwrap();
     let (mut watcher, _ww, _fence) = h.subscribe().await;
 
     assert!(h

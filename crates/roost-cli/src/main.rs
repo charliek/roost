@@ -13,7 +13,7 @@
 //!   roostctl tab focus [--tab ID]
 //!   roostctl tab list
 //!   roostctl tab set-state --state STATE [--tab ID]
-//!   roostctl tab open --project-id N [--cwd …] [--after-tab ID] [--focus] [--hold] [-- <cmd…>]
+//!   roostctl tab open --project-id N [--cwd …] [--after-tab ID] [--focus | --no-activate] [--hold] [-- <cmd…>]
 //!   roostctl tab close [--tab ID]
 //!   roostctl tab send [--tab ID] --bytes 'echo hi\n' [--raw]
 //!   roostctl tab send [--tab ID] --bytes-base64 BASE64
@@ -22,7 +22,7 @@
 //!   roostctl tab reorder --project-id N --order id1,id2,id3
 //!   roostctl tab clear-notification [--tab ID]
 //!   roostctl project {list,create,ensure,rename,delete,reorder}
-//!   roostctl open --project NAME [--cwd …] [--title T] [--focus] [--hold] [-- <cmd…>]
+//!   roostctl open --project NAME [--cwd …] [--title T] [--focus | --no-activate] [--hold] [-- <cmd…>]
 //!   roostctl palette {open,state,query,activate,dismiss}
 //!   roostctl screenshot [--out PATH] [--scale 1|2]
 //!   roostctl render-stats [--reset]
@@ -304,10 +304,10 @@ enum Cmd {
     /// created — with or without `--json`: this is an agent verb, not a
     /// human-typed one. `--cwd` defaults to `$PWD`, for both the ensure
     /// and the open. Without `-- cmd…` the tab opens the default shell,
-    /// same as `tab open`; `--hold` and `--focus` compose exactly as
-    /// they do there — `--focus` runs a follow-up `tab.focus` and
-    /// nothing else ever does, so a caller that didn't ask never steals
-    /// the window.
+    /// same as `tab open`; `--hold`, `--focus` and `--no-activate`
+    /// compose exactly as they do there — `--focus` runs a follow-up
+    /// `tab.focus` and nothing else ever does, and `--no-activate` asks
+    /// `tab.open` itself to leave the selection where it was.
     ///
     /// Refuses `unsupported` (exit 1) against a server whose
     /// `identify.ops` doesn't list `project.ensure` — the Mac app today
@@ -333,6 +333,11 @@ enum Cmd {
         /// Focus (activate) the new tab after opening.
         #[arg(long, default_value_t = false)]
         focus: bool,
+        /// Open the tab without selecting it: the user's selection stays
+        /// where it was. A server that predates the field refuses it
+        /// with `unknown-field`.
+        #[arg(long, default_value_t = false, conflicts_with = "focus")]
+        no_activate: bool,
         /// Keep the tab open after the command exits, dropping to an
         /// interactive shell (mirrors `tab open --hold`). Only
         /// meaningful with a command.
@@ -648,6 +653,11 @@ enum TabCmd {
         /// Focus (activate) the new tab after opening it.
         #[arg(long, default_value_t = false)]
         focus: bool,
+        /// Open the tab without selecting it: the user's selection stays
+        /// where it was. A server that predates the field refuses it
+        /// with `unknown-field`.
+        #[arg(long, default_value_t = false, conflicts_with = "focus")]
+        no_activate: bool,
         /// Keep the tab open after the command exits, dropping to an
         /// interactive shell (mirrors `command = … hold=true`). Only
         /// meaningful with a command after `--`.
@@ -1212,6 +1222,7 @@ async fn run_on_ui(
             title,
             after_tab,
             focus,
+            no_activate,
             hold,
             argv,
         }) => {
@@ -1235,6 +1246,7 @@ async fn run_on_ui(
                         cols,
                         rows,
                         title,
+                        activate: no_activate.then_some(false),
                     },
                 )
                 .await?;
@@ -1282,6 +1294,7 @@ async fn run_on_ui(
             cwd,
             title,
             focus,
+            no_activate,
             hold,
             argv,
         } => {
@@ -1321,6 +1334,7 @@ async fn run_on_ui(
                         cols: 80,
                         rows: 24,
                         title,
+                        activate: no_activate.then_some(false),
                     },
                 )
                 .await?;
@@ -3842,6 +3856,106 @@ mod tests {
             "{sent:?}"
         );
         assert_eq!(sent[3].1["tab_id"], "99", "focuses the newly opened tab");
+    }
+
+    /// #503: `--no-activate` is refused beside `--focus` before anything
+    /// is dialled, on both verbs that open a tab.
+    #[test]
+    fn no_activate_beside_focus_is_a_usage_error() {
+        for argv in [
+            &[
+                "roostctl",
+                "open",
+                "--project",
+                "x",
+                "--focus",
+                "--no-activate",
+            ][..],
+            &[
+                "roostctl",
+                "tab",
+                "open",
+                "--project-id",
+                "1",
+                "--no-activate",
+                "--focus",
+            ],
+        ] {
+            let argv: Vec<OsString> = argv.iter().map(OsString::from).collect();
+            let error = Args::try_parse_from(&argv).expect_err("the flags conflict");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{argv:?}"
+            );
+            assert_eq!(refuse_command_line(&error, &argv), 2, "{argv:?}");
+        }
+    }
+
+    /// #503: `--no-activate` is `activate: false` on the `tab.open` both
+    /// verbs send, and without it the key is not sent at all. A server
+    /// that refuses the field is the answer, verbatim: no second
+    /// `tab.open` without it.
+    #[tokio::test]
+    async fn no_activate_sends_activate_false_and_nothing_otherwise() {
+        let ui = FakeUi::start("no-activate", answer_ensure_and_open);
+        let open = ["open", "--project", "proj", "--cwd", "/x"];
+        let tab_open = ["tab", "open", "--project-id", "42"];
+        for verb in [&open[..], &tab_open[..]] {
+            for no_activate in [false, true] {
+                let mut argv = vec!["--socket", ui.socket.as_str()];
+                argv.extend_from_slice(verb);
+                if no_activate {
+                    argv.push("--no-activate");
+                }
+                assert_eq!(run_argv(&argv, None).await, Ok(0), "{argv:?}");
+                let sent = ui.take();
+                let opens: Vec<_> = sent.iter().filter(|(op, _)| op == ops::TAB_OPEN).collect();
+                assert_eq!(opens.len(), 1, "{argv:?}: {sent:?}");
+                let activate = opens[0].1.get("activate");
+                if no_activate {
+                    assert_eq!(activate, Some(&serde_json::json!(false)), "{argv:?}");
+                } else {
+                    assert_eq!(activate, None, "{argv:?}");
+                }
+                assert!(
+                    sent.iter().all(|(op, _)| op != ops::TAB_FOCUS),
+                    "{argv:?}: {sent:?}"
+                );
+            }
+        }
+
+        let refusing = FakeUi::start("no-activate-refused", |op| match op {
+            "tab.open" => Err(("unknown-field", "unknown params: activate")),
+            _ => answer_ensure_and_open(op),
+        });
+        let error = run_argv(
+            &[
+                "--socket",
+                &refusing.socket,
+                "tab",
+                "open",
+                "--project-id",
+                "42",
+                "--no-activate",
+            ],
+            None,
+        )
+        .await
+        .expect_err("the server refuses the field");
+        assert_eq!(
+            error,
+            CliError::Server {
+                code: "unknown-field".into(),
+                message: "unknown params: activate".into(),
+            }
+        );
+        let sent = refusing.take();
+        assert_eq!(
+            sent.iter().filter(|(op, _)| op == ops::TAB_OPEN).count(),
+            1,
+            "{sent:?}"
+        );
     }
 
     #[tokio::test]

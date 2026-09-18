@@ -81,6 +81,7 @@ async fn identify_create_project_open_tab_list() {
                 cols: 80,
                 rows: 24,
                 title: "".into(),
+                activate: None,
             },
         )
         .await
