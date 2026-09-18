@@ -183,7 +183,7 @@ impl Uploads {
             Ok(()) => Ok(rx),
             Err(mpsc::error::TrySendError::Full(upload)) => {
                 tracing::warn!(name = %upload.name, "the host upload queue is full");
-                Err(HostOpError::Unavailable)
+                Err(HostOpError::QueueFull)
             }
             // The dispatcher is winding down; a new one belongs to a
             // different incarnation, which this upload was not asked of.
@@ -553,7 +553,7 @@ mod tests {
             uploads
                 .enqueue("overflow.png".into(), UploadSource::Bytes(vec![1]))
                 .err(),
-            Some(HostOpError::Unavailable),
+            Some(HostOpError::QueueFull),
             "the ninth is refused, not awaited"
         );
 

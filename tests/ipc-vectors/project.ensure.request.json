@@ -1,0 +1,8 @@
+{
+  "id": "41",
+  "op": "project.ensure",
+  "params": {
+    "name": "review",
+    "cwd": "/home/u/review"
+  }
+}

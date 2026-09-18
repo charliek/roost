@@ -132,11 +132,13 @@ fn slot_unavailable(message: &str) -> Result<serde_json::Value, HostOpFailure> {
 /// Only a project creation is `Create`, matching the local dispatches:
 /// §D6 and §D9 both ask "is a creation owed?" as its own clause, and a
 /// forwarded `tab.open` is no more a creation than the ⌘T that reaches
-/// `open_host_tab_flow`.
+/// `open_host_tab_flow`. `project.ensure` counts because it may create,
+/// and nothing on this side knows whether it will until it answers.
 fn forwarded_op_kind(op: &str) -> local_backend::HostOpKind {
-    match op == roost_ipc::messages::ops::PROJECT_CREATE {
-        true => local_backend::HostOpKind::Create,
-        false => local_backend::HostOpKind::Other,
+    use roost_ipc::messages::ops;
+    match op {
+        ops::PROJECT_CREATE | ops::PROJECT_ENSURE => local_backend::HostOpKind::Create,
+        _ => local_backend::HostOpKind::Other,
     }
 }
 
@@ -3858,7 +3860,7 @@ impl App {
         };
         let mutating = roost_engine::ipc::is_mutating_op(&op);
         if mutating && self.switch_in_flight() {
-            let _ = reply.send(slot_unavailable(local_backend::SWITCH_BUSY));
+            let _ = reply.send(slot_unavailable(roost_ipc::local_route::SWITCH_BUSY));
             return UiTask::None;
         }
         // A read mints an id too, so the dispatch has one shape; only a
@@ -4084,14 +4086,17 @@ mod tests {
     use super::*;
 
     /// Plan 063 §D10: a forwarded mutation is registered by what it does
-    /// to the slot, and only a project creation is a creation.
+    /// to the slot, and only an op that can create a project is a creation.
     #[test]
-    fn a_forwarded_project_create_is_the_only_creation() {
+    fn only_an_op_that_can_create_a_project_is_a_creation() {
         use roost_ipc::messages::ops;
-        assert_eq!(
-            forwarded_op_kind(ops::PROJECT_CREATE),
-            local_backend::HostOpKind::Create
-        );
+        for op in [ops::PROJECT_CREATE, ops::PROJECT_ENSURE] {
+            assert_eq!(
+                forwarded_op_kind(op),
+                local_backend::HostOpKind::Create,
+                "{op}"
+            );
+        }
         for op in [
             ops::TAB_OPEN,
             ops::TAB_CLOSE,
@@ -4162,6 +4167,18 @@ mod tests {
         let dropped = forwarded_failure(&crate::host_conn::HostOpError::Disconnected);
         assert_eq!(dropped.code, roost_ipc::local_route::SLOT_UNAVAILABLE_CODE);
         assert_eq!(dropped.message, "the host disconnected before this ran");
+        for unserved in [
+            crate::host_conn::HostOpError::QueueFull,
+            crate::host_conn::HostOpError::WorkerGone,
+        ] {
+            let failure = forwarded_failure(&unserved);
+            assert_eq!(
+                failure.code,
+                roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
+                "{unserved:?}"
+            );
+            assert_eq!(failure.message, unserved.to_string());
+        }
     }
 
     /// Both refusals a forward can answer keep the UI socket's own
@@ -4169,7 +4186,7 @@ mod tests {
     #[test]
     fn a_refused_forward_says_which_of_the_two_reasons_it_was() {
         let down = slot_unavailable(roost_ipc::local_route::SLOT_UNAVAILABLE).unwrap_err();
-        let busy = slot_unavailable(local_backend::SWITCH_BUSY).unwrap_err();
+        let busy = slot_unavailable(roost_ipc::local_route::SWITCH_BUSY).unwrap_err();
         // The typed code this socket already documents, not a new one.
         assert_eq!(down.code, HOST_UNAVAILABLE);
         assert_eq!(busy.code, down.code);
@@ -4424,13 +4441,14 @@ mod tests {
             );
         }
 
-        // The three that are this connection failing rather than the
+        // The ones that are this connection failing rather than the
         // session answering: one code, and `HostOpError`'s own words —
         // the sentence the drag gesture's status banner shows.
         for error in [
             HostOpError::Disconnected,
             HostOpError::Transport("broken pipe".into()),
-            HostOpError::Unavailable,
+            HostOpError::QueueFull,
+            HostOpError::WorkerGone,
         ] {
             let expected = error.to_string();
             let failure = host_op_failure(&error);

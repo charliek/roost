@@ -606,6 +606,10 @@ pub enum WorkspaceError {
     HostLabelReserved,
     #[error("a host named {0:?} already exists")]
     HostLabelTaken(String),
+    #[error("project name must not be blank")]
+    ProjectNameBlank,
+    #[error("no project is named {0:?}, and creating it needs a cwd")]
+    ProjectCwdRequired(String),
     /// An app-side invariant did not hold, so the reply would have been
     /// a lie. Answered rather than papered over: today the only source
     /// is `host.status` finding the sidebar's cached bands out of step
@@ -1103,6 +1107,12 @@ impl Workspace {
         self.versioned_events.subscribe()
     }
 
+    /// How many versioned receivers are alive — one per live event
+    /// relay. Test-only today: it is how a test sees a relay let go.
+    pub fn versioned_receiver_count(&self) -> usize {
+        self.versioned_events.receiver_count()
+    }
+
     /// Start a subscription at the current revision — see [`ResumeCut`].
     pub fn subscribe_live(&self) -> ResumeCut {
         let inner = self.inner.lock().unwrap();
@@ -1185,25 +1195,28 @@ impl Workspace {
         let mut out: Vec<Project> = inner
             .projects
             .values()
-            .map(|p| Project {
-                id: p.id,
-                name: p.name.clone(),
-                cwd: p.cwd.clone(),
-                position: p.position,
-                created_at: p.created_at,
-                tabs: inner
-                    .tabs
-                    .values()
-                    .filter(|t| t.project_id == p.id)
-                    .map(|t| self.to_wire_tab(t, inner))
-                    .collect(),
-            })
+            .map(|p| self.wire_project(p, inner))
             .collect();
         out.sort_by_key(|p| (p.position, p.id));
-        for p in &mut out {
-            p.tabs.sort_by_key(|t| (t.position, t.id));
-        }
         out
+    }
+
+    fn wire_project(&self, p: &ProjectRow, inner: &Inner) -> Project {
+        let mut tabs: Vec<Tab> = inner
+            .tabs
+            .values()
+            .filter(|t| t.project_id == p.id)
+            .map(|t| self.to_wire_tab(t, inner))
+            .collect();
+        tabs.sort_by_key(|t| (t.position, t.id));
+        Project {
+            id: p.id,
+            name: p.name.clone(),
+            cwd: p.cwd.clone(),
+            position: p.position,
+            created_at: p.created_at,
+            tabs,
+        }
     }
 
     /// Build a `Resync` event carrying the current full snapshot.
@@ -1277,7 +1290,37 @@ impl Workspace {
     }
 
     pub fn create_project(&self, name: &str, cwd: &str) -> Result<Project, WorkspaceError> {
-        let mut inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
+        Ok(self.insert_project(inner, name, cwd))
+    }
+
+    /// The project named exactly `name`, or a new one at `cwd`, and
+    /// whether it was created. Find and create share one lock, so callers
+    /// racing on a name get one project between them.
+    ///
+    /// Names are not unique: among duplicates the first in display order
+    /// wins. `cwd` is read only when creating. Unlike
+    /// [`Self::ensure_default_project`], this never activates.
+    pub fn ensure_project(&self, name: &str, cwd: &str) -> Result<(Project, bool), WorkspaceError> {
+        if name.trim().is_empty() {
+            return Err(WorkspaceError::ProjectNameBlank);
+        }
+        let inner = self.inner.lock().unwrap();
+        if let Some(found) = inner
+            .projects
+            .values()
+            .filter(|p| p.name == name)
+            .min_by_key(|p| (p.position, p.id))
+        {
+            return Ok((self.wire_project(found, &inner), false));
+        }
+        if cwd.trim().is_empty() {
+            return Err(WorkspaceError::ProjectCwdRequired(name.to_string()));
+        }
+        Ok((self.insert_project(inner, name, cwd), true))
+    }
+
+    fn insert_project(&self, mut inner: MutexGuard<'_, Inner>, name: &str, cwd: &str) -> Project {
         let id = inner.alloc_id();
         let position = inner.next_project_position();
         let chosen_name = if name.is_empty() {
@@ -1307,7 +1350,7 @@ impl Workspace {
             vec![WorkspaceEvent::ProjectCreated(project.clone())],
             Persist::Write,
         );
-        Ok(project)
+        project
     }
 
     pub fn rename_project(&self, project_id: i64, name: &str) -> Result<(), WorkspaceError> {
@@ -2927,6 +2970,115 @@ mod tests {
         let ws = Workspace::new();
         let project = ws.create_project("mine", "").unwrap();
         assert_eq!(project.cwd, "");
+    }
+
+    fn projects_created(events: &mut broadcast::Receiver<WorkspaceEvent>) -> usize {
+        drain(events)
+            .iter()
+            .filter(|e| matches!(e, WorkspaceEvent::ProjectCreated(_)))
+            .count()
+    }
+
+    /// Many rounds, because a find-then-create that let go of the lock in
+    /// between can still get lucky on any one of them.
+    #[test]
+    fn callers_racing_to_ensure_one_name_create_it_once() {
+        const CALLERS: usize = 8;
+        const ROUNDS: usize = 50;
+        let ws = Workspace::new();
+        let mut events = ws.subscribe();
+        for round in 0..ROUNDS {
+            let name = format!("race-{round}");
+            let barrier = std::sync::Barrier::new(CALLERS);
+            let answers: Vec<(Project, bool)> = std::thread::scope(|scope| {
+                let callers: Vec<_> = (0..CALLERS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            ws.ensure_project(&name, "/tmp").unwrap()
+                        })
+                    })
+                    .collect();
+                callers
+                    .into_iter()
+                    .map(|caller| caller.join().unwrap())
+                    .collect()
+            });
+
+            let ids: std::collections::BTreeSet<i64> = answers.iter().map(|(p, _)| p.id).collect();
+            assert_eq!(ids.len(), 1, "round {round}: one project for every caller");
+            let creators = answers.iter().filter(|(_, created)| *created).count();
+            assert_eq!(creators, 1, "round {round}: exactly one caller created it");
+            assert_eq!(
+                projects_created(&mut events),
+                1,
+                "round {round}: one project.created"
+            );
+        }
+        assert_eq!(ws.snapshot().len(), ROUNDS);
+    }
+
+    #[test]
+    fn ensure_matches_the_lowest_positioned_of_duplicate_names() {
+        let ws = Workspace::new();
+        let older = ws.create_project("dup", "/a").unwrap();
+        let newer = ws.create_project("dup", "/b").unwrap();
+        let (found, created) = ws.ensure_project("dup", "").unwrap();
+        assert!(!created);
+        assert_eq!(found.id, older.id);
+
+        ws.reorder_projects(&[newer.id, older.id]).unwrap();
+        let (found, created) = ws.ensure_project("dup", "").unwrap();
+        assert!(!created);
+        assert_eq!(found.id, newer.id, "position decides, not id or age");
+        assert_eq!(ws.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn ensure_refuses_a_blank_name_and_a_create_without_a_cwd() {
+        let ws = Workspace::new();
+        for name in ["", " \t"] {
+            let refused = ws.ensure_project(name, "/tmp");
+            assert!(
+                matches!(refused, Err(WorkspaceError::ProjectNameBlank)),
+                "{name:?}: {refused:?}"
+            );
+        }
+        for cwd in ["", "  "] {
+            let refused = ws.ensure_project("review", cwd);
+            assert!(
+                matches!(refused, Err(WorkspaceError::ProjectCwdRequired(_))),
+                "{cwd:?}: {refused:?}"
+            );
+        }
+        assert!(ws.snapshot().is_empty(), "a refusal creates nothing");
+    }
+
+    #[test]
+    fn ensure_never_activates_and_a_find_changes_nothing() {
+        let ws = Workspace::new();
+        let home = ws.ensure_default_project("/home");
+        let active = ws.active();
+        assert_eq!(active.0, home);
+        let mut events = ws.subscribe();
+
+        let (made, created) = ws.ensure_project("review", "/review").unwrap();
+        assert!(created);
+        assert_eq!(made.cwd, "/review");
+        assert_eq!(ws.active(), active, "a create does not activate");
+        assert_eq!(projects_created(&mut events), 1);
+
+        for cwd in ["", "/elsewhere"] {
+            let (found, created) = ws.ensure_project("review", cwd).unwrap();
+            assert!(!created, "{cwd:?}");
+            assert_eq!(found.id, made.id);
+            assert_eq!(found.cwd, "/review", "a find leaves the cwd alone");
+        }
+        assert_eq!(ws.active(), active, "nor does a find");
+        assert!(
+            drain(&mut events).is_empty(),
+            "a find commits nothing, so it announces nothing"
+        );
     }
 
     #[test]

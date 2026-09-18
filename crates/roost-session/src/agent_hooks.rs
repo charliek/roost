@@ -450,6 +450,28 @@ mod tests {
         assert!(!dir.path().join(".claude/settings.json").exists());
     }
 
+    /// #491: a raise that fails after it widened the key is still an
+    /// error frame, and that frame is all the client gets — so it names
+    /// the key this host now holds.
+    #[test]
+    fn a_failure_after_the_key_write_names_the_key_in_the_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = a_home(dir.path());
+        // A directory where the state record belongs: read only after
+        // the key is written.
+        std::fs::create_dir_all(home.record_path()).unwrap();
+
+        let failed = ensure_in(&home, &request(&["claude"]), Guard::PERMITTED);
+        let Err(AgentHooksError::Failed(message)) = &failed else {
+            panic!("a failed raise must answer `internal`: {failed:?}");
+        };
+        assert!(
+            message.contains("the agent-hooks key `claude` is already on disk"),
+            "{message}"
+        );
+        assert_eq!(key_of(&home), "claude");
+    }
+
     /// A run whose lock is busy *waits* for it and then succeeds — the
     /// deadline is a backstop, not a fast failure.
     ///

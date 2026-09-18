@@ -1,17 +1,22 @@
 //! CLI-side target selection for `roostctl`.
 //!
-//! `roostctl` can dial the Mac, Linux, or Iced UI. With multiple UIs
-//! running, the CLI needs to be told which to
-//! talk to. Resolution order (highest precedence first):
+//! `roostctl` can dial the Mac, Linux, or Iced UI, or — explicitly only
+//! — the headless `roost-session` daemon. With multiple UIs running,
+//! the CLI needs to be told which to talk to. Resolution order
+//! (highest precedence first):
 //!
 //! 1. `--socket <path>` (explicit path).
 //! 2. `ROOST_SOCKET` env var.
-//! 3. `--target {mac,linux,iced}` shortcut (resolves to that profile's
-//!    canonical socket path).
-//! 4. `ROOST_BUNDLE_PROFILE` env var (same effect as `--target`).
-//! 5. Auto-detect: probe every distinct known socket path. If exactly
-//!    one is listening, use it. If multiple are listening, return
-//!    [`TargetError::Ambiguous`]. If none, return
+//! 3. `--target {mac,linux,iced,session}` shortcut (resolves to that
+//!    profile's canonical socket path).
+//! 4. `ROOST_BUNDLE_PROFILE` env var (same effect as `--target`, but
+//!    accepts only `mac`/`linux`/`iced` — `session` is refused here
+//!    like any other unknown value; see
+//!    `session_is_not_a_roostctl_target` below).
+//! 5. Auto-detect: probe every distinct known **UI** socket path (never
+//!    the session's — a session is never an auto-detect candidate). If
+//!    exactly one is listening, use it. If multiple are listening,
+//!    return [`TargetError::Ambiguous`]. If none, return
 //!    [`TargetError::NoLiveTarget`].
 //!
 //! The auto-detect probe must be cheap and fast — it's on the hot
@@ -32,7 +37,9 @@ use crate::paths::{BundleProfile, BundleProfileKind};
 pub struct TargetSelector {
     /// `--socket <path>` value. Highest precedence.
     pub socket_override: Option<PathBuf>,
-    /// `--target {mac,linux,iced}` value.
+    /// `--target {mac,linux,iced,session}` value. `session` reaches
+    /// here only from `--target` — `ROOST_BUNDLE_PROFILE=session` never
+    /// produces this (#475).
     pub kind_override: Option<BundleProfileKind>,
 }
 
@@ -212,7 +219,9 @@ fn classify(
     if let Some(env) = socket_env.filter(|v| !v.is_empty()) {
         return Step::Socket(PathBuf::from(env), TargetOrigin::SocketEnv);
     }
-    // 3. --target
+    // 3. --target. Every `BundleProfileKind` is accepted here alike,
+    // `Session` included (#475) — this is the only rung `session`
+    // reaches; rung 4 below refuses it by name.
     if let Some(kind) = kind_override {
         return Step::Profile(kind, TargetOrigin::TargetFlag);
     }
@@ -544,6 +553,25 @@ mod tests {
             );
             assert_ne!(*path, session.socket_path);
         }
+    }
+
+    /// `--target session` (#475): unlike `ROOST_BUNDLE_PROFILE=session`
+    /// (refused above), the `--target` flag *does* accept `session` —
+    /// rung 3 of the ladder treats every [`BundleProfileKind`] alike,
+    /// `Session` included — and resolves to the same socket path
+    /// [`BundleProfile::session`] itself reports. Explicit only: this
+    /// is reached by `kind_override`, never by rung 4 or auto-detect.
+    #[test]
+    fn target_flag_session_resolves_to_the_session_profile() {
+        assert_eq!(
+            classify(None, None, Some(BundleProfileKind::Session), None),
+            Step::Profile(BundleProfileKind::Session, TargetOrigin::TargetFlag)
+        );
+
+        let resolved = for_kind(BundleProfileKind::Session).expect("resolve session profile");
+        let session = BundleProfile::session().expect("session profile");
+        assert_eq!(resolved.kind, Some(BundleProfileKind::Session));
+        assert_eq!(resolved.socket_path, session.socket_path);
     }
 
     #[test]

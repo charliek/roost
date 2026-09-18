@@ -28,14 +28,19 @@ A running Roost serves a newline-delimited JSON socket. `roostctl` is a
 thin CLI over it; anything `roostctl` does, your script can do directly.
 
 ```bash
-# Find a project named "review", create it if missing, open a tab, run a command.
+# Find-or-create a project named "review", open a tab in it, run a command.
 name="review"
-pid=$(roostctl tab list --json | jq -r --arg n "$name" \
-        '.projects[] | select(.name==$n) | .id' | head -1)
-[ -z "$pid" ] && pid=$(roostctl project create --name "$name" --cwd "$PWD" \
-        | jq -r '.project.id')
-roostctl tab open --project-id "$pid" --title "$name" -- bash -lc 'make test'
+roostctl open --project "$name" --cwd "$PWD" --title "$name" -- bash -lc 'make test'
 ```
+
+`open` is `project.ensure` (find-or-create by exact name) followed by
+`tab.open`, atomic *per call* — a hand-written list-then-create (`tab
+list` to look for the project, `project create` if it's missing) races
+another caller doing the same thing at the same time, and two of them
+can each create their own "review" project (#221). `open` refuses
+`unsupported` instead of racing on a Roost with no `project.ensure` (the
+Swift Mac app today) — see [`open`](../reference/cli.md#open) for the
+full contract, including `--hold`/`--focus` and its exit codes.
 
 A script launched *inside* a Roost tab can call back without any discovery
 — Roost injects `ROOST_SOCKET` and `ROOST_TAB_ID` into every tab's
@@ -46,7 +51,11 @@ roostctl --socket "$ROOST_SOCKET" set-title --tab "$ROOST_TAB_ID" --title "build
 ```
 
 See the [CLI reference](../reference/cli.md) and the
-[IPC wire format](../reference/ipc.md) for the full op set.
+[IPC wire format](../reference/ipc.md) for the full op set. The
+[Automation](automation.md) guide covers the fuller picture for a
+script or an agent driving Roost this way — the model, the target
+policy, `wait`/`events`, and the two-connection recipe for a raw-socket
+client that wants to follow events instead of polling.
 
 ---
 

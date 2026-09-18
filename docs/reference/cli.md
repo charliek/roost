@@ -15,7 +15,7 @@ Crate: `crates/roost-cli` (binary `roostctl`).
 ## Usage
 
 ```text
-roostctl [--socket <PATH>] <COMMAND>
+roostctl [--socket <PATH>] [--target <mac|linux|iced|session>] [--json] <COMMAND>
 ```
 
 | Command | Purpose |
@@ -27,20 +27,84 @@ roostctl [--socket <PATH>] <COMMAND>
 | `tab list` | List every tab grouped by project |
 | `tab set-state` | Set the per-tab agent state |
 | `tab clear-notification` | Clear a tab's pending-attention flag |
+| `wait` | Block until a tab reaches a state, shows a string, or closes |
+| `events` | Print the event stream, one JSON line per event |
 | `tab open` / `close` / `send` / `resize` / `reorder` | Tab lifecycle + I/O |
-| `project list` / `create` / `rename` / `delete` / `reorder` | Project lifecycle |
+| `project list` / `create` / `ensure` / `rename` / `delete` / `reorder` | Project lifecycle |
+| `open` | Find-or-create a project by name, then open a tab in it — one call, atomic on the server |
 | `agent ensure` / `set` / `install` / `uninstall` / `status` | Wire Roost's hook entries into the supported agents' own configs |
 | `agent-hook <agent>` | Internal: the one hook entrypoint every supported agent invokes |
 | `claude install` | Alias of `agent install claude` |
 | `claude-hook` | Internal: invoked by Claude on each hook event (kept for settings files an earlier Roost wrote) |
 | `doctor` | Read-only diagnosis of the Roost integration (target, socket, shell, tab, agent hooks) |
 | `session start` / `stop` / `status` | Start, stop, or inspect the headless `roost-session` daemon |
+| `rpc <op> [params]` | Call any IPC op directly by name, bypassing every named verb |
+| `skill` | Print the agent skill (`skills/roost/SKILL.md`), byte for byte as the plugin installs it |
 
 `--socket` overrides `ROOST_SOCKET`; one of the two must resolve to the running UI's socket. A
 session is not a UI: `session start|stop|status` address the session profile's own socket
-directly and ignore `--target` / `--socket` / `ROOST_BUNDLE_PROFILE` entirely — any other op
-reaches a running session only via an explicit `--socket <path>` (see
-[`session` subcommands](#session-subcommands)).
+directly and ignore `--target` / `--socket` / `ROOST_BUNDLE_PROFILE` entirely (see
+[`session` subcommands](#session-subcommands)). Any other op reaches a running session only
+explicitly — `--target session` or `--socket <path>` (#475) — never by `ROOST_BUNDLE_PROFILE`
+(`session` is refused there like any other unrecognized value) or auto-detect (a session is
+never a candidate). An op the session does not serve fails with the server's own error for
+that op — `unknown-op` for `host.*` and `agent.set_hooks`, `internal: no UI attached` for
+`app.*` window/UI ops (`app.activate` alone answers `{}` and does nothing) — not a session-specific one; see
+[`ipc.md`](ipc.md#session-sockets) for the wire-level contract and
+[`identify`](ipc.md#identify) / [`session.identify`](ipc.md#sessionidentify) for what each
+socket serves.
+
+### JSON output
+
+`--json` is a global flag: every command accepts it, before or after the
+subcommand (`roostctl --json tab list` and `roostctl tab list --json` are
+the same call). With it, a command prints exactly one JSON document on
+stdout:
+
+| Command | `--json` prints |
+|---|---|
+| A command backed by one IPC op (`identify`, `tab open`, `tab dump`, `tab send-file`, `project create`, `render-stats`, `palette …`, `host add`/`connect`/`disconnect`, bare `agent set`, …) | That op's result object, verbatim |
+| A command that prints nothing without the flag (`notify`, `set-title`, `tab send`, `tab close`, `tab focus`, `tab resize`, `tab set-state`, `tab clear-notification`, `tab reorder`, `project rename`/`delete`/`reorder`, `host remove`) | The op's result object — usually `{}` |
+| `tab list`, `project list` | The `tab.list` result |
+| `host list`, `host status`, `agent status`, `agent ensure`, `doctor` | The same JSON these printed with their own `--json` before it became global |
+| `agent install` / `uninstall` / `set --local` | The outcome `agent ensure --json` prints |
+| `wait` | `{"tab_id", "satisfied": {"state", "text", "gone"}, "after_ms"}` once the condition holds — see [`wait`](#wait) |
+| `screenshot` | `{"out": "<path>", "bytes": N}` — and it needs `--out`, since the PNG and the JSON would otherwise share stdout |
+| `session start` | `{"outcome", "socket", "identity", "launcher_reported_pid"}`, `outcome` being `started` or `already-running` |
+| `session stop` | `{"socket", "session_id", "reap"}` — `session_id` and `reap` are `null` when nothing was running |
+| `session status` | `{"socket", "identity", "projects", "tabs"}` |
+| `agent-hook`, `claude-hook` | Nothing different: they ignore the flag and always answer `{}` and exit 0, because a decision hook must never be blocked by a CLI error |
+| `project ensure` | `{"project", "created"}` — always, `--json` or not; see [`project ensure`](#project-subcommands) |
+| `open` | `{"project", "tab", "created"}` — always, `--json` or not: an agent verb, not a human-typed one; see [`open`](#open) |
+| `rpc` | Not affected by the flag at all — see [`rpc`](#rpc) below |
+| `events` | Not affected either: always one JSON line per event — see [`events`](#events) |
+| `skill` | `{"topic": "roost", "format": "markdown", "content": "…"}` — always the same skill `--json` or not; see [`skill`](#skill) |
+
+Without `--json`, every command prints what it always has. An error is
+never written to stdout either way — see [Exit codes](#exit-codes).
+
+### Which tab a command acts on
+
+A command that **changes** a tab — `notify`, `set-title`, `tab set-state`,
+`tab clear-notification`, `tab close`, `tab send`, `tab resize`,
+`tab focus` — acts on `--tab`, or else on `$ROOST_TAB_ID`. With neither
+it refuses, before it dials anything, and exits 2:
+
+```text
+roostctl: usage: no --tab and ROOST_TAB_ID is unset; refusing to guess the active tab for a command that changes it — `roostctl tab list` shows ids
+```
+
+Every shell inside a Roost tab has `ROOST_TAB_ID` set to its own tab, so
+the bare forms in the examples below work exactly as written there.
+Outside a tab — a CI runner, a second terminal, an agent driving Roost
+from elsewhere — pass `--tab`; the UI's active tab is whatever a person
+last clicked, which is no answer for a command that writes to a tab.
+
+The read-only `tab dump` and `wait` still fall back to the UI's active
+tab when `ROOST_TAB_ID` is unset too. `tab send-file` has always required `--tab`.
+`events --tab` is a filter, not a target, so it reads neither: without the
+flag every event prints.
+A `ROOST_TAB_ID` that is not a tab id is refused the same way (exit 2).
 
 ### Where `roostctl` lives
 
@@ -62,29 +126,33 @@ platforms. See [Extending Roost](../guides/extending.md#opening-tabs-from-activa
 ## `notify`
 
 ```bash
-roostctl notify --title "Build done" --body "tests pass"
+roostctl notify --title "Build done" --body "tests pass"   # inside a Roost tab
 roostctl notify --tab 3 --title "From CI" --body "deploy ready"
 ```
+
+The first form relies on `ROOST_TAB_ID`, which only a shell inside a Roost tab has; anywhere else pass `--tab` ([why](#which-tab-a-command-acts-on)).
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--title` | string | required | Notification title |
 | `--body` | string | empty | Notification body |
-| `--tab` | int | `$ROOST_TAB_ID` | Target tab id; required if env var is unset |
+| `--tab` | int | `$ROOST_TAB_ID` | Target tab id; exits 2 when neither is set |
 
 ## `set-title`
 
 Set a tab's display title. Persists across restarts and locks the tab against subsequent OSC 1/2 escapes from the shell.
 
 ```bash
-roostctl set-title --title "build-watcher"
+roostctl set-title --title "build-watcher"   # inside a Roost tab
 roostctl set-title --title "deploy" --tab 3
 ```
+
+The first form relies on `ROOST_TAB_ID`, which only a shell inside a Roost tab has; anywhere else pass `--tab` ([why](#which-tab-a-command-acts-on)).
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--title` | string | required | New tab title |
-| `--tab` | int | `$ROOST_TAB_ID` | Target tab id |
+| `--tab` | int | `$ROOST_TAB_ID` | Target tab id; exits 2 when neither is set |
 
 ## `identify`
 
@@ -102,15 +170,17 @@ proto_version=1
 app_id=ai.stridelabs.Roost
 ```
 
-Prints `key=value` lines, not JSON. Useful for verifying the socket is reachable and the env vars are wired correctly.
+Prints `key=value` lines; `--json` prints the full `identify` result instead. Useful for verifying the socket is reachable and the env vars are wired correctly.
 
 ## `tab focus`
 
 ```bash
-roostctl tab focus               # focus the calling shell's tab
+roostctl tab focus               # focus the calling shell's tab (inside a Roost tab)
 roostctl tab focus --tab 7
 roostctl tab focus --tab h3.7    # a tab on connected host 3 (host sessions)
 ```
+
+The bare form relies on `ROOST_TAB_ID`, which only a shell inside a Roost tab has; anywhere else pass `--tab` ([why](#which-tab-a-command-acts-on)).
 
 Raises the window, switches the active project, selects the tab. Used as the click-through target for desktop banners.
 
@@ -128,18 +198,20 @@ Default output is a human-readable tree; `--json` prints the raw response. Each 
 ## `tab set-state`
 
 ```bash
-roostctl tab set-state --state running
+roostctl tab set-state --state running   # inside a Roost tab
 roostctl tab set-state --tab 3 --state idle
 ```
+
+The first form relies on `ROOST_TAB_ID`, which only a shell inside a Roost tab has; anywhere else pass `--tab` ([why](#which-tab-a-command-acts-on)).
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--state` | string | required | One of `none`, `running`, `needs_input`, `idle` |
-| `--tab` | int | `$ROOST_TAB_ID` | Target tab id |
+| `--tab` | int | `$ROOST_TAB_ID` | Target tab id; exits 2 when neither is set |
 
 ## `tab open` / `close` / `send` / `resize` / `reorder` / `dump`
 
-Tab lifecycle and I/O for automation. `tab send` needs an existing live PTY (a UI must have already attached); errors with `NotFound` otherwise. `--bytes` accepts Rust string-escape sequences (`\n`, `\r`, `\x1b`, …); pass `--raw` to disable escape decoding.
+Tab lifecycle and I/O for automation. `tab close`, `tab send` and `tab resize` act on `--tab` or `$ROOST_TAB_ID` and exit 2 with neither; `tab dump` falls back to the UI's active tab ([why](#which-tab-a-command-acts-on)). `tab send` needs an existing live PTY (a UI must have already attached); errors with `NotFound` otherwise. `--bytes` accepts Rust string-escape sequences (`\n`, `\r`, `\x1b`, …); pass `--raw` to disable escape decoding.
 
 ```bash
 roostctl tab open --project-id 1 --cwd ~/projects/roost
@@ -155,7 +227,7 @@ roostctl tab dump --tab 5 --json   # full result: dims + cursor + rows
 roostctl tab dump --tab 5 --scrollback 200   # 200 rows of history, then the viewport
 ```
 
-`tab open` prints the new tab id on stdout (so `id=$(roostctl tab open …)`). A **command** can follow `--`; without one the tab opens the default shell. The command's working directory is `--cwd` (default: the project's cwd).
+`tab open` prints the new tab id on stdout (so `id=$(roostctl tab open …)`); `--json` prints the `tab.open` result instead. A **command** can follow `--`; without one the tab opens the default shell. The command's working directory is `--cwd` (default: the project's cwd).
 
 | Flag | Effect |
 |---|---|
@@ -166,9 +238,9 @@ roostctl tab dump --tab 5 --scrollback 200   # 200 rows of history, then the vie
 
 These compose: `--after-tab X --focus -- <cmd>` is the "open a command in a tab right here and switch to it" primitive that providers and other scripts use. (`--after-tab`/`--focus` are CLI orchestration over `tab.reorder` / `tab.focus`; `-- <cmd>` fills the `tab.open` op's `argv` — see [ipc.md](ipc.md).)
 
-**`tab send` needs no credential.** A write needs none on a UI socket (`--target mac|linux|iced`) or a **host session's own socket** (reached with `--socket <path>`, e.g. one a `roostctl session start` daemon owns) alike: same-UID access to the socket is the whole boundary, and there is no authority layer above it to present anything to. There is deliberately no `--lease` flag and never was one worth adding back — argv leaks through shell history and `ps`, and there is nothing on this wire a flag like that could still mean.
+**`tab send` needs no credential.** A write needs none on a UI socket (`--target mac|linux|iced`) or a **host session's own socket** (reached with `--target session` or `--socket <path>`, e.g. one a `roostctl session start` daemon owns) alike: same-UID access to the socket is the whole boundary, and there is no authority layer above it to present anything to. There is deliberately no `--lease` flag and never was one worth adding back — argv leaks through shell history and `ps`, and there is nothing on this wire a flag like that could still mean.
 
-`tab dump` reads the tab's live terminal viewport as text — the determinism backbone for tests: assert on exact content instead of matching pixels. Plain output is one line per visible row (trailing blanks trimmed); `--json` adds dimensions and cursor. Backed by the `tab.dump` IPC op — see [ipc.md](ipc.md).
+`tab dump` reads the tab's live terminal viewport as text — the determinism backbone for tests: assert on exact content instead of matching pixels. Plain output is one line per visible row (trailing blanks trimmed); `--json` adds dimensions and cursor. Backed by the `tab.dump` IPC op — see [ipc.md](ipc.md). Under `local-backend = session` a bare id (from `--tab`, `ROOST_TAB_ID`, or the active tab) is read from the session `identify.local_session_socket` names, as [`wait`](#wait) reads it, because the UI holds a terminal only for the tab it is showing; an `h<host>.<id>` still reads the UI's.
 
 **`--scrollback <N>`** widens the read to `N` rows of history above the viewport. In plain mode the history rows print **first, with no separator**, so `roostctl tab dump --scrollback 200 --tab 5 | grep …` keeps working over the larger window rather than needing a new parse; `--json` carries them as `scrollback_text` beside a `scrollback_rows` count of everything that was available. The rows are anchored on the viewport that was dumped, so the last history row is always the one directly above the first visible row, even on a tab the user has scrolled up. Asking for more than exists — or more than the server's 10 000-row cap — is **clamped, not refused**: `--scrollback 1000000` is a legitimate way to say "all of it".
 
@@ -201,12 +273,11 @@ note](ipc.md#tabsend_file).
 | `<path>…` | At least one. Canonicalized in **roostctl's own** working directory before sending. |
 | `--json` | Print the whole result — `pasted`, `uploads`, `skipped` — instead of just the pasted text. |
 
-`--tab` is required here and nowhere else in the `tab` family, and
-unlike the others it does **not** read `ROOST_TAB_ID`. The no-flag
-fallback every other verb has resolves the UI's **local active tab** via
-`identify`, which is never the host tab a caller sending files means;
-guessing it would paste a remote-looking gesture into a local
-shell. Paths are canonicalized on this side because the shell you typed
+`--tab` is required here, and unlike the other commands that change a
+tab it does **not** read `ROOST_TAB_ID` either: the id in a shell's
+environment is a local tab, which is never the host tab a caller sending
+files means, and guessing it would paste a remote-looking gesture into a
+local shell. Paths are canonicalized on this side because the shell you typed
 them in is the only cwd that can resolve a relative one — the op itself
 refuses relative paths for exactly that reason — so a path that is not
 there fails locally, naming it (`cannot send shot.png: …`), rather than
@@ -231,34 +302,191 @@ still land.
 
 ## `wait`
 
-Block until a tab reaches a condition, then exit `0` — the no-`sleep` synchronization primitive for scripts and tests. Polls the running UI on an interval; exits non-zero if `--timeout` elapses first. At least one condition is required; when several are given, all must hold.
+Block until a tab reaches a condition, then exit `0` — the no-`sleep`
+synchronization primitive for scripts, tests and agents. At least one
+condition is required; when several are given, all must hold.
 
 ```bash
 roostctl wait --tab 5 --state idle            # until the agent state is idle
 roostctl wait --tab 5 --text 'BUILD OK'       # until the viewport contains a string
 roostctl wait --tab 5 --gone                  # until the tab is closed
+roostctl wait --tab 5 --state idle --no-timeout --json
 ```
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--state` | string | — | Wait until the tab's agent state equals this (`none`/`running`/`needs_input`/`idle`) |
 | `--text` | string | — | Wait until the viewport (via `tab.dump`) contains this substring. Pick a needle from command *output*, not the echoed command |
-| `--gone` | flag | `false` | Wait until the tab no longer exists |
-| `--timeout` | float | `5.0` | Give up after this many seconds |
-| `--interval-ms` | int | `100` | Poll interval |
-| `--tab` | int | `$ROOST_TAB_ID` | Target tab id |
+| `--gone` | flag | `false` | Wait until the tab no longer exists. Cannot be combined with `--state` or `--text` |
+| `--timeout` | float | `5.0` | Give up after this many seconds. `0` checks once: exit `0` if the condition already holds, `4` if not |
+| `--no-timeout` | flag | `false` | Wait for as long as it takes. Cannot be combined with `--timeout` (exit 2) |
+| `--interval-ms` | int | `100` | The poll interval where there is no stream, and how often `--text` re-reads the viewport where there is |
+| `--tab` | bare id | `$ROOST_TAB_ID`, then the UI's active tab | Target tab. A host tab (`h<host>.<id>`) is refused with `usage` (exit 2): the stream is the local workspace's |
+
+**Where it listens.** `wait` asks the UI's `identify` which socket owns
+the tabs, and follows that socket's [event stream](ipc.md#eventssubscribe)
+instead of polling:
+
+| `identify` says | `wait` reads |
+|---|---|
+| `local_session_socket` is present (`local-backend = session`) | The local session: both connections dial that socket |
+| `ops` names `events.subscribe` (the iced UI, in-process) | The UI socket itself |
+| Neither — the Swift Mac app, or a Roost older than this | The poll loop: `tab.list` (and `tab.dump` for `--text`) every `--interval-ms`, as `wait` always did |
+
+On a stream it subscribes on one connection, then — on a second — checks
+that `identify.instance_id` (or, on a session,
+`session.identify.session_id`) is the one the subscription acked, and only
+then takes a `tab.list` snapshot. Batches the snapshot already holds are
+discarded; a snapshot older than the subscription fences nothing and counts
+as a lost stream. `--state` and `--gone` are then decided by
+`tab.state_changed` and `tab.closed` as they arrive, with no `tab.dump` at
+all. No event carries a tab's output, so `--text` re-reads the viewport on
+every event for the tab and every `--interval-ms`. A bare `--tab` id means
+the same tab on the UI socket and on the session under
+`local-backend = session`, so the id (or the active tab) is resolved on the
+UI and used on the session unchanged.
+
+**When the stream goes away.** A stream that closes without a label, skips a
+revision, or ends with `stream.ended`, or whose second connection drops —
+while the subscription is still being opened, too — is resolved again from
+`identify` once, after any local-backend switch in flight has settled. The
+wait carries on **only if the new stream is the same process** — the same
+`instance_id` or `session_id` its first subscription acked — as it is for a
+subscriber the server cut for falling behind. Anything else exits 1
+`connection`: "the Roost serving tab N changed … tab ids do not carry across
+— re-resolve the tab and wait again". Tab ids belong to the process that
+minted them: a switch replays the tabs onto its destination under new ids,
+and a restart mints new ones, so tab N over there is some other tab or none,
+and `--gone` read off its snapshot would be wrong. `stream.ended` is a
+switch, so a wait across one normally ends that way. A second loss exits 1
+`connection` too, and so does a resolve that fails — no Roost found, or a
+server that refuses the subscribe — with that failure's own code and message
+inside the `connection` one. A session that stops (`session.stopping`) exits
+1 `connection` at once, with that reason. If the two connections of one
+subscription keep reaching different processes (the server restarting
+between them), the sequence is retried three times and then exits 1
+`connection`.
+
+**Exits.** `0` once the condition holds; **4** (`timeout`) if `--timeout`
+elapses first, including while a backend switch in flight holds the wait off
+(re-checked every `--interval-ms`, never past the deadline) — before plan
+066 it exited 1, which a script could not tell from a failed connection; 2
+`usage` for a bad command line; 1 for everything in [Exit
+codes](#exit-codes).
+
+With `--json`, success prints:
+
+```json
+{"tab_id": "5", "satisfied": {"state": "idle", "text": null, "gone": null}, "after_ms": 812}
+```
+
+Each `satisfied` field is `null` unless its flag was given: `state` is the
+state the tab was seen in, `text` the needle that was found, `gone` is
+`true`. `after_ms` counts from the command's start, dialling included.
+
+## `events`
+
+Print the event stream as a line protocol: one compact JSON document per
+line, flushed as it arrives, until the stream ends.
+
+```bash
+roostctl events                       # every event
+roostctl events --tab 5               # only the events that name tab 5
+roostctl events | jq -c 'select(.event == "tab.state_changed")'
+```
+
+Each line is one [event envelope](ipc.md#events) with the revision of the
+commit it rode in:
+
+```json
+{"event":"tab.state_changed","data":{"tab_id":"5","state":"idle"},"revision":42}
+```
+
+Events of one commit share a `revision` and keep their order; a commit
+with no events prints nothing. The stream's last line is its terminal
+envelope, which carries no `revision`:
+`{"event":"session.stopping","data":{"reason":"stop"}}` from a session, or
+`{"event":"stream.ended","data":{"reason":"backend-switch"}}` from a UI whose
+local backend is switching.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--tab` | — | Keep only the events that name this tab — by `data.tab_id` (for `active.changed`, the tab it made active), `data.tab.id` for `tab.opened`, or any of `data.tab_ids` for `tabs.reordered` — and drop the rest, event by event: a commit touching several tabs keeps just this tab's lines. Events that name no tab (`project.*`, `projects.reordered`, `workspace.durability_changed`) are dropped. The terminal envelope always prints. A bare id only; a host tab is refused with `usage`. Not read from `ROOST_TAB_ID` |
+
+It reads the same socket [`wait`](#wait) does — the in-process UI, or the
+local session under `local-backend = session` — with the same identity check,
+and no snapshot. There is no poll fallback.
+
+| Exit | When |
+|---|---|
+| 0 | The terminal envelope arrived (printed as the last line), or the reader of stdout went away (`events \| head -n1`) |
+| 1 `connection` | The stream closed without a label or skipped a revision — nothing is resolved again; run it again |
+| 1 *the server's own* | The server does not serve the stream: the Swift Mac app, an older Roost. Its refusal is passed through verbatim (`not-implemented`, `unknown-op`) |
+| 2 `usage` | A bad command line, including a host `--tab` |
+
+`events` is always JSON, with or without `--json`; a failure still goes
+through the one [error envelope](#exit-codes).
 
 ## `project` subcommands
 
 ```bash
 roostctl project list
 roostctl project create --name "scratch" --cwd ~
+roostctl project ensure --name "scratch"                 # --cwd defaults to $PWD
+roostctl project ensure --name "scratch" --cwd ~/scratch
 roostctl project rename --project-id 1 --name "main"
 roostctl project delete --project-id 2
 roostctl project reorder --order 1,3,2
 ```
 
 `project delete` cascades to the project's tabs. `project reorder` is the same shape as `tab reorder` — any id not in `--order` keeps its prior position.
+
+`project ensure` finds the project with this **exact** name, or creates
+it at `--cwd` (defaulting to `$PWD`) if none exists — atomic on the
+server, so two callers racing the same name converge on one project
+(#221) rather than each creating their own — and never activates it.
+Always prints `{"project", "created"}` (the `project.ensure` wire
+result), **with or without `--json`**: `project create` is the only
+other `project` verb with a one-line human form, and
+`rename`/`delete`/`reorder` print nothing without the flag, so there is
+no single convention `ensure` could join instead.
+
+Refuses `unsupported` (exit 1) against a server whose `identify --json`
+`ops` field doesn't list `project.ensure` — the Swift Mac app today.
+The refusal names the manual route — `project list --json` to find an
+existing project by name, `project create` to make one — rather than
+falling back to it itself: a list-then-create fallback inside `ensure`
+would reopen the very race (#221) it exists to close.
+
+## `open`
+
+```bash
+roostctl open --project "review" --cwd "$PWD" -- bash -lc 'make test'
+roostctl open --project "review" --title "review" --focus -- vim
+roostctl open --project "review" --hold -- make test   # keep the tab open after it exits
+```
+
+The one-shot agent verb: `project.ensure` (find-or-create, by exact name),
+then `tab.open` in the ensured project. It replaces composing those two
+calls by hand, and the older `project list`-then-`project create` recipe.
+Each call is atomic on the server, so unlike that recipe it cannot race
+another caller into a second project of the same name (#221). `--cwd`
+defaults to `$PWD` and is used for **both** calls: the project (if this call
+creates it) and the new tab. Without `-- cmd…` the tab opens the default
+shell, same as [`tab open`](#tab-open-close-send-resize-reorder-dump);
+`--hold` and `--focus` compose exactly as they do there.
+
+Always prints `{"project", "tab", "created"}` — the ensured project, the
+opened tab, and whether the project was just created — **with or
+without `--json`**: this is an agent verb, not a human-typed one.
+
+**Refusals:**
+
+| Exit | `code` | When |
+|---|---|---|
+| 1 | `unsupported` | This server's `identify --json` `ops` doesn't list `project.ensure` (the Mac app today) — names the manual route (`project list --json` + `tab open --project-id`) rather than racing it itself (#221) |
+| 2 | `usage` | `identify --json`'s `local_backend_switch` shows a backend switch in progress — the project set is mid-flight, so a name resolved against it may not hold; retry once it settles |
+| 1 | *the server's own* | `tab.open`'s own refusal, verbatim — most notably `not-found` if the ensured project vanished between the two calls (a backend switch landing in that window, say). **The two calls are not atomic with each other**, only each is atomic on the server, so this is possible even though `ensure` itself never races another `ensure` |
 
 ## `screenshot`
 
@@ -270,7 +498,7 @@ roostctl screenshot --scale 2 --out shot.png   # 2x super-sampled
 roostctl screenshot > shot.png            # raw PNG bytes to stdout
 ```
 
-`--scale` is `1` (default, logical window size) or `2`. With `--out` the CLI writes the file and prints the dimensions + byte count to stderr; without it, the raw PNG bytes go to stdout (nothing else is printed, so the stream stays binary-clean). Backed by the `app.screenshot` IPC op — see [ipc.md](ipc.md).
+`--scale` is `1` (default, logical window size) or `2`. With `--out` the CLI writes the file and prints the dimensions + byte count to stderr; without it, the raw PNG bytes go to stdout (nothing else is printed, so the stream stays binary-clean). `--json` requires `--out` and prints `{"out": "<path>", "bytes": N}` on stdout instead of the stderr line. Backed by the `app.screenshot` IPC op — see [ipc.md](ipc.md).
 
 ## `render-stats`
 
@@ -438,8 +666,15 @@ These three verbs are a deliberate carve-out: a session is not a UI, so
 they never go through `--target` / `ROOST_BUNDLE_PROFILE` / auto-detect
 — they resolve the `Session` bundle profile's socket directly, and
 `start` has to work when nothing is listening at all. Any other op
-(`tab.list`, `tab.open`, …) reaches a running session only through an
-explicit `roostctl --socket <path> <op>` pointed at that same socket.
+(`tab.list`, `tab.open`, …) reaches a running session explicitly —
+`roostctl --target session <op>` or `roostctl --socket <path> <op>`
+pointed at that same socket (#475) — never by `ROOST_BUNDLE_PROFILE`
+(`session` is refused there like any other unrecognized value) or
+auto-detect, which never probes it. An op the session does not serve
+answers with the server's own error for that op, not a
+session-specific one: `unknown-op` for `host.*` and `agent.set_hooks`,
+`internal: no UI attached` for `app.*` window/UI ops, except `app.activate`,
+which answers `{}` and does nothing.
 
 `session start` spawns `roost-session start`, which daemonizes and
 seeds its first project from the calling shell's cwd on a fresh state
@@ -457,12 +692,12 @@ exiting — stopping something that is not already running is a success
 (`systemctl stop` style), so `session stop` always exits 0 short of a
 genuine fault reaching the socket.
 
-`session status` prints the session's identity and tab count. It is
-the one verb with a distinct
-not-running exit code: **3** when no session is listening, matching
-`systemctl status`'s convention so a script can branch on the code
-alone without parsing output; a socket that exists but will not answer
-is a real fault and exits 1, not 3.
+`session status` prints the session's identity and tab count. When no
+session is listening it prints `not running (no session at …)`, reports
+`not-running` on stderr and exits **3**, matching `systemctl status`'s
+convention so a script can branch on the code alone without parsing
+output; a socket that exists but will not answer is a real fault and
+exits 1 (`connection`), not 3.
 
 | Verb | Exit 0 | Exit 1 | Exit 3 |
 |---|---|---|---|
@@ -498,6 +733,66 @@ There is no `roostctl host stop`: the palette's **Stop Session** verb goes strai
 
 **Swift Mac app note:** `roostctl host *` against `--target mac` answers `unknown-op` — a documented, permanent boundary, not a gap. Host sessions are iced-only (the Linux `roost` build and the experimental Roost-Iced Mac app); the Swift `Roost.app` never grows this surface.
 
+## `rpc`
+
+Call any IPC op directly, by name — the escape hatch for an op that has
+no verb of its own yet, or for a script that would rather speak the wire
+format straight through.
+
+```bash
+roostctl rpc tab.list
+roostctl rpc tab.write '{"tab_id":"4","data":"bHM="}'
+echo '{"tab_id":"4","data":"bHM="}' | roostctl rpc tab.write -   # params from stdin
+```
+
+| Argument | Description |
+|---|---|
+| `<op>` | The op name, passed through **verbatim** — no local validation against the ops this build knows. An op the server does not serve answers the server's own `unknown-op`, passed through the same way. |
+| `[params]` | The op's params as a JSON **object** literal, or `-` to read one from stdin. Omitted ⇒ `{}`. Anything that is not valid JSON, or that parses to something other than an object (an array, a string, a number), is refused with `usage` (exit 2) **before** the socket is dialled. |
+
+See [ipc.md](ipc.md#operations) for op names and their params, and
+`roostctl identify --json`'s `ops` field for exactly which ops the Roost
+this socket reaches serves right now. `rpc` never re-routes: under
+`local-backend = session` a raw op goes to the socket you dialled, not to
+the session that [`tab dump`](#tab-open-close-send-resize-reorder-dump),
+[`wait`](#wait) and [`events`](#events) read from.
+
+`rpc` is always JSON, with or without `--json` on the command line: the
+op's result object, pretty-printed on stdout — the same shape every
+other IPC-backed verb prints under `--json`. A failure still goes
+through the one [`CliError`](#exit-codes) envelope every verb uses:
+`roostctl: <code>: <message>` on stderr normally, or
+`{"error":{"code","message"}}` when `--json` is also given.
+
+**It bypasses the tab policy.** `rpc` is not in the list of verbs
+[Which tab a command acts on](#which-tab-a-command-acts-on) governs, and
+it does not read `ROOST_TAB_ID` either — the caller writes whatever ids
+`params` needs directly, so there is no `--tab` for this verb to
+resolve. That also means `rpc` is **not a way around `--tab`**: a verb
+that needs `--tab` or `ROOST_TAB_ID` to guard a mutation (`tab close`,
+`tab send`, …) stays that named verb: `rpc tab.write` with a hand-picked
+`tab_id` skips none of that verb's own checks, it just skips the CLI's
+tab-resolution convenience.
+
+## `skill`
+
+Print the agent skill — the same `skills/roost/SKILL.md` the [Claude
+Code plugin and `npx skills add`](../guides/agent-skill.md#install)
+install, byte for byte, so the binary and the published skill cannot
+disagree:
+
+```bash
+roostctl skill              # the skill as markdown, on stdout
+roostctl skill --json       # {"topic","format","content"}
+```
+
+Needs no running Roost — an agent reads the skill to learn how to find
+one. `--json` prints `{"topic": "roost", "format": "markdown",
+"content": "<the skill's markdown>"}`; without it, the raw markdown
+goes to stdout. See the [Agent Skill](../guides/agent-skill.md) guide
+for what the skill covers and how it relates to [Agent
+Hooks](../guides/agents.md).
+
 ## `doctor`
 
 A **read-only** diagnostic for the Roost integration — it reports and
@@ -515,8 +810,8 @@ roostctl doctor --color=always
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `--tab` | int | `$ROOST_TAB_ID` / the UI's active tab | Inspect this tab instead. Read directly from the env var rather than clap's `env = "ROOST_TAB_ID"`, so an unparsable `$ROOST_TAB_ID` becomes a diagnostic (`env.tab_id: fail`) instead of a silent clap exit 2 |
-| `--json` | flag | `false` | Machine-readable report |
+| `--tab` | int | `$ROOST_TAB_ID` / the UI's active tab | Inspect this tab instead. Doctor reads the env var itself rather than through the parse every other `--tab` command shares, so an unparsable `$ROOST_TAB_ID` becomes a diagnostic (`env.tab_id: fail`) instead of exit 2 `usage` |
+| `--json` | flag | `false` | Machine-readable report (the global flag; see [JSON output](#json-output)) |
 | `-v` / `--verbose` | flag | `false` | Print the full per-check report — all 39 entries with details and doc links — instead of the one-line-per-section summary. Ignored by `--json`, which always carries everything |
 | `--color` | `auto` \| `always` \| `never` | `auto` | Colorize the text output. `auto` enables color only when stdout is a TTY, `NO_COLOR` is unset **or empty**, and `TERM` is not `dumb`; `always` bypasses all three checks; `never` always disables. Per <https://no-color.org/>, `NO_COLOR=` (present but empty) does **not** disable — only a non-empty value does. Ignored by `--json` |
 
@@ -673,7 +968,7 @@ flag.
 | Variable | Effect |
 |---|---|
 | `ROOST_SOCKET` | Override the UI socket the CLI dials |
-| `ROOST_TAB_ID` | Default tab id when `--tab` is not given |
+| `ROOST_TAB_ID` | Default tab id when `--tab` is not given. A command that changes a tab refuses without one of the two ([why](#which-tab-a-command-acts-on)) |
 | `ROOST_ROOSTCTL` | Set by the UI for provider scripts: absolute path to its own `roostctl`. Best-effort — may be absent if the UI can't resolve its bundled/sibling CLI, so scripts keep the `"${ROOST_ROOSTCTL:-roostctl}"` fallback (see [Where `roostctl` lives](#where-roostctl-lives)) |
 | `ROOST_AGENT_HOOK` | Set by the UI (or `roost-session`) on every tab: absolute path of the `roostctl` (or `roost-session`) that understands `agent-hook <agent>`. Every hook entry Roost installs into an agent's config reads this indirectly through a shell fallback rather than calling `roostctl` directly, which is what keeps the installed command host-independent — see [Agent Hooks](../guides/agents.md#inert-outside-roost). Resolved the same sibling → bundled-`Resources/bin` → `PATH` ladder as `ROOST_ROOSTCTL`; omitted, like that variable, when nothing resolves |
 | `ROOST_DEBUG` | If set, `claude-hook` and `agent-hook` write failure messages to stderr |
@@ -681,15 +976,48 @@ flag.
 | `ROOST_SESSION_BIN` | Overrides where `session start` looks for the `roost-session` binary (default: next to `roostctl`, then `PATH`) |
 | `ROOST_SSH_BIN` | Overrides the `ssh` binary a host's SSH transport execs (default: `ssh` on `PATH`) — read by `host add --verify` against an SSH target and by the UI's own tunnel. See [`paths.md`](paths.md#ssh-scratch-directories). |
 
-`ROOST_SOCKET` / `ROOST_TAB_ID` / `ROOST_AGENT_HOOK` are auto-set by the UI when it spawns a tab's shell. Set them by hand only when invoking the CLI from outside a Roost tab (e.g. a CI runner). The UI side also honors `ROOST_CONFIG` (config path) and `ROOST_BUNDLE_PROFILE` (`mac` / `linux` / `iced`) — see [Paths & Environment](paths.md). `roostctl` reads `ROOST_BUNDLE_PROFILE` too, as the env-var form of `--target`; an unrecognized value is a hard error there ("unknown ROOST_BUNDLE_PROFILE value … expected `mac`, `linux`, or `iced`") rather than the UI's warn-and-fall-back.
+`ROOST_SOCKET` / `ROOST_TAB_ID` / `ROOST_AGENT_HOOK` are auto-set by the UI when it spawns a tab's shell. Set them by hand only when invoking the CLI from outside a Roost tab (e.g. a CI runner). The UI side also honors `ROOST_CONFIG` (config path) and `ROOST_BUNDLE_PROFILE` (`mac` / `linux` / `iced`) — see [Paths & Environment](paths.md). `roostctl` reads `ROOST_BUNDLE_PROFILE` too, as the env-var form of `--target`; an unrecognized value is a hard error there ("unknown ROOST_BUNDLE_PROFILE value … expected `mac`, `linux`, or `iced`") rather than the UI's warn-and-fall-back. `--target` alone additionally accepts `session` (#475) — `ROOST_BUNDLE_PROFILE=session` is one of the values that hard error names as unrecognized, by design: a session is reachable only explicitly.
 
 ## Exit codes
 
-| Code | Meaning |
-|---|---|
-| 0 | Success |
-| 1 | RPC error or connection failure |
-| 2 | Bad command-line input |
+Every failure prints one error line on stderr, never on stdout:
+
+```text
+roostctl: <code>: <message>
+```
+
+A command line clap refuses keeps clap's usage text after that line, and
+a command given no subcommand at all (`roostctl tab`) prints its help
+instead. `doctor` and `session status` still print their report on
+stdout when they fail.
+
+With `--json` (read off the raw command line even when parsing itself
+failed), the line is a JSON envelope instead:
+
+```json
+{"error":{"code":"usage","message":"no --tab and ROOST_TAB_ID is unset; …"}}
+```
+
+`code` is the stable part to branch on; `message` is for people.
+
+| Exit | `code` | Meaning |
+|---|---|---|
+| 0 | — | Success |
+| 2 | `usage` | A bad command line, including a command that changes a tab given no `--tab` and no `ROOST_TAB_ID`. A parser error keeps clap's usage text in the message; `--help` and `--version` print to stdout and exit 0 |
+| 1 | `no-target` | Auto-detect found nothing listening at any known socket |
+| 1 | `ambiguous-target` | Several Roost UIs are running; pass `--target` |
+| 1 | `connection` | Dialing, reading or writing the socket failed, or the stream dropped (`wait` after a second loss or a stopping session; `events` on any drop or gap) |
+| 1 | *the server's own* | The server refused the request; its code is passed through verbatim (`not-found`, `invalid-param`, `unknown-op`, …) |
+| 1 | `unsupported` | This server does not serve an op the command needs |
+| 1 | `checks-failed` | `doctor` found a failing check; the report itself is on stdout |
+| 1 | `failed` | Something on this machine outside the wire: a file that could not be written, a binary that could not be found, an unset `$HOME` |
+| 3 | `not-running` | `session status` found no session running |
+| 4 | `timeout` | `wait`'s condition did not hold before `--timeout` |
+
+A command can also exit 1 **without** an error line when it has a
+partial outcome to report: `agent install`/`uninstall`/`ensure`/`set`
+print what they did on stdout and exit 1 if any agent (or, for `agent
+set`, any connected host) failed.
 
 `doctor` exits 1 when **any** check's status is `fail`; `warn` never
 affects the exit code, and neither does `skipped` — a check that
@@ -699,8 +1027,3 @@ Roost UI is running" is itself a failed check (`ui.socket` / `ui.target`),
 so `roostctl doctor` exits 1 whenever nothing is listening — that's by
 design, not a bug: the whole point of the `ui` section is to fail when
 there's nothing there.
-
-`session status` is the one command with its own not-running exit code,
-**3**, distinct from this table — see the [`session`
-subcommands](#session-subcommands) table above. `session start` and
-`session stop` use the plain 0/1 split.

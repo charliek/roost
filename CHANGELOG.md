@@ -303,6 +303,42 @@ release workflow asserts they agree).
   `connect.resumed` and `connect.from_revision`, and the new `tabs`
   count, so a caller can see the no-flicker behavior directly instead
   of scraping the sidebar.
+- **An agent control surface: `roostctl open`, `rpc`, `events`, and a
+  skill that drives it all (plan 066)** — `project.ensure` finds a
+  project by its exact name or creates it, atomically on the server, so
+  two callers racing the same name converge on one project instead of
+  each creating their own (#221); `roostctl open` composes it with
+  `tab.open` in one call, printing `{"project","tab","created"}` with
+  or without `--json`. `identify` now names `ops` — the operations this
+  socket serves right now, worked out per request so it follows the
+  live `local_backend` and test mode — and `instance_id`, 16 hex digits
+  minted once at launch so a client can tell a restarted UI from the
+  one it last talked to; a session's `session.identify` grew the same
+  `ops` field. `events.subscribe` is now served **live** by a UI socket
+  running its tabs in-process, not just by a host session — the same
+  batches, the same gap rule, fenced against a second connection's
+  `tab.list` rather than a session's replay ring, and ended with
+  `stream.ended` when a local-backend switch is about to retire the
+  workspace it streams. `roostctl wait` follows that stream instead of
+  polling wherever one exists (falling back to polling only against a
+  server with none, such as the Mac app), and grows `--no-timeout` for
+  an unbounded wait; `roostctl events` is the new verb that prints the
+  stream directly, one JSON line per event, for a script that wants to
+  watch rather than block. `roostctl rpc <op> [params]` calls any
+  operation by name for whatever a named verb doesn't cover yet. And a
+  Claude Code skill — installable via `npx skills add charliek/roost`
+  or, for Claude Code, `/plugin marketplace add charliek/roost` then
+  `/plugin install roost@roost` — teaches an agent the rules this
+  surface implies (the target policy, the exit-code table, when to
+  focus a tab); `roostctl skill` prints the copy built into the
+  binary, `--json` included, so the skill that matches your installed
+  `roostctl` is always one command away. `roostctl --target session`
+  reaches a host session explicitly (#475) — never by auto-detect or
+  `ROOST_BUNDLE_PROFILE` — and an op a session does not serve answers
+  with the server's own error. See the new [Automation](docs/guides/automation.md)
+  and [Agent Skill](docs/guides/agent-skill.md) guides, and
+  [`ipc.md`](docs/reference/ipc.md) — which now carries a contract
+  section for every operation, a gap a test now enforces.
 
 ### Removed
 
@@ -435,6 +471,30 @@ release workflow asserts they agree).
   `agent.claude.legacy_settings` check names the two cleanup steps — see
   the [Agent Hooks](docs/guides/agents.md#legacy-claude-settings)
   guide.
+- **A mutating verb refuses without `--tab` instead of guessing the
+  active tab, and `roostctl` speaks one error contract (plan 066)** —
+  `notify`, `set-title`, `tab set-state`, `tab clear-notification`,
+  `tab close`, `tab send`, `tab resize`, and `tab focus` used to fall
+  back to the UI's active tab — whatever a person last clicked — when
+  neither `--tab` nor `ROOST_TAB_ID` was given, which is no answer for
+  a command that writes to a tab. They now refuse before dialling
+  anything, exit 2 `usage`, and name `roostctl tab list` as the way to
+  find an id. Every verb now also speaks one error shape: a failure
+  prints `roostctl: <code>: <message>` on stderr (never anyhow's bare
+  `Error: …`), or `{"error":{"code","message"}}` under the now-global
+  `--json` flag, and `code` is the stable part scripts branch on — see
+  the [exit-code table](docs/reference/cli.md#exit-codes). `tab list
+  --json` against an in-process UI now carries a `revision`, the fence a
+  client pairs with `events.subscribe` to know which batches it has
+  already seen.
+- **`roostctl wait` exits 4 on timeout, not 1 (plan 066)** — a script
+  that treated any non-zero `wait` as "timed out" keeps working, but one
+  that matched exit 1 must now match 4 (`timeout`). Exit 1 is left for a
+  real failure (`connection`, a server refusal), so "the condition never
+  held" and "the connection failed" no longer share a code. A `wait`
+  that loses its event stream across a local-backend switch or a
+  restart also exits 1 `connection`, because tab ids do not carry
+  across.
 
 ### Fixed
 
@@ -582,6 +642,44 @@ release workflow asserts they agree).
   nothing there; it now cycles Name → Target → Add & Connect → Cancel and
   back, Shift+Tab reverses, and Enter or Space activates whichever button
   the ring is on.
+- **The Mac e2e lane no longer runs a stale `Roost.app` (#493)** — the
+  harness bundled the Swift app only when `mac/build/Roost.app` was
+  missing, so a local run could exercise a bundle from an older
+  checkout while a green `e2e-mac` said nothing about the Swift sources
+  actually in the tree (CI was unaffected — it always bundles first).
+  The harness now bundles unconditionally before the first Mac launch
+  in a test process, reuses that bundle for the rest of it, and warns
+  `stale Roost.app: sources are newer than the bundle` if the binary's
+  mtime is somehow still older than the newest source under `mac/`.
+  `ROOST_MAC_NO_BUNDLE=1` skips the rebuild and refuses outright when
+  there's no bundle to reuse.
+- **A momentarily full host op queue no longer detaches the tab (#500)** —
+  a host connection whose op queue was full for even one send used to
+  read that the same way as the worker being gone entirely, and
+  detached the tab for good. A full queue is now retried on the
+  existing backoff ladder — up to six times, 250ms to 5s — and only a
+  seventh refusal, or the worker actually being gone, detaches it;
+  reaching a live connection resets the count.
+- **An agent-hooks apply that fails after its key write says so, and
+  names the key (#491)** — `set_hooks`/`raise` write the `agent-hooks`
+  key to `config.conf` first, under the config lock, so the user's
+  answer is durable even if the reconcile that follows fails. An `Err`
+  from either used to say nothing about that: the running iced UI kept
+  its old `agent_hooks` value in memory while disk already held the
+  new one, and `roostctl agent set` / a session's reply gave no hint
+  the key had changed. The error now names the key and says it's
+  already on disk, and the iced UI's in-memory value is updated to
+  match before the failure is shown, so what the UI reports and what's
+  on disk never disagree.
+- **`roostctl screenshot` under the GL fallback renderer is now
+  documented as unreliable (#496)** — the GLES/GL fallback (as opposed
+  to Vulkan/Metal) can render geometry with no text and can hand back a
+  frozen frame, which was undocumented and easy to mistake for a real
+  bug when triaging a screenshot. `CLAUDE.md` and
+  [`tools/screenshot/README.md`](tools/screenshot/README.md) now name
+  the `Selected: AdapterInfo { … backend: … }` UI-log line that says
+  which renderer is live, and point at
+  `tools/wayland/weston-run.sh` for a capture you can trust.
 
 ### Internal
 

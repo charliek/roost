@@ -128,7 +128,9 @@ impl EngineError {
             Self::Workspace(
                 WorkspaceError::HostLabelEmpty
                 | WorkspaceError::HostLabelReserved
-                | WorkspaceError::HostLabelTaken(_),
+                | WorkspaceError::HostLabelTaken(_)
+                | WorkspaceError::ProjectNameBlank
+                | WorkspaceError::ProjectCwdRequired(_),
             ) => "invalid_argument",
             Self::Pty(PtyError::NotFound(_)) | Self::Pty(PtyError::Closed(_)) => "tab_not_found",
             Self::Pty(PtyError::Cancelled(_)) => "cancelled",

@@ -1497,3 +1497,58 @@ def test_a_superseded_apply_still_moves_the_running_key(short_root, iced_only):
         f"the UI still holds the key it launched with, not the one on disk: {card}"
     )
     assert rows["codex"]["on"] is False, card
+
+
+def test_a_failure_after_the_key_write_still_moves_the_running_key(short_root, iced_only):
+    """#491: an apply that writes the key and then fails answers its
+    caller with an error naming the key now on disk — and the running UI
+    takes that key anyway.
+
+    The failure is a real one rather than a seam: a directory where the
+    state record belongs. Nothing reads the record before the key is
+    written, so the run fails only once the key has landed.
+
+    The running value is read the way the superseded-apply case above
+    reads it: the preferences card falls back to it when `config.conf`
+    cannot be read. A UI that dropped the failed apply would still hold
+    the `off` it launched with.
+    """
+    jail = Jail(short_root, agent_hooks="off", present=("claude", "codex"))
+    sock = jailed_socket(jail)
+
+    with jailed_ui(jail) as (proc, log):
+        wait_for_jailed_window(jail, proc, log)
+        jail.record.mkdir()
+        try:
+            failed = run_agent(jail, "set", "claude", socket=str(sock))
+        finally:
+            jail.record.rmdir()
+        assert failed.returncode != 0, failed.stdout + failed.stderr
+        assert "the agent-hooks key `claude` is already on disk" in failed.stderr, (
+            failed.stderr
+        )
+        assert jail.read_key() == "claude", jail.config.read_text()
+        # Logged after the key is taken, so the card below cannot open
+        # ahead of it.
+        wait_for_log_line(
+            log,
+            "agent.set_hooks failed after writing the key",
+            "the jailed UI to take the key a failed apply left on disk",
+        )
+
+        jail.config.chmod(0o000)
+        try:
+            with Roost(str(sock), timeout=scaled_timeout(30)) as roost:
+                roost.palette_dismiss()
+                roost.palette_open()
+                roost.palette_activate("agent_hooks")
+                roost.palette_dismiss()
+                card = wait_for_agent_hooks_card(roost)
+        finally:
+            jail.config.chmod(0o600)
+
+    rows = {row["agent"]: row for row in card["rows"]}
+    assert rows["claude"]["on"] is True, (
+        f"the UI still holds the key it launched with, not the one on disk: {card}"
+    )
+    assert rows["codex"]["on"] is False, card

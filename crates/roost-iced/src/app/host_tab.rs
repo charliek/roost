@@ -54,6 +54,25 @@ const WITHHOLD_DEADLINE: Duration = Duration::from_secs(2);
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
 const BACKOFF_CAP: Duration = Duration::from_secs(5);
 
+/// The first rung of the ladder whose delay is [`BACKOFF_CAP`].
+const BACKOFF_CAP_STEP: u32 = {
+    let mut step = 0;
+    while BACKOFF_BASE.as_nanos() << step < BACKOFF_CAP.as_nanos() {
+        step += 1;
+    }
+    step
+};
+
+/// How many times an attach refused by a full op queue is retried before
+/// it detaches: as many times as the ladder has rungs, the capped one
+/// included.
+///
+/// Bounded where every other retryable failure is not, because what
+/// failed is not this attach's own: a queue still full once the ladder
+/// has been climbed is the host connection's to recover, not this tab's
+/// to keep asking at the cap.
+const FULL_QUEUE_RETRIES: u32 = BACKOFF_CAP_STEP + 1;
+
 /// The grid + pixel geometry an attach negotiates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Geometry {
@@ -130,6 +149,14 @@ pub(crate) enum HostTabFrame {
     Failed {
         attempt: u64,
         reason: FailReason,
+    },
+    /// The queue permit was refused, before the grant or by the fence
+    /// after it. Carried typed rather than classified on the task: whether
+    /// a full queue is still worth a retry depends on how many times it
+    /// has refused this attach, which only the main thread counts.
+    PermitRefused {
+        attempt: u64,
+        error: HostOpError,
     },
     Snap {
         attempt: u64,
@@ -330,6 +357,9 @@ pub(super) struct HostAttach {
     /// wholesale on detach or re-attach.
     tasks: Vec<tokio::task::AbortHandle>,
     backoff_step: u32,
+    /// Permits refused by a full queue since the stream was last Live —
+    /// see [`FULL_QUEUE_RETRIES`].
+    full_refusals: u32,
 }
 
 impl HostAttach {
@@ -347,6 +377,7 @@ impl HostAttach {
             input_rx: Arc::new(tokio::sync::Mutex::new(input_rx)),
             tasks: Vec::new(),
             backoff_step: 0,
+            full_refusals: 0,
         }
     }
 
@@ -557,7 +588,7 @@ impl HostAttach {
                     // Reaching Live is what resets the backoff ladder —
                     // a mere accept from a server that then dies would
                     // otherwise hot-loop at the base delay.
-                    self.backoff_step = 0;
+                    self.reset_ladder();
                     self.phase = Phase::Live;
                     if let Some(geometry) = self.withheld.take() {
                         // A stale withhold from a previous attempt's
@@ -617,22 +648,11 @@ impl HostAttach {
                 }
                 AttachStep::None
             }
-            HostTabFrame::Failed { reason, .. } => match reason {
-                FailReason::BuildMismatch(message) => {
-                    tracing::warn!(key = %self.key, %message, "attach refused: build mismatch");
-                    self.phase = Phase::Ended;
-                    AttachStep::Detach
-                }
-                FailReason::HostGone(message) => {
-                    tracing::debug!(key = %self.key, %message, "attach refused: host connection gone");
-                    self.phase = Phase::Ended;
-                    AttachStep::Detach
-                }
-                FailReason::Retryable(message) => {
-                    tracing::debug!(key = %self.key, %message, "attach attempt failed; backing off");
-                    self.schedule_reattach()
-                }
-            },
+            HostTabFrame::Failed { reason, .. } => self.apply_failure(reason),
+            HostTabFrame::PermitRefused { error, .. } => {
+                let reason = self.count_permit_refusal(&error);
+                self.apply_failure(reason)
+            }
             HostTabFrame::Snap { bytes, .. } => self.apply_snap(&bytes, tab, feed),
             HostTabFrame::Pty { seq, bytes, .. } => self.apply_pty(seq, bytes, tab),
             HostTabFrame::Exit {
@@ -773,13 +793,51 @@ impl HostAttach {
         drained
     }
 
+    fn apply_failure(&mut self, reason: FailReason) -> AttachStep {
+        match reason {
+            FailReason::BuildMismatch(message) => {
+                tracing::warn!(key = %self.key, %message, "attach refused: build mismatch");
+                self.phase = Phase::Ended;
+                AttachStep::Detach
+            }
+            FailReason::HostGone(message) => {
+                tracing::debug!(key = %self.key, %message, "attach refused: host connection gone");
+                self.phase = Phase::Ended;
+                AttachStep::Detach
+            }
+            FailReason::Retryable(message) => {
+                tracing::debug!(key = %self.key, %message, "attach attempt failed; backing off");
+                self.schedule_reattach()
+            }
+        }
+    }
+
+    /// [`classify_permit_failure`], with a full queue retried at most
+    /// [`FULL_QUEUE_RETRIES`] times.
+    fn count_permit_refusal(&mut self, error: &HostOpError) -> FailReason {
+        if *error == HostOpError::QueueFull {
+            self.full_refusals += 1;
+            if self.full_refusals > FULL_QUEUE_RETRIES {
+                return FailReason::HostGone(format!(
+                    "{error}, still after {FULL_QUEUE_RETRIES} retries"
+                ));
+            }
+        }
+        classify_permit_failure(error)
+    }
+
+    fn reset_ladder(&mut self) {
+        self.backoff_step = 0;
+        self.full_refusals = 0;
+    }
+
     fn schedule_reattach(&mut self) -> AttachStep {
         self.abort_tasks();
         if let Phase::Hydrating(hydration) = std::mem::replace(&mut self.phase, Phase::Requesting) {
             hydration.hydrator.abandon();
         }
         let delay = BACKOFF_BASE
-            .saturating_mul(1u32 << self.backoff_step.min(5))
+            .saturating_mul(1u32 << self.backoff_step.min(BACKOFF_CAP_STEP))
             .min(BACKOFF_CAP);
         self.backoff_step = self.backoff_step.saturating_add(1);
         AttachStep::Reattach { delay }
@@ -970,7 +1028,7 @@ impl HostAttach {
         self.resume = Some(identity);
         // The stream proved itself end to end; the next failure starts
         // the ladder from the bottom.
-        self.backoff_step = 0;
+        self.reset_ladder();
         if let Some(geometry) = self.withheld.take() {
             // Held through hydration; send it now, in order behind any
             // buffered input.
@@ -999,6 +1057,7 @@ fn frame_attempt(frame: &HostTabFrame) -> u64 {
     match frame {
         HostTabFrame::Accepted { attempt, .. }
         | HostTabFrame::Failed { attempt, .. }
+        | HostTabFrame::PermitRefused { attempt, .. }
         | HostTabFrame::Snap { attempt, .. }
         | HostTabFrame::Pty { attempt, .. }
         | HostTabFrame::Exit { attempt, .. }
@@ -1078,18 +1137,20 @@ fn reason_for(code: Option<&ServerCode>, message: String) -> FailReason {
 
 /// What a refused queue permit means for the attach.
 ///
-/// Two rows, because a permit is refused in exactly two ways, and they
-/// say the same thing: the host connection owns this, not the tab. A
-/// permit refused *after* the grant, by the fence it was granted under
-/// ([`AttachPermit::guarding`]), is the first row and no new one — the
-/// connection went away, which is what `Disconnected` means.
+/// Three rows, because a permit is refused in exactly three ways. Only a
+/// full queue is worth a retry; the other two say the host connection
+/// owns this, not the tab. A permit refused *after* the grant, by the
+/// fence it was granted under ([`AttachPermit::guarding`]), is the
+/// `Disconnected` row and no new one — the connection went away, which
+/// is what `Disconnected` means.
 fn classify_permit_failure(error: &HostOpError) -> FailReason {
     match error {
+        HostOpError::QueueFull => FailReason::Retryable(error.to_string()),
         // The queue was flushed before the permit came up, or the
         // connection it was granted for ended before the dial.
         HostOpError::Disconnected
-        // The queue was full, or its worker is already gone.
-        | HostOpError::Unavailable
+        // Nothing is left to serve the queue at all.
+        | HostOpError::WorkerGone
         // Nothing else can reach a barrier — it is answered by the
         // worker itself and never put on the wire, so there is no
         // session refusal, no dead wire and no upload error to sort. Not
@@ -1137,9 +1198,15 @@ async fn run_attempt(
             HostTabFrame::Failed { attempt, reason },
         ));
     };
+    let refused = |error: HostOpError, feed: &EngineFeedSender| {
+        feed.send(EngineFeed::HostTab(
+            key,
+            HostTabFrame::PermitRefused { attempt, error },
+        ));
+    };
     let permit = match permit.await {
         Ok(permit) => permit,
-        Err(error) => return fail(classify_permit_failure(&error), &feed),
+        Err(error) => return refused(error, &feed),
     };
     // Bounded, on the same budget a control leg gets. `DataConnection::dial`
     // has no timeout of its own, and the socket it dials is not always a
@@ -1171,11 +1238,9 @@ async fn run_attempt(
                 &feed,
             )
         }
-        // The connection this attach was admitted for is gone. Same two
-        // rows, same meaning as a refused permit: the host connection
-        // owns the recovery, and re-attaching is its job, not this
-        // attempt's.
-        Err(error) => return fail(classify_permit_failure(&error), &feed),
+        // Refused by the fence: the connection this attach was admitted
+        // for is gone.
+        Err(error) => return refused(error, &feed),
     };
     let kind = match negotiated_kind(&accepted.kind) {
         Ok(kind) => kind,
@@ -2243,8 +2308,7 @@ mod tests {
         let mut stand_in = StandIn::new();
         let serving = stand_in.ops.serving().open(key().host);
 
-        let (feed_tx, mut feed_rx) = engine_feed::channel();
-        let mut attach = HostAttach::new(key(), GEOMETRY);
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
         attach.begin(
             &stand_in.ops,
             Some("sess-1"),
@@ -2263,8 +2327,17 @@ mod tests {
         stand_in
             .nothing_dialed("a permit granted for a connection that has ended opens nothing")
             .await;
-        assert!(
-            matches!(next_failure(&mut feed_rx).await, FailReason::HostGone(_),),
+        let refusal = next_permit_refusal(&mut feed_rx).await;
+        assert!(matches!(
+            refusal,
+            HostTabFrame::PermitRefused {
+                error: HostOpError::Disconnected,
+                ..
+            }
+        ));
+        assert_eq!(
+            attach.on_frame(refusal, &mut tab, &feed_tx),
+            AttachStep::Detach,
             "and the tab is told the host connection owns the recovery"
         );
 
@@ -2272,22 +2345,205 @@ mod tests {
         stand_in.data_plane.abort();
     }
 
-    /// Take the reason off the first `Failed` frame the attempt puts on
-    /// the feed.
-    async fn next_failure(feed_rx: &mut EngineFeedReceiver) -> FailReason {
+    #[test]
+    fn only_a_full_queue_makes_a_refused_permit_retryable() {
+        for (error, expected) in [
+            (
+                HostOpError::QueueFull,
+                FailReason::Retryable as fn(String) -> FailReason,
+            ),
+            (HostOpError::Disconnected, FailReason::HostGone),
+            (HostOpError::WorkerGone, FailReason::HostGone),
+        ] {
+            assert_eq!(
+                classify_permit_failure(&error),
+                expected(error.to_string()),
+                "{error:?}"
+            );
+        }
+    }
+
+    /// **A full queue is a worker behind, not a host gone** (#500). The
+    /// refused attach backs off instead of detaching, and the retry that
+    /// comes due after the queue drains takes its place in line and
+    /// dials.
+    #[tokio::test]
+    async fn an_attach_refused_by_a_full_queue_attaches_once_it_drains() {
+        let mut stand_in = StandIn::new();
+        let _serving = stand_in.ops.serving().open(key().host);
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+
+        fill(&stand_in.ops);
+        attach.begin(
+            &stand_in.ops,
+            Some("sess-1"),
+            stand_in.socket.clone(),
+            "gb",
+            &feed_tx,
+        );
+        let refusal = next_permit_refusal(&mut feed_rx).await;
+        let AttachStep::Reattach { delay } = attach.on_frame(refusal, &mut tab, &feed_tx) else {
+            panic!("a full queue is retried, not detached");
+        };
+        assert!(!delay.is_zero(), "the retry waits its rung out");
+
+        while stand_in.ops_rx.try_recv().is_ok() {}
+        attach.arm_reattach(delay, &feed_tx);
+        let due = next_host_frame(&mut feed_rx, |frame| {
+            matches!(frame, HostTabFrame::ReattachDue { .. })
+        })
+        .await;
+        assert_eq!(
+            attach.on_frame(due, &mut tab, &feed_tx),
+            AttachStep::Reattach {
+                delay: Duration::ZERO
+            }
+        );
+        attach.begin(
+            &stand_in.ops,
+            Some("sess-1"),
+            stand_in.socket.clone(),
+            "gb",
+            &feed_tx,
+        );
+
+        stand_in.barrier().await.answer(Ok(serde_json::Value::Null));
+        tokio::time::timeout(Duration::from_secs(5), stand_in.dialed)
+            .await
+            .expect("the retry dials once its permit is granted")
+            .expect("the data plane accepted");
+
+        attach.abort_tasks();
+        stand_in.data_plane.abort();
+    }
+
+    /// **A queue that never drains ends the attach** once the ladder has
+    /// been climbed, and every retry before that waits its rung out.
+    #[tokio::test]
+    async fn an_attach_refused_by_a_queue_that_never_drains_detaches_at_the_top_of_the_ladder() {
+        let (ops, _stalled_worker) = HostOps::channel();
+        fill(&ops);
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+
+        let mut waits = Vec::new();
+        let last = loop {
+            attach.begin(
+                &ops,
+                Some("sess-1"),
+                std::path::PathBuf::from("/nonexistent/roost-full-queue.sock"),
+                "gb",
+                &feed_tx,
+            );
+            let refusal = next_permit_refusal(&mut feed_rx).await;
+            match attach.on_frame(refusal, &mut tab, &feed_tx) {
+                AttachStep::Reattach { delay } if waits.len() <= FULL_QUEUE_RETRIES as usize => {
+                    waits.push(delay);
+                }
+                step => break step,
+            }
+        };
+
+        assert_eq!(last, AttachStep::Detach, "after {waits:?}");
+        assert_eq!(waits.len(), FULL_QUEUE_RETRIES as usize, "{waits:?}");
+        assert!(waits.iter().all(|delay| !delay.is_zero()), "{waits:?}");
+        assert_eq!(
+            &waits[waits.len() - 2..],
+            &[BACKOFF_BASE * (1 << (BACKOFF_CAP_STEP - 1)), BACKOFF_CAP],
+            "one retry on the capped rung, and it is the last"
+        );
+        assert!(!attach.live());
+    }
+
+    /// Reaching Live restarts the count with the rest of the ladder: a
+    /// queue that was full before the stream came up does not shorten
+    /// the retries of the next stall.
+    #[tokio::test]
+    async fn reaching_live_restarts_the_full_queue_count() {
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        let full = || HostTabFrame::PermitRefused {
+            attempt: 1,
+            error: HostOpError::QueueFull,
+        };
+        for _ in 0..FULL_QUEUE_RETRIES {
+            assert!(matches!(
+                attach.on_frame(full(), &mut tab, &feed_tx),
+                AttachStep::Reattach { .. }
+            ));
+        }
+        attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
+        assert!(
+            matches!(
+                attach.on_frame(full(), &mut tab, &feed_tx),
+                AttachStep::Reattach { .. }
+            ),
+            "the count restarted when the stream went Live"
+        );
+    }
+
+    /// A gone worker is not a queue that might drain: the attach detaches
+    /// on the first refusal.
+    #[tokio::test]
+    async fn an_attach_refused_by_a_gone_worker_detaches_at_once() {
+        let (ops, worker) = HostOps::channel();
+        drop(worker);
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+
+        attach.begin(
+            &ops,
+            Some("sess-1"),
+            std::path::PathBuf::from("/nonexistent/roost-gone-worker.sock"),
+            "gb",
+            &feed_tx,
+        );
+        let refusal = next_permit_refusal(&mut feed_rx).await;
+        assert!(matches!(
+            refusal,
+            HostTabFrame::PermitRefused {
+                error: HostOpError::WorkerGone,
+                ..
+            }
+        ));
+        assert_eq!(
+            attach.on_frame(refusal, &mut tab, &feed_tx),
+            AttachStep::Detach
+        );
+    }
+
+    /// A queue whose worker has stopped draining it.
+    fn fill(ops: &HostOps) {
+        while ops
+            .send(HostIntent::new("fill", serde_json::json!({})))
+            .is_ok()
+        {}
+    }
+
+    async fn next_permit_refusal(feed_rx: &mut EngineFeedReceiver) -> HostTabFrame {
+        next_host_frame(feed_rx, |frame| {
+            matches!(frame, HostTabFrame::PermitRefused { .. })
+        })
+        .await
+    }
+
+    /// The first frame on the feed that `wanted` picks, skipping the rest.
+    async fn next_host_frame(
+        feed_rx: &mut EngineFeedReceiver,
+        wanted: impl Fn(&HostTabFrame) -> bool,
+    ) -> HostTabFrame {
         let mut batch = crate::engine_feed::EngineBatch::default();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 while let Some(item) = feed_rx.try_next(&mut batch) {
-                    if let EngineFeed::HostTab(_, HostTabFrame::Failed { reason, .. }) = item {
-                        return reason;
+                    if let EngineFeed::HostTab(_, frame) = item {
+                        if wanted(&frame) {
+                            return frame;
+                        }
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("the attempt reported a failure")
+        .expect("the attempt put the frame on the feed")
     }
 
     /// A resize that runs out of patience during a `vt` payload

@@ -53,7 +53,7 @@ pub const TOTAL_BUDGET: Duration = Duration::from_secs(2);
 /// value the hook silently drops.
 ///
 /// Deliberately does **not** trim: every other per-tab command reads the
-/// same variable through clap, whose `i64` parser rejects surrounding
+/// same variable through `str::parse`, which rejects surrounding
 /// whitespace outright, so accepting `" 7 "` here would make doctor bless
 /// a value that exits 2 everywhere else. `0` and negatives are the same
 /// silent no-op as an unparseable value.

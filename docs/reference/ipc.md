@@ -18,8 +18,8 @@ The socket path is the bundle profile's `socket_path` (see
 * Iced dev build on Linux (XDG):    `$XDG_RUNTIME_DIR/roost-iced/roost.sock`
 * Linux fallback:             `/tmp/roost[-iced]-<uid>/roost.sock`
 
-`roostctl --target mac|linux|iced` selects a profile explicitly. Without an
-explicit selector, `roostctl` probes every distinct profile socket; if more
+`roostctl --target mac|linux|iced` selects a UI profile explicitly. Without an
+explicit selector, `roostctl` probes every distinct UI profile socket; if more
 than one is live, it reports the actual candidates and requires selection.
 (The `linux` profile also resolves on macOS, as `~/Library/Caches/Roost-linux/`,
 but nothing ships or launches it there.)
@@ -28,13 +28,28 @@ A fifth socket path, `Session` (`~/Library/Caches/RoostSession/roost.sock`
 on macOS, `$XDG_RUNTIME_DIR/roost-session/roost.sock` on Linux), is served
 by the headless `roost-session` daemon (HS-1a, plan 035) — see
 [Session sockets](#session-sockets) and [`paths.md`](paths.md#session-profile).
-It is **not** a `roostctl --target` value and `roostctl` never auto-probes
-it: `roostctl session start|stop|status` address the session profile's
-socket directly (a pre-connect carve-out, since `start` must work when
-nothing is listening yet), and any other op reaches a session only
-through an explicit `--socket`. A UI socket answers `unknown-op` for
-every `session.*` op and `not-implemented` for `events.subscribe`,
-byte-identical to before `roost-session` existed.
+A session is reachable only **explicitly**: `roostctl --target session` (or
+`--socket` pointed at its path) — never by auto-detect, and never by
+`ROOST_BUNDLE_PROFILE`, which still refuses `session` like any other
+unrecognized value (#475). `roostctl session start|stop|status` keep their
+own carve-out ahead of that ladder: they address the session profile's
+socket directly, since `start` must work when nothing is listening yet.
+An op a session does not serve fails with the server's own error for that
+op, not a session-specific one: `unknown-op` for `host.*` and
+`agent.set_hooks` (client-side UI state a session doesn't keep), `internal:
+no UI attached` for `app.*` window/UI ops (except
+[`app.activate`](#appactivate), which answers `{}` and does nothing). [`identify`](#identify) (on a UI
+socket) and [`session.identify`](#sessionidentify) (on a session) each list
+what that socket serves right now in `ops`. A UI socket, symmetrically,
+answers `unknown-op` for every `session.*` op, and serves
+`events.subscribe` only while it runs its tabs in-process, and only live —
+see [On a UI socket](#on-a-ui-socket).
+
+The Swift Mac app (`Roost.app`) does not do three things this page
+describes for agent tooling: it answers `unknown-op` to
+[`project.ensure`](#projectensure), its [`identify`](#identify) reply
+has no `ops` and no `instance_id`, and it answers `not-implemented` to
+[`events.subscribe`](#eventssubscribe).
 
 A session socket also carries a second, **binary** protocol on its own
 connections — the per-tab attach stream a client renders a remote
@@ -63,8 +78,9 @@ terminal from. It shares the socket path but not the framing; see
   `{"event": "<dotted-name>", "data": {...}}` — no `id`, no response
   expected. Pushed inside an `EventBatch` on a connection that ran
   [`events.subscribe`](#eventssubscribe), which host-session sockets
-  serve and UI sockets do not. The one exception is the terminal
-  `session.stopping` control envelope, which rides bare (no batch, no
+  serve and an in-process UI socket serves live. The one exception is
+  the terminal control envelope — `session.stopping` from a session,
+  `stream.ended` from a UI socket — which rides bare (no batch, no
   revision) as the last frame on the stream. Catalog:
   [Events](#events) below.
 * **Bytes payloads** (e.g. `tab.write.data`, and any future binary
@@ -252,16 +268,42 @@ Response:
   "protocol_version": 1,
   "local_backend": "in-process",
   "local_session_socket": null,
-  "local_backend_switch": null
+  "local_backend_switch": null,
+  "ops": ["identify", "tab.open", "tab.list", "project.ensure", "…"],
+  "instance_id": "5d0c7e21a9f3b846"
 }}
 ```
 
+`ops` lists the ops this socket **would dispatch right now** — worked
+out per request, so it follows the live `local_backend` and test mode.
+An op is left out when this socket would answer it with `unknown-op`
+(`session.*` here; `host.*` and `agent.set_hooks` on a session socket's
+`identify`), with `not-implemented` (the six macOS-only test ops off
+macOS), with `not-enabled` (a gated test op
+without `ROOST_TEST_MODE=1`), or with `no UI attached` (an op that needs
+a window, on a socket with none behind it). Under `local-backend =
+session` the Unsupported ops in [the table
+below](#a-ui-socket-under-local-backend-session) are left out too, and
+the Forward and Rewrite ops are listed: they reach the slot. **A UI
+launched with `ROOST_TEST_MODE=1` lists its test seams** —
+`tab.feed_pty_bytes`, `app.dialog_answer` and the rest — which are
+harness drivers, not a surface an agent should use. Read the list for
+membership: a name that is absent means this server does not serve that
+op, and a reply with no `ops` field at all is an older server or the
+Swift Mac app, which a client treats the same way. The contents are not
+a compatibility promise.
+
+`instance_id` names this UI process: 63 random bits as 16 lowercase hex
+digits, minted once at launch, so a restarted UI has a new one. A
+session socket's `identify` omits it — a session's identity is
+[`session.identify.session_id`](#sessionidentify) — and so does the
+Swift Mac app.
+
 `persist_error` is present only when the last attempt to write
 `state.json` failed — the message of that write, and absent otherwise.
-A UI socket serves no event stream, so this field is the whole of its
-durability surface; see
-[`workspace.durability_changed`](#events) for the session's live
-counterpart and what the value means.
+It is the standing value; an in-process subscriber also sees
+[`workspace.durability_changed`](#events) live, and that event's entry
+says what the value means.
 
 `local_backend` (plan 063 §D1) is `"in-process"` or `"session"` — which
 backend this UI's own local tabs run on, the [`local-backend` config
@@ -269,9 +311,9 @@ key](config.md#local-backend)'s live value. Absent from a Swift Mac
 reply, which decodes to `"in-process"`: Swift always runs its tabs
 in-process and never reads the key. `local_session_socket` is the local
 `roost-session`'s own socket path, present only under `session` — a
-client that wants the event stream a UI socket cannot serve
-(`events.subscribe` stays [`not-implemented` here](#eventssubscribe))
-dials that socket instead. Under `session`, `active_project_id` and
+client that wants the event stream this socket does not serve under
+`session` (`events.subscribe` answers
+[`not-implemented` there](#on-a-ui-socket)) dials that socket instead. Under `session`, `active_project_id` and
 `active_tab_id` name **the slot's** own UI-selected pair rather than
 this socket's own (empty) workspace, which is what lets `roostctl tab
 write` / `send` / `state` with no `--tab` still have something to act
@@ -302,11 +344,12 @@ by name if one is ever added without a row:
   reply is returned unchanged (including its error code and message).
   A bare id therefore *means* the slot's id. Every workspace mutation is
   here — `tab.open`, `tab.close`, `tab.list`, `tab.write`, `tab.resize`,
-  `project.create`, `project.rename`, `project.delete`, `tab.set_title`,
-  `tab.set_state`, `tab.clear_notification`, `tab.set_hook_active`,
-  `tab.agent_report`, `notification.create`. (`tab.open`'s `project_id:
-  "0"` special case forwards verbatim too, so it is the *slot* that
-  mints a default project when there is none — not this socket.)
+  `project.create`, `project.ensure`, `project.rename`, `project.delete`,
+  `tab.set_title`, `tab.set_state`, `tab.clear_notification`,
+  `tab.set_hook_active`, `tab.agent_report`, `notification.create`.
+  (`tab.open`'s `project_id: "0"` special case forwards verbatim too,
+  so it is the *slot* that mints a default project when there is none
+  — not this socket.)
 - **Rewrite.** The UI answers it here, after rewriting any bare id in
   the request to the slot's `h<n>.<id>` form first; a ref that already
   arrived host-qualified is left exactly as it was, so an explicit
@@ -326,9 +369,10 @@ by name if one is ever added without a row:
   `app.render_stats`, `window.resize`, `clipboard.*`, and the rest of
   the `app.*` surface all stay exactly as documented elsewhere on this
   page.
-- **Unsupported.** Not served on a UI socket before this mode or after
-  it: `events.subscribe` (`not-implemented` — dial
-  `identify.local_session_socket` instead).
+- **Unsupported.** Refused under this mode, though the same socket
+  serves it in-process: `events.subscribe` (`not-implemented`, its
+  message ending `dial identify.local_session_socket`). The workspace
+  this socket would stream is the hidden one.
 - **Session-only / event.** `session.*` ops and every `tab.*`/`project.*`
   event name answer `unknown-op` on a UI socket exactly as they always
   have; the mode plays no part.
@@ -348,8 +392,8 @@ this socket's.
 
 `tab.list`'s `revision` field is **stripped** at this boundary before
 the reply reaches the caller: [`revision`](#tablist) is the fence a
-client pairs with `events.subscribe`, and a UI socket serves no event
-stream to fence — a caller that wants it dials
+client pairs with `events.subscribe`, and under this mode the UI socket
+serves no event stream to fence — a caller that wants both legs dials
 `identify.local_session_socket` and asks the session directly.
 
 ### `tab.open`
@@ -393,14 +437,16 @@ Snapshot of the workspace. Same shape as the legacy
 
 Response: `{"projects": [<Project>, ...]}`.
 
-On a **host-session socket** the response also carries
-`"revision": <u64>` — the commit the snapshot was taken at, read under
-the same lock as the projects. It is the fence a client pairs with
-[`events.subscribe`](#eventssubscribe): discard every `EventBatch`
-whose `revision` is `<=` this one, apply the rest, and the first batch
-it keeps is exactly `revision + 1`. A UI socket omits the key entirely
-(not `null`) — it serves no event stream, so there would be nothing to
-fence against.
+On a **host-session socket**, and on a **UI socket running its tabs
+in-process**, the response also carries `"revision": <u64>` — the
+commit the snapshot was taken at, read under the same lock as the
+projects. It is the fence a client pairs with
+[`events.subscribe`](#eventssubscribe) on the same socket: discard
+every `EventBatch` whose `revision` is `<=` this one, apply the rest,
+and the first batch it keeps is exactly `revision + 1`. A UI socket
+under `local-backend = session` omits the key entirely (not `null`),
+and so does the Swift Mac app: neither serves an event stream, so there
+would be nothing to fence against.
 
 ### `tab.write`
 
@@ -805,12 +851,125 @@ tab. Implemented by the iced UI only; the Swift Mac app has no case for
 this op and answers `unknown-op` (it does support IME input, via AppKit's
 own `interpretKeyEvents` — there is just no IPC op to drive it).
 
+### `tab.expand_selection_at` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Drives the same double-/
+triple-click word/line expansion the production `handle_click_count` /
+`handleClickCount` path runs from a real mouse press, then commits the
+resulting span as the tab's selection — so the e2e suite can pin
+word/line expansion without a synthetic mouse sequence. Same gate as
+`tab.feed_pty_bytes`.
+
+Request:
+```json
+{"params": {"tab_id": "3", "col": 12, "row": 4, "click_count": 2}}
+```
+
+`click_count` is `2` for a double-click (word) or `3`+ for a
+triple-click (line); a value below `2` is `invalid-param`, checked
+before the gate. Response:
+
+```json
+{"col0": 8, "col1": 15, "text": "example"}
+```
+
+`col0` / `col1` are the expanded span's inclusive start/end columns on
+`row`; `text` is the selected text, or `null` for a span that resolved
+to nothing (never an error by itself).
+
+Errors: `not-found` — either the tab has no live terminal, or `(col,
+row)` has no word/line span (whitespace under a double-click, or a row
+out of range). The iced UI reports these as two distinct messages under
+the same code; the Swift app reports one combined message.
+
+`tab_id` is a bare `string_int64`, not the `h<host>.<id>` wire spelling
+`tab.dump` accepts — under `local-backend = session` the UI resolves it
+against the slot itself rather than needing a host-qualified id; see [A
+UI socket under `local-backend =
+session`](#a-ui-socket-under-local-backend-session).
+
+Implemented by both UIs.
+
+### `tab.dispatch_mouse_event` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Drives a synthetic mouse
+event into the UI's mouse-routing handler at cell-grid coordinates —
+the same path a real `NSEvent` / iced `GestureClick` takes, including
+gating on the negotiated mouse-tracking mode, encoder choice, and the
+SGR/X10/pixel report formats, so the op exercises exactly what
+production does rather than a shortcut around it. Same gate as
+`tab.feed_pty_bytes`.
+
+Request:
+```json
+{"params": {"tab_id": "3", "kind": "press", "button": "left",
+            "cell_x": 10, "cell_y": 4, "mods": 0}}
+```
+
+`kind` is `"press" | "release" | "motion"`; `button` is `"left" |
+"right" | "middle" | "wheel_up" | "wheel_down" | "none"` (`"none"` for a
+plain hover motion). `cell_x` / `cell_y` are 0-based terminal cell
+coordinates. `mods` defaults to `0` and matches the key encoder's
+`Mods` bit layout: shift(0), ctrl(1), alt(2), cmd/super(3).
+
+Response: `{}`. Errors: `invalid-param` for an unrecognized `kind` or
+`button`.
+
+On the iced UI, `mods` also decides whether the *link* modifier is
+held, so a left press on a hyperlink opens it through the UI's own
+launcher exactly as a real click does — a Linux-only effect in
+practice, since the Mac UI drives the mouse-tracking encoder alone and
+does not run this path (`TerminalView.emitMouseTracking`).
+
+`tab_id` is a bare `string_int64`; under `local-backend = session` it
+resolves against the slot the same way [`tab.expand_selection_at`
+above](#tabexpand_selection_at-test-only-gated) does.
+
+Implemented by both UIs.
+
 ### `project.create`
 
 Request: `{"params": {"name": "", "cwd": "/tmp"}}`. `name` empty means
 the server picks `"Untitled <n>"`.
 
 Response: `{"project": <Project>}` — `tabs` is empty.
+
+### `project.ensure`
+
+Find the project with this exact name, or create it. Served by the iced
+UI and by a host session; the Swift Mac app has no case for this op and
+answers `unknown-op`.
+
+Request:
+```json
+{"id": "41", "op": "project.ensure",
+ "params": {"name": "review", "cwd": "/home/u/review"}}
+```
+
+Response: `{"project": <Project>, "created": <bool>}`.
+
+The match is on the exact name (no trimming, case-sensitive), and the
+find and the create are one step: callers racing on a name get one
+project between them, and at most one of them sees `created: true`.
+Project names are not unique, so when several share the name the one
+with the lowest `position` (the first in display order) is returned. That
+pick is stable but arbitrary, and `created: false` says nothing about
+duplicates. Key on `project.id` from then on, not on the name.
+
+- `cwd` is read only on the create path. It may be omitted when the
+  project exists, and a found project's `cwd` is never updated.
+- A found project comes back as `tab.list` shows it, `tabs` included.
+  A created one has empty `tabs`.
+- Neither path changes the active selection (like `project.create`).
+- `project.created` fires only when the call creates. A find commits
+  nothing and emits nothing.
+
+Errors: `invalid-param` for a `name` that is empty or only whitespace,
+and for an empty or whitespace-only (or omitted) `cwd` when no project
+has the name. A missing `name` is `missing-param`, and an unknown key is
+`unknown-field`.
 
 ### `project.rename`
 
@@ -1108,6 +1267,33 @@ Request:
 
 Response: `{}`.
 
+### `app.activate`
+
+Raise + focus the running UI window. Sent by a second launch that loses
+the single-instance flock (#6) — the running Roost's window comes
+forward instead of a second instance starting — so a user who
+double-clicks the Dock icon or reruns the binary while Roost is already
+up gets the existing window rather than a launch failure. Nothing else
+sends this op today; `roostctl` has no verb for it.
+
+Request: `{"params": {}}`. Response: `{}`.
+
+Takes no params — the envelope is declared empty and strict
+(`deny_unknown_fields`), so an unexpected key is `unknown-field` rather
+than silently ignored.
+
+Unlike every other `app.*` op, the handler does **not** go through the
+usual `ui_call` (which answers `internal: no UI attached` with nothing
+wired up). It checks the engine's UI channel directly and, if there is
+none — a headless embedder, or a session with no UI attached — sends
+nothing and still answers `{}`: a fire-and-forget no-op rather than an
+error.
+
+Implemented only by the iced UI (`crates/roost-iced/src/main.rs`'s
+second-launch path is the only sender); the Swift Mac app has no case
+for this op and answers `unknown-op` — its own single-instance path
+does not dial the socket.
+
 ### `app.screenshot`
 
 Render the running UI's whole window (sidebar + tab bar + active
@@ -1272,6 +1458,97 @@ classic single sticky `PROJECTS` header instead of a strip:
 the same absent-tolerant contract `hosts` uses, for the same reason.
 
 Ungated, read-only — always available, matching `app.window_metrics`.
+
+### `app.set_window_focus` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Drives the focus-tracking
+emit path without moving real OS focus — the *whole* production
+window-focus route, not just the emit half: on the iced UI this runs
+`window_opened` first and the focus change second, the same re-entry a
+real focus change takes, because the once-per-process latches that hang
+off `window_opened` (the agent-hooks startup ensure, plan 064's consent
+card) only exist because a focus change re-enters it. An op that skipped
+that half could not fail when a latch was removed, which is the same as
+not testing it.
+
+Request: `{"params": {"focus": true}}`. Response: `{}`.
+
+When mode 1004 (focus reporting) is negotiated, the UI writes `\x1b[I`
+(focused) / `\x1b[O` (unfocused) onto the active tab's PTY-input
+channel; tests pick it up via
+[`tab.capture_pty_input`](#tabcapture_pty_input-test-only-gated).
+
+**The two UIs disagree with no active tab.** The iced UI still applies
+every other side effect of a focus change (workspace state, drag/IME/
+rename teardown) and answers `{}` regardless; the Swift app answers
+`not-found` ("no active tab to drive focus on"). A harness driving both
+UIs should open a tab before calling this op.
+
+Implemented by both UIs.
+
+### `app.cursor_shape`
+
+Ungated read of the active tab's current W3C cursor name — the latest
+OSC 22 payload the terminal program requested, or `"default"` if none
+has landed yet (and `"default"` for OSC 22's empty-string reset form
+too, so callers can always assert against a non-empty name). A
+transient UI-owned link hover can override the last-requested shape
+while the pointer sits over a hyperlink.
+
+Request: `{"params": {}}`. Response:
+
+```json
+{"shape": "pointer"}
+```
+
+Reads the *active* tab implicitly — there is no `tab_id` param, and the
+params envelope is empty and strict. `internal: no UI attached` with no
+UI behind the socket. Used by the e2e suite to assert an OSC 22 request
+actually applied.
+
+Implemented by both UIs.
+
+### `app.active_terminal_focused`
+
+Ungated read of whether the active tab's terminal currently owns the
+UI's *logical* keyboard route. Deliberately independent of native
+toplevel or compositor focus: an in-app overlay (the palette, a modal)
+can hold real OS focus while this reads `false`, because the overlay
+owns the keyboard route instead.
+
+Request: `{"params": {}}`. Response:
+
+```json
+{"focused": true}
+```
+
+`internal: no UI attached` with no UI behind the socket.
+
+Implemented only by the iced UI; the Swift Mac app has no case for this
+op and answers `unknown-op`.
+
+### `app.selected_tab_id`
+
+Ungated read of the active project's on-screen selected tab id — UI
+truth, for asserting the core and the displayed tab agree.
+`"0"` when nothing is selected.
+
+Request: `{"params": {}}`. Response:
+
+```json
+{"tab_id": "7"}
+```
+
+Under `local-backend = session` this reads the slot's own on-screen
+selected tab — the same UI-owned reading
+[`identify.active_tab_id`](#identify), the title bar, and the tab strip
+take (plan 063 §D10); see [A UI socket under `local-backend =
+session`](#a-ui-socket-under-local-backend-session). `internal: no UI
+attached` with no UI behind the socket.
+
+Implemented only by the iced UI; the Swift Mac app has no case for this
+op and answers `unknown-op`.
 
 ### `app.render_stats` *(iced UI only)*
 
@@ -1541,6 +1818,34 @@ this `true`; the real prompt/click is the morning checklist (#285).
 Implemented by both UIs, macOS only — unlike `app.menu_dump` above and
 the other macOS-gated ops around it, which are iced only and have no
 Swift counterpart.
+
+### `window.resize` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Programmatically set the
+running UI window's logical size — the harness driver behind the
+sidebar-layout regression suite (`tools/roosttest`), so a resize can be
+pinned without a real pointer or window-manager event.
+
+Request: `{"params": {"width": 1100.0, "height": 700.0}}`. Response: `{}`.
+
+`width` / `height` are the window's logical **content** size (matches
+iced's `set_inner_size`; the Mac handler converts to the outer frame so
+both UIs land on the same content rect for the same call). Both must be
+finite and `> 0` — `invalid-param` otherwise, checked before the gate,
+so a malformed size is rejected the same way whether or not test mode
+is on.
+
+Some Wayland compositors retain authority over toplevel size and may
+ignore the request outright; the iced UI applies the requested geometry
+to its own state immediately regardless, and a compositor `Resized`
+event afterward remains authoritative if one arrives.
+
+Under `local-backend = session` this stays UI-owned — the window
+belongs to this process, not the slot; see [A UI socket under
+`local-backend = session`](#a-ui-socket-under-local-backend-session).
+
+Implemented by both UIs.
 
 ### `sidebar.set_width` *(test-only — gated)*
 
@@ -1960,7 +2265,9 @@ Every optional field is omitted rather than `null`, so a host that has never con
 ### `events.subscribe`
 
 Turn this connection into a one-way event stream. **Served by a
-host-session socket only.** Every subscriber receives every event —
+host-session socket**, and — live only, with the differences
+[On a UI socket](#on-a-ui-socket) lists — by a UI socket running its
+tabs in-process. Every subscriber receives every event —
 there is no per-connection classification of the stream, and there
 never needs to be: reading is not authority, so a client that only
 wants to watch and one that also types get the same feed.
@@ -2048,10 +2355,11 @@ the stream:
 ```
 
 `reason` is always `"stop"` — the session is shutting down, the only
-way this wire ever ends a stream deliberately. It carries **no
+way a session ever ends a stream deliberately. It carries **no
 `revision`** and is exempt from the gap check below: it is not a
 commit, it is the stream saying why it is over, and it is always the
-last frame before the close.
+last frame before the close. A UI socket's counterpart is
+[`stream.ended`](#on-a-ui-socket).
 
 The catalog of batch envelopes is [Events](#events) below.
 
@@ -2108,10 +2416,10 @@ still do — the ring just means fewer clients ever need the third one:
   out of the stream. A close is still the resync signal: reconnect, and
   either re-subscribe fresh and re-pull `tab.list`, or — with a fence and
   a `session_id` in hand — resume, and let the replay window catch up
-  what the gap cost instead of re-snapshotting. Exactly two things ask
-  for the close on this wire — `session.stopping`, and an EOF —
-  and `session.stopping` only says *why* the stream that is already
-  ending ended.
+  what the gap cost instead of re-snapshotting. Exactly three things
+  ask for the close on this wire — `session.stopping`, a UI socket's
+  `stream.ended`, and an EOF — and the two envelopes only say *why* the
+  stream that is already ending ended.
 
 After the flip the connection answers nothing. Frames a client writes
 on it are read and discarded (so the server still notices a peer that
@@ -2136,11 +2444,89 @@ leaseless subscribe opened an observer stream with `tab.effect` stripped
 The history of how this op's shape moved across earlier generations is
 in [Versioning](#versioning) and CHANGELOG.
 
-On a **UI socket** the op is still unimplemented: it answers
-`{"ok": false, "error": {"code": "not-implemented", "message":
-"events.subscribe is not yet implemented"}}` rather than a false ACK,
-because a UI process pushes nothing. Callers there poll `tab.list` /
-`tab.dump` instead. A UI-side stream lands with its first consumer.
+#### On a UI socket
+
+A UI socket running its tabs **in-process** serves the same live
+stream over its own workspace — the same batches, the same gap rule,
+the same catalog — with these differences:
+
+* **The ack's `session_id` is the UI's
+  [`identify.instance_id`](#identify)**, since a UI process has no
+  session. A client compares the two to know its stream and its
+  snapshot came from the same process: a UI that restarted between a
+  client's `identify` and its subscribe has a new `instance_id`, and
+  revisions restart with it.
+* **Live only.** A UI keeps no replay ring, so `from_revision` is
+  refused `invalid-param`: "resume is a session-socket feature:
+  subscribe live and snapshot with tab.list". A `session_id` that is
+  not this UI's `instance_id` is refused `invalid-param` too, and a
+  non-zero `tab_id_filter` gets the same `invalid-param` a session gives.
+* **The snapshot fence takes a second connection.** Subscribe first,
+  then call [`tab.list`](#tablist) — whose `revision` an in-process UI
+  socket carries — on **another** connection, because a connection that
+  flipped to push answers nothing more. Discard every batch with
+  `revision <=` that `tab.list.revision` and apply the rest.
+* **A slow subscriber cannot hold the UI up.** The bounds above are the
+  same: a subscriber that stops reading is closed once its queue or its
+  socket write stays stuck past the stall budget, and one that falls
+  behind the workspace broadcast is closed at once — the UI never waits
+  on a subscriber.
+* **How it ends.** Lag, a stall, or an internal resync closes it with a
+  bare EOF — the resync signal: subscribe again and re-pull `tab.list`.
+  A [local-backend switch](#a-ui-socket-under-local-backend-session)
+  ends every in-process stream deliberately, with one last envelope and
+  then the close:
+
+  ```json
+  {"event": "stream.ended", "data": {"reason": "backend-switch"}}
+  ```
+
+  `reason` is always `"backend-switch"`: the workspace this stream reads
+  is about to stop being the one on screen. Like `session.stopping` it
+  carries no `revision`, is exempt from the gap check, never enters a
+  replay, and is always the last frame.
+* **Refusals around a switch.** While a switch is in flight a subscribe
+  is refused `host-unavailable` with `busy: a local-backend switch is
+  in progress` — the same answer a mutation gets then — rather than
+  handed a stream nothing would end. Under `local-backend = session`
+  the op answers `not-implemented`, the message ending `dial
+  identify.local_session_socket`: that session serves the stream, with
+  resume, and its own `tab.list` fences it.
+
+#### Waiting on a condition
+
+How a raw-socket client waits for a tab to change without polling — and
+what `roostctl wait` does:
+
+1. **Pick the socket.** Call [`identify`](#identify) on the UI socket. If
+   `local_session_socket` is present, use that socket for everything
+   below; else, if `ops` names `events.subscribe`, use the UI socket;
+   else the server has no stream (the Swift Mac app, an older Roost):
+   poll `tab.list`.
+2. **Subscribe first**, on connection A. Keep the ack's `revision` and
+   `session_id`.
+3. **Then, on connection B**, check the process: `identify.instance_id`
+   on a UI socket, `session.identify.session_id` on a session socket, must
+   equal the ack's `session_id`. If not, the server restarted between the
+   two — revisions restarted with it — so close both and start again. Then
+   take the snapshot: `tab.list`, whose `revision` is at or past the ack's.
+4. **Evaluate the snapshot, then the stream.** Discard every batch whose
+   `revision` is `<=` the snapshot's; apply the rest in order
+   (`tab.state_changed`, `tab.closed`, …) and re-evaluate after each.
+   Nothing on the stream carries a tab's output, so a condition on the
+   viewport re-reads `tab.dump` on connection B.
+
+The order is the whole trick: every commit after the subscribe is on the
+stream, so a snapshot taken after it can only be newer. Snapshot first
+and a commit landing between the two legs is in neither. A bare EOF or a
+revision gap means start again from step 1, and so does `stream.ended` —
+but a tab id means something only to the process that minted it. A
+local-backend switch replays the tabs onto its destination under new ids,
+and a restart mints new ones, so if the fresh ack's `session_id` is not the
+one the wait began with, the tab being waited on has to be found again
+(by title, cwd, or whatever the client knew it by) before anything is read
+off the new snapshot — a tab missing there is not a tab that closed.
+`session.stopping` means the session is going away.
 
 ## Session ops
 
@@ -2220,10 +2606,13 @@ session.
 
 `roostctl session start|stop|status` address this socket directly; they
 are a pre-connect carve-out (`session start` has to work when nothing is
-listening at all) and are deliberately **not** reachable through
+listening at all) and stay deliberately **not** reachable through
 `--target` / `ROOST_BUNDLE_PROFILE` / auto-detect. Any other op reaches a
-session only via an explicit `--socket <path>`. See [`cli.md`](cli.md)
-for the verb-level contract (exit codes, `ROOST_SESSION_BIN`).
+session explicitly — `roostctl --target session` or `--socket <path>`
+(#475) — never through `ROOST_BUNDLE_PROFILE` (`session` is refused
+there like any other unrecognized value) or auto-detect (a session is
+never a candidate). See [`cli.md`](cli.md) for the verb-level contract
+(exit codes, `ROOST_SESSION_BIN`).
 
 A session's default tab size is `120x40` (`DEFAULT_TAB_COLS` /
 `DEFAULT_TAB_ROWS`) for both restored and freshly-opened tabs, since
@@ -2289,9 +2678,18 @@ Params: `{}`. Response:
   "payload_kinds": ["ghostty-snapshot", "vt"],
   "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
   "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
-  "started_at": "2026-08-27T14:03:11Z"
+  "started_at": "2026-08-27T14:03:11Z",
+  "ops": ["identify", "tab.open", "events.subscribe", "session.stop", "…"]
 }
 ```
+
+`ops` is [`identify.ops`](#identify) for this socket: the ops this
+session would dispatch right now. A headless session never lists an op
+that needs a window, nor `host.*` and `agent.set_hooks` (`unknown-op`
+here), and lists `tab.feed_pty_bytes` and `tab.capture_pty_input` only
+when it was started with `ROOST_TEST_MODE=1`. Absent from an older
+session. It is discovery, not negotiation — the generation check below
+still comes first — and its contents are not a compatibility promise.
 
 An optional `persist_error` rides beside them, present only when the
 last attempt to write `state.json` failed, carrying that write's
@@ -3094,8 +3492,8 @@ supported pattern.
 
 ## Events
 
-Server-push only, delivered on a host-session socket after
-[`events.subscribe`](#eventssubscribe). Each envelope is a
+Server-push only, delivered on a host-session socket or an in-process
+UI socket after [`events.subscribe`](#eventssubscribe). Each envelope is a
 `{"event": "<name>", "data": {...}}` object inside an `EventBatch`;
 several envelopes can share one batch, which is what makes a commit
 atomic on the wire. The set below is exhaustive — the serializer
@@ -3103,11 +3501,13 @@ atomic on the wire. The set below is exhaustive — the serializer
 workspace's event enum, so a new event cannot ship without a name
 here.
 
-`session.stopping` is deliberately **not** in this set: it is not a
-workspace event, it carries no `revision`, and it never rides inside a
-batch — it is the connection's own terminal control envelope, delivered
-outside the batch discipline, the last frame before the stream closes.
-See [`events.subscribe`](#eventssubscribe) for the full envelope shape.
+`session.stopping` and `stream.ended` are deliberately **not** in this
+set: neither is a workspace event, neither carries a `revision`, and
+neither ever rides inside a batch or enters a replay — each is the
+connection's own terminal control envelope, delivered outside the batch
+discipline, the last frame before the stream closes. See
+[`events.subscribe`](#eventssubscribe) for `session.stopping` and
+[On a UI socket](#on-a-ui-socket) for `stream.ended`.
 
 * `tab.opened` — `{"tab": <Tab>}`.
 * `tab.closed` — `{"tab_id": "<id>"}`.

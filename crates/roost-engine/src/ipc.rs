@@ -39,21 +39,21 @@ use roost_ipc::messages::{
     IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
     PaletteDismissParams, PaletteOpenParams, PalettePresentParams, PalettePresentResult,
     PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
-    ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams, ProjectReorderParams,
-    ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
-    SelectionDumpResult, SelectionSetParams, SessionIdentify, SessionIdentifyParams,
-    SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams, SessionSetThemeParams,
-    SessionStopParams, SessionStopResult, SidebarDumpParams, SidebarDumpResult,
-    SidebarSetWidthParams, TabAgentReportResult, TabCapturePtyInputParams,
-    TabCapturePtyInputResult, TabClearNotificationParams, TabClearNotificationResult,
-    TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams,
-    TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams,
-    TabExpandSelectionAtResult, TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams,
-    TabFocusResult, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
-    TabSendFileParams, TabSendFileResult, TabSetHookActiveParams, TabSetStateParams,
-    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
-    WindowResizeParams, WireProjectRef, WireTabRef, MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES,
-    SESSION_PROTOCOL_VERSION,
+    ProjectCreateResult, ProjectDeleteParams, ProjectEnsureParams, ProjectEnsureResult,
+    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
+    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
+    SessionIdentify, SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult,
+    SessionSetAgentHooksParams, SessionSetThemeParams, SessionStopParams, SessionStopResult,
+    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams,
+    TabClearNotificationResult, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
+    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
+    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
+    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
+    TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams, TabSendFileResult,
+    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
+    WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef, WireTabRef,
+    MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{AttachHandshake, SessionSetThemeResult};
@@ -1056,13 +1056,14 @@ struct SessionState {
 /// tab it is showing, and a tab is shown by one client at a time.
 pub const MAX_DATA_CONNS_PER_SESSION: usize = 32;
 
-/// One live `events.subscribe` subscriber.
+/// One live `events.subscribe` subscriber — a session's, or a UI's in
+/// [`InProcessStreams`].
 ///
-/// Subscribers are registered **here and never under [`Connections::controls`]**
-/// (plan 049 §3.7), because a stop treats the two kinds differently: it
-/// closes a subscriber and only then aborts its relay. Keeping them in
-/// separate lists is what makes that structural instead of a branch
-/// somebody has to remember.
+/// A session registers subscribers **here and never under
+/// [`Connections::controls`]** (plan 049 §3.7), because a stop treats the
+/// two kinds differently: it closes a subscriber and only then aborts its
+/// relay. Keeping them in separate lists is what makes that structural
+/// instead of a branch somebody has to remember.
 struct Subscriber {
     conn_id: u64,
     closer: ConnCloser,
@@ -1076,6 +1077,51 @@ impl Subscriber {
     /// satisfies neither, which is what the prunes retain on.
     fn is_live(&self) -> bool {
         !self.relay.is_finished() && !self.closer.is_closed()
+    }
+}
+
+/// Every live in-process `events.subscribe` stream on a UI socket (plan
+/// 066 §3.1), kept for one caller: the local-backend switch, which ends
+/// them all.
+///
+/// Nothing else needs a record. A peer that goes away ends its own relay
+/// (`tx.closed()` in `event_push`), and one that stops reading is cut by
+/// [`PushLimits::stall`], so neither can hold the UI up.
+#[derive(Default)]
+pub struct InProcessStreams {
+    subscribers: std::sync::Mutex<Vec<Subscriber>>,
+}
+
+impl InProcessStreams {
+    /// End every stream with a final `stream.ended` envelope, because the
+    /// workspace it reads is about to stop being the one on screen.
+    ///
+    /// The UI calls this only **after** publishing the switch's phase to
+    /// the route cell. A subscribe reads that cell under this same lock
+    /// ([`IpcHandler::register_in_process_stream`]), so one that lands
+    /// after the sweep sees the switch and is refused instead of
+    /// registering a stream nothing would ever end.
+    ///
+    /// Closers first, then relays, for the reason
+    /// [`Connections::abort_subscribers`] gives.
+    pub fn end_for_backend_switch(&self) {
+        let subscribers = std::mem::take(&mut *lock(&self.subscribers));
+        for subscriber in &subscribers {
+            subscriber.closer.close(CloseReason::BackendSwitch);
+        }
+        for subscriber in subscribers {
+            subscriber.relay.abort();
+        }
+    }
+
+    /// How many streams are registered. Test-only today.
+    pub fn count(&self) -> usize {
+        lock(&self.subscribers).len()
+    }
+
+    fn forget(&self, conn_id: u64) {
+        lock(&self.subscribers)
+            .retain(|subscriber| subscriber.conn_id != conn_id && subscriber.is_live());
     }
 }
 
@@ -1396,6 +1442,7 @@ pub fn is_mutating_op(op: &str) -> bool {
             | ops::TAB_AGENT_REPORT
             | ops::TAB_REORDER
             | ops::PROJECT_CREATE
+            | ops::PROJECT_ENSURE
             | ops::PROJECT_RENAME
             | ops::PROJECT_DELETE
             | ops::PROJECT_REORDER
@@ -1441,10 +1488,11 @@ pub struct IpcHandler {
     /// Set by the host-session daemon. `None` on every UI socket, which
     /// is what makes `session.*` an `unknown-op` there.
     session: Option<Arc<SessionState>>,
-    /// Bounds on one `events.subscribe` subscriber's delivery. Only a
-    /// session socket ever serves that op, so this is inert on a UI
-    /// socket.
+    /// Bounds on one `events.subscribe` subscriber's delivery.
     push_limits: PushLimits,
+    /// A UI socket's in-process event streams. Always empty on a session,
+    /// which tracks its subscribers in [`SessionState`].
+    in_process_streams: Arc<InProcessStreams>,
     /// Set by the host-session daemon: what `session.set_agent_hooks`
     /// actually does. `None` everywhere else, and the op answers
     /// `not-supported` — see [`AgentHooksHandle`] for why this crate
@@ -1460,6 +1508,14 @@ pub struct IpcHandler {
     /// session's — so `identify` on a session socket keeps answering
     /// exactly what it always has.
     local_route: Option<Arc<LocalBackendCell>>,
+    /// Whether the UI driving this socket was launched with
+    /// `ROOST_TEST_MODE=1`, passed in for the reason
+    /// [`SessionInfo::test_mode`] is. A session reads its own from there.
+    test_mode: bool,
+    /// `identify.instance_id`: minted with the handler, which a UI
+    /// process builds once. A session never reports it — its identity is
+    /// `session_id`.
+    instance_id: String,
 }
 
 impl IpcHandler {
@@ -1479,9 +1535,12 @@ impl IpcHandler {
             ui_tx: None,
             session: None,
             push_limits: PushLimits::default(),
+            in_process_streams: Arc::default(),
             agent_hooks: None,
             files: None,
             local_route: None,
+            test_mode: false,
+            instance_id: mint_instance_id(),
         }
     }
 
@@ -1529,6 +1588,15 @@ impl IpcHandler {
         self
     }
 
+    /// Tell a UI socket whether its app was launched with
+    /// `ROOST_TEST_MODE=1`, which decides whether `identify.ops` lists
+    /// the gated test seams.
+    #[must_use]
+    pub fn with_test_mode(mut self, test_mode: bool) -> Self {
+        self.test_mode = test_mode;
+        self
+    }
+
     /// The current local-backend snapshot, defaulted to in-process
     /// wherever no UI installed a cell.
     fn local_route(&self) -> Arc<LocalRoute> {
@@ -1568,6 +1636,40 @@ impl IpcHandler {
         self
     }
 
+    /// The in-process streams this UI socket has handed out, for the UI to
+    /// end when it switches its local backend.
+    pub fn in_process_streams(&self) -> Arc<InProcessStreams> {
+        Arc::clone(&self.in_process_streams)
+    }
+
+    /// Register an in-process stream, or refuse it with what the route
+    /// says now.
+    ///
+    /// The route is read under the registry lock, which is what makes a
+    /// switch's sweep final — see [`InProcessStreams::end_for_backend_switch`].
+    fn register_in_process_stream(
+        &self,
+        ctx: &ConnCtx,
+        relay: tokio::task::AbortHandle,
+    ) -> Result<(), HandlerError> {
+        let mut subscribers = lock(&self.in_process_streams.subscribers);
+        let route = self.local_route();
+        served_in_process(&route)?;
+        if route.switch.is_some() {
+            return Err(HandlerError::new(
+                roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
+                roost_ipc::local_route::SWITCH_BUSY,
+            ));
+        }
+        subscribers.retain(Subscriber::is_live);
+        subscribers.push(Subscriber {
+            conn_id: ctx.conn_id,
+            closer: ctx.closer.clone(),
+            relay,
+        });
+        Ok(())
+    }
+
     /// Whether a UI adapter is driving this handler.
     ///
     /// Only the `host.*` registry ops ask: they have a working headless
@@ -1576,6 +1678,27 @@ impl IpcHandler {
     /// UI-only and lets `ui_call` answer `no UI attached`.
     fn has_ui(&self) -> bool {
         self.ui_tx.is_some()
+    }
+
+    /// `identify.ops` / `session.identify.ops`: [`served_ops`] for this
+    /// socket under `route`.
+    fn serves(&self, route: &LocalRoute) -> Vec<String> {
+        let (socket, test_mode) = match &self.session {
+            Some(session) => (SocketKind::Session, session.info.test_mode),
+            None => (SocketKind::Ui(route.mode), self.test_mode),
+        };
+        served_ops(socket, test_mode, self.has_ui())
+            .into_iter()
+            // `served_ops` is the socket's shape; these two also depend on
+            // what the daemon built this handler with, and without it each
+            // answers `not-supported` on every call.
+            .filter(|op| match *op {
+                ops::SESSION_PUT_FILE => self.files.is_some(),
+                ops::SESSION_SET_AGENT_HOOKS => self.agent_hooks.is_some(),
+                _ => true,
+            })
+            .map(str::to_string)
+            .collect()
     }
 
     /// Hand a request-reply [`UiRequest`] to the UI adapter's main thread
@@ -1626,14 +1749,13 @@ impl Handler for IpcHandler {
         })
     }
 
-    /// Retire everything keyed to one connection: its control entry and
-    /// its subscriber slot. A UI socket has no session registry and
-    /// does nothing here.
+    /// Retire everything keyed to one connection: a session's control
+    /// entry and subscriber slot, or a UI socket's in-process stream.
     fn connection_ended(&self, conn_id: u64) {
-        let Some(session) = self.session.as_ref() else {
-            return;
-        };
-        session.forget_connection(conn_id);
+        match self.session.as_ref() {
+            Some(session) => session.forget_connection(conn_id),
+            None => self.in_process_streams.forget(conn_id),
+        }
     }
 
     /// A data connection is a session's business only. Without a
@@ -2156,14 +2278,21 @@ mod served {
 
 /// The session layer wrapped around the op dispatcher: `session.*`, the
 /// stop latch, and the mutation barrier. Without a [`SessionState`] this
-/// is a straight pass-through, so a UI socket's wire behavior is exactly
-/// what it was before host sessions existed.
+/// is a straight pass-through for every op but `events.subscribe`, the
+/// one a UI socket answers by flipping the connection to push — which
+/// only this layer can return.
 async fn dispatch_outcome(
     h: &IpcHandler,
     ctx: &ConnCtx,
     op: &str,
     params: serde_json::Value,
 ) -> Result<HandlerOutcome, HandlerError> {
+    if op == ops::EVENTS_SUBSCRIBE {
+        return match h.session.as_ref() {
+            Some(session) => events_subscribe(h, session, ctx, &decode(params)?),
+            None => ui_events_subscribe(h, ctx, params),
+        };
+    }
     let Some(session) = h.session.as_ref() else {
         return dispatch(h, op, params).await.map(HandlerOutcome::Reply);
     };
@@ -2179,16 +2308,13 @@ async fn dispatch_outcome(
                 session_id: session.info.session_id.clone(),
                 started_at: session.info.started_at.clone(),
                 persist_error: h.workspace.persist_error(),
+                ops: Some(h.serves(&h.local_route())),
             };
             return encode(&result).map(HandlerOutcome::Reply);
         }
         ops::SESSION_STOP => {
             let _p: SessionStopParams = decode(params)?;
             return session_stop(h, session).await;
-        }
-        ops::EVENTS_SUBSCRIBE => {
-            let p: EventsSubscribeParams = decode(params)?;
-            return events_subscribe(h, session, ctx, &p);
         }
         // The host registry is client-side state (D8): a UI socket's op
         // family. Letting it fall through would grow a shadow registry in
@@ -2702,32 +2828,103 @@ fn events_subscribe(
     ctx: &ConnCtx,
     params: &EventsSubscribeParams,
 ) -> Result<HandlerOutcome, HandlerError> {
-    if params.tab_id_filter != 0 {
-        return Err(HandlerError::invalid_param(format!(
-            "tab_id_filter is not implemented (got {}); subscribe unfiltered and filter \
-             client-side until HS-2 adds it",
-            params.tab_id_filter
-        )));
-    }
+    refuse_tab_id_filter(params)?;
     // Everything a resume can be refused for is settled before anything
     // is spawned or registered, so a refusal leaves the connection the
     // request/response connection it was and the client can simply
     // subscribe again on it.
     let cut = resume_cut(h, session, params)?;
+    start_stream(h, cut, session.info.session_id.clone(), |relay| {
+        match session.register_subscriber(ctx, relay) {
+            true => Ok(()),
+            // Lost the race with the stop's sweep.
+            false => Err(shutting_down()),
+        }
+    })
+}
+
+/// Spawn a relay from `cut`, register it, and ack with `stream_id`, then
+/// push. A refused registration aborts the relay just started rather than
+/// leaking one whose sweep has already run.
+fn start_stream(
+    h: &IpcHandler,
+    cut: ResumeCut,
+    stream_id: String,
+    register: impl FnOnce(tokio::task::AbortHandle) -> Result<(), HandlerError>,
+) -> Result<HandlerOutcome, HandlerError> {
     let subscription = event_push::spawn(cut, h.push_limits);
-    if !session.register_subscriber(ctx, subscription.abort.clone()) {
-        // Lost the race with the stop's sweep. Abort what we just
-        // started rather than leaking a relay the stop will never see.
+    if let Err(refused) = register(subscription.abort.clone()) {
         subscription.abort.abort();
-        return Err(shutting_down());
+        return Err(refused);
     }
     Ok(HandlerOutcome::ReplyThen {
         reply: encode(&EventsSubscribeResult {
             revision: subscription.revision,
-            session_id: session.info.session_id.clone(),
+            session_id: stream_id,
         })?,
         then: ConnAction::StartPush(subscription.source),
     })
+}
+
+/// `events.subscribe` on a UI socket running its tabs in-process: the
+/// session's live stream over this process's own workspace, acked with
+/// the UI's `instance_id` where a session names its `session_id`.
+///
+/// Live only. A UI keeps no replay ring, so a resume has nothing to be
+/// served from; a client that lost its stream snapshots with `tab.list`
+/// and subscribes afresh.
+fn ui_events_subscribe(
+    h: &IpcHandler,
+    ctx: &ConnCtx,
+    params: serde_json::Value,
+) -> Result<HandlerOutcome, HandlerError> {
+    served_in_process(&h.local_route())?;
+    let params: EventsSubscribeParams = decode(params)?;
+    if params.from_revision.is_some() {
+        return Err(HandlerError::invalid_param(
+            "resume is a session-socket feature: subscribe live and snapshot with tab.list",
+        ));
+    }
+    if let Some(named) = &params.session_id {
+        if *named != h.instance_id {
+            return Err(HandlerError::invalid_param(format!(
+                "this is UI instance {}, not {named}: an instance_id names one UI process; \
+                 re-read identify.instance_id and snapshot with tab.list",
+                h.instance_id
+            )));
+        }
+    }
+    refuse_tab_id_filter(&params)?;
+    start_stream(
+        h,
+        h.workspace.subscribe_live(),
+        h.instance_id.clone(),
+        |relay| h.register_in_process_stream(ctx, relay),
+    )
+}
+
+/// Under `local-backend = session` a UI socket's own workspace is the
+/// hidden one, so it serves no stream (plan 063 §D10's `Unsupported`).
+fn served_in_process(route: &LocalRoute) -> Result<(), HandlerError> {
+    match route.mode {
+        LocalBackendMode::InProcess => Ok(()),
+        LocalBackendMode::Session => Err(HandlerError::new(
+            "not-implemented",
+            "events.subscribe is not served by a UI socket under local-backend = session; \
+             for its tabs' events, dial identify.local_session_socket",
+        )),
+    }
+}
+
+fn refuse_tab_id_filter(params: &EventsSubscribeParams) -> Result<(), HandlerError> {
+    if params.tab_id_filter == 0 {
+        return Ok(());
+    }
+    Err(HandlerError::invalid_param(format!(
+        "tab_id_filter is not implemented (got {}); subscribe unfiltered and filter \
+         client-side until HS-2 adds it",
+        params.tab_id_filter
+    )))
 }
 
 /// `session.stop`: latch, barrier, flush, reap, reply, *then* finalize.
@@ -2820,12 +3017,11 @@ async fn forward_to_local_session(
 
 /// Take the session's `revision` back off a forwarded reply.
 ///
-/// The `tab.list` arm rides its fence only on a socket that also serves
-/// the event stream it fences. A forwarded reply carries the
-/// *session's* fence, and this socket still cannot serve that stream —
+/// A forwarded reply carries the *session's* fence, and under
+/// `local-backend = session` this socket serves no stream at all —
 /// `events.subscribe` is `not-implemented` here — so a client holding
 /// one could not do anything with it but believe it had a fence. One
-/// that wants it dials `identify.local_session_socket`.
+/// that wants it dials `identify.local_session_socket` for both legs.
 fn strip_ui_socket_fence(op: &str, reply: &mut serde_json::Value) {
     if op != ops::TAB_LIST {
         return;
@@ -2897,6 +3093,8 @@ async fn dispatch(
                 local_session_socket: local_session_socket(route.mode),
                 local_backend_switch: route.switch.map(str::to_string),
                 persist_error: h.workspace.persist_error(),
+                ops: Some(h.serves(&route)),
+                instance_id: h.session.is_none().then(|| h.instance_id.clone()),
             };
             encode(&result)
         }
@@ -2955,13 +3153,13 @@ async fn dispatch(
         ops::TAB_LIST => {
             // Read under the snapshot's own lock: a separate revision
             // read would race a commit and hand back a fence that does
-            // not describe the projects next to it. It rides along only
-            // where it means something — a session socket, which also
-            // serves the event stream it fences.
+            // not describe the projects next to it. Every socket this arm
+            // answers on serves the event stream it fences — a UI socket
+            // under `local-backend = session` forwards the op instead.
             let (revision, projects) = h.workspace.snapshot_with_revision();
             encode(&TabListResult {
                 projects,
-                revision: h.session.is_some().then_some(revision),
+                revision: Some(revision),
             })
         }
         ops::TAB_WRITE => {
@@ -3026,6 +3224,14 @@ async fn dispatch(
             };
             let project = h.workspace.create_project(&p.name, &cwd).map_err(ws_err)?;
             encode(&ProjectCreateResult { project })
+        }
+        ops::PROJECT_ENSURE => {
+            let p: ProjectEnsureParams = decode(params)?;
+            let (project, created) = h
+                .workspace
+                .ensure_project(&p.name, p.cwd.as_deref().unwrap_or_default())
+                .map_err(ws_err)?;
+            encode(&ProjectEnsureResult { project, created })
         }
         ops::PROJECT_RENAME => {
             let p: ProjectRenameParams = decode(params)?;
@@ -3750,21 +3956,6 @@ async fn dispatch(
                 .map_err(map_test_op_err)?;
             encode(&result)
         }
-        ops::EVENTS_SUBSCRIBE => {
-            // Only reachable on a UI socket: a session socket handles
-            // this op in `dispatch_outcome`, above the dispatcher.
-            //
-            // Honest failure rather than a false ACK: a UI process
-            // pushes nothing on the connection, so a client that
-            // "subscribed" would wait forever. Surface not-implemented
-            // so it can fall back (e.g. poll `tab.list`). A UI-side
-            // stream lands with its first consumer — the planned
-            // `roostctl watch` (#9).
-            Err(HandlerError::new(
-                "not-implemented",
-                "events.subscribe is not yet implemented",
-            ))
-        }
         // Answered by the app alone, with no headless fallback: the
         // reply names what every *connected* host did, and the
         // connection set is the app's. A socket with no window behind
@@ -3859,6 +4050,181 @@ async fn dispatch(
     }
 }
 
+/// Which socket a [`served_ops`] answer describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketKind {
+    /// A UI socket, running its own local tabs on this backend.
+    Ui(LocalBackendMode),
+    /// A host session's socket.
+    Session,
+}
+
+/// Why a dispatched op is left out of `identify.ops`, named for what the
+/// socket answers instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Withheld {
+    /// `unknown-op` on a UI socket: a host session's own op.
+    SessionOnly,
+    /// `unknown-op` on a session: the host registry and this machine's
+    /// own `agent-hooks` key are client state a session does not keep.
+    UiSocketOnly,
+    /// `internal: no UI attached` with no app behind the socket — or,
+    /// for the fire-and-forget `app.activate` and `clipboard.write`,
+    /// nothing at all.
+    NeedsUi,
+    /// [`Self::NeedsUi`], except on a session built with `server-vt`,
+    /// which answers from the tab's own server terminal.
+    NeedsATerminal,
+    /// `not-enabled` unless the process was launched with
+    /// `ROOST_TEST_MODE=1`.
+    TestMode,
+    /// `not-implemented` off macOS: the Dock, the native menu bar,
+    /// Sparkle and `UNUserNotificationCenter` are macOS iced's alone.
+    MacosOnly,
+    /// `unsupported-kind` on a session built without `server-vt`: there
+    /// is no server terminal to recolor.
+    ServerVt,
+}
+
+impl Withheld {
+    fn applies(self, socket: SocketKind, test_mode: bool, has_ui: bool) -> bool {
+        match self {
+            Self::SessionOnly => matches!(socket, SocketKind::Ui(_)),
+            Self::UiSocketOnly => socket == SocketKind::Session,
+            Self::NeedsUi => !has_ui,
+            Self::NeedsATerminal => {
+                !has_ui && !(socket == SocketKind::Session && cfg!(feature = "server-vt"))
+            }
+            Self::TestMode => !test_mode,
+            Self::MacosOnly => !cfg!(target_os = "macos"),
+            Self::ServerVt => !cfg!(feature = "server-vt"),
+        }
+    }
+}
+
+/// One row per op `dispatch_outcome` and `dispatch` have an arm for, with
+/// what keeps it out of `identify.ops` and where; an empty list is an op
+/// every socket serves. A test parses both dispatchers' arms against it.
+const DISPATCHED_OPS: &[(&str, &[Withheld])] = {
+    use Withheld::{
+        MacosOnly, NeedsATerminal, NeedsUi, ServerVt, SessionOnly, TestMode, UiSocketOnly,
+    };
+    &[
+        (ops::IDENTIFY, &[]),
+        (ops::TAB_OPEN, &[]),
+        (ops::TAB_CLOSE, &[]),
+        (ops::TAB_LIST, &[]),
+        (ops::TAB_WRITE, &[]),
+        (ops::TAB_RESIZE, &[]),
+        (ops::TAB_DUMP, &[NeedsATerminal]),
+        (ops::PROJECT_CREATE, &[]),
+        (ops::PROJECT_ENSURE, &[]),
+        (ops::PROJECT_RENAME, &[]),
+        (ops::PROJECT_DELETE, &[]),
+        (ops::TAB_REORDER, &[]),
+        (ops::PROJECT_REORDER, &[]),
+        (ops::TAB_FOCUS, &[]),
+        (ops::TAB_SEND_FILE, &[NeedsUi]),
+        (ops::TAB_SET_TITLE, &[]),
+        (ops::TAB_SET_STATE, &[]),
+        (ops::TAB_CLEAR_NOTIFICATION, &[]),
+        (ops::TAB_SET_HOOK_ACTIVE, &[]),
+        (ops::TAB_AGENT_REPORT, &[]),
+        (ops::NOTIFICATION_CREATE, &[]),
+        (ops::APP_ACTIVATE, &[NeedsUi]),
+        (ops::SCREENSHOT, &[NeedsUi]),
+        (ops::WINDOW_METRICS, &[NeedsUi]),
+        (ops::APP_RENDER_STATS, &[NeedsUi]),
+        (ops::SIDEBAR_DUMP, &[NeedsUi]),
+        (ops::PALETTE_OPEN, &[NeedsUi]),
+        (ops::PALETTE_STATE, &[NeedsUi]),
+        (ops::PALETTE_QUERY, &[NeedsUi]),
+        (ops::PALETTE_ACTIVATE, &[NeedsUi]),
+        (ops::PALETTE_DISMISS, &[NeedsUi]),
+        (ops::PALETTE_PRESENT, &[NeedsUi]),
+        (ops::SELECTION_SET, &[NeedsUi]),
+        (ops::SELECTION_CLEAR, &[NeedsUi]),
+        (ops::SELECTION_DUMP, &[NeedsUi]),
+        (ops::CLIPBOARD_DUMP, &[NeedsUi]),
+        (ops::CLIPBOARD_WRITE, &[NeedsUi]),
+        (ops::TAB_FEED_PTY_BYTES, &[NeedsATerminal, TestMode]),
+        (ops::TAB_CAPTURE_PTY_INPUT, &[NeedsATerminal, TestMode]),
+        (ops::TAB_EXPAND_SELECTION_AT, &[NeedsUi, TestMode]),
+        (ops::TAB_FEED_IME, &[NeedsUi, TestMode]),
+        (ops::WINDOW_RESIZE, &[NeedsUi, TestMode]),
+        (ops::SIDEBAR_SET_WIDTH, &[NeedsUi, TestMode]),
+        (ops::TAB_DUMP_RESOLVED, &[NeedsATerminal]),
+        (ops::TAB_DISPATCH_MOUSE_EVENT, &[NeedsUi, TestMode]),
+        (ops::APP_SET_WINDOW_FOCUS, &[NeedsUi, TestMode]),
+        (ops::APP_CURSOR_SHAPE, &[NeedsUi]),
+        (ops::APP_ACTIVE_TERMINAL_FOCUSED, &[NeedsUi]),
+        (ops::APP_SELECTED_TAB_ID, &[NeedsUi]),
+        (ops::APP_DOCK_BADGE, &[NeedsUi, TestMode, MacosOnly]),
+        (ops::APP_MENU_DUMP, &[NeedsUi, TestMode, MacosOnly]),
+        (ops::APP_MENU_ACTIVATE, &[NeedsUi, TestMode, MacosOnly]),
+        (ops::APP_DIALOG_DUMP, &[NeedsUi, TestMode]),
+        (ops::APP_DIALOG_ANSWER, &[NeedsUi, TestMode]),
+        (ops::APP_KEYBIND_DISPATCH, &[NeedsUi, TestMode]),
+        (ops::APP_UPDATE_STATUS, &[NeedsUi, TestMode, MacosOnly]),
+        (ops::APP_UPDATE_CHECK, &[NeedsUi, TestMode, MacosOnly]),
+        (
+            ops::APP_NOTIFICATION_STATUS,
+            &[NeedsUi, TestMode, MacosOnly],
+        ),
+        (ops::EVENTS_SUBSCRIBE, &[]),
+        (ops::AGENT_SET_HOOKS, &[UiSocketOnly, NeedsUi]),
+        (ops::HOST_ADD, &[UiSocketOnly]),
+        (ops::HOST_REMOVE, &[UiSocketOnly]),
+        (ops::HOST_CONNECT, &[UiSocketOnly, NeedsUi]),
+        (ops::HOST_DISCONNECT, &[UiSocketOnly, NeedsUi]),
+        (ops::HOST_LIST, &[UiSocketOnly]),
+        (ops::HOST_STATUS, &[UiSocketOnly, NeedsUi]),
+        (ops::SESSION_IDENTIFY, &[SessionOnly]),
+        (ops::SESSION_STOP, &[SessionOnly]),
+        (ops::SESSION_SET_THEME, &[SessionOnly, ServerVt]),
+        (ops::SESSION_SET_AGENT_HOOKS, &[SessionOnly]),
+        (ops::SESSION_PUT_FILE, &[SessionOnly]),
+    ]
+};
+
+/// The ops a socket would dispatch right now (plan 066 §3.1).
+///
+/// A capability that can never succeed is not one, so an op that could
+/// only answer `internal: no UI attached` is withheld as surely as one
+/// answering `unknown-op`. Pure — no handler, no I/O — so what a socket
+/// claims can be tested without executing anything.
+fn served_ops(socket: SocketKind, test_mode: bool, has_ui: bool) -> Vec<&'static str> {
+    DISPATCHED_OPS
+        .iter()
+        .filter(|(op, withheld)| {
+            !withheld
+                .iter()
+                .any(|reason| reason.applies(socket, test_mode, has_ui))
+                && !(socket == SocketKind::Ui(LocalBackendMode::Session)
+                    && withheld_from_the_slot(op, has_ui))
+        })
+        .map(|(op, _)| *op)
+        .collect()
+}
+
+/// A UI socket under `local-backend = session` refuses what plan 063
+/// §D10 classes `Unsupported`, and reaches the slot for a `Forward` or
+/// `Rewrite` op only through the app.
+fn withheld_from_the_slot(op: &str, has_ui: bool) -> bool {
+    match roost_ipc::local_route::classify(op) {
+        Some(roost_ipc::OpClass::Unsupported) => true,
+        Some(roost_ipc::OpClass::Forward | roost_ipc::OpClass::Rewrite(_)) => !has_ui,
+        _ => false,
+    }
+}
+
+/// 63 random bits as 16 lowercase hex digits.
+fn mint_instance_id() -> String {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).expect("the OS random source must be available");
+    format!("{:016x}", u64::from_le_bytes(bytes) & (i64::MAX as u64))
+}
+
 /// `persistence::HostSnapshot` (storage) → `messages::Host` (wire).
 /// `Host` is foreign to this crate, but the orphan rule still allows the
 /// impl here because `HostSnapshot` — the trait's type parameter — is
@@ -3919,7 +4285,7 @@ fn rgb_hex(c: (u8, u8, u8)) -> String {
 ///   * an op a UI hasn't wired up yet (`tab.feed_ime` off Mac, still
 ///     iced-only), or one that is structurally unavailable there
 ///     (`app.dock_badge` off macOS — there is no Dock) →
-///     `not-implemented`, mirroring `events.subscribe`.
+///     `not-implemented`.
 ///   * anything else (capture buffer poisoned, feed channel closed,
 ///     the native menu bar not installed yet) → `internal`, so a real
 ///     failure surfaces clearly rather than being mistaken for a
@@ -3980,7 +4346,9 @@ fn ws_err(e: WorkspaceError) -> HandlerError {
         WorkspaceError::HostNotFound(_) => HandlerError::not_found(e.to_string()),
         WorkspaceError::HostLabelEmpty
         | WorkspaceError::HostLabelReserved
-        | WorkspaceError::HostLabelTaken(_) => HandlerError::invalid_param(e.to_string()),
+        | WorkspaceError::HostLabelTaken(_)
+        | WorkspaceError::ProjectNameBlank
+        | WorkspaceError::ProjectCwdRequired(_) => HandlerError::invalid_param(e.to_string()),
     }
 }
 
@@ -4033,6 +4401,7 @@ fn parse_clipboard_op(s: &str) -> Result<ClipboardOp, HandlerError> {
 mod tests {
     use super::*;
     use roost_ipc::paths::BundleProfile;
+    use std::collections::BTreeSet;
 
     fn session_state() -> SessionState {
         SessionState {
@@ -4582,6 +4951,65 @@ mod tests {
         assert_eq!(h.workspace.snapshot().len(), before + 1);
     }
 
+    /// `project.ensure` forwards both of its outcomes: the hidden
+    /// workspace already holds a `p`, so a find answered here would
+    /// succeed, and a create answered here would land a `ghost`.
+    #[tokio::test]
+    async fn a_bare_project_ensure_under_session_never_touches_the_local_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = forwarding_handler(dir.path(), Some(2));
+        let before = h.workspace.snapshot();
+        for name in ["p", "ghost"] {
+            let error = dispatch(
+                &h,
+                ops::PROJECT_ENSURE,
+                serde_json::json!({"name": name, "cwd": "/tmp"}),
+            )
+            .await
+            .expect_err("there is no UI to forward to");
+            assert_eq!(error.code, "internal", "{name}: {error:?}");
+        }
+        assert_eq!(h.workspace.snapshot(), before);
+    }
+
+    #[tokio::test]
+    async fn project_ensure_on_the_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path());
+        let active = h.workspace.active();
+        let ensure = |params: serde_json::Value| dispatch(&h, ops::PROJECT_ENSURE, params);
+
+        for params in [
+            serde_json::json!({"name": " ", "cwd": "/tmp"}),
+            serde_json::json!({"name": "new"}),
+            serde_json::json!({"name": "new", "cwd": ""}),
+        ] {
+            let error = ensure(params.clone()).await.expect_err("refused");
+            assert_eq!(error.code, "invalid-param", "{params}: {error:?}");
+        }
+        let error = ensure(serde_json::json!({"name": "p", "activate": true}))
+            .await
+            .expect_err("strict params");
+        assert_eq!(error.code, "unknown-field", "{error:?}");
+
+        let found: ProjectEnsureResult =
+            serde_json::from_value(ensure(serde_json::json!({"name": "p"})).await.unwrap())
+                .unwrap();
+        assert!(!found.created);
+        assert_eq!(found.project.cwd, "/tmp");
+        assert_eq!(found.project.tabs.len(), 1, "a find carries its tabs");
+
+        let made: ProjectEnsureResult = serde_json::from_value(
+            ensure(serde_json::json!({"name": "new", "cwd": "/var"}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(made.created);
+        assert_eq!(made.project.cwd, "/var");
+        assert_eq!(h.workspace.active(), active);
+    }
+
     /// §D10's ordering clause. A host-qualified reorder must reach the
     /// op's own route parser, which refuses it here for want of a UI —
     /// *not* be re-addressed to the slot.
@@ -4692,5 +5120,663 @@ mod tests {
         let mut without = serde_json::json!({"projects": []});
         strip_ui_socket_fence(ops::TAB_LIST, &mut without);
         assert_eq!(without, serde_json::json!({"projects": []}));
+    }
+
+    // ── plan 066 §3.1: what a socket says it serves ─────────────────
+
+    /// A UI socket with an app behind it, outside test mode — in-process
+    /// and under `local-backend = session` alike.
+    const UI: &[&str] = &[
+        "agent.set_hooks",
+        "app.activate",
+        "app.active_terminal_focused",
+        "app.cursor_shape",
+        "app.render_stats",
+        "app.screenshot",
+        "app.selected_tab_id",
+        "app.sidebar_dump",
+        "app.window_metrics",
+        "clipboard.dump",
+        "clipboard.write",
+        "host.add",
+        "host.connect",
+        "host.disconnect",
+        "host.list",
+        "host.remove",
+        "host.status",
+        "identify",
+        "notification.create",
+        "palette.activate",
+        "palette.dismiss",
+        "palette.open",
+        "palette.present",
+        "palette.query",
+        "palette.state",
+        "project.create",
+        "project.delete",
+        "project.ensure",
+        "project.rename",
+        "project.reorder",
+        "selection.clear",
+        "selection.dump",
+        "selection.set",
+        "tab.agent_report",
+        "tab.clear_notification",
+        "tab.close",
+        "tab.dump",
+        "tab.dump_resolved",
+        "tab.focus",
+        "tab.list",
+        "tab.open",
+        "tab.reorder",
+        "tab.resize",
+        "tab.send_file",
+        "tab.set_hook_active",
+        "tab.set_state",
+        "tab.set_title",
+        "tab.write",
+    ];
+
+    /// What a UI socket adds to [`UI`] while it runs its tabs in-process.
+    const UI_IN_PROCESS: &[&str] = &["events.subscribe"];
+
+    /// What `ROOST_TEST_MODE=1` adds to [`UI`].
+    const UI_TEST_SEAMS: &[&str] = &[
+        "app.dialog_answer",
+        "app.dialog_dump",
+        "app.keybind_dispatch",
+        "app.set_window_focus",
+        "sidebar.set_width",
+        "tab.capture_pty_input",
+        "tab.dispatch_mouse_event",
+        "tab.expand_selection_at",
+        "tab.feed_ime",
+        "tab.feed_pty_bytes",
+        "window.resize",
+    ];
+
+    /// What test mode adds on macOS only.
+    const MACOS_TEST_SEAMS: &[&str] = &[
+        "app.dock_badge",
+        "app.menu_activate",
+        "app.menu_dump",
+        "app.notification_status",
+        "app.update_check",
+        "app.update_status",
+    ];
+
+    /// A headless session outside test mode.
+    const SESSION: &[&str] = &[
+        "events.subscribe",
+        "identify",
+        "notification.create",
+        "project.create",
+        "project.delete",
+        "project.ensure",
+        "project.rename",
+        "project.reorder",
+        "session.identify",
+        "session.put_file",
+        "session.set_agent_hooks",
+        "session.stop",
+        "tab.agent_report",
+        "tab.clear_notification",
+        "tab.close",
+        "tab.focus",
+        "tab.list",
+        "tab.open",
+        "tab.reorder",
+        "tab.resize",
+        "tab.set_hook_active",
+        "tab.set_state",
+        "tab.set_title",
+        "tab.write",
+    ];
+
+    /// What a session built with `server-vt` — every shipped one — adds.
+    const SESSION_SERVER_VT: &[&str] = &["session.set_theme", "tab.dump", "tab.dump_resolved"];
+
+    fn on_this_platform(seams: &'static [&'static str]) -> &'static [&'static str] {
+        if cfg!(target_os = "macos") {
+            seams
+        } else {
+            &[]
+        }
+    }
+
+    fn with_server_vt(extra: &'static [&'static str]) -> &'static [&'static str] {
+        if cfg!(feature = "server-vt") {
+            extra
+        } else {
+            &[]
+        }
+    }
+
+    fn sorted(parts: &[&[&str]]) -> Vec<String> {
+        let mut ops: Vec<String> = parts.concat().into_iter().map(str::to_string).collect();
+        ops.sort_unstable();
+        ops
+    }
+
+    fn every_configuration() -> impl Iterator<Item = (SocketKind, bool, bool)> {
+        [
+            SocketKind::Ui(LocalBackendMode::InProcess),
+            SocketKind::Ui(LocalBackendMode::Session),
+            SocketKind::Session,
+        ]
+        .into_iter()
+        .flat_map(|socket| {
+            [(false, false), (false, true), (true, false), (true, true)]
+                .map(|(test_mode, has_ui)| (socket, test_mode, has_ui))
+        })
+    }
+
+    /// The op constants `dispatch_outcome` and `dispatch` match on, read
+    /// out of this file: `ops::X =>` arms, their `|` alternations on one
+    /// line or several, and the `if op == ops::X` checks
+    /// `dispatch_outcome` makes under the barrier.
+    fn dispatcher_arm_names() -> Vec<String> {
+        let source = include_str!("ipc.rs");
+        let mut names: Vec<String> = Vec::new();
+        for signature in ["\nasync fn dispatch_outcome(", "\nasync fn dispatch("] {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("ipc.rs declares {signature:?}"));
+            let body = &source[start + 1..];
+            let body = &body[..body.find("\n}\n").expect("the dispatcher closes")];
+            for line in body.lines().map(str::trim) {
+                let pattern = match line.strip_prefix("if op == ") {
+                    Some(guard) => guard.trim_end_matches(" {"),
+                    None => {
+                        let line = line.trim_start_matches("| ");
+                        line.split_once(" =>").map_or(line, |(pattern, _)| pattern)
+                    }
+                };
+                let alternatives: Option<Vec<&str>> = pattern
+                    .split(" | ")
+                    .map(|alternative| {
+                        alternative.strip_prefix("ops::").filter(|name| {
+                            !name.is_empty()
+                                && name.chars().all(|c| {
+                                    c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'
+                                })
+                        })
+                    })
+                    .collect();
+                for name in alternatives.into_iter().flatten() {
+                    if !names.iter().any(|seen| seen == name) {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+        assert!(
+            names.len() > 60,
+            "only {} dispatcher arms parsed out of ipc.rs - the scan has \
+             drifted and would pass vacuously",
+            names.len()
+        );
+        names
+    }
+
+    /// Every `(NAME, "value")` in `messages.rs`'s `ops` module.
+    fn ops_declared() -> Vec<(String, String)> {
+        let source = include_str!("../../roost-ipc/src/messages.rs");
+        let start = source
+            .find("\npub mod ops {\n")
+            .expect("messages.rs declares `pub mod ops`");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("the ops module closes")];
+        body.lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("pub const ")?;
+                let (name, rest) = rest.split_once(": &str = ")?;
+                let value = rest.strip_prefix('"')?.strip_suffix("\";")?;
+                Some((name.to_string(), value.to_string()))
+            })
+            .collect()
+    }
+
+    /// Parsed rather than walked: a walk of [`DISPATCHED_OPS`] would agree
+    /// with itself about an arm somebody added without a row.
+    #[test]
+    fn every_dispatcher_arm_is_served_somewhere_or_withheld_by_name() {
+        let declared = ops_declared();
+        let value_of = |name: &str| {
+            declared
+                .iter()
+                .find(|(declared, _)| declared == name)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| panic!("ops::{name} is not declared in messages.rs"))
+        };
+        let arms: BTreeSet<String> = dispatcher_arm_names()
+            .iter()
+            .map(|name| value_of(name))
+            .collect();
+        let served_somewhere: BTreeSet<&str> = every_configuration()
+            .flat_map(|(socket, test_mode, has_ui)| served_ops(socket, test_mode, has_ui))
+            .collect();
+        let withheld_by_name: BTreeSet<&str> = DISPATCHED_OPS
+            .iter()
+            .filter(|(_, withheld)| !withheld.is_empty())
+            .map(|(op, _)| *op)
+            .collect();
+        let accounted = |op: &str| served_somewhere.contains(op) || withheld_by_name.contains(op);
+
+        let unaccounted: Vec<_> = arms.iter().filter(|arm| !accounted(arm)).collect();
+        assert!(
+            unaccounted.is_empty(),
+            "dispatcher arms served_ops never returns and names no reason for: \
+             {unaccounted:?}. Give each a DISPATCHED_OPS row."
+        );
+
+        let rowless: Vec<_> = DISPATCHED_OPS
+            .iter()
+            .map(|(op, _)| *op)
+            .filter(|op| !arms.contains(*op))
+            .collect();
+        assert!(
+            rowless.is_empty(),
+            "DISPATCHED_OPS rows no dispatcher arm answers: {rowless:?}"
+        );
+        assert_eq!(
+            DISPATCHED_OPS.len(),
+            arms.len(),
+            "one row per arm, and no duplicates"
+        );
+
+        let undispatched: Vec<_> = declared
+            .iter()
+            .filter(|(_, value)| {
+                roost_ipc::local_route::classify(value) != Some(roost_ipc::OpClass::Event)
+                    && !accounted(value)
+            })
+            .map(|(name, value)| format!("ops::{name} ({value:?})"))
+            .collect();
+        assert!(
+            undispatched.is_empty(),
+            "op constants neither served nor withheld: {}",
+            undispatched.join(", ")
+        );
+    }
+
+    #[test]
+    fn the_four_configurations_serve_their_checked_in_lists() {
+        let served =
+            |socket, test_mode, has_ui| sorted(&[served_ops(socket, test_mode, has_ui).as_slice()]);
+        assert_eq!(
+            served(SocketKind::Ui(LocalBackendMode::InProcess), false, true),
+            sorted(&[UI, UI_IN_PROCESS]),
+            "UI in-process"
+        );
+        assert_eq!(
+            served(SocketKind::Ui(LocalBackendMode::Session), false, true),
+            sorted(&[UI]),
+            "UI under local-backend = session"
+        );
+        assert_eq!(
+            served(SocketKind::Session, false, false),
+            sorted(&[SESSION, with_server_vt(SESSION_SERVER_VT)]),
+            "a headless session"
+        );
+        assert_eq!(
+            served(SocketKind::Ui(LocalBackendMode::InProcess), true, true),
+            sorted(&[
+                UI,
+                UI_IN_PROCESS,
+                UI_TEST_SEAMS,
+                on_this_platform(MACOS_TEST_SEAMS)
+            ]),
+            "UI with ROOST_TEST_MODE=1"
+        );
+    }
+
+    /// A handler with an app behind it: a channel nothing drains, which
+    /// `identify` never sends on.
+    fn with_a_ui(h: IpcHandler) -> (IpcHandler, tokio::sync::mpsc::UnboundedReceiver<UiRequest>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (h.with_ui(tx), rx)
+    }
+
+    async fn reply_of(h: &IpcHandler, op: &str) -> serde_json::Value {
+        let (ctx, _watch) = ConnCtx::new(1);
+        match h.handle(&ctx, op, serde_json::json!({})).await {
+            Ok(HandlerOutcome::Reply(value)) => value,
+            Ok(HandlerOutcome::ReplyThen { .. }) => panic!("{op} answered with an action"),
+            Err(error) => panic!("{op}: {error:?}"),
+        }
+    }
+
+    fn ops_in(reply: &serde_json::Value) -> Vec<String> {
+        let mut ops: Vec<String> =
+            serde_json::from_value(reply["ops"].clone()).expect("an ops list");
+        ops.sort_unstable();
+        ops
+    }
+
+    #[tokio::test]
+    async fn a_ui_sockets_identify_names_what_it_serves_and_which_process_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, _ui) = with_a_ui(identify_handler(dir.path()));
+        let reply = reply_of(&h, ops::IDENTIFY).await;
+        assert_eq!(ops_in(&reply), sorted(&[UI, UI_IN_PROCESS]));
+        let instance_id = reply["instance_id"].as_str().expect("an instance_id");
+        assert_eq!(instance_id.len(), 16, "{instance_id}");
+        assert!(
+            instance_id
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "{instance_id}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (h, _ui) = with_a_ui(identify_handler(dir.path()).with_test_mode(true));
+        assert_eq!(
+            ops_in(&reply_of(&h, ops::IDENTIFY).await),
+            sorted(&[
+                UI,
+                UI_IN_PROCESS,
+                UI_TEST_SEAMS,
+                on_this_platform(MACOS_TEST_SEAMS)
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn under_session_mode_identify_names_what_reaches_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, _ui) = with_a_ui(forwarding_handler(dir.path(), Some(2)));
+        let reply = reply_of(&h, ops::IDENTIFY).await;
+        assert_eq!(ops_in(&reply), sorted(&[UI]));
+        assert!(reply["instance_id"].is_string(), "{reply}");
+
+        // With no app to carry them, a forward and a rewrite reach
+        // nothing, where in-process the same two are answered here.
+        let dir = tempfile::tempdir().unwrap();
+        let headless =
+            ops_in(&reply_of(&forwarding_handler(dir.path(), Some(2)), ops::IDENTIFY).await);
+        let dir = tempfile::tempdir().unwrap();
+        let in_process = ops_in(&reply_of(&identify_handler(dir.path()), ops::IDENTIFY).await);
+        for op in [ops::TAB_OPEN, ops::TAB_FOCUS] {
+            assert!(!headless.iter().any(|served| served == op), "{op}");
+            assert!(in_process.iter().any(|served| served == op), "{op}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_names_what_it_serves_and_no_instance_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path())
+            .with_session(session_state().info, StopHandle::new(|| async {}))
+            .with_file_store(FileStore::new(store.path().to_path_buf()).unwrap())
+            .with_agent_hooks(AgentHooksHandle::new(|_| async {
+                Ok(AgentHooksOutcome::default())
+            }));
+        let session_identify = reply_of(&h, ops::SESSION_IDENTIFY).await;
+        assert_eq!(
+            ops_in(&session_identify),
+            sorted(&[SESSION, with_server_vt(SESSION_SERVER_VT)])
+        );
+
+        // Built without a file store or an agent-hooks handle, a session
+        // answers both ops `not-supported`, so it does not name them.
+        let bare_dir = tempfile::tempdir().unwrap();
+        let bare = identify_handler(bare_dir.path())
+            .with_session(session_state().info, StopHandle::new(|| async {}));
+        let bare_ops = ops_in(&reply_of(&bare, ops::SESSION_IDENTIFY).await);
+        let unbuilt = ["session.put_file", "session.set_agent_hooks"];
+        assert!(
+            bare_ops.iter().all(|op| !unbuilt.contains(&op.as_str())),
+            "{bare_ops:?}"
+        );
+        assert_eq!(
+            bare_ops.len(),
+            ops_in(&session_identify).len() - unbuilt.len()
+        );
+        assert!(session_identify.get("instance_id").is_none());
+
+        let identify = reply_of(&h, ops::IDENTIFY).await;
+        assert_eq!(ops_in(&identify), ops_in(&session_identify));
+        assert!(
+            identify.get("instance_id").is_none(),
+            "a session's identity is its session_id: {identify}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut info = session_state().info;
+        info.test_mode = true;
+        let h = identify_handler(dir.path())
+            .with_session(info, StopHandle::new(|| async {}))
+            .with_file_store(FileStore::new(store.path().join("seams")).unwrap())
+            .with_agent_hooks(AgentHooksHandle::new(|_| async {
+                Ok(AgentHooksOutcome::default())
+            }));
+        let seams: &[&str] = &["tab.capture_pty_input", "tab.feed_pty_bytes"];
+        assert_eq!(
+            ops_in(&reply_of(&h, ops::SESSION_IDENTIFY).await),
+            sorted(&[
+                SESSION,
+                with_server_vt(SESSION_SERVER_VT),
+                with_server_vt(seams)
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_instance_id_is_minted_once_per_handler() {
+        let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let a = identify_handler(dir_a.path());
+        let first = reply_of(&a, ops::IDENTIFY).await["instance_id"].clone();
+        assert!(first.is_string(), "{first}");
+        assert_eq!(reply_of(&a, ops::IDENTIFY).await["instance_id"], first);
+        let b = identify_handler(dir_b.path());
+        assert_ne!(reply_of(&b, ops::IDENTIFY).await["instance_id"], first);
+    }
+
+    // ── plan 066 §3.1: events.subscribe on a UI socket ──────────────
+
+    /// The ack, the source and the watch — the last held so the stream
+    /// stays a live registry entry.
+    async fn subscribe_on(
+        h: &IpcHandler,
+        conn_id: u64,
+        params: serde_json::Value,
+    ) -> Result<
+        (
+            EventsSubscribeResult,
+            roost_ipc::PushSource,
+            roost_ipc::ConnCloseWatch,
+        ),
+        HandlerError,
+    > {
+        let (ctx, watch) = ConnCtx::new(conn_id);
+        match h.handle(&ctx, ops::EVENTS_SUBSCRIBE, params).await? {
+            HandlerOutcome::ReplyThen {
+                reply,
+                then: ConnAction::StartPush(source),
+            } => Ok((
+                serde_json::from_value(reply).expect("a typed ack"),
+                source,
+                watch,
+            )),
+            other => panic!("a subscribe must flip to push, not {other:?}"),
+        }
+    }
+
+    async fn refusal_of(h: &IpcHandler, params: serde_json::Value) -> HandlerError {
+        match subscribe_on(h, 1, params).await {
+            Err(refused) => refused,
+            Ok((ack, ..)) => panic!("expected a refusal, got an ack at {}", ack.revision),
+        }
+    }
+
+    async fn next_batch(source: &mut roost_ipc::PushSource) -> roost_ipc::messages::EventBatch {
+        let value = tokio::time::timeout(std::time::Duration::from_secs(5), source.next())
+            .await
+            .expect("the stream must answer")
+            .expect("a frame");
+        serde_json::from_value(value).expect("a typed batch")
+    }
+
+    async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ui_socket_acks_with_its_instance_id_and_streams_what_follows() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path());
+        let identify = reply_of(&h, ops::IDENTIFY).await;
+
+        let (ack, mut source, _watch) = subscribe_on(&h, 7, serde_json::json!({}))
+            .await
+            .expect("an in-process UI serves the stream");
+        assert_eq!(
+            Some(ack.session_id.as_str()),
+            identify["instance_id"].as_str(),
+            "the ack names the UI process identify names"
+        );
+
+        h.workspace.create_project("after", "/tmp").unwrap();
+        let batch = next_batch(&mut source).await;
+        assert_eq!(batch.revision, ack.revision + 1);
+    }
+
+    /// The fence and the stream count the same commits: nothing between
+    /// the ack and the list, so the two agree, and the next commit is one
+    /// past both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_in_process_tab_list_fences_the_ui_sockets_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path());
+        let (ack, mut source, _watch) = subscribe_on(&h, 7, serde_json::json!({}))
+            .await
+            .expect("subscribe");
+
+        let listed: TabListResult = serde_json::from_value(
+            dispatch(&h, ops::TAB_LIST, serde_json::json!({}))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let fence = listed.revision.expect("an in-process UI fences tab.list");
+        assert_eq!(fence, ack.revision);
+
+        h.workspace.create_project("after", "/tmp").unwrap();
+        assert_eq!(next_batch(&mut source).await.revision, fence + 1);
+    }
+
+    /// Under `session` the list is the slot's, and its fence is the
+    /// session's — which this socket serves no stream against.
+    #[tokio::test]
+    async fn a_forwarded_tab_list_arrives_without_the_sessions_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, mut ui) = with_a_ui(forwarding_handler(dir.path(), Some(2)));
+        tokio::spawn(async move {
+            while let Some(request) = ui.recv().await {
+                if let UiRequest::LocalSessionForward { reply, .. } = request {
+                    let _ = reply.send(Ok(serde_json::json!({"projects": [], "revision": 12})));
+                }
+            }
+        });
+        let listed = dispatch(&h, ops::TAB_LIST, serde_json::json!({}))
+            .await
+            .expect("the slot answered");
+        assert_eq!(listed, serde_json::json!({"projects": []}));
+    }
+
+    #[tokio::test]
+    async fn a_ui_socket_refuses_what_its_stream_cannot_be() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path());
+        let instance_id = h.instance_id.clone();
+
+        for params in [
+            serde_json::json!({"from_revision": 0}),
+            serde_json::json!({"from_revision": 3, "session_id": instance_id}),
+        ] {
+            let refused = refusal_of(&h, params.clone()).await;
+            assert_eq!(refused.code, "invalid-param", "{params}");
+            assert_eq!(
+                refused.message,
+                "resume is a session-socket feature: subscribe live and snapshot with tab.list"
+            );
+        }
+
+        let refused = refusal_of(&h, serde_json::json!({"session_id": "0123456789abcdef"})).await;
+        assert_eq!(refused.code, "invalid-param", "{refused:?}");
+
+        let filter = serde_json::json!({"tab_id_filter": "5"});
+        let refused = refusal_of(&h, filter.clone()).await;
+        let session = identify_handler(dir.path())
+            .with_session(session_state().info, StopHandle::new(|| async {}));
+        let (ctx, _watch) = ConnCtx::new(1);
+        let sessions = session
+            .handle(&ctx, ops::EVENTS_SUBSCRIBE, filter)
+            .await
+            .expect_err("a session refuses it too");
+        assert_eq!(refused.code, "invalid-param");
+        assert_eq!(
+            (refused.code, refused.message),
+            (sessions.code, sessions.message),
+            "one refusal, both sockets"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let slot = forwarding_handler(dir.path(), None);
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({"from_revision": 3}),
+        ] {
+            let refused = refusal_of(&slot, params).await;
+            assert_eq!(refused.code, "not-implemented", "{refused:?}");
+            assert!(
+                refused
+                    .message
+                    .ends_with("dial identify.local_session_socket"),
+                "{refused:?}"
+            );
+        }
+
+        assert_eq!(h.in_process_streams().count(), 0);
+        assert_eq!(slot.in_process_streams().count(), 0);
+        wait_for("every refused relay to let go", || {
+            h.workspace.versioned_receiver_count() == 0
+        })
+        .await;
+    }
+
+    /// A subscribe that lands while a switch is in flight — after its
+    /// sweep — would be a stream nothing ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subscribe_during_a_switch_is_refused_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path()).with_local_route(Arc::new(LocalBackendCell::new(
+            LocalRoute {
+                switch: Some("preparing"),
+                ..LocalRoute::default()
+            },
+        )));
+        let refused = refusal_of(&h, serde_json::json!({})).await;
+        assert_eq!(
+            (refused.code.as_str(), refused.message.as_str()),
+            (
+                roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
+                roost_ipc::local_route::SWITCH_BUSY
+            )
+        );
+        assert_eq!(h.in_process_streams().count(), 0);
+        wait_for("the refused relay to let go", || {
+            h.workspace.versioned_receiver_count() == 0
+        })
+        .await;
     }
 }

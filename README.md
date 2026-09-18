@@ -44,6 +44,29 @@ release — the iced UI built for macOS, installed side by side with
 `Roost.app` under its own bundle id. See
 [Installation](docs/getting-started/installation.md) for details.
 
+### Claude Code / agent skills
+
+Roost ships a skill that teaches your coding agent to drive a running Roost
+through `roostctl`: open a project tab running a command, send input, read a
+tab's screen, wait on its state, watch events, and notify you. Install Roost
+(above) first, since the skill drives it; `roostctl skill` prints the same
+skill.
+
+The general route ([`skills`](https://skills.sh)) installs into Claude Code,
+GitHub Copilot, OpenCode, and other agents:
+
+```bash
+npx skills add charliek/roost
+```
+
+For Claude Code, a native plugin is also available (it namespaces the skill as
+`roost:roost`):
+
+```text
+/plugin marketplace add charliek/roost
+/plugin install roost@roost
+```
+
 ## Build from source
 
 ```bash

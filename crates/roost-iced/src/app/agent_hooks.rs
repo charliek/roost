@@ -29,7 +29,7 @@
 //! a toast the next launch shows instead.
 
 use roost_agent::Agent;
-use roost_agent_install::{Guard, Home, Mode};
+use roost_agent_install::{Guard, Home, InstallError, Mode};
 use roost_ipc::messages::{
     AgentHooksFailed, AgentHooksOutcome, AgentHooksSkipped, AgentSetHooksAgents,
     AgentSetHooksHostOutcome, AgentSetHooksResult,
@@ -303,6 +303,14 @@ async fn apply_set_hooks(apply: AgentHooksApply, feed: &EngineFeedSender) {
             return;
         }
     };
+    if let Some(message) = &done.error {
+        // The key landed and the rest of the run did not (#491): the
+        // caller hears the failure, the main thread still takes the key,
+        // and no host is raised.
+        let _ = reply.send(Err(super::HostOpFailure::new("internal", message.clone())));
+        feed.send(EngineFeed::AgentHooksSet(Box::new(done)));
+        return;
+    }
     done.outcome
         .skipped
         .extend(AgentHooksSkipped::unknown(&unknown));
@@ -530,29 +538,54 @@ pub(crate) struct AgentHooksSet {
     /// are already in [`AgentHooksOutcome::wired`]; the agents are kept
     /// beside them because that is what both of those take.
     pub unnoticed: Vec<Agent>,
+    /// Set when the run failed after it wrote the key
+    /// ([`roost_agent_install::InstallError::AfterKey`]): `key` is on
+    /// disk, nothing else of the run is, and `outcome` is empty. The
+    /// caller is answered with this error; the main thread still takes
+    /// the key.
+    pub error: Option<String>,
 }
 
 /// The blocking half of `agent.set_hooks`: the key write and the
 /// reconcile, under the install lock.
 ///
 /// Off the UI thread for this module's own reason — see its header.
-/// Only a whole-run failure is an `Err`; a per-agent one rides back in
-/// [`AgentHooksOutcome::errors`], because one unparseable `config.toml`
-/// must not cost the user the answer they just gave.
+/// Only a whole-run failure that wrote no key is an `Err`; a per-agent
+/// one rides back in [`AgentHooksOutcome::errors`], because one
+/// unparseable `config.toml` must not cost the user the answer they
+/// just gave.
 pub(crate) fn set_hooks_blocking(
     ticket: u64,
     mode: &Mode,
     guard: Guard,
 ) -> Result<AgentHooksSet, String> {
     let home = Home::from_env().map_err(|error| error.to_string())?;
-    let outcome =
-        roost_agent_install::set_hooks(&home, mode, BY, guard).map_err(|e| e.to_string())?;
+    set_hooks_in(&home, ticket, mode, guard)
+}
+
+/// [`set_hooks_blocking`] against an explicit [`Home`] — the seam the
+/// tests drive.
+fn set_hooks_in(
+    home: &Home,
+    ticket: u64,
+    mode: &Mode,
+    guard: Guard,
+) -> Result<AgentHooksSet, String> {
+    let (outcome, error) = match roost_agent_install::set_hooks(home, mode, BY, guard) {
+        Ok(outcome) => (outcome, None),
+        Err(error @ InstallError::AfterKey { .. }) => (
+            roost_agent_install::Outcome::default(),
+            Some(error.to_string()),
+        ),
+        Err(error) => return Err(error.to_string()),
+    };
     Ok(AgentHooksSet {
         ticket,
         config_path: home.config_path().display().to_string(),
         outcome: wire_outcome(&outcome),
         key: mode.to_config(),
         unnoticed: outcome.unnoticed,
+        error,
     })
 }
 
@@ -851,6 +884,50 @@ mod tests {
         assert!(set(&["  "]).unwrap_err().contains("empty name"));
         assert!(set(&["claude", ""]).unwrap_err().contains("empty name"));
         assert!(set(&["gemini", ""]).unwrap_err().contains("empty name"));
+    }
+
+    /// #491: a set that fails after its key write is still a result —
+    /// the main thread has to take the key — carrying the error that
+    /// names it.
+    #[test]
+    fn a_set_that_fails_after_the_key_write_still_carries_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::rooted(dir.path());
+        // A directory where the state record belongs: read only after
+        // the key is written.
+        std::fs::create_dir_all(home.record_path()).unwrap();
+        let mode = Mode::Allow(vec![Agent::Claude]);
+
+        let done = set_hooks_in(&home, 7, &mode, Guard::PERMITTED)
+            .unwrap_or_else(|error| panic!("the key is on disk, so this is a result: {error}"));
+        let error = done
+            .error
+            .as_deref()
+            .expect("the failure rides with the key");
+        assert!(
+            error.contains("the agent-hooks key `claude` is already on disk"),
+            "{error}"
+        );
+        let text = std::fs::read_to_string(home.config_path()).expect("config.conf");
+        assert_eq!(done.key, RoostConfig::parse(&text).agent_hooks);
+        assert_eq!(done.outcome, AgentHooksOutcome::default());
+        assert!(done.unnoticed.is_empty());
+    }
+
+    /// A refusal before the key write stays an `Err`: there is no key to
+    /// take.
+    #[test]
+    fn a_set_refused_before_the_key_write_is_not_a_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::rooted(dir.path());
+        let fenced = Guard {
+            test_mode: true,
+            forced: false,
+        };
+
+        let refused = set_hooks_in(&home, 1, &Mode::Allow(vec![Agent::Claude]), fenced);
+        assert!(refused.is_err());
+        assert!(!home.config_path().exists());
     }
 
     /// It goes into the host's state record, so it has to be a name and

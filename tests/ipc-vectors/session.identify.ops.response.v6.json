@@ -1,0 +1,44 @@
+{
+  "id": "1",
+  "ok": true,
+  "result": {
+    "app_version": "0.0.18",
+    "session_protocol": 6,
+    "payload_kinds": [
+      "ghostty-snapshot",
+      "vt"
+    ],
+    "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
+    "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
+    "started_at": "2026-08-27T14:03:11Z",
+    "ops": [
+      "identify",
+      "tab.open",
+      "tab.close",
+      "tab.list",
+      "tab.write",
+      "tab.resize",
+      "tab.dump",
+      "project.create",
+      "project.ensure",
+      "project.rename",
+      "project.delete",
+      "tab.reorder",
+      "project.reorder",
+      "tab.focus",
+      "tab.set_title",
+      "tab.set_state",
+      "tab.clear_notification",
+      "tab.set_hook_active",
+      "tab.agent_report",
+      "notification.create",
+      "tab.dump_resolved",
+      "events.subscribe",
+      "session.identify",
+      "session.stop",
+      "session.set_theme",
+      "session.set_agent_hooks",
+      "session.put_file"
+    ]
+  }
+}

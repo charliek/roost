@@ -21,14 +21,15 @@ use roost_ipc::messages::{
     AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachHandshakeTerms, AttachMode,
     AttachPayloadKind, ClipboardEffectTarget, ClipboardWriteParams, DurabilityChangedEvent,
     EventBatch, EventEnvelope, EventsSubscribeParams, EventsSubscribeResult, IdentifyResult,
-    NotificationFiredEvent, ProjectReorderParams, ResponseError, RetrySchedule, SentFile,
-    SessionBinaryIdentity, SessionIdentify, SessionIdentifyParams, SessionPutFileParams,
-    SessionPutFileResult, SessionSetAgentHooksParams, SessionSetThemeParams, SessionSetThemeResult,
-    SessionStopParams, SessionStopResult, SessionStoppingEvent, SkippedFile,
-    TabClearNotificationParams, TabClearNotificationResult, TabDumpCursor, TabDumpParams,
-    TabDumpResult, TabEffect, TabEffectEvent, TabReorderParams, TabSendFileParams,
-    TabSendFileResult, TabWriteParams, WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES,
-    SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
+    NotificationFiredEvent, ProjectEnsureParams, ProjectEnsureResult, ProjectReorderParams,
+    ResponseError, RetrySchedule, SentFile, SessionBinaryIdentity, SessionIdentify,
+    SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams,
+    SessionSetThemeParams, SessionSetThemeResult, SessionStopParams, SessionStopResult,
+    SessionStoppingEvent, SkippedFile, StreamEndedEvent, TabClearNotificationParams,
+    TabClearNotificationResult, TabDumpCursor, TabDumpParams, TabDumpResult, TabEffect,
+    TabEffectEvent, TabReorderParams, TabSendFileParams, TabSendFileResult, TabWriteParams,
+    WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
+    SESSION_STOPPING_EVENT, STREAM_ENDED_EVENT,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -58,6 +59,7 @@ fn sample_identify() -> SessionIdentify {
         session_id: "01K3S8TQ4F0Q9YB2K6WZ5D7XN".into(),
         started_at: "2026-08-27T14:03:11Z".into(),
         persist_error: None,
+        ops: None,
     }
 }
 
@@ -789,6 +791,24 @@ fn session_stopping_vector_decodes_into_its_typed_shape() {
     round_trip(&data);
 }
 
+/// The UI socket's terminal envelope, and the server's own spelling of
+/// it: a push loop writes `CloseReason::BackendSwitch` from
+/// `push_envelope`, so that pair is what the vector has to be.
+#[test]
+fn stream_ended_vector_decodes_into_its_typed_shape() {
+    let raw = read_vector("stream.ended.event.json");
+    let envelope: EventEnvelope = serde_json::from_str(&raw).expect("decode event envelope");
+    assert_eq!(envelope.event, STREAM_ENDED_EVENT);
+    let data: StreamEndedEvent =
+        serde_json::from_value(envelope.data).expect("decode stream.ended data");
+    assert_eq!(data.reason, "backend-switch");
+    round_trip(&data);
+    assert_eq!(
+        roost_ipc::CloseReason::BackendSwitch.push_envelope(),
+        (envelope.event.as_str(), data.reason.as_str())
+    );
+}
+
 #[test]
 fn event_batch_vector_decodes_into_its_typed_shape() {
     let raw = read_vector("events.batch.json");
@@ -971,6 +991,54 @@ fn identify_carries_a_persist_error_only_when_there_is_one() {
             .persist_error
             .as_deref(),
         Some("Read-only file system (os error 30)")
+    );
+}
+
+/// Plan 066 §3.1's two fields are additive in the same way: the plain
+/// vectors — an older server's shape, and the Swift app's — decode with
+/// both absent, and the variants carry them.
+#[test]
+fn identify_carries_ops_and_an_instance_id_only_where_a_server_sends_them() {
+    fn result(name: &str) -> IdentifyResult {
+        let raw = read_vector(name);
+        let resp: roost_ipc::messages::Response =
+            serde_json::from_str(&raw).expect("decode response envelope");
+        serde_json::from_value(resp.result.expect("result body")).expect("decode identify result")
+    }
+
+    let plain = result("identify.response.json");
+    assert_eq!(plain.ops, None);
+    assert_eq!(plain.instance_id, None);
+    let json = serde_json::to_value(&plain).unwrap();
+    assert!(json.get("ops").is_none() && json.get("instance_id").is_none());
+
+    let served = result("identify.ops.response.json");
+    let ops = served.ops.as_deref().expect("an ops list");
+    assert!(ops
+        .iter()
+        .any(|op| op == roost_ipc::messages::ops::PROJECT_ENSURE));
+    assert!(!ops
+        .iter()
+        .any(|op| op == roost_ipc::messages::ops::SESSION_IDENTIFY));
+    assert_eq!(served.instance_id.as_deref(), Some("5d0c7e21a9f3b846"));
+    round_trip(&served);
+
+    let session = decode_identify_vector(&format!(
+        "session.identify.ops.response.v{SESSION_PROTOCOL_VERSION}.json"
+    ));
+    let ops = session.ops.clone().expect("an ops list");
+    assert!(ops
+        .iter()
+        .any(|op| op == roost_ipc::messages::ops::SESSION_STOP));
+    assert!(!ops
+        .iter()
+        .any(|op| op == roost_ipc::messages::ops::HOST_ADD));
+    assert_eq!(
+        SessionIdentify {
+            ops: None,
+            ..session
+        },
+        sample_identify()
     );
 }
 
@@ -1857,6 +1925,36 @@ fn events_subscribe_resume_matches_its_vector() {
     assert_eq!(typed.session_id, None);
 }
 
+/// A UI socket's subscribe is the plain request, and its ack names the
+/// UI process where a session's names the session: the same value
+/// `identify.instance_id` carries, which is the identity check a client
+/// makes.
+#[test]
+fn events_subscribe_ui_vectors_decode_into_their_typed_shapes() {
+    let params = decode_request_vector("events.subscribe.ui.request.json");
+    let typed: EventsSubscribeParams = serde_json::from_value(params).expect("typed params");
+    assert_eq!(typed.tab_id_filter, 0);
+    assert_eq!(typed.from_revision, None, "a UI stream is live only");
+    assert_eq!(typed.session_id, None);
+
+    let raw = read_vector("events.subscribe.ui.response.json");
+    let response: roost_ipc::messages::Response =
+        serde_json::from_str(&raw).expect("decode response envelope");
+    let ack: EventsSubscribeResult =
+        serde_json::from_value(response.result.expect("a result")).expect("typed ack");
+    assert_eq!(ack.revision, 42);
+
+    let raw = read_vector("identify.ops.response.json");
+    let response: roost_ipc::messages::Response =
+        serde_json::from_str(&raw).expect("decode response envelope");
+    let identify: IdentifyResult =
+        serde_json::from_value(response.result.expect("a result")).expect("typed identify");
+    assert_eq!(
+        identify.instance_id.as_deref(),
+        Some(ack.session_id.as_str())
+    );
+}
+
 /// The refusal a client feature-detects on: it is answered on the ack,
 /// so it arrives as an ordinary error envelope and the connection is
 /// still a request/response connection afterwards.
@@ -1878,4 +1976,38 @@ fn events_subscribe_error_vector_decodes_as_replay_expired() {
         "the message must say how far back a resume can reach: {}",
         error.message
     );
+}
+
+// ---------------------------------------------------------------------------
+// project.ensure (plan 066)
+// ---------------------------------------------------------------------------
+
+/// `project.ensure`'s request and both of its answers, decoded into the
+/// typed shapes: `created` is the one field a caller branches on, so a
+/// vector that spelled it wrong or dropped it would otherwise pass.
+#[test]
+fn project_ensure_vectors_decode_into_their_typed_shapes() {
+    let result = |name: &str| -> ProjectEnsureResult {
+        let resp: roost_ipc::messages::Response =
+            serde_json::from_str(&read_vector(name)).expect("decode response envelope");
+        serde_json::from_value(resp.result.expect("result body"))
+            .unwrap_or_else(|error| panic!("{name} must decode as ProjectEnsureResult: {error}"))
+    };
+
+    let req: roost_ipc::messages::RawRequest =
+        serde_json::from_str(&read_vector("project.ensure.request.json")).expect("decode envelope");
+    assert_eq!(req.op, ops::PROJECT_ENSURE);
+    let params: ProjectEnsureParams =
+        serde_json::from_value(req.params).expect("decode project.ensure params");
+    assert_eq!(params.name, "review");
+    assert_eq!(params.cwd.as_deref(), Some("/home/u/review"));
+
+    let found = result("project.ensure.response.json");
+    assert!(!found.created);
+    assert_eq!(found.project.id, 7);
+    assert_eq!(found.project.name, params.name);
+
+    let made = result("project.ensure.created.response.json");
+    assert!(made.created);
+    assert_eq!(made.project.name, params.name);
 }

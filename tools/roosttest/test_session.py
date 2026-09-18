@@ -27,16 +27,20 @@ synchronization.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 import signal
 import stat
+import subprocess
 import threading
+import uuid
 
 import pytest
 import session as sessionlib
 from client import RoostError
 from eventstream import EventStream
+from relay import Relay
 
 # The resume cases below are effect cases too — a resumed stream must
 # never carry an effect out of its gap — so they borrow the helpers that
@@ -163,6 +167,21 @@ def test_daemonized_start_identify_stop(env):
     env.wait_socket_gone()
     env.wait_pid_gone(launch.verdict.pid)
     assert env.state() is not None, "a clean stop must leave state.json behind"
+
+
+def test_a_session_names_the_ops_it_serves(env):
+    """Plan 066 §3.1 against a real daemon: no window op and no host
+    registry op, and no UI `instance_id` on either identify reply."""
+    started(env)
+    identity = env.identify()
+    ops = set(identity["ops"])
+    assert {"session.stop", "events.subscribe", "tab.open", "tab.dump"} <= ops, sorted(ops)
+    assert not ops & {"host.add", "agent.set_hooks", "app.screenshot", "palette.open"}, sorted(ops)
+    assert "instance_id" not in identity
+    with env.client() as client:
+        plain = client.call("identify")
+    assert set(plain["ops"]) == ops
+    assert "instance_id" not in plain
 
 
 # ---------------------------------------------------------------------------
@@ -1093,3 +1112,194 @@ def test_roostctl_session_start_status_stop(env):
 
     status = env.roostctl("session", "status")
     assert status.returncode == 3, status.stdout + status.stderr
+
+
+def test_rpc_matches_the_named_verb_and_reports_errors_through_the_envelope(env):
+    """Plan 066 §3.2 AC2: `rpc` is a thin, id-agnostic pass-through to
+    the same op a named verb calls — `rpc tab.list`'s result must be
+    JSON-equal to `tab list --json`'s — and its failures still go
+    through the one `CliError` envelope every other verb uses."""
+    started(env)
+    with env.client() as client:
+        project = first_project(client)
+        client.open_tab(project, cwd=str(env.launch_cwd), title="rpc-check")
+
+    socket = str(env.socket)
+
+    rpc = env.roostctl("--socket", socket, "rpc", "tab.list")
+    assert rpc.returncode == 0, rpc.stdout + rpc.stderr
+    direct = env.roostctl("--socket", socket, "tab", "list", "--json")
+    assert direct.returncode == 0, direct.stdout + direct.stderr
+    assert json.loads(rpc.stdout) == json.loads(direct.stdout)
+
+    unknown = env.roostctl("--socket", socket, "--json", "rpc", "no.such.op")
+    assert unknown.returncode == 1, unknown.stdout + unknown.stderr
+    error = json.loads(unknown.stderr)
+    assert error["error"]["code"] == "unknown-op", unknown.stderr
+
+    bad_params = env.roostctl("--socket", socket, "rpc", "tab.write", "[1,2,3]")
+    assert bad_params.returncode == 2, bad_params.stdout + bad_params.stderr
+    assert "usage" in bad_params.stderr, bad_params.stderr
+
+
+def test_open_against_a_session_creates_a_project_and_a_tab(env):
+    """Plan 066 §3.2 (C10): `open` needs no UI. `project.ensure` is
+    served by the shared engine both UIs and `roost-session` embed
+    (`served_ops` withholds it from neither — see `roost-engine::ipc`),
+    so a session reached through `--socket` answers `open` the same way
+    a UI socket does — unlike the Mac app, which is a UI-only gap this
+    module doesn't cover."""
+    started(env)
+    socket = str(env.socket)
+    name = f"e2e-session-open-{uuid.uuid4().hex[:8]}"
+
+    opened = env.roostctl(
+        "--socket", socket, "open", "--project", name, "--cwd", str(env.launch_cwd),
+        "--json",
+    )
+    assert opened.returncode == 0, opened.stdout + opened.stderr
+    made = json.loads(opened.stdout)
+    assert made["created"] is True, made
+    pid = int(made["project"]["id"])
+    tab_id = int(made["tab"]["id"])
+
+    with env.client() as client:
+        assert client.project(pid) is not None, "the ensured project is on the session"
+        assert tab_id in client.project_tab_ids(pid), "the opened tab is in that project"
+
+
+def test_roostctl_events_and_wait_read_a_session_named_by_socket(env):
+    """Plan 066 §3.2 on a session reached through `--socket`: its `identify`
+    carries the stream in `ops` and no `instance_id`, so `roostctl` checks
+    the stream's incarnation with `session.identify`. `events --tab N`
+    prints N's `tab.state_changed` and no other tab's, then the session's
+    `session.stopping` as its last line, and exits 0; `wait --timeout 0`
+    checks once either way."""
+    started(env)
+    with env.client() as client:
+        project = first_project(client)
+        watched = client.open_tab(project, cwd=str(env.launch_cwd), title="watched")
+        other = client.open_tab(project, cwd=str(env.launch_cwd), title="other")
+        client.set_state(watched, "running")
+
+    with Relay(env.socket, env.root / "relay.sock") as relay:
+        events = subprocess.Popen(
+            [sessionlib.roostctl_binary(), "--socket", relay.path, "events", "--tab", str(watched)],
+            env=env.command_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            relay.wait_for_response("session.identify")
+            assert list(relay.by_connection().values()) == [
+                ["identify"],
+                ["events.subscribe"],
+                ["session.identify"],
+            ], relay.by_connection()
+
+            once = ["--socket", relay.path, "wait", "--tab", str(watched), "--timeout", "0"]
+            assert env.roostctl(*once, "--state", "running").returncode == 0
+            unheld = env.roostctl(*once, "--state", "idle")
+            assert unheld.returncode == 4, unheld.stdout + unheld.stderr
+
+            with env.client() as client:
+                client.set_state(other, "idle")
+                client.set_state(watched, "needs_input")
+            env.stop_over_the_wire()
+            out, err = events.communicate(timeout=sessionlib.scaled_timeout(60.0))
+        finally:
+            if events.poll() is None:
+                events.kill()
+                events.communicate()
+    assert events.returncode == 0, out + err
+    lines = [json.loads(line) for line in out.splitlines()]
+    assert lines[-1] == {"event": "session.stopping", "data": {"reason": "stop"}}, lines
+    assert {"tab_id": str(watched), "state": "needs_input"} in [
+        line["data"] for line in lines if line["event"] == "tab.state_changed"
+    ], lines
+    assert all(line["data"].get("tab_id") == str(watched) for line in lines[:-1]), lines
+
+
+# ---------------------------------------------------------------------------
+# 17. `--target session` (#475): the same explicit route as `--socket`
+# ---------------------------------------------------------------------------
+#
+# `env.roostctl(...)` already runs against `env.command_env()` — the
+# jailed `HOME` / `XDG_RUNTIME_DIR` this env's daemon itself resolved its
+# socket from (`session.py`'s `make_env`). `--target session` reads that
+# same environment to resolve `BundleProfile::session()`'s socket path,
+# so a call through it lands on exactly the daemon `started()` brought
+# up, with no `--socket` in sight — that convergence is what each case
+# below checks before asserting anything about the op it ran.
+
+
+def test_target_session_reaches_identify_tab_list_and_open(env):
+    """Plan 066 §3.2 (C14, #475): `--target session` is explicit-only —
+    no auto-detect, no `ROOST_BUNDLE_PROFILE` (the HS-0 fence in
+    `roost_ipc::target` pins both) — and resolves to the same socket
+    `--socket <path>` already proved out above
+    (`test_open_against_a_session_creates_a_project_and_a_tab`,
+    `test_rpc_matches_the_named_verb_and_reports_errors_through_the_envelope`).
+    `identify` answers with no `instance_id` and its `ops`; `tab list`
+    and `open` (`project.ensure`, served here) work through it too."""
+    started(env)
+
+    identify = env.roostctl("--target", "session", "identify", "--json")
+    assert identify.returncode == 0, identify.stdout + identify.stderr
+    identity = json.loads(identify.stdout)
+    assert identity["ops"], identity
+    assert "instance_id" not in identity, identity
+    # The convergence check: this call landed on `env`'s own daemon, not
+    # some other socket `--target session` might have resolved to. The
+    # bare `identify` op (unlike `session.identify`) carries no
+    # `session_id`, so `socket_path` is the field that pins it.
+    assert identity["socket_path"] == str(env.socket), identity
+
+    listed = env.roostctl("--target", "session", "tab", "list", "--json")
+    assert listed.returncode == 0, listed.stdout + listed.stderr
+    assert "projects" in json.loads(listed.stdout)
+
+    name = f"e2e-session-target-{uuid.uuid4().hex[:8]}"
+    opened = env.roostctl(
+        "--target", "session", "open", "--project", name, "--cwd", str(env.launch_cwd),
+        "--json",
+    )
+    assert opened.returncode == 0, opened.stdout + opened.stderr
+    made = json.loads(opened.stdout)
+    assert made["created"] is True, made
+    pid = int(made["project"]["id"])
+    tab_id = int(made["tab"]["id"])
+    with env.client() as client:
+        assert client.project(pid) is not None, "the ensured project is on this session"
+        assert tab_id in client.project_tab_ids(pid), "the opened tab is in that project"
+
+
+def test_target_session_refuses_a_host_op_with_the_servers_unknown_op(env):
+    """`host.*` is client-side UI state a session does not keep
+    (`crates/roost-engine/src/ipc.rs`'s session dispatch refuses the
+    whole family with `HandlerError::unknown_op`) — `roostctl` surfaces
+    that verbatim, not a session-specific refusal."""
+    started(env)
+    result = env.roostctl("--target", "session", "host", "list", "--json")
+    assert result.returncode == 1, result.stdout + result.stderr
+    error = json.loads(result.stderr)
+    assert error["error"]["code"] == "unknown-op", result.stderr
+    assert "host.list" in error["error"]["message"], result.stderr
+
+
+def test_target_session_refuses_an_app_op_with_no_ui_attached(env):
+    """`app.*` ops need a window; a session has none, so `ui_call`
+    answers `internal: no UI attached` (`crates/roost-engine/src/ipc.rs`)
+    and `roostctl` passes that through unchanged — not `unknown-op`,
+    since the op exists, there is just nothing behind the socket to
+    serve it."""
+    started(env)
+    out_path = env.root / "target-session-screenshot.png"
+    result = env.roostctl(
+        "--target", "session", "screenshot", "--out", str(out_path), "--json",
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    error = json.loads(result.stderr)
+    assert error["error"] == {"code": "internal", "message": "no UI attached"}, result.stderr
+    assert not out_path.exists(), "a failed screenshot must not write a file"

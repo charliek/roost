@@ -16,8 +16,8 @@ That's it. Everything else is automatic.
    - Asks/confirms version
    - Drafts a CHANGELOG entry from `git log v<previous>..HEAD`, commits as
      `docs(changelog): vX.Y.Z entry`
-   - Runs `scripts/release/update-version.sh X.Y.Z` → bumps Cargo.toml +
-     Cargo.lock
+   - Runs `scripts/release/update-version.sh X.Y.Z` → bumps Cargo.toml,
+     Cargo.lock, and `.claude-plugin/plugin.json`
    - Commits as `chore(version): bump to X.Y.Z`
    - Tags `vX.Y.Z` (annotated) on the version commit
    - `git push --follow-tags`
@@ -160,6 +160,8 @@ special.
 - `Cargo.toml` — `[workspace.package].version`, the canonical roost version
 - `Cargo.lock` — workspace member entries, regenerated via
   `cargo update --workspace --offline`
+- `.claude-plugin/plugin.json` — the Claude Code plugin's `version`, which
+  Claude Code compares to decide whether an installed skill is stale
 
 NOT bumped:
 

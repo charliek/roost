@@ -189,7 +189,12 @@ wrapper small.
   banners, sidebar rollup, and the hook lifecycle. To *see* the live
   UI when verifying a change, `roostctl screenshot --out /tmp/shot.png`
   renders the running window to a PNG in-process (no OS screen capture;
-  works even when the window is unfocused or occluded).
+  works even when the window is unfocused or occluded). Under the
+  GLES/GL fallback renderer, `roostctl screenshot` can return geometry
+  without text and a frozen frame (#496) — check which renderer is in
+  use from the UI log's `Selected: AdapterInfo { … backend: … }` line,
+  and use `tools/wayland/weston-run.sh` (headless weston) when a
+  trustworthy picture is needed.
 - **Test-harness map**: the harnesses are organized in three layers —
   see [`tools/README.md`](tools/README.md) (functional / visual /
   real-input) for which to reach for.

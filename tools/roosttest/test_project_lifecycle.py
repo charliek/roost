@@ -50,14 +50,17 @@ different surface.
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import subprocess
 import uuid
 
 import pytest
 
-from client import RoostError
-from util import wait_shell_ready, wait_tab_attached
+import ui
+from client import RoostError, scaled_timeout
+from util import roostctl_path, wait_shell_ready, wait_tab_attached
 
 
 def _project_ids(roost) -> list[int]:
@@ -126,6 +129,132 @@ def test_project_create_appears_untitled_and_does_not_activate(roost):
             "`.projectCreated` arm only inserts locally without switching "
             "active; the Rust engine's create_project likewise only emits "
             "ProjectCreated"
+        )
+    finally:
+        _cleanup_project(roost, pid)
+
+
+# -- project.ensure -------------------------------------------------------
+
+
+def test_project_ensure_creates_once_then_finds_without_activating(roost, target):
+    """A missing name is created at `cwd`; asking again, with no `cwd`,
+    answers that same project with `created: false` and its cwd as it
+    was. Neither call moves the active selection."""
+    if target == "mac":
+        pytest.skip("the Mac app has no project.ensure: it answers unknown-op")
+
+    with pytest.raises(RoostError) as refused:
+        roost.ensure_project("  ", cwd="/tmp")
+    assert refused.value.code == "invalid-param", refused.value
+
+    name = f"pytest-ensure-{uuid.uuid4().hex[:8]}"
+    before_active = roost.identify()["active_project_id"]
+    made = roost.ensure_project(name, cwd="/tmp")
+    pid = int(made["project"]["id"])
+    try:
+        assert made["created"] is True, made
+
+        found = roost.ensure_project(name)
+        assert found["created"] is False, found
+        assert int(found["project"]["id"]) == pid
+        assert found["project"]["cwd"] == "/tmp"
+
+        assert [int(p["id"]) for p in roost.list() if p["name"] == name] == [pid]
+        assert roost.identify()["active_project_id"] == before_active
+    finally:
+        _cleanup_project(roost, pid)
+
+
+# -- `roostctl open` (plan 066 §3.2, C10) -----------------------------------
+
+
+def _open(target: str, *args: str, timeout: float = 30.0) -> subprocess.CompletedProcess:
+    """`roostctl --socket <target's socket> --json open <args…>`, run as a
+    subprocess — `open` is a CLI-level composition (`project.ensure` then
+    `tab.open`), not a raw IPC op `client.Roost` can drive directly.
+    `--json` goes before `open`: after a `-- cmd…` it would be part of the
+    tab's command."""
+    argv = [
+        roostctl_path(),
+        "--socket",
+        str(ui.socket_path(target)),
+        "--json",
+        "open",
+        *args,
+    ]
+    return subprocess.run(
+        argv, capture_output=True, text=True, timeout=scaled_timeout(timeout)
+    )
+
+
+def test_open_finds_or_creates_the_project_then_opens_a_tab(roost, target):
+    """`open` is `project.ensure` + `tab.open` in one call (#221's
+    fix): a first call creates the project and a tab; a second call with
+    the same name reuses the project (`created: false`, same id) and adds
+    a second tab. `open` itself never raises a follow-up `tab.focus`
+    unless `--focus` is given (which this test never passes) — but
+    `tab.open` always "steals" the active selection on its own
+    (`Workspace::open_tab`, workspace.rs: "New tabs steal the active
+    selection"), the same way the plain `tab open` verb does, so each
+    `open` call here still leaves the newly opened tab active. That is
+    existing `tab.open` behavior, not something this verb changes.
+
+    Target-gated the same way C4's `project.ensure` case is: the Mac app
+    has no `project.ensure` yet, so `open` must **degrade** there rather
+    than falling back to a list-then-create race — exit 1 `unsupported`
+    under `--json`, project count unchanged. That degradation is asserted
+    here rather than skipped, per plan 066's automated Mac-degradation
+    check; `make e2e-mac` collects this module against the Swift app."""
+    name = f"pytest-open-{uuid.uuid4().hex[:8]}"
+    before_count = len(roost.list())
+    argv = ["--project", name, "--cwd", "/tmp", "--", "sh", "-c", "echo hi; exec sleep 30"]
+
+    first = _open(target, *argv)
+
+    if target == "mac":
+        assert first.returncode == 1, first.stdout + first.stderr
+        error = json.loads(first.stderr)
+        assert error["error"]["code"] == "unsupported", first.stderr
+        assert len(roost.list()) == before_count, "unsupported must not create a project"
+        return
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    made = json.loads(first.stdout)
+    assert made["created"] is True, made
+    pid = int(made["project"]["id"])
+    tab1 = int(made["tab"]["id"])
+    try:
+        roost._wait(
+            lambda: roost.project(pid) is not None,
+            4.0,
+            "open's project appears in tab.list",
+        )
+        assert tab1 in roost.project_tab_ids(pid)
+        roost._wait(
+            lambda: roost.identify()["active_tab_id"] == tab1,
+            4.0,
+            "tab.open's own steal-the-active-selection makes tab1 active",
+        )
+
+        second = _open(target, *argv)
+        assert second.returncode == 0, second.stdout + second.stderr
+        found = json.loads(second.stdout)
+        assert found["created"] is False, found
+        assert int(found["project"]["id"]) == pid
+        tab2 = int(found["tab"]["id"])
+        assert tab2 != tab1
+
+        roost._wait(
+            lambda: tab2 in roost.project_tab_ids(pid),
+            4.0,
+            "open's second tab appears in tab.list",
+        )
+        assert {tab1, tab2} <= set(roost.project_tab_ids(pid))
+        roost._wait(
+            lambda: roost.identify()["active_tab_id"] == tab2,
+            4.0,
+            "the second open's tab.open likewise becomes active",
         )
     finally:
         _cleanup_project(roost, pid)

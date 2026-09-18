@@ -2,7 +2,7 @@
 
 Roost resolves all of its filesystem state once at startup. Other components read the paths from this resolution; nothing should derive its own.
 
-There are three UI bundle profiles — `Mac`, `Linux`, and `Iced` (slugs `mac`, `linux`, `iced`) — and each running UI resolves exactly one of them; each owns its own workspace + PTY supervisor in-process, so there is no daemon a UI depends on. A fourth profile, `Session`, is resolved by the headless `roost-session` daemon (HS-1a, plan 035) — a workspace + PTY supervisor with no UI attached, opt-in via `roostctl session start` (see [Session profile](#session-profile) below). It is not a legal `roostctl --target` value or `ROOST_BUNDLE_PROFILE` value; `roostctl session start|stop|status` address its socket directly instead. The Rust definition lives in `crates/roost-ipc/src/paths.rs`; the Swift companion is `mac/Sources/Roost/BundleProfile.swift`. On macOS the two implementations are tested in lockstep.
+There are three UI bundle profiles — `Mac`, `Linux`, and `Iced` (slugs `mac`, `linux`, `iced`) — and each running UI resolves exactly one of them; each owns its own workspace + PTY supervisor in-process, so there is no daemon a UI depends on. A fourth profile, `Session`, is resolved by the headless `roost-session` daemon (HS-1a, plan 035) — a workspace + PTY supervisor with no UI attached, opt-in via `roostctl session start` (see [Session profile](#session-profile) below). It is a legal `roostctl --target` value (`--target session`, explicit only — #475) but not a legal `ROOST_BUNDLE_PROFILE` value, and auto-detect never probes it; `roostctl session start|stop|status` keep their own carve-out, addressing its socket directly ahead of that ladder. The Rust definition lives in `crates/roost-ipc/src/paths.rs`; the Swift companion is `mac/Sources/Roost/BundleProfile.swift`. On macOS the two implementations are tested in lockstep.
 
 | Profile | Who resolves it | `app_label` | `app_id` |
 |---|---|---|---|
@@ -22,9 +22,9 @@ The profile defaults to:
 | Swift `Roost.app` | `Mac` | n/a (the app picks `Mac` directly) |
 | `roost` (Linux `.deb`, built `--features roost-iced/linux-package`) | `Linux` | `ROOST_BUNDLE_PROFILE=iced` to keep the isolated profile in a packaged build (or `=mac` to target another UI) |
 | `roost-iced` (dev build, any platform; macOS `Roost-Iced.app`) | `Iced` | `ROOST_BUNDLE_PROFILE=mac` / `=linux` to dial another profile's namespace |
-| `roostctl` (binary from the `roost-cli` crate) | auto-detect | `ROOST_BUNDLE_PROFILE` / `--socket` / `ROOST_SOCKET` / `--target {mac,linux,iced}` |
+| `roostctl` (binary from the `roost-cli` crate) | auto-detect | `ROOST_BUNDLE_PROFILE` / `--socket` / `ROOST_SOCKET` / `--target {mac,linux,iced,session}` |
 
-The two sides treat an **unrecognized** `ROOST_BUNDLE_PROFILE` value differently, on purpose. A UI logs a warning and falls back to its compiled-in default rather than refusing to launch; `roostctl` hard-errors with `unknown ROOST_BUNDLE_PROFILE value … (expected mac, linux, or iced)`. A stale `ROOST_BUNDLE_PROFILE=gtk` left over from an older install therefore starts the UI on its normal profile (with a warning in the log) but stops the CLI outright. `session` gets the same `roostctl` rejection — it names a real profile kind internally, but a session is deliberately not one of `--target`'s / `ROOST_BUNDLE_PROFILE`'s legal values, by design (see [Session profile](#session-profile)), not because it is unimplemented.
+The two sides treat an **unrecognized** `ROOST_BUNDLE_PROFILE` value differently, on purpose. A UI logs a warning and falls back to its compiled-in default rather than refusing to launch; `roostctl` hard-errors with `unknown ROOST_BUNDLE_PROFILE value … (expected mac, linux, or iced)`. A stale `ROOST_BUNDLE_PROFILE=gtk` left over from an older install therefore starts the UI on its normal profile (with a warning in the log) but stops the CLI outright. `session` gets that same `roostctl` rejection **from `ROOST_BUNDLE_PROFILE`** — it names a real profile kind internally, but is deliberately not one of `ROOST_BUNDLE_PROFILE`'s legal values, by design (see [Session profile](#session-profile)), not because it is unimplemented. `--target` is the exception: `--target session` is accepted, explicitly only (#475) — auto-detect still never probes it either way.
 
 ## File locations
 
@@ -119,19 +119,24 @@ now live: the headless `roost-session` daemon (HS-1a, plan 035) resolves
 it — the Linux `.deb` ships it as `/usr/bin/roost-session` and
 `Roost-Iced.app` ships it at `Contents/MacOS/roost-session` (HS-4b),
 opt-in via `roostctl session start` or the palette's
-**Connect Host: localhost**. It is still **not** a `roostctl --target` value
-and **not** a legal `ROOST_BUNDLE_PROFILE` value — `roostctl --target
-session` is rejected, and `ROOST_BUNDLE_PROFILE=session` is rejected by
-ordinary target resolution (the dedicated `session` verbs never consult
-either knob — they resolve this profile directly), by design
-(see `session.rs`'s module doc: a session is not a UI, and `start` has to
-work when nothing is listening at all, so `roostctl session
-start|stop|status` address this profile's socket directly instead as a
-pre-connect carve-out). Any other op reaches a session only through an
-explicit `roostctl --socket <path>`. Debug builds substitute
-`RoostSessionDev` / `roost-session-dev` for the directory name in **all**
-of the paths below (socket, state, logs, and the upload store), so a dev
-session can never collide with a real one.
+**Connect Host: localhost**. It is a legal `roostctl --target` value —
+`roostctl --target session` resolves to this profile's socket — but
+**explicitly only** (#475): it is still not a legal `ROOST_BUNDLE_PROFILE`
+value (`ROOST_BUNDLE_PROFILE=session` is rejected the same as any other
+unrecognized value) and auto-detect never probes it, by design (see
+`session.rs`'s module doc: a session is not a UI). `roostctl session
+start|stop|status` keep their own pre-connect carve-out ahead of all of
+this — they never consult `--target` / `ROOST_BUNDLE_PROFILE` /
+auto-detect at all, resolving this profile's socket directly, since
+`start` has to work when nothing is listening yet. Any other op reaches
+a session through `roostctl --target session` or an explicit `roostctl
+--socket <path>`; an op the session does not serve fails with the
+server's own error for that op — `unknown-op` for `host.*` and
+`agent.set_hooks`, `internal: no UI attached` for `app.*` window/UI ops
+(`app.activate` alone answers `{}` and does nothing) — not a session-specific one. Debug builds substitute `RoostSessionDev`
+/ `roost-session-dev` for the directory name in **all** of the paths
+below (socket, state, logs, and the upload store), so a dev session can
+never collide with a real one.
 
 | Platform | Socket | State | Logs | Uploaded files |
 |---|---|---|---|---|
@@ -373,12 +378,15 @@ opt-out (`no-ssh-env`).
 | `ROOST_SSH_BIN` | Override the `ssh` binary a host's SSH transport execs (default: `ssh` on `PATH`) — see [SSH scratch directories](#ssh-scratch-directories) above. Read by both `roostctl host add --verify` and the UI's own tunnel. |
 
 `roostctl` also honours `ROOST_BUNDLE_PROFILE=mac|linux|iced` (the env form of
-`--target`; an unrecognized value is a hard error, not a fallback). With no
-explicit selector it probes every distinct socket, chooses the only live UI, or
-names the live candidates when selection is ambiguous. The candidates are the
-three profiles' sockets in `mac`, `linux`, `iced` order, deduplicated by path —
-so macOS probes three and Linux probes two, where `mac` and `linux` collapse
-onto the same production socket.
+`--target`; an unrecognized value is a hard error, not a fallback). `--target`
+itself additionally accepts `session`, but only there — `ROOST_BUNDLE_PROFILE`
+does not, and neither knob's absence changes auto-detect, which never probes
+the session socket (see [Session profile](#session-profile) above). With no
+explicit selector it probes every distinct UI socket, chooses the only live
+one, or names the live candidates when selection is ambiguous. The candidates
+are the three UI profiles' sockets in `mac`, `linux`, `iced` order, deduplicated
+by path — so macOS probes three and Linux probes two, where `mac` and `linux`
+collapse onto the same production socket.
 
 ## Resetting state
 

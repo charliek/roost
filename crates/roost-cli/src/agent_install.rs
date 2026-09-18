@@ -37,8 +37,10 @@ use roost_ipc::messages::{
     ops, AgentHooksOutcome, AgentSetHooksAgents, AgentSetHooksHostOutcome, AgentSetHooksParams,
     AgentSetHooksResult,
 };
-use roost_ipc::IpcClient;
 use roost_ui_model::config::{AgentHooks, RoostConfig};
+
+use crate::error::CliError;
+use crate::UiSocket;
 
 /// How this client identifies itself in the state record.
 const BY: &str = "local";
@@ -50,8 +52,6 @@ pub enum AgentCmd {
     /// what it does not. Safe to run any number of times, and a run with
     /// nothing to do writes nothing.
     Ensure {
-        #[arg(long, default_value_t = false)]
-        json: bool,
         /// Wire and refresh what `agent-hooks` names, and remove
         /// nothing. What a UI runs at launch: a launch must never undo a
         /// hook somebody added by hand, and it must never act on a key
@@ -79,8 +79,6 @@ pub enum AgentCmd {
         /// dialing the running UI. No host is told.
         #[arg(long, default_value_t = false)]
         local: bool,
-        #[arg(long, default_value_t = false)]
-        json: bool,
     },
     /// Wire one agent, or all of them, and add it to `agent-hooks`.
     /// Explicit wins: this works even when the key says `off`.
@@ -101,34 +99,25 @@ pub enum AgentCmd {
     },
     /// Per agent: installed, wired at which integration version, and
     /// whether anything is out of date.
-    Status {
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
+    Status,
 }
 
-/// Exit code, not a `Result`: a partial failure still has an outcome
-/// worth printing, so the report goes to stdout and the code says
-/// whether anything in it failed.
-pub fn run(cmd: &AgentCmd) -> i32 {
-    let home = match Home::from_env() {
-        Ok(home) => home,
-        Err(e) => {
-            eprintln!("roostctl agent: {e}");
-            return 1;
-        }
-    };
+/// `Ok(1)` rather than an error for a partial failure: it still has an
+/// outcome worth printing, so the report goes to stdout and the code
+/// says whether anything in it failed.
+pub fn run(cmd: &AgentCmd, json: bool) -> Result<i32, CliError> {
+    let home = Home::from_env().map_err(CliError::failed)?;
     let guard = Guard::from_env();
 
     match cmd {
-        AgentCmd::Ensure { json, startup } => match configured() {
+        AgentCmd::Ensure { startup } => match configured() {
             // `--startup` passes no mode: `ensure` re-reads the key
             // inside the lock. This read decides only whether there is
             // an answer to act on at all — the Mac spawns exactly this
             // at launch, and the key can be answered between its read
             // and this process's write.
-            Some(_) if *startup => report(ensure(&home, BY, guard), *json),
-            Some(mode) => report(reconcile(&home, &mode, BY, guard), *json),
+            Some(_) if *startup => report(ensure(&home, BY, guard), json),
+            Some(mode) => report(reconcile(&home, &mode, BY, guard), json),
             None => {
                 // `--json` is a machine contract — the Mac app spawns
                 // exactly this and decodes stdout — so the unconfigured
@@ -138,84 +127,70 @@ pub fn run(cmd: &AgentCmd) -> i32 {
                 let note = "agent-hooks is not configured; nothing was wired. Choose agents \
                             in Roost (Agent Hooks… in the command palette) or run `roostctl \
                             agent set <list|off> --local`.";
-                if *json {
+                if json {
                     println!("{}", outcome_json(&Outcome::default()));
                     eprintln!("{note}");
                 } else {
                     println!("{note}");
                 }
-                0
+                Ok(0)
             }
         },
         // Unreachable through `main`, which sends this shape to
         // [`run_over_ipc`]. Refused rather than written: the one thing a
         // misroute must never do is quietly set the local key when the
         // caller asked for every connected host to be set too.
-        AgentCmd::Set { local: false, .. } => {
-            eprintln!("roostctl agent set: the UI-routed form is not served here");
-            2
+        AgentCmd::Set { local: false, .. } => Err(CliError::Usage(
+            "agent set: the UI-routed form is not served here".into(),
+        )),
+        AgentCmd::Set { spec, .. } => {
+            let mode = parse_set_spec(spec).map_err(CliError::Usage)?;
+            let allow = matches!(mode, Mode::Allow(_));
+            let code = report(set_hooks(&home, &mode, BY, guard), json)?;
+            if allow {
+                let note = "a connected host will not see this until it connects again";
+                if json {
+                    eprintln!("{note}");
+                } else {
+                    println!("{note}");
+                }
+            }
+            Ok(code)
         }
-        AgentCmd::Set { spec, json, .. } => match parse_set_spec(spec) {
-            Ok(mode) => {
-                let allow = matches!(mode, Mode::Allow(_));
-                let code = report(set_hooks(&home, &mode, BY, guard), *json);
-                if allow {
-                    let note = "a connected host will not see this until it connects again";
-                    if *json {
-                        eprintln!("{note}");
-                    } else {
-                        println!("{note}");
-                    }
-                }
-                code
+        AgentCmd::Install { agent, all } => {
+            let agents = targets(agent.as_deref(), *all)?;
+            report(install(&home, &agents, BY, guard), json)
+        }
+        AgentCmd::Uninstall { agent, all } => {
+            let agents = targets(agent.as_deref(), *all)?;
+            let outcome = uninstall(&home, &agents, guard);
+            // The legacy `claude-settings.json` this crate never
+            // touches — it predates this crate — so `agent
+            // uninstall claude` cleans it up as a side effect,
+            // never in place of the ordinary uninstall above.
+            //
+            // "As a side effect" is load-bearing: a run that never
+            // unwired Claude has no business deleting Claude's
+            // legacy file. `uninstall` returns `Err` when the
+            // harness guard refused it or the lock could not be
+            // taken, and names a per-agent error when the write
+            // failed — either way the delete is off, or a refused
+            // `agent uninstall claude` would exit 1 while reporting
+            // it had removed the file it just deleted.
+            let cleanup = agents.contains(&Agent::Claude)
+                && matches!(&outcome, Ok(o) if o.errors.iter().all(|e| e.agent != Agent::Claude));
+            let code = report(outcome, json)?;
+            if cleanup {
+                crate::legacy_claude_uninstall(guard);
             }
-            Err(message) => {
-                eprintln!("roostctl agent set: {message}");
-                2
-            }
-        },
-        AgentCmd::Install { agent, all } => match targets(agent.as_deref(), *all) {
-            Ok(agents) => report(install(&home, &agents, BY, guard), false),
-            Err(code) => code,
-        },
-        AgentCmd::Uninstall { agent, all } => match targets(agent.as_deref(), *all) {
-            Ok(agents) => {
-                let outcome = uninstall(&home, &agents, guard);
-                // The legacy `claude-settings.json` this crate never
-                // touches — it predates this crate — so `agent
-                // uninstall claude` cleans it up as a side effect,
-                // never in place of the ordinary uninstall above.
-                //
-                // "As a side effect" is load-bearing: a run that never
-                // unwired Claude has no business deleting Claude's
-                // legacy file. `uninstall` returns `Err` when the
-                // harness guard refused it or the lock could not be
-                // taken, and names a per-agent error when the write
-                // failed — either way the delete is off, or a refused
-                // `agent uninstall claude` would exit 1 while reporting
-                // it had removed the file it just deleted.
-                let cleanup = agents.contains(&Agent::Claude)
-                    && matches!(&outcome, Ok(o) if o.errors.iter().all(|e| e.agent != Agent::Claude));
-                let code = report(outcome, false);
-                if cleanup {
-                    crate::legacy_claude_uninstall(guard);
-                }
-                code
-            }
-            Err(code) => code,
-        },
-        AgentCmd::Status { json } => {
+            Ok(code)
+        }
+        AgentCmd::Status => {
             let (key, mode) = resolved_or_nothing();
-            match status(&home, &mode) {
-                Ok(rows) => {
-                    print_status(&rows, key.unknown(), *json);
-                    0
-                }
-                Err(e) => {
-                    eprintln!("roostctl agent status: {e}");
-                    1
-                }
-            }
+            let rows =
+                status(&home, &mode).map_err(|e| CliError::Failed(format!("agent status: {e}")))?;
+            print_status(&rows, key.unknown(), json);
+            Ok(0)
         }
     }
 }
@@ -224,7 +199,7 @@ pub fn run(cmd: &AgentCmd) -> i32 {
 ///
 /// Exactly one shape is: `set` without `--local`. Every other `agent`
 /// verb must keep working with nothing running, which is why `main`
-/// asks this before its connect prologue rather than after.
+/// asks this before it dials the UI socket rather than after.
 pub fn dials_the_ui(cmd: &AgentCmd) -> bool {
     matches!(cmd, AgentCmd::Set { local: false, .. })
 }
@@ -232,21 +207,20 @@ pub fn dials_the_ui(cmd: &AgentCmd) -> bool {
 /// `roostctl agent set <list|off>` — the UI-routed form, over
 /// `agent.set_hooks` (plan 064 §3.4).
 ///
-/// The spec is parsed here, before the op is sent, so an unknown name is
-/// the same exit 2 `--local` gives rather than a round trip that ends in
-/// `invalid-param`.
-pub async fn run_over_ipc(cmd: &AgentCmd, client: &mut IpcClient) -> i32 {
-    let AgentCmd::Set { spec, json, .. } = cmd else {
-        eprintln!("roostctl agent: {cmd:?} does not dial the UI");
-        return 2;
+/// The spec is parsed here, before anything is dialled, so an unknown
+/// name is the same exit 2 `--local` gives rather than a round trip that
+/// ends in `invalid-param`.
+pub async fn run_over_ipc(
+    cmd: &AgentCmd,
+    ui: &mut UiSocket<'_>,
+    json: bool,
+) -> Result<i32, CliError> {
+    let AgentCmd::Set { spec, .. } = cmd else {
+        return Err(CliError::Usage(format!(
+            "agent: {cmd:?} does not dial the UI"
+        )));
     };
-    let mode = match parse_set_spec(spec) {
-        Ok(mode) => mode,
-        Err(message) => {
-            eprintln!("roostctl agent set: {message}");
-            return 2;
-        }
-    };
+    let mode = parse_set_spec(spec).map_err(CliError::Usage)?;
     let params = AgentSetHooksParams {
         agents: match &mode {
             Mode::Off => AgentSetHooksAgents::Off,
@@ -255,21 +229,10 @@ pub async fn run_over_ipc(cmd: &AgentCmd, client: &mut IpcClient) -> i32 {
             }
         },
     };
-    let result: AgentSetHooksResult = match client.call(ops::AGENT_SET_HOOKS, params).await {
-        Ok(result) => result,
-        Err(error) => {
-            eprintln!("roostctl agent set: {error}");
-            return 1;
-        }
-    };
-    if *json {
-        match serde_json::to_string(&result) {
-            Ok(body) => println!("{body}"),
-            Err(error) => {
-                eprintln!("roostctl agent set: {error}");
-                return 1;
-            }
-        }
+    let result: AgentSetHooksResult = ui.call(ops::AGENT_SET_HOOKS, params).await?;
+    if json {
+        let body = serde_json::to_string(&result).map_err(CliError::failed)?;
+        println!("{body}");
     } else {
         print_set_result(&result);
     }
@@ -284,7 +247,7 @@ pub async fn run_over_ipc(cmd: &AgentCmd, client: &mut IpcClient) -> i32 {
             AgentSetHooksHostOutcome::Error { .. } => true,
             AgentSetHooksHostOutcome::Result { result, .. } => !result.errors.is_empty(),
         });
-    i32::from(failed)
+    Ok(i32::from(failed))
 }
 
 /// `agent.set_hooks`'s reply in [`print_outcome`]'s shape, plus the two
@@ -418,45 +381,33 @@ fn parse_set_spec(spec: &str) -> Result<Mode, String> {
     Ok(Mode::Allow(agents))
 }
 
-fn targets(agent: Option<&str>, all: bool) -> Result<Vec<Agent>, i32> {
+fn targets(agent: Option<&str>, all: bool) -> Result<Vec<Agent>, CliError> {
     match (agent, all) {
-        (Some(_), true) => {
-            eprintln!("roostctl agent: pass an agent name or --all, not both");
-            Err(2)
-        }
-        (None, false) => {
-            eprintln!(
-                "roostctl agent: name an agent ({}) or pass --all",
-                roost_agent_install::agent_names()
-            );
-            Err(2)
-        }
+        (Some(_), true) => Err(CliError::Usage(
+            "agent: pass an agent name or --all, not both".into(),
+        )),
+        (None, false) => Err(CliError::Usage(format!(
+            "agent: name an agent ({}) or pass --all",
+            roost_agent_install::agent_names()
+        ))),
         (None, true) => Ok(ALL_AGENTS.to_vec()),
-        (Some(name), false) => match Agent::parse(name) {
-            Some(agent) => Ok(vec![agent]),
-            None => {
-                eprintln!("roostctl agent: unknown agent: {name}");
-                Err(2)
-            }
-        },
+        (Some(name), false) => Agent::parse(name)
+            .map(|agent| vec![agent])
+            .ok_or_else(|| CliError::Usage(format!("agent: unknown agent: {name}"))),
     }
 }
 
-fn report(outcome: Result<Outcome, roost_agent_install::InstallError>, json: bool) -> i32 {
-    let outcome = match outcome {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            eprintln!("roostctl agent: {e}");
-            return 1;
-        }
-    };
-
+fn report(
+    outcome: Result<Outcome, roost_agent_install::InstallError>,
+    json: bool,
+) -> Result<i32, CliError> {
+    let outcome = outcome.map_err(|e| CliError::Failed(format!("agent: {e}")))?;
     if json {
         println!("{}", outcome_json(&outcome));
     } else {
         print_outcome(&outcome);
     }
-    i32::from(!outcome.is_clean())
+    Ok(i32::from(!outcome.is_clean()))
 }
 
 fn names(agents: &[Agent]) -> Vec<&'static str> {
@@ -628,32 +579,19 @@ mod tests {
             .cmd
     }
 
+    /// `--json` is `roostctl`'s global flag, so the argv the Mac app
+    /// spawns with it is pinned against the real `Args` in `main.rs`.
     #[test]
     fn the_five_verbs_parse_the_way_the_docs_spell_them() {
         assert!(matches!(
             parse(&["ensure"]),
-            AgentCmd::Ensure {
-                json: false,
-                startup: false
-            }
+            AgentCmd::Ensure { startup: false }
         ));
         assert!(matches!(
-            parse(&["ensure", "--json"]),
-            AgentCmd::Ensure { json: true, .. }
+            parse(&["ensure", "--startup"]),
+            AgentCmd::Ensure { startup: true }
         ));
-        // What the Mac app spawns at launch, spelled here so a rename
-        // breaks this before it breaks a launch nobody is watching.
-        assert!(matches!(
-            parse(&["ensure", "--startup", "--json"]),
-            AgentCmd::Ensure {
-                json: true,
-                startup: true
-            }
-        ));
-        assert!(matches!(
-            parse(&["status"]),
-            AgentCmd::Status { json: false }
-        ));
+        assert!(matches!(parse(&["status"]), AgentCmd::Status));
         assert!(matches!(
             parse(&["install", "--all"]),
             AgentCmd::Install { all: true, .. }
@@ -663,11 +601,11 @@ mod tests {
         );
         assert!(matches!(
             parse(&["set", "claude,codex", "--local"]),
-            AgentCmd::Set { spec, local: true, json: false } if spec == "claude,codex"
+            AgentCmd::Set { spec, local: true } if spec == "claude,codex"
         ));
         assert!(matches!(
-            parse(&["set", "off", "--local", "--json"]),
-            AgentCmd::Set { spec, local: true, json: true } if spec == "off"
+            parse(&["set", "off", "--local"]),
+            AgentCmd::Set { spec, local: true } if spec == "off"
         ));
         assert!(matches!(
             parse(&["set", "claude"]),
@@ -697,11 +635,17 @@ mod tests {
     fn an_ambiguous_or_empty_target_is_refused() {
         assert_eq!(targets(Some("codex"), false), Ok(vec![Agent::Codex]));
         assert_eq!(targets(None, true), Ok(ALL_AGENTS.to_vec()));
-        assert_eq!(targets(Some("codex"), true), Err(2));
-        assert_eq!(targets(None, false), Err(2));
-        assert_eq!(targets(Some("gemini"), false), Err(2));
-        // gx reports as grok and has no name of its own.
-        assert_eq!(targets(Some("gx"), false), Err(2));
+        for (agent, all) in [
+            (Some("codex"), true),
+            (None, false),
+            (Some("gemini"), false),
+            // gx reports as grok and has no name of its own.
+            (Some("gx"), false),
+        ] {
+            let refused = targets(agent, all).expect_err("refused");
+            assert_eq!(refused.exit_code(), 2, "{agent:?} {all}: {refused:?}");
+            assert_eq!(refused.code(), "usage");
+        }
     }
 
     /// `set`'s argument, unlike `AgentHooks::parse`, refuses a list that

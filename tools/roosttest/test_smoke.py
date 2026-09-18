@@ -6,9 +6,13 @@ docs/development/claude-testing.md.
 
 from __future__ import annotations
 
+import os
 import uuid
 
 import pytest
+from client import RoostError
+from eventstream import EventStream
+import ui
 
 
 EXPECTED_APP_IDS = {
@@ -73,6 +77,72 @@ def test_the_suite_runs_against_the_in_process_backend(roost, target):
     if target == "mac":
         pytest.skip("Swift omits local_backend: the Mac app is in-process by construction")
     assert roost.identify()["local_backend"] == "in-process"
+
+
+def test_identify_names_what_this_socket_serves_and_which_process_it_is(roost, target):
+    """Plan 066 §3.1. The test seams are listed exactly when the UI was
+    launched with ROOST_TEST_MODE=1 — the one input to `identify.ops`
+    only a running app wires."""
+    if target == "mac":
+        pytest.skip("Swift omits identify.ops and identify.instance_id")
+    first = roost.identify()
+    ops = set(first["ops"])
+    assert {"identify", "tab.open", "project.ensure", "host.status", "events.subscribe"} <= ops, (
+        sorted(ops)
+    )
+    assert not ops & {"session.identify", "session.stop"}, sorted(ops)
+    # Only a UI this harness launched carries this process's
+    # ROOST_TEST_MODE; a reused one could have been started either way.
+    if ui.session_state_dir() is not None:
+        test_mode = os.environ.get("ROOST_TEST_MODE") == "1"
+        assert ("tab.feed_pty_bytes" in ops) == test_mode, sorted(ops)
+    assert len(first["instance_id"]) == 16, first["instance_id"]
+    assert roost.identify()["instance_id"] == first["instance_id"]
+
+
+def test_the_ui_socket_streams_its_own_workspace_fenced_by_tab_list(roost, project, target):
+    """Plan 066 §3.1: an in-process UI serves `events.subscribe` live.
+    The ack names the process `identify.instance_id` names, and a
+    `tab.list` taken on a second connection — the pushed one answers
+    nothing — fences the stream: every batch at or below its revision is
+    already in the snapshot, and the next is exactly one past it."""
+    if target == "mac":
+        pytest.skip("the Swift Mac app answers events.subscribe not-implemented")
+    with EventStream(roost.path) as stream:
+        fence = stream.subscribe()
+        assert stream.session_id == roost.identify()["instance_id"]
+
+        roost.rename_project(project, f"fenced-{uuid.uuid4().hex[:6]}")
+        snapshot = roost.call("tab.list", {})["revision"]
+        assert snapshot > fence, (snapshot, fence)
+        name = f"streamed-{uuid.uuid4().hex[:6]}"
+        roost.rename_project(project, name)
+
+        batches, envelope = stream.recv_until("project.renamed")
+        assert batches[0]["revision"] == fence + 1, batches
+        while envelope["data"]["name"] != name:
+            more, envelope = stream.recv_until("project.renamed")
+            batches += more
+        stream.expect_contiguous(batches, fence)
+        kept = [b for b in batches if b["revision"] > snapshot]
+        assert kept and kept[0]["revision"] == snapshot + 1, (snapshot, batches)
+
+
+def test_the_ui_socket_refuses_a_stream_it_cannot_serve(roost, target):
+    """A UI keeps no replay ring, and no filter is implemented anywhere:
+    both are refused on the ack rather than quietly served as something
+    else."""
+    if target == "mac":
+        pytest.skip("the Swift Mac app answers events.subscribe not-implemented")
+    with EventStream(roost.path) as stream:
+        with pytest.raises(RoostError) as resumed:
+            stream.subscribe(from_revision=0, session_id=roost.identify()["instance_id"])
+    assert resumed.value.code == "invalid-param", resumed.value
+    assert "resume is a session-socket feature" in str(resumed.value), resumed.value
+    with EventStream(roost.path) as stream:
+        with pytest.raises(RoostError) as filtered:
+            stream.subscribe(tab_id_filter=7)
+    assert filtered.value.code == "invalid-param", filtered.value
 
 
 def test_focus_sets_active_tab(roost, project):

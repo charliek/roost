@@ -12,6 +12,7 @@
 //! ends in `Workspace::commit`), and it keeps the tests free of PTYs
 //! they would only have to reap.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,11 +21,12 @@ use roost_engine::ipc::{IpcHandler, SessionInfo, StopHandle};
 use roost_engine::{PtySupervisor, ReplayBounds, Workspace, WorkspaceEvent};
 use roost_ipc::agent::{AgentLifecycle, AgentTabState, Ownership, ShellState};
 use roost_ipc::framing::{write_frame, FrameReader};
+use roost_ipc::local_route::{SLOT_UNAVAILABLE_CODE, SWITCH_BUSY};
 use roost_ipc::messages::{
-    ops, EventBatch, EventsSubscribeResult, Project, Response, SessionStopResult, Tab,
-    TabListResult, TabState, SESSION_STOPPING_EVENT,
+    ops, EventBatch, EventsSubscribeResult, IdentifyResult, Project, Response, SessionStopResult,
+    Tab, TabListResult, TabState, SESSION_STOPPING_EVENT, STREAM_ENDED_EVENT,
 };
-use roost_ipc::{IpcClient, IpcServer};
+use roost_ipc::{IpcClient, IpcServer, LocalBackendCell, LocalRoute};
 use tempfile::TempDir;
 use tokio::net::UnixStream;
 
@@ -43,6 +45,7 @@ type Writer = tokio::net::unix::OwnedWriteHalf;
 struct Harness {
     socket: std::path::PathBuf,
     workspace: Arc<Workspace>,
+    handler: Arc<IpcHandler>,
     _dir: TempDir,
 }
 
@@ -53,6 +56,15 @@ struct Harness {
 /// retains a thousand: `replay-expired` is then a handful of commits
 /// away rather than a thousand round trips.
 async fn harness(session: bool, limits: Option<PushLimits>) -> Harness {
+    harness_with(session, limits, None).await
+}
+
+/// [`harness`], with the route cell a running UI would share.
+async fn harness_with(
+    session: bool,
+    limits: Option<PushLimits>,
+    route: Option<Arc<LocalBackendCell>>,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("roost.sock");
     let workspace = Arc::new(Workspace::open(dir.path().join("state.json")).with_replay(
@@ -86,13 +98,18 @@ async fn harness(session: bool, limits: Option<PushLimits>) -> Harness {
     if let Some(limits) = limits {
         handler = handler.with_push_limits(limits);
     }
+    if let Some(route) = route {
+        handler = handler.with_local_route(route);
+    }
     let server = IpcServer::bind(&socket, handler).await.expect("bind");
+    let handler = Arc::clone(server.handler());
     tokio::spawn(async move {
         let _ = server.run().await;
     });
     Harness {
         socket,
         workspace,
+        handler,
         _dir: dir,
     }
 }
@@ -566,53 +583,174 @@ async fn a_notification_reaches_a_subscriber() {
 /// legitimately still in flight, so the label is asserted on the *last*
 /// frame rather than the next one.
 async fn read_to_close(reader: &mut Reader) -> (Option<serde_json::Value>, bool) {
-    let mut last = None;
+    let (mut frames, closed) = frames_to_close(reader).await;
+    (frames.pop(), closed)
+}
+
+/// Every frame up to the close, and whether the close came in time.
+async fn frames_to_close(reader: &mut Reader) -> (Vec<serde_json::Value>, bool) {
+    let mut frames = Vec::new();
     let closed = tokio::time::timeout(TIMEOUT, async {
         loop {
             match reader.read_line().await {
-                Ok(Some(line)) => last = serde_json::from_slice(&line).ok(),
+                Ok(Some(line)) => frames.push(serde_json::from_slice(&line).expect("JSON")),
                 Ok(None) | Err(_) => return,
             }
         }
     })
     .await;
-    (last, closed.is_ok())
+    (frames, closed.is_ok())
 }
 
-/// The UI socket is untouched by all of the above: the op still answers
-/// `not-implemented` with the exact message it always has, and
-/// `tab.list` carries no `revision` key at all — not `null`, absent.
+/// Poll `done` until it holds or [`TIMEOUT`] passes.
+async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while !done() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A UI socket running its tabs in-process serves the same live stream,
+/// over its own workspace: the ack names the UI process `identify`
+/// names, and `tab.list` — on a second connection, because a pushed one
+/// answers nothing — fences it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_ui_socket_is_byte_identical() {
+async fn a_ui_socket_streams_its_own_workspace_fenced_by_tab_list() {
     let h = harness(false, None).await;
     let (mut reader, mut w) = h.dial().await;
-
     request(&mut w, 1, ops::EVENTS_SUBSCRIBE, serde_json::json!({})).await;
-    let reply = read_frame(&mut reader).await;
+    let ack = read_frame(&mut reader).await;
+    let ack: EventsSubscribeResult =
+        serde_json::from_value(ack["result"].clone()).unwrap_or_else(|_| panic!("ack: {ack}"));
+
+    let mut client = IpcClient::connect(&h.socket).await.expect("connect");
+    let identify: IdentifyResult = client
+        .call(ops::IDENTIFY, serde_json::json!({}))
+        .await
+        .expect("identify");
     assert_eq!(
-        reply,
-        serde_json::json!({
-            "id": "1",
-            "ok": false,
-            "error": {
-                "code": "not-implemented",
-                "message": "events.subscribe is not yet implemented",
-            },
-        })
+        identify.instance_id.as_deref(),
+        Some(ack.session_id.as_str())
     );
 
     h.workspace.create_project("p", "/tmp").unwrap();
-    request(&mut w, 2, ops::TAB_LIST, serde_json::json!({})).await;
+    let list: TabListResult = client
+        .call(ops::TAB_LIST, serde_json::json!({}))
+        .await
+        .expect("tab.list");
+    let snapshot = list
+        .revision
+        .expect("an in-process UI socket fences tab.list");
+    h.workspace.create_project("after", "/tmp").unwrap();
+
+    let mut batch = read_batch(&mut reader).await;
+    assert_eq!(batch.revision, ack.revision + 1);
+    while batch.revision <= snapshot {
+        batch = read_batch(&mut reader).await;
+    }
+    assert_eq!(batch.revision, snapshot + 1);
+}
+
+/// A subscriber that hangs up needs nobody to notice it: its relay lets
+/// go of the broadcast with no commit to wake it, and the connection's
+/// end retires its record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ui_stream_whose_peer_hangs_up_lets_go_of_its_relay_and_its_record() {
+    let h = harness(false, None).await;
+    let streams = h.handler.in_process_streams();
+    let baseline = h.workspace.versioned_receiver_count();
+
+    let (reader, w, _fence) = h.subscribe().await;
+    assert_eq!(h.workspace.versioned_receiver_count(), baseline + 1);
+    assert_eq!(streams.count(), 1);
+
+    drop((reader, w));
+    wait_until("the relay to drop its receiver", || {
+        h.workspace.versioned_receiver_count() == baseline
+    })
+    .await;
+    wait_until("the stream's record to be retired", || streams.count() == 0).await;
+}
+
+/// A local-backend switch ends every in-process stream with exactly one
+/// `stream.ended`, and the close follows it. Many idle streams, swept
+/// from a plain thread the way the UI's main thread sweeps them: a sweep
+/// that aborted a relay before firing its closer lets that push loop
+/// see its source end first, and the stream closes unlabeled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backend_switch_ends_every_in_process_stream_with_exactly_one_label() {
+    const STREAMS: usize = 48;
+    let route = Arc::new(LocalBackendCell::new(LocalRoute::default()));
+    let h = harness_with(false, None, Some(Arc::clone(&route))).await;
+
+    let mut streams = Vec::new();
+    for _ in 0..STREAMS {
+        streams.push(h.subscribe().await);
+    }
+    h.workspace.create_project("before", "/tmp").unwrap();
+    for (reader, _w, fence) in &mut streams {
+        assert_eq!(read_batch(reader).await.revision, *fence + 1);
+    }
+
+    // Workers kept awake: parked ones would only tear a cancelled relay
+    // down after the whole sweep, closers included, had already run —
+    // and a wrongly-ordered sweep would pass.
+    let spinning = Arc::new(AtomicBool::new(true));
+    let spinners: Vec<_> = (0..3)
+        .map(|_| {
+            let spinning = Arc::clone(&spinning);
+            tokio::spawn(async move {
+                while spinning.load(Ordering::Relaxed) {
+                    tokio::task::yield_now().await;
+                }
+            })
+        })
+        .collect();
+
+    let registry = h.handler.in_process_streams();
+    std::thread::spawn(move || {
+        route.store(LocalRoute {
+            switch: Some("preparing"),
+            ..LocalRoute::default()
+        });
+        registry.end_for_backend_switch();
+    })
+    .join()
+    .unwrap();
+    spinning.store(false, Ordering::Relaxed);
+    for spinner in spinners {
+        spinner.await.unwrap();
+    }
+
+    for (index, (reader, _w, _fence)) in streams.iter_mut().enumerate() {
+        let (frames, closed) = frames_to_close(reader).await;
+        assert!(closed, "stream {index} must close after its label");
+        let labels = frames
+            .iter()
+            .filter(|frame| frame["event"] == STREAM_ENDED_EVENT)
+            .count();
+        assert_eq!(labels, 1, "stream {index} read {frames:?}");
+        let last = frames.last().expect("a label");
+        assert_eq!(
+            last["event"], STREAM_ENDED_EVENT,
+            "stream {index}: {frames:?}"
+        );
+        assert_eq!(last["data"]["reason"], "backend-switch");
+        assert!(last.get("revision").is_none(), "{last}");
+    }
+    assert_eq!(h.handler.in_process_streams().count(), 0);
+
+    // A subscribe that lands while the switch is still in flight is
+    // refused rather than handed a stream nothing will ever end.
+    let (mut reader, mut w) = h.dial().await;
+    request(&mut w, 1, ops::EVENTS_SUBSCRIBE, serde_json::json!({})).await;
     let reply = read_frame(&mut reader).await;
-    let result = reply["result"].as_object().expect("result object");
-    assert_eq!(
-        result.keys().collect::<Vec<_>>(),
-        vec!["projects"],
-        "a UI socket's tab.list must carry nothing but projects"
-    );
-    // The typed decode still works, with the field defaulted to absent.
-    let list: TabListResult = serde_json::from_value(reply["result"].clone()).unwrap();
-    assert_eq!(list.revision, None);
+    assert_eq!(reply["error"]["code"], SLOT_UNAVAILABLE_CODE, "{reply}");
+    assert_eq!(reply["error"]["message"], SWITCH_BUSY, "{reply}");
 }
 
 /// A session socket's `tab.list` does carry it, and the response still

@@ -43,6 +43,8 @@ use roost_ipc::socket_state::{self, describe_file_type, SocketState};
 use roost_ipc::target::{TargetError, TargetOrigin, TargetSelector};
 use roost_ipc::{ClientError, IpcClient};
 
+use crate::error::CliError;
+
 /// `IpcClient` has no read/write timeout of its own, so every leg of the
 /// conversation gets one here — "Roost is hung" must render as a failed
 /// check, not a hung doctor.
@@ -343,6 +345,24 @@ impl Report {
     /// status-less observations never change it (plan §3.3).
     pub fn exit_code(&self) -> i32 {
         i32::from(self.checks().any(|c| c.status == Some(Status::Fail)))
+    }
+
+    /// Doctor's outcome once the report is on stdout: a failing check is
+    /// `checks-failed`, carrying [`exit_code`]'s 1 through the one
+    /// renderer every verb shares.
+    ///
+    /// [`exit_code`]: Report::exit_code
+    pub fn verdict(&self) -> Result<i32, CliError> {
+        match self.exit_code() {
+            0 => Ok(0),
+            _ => {
+                let failed = self.summary().fail;
+                let noun = if failed == 1 { "check" } else { "checks" };
+                Err(CliError::ChecksFailed(format!(
+                    "{failed} {noun} failed; the report is on stdout"
+                )))
+            }
+        }
     }
 }
 
@@ -3765,6 +3785,8 @@ mod tests {
             local_session_socket: None,
             local_backend_switch: None,
             persist_error: None,
+            ops: None,
+            instance_id: None,
         }
     }
 
@@ -4557,6 +4579,22 @@ mod tests {
     }
 
     // ---------------------------------------------------------------- tab
+
+    /// Doctor's exit code reaches the caller as `checks-failed` through
+    /// the shared renderer, and only when a check actually failed.
+    #[test]
+    fn a_failing_check_is_the_checks_failed_verdict() {
+        assert_eq!(evaluate(&healthy()).verdict(), Ok(0));
+
+        let failing = evaluate(&Inputs {
+            explicit_tab: Some(999),
+            ..healthy()
+        });
+        let error = failing.verdict().expect_err("tab.selection fails");
+        assert_eq!(error.code(), "checks-failed");
+        assert_eq!(error.exit_code(), failing.exit_code());
+        assert_eq!(error.message(), "1 check failed; the report is on stdout");
+    }
 
     #[test]
     fn a_nonexistent_tab_fails_selection() {

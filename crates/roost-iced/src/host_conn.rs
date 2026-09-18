@@ -2152,8 +2152,8 @@ impl HostConnSet {
         match self.ops(host) {
             Some(ops) => ops.send(intent),
             None => {
-                intent.answer(Err(HostOpError::Unavailable));
-                Err(HostOpError::Unavailable)
+                intent.answer(Err(HostOpError::WorkerGone));
+                Err(HostOpError::WorkerGone)
             }
         }
     }
@@ -2171,8 +2171,8 @@ impl HostConnSet {
         match self.owner_of(incarnation) {
             Some(host) => self.send(&host, intent),
             None => {
-                intent.answer(Err(HostOpError::Unavailable));
-                Err(HostOpError::Unavailable)
+                intent.answer(Err(HostOpError::WorkerGone));
+                Err(HostOpError::WorkerGone)
             }
         }
     }
@@ -3423,13 +3423,24 @@ mod tests {
                     dead,
                     HostIntent::new(ops::TAB_CLOSE, serde_json::json!({})).answering(tx)
                 ),
-                Err(HostOpError::Unavailable)
+                Err(HostOpError::WorkerGone)
             ));
             assert!(
-                matches!(rx.try_recv(), Ok(Err(HostOpError::Unavailable))),
+                matches!(rx.try_recv(), Ok(Err(HostOpError::WorkerGone))),
                 "a refused intent is answered, never dropped on the floor"
             );
         }
+
+        // The same refusal by saved id, for a host with no connection.
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        assert!(matches!(
+            set.send(
+                "h2",
+                HostIntent::new(ops::TAB_CLOSE, serde_json::json!({})).answering(tx)
+            ),
+            Err(HostOpError::WorkerGone)
+        ));
+        assert!(matches!(rx.try_recv(), Ok(Err(HostOpError::WorkerGone))));
     }
 
     /// A failed establish never enters `HostConn` — there is no socket to

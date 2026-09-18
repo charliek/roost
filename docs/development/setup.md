@@ -77,12 +77,14 @@ compiled-in default.
 Without `XDG_RUNTIME_DIR`, Linux falls back to `/tmp/roost-<uid>` and
 `/tmp/roost-iced-<uid>` respectively (and `/tmp/roost-session-<uid>` for
 a session; a debug-build session uses `/tmp/roost-session-dev-<uid>`). Select a live UI with `roostctl --target mac|linux|iced` —
-`session` is deliberately not a `--target` value; drive it with
-`roostctl session start|stop|status`, and reach a running session with
-any other op only via an explicit `roostctl --socket <path>` (see
-[`cli.md`](../reference/cli.md#session-subcommands)). The full table —
-state, locks, logs, and the macOS dev paths for the `linux` profile — is
-in [Paths & Environment](../reference/paths.md).
+auto-detect and `ROOST_BUNDLE_PROFILE` never consider `session`, but
+`--target session` reaches one explicitly (#475). `roostctl session
+start|stop|status` still keep their own pre-connect carve-out, driving
+it directly ahead of all of that; any other op reaches a running
+session via `--target session` or an explicit `roostctl --socket <path>`
+(see [`cli.md`](../reference/cli.md#session-subcommands)). The full
+table — state, locks, logs, and the macOS dev paths for the `linux`
+profile — is in [Paths & Environment](../reference/paths.md).
 
 Each UI writes a log file **and** tees to stdout. The iced UI logs to
 `$XDG_STATE_HOME/roost/roost.log` when it resolves the `linux` profile and

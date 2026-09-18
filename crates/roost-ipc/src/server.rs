@@ -27,7 +27,7 @@ use crate::dataframe::DataFrameReader;
 use crate::framing::{write_frame, FrameReader};
 use crate::messages::{
     AttachHandshake, AttachHandshakeReply, EventEnvelope, RawRequest, Response,
-    SessionStoppingEvent, SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT,
+    SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT, STREAM_ENDED_EVENT,
 };
 use crate::socket_state::{self, SocketState};
 use crate::Error;
@@ -66,9 +66,10 @@ pub trait Handler: Send + Sync + 'static {
     /// served (a foreign uid). Synchronous and on the connection's own
     /// task: whatever a handler does here must not block.
     ///
-    /// The default does nothing. A host session overrides it because
-    /// "this connection went away" is a fact no request can report — the
-    /// client that would have sent it is the one that vanished.
+    /// The default does nothing. The engine's handler overrides it — for
+    /// a host session's registry and a UI socket's in-process streams —
+    /// because "this connection went away" is a fact no request can
+    /// report: the client that would have sent it is the one that vanished.
     fn connection_ended(&self, conn_id: u64) {
         let _ = conn_id;
     }
@@ -113,14 +114,18 @@ pub trait Handler: Send + Sync + 'static {
 pub enum CloseReason {
     /// The session is stopping.
     ShuttingDown,
+    /// The UI is switching its local backend, so an in-process stream
+    /// would go on reading a workspace that is about to be hidden.
+    BackendSwitch,
 }
 
 impl CloseReason {
-    /// The `reason` a push connection's [`SESSION_STOPPING_EVENT`]
-    /// envelope carries. The published vocabulary is exactly `"stop"`.
-    pub fn stopping_reason(self) -> &'static str {
+    /// The terminal envelope a push connection closed for this reason
+    /// writes last: its event name and its `data.reason`.
+    pub fn push_envelope(self) -> (&'static str, &'static str) {
         match self {
-            CloseReason::ShuttingDown => "stop",
+            CloseReason::ShuttingDown => (SESSION_STOPPING_EVENT, "stop"),
+            CloseReason::BackendSwitch => (STREAM_ENDED_EVENT, "backend-switch"),
         }
     }
 
@@ -129,9 +134,14 @@ impl CloseReason {
     /// No caller in this crate: the frame is written by whatever
     /// overrides [`Handler::handle_data`] (the engine), and the
     /// vocabulary lives here so both ends read it from one place.
+    ///
+    /// A UI socket serves no data connections, so [`Self::BackendSwitch`]
+    /// never reaches one today; it names the code a switch already
+    /// refuses a UI socket's ops with.
     pub fn error_code(self) -> &'static str {
         match self {
             CloseReason::ShuttingDown => "shutting-down",
+            CloseReason::BackendSwitch => crate::local_route::SLOT_UNAVAILABLE_CODE,
         }
     }
 }
@@ -953,9 +963,10 @@ async fn serve_data<H: Handler>(
 /// with it; a write failure, a stalled write, or an exhausted source
 /// aborts the reader.
 ///
-/// The third way it ends is the server closing it (a stop): the peer
-/// gets one final labeled control envelope, best-effort under
-/// [`CLOSE_LABEL_DEADLINE`], and then the connection goes away.
+/// The third way it ends is the server closing it (a stop, or a UI's
+/// backend switch): the peer gets one final labeled control envelope,
+/// best-effort under [`CLOSE_LABEL_DEADLINE`], and then the connection
+/// goes away.
 async fn serve_push(
     mut reader: FrameReader<tokio::net::unix::OwnedReadHalf>,
     mut w: tokio::net::unix::OwnedWriteHalf,
@@ -970,7 +981,7 @@ async fn serve_push(
         // event, a simultaneous EOF), or a closing client could keep
         // receiving batches — or lose its label — on a coin flip.
         if let Some(reason) = close_watch.reason() {
-            write_stopping_envelope(&mut w, reason).await;
+            write_terminal_envelope(&mut w, reason).await;
             break Ok(());
         }
         tokio::select! {
@@ -981,7 +992,7 @@ async fn serve_push(
             // label on a coin flip.
             biased;
             reason = close_watch.closed() => {
-                write_stopping_envelope(&mut w, reason).await;
+                write_terminal_envelope(&mut w, reason).await;
                 break Ok(());
             }
             _ = &mut eof => break Ok(()),
@@ -1031,7 +1042,7 @@ async fn serve_push(
                     };
                     match (wrote, close_reason) {
                         (Some(Ok(())), Some(reason)) => {
-                            write_stopping_envelope(&mut w, reason).await;
+                            write_terminal_envelope(&mut w, reason).await;
                             break Ok(());
                         }
                         (Some(Ok(())), None) => {}
@@ -1069,27 +1080,23 @@ async fn serve_push(
 /// made this write impossible once the socket buffer filled, and EOF is
 /// then the only signal it gets — so a failure here is logged, never
 /// propagated.
-async fn write_stopping_envelope(w: &mut tokio::net::unix::OwnedWriteHalf, reason: CloseReason) {
-    let encoded = serde_json::to_value(SessionStoppingEvent {
-        reason: reason.stopping_reason().to_string(),
-    })
-    .and_then(|data| {
-        serde_json::to_vec(&EventEnvelope {
-            event: SESSION_STOPPING_EVENT.to_string(),
-            data,
-        })
+async fn write_terminal_envelope(w: &mut tokio::net::unix::OwnedWriteHalf, reason: CloseReason) {
+    let (event, label) = reason.push_envelope();
+    let encoded = serde_json::to_vec(&EventEnvelope {
+        event: event.to_string(),
+        data: serde_json::json!({ "reason": label }),
     });
     let body = match encoded {
         Ok(b) => b,
         Err(e) => {
-            warn!(error = %e, "stopping envelope failed to serialize");
+            warn!(error = %e, "terminal envelope failed to serialize");
             return;
         }
     };
     match tokio::time::timeout(CLOSE_LABEL_DEADLINE, write_frame(w, &body)).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => debug!(error = %e, "stopping envelope could not be written; closing anyway"),
-        Err(_) => debug!("stopping envelope stalled past its deadline; closing anyway"),
+        Ok(Err(e)) => debug!(error = %e, "terminal envelope could not be written; closing anyway"),
+        Err(_) => debug!("terminal envelope stalled past its deadline; closing anyway"),
     }
 }
 

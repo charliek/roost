@@ -112,6 +112,8 @@ From inside a Roost tab:
 roostctl notify --title "Build done" --body "tests pass"
 ```
 
+That works because every Roost tab sets `ROOST_TAB_ID`; without it or `--tab`, `notify` exits 2 rather than guess ([why](../reference/cli.md#which-tab-a-command-acts-on)).
+
 From outside Roost, target a specific tab:
 
 ```bash

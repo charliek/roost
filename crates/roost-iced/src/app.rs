@@ -2520,6 +2520,9 @@ pub struct App {
     /// What the IPC handler answers `identify` from. Written only by
     /// [`Self::publish_local_route`].
     local_route: Arc<LocalBackendCell>,
+    /// The IPC socket's in-process event streams, which a local-backend
+    /// switch ends.
+    in_process_streams: Arc<roost_engine::ipc::InProcessStreams>,
     /// The local-backend switch in flight (plan 063 §D8), or `None`.
     /// [`local_backend::SwitchState::Idle`] is spelled as the absence of
     /// a run, so nothing can be mid-phase with no phase data.
@@ -2931,6 +2934,7 @@ impl App {
             local_backend::SlotSelection::default(),
             local_backend::SwitchState::Idle,
         )));
+        let test_mode = std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1");
         let handler = IpcHandler::new(
             Arc::clone(&workspace),
             Arc::clone(&supervisor),
@@ -2939,7 +2943,9 @@ impl App {
             profile.app_id,
         )
         .with_ui(ui_tx)
-        .with_local_route(Arc::clone(&local_route));
+        .with_local_route(Arc::clone(&local_route))
+        .with_test_mode(test_mode);
+        let in_process_streams = handler.in_process_streams();
         let server = runtime
             .block_on(IpcServer::bind(&profile.socket_path, handler))
             .context("bind Iced IPC server")?;
@@ -2949,7 +2955,6 @@ impl App {
             }
         });
 
-        let test_mode = std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1");
         let mut app = Self {
             workspace,
             // The engine keeps its direct supervisor reference (the
@@ -2997,6 +3002,7 @@ impl App {
             config,
             local_backend: backend_mode,
             local_route,
+            in_process_streams,
             switch: None,
             pending_migration,
             pending_dest_cleanup: resumed.delete_dest,
@@ -3561,27 +3567,43 @@ impl App {
         for failure in &done.outcome.errors {
             tracing::warn!(agent = %failure.agent, error = %failure.error, "agent hooks");
         }
+        let key = done
+            .key
+            .to_config_value()
+            .unwrap_or_else(|| "ask".to_string());
+        // The key is taken **whatever the ticket says**, and whether or
+        // not the run failed after it (#491). This message exists only
+        // for an apply that got past `set_hooks`' first step, which
+        // writes the key and fails the whole run if it cannot — so the
+        // file holds `done.key`, and the running UI's copy has to say the
+        // same or every later fallback read answers with something that
+        // is not on disk. Dropping a superseded one because "the newer
+        // apply already wrote the file" assumes the newer apply *lands*;
+        // it may yet refuse without writing anything (a `config.lock` it
+        // never gets), and then the newest thing on disk is this one.
+        // Ordering is safe to lean on: one worker drains the queue and
+        // one FIFO feed carries the answers, so results arrive in ticket
+        // order and the last key taken is the last key written.
+        self.config.agent_hooks = done.key;
+        if let Some(error) = done.error {
+            // Its caller was already answered with this error; the log
+            // is for a dialog nobody was watching. Nothing was wired, so
+            // there is no receipt.
+            tracing::warn!(
+                ticket = done.ticket,
+                key,
+                %error,
+                "agent.set_hooks failed after writing the key"
+            );
+            return;
+        }
         tracing::info!(
             ticket = done.ticket,
-            key = %done.key.to_config_value().unwrap_or_else(|| "ask".to_string()),
+            key,
             unannounced = done.unnoticed.len(),
             errors = done.outcome.errors.len(),
             "agent.set_hooks applied"
         );
-        // The key is taken **whatever the ticket says**. This message
-        // exists only for an apply that got past `set_hooks`' first
-        // step, which writes the key and fails the whole run if it
-        // cannot — so the file holds `done.key`, and the running UI's
-        // copy has to say the same or every later fallback read answers
-        // with something that is not on disk. Dropping a superseded one
-        // because "the newer apply already wrote the file" assumes the
-        // newer apply *lands*; it may yet refuse without writing
-        // anything (a `config.lock` it never gets), and then the newest
-        // thing on disk is this one. Ordering is safe to lean on: one
-        // worker drains the queue and one FIFO feed carries the answers,
-        // so results arrive in ticket order and the last key taken is
-        // the last key written.
-        self.config.agent_hooks = done.key;
         // The receipt is the opposite rule (#490): it answers the user's
         // latest gesture, so a choice they have already replaced says
         // nothing. The `agent_hooks_surveyed` rule, for the same reason.

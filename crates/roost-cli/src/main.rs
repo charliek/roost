@@ -8,18 +8,21 @@
 //!   roostctl notify --title TITLE [--body BODY] [--tab ID]
 //!   roostctl set-title --title TITLE [--tab ID]
 //!   roostctl identify
+//!   roostctl wait [--tab ID] {--state S | --text T | --gone} [--timeout SECS | --no-timeout]
+//!   roostctl events [--tab ID]
 //!   roostctl tab focus [--tab ID]
-//!   roostctl tab list [--json]
+//!   roostctl tab list
 //!   roostctl tab set-state --state STATE [--tab ID]
 //!   roostctl tab open --project-id N [--cwd …] [--after-tab ID] [--focus] [--hold] [-- <cmd…>]
 //!   roostctl tab close [--tab ID]
 //!   roostctl tab send [--tab ID] --bytes 'echo hi\n' [--raw]
 //!   roostctl tab send [--tab ID] --bytes-base64 BASE64
-//!   roostctl tab send-file --tab ID PATH… [--json]
+//!   roostctl tab send-file --tab ID PATH…
 //!   roostctl tab resize [--tab ID] --cols N --rows N
 //!   roostctl tab reorder --project-id N --order id1,id2,id3
 //!   roostctl tab clear-notification [--tab ID]
-//!   roostctl project {list,create,rename,delete,reorder}
+//!   roostctl project {list,create,ensure,rename,delete,reorder}
+//!   roostctl open --project NAME [--cwd …] [--title T] [--focus] [--hold] [-- <cmd…>]
 //!   roostctl palette {open,state,query,activate,dismiss}
 //!   roostctl screenshot [--out PATH] [--scale 1|2]
 //!   roostctl render-stats [--reset]
@@ -31,31 +34,46 @@
 //!   roostctl session {start,stop,status}
 //!   roostctl host {add,list,remove,connect,disconnect}
 //!     add: --label, --target, [--verify]; the last three: --id
+//!   roostctl rpc <op> [params]
+//!   roostctl skill
+//!
+//! `--json` is global: every verb but the two hooks prints one JSON
+//! document with it, and every failure goes through [`CliError`]'s one
+//! renderer. `[--tab ID]` falls back to `ROOST_TAB_ID`; a verb in
+//! [`MUTATING_TAB_VERBS`] refuses without either.
 //!
 //! Target selection (which UI socket to dial):
 //!   --socket PATH           (highest precedence)
 //!   ROOST_SOCKET env var
-//!   --target {mac,linux,iced} (resolves to that profile's canonical socket)
-//!   ROOST_BUNDLE_PROFILE    (same effect as --target)
-//!   auto-detect             (probes all distinct paths; fails on ambiguity)
+//!   --target {mac,linux,iced,session} (resolves to that profile's canonical socket)
+//!   ROOST_BUNDLE_PROFILE    (same effect as --target, `mac`/`linux`/`iced` only)
+//!   auto-detect             (probes all distinct UI paths; fails on ambiguity)
 //!
-//! See `crates/roost-ipc/src/target.rs` for resolution logic. The
-//! headless session is **not** a target on that ladder: `session …`
-//! addresses its socket directly (see [`session`]), and a generic op
-//! reaches a session only through an explicit `--socket`.
+//! See `crates/roost-ipc/src/target.rs` for resolution logic. `session`
+//! is explicit-only (#475): it never rides `ROOST_BUNDLE_PROFILE` and
+//! auto-detect never probes its socket. `session start|stop|status`
+//! (see [`session`]) still bypass this ladder entirely and address the
+//! session profile's socket directly, since `start` must work when
+//! nothing is listening yet. Any other op reaches a session either via
+//! `--target session` or an explicit `--socket`.
 
 mod agent_install;
 mod doctor;
+mod error;
+mod events;
 mod host;
 mod session;
+mod wait;
 
+use std::ffi::OsString;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
 use base64::prelude::*;
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 use roost_agent::claude::{canonical_hook_event, claude_event_to_reports};
 use roost_agent::hook::{self, hook_payload, parse_tab_id, payload_event_name};
@@ -67,18 +85,53 @@ use roost_ipc::messages::{
     AppRenderStatsParams, AppRenderStatsResult, IdentifyParams, IdentifyResult,
     NotificationCreateParams, PaletteActivateParams, PaletteItemView, PaletteOpenParams,
     PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateResult,
-    ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectRenameParams,
-    ProjectReorderParams, ScreenshotParams, ScreenshotResult, TabClearNotificationParams,
-    TabCloseParams, TabDumpParams, TabDumpResult, TabFocusParams, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams, TabSendFileResult,
-    TabSetStateParams, TabSetTitleParams, TabState, TabWriteParams, WireProjectRef, WireTabRef,
+    ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectEnsureParams,
+    ProjectEnsureResult, ProjectRenameParams, ProjectReorderParams, ScreenshotParams,
+    ScreenshotResult, TabClearNotificationParams, TabCloseParams, TabDumpParams, TabDumpResult,
+    TabFocusParams, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
+    TabSendFileParams, TabSendFileResult, TabSetStateParams, TabSetTitleParams, TabState,
+    TabWriteParams, WireProjectRef, WireTabRef,
 };
 use roost_ipc::paths::BundleProfileKind;
 use roost_ipc::session_launch::timeout_scale;
-use roost_ipc::target::{ResolvedTarget, TargetError, TargetSelector};
+use roost_ipc::target::TargetSelector;
 use roost_ipc::IpcClient;
 
+use crate::error::CliError;
+
 const CLIENT_NAME: &str = "roostctl";
+
+/// The verbs that change a tab, spelled the way a user types them.
+///
+/// Each takes its tab from `--tab` or `ROOST_TAB_ID` and otherwise exits
+/// 2 `usage` before dialling ([`require_tab`]): the UI's active tab is
+/// whatever a person last clicked, which is no answer for a command that
+/// writes to it. The read-only `tab dump` and `wait` keep that fallback
+/// ([`active_tab`]).
+///
+/// `tab send-file` is not listed because clap itself requires its
+/// `--tab`. Neither are `agent-hook` and `claude-hook`: they take no
+/// `--tab`, and the id their reports carry in the payload comes from
+/// `ROOST_TAB_ID` alone — a hook without one sends nothing and still
+/// answers `{}`.
+const MUTATING_TAB_VERBS: &[&str] = &[
+    "notify",
+    "set-title",
+    "tab set-state",
+    "tab clear-notification",
+    "tab close",
+    "tab send",
+    "tab resize",
+    "tab focus",
+];
+
+/// The agent skill `roostctl skill` prints: the repo's `skills/roost/SKILL.md`,
+/// which the Claude Code plugin and `npx skills add` also install, so the
+/// binary and the published skill cannot disagree.
+const SKILL: &str = include_str!("../../../skills/roost/SKILL.md");
+
+const NO_TAB: &str = "no --tab and ROOST_TAB_ID is unset; refusing to guess the active tab for \
+                      a command that changes it — `roostctl tab list` shows ids";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -89,11 +142,21 @@ const CLIENT_NAME: &str = "roostctl";
                   Bare tab and project ids mean whichever backend the UI \
                   runs its own tabs on. With `local-backend = session` the \
                   UI hands those ops to the local `roost-session` and \
-                  answers with the session's reply, so `--tab 7` and the \
-                  no-flag active tab both name a session tab; `--tab \
-                  h<n>.<id>` still names a saved host's tab and is never \
-                  re-addressed. `roostctl identify` prints the backend and \
-                  the session socket."
+                  answers with the session's reply, so `--tab 7` names a \
+                  session tab, and so does the active tab `tab dump` and \
+                  `wait` fall back to; `--tab h<n>.<id>` still names a saved \
+                  host's tab and is never re-addressed. `roostctl identify` \
+                  prints the backend and the session socket.\n\n\
+                  A command that changes a tab (notify, set-title, tab \
+                  set-state, tab clear-notification, tab close, tab send, \
+                  tab resize, tab focus) needs --tab or ROOST_TAB_ID, which \
+                  every Roost tab sets; without either it exits 2.\n\n\
+                  Exit codes: 0 ok, 1 failed, 2 usage, 3 `session status` \
+                  found no session, 4 `wait` timed out. A failure prints \
+                  `roostctl: <code>: <message>` on stderr, or \
+                  {\"error\":{\"code\",\"message\"}} under --json.",
+    after_help = "Driving Roost from an agent? `roostctl skill` prints the skill; \
+                  docs: https://charliek.github.io/roost/guides/automation/"
 )]
 struct Args {
     /// Explicit socket path. Highest precedence; overrides
@@ -104,9 +167,19 @@ struct Args {
     /// Which Roost UI to talk to when auto-detect would otherwise
     /// be ambiguous. `--socket` and `ROOST_SOCKET` both win over
     /// this; passing `--target` short-circuits the auto-detect
-    /// probe so the call is also faster when you know.
+    /// probe so the call is also faster when you know. `session`
+    /// addresses a headless `roost-session` daemon and is explicit
+    /// only: auto-detect never probes it and `ROOST_BUNDLE_PROFILE`
+    /// does not accept it — only `--target session` (or `--socket`
+    /// pointed at its path) reaches one (#475).
     #[arg(long, value_enum)]
     target: Option<TargetArg>,
+
+    /// Print the result as one JSON document on stdout, and a failure as
+    /// `{"error":{"code","message"}}` on stderr. Accepted before or after
+    /// the subcommand. `agent-hook` and `claude-hook` ignore it.
+    #[arg(long, global = true)]
+    json: bool,
 
     #[command(subcommand)]
     command: Cmd,
@@ -117,6 +190,11 @@ enum TargetArg {
     Mac,
     Linux,
     Iced,
+    /// The headless `roost-session` daemon (#475). Explicit only —
+    /// unlike the other three, this value has no `ROOST_BUNDLE_PROFILE`
+    /// equivalent and is never a candidate for auto-detect; naming it
+    /// here is the only way in besides `--socket`.
+    Session,
 }
 
 impl From<TargetArg> for BundleProfileKind {
@@ -125,6 +203,7 @@ impl From<TargetArg> for BundleProfileKind {
             TargetArg::Mac => BundleProfileKind::Mac,
             TargetArg::Linux => BundleProfileKind::Linux,
             TargetArg::Iced => BundleProfileKind::Iced,
+            TargetArg::Session => BundleProfileKind::Session,
         }
     }
 }
@@ -132,60 +211,77 @@ impl From<TargetArg> for BundleProfileKind {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Fire a notification on a tab.
+    ///
+    /// Needs `--tab` or `ROOST_TAB_ID`: it never falls back to the UI's
+    /// active tab.
     Notify {
         #[arg(long)]
         title: String,
         #[arg(long, default_value = "")]
         body: String,
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
+        #[arg(long)]
         tab: Option<i64>,
     },
     /// Rename a tab (locks it from OSC overwrites).
+    ///
+    /// Needs `--tab` or `ROOST_TAB_ID`: it never falls back to the UI's
+    /// active tab.
     SetTitle {
         #[arg(long)]
         title: String,
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
+        #[arg(long)]
         tab: Option<i64>,
     },
     /// Print the running UI's identity (socket, pid, active tab,
     /// version).
     Identify,
     /// Block until a tab reaches a condition, then exit 0 — the
-    /// no-`sleep` synchronization primitive for scripts + tests. Polls
-    /// the running UI on an interval (event-driven `events.subscribe` is
-    /// a planned upgrade behind this same interface). Exits non-zero if
-    /// `--timeout` elapses first. At least one of `--state` / `--text` /
-    /// `--gone` is required; when several are given, all must hold.
-    Wait {
-        #[arg(long, env = "ROOST_TAB_ID")]
-        tab: Option<i64>,
-        /// Wait until the tab's agent state equals this.
-        #[arg(long, value_parser = ["none", "running", "needs_input", "idle"])]
-        state: Option<String>,
-        /// Wait until the tab's terminal viewport (via `tab.dump`)
-        /// contains this substring — e.g. a command's expected output.
-        /// Note: the shell echoes the command you `tab send`, so pick a
-        /// needle that appears in the OUTPUT, not in the command text
-        /// itself (else it matches immediately).
+    /// no-`sleep` synchronization primitive for scripts and tests. At least
+    /// one of `--state` / `--text` / `--gone` is required; when several are
+    /// given, all must hold. Exits 4 (`timeout`) if `--timeout` elapses
+    /// first.
+    ///
+    /// Event-driven where the tabs' socket streams its events: an
+    /// in-process UI, or the local session `identify` names under
+    /// `local-backend = session`. `--text` also re-reads the viewport every
+    /// `--interval-ms`, since no event carries a tab's output. Against a
+    /// server with no stream (the Mac app, an older Roost) it polls at
+    /// `--interval-ms` instead. A lost stream is resolved again once, and
+    /// the wait carries on only if the same process answers: tab ids do not
+    /// carry across a local-backend switch or a restart, so either exits 1
+    /// (`connection`), as do a second loss and a session that stops.
+    ///
+    /// `--json` prints `tab_id`, `satisfied` (`state`, `text` and `gone`,
+    /// each `null` unless its flag was given) and `after_ms`.
+    Wait(wait::Args),
+    /// Print the event stream, one JSON line per event, until it ends.
+    ///
+    /// Each line is an event envelope, `{"event","data","revision"}` —
+    /// the events of one commit share a `revision`, in order, and a commit
+    /// with no events prints nothing. The stream's last line is its
+    /// terminal envelope, `session.stopping` or `stream.ended` (no
+    /// `revision`), and then it exits 0. A stream that drops or skips a
+    /// revision exits 1 (`connection`); a server that does not serve the
+    /// stream (the Mac app, an older Roost) exits 1 with its own refusal.
+    /// Always JSON, with or without `--json`.
+    ///
+    /// Reads the same source `wait` does: the UI's in-process stream, or
+    /// the local session under `local-backend = session`.
+    Events {
+        /// Print only the events that name this tab (a bare id). Takes no
+        /// default from `$ROOST_TAB_ID`: without it every event prints.
         #[arg(long)]
-        text: Option<String>,
-        /// Wait until the tab no longer exists (closed).
-        #[arg(long, default_value_t = false)]
-        gone: bool,
-        /// Give up after this many seconds.
-        #[arg(long, default_value_t = 5.0)]
-        timeout: f64,
-        /// Poll interval in milliseconds.
-        #[arg(long, default_value_t = 100)]
-        interval_ms: u64,
+        tab: Option<String>,
     },
     /// Tab subcommands.
     ///
-    /// A bare `--tab` (and the active tab used when the flag is
-    /// omitted) names a tab on whichever backend the UI runs its own
-    /// tabs on — see `roostctl --help`. `events.subscribe` is not
-    /// served on a UI socket either way; a client that wants the event
-    /// stream dials `identify`'s `local_session_socket`.
+    /// A bare `--tab` (and the active tab `tab dump` falls back to when
+    /// the flag and `ROOST_TAB_ID` are both absent) names a tab on
+    /// whichever backend the UI runs its own tabs on — see `roostctl
+    /// --help`. Every verb here that changes a tab needs `--tab` or
+    /// `ROOST_TAB_ID` and exits 2 without either.
     #[command(subcommand)]
     Tab(TabCmd),
     /// Project subcommands.
@@ -194,6 +290,59 @@ enum Cmd {
     /// `local-backend = session` they are the local session's projects.
     #[command(subcommand)]
     Project(ProjectCmd),
+    /// Find-or-create a project by exact name, then open a tab in it —
+    /// `project.ensure` followed by `tab.open` (plan 066 §3.2). The
+    /// one-shot verb an agent skill reaches for instead of composing
+    /// `project list` + `project create` by hand, which races another
+    /// caller doing the same thing (#221): the two calls this makes are
+    /// **not atomic** with each other, but each is atomic on the server,
+    /// so two concurrent `open`s with the same `--project` converge on
+    /// one project either way.
+    ///
+    /// Always prints `{"project","tab","created"}` — the ensured
+    /// project, the opened tab, and whether the project was just
+    /// created — with or without `--json`: this is an agent verb, not a
+    /// human-typed one. `--cwd` defaults to `$PWD`, for both the ensure
+    /// and the open. Without `-- cmd…` the tab opens the default shell,
+    /// same as `tab open`; `--hold` and `--focus` compose exactly as
+    /// they do there — `--focus` runs a follow-up `tab.focus` and
+    /// nothing else ever does, so a caller that didn't ask never steals
+    /// the window.
+    ///
+    /// Refuses `unsupported` (exit 1) against a server whose
+    /// `identify.ops` doesn't list `project.ensure` — the Mac app today
+    /// — naming the manual route (`project list --json` +
+    /// `tab open --project-id`) rather than falling back to it itself,
+    /// which would reopen the same race. Refuses `usage` (exit 2) while
+    /// `identify.local_backend_switch` shows a switch in progress: the
+    /// project set is mid-flight, so a name resolved against it may not
+    /// hold. A `not-found` from the `tab.open` half (the project vanished
+    /// between the two calls — a switch landing in that window, say)
+    /// reaches the caller as the server's own refusal, unchanged.
+    Open {
+        /// The project's exact name. Created at `--cwd` if no project
+        /// has it; found otherwise.
+        #[arg(long)]
+        project: String,
+        /// Working directory for both the ensured project (if created)
+        /// and the new tab. Defaults to `$PWD`.
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long, default_value = "roostctl")]
+        title: String,
+        /// Focus (activate) the new tab after opening.
+        #[arg(long, default_value_t = false)]
+        focus: bool,
+        /// Keep the tab open after the command exits, dropping to an
+        /// interactive shell (mirrors `tab open --hold`). Only
+        /// meaningful with a command.
+        #[arg(long, default_value_t = false)]
+        hold: bool,
+        /// Command + args to run in the tab, after `--`. Empty ⇒ the
+        /// default shell.
+        #[arg(last = true)]
+        argv: Vec<String>,
+    },
     /// Command-palette subcommands: drive the overlay (open, inspect,
     /// filter, activate a row, dismiss). Activating a row runs the same
     /// command its keybind would — so this is also a command-dispatch
@@ -202,7 +351,8 @@ enum Cmd {
     Palette(PaletteCmd),
     /// Capture a PNG of the running UI's whole window (sidebar, tabs,
     /// active terminal), rendered in-process. Writes to `--out` if
-    /// given, otherwise raw PNG bytes to stdout.
+    /// given, otherwise raw PNG bytes to stdout. `--json` needs `--out`
+    /// and prints `{"out","bytes"}`.
     Screenshot {
         /// File to write the PNG to. Omit to stream raw bytes to stdout.
         #[arg(long)]
@@ -284,23 +434,48 @@ enum Cmd {
     /// session daemon's own workspace.
     #[command(subcommand)]
     Host(host::HostCmd),
+    /// Call an op directly, by name: `roostctl rpc tab.list`,
+    /// `roostctl rpc tab.write '{"tab_id":"4","data":"bHM="}'`. `params`
+    /// is a JSON object literal, or `-` to read one from stdin; omitted
+    /// ⇒ `{}`. Always prints the result as one JSON document, with or
+    /// without `--json`; a failure goes through the same
+    /// `roostctl: <code>: <message>` / `{"error":…}` envelope as every
+    /// other verb, and an op this socket does not serve answers the
+    /// server's own `unknown-op` verbatim.
+    ///
+    /// Bypasses the target policy [`MUTATING_TAB_VERBS`] enforces on the
+    /// named verbs, and does not read `ROOST_TAB_ID`: the caller writes
+    /// ids straight into `params`, so there is no `--tab` for this verb
+    /// to resolve — and it is **not** a way around `--tab` for a verb
+    /// that needs it; that verb stays the named one.
+    Rpc {
+        /// The op name, passed through verbatim (e.g. `tab.list`).
+        op: String,
+        /// The op's params as a JSON object, or `-` to read them from
+        /// stdin. Omitted ⇒ `{}`.
+        params: Option<String>,
+    },
+    /// Print the agent skill: the `SKILL.md` that teaches a coding agent
+    /// to drive Roost with this CLI, byte for byte as the plugin installs
+    /// it. Needs no running Roost. `--json` prints
+    /// `{"topic":"roost","format":"markdown","content"}`.
+    Skill,
     /// Diagnose the Roost integration: target resolution, socket, UI
     /// identity, shell-integration contract, the selected tab's four
     /// agent axes, and the Claude hook install. Read-only — it reports
-    /// and links, it never repairs. Exits 1 if any check fails.
+    /// and links, it never repairs. Exits 1 (`checks-failed`) if any
+    /// check fails; the report is on stdout either way.
     Doctor {
         /// Inspect this tab instead of `$ROOST_TAB_ID` / the UI's active
         /// tab.
-        ///
-        /// Deliberately NOT `env = "ROOST_TAB_ID"` like every other
-        /// per-tab command: clap would turn an unparseable env value
-        /// into exit 2 instead of a diagnostic, and erase the difference
-        /// between "the user passed --tab" and "clap read the env".
-        /// Doctor reads the env var itself.
+        //
+        // Doctor reads the env var itself rather than through
+        // [`named_tab`] like every other per-tab command: that turns an
+        // unparseable value into exit 2 where doctor owes a diagnostic,
+        // and erases the difference between "the user passed --tab" and
+        // "the env named a tab".
         #[arg(long)]
         tab: Option<i64>,
-        #[arg(long, default_value_t = false)]
-        json: bool,
         /// Print the full per-check report instead of one line per
         /// section. Ignored by `--json`, which always carries everything.
         #[arg(short, long, default_value_t = false)]
@@ -332,6 +507,32 @@ enum ProjectCmd {
         #[arg(long, default_value = "")]
         cwd: String,
     },
+    /// Find the project with this exact name, or create it at `--cwd` —
+    /// atomic on the server, so two callers racing the same name
+    /// converge on one project (#221) rather than each creating their
+    /// own. Never activates it. `--cwd` defaults to `$PWD`: the op needs
+    /// a directory on the create path, and this verb always sends one
+    /// rather than leaving it to the server's "caller already knows this
+    /// project exists" omission.
+    ///
+    /// Always prints `{"project","created"}` — the wire result — with or
+    /// without `--json`: `project create`/`rename`/`delete`/`reorder`
+    /// print nothing without the flag, so there is no single human form
+    /// this verb could match instead.
+    ///
+    /// Refuses `unsupported` (exit 1) against a server whose
+    /// `identify.ops` doesn't list `project.ensure` — the Mac app today
+    /// — naming the manual route (`project list --json` + `project
+    /// create`) rather than racing it with a list-then-create fallback.
+    Ensure {
+        /// The project's exact name.
+        #[arg(long)]
+        name: String,
+        /// Working directory to create the project at, if it doesn't
+        /// already exist. Defaults to `$PWD`.
+        #[arg(long)]
+        cwd: Option<String>,
+    },
     /// Rename a project.
     Rename {
         #[arg(long)]
@@ -357,9 +558,11 @@ enum ProjectCmd {
 #[derive(Subcommand, Debug)]
 enum TabCmd {
     /// Focus a tab. `--tab` takes a bare id, or the `h<host>.<id>`
-    /// spelling to select (and attach) a connected host's tab.
+    /// spelling to select (and attach) a connected host's tab. Needs
+    /// `--tab` or `ROOST_TAB_ID`.
     Focus {
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
+        #[arg(long)]
         tab: Option<String>,
     },
     /// Send local files to a tab: upload them to the tab's host and
@@ -379,19 +582,15 @@ enum TabCmd {
         tab: String,
         #[arg(required = true)]
         paths: Vec<PathBuf>,
-        #[arg(long, default_value_t = false)]
-        json: bool,
     },
     /// List projects + their tabs. `--json` emits the machine-readable
     /// workspace snapshot (the `tab.list` result) instead of plain text.
     ///
-    /// Never carries a `revision`: that fence only means something on a
-    /// socket that also serves the event stream, which a UI socket does
-    /// not — including when the answer came from the local session.
-    List {
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
+    /// Carries `revision` exactly where the socket also serves the event
+    /// stream it fences: a UI running its tabs in-process does, and a UI
+    /// under `local-backend = session` does not, though its answer came
+    /// from the local session.
+    List,
     /// Set the tab's agent-lifecycle axis by claiming ownership as
     /// `manual` (plan 002 §3.7). This **supersedes a live agent's
     /// ownership** — if Claude (or another agent) currently owns the
@@ -410,11 +609,15 @@ enum TabCmd {
         /// with that lifecycle.
         #[arg(long, value_parser = ["none", "running", "needs_input", "idle"])]
         state: String,
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
+        #[arg(long)]
         tab: Option<i64>,
     },
+    /// Clear a tab's pending notification. Needs `--tab` or
+    /// `ROOST_TAB_ID`.
     ClearNotification {
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
+        #[arg(long)]
         tab: Option<i64>,
     },
     /// Open a new tab in the given project. `--cwd` defaults to
@@ -456,9 +659,10 @@ enum TabCmd {
         argv: Vec<String>,
     },
     /// Close a tab. The UI closes the PTY (if live) and emits
-    /// `tab.closed`.
+    /// `tab.closed`. Needs `--tab` or `ROOST_TAB_ID`.
     Close {
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
+        #[arg(long)]
         tab: Option<i64>,
     },
     /// Write bytes into a tab's PTY without attaching a
@@ -467,9 +671,11 @@ enum TabCmd {
     /// `not-found` otherwise. `--bytes` is treated as a
     /// Rust-style escaped string (`\n`, `\r`, `\t`, `\x1b`, etc.)
     /// unless `--raw` is set. For binary fidelity (arbitrary
-    /// bytes, not UTF-8) use `--bytes-base64` instead.
+    /// bytes, not UTF-8) use `--bytes-base64` instead. Needs `--tab` or
+    /// `ROOST_TAB_ID`.
     Send {
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
+        #[arg(long)]
         tab: Option<i64>,
         #[arg(
             long,
@@ -486,10 +692,11 @@ enum TabCmd {
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
-    /// Resize a tab's PTY. Same constraint as `tab send` —
-    /// needs an existing live PTY.
+    /// Resize a tab's PTY. Same constraints as `tab send` —
+    /// needs an existing live PTY, and `--tab` or `ROOST_TAB_ID`.
     Resize {
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
+        #[arg(long)]
         tab: Option<i64>,
         #[arg(long)]
         cols: u32,
@@ -503,11 +710,9 @@ enum TabCmd {
     /// `h<host>.<id>` spelling of an attached host tab's client-side
     /// terminal (host-sessions §3.4).
     Dump {
-        #[arg(long, env = "ROOST_TAB_ID")]
+        /// The tab. Defaults to `$ROOST_TAB_ID`, then the UI's active tab.
+        #[arg(long)]
         tab: Option<String>,
-        /// Emit the structured JSON result instead of plain text rows.
-        #[arg(long, default_value_t = false)]
-        json: bool,
         /// History rows above the viewport to include. Printed before
         /// the viewport rows with no separator, so `| grep` keeps
         /// working over the larger window. Server-side clamped, so
@@ -541,20 +746,13 @@ enum PaletteCmd {
         /// `custom`, or `agents`.
         #[arg(long, default_value = "commands")]
         kind: String,
-        #[arg(long, default_value_t = false)]
-        json: bool,
     },
     /// Print the current palette state (open?, frame, query, rows).
-    State {
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
+    State,
     /// Set the current frame's filter (as if typed), print the result.
     Query {
         /// The filter text.
         query: String,
-        #[arg(long, default_value_t = false)]
-        json: bool,
     },
     /// Activate the row with this item id — the same dispatch as its
     /// keybind. Errors `not-found` if no palette is open or no row
@@ -563,14 +761,9 @@ enum PaletteCmd {
         /// The item id (a KeybindAction id like `new_tab`, or a sub-frame
         /// row id like a theme name).
         id: String,
-        #[arg(long, default_value_t = false)]
-        json: bool,
     },
     /// Dismiss any open palette.
-    Dismiss {
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
+    Dismiss,
     /// Present a caller-supplied list and block until the user picks a
     /// row or dismisses, then print the chosen id (nothing on dismiss).
     /// Items come from `--items <json>` or stdin: a JSON array
@@ -585,13 +778,11 @@ enum PaletteCmd {
         /// The items JSON. When omitted, read from stdin (dmenu-style).
         #[arg(long)]
         items: Option<String>,
-        #[arg(long, default_value_t = false)]
-        json: bool,
     },
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     // Diagnostics to stderr, because stdout is this binary's *data*
     // channel: `--json` on any verb, `tab dump`, and the hook payloads
     // are all decoded by something. The config parser warns about a key
@@ -605,221 +796,295 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let args = Args::parse();
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    let args = match Args::try_parse_from(&argv) {
+        Ok(args) => args,
+        Err(error) => std::process::exit(refuse_command_line(&error, &argv)),
+    };
+    let json = args.json;
+    let tab_env = std::env::var("ROOST_TAB_ID").ok();
+    // `$PWD` as `open` / `project ensure` default `--cwd` to. Falls back to
+    // the process's own working directory when the shell variable is
+    // unset (a non-interactive launcher, say) — resolved once here, never
+    // inside `run`, so a test can inject an arbitrary string without a
+    // real directory or a process-wide `chdir` to back it.
+    let cwd_env = std::env::var("PWD").ok().or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.display().to_string())
+    });
+    let code = match run(args, tab_env.as_deref(), cwd_env.as_deref()).await {
+        Ok(code) => code,
+        Err(error) => report(&error, json),
+    };
+    std::process::exit(code);
+}
 
-    // Both hook verbs are fire-and-forget — any failure path must exit
-    // 0 with `{}` on stdout, written fallibly: Rust ignores SIGPIPE, so
-    // a `println!` into a pipe whose reader has gone would panic with
-    // 101 and no JSON at all, which a decision hook may read as a block.
-    // Split them out before resolving the target so an offline UI
-    // doesn't make the hook itself fail.
-    //
-    // `claude-hook EVENT` is the alias `agent-hook claude` grew out of:
-    // it takes its event from argv instead of the payload, which is what
-    // every already-installed `claude-settings.json` writes.
-    if let Cmd::ClaudeHook { event } = &args.command {
-        let _ = run_claude_hook(event, &args).await;
-        return hook_answer();
+/// Write a failure to stderr and hand back its exit code. Fallible for
+/// the reason [`hook_answer`] is: `eprintln!` panics on a closed stderr,
+/// which would trade this exit code for 101.
+fn report(error: &CliError, json: bool) -> i32 {
+    let _ = std::io::stderr()
+        .lock()
+        .write_all(error.render(json).as_bytes());
+    error.exit_code()
+}
+
+/// A command line clap would not accept, rendered like every other
+/// failure. `--help` and `--version` are not failures and still print to
+/// stdout; a missing subcommand prints clap's help unchanged, because
+/// that help is the usage text.
+fn refuse_command_line(error: &clap::Error, argv: &[OsString]) -> i32 {
+    use clap::error::ErrorKind;
+    if matches!(
+        error.kind(),
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+    ) {
+        error.exit();
     }
-    if let Cmd::AgentHook { agent } = &args.command {
-        let _ = run_agent_hook(agent, &args).await;
-        return hook_answer();
+    let usage = CliError::from_clap(error);
+    let json = asks_for_json(argv);
+    if !json && error.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
+        let _ = error.print();
+        return usage.exit_code();
     }
+    report(&usage, json)
+}
 
-    // The `agent` verbs write dotfiles and never dial a UI, so they run
-    // before the connect prologue — wiring an agent has to work with
-    // nothing running, which is exactly when a user reaches for it. The
-    // one shape `dials_the_ui` names falls through to the prologue
-    // instead, and is served after it.
-    if let Cmd::Agent(cmd) = &args.command {
-        if !agent_install::dials_the_ui(cmd) {
-            std::process::exit(agent_install::run(cmd));
-        }
-    }
+/// Whether argv carries `--json` — read off the raw words because a
+/// command line clap refused has no parsed flag to ask. Stops at `--`:
+/// every word past it belongs to the command `tab open` runs.
+fn asks_for_json(argv: &[OsString]) -> bool {
+    argv.iter()
+        .skip(1)
+        .map(|arg| arg.to_str())
+        .take_while(|arg| *arg != Some("--"))
+        .any(|arg| arg == Some("--json"))
+}
 
-    // `claude install` doesn't dial the UI either — it is a bare alias
-    // of `agent install claude`, which only reads and writes dotfiles.
-    if let Cmd::Claude(ClaudeCmd::Install) = args.command {
-        std::process::exit(claude_install());
-    }
-
-    // `session` addresses the session profile's own socket, which no
-    // target selector resolves (and must not — see `roost_ipc::target`'s
-    // HS-0 fences). `start` also has to work with nothing listening at
-    // all, so like doctor it runs before the connect prologue.
-    if let Cmd::Session(cmd) = &args.command {
-        std::process::exit(session::run(cmd).await);
-    }
-
-    // doctor exists to report "no UI is running", so it must not go
-    // through the connect prologue below, which `?`-exits on exactly
-    // that condition before any match arm runs.
-    //
-    // Destructuring by value moves out of `args`, so `selector(&args)`
-    // below only compiles while every field here is `Copy` — which is
-    // why `--color` is a `Copy` `ValueEnum` rather than a `String`.
-    if let Cmd::Doctor {
-        tab,
-        json,
-        verbose,
-        color,
-    } = args.command
-    {
-        // The three impure probes live here, in the thin I/O layer;
-        // `color_enabled` itself stays pure so its precedence is
-        // table-testable.
-        let no_color = std::env::var("NO_COLOR").ok();
-        let term = std::env::var("TERM").ok();
-        let style = doctor::Style {
-            color: doctor::color_enabled(
-                color,
-                std::io::stdout().is_terminal(),
-                no_color.as_deref(),
-                term.as_deref(),
-            ),
-        };
-        let report = doctor::evaluate(&doctor::collect(&selector(&args), tab).await);
-        {
-            let mut stdout = std::io::stdout().lock();
-            write!(stdout, "{}", doctor::render(&report, json, style, verbose)?)?;
-            stdout.flush()?;
-        }
-        std::process::exit(report.exit_code());
-    }
-
-    // Everything else needs a live UI socket.
-    let target = resolve_target(&args, /*probe_alive=*/ true).await?;
-    let mut client = IpcClient::connect(&target.socket_path).await?;
-
+/// Every verb, after parsing: its exit code, or its failure for `main`
+/// to render.
+///
+/// `tab_env` is `ROOST_TAB_ID`, `cwd_env` is `$PWD` (falling back to the
+/// process cwd), both as `main` read them — parameters so the target
+/// policy and `open`/`project ensure`'s `--cwd` default are tested
+/// without writing to the process environment every other test in this
+/// binary reads.
+async fn run(args: Args, tab_env: Option<&str>, cwd_env: Option<&str>) -> Result<i32, CliError> {
+    let json = args.json;
+    let selector = selector(&args);
     match args.command {
+        // Both hook verbs are fire-and-forget — any failure path must
+        // exit 0 with `{}` on stdout, written fallibly: Rust ignores
+        // SIGPIPE, so a `println!` into a pipe whose reader has gone
+        // would panic with 101 and no JSON at all, which a decision hook
+        // may read as a block. They never reach [`UiSocket`], so an
+        // offline UI doesn't make the hook itself fail, and they ignore
+        // `--json`: `{}` is already the only answer they give.
+        //
+        // `claude-hook EVENT` is the alias `agent-hook claude` grew out
+        // of: it takes its event from argv instead of the payload, which
+        // is what every already-installed `claude-settings.json` writes.
+        Cmd::ClaudeHook { event } => {
+            run_claude_hook(&event, &selector, tab_env).await;
+            hook_answer();
+            Ok(0)
+        }
+        Cmd::AgentHook { agent } => {
+            run_agent_hook(&agent, &selector, tab_env).await;
+            hook_answer();
+            Ok(0)
+        }
+        // The `agent` verbs write dotfiles and never dial a UI — wiring
+        // an agent has to work with nothing running, which is exactly
+        // when a user reaches for it. The one shape `dials_the_ui` names
+        // is served over the UI socket instead.
+        Cmd::Agent(cmd) if !agent_install::dials_the_ui(&cmd) => agent_install::run(&cmd, json),
+        // `claude install` doesn't dial the UI either — it is a bare
+        // alias of `agent install claude`, which only reads and writes
+        // dotfiles.
+        Cmd::Claude(ClaudeCmd::Install) => claude_install(json),
+        // An agent reads the skill to learn how to find a Roost, so it
+        // must print with none running.
+        Cmd::Skill => write_skill(&mut std::io::stdout().lock(), json),
+        // `session start|stop|status` address the session profile's own
+        // socket directly and never go through `selector` (unlike a
+        // generic op, which can now also reach a session via
+        // `--target session` — #475). `start` has to work with nothing
+        // listening at all, which a target-selector dial cannot promise.
+        Cmd::Session(cmd) => session::run(&cmd, json).await,
+        // doctor exists to report "no UI is running", so it must not
+        // dial through [`UiSocket`], which fails on exactly that
+        // condition before the verb's own code runs.
+        Cmd::Doctor {
+            tab,
+            verbose,
+            color,
+        } => run_doctor(&selector, tab, json, verbose, color).await,
+        command => {
+            run_on_ui(
+                command,
+                &mut UiSocket::new(&selector),
+                tab_env,
+                cwd_env,
+                json,
+            )
+            .await
+        }
+    }
+}
+
+async fn run_doctor(
+    selector: &TargetSelector,
+    tab: Option<i64>,
+    json: bool,
+    verbose: bool,
+    color: doctor::ColorMode,
+) -> Result<i32, CliError> {
+    // The three impure probes live here, in the thin I/O layer;
+    // `color_enabled` itself stays pure so its precedence is
+    // table-testable.
+    let no_color = std::env::var("NO_COLOR").ok();
+    let term = std::env::var("TERM").ok();
+    let style = doctor::Style {
+        color: doctor::color_enabled(
+            color,
+            std::io::stdout().is_terminal(),
+            no_color.as_deref(),
+            term.as_deref(),
+        ),
+    };
+    let report = doctor::evaluate(&doctor::collect(selector, tab).await);
+    let rendered = doctor::render(&report, json, style, verbose).map_err(CliError::failed)?;
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(rendered.as_bytes())
+        .and_then(|()| stdout.flush())
+        .map_err(|e| CliError::Failed(format!("write the report: {e}")))?;
+    report.verdict()
+}
+
+/// The UI socket a verb talks to, dialled the first time the verb asks
+/// for it — so a verb that refuses its own arguments has dialled nothing.
+struct UiSocket<'a> {
+    selector: &'a TargetSelector,
+    client: Option<IpcClient>,
+    path: PathBuf,
+}
+
+impl<'a> UiSocket<'a> {
+    fn new(selector: &'a TargetSelector) -> Self {
+        Self {
+            selector,
+            client: None,
+            path: PathBuf::new(),
+        }
+    }
+
+    async fn client(&mut self) -> Result<&mut IpcClient, CliError> {
+        let client = match self.client.take() {
+            Some(client) => client,
+            None => {
+                let target = self.selector.resolve(true).await?;
+                let client = dial(&target.socket_path).await?;
+                self.path = target.socket_path;
+                client
+            }
+        };
+        Ok(self.client.insert(client))
+    }
+
+    /// The socket [`Self::client`] dialled; empty before it has.
+    fn socket_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Hang up, so the next [`Self::client`] resolves and dials afresh.
+    fn redial(&mut self) {
+        self.client = None;
+    }
+
+    async fn call<P: Serialize, R: DeserializeOwned>(
+        &mut self,
+        op: &str,
+        params: P,
+    ) -> Result<R, CliError> {
+        Ok(self.client().await?.call(op, params).await?)
+    }
+
+    /// A verb that prints nothing on success: under `--json`, the op's reply.
+    async fn ack<P: Serialize>(&mut self, op: &str, params: P, json: bool) -> Result<(), CliError> {
+        let reply: serde_json::Value = self.call(op, params).await?;
+        if json {
+            print_json(&reply)?;
+        }
+        Ok(())
+    }
+}
+
+/// The verbs served over the UI socket.
+async fn run_on_ui(
+    command: Cmd,
+    ui: &mut UiSocket<'_>,
+    tab_env: Option<&str>,
+    cwd_env: Option<&str>,
+    json: bool,
+) -> Result<i32, CliError> {
+    match command {
         Cmd::Notify { title, body, tab } => {
-            let tab_id = resolve_tab(&mut client, tab).await?;
-            client
-                .call::<_, serde_json::Value>(
-                    ops::NOTIFICATION_CREATE,
-                    NotificationCreateParams {
-                        tab_id,
-                        title,
-                        body,
-                    },
-                )
-                .await?;
+            let tab_id = require_tab("notify", tab, tab_env)?;
+            ui.ack(
+                ops::NOTIFICATION_CREATE,
+                NotificationCreateParams {
+                    tab_id,
+                    title,
+                    body,
+                },
+                json,
+            )
+            .await?;
         }
         Cmd::SetTitle { title, tab } => {
-            let tab_id = resolve_tab(&mut client, tab).await?;
-            client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_SET_TITLE,
-                    TabSetTitleParams { tab_id, title },
-                )
-                .await?;
+            let tab_id = require_tab("set-title", tab, tab_env)?;
+            ui.ack(
+                ops::TAB_SET_TITLE,
+                TabSetTitleParams { tab_id, title },
+                json,
+            )
+            .await?;
         }
         Cmd::Identify => {
-            let resp = identify(&mut client).await?;
-            println!(
-                "socket={}\npid={}\nactive_project={}\nactive_tab={}\nui_version={}\nproto_version={}\napp_id={}",
-                resp.socket_path,
-                resp.pid,
-                resp.active_project_id,
-                resp.active_tab_id,
-                resp.ui_version,
-                resp.protocol_version,
-                resp.app_id
-            );
-        }
-        Cmd::Wait {
-            tab,
-            state,
-            text,
-            gone,
-            timeout,
-            interval_ms,
-        } => {
-            if state.is_none() && text.is_none() && !gone {
-                anyhow::bail!("wait needs at least one of --state, --text, or --gone");
-            }
-            // `--gone` (tab must NOT exist) contradicts --state/--text
-            // (tab must exist); reject the combination up front rather
-            // than silently letting --gone win.
-            if gone && (state.is_some() || text.is_some()) {
-                anyhow::bail!("--gone cannot be combined with --state or --text");
-            }
-            let tab_id = resolve_tab(&mut client, tab).await?;
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout.max(0.0));
-            let interval = std::time::Duration::from_millis(interval_ms.max(10));
-            loop {
-                let list = list_tabs(&mut client).await?;
-                let exists = list
-                    .projects
-                    .iter()
-                    .flat_map(|p| &p.tabs)
-                    .any(|t| t.id == tab_id);
-                // `--gone` is checked alone (it contradicts state/text,
-                // which both require the tab to exist). Otherwise the
-                // tab must exist and every requested condition must hold.
-                let satisfied = if gone {
-                    !exists
-                } else if !exists {
-                    false
-                } else {
-                    let state_ok = match &state {
-                        Some(want) => list
-                            .projects
-                            .iter()
-                            .flat_map(|p| &p.tabs)
-                            .find(|t| t.id == tab_id)
-                            .map(|t| format_state(t.state) == want)
-                            .unwrap_or(false),
-                        None => true,
-                    };
-                    let text_ok = match &text {
-                        Some(needle) => {
-                            match client
-                                .call::<_, TabDumpResult>(
-                                    ops::TAB_DUMP,
-                                    TabDumpParams {
-                                        tab_id: WireTabRef::Local(tab_id),
-                                        ..Default::default()
-                                    },
-                                )
-                                .await
-                            {
-                                Ok(dump) => dump.rows_text.join("\n").contains(needle.as_str()),
-                                // The tab closed between the list check
-                                // and the dump — not satisfied yet; keep
-                                // polling rather than failing the wait.
-                                Err(roost_ipc::ClientError::Server { code, .. })
-                                    if code == "not-found" =>
-                                {
-                                    false
-                                }
-                                Err(e) => return Err(e.into()),
-                            }
-                        }
-                        None => true,
-                    };
-                    state_ok && text_ok
-                };
-                if satisfied {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    anyhow::bail!("timed out after {timeout}s waiting for tab {tab_id}");
-                }
-                tokio::time::sleep(interval).await;
+            let resp = identify(ui.client().await?).await?;
+            if json {
+                print_json(&resp)?;
+            } else {
+                println!(
+                    "socket={}\npid={}\nactive_project={}\nactive_tab={}\nui_version={}\nproto_version={}\napp_id={}",
+                    resp.socket_path,
+                    resp.pid,
+                    resp.active_project_id,
+                    resp.active_tab_id,
+                    resp.ui_version,
+                    resp.protocol_version,
+                    resp.app_id
+                );
             }
         }
+        Cmd::Wait(args) => return wait::run(ui, args, tab_env, json).await,
+        Cmd::Events { tab } => return events::run(ui, tab).await,
         Cmd::Tab(TabCmd::Focus { tab }) => {
-            let tab_id = wire_tab_ref(&mut client, tab.as_deref()).await?;
-            client
-                .call::<_, serde_json::Value>(ops::TAB_FOCUS, TabFocusParams { tab_id })
+            let tab_id = require_tab(
+                "tab focus",
+                tab.as_deref().map(parse_tab_flag).transpose()?,
+                tab_env,
+            )?;
+            ui.ack(ops::TAB_FOCUS, TabFocusParams { tab_id }, json)
                 .await?;
         }
-        Cmd::Tab(TabCmd::List { json }) => {
-            let resp = list_tabs(&mut client).await?;
+        Cmd::Tab(TabCmd::List) => {
+            let resp = list_tabs(ui.client().await?).await?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&resp)?);
+                print_json(&resp)?;
             } else {
                 for project in resp.projects {
                     println!("project {} — {}", project.id, project.name);
@@ -836,81 +1101,108 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Tab(TabCmd::SetState { state, tab }) => {
-            let tab_id = resolve_tab(&mut client, tab).await?;
+            let tab_id = require_tab("tab set-state", tab, tab_env)?;
             let state = parse_state(&state)?;
-            client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_SET_STATE,
-                    TabSetStateParams { tab_id, state },
-                )
-                .await?;
+            ui.ack(
+                ops::TAB_SET_STATE,
+                TabSetStateParams { tab_id, state },
+                json,
+            )
+            .await?;
         }
         Cmd::Tab(TabCmd::ClearNotification { tab }) => {
-            let tab_id = resolve_tab(&mut client, tab).await?;
-            client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_CLEAR_NOTIFICATION,
-                    // No `generation`: a person at a CLI is answering the
-                    // tab, not one raise on it.
-                    TabClearNotificationParams {
-                        tab_id,
-                        generation: None,
-                    },
-                )
-                .await?;
+            let tab_id = require_tab("tab clear-notification", tab, tab_env)?;
+            ui.ack(
+                ops::TAB_CLEAR_NOTIFICATION,
+                // No `generation`: a person at a CLI is answering the
+                // tab, not one raise on it.
+                TabClearNotificationParams {
+                    tab_id,
+                    generation: None,
+                },
+                json,
+            )
+            .await?;
         }
         Cmd::Project(ProjectCmd::List) => {
-            let resp = list_tabs(&mut client).await?;
-            for p in resp.projects {
-                println!(
-                    "project {} — {}  cwd={}  tabs={}",
-                    p.id,
-                    p.name,
-                    p.cwd,
-                    p.tabs.len()
-                );
+            let resp = list_tabs(ui.client().await?).await?;
+            if json {
+                print_json(&resp)?;
+            } else {
+                for p in resp.projects {
+                    println!(
+                        "project {} — {}  cwd={}  tabs={}",
+                        p.id,
+                        p.name,
+                        p.cwd,
+                        p.tabs.len()
+                    );
+                }
             }
         }
         Cmd::Project(ProjectCmd::Create { name, cwd }) => {
-            let resp: ProjectCreateResult = client
+            let resp: ProjectCreateResult = ui
                 .call(ops::PROJECT_CREATE, ProjectCreateParams { name, cwd })
                 .await?;
-            println!(
-                "created project {} — {}",
-                resp.project.id, resp.project.name
-            );
+            if json {
+                print_json(&resp)?;
+            } else {
+                println!(
+                    "created project {} — {}",
+                    resp.project.id, resp.project.name
+                );
+            }
+        }
+        Cmd::Project(ProjectCmd::Ensure { name, cwd }) => {
+            require_project_ensure(ui).await?;
+            let cwd = resolve_cwd(cwd, cwd_env)?;
+            let resp: ProjectEnsureResult = ui
+                .call(
+                    ops::PROJECT_ENSURE,
+                    ProjectEnsureParams {
+                        name,
+                        cwd: Some(cwd),
+                    },
+                )
+                .await?;
+            // Always the wire result, `--json` or not: `create` is the
+            // only other `project` verb with a one-line human form, and
+            // `rename`/`delete`/`reorder` print nothing without the
+            // flag, so there is no single convention this could join
+            // instead of just always answering in JSON.
+            print_json(&resp)?;
         }
         Cmd::Project(ProjectCmd::Rename { id, name }) => {
-            client
-                .call::<_, serde_json::Value>(
-                    ops::PROJECT_RENAME,
-                    ProjectRenameParams {
-                        project_id: id,
-                        name,
-                    },
-                )
-                .await?;
+            ui.ack(
+                ops::PROJECT_RENAME,
+                ProjectRenameParams {
+                    project_id: id,
+                    name,
+                },
+                json,
+            )
+            .await?;
         }
         Cmd::Project(ProjectCmd::Delete { id }) => {
-            client
-                .call::<_, serde_json::Value>(
-                    ops::PROJECT_DELETE,
-                    ProjectDeleteParams { project_id: id },
-                )
-                .await?;
+            ui.ack(
+                ops::PROJECT_DELETE,
+                ProjectDeleteParams { project_id: id },
+                json,
+            )
+            .await?;
         }
         Cmd::Project(ProjectCmd::Reorder { order }) => {
-            client
-                .call::<_, serde_json::Value>(
-                    ops::PROJECT_REORDER,
-                    ProjectReorderParams {
-                        // The CLI's ids are numbers; the host-qualified
-                        // wire form is reachable through the op, not
-                        // through this verb (plan 044 §4).
-                        project_ids: order.into_iter().map(WireProjectRef::Local).collect(),
-                    },
-                )
-                .await?;
+            ui.ack(
+                ops::PROJECT_REORDER,
+                ProjectReorderParams {
+                    // The CLI's ids are numbers; the host-qualified
+                    // wire form is reachable through the op, not
+                    // through this verb (plan 044 §4).
+                    project_ids: order.into_iter().map(WireProjectRef::Local).collect(),
+                },
+                json,
+            )
+            .await?;
         }
         Cmd::Tab(TabCmd::Open {
             project_id,
@@ -932,6 +1224,7 @@ async fn main() -> Result<()> {
             } else {
                 argv
             };
+            let client = ui.client().await?;
             let resp: TabOpenResult = client
                 .call(
                     ops::TAB_OPEN,
@@ -949,7 +1242,7 @@ async fn main() -> Result<()> {
             // `--after-tab`: place the new tab right after that one via a
             // reorder over the project's current order.
             if let Some(after) = after_tab {
-                let snapshot = list_tabs(&mut client).await?;
+                let snapshot = list_tabs(client).await?;
                 if let Some(project) = snapshot.projects.iter().find(|p| p.id == project_id) {
                     let ids: Vec<i64> = project.tabs.iter().map(|t| t.id).collect();
                     client
@@ -976,14 +1269,82 @@ async fn main() -> Result<()> {
                     )
                     .await?;
             }
-            // Print just the new tab id (matches the documented contract;
-            // script-friendly for `id=$(roostctl tab open …)`).
-            println!("{new_id}");
+            if json {
+                print_json(&resp)?;
+            } else {
+                // Print just the new tab id (matches the documented
+                // contract; script-friendly for `id=$(roostctl tab open …)`).
+                println!("{new_id}");
+            }
+        }
+        Cmd::Open {
+            project,
+            cwd,
+            title,
+            focus,
+            hold,
+            argv,
+        } => {
+            let identity = require_project_ensure(ui).await?;
+            if identity.local_backend_switch.is_some() {
+                return Err(CliError::Usage(
+                    "a backend switch is in progress; retry".into(),
+                ));
+            }
+            let cwd = resolve_cwd(cwd, cwd_env)?;
+            let ensured: ProjectEnsureResult = ui
+                .call(
+                    ops::PROJECT_ENSURE,
+                    ProjectEnsureParams {
+                        name: project,
+                        cwd: Some(cwd.clone()),
+                    },
+                )
+                .await?;
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            // Same `--hold` composition `tab open --hold` uses — see its
+            // handler above; not duplicated as a shared helper because
+            // this is the entire use of the local `argv` binding here.
+            let argv = if hold && !argv.is_empty() {
+                held_argv(&shell, &argv)
+            } else {
+                argv
+            };
+            let client = ui.client().await?;
+            let opened: TabOpenResult = client
+                .call(
+                    ops::TAB_OPEN,
+                    TabOpenParams {
+                        project_id: ensured.project.id,
+                        cwd,
+                        argv,
+                        cols: 80,
+                        rows: 24,
+                        title,
+                    },
+                )
+                .await?;
+            if focus {
+                client
+                    .call::<_, serde_json::Value>(
+                        ops::TAB_FOCUS,
+                        TabFocusParams {
+                            tab_id: WireTabRef::Local(opened.tab.id),
+                        },
+                    )
+                    .await?;
+            }
+            // Always JSON, `--json` or not — an agent verb, not a
+            // human-typed one.
+            print_json(&serde_json::json!({
+                "project": ensured.project,
+                "tab": opened.tab,
+                "created": ensured.created,
+            }))?;
         }
         Cmd::Tab(TabCmd::Close { tab }) => {
-            let tab_id = resolve_tab(&mut client, tab).await?;
-            client
-                .call::<_, serde_json::Value>(ops::TAB_CLOSE, TabCloseParams { tab_id })
+            let tab_id = require_tab("tab close", tab, tab_env)?;
+            ui.ack(ops::TAB_CLOSE, TabCloseParams { tab_id }, json)
                 .await?;
         }
         Cmd::Tab(TabCmd::Send {
@@ -992,29 +1353,29 @@ async fn main() -> Result<()> {
             bytes_base64,
             raw,
         }) => {
-            let tab_id = resolve_tab(&mut client, tab).await?;
+            let tab_id = require_tab("tab send", tab, tab_env)?;
             let data = if let Some(b64) = bytes_base64 {
                 BASE64_STANDARD
                     .decode(b64.as_bytes())
-                    .map_err(|e| anyhow!("--bytes-base64 decode failed: {e}"))?
+                    .map_err(|e| CliError::Usage(format!("--bytes-base64 decode failed: {e}")))?
             } else {
-                let s =
-                    bytes.ok_or_else(|| anyhow!("tab send requires --bytes or --bytes-base64"))?;
+                let s = bytes.ok_or_else(|| {
+                    CliError::Usage("tab send requires --bytes or --bytes-base64".into())
+                })?;
                 if raw {
                     s.into_bytes()
                 } else {
                     decode_escapes(&s)
                 }
             };
-            client
-                .call::<_, serde_json::Value>(ops::TAB_WRITE, TabWriteParams { tab_id, data })
+            ui.ack(ops::TAB_WRITE, TabWriteParams { tab_id, data }, json)
                 .await?;
         }
-        Cmd::Tab(TabCmd::SendFile { tab, paths, json }) => {
-            let tab_id = wire_tab_ref(&mut client, Some(tab.as_str())).await?;
+        Cmd::Tab(TabCmd::SendFile { tab, paths }) => {
+            let tab_id = parse_tab_flag(&tab)?;
             let paths = canonicalize_for_send_file(&paths)?;
             let budget = send_file_budget(paths.len(), timeout_scale());
-            let call = client.call(
+            let call = ui.client().await?.call(
                 ops::TAB_SEND_FILE,
                 TabSendFileParams {
                     tab: tab_id.to_string(),
@@ -1023,37 +1384,31 @@ async fn main() -> Result<()> {
             );
             let result: TabSendFileResult =
                 tokio::time::timeout(budget, call).await.map_err(|_| {
-                    anyhow!(
+                    CliError::Connection(format!(
                         "tab send-file gave up after {}s; the paste may still land in the tab",
                         budget.as_secs()
-                    )
+                    ))
                 })??;
             if json {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                print_json(&result)?;
             } else {
                 println!("{}", result.pasted);
             }
         }
         Cmd::Tab(TabCmd::Resize { tab, cols, rows }) => {
-            let tab_id = resolve_tab(&mut client, tab).await?;
-            client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_RESIZE,
-                    TabResizeParams { tab_id, cols, rows },
-                )
-                .await?;
+            let tab_id = require_tab("tab resize", tab, tab_env)?;
+            ui.ack(
+                ops::TAB_RESIZE,
+                TabResizeParams { tab_id, cols, rows },
+                json,
+            )
+            .await?;
         }
-        Cmd::Tab(TabCmd::Dump {
-            tab,
-            json,
-            scrollback,
-        }) => {
-            let tab_id = wire_tab_ref(&mut client, tab.as_deref()).await?;
-            let result: TabDumpResult = client
-                .call(ops::TAB_DUMP, TabDumpParams { tab_id, scrollback })
-                .await?;
+        Cmd::Tab(TabCmd::Dump { tab, scrollback }) => {
+            let flag = tab.as_deref().map(parse_tab_flag).transpose()?;
+            let result = dump_tab(ui, flag, tab_env, scrollback).await?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                print_json(&result)?;
             } else {
                 // Plain text: history rows then viewport rows, no
                 // separator between them, reconstructing the screen for
@@ -1069,47 +1424,64 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Tab(TabCmd::Reorder { project_id, order }) => {
-            client
-                .call::<_, serde_json::Value>(
-                    ops::TAB_REORDER,
-                    TabReorderParams {
-                        project_id: WireProjectRef::Local(project_id),
-                        tab_ids: order.into_iter().map(WireTabRef::Local).collect(),
-                    },
-                )
-                .await?;
+            ui.ack(
+                ops::TAB_REORDER,
+                TabReorderParams {
+                    project_id: WireProjectRef::Local(project_id),
+                    tab_ids: order.into_iter().map(WireTabRef::Local).collect(),
+                },
+                json,
+            )
+            .await?;
         }
         Cmd::Screenshot { out, scale } => {
+            if json && out.is_none() {
+                return Err(CliError::Usage(
+                    "--json needs --out: the PNG and the JSON would share stdout".into(),
+                ));
+            }
             // `scale` range is enforced by clap's value_parser (exit 2).
-            let resp: ScreenshotResult = client
-                .call(ops::SCREENSHOT, ScreenshotParams { scale })
-                .await?;
+            let resp: ScreenshotResult =
+                ui.call(ops::SCREENSHOT, ScreenshotParams { scale }).await?;
             match out {
                 Some(path) => {
                     std::fs::write(&path, &resp.png)
-                        .map_err(|e| anyhow!("write {}: {e}", path.display()))?;
-                    eprintln!(
-                        "wrote {} ({}x{} @ {}x, {} bytes)",
-                        path.display(),
-                        resp.width,
-                        resp.height,
-                        resp.scale,
-                        resp.png.len()
-                    );
+                        .map_err(|e| CliError::Failed(format!("write {}: {e}", path.display())))?;
+                    if json {
+                        print_json(&serde_json::json!({
+                            "out": path.display().to_string(),
+                            "bytes": resp.png.len(),
+                        }))?;
+                    } else {
+                        eprintln!(
+                            "wrote {} ({}x{} @ {}x, {} bytes)",
+                            path.display(),
+                            resp.width,
+                            resp.height,
+                            resp.scale,
+                            resp.png.len()
+                        );
+                    }
                 }
                 None => {
                     // Raw PNG to stdout — never `println!`, which would
                     // append a newline and corrupt the binary stream.
                     let mut stdout = std::io::stdout().lock();
-                    stdout.write_all(&resp.png)?;
-                    stdout.flush()?;
+                    stdout
+                        .write_all(&resp.png)
+                        .and_then(|()| stdout.flush())
+                        .map_err(|e| CliError::Failed(format!("write the PNG to stdout: {e}")))?;
                 }
             }
         }
         Cmd::RenderStats { reset } => {
-            let stats: AppRenderStatsResult = client
+            let stats: AppRenderStatsResult = ui
                 .call(ops::APP_RENDER_STATS, AppRenderStatsParams { reset })
                 .await?;
+            if json {
+                print_json(&stats)?;
+                return Ok(0);
+            }
             let per = |total: i64, calls: i64| {
                 if calls > 0 {
                     (total / calls).to_string()
@@ -1145,53 +1517,51 @@ async fn main() -> Result<()> {
                 per(stats.elide_nanos, stats.elide_calls)
             );
         }
-        Cmd::Palette(PaletteCmd::Open { kind, json }) => {
-            let state: PaletteStateResult = client
+        Cmd::Palette(PaletteCmd::Open { kind }) => {
+            let state: PaletteStateResult = ui
                 .call(ops::PALETTE_OPEN, PaletteOpenParams { kind })
                 .await?;
             print_palette(&state, json)?;
         }
-        Cmd::Palette(PaletteCmd::State { json }) => {
-            let state: PaletteStateResult = client
-                .call(ops::PALETTE_STATE, serde_json::json!({}))
-                .await?;
+        Cmd::Palette(PaletteCmd::State) => {
+            let state: PaletteStateResult =
+                ui.call(ops::PALETTE_STATE, serde_json::json!({})).await?;
             print_palette(&state, json)?;
         }
-        Cmd::Palette(PaletteCmd::Query { query, json }) => {
-            let state: PaletteStateResult = client
+        Cmd::Palette(PaletteCmd::Query { query }) => {
+            let state: PaletteStateResult = ui
                 .call(ops::PALETTE_QUERY, PaletteQueryParams { query })
                 .await?;
             print_palette(&state, json)?;
         }
-        Cmd::Palette(PaletteCmd::Activate { id, json }) => {
-            let state: PaletteStateResult = client
+        Cmd::Palette(PaletteCmd::Activate { id }) => {
+            let state: PaletteStateResult = ui
                 .call(ops::PALETTE_ACTIVATE, PaletteActivateParams { id })
                 .await?;
             print_palette(&state, json)?;
         }
-        Cmd::Palette(PaletteCmd::Dismiss { json }) => {
-            let state: PaletteStateResult = client
-                .call(ops::PALETTE_DISMISS, serde_json::json!({}))
-                .await?;
+        Cmd::Palette(PaletteCmd::Dismiss) => {
+            let state: PaletteStateResult =
+                ui.call(ops::PALETTE_DISMISS, serde_json::json!({})).await?;
             print_palette(&state, json)?;
         }
         Cmd::Palette(PaletteCmd::Present {
             title,
             placeholder,
             items,
-            json,
         }) => {
             let raw = match items {
                 Some(s) => s,
                 None => {
-                    use std::io::Read;
                     let mut buf = String::new();
-                    std::io::stdin().read_to_string(&mut buf)?;
+                    std::io::stdin()
+                        .read_to_string(&mut buf)
+                        .map_err(|e| CliError::Failed(format!("read items from stdin: {e}")))?;
                     buf
                 }
             };
             let parsed = parse_present_items(&raw)?;
-            let result: PalettePresentResult = client
+            let result: PalettePresentResult = ui
                 .call(
                     ops::PALETTE_PRESENT,
                     PalettePresentParams {
@@ -1202,28 +1572,56 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&result)?);
+                print_json(&result)?;
             } else if let Some(id) = &result.selected_id {
                 println!("{id}");
             }
             // Dismissed → print nothing; exit 0 either way.
         }
-        Cmd::Host(cmd) => {
-            std::process::exit(host::run(&cmd, &mut client).await);
+        Cmd::Rpc { op, params } => {
+            let value = rpc_params(params)?;
+            let result: serde_json::Value = ui.call(&op, value).await?;
+            print_json(&result)?;
         }
-        Cmd::Agent(cmd) => {
-            std::process::exit(agent_install::run_over_ipc(&cmd, &mut client).await);
-        }
-        // Already handled above before client connect.
+        Cmd::Host(cmd) => return host::run(&cmd, ui, json).await,
+        Cmd::Agent(cmd) => return agent_install::run_over_ipc(&cmd, ui, json).await,
         Cmd::ClaudeHook { .. }
         | Cmd::AgentHook { .. }
         | Cmd::Claude(_)
+        | Cmd::Skill
         | Cmd::Doctor { .. }
-        | Cmd::Session(_) => {
-            unreachable!()
-        }
+        | Cmd::Session(_) => unreachable!("`run` serves these without the UI socket"),
     }
+    Ok(0)
+}
 
+/// `skill`'s output. A reader that hung up (`roostctl skill | head`) got
+/// what it wanted, so that is success, as it is for `events`.
+fn write_skill(out: &mut impl Write, json: bool) -> Result<i32, CliError> {
+    let body = if json {
+        let value = serde_json::json!({
+            "topic": "roost",
+            "format": "markdown",
+            "content": SKILL,
+        });
+        serde_json::to_string_pretty(&value)
+            .map_err(|e| CliError::Failed(format!("encode the skill as JSON: {e}")))?
+            + "\n"
+    } else {
+        SKILL.to_string()
+    };
+    match out.write_all(body.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => Ok(0),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(0),
+        Err(e) => Err(CliError::Failed(format!("write the skill: {e}"))),
+    }
+}
+
+/// `--json`'s output: one pretty-printed document on stdout.
+fn print_json<T: Serialize + ?Sized>(value: &T) -> Result<(), CliError> {
+    let body = serde_json::to_string_pretty(value)
+        .map_err(|e| CliError::Failed(format!("encode the result as JSON: {e}")))?;
+    println!("{body}");
     Ok(())
 }
 
@@ -1232,35 +1630,59 @@ async fn main() -> Result<()> {
 /// provider prints), so a script can pipe either form. Rejects an
 /// empty/blank payload so the user gets a clear error instead of an
 /// `invalid-param` from the daemon.
-fn parse_present_items(raw: &str) -> Result<Vec<PaletteItemView>> {
+fn parse_present_items(raw: &str) -> Result<Vec<PaletteItemView>, CliError> {
     let raw = raw.trim();
     if raw.is_empty() {
-        anyhow::bail!("no items: pass --items <json> or pipe a JSON array on stdin");
+        return Err(CliError::Usage(
+            "no items: pass --items <json> or pipe a JSON array on stdin".into(),
+        ));
     }
     let value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("parse items json: {e}"))?;
+        serde_json::from_str(raw).map_err(|e| CliError::Usage(format!("parse items json: {e}")))?;
     let items_value = if value.is_array() {
         value
     } else {
         value.get("items").cloned().ok_or_else(|| {
-            anyhow::anyhow!("items json must be an array or have an `items` array")
+            CliError::Usage("items json must be an array or have an `items` array".into())
         })?
     };
-    let items: Vec<PaletteItemView> =
-        serde_json::from_value(items_value).map_err(|e| anyhow::anyhow!("decode items: {e}"))?;
+    let items: Vec<PaletteItemView> = serde_json::from_value(items_value)
+        .map_err(|e| CliError::Usage(format!("decode items: {e}")))?;
     if items.is_empty() {
-        anyhow::bail!("items list is empty");
+        return Err(CliError::Usage("items list is empty".into()));
     }
     Ok(items)
+}
+
+/// `rpc`'s params: the positional argument, `-` for stdin, or `{}` when
+/// omitted. Parsed and object-checked before anything is dialled — the
+/// same posture [`require_tab`] takes toward a mutating verb's `--tab`.
+fn rpc_params(raw: Option<String>) -> Result<serde_json::Value, CliError> {
+    let raw = match raw {
+        None => return Ok(serde_json::json!({})),
+        Some(s) if s == "-" => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|e| CliError::Failed(format!("read params from stdin: {e}")))?;
+            buf
+        }
+        Some(s) => s,
+    };
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| CliError::Usage(format!("parse params json: {e}")))?;
+    if !value.is_object() {
+        return Err(CliError::Usage("params must be a JSON object".into()));
+    }
+    Ok(value)
 }
 
 /// Render a [`PaletteStateResult`] for the terminal: a header line, then
 /// one row per item with `>` marking the highlighted selection. `--json`
 /// emits the structured result verbatim instead.
-fn print_palette(state: &PaletteStateResult, json: bool) -> Result<()> {
+fn print_palette(state: &PaletteStateResult, json: bool) -> Result<(), CliError> {
     if json {
-        println!("{}", serde_json::to_string_pretty(state)?);
-        return Ok(());
+        return print_json(state);
     }
     if !state.open {
         println!("palette: closed");
@@ -1296,18 +1718,13 @@ fn selector(args: &Args) -> TargetSelector {
     }
 }
 
-/// Resolve the CLI args to a concrete socket path. `probe_alive`
-/// controls whether the auto-detect step actually dials candidate
-/// sockets; pass `false` for fire-and-forget commands (claude-hook) that
-/// no-op when the UI is offline.
-async fn resolve_target(args: &Args, probe_alive: bool) -> Result<ResolvedTarget> {
-    selector(args)
-        .resolve(probe_alive)
+async fn dial(socket: &Path) -> Result<IpcClient, CliError> {
+    IpcClient::connect(socket)
         .await
-        .map_err(|e: TargetError| anyhow!(e))
+        .map_err(|e| CliError::Connection(format!("{}: {e}", socket.display())))
 }
 
-async fn identify(client: &mut IpcClient) -> Result<IdentifyResult> {
+async fn identify(client: &mut IpcClient) -> Result<IdentifyResult, CliError> {
     Ok(client
         .identify(IdentifyParams {
             client_name: CLIENT_NAME.into(),
@@ -1316,16 +1733,55 @@ async fn identify(client: &mut IpcClient) -> Result<IdentifyResult> {
         .await?)
 }
 
-async fn list_tabs(client: &mut IpcClient) -> Result<TabListResult> {
+async fn list_tabs(client: &mut IpcClient) -> Result<TabListResult, CliError> {
     Ok(client.call(ops::TAB_LIST, serde_json::json!({})).await?)
+}
+
+/// `identify`, refusing `unsupported` (exit 1) if this server's `ops`
+/// doesn't list `project.ensure` — an absent field (an older server, or
+/// the Swift Mac app) and a list without the name both mean "not
+/// served" (plan 066 §3.1). Named for the manual route rather than
+/// falling back to it: a list-then-create fallback here would reopen the
+/// #221 race `project.ensure` exists to close, so `open` and `project
+/// ensure` refuse instead of ever sending `project.list`/`project.create`
+/// themselves.
+async fn require_project_ensure(ui: &mut UiSocket<'_>) -> Result<IdentifyResult, CliError> {
+    let identity = identify(ui.client().await?).await?;
+    let supported = identity
+        .ops
+        .as_deref()
+        .is_some_and(|served| served.iter().any(|op| op == ops::PROJECT_ENSURE));
+    if !supported {
+        return Err(CliError::Unsupported(format!(
+            "this Roost does not serve {}; find the project with `roostctl project list \
+             --json` and open the tab directly with `roostctl tab open --project-id`",
+            ops::PROJECT_ENSURE
+        )));
+    }
+    Ok(identity)
+}
+
+/// `--cwd`, or `cwd_env` (`$PWD` as `main` resolved it) when the flag is
+/// absent. `open` and `project ensure` both need an actual directory —
+/// `project.ensure` only reads `cwd` on the create path, but neither verb
+/// knows in advance whether this call creates, so both always send one
+/// rather than leaving it to the op's own omit-if-you-already-know-it
+/// allowance.
+fn resolve_cwd(explicit: Option<String>, cwd_env: Option<&str>) -> Result<String, CliError> {
+    if let Some(cwd) = explicit {
+        return Ok(cwd);
+    }
+    cwd_env
+        .map(str::to_string)
+        .ok_or_else(|| CliError::Failed("no --cwd, and $PWD could not be resolved".into()))
 }
 
 /// Claude Code hook dispatch. Reads the JSON payload from stdin
 /// (Claude's contract), maps the event to the reports
 /// `roost-agent`'s pure adapter derives, and sends each as a
-/// `tab.agent_report`. Best-effort — failures don't surface to Claude
-/// (caller wraps in `let _ = ...` and always exits 0).
-async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
+/// `tab.agent_report`. Best-effort — failures don't surface to Claude,
+/// and the caller always exits 0.
+async fn run_claude_hook(event: &str, selector: &TargetSelector, tab_env: Option<&str>) {
     // Drained first and unconditionally, exactly as in
     // [`run_agent_hook`]: Claude is writing into this pipe right now,
     // and returning on an unset `ROOST_TAB_ID` without consuming a byte
@@ -1333,18 +1789,14 @@ async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
     // invisible.
     let stdin_buf = drain_stdin();
 
-    let Some(tab_id) = std::env::var("ROOST_TAB_ID")
-        .ok()
-        .as_deref()
-        .and_then(parse_tab_id)
-    else {
-        return Ok(());
+    let Some(tab_id) = tab_env.and_then(parse_tab_id) else {
+        return;
     };
     let Some(payload) = hook_payload(&stdin_buf, tab_id) else {
         hook_debug(&format!(
             "claude-hook: unparseable payload for event: {event}"
         ));
-        return Ok(());
+        return;
     };
 
     let reports = canonical_hook_event(event)
@@ -1352,7 +1804,7 @@ async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
         .unwrap_or_default();
     if reports.is_empty() {
         hook_debug(&format!("claude-hook: no reports for event: {event}"));
-        return Ok(());
+        return;
     }
 
     // `claude install` writes a `PermissionRequest` entry on this verb,
@@ -1364,11 +1816,10 @@ async fn run_claude_hook(event: &str, args: &Args) -> Result<()> {
     // (`docs/development/claude-testing.md`) that is driven outside a
     // Roost tab, where the default profile path is the only answer
     // there is.
-    let Ok(target) = resolve_target(args, false).await else {
-        return Ok(());
+    let Ok(target) = selector.resolve(false).await else {
+        return;
     };
     deliver_reports(reports, &target.socket_path).await;
-    Ok(())
 }
 
 /// Read stdin to the shared cap **and keep reading past it**.
@@ -1393,10 +1844,9 @@ fn drain_stdin() -> Vec<u8> {
 /// SIGPIPE, so `println!` turns a reader that has already gone into a
 /// panic — exit 101 with no JSON, which is precisely the shape a
 /// decision hook may read as a block.
-fn hook_answer() -> Result<()> {
+fn hook_answer() {
     let mut stdout = std::io::stdout().lock();
     let _ = stdout.write_all(b"{}\n").and_then(|()| stdout.flush());
-    Ok(())
 }
 
 /// The generic agent hook entrypoint: `roostctl agent-hook <agent>`.
@@ -1412,7 +1862,7 @@ fn hook_answer() -> Result<()> {
 /// contract of this path is exit 0 with `{}` on stdout — a hook that
 /// reports its own trouble to a decision dialog may be read as a block —
 /// so the only diagnostic channel is `ROOST_DEBUG` on stderr.
-async fn run_agent_hook(agent: &str, args: &Args) -> Result<()> {
+async fn run_agent_hook(agent: &str, selector: &TargetSelector, tab_env: Option<&str>) {
     // Drained first and unconditionally: the agent is writing into this
     // pipe right now, and every early return below would otherwise leave
     // it with an EPIPE from a hook that is supposed to be invisible.
@@ -1420,45 +1870,40 @@ async fn run_agent_hook(agent: &str, args: &Args) -> Result<()> {
 
     let Some(adapter) = Agent::parse(agent) else {
         hook_debug(&format!("agent-hook: no adapter for agent: {agent}"));
-        return Ok(());
+        return;
     };
-    let Some(tab_id) = std::env::var("ROOST_TAB_ID")
-        .ok()
-        .as_deref()
-        .and_then(parse_tab_id)
-    else {
-        return Ok(());
+    let Some(tab_id) = tab_env.and_then(parse_tab_id) else {
+        return;
     };
-    let Some(socket) = agent_hook_socket(args) else {
+    let Some(socket) = agent_hook_socket(selector) else {
         hook_debug(&format!("agent-hook {agent}: no ROOST_SOCKET"));
-        return Ok(());
+        return;
     };
     let Some(payload) = hook_payload(&stdin_buf, tab_id) else {
         hook_debug(&format!("agent-hook {agent}: unparseable payload"));
-        return Ok(());
+        return;
     };
 
     let event = payload_event_name(&payload);
     if event.is_empty() {
         hook_debug(&format!("agent-hook {agent}: payload names no event"));
-        return Ok(());
+        return;
     }
     let reports = adapter.event_to_reports(event, &payload, tab_id);
     if reports.is_empty() {
         hook_debug(&format!(
             "agent-hook {agent}: no reports for event: {event}"
         ));
-        return Ok(());
+        return;
     }
 
     deliver_reports(reports, &socket).await;
-    Ok(())
 }
 
 /// The socket `agent-hook` reports into — `ROOST_SOCKET` and nothing
 /// else, with `--socket` as the one explicit override.
 ///
-/// Deliberately **not** [`resolve_target`]. That ladder falls back to
+/// Deliberately **not** [`TargetSelector::resolve`]. That ladder falls back to
 /// the bundle profile's default path, and this verb runs inside a tab
 /// whose `ROOST_TAB_ID` is only meaningful to the Roost that spawned it:
 /// with the variable stripped (`env -i`, a sanitized launcher) but the
@@ -1470,8 +1915,8 @@ async fn run_agent_hook(agent: &str, args: &Args) -> Result<()> {
 /// as a by-hand debugging verb driven from outside a tab
 /// (`docs/development/claude-testing.md`), where the default path is the
 /// only answer there is.
-fn agent_hook_socket(args: &Args) -> Option<PathBuf> {
-    args.socket.clone().or_else(|| {
+fn agent_hook_socket(selector: &TargetSelector) -> Option<PathBuf> {
+    selector.socket_override.clone().or_else(|| {
         std::env::var_os("ROOST_SOCKET")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
@@ -1531,8 +1976,8 @@ fn hook_debug(message: &str) {
 /// `~/.config/roost/claude-settings.json` instead — `doctor`'s
 /// `agent.claude.legacy_settings` check is what still knows about that
 /// retired path.
-fn claude_settings_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME").map_err(|_| anyhow!("$HOME not set"))?;
+fn claude_settings_path() -> anyhow::Result<PathBuf> {
+    let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("$HOME not set"))?;
     let dir = std::env::var("CLAUDE_CONFIG_DIR")
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -1552,8 +1997,8 @@ fn claude_settings_path() -> Result<PathBuf> {
 /// Kept as its own function (rather than inlining the join) so
 /// `agent.claude.legacy_settings` and `legacy_claude_uninstall` cannot
 /// spell it two ways.
-fn legacy_claude_settings_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME").map_err(|_| anyhow!("$HOME not set"))?;
+fn legacy_claude_settings_path() -> anyhow::Result<PathBuf> {
+    let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("$HOME not set"))?;
     Ok(PathBuf::from(home)
         .join(".config")
         .join("roost")
@@ -1567,16 +2012,19 @@ fn legacy_claude_settings_path() -> Result<PathBuf> {
 /// left for a shell alias to route. Exit code follows `agent install`:
 /// 0 whether this run wired Claude or found it already wired, matching
 /// every other agent verb's "explicit wins" idempotency.
-fn claude_install() -> i32 {
+fn claude_install(json: bool) -> Result<i32, CliError> {
     eprintln!(
         "roostctl claude install: alias of `roostctl agent install claude` — it no longer \
          writes ~/.config/roost/claude-settings.json or prints a shell alias. Run `roostctl \
          agent status` to see what is wired, or `roostctl agent uninstall claude` to remove it."
     );
-    agent_install::run(&agent_install::AgentCmd::Install {
-        agent: Some("claude".to_string()),
-        all: false,
-    })
+    agent_install::run(
+        &agent_install::AgentCmd::Install {
+            agent: Some("claude".to_string()),
+            all: false,
+        },
+        json,
+    )
 }
 
 /// Test-only now: production code stopped writing quoted commands when
@@ -1858,18 +2306,6 @@ fn decode_escapes(s: &str) -> Vec<u8> {
     out
 }
 
-/// A `--tab` argument as the wire wants it: a bare id, the
-/// `h<host>.<id>` spelling of a connected host's tab, or — when the flag
-/// is absent — the UI's own active tab, which is always local.
-async fn wire_tab_ref(client: &mut IpcClient, explicit: Option<&str>) -> Result<WireTabRef> {
-    match explicit {
-        Some(raw) => {
-            WireTabRef::parse(raw).ok_or_else(|| anyhow::anyhow!("invalid --tab reference: {raw}"))
-        }
-        None => Ok(WireTabRef::Local(resolve_tab(client, None).await?)),
-    }
-}
-
 /// `tab.send_file`'s paths as the op wants them: absolute and existing.
 ///
 /// Canonicalized in **roostctl's** cwd, because that is where the
@@ -1877,17 +2313,17 @@ async fn wire_tab_ref(client: &mut IpcClient, explicit: Option<&str>) -> Result<
 /// relative path for exactly that reason. A path that is not there is
 /// this side's error, naming the path, rather than a wire round-trip
 /// that comes back saying the same thing later.
-fn canonicalize_for_send_file(paths: &[PathBuf]) -> Result<Vec<String>> {
+fn canonicalize_for_send_file(paths: &[PathBuf]) -> Result<Vec<String>, CliError> {
     paths
         .iter()
         .map(|path| {
             let resolved = std::fs::canonicalize(path)
-                .map_err(|e| anyhow!("cannot send {}: {e}", path.display()))?;
+                .map_err(|e| CliError::Usage(format!("cannot send {}: {e}", path.display())))?;
             resolved.into_os_string().into_string().map_err(|bad| {
-                anyhow!(
+                CliError::Usage(format!(
                     "cannot send {}: the resolved path is not valid UTF-8",
                     Path::new(&bad).display()
-                )
+                ))
             })
         })
         .collect()
@@ -1905,32 +2341,114 @@ fn send_file_budget(paths: usize, scale: f64) -> Duration {
     Duration::from_secs(60 + 300 * paths as u64).mul_f64(scale)
 }
 
-/// Resolve the tab id for a per-tab command. Falls back to the
-/// running UI's active tab via `identify` when neither `--tab` nor
-/// `ROOST_TAB_ID` is set. Errors with a clear message when the UI
-/// has no active tab either — better than sending `tab_id = 0` and
-/// getting a confusing `not-found` back.
-async fn resolve_tab(client: &mut IpcClient, explicit: Option<i64>) -> Result<i64> {
-    if let Some(id) = explicit {
-        return Ok(id);
-    }
-    let resp = identify(client).await?;
-    if resp.active_tab_id == 0 {
-        anyhow::bail!(
-            "no --tab specified and the UI reports no active tab; \
-             pass --tab or set ROOST_TAB_ID"
-        );
-    }
-    Ok(resp.active_tab_id)
+/// What a verb's `--tab` holds: a bare local id, or a [`WireTabRef`] that
+/// can also name a connected host's tab. `ROOST_TAB_ID` is read into the
+/// same type, so the env reaches both kinds of verb alike — and a local id
+/// in it must be positive, as [`parse_tab_id`] (the hooks' and doctor's
+/// reading) requires, or a mutating verb would send `0` rather than refuse.
+trait TabRef: Sized {
+    fn from_env(raw: &str) -> Option<Self>;
 }
 
-fn parse_state(s: &str) -> Result<TabState> {
+impl TabRef for i64 {
+    fn from_env(raw: &str) -> Option<Self> {
+        parse_tab_id(raw)
+    }
+}
+
+impl TabRef for WireTabRef {
+    fn from_env(raw: &str) -> Option<Self> {
+        WireTabRef::parse(raw).filter(|tab| match tab {
+            WireTabRef::Local(id) => *id > 0,
+            WireTabRef::Host { .. } => true,
+        })
+    }
+}
+
+/// `--tab`, else `ROOST_TAB_ID` (empty counts as unset), else nothing.
+fn named_tab<T: TabRef>(flag: Option<T>, tab_env: Option<&str>) -> Result<Option<T>, CliError> {
+    match (flag, tab_env.filter(|raw| !raw.is_empty())) {
+        (Some(tab), _) => Ok(Some(tab)),
+        (None, Some(raw)) => T::from_env(raw)
+            .map(Some)
+            .ok_or_else(|| CliError::Usage(format!("ROOST_TAB_ID={raw} is not a tab id"))),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The tab a verb in [`MUTATING_TAB_VERBS`] acts on — never the UI's
+/// active tab. Pure, so the refusal comes before anything is dialled.
+fn require_tab<T: TabRef>(
+    verb: &str,
+    flag: Option<T>,
+    tab_env: Option<&str>,
+) -> Result<T, CliError> {
+    debug_assert!(
+        MUTATING_TAB_VERBS.contains(&verb),
+        "{verb} requires a tab but is missing from MUTATING_TAB_VERBS"
+    );
+    named_tab(flag, tab_env)?.ok_or_else(|| CliError::Usage(NO_TAB.to_string()))
+}
+
+/// `tab dump` of `--tab`, `ROOST_TAB_ID`, or else the UI's active tab.
+///
+/// A bare id is read off the socket that owns the tabs, the one `wait`
+/// reads ([`events::resolve`]): under `local-backend = session` the UI
+/// keeps a terminal only for the tab it is showing, and refuses the rest
+/// `not-found`. An `h<host>.<id>` names that client-side terminal itself,
+/// so it stays on the UI socket.
+async fn dump_tab(
+    ui: &mut UiSocket<'_>,
+    flag: Option<WireTabRef>,
+    tab_env: Option<&str>,
+    scrollback: u32,
+) -> Result<TabDumpResult, CliError> {
+    let named = named_tab(flag, tab_env)?;
+    if let Some(tab_id @ WireTabRef::Host { .. }) = named {
+        return ui
+            .call(ops::TAB_DUMP, TabDumpParams { tab_id, scrollback })
+            .await;
+    }
+    let identify = identify(ui.client().await?).await?;
+    let tab_id = match named {
+        Some(tab) => tab,
+        None => WireTabRef::Local(active_tab(&identify)?),
+    };
+    let params = TabDumpParams { tab_id, scrollback };
+    let source = events::resolve(ui.socket_path(), &identify);
+    if source.socket == ui.socket_path() {
+        return ui.call(ops::TAB_DUMP, params).await;
+    }
+    Ok(dial(&source.socket)
+        .await?
+        .call(ops::TAB_DUMP, params)
+        .await?)
+}
+
+/// The UI's active tab, refused when it has none rather than sent
+/// `tab_id = 0` for a confusing `not-found`.
+fn active_tab(identify: &IdentifyResult) -> Result<i64, CliError> {
+    if identify.active_tab_id == 0 {
+        return Err(CliError::Usage(
+            "no --tab, ROOST_TAB_ID is unset, and the UI reports no active tab; pass --tab".into(),
+        ));
+    }
+    Ok(identify.active_tab_id)
+}
+
+/// A `--tab` given as text: a bare id or `h<host>.<id>`, checked before
+/// anything is dialled.
+fn parse_tab_flag(raw: &str) -> Result<WireTabRef, CliError> {
+    WireTabRef::parse(raw).ok_or_else(|| CliError::Usage(format!("invalid --tab reference: {raw}")))
+}
+
+fn parse_state(s: &str) -> Result<TabState, CliError> {
     Ok(match s {
         "none" => TabState::None,
         "running" => TabState::Running,
         "needs_input" => TabState::NeedsInput,
         "idle" => TabState::Idle,
-        other => anyhow::bail!("unknown state '{other}'"),
+        other => return Err(CliError::Usage(format!("unknown state '{other}'"))),
     })
 }
 
@@ -2013,16 +2531,10 @@ mod tests {
     fn dump_scrollback_defaults_to_zero_and_otherwise_parses_through() {
         let args = Args::try_parse_from(["roostctl", "tab", "dump", "--tab", "7"])
             .expect("a bare tab id parses");
-        let Cmd::Tab(TabCmd::Dump {
-            tab,
-            json,
-            scrollback,
-        }) = args.command
-        else {
+        let Cmd::Tab(TabCmd::Dump { tab, scrollback }) = args.command else {
             panic!("expected tab dump")
         };
         assert_eq!(tab.as_deref(), Some("7"));
-        assert!(!json);
         assert_eq!(scrollback, 0);
 
         let args = Args::try_parse_from([
@@ -2047,12 +2559,11 @@ mod tests {
     fn send_file_requires_a_tab_and_at_least_one_path() {
         let args = Args::try_parse_from(["roostctl", "tab", "send-file", "--tab", "h2.7", "a.png"])
             .expect("a tab and a path parse");
-        let Cmd::Tab(TabCmd::SendFile { tab, paths, json }) = args.command else {
+        let Cmd::Tab(TabCmd::SendFile { tab, paths }) = args.command else {
             panic!("expected tab send-file")
         };
         assert_eq!(tab, "h2.7");
         assert_eq!(paths, vec![PathBuf::from("a.png")]);
-        assert!(!json);
 
         assert!(
             Args::try_parse_from(["roostctl", "tab", "send-file", "a.png"]).is_err(),
@@ -2091,9 +2602,10 @@ mod tests {
             let error = canonicalize_for_send_file(std::slice::from_ref(&missing))
                 .expect_err("a path that is not there is our error, not the wire's");
             assert!(
-                error.to_string().contains(&missing.display().to_string()),
-                "{error}"
+                error.message().contains(&missing.display().to_string()),
+                "{error:?}"
             );
+            assert_eq!(error.code(), "usage");
         }
     }
 
@@ -2196,22 +2708,39 @@ mod tests {
             BundleProfileKind::from(TargetArg::Iced),
             BundleProfileKind::Iced
         ));
+        assert!(matches!(
+            BundleProfileKind::from(TargetArg::Session),
+            BundleProfileKind::Session
+        ));
     }
 
-    /// HS-0 fence: `BundleProfileKind::Session` exists, but `roostctl`
-    /// cannot be pointed at a session. HS-1 defines session targeting;
-    /// until then `--target session` must be rejected outright.
+    /// `--target session` (#475): explicit-only targeting of the
+    /// headless `roost-session` daemon. Unlike the other three values,
+    /// `session` has no `ROOST_BUNDLE_PROFILE` equivalent (pinned by
+    /// `roost_ipc::target`'s HS-0 fence,
+    /// `session_is_not_a_roostctl_target`, which stays unchanged) and is
+    /// never an auto-detect candidate — naming it here is the only way
+    /// in besides `--socket`.
     #[test]
-    fn session_is_not_a_target_flag_value() {
+    fn session_is_an_explicit_target_flag_value() {
         use clap::ValueEnum;
-        assert!(TargetArg::from_str("session", true).is_err());
+        assert!(TargetArg::from_str("session", true).is_ok());
         assert_eq!(
             TargetArg::value_variants()
                 .iter()
                 .filter_map(|v| v.to_possible_value().map(|p| p.get_name().to_string()))
                 .collect::<Vec<_>>(),
-            vec!["mac", "linux", "iced"]
+            vec!["mac", "linux", "iced", "session"]
         );
+    }
+
+    /// `roostctl --target session tab list` parses: clap accepts
+    /// `session` ahead of any subcommand, same as `mac`/`linux`/`iced`.
+    #[test]
+    fn target_session_flag_parses_ahead_of_a_subcommand() {
+        let args = Args::try_parse_from(["roostctl", "--target", "session", "tab", "list"])
+            .expect("--target session parses");
+        assert!(matches!(args.target, Some(TargetArg::Session)));
     }
 
     /// The two hook verbs, as the installed configs spell them.
@@ -2468,6 +2997,22 @@ mod tests {
     /// explicit force leaves the file exactly where it is — the install
     /// engine's own guard never sees this file, so nothing else would
     /// stop it.
+    /// A unique directory for a test socket, under `/tmp` rather than
+    /// `temp_dir()`: macOS's `$TMPDIR` is long enough that a socket path
+    /// under it overruns `SUN_LEN` (104 bytes) and `bind` refuses it.
+    fn short_socket_dir(tag: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tag: String = tag.chars().take(12).collect();
+        let dir = PathBuf::from("/tmp").join(format!(
+            "rctl-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     /// A unique scratch directory, the same way `session::tests` makes
     /// one: this crate has no tempdir dependency, and one test file is
     /// not a reason to take one.
@@ -2558,5 +3103,1473 @@ mod tests {
                 "{canonical} should map to a report"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Global `--json`, the error contract, and the target policy
+    // ------------------------------------------------------------------
+
+    /// Representative argv for every leaf verb — the least each needs to
+    /// parse. [`every_verb_takes_json_before_and_after_itself`] fails when
+    /// a verb is missing, so a new one cannot skip the global flag.
+    const EVERY_VERB: &[&[&str]] = &[
+        &["notify", "--title", "t"],
+        &["set-title", "--title", "t"],
+        &["identify"],
+        &["wait", "--state", "idle"],
+        &["events"],
+        &["tab", "focus"],
+        &["tab", "send-file", "--tab", "7", "a.png"],
+        &["tab", "list"],
+        &["tab", "set-state", "--state", "idle"],
+        &["tab", "clear-notification"],
+        &["tab", "open", "--project-id", "1"],
+        &["tab", "close"],
+        &["tab", "send", "--bytes", "x"],
+        &["tab", "resize", "--cols", "80", "--rows", "24"],
+        &["tab", "dump"],
+        &["tab", "reorder", "--project-id", "1", "--order", "1,2"],
+        &["project", "list"],
+        &["project", "create"],
+        &["project", "ensure", "--name", "n"],
+        &["project", "rename", "--id", "1", "--name", "n"],
+        &["project", "delete", "--id", "1"],
+        &["project", "reorder", "--order", "1,2"],
+        &["open", "--project", "n"],
+        &["palette", "open"],
+        &["palette", "state"],
+        &["palette", "query", "q"],
+        &["palette", "activate", "new_tab"],
+        &["palette", "dismiss"],
+        &["palette", "present", "--items", "[]"],
+        &["screenshot", "--out", "shot.png"],
+        &["render-stats"],
+        &["claude-hook", "Stop"],
+        &["agent-hook", "claude"],
+        &["agent", "ensure"],
+        &["agent", "set", "claude"],
+        &["agent", "install", "claude"],
+        &["agent", "uninstall", "claude"],
+        &["agent", "status"],
+        &["claude", "install"],
+        &["session", "start"],
+        &["session", "stop"],
+        &["session", "status"],
+        &["host", "add", "--label", "l", "--target", "t"],
+        &["host", "list"],
+        &["host", "status"],
+        &["host", "remove", "--id", "a"],
+        &["host", "connect", "--id", "a"],
+        &["host", "disconnect", "--id", "a"],
+        &["rpc", "tab.list"],
+        &["skill"],
+        &["doctor"],
+    ];
+
+    /// Every leaf verb as a user types it (`tab send`), with its clap
+    /// command.
+    fn leaf_verbs() -> Vec<(String, clap::Command)> {
+        use clap::CommandFactory;
+        let mut leaves = Vec::new();
+        for sub in Args::command().get_subcommands() {
+            if sub.has_subcommands() {
+                for leaf in sub.get_subcommands() {
+                    leaves.push((
+                        format!("{} {}", sub.get_name(), leaf.get_name()),
+                        leaf.clone(),
+                    ));
+                }
+            } else {
+                leaves.push((sub.get_name().to_string(), sub.clone()));
+            }
+        }
+        leaves
+    }
+
+    fn verb_name(argv: &[&str]) -> String {
+        use clap::CommandFactory;
+        let root = Args::command();
+        let first = root.find_subcommand(argv[0]).expect("a verb");
+        if first.has_subcommands() {
+            format!("{} {}", argv[0], argv[1])
+        } else {
+            argv[0].to_string()
+        }
+    }
+
+    fn parse(argv: &[&str]) -> Result<Args, clap::Error> {
+        Args::try_parse_from(std::iter::once("roostctl").chain(argv.iter().copied()))
+    }
+
+    /// A propagated name declared twice panics when clap builds the
+    /// command, which is at every startup — so this is the test that the
+    /// per-verb `--json` flags are really gone.
+    #[test]
+    fn the_command_line_definition_is_well_formed() {
+        use clap::CommandFactory;
+        Args::command().debug_assert();
+    }
+
+    #[test]
+    fn every_verb_takes_json_before_and_after_itself() {
+        let mut tabled: Vec<String> = EVERY_VERB.iter().map(|argv| verb_name(argv)).collect();
+        tabled.sort();
+        let mut leaves: Vec<String> = leaf_verbs().into_iter().map(|(name, _)| name).collect();
+        leaves.sort();
+        assert_eq!(
+            tabled, leaves,
+            "EVERY_VERB must name every leaf verb exactly once"
+        );
+
+        for argv in EVERY_VERB {
+            let bare = parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert!(!bare.json, "{argv:?}");
+
+            let before: Vec<&str> = std::iter::once("--json")
+                .chain(argv.iter().copied())
+                .collect();
+            let after: Vec<&str> = argv.iter().copied().chain(["--json"]).collect();
+            for spelled in [before, after] {
+                let args = parse(&spelled).unwrap_or_else(|e| panic!("{spelled:?}: {e}"));
+                assert!(args.json, "{spelled:?}");
+            }
+        }
+    }
+
+    /// The Mac app spawns these and decodes their stdout; there is no
+    /// Linux lane that runs the spawn, so the argv is pinned here.
+    #[test]
+    fn the_argv_the_mac_app_spawns_still_parses() {
+        let args = Args::try_parse_from(["roostctl", "agent", "ensure", "--json"])
+            .expect("the Mac app's agent ensure argv");
+        assert!(args.json);
+        assert!(matches!(
+            args.command,
+            Cmd::Agent(agent_install::AgentCmd::Ensure { startup: false })
+        ));
+
+        for argv in [
+            &["roostctl", "agent", "ensure", "--startup", "--json"][..],
+            &["roostctl", "agent", "status", "--json"],
+            &["roostctl", "agent", "set", "--local", "claude", "--json"],
+        ] {
+            let args = Args::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert!(args.json, "{argv:?}");
+            assert!(matches!(args.command, Cmd::Agent(_)), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_refused_command_line_reads_json_off_the_raw_argv() {
+        let argv: Vec<OsString> = ["roostctl", "--json", "tab", "list", "--bogus"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        let error = Args::try_parse_from(&argv).expect_err("--bogus is refused");
+        assert!(asks_for_json(&argv));
+        let usage = CliError::from_clap(&error);
+        assert_eq!(usage.code(), "usage");
+        let rendered: serde_json::Value =
+            serde_json::from_str(&usage.render(true)).expect("one JSON document");
+        assert_eq!(rendered["error"]["code"], "usage");
+        assert!(
+            rendered["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("--bogus")),
+            "{rendered}"
+        );
+        assert_eq!(refuse_command_line(&error, &argv), 2);
+
+        let plain: Vec<OsString> = ["roostctl", "tab", "list", "--bogus"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        assert!(!asks_for_json(&plain));
+
+        // Past `--` the words are the command `tab open` runs.
+        let separated: Vec<OsString> = ["roostctl", "tab", "open", "--", "jq", "--json"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        assert!(!asks_for_json(&separated));
+    }
+
+    /// A socket path in a fresh scratch directory that nothing listens on.
+    fn nowhere(tag: &str) -> String {
+        short_socket_dir(tag)
+            .join("nothing.sock")
+            .display()
+            .to_string()
+    }
+
+    async fn run_argv(argv: &[&str], tab_env: Option<&str>) -> Result<i32, CliError> {
+        run_argv_env(argv, tab_env, None).await
+    }
+
+    /// [`run_argv`] plus an injected `$PWD` — the `open` / `project
+    /// ensure` `--cwd` default, tested the same way [`run_argv`] tests
+    /// `ROOST_TAB_ID`: a parameter, never a real `chdir` or a dependency
+    /// on the test runner's own working directory.
+    async fn run_argv_env(
+        argv: &[&str],
+        tab_env: Option<&str>,
+        cwd_env: Option<&str>,
+    ) -> Result<i32, CliError> {
+        run(
+            parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}")),
+            tab_env,
+            cwd_env,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn no_ui_listening_is_a_connection_failure() {
+        let socket = nowhere("no-ui");
+        let error = run_argv(&["--socket", &socket, "tab", "list"], None)
+            .await
+            .expect_err("nothing is listening");
+        assert!(matches!(error, CliError::Connection(_)), "{error:?}");
+        assert_eq!(error.exit_code(), 1);
+        assert!(error.message().contains(&socket), "{error:?}");
+    }
+
+    /// A stand-in UI on a real socket. It answers each request through
+    /// `answer` and records what it was asked, so a test can say what
+    /// `roostctl` sent.
+    struct FakeUi {
+        socket: String,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    type Answer = Result<serde_json::Value, (&'static str, &'static str)>;
+
+    impl FakeUi {
+        fn start(tag: &str, answer: impl Fn(&str) -> Answer + Send + Sync + 'static) -> Self {
+            use roost_ipc::messages::{RawRequest, Response};
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+            let socket = short_socket_dir(tag).join("ui.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).expect("bind the fake UI");
+            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = requests.clone();
+            let answer = std::sync::Arc::new(answer);
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let seen = seen.clone();
+                    let answer = answer.clone();
+                    tokio::spawn(async move {
+                        let (read, mut write) = stream.into_split();
+                        let mut lines = BufReader::new(read).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let request: RawRequest =
+                                serde_json::from_str(&line).expect("a request frame");
+                            seen.lock()
+                                .unwrap()
+                                .push((request.op.clone(), request.params.clone()));
+                            let response = match answer(&request.op) {
+                                Ok(result) => Response::ok(request.id, result),
+                                Err((code, message)) => Response::err(request.id, code, message),
+                            };
+                            let mut frame = serde_json::to_vec(&response).unwrap();
+                            frame.push(b'\n');
+                            if write.write_all(&frame).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                socket: socket.display().to_string(),
+                requests,
+            }
+        }
+
+        fn take(&self) -> Vec<(String, serde_json::Value)> {
+            std::mem::take(&mut self.requests.lock().unwrap())
+        }
+    }
+
+    fn fake_identify(active_tab_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "socket_path": "/tmp/fake.sock",
+            "pid": 1,
+            "active_project_id": "1",
+            "active_tab_id": active_tab_id.to_string(),
+            "app_label": "Roost",
+            "app_id": "test",
+            "ui_version": "0",
+            "protocol_version": 1,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_server_refusal_reaches_the_caller_verbatim() {
+        let ui = FakeUi::start("server-refusal", |_| Err(("not-found", "no tab 7")));
+        let error = run_argv(
+            &["--socket", &ui.socket, "tab", "close", "--tab", "7"],
+            None,
+        )
+        .await
+        .expect_err("the server refused");
+        assert_eq!(
+            error,
+            CliError::Server {
+                code: "not-found".into(),
+                message: "no tab 7".into()
+            }
+        );
+        assert_eq!(error.exit_code(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_wait_that_never_holds_times_out_with_exit_4() {
+        let ui = FakeUi::start("wait-timeout", |op| match op {
+            "identify" => Ok(fake_identify(0)),
+            "tab.list" => Ok(serde_json::json!({"projects": []})),
+            _ => Err(("unknown-op", "not faked")),
+        });
+        let error = run_argv(
+            &[
+                "--socket",
+                &ui.socket,
+                "wait",
+                "--tab",
+                "7",
+                "--state",
+                "idle",
+                "--timeout",
+                "0",
+            ],
+            None,
+        )
+        .await
+        .expect_err("tab 7 never appears");
+        assert!(matches!(error, CliError::Timeout(_)), "{error:?}");
+        assert_eq!(error.exit_code(), 4);
+        assert_eq!(error.code(), "timeout");
+    }
+
+    fn mutating_argv(verb: &str) -> Vec<&'static str> {
+        EVERY_VERB
+            .iter()
+            .find(|argv| verb_name(argv) == verb)
+            .unwrap_or_else(|| panic!("{verb} is in MUTATING_TAB_VERBS with no argv in EVERY_VERB"))
+            .to_vec()
+    }
+
+    /// Refused against a socket nothing listens on, so a verb that dialled
+    /// before checking its tab would fail `connection`, never `usage`.
+    #[tokio::test]
+    async fn a_mutating_verb_with_no_tab_refuses_before_dialling() {
+        let socket = nowhere("refuse");
+        for verb in MUTATING_TAB_VERBS {
+            let argv: Vec<&str> = ["--socket", socket.as_str()]
+                .into_iter()
+                .chain(mutating_argv(verb))
+                .collect();
+            for unset in [None, Some("")] {
+                let refused = run_argv(&argv, unset).await.expect_err(verb);
+                assert_eq!(refused, CliError::Usage(NO_TAB.into()), "{verb} {unset:?}");
+                assert_eq!(refused.exit_code(), 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn roost_tab_id_or_the_flag_satisfies_a_mutating_verb() {
+        let ui = FakeUi::start("satisfied", |_| Ok(serde_json::json!({})));
+        for verb in MUTATING_TAB_VERBS {
+            let argv: Vec<&str> = ["--socket", ui.socket.as_str()]
+                .into_iter()
+                .chain(mutating_argv(verb))
+                .collect();
+            assert_eq!(run_argv(&argv, Some("7")).await, Ok(0), "{verb}");
+            let flagged: Vec<&str> = argv.iter().copied().chain(["--tab", "8"]).collect();
+            assert_eq!(run_argv(&flagged, Some("7")).await, Ok(0), "{verb}");
+
+            let sent = ui.take();
+            let tab_ids: Vec<&serde_json::Value> =
+                sent.iter().map(|(_, params)| &params["tab_id"]).collect();
+            assert_eq!(tab_ids, ["7", "8"], "{verb}: {sent:?}");
+            assert!(
+                sent.iter().all(|(op, _)| op != ops::IDENTIFY),
+                "{verb} asked for the active tab: {sent:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unusable_roost_tab_id_is_usage() {
+        let socket = nowhere("bad-env");
+        for argv in [
+            vec!["--socket", socket.as_str(), "tab", "close"],
+            vec!["--socket", socket.as_str(), "tab", "focus"],
+        ] {
+            for raw in ["seven", "0", "-3"] {
+                let refused = run_argv(&argv, Some(raw)).await.expect_err("refused");
+                assert_eq!(
+                    refused,
+                    CliError::Usage(format!("ROOST_TAB_ID={raw} is not a tab id")),
+                    "{argv:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_read_only_verbs_fall_back_to_the_active_tab() {
+        let ui = FakeUi::start("fallback", |op| match op {
+            "identify" => Ok(fake_identify(5)),
+            "tab.list" => Ok(serde_json::json!({"projects": []})),
+            "tab.dump" => Ok(serde_json::json!({"cols": 80, "rows": 1, "rows_text": [""]})),
+            _ => Err(("unknown-op", "not faked")),
+        });
+
+        assert_eq!(
+            run_argv(&["--socket", &ui.socket, "tab", "dump"], None).await,
+            Ok(0)
+        );
+        let sent = ui.take();
+        assert_eq!(sent[0].0, ops::IDENTIFY, "{sent:?}");
+        assert_eq!(
+            (sent[1].0.as_str(), &sent[1].1["tab_id"]),
+            (ops::TAB_DUMP, &"5".into())
+        );
+
+        assert_eq!(
+            run_argv(
+                &["--socket", &ui.socket, "wait", "--gone", "--timeout", "0"],
+                None
+            )
+            .await,
+            Ok(0)
+        );
+        assert_eq!(ui.take()[0].0, ops::IDENTIFY);
+
+        // `ROOST_TAB_ID` still comes before the active tab.
+        assert_eq!(
+            run_argv(&["--socket", &ui.socket, "tab", "dump"], Some("9")).await,
+            Ok(0)
+        );
+        let sent = ui.take();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[1].1["tab_id"], "9");
+    }
+
+    /// `tab dump` of a bare id — named, from `ROOST_TAB_ID`, or the active
+    /// tab — goes, with that id, to `identify.local_session_socket` when
+    /// the UI names one, and to the UI socket when it does not. An
+    /// `h<host>.<id>` stays on the UI either way.
+    #[tokio::test]
+    async fn tab_dump_reads_a_bare_id_off_the_session_the_ui_names() {
+        fn dumped(op: &str) -> Answer {
+            match op {
+                "tab.dump" => Ok(serde_json::json!({"cols": 80, "rows": 1, "rows_text": [""]})),
+                _ => Err(("unknown-op", "not faked")),
+            }
+        }
+        let asked = |tab_id: &str| {
+            vec![(
+                ops::TAB_DUMP.to_string(),
+                serde_json::json!({ "tab_id": tab_id }),
+            )]
+        };
+        let session = FakeUi::start("dump-session", dumped);
+        let session_socket = session.socket.clone();
+        let on_session = FakeUi::start("dump-session-ui", move |op| match op {
+            "identify" => {
+                let mut identify = fake_identify(5);
+                identify["local_session_socket"] = serde_json::json!(session_socket);
+                Ok(identify)
+            }
+            other => dumped(other),
+        });
+        let in_process = FakeUi::start("dump-in-process-ui", |op| match op {
+            "identify" => Ok(fake_identify(5)),
+            other => dumped(other),
+        });
+
+        for (tab, tab_env, tab_id) in [
+            (Some("7"), None, "7"),
+            (None, Some("9"), "9"),
+            (None, None, "5"),
+        ] {
+            for ui in [&on_session, &in_process] {
+                let mut argv = vec!["--socket", ui.socket.as_str(), "tab", "dump"];
+                argv.extend(tab.map(|tab| ["--tab", tab]).into_iter().flatten());
+                assert_eq!(
+                    run_argv(&argv, tab_env).await,
+                    Ok(0),
+                    "{argv:?} {tab_env:?}"
+                );
+            }
+            let sent = on_session.take();
+            let named: Vec<&str> = sent.iter().map(|(op, _)| op.as_str()).collect();
+            assert_eq!(named, [ops::IDENTIFY], "{tab:?} {tab_env:?}");
+            assert_eq!(session.take(), asked(tab_id), "{tab:?} {tab_env:?}");
+            let sent = in_process.take();
+            assert_eq!(sent.first().map(|(op, _)| op.as_str()), Some(ops::IDENTIFY));
+            assert_eq!(sent[1..], asked(tab_id), "{tab:?} {tab_env:?}");
+        }
+
+        assert_eq!(
+            run_argv(
+                &[
+                    "--socket",
+                    &on_session.socket,
+                    "tab",
+                    "dump",
+                    "--tab",
+                    "h1.7"
+                ],
+                None
+            )
+            .await,
+            Ok(0)
+        );
+        assert_eq!(on_session.take(), asked("h1.7"));
+        assert!(session.take().is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // `open` / `project ensure` (plan 066 §3.2)
+    // ------------------------------------------------------------------
+
+    /// `identify.ops` advertising `project.ensure` (and the rest `open`
+    /// needs), with no backend switch in flight.
+    fn fake_identify_supports_ensure() -> serde_json::Value {
+        let mut identity = fake_identify(0);
+        identity["ops"] =
+            serde_json::json!(["identify", "project.ensure", "tab.open", "tab.focus",]);
+        identity
+    }
+
+    /// The same, with a backend switch reported in progress.
+    fn fake_identify_ensure_mid_switch() -> serde_json::Value {
+        let mut identity = fake_identify_supports_ensure();
+        identity["local_backend_switch"] = serde_json::json!("attach_remote");
+        identity
+    }
+
+    fn fake_project(id: i64, cwd: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id.to_string(),
+            "name": "proj",
+            "cwd": cwd,
+            "position": 0,
+            "created_at": 0,
+        })
+    }
+
+    fn fake_project_ensure_result() -> serde_json::Value {
+        serde_json::json!({"project": fake_project(42, "/ensured/cwd"), "created": true})
+    }
+
+    fn fake_tab(id: i64, project_id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id.to_string(),
+            "project_id": project_id.to_string(),
+            "title": "roostctl",
+            "cwd": "/ensured/cwd",
+            "state": "none",
+            "has_notification": false,
+            "is_active": false,
+            "user_titled": false,
+            "position": 0,
+            "created_at": 0,
+            "last_active": 0,
+            "hook_active": false,
+        })
+    }
+
+    fn fake_tab_open_result() -> serde_json::Value {
+        serde_json::json!({"tab": fake_tab(99, 42)})
+    }
+
+    fn answer_ensure_and_open(op: &str) -> Result<serde_json::Value, (&'static str, &'static str)> {
+        match op {
+            "identify" => Ok(fake_identify_supports_ensure()),
+            "project.ensure" => Ok(fake_project_ensure_result()),
+            "tab.open" => Ok(fake_tab_open_result()),
+            "tab.focus" => Ok(serde_json::json!({})),
+            _ => Err(("unknown-op", "not faked")),
+        }
+    }
+
+    #[test]
+    fn open_argv_parses_the_project_command_and_json_either_side() {
+        let parsed = parse(&["open", "--project", "X", "--", "cmd", "a", "b"]).expect("parses");
+        match parsed.command {
+            Cmd::Open {
+                project,
+                argv,
+                hold,
+                focus,
+                ..
+            } => {
+                assert_eq!(project, "X");
+                assert_eq!(argv, vec!["cmd", "a", "b"]);
+                assert!(!hold);
+                assert!(!focus);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        for spelled in [
+            vec!["--json", "open", "--project", "X"],
+            vec!["open", "--project", "X", "--json"],
+        ] {
+            let args = parse(&spelled).unwrap_or_else(|e| panic!("{spelled:?}: {e}"));
+            assert!(args.json, "{spelled:?}");
+            assert!(matches!(args.command, Cmd::Open { .. }), "{spelled:?}");
+        }
+    }
+
+    #[test]
+    fn project_ensure_argv_parses() {
+        let parsed = parse(&["project", "ensure", "--name", "X"]).expect("parses");
+        match parsed.command {
+            Cmd::Project(ProjectCmd::Ensure { name, cwd }) => {
+                assert_eq!(name, "X");
+                assert_eq!(cwd, None);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn open_and_project_ensure_default_cwd_to_the_injected_pwd() {
+        let ui = FakeUi::start("cwd-default", answer_ensure_and_open);
+
+        assert_eq!(
+            run_argv_env(
+                &["--socket", &ui.socket, "project", "ensure", "--name", "proj"],
+                None,
+                Some("/injected/pwd"),
+            )
+            .await,
+            Ok(0)
+        );
+        let sent = ui.take();
+        assert_eq!(sent[1].0, ops::PROJECT_ENSURE, "{sent:?}");
+        assert_eq!(sent[1].1["cwd"], "/injected/pwd", "{sent:?}");
+
+        assert_eq!(
+            run_argv_env(
+                &["--socket", &ui.socket, "open", "--project", "proj"],
+                None,
+                Some("/injected/pwd"),
+            )
+            .await,
+            Ok(0)
+        );
+        let sent = ui.take();
+        assert_eq!(
+            (sent[1].0.as_str(), &sent[1].1["cwd"]),
+            (ops::PROJECT_ENSURE, &"/injected/pwd".into())
+        );
+        assert_eq!(
+            (sent[2].0.as_str(), &sent[2].1["cwd"]),
+            (ops::TAB_OPEN, &"/injected/pwd".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn open_sequences_ensure_then_tab_open_and_focuses_only_with_the_flag() {
+        let ui = FakeUi::start("open-sequence", answer_ensure_and_open);
+
+        assert_eq!(
+            run_argv_env(
+                &[
+                    "--socket",
+                    &ui.socket,
+                    "open",
+                    "--project",
+                    "proj",
+                    "--cwd",
+                    "/ensured/cwd",
+                ],
+                None,
+                None,
+            )
+            .await,
+            Ok(0)
+        );
+        let sent = ui.take();
+        let seen: Vec<&str> = sent.iter().map(|(op, _)| op.as_str()).collect();
+        assert_eq!(
+            seen,
+            [ops::IDENTIFY, ops::PROJECT_ENSURE, ops::TAB_OPEN],
+            "{sent:?}"
+        );
+        assert_eq!(sent[1].1["name"], "proj");
+        assert_eq!(
+            sent[2].1["project_id"], "42",
+            "must use the ensured project's id"
+        );
+
+        assert_eq!(
+            run_argv_env(
+                &[
+                    "--socket",
+                    &ui.socket,
+                    "open",
+                    "--project",
+                    "proj",
+                    "--cwd",
+                    "/ensured/cwd",
+                    "--focus",
+                ],
+                None,
+                None,
+            )
+            .await,
+            Ok(0)
+        );
+        let sent = ui.take();
+        let seen: Vec<&str> = sent.iter().map(|(op, _)| op.as_str()).collect();
+        assert_eq!(
+            seen,
+            [
+                ops::IDENTIFY,
+                ops::PROJECT_ENSURE,
+                ops::TAB_OPEN,
+                ops::TAB_FOCUS
+            ],
+            "{sent:?}"
+        );
+        assert_eq!(sent[3].1["tab_id"], "99", "focuses the newly opened tab");
+    }
+
+    #[tokio::test]
+    async fn open_hold_rewrites_argv_like_tab_open_does() {
+        let ui = FakeUi::start("open-hold", answer_ensure_and_open);
+        assert_eq!(
+            run_argv_env(
+                &[
+                    "--socket",
+                    &ui.socket,
+                    "open",
+                    "--project",
+                    "proj",
+                    "--cwd",
+                    "/x",
+                    "--hold",
+                    "--",
+                    "make",
+                    "test",
+                ],
+                None,
+                None,
+            )
+            .await,
+            Ok(0)
+        );
+        let sent = ui.take();
+        let opened = sent
+            .iter()
+            .find(|(op, _)| op == ops::TAB_OPEN)
+            .expect("tab.open sent");
+        let argv: Vec<String> = serde_json::from_value(opened.1["argv"].clone()).unwrap();
+        assert_eq!(
+            argv,
+            held_argv(
+                &std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+                &["make".to_string(), "test".to_string()]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_when_identify_has_no_ops_field_sends_nothing_else() {
+        let ui = FakeUi::start("no-ops-field", |op| match op {
+            "identify" => Ok(fake_identify(0)), // no `ops` field at all
+            _ => Err(("unknown-op", "not faked")),
+        });
+        for argv in [
+            vec![
+                "--socket",
+                ui.socket.as_str(),
+                "project",
+                "ensure",
+                "--name",
+                "x",
+            ],
+            vec!["--socket", ui.socket.as_str(), "open", "--project", "x"],
+        ] {
+            let error = run_argv(&argv, None).await.expect_err(&format!("{argv:?}"));
+            assert_eq!(error.code(), "unsupported", "{argv:?}: {error:?}");
+            assert_eq!(error.exit_code(), 1, "{argv:?}");
+            let sent = ui.take();
+            assert_eq!(
+                sent.iter().map(|(op, _)| op.as_str()).collect::<Vec<_>>(),
+                vec![ops::IDENTIFY],
+                "{argv:?}: {sent:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_when_ops_lacks_project_ensure_sends_nothing_else() {
+        let ui = FakeUi::start("ops-without-ensure", |op| match op {
+            "identify" => {
+                let mut identity = fake_identify(0);
+                identity["ops"] = serde_json::json!(["identify", "tab.open", "tab.list"]);
+                Ok(identity)
+            }
+            _ => Err(("unknown-op", "not faked")),
+        });
+        for argv in [
+            vec![
+                "--socket",
+                ui.socket.as_str(),
+                "project",
+                "ensure",
+                "--name",
+                "x",
+            ],
+            vec!["--socket", ui.socket.as_str(), "open", "--project", "x"],
+        ] {
+            let error = run_argv(&argv, None).await.expect_err(&format!("{argv:?}"));
+            assert_eq!(error.code(), "unsupported", "{argv:?}: {error:?}");
+            let sent = ui.take();
+            assert_eq!(
+                sent.iter().map(|(op, _)| op.as_str()).collect::<Vec<_>>(),
+                vec![ops::IDENTIFY],
+                "{argv:?}: {sent:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn open_refuses_usage_during_a_backend_switch_before_project_ensure() {
+        let ui = FakeUi::start("switch-in-progress", |op| match op {
+            "identify" => Ok(fake_identify_ensure_mid_switch()),
+            _ => Err(("unknown-op", "not faked")),
+        });
+        let error = run_argv(
+            &[
+                "--socket",
+                &ui.socket,
+                "open",
+                "--project",
+                "x",
+                "--cwd",
+                "/x",
+            ],
+            None,
+        )
+        .await
+        .expect_err("a switch is in progress");
+        assert_eq!(
+            error,
+            CliError::Usage("a backend switch is in progress; retry".into())
+        );
+        let sent = ui.take();
+        assert_eq!(
+            sent.iter().map(|(op, _)| op.as_str()).collect::<Vec<_>>(),
+            vec![ops::IDENTIFY],
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_passes_through_a_not_found_from_tab_open_verbatim() {
+        let ui = FakeUi::start("open-not-found", |op| match op {
+            "identify" => Ok(fake_identify_supports_ensure()),
+            "project.ensure" => Ok(fake_project_ensure_result()),
+            "tab.open" => Err(("not-found", "project 42 is gone")),
+            _ => Err(("unknown-op", "not faked")),
+        });
+        let error = run_argv(
+            &[
+                "--socket",
+                &ui.socket,
+                "open",
+                "--project",
+                "x",
+                "--cwd",
+                "/x",
+            ],
+            None,
+        )
+        .await
+        .expect_err("the project vanished between the two calls");
+        assert_eq!(
+            error,
+            CliError::Server {
+                code: "not-found".into(),
+                message: "project 42 is gone".into(),
+            }
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `rpc`
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn rpc_argv_parses_with_and_without_params() {
+        let bare = parse(&["rpc", "tab.list"]).expect("no params");
+        match bare.command {
+            Cmd::Rpc { op, params } => {
+                assert_eq!(op, "tab.list");
+                assert_eq!(params, None);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let with_params =
+            parse(&["rpc", "tab.write", r#"{"tab_id":"4"}"#]).expect("params argument");
+        match with_params.command {
+            Cmd::Rpc { op, params } => {
+                assert_eq!(op, "tab.write");
+                assert_eq!(params.as_deref(), Some(r#"{"tab_id":"4"}"#));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let from_stdin = parse(&["rpc", "tab.write", "-"]).expect("dash for stdin");
+        assert!(
+            matches!(&from_stdin.command, Cmd::Rpc { params: Some(p), .. } if p == "-"),
+            "{:?}",
+            from_stdin.command
+        );
+
+        for spelled in [
+            vec!["--json", "rpc", "tab.list"],
+            vec!["rpc", "tab.list", "--json"],
+        ] {
+            let args = parse(&spelled).unwrap_or_else(|e| panic!("{spelled:?}: {e}"));
+            assert!(args.json, "{spelled:?}");
+            assert!(matches!(args.command, Cmd::Rpc { .. }), "{spelled:?}");
+        }
+    }
+
+    /// Params that don't parse as JSON, or that parse as something other
+    /// than an object, are refused before the socket is dialled — the
+    /// same "checked before it's dialled" posture [`require_tab`] takes,
+    /// proven the same way: nothing is listening at `socket`, so a verb
+    /// that dialled first would fail `connection`, never `usage`.
+    #[tokio::test]
+    async fn rpc_params_must_be_a_json_object() {
+        let socket = nowhere("rpc-bad-params");
+        for bad in ["[1,2,3]", "\"a string\"", "42", "not json", ""] {
+            let refused = run_argv(&["--socket", &socket, "rpc", "tab.list", bad], None)
+                .await
+                .expect_err(bad);
+            assert!(matches!(refused, CliError::Usage(_)), "{bad}: {refused:?}");
+            assert_eq!(refused.exit_code(), 2, "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_sends_the_op_verbatim_with_params_or_an_empty_object() {
+        let ui = FakeUi::start("rpc-ok", |_| Ok(serde_json::json!({"ok": true})));
+
+        assert_eq!(
+            run_argv(&["--socket", &ui.socket, "rpc", "tab.list"], None).await,
+            Ok(0)
+        );
+        assert_eq!(
+            ui.take(),
+            vec![("tab.list".to_string(), serde_json::json!({}))]
+        );
+
+        assert_eq!(
+            run_argv(
+                &[
+                    "--socket",
+                    &ui.socket,
+                    "rpc",
+                    "tab.write",
+                    r#"{"tab_id":"4"}"#,
+                ],
+                None,
+            )
+            .await,
+            Ok(0)
+        );
+        assert_eq!(
+            ui.take(),
+            vec![("tab.write".to_string(), serde_json::json!({"tab_id": "4"}))]
+        );
+    }
+
+    /// The server's own `unknown-op` reaches the caller verbatim — `rpc`
+    /// validates nothing about the op name itself.
+    #[tokio::test]
+    async fn rpc_passes_an_unknown_op_through_to_the_servers_refusal() {
+        let ui = FakeUi::start("rpc-unknown-op", |_| {
+            Err(("unknown-op", "no such op: no.such.op"))
+        });
+        let error = run_argv(&["--socket", &ui.socket, "rpc", "no.such.op"], None)
+            .await
+            .expect_err("the server refused");
+        assert_eq!(
+            error,
+            CliError::Server {
+                code: "unknown-op".into(),
+                message: "no such op: no.such.op".into(),
+            }
+        );
+        assert_eq!(error.exit_code(), 1);
+    }
+
+    /// `require_tab`'s call sites are the policy; the const is what a
+    /// reader (and the skill) sees of it. Read off this file's own source
+    /// so a handler cannot refuse without being listed, nor be listed
+    /// without refusing.
+    #[test]
+    fn the_mutating_list_names_exactly_the_verbs_that_call_require_tab() {
+        let source = include_str!("main.rs");
+        let needle = concat!("require", "_tab(");
+        let mut called: Vec<&str> = source
+            .match_indices(needle)
+            .filter_map(|(at, _)| {
+                let rest = source[at + needle.len()..].trim_start().strip_prefix('"')?;
+                Some(&rest[..rest.find('"')?])
+            })
+            .collect();
+        called.sort_unstable();
+        let mut listed = MUTATING_TAB_VERBS.to_vec();
+        listed.sort_unstable();
+        assert_eq!(called, listed);
+    }
+
+    /// A new verb that takes `--tab` has to be put on one side or the
+    /// other, so it cannot pick up the active-tab fallback by omission.
+    #[test]
+    fn every_verb_that_takes_a_tab_is_mutating_or_a_known_reader() {
+        const READERS: &[&str] = &["wait", "events", "tab dump", "tab send-file", "doctor"];
+        let mut with_tab: Vec<String> = leaf_verbs()
+            .into_iter()
+            .filter(|(_, cmd)| cmd.get_arguments().any(|arg| arg.get_id() == "tab"))
+            .map(|(name, _)| name)
+            .collect();
+        with_tab.sort();
+        let mut classified: Vec<String> = MUTATING_TAB_VERBS
+            .iter()
+            .chain(READERS)
+            .map(|verb| verb.to_string())
+            .collect();
+        classified.sort();
+        assert_eq!(with_tab, classified);
+    }
+
+    // `roostctl skill` and the SKILL.md it embeds (plan 066 §3.3).
+
+    /// The executable fence marker; a harness replays exactly these.
+    const RECIPE_FENCE: &str = "```bash roost-recipe";
+
+    /// Each ` ```bash roost-recipe ` fence as its logical lines — a
+    /// trailing `\` joins the next line — with the SKILL.md line number
+    /// each starts on.
+    fn recipe_fences(doc: &str) -> Vec<Vec<(usize, String)>> {
+        let mut fences = Vec::new();
+        let mut open: Option<Vec<(usize, String)>> = None;
+        let mut continued: Option<(usize, String)> = None;
+        for (index, line) in doc.lines().enumerate() {
+            let number = index + 1;
+            let Some(fence) = open.as_mut() else {
+                if line.trim_end() == RECIPE_FENCE {
+                    open = Some(Vec::new());
+                } else {
+                    assert!(
+                        !(line.starts_with("```") && line.contains("roost-recipe")),
+                        "SKILL.md:{number}: a misspelt recipe fence would be skipped: {line}"
+                    );
+                }
+                continue;
+            };
+            if line.trim_end() == "```" {
+                assert!(
+                    continued.is_none(),
+                    "SKILL.md:{number}: a fence ends on `\\`"
+                );
+                if let Some(fence) = open.take() {
+                    fences.push(fence);
+                }
+                continue;
+            }
+            let (start, mut text) = continued.take().unwrap_or((number, String::new()));
+            match line.strip_suffix('\\') {
+                Some(head) => {
+                    text.push_str(head);
+                    continued = Some((start, text));
+                }
+                None => {
+                    text.push_str(line);
+                    fence.push((start, text));
+                }
+            }
+        }
+        assert!(open.is_none(), "SKILL.md ends inside a recipe fence");
+        fences
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum ShellToken {
+        Word(String),
+        /// `|`, `;`, `&`, `$(`, `)`, a redirection: whatever ends a command.
+        Operator,
+    }
+
+    /// `"$PWD"` → `/tmp`; any other variable (`$tab`, `$ROOST_TAB_ID`) → a
+    /// tab id, which is also a valid string for every other flag.
+    fn expand_variable(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+        let braced = chars.next_if_eq(&'{').is_some();
+        let mut name = String::new();
+        while let Some(c) = chars.next_if(|c| c.is_ascii_alphanumeric() || *c == '_') {
+            name.push(c);
+        }
+        if braced {
+            assert_eq!(
+                chars.next(),
+                Some('}'),
+                "only a plain ${{name}} is expanded"
+            );
+        }
+        if name.is_empty() {
+            return "$".into();
+        }
+        if name == "PWD" {
+            "/tmp".into()
+        } else {
+            "7".into()
+        }
+    }
+
+    /// Split one recipe line the way `sh` would, as far as recovering each
+    /// `roostctl` argv needs: quotes, escapes, variables, comments, and the
+    /// operators that end a command. A construct it does not model panics
+    /// rather than being skipped.
+    fn shell_tokens(line: &str) -> Vec<ShellToken> {
+        let mut tokens = Vec::new();
+        let mut word: Option<String> = None;
+        let mut chars = line.chars().peekable();
+        fn end(word: &mut Option<String>, tokens: &mut Vec<ShellToken>) {
+            tokens.extend(word.take().map(ShellToken::Word));
+        }
+        while let Some(c) = chars.next() {
+            match c {
+                c if c.is_whitespace() => end(&mut word, &mut tokens),
+                '#' if word.is_none() => break,
+                '\'' => {
+                    let text = word.get_or_insert_with(String::new);
+                    loop {
+                        match chars.next().expect("an unclosed single quote") {
+                            '\'' => break,
+                            c => text.push(c),
+                        }
+                    }
+                }
+                '"' => {
+                    let text = word.get_or_insert_with(String::new);
+                    loop {
+                        match chars.next().expect("an unclosed double quote") {
+                            '"' => break,
+                            '\\' => {
+                                let next = chars.next().expect("a trailing backslash");
+                                if !matches!(next, '"' | '\\' | '$' | '`') {
+                                    text.push('\\');
+                                }
+                                text.push(next);
+                            }
+                            '$' => {
+                                assert!(
+                                    chars.peek() != Some(&'('),
+                                    "unparsed: $( inside quotes in `{line}`"
+                                );
+                                text.push_str(&expand_variable(&mut chars));
+                            }
+                            '`' => panic!("unparsed: a backtick in `{line}`"),
+                            c => text.push(c),
+                        }
+                    }
+                }
+                '\\' => {
+                    let next = chars.next().expect("a trailing backslash");
+                    word.get_or_insert_with(String::new).push(next);
+                }
+                '$' if chars.peek() == Some(&'(') => {
+                    chars.next();
+                    end(&mut word, &mut tokens);
+                    tokens.push(ShellToken::Operator);
+                }
+                '$' => {
+                    let value = expand_variable(&mut chars);
+                    word.get_or_insert_with(String::new).push_str(&value);
+                }
+                '`' => panic!("unparsed: a backtick in `{line}`"),
+                '|' | ';' | '&' | '(' | ')' | '<' | '>' => {
+                    end(&mut word, &mut tokens);
+                    tokens.push(ShellToken::Operator);
+                }
+                c => word.get_or_insert_with(String::new).push(c),
+            }
+        }
+        end(&mut word, &mut tokens);
+        tokens
+    }
+
+    /// Every `roostctl` a recipe line runs, as the argv after the program
+    /// name, with the placeholders `N` and `X` given real values.
+    fn roostctl_argvs(line: &str) -> Vec<Vec<String>> {
+        let tokens = shell_tokens(line);
+        tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| **token == ShellToken::Word("roostctl".into()))
+            .map(|(at, _)| {
+                tokens[at + 1..]
+                    .iter()
+                    .map_while(|token| match token {
+                        ShellToken::Word(word) => Some(match word.as_str() {
+                            "N" => "7".to_string(),
+                            "X" => "review".to_string(),
+                            _ => word.clone(),
+                        }),
+                        ShellToken::Operator => None,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The splitter is what the parity test trusts, so it is pinned on the
+    /// shapes the recipes use.
+    #[test]
+    fn the_recipe_splitter_recovers_each_roostctl_argv() {
+        let strings = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            roostctl_argvs(
+                r#"tab=$(roostctl open --project X --cwd "$PWD" --json -- sh -c 'a; echo "b $?"' | jq -r .tab.id)"#
+            ),
+            vec![strings(&[
+                "open",
+                "--project",
+                "review",
+                "--cwd",
+                "/tmp",
+                "--json",
+                "--",
+                "sh",
+                "-c",
+                r#"a; echo "b $?""#,
+            ])]
+        );
+        assert_eq!(
+            roostctl_argvs("timeout 30 roostctl events --tab N | jq -c . # watch"),
+            vec![strings(&["events", "--tab", "7"])]
+        );
+        assert_eq!(
+            roostctl_argvs(
+                r#"roostctl wait --tab "$tab" --text 'a b'; roostctl tab dump --tab ${tab}"#
+            ),
+            vec![
+                strings(&["wait", "--tab", "7", "--text", "a b"]),
+                strings(&["tab", "dump", "--tab", "7"]),
+            ]
+        );
+        assert_eq!(
+            roostctl_argvs(
+                r#"roostctl tab send --tab N --bytes 'echo "x "y $?\n' && roostctl identify"#
+            ),
+            vec![
+                strings(&["tab", "send", "--tab", "7", "--bytes", r#"echo "x "y $?\n"#]),
+                strings(&["identify"]),
+            ]
+        );
+        assert!(roostctl_argvs("# roostctl identify").is_empty());
+    }
+
+    /// Every `roostctl` in every executable fence parses through clap, so
+    /// a recipe pins its options and not only its verb names.
+    #[test]
+    fn every_skill_recipe_parses_as_a_roostctl_command_line() {
+        let fences = recipe_fences(SKILL);
+        assert!(!fences.is_empty(), "SKILL.md has no `{RECIPE_FENCE}` fence");
+        for fence in &fences {
+            let mut invocations = 0;
+            for (number, line) in fence {
+                let argvs = roostctl_argvs(line);
+                if line.contains("roostctl") {
+                    assert!(
+                        !argvs.is_empty(),
+                        "SKILL.md:{number}: `{line}` names roostctl but runs none"
+                    );
+                }
+                for argv in argvs {
+                    invocations += 1;
+                    let full = std::iter::once("roostctl".to_string()).chain(argv.iter().cloned());
+                    if let Err(error) = Args::try_parse_from(full) {
+                        panic!("SKILL.md:{number}: `{line}` does not parse as {argv:?}:\n{error}");
+                    }
+                }
+            }
+            let first = fence.first().map_or(0, |(number, _)| *number);
+            assert!(
+                invocations > 0,
+                "the recipe fence at SKILL.md:{first} runs no roostctl"
+            );
+        }
+    }
+
+    /// The skill's rule about `--tab` is the agent-facing copy of
+    /// [`MUTATING_TAB_VERBS`], so a verb added there must be named here.
+    #[test]
+    fn the_skill_tab_rule_names_every_mutating_verb() {
+        let (_, rules) = SKILL.split_once("\n## Rules\n").expect("a Rules section");
+        let rules = rules.split("\n## ").next().unwrap_or(rules);
+        let mut items: Vec<String> = Vec::new();
+        let mut in_item = false;
+        for line in rules.lines() {
+            if let Some(start) = line.strip_prefix("- ") {
+                items.push(start.to_string());
+                in_item = true;
+            } else if line.trim().is_empty() || line.starts_with('|') {
+                in_item = false;
+            } else if in_item {
+                let item = items.last_mut().expect("a continued item");
+                item.push(' ');
+                item.push_str(line.trim());
+            }
+        }
+        let items: Vec<String> = items
+            .iter()
+            .map(|item| item.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect();
+        let rule = items
+            .iter()
+            .find(|item| item.contains("`--tab`"))
+            .expect("a Rules item about `--tab`");
+        assert!(rule.starts_with("Always pass `--tab`"), "{rule}");
+        for verb in MUTATING_TAB_VERBS {
+            assert!(
+                rule.contains(&format!("`{verb}`")),
+                "the --tab rule does not name `{verb}`: {rule}"
+            );
+        }
+    }
+
+    /// AC3: what `skill` prints is the file the plugin installs, read from
+    /// disk rather than through the same `include_str!`.
+    #[test]
+    fn skill_prints_skill_md_byte_for_byte() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/roost/SKILL.md");
+        let on_disk = std::fs::read_to_string(&path).expect("skills/roost/SKILL.md");
+
+        let mut printed = Vec::new();
+        assert_eq!(write_skill(&mut printed, false), Ok(0));
+        assert!(
+            printed == on_disk.as_bytes(),
+            "`roostctl skill` printed {} bytes, SKILL.md has {}",
+            printed.len(),
+            on_disk.len()
+        );
+
+        let mut printed = Vec::new();
+        assert_eq!(write_skill(&mut printed, true), Ok(0));
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&printed).expect("one JSON document");
+        assert_eq!(
+            envelope,
+            serde_json::json!({"topic": "roost", "format": "markdown", "content": on_disk})
+        );
+    }
+
+    #[test]
+    fn a_reader_that_hangs_up_on_skill_is_not_a_failure() {
+        struct Refuses(std::io::ErrorKind);
+        impl Write for Refuses {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(self.0.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(
+            write_skill(&mut Refuses(std::io::ErrorKind::BrokenPipe), false),
+            Ok(0)
+        );
+        let error = write_skill(&mut Refuses(std::io::ErrorKind::StorageFull), false)
+            .expect_err("a full disk is a failure");
+        assert_eq!(error.code(), "failed");
+    }
+
+    #[test]
+    fn the_skill_frontmatter_names_roost_and_says_when_to_use_it() {
+        let rest = SKILL
+            .strip_prefix("---\n")
+            .expect("SKILL.md opens with frontmatter");
+        let (front, _) = rest.split_once("\n---\n").expect("the frontmatter closes");
+        let field = |key: &str| {
+            front
+                .lines()
+                .find_map(|line| line.strip_prefix(key)?.strip_prefix(": "))
+        };
+        assert_eq!(field("name"), Some("roost"));
+        let description = field("description").expect("a description");
+        // Quoted: it holds `: `, which bare YAML would read as a mapping.
+        let text = description
+            .strip_prefix('"')
+            .and_then(|d| d.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("the description is not double-quoted: {description}"));
+        assert!(text.contains("Roost"), "{text}");
+    }
+
+    #[test]
+    fn the_plugin_manifests_carry_proxs_fields_at_the_workspace_version() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |rel: &str| {
+            std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+        };
+        let cargo = read("Cargo.toml");
+        let (_, package) = cargo
+            .split_once("\n[workspace.package]\n")
+            .expect("a [workspace.package] table");
+        let version = package
+            .lines()
+            .take_while(|line| !line.starts_with('['))
+            .find_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                (key.trim() == "version").then(|| value.trim().trim_matches('"'))
+            })
+            .expect("[workspace.package] version");
+
+        let plugin: serde_json::Value =
+            serde_json::from_str(&read(".claude-plugin/plugin.json")).expect("plugin.json");
+        assert_eq!(plugin["name"], "roost");
+        assert_eq!(plugin["version"], version);
+        assert_eq!(plugin["repository"], "https://github.com/charliek/roost");
+        for key in ["description", "homepage", "license"] {
+            assert!(
+                plugin[key].as_str().is_some_and(|value| !value.is_empty()),
+                "plugin.json {key}"
+            );
+        }
+        assert!(
+            plugin["author"]["name"]
+                .as_str()
+                .is_some_and(|name| !name.is_empty()),
+            "plugin.json author.name"
+        );
+        assert!(
+            plugin["keywords"]
+                .as_array()
+                .is_some_and(|keywords| keywords.iter().any(|k| k == "roost")),
+            "plugin.json keywords"
+        );
+
+        let marketplace: serde_json::Value =
+            serde_json::from_str(&read(".claude-plugin/marketplace.json"))
+                .expect("marketplace.json");
+        assert_eq!(marketplace["name"], "roost");
+        assert_eq!(marketplace["plugins"][0]["name"], "roost");
+        assert_eq!(marketplace["plugins"][0]["source"], "./");
     }
 }

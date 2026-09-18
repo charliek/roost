@@ -42,6 +42,8 @@ nav = [
     { "Claude Code Hooks" = "guides/claude-code.md" },
     { "Working Directory Tracking" = "guides/cwd-tracking.md" },
     { "Extending Roost" = "guides/extending.md" },
+    { "Automation" = "guides/automation.md" },
+    { "Agent Skill" = "guides/agent-skill.md" },
     { "Host Sessions" = "guides/host-sessions.md" },
   ] },
   { "Reference" = [

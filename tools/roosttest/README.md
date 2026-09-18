@@ -43,6 +43,13 @@ test-mode-gated ops (`ROOST_TEST_MODE=1`) and force a fresh harness-owned
 instance (`--roost-fresh`), so you run the *same set CI does* rather than
 silently skipping ~30 mode-gated tests. See "Hermetic / fresh mode" below.
 
+Every mac launch (the first one per process; a mid-test relaunch reuses it)
+runs `./mac/scripts/bundle.sh debug` — SwiftPM is incremental, so a no-op
+rebuild is cheap — and logs the bundle binary's mtime against the newest
+`mac/` source mtime, warning `stale Roost.app: sources are newer than the
+bundle` when the bundle is older. Set `ROOST_MAC_NO_BUNDLE=1` to skip the
+rebuild (still logs/warns); it errors if no bundle exists yet.
+
 ## Layout
 
 | File | What |
@@ -50,6 +57,7 @@ silently skipping ~30 mode-gated tests. See "Hermetic / fresh mode" below.
 | `client.py` | `Roost` — a thin JSON-IPC client (direct Unix socket). Op methods (`open_tab`, `set_state`, `agent_report`, `dump`, …), the agent-axis readers (`shell_state`, `agent_lifecycle`, `ownership`, `hook_active`) + no-`sleep` waits (`wait_state`, `wait_lifecycle`, `wait_shell_state`, `wait_notification`, `wait_text`, `wait_gone`) + `run()` (wait for prompt, then send a command). |
 | `session.py` | The **host-session** launcher: build a throwaway `roost-session` profile (per-OS env isolation), spawn the daemon in either start shape, parse its readiness verdict, and tear every process down before the root goes. Deliberately parallel to `ui.py` rather than part of it — a session is not a UI. |
 | `eventstream.py` | `EventStream` — a second connection that sends `events.subscribe`, keeps the ack's fence revision, then reads pushed `EventBatch` frames. Separate from `client.py` because the push stream is one-way and would sit in front of every ordinary `call`. |
+| `relay.py` | `Relay` — a recording Unix-socket proxy in front of a UI or session socket: `roostctl --socket <relay>` goes through it, and it logs each connection's requests and the answers it passed back, so a test asserts which ops `roostctl` sent on which connection. `forced_poll=True` strips `events.subscribe` (and `local_session_socket`) from `identify`, which forces `roostctl wait` onto its poll loop; `session_socket=` reroutes a session-mode UI's `local_session_socket` through a second relay. |
 | `dataplane.py` | `DataPlane` — an attach **data** connection: the handshake line, the `ROOSTDP2` preamble, and the length-prefixed binary frames behind it (`INPUT` / `RESIZE` out, `SNAP` / `PTY` / `EXIT` / `ERROR` in). Its own module for `eventstream.py`'s reason — `client.py`'s whole shape is one request, one response. It decodes no payload: GHOSTSNP and `vt` each have exactly one client implementation and both live Rust-side, so what happens here is frame accounting (seq contiguity, terminal frames, nothing ahead of readiness) plus a walk of GHOSTSNP's record *boundaries*. Its header is the contract. |
 | `ui.py` | Launch/quit a UI per target + socket-path resolution. `wait_alive` also confirms the UI's event subscription is live (see below). |
 | `conftest.py` | Fixtures: `target` (`--roost-target`), `fresh` (`--roost-fresh`/`ROOST_TEST_FRESH`), a session fixture that owns/ensures the UI (hermetic in fresh mode), `roost` (a client), `project` (a throwaway, cascade-cleaned project). Also the `SKIPS: N` terminal summary. |
