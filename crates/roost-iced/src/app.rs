@@ -39,7 +39,7 @@ use roost_ipc::messages::{
     SidebarDumpSection, WindowMetricsResult,
 };
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
-use roost_ipc::{IpcServer, LocalBackendCell, LocalBackendMode};
+use roost_ipc::{codes, IpcServer, LocalBackendCell, LocalBackendMode};
 use roost_ui_model::theme::Theme;
 use roost_ui_model::typography::{self, FamilyApply, TerminalTypography};
 use roost_ui_model::{
@@ -3490,7 +3490,7 @@ impl App {
         let request = match agent_hooks::resolve_set(agents) {
             Ok(request) => request,
             Err(message) => {
-                let _ = reply.send(Err(HostOpFailure::new("invalid-param", message)));
+                let _ = reply.send(Err(HostOpFailure::new(codes::INVALID_PARAM, message)));
                 return;
             }
         };
@@ -3516,7 +3516,7 @@ impl App {
             // `internal`, the same code a whole-run install failure
             // answers with on a host — a refusal is this machine
             // declining, not a malformed request.
-            let _ = reply.send(Err(HostOpFailure::new("internal", error.to_string())));
+            let _ = reply.send(Err(HostOpFailure::new(codes::INTERNAL, error.to_string())));
             return;
         }
 

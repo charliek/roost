@@ -279,11 +279,10 @@ pub struct IdentifyResult {
     /// The phase of a local-backend switch in flight (plan 063 §D8a),
     /// absent while the UI is idle.
     ///
-    /// Present so a client told `busy: a local-backend switch is in
-    /// progress` can see *why*, and so a test can tell the phases apart
-    /// — the mode above flips at one documented point inside the
-    /// sequence, and nothing else on the wire distinguishes "before" it
-    /// from "after".
+    /// Present so a client refused `busy` can see *why*, and so a test
+    /// can tell the phases apart — the mode above flips at one documented
+    /// point inside the sequence, and nothing else on the wire
+    /// distinguishes "before" it from "after".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_backend_switch: Option<String>,
     /// Why the last attempt to write `state.json` failed, absent while

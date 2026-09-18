@@ -187,6 +187,11 @@ touching the protocol integer:
   same shape for a single value rather than a list: a client ignores
   what it does not recognize instead of preserving it forward.
 
+Error codes are an open set in the same way: a new code is a new string,
+every producer names it from `roost_ipc::codes`, and a client treats a
+code it does not know as fatal for the request, as the
+[catalogue](ipc.md#wire-format) already says.
+
 When a change can be expressed through one of these channels, it should
 be. A protocol generation is expensive; a map key is not.
 

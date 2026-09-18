@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use roost_ipc::local_route::SWITCH_BUSY;
 use roost_ipc::messages::Project;
 use roost_ipc::{LocalBackendMode, LocalRoute};
 use roost_ui_model::config::RoostConfig;
@@ -20,6 +19,12 @@ use roost_ui_model::keybind::KeybindAction;
 use roost_ui_model::keys::{HostId, ProjectKey, TabKey};
 
 use crate::config_writer::ConfigWriter;
+
+/// What a palette row or keybind that would mutate the local backend is
+/// refused with while a switch is in flight (plan 063 §D8a) — a toast, or
+/// the error text of a `palette.activate` reply. The wire refusal is
+/// `busy` with [`roost_ipc::local_route::SWITCH_BUSY_MESSAGE`].
+const SWITCH_BUSY_PALETTE: &str = "busy: a local-backend switch is in progress";
 
 /// What the effective-mode ladder concluded (plan 063 §D5 steps 2–4).
 ///
@@ -698,7 +703,7 @@ impl SwitchDirection {
 /// Everything that could act on a half-migrated workspace reads it: both
 /// switch verbs' "offered when", the local-backend mutations, §D6's
 /// auto-remove, §D9's exit rule, and the Quit deferral. It is published
-/// on `LocalRoute` too, so `identify` can say which phase a `busy:`
+/// on `LocalRoute` too, so `identify` can say which phase a `busy`
 /// refusal came from.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1674,7 +1679,7 @@ impl super::App {
     /// switch is in flight (§D8a).
     pub(crate) fn refuse_during_switch(&self) -> Result<(), String> {
         match self.switch_in_flight() {
-            true => Err(SWITCH_BUSY.to_string()),
+            true => Err(SWITCH_BUSY_PALETTE.to_string()),
             false => Ok(()),
         }
     }
@@ -4534,8 +4539,10 @@ mod switch_tests {
             assert!(!palette_row_mutates_local_backend(id), "{id}");
         }
 
-        // One string, because a client has to be able to match on it.
-        assert_eq!(SWITCH_BUSY, "busy: a local-backend switch is in progress");
+        assert_eq!(
+            SWITCH_BUSY_PALETTE,
+            "busy: a local-backend switch is in progress"
+        );
     }
 
     /// The confirm copy names the counts and the irreversible part —

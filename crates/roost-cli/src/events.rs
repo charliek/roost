@@ -450,8 +450,8 @@ pub(crate) mod fake {
                         Err(("not-implemented".into(), "no stream here".into()))
                     } else if !self.identify["local_backend_switch"].is_null() {
                         Err((
-                            "host-unavailable".into(),
-                            roost_ipc::local_route::SWITCH_BUSY.into(),
+                            roost_ipc::codes::BUSY.into(),
+                            roost_ipc::local_route::SWITCH_BUSY_MESSAGE.into(),
                         ))
                     } else {
                         let (tx, rx) = mpsc::unbounded_channel();

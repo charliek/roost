@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use roost_engine::ipc::{DumpError, HostOpFailure, HostOpReply};
+use roost_ipc::codes;
 use roost_ipc::messages::{SentFile, SkippedFile, TabSendFileResult};
 use roost_ui_model::file_transfer::{status, Refusal, Skipped, Target};
 use roost_ui_model::keys::HostId;
@@ -12,9 +13,10 @@ use super::interactions::{host_reorder_call, ReorderTarget};
 use super::*;
 
 /// The UI socket's own error codes (`docs/reference/ipc.md`'s "Errors"
-/// bullet) **minus `shutting-down`** — the codes that mean the same
-/// thing whichever socket answered, so a session's refusal spelt one of
-/// these can cross unchanged.
+/// bullet) **minus `shutting-down`**, `host-unavailable` itself and
+/// `not-enabled` — the codes that mean the same thing whichever socket
+/// answered, so a session's refusal spelt one of these can cross
+/// unchanged.
 ///
 /// `shutting-down` is excluded even though it is on that list, because
 /// the same doc marks it session-socket-only: it describes a *session's*
@@ -28,19 +30,24 @@ use super::*;
 /// `host-unavailable` would tell a caller the host is gone when what
 /// happened is that one file was too big for a host that is right
 /// there.
-const CODES_A_UI_SOCKET_ALSO_SPEAKS: [&str; 12] = [
-    "unknown-op",
-    "unknown-field",
-    "missing-param",
-    "invalid-param",
-    "parse-error",
-    "frame-too-large",
-    "duplicate-id",
-    "not-found",
-    "not-implemented",
-    "internal",
-    "too-large",
-    "store-full",
+///
+/// `busy` joins it for plan 067 §3.1: it is the one refusal a caller
+/// retries, and folding it would turn "try again shortly" into "the host
+/// is gone".
+const CODES_A_UI_SOCKET_ALSO_SPEAKS: &[&str] = &[
+    codes::UNKNOWN_OP,
+    codes::UNKNOWN_FIELD,
+    codes::MISSING_PARAM,
+    codes::INVALID_PARAM,
+    codes::PARSE_ERROR,
+    codes::FRAME_TOO_LARGE,
+    codes::DUPLICATE_ID,
+    codes::NOT_FOUND,
+    codes::NOT_IMPLEMENTED,
+    codes::INTERNAL,
+    codes::TOO_LARGE,
+    codes::STORE_FULL,
+    codes::BUSY,
 ];
 
 /// What a host-routed op's failure says on the wire (plan 044 §3.1 d6).
@@ -69,21 +76,15 @@ fn host_op_failure(error: &crate::host_conn::HostOpError) -> HostOpFailure {
     host_unavailable(error.to_string())
 }
 
-/// This client could not reach the host session an op named.
-///
-/// `ServerCode::as_str` is not `const` (its `Other` arm derefs a
-/// `String`), so the spelling is written out here and tied to the typed
-/// variant by `host_unavailable_is_the_typed_code`.
-const HOST_UNAVAILABLE: &str = "host-unavailable";
-
 /// The answer for an incarnation this client is not connected to — the
 /// same `not-found` `tab.focus` gives for the same reason.
 fn no_connected_host() -> HostOpFailure {
-    HostOpFailure::new("not-found", "no connected host with that incarnation")
+    HostOpFailure::new(codes::NOT_FOUND, "no connected host with that incarnation")
 }
 
+/// This client could not reach the host session an op named.
 fn host_unavailable(message: impl Into<String>) -> HostOpFailure {
-    HostOpFailure::new(HOST_UNAVAILABLE, message)
+    HostOpFailure::new(codes::HOST_UNAVAILABLE, message)
 }
 
 /// What a **forwarded** op's failure says on the wire (plan 063 §D10).
@@ -114,16 +115,21 @@ fn forwarded_failure(error: &crate::host_conn::HostOpError) -> HostOpFailure {
     }
 }
 
-/// A forwarded op that could not be put to the slot (plan 063 §D10) —
-/// the slot is down, or a switch has quiesced it.
-///
-/// The same code both ways, deliberately: from the caller's side "the
-/// local session could not take this" is one outcome with two reasons,
-/// and the sentence says which.
-fn slot_unavailable(message: &str) -> Result<serde_json::Value, HostOpFailure> {
+/// A forwarded op that could not be put to the slot because it is not
+/// connected (plan 063 §D10).
+fn slot_unavailable() -> Result<serde_json::Value, HostOpFailure> {
     Err(HostOpFailure::new(
         roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
-        message,
+        roost_ipc::local_route::SLOT_UNAVAILABLE,
+    ))
+}
+
+/// A forwarded mutation refused because a local-backend switch is in
+/// flight (plan 063 §D8a).
+fn switch_busy() -> Result<serde_json::Value, HostOpFailure> {
+    Err(HostOpFailure::new(
+        codes::BUSY,
+        roost_ipc::local_route::SWITCH_BUSY_MESSAGE,
     ))
 }
 
@@ -177,18 +183,20 @@ fn send_file_outcome(outcome: GestureOutcome) -> Result<TabSendFileResult, HostO
         // skips spelled out is the only answer that tells the caller
         // which path to fix.
         GestureOutcome::Refused(Refusal::NothingUploadable(skipped)) => Err(HostOpFailure::new(
-            "invalid-param",
+            codes::INVALID_PARAM,
             nothing_to_send(&skipped),
         )),
-        GestureOutcome::Refused(Refusal::Empty) => {
-            Err(HostOpFailure::new("invalid-param", nothing_to_send(&[])))
-        }
+        GestureOutcome::Refused(Refusal::Empty) => Err(HostOpFailure::new(
+            codes::INVALID_PARAM,
+            nothing_to_send(&[]),
+        )),
         // The client's own per-gesture cap, refused before a byte
         // moved. `too-large` because it is the same judgement the host
         // makes per file, and the message is the toast's own wording.
-        GestureOutcome::Refused(Refusal::GestureOverBudget { total }) => {
-            Err(HostOpFailure::new("too-large", status::over_budget(total)))
-        }
+        GestureOutcome::Refused(Refusal::GestureOverBudget { total }) => Err(HostOpFailure::new(
+            codes::TOO_LARGE,
+            status::over_budget(total),
+        )),
         // One upload failed, so nothing pasted (§3.3's all-or-nothing).
         GestureOutcome::Failed { name, error } => {
             let failure = host_op_failure(&error);
@@ -224,7 +232,7 @@ fn send_file_refusal(target: Target, paths: &[String]) -> Option<HostOpFailure> 
     }
     if paths.is_empty() {
         return Some(HostOpFailure::new(
-            "invalid-param",
+            codes::INVALID_PARAM,
             "paths must not be empty",
         ));
     }
@@ -232,7 +240,7 @@ fn send_file_refusal(target: Target, paths: &[String]) -> Option<HostOpFailure> 
         .iter()
         .find(|path| !std::path::Path::new(path).is_absolute())?;
     Some(HostOpFailure::new(
-        "invalid-param",
+        codes::INVALID_PARAM,
         format!("paths must be absolute: {relative}"),
     ))
 }
@@ -970,7 +978,7 @@ fn macos_test_gated<T>(
 fn image_write_refusal(test_mode: bool) -> Option<HostOpFailure> {
     (!test_mode).then(|| {
         HostOpFailure::new(
-            "not-supported",
+            codes::NOT_SUPPORTED,
             "clipboard.write `image_png` requires ROOST_TEST_MODE=1 at UI launch",
         )
     })
@@ -3700,7 +3708,7 @@ impl App {
                 let live = self.wire_tab_key(tab).filter(|key| self.tab_live(*key));
                 let Some(key) = live else {
                     let _ = reply.send(Err(HostOpFailure::new(
-                        "not-found",
+                        codes::NOT_FOUND,
                         format!("tab {tab} has no live terminal"),
                     )));
                     return task;
@@ -3851,16 +3859,16 @@ impl App {
         reply: roost_engine::ipc::HostOpReply<serde_json::Value>,
     ) -> UiTask {
         let Some(host) = self.connected_slot_host() else {
-            let _ = reply.send(slot_unavailable(roost_ipc::local_route::SLOT_UNAVAILABLE));
+            let _ = reply.send(slot_unavailable());
             return UiTask::None;
         };
         let Some(queue) = self.hosts.ops_for(host).cloned() else {
-            let _ = reply.send(slot_unavailable(roost_ipc::local_route::SLOT_UNAVAILABLE));
+            let _ = reply.send(slot_unavailable());
             return UiTask::None;
         };
         let mutating = roost_engine::ipc::is_mutating_op(&op);
         if mutating && self.switch_in_flight() {
-            let _ = reply.send(slot_unavailable(roost_ipc::local_route::SWITCH_BUSY));
+            let _ = reply.send(switch_busy());
             return UiTask::None;
         }
         // A read mints an id too, so the dispatch has one shape; only a
@@ -3879,7 +3887,7 @@ impl App {
                 // runtime is going away; either way the client is owed
                 // an answer rather than a dropped channel.
                 let answer =
-                    joined.unwrap_or_else(|error| Err(HostOpFailure::new("internal", error)));
+                    joined.unwrap_or_else(|error| Err(HostOpFailure::new(codes::INTERNAL, error)));
                 EngineOpResult::LocalForward {
                     op: op_id,
                     answer: Box::new(answer),
@@ -4151,7 +4159,7 @@ mod tests {
 
         // The mapping the UI-answered ops keep, on the same input.
         let folded = host_op_failure(&refusal);
-        assert_eq!(folded.code, HOST_UNAVAILABLE);
+        assert_eq!(folded.code, codes::HOST_UNAVAILABLE);
         assert_ne!(folded.code, forwarded.code, "the two mappers differ here");
         assert!(folded.message.contains("shutting-down"), "{folded:?}");
 
@@ -4181,17 +4189,17 @@ mod tests {
         }
     }
 
-    /// Both refusals a forward can answer keep the UI socket's own
-    /// documented code, and differ only in the sentence.
+    /// The two refusals a forward can answer before the slot sees it are
+    /// two codes: `host-unavailable` keeps its one meaning, and a switch
+    /// in flight is `busy`.
     #[test]
     fn a_refused_forward_says_which_of_the_two_reasons_it_was() {
-        let down = slot_unavailable(roost_ipc::local_route::SLOT_UNAVAILABLE).unwrap_err();
-        let busy = slot_unavailable(roost_ipc::local_route::SWITCH_BUSY).unwrap_err();
-        // The typed code this socket already documents, not a new one.
-        assert_eq!(down.code, HOST_UNAVAILABLE);
-        assert_eq!(busy.code, down.code);
+        let down = slot_unavailable().unwrap_err();
+        let busy = switch_busy().unwrap_err();
+        assert_eq!(down.code, "host-unavailable");
         assert_eq!(down.message, "local session is not connected");
-        assert!(busy.message.starts_with("busy:"), "{}", busy.message);
+        assert_eq!(busy.code, "busy");
+        assert_eq!(busy.message, "a local-backend switch is in progress");
     }
 
     /// `app.sidebar_dump`'s band strip, one row per plan 063 §D2
@@ -4415,7 +4423,7 @@ mod tests {
             message: "the session said so".into(),
         };
 
-        for code in CODES_A_UI_SOCKET_ALSO_SPEAKS {
+        for &code in CODES_A_UI_SOCKET_ALSO_SPEAKS {
             let failure = host_op_failure(&rejected(code));
             assert_eq!(failure.code, code);
             assert_eq!(
@@ -4433,7 +4441,11 @@ mod tests {
             "a-code-from-a-newer-session",
         ] {
             let failure = host_op_failure(&rejected(code));
-            assert_eq!(failure.code, HOST_UNAVAILABLE, "{code} must not cross");
+            assert_eq!(
+                failure.code,
+                codes::HOST_UNAVAILABLE,
+                "{code} must not cross"
+            );
             assert_eq!(
                 failure.message,
                 format!("{code}: the session said so"),
@@ -4452,25 +4464,9 @@ mod tests {
         ] {
             let expected = error.to_string();
             let failure = host_op_failure(&error);
-            assert_eq!(failure.code, HOST_UNAVAILABLE);
+            assert_eq!(failure.code, codes::HOST_UNAVAILABLE);
             assert_eq!(failure.message, expected);
         }
-    }
-
-    /// The minted spelling is the typed variant's, so a client matching
-    /// `ServerCode::HostUnavailable` and this handler cannot drift.
-    #[test]
-    fn host_unavailable_is_the_typed_code() {
-        assert_eq!(
-            HOST_UNAVAILABLE,
-            roost_ipc::client::ServerCode::HostUnavailable.as_str()
-        );
-        assert_eq!(
-            roost_ipc::client::ServerCode::from_wire(HOST_UNAVAILABLE),
-            roost_ipc::client::ServerCode::HostUnavailable,
-            "an unrecognised code would decode as `Other` and defeat the \
-             point of declaring it"
-        );
     }
 
     /// §3.4's error precedence, over every terminal outcome a gesture
@@ -4729,7 +4725,7 @@ mod tests {
             .expect("the deferred task answers");
         assert_eq!(
             answered.expect_err("an unavailable host refuses").code,
-            HOST_UNAVAILABLE
+            codes::HOST_UNAVAILABLE
         );
         assert!(
             matches!(
@@ -4764,7 +4760,7 @@ mod tests {
             .expect("a dropped gesture answers too")
             .expect("the deferred task answers")
             .expect_err("there is nothing to paste");
-        assert_eq!(failure.code, HOST_UNAVAILABLE);
+        assert_eq!(failure.code, codes::HOST_UNAVAILABLE);
     }
 
     /// The other arm of `host_reorder_op`: an incarnation this client

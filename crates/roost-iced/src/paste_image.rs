@@ -29,6 +29,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use roost_engine::ipc::HostOpFailure;
+use roost_ipc::codes;
 use roost_ipc::messages::MAX_PUT_FILE_BYTES;
 
 /// Decoded-pixel cap. Unlike the now-removed GTK UI — which streamed a
@@ -92,8 +93,8 @@ pub(crate) fn probe(sink: crate::app::ProbeSink) -> Result<Materialized, ProbeEr
 /// §3.5): the caller's PNG onto this machine's clipboard, answered with
 /// the code the op reports.
 pub(crate) fn write_png(png: &[u8]) -> Result<(), HostOpFailure> {
-    let (width, height, rgba) =
-        decode_png_rgba(png).map_err(|message| HostOpFailure::new("invalid-param", message))?;
+    let (width, height, rgba) = decode_png_rgba(png)
+        .map_err(|message| HostOpFailure::new(codes::INVALID_PARAM, message))?;
     write_clipboard_image(width, height, rgba)
         .map_err(|error| write_failure(&error, std::env::var_os("WAYLAND_DISPLAY").is_some()))
 }
@@ -111,11 +112,11 @@ pub(crate) fn write_png(png: &[u8]) -> Result<(), HostOpFailure> {
 fn write_failure(error: &str, wayland_display: bool) -> HostOpFailure {
     if wayland_display {
         HostOpFailure::new(
-            "not-supported",
+            codes::NOT_SUPPORTED,
             format!("{error} — this Wayland session offers no clipboard to write (issue #302)"),
         )
     } else {
-        HostOpFailure::new("internal", error)
+        HostOpFailure::new(codes::INTERNAL, error)
     }
 }
 

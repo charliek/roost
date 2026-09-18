@@ -100,8 +100,12 @@ from test_host_local_spawn import roostctl_session, running_session_id  # noqa: 
 
 pytestmark = pytest.mark.host_client
 
-#: `crates/roost-ipc/src/local_route.rs`'s `SWITCH_BUSY`.
-BUSY = "busy: a local-backend switch is in progress"
+#: `crates/roost-iced/src/app/local_backend.rs`'s `SWITCH_BUSY_PALETTE`:
+#: what a palette row that would mutate the local backend answers mid-switch.
+BUSY_PALETTE = "busy: a local-backend switch is in progress"
+#: `crates/roost-ipc/src/local_route.rs`'s `SWITCH_BUSY_MESSAGE`, which a
+#: wire refusal carries under the code `busy`.
+BUSY_MESSAGE = "a local-backend switch is in progress"
 USE_SESSION = "local:use_session"
 USE_IN_PROCESS = "local:use_in_process"
 JOURNAL = "switch-journal.json"
@@ -873,7 +877,7 @@ def test_a_switch_in_flight_hides_its_verb_and_refuses_local_mutations(lane: Lan
                 roost.palette_activate(USE_SESSION)
             finally:
                 roost.palette_dismiss()
-        assert "not-found" in raised.value.code or BUSY in str(raised.value), raised.value
+        assert "not-found" in raised.value.code or BUSY_PALETTE in str(raised.value), raised.value
 
         # Every local-backend mutation answers with the one stable
         # string, from the surface `roostctl` reaches — the four command
@@ -891,7 +895,7 @@ def test_a_switch_in_flight_hides_its_verb_and_refuses_local_mutations(lane: Lan
             try:
                 with pytest.raises(RoostError) as refused:
                     roost.palette_activate(row)
-                assert BUSY in str(refused.value), (row, refused.value)
+                assert BUSY_PALETTE in str(refused.value), (row, refused.value)
             finally:
                 roost.palette_dismiss()
 
@@ -934,8 +938,8 @@ def test_a_switch_ends_the_in_process_event_stream_and_refuses_a_new_one(lane: L
         with EventStream(ui.socket_path(lane.target)) as late:
             with pytest.raises(RoostError) as refused:
                 late.subscribe()
-        assert refused.value.code == "host-unavailable", refused.value
-        assert refused.value.message == BUSY, refused.value
+        assert refused.value.code == "busy", refused.value
+        assert refused.value.message == BUSY_MESSAGE, refused.value
     finally:
         stream.close()
         ui.quit(lane.target)

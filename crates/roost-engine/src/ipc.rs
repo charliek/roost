@@ -58,7 +58,7 @@ use roost_ipc::messages::{
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{AttachHandshake, SessionSetThemeResult};
 use roost_ipc::{
-    CloseReason, ConnAction, ConnCloser, ConnCtx, Handler, HandlerError, HandlerOutcome,
+    codes, CloseReason, ConnAction, ConnCloser, ConnCtx, Handler, HandlerError, HandlerOutcome,
     LocalBackendCell, LocalBackendMode, LocalRoute, StopFinalizer,
 };
 
@@ -918,7 +918,7 @@ impl FileStore {
                     path.display()
                 ),
             };
-            return Err(HandlerError::new("internal", message));
+            return Err(HandlerError::new(codes::INTERNAL, message));
         }
         Ok(path)
     }
@@ -933,7 +933,7 @@ impl FileStore {
             .filter(|after| *after <= self.0.cap)
             .ok_or_else(|| {
                 HandlerError::new(
-                    "store-full",
+                    codes::STORE_FULL,
                     format!(
                         "the host's file store holds {} of its {} byte cap and cannot take \
                          {bytes} more; restart the session to clear it",
@@ -946,7 +946,7 @@ impl FileStore {
         let dir = self.0.root.join(crate::workspace::random_hex(8));
         create_private_dir(&dir).map_err(|error| {
             HandlerError::new(
-                "internal",
+                codes::INTERNAL,
                 format!(
                     "could not create the upload directory {}: {error}",
                     dir.display()
@@ -1293,7 +1293,7 @@ impl Connections {
         });
         if self.data_conn_count() >= MAX_DATA_CONNS_PER_SESSION {
             return Err(HandlerError::new(
-                "too-many-attaches",
+                codes::TOO_MANY_ATTACHES,
                 format!(
                     "this session already serves {MAX_DATA_CONNS_PER_SESSION} data \
                      connections; detach one before attaching again"
@@ -1466,7 +1466,7 @@ pub fn is_mutating_op(op: &str) -> bool {
 }
 
 fn shutting_down() -> HandlerError {
-    HandlerError::new("shutting-down", "session is shutting down")
+    HandlerError::new(codes::SHUTTING_DOWN, "session is shutting down")
 }
 
 /// Glue between the JSON IPC server and the in-process workspace +
@@ -1657,8 +1657,8 @@ impl IpcHandler {
         served_in_process(&route)?;
         if route.switch.is_some() {
             return Err(HandlerError::new(
-                roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
-                roost_ipc::local_route::SWITCH_BUSY,
+                codes::BUSY,
+                roost_ipc::local_route::SWITCH_BUSY_MESSAGE,
             ));
         }
         subscribers.retain(Subscriber::is_live);
@@ -1720,13 +1720,13 @@ impl IpcHandler {
         let tx = self
             .ui_tx
             .as_ref()
-            .ok_or_else(|| HandlerError::new("internal", "no UI attached"))?;
+            .ok_or_else(|| HandlerError::new(codes::INTERNAL, "no UI attached"))?;
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         tx.send(make(reply_tx))
-            .map_err(|_| HandlerError::new("internal", "UI gone"))?;
+            .map_err(|_| HandlerError::new(codes::INTERNAL, "UI gone"))?;
         reply_rx
             .await
-            .map_err(|_| HandlerError::new("internal", "UI dropped reply"))
+            .map_err(|_| HandlerError::new(codes::INTERNAL, "UI dropped reply"))
     }
 }
 
@@ -1760,7 +1760,7 @@ impl Handler for IpcHandler {
 
     /// A data connection is a session's business only. Without a
     /// [`SessionState`] this is a UI socket, and the answer is the same
-    /// "not-supported" the trait's default gives — restated here rather
+    /// `not-supported` the trait's default gives — restated here rather
     /// than delegated because overriding the method takes the default
     /// off the table.
     #[cfg(feature = "server-vt")]
@@ -1774,7 +1774,7 @@ impl Handler for IpcHandler {
             if self.session.is_none() {
                 crate::attach::refuse(
                     conn,
-                    "not-supported",
+                    codes::NOT_SUPPORTED,
                     "this socket does not serve attach data connections",
                 )
                 .await;
@@ -1812,7 +1812,7 @@ impl IpcHandler {
     ) -> Result<AdmittedAttach, HandlerError> {
         let session = self.session.as_ref().ok_or_else(|| {
             HandlerError::new(
-                "not-supported",
+                codes::NOT_SUPPORTED,
                 "this socket does not serve attach data connections",
             )
         })?;
@@ -1825,7 +1825,7 @@ impl IpcHandler {
         // and be served a tab nobody asked for.
         if terms.session_id != session.info.session_id {
             return Err(HandlerError::new(
-                "session-mismatch",
+                codes::SESSION_MISMATCH,
                 format!(
                     "this session is {:?}; the client attached to {:?}",
                     session.info.session_id, terms.session_id
@@ -1908,7 +1908,7 @@ pub(crate) fn tab_gone(tab_id: i64) -> HandlerError {
 /// worded to be true of both.
 fn no_server_vt() -> HandlerError {
     HandlerError::new(
-        "unsupported-kind",
+        codes::UNSUPPORTED_KIND,
         "this session has no server-VT data plane",
     )
 }
@@ -1944,7 +1944,7 @@ fn tab_err(e: crate::tab_task::TabError) -> HandlerError {
     match e {
         TabError::Gone | TabError::RingMiss { .. } => HandlerError::not_found(e.to_string()),
         TabError::SnapshotFailed(_) | TabError::Render(_) | TabError::WinsizeFailed(_) => {
-            HandlerError::new("internal", e.to_string())
+            HandlerError::new(codes::INTERNAL, e.to_string())
         }
     }
 }
@@ -1971,8 +1971,8 @@ pub(crate) fn attach_resize_refusal(
 ) -> HandlerError {
     use crate::tab_task::TabError;
     let code = match error {
-        TabError::WinsizeFailed(_) => "internal",
-        _ => "invalid-param",
+        TabError::WinsizeFailed(_) => codes::INTERNAL,
+        _ => codes::INVALID_PARAM,
     };
     HandlerError::new(
         code,
@@ -1989,7 +1989,7 @@ fn session_test_mode(h: &IpcHandler) -> Result<(), HandlerError> {
         return Ok(());
     }
     Err(HandlerError::new(
-        "not-enabled",
+        codes::NOT_ENABLED,
         "this op requires the session to have been started with ROOST_TEST_MODE=1",
     ))
 }
@@ -2465,7 +2465,7 @@ fn negotiate_kind(
         .collect();
     if servable.is_empty() {
         return Err(HandlerError::new(
-            "unsupported-kind",
+            codes::UNSUPPORTED_KIND,
             format!(
                 "this session serves {:?}; the client offered {kinds:?}",
                 info.payload_kinds
@@ -2488,7 +2488,7 @@ fn negotiate_kind(
             // served GHOSTSNP under another name.
             other => {
                 return Err(HandlerError::new(
-                    "internal",
+                    codes::INTERNAL,
                     format!("this session advertises {other:?}, which it cannot serve"),
                 ))
             }
@@ -2502,7 +2502,7 @@ fn negotiate_kind(
     // "mismatch" cannot tell which side to upgrade.
     eligible.ok_or_else(|| {
         HandlerError::new(
-            "build-mismatch",
+            codes::BUILD_MISMATCH,
             format!(
                 "this session is {:?}; the client is {libghostty_build:?}",
                 info.libghostty_build
@@ -2580,7 +2580,7 @@ async fn session_set_agent_hooks(
 ) -> Result<serde_json::Value, HandlerError> {
     let handle = h.agent_hooks.as_ref().ok_or_else(|| {
         HandlerError::new(
-            "not-supported",
+            codes::NOT_SUPPORTED,
             "this session cannot wire agent hooks: it was built without an install backend",
         )
     })?;
@@ -2591,8 +2591,8 @@ async fn session_set_agent_hooks(
         })
         .await
         .map_err(|error| match error {
-            AgentHooksError::InvalidParam(message) => HandlerError::new("invalid-param", message),
-            AgentHooksError::Failed(message) => HandlerError::new("internal", message),
+            AgentHooksError::InvalidParam(message) => HandlerError::invalid_param(message),
+            AgentHooksError::Failed(message) => HandlerError::new(codes::INTERNAL, message),
         })?;
     encode(&result)
 }
@@ -2612,7 +2612,7 @@ async fn session_put_file(
 ) -> Result<serde_json::Value, HandlerError> {
     let store = h.files.clone().ok_or_else(|| {
         HandlerError::new(
-            "not-supported",
+            codes::NOT_SUPPORTED,
             "this session cannot receive files: it was built without a file store",
         )
     })?;
@@ -2626,7 +2626,9 @@ async fn session_put_file(
     let SessionPutFileParams { name, data, .. } = p;
     let path = tokio::task::spawn_blocking(move || store.put(&name, &data))
         .await
-        .map_err(|error| HandlerError::new("internal", format!("the upload failed: {error}")))??;
+        .map_err(|error| {
+            HandlerError::new(codes::INTERNAL, format!("the upload failed: {error}"))
+        })??;
 
     encode(&SessionPutFileResult {
         // Lossy is not a repair here: the root came from a session that
@@ -2659,7 +2661,7 @@ fn put_file_size_guard(params: &serde_json::Value) -> Result<(), HandlerError> {
 
 fn too_large() -> HandlerError {
     HandlerError::new(
-        "too-large",
+        codes::TOO_LARGE,
         format!(
             "this file is over the {} byte cap on one upload",
             MAX_PUT_FILE_BYTES
@@ -2765,7 +2767,7 @@ fn resume_cut(
     if let Some(named) = &params.session_id {
         if *named != session.info.session_id {
             return Err(HandlerError::new(
-                "session-mismatch",
+                codes::SESSION_MISMATCH,
                 format!(
                     "this is session {}, not {named}: revisions restart with the process, so a \
                      fence from another incarnation cannot be resumed; snapshot with tab.list and \
@@ -2788,7 +2790,7 @@ fn resume_cut(
         .subscribe_from(from_revision)
         .map_err(|err| match err {
             ResumeError::Ahead { current } => HandlerError::new(
-                "revision-ahead",
+                codes::REVISION_AHEAD,
                 format!(
                     "this session never produced revision {from_revision} (current: {current}): a \
                  different incarnation, or a client bug; compare session.identify.session_id, \
@@ -2799,7 +2801,7 @@ fn resume_cut(
                 oldest_resumable_from,
                 current,
             } => HandlerError::new(
-                "replay-expired",
+                codes::REPLAY_EXPIRED,
                 format!(
                     "revision {from_revision} is outside the replay window (oldest resumable: \
                  {oldest_resumable_from}, current: {current}); snapshot with tab.list and \
@@ -2909,7 +2911,7 @@ fn served_in_process(route: &LocalRoute) -> Result<(), HandlerError> {
     match route.mode {
         LocalBackendMode::InProcess => Ok(()),
         LocalBackendMode::Session => Err(HandlerError::new(
-            "not-implemented",
+            codes::NOT_IMPLEMENTED,
             "events.subscribe is not served by a UI socket under local-backend = session; \
              for its tabs' events, dial identify.local_session_socket",
         )),
@@ -3141,7 +3143,7 @@ async fn dispatch(
             )
             .map_err(|err| match err.downcast_ref::<PtyError>() {
                 Some(pty) => pty_err(pty),
-                None => HandlerError::new("internal", format!("pty spawn failed: {err}")),
+                None => HandlerError::new(codes::INTERNAL, format!("pty spawn failed: {err}")),
             })?;
             encode(&TabOpenResult { tab })
         }
@@ -3425,7 +3427,7 @@ async fn dispatch(
                     reply,
                 })
                 .await?
-                .map_err(|m| HandlerError::new("internal", m))?;
+                .map_err(|m| HandlerError::new(codes::INTERNAL, m))?;
             // Preflight the 16 MiB IPC frame cap: the response rides one
             // newline-delimited JSON frame, and `png` dominates it once
             // base64-expanded (~4/3). Fail with a structured error here
@@ -3444,7 +3446,7 @@ async fn dispatch(
             let result = h
                 .ui_call(|reply| UiRequest::WindowMetrics { reply })
                 .await?
-                .map_err(|m| HandlerError::new("internal", m))?;
+                .map_err(|m| HandlerError::new(codes::INTERNAL, m))?;
             encode(&result)
         }
         ops::APP_RENDER_STATS => {
@@ -3455,7 +3457,7 @@ async fn dispatch(
                     reply,
                 })
                 .await?
-                .map_err(|m| HandlerError::new("internal", m))?;
+                .map_err(|m| HandlerError::new(codes::INTERNAL, m))?;
             encode(&result)
         }
         ops::SIDEBAR_DUMP => {
@@ -3463,7 +3465,7 @@ async fn dispatch(
             let result = h
                 .ui_call(|reply| UiRequest::SidebarDump { reply })
                 .await?
-                .map_err(|m| HandlerError::new("internal", m))?;
+                .map_err(|m| HandlerError::new(codes::INTERNAL, m))?;
             encode(&result)
         }
         ops::PALETTE_OPEN => {
@@ -3593,7 +3595,7 @@ async fn dispatch(
             let text = h
                 .ui_call(|reply| UiRequest::ClipboardDump { target, reply })
                 .await?
-                .map_err(|e| HandlerError::new("internal", e))?;
+                .map_err(|e| HandlerError::new(codes::INTERNAL, e))?;
             encode(&ClipboardDumpResult { text })
         }
         ops::CLIPBOARD_WRITE => {
@@ -3604,8 +3606,7 @@ async fn dispatch(
             // preferring `text` would drop an image the caller believed
             // it had written.
             if p.text.is_some() && p.image_png.is_some() {
-                return Err(HandlerError::new(
-                    "invalid-param",
+                return Err(HandlerError::invalid_param(
                     "clipboard.write takes `text` or `image_png`, not both",
                 ));
             }
@@ -3616,8 +3617,7 @@ async fn dispatch(
                 // reads. Refused here rather than in the UI so the
                 // headless dispatcher answers it too.
                 if target != ClipboardOp::System {
-                    return Err(HandlerError::new(
-                        "invalid-param",
+                    return Err(HandlerError::invalid_param(
                         "clipboard.write `image_png` requires target \"system\"",
                     ));
                 }
@@ -3626,7 +3626,7 @@ async fn dispatch(
                 return Ok(serde_json::json!({}));
             }
             let text = p.text.ok_or_else(|| {
-                HandlerError::new("missing-param", "clipboard.write requires `text`")
+                HandlerError::new(codes::MISSING_PARAM, "clipboard.write requires `text`")
             })?;
             // Fire-and-forget — matches the `app.activate` pattern.
             // Headless handler / dropped receiver: no-op.
@@ -3668,10 +3668,10 @@ async fn dispatch(
         ops::TAB_EXPAND_SELECTION_AT => {
             let p: TabExpandSelectionAtParams = decode(params)?;
             if p.click_count < 2 {
-                return Err(HandlerError::new(
-                    "invalid-param",
-                    format!("click_count must be >= 2 (got {})", p.click_count),
-                ));
+                return Err(HandlerError::invalid_param(format!(
+                    "click_count must be >= 2 (got {})",
+                    p.click_count
+                )));
             }
             let data = h
                 .ui_call(|reply| UiRequest::TabExpandSelectionAt {
@@ -3843,7 +3843,7 @@ async fn dispatch(
             let shape = h
                 .ui_call(|reply| UiRequest::AppCursorShape { reply })
                 .await?
-                .map_err(|e| HandlerError::new("internal", e))?;
+                .map_err(|e| HandlerError::new(codes::INTERNAL, e))?;
             encode(&AppCursorShapeResult { shape })
         }
         ops::APP_ACTIVE_TERMINAL_FOCUSED => {
@@ -3851,7 +3851,7 @@ async fn dispatch(
             let focused = h
                 .ui_call(|reply| UiRequest::AppActiveTerminalFocused { reply })
                 .await?
-                .map_err(|e| HandlerError::new("internal", e))?;
+                .map_err(|e| HandlerError::new(codes::INTERNAL, e))?;
             encode(&AppActiveTerminalFocusedResult { focused })
         }
         ops::APP_SELECTED_TAB_ID => {
@@ -3859,7 +3859,7 @@ async fn dispatch(
             let tab_id = h
                 .ui_call(|reply| UiRequest::AppSelectedTabId { reply })
                 .await?
-                .map_err(|e| HandlerError::new("internal", e))?;
+                .map_err(|e| HandlerError::new(codes::INTERNAL, e))?;
             encode(&AppSelectedTabIdResult { tab_id })
         }
         ops::APP_DOCK_BADGE => {
@@ -4248,9 +4248,9 @@ fn decode<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T,
         // "missing field `foo` at line ..." form.
         let msg = e.to_string();
         if msg.contains("unknown field") {
-            HandlerError::new("unknown-field", msg)
+            HandlerError::new(codes::UNKNOWN_FIELD, msg)
         } else if msg.contains("missing field") {
-            HandlerError::new("missing-param", msg)
+            HandlerError::new(codes::MISSING_PARAM, msg)
         } else {
             HandlerError::invalid_param(msg)
         }
@@ -4258,7 +4258,7 @@ fn decode<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T,
 }
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<serde_json::Value, HandlerError> {
-    serde_json::to_value(value).map_err(|e| HandlerError::new("internal", e.to_string()))
+    serde_json::to_value(value).map_err(|e| HandlerError::new(codes::INTERNAL, e.to_string()))
 }
 
 /// Format an (r,g,b) triple as `#RRGGBB` for the
@@ -4296,7 +4296,7 @@ fn rgb_hex(c: (u8, u8, u8)) -> String {
 /// error is the right move when the arms keep growing.
 fn map_test_op_err(err: String) -> HandlerError {
     if err.contains("ROOST_TEST_MODE") {
-        HandlerError::new("not-enabled", err)
+        HandlerError::new(codes::NOT_ENABLED, err)
     } else if err.contains("has no live terminal") || err.contains("no word/line span") {
         HandlerError::not_found(err)
     } else if err.contains("is not the active terminal")
@@ -4309,9 +4309,9 @@ fn map_test_op_err(err: String) -> HandlerError {
     {
         HandlerError::invalid_param(err)
     } else if err.contains("not supported on this UI") {
-        HandlerError::new("not-implemented", err)
+        HandlerError::new(codes::NOT_IMPLEMENTED, err)
     } else {
-        HandlerError::new("internal", err)
+        HandlerError::new(codes::INTERNAL, err)
     }
 }
 
@@ -4323,7 +4323,7 @@ fn screenshot_frame_guard(png_len: usize) -> Result<(), HandlerError> {
     let encoded = png_len.div_ceil(3) * 4;
     if encoded + ENVELOPE_MARGIN > roost_ipc::MAX_FRAME_BYTES {
         return Err(HandlerError::new(
-            "internal",
+            codes::INTERNAL,
             format!(
                 "screenshot too large: {encoded} base64 bytes exceeds the {} byte IPC frame cap (try --scale 1)",
                 roost_ipc::MAX_FRAME_BYTES
@@ -4341,7 +4341,7 @@ fn ws_err(e: WorkspaceError) -> HandlerError {
         }
         WorkspaceError::TabProjectMismatch { .. } => HandlerError::invalid_param(e.to_string()),
         WorkspaceError::Io(_) | WorkspaceError::Json(_) | WorkspaceError::Inconsistent(_) => {
-            HandlerError::new("internal", e.to_string())
+            HandlerError::new(codes::INTERNAL, e.to_string())
         }
         WorkspaceError::HostNotFound(_) => HandlerError::not_found(e.to_string()),
         WorkspaceError::HostLabelEmpty
@@ -4358,7 +4358,7 @@ fn ws_err(e: WorkspaceError) -> HandlerError {
 fn dump_err(e: DumpError) -> HandlerError {
     match e {
         DumpError::NoTab(msg) => HandlerError::not_found(msg),
-        DumpError::Read(msg) => HandlerError::new("internal", msg),
+        DumpError::Read(msg) => HandlerError::new(codes::INTERNAL, msg),
     }
 }
 
@@ -4368,7 +4368,7 @@ fn pty_err(e: &PtyError) -> HandlerError {
             HandlerError::not_found(e.to_string())
         }
         PtyError::DuplicateTab(_) => HandlerError::invalid_param(e.to_string()),
-        PtyError::ShuttingDown(_) => HandlerError::new("shutting-down", e.to_string()),
+        PtyError::ShuttingDown(_) => HandlerError::new(codes::SHUTTING_DOWN, e.to_string()),
     }
 }
 
@@ -5768,10 +5768,7 @@ mod tests {
         let refused = refusal_of(&h, serde_json::json!({})).await;
         assert_eq!(
             (refused.code.as_str(), refused.message.as_str()),
-            (
-                roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
-                roost_ipc::local_route::SWITCH_BUSY
-            )
+            (codes::BUSY, roost_ipc::local_route::SWITCH_BUSY_MESSAGE)
         );
         assert_eq!(h.in_process_streams().count(), 0);
         wait_for("the refused relay to let go", || {

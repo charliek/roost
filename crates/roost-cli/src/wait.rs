@@ -11,7 +11,7 @@ use roost_ipc::messages::{
     ops, EventBatch, IdentifyResult, TabClosedEvent, TabDumpParams, TabDumpResult, TabListResult,
     TabOpenedEvent, TabState, TabStateChangedEvent, WireTabRef,
 };
-use roost_ipc::{ClientError, IpcClient};
+use roost_ipc::{codes, ClientError, IpcClient};
 
 use crate::error::CliError;
 use crate::events::{self, Legs, Opened, Source};
@@ -273,18 +273,32 @@ impl Waiting<'_> {
     }
 
     /// Once no local-backend switch is in flight, the source `identify`
-    /// names, subscribed to where it serves a stream.
+    /// names, subscribed to where it serves a stream. Until a switch
+    /// settles, which socket serves the stream is not yet decided; a
+    /// subscribe refused `busy` met a switch that began after that
+    /// `identify`, and is held off the same way.
     async fn reach(
         &self,
         ui: &mut UiSocket<'_>,
-        identify: IdentifyResult,
+        mut identify: IdentifyResult,
     ) -> Result<Reached, CliError> {
-        let identify = self.settled(ui, identify).await?;
-        let source = events::resolve(ui.socket_path(), &identify);
-        if !source.serves_stream {
-            return Ok(Reached::Poll(source));
-        }
-        Ok(match events::open(&source, true).await? {
+        let (source, opened) = loop {
+            if identify.local_backend_switch.is_some() {
+                identify = self.hold_off(ui).await?;
+                continue;
+            }
+            let source = events::resolve(ui.socket_path(), &identify);
+            if !source.serves_stream {
+                return Ok(Reached::Poll(source));
+            }
+            match events::open(&source, true).await {
+                Err(CliError::Server { code, .. }) if code == codes::BUSY => {
+                    identify = self.hold_off(ui).await?;
+                }
+                opened => break (source, opened?),
+            }
+        };
+        Ok(match opened {
             Opened::Legs(legs) => Reached::Stream(source, legs),
             Opened::Dropped { acked, error } => Reached::Lost(
                 source,
@@ -314,23 +328,13 @@ impl Waiting<'_> {
         ))
     }
 
-    /// `identify` once no local-backend switch is in flight: until one
-    /// settles, a subscribe is refused busy, and which socket serves the
-    /// stream is not yet decided.
-    async fn settled(
-        &self,
-        ui: &mut UiSocket<'_>,
-        mut identify: IdentifyResult,
-    ) -> Result<IdentifyResult, CliError> {
-        while identify.local_backend_switch.is_some() {
-            self.check_deadline()?;
-            let wake = Instant::now() + self.interval;
-            tokio::time::sleep_until(self.deadline.map_or(wake, |deadline| deadline.min(wake)))
-                .await;
-            self.check_deadline()?;
-            identify = crate::identify(ui.client().await?).await?;
-        }
-        Ok(identify)
+    /// One interval, cut short by the deadline, then `identify` again.
+    async fn hold_off(&self, ui: &mut UiSocket<'_>) -> Result<IdentifyResult, CliError> {
+        self.check_deadline()?;
+        let wake = Instant::now() + self.interval;
+        tokio::time::sleep_until(self.deadline.map_or(wake, |deadline| deadline.min(wake))).await;
+        self.check_deadline()?;
+        crate::identify(ui.client().await?).await
     }
 
     fn check_deadline(&self) -> Result<(), CliError> {
@@ -480,7 +484,7 @@ async fn dump_contains(
         .await;
     match dumped {
         Ok(dump) => Ok(dump.rows_text.join("\n").contains(needle)),
-        Err(ClientError::Server { code, .. }) if code == "not-found" => Ok(false),
+        Err(ClientError::Server { code, .. }) if code == codes::NOT_FOUND => Ok(false),
         Err(error) => Err(error),
     }
 }
@@ -947,6 +951,38 @@ mod tests {
         assert_eq!(
             fake.with(|world| world.ops().join(" ")),
             "identify identify identify events.subscribe identify tab.list"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subscribe_refused_busy_is_held_off_until_the_switch_settles() {
+        let fake = Fake::ui("busy");
+        fake.with(|world| world.tabs.insert(7, "idle"));
+        fake.on("identify", 1, Phase::After, |world| {
+            world.identify["local_backend_switch"] = json!("preparing");
+        });
+        fake.on("identify", 3, Phase::Before, |world| {
+            world.identify["local_backend_switch"] = serde_json::Value::Null;
+        });
+        let exit = wait(
+            &fake,
+            &[
+                "--tab",
+                "7",
+                "--state",
+                "idle",
+                "--interval-ms",
+                "10",
+                "--timeout",
+                "5",
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(exit, Ok(0));
+        assert_eq!(
+            fake.with(|world| world.ops().join(" ")),
+            "identify events.subscribe identify identify events.subscribe identify tab.list"
         );
     }
 

@@ -20,8 +20,9 @@ use roost_engine::event_push::{self, PushLimits};
 use roost_engine::ipc::{IpcHandler, SessionInfo, StopHandle};
 use roost_engine::{PtySupervisor, ReplayBounds, Workspace, WorkspaceEvent};
 use roost_ipc::agent::{AgentLifecycle, AgentTabState, Ownership, ShellState};
+use roost_ipc::codes;
 use roost_ipc::framing::{write_frame, FrameReader};
-use roost_ipc::local_route::{SLOT_UNAVAILABLE_CODE, SWITCH_BUSY};
+use roost_ipc::local_route::SWITCH_BUSY_MESSAGE;
 use roost_ipc::messages::{
     ops, EventBatch, EventsSubscribeResult, IdentifyResult, Project, Response, SessionStopResult,
     Tab, TabListResult, TabState, SESSION_STOPPING_EVENT, STREAM_ENDED_EVENT,
@@ -749,8 +750,8 @@ async fn a_backend_switch_ends_every_in_process_stream_with_exactly_one_label() 
     let (mut reader, mut w) = h.dial().await;
     request(&mut w, 1, ops::EVENTS_SUBSCRIBE, serde_json::json!({})).await;
     let reply = read_frame(&mut reader).await;
-    assert_eq!(reply["error"]["code"], SLOT_UNAVAILABLE_CODE, "{reply}");
-    assert_eq!(reply["error"]["message"], SWITCH_BUSY, "{reply}");
+    assert_eq!(reply["error"]["code"], codes::BUSY, "{reply}");
+    assert_eq!(reply["error"]["message"], SWITCH_BUSY_MESSAGE, "{reply}");
 }
 
 /// A session socket's `tab.list` does carry it, and the response still
