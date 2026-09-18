@@ -130,6 +130,12 @@ const MUTATING_TAB_VERBS: &[&str] = &[
 /// binary and the published skill cannot disagree.
 const SKILL: &str = include_str!("../../../skills/roost/SKILL.md");
 
+/// The pinned JSON Schema bundle `roostctl schema` prints:
+/// `roost_ipc::schema::bundle_json()`, checked in at
+/// `docs/reference/api/roost-ipc.schema.json` and kept byte-identical to
+/// it by `schema_pin_test.rs`, so the binary and the file cannot drift.
+const SCHEMA: &str = include_str!("../../../docs/reference/api/roost-ipc.schema.json");
+
 const NO_TAB: &str = "no --tab and ROOST_TAB_ID is unset; refusing to guess the active tab for \
                       a command that changes it — `roostctl tab list` shows ids";
 
@@ -465,6 +471,13 @@ enum Cmd {
     /// it. Needs no running Roost. `--json` prints
     /// `{"topic":"roost","format":"markdown","content"}`.
     Skill,
+    /// Print the wire's JSON Schema bundle: every op's params and
+    /// result, every event's data, and the envelopes around them
+    /// (`docs/reference/api/roost-ipc.schema.json`), byte for byte as
+    /// generated from the serde types. Needs no running Roost. Always
+    /// JSON — `--json` changes nothing, because the file already is the
+    /// payload.
+    Schema,
     /// Diagnose the Roost integration: target resolution, socket, UI
     /// identity, shell-integration contract, the selected tab's four
     /// agent axes, and the Claude hook install. Read-only — it reports
@@ -917,6 +930,10 @@ async fn run(args: Args, tab_env: Option<&str>, cwd_env: Option<&str>) -> Result
         // An agent reads the skill to learn how to find a Roost, so it
         // must print with none running.
         Cmd::Skill => write_skill(&mut std::io::stdout().lock(), json),
+        // Same reasoning as `skill`: a schema consumer reads the
+        // contract to learn how to talk to a Roost, so it must print
+        // with none running, and it never dials a socket.
+        Cmd::Schema => write_schema(&mut std::io::stdout().lock()),
         // `session start|stop|status` address the session profile's own
         // socket directly and never go through `selector` (unlike a
         // generic op, which can now also reach a session via
@@ -1603,6 +1620,7 @@ async fn run_on_ui(
         | Cmd::AgentHook { .. }
         | Cmd::Claude(_)
         | Cmd::Skill
+        | Cmd::Schema
         | Cmd::Doctor { .. }
         | Cmd::Session(_) => unreachable!("`run` serves these without the UI socket"),
     }
@@ -1628,6 +1646,17 @@ fn write_skill(out: &mut impl Write, json: bool) -> Result<i32, CliError> {
         Ok(()) => Ok(0),
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(0),
         Err(e) => Err(CliError::Failed(format!("write the skill: {e}"))),
+    }
+}
+
+/// `schema`'s output: the pinned bundle, byte for byte. Unlike
+/// [`write_skill`], `--json` never changes this — the file already is
+/// the JSON payload — so this takes no `json` flag.
+fn write_schema(out: &mut impl Write) -> Result<i32, CliError> {
+    match out.write_all(SCHEMA.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => Ok(0),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(0),
+        Err(e) => Err(CliError::Failed(format!("write the schema: {e}"))),
     }
 }
 
@@ -3178,6 +3207,7 @@ mod tests {
         &["host", "disconnect", "--id", "a"],
         &["rpc", "tab.list"],
         &["skill"],
+        &["schema"],
         &["doctor"],
     ];
 
@@ -3347,6 +3377,17 @@ mod tests {
         assert!(matches!(error, CliError::Connection(_)), "{error:?}");
         assert_eq!(error.exit_code(), 1);
         assert!(error.message().contains(&socket), "{error:?}");
+    }
+
+    /// AC6: `schema`, like `skill`, is in the no-socket branch of `run` —
+    /// it must succeed even against a socket path nothing listens on.
+    #[tokio::test]
+    async fn schema_runs_with_no_socket_reachable() {
+        let socket = nowhere("schema");
+        assert_eq!(
+            run_argv(&["--socket", &socket, "schema"], None).await,
+            Ok(0)
+        );
     }
 
     /// A stand-in UI on a real socket. It answers each request through
@@ -4612,6 +4653,38 @@ mod tests {
             Ok(0)
         );
         let error = write_skill(&mut Refuses(std::io::ErrorKind::StorageFull), false)
+            .expect_err("a full disk is a failure");
+        assert_eq!(error.code(), "failed");
+    }
+
+    /// AC6: the binary and the schema bundle it is generated from cannot
+    /// drift — `schema_pin_test.rs` pins the checked-in file to the same
+    /// [`roost_ipc::schema::bundle_json`], so this closes the loop from
+    /// `roostctl`'s own `include_str!` back to the generator.
+    #[test]
+    fn schema_prints_the_bundle_json_byte_for_byte() {
+        let mut printed = Vec::new();
+        assert_eq!(write_schema(&mut printed), Ok(0));
+        let printed = String::from_utf8(printed).expect("the schema is UTF-8");
+        assert_eq!(printed, roost_ipc::schema::bundle_json());
+    }
+
+    #[test]
+    fn a_reader_that_hangs_up_on_schema_is_not_a_failure() {
+        struct Refuses(std::io::ErrorKind);
+        impl Write for Refuses {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(self.0.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(
+            write_schema(&mut Refuses(std::io::ErrorKind::BrokenPipe)),
+            Ok(0)
+        );
+        let error = write_schema(&mut Refuses(std::io::ErrorKind::StorageFull))
             .expect_err("a full disk is a failure");
         assert_eq!(error.code(), "failed");
     }

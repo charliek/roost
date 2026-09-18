@@ -444,7 +444,15 @@ Stated honestly, because overstating it would be worse than the gap:
   This is what makes individual files effectively frozen;
 * **the emptied-directory guard** — the loader fails if the vector
   directory comes back empty, catching the path-resolution failure that
-  would otherwise turn the whole corpus into a silent no-op.
+  would otherwise turn the whole corpus into a silent no-op;
+* **the schema pin, coverage and fidelity tests** — `schema_pin_test.rs`
+  pins `docs/reference/api/roost-ipc.schema.json` to
+  `roost_ipc::schema::bundle_json()`; a coverage test in `schema.rs`
+  asserts every `ops::`/event constant has an `OP_TYPES` row and vice
+  versa; a fidelity test validates every vector in this corpus against
+  the bundle, so the pin proves the schema matches the wire, not only
+  that it is deterministic. See [Machine-readable
+  schema](ipc.md#machine-readable-schema).
 
 There is deliberately **no hash manifest**. At this corpus size it would
 be ceremony: a second file to update on every legitimate addition,

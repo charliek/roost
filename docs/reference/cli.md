@@ -40,6 +40,7 @@ roostctl [--socket <PATH>] [--target <mac|linux|iced|session>] [--json] <COMMAND
 | `session start` / `stop` / `status` | Start, stop, or inspect the headless `roost-session` daemon |
 | `rpc <op> [params]` | Call any IPC op directly by name, bypassing every named verb |
 | `skill` | Print the agent skill (`skills/roost/SKILL.md`), byte for byte as the plugin installs it |
+| `schema` | Print the wire's JSON Schema bundle (`docs/reference/api/roost-ipc.schema.json`), byte for byte |
 
 `--socket` overrides `ROOST_SOCKET`; one of the two must resolve to the running UI's socket. A
 session is not a UI: `session start|stop|status` address the session profile's own socket
@@ -79,6 +80,7 @@ stdout:
 | `rpc` | Not affected by the flag at all — see [`rpc`](#rpc) below |
 | `events` | Not affected either: always one JSON line per event — see [`events`](#events) |
 | `skill` | `{"topic": "roost", "format": "markdown", "content": "…"}` — always the same skill `--json` or not; see [`skill`](#skill) |
+| `schema` | Not affected by the flag at all: the printed file already is JSON — see [`schema`](#schema) |
 
 Without `--json`, every command prints what it always has. An error is
 never written to stdout either way — see [Exit codes](#exit-codes).
@@ -802,6 +804,22 @@ one. `--json` prints `{"topic": "roost", "format": "markdown",
 goes to stdout. See the [Agent Skill](../guides/agent-skill.md) guide
 for what the skill covers and how it relates to [Agent
 Hooks](../guides/agents.md).
+
+## `schema`
+
+Print the wire's JSON Schema bundle — the same
+`docs/reference/api/roost-ipc.schema.json` this repo checks in, byte for
+byte, so the binary and the file cannot disagree:
+
+```bash
+roostctl schema
+```
+
+Needs no running Roost and no socket. Always prints the same JSON
+document — `--json` changes nothing, because the printed file already
+is the payload. See [Machine-readable
+schema](ipc.md#machine-readable-schema) for the bundle's shape and how
+it is generated and pinned.
 
 ## `doctor`
 

@@ -1,0 +1,4266 @@
+{
+  "$defs": {
+    "ActiveChangedEvent": {
+      "properties": {
+        "project_id": {
+          "type": "string"
+        },
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "tab_id"
+      ],
+      "type": "object"
+    },
+    "AgentHooksFailed": {
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "error": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent",
+        "error"
+      ],
+      "type": "object"
+    },
+    "AgentHooksOutcome": {
+      "properties": {
+        "errors": {
+          "items": {
+            "$ref": "#/$defs/AgentHooksFailed"
+          },
+          "type": "array"
+        },
+        "refreshed": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "removed": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "skipped": {
+          "items": {
+            "$ref": "#/$defs/AgentHooksSkipped"
+          },
+          "type": "array"
+        },
+        "wired": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "wired",
+        "refreshed",
+        "removed",
+        "skipped",
+        "errors"
+      ],
+      "type": "object"
+    },
+    "AgentHooksSkipped": {
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "AgentLifecycle": {
+      "enum": [
+        "inactive",
+        "working",
+        "waiting",
+        "finished",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "AgentReportChangedEvent": {
+      "properties": {
+        "agent_lifecycle": {
+          "$ref": "#/$defs/AgentLifecycle",
+          "default": "inactive"
+        },
+        "hook_active": {
+          "type": "boolean"
+        },
+        "ownership": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Ownership"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "shell_state": {
+          "$ref": "#/$defs/ShellState",
+          "default": "unknown"
+        },
+        "state": {
+          "$ref": "#/$defs/TabState"
+        },
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "state",
+        "hook_active"
+      ],
+      "type": "object"
+    },
+    "AgentSetHooksAgents": {
+      "anyOf": [
+        {
+          "const": "off"
+        },
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ]
+    },
+    "AgentSetHooksHostOutcome": {
+      "anyOf": [
+        {
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "result": {
+              "$ref": "#/$defs/AgentHooksOutcome"
+            }
+          },
+          "required": [
+            "host",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "error": {
+              "type": "string"
+            },
+            "host": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "host",
+            "error"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AgentSetHooksParams": {
+      "additionalProperties": false,
+      "properties": {
+        "agents": {
+          "$ref": "#/$defs/AgentSetHooksAgents"
+        }
+      },
+      "required": [
+        "agents"
+      ],
+      "type": "object"
+    },
+    "AgentSetHooksResult": {
+      "properties": {
+        "config_path": {
+          "type": "string"
+        },
+        "hosts": {
+          "items": {
+            "$ref": "#/$defs/AgentSetHooksHostOutcome"
+          },
+          "type": "array"
+        },
+        "local": {
+          "$ref": "#/$defs/AgentHooksOutcome"
+        }
+      },
+      "required": [
+        "config_path",
+        "local",
+        "hosts"
+      ],
+      "type": "object"
+    },
+    "AppActivateParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AppActiveTerminalFocusedParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AppActiveTerminalFocusedResult": {
+      "properties": {
+        "focused": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "focused"
+      ],
+      "type": "object"
+    },
+    "AppCursorShapeParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AppCursorShapeResult": {
+      "properties": {
+        "shape": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "shape"
+      ],
+      "type": "object"
+    },
+    "AppDialogAgentRow": {
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "files": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "found": {
+          "type": "boolean"
+        },
+        "on": {
+          "type": "boolean"
+        },
+        "status": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "agent",
+        "on",
+        "found",
+        "files"
+      ],
+      "type": "object"
+    },
+    "AppDialogAnswerParams": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "AppDialogDumpParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AppDialogDumpResult": {
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "buttons": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "dialog": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "host": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rows": {
+          "items": {
+            "$ref": "#/$defs/AppDialogAgentRow"
+          },
+          "type": "array"
+        },
+        "title": {
+          "type": "string"
+        },
+        "variant": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "title",
+        "body",
+        "buttons"
+      ],
+      "type": "object"
+    },
+    "AppDockBadgeParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AppDockBadgeResult": {
+      "properties": {
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "AppKeybindDispatchParams": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "AppMenuActivateParams": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "AppMenuDumpParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AppMenuDumpResult": {
+      "properties": {
+        "menus": {
+          "items": {
+            "$ref": "#/$defs/MenuDump"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "menus"
+      ],
+      "type": "object"
+    },
+    "AppNotificationStatusParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AppNotificationStatusResult": {
+      "properties": {
+        "authorized": {
+          "type": "boolean"
+        },
+        "backend": {
+          "type": "string"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "backend",
+        "authorized"
+      ],
+      "type": "object"
+    },
+    "AppRenderStatsParams": {
+      "additionalProperties": false,
+      "properties": {
+        "reset": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "AppRenderStatsResult": {
+      "properties": {
+        "cells_walked": {
+          "type": "string"
+        },
+        "draw_calls": {
+          "type": "string"
+        },
+        "draw_nanos": {
+          "type": "string"
+        },
+        "elide_calls": {
+          "default": "0",
+          "type": "string"
+        },
+        "elide_nanos": {
+          "default": "0",
+          "type": "string"
+        },
+        "fill_text_calls": {
+          "type": "string"
+        },
+        "refresh_calls": {
+          "type": "string"
+        },
+        "refresh_nanos": {
+          "type": "string"
+        },
+        "rows_rebuilt": {
+          "type": "string"
+        },
+        "view_calls": {
+          "default": "0",
+          "type": "string"
+        },
+        "view_nanos": {
+          "default": "0",
+          "type": "string"
+        }
+      },
+      "required": [
+        "refresh_calls",
+        "refresh_nanos",
+        "rows_rebuilt",
+        "cells_walked",
+        "draw_calls",
+        "draw_nanos",
+        "fill_text_calls"
+      ],
+      "type": "object"
+    },
+    "AppSelectedTabIdParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AppSelectedTabIdResult": {
+      "properties": {
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id"
+      ],
+      "type": "object"
+    },
+    "AppSetWindowFocusParams": {
+      "additionalProperties": false,
+      "properties": {
+        "focus": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "focus"
+      ],
+      "type": "object"
+    },
+    "AppUpdateCheckParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AppUpdateStatusParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AppUpdateStatusResult": {
+      "properties": {
+        "check_id": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "framework_loaded": {
+          "type": "boolean"
+        },
+        "last_check": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpdateCheckDump"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updater": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "framework_loaded",
+        "updater",
+        "check_id"
+      ],
+      "type": "object"
+    },
+    "AttachHandshake": {
+      "properties": {
+        "attach": {
+          "type": "string"
+        },
+        "cell_h_px": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cell_w_px": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cols": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "focus": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "kinds": {
+          "items": {
+            "$ref": "#/$defs/AttachPayloadKind"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "libghostty_build": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "protocol_version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "resume_from_seq": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "rows": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "server_epoch": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tab_generation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "attach",
+        "protocol_version"
+      ],
+      "type": "object"
+    },
+    "AttachHandshakeReply": {
+      "properties": {
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResponseError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttachPayloadKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttachMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "seq": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "server_epoch": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "snapshot_cols": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "snapshot_rows": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tab_generation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "ok"
+      ],
+      "type": "object"
+    },
+    "AttachMode": {
+      "oneOf": [
+        {
+          "const": "snapshot",
+          "type": "string"
+        },
+        {
+          "const": "resume",
+          "type": "string"
+        }
+      ]
+    },
+    "AttachPayloadKind": {
+      "type": "string"
+    },
+    "AttentionOp": {
+      "enum": [
+        "set",
+        "clear",
+        "preserve"
+      ],
+      "type": "string"
+    },
+    "ClipboardDumpParams": {
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    },
+    "ClipboardDumpResult": {
+      "properties": {
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ClipboardEffectTarget": {
+      "enum": [
+        "system",
+        "selection"
+      ],
+      "type": "string"
+    },
+    "ClipboardWriteParams": {
+      "additionalProperties": false,
+      "properties": {
+        "image_png": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target": {
+          "type": "string"
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    },
+    "DurabilityChangedEvent": {
+      "properties": {
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "EmptyResult": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "EventBatch": {
+      "properties": {
+        "events": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EventEnvelope"
+          },
+          "type": "array"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision"
+      ],
+      "type": "object"
+    },
+    "EventEnvelope": {
+      "properties": {
+        "data": true,
+        "event": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "event",
+        "data"
+      ],
+      "type": "object"
+    },
+    "EventsSubscribeParams": {
+      "additionalProperties": false,
+      "properties": {
+        "from_revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tab_id_filter": {
+          "default": "0",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "EventsSubscribeResult": {
+      "properties": {
+        "revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "revision",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "HookActiveChangedEvent": {
+      "properties": {
+        "active": {
+          "type": "boolean"
+        },
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "active"
+      ],
+      "type": "object"
+    },
+    "Host": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "last_connected": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "target"
+      ],
+      "type": "object"
+    },
+    "HostAddParams": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "target"
+      ],
+      "type": "object"
+    },
+    "HostAddResult": {
+      "properties": {
+        "host": {
+          "$ref": "#/$defs/Host"
+        }
+      },
+      "required": [
+        "host"
+      ],
+      "type": "object"
+    },
+    "HostConnectParams": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "test_user_origin": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "HostConnectStatus": {
+      "properties": {
+        "from_revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reduced_fidelity": {
+          "type": "boolean"
+        },
+        "resumed": {
+          "type": "boolean"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "reduced_fidelity",
+        "resumed"
+      ],
+      "type": "object"
+    },
+    "HostConnectionResult": {
+      "properties": {
+        "host": {
+          "$ref": "#/$defs/Host"
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "host",
+        "state"
+      ],
+      "type": "object"
+    },
+    "HostDisconnectParams": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "HostListParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "HostListResult": {
+      "properties": {
+        "hosts": {
+          "items": {
+            "$ref": "#/$defs/Host"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "hosts"
+      ],
+      "type": "object"
+    },
+    "HostRemoveParams": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "HostStatus": {
+      "properties": {
+        "connect": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostConnectStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "last_connected": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "payload_kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retry": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RetrySchedule"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rollup": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "type": "string"
+        },
+        "tabs": {
+          "default": 0,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "target",
+        "generation",
+        "state"
+      ],
+      "type": "object"
+    },
+    "HostStatusParams": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "HostStatusResult": {
+      "properties": {
+        "hosts": {
+          "items": {
+            "$ref": "#/$defs/HostStatus"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "hosts"
+      ],
+      "type": "object"
+    },
+    "IdentifyParams": {
+      "additionalProperties": false,
+      "properties": {
+        "client_name": {
+          "default": "",
+          "type": "string"
+        },
+        "client_version": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "IdentifyResult": {
+      "properties": {
+        "active_project_id": {
+          "type": "string"
+        },
+        "active_tab_id": {
+          "type": "string"
+        },
+        "app_id": {
+          "type": "string"
+        },
+        "app_label": {
+          "type": "string"
+        },
+        "instance_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "local_backend": {
+          "$ref": "#/$defs/LocalBackendMode",
+          "default": "in-process"
+        },
+        "local_backend_switch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "local_session_socket": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ops": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "persist_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pid": {
+          "format": "int32",
+          "type": "integer"
+        },
+        "protocol_version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "socket_path": {
+          "type": "string"
+        },
+        "ui_version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "socket_path",
+        "pid",
+        "active_project_id",
+        "active_tab_id",
+        "app_label",
+        "app_id",
+        "ui_version",
+        "protocol_version"
+      ],
+      "type": "object"
+    },
+    "LocalBackendMode": {
+      "oneOf": [
+        {
+          "const": "in-process",
+          "type": "string"
+        },
+        {
+          "const": "session",
+          "type": "string"
+        }
+      ]
+    },
+    "MenuDump": {
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/$defs/MenuItemDump"
+          },
+          "type": "array"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "items"
+      ],
+      "type": "object"
+    },
+    "MenuItemDump": {
+      "properties": {
+        "action": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "key_equivalent": {
+          "type": "string"
+        },
+        "modifiers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "separator": {
+          "type": "boolean"
+        },
+        "state": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "key_equivalent",
+        "modifiers",
+        "enabled",
+        "state",
+        "separator"
+      ],
+      "type": "object"
+    },
+    "NotificationCreateParams": {
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "default": "",
+          "type": "string"
+        },
+        "tab_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "title"
+      ],
+      "type": "object"
+    },
+    "NotificationFiredEvent": {
+      "properties": {
+        "body": {
+          "default": "",
+          "type": "string"
+        },
+        "generation": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tab_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "title"
+      ],
+      "type": "object"
+    },
+    "OscColorsParams": {
+      "additionalProperties": false,
+      "properties": {
+        "background": {
+          "type": "string"
+        },
+        "cursor": {
+          "type": "string"
+        },
+        "foreground": {
+          "type": "string"
+        },
+        "palette": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "foreground",
+        "background",
+        "cursor",
+        "palette"
+      ],
+      "type": "object"
+    },
+    "Ownership": {
+      "properties": {
+        "detail": {
+          "default": "",
+          "type": "string"
+        },
+        "last_event_at": {
+          "default": 0,
+          "format": "int64",
+          "type": "integer"
+        },
+        "metadata": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "session_id": {
+          "default": "",
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "type": "object"
+    },
+    "OwnershipAction": {
+      "enum": [
+        "claim",
+        "preserve",
+        "release"
+      ],
+      "type": "string"
+    },
+    "PaletteActivateParams": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "PaletteAgentRow": {
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "effective_lifecycle": {
+          "$ref": "#/$defs/AgentLifecycle"
+        },
+        "metrics_text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "project": {
+          "type": "string"
+        },
+        "status_text": {
+          "type": "string"
+        },
+        "time_text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "effective_lifecycle",
+        "agent",
+        "project",
+        "name",
+        "status_text",
+        "time_text"
+      ],
+      "type": "object"
+    },
+    "PaletteDismissParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "PaletteItemView": {
+      "properties": {
+        "agent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaletteAgentRow"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "subtitle": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title"
+      ],
+      "type": "object"
+    },
+    "PaletteOpenParams": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "PalettePresentParams": {
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/$defs/PaletteItemView"
+          },
+          "type": "array"
+        },
+        "placeholder": {
+          "default": "",
+          "type": "string"
+        },
+        "title": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "type": "object"
+    },
+    "PalettePresentResult": {
+      "properties": {
+        "dismissed": {
+          "default": false,
+          "type": "boolean"
+        },
+        "selected_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "PaletteQueryParams": {
+      "additionalProperties": false,
+      "properties": {
+        "query": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "PaletteStateParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "PaletteStateResult": {
+      "properties": {
+        "frame": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "items": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PaletteItemView"
+          },
+          "type": "array"
+        },
+        "open": {
+          "type": "boolean"
+        },
+        "query": {
+          "default": "",
+          "type": "string"
+        },
+        "selected_in_view": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "selection": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "open"
+      ],
+      "type": "object"
+    },
+    "Project": {
+      "properties": {
+        "created_at": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "position": {
+          "format": "int32",
+          "type": "integer"
+        },
+        "tabs": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Tab"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "cwd",
+        "position",
+        "created_at"
+      ],
+      "type": "object"
+    },
+    "ProjectCreateParams": {
+      "additionalProperties": false,
+      "properties": {
+        "cwd": {
+          "default": "",
+          "type": "string"
+        },
+        "name": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "ProjectCreateResult": {
+      "properties": {
+        "project": {
+          "$ref": "#/$defs/Project"
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "type": "object"
+    },
+    "ProjectCreatedEvent": {
+      "properties": {
+        "project": {
+          "$ref": "#/$defs/Project"
+        }
+      },
+      "required": [
+        "project"
+      ],
+      "type": "object"
+    },
+    "ProjectDeleteParams": {
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object"
+    },
+    "ProjectDeletedEvent": {
+      "properties": {
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object"
+    },
+    "ProjectEnsureParams": {
+      "additionalProperties": false,
+      "properties": {
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "ProjectEnsureResult": {
+      "properties": {
+        "created": {
+          "type": "boolean"
+        },
+        "project": {
+          "$ref": "#/$defs/Project"
+        }
+      },
+      "required": [
+        "project",
+        "created"
+      ],
+      "type": "object"
+    },
+    "ProjectRenameParams": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "name"
+      ],
+      "type": "object"
+    },
+    "ProjectRenamedEvent": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "name"
+      ],
+      "type": "object"
+    },
+    "ProjectReorderParams": {
+      "additionalProperties": false,
+      "properties": {
+        "project_ids": {
+          "items": {
+            "$ref": "#/$defs/WireProjectRef"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "project_ids"
+      ],
+      "type": "object"
+    },
+    "ProjectsReorderedEvent": {
+      "properties": {
+        "project_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "project_ids"
+      ],
+      "type": "object"
+    },
+    "RawRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "op": {
+          "type": "string"
+        },
+        "params": {
+          "default": {}
+        }
+      },
+      "required": [
+        "id",
+        "op"
+      ],
+      "type": "object"
+    },
+    "ResolvedCell": {
+      "properties": {
+        "bg": {
+          "type": "string"
+        },
+        "bold": {
+          "type": "boolean"
+        },
+        "col": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fg": {
+          "type": "string"
+        },
+        "has_explicit_bg": {
+          "type": "boolean"
+        },
+        "inverse": {
+          "type": "boolean"
+        },
+        "italic": {
+          "type": "boolean"
+        },
+        "row": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "row",
+        "col",
+        "text",
+        "fg",
+        "bg",
+        "has_explicit_bg",
+        "bold",
+        "italic",
+        "inverse"
+      ],
+      "type": "object"
+    },
+    "Response": {
+      "properties": {
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResponseError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "result": true
+      },
+      "required": [
+        "id",
+        "ok"
+      ],
+      "type": "object"
+    },
+    "ResponseError": {
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "RetrySchedule": {
+      "properties": {
+        "armed_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attempt": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "budget": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "delay_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "delay_ms"
+      ],
+      "type": "object"
+    },
+    "ScreenshotParams": {
+      "additionalProperties": false,
+      "properties": {
+        "scale": {
+          "default": 1,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "ScreenshotResult": {
+      "properties": {
+        "height": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "png": {
+          "type": "string"
+        },
+        "scale": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "width": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "png",
+        "width",
+        "height",
+        "scale"
+      ],
+      "type": "object"
+    },
+    "SelectionClearParams": {
+      "additionalProperties": false,
+      "properties": {
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id"
+      ],
+      "type": "object"
+    },
+    "SelectionDumpParams": {
+      "additionalProperties": false,
+      "properties": {
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id"
+      ],
+      "type": "object"
+    },
+    "SelectionDumpResult": {
+      "properties": {
+        "anchor_visible": {
+          "type": "boolean"
+        },
+        "cursor_visible": {
+          "type": "boolean"
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "anchor_visible",
+        "cursor_visible"
+      ],
+      "type": "object"
+    },
+    "SelectionPoint": {
+      "properties": {
+        "col": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "row": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "col",
+        "row"
+      ],
+      "type": "object"
+    },
+    "SelectionSetParams": {
+      "additionalProperties": false,
+      "properties": {
+        "anchor": {
+          "$ref": "#/$defs/SelectionPoint"
+        },
+        "cursor": {
+          "$ref": "#/$defs/SelectionPoint"
+        },
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "anchor",
+        "cursor"
+      ],
+      "type": "object"
+    },
+    "SentFile": {
+      "properties": {
+        "bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "name",
+        "path",
+        "bytes"
+      ],
+      "type": "object"
+    },
+    "SessionIdentify": {
+      "properties": {
+        "app_version": {
+          "type": "string"
+        },
+        "libghostty_build": {
+          "type": "string"
+        },
+        "ops": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "payload_kinds": {
+          "items": {
+            "$ref": "#/$defs/AttachPayloadKind"
+          },
+          "type": "array"
+        },
+        "persist_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "session_protocol": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "started_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "app_version",
+        "session_protocol",
+        "payload_kinds",
+        "libghostty_build",
+        "session_id",
+        "started_at"
+      ],
+      "type": "object"
+    },
+    "SessionIdentifyParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "SessionPutFileParams": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "data"
+      ],
+      "type": "object"
+    },
+    "SessionPutFileResult": {
+      "properties": {
+        "bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "bytes"
+      ],
+      "type": "object"
+    },
+    "SessionSetAgentHooksParams": {
+      "additionalProperties": false,
+      "properties": {
+        "agents": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "client": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agents",
+        "client"
+      ],
+      "type": "object"
+    },
+    "SessionSetThemeParams": {
+      "additionalProperties": false,
+      "properties": {
+        "osc_colors": {
+          "$ref": "#/$defs/OscColorsParams"
+        }
+      },
+      "required": [
+        "osc_colors"
+      ],
+      "type": "object"
+    },
+    "SessionSetThemeResult": {
+      "properties": {
+        "tabs": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "tabs"
+      ],
+      "type": "object"
+    },
+    "SessionStopParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "SessionStopResult": {
+      "properties": {
+        "abandoned": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "killed": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "reaped": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "reaped",
+        "killed",
+        "abandoned"
+      ],
+      "type": "object"
+    },
+    "SessionStoppingEvent": {
+      "properties": {
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "type": "object"
+    },
+    "Severity": {
+      "enum": [
+        "info",
+        "warn",
+        "error"
+      ],
+      "type": "string"
+    },
+    "ShellState": {
+      "enum": [
+        "unknown",
+        "at_prompt",
+        "foreground_process"
+      ],
+      "type": "string"
+    },
+    "SidebarDumpAgentRow": {
+      "properties": {
+        "is_active": {
+          "type": "boolean"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/AgentLifecycle"
+        },
+        "name": {
+          "type": "string"
+        },
+        "status_text": {
+          "type": "string"
+        },
+        "tab_id": {
+          "type": "string"
+        },
+        "time_text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "name",
+        "lifecycle",
+        "status_text",
+        "time_text",
+        "is_active"
+      ],
+      "type": "object"
+    },
+    "SidebarDumpHost": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "projects": {
+          "items": {
+            "$ref": "#/$defs/SidebarDumpHostProject"
+          },
+          "type": "array"
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "state",
+        "projects"
+      ],
+      "type": "object"
+    },
+    "SidebarDumpHostProject": {
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "tabs": {
+          "items": {
+            "$ref": "#/$defs/SidebarDumpHostTab"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "key",
+        "name",
+        "tabs"
+      ],
+      "type": "object"
+    },
+    "SidebarDumpHostTab": {
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "title"
+      ],
+      "type": "object"
+    },
+    "SidebarDumpParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "SidebarDumpProject": {
+      "properties": {
+        "agents": {
+          "items": {
+            "$ref": "#/$defs/SidebarDumpAgentRow"
+          },
+          "type": "array"
+        },
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "agents"
+      ],
+      "type": "object"
+    },
+    "SidebarDumpResult": {
+      "properties": {
+        "agents_visible": {
+          "type": "boolean"
+        },
+        "hosts": {
+          "items": {
+            "$ref": "#/$defs/SidebarDumpHost"
+          },
+          "type": "array"
+        },
+        "projects": {
+          "items": {
+            "$ref": "#/$defs/SidebarDumpProject"
+          },
+          "type": "array"
+        },
+        "sections": {
+          "items": {
+            "$ref": "#/$defs/SidebarDumpSection"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "agents_visible",
+        "projects"
+      ],
+      "type": "object"
+    },
+    "SidebarDumpSection": {
+      "properties": {
+        "dot": {
+          "type": "string"
+        },
+        "fidelity": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "type": "string"
+        },
+        "reconnect_row": {
+          "type": "boolean"
+        },
+        "role": {
+          "type": "string"
+        },
+        "saved_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "label",
+        "state",
+        "dot",
+        "reconnect_row"
+      ],
+      "type": "object"
+    },
+    "SidebarSetWidthParams": {
+      "additionalProperties": false,
+      "properties": {
+        "width": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "width"
+      ],
+      "type": "object"
+    },
+    "SkippedFile": {
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "StreamEndedEvent": {
+      "properties": {
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "type": "object"
+    },
+    "Tab": {
+      "properties": {
+        "agent_lifecycle": {
+          "$ref": "#/$defs/AgentLifecycle",
+          "default": "inactive"
+        },
+        "created_at": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "has_notification": {
+          "type": "boolean"
+        },
+        "hook_active": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "is_active": {
+          "type": "boolean"
+        },
+        "last_active": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "ownership": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Ownership"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "position": {
+          "format": "int32",
+          "type": "integer"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "shell_state": {
+          "$ref": "#/$defs/ShellState",
+          "default": "unknown"
+        },
+        "state": {
+          "$ref": "#/$defs/TabState"
+        },
+        "title": {
+          "type": "string"
+        },
+        "user_titled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "project_id",
+        "title",
+        "cwd",
+        "state",
+        "has_notification",
+        "is_active",
+        "user_titled",
+        "position",
+        "created_at",
+        "last_active",
+        "hook_active"
+      ],
+      "type": "object"
+    },
+    "TabAgentReportParams": {
+      "additionalProperties": false,
+      "properties": {
+        "attention": {
+          "$ref": "#/$defs/AttentionOp",
+          "default": "preserve"
+        },
+        "body": {
+          "default": "",
+          "type": "string"
+        },
+        "detail": {
+          "default": "",
+          "type": "string"
+        },
+        "lifecycle": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentLifecycle"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lifecycle_if": {
+          "items": {
+            "$ref": "#/$defs/AgentLifecycle"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "metadata": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "ownership_action": {
+          "$ref": "#/$defs/OwnershipAction"
+        },
+        "session_id": {
+          "default": "",
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/Severity",
+          "default": "info"
+        },
+        "source": {
+          "type": "string"
+        },
+        "tab_id": {
+          "type": "string"
+        },
+        "title": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "source",
+        "ownership_action"
+      ],
+      "type": "object"
+    },
+    "TabAgentReportResult": {
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        },
+        "tab": {
+          "$ref": "#/$defs/Tab"
+        }
+      },
+      "required": [
+        "accepted",
+        "tab"
+      ],
+      "type": "object"
+    },
+    "TabCapturePtyInputParams": {
+      "additionalProperties": false,
+      "properties": {
+        "drain": {
+          "default": false,
+          "type": "boolean"
+        },
+        "tab_id": {
+          "$ref": "#/$defs/WireTabRef"
+        }
+      },
+      "required": [
+        "tab_id"
+      ],
+      "type": "object"
+    },
+    "TabCapturePtyInputResult": {
+      "properties": {
+        "data": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "data"
+      ],
+      "type": "object"
+    },
+    "TabClearNotificationParams": {
+      "additionalProperties": false,
+      "properties": {
+        "generation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id"
+      ],
+      "type": "object"
+    },
+    "TabClearNotificationResult": {
+      "properties": {
+        "cleared": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "cleared"
+      ],
+      "type": "object"
+    },
+    "TabCloseParams": {
+      "additionalProperties": false,
+      "properties": {
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id"
+      ],
+      "type": "object"
+    },
+    "TabClosedEvent": {
+      "properties": {
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id"
+      ],
+      "type": "object"
+    },
+    "TabCwdChangedEvent": {
+      "properties": {
+        "cwd": {
+          "type": "string"
+        },
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "cwd"
+      ],
+      "type": "object"
+    },
+    "TabDispatchMouseEventParams": {
+      "additionalProperties": false,
+      "properties": {
+        "button": {
+          "type": "string"
+        },
+        "cell_x": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cell_y": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "mods": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "kind",
+        "button",
+        "cell_x",
+        "cell_y"
+      ],
+      "type": "object"
+    },
+    "TabDumpCursor": {
+      "properties": {
+        "col": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "row": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "visible": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "row",
+        "col",
+        "visible"
+      ],
+      "type": "object"
+    },
+    "TabDumpParams": {
+      "additionalProperties": false,
+      "properties": {
+        "scrollback": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tab_id": {
+          "$ref": "#/$defs/WireTabRef"
+        }
+      },
+      "required": [
+        "tab_id"
+      ],
+      "type": "object"
+    },
+    "TabDumpResolvedParams": {
+      "additionalProperties": false,
+      "properties": {
+        "tab_id": {
+          "$ref": "#/$defs/WireTabRef"
+        }
+      },
+      "required": [
+        "tab_id"
+      ],
+      "type": "object"
+    },
+    "TabDumpResolvedResult": {
+      "properties": {
+        "cells": {
+          "items": {
+            "$ref": "#/$defs/ResolvedCell"
+          },
+          "type": "array"
+        },
+        "cols": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rows": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cols",
+        "rows",
+        "cells"
+      ],
+      "type": "object"
+    },
+    "TabDumpResult": {
+      "properties": {
+        "cols": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TabDumpCursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rows": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rows_text": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "scrollback_rows": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "scrollback_text": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "cols",
+        "rows",
+        "rows_text"
+      ],
+      "type": "object"
+    },
+    "TabEffect": {
+      "type": "string"
+    },
+    "TabEffectEvent": {
+      "properties": {
+        "data": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effect": {
+          "$ref": "#/$defs/TabEffect"
+        },
+        "tab_id": {
+          "type": "string"
+        },
+        "target": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClipboardEffectTarget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "tab_id",
+        "effect"
+      ],
+      "type": "object"
+    },
+    "TabExpandSelectionAtParams": {
+      "additionalProperties": false,
+      "properties": {
+        "click_count": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "col": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "row": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "col",
+        "row",
+        "click_count"
+      ],
+      "type": "object"
+    },
+    "TabExpandSelectionAtResult": {
+      "properties": {
+        "col0": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "col1": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "col0",
+        "col1"
+      ],
+      "type": "object"
+    },
+    "TabFeedImeParams": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "cursor_end": {
+          "default": null,
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cursor_start": {
+          "default": null,
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tab_id": {
+          "type": "string"
+        },
+        "text": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "action"
+      ],
+      "type": "object"
+    },
+    "TabFeedPtyBytesParams": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "type": "string"
+        },
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "data"
+      ],
+      "type": "object"
+    },
+    "TabFocusParams": {
+      "additionalProperties": false,
+      "properties": {
+        "tab_id": {
+          "$ref": "#/$defs/WireTabRef"
+        }
+      },
+      "required": [
+        "tab_id"
+      ],
+      "type": "object"
+    },
+    "TabFocusResult": {
+      "properties": {
+        "previous_project_id": {
+          "type": "string"
+        },
+        "previous_tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "previous_project_id",
+        "previous_tab_id"
+      ],
+      "type": "object"
+    },
+    "TabListParams": {
+      "type": "object"
+    },
+    "TabListResult": {
+      "properties": {
+        "projects": {
+          "items": {
+            "$ref": "#/$defs/Project"
+          },
+          "type": "array"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "projects"
+      ],
+      "type": "object"
+    },
+    "TabNotificationEvent": {
+      "properties": {
+        "has_pending": {
+          "type": "boolean"
+        },
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "has_pending"
+      ],
+      "type": "object"
+    },
+    "TabOpenParams": {
+      "additionalProperties": false,
+      "properties": {
+        "activate": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "argv": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cols": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cwd": {
+          "default": "",
+          "type": "string"
+        },
+        "project_id": {
+          "default": "0",
+          "type": "string"
+        },
+        "rows": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "title": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "TabOpenResult": {
+      "properties": {
+        "tab": {
+          "$ref": "#/$defs/Tab"
+        }
+      },
+      "required": [
+        "tab"
+      ],
+      "type": "object"
+    },
+    "TabOpenedEvent": {
+      "properties": {
+        "tab": {
+          "$ref": "#/$defs/Tab"
+        }
+      },
+      "required": [
+        "tab"
+      ],
+      "type": "object"
+    },
+    "TabReorderParams": {
+      "additionalProperties": false,
+      "properties": {
+        "project_id": {
+          "$ref": "#/$defs/WireProjectRef"
+        },
+        "tab_ids": {
+          "items": {
+            "$ref": "#/$defs/WireTabRef"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "project_id",
+        "tab_ids"
+      ],
+      "type": "object"
+    },
+    "TabResizeParams": {
+      "additionalProperties": false,
+      "properties": {
+        "cols": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rows": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "cols",
+        "rows"
+      ],
+      "type": "object"
+    },
+    "TabSendFileParams": {
+      "additionalProperties": false,
+      "properties": {
+        "paths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tab": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab",
+        "paths"
+      ],
+      "type": "object"
+    },
+    "TabSendFileResult": {
+      "properties": {
+        "pasted": {
+          "type": "string"
+        },
+        "skipped": {
+          "items": {
+            "$ref": "#/$defs/SkippedFile"
+          },
+          "type": "array"
+        },
+        "uploads": {
+          "items": {
+            "$ref": "#/$defs/SentFile"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "pasted",
+        "uploads",
+        "skipped"
+      ],
+      "type": "object"
+    },
+    "TabSetHookActiveParams": {
+      "additionalProperties": false,
+      "properties": {
+        "active": {
+          "type": "boolean"
+        },
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "active"
+      ],
+      "type": "object"
+    },
+    "TabSetStateParams": {
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "$ref": "#/$defs/TabState"
+        },
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "state"
+      ],
+      "type": "object"
+    },
+    "TabSetTitleParams": {
+      "additionalProperties": false,
+      "properties": {
+        "tab_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "title"
+      ],
+      "type": "object"
+    },
+    "TabState": {
+      "enum": [
+        "none",
+        "running",
+        "needs_input",
+        "idle"
+      ],
+      "type": "string"
+    },
+    "TabStateChangedEvent": {
+      "properties": {
+        "state": {
+          "$ref": "#/$defs/TabState"
+        },
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "state"
+      ],
+      "type": "object"
+    },
+    "TabTitleChangedEvent": {
+      "properties": {
+        "tab_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "title"
+      ],
+      "type": "object"
+    },
+    "TabWriteParams": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "type": "string"
+        },
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "data"
+      ],
+      "type": "object"
+    },
+    "TabsReorderedEvent": {
+      "properties": {
+        "project_id": {
+          "type": "string"
+        },
+        "tab_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "project_id",
+        "tab_ids"
+      ],
+      "type": "object"
+    },
+    "UpdateCheckDump": {
+      "properties": {
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outcome": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "outcome"
+      ],
+      "type": "object"
+    },
+    "WindowMetricsParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "WindowMetricsResult": {
+      "properties": {
+        "sidebar_collapsed": {
+          "type": "boolean"
+        },
+        "sidebar_width": {
+          "format": "double",
+          "type": "number"
+        },
+        "terminal_font_family": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "terminal_top": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "window_height": {
+          "format": "double",
+          "type": "number"
+        },
+        "window_width": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "window_width",
+        "window_height",
+        "sidebar_width",
+        "sidebar_collapsed"
+      ],
+      "type": "object"
+    },
+    "WindowResizeParams": {
+      "additionalProperties": false,
+      "properties": {
+        "height": {
+          "format": "double",
+          "type": "number"
+        },
+        "width": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "width",
+        "height"
+      ],
+      "type": "object"
+    },
+    "WireProjectRef": {
+      "pattern": "^(0|-?[1-9][0-9]*|h[1-9][0-9]*\\.(0|-?[1-9][0-9]*))$",
+      "type": "string"
+    },
+    "WireTabRef": {
+      "pattern": "^(0|-?[1-9][0-9]*|h[1-9][0-9]*\\.(0|-?[1-9][0-9]*))$",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "envelopes": {
+    "error": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/Response"
+        }
+      ],
+      "properties": {
+        "ok": {
+          "const": false
+        }
+      },
+      "required": [
+        "error"
+      ]
+    },
+    "event_batch": {
+      "$ref": "#/$defs/EventBatch"
+    },
+    "request": {
+      "$ref": "#/$defs/RawRequest"
+    },
+    "response": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/Response"
+        }
+      ],
+      "properties": {
+        "ok": {
+          "const": true
+        }
+      },
+      "required": [
+        "result"
+      ]
+    },
+    "session_stopping": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/EventEnvelope"
+        }
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/SessionStoppingEvent"
+        },
+        "event": {
+          "const": "session.stopping"
+        }
+      }
+    },
+    "stream_ended": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/EventEnvelope"
+        }
+      ],
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/StreamEndedEvent"
+        },
+        "event": {
+          "const": "stream.ended"
+        }
+      }
+    }
+  },
+  "events": {
+    "active.changed": {
+      "$ref": "#/$defs/ActiveChangedEvent"
+    },
+    "agent_report.changed": {
+      "$ref": "#/$defs/AgentReportChangedEvent"
+    },
+    "hook_active.changed": {
+      "$ref": "#/$defs/HookActiveChangedEvent"
+    },
+    "notification.fired": {
+      "$ref": "#/$defs/NotificationFiredEvent"
+    },
+    "project.created": {
+      "$ref": "#/$defs/ProjectCreatedEvent"
+    },
+    "project.deleted": {
+      "$ref": "#/$defs/ProjectDeletedEvent"
+    },
+    "project.renamed": {
+      "$ref": "#/$defs/ProjectRenamedEvent"
+    },
+    "projects.reordered": {
+      "$ref": "#/$defs/ProjectsReorderedEvent"
+    },
+    "tab.closed": {
+      "$ref": "#/$defs/TabClosedEvent"
+    },
+    "tab.cwd_changed": {
+      "$ref": "#/$defs/TabCwdChangedEvent"
+    },
+    "tab.effect": {
+      "$ref": "#/$defs/TabEffectEvent"
+    },
+    "tab.notification": {
+      "$ref": "#/$defs/TabNotificationEvent"
+    },
+    "tab.opened": {
+      "$ref": "#/$defs/TabOpenedEvent"
+    },
+    "tab.state_changed": {
+      "$ref": "#/$defs/TabStateChangedEvent"
+    },
+    "tab.title_changed": {
+      "$ref": "#/$defs/TabTitleChangedEvent"
+    },
+    "tabs.reordered": {
+      "$ref": "#/$defs/TabsReorderedEvent"
+    },
+    "workspace.durability_changed": {
+      "$ref": "#/$defs/DurabilityChangedEvent"
+    }
+  },
+  "ops": {
+    "agent.set_hooks": {
+      "params": {
+        "$ref": "#/$defs/AgentSetHooksParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AgentSetHooksResult"
+      }
+    },
+    "app.activate": {
+      "params": {
+        "$ref": "#/$defs/AppActivateParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "app.active_terminal_focused": {
+      "params": {
+        "$ref": "#/$defs/AppActiveTerminalFocusedParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AppActiveTerminalFocusedResult"
+      }
+    },
+    "app.cursor_shape": {
+      "params": {
+        "$ref": "#/$defs/AppCursorShapeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AppCursorShapeResult"
+      }
+    },
+    "app.dialog_answer": {
+      "params": {
+        "$ref": "#/$defs/AppDialogAnswerParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "app.dialog_dump": {
+      "params": {
+        "$ref": "#/$defs/AppDialogDumpParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AppDialogDumpResult"
+      }
+    },
+    "app.dock_badge": {
+      "params": {
+        "$ref": "#/$defs/AppDockBadgeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AppDockBadgeResult"
+      }
+    },
+    "app.keybind_dispatch": {
+      "params": {
+        "$ref": "#/$defs/AppKeybindDispatchParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "app.menu_activate": {
+      "params": {
+        "$ref": "#/$defs/AppMenuActivateParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "app.menu_dump": {
+      "params": {
+        "$ref": "#/$defs/AppMenuDumpParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AppMenuDumpResult"
+      }
+    },
+    "app.notification_status": {
+      "params": {
+        "$ref": "#/$defs/AppNotificationStatusParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AppNotificationStatusResult"
+      }
+    },
+    "app.render_stats": {
+      "params": {
+        "$ref": "#/$defs/AppRenderStatsParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AppRenderStatsResult"
+      }
+    },
+    "app.screenshot": {
+      "params": {
+        "$ref": "#/$defs/ScreenshotParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ScreenshotResult"
+      }
+    },
+    "app.selected_tab_id": {
+      "params": {
+        "$ref": "#/$defs/AppSelectedTabIdParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AppSelectedTabIdResult"
+      }
+    },
+    "app.set_window_focus": {
+      "params": {
+        "$ref": "#/$defs/AppSetWindowFocusParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "app.sidebar_dump": {
+      "params": {
+        "$ref": "#/$defs/SidebarDumpParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SidebarDumpResult"
+      }
+    },
+    "app.update_check": {
+      "params": {
+        "$ref": "#/$defs/AppUpdateCheckParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "app.update_status": {
+      "params": {
+        "$ref": "#/$defs/AppUpdateStatusParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AppUpdateStatusResult"
+      }
+    },
+    "app.window_metrics": {
+      "params": {
+        "$ref": "#/$defs/WindowMetricsParams"
+      },
+      "result": {
+        "$ref": "#/$defs/WindowMetricsResult"
+      }
+    },
+    "clipboard.dump": {
+      "params": {
+        "$ref": "#/$defs/ClipboardDumpParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ClipboardDumpResult"
+      }
+    },
+    "clipboard.write": {
+      "params": {
+        "$ref": "#/$defs/ClipboardWriteParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "events.subscribe": {
+      "params": {
+        "$ref": "#/$defs/EventsSubscribeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EventsSubscribeResult"
+      }
+    },
+    "host.add": {
+      "params": {
+        "$ref": "#/$defs/HostAddParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostAddResult"
+      }
+    },
+    "host.connect": {
+      "params": {
+        "$ref": "#/$defs/HostConnectParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostConnectionResult"
+      }
+    },
+    "host.disconnect": {
+      "params": {
+        "$ref": "#/$defs/HostDisconnectParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostConnectionResult"
+      }
+    },
+    "host.list": {
+      "params": {
+        "$ref": "#/$defs/HostListParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostListResult"
+      }
+    },
+    "host.remove": {
+      "params": {
+        "$ref": "#/$defs/HostRemoveParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "host.status": {
+      "params": {
+        "$ref": "#/$defs/HostStatusParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostStatusResult"
+      }
+    },
+    "identify": {
+      "params": {
+        "$ref": "#/$defs/IdentifyParams"
+      },
+      "result": {
+        "$ref": "#/$defs/IdentifyResult"
+      }
+    },
+    "notification.create": {
+      "params": {
+        "$ref": "#/$defs/NotificationCreateParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "palette.activate": {
+      "params": {
+        "$ref": "#/$defs/PaletteActivateParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PaletteStateResult"
+      }
+    },
+    "palette.dismiss": {
+      "params": {
+        "$ref": "#/$defs/PaletteDismissParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PaletteStateResult"
+      }
+    },
+    "palette.open": {
+      "params": {
+        "$ref": "#/$defs/PaletteOpenParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PaletteStateResult"
+      }
+    },
+    "palette.present": {
+      "params": {
+        "$ref": "#/$defs/PalettePresentParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PalettePresentResult"
+      }
+    },
+    "palette.query": {
+      "params": {
+        "$ref": "#/$defs/PaletteQueryParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PaletteStateResult"
+      }
+    },
+    "palette.state": {
+      "params": {
+        "$ref": "#/$defs/PaletteStateParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PaletteStateResult"
+      }
+    },
+    "project.create": {
+      "params": {
+        "$ref": "#/$defs/ProjectCreateParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ProjectCreateResult"
+      }
+    },
+    "project.delete": {
+      "params": {
+        "$ref": "#/$defs/ProjectDeleteParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "project.ensure": {
+      "params": {
+        "$ref": "#/$defs/ProjectEnsureParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ProjectEnsureResult"
+      }
+    },
+    "project.rename": {
+      "params": {
+        "$ref": "#/$defs/ProjectRenameParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "project.reorder": {
+      "params": {
+        "$ref": "#/$defs/ProjectReorderParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "selection.clear": {
+      "params": {
+        "$ref": "#/$defs/SelectionClearParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "selection.dump": {
+      "params": {
+        "$ref": "#/$defs/SelectionDumpParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SelectionDumpResult"
+      }
+    },
+    "selection.set": {
+      "params": {
+        "$ref": "#/$defs/SelectionSetParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "session.identify": {
+      "params": {
+        "$ref": "#/$defs/SessionIdentifyParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SessionIdentify"
+      }
+    },
+    "session.put_file": {
+      "params": {
+        "$ref": "#/$defs/SessionPutFileParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SessionPutFileResult"
+      }
+    },
+    "session.set_agent_hooks": {
+      "params": {
+        "$ref": "#/$defs/SessionSetAgentHooksParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AgentHooksOutcome"
+      }
+    },
+    "session.set_theme": {
+      "params": {
+        "$ref": "#/$defs/SessionSetThemeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SessionSetThemeResult"
+      }
+    },
+    "session.stop": {
+      "params": {
+        "$ref": "#/$defs/SessionStopParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SessionStopResult"
+      }
+    },
+    "sidebar.set_width": {
+      "params": {
+        "$ref": "#/$defs/SidebarSetWidthParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "tab.agent_report": {
+      "params": {
+        "$ref": "#/$defs/TabAgentReportParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TabAgentReportResult"
+      }
+    },
+    "tab.capture_pty_input": {
+      "params": {
+        "$ref": "#/$defs/TabCapturePtyInputParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TabCapturePtyInputResult"
+      }
+    },
+    "tab.clear_notification": {
+      "params": {
+        "$ref": "#/$defs/TabClearNotificationParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TabClearNotificationResult"
+      }
+    },
+    "tab.close": {
+      "params": {
+        "$ref": "#/$defs/TabCloseParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "tab.dispatch_mouse_event": {
+      "params": {
+        "$ref": "#/$defs/TabDispatchMouseEventParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "tab.dump": {
+      "params": {
+        "$ref": "#/$defs/TabDumpParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TabDumpResult"
+      }
+    },
+    "tab.dump_resolved": {
+      "params": {
+        "$ref": "#/$defs/TabDumpResolvedParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TabDumpResolvedResult"
+      }
+    },
+    "tab.expand_selection_at": {
+      "params": {
+        "$ref": "#/$defs/TabExpandSelectionAtParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TabExpandSelectionAtResult"
+      }
+    },
+    "tab.feed_ime": {
+      "params": {
+        "$ref": "#/$defs/TabFeedImeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "tab.feed_pty_bytes": {
+      "params": {
+        "$ref": "#/$defs/TabFeedPtyBytesParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "tab.focus": {
+      "params": {
+        "$ref": "#/$defs/TabFocusParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TabFocusResult"
+      }
+    },
+    "tab.list": {
+      "params": {
+        "$ref": "#/$defs/TabListParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TabListResult"
+      }
+    },
+    "tab.open": {
+      "params": {
+        "$ref": "#/$defs/TabOpenParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TabOpenResult"
+      }
+    },
+    "tab.reorder": {
+      "params": {
+        "$ref": "#/$defs/TabReorderParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "tab.resize": {
+      "params": {
+        "$ref": "#/$defs/TabResizeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "tab.send_file": {
+      "params": {
+        "$ref": "#/$defs/TabSendFileParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TabSendFileResult"
+      }
+    },
+    "tab.set_hook_active": {
+      "params": {
+        "$ref": "#/$defs/TabSetHookActiveParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "tab.set_state": {
+      "params": {
+        "$ref": "#/$defs/TabSetStateParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "tab.set_title": {
+      "params": {
+        "$ref": "#/$defs/TabSetTitleParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "tab.write": {
+      "params": {
+        "$ref": "#/$defs/TabWriteParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "window.resize": {
+      "params": {
+        "$ref": "#/$defs/WindowResizeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    }
+  },
+  "protocol_version": 1,
+  "schema_version": 1,
+  "session_protocol_version": 6
+}

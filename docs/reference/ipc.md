@@ -3636,6 +3636,45 @@ rationale belongs with the change that made it, once.
 which direction, which enums are closed, when either integer bumps, and
 how an external project depends on `roost-ipc`.
 
+## Machine-readable schema
+
+[`docs/reference/api/roost-ipc.schema.json`](api/roost-ipc.schema.json)
+is a [JSON Schema](https://json-schema.org/) (draft 2020-12) bundle
+generated from the same serde types this page describes by hand, so a
+wire-shape change shows up in that file's diff — it cannot describe a
+shape the types this crate actually serializes don't accept. The bundle
+is one document:
+
+```json
+{"$schema": "https://json-schema.org/draft/2020-12/schema",
+ "schema_version": 1, "protocol_version": 1, "session_protocol_version": 6,
+ "envelopes": {"request": …, "response": …, "error": …, "event_batch": …,
+               "session_stopping": …, "stream_ended": …},
+ "ops": {"tab.open": {"params": …, "result": …}, …},
+ "events": {"tab.opened": …, …},
+ "$defs": {…}}
+```
+
+`envelopes` are the six frame shapes every op or event rides inside;
+`ops` and `events` name every `ops::`/`EVENT_*` constant's params/result
+or data type, each a `$ref` into `$defs`. **Which socket serves an op is
+not encoded here** — that is [`identify.ops`](#identify)'s job, not the
+schema's: a session socket and a UI socket can both appear in `ops` even
+though only one serves a given op at runtime.
+
+`roostctl schema` prints the file verbatim, with no running Roost and no
+`--json` distinction (the file already is the payload) — see
+[`schema`](cli.md#schema) in the CLI reference. The file is generated
+from `crates/roost-ipc/src/schema.rs`'s `bundle()`/`bundle_json()` and
+pinned byte-for-byte by `crates/roost-ipc/tests/schema_pin_test.rs`;
+coverage and fidelity tests (the latter validating every file in
+`tests/ipc-vectors/` against the bundle) are in the same crate — see
+[What enforces this](ipc-compatibility.md#what-enforces-this).
+
+**No consumer validates against this schema yet** — it exists so one
+can, this release ships the generator, the pin, and the file, not a
+client-side validator.
+
 ## See also
 
 [`docs/archive/ipc-legacy-proto.md`](../archive/ipc-legacy-proto.md)
