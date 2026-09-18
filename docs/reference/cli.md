@@ -318,7 +318,7 @@ roostctl wait --tab 5 --state idle --no-timeout --json
 | `--state` | string | — | Wait until the tab's agent state equals this (`none`/`running`/`needs_input`/`idle`) |
 | `--text` | string | — | Wait until the viewport (via `tab.dump`) contains this substring. Pick a needle from command *output*, not the echoed command |
 | `--gone` | flag | `false` | Wait until the tab no longer exists. Cannot be combined with `--state` or `--text` |
-| `--timeout` | float | `5.0` | Give up after this many seconds. `0` checks once: exit `0` if the condition already holds, `4` if not |
+| `--timeout` | float | `5.0` | Give up after this many seconds, every call to the socket included. `0` checks once: exit `0` if the condition already holds, `4` if not. A value that is not a finite number of seconds (`inf`, `nan`), or too long to set a deadline by, is `usage` (exit 2), never "forever" |
 | `--no-timeout` | flag | `false` | Wait for as long as it takes. Cannot be combined with `--timeout` (exit 2) |
 | `--interval-ms` | int | `100` | The poll interval where there is no stream, and how often `--text` re-reads the viewport where there is |
 | `--tab` | bare id | `$ROOST_TAB_ID`, then the UI's active tab | Target tab. A host tab (`h<host>.<id>`) is refused with `usage` (exit 2): the stream is the local workspace's |
@@ -369,10 +369,16 @@ between them), the sequence is retried three times and then exits 1
 
 **Exits.** `0` once the condition holds; **4** (`timeout`) if `--timeout`
 elapses first, including while a backend switch in flight holds the wait off
-(re-checked every `--interval-ms`, never past the deadline) — before plan
-066 it exited 1, which a script could not tell from a failed connection; 2
-`usage` for a bad command line; 1 for everything in [Exit
-codes](#exit-codes).
+(re-checked every `--interval-ms`, never past the deadline) and inside a call
+the socket has not answered — "timed out after 1s waiting for tab 5
+(tab.dump did not answer)" — before plan 066 it exited 1, which a script
+could not tell from a failed connection. Under `--timeout 0` and
+`--no-timeout` there is no deadline, so each call gets **30 s**: a call left
+unanswered that long exits 1 `connection` ("tab.dump did not answer within
+30s"), because a server that accepts a call and never answers it is a dead
+connection, not a condition still pending. 2 `usage` for a bad command line,
+including a `--timeout` that is not a finite number of seconds; 1 for
+everything in [Exit codes](#exit-codes).
 
 With `--json`, success prints:
 
@@ -1006,7 +1012,7 @@ failed), the line is a JSON envelope instead:
 | 2 | `usage` | A bad command line, including a command that changes a tab given no `--tab` and no `ROOST_TAB_ID`. A parser error keeps clap's usage text in the message; `--help` and `--version` print to stdout and exit 0 |
 | 1 | `no-target` | Auto-detect found nothing listening at any known socket |
 | 1 | `ambiguous-target` | Several Roost UIs are running; pass `--target` |
-| 1 | `connection` | Dialing, reading or writing the socket failed, or the stream dropped (`wait` after a second loss or a stopping session; `events` on any drop or gap) |
+| 1 | `connection` | Dialing, reading or writing the socket failed, or the stream dropped (`wait` after a second loss or a stopping session; `events` on any drop or gap), or a call went unanswered for 30 s (`wait --timeout 0` or `--no-timeout`) |
 | 1 | *the server's own* | The server refused the request; its code is passed through verbatim (`not-found`, `invalid-param`, `unknown-op`, …) |
 | 1 | `unsupported` | This server does not serve an op the command needs |
 | 1 | `checks-failed` | `doctor` found a failing check; the report itself is on stdout |

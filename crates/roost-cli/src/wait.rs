@@ -1,6 +1,7 @@
 //! `roostctl wait`: block until a tab reaches a condition — on the tabs'
 //! event stream where the server serves one, else by polling.
 
+use std::future::Future;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -36,10 +37,12 @@ pub(crate) struct Args {
     /// Wait until the tab no longer exists (closed).
     #[arg(long, default_value_t = false)]
     pub gone: bool,
-    /// Give up after this many seconds. `0` checks once.
+    /// Give up after this many seconds, every call to the socket
+    /// included. `0` checks once.
     #[arg(long, default_value_t = 5.0)]
     pub timeout: f64,
-    /// Wait for as long as it takes.
+    /// Wait for as long as it takes. A call the socket does not answer
+    /// within 30 s still ends the wait.
     #[arg(long, conflicts_with = "timeout")]
     pub no_timeout: bool,
     /// Poll interval in milliseconds, and how often `--text` re-reads
@@ -150,17 +153,18 @@ pub(crate) async fn run(
     let named = crate::named_tab(flag, tab_env)?
         .map(|tab| events::local_tab("wait", tab))
         .transpose()?;
-    let identify = crate::identify(ui.client().await?).await?;
+    let bound = Bound::new(args.timeout, args.no_timeout)?;
+    let timeout = args.timeout.max(0.0);
+    let identify = identify(ui, bound, |op| cut_short(bound, timeout, named, op)).await?;
     let tab_id = match named {
         Some(tab_id) => tab_id,
         None => crate::active_tab(&identify)?,
     };
-    let deadline = budget(args.timeout, args.no_timeout).map(|budget| Instant::now() + budget);
     let waiting = Waiting {
         tab_id,
         want: &want,
-        deadline,
-        timeout: args.timeout,
+        bound,
+        timeout,
         interval: Duration::from_millis(args.interval_ms.max(10)),
     };
     let seen = waiting.run(ui, identify).await?;
@@ -170,13 +174,123 @@ pub(crate) async fn run(
     Ok(0)
 }
 
-/// How long to wait: `--timeout` seconds (a negative one is `0`, one check),
-/// or forever under `--no-timeout` or for a timeout too long to measure.
-fn budget(timeout: f64, no_timeout: bool) -> Option<Duration> {
-    if no_timeout {
-        return None;
+/// What bounds `wait`'s socket calls, decided once from `--timeout` and
+/// `--no-timeout` before anything is dialled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bound {
+    /// `--timeout N` for an `N` above `0`: every call, and the wait, ends
+    /// by then.
+    Deadline(Instant),
+    /// `--timeout 0` or `--no-timeout`: no deadline, so each call gets
+    /// [`call_ceiling`].
+    Ceiling,
+}
+
+/// How long one call may go unanswered under [`Bound::Ceiling`]. A server
+/// that accepted the call and answers nothing for this long is a dead
+/// connection.
+const CALL_CEILING: Duration = Duration::from_secs(30);
+
+fn call_ceiling() -> Duration {
+    if cfg!(test) {
+        Duration::from_secs(1)
+    } else {
+        CALL_CEILING
     }
-    Duration::try_from_secs_f64(timeout.max(0.0)).ok()
+}
+
+/// The step before an op's own call: resolving the socket and dialling it.
+pub(crate) const DIAL: &str = "the dial";
+
+impl Bound {
+    /// `--timeout`, or `--no-timeout`. A negative timeout is `0`; one that
+    /// is not a finite number of seconds, or is too long to set a deadline
+    /// by, is refused rather than read as "forever".
+    pub(crate) fn new(timeout: f64, no_timeout: bool) -> Result<Self, CliError> {
+        if no_timeout {
+            return Ok(Self::Ceiling);
+        }
+        if !timeout.is_finite() {
+            return Err(CliError::Usage(format!(
+                "--timeout must be a finite number of seconds, not {timeout}; use --no-timeout \
+                 to wait for as long as it takes"
+            )));
+        }
+        if timeout <= 0.0 {
+            return Ok(Self::Ceiling);
+        }
+        Duration::try_from_secs_f64(timeout)
+            .ok()
+            .and_then(|span| Instant::now().checked_add(span))
+            .map(Self::Deadline)
+            .ok_or_else(|| {
+                CliError::Usage(format!(
+                    "--timeout {timeout} is too long to wait for; use --no-timeout to wait for \
+                     as long as it takes"
+                ))
+            })
+    }
+
+    pub(crate) fn deadline(self) -> Option<Instant> {
+        match self {
+            Self::Deadline(deadline) => Some(deadline),
+            Self::Ceiling => None,
+        }
+    }
+
+    /// `step`'s outcome, or `None` when this bound cut it short.
+    pub(crate) async fn within<F: Future>(self, step: F) -> Option<F::Output> {
+        match self {
+            Self::Deadline(deadline) => tokio::time::timeout_at(deadline, step).await.ok(),
+            Self::Ceiling => tokio::time::timeout(call_ceiling(), step).await.ok(),
+        }
+    }
+}
+
+/// The failure for `op`, cut short by `bound` while waiting for `tab`
+/// (`None`: the active tab, not yet read). The deadline passing is a
+/// timeout. A call that outlived the ceiling went to a server that
+/// accepted it and stopped answering: a dead connection, not a timeout, so
+/// exit 4 keeps its one meaning — the condition did not hold in time.
+fn cut_short(bound: Bound, timeout: f64, tab: Option<i64>, op: &str) -> CliError {
+    match bound {
+        Bound::Deadline(_) => timed_out(timeout, tab, Some(op)),
+        Bound::Ceiling => unanswered(op),
+    }
+}
+
+/// The deadline passed — while `cut` was waiting on its answer, if a call
+/// was cut.
+fn timed_out(timeout: f64, tab: Option<i64>, cut: Option<&str>) -> CliError {
+    let tab = match tab {
+        Some(tab) => format!("tab {tab}"),
+        None => "the active tab".into(),
+    };
+    let cut = cut
+        .map(|op| format!(" ({op} did not answer)"))
+        .unwrap_or_default();
+    CliError::Timeout(format!("timed out after {timeout}s waiting for {tab}{cut}"))
+}
+
+/// `op` did not answer within [`call_ceiling`].
+pub(crate) fn unanswered(op: &str) -> CliError {
+    CliError::Connection(format!(
+        "{op} did not answer within {}s",
+        call_ceiling().as_secs_f64()
+    ))
+}
+
+/// `identify`, dialling first when the socket has not been; each step
+/// under `bound`, and `cut` the failure for one it cut short.
+async fn identify(
+    ui: &mut UiSocket<'_>,
+    bound: Bound,
+    cut: impl Fn(&str) -> CliError,
+) -> Result<IdentifyResult, CliError> {
+    let dialled = bound.within(ui.client()).await;
+    let client = dialled.unwrap_or_else(|| Err(cut(DIAL)))?;
+    let identified = bound.within(crate::identify(client)).await;
+    identified.unwrap_or_else(|| Err(cut(ops::IDENTIFY)))
 }
 
 /// `--json`'s success document. Each `satisfied` field is `null` unless
@@ -197,7 +311,9 @@ fn satisfied(tab_id: i64, want: &Want, seen: &Seen, after: Duration) -> serde_js
 struct Waiting<'a> {
     tab_id: i64,
     want: &'a Want,
-    deadline: Option<Instant>,
+    bound: Bound,
+    /// `--timeout`, a negative one `0`: `0` checks once, and a timeout
+    /// names it.
     timeout: f64,
     interval: Duration,
 }
@@ -235,7 +351,7 @@ impl Waiting<'_> {
     /// read off its snapshot would be a lie.
     async fn run(&self, ui: &mut UiSocket<'_>, identify: IdentifyResult) -> Result<Seen, CliError> {
         let lost = match self.reach(ui, identify).await? {
-            Reached::Poll(_) => return self.poll(ui.client().await?).await,
+            Reached::Poll(_) => return self.poll(ui).await,
             Reached::Stream(source, legs) => match self.watch(&source, *legs).await? {
                 Watched::Held(seen) => return Ok(seen),
                 Watched::Lost(lost) => lost,
@@ -291,7 +407,7 @@ impl Waiting<'_> {
             if !source.serves_stream {
                 return Ok(Reached::Poll(source));
             }
-            match events::open(&source, true).await {
+            match events::open(&source, true, self.bound).await {
                 Err(CliError::Server { code, .. }) if code == codes::BUSY => {
                     identify = self.hold_off(ui).await?;
                 }
@@ -307,13 +423,14 @@ impl Waiting<'_> {
                     why: error.message().to_string(),
                 },
             ),
+            Opened::Unanswered(op) => return Err(self.cut(op)),
         })
     }
 
     /// [`Self::reach`] from a fresh dial and a fresh `identify`.
     async fn reach_again(&self, ui: &mut UiSocket<'_>) -> Result<Reached, CliError> {
         ui.redial();
-        let identify = crate::identify(ui.client().await?).await?;
+        let identify = self.identify(ui).await?;
         self.reach(ui, identify).await
     }
 
@@ -328,26 +445,54 @@ impl Waiting<'_> {
         ))
     }
 
-    /// One interval, cut short by the deadline, then `identify` again.
+    /// One interval, then `identify` again.
     async fn hold_off(&self, ui: &mut UiSocket<'_>) -> Result<IdentifyResult, CliError> {
         self.check_deadline()?;
-        let wake = Instant::now() + self.interval;
-        tokio::time::sleep_until(self.deadline.map_or(wake, |deadline| deadline.min(wake))).await;
+        self.pause().await;
         self.check_deadline()?;
-        crate::identify(ui.client().await?).await
+        self.identify(ui).await
+    }
+
+    /// One interval, cut short by the deadline.
+    async fn pause(&self) {
+        let wake = Instant::now() + self.interval;
+        tokio::time::sleep_until(
+            self.bound
+                .deadline()
+                .map_or(wake, |deadline| deadline.min(wake)),
+        )
+        .await;
     }
 
     fn check_deadline(&self) -> Result<(), CliError> {
-        if self
-            .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            return Err(CliError::Timeout(format!(
-                "timed out after {}s waiting for tab {}",
-                self.timeout, self.tab_id
-            )));
+        let passed = match self.bound {
+            Bound::Deadline(deadline) => Instant::now() >= deadline,
+            Bound::Ceiling => self.timeout == 0.0,
+        };
+        if passed {
+            return Err(timed_out(self.timeout, Some(self.tab_id), None));
         }
         Ok(())
+    }
+
+    fn cut(&self, op: &str) -> CliError {
+        cut_short(self.bound, self.timeout, Some(self.tab_id), op)
+    }
+
+    /// One socket call under the bound.
+    async fn call<T, E: Into<CliError>>(
+        &self,
+        op: &str,
+        step: impl Future<Output = Result<T, E>>,
+    ) -> Result<T, CliError> {
+        match self.bound.within(step).await {
+            Some(done) => done.map_err(Into::into),
+            None => Err(self.cut(op)),
+        }
+    }
+
+    async fn identify(&self, ui: &mut UiSocket<'_>) -> Result<IdentifyResult, CliError> {
+        identify(ui, self.bound, |op| self.cut(op)).await
     }
 
     /// The wait on the stream: the snapshot, then every commit after it.
@@ -399,7 +544,7 @@ impl Waiting<'_> {
             // buffer, so losing the race to the tick or the deadline
             // drops nothing.
             reread = tokio::select! {
-                () = sleep_until(self.deadline) => false,
+                () = sleep_until(self.bound.deadline()) => false,
                 frame = stream.next() => match frame {
                     Ok(Some(EventFrame::Batch(batch))) => {
                         batch.revision > fence && seen.apply(&batch, self.tab_id)
@@ -437,7 +582,14 @@ impl Waiting<'_> {
             seen.text = false;
             return Ok(None);
         }
-        match dump_contains(conn, self.tab_id, needle).await {
+        let dumped = self
+            .bound
+            .within(dump_contains(conn, self.tab_id, needle))
+            .await;
+        let Some(dumped) = dumped else {
+            return Err(self.cut(ops::TAB_DUMP));
+        };
+        match dumped {
             Ok(found) => {
                 seen.text = found;
                 Ok(None)
@@ -450,18 +602,22 @@ impl Waiting<'_> {
     }
 
     /// The poll loop, for a server with no stream.
-    async fn poll(&self, client: &mut IpcClient) -> Result<Seen, CliError> {
+    async fn poll(&self, ui: &mut UiSocket<'_>) -> Result<Seen, CliError> {
+        let client = self.call(DIAL, ui.client()).await?;
         loop {
-            let list = crate::list_tabs(client).await?;
+            let list = self.call(ops::TAB_LIST, crate::list_tabs(client)).await?;
             let mut seen = Seen::listed(&list, self.tab_id);
             if let (Some(needle), true) = (&self.want.text, seen.exists) {
-                seen.text = dump_contains(client, self.tab_id, needle).await?;
+                seen.text = self
+                    .call(ops::TAB_DUMP, dump_contains(client, self.tab_id, needle))
+                    .await?;
             }
             if self.want.holds(&seen) {
                 return Ok(seen);
             }
             self.check_deadline()?;
-            tokio::time::sleep(self.interval).await;
+            self.pause().await;
+            self.check_deadline()?;
         }
     }
 }
@@ -519,8 +675,11 @@ mod tests {
     use serde_json::json;
 
     async fn wait(fake: &Fake, argv: &[&str], tab_env: Option<&str>) -> Result<i32, CliError> {
-        let socket = fake.socket();
-        let argv = ["roostctl", "--socket", &socket, "wait"]
+        wait_on(&fake.socket(), argv, tab_env).await
+    }
+
+    async fn wait_on(socket: &str, argv: &[&str], tab_env: Option<&str>) -> Result<i32, CliError> {
+        let argv = ["roostctl", "--socket", socket, "wait"]
             .into_iter()
             .chain(argv.iter().copied());
         let args = <crate::Args as clap::Parser>::try_parse_from(argv).expect("the argv parses");
@@ -1076,13 +1235,204 @@ mod tests {
         assert!(timed_out(&exit), "{exit:?}");
     }
 
+    /// Polling, the sleep ends at the deadline and the deadline is checked
+    /// again before another `tab.list`.
+    #[tokio::test]
+    async fn a_poll_interval_longer_than_the_timeout_times_out_on_time() {
+        let fake = Fake::without_stream("poll-late");
+        let argv = [
+            "--tab",
+            "7",
+            "--state",
+            "idle",
+            "--timeout",
+            "1",
+            "--interval-ms",
+            "60000",
+        ];
+        let started = std::time::Instant::now();
+        let exit = wait(&fake, &argv, None).await;
+        assert_eq!(
+            exit,
+            Err(CliError::Timeout(
+                "timed out after 1s waiting for tab 7".into()
+            ))
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(fake.with(|world| world.count("tab.list")), 1);
+    }
+
     #[test]
-    fn the_budget_is_the_timeout_or_nothing_at_all() {
-        assert_eq!(budget(2.5, false), Some(Duration::from_millis(2500)));
-        assert_eq!(budget(0.0, false), Some(Duration::ZERO));
-        assert_eq!(budget(-1.0, false), Some(Duration::ZERO));
-        assert_eq!(budget(5.0, true), None);
-        assert_eq!(budget(f64::INFINITY, false), None);
+    fn a_positive_timeout_is_a_deadline_and_the_rest_the_ceiling() {
+        let before = Instant::now();
+        let Ok(Bound::Deadline(deadline)) = Bound::new(2.5, false) else {
+            panic!("2.5 s is a deadline")
+        };
+        let span = Duration::from_millis(2500);
+        assert!(deadline >= before + span && deadline <= Instant::now() + span);
+        assert_eq!(Bound::new(0.0, false), Ok(Bound::Ceiling));
+        assert_eq!(Bound::new(-1.0, false), Ok(Bound::Ceiling));
+        assert_eq!(Bound::new(5.0, true), Ok(Bound::Ceiling));
+        for refused in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN, 1e300, 1e19] {
+            let error = Bound::new(refused, false).expect_err("never forever");
+            assert_eq!(error.exit_code(), 2, "{refused}: {error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timeout_that_is_not_a_finite_number_of_seconds_is_usage() {
+        let fake = Fake::ui("non-finite");
+        for timeout in ["--timeout=inf", "--timeout=nan", "--timeout=-inf"] {
+            let exit = wait(&fake, &["--tab", "7", "--gone", timeout], None).await;
+            let Err(error) = exit else {
+                panic!("{timeout}: {exit:?}")
+            };
+            assert_eq!((error.exit_code(), error.code()), (2, "usage"), "{error:?}");
+            assert!(error.message().contains("finite"), "{error:?}");
+        }
+        assert!(fake.with(|world| world.log.is_empty()));
+    }
+
+    /// Exit 4 for `--timeout 1`, inside two seconds, naming the call the
+    /// deadline cut.
+    fn cut_at_the_deadline(
+        exit: &Result<i32, CliError>,
+        started: std::time::Instant,
+        tab: &str,
+        op: &str,
+    ) {
+        let elapsed = started.elapsed();
+        let Err(error) = exit else { panic!("{exit:?}") };
+        assert_eq!(
+            (error.exit_code(), error.code()),
+            (4, "timeout"),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.message(),
+            format!("timed out after 1s waiting for {tab} ({op} did not answer)")
+        );
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    }
+
+    fn never_answers(fake: &Fake, op: &'static str) {
+        fake.hook(move |world, seen, phase| {
+            if seen == op && phase == Phase::Before {
+                world.instead = Some(Instead::Never);
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn a_dump_that_never_answers_times_out_on_time() {
+        for fake in [
+            Fake::ui("dump-never"),
+            Fake::without_stream("dump-never-poll"),
+        ] {
+            never_answers(&fake, "tab.dump");
+            let started = std::time::Instant::now();
+            let argv = ["--tab", "7", "--text", "OK", "--timeout", "1"];
+            let exit = wait(&fake, &argv, None).await;
+            cut_at_the_deadline(&exit, started, "tab 7", "tab.dump");
+            assert_eq!(fake.with(|world| world.count("tab.dump")), 1);
+        }
+    }
+
+    /// The first `identify`, whether or not `--tab` named the tab, and the
+    /// one that checks the stream's second connection.
+    #[tokio::test]
+    async fn an_identify_that_never_answers_times_out_on_time() {
+        for (nth, tab_flag, tab) in [
+            (1, &["--tab", "7"][..], "tab 7"),
+            (1, &[][..], "the active tab"),
+            (2, &["--tab", "7"][..], "tab 7"),
+        ] {
+            let fake = Fake::ui("identify-never");
+            fake.on("identify", nth, Phase::Before, |world| {
+                world.instead = Some(Instead::Never);
+            });
+            let started = std::time::Instant::now();
+            let argv = [tab_flag, &["--state", "idle", "--timeout", "1"]].concat();
+            let exit = wait(&fake, &argv, None).await;
+            cut_at_the_deadline(&exit, started, tab, "identify");
+            assert_eq!(fake.with(|world| world.count("identify")), nth, "{tab}");
+        }
+    }
+
+    /// A Unix socket completes a dial from its listen backlog, so a socket
+    /// that never accepts is cut at the `identify` the dial carries.
+    #[tokio::test]
+    async fn a_socket_that_never_accepts_times_out_on_time() {
+        let socket = crate::tests::short_socket_dir("never-accept").join("s.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let started = std::time::Instant::now();
+        let argv = ["--tab", "7", "--gone", "--timeout", "1"];
+        let exit = wait_on(&socket.display().to_string(), &argv, None).await;
+        cut_at_the_deadline(&exit, started, "tab 7", "identify");
+    }
+
+    /// A small budget can run out before the wait has read anything at all,
+    /// and that is a timeout too.
+    #[tokio::test]
+    async fn a_budget_spent_in_a_slow_identify_times_out() {
+        let fake = Fake::ui("identify-slow");
+        fake.on("identify", 1, Phase::Before, |world| {
+            world.instead = Some(Instead::Late(Duration::from_secs(2)));
+        });
+        let started = std::time::Instant::now();
+        let argv = ["--tab", "7", "--state", "running", "--timeout", "0.05"];
+        let Err(error) = wait(&fake, &argv, None).await else {
+            panic!("the answer came too late")
+        };
+        assert_eq!(
+            error,
+            CliError::Timeout(
+                "timed out after 0.05s waiting for tab 7 (identify did not answer)".into()
+            )
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// With no deadline to pass, a call left unanswered past the ceiling is
+    /// a dead connection, not a timeout — here the first call of all, and a
+    /// dump on a stream the wait already holds, which ends the wait rather
+    /// than resolving the stream again.
+    #[tokio::test]
+    async fn without_a_deadline_a_call_that_never_answers_is_a_dead_connection() {
+        for (bound, op) in [
+            (&["--timeout", "0"][..], "identify"),
+            (&["--no-timeout"][..], "identify"),
+            (&["--no-timeout"][..], "tab.dump"),
+        ] {
+            let fake = Fake::ui("dead");
+            never_answers(&fake, op);
+            let started = std::time::Instant::now();
+            let argv = [&["--tab", "7", "--text", "OK"][..], bound].concat();
+            let exit = wait(&fake, &argv, None).await;
+            let elapsed = started.elapsed();
+            let Err(error) = exit else {
+                panic!("{bound:?} {op}: {exit:?}")
+            };
+            assert_eq!(
+                (error.exit_code(), error.code()),
+                (1, "connection"),
+                "{error:?}"
+            );
+            assert_eq!(error.message(), format!("{op} did not answer within 1s"));
+            assert!(elapsed >= call_ceiling(), "{bound:?} {op}: {elapsed:?}");
+            assert_eq!(
+                fake.with(|world| world.count("events.subscribe")),
+                usize::from(op == "tab.dump")
+            );
+        }
     }
 
     #[test]

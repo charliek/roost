@@ -20,6 +20,7 @@ use roost_ipc::messages::{
 use roost_ipc::IpcClient;
 
 use crate::error::CliError;
+use crate::wait::{self, Bound};
 use crate::UiSocket;
 
 /// How many times a subscribe whose two legs reached different processes
@@ -44,6 +45,15 @@ pub(crate) enum Identity {
     Session,
     /// `identify.instance_id`.
     Ui,
+}
+
+impl Identity {
+    fn op(self) -> &'static str {
+        match self {
+            Self::Session => ops::SESSION_IDENTIFY,
+            Self::Ui => ops::IDENTIFY,
+        }
+    }
 }
 
 /// The stream's source, from the `identify` the resolved UI socket gave.
@@ -92,6 +102,10 @@ pub(crate) enum Opened {
         acked: String,
         error: CliError,
     },
+    /// The bound cut this op's call short. Not a dropped leg to retry: a
+    /// server that accepted the call and answers nothing would only be
+    /// waited on again.
+    Unanswered(&'static str),
 }
 
 /// The second connection, once the stream is acked.
@@ -99,6 +113,7 @@ enum Second {
     Matched(IpcClient, Option<TabListResult>),
     /// Named some other process, or none.
     Other(Option<String>),
+    Unanswered(&'static str),
 }
 
 /// Subscribe on one connection, then identify (and snapshot) on another.
@@ -107,13 +122,24 @@ enum Second {
 /// arrives on the stream, so a `tab.list` taken after it can only be
 /// newer, and a caller discards the batches that snapshot already holds.
 /// Two legs that name different processes mean it restarted in between,
-/// where revisions restart too; that is retried, and then refused.
-pub(crate) async fn open(source: &Source, snapshot: bool) -> Result<Opened, CliError> {
+/// where revisions restart too; that is retried, and then refused. Every
+/// call is under `bound`.
+pub(crate) async fn open(
+    source: &Source,
+    snapshot: bool,
+    bound: Bound,
+) -> Result<Opened, CliError> {
     let mut named = Vec::new();
     for _ in 0..=IDENTITY_RETRIES {
-        let stream = subscribe(&source.socket).await?;
+        let Some(conn) = bound.within(crate::dial(&source.socket)).await else {
+            return Ok(Opened::Unanswered(wait::DIAL));
+        };
+        let Some(stream) = bound.within(conn?.subscribe_events()).await else {
+            return Ok(Opened::Unanswered(ops::EVENTS_SUBSCRIBE));
+        };
+        let stream = stream?;
         let acked = stream.session_id().to_string();
-        match second(source, &acked, snapshot).await {
+        match second(source, &acked, snapshot, bound).await {
             Ok(Second::Matched(conn, tabs)) => {
                 return Ok(Opened::Legs(Box::new(Legs { stream, conn, tabs })))
             }
@@ -121,6 +147,7 @@ pub(crate) async fn open(source: &Source, snapshot: bool) -> Result<Opened, CliE
                 "{acked} then {}",
                 incarnation.as_deref().unwrap_or("nothing")
             )),
+            Ok(Second::Unanswered(op)) => return Ok(Opened::Unanswered(op)),
             Err(error @ CliError::Connection(_)) => return Ok(Opened::Dropped { acked, error }),
             Err(refused) => return Err(refused),
         }
@@ -133,24 +160,34 @@ pub(crate) async fn open(source: &Source, snapshot: bool) -> Result<Opened, CliE
     )))
 }
 
-async fn second(source: &Source, acked: &str, snapshot: bool) -> Result<Second, CliError> {
-    let mut conn = crate::dial(&source.socket).await?;
-    let incarnation = incarnation(&mut conn, source.identity).await?;
+async fn second(
+    source: &Source,
+    acked: &str,
+    snapshot: bool,
+    bound: Bound,
+) -> Result<Second, CliError> {
+    let Some(conn) = bound.within(crate::dial(&source.socket)).await else {
+        return Ok(Second::Unanswered(wait::DIAL));
+    };
+    let mut conn = conn?;
+    let Some(incarnation) = bound.within(incarnation(&mut conn, source.identity)).await else {
+        return Ok(Second::Unanswered(source.identity.op()));
+    };
+    let incarnation = incarnation?;
     // Before the snapshot, which another process could not fence — and
     // whose failure there would end the open instead of retrying it.
     if incarnation.as_deref() != Some(acked) {
         return Ok(Second::Other(incarnation));
     }
     let tabs = if snapshot {
-        Some(crate::list_tabs(&mut conn).await?)
+        let Some(tabs) = bound.within(crate::list_tabs(&mut conn)).await else {
+            return Ok(Second::Unanswered(ops::TAB_LIST));
+        };
+        Some(tabs?)
     } else {
         None
     };
     Ok(Second::Matched(conn, tabs))
-}
-
-async fn subscribe(socket: &Path) -> Result<EventStream, CliError> {
-    Ok(crate::dial(socket).await?.subscribe_events().await?)
 }
 
 async fn incarnation(conn: &mut IpcClient, identity: Identity) -> Result<Option<String>, CliError> {
@@ -230,9 +267,10 @@ async fn stream_to(
     // No poll fallback: a server without the stream refuses the subscribe
     // in its own words, and that refusal is the answer.
     let source = resolve(ui.socket_path(), &identify);
-    let mut stream = match open(&source, false).await? {
+    let mut stream = match open(&source, false, Bound::Ceiling).await? {
         Opened::Legs(legs) => legs.stream,
         Opened::Dropped { error, .. } => return Err(error),
+        Opened::Unanswered(op) => return Err(wait::unanswered(op)),
     };
     loop {
         match stream.next().await {
@@ -308,8 +346,8 @@ fn emit(out: &mut impl Write, line: &Line<'_>) -> Result<bool, CliError> {
 pub(crate) mod fake {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use serde_json::{json, Value};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -342,6 +380,10 @@ pub(crate) mod fake {
         HangUp,
         /// Refuse it with this code and message.
         Refuse(&'static str, &'static str),
+        /// Keep the connection open and never answer.
+        Never,
+        /// Answer it this long after it arrived.
+        Late(Duration),
     }
 
     pub(crate) struct World {
@@ -414,19 +456,21 @@ pub(crate) mod fake {
             self.log.iter().filter(|(_, logged)| logged == op).count()
         }
 
-        /// `None` hangs up.
-        fn handle(&mut self, conn: u64, op: &str) -> Option<Answer> {
+        /// The answer and how long it waits, or [`Instead::HangUp`] or
+        /// [`Instead::Never`].
+        fn handle(&mut self, conn: u64, op: &str) -> Result<(Answer, Duration), Instead> {
             self.log.push((conn, op.to_string()));
             let mut hook = self.hook.take();
             if let Some(hook) = hook.as_mut() {
                 hook(self, op, Phase::Before);
             }
             let answered = match self.instead.take() {
-                Some(Instead::HangUp) => None,
+                None => Ok((self.answer(op), Duration::ZERO)),
                 Some(Instead::Refuse(code, message)) => {
-                    Some((Err((code.into(), message.into())), None))
+                    Ok(((Err((code.into(), message.into())), None), Duration::ZERO))
                 }
-                None => Some(self.answer(op)),
+                Some(Instead::Late(after)) => Ok((self.answer(op), after)),
+                Some(unanswered) => Err(unanswered),
             };
             if let Some(hook) = hook.as_mut() {
                 hook(self, op, Phase::After);
@@ -525,15 +569,7 @@ pub(crate) mod fake {
         }
 
         fn start(tag: &str, identify: Value, id: &str) -> Self {
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let dir = std::env::temp_dir().join(format!(
-                "roostctl-stream-{tag}-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&dir).expect("a scratch dir");
-            let socket = dir.join("s.sock");
-            let _ = std::fs::remove_file(&socket);
+            let socket = crate::tests::short_socket_dir(tag).join("s.sock");
             let world = Arc::new(Mutex::new(World {
                 revision: 40,
                 tabs: BTreeMap::from([(7, "running")]),
@@ -601,9 +637,15 @@ pub(crate) mod fake {
         let mut lines = BufReader::new(read).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let request: RawRequest = serde_json::from_str(&line).expect("a request frame");
-            let Some((reply, pushes)) = world.lock().unwrap().handle(conn, &request.op) else {
-                return;
+            let handled = world.lock().unwrap().handle(conn, &request.op);
+            let ((reply, pushes), after) = match handled {
+                Ok(answer) => answer,
+                Err(Instead::Never) => return std::future::pending().await,
+                Err(_) => return,
             };
+            if !after.is_zero() {
+                tokio::time::sleep(after).await;
+            }
             let response = match reply {
                 Ok(result) => Response::ok(request.id, result),
                 Err((code, message)) => Response::err(request.id, code, message),
@@ -878,7 +920,9 @@ mod tests {
             &fake.socket,
             &serde_json::from_value(fake.with(|w| w.identify.clone())).unwrap(),
         );
-        let Err(CliError::Connection(message)) = open(&source, false).await.map(|_| ()) else {
+        let Err(CliError::Connection(message)) =
+            open(&source, false, Bound::Ceiling).await.map(|_| ())
+        else {
             panic!("the identity never matched")
         };
         assert!(message.contains("different processes"), "{message}");
@@ -902,10 +946,11 @@ mod tests {
             &fake.socket,
             &serde_json::from_value(fake.with(|w| w.identify.clone())).unwrap(),
         );
-        let message = match open(&source, true).await {
+        let message = match open(&source, true, Bound::Ceiling).await {
             Err(CliError::Connection(message)) => message,
             Ok(Opened::Dropped { error, .. }) => panic!("ended on the hung-up snapshot: {error:?}"),
             Ok(Opened::Legs(_)) => panic!("the identity never matched, and still opened"),
+            Ok(Opened::Unanswered(op)) => panic!("{op} was cut short"),
             Err(error) => panic!("{error:?}"),
         };
         assert!(message.contains("different processes"), "{message}");
@@ -925,7 +970,7 @@ mod tests {
             &serde_json::from_value(fake.with(|w| w.identify.clone())).unwrap(),
         );
         assert_eq!(source.identity, Identity::Session);
-        let Ok(Opened::Legs(legs)) = open(&source, true).await else {
+        let Ok(Opened::Legs(legs)) = open(&source, true, Bound::Ceiling).await else {
             panic!("the second attempt matches");
         };
         assert_eq!(legs.stream.session_id(), "session-1");

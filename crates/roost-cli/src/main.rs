@@ -3000,7 +3000,7 @@ mod tests {
     /// A unique directory for a test socket, under `/tmp` rather than
     /// `temp_dir()`: macOS's `$TMPDIR` is long enough that a socket path
     /// under it overruns `SUN_LEN` (104 bytes) and `bind` refuses it.
-    fn short_socket_dir(tag: &str) -> PathBuf {
+    pub(crate) fn short_socket_dir(tag: &str) -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let tag: String = tag.chars().take(12).collect();
         let dir = PathBuf::from("/tmp").join(format!(

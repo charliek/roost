@@ -16,7 +16,8 @@ pub enum CliError {
     NoTarget(String),
     /// Auto-detect found several UIs.
     AmbiguousTarget(String),
-    /// A dial, read or write failed, or the stream dropped.
+    /// A dial, read or write failed, the stream dropped, or a call went
+    /// unanswered for `wait`'s per-call ceiling.
     Connection(String),
     /// The server refused; `code` is the server's own, verbatim.
     Server { code: String, message: String },
