@@ -30,6 +30,8 @@ roostctl [--socket <PATH>] [--target <mac|linux|iced|session>] [--json] <COMMAND
 | `wait` | Block until a tab reaches a state, shows a string, or closes |
 | `events` | Print the event stream, one JSON line per event |
 | `tab open` / `close` / `send` / `resize` / `reorder` | Tab lifecycle + I/O |
+| `tab report` | Report an agent-hook event straight to `tab.agent_report` |
+| `tab prompt` | Submit a prompt to a tab's agent and wait for the turn it starts |
 | `project list` / `create` / `ensure` / `rename` / `delete` / `reorder` | Project lifecycle |
 | `open` | Find-or-create a project by name, then open a tab in it — one call, atomic on the server |
 | `agent ensure` / `set` / `install` / `uninstall` / `status` | Wire Roost's hook entries into the supported agents' own configs |
@@ -89,8 +91,9 @@ never written to stdout either way — see [Exit codes](#exit-codes).
 
 A command that **changes** a tab — `notify`, `set-title`, `tab set-state`,
 `tab clear-notification`, `tab close`, `tab send`, `tab resize`,
-`tab focus` — acts on `--tab`, or else on `$ROOST_TAB_ID`. With neither
-it refuses, before it dials anything, and exits 2:
+`tab focus`, `tab report`, `tab prompt` — acts on `--tab`, or else on
+`$ROOST_TAB_ID`. With neither it refuses, before it dials anything, and
+exits 2:
 
 ```text
 roostctl: usage: no --tab and ROOST_TAB_ID is unset; refusing to guess the active tab for a command that changes it — `roostctl tab list` shows ids
@@ -247,6 +250,90 @@ or `not accepted: tab N has no owner`, on `accepted: false`. **Exit 0
 either way** — the op succeeded and the ownership answer is data for the
 caller. A server refusal (a bad param, an unknown tab) exits 1 with the
 server's own code, same as every other verb.
+
+## `tab prompt`
+
+Submit a prompt to the agent running in a tab and wait for the turn it
+starts. The race-free form of `tab send` followed by `wait`, and the one
+verb that needs no `if` around the `running` wait.
+
+```bash
+roostctl tab prompt --tab 3 --timeout 600 'Summarize the failing tests.'
+roostctl tab prompt --tab 3 --no-timeout --until needs_input --json 'Fix it.'
+```
+
+**The sequence.** No new op — the verb is two `tab.write`s and the
+[event stream](ipc.md#eventssubscribe), in the one order that closes the
+race between them:
+
+1. Subscribe to the stream and fence it with a `tab.list` snapshot,
+   exactly as [`wait`](#wait) does — **before** anything is written.
+2. `tab.write` the text, on the request connection that subscription
+   checked the identity of.
+3. `tab.write` `\r` on that same connection, as a separate write, so an
+   input box that reads one write as a paste does not swallow the Enter
+   into the text.
+4. **The activity gate**: within `--activity-timeout`, or whatever
+   `--timeout` has left, whichever is sooner, the tab must reach
+   `running`. Otherwise exit 4 `stalled`.
+5. **The settled wait**: until the tab's state is one of `--until`.
+   Then exit 0.
+
+Both writes go on the subscribed connection so the prompt and the wait
+cannot straddle a restart, and the stream is fenced first so a turn that
+starts and ends quickly cannot slip into the gap between them — which is
+exactly what a `tab send` and a separate `wait --state running` can miss.
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `<text>` | positional | required | The prompt. Written as-is; Enter follows as a second write |
+| `--tab` | bare id | `$ROOST_TAB_ID` | Target tab; exits 2 with neither ([why](#which-tab-a-command-acts-on)). A host tab (`h<host>.<id>`) is refused |
+| `--activity-timeout` | float | `5.0` | How long the tab has to reach `running` after the prompt. Never outlasts `--timeout` |
+| `--until` | string, repeatable | `idle`, `needs_input` | A state the turn may settle in (`none`/`running`/`needs_input`/`idle`) |
+| `--timeout` | float | — | Give up after this many seconds, every call to the socket included. **Required** unless `--no-timeout`: how long a turn takes is not something this verb can guess, so it has no default. `0`, a negative, `inf` and `nan` are all `usage` (exit 2) |
+| `--no-timeout` | flag | `false` | Wait for as long as the turn takes. Cannot be combined with `--timeout` |
+
+**Two caveats.** The gate is **temporal, not causal**: it asks whether
+the tab reached `running` after the fence, not whether this prompt is
+what took it there, so an unrelated turn starting in the window
+satisfies it. And a tab that was **already `running`** when the stream
+was fenced has no start left to catch: the writes still go through
+(queueing a prompt behind the one running is the agent's business), the
+gate is skipped, the settled wait begins at once, and
+`started_after_ms` is `null`.
+
+**The stream is required.** Against a server whose `identify.ops` lacks
+`events.subscribe` and that names no `local_session_socket` — the Swift
+Mac app today — the verb exits 1 `unsupported` and writes nothing. There
+is no polling fallback: a poll cannot see a turn that starts and ends
+between two `tab.list` calls, so it would report a stall that never
+happened. Use [`tab send`](#tab-open-close-send-resize-reorder-dump)
+and [`tab dump`](#tab-open-close-send-resize-reorder-dump) there.
+
+Every call to the socket is bounded the way [`wait`](#wait)'s are, and a
+stream lost after the writes follows `wait`'s rules — resolved again
+once, and only against the same process. The writes are never repeated.
+
+| Exit | When |
+|---|---|
+| 0 | The turn settled in one of `--until` |
+| 4 `stalled` | The tab reached no `running` within `--activity-timeout` of the prompt. The text and the Enter *were* written, so the turn may yet start — read the tab with `tab dump` before sending anything again |
+| 4 `timeout` | `--timeout` ran out, whether in the gate or in the settled wait. `--timeout` always wins over `--activity-timeout` and keeps its own code |
+| 2 `usage` | No `--tab` and no `ROOST_TAB_ID` (checked first, before the budget), a host `--tab`, a missing or non-positive `--timeout` with no `--no-timeout`, or a non-positive `--activity-timeout` |
+| 1 `unsupported` | This server serves no event stream |
+| 1 *the server's own* | Either `tab.write` was refused — `not-found` for a tab with no live PTY, say — passed through verbatim |
+| 1 `connection` | The stream was lost twice, the Roost serving the tab changed, or a call went unanswered for 30 s under `--no-timeout` |
+
+With `--json`, success prints:
+
+```json
+{"tab_id": "3", "started_after_ms": 412, "settled": {"state": "idle"}, "after_ms": 38104}
+```
+
+Both durations are measured from the **Enter write**, not from the
+command's start. `started_after_ms` is `null` when the gate was skipped.
+Without `--json` the same facts print as one line:
+`prompted: tab 3 started after 412ms, idle after 38104ms`.
 
 ## `tab open` / `close` / `send` / `resize` / `reorder` / `dump`
 
@@ -1077,7 +1164,8 @@ failed), the line is a JSON envelope instead:
 | 1 | `checks-failed` | `doctor` found a failing check; the report itself is on stdout |
 | 1 | `failed` | Something on this machine outside the wire: a file that could not be written, a binary that could not be found, an unset `$HOME` |
 | 3 | `not-running` | `session status` found no session running |
-| 4 | `timeout` | `wait`'s condition did not hold before `--timeout` |
+| 4 | `timeout` | `wait`'s or `tab prompt`'s condition did not hold before `--timeout` |
+| 4 | `stalled` | `tab prompt` wrote the prompt and the tab reached no `running` within `--activity-timeout`. CLI-local: no server answers this code |
 
 A command can also exit 1 **without** an error line when it has a
 partial outcome to report: `agent install`/`uninstall`/`ensure`/`set`

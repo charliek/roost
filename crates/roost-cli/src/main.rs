@@ -18,6 +18,8 @@
 //!   roostctl tab send [--tab ID] --bytes 'echo hi\n' [--raw]
 //!   roostctl tab send [--tab ID] --bytes-base64 BASE64
 //!   roostctl tab send-file --tab ID PATH…
+//!   roostctl tab prompt --tab ID <text> [--activity-timeout S]
+//!     [--until STATE]... (--timeout S | --no-timeout)
 //!   roostctl tab resize [--tab ID] --cols N --rows N
 //!   roostctl tab reorder --project-id N --order id1,id2,id3
 //!   roostctl tab clear-notification [--tab ID]
@@ -66,6 +68,7 @@ mod doctor;
 mod error;
 mod events;
 mod host;
+mod prompt;
 mod report;
 mod session;
 mod wait;
@@ -129,6 +132,7 @@ const MUTATING_TAB_VERBS: &[&str] = &[
     "tab resize",
     "tab focus",
     "tab report",
+    "tab prompt",
 ];
 
 /// The agent skill `roostctl skill` prints: the repo's `skills/roost/SKILL.md`,
@@ -161,12 +165,13 @@ const NO_TAB: &str = "no --tab and ROOST_TAB_ID is unset; refusing to guess the 
                   prints the backend and the session socket.\n\n\
                   A command that changes a tab (notify, set-title, tab \
                   set-state, tab clear-notification, tab close, tab send, \
-                  tab resize, tab focus, tab report) needs --tab or \
-                  ROOST_TAB_ID, which every Roost tab sets; without either \
-                  it exits 2.\n\n\
+                  tab resize, tab focus, tab report, tab prompt) needs \
+                  --tab or ROOST_TAB_ID, which every Roost tab sets; \
+                  without either it exits 2.\n\n\
                   Exit codes: 0 ok, 1 failed, 2 usage, 3 `session status` \
-                  found no session, 4 `wait` timed out. A failure prints \
-                  `roostctl: <code>: <message>` on stderr, or \
+                  found no session, 4 `wait` or `tab prompt` ran out of \
+                  time. A failure prints `roostctl: <code>: <message>` on \
+                  stderr, or \
                   {\"error\":{\"code\",\"message\"}} under --json.",
     after_help = "Driving Roost from an agent? `roostctl skill` prints the skill; \
                   docs: https://charliek.github.io/roost/guides/automation/"
@@ -763,6 +768,34 @@ enum TabCmd {
         #[arg(long, value_delimiter = ',')]
         order: Vec<i64>,
     },
+    /// Submit a prompt to the agent in a tab and wait for the turn it
+    /// starts: `tab.write` the text, `tab.write` Enter, then follow the
+    /// tab's event stream until it settles (plan 067 §3.8). The
+    /// race-free form of `tab send` followed by `wait`. Needs `--tab` or
+    /// `ROOST_TAB_ID`.
+    ///
+    /// The stream is subscribed and fenced **before** the writes, and
+    /// both writes go on the connection that subscription checked the
+    /// identity of — so a turn that starts and ends quickly cannot slip
+    /// between the prompt and the wait, and neither can a restart.
+    ///
+    /// Two caveats worth knowing. **The gate is temporal, not causal**:
+    /// it asks whether the tab reached `running` after the fence, not
+    /// whether this prompt is what took it there, so an unrelated turn
+    /// starting in the window satisfies it. And a tab that was
+    /// **already running** when the stream was fenced has no start left
+    /// to catch: the writes still go through, the gate is skipped, and
+    /// `started_after_ms` is `null`.
+    ///
+    /// Exits 4 `stalled` when the tab reaches no `running` within
+    /// `--activity-timeout`, 4 `timeout` when `--timeout` runs out, and
+    /// 1 `unsupported` against a server that serves no event stream (the
+    /// Swift Mac app) — there is no polling fallback.
+    ///
+    /// Prints `{"tab_id","started_after_ms","settled":{"state"},"after_ms"}`
+    /// under `--json`, and one line with the same facts without it. Both
+    /// durations are measured from the Enter write.
+    Prompt(prompt::Args),
     /// Report an agent-hook event straight to `tab.agent_report` — for
     /// an agent with no adapter yet (`agent-hook`), or a script driving
     /// the op by hand. A thin wrapper: flags map one-to-one onto
@@ -1534,6 +1567,12 @@ async fn run_on_ui(
                 json,
             )
             .await?;
+        }
+        Cmd::Tab(TabCmd::Prompt(args)) => {
+            let flag = args.tab.as_deref().map(parse_tab_flag).transpose()?;
+            let tab_id = require_tab("tab prompt", flag, tab_env)?;
+            let tab_id = events::local_tab("tab prompt", tab_id)?;
+            return prompt::run(ui, args, tab_id, json).await;
         }
         Cmd::Tab(TabCmd::Report {
             tab,
@@ -2617,6 +2656,12 @@ fn format_state(state: TabState) -> &'static str {
     }
 }
 
+/// A span as a `*_ms` JSON number. Saturating: a duration too long for a
+/// `u64` of milliseconds is nothing a caller waited out.
+fn millis(span: std::time::Duration) -> u64 {
+    u64::try_from(span.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Wrap `argv` (a command) so the tab persists after it exits (hold=true):
 /// run the command, then `exec` a fresh interactive shell. Uses the
 /// positional-args trick — `"$@"` runs the command, `"$0"` is the shell —
@@ -3285,6 +3330,7 @@ mod tests {
         &["tab", "resize", "--cols", "80", "--rows", "24"],
         &["tab", "dump"],
         &["tab", "reorder", "--project-id", "1", "--order", "1,2"],
+        &["tab", "prompt", "--timeout", "5", "hello"],
         &[
             "tab",
             "report",
@@ -3658,6 +3704,13 @@ mod tests {
     /// `tab report` — the one whose reply is a real `TabAgentReportResult`,
     /// not an empty ack — answers that shape instead, on the same fake
     /// UI and the same `tab_id`/no-`identify` assertions.
+    ///
+    /// `tab prompt` is excluded by name: it is a compound verb —
+    /// subscribe, two writes, then a wait on the stream — so it dials
+    /// twice, calls `identify` to resolve the stream, and sends two
+    /// `tab.write`s per run, none of which this table's one-call shape
+    /// can express. It gets its own equivalent in
+    /// [`tab_prompt_writes_to_roost_tab_id_or_the_flag`].
     #[tokio::test]
     async fn roost_tab_id_or_the_flag_satisfies_a_mutating_verb() {
         let ui = FakeUi::start("satisfied", |op| {
@@ -3667,7 +3720,10 @@ mod tests {
                 Ok(serde_json::json!({}))
             }
         });
-        for verb in MUTATING_TAB_VERBS {
+        for verb in MUTATING_TAB_VERBS
+            .iter()
+            .filter(|verb| **verb != "tab prompt")
+        {
             let argv: Vec<&str> = ["--socket", ui.socket.as_str()]
                 .into_iter()
                 .chain(mutating_argv(verb))

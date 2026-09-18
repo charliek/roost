@@ -7,7 +7,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::time::Instant;
 
-use roost_ipc::client::EventFrame;
+use roost_ipc::client::{EventFrame, EventStream};
 use roost_ipc::messages::{
     ops, EventBatch, IdentifyResult, TabClosedEvent, TabDumpParams, TabDumpResult, TabListResult,
     TabOpenedEvent, TabState, TabStateChangedEvent, WireTabRef,
@@ -53,10 +53,11 @@ pub(crate) struct Args {
 
 /// The conditions, all of which must hold.
 #[derive(Debug, Default)]
-struct Want {
-    state: Option<TabState>,
-    text: Option<String>,
-    gone: bool,
+pub(crate) struct Want {
+    /// Any one of these. Empty: the state was not asked about.
+    pub states: Vec<TabState>,
+    pub text: Option<String>,
+    pub gone: bool,
 }
 
 impl Want {
@@ -65,9 +66,20 @@ impl Want {
             return !seen.exists;
         }
         seen.exists
-            && self.state.is_none_or(|want| seen.state == Some(want))
+            && (self.states.is_empty()
+                || seen.state.is_some_and(|seen| self.states.contains(&seen)))
             && (self.text.is_none() || seen.text)
     }
+}
+
+/// The tab's state in a `tab.list` snapshot, or `None` when the snapshot
+/// does not list it.
+pub(crate) fn state_in(list: &TabListResult, tab_id: i64) -> Option<TabState> {
+    list.projects
+        .iter()
+        .flat_map(|p| &p.tabs)
+        .find(|t| t.id == tab_id)
+        .map(|t| t.state)
 }
 
 /// What the wait knows about its tab.
@@ -81,14 +93,10 @@ struct Seen {
 
 impl Seen {
     fn listed(list: &TabListResult, tab_id: i64) -> Self {
-        let tab = list
-            .projects
-            .iter()
-            .flat_map(|p| &p.tabs)
-            .find(|t| t.id == tab_id);
+        let state = state_in(list, tab_id);
         Seen {
-            exists: tab.is_some(),
-            state: tab.map(|t| t.state),
+            exists: state.is_some(),
+            state,
             text: false,
         }
     }
@@ -145,7 +153,13 @@ pub(crate) async fn run(
         ));
     }
     let want = Want {
-        state: args.state.as_deref().map(crate::parse_state).transpose()?,
+        states: args
+            .state
+            .as_deref()
+            .map(crate::parse_state)
+            .transpose()?
+            .into_iter()
+            .collect(),
         text: args.text,
         gone: args.gone,
     };
@@ -282,7 +296,7 @@ pub(crate) fn unanswered(op: &str) -> CliError {
 
 /// `identify`, dialling first when the socket has not been; each step
 /// under `bound`, and `cut` the failure for one it cut short.
-async fn identify(
+pub(crate) async fn identify(
     ui: &mut UiSocket<'_>,
     bound: Bound,
     cut: impl Fn(&str) -> CliError,
@@ -300,28 +314,49 @@ fn satisfied(tab_id: i64, want: &Want, seen: &Seen, after: Duration) -> serde_js
     serde_json::json!({
         "tab_id": tab_id.to_string(),
         "satisfied": {
-            "state": want.state.and(seen.state).map(crate::format_state),
+            "state": seen.state.filter(|_| !want.states.is_empty()).map(crate::format_state),
             "text": want.text.as_deref().filter(|_| seen.text),
             "gone": (want.gone && !seen.exists).then_some(true),
         },
-        "after_ms": u64::try_from(after.as_millis()).unwrap_or(u64::MAX),
+        "after_ms": crate::millis(after),
     })
 }
 
-struct Waiting<'a> {
-    tab_id: i64,
-    want: &'a Want,
-    bound: Bound,
+pub(crate) struct Waiting<'a> {
+    pub tab_id: i64,
+    pub want: &'a Want,
+    pub bound: Bound,
     /// `--timeout`, a negative one `0`: `0` checks once, and a timeout
     /// names it.
-    timeout: f64,
-    interval: Duration,
+    pub timeout: f64,
+    pub interval: Duration,
+}
+
+/// A subscribed stream a wait is following: the two legs, the snapshot
+/// revision that fences it, and what it has shown about the tab so far.
+///
+/// A caller whose next condition is on the same stream holds this rather
+/// than subscribing again — commits keep arriving on it in between, so
+/// re-subscribing would be a second fence with a gap in front of it.
+pub(crate) struct Following {
+    stream: EventStream,
+    conn: IpcClient,
+    /// Commits at or below this revision are already in `seen`.
+    fence: u64,
+    seen: Seen,
+}
+
+impl Following {
+    /// The tab's state, as this stream and its snapshot last showed it.
+    pub(crate) fn state(&self) -> Option<TabState> {
+        self.seen.state
+    }
 }
 
 /// How following a stream ended: the condition held, or the stream was
 /// lost.
 enum Watched {
-    Held(Seen),
+    Held(Box<Following>),
     Lost(Loss),
 }
 
@@ -329,6 +364,15 @@ enum Watched {
 struct Loss {
     incarnation: String,
     why: String,
+}
+
+/// What a caller that needs the stream itself — to write on the request
+/// connection before it follows the stream — reached.
+pub(crate) enum Subscribed {
+    /// The two legs, in the order that fences them.
+    Legs(Source, Box<Legs>),
+    /// This server serves no stream at all.
+    None(Source),
 }
 
 /// Where resolving the source got to.
@@ -341,23 +385,82 @@ enum Reached {
 }
 
 impl Waiting<'_> {
-    /// Resolve the source and wait on it; after a lost stream, resolve
-    /// again, once.
-    ///
-    /// The wait carries on only against the process it started on. Tab ids
-    /// are that process's own: a local-backend switch replays the tabs onto
-    /// the destination under new ids, and a restart mints new ones, so on
-    /// any other process tab N is some other tab, or none — and a `--gone`
-    /// read off its snapshot would be a lie.
+    /// Resolve the source and wait on it.
     async fn run(&self, ui: &mut UiSocket<'_>, identify: IdentifyResult) -> Result<Seen, CliError> {
-        let lost = match self.reach(ui, identify).await? {
+        let held = match self.reach(ui, identify).await? {
             Reached::Poll(_) => return self.poll(ui).await,
-            Reached::Stream(source, legs) => match self.watch(&source, *legs).await? {
-                Watched::Held(seen) => return Ok(seen),
-                Watched::Lost(lost) => lost,
-            },
-            Reached::Lost(_, lost) => lost,
+            Reached::Stream(source, legs) => self.follow(ui, &source, *legs).await?,
+            Reached::Lost(_, lost) => self.again(ui, lost).await?,
         };
+        Ok(held.seen)
+    }
+
+    /// The two legs of a subscribed stream, for a caller that writes on
+    /// the request connection before it follows the stream.
+    pub(crate) async fn subscribe(
+        &self,
+        ui: &mut UiSocket<'_>,
+        identify: IdentifyResult,
+    ) -> Result<Subscribed, CliError> {
+        let reached = match self.reach(ui, identify).await? {
+            // Nothing has been written yet, so a subscription dropped
+            // while it was still opening starts the whole sequence over
+            // rather than carrying one on: there is no observation on the
+            // old stream to keep, and no reason to hold the caller to the
+            // process that dropped it.
+            Reached::Lost(..) => self.reach_again(ui).await?,
+            reached => reached,
+        };
+        Ok(match reached {
+            Reached::Poll(source) => Subscribed::None(source),
+            Reached::Stream(source, legs) => Subscribed::Legs(source, legs),
+            Reached::Lost(source, again) => {
+                return Err(CliError::Connection(format!(
+                    "{}: the event stream was lost twice while it was being opened: {}",
+                    source.socket.display(),
+                    again.why
+                )))
+            }
+        })
+    }
+
+    /// Wait on a stream the caller holds; after a lost one, resolve again,
+    /// once.
+    pub(crate) async fn follow(
+        &self,
+        ui: &mut UiSocket<'_>,
+        source: &Source,
+        legs: Legs,
+    ) -> Result<Following, CliError> {
+        let watched = self.watch(source, legs).await?;
+        self.held(ui, watched).await
+    }
+
+    /// [`Self::follow`] for a stream already fenced and part-followed.
+    pub(crate) async fn follow_on(
+        &self,
+        ui: &mut UiSocket<'_>,
+        source: &Source,
+        following: Following,
+    ) -> Result<Following, CliError> {
+        let watched = self.tail(source, following).await?;
+        self.held(ui, watched).await
+    }
+
+    async fn held(&self, ui: &mut UiSocket<'_>, watched: Watched) -> Result<Following, CliError> {
+        match watched {
+            Watched::Held(following) => Ok(*following),
+            Watched::Lost(lost) => self.again(ui, lost).await,
+        }
+    }
+
+    /// Resolve the source again after a lost stream, and carry on only
+    /// against the process the wait started on. Tab ids are that process's
+    /// own: a local-backend switch replays the tabs onto the destination
+    /// under new ids, and a restart mints new ones, so on any other process
+    /// tab N is some other tab, or none — and a `--gone` read off its
+    /// snapshot would be a lie.
+    async fn again(&self, ui: &mut UiSocket<'_>, lost: Loss) -> Result<Following, CliError> {
         let reached = match self.reach_again(ui).await {
             Ok(reached) => reached,
             Err(error) => return Err(after_loss(&lost, error)),
@@ -369,7 +472,7 @@ impl Waiting<'_> {
                     return Err(self.changed(&source, &lost.why));
                 }
                 match self.watch(&source, *legs).await? {
-                    Watched::Held(seen) => return Ok(seen),
+                    Watched::Held(following) => return Ok(*following),
                     Watched::Lost(again) => (source, again),
                 }
             }
@@ -475,12 +578,12 @@ impl Waiting<'_> {
         Ok(())
     }
 
-    fn cut(&self, op: &str) -> CliError {
+    pub(crate) fn cut(&self, op: &str) -> CliError {
         cut_short(self.bound, self.timeout, Some(self.tab_id), op)
     }
 
     /// One socket call under the bound.
-    async fn call<T, E: Into<CliError>>(
+    pub(crate) async fn call<T, E: Into<CliError>>(
         &self,
         op: &str,
         step: impl Future<Output = Result<T, E>>,
@@ -495,20 +598,10 @@ impl Waiting<'_> {
         identify(ui, self.bound, |op| self.cut(op)).await
     }
 
-    /// The wait on the stream: the snapshot, then every commit after it.
+    /// The wait on the stream: the snapshot fences it, then every commit
+    /// after that.
     async fn watch(&self, source: &Source, legs: Legs) -> Result<Watched, CliError> {
-        let Legs {
-            mut stream,
-            mut conn,
-            tabs,
-        } = legs;
-        let incarnation = stream.session_id().to_string();
-        let lost = |why: String| {
-            Ok(Watched::Lost(Loss {
-                incarnation: incarnation.clone(),
-                why,
-            }))
-        };
+        let Legs { stream, conn, tabs } = legs;
         let tabs = tabs.unwrap_or_default();
         let Some(fence) = tabs.revision else {
             return Err(CliError::Failed(format!(
@@ -519,25 +612,50 @@ impl Waiting<'_> {
         };
         // Commits between the two would be on neither.
         if fence < stream.revision() {
-            return lost(format!(
-                "the tab.list snapshot (revision {fence}) is older than the subscription \
-                 (revision {})",
-                stream.revision()
-            ));
+            return Ok(Watched::Lost(Loss {
+                incarnation: stream.session_id().to_string(),
+                why: format!(
+                    "the tab.list snapshot (revision {fence}) is older than the subscription \
+                     (revision {})",
+                    stream.revision()
+                ),
+            }));
         }
-        let mut seen = Seen::listed(&tabs, self.tab_id);
+        let seen = Seen::listed(&tabs, self.tab_id);
+        self.tail(
+            source,
+            Following {
+                stream,
+                conn,
+                fence,
+                seen,
+            },
+        )
+        .await
+    }
+
+    /// Every commit past the fence, until the condition holds or the
+    /// stream goes away.
+    async fn tail(&self, source: &Source, mut following: Following) -> Result<Watched, CliError> {
+        let incarnation = following.stream.session_id().to_string();
+        let lost = |why: String| {
+            Ok(Watched::Lost(Loss {
+                incarnation: incarnation.clone(),
+                why,
+            }))
+        };
         let mut tick = tokio::time::interval_at(Instant::now() + self.interval, self.interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut reread = true;
         loop {
             if reread {
-                if let Some(dropped) = self.dump(&mut conn, &mut seen).await? {
+                if let Some(dropped) = self.dump(&mut following.conn, &mut following.seen).await? {
                     return lost(dropped);
                 }
                 tick.reset();
             }
-            if self.want.holds(&seen) {
-                return Ok(Watched::Held(seen));
+            if self.want.holds(&following.seen) {
+                return Ok(Watched::Held(Box::new(following)));
             }
             self.check_deadline()?;
             // `EventStream::next` keeps a part-read frame in its own
@@ -545,9 +663,10 @@ impl Waiting<'_> {
             // drops nothing.
             reread = tokio::select! {
                 () = sleep_until(self.bound.deadline()) => false,
-                frame = stream.next() => match frame {
+                frame = following.stream.next() => match frame {
                     Ok(Some(EventFrame::Batch(batch))) => {
-                        batch.revision > fence && seen.apply(&batch, self.tab_id)
+                        batch.revision > following.fence
+                            && following.seen.apply(&batch, self.tab_id)
                     }
                     Ok(Some(EventFrame::Stopping(stopping))) => {
                         return Err(CliError::Connection(format!(
@@ -1536,7 +1655,7 @@ mod tests {
             text: true,
         };
         let want = Want {
-            state: Some(TabState::Idle),
+            states: vec![TabState::Idle],
             text: Some("OK".into()),
             gone: false,
         };

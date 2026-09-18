@@ -349,6 +349,7 @@ pub(crate) mod fake {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use base64::prelude::{Engine as _, BASE64_STANDARD};
     use serde_json::{json, Value};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::sync::mpsc;
@@ -405,6 +406,10 @@ pub(crate) mod fake {
         pub instead: Option<Instead>,
         /// Every request, as `(connection, op)`.
         pub log: Vec<(u64, String)>,
+        /// Every `tab.write`, as `(connection, tab_id, bytes)`. Params are
+        /// kept for this op alone: which connection a write went out on,
+        /// and in how many pieces, is what `tab prompt` is about.
+        pub writes: Vec<(u64, String, Vec<u8>)>,
         subscribers: Vec<mpsc::UnboundedSender<Push>>,
         hook: Option<Hook>,
     }
@@ -458,8 +463,21 @@ pub(crate) mod fake {
 
         /// The answer and how long it waits, or [`Instead::HangUp`] or
         /// [`Instead::Never`].
-        fn handle(&mut self, conn: u64, op: &str) -> Result<(Answer, Duration), Instead> {
+        fn handle(
+            &mut self,
+            conn: u64,
+            op: &str,
+            params: &Value,
+        ) -> Result<(Answer, Duration), Instead> {
             self.log.push((conn, op.to_string()));
+            if op == "tab.write" {
+                let data = params["data"]
+                    .as_str()
+                    .and_then(|encoded| BASE64_STANDARD.decode(encoded).ok())
+                    .unwrap_or_default();
+                let tab = params["tab_id"].as_str().unwrap_or_default().to_string();
+                self.writes.push((conn, tab, data));
+            }
             let mut hook = self.hook.take();
             if let Some(hook) = hook.as_mut() {
                 hook(self, op, Phase::Before);
@@ -517,6 +535,7 @@ pub(crate) mod fake {
                     "revision": self.revision - self.snapshot_behind,
                 })),
                 "tab.dump" => Ok(json!({ "cols": 80, "rows": 1, "rows_text": [self.dump] })),
+                "tab.write" => Ok(json!({})),
                 other => Err(("unknown-op".into(), format!("not faked: {other}"))),
             };
             (reply, None)
@@ -580,6 +599,7 @@ pub(crate) mod fake {
                 snapshot_behind: 0,
                 instead: None,
                 log: Vec::new(),
+                writes: Vec::new(),
                 subscribers: Vec::new(),
                 hook: None,
             }));
@@ -630,6 +650,14 @@ pub(crate) mod fake {
         pub fn socket(&self) -> String {
             self.socket.display().to_string()
         }
+
+        /// What a [`crate::UiSocket`] dials this fake with.
+        pub fn selector(&self) -> roost_ipc::target::TargetSelector {
+            roost_ipc::target::TargetSelector {
+                socket_override: Some(self.socket.clone()),
+                kind_override: None,
+            }
+        }
     }
 
     async fn serve(conn: u64, stream: tokio::net::UnixStream, world: Arc<Mutex<World>>) {
@@ -637,7 +665,10 @@ pub(crate) mod fake {
         let mut lines = BufReader::new(read).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let request: RawRequest = serde_json::from_str(&line).expect("a request frame");
-            let handled = world.lock().unwrap().handle(conn, &request.op);
+            let handled = world
+                .lock()
+                .unwrap()
+                .handle(conn, &request.op, &request.params);
             let ((reply, pushes), after) = match handled {
                 Ok(answer) => answer,
                 Err(Instead::Never) => return std::future::pending().await,
@@ -674,17 +705,13 @@ pub(crate) mod fake {
 mod tests {
     use super::fake::{Fake, Instead, Phase};
     use super::*;
-    use roost_ipc::target::TargetSelector;
     use serde_json::json;
 
     async fn events(
         fake: &Fake,
         tab: Option<&str>,
     ) -> (Result<i32, CliError>, Vec<serde_json::Value>) {
-        let selector = TargetSelector {
-            socket_override: Some(fake.socket.clone()),
-            kind_override: None,
-        };
+        let selector = fake.selector();
         let mut out = Vec::new();
         let mut ui = UiSocket::new(&selector);
         let run = stream_to(&mut ui, tab.map(str::to_string), &mut out);
