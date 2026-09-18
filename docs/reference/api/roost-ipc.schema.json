@@ -363,6 +363,9 @@
           ]
         }
       },
+      "required": [
+        "label"
+      ],
       "type": "object"
     },
     "AppKeybindDispatchParams": {
@@ -431,7 +434,8 @@
       },
       "required": [
         "backend",
-        "authorized"
+        "authorized",
+        "reason"
       ],
       "type": "object"
     },
@@ -563,7 +567,9 @@
       "required": [
         "framework_loaded",
         "updater",
-        "check_id"
+        "check_id",
+        "reason",
+        "last_check"
       ],
       "type": "object"
     },
@@ -667,92 +673,193 @@
       },
       "required": [
         "attach",
-        "protocol_version"
+        "protocol_version",
+        "session_id",
+        "kinds",
+        "cols",
+        "rows",
+        "libghostty_build",
+        "focus"
       ],
       "type": "object"
     },
     "AttachHandshakeReply": {
-      "properties": {
-        "error": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ResponseError"
+      "oneOf": [
+        {
+          "properties": {
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ResponseError"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "kind": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/AttachPayloadKind"
+            "kind": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AttachPayloadKind"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "mode": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/AttachMode"
+            "mode": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AttachMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
-            {
-              "type": "null"
+            "ok": {
+              "const": true
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "server_epoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "snapshot_cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "snapshot_rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "tab_generation": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             }
-          ]
+          },
+          "required": [
+            "ok",
+            "kind",
+            "mode",
+            "seq",
+            "server_epoch",
+            "tab_generation",
+            "snapshot_cols",
+            "snapshot_rows"
+          ],
+          "type": "object"
         },
-        "ok": {
-          "type": "boolean"
-        },
-        "seq": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "server_epoch": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "snapshot_cols": {
-          "format": "uint16",
-          "maximum": 65535,
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "snapshot_rows": {
-          "format": "uint16",
-          "maximum": 65535,
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "tab_generation": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
+        {
+          "properties": {
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ResponseError"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AttachPayloadKind"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "mode": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AttachMode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "ok": {
+              "const": false
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "server_epoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "snapshot_cols": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "snapshot_rows": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "tab_generation": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "ok",
+            "error"
+          ],
+          "type": "object"
         }
-      },
-      "required": [
-        "ok"
-      ],
-      "type": "object"
+      ]
     },
     "AttachMode": {
       "oneOf": [
@@ -840,6 +947,9 @@
           ]
         }
       },
+      "required": [
+        "error"
+      ],
       "type": "object"
     },
     "EmptyResult": {
@@ -1357,7 +1467,8 @@
         "modifiers",
         "enabled",
         "state",
-        "separator"
+        "separator",
+        "action"
       ],
       "type": "object"
     },
@@ -3077,7 +3188,8 @@
       },
       "required": [
         "col0",
-        "col1"
+        "col1",
+        "text"
       ],
       "type": "object"
     },
@@ -3494,7 +3606,9 @@
         }
       },
       "required": [
-        "outcome"
+        "outcome",
+        "version",
+        "detail"
       ],
       "type": "object"
     },

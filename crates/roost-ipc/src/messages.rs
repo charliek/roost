@@ -19,6 +19,7 @@ use std::fmt;
 
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::agent::{AgentLifecycle, AgentTabState, Ownership, ShellState};
 use crate::local_route::LocalBackendMode;
@@ -2347,8 +2348,29 @@ impl JsonSchema for AttachHandshake {
         "AttachHandshake".into()
     }
 
+    /// [`RawAttachHandshake`]'s derived schema, with `required` replaced
+    /// to match [`TryFrom<RawAttachHandshake>`] exactly: every terms
+    /// field the conversion `ok_or`s on, plus the two top-level fields
+    /// that are never optional. `cell_w_px`/`cell_h_px` stay out —
+    /// they default to 0 for a headless client — and so does the
+    /// all-or-nothing resume triple, which falls back to snapshot mode
+    /// rather than erroring.
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
-        RawAttachHandshake::json_schema(generator)
+        let mut schema = RawAttachHandshake::json_schema(generator);
+        schema.insert(
+            "required".to_string(),
+            json!([
+                "attach",
+                "protocol_version",
+                "session_id",
+                "kinds",
+                "cols",
+                "rows",
+                "libghostty_build",
+                "focus",
+            ]),
+        );
+        schema
     }
 }
 
@@ -2512,8 +2534,46 @@ impl JsonSchema for AttachHandshakeReply {
         "AttachHandshakeReply".into()
     }
 
+    /// Two arms over [`RawAttachHandshakeReply`]'s properties, matching
+    /// `TryFrom<RawAttachHandshakeReply>` field for field: `ok: true`
+    /// requires everything [`AttachAccepted`] carries, `ok: false`
+    /// requires only `error`. A single flat `required` list (what the
+    /// derive would produce) cannot state that — it would either demand
+    /// the accepted fields on a rejection or leave them all optional.
     fn json_schema(generator: &mut SchemaGenerator) -> Schema {
-        RawAttachHandshakeReply::json_schema(generator)
+        let raw = RawAttachHandshakeReply::json_schema(generator);
+        let properties = raw
+            .get("properties")
+            .and_then(Value::as_object)
+            .cloned()
+            .expect("RawAttachHandshakeReply schema has properties");
+
+        let mut accepted_properties = properties.clone();
+        accepted_properties.insert("ok".to_string(), json!({"const": true}));
+        let accepted = json_schema!({
+            "type": "object",
+            "properties": accepted_properties,
+            "required": [
+                "ok",
+                "kind",
+                "mode",
+                "seq",
+                "server_epoch",
+                "tab_generation",
+                "snapshot_cols",
+                "snapshot_rows",
+            ],
+        });
+
+        let mut rejected_properties = properties;
+        rejected_properties.insert("ok".to_string(), json!({"const": false}));
+        let rejected = json_schema!({
+            "type": "object",
+            "properties": rejected_properties,
+            "required": ["ok", "error"],
+        });
+
+        json_schema!({"oneOf": [accepted, rejected]})
     }
 }
 

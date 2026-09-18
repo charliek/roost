@@ -77,7 +77,7 @@ pub fn bundle() -> Value {
     generator.subschema_for::<AttachHandshake>();
     generator.subschema_for::<AttachHandshakeReply>();
 
-    sorted(json!({
+    let mut result = json!({
         "$schema": meta_schema,
         "$defs": generator.take_definitions(true),
         "schema_version": SCHEMA_VERSION,
@@ -86,7 +86,60 @@ pub fn bundle() -> Value {
         "envelopes": envelopes,
         "ops": ops,
         "events": events,
-    }))
+    });
+    mark_always_present(&mut result);
+    sorted(result)
+}
+
+/// `(json pointer to the object schema, field name)`: fields whose
+/// `Option<T>` is optional in Rust's type system but not on the wire —
+/// no `#[serde(default)]` and no `skip_serializing_if`, so `Serialize`
+/// always writes the key (`null` included) and `Deserialize` has no
+/// fallback for its absence (plan 067 review, finding 2).
+///
+/// `derive(JsonSchema)`'s own `#[schemars(required)]` cannot state this:
+/// it routes through `_schemars_private_non_optional_json_schema`, which
+/// also strips the type's nullability, and every field here is
+/// legitimately `null` on the wire some of the time (that is the whole
+/// reason each is `Option<T>` rather than `T`). So `bundle()` patches
+/// `required` onto the already-generated schema instead, leaving the
+/// type alone.
+///
+/// Kept honest by `required_matches_serde_for_every_option_field`: a
+/// field belongs here iff that scan's `should_be_required` says so, and
+/// mutating one out (or leaving a new one off) fails either that test or
+/// `every_vector_validates_against_the_bundle` on the recorded vector
+/// the field's own value differs in.
+const ALWAYS_PRESENT: &[(&str, &str)] = &[
+    ("/$defs/AppDockBadgeResult", "label"),
+    ("/$defs/MenuItemDump", "action"),
+    ("/$defs/AppUpdateStatusResult", "reason"),
+    ("/$defs/AppUpdateStatusResult", "last_check"),
+    ("/$defs/UpdateCheckDump", "version"),
+    ("/$defs/UpdateCheckDump", "detail"),
+    ("/$defs/AppNotificationStatusResult", "reason"),
+    ("/$defs/TabExpandSelectionAtResult", "text"),
+    ("/$defs/DurabilityChangedEvent", "error"),
+];
+
+fn mark_always_present(bundle: &mut Value) {
+    for (pointer, field) in ALWAYS_PRESENT {
+        let target = bundle
+            .pointer_mut(pointer)
+            .unwrap_or_else(|| panic!("{pointer} does not exist in the bundle"));
+        let object = target
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("{pointer} is not an object schema"));
+        let required = object
+            .entry("required")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let required = required
+            .as_array_mut()
+            .unwrap_or_else(|| panic!("{pointer}/required is not an array"));
+        if !required.iter().any(|v| v == field) {
+            required.push(Value::String((*field).to_string()));
+        }
+    }
 }
 
 /// [`bundle`] as the checked-in file spells it: pretty, sorted, and
@@ -481,6 +534,240 @@ mod tests {
         }
     }
 
+    /// One `Option<...>` field a `#[derive(JsonSchema)]` struct declares,
+    /// with whatever attributes ride directly above it.
+    struct OptionField {
+        struct_name: String,
+        field: String,
+        has_default: bool,
+        has_skip: bool,
+    }
+
+    /// The attribute lines (doc comments dropped) immediately above
+    /// `lines[i]`, each multi-line `#[...]` joined into one string by
+    /// bracket-depth, and the index of the first line that is neither.
+    fn collect_attrs(lines: &[&str], mut i: usize) -> (Vec<String>, usize) {
+        let mut attrs = Vec::new();
+        while i < lines.len() {
+            let t = lines[i].trim();
+            if t.is_empty() || t.starts_with("///") || t.starts_with("//!") {
+                i += 1;
+            } else if t.starts_with("#[") {
+                let mut depth = t.matches('[').count() as i32 - t.matches(']').count() as i32;
+                let mut text = t.to_string();
+                while depth > 0 {
+                    i += 1;
+                    let next = lines.get(i).copied().unwrap_or_default().trim();
+                    depth += next.matches('[').count() as i32 - next.matches(']').count() as i32;
+                    text.push(' ');
+                    text.push_str(next);
+                }
+                attrs.push(text);
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        (attrs, i)
+    }
+
+    /// `name: Option<...>,` (a plain struct field, not a function
+    /// parameter — callers only feed this lines known to sit inside a
+    /// struct's `{ … }`), trailing comments and all.
+    fn parse_option_field(line: &str) -> Option<String> {
+        let line = line.split("//").next().unwrap_or(line).trim();
+        let rest = line.strip_prefix("pub ").unwrap_or(line);
+        let (name, ty) = rest.split_once(':')?;
+        let name = name.trim();
+        if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+        let ty = ty.trim().strip_suffix(',')?.trim();
+        (ty.starts_with("Option<") && ty.ends_with('>')).then(|| name.to_string())
+    }
+
+    /// Every `Option<...>` field of every `#[derive(..., JsonSchema,
+    /// ...)]` struct in a source file's production code (the same cut
+    /// point [`strict_structs`] uses), scoped strictly to lines inside
+    /// that struct's brace range so a same-shaped function parameter
+    /// elsewhere in the file (`TabAgentReportParams::sessionless`'s
+    /// `lifecycle: Option<AgentLifecycle>` argument, for one) is never
+    /// mistaken for a field.
+    ///
+    /// [`AttachHandshake`] and [`AttachHandshakeReply`] hand-write their
+    /// `JsonSchema` impl instead of deriving it (finding 1), so their own
+    /// field lists never match the `derive(JsonSchema)` gate here and are
+    /// skipped — correctly: their `TryFrom` requiredness is asserted
+    /// directly by `attach_handshake_requires_what_try_from_requires` and
+    /// `attach_handshake_reply_arms_require_their_own_fields` above, not
+    /// by this generic pass over their flat `Raw*` mirrors' own
+    /// `#[serde(default, skip_serializing_if = …)]` fields.
+    fn option_fields_declared_in_the_source(source: &str) -> Vec<OptionField> {
+        let source = source
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split yields at least one piece");
+        let lines: Vec<&str> = source.lines().collect();
+
+        let mut fields = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let (attrs, next) = collect_attrs(&lines, i);
+            i = next;
+            let Some(&line) = lines.get(i) else { break };
+            let trimmed = line.trim();
+            let struct_name = trimmed
+                .strip_prefix("pub struct ")
+                .or_else(|| trimmed.strip_prefix("struct "))
+                .and_then(|rest| {
+                    rest.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                });
+            let derives_json_schema = attrs
+                .iter()
+                .any(|a| a.contains("derive") && a.contains("JsonSchema"));
+            match struct_name {
+                Some(name) if derives_json_schema && trimmed.ends_with('{') => {
+                    let struct_name = name.to_string();
+                    i += 1;
+                    while i < lines.len() && lines[i].trim() != "}" {
+                        let (field_attrs, next) = collect_attrs(&lines, i);
+                        i = next;
+                        if lines.get(i).map(|l| l.trim()) == Some("}") {
+                            break;
+                        }
+                        let Some(&field_line) = lines.get(i) else {
+                            break;
+                        };
+                        if let Some(field) = parse_option_field(field_line) {
+                            let is_serde = |a: &&String| a.contains("serde");
+                            fields.push(OptionField {
+                                struct_name: struct_name.clone(),
+                                field,
+                                has_default: field_attrs
+                                    .iter()
+                                    .any(|a| is_serde(&a) && a.contains("default")),
+                                has_skip: field_attrs
+                                    .iter()
+                                    .any(|a| a.contains("skip_serializing_if")),
+                            });
+                        }
+                        i += 1;
+                    }
+                    i += 1; // the closing `}`
+                }
+                _ => i += 1,
+            }
+        }
+        fields
+    }
+
+    /// `Struct.field` pairs the scan parses out of the source but that
+    /// `bundle()` has nowhere to check against: no `$defs` entry named
+    /// after the struct. Two reasons, both benign — every field listed
+    /// here already has `#[serde(default)]` and/or `skip_serializing_if`,
+    /// so `should_be_required` is `false` for all of them and there is
+    /// no finding-2 defect being hidden by the exemption:
+    ///
+    /// - `RawAttachHandshake`/`RawAttachHandshakeReply`: [`AttachHandshake`]
+    ///   and [`AttachHandshakeReply`] hand-write `JsonSchema` by calling
+    ///   `RawAttachHandshake::json_schema(generator)` directly rather
+    ///   than `generator.subschema_for::<RawAttachHandshake>()`, so the
+    ///   `Raw*` type itself is never registered in `$defs` — its schema
+    ///   is inlined wherever the outer type is. Their own requiredness
+    ///   is asserted directly by `attach_handshake_requires_what_try_
+    ///   from_requires` and `attach_handshake_reply_arms_require_their_
+    ///   own_fields` above.
+    /// - `AgentTabState`: derives `JsonSchema` but nothing in `OP_TYPES`
+    ///   ever reaches it — `Tab::agent_state()` computes one for
+    ///   server-internal use; it never rides the wire as a field of any
+    ///   op, event, or nested type, so `bundle()` never calls
+    ///   `subschema_for::<AgentTabState>()` and it has no `$defs` entry.
+    const NOT_IN_DEFS: &[(&str, &str)] = &[
+        ("RawAttachHandshake", "session_id"),
+        ("RawAttachHandshake", "kinds"),
+        ("RawAttachHandshake", "cols"),
+        ("RawAttachHandshake", "rows"),
+        ("RawAttachHandshake", "cell_w_px"),
+        ("RawAttachHandshake", "cell_h_px"),
+        ("RawAttachHandshake", "libghostty_build"),
+        ("RawAttachHandshake", "focus"),
+        ("RawAttachHandshake", "resume_from_seq"),
+        ("RawAttachHandshake", "server_epoch"),
+        ("RawAttachHandshake", "tab_generation"),
+        ("RawAttachHandshakeReply", "kind"),
+        ("RawAttachHandshakeReply", "mode"),
+        ("RawAttachHandshakeReply", "seq"),
+        ("RawAttachHandshakeReply", "server_epoch"),
+        ("RawAttachHandshakeReply", "tab_generation"),
+        ("RawAttachHandshakeReply", "snapshot_cols"),
+        ("RawAttachHandshakeReply", "snapshot_rows"),
+        ("RawAttachHandshakeReply", "error"),
+        ("AgentTabState", "ownership"),
+    ];
+
+    /// Finding 2: an `Option<T>` field with neither `#[serde(default)]`
+    /// nor `skip_serializing_if` is always written by `Serialize` and
+    /// has no fallback for `Deserialize`, so it is required on the wire;
+    /// the bundle must say so. Conversely a field with either attribute
+    /// must stay out of `required` — schemars already leaves it out by
+    /// default, so this direction mostly guards against a stray
+    /// `#[schemars(required)]` added to a field that is genuinely
+    /// optional.
+    #[test]
+    fn required_matches_serde_for_every_option_field() {
+        let fields: Vec<_> = option_fields_declared_in_the_source(include_str!("messages.rs"))
+            .into_iter()
+            .chain(option_fields_declared_in_the_source(include_str!(
+                "agent.rs"
+            )))
+            .collect();
+        assert!(
+            fields.len() > 60,
+            "only {} Option<> struct fields parsed - the scanner has drifted",
+            fields.len()
+        );
+
+        let bundle = bundle();
+        let defs = bundle["$defs"].as_object().expect("$defs");
+        let mut seen_not_in_defs = BTreeSet::new();
+        let mut checked = 0;
+        let mut mismatches = Vec::new();
+        for field in &fields {
+            let Some(def) = defs.get(&field.struct_name) else {
+                seen_not_in_defs.insert((field.struct_name.as_str(), field.field.as_str()));
+                continue;
+            };
+            let required: BTreeSet<&str> = def["required"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let should_be_required = !field.has_default && !field.has_skip;
+            let is_required = required.contains(field.field.as_str());
+            checked += 1;
+            if should_be_required != is_required {
+                mismatches.push(format!(
+                    "{}.{}: serde requires it on the wire = {should_be_required}, \
+                     the bundle's `required` says {is_required}",
+                    field.struct_name, field.field
+                ));
+            }
+        }
+        assert!(checked > 60, "only {checked} fields checked against $defs");
+        assert!(
+            mismatches.is_empty(),
+            "the bundle's `required` disagrees with what serde actually does:\n{}",
+            mismatches.join("\n")
+        );
+
+        let expected: BTreeSet<_> = NOT_IN_DEFS.iter().copied().collect();
+        assert_eq!(
+            seen_not_in_defs, expected,
+            "fields the scan could not check against $defs changed; update NOT_IN_DEFS \
+             and its reasoning, or investigate why a struct dropped out of $defs"
+        );
+    }
+
     #[test]
     fn the_ref_pattern_accepts_exactly_what_the_parsers_do() {
         let bundle = bundle();
@@ -507,6 +794,78 @@ mod tests {
                     "{name}: the pattern and the parser disagree on {text:?}"
                 );
             }
+        }
+    }
+
+    fn validator_for(bundle: &Value, name: &str) -> jsonschema::Validator {
+        let schema = json!({
+            "$schema": DRAFT_2020_12,
+            "$defs": bundle["$defs"],
+            "$ref": format!("#/$defs/{name}"),
+        });
+        jsonschema::draft202012::new(&schema).expect("the schema compiles")
+    }
+
+    fn read_vector(name: &str) -> Value {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/ipc-vectors");
+        let text =
+            std::fs::read_to_string(dir.join(name)).unwrap_or_else(|e| panic!("read {name}: {e}"));
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name} is JSON: {e}"))
+    }
+
+    /// Finding 1 (plan 067 review): the bundle states exactly what
+    /// `TryFrom<RawAttachHandshake>` requires. A handshake missing any
+    /// term the conversion `ok_or`s on must fail, and the four real
+    /// request vectors — which the conversion accepts — must still pass.
+    #[test]
+    fn attach_handshake_requires_what_try_from_requires() {
+        let bundle = bundle();
+        let validator = validator_for(&bundle, "AttachHandshake");
+
+        assert!(
+            !validator.is_valid(&json!({"attach": "5", "protocol_version": 6})),
+            "a minimal handshake with none of the terms must not validate"
+        );
+
+        let vectors = [
+            "attach.handshake.request.json",
+            "attach.handshake.resume.request.json",
+            "attach.handshake.unfocused.request.json",
+            "attach.handshake.vt.request.json",
+        ];
+        for name in vectors {
+            let vector = read_vector(name);
+            let errors: Vec<_> = validator.iter_errors(&vector).collect();
+            assert!(errors.is_empty(), "{name} should validate: {errors:?}");
+        }
+    }
+
+    /// Finding 1's other half: the bundle states exactly what
+    /// `TryFrom<RawAttachHandshakeReply>` requires per arm — an accepted
+    /// reply needs every `AttachAccepted` field, a rejected reply needs
+    /// only `error` — and the real accepted/rejected vectors must still
+    /// pass.
+    #[test]
+    fn attach_handshake_reply_arms_require_their_own_fields() {
+        let bundle = bundle();
+        let validator = validator_for(&bundle, "AttachHandshakeReply");
+
+        assert!(
+            !validator.is_valid(&json!({"ok": true})),
+            "an accepted reply with none of AttachAccepted's fields must not validate"
+        );
+        assert!(
+            !validator.is_valid(&json!({"ok": false})),
+            "a rejected reply with no `error` must not validate"
+        );
+
+        for name in [
+            "attach.handshake.accepted.json",
+            "attach.handshake.rejected.json",
+        ] {
+            let vector = read_vector(name);
+            let errors: Vec<_> = validator.iter_errors(&vector).collect();
+            assert!(errors.is_empty(), "{name} should validate: {errors:?}");
         }
     }
 
