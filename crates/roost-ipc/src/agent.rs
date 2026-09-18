@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::messages::TabState;
@@ -26,7 +27,7 @@ use crate::messages::TabState;
 /// Shell activity, written by OSC 133 marks. `Unknown` is the state of
 /// a shell that has not emitted a mark yet (no shell integration, or
 /// nothing has run).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellState {
     #[default]
@@ -37,7 +38,7 @@ pub enum ShellState {
 
 /// Agent turn state, written by adapters. Independent of [`ShellState`]
 /// — an agent can be `Working` while the shell sits at a prompt.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentLifecycle {
     #[default]
@@ -49,7 +50,7 @@ pub enum AgentLifecycle {
 }
 
 /// Notification severity.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     #[default]
@@ -61,7 +62,7 @@ pub enum Severity {
 /// What a report intends to do to ownership. Required on every report —
 /// there is no sensible default, since "take the tab" and "I already
 /// own the tab" have opposite failure modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OwnershipAction {
     Claim,
@@ -71,7 +72,7 @@ pub enum OwnershipAction {
 
 /// What a report intends to do to the tab's attention (notification)
 /// state.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AttentionOp {
     Set,
@@ -86,7 +87,7 @@ pub enum AttentionOp {
 ///
 /// `source` is an open string (AD-8) — adding a second agent must not
 /// require touching this enum-free type.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Ownership {
     pub source: String,
     #[serde(default)]
@@ -101,7 +102,7 @@ pub struct Ownership {
     pub metadata: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentTabState {
     #[serde(default)]
     pub shell: ShellState,
@@ -128,10 +129,11 @@ pub struct AgentTabState {
 /// is a request-schema change rather than an additive one — an older
 /// server rejects the whole report — so anything an adapter can express
 /// as data goes in the map instead.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabAgentReportParams {
     #[serde(with = "crate::messages::string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     pub source: String,
     /// Empty for sources that have no session concept (e.g. `manual`).
@@ -360,7 +362,7 @@ pub fn apply_shell_mark(current: &AgentTabState, body: &str) -> Option<AgentTabS
 // ============================================================================
 
 /// What [`apply_report`] wants the caller to do about attention.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AttentionEffect {
     Set {

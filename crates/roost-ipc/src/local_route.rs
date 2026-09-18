@@ -8,12 +8,13 @@
 
 use std::sync::{Arc, RwLock};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::paths::BundleProfile;
 
 /// Which local backend the UI is running its own tabs on.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum LocalBackendMode {
     /// PTYs in the UI process — the original arrangement (DL-4).

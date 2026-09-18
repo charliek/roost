@@ -12,6 +12,8 @@
 //!   `TabState`).
 //! * [`codes`] — every wire error code, one constant each, and
 //!   [`codes::ALL`].
+//! * [`schema`] — the JSON Schema bundle of every op, event and
+//!   envelope, generated from the types in [`messages`] and [`agent`].
 //! * [`agent`] — the agent state model (shell / lifecycle / ownership
 //!   axes) and the pure state machine that derives `TabState` from it.
 //!   Shared with the Swift port via `tests/agent-state-fixtures/`.
@@ -68,6 +70,7 @@ pub mod framing;
 pub mod local_route;
 pub mod messages;
 pub mod paths;
+pub mod schema;
 pub mod session_launch;
 pub mod socket_state;
 pub mod ssh;

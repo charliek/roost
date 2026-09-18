@@ -75,9 +75,11 @@ pulls in.
 | [`agent`](https://github.com/charliek/roost/blob/main/crates/roost-ipc/src/agent.rs) | Agent-report helpers shared by the hook adapters |
 
 The crate has **no workspace-internal dependencies** — its whole
-dependency set is serde, serde_json, base64, tokio, anyhow, thiserror,
-sha2, tracing, and libc. That is a property worth preserving: it is what
-makes the crate consumable at all. There is no feature gating today
+dependency set is serde, serde_json, base64, schemars, tokio, anyhow,
+thiserror, sha2, tracing, and libc, where schemars derives the wire's
+JSON Schema from the same serde types so the two cannot drift. That is
+a property worth preserving: it is what makes the crate consumable at
+all. There is no feature gating today
 (`ssh` and `bootstrap` come along whether or not a consumer wants them);
 splitting them behind features is a crates.io-era question, not a
 git-dependency one.
