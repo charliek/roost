@@ -211,6 +211,43 @@ The first form relies on `ROOST_TAB_ID`, which only a shell inside a Roost tab h
 | `--state` | string | required | One of `none`, `running`, `needs_input`, `idle` |
 | `--tab` | int | `$ROOST_TAB_ID` | Target tab id; exits 2 when neither is set |
 
+## `tab report`
+
+```bash
+roostctl tab report --tab 3 --source my-agent --session-id s-1 --claim \
+  --lifecycle working
+roostctl tab report --tab 3 --source my-agent --session-id s-1 --preserve \
+  --attention set --title "Needs input" --body "waiting on a confirm"
+roostctl tab report --tab 3 --source my-agent --session-id s-1 --release
+```
+
+A thin wrapper over the `tab.agent_report` op — flags map one-to-one onto
+its params ([ipc.md](ipc.md)). For an agent with no adapter yet, or a
+script driving the op by hand; a wired adapter reports through
+`agent-hook`/`claude-hook` instead. Needs `--tab` or `ROOST_TAB_ID`
+([why](#which-tab-a-command-acts-on)).
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--source` | string | required | Ownership identity, half one. Refused when it names a Roost agent adapter's own source, or `manual`/`legacy` |
+| `--session-id` | string | required | Ownership identity, half two. Pass `""` for a source with no session concept |
+| `--claim` / `--preserve` / `--release` | flag | — | Exactly one is required: take ownership, report without changing it, or give it up |
+| `--lifecycle` | string | unchanged | One of `inactive`, `working`, `waiting`, `finished`, `failed` |
+| `--if` | string, repeatable | unconditional | Guard: apply `--lifecycle` / `--attention set` only if the tab's *current* lifecycle is one of these |
+| `--attention` | string | `preserve` | One of `set`, `clear`, `preserve`. `set` requires non-empty `--title` and `--body` |
+| `--severity` | string | `info` | One of `info`, `warn`, `error` |
+| `--title` / `--body` / `--detail` | string | `""` | The attention banner's title/body, and a free-form reason recorded on the owner |
+| `--metadata` | `KEY=VALUE`, repeatable | — | Open extension data. An empty key, a value with no `=`, or a repeated key is `usage` |
+
+`--json` prints the `tab.agent_report` reply verbatim (`accepted`, `tab`).
+Otherwise: `reported: tab N <lifecycle>` on `accepted: true` (the
+**returned** lifecycle — `--release` forces `inactive` even with no
+`--lifecycle` given); `not accepted: tab N is owned by <source>/<session_id>`,
+or `not accepted: tab N has no owner`, on `accepted: false`. **Exit 0
+either way** — the op succeeded and the ownership answer is data for the
+caller. A server refusal (a bad param, an unknown tab) exits 1 with the
+server's own code, same as every other verb.
+
 ## `tab open` / `close` / `send` / `resize` / `reorder` / `dump`
 
 Tab lifecycle and I/O for automation. `tab close`, `tab send` and `tab resize` act on `--tab` or `$ROOST_TAB_ID` and exit 2 with neither; `tab dump` falls back to the UI's active tab ([why](#which-tab-a-command-acts-on)). `tab send` needs an existing live PTY (a UI must have already attached); errors with `NotFound` otherwise. `--bytes` accepts Rust string-escape sequences (`\n`, `\r`, `\x1b`, …); pass `--raw` to disable escape decoding.

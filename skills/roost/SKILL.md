@@ -139,7 +139,7 @@ roostctl rpc identify '{}'
 
 ## Rules
 
-- Always pass `--tab`. Without it, `notify`, `set-title`, `tab set-state`, `tab clear-notification`, `tab close`, `tab send`, `tab resize`, and `tab focus` act on `ROOST_TAB_ID`, which inside Roost is your own tab, and exit 2 when it is unset or empty. `tab dump` and `wait` also use `ROOST_TAB_ID` first, but when it is unset or empty they fall back to the UI's active tab, whichever tab the user last clicked.
+- Always pass `--tab`. Without it, `notify`, `set-title`, `tab set-state`, `tab clear-notification`, `tab close`, `tab send`, `tab resize`, `tab focus`, and `tab report` act on `ROOST_TAB_ID`, which inside Roost is your own tab, and exit 2 when it is unset or empty. `tab dump` and `wait` also use `ROOST_TAB_ID` first, but when it is unset or empty they fall back to the UI's active tab, whichever tab the user last clicked.
 - Parse ids from `--json` output. Never derive them from sidebar order, tab titles, or examples.
 - Never pass `--focus` or run `tab focus` unless the user asked to switch tabs. Opening a tab can make it the active tab even without `--focus` (an in-process Roost always does), so only open tabs when the user asked for something to run in Roost.
 - Never close a tab or delete a project you did not open, unless the user explicitly asked.

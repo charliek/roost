@@ -21,6 +21,10 @@
 //!   roostctl tab resize [--tab ID] --cols N --rows N
 //!   roostctl tab reorder --project-id N --order id1,id2,id3
 //!   roostctl tab clear-notification [--tab ID]
+//!   roostctl tab report --tab N --source S --session-id ID
+//!     (--claim|--preserve|--release) [--lifecycle L] [--if L]...
+//!     [--attention set|clear|preserve] [--severity info|warn|error]
+//!     [--title T] [--body B] [--detail D] [--metadata KEY=VALUE]...
 //!   roostctl project {list,create,ensure,rename,delete,reorder}
 //!   roostctl open --project NAME [--cwd …] [--title T] [--focus | --no-activate] [--hold] [-- <cmd…>]
 //!   roostctl palette {open,state,query,activate,dismiss}
@@ -62,6 +66,7 @@ mod doctor;
 mod error;
 mod events;
 mod host;
+mod report;
 mod session;
 mod wait;
 
@@ -87,10 +92,10 @@ use roost_ipc::messages::{
     PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateResult,
     ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectEnsureParams,
     ProjectEnsureResult, ProjectRenameParams, ProjectReorderParams, ScreenshotParams,
-    ScreenshotResult, TabClearNotificationParams, TabCloseParams, TabDumpParams, TabDumpResult,
-    TabFocusParams, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
-    TabSendFileParams, TabSendFileResult, TabSetStateParams, TabSetTitleParams, TabState,
-    TabWriteParams, WireProjectRef, WireTabRef,
+    ScreenshotResult, TabAgentReportResult, TabClearNotificationParams, TabCloseParams,
+    TabDumpParams, TabDumpResult, TabFocusParams, TabListResult, TabOpenParams, TabOpenResult,
+    TabReorderParams, TabResizeParams, TabSendFileParams, TabSendFileResult, TabSetStateParams,
+    TabSetTitleParams, TabState, TabWriteParams, WireProjectRef, WireTabRef,
 };
 use roost_ipc::paths::BundleProfileKind;
 use roost_ipc::session_launch::timeout_scale;
@@ -123,6 +128,7 @@ const MUTATING_TAB_VERBS: &[&str] = &[
     "tab send",
     "tab resize",
     "tab focus",
+    "tab report",
 ];
 
 /// The agent skill `roostctl skill` prints: the repo's `skills/roost/SKILL.md`,
@@ -155,8 +161,9 @@ const NO_TAB: &str = "no --tab and ROOST_TAB_ID is unset; refusing to guess the 
                   prints the backend and the session socket.\n\n\
                   A command that changes a tab (notify, set-title, tab \
                   set-state, tab clear-notification, tab close, tab send, \
-                  tab resize, tab focus) needs --tab or ROOST_TAB_ID, which \
-                  every Roost tab sets; without either it exits 2.\n\n\
+                  tab resize, tab focus, tab report) needs --tab or \
+                  ROOST_TAB_ID, which every Roost tab sets; without either \
+                  it exits 2.\n\n\
                   Exit codes: 0 ok, 1 failed, 2 usage, 3 `session status` \
                   found no session, 4 `wait` timed out. A failure prints \
                   `roostctl: <code>: <message>` on stderr, or \
@@ -755,6 +762,69 @@ enum TabCmd {
         project_id: i64,
         #[arg(long, value_delimiter = ',')]
         order: Vec<i64>,
+    },
+    /// Report an agent-hook event straight to `tab.agent_report` — for
+    /// an agent with no adapter yet (`agent-hook`), or a script driving
+    /// the op by hand. A thin wrapper: flags map one-to-one onto
+    /// `TabAgentReportParams` (plan 067 §3.7). Needs `--tab` or
+    /// `ROOST_TAB_ID`.
+    ///
+    /// Exactly one of `--claim` / `--preserve` / `--release` is
+    /// required — there is no default ownership intent.
+    ///
+    /// Exit 0 either way: the op succeeded and the ownership answer
+    /// (`accepted: true`/`false`) is data for the caller, not a
+    /// failure. A server refusal (a bad param, an unknown tab) exits 1
+    /// with the server's own code, same as every other verb.
+    Report {
+        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
+        #[arg(long)]
+        tab: Option<i64>,
+        /// Ownership identity, half one: who is reporting. Refused when
+        /// it names a source a Roost agent adapter already owns, or
+        /// `manual`/`legacy`.
+        #[arg(long)]
+        source: String,
+        /// Ownership identity, half two. Required on the command line;
+        /// pass an empty string for a source with no session concept.
+        #[arg(long)]
+        session_id: String,
+        /// Take ownership as `source`/`session_id`, superseding any
+        /// current owner.
+        #[arg(long, conflicts_with_all = ["preserve", "release"])]
+        claim: bool,
+        /// Report an event without changing ownership.
+        #[arg(long, conflicts_with_all = ["claim", "release"])]
+        preserve: bool,
+        /// Give up ownership. Forces the returned `agent_lifecycle` to
+        /// `inactive` regardless of `--lifecycle`.
+        #[arg(long, conflicts_with_all = ["claim", "preserve"])]
+        release: bool,
+        /// Omitted means "leave the tab's lifecycle unchanged".
+        #[arg(long, value_parser = ["inactive", "working", "waiting", "finished", "failed"])]
+        lifecycle: Option<String>,
+        /// Guard: `--lifecycle` and `--attention set` apply only if the
+        /// tab's *current* lifecycle is one of these. Repeatable;
+        /// omitted means unconditional.
+        #[arg(long = "if", value_parser = ["inactive", "working", "waiting", "finished", "failed"])]
+        lifecycle_if: Vec<String>,
+        #[arg(long, value_parser = ["set", "clear", "preserve"], default_value = "preserve")]
+        attention: String,
+        #[arg(long, value_parser = ["info", "warn", "error"], default_value = "info")]
+        severity: String,
+        /// Required (non-empty) when `--attention set`.
+        #[arg(long, default_value = "")]
+        title: String,
+        /// Required (non-empty) when `--attention set`.
+        #[arg(long, default_value = "")]
+        body: String,
+        /// Free-form reason for the report, recorded on the owner.
+        #[arg(long, default_value = "")]
+        detail: String,
+        /// `KEY=VALUE`, repeatable. An empty key, a value with no `=`,
+        /// or a key repeated across flags is `usage`.
+        #[arg(long)]
+        metadata: Vec<String>,
     },
 }
 
@@ -1464,6 +1534,48 @@ async fn run_on_ui(
                 json,
             )
             .await?;
+        }
+        Cmd::Tab(TabCmd::Report {
+            tab,
+            source,
+            session_id,
+            claim,
+            preserve,
+            release,
+            lifecycle,
+            lifecycle_if,
+            attention,
+            severity,
+            title,
+            body,
+            detail,
+            metadata,
+        }) => {
+            let tab_id = require_tab("tab report", tab, tab_env)?;
+            let params = report::build_params(
+                tab_id,
+                source,
+                session_id,
+                claim,
+                preserve,
+                release,
+                lifecycle.as_deref(),
+                &lifecycle_if,
+                &attention,
+                &severity,
+                title,
+                body,
+                detail,
+                &metadata,
+            )?;
+            let resp: TabAgentReportResult = ui.call(ops::TAB_AGENT_REPORT, params).await?;
+            if json {
+                print_json(&resp)?;
+            } else if resp.accepted {
+                println!("{}", report::accepted_line(tab_id, &resp.tab));
+            } else {
+                println!("{}", report::not_accepted_line(tab_id, &resp.tab));
+            }
         }
         Cmd::Screenshot { out, scale } => {
             if json && out.is_none() {
@@ -3173,6 +3285,15 @@ mod tests {
         &["tab", "resize", "--cols", "80", "--rows", "24"],
         &["tab", "dump"],
         &["tab", "reorder", "--project-id", "1", "--order", "1,2"],
+        &[
+            "tab",
+            "report",
+            "--source",
+            "test-agent",
+            "--session-id",
+            "s1",
+            "--claim",
+        ],
         &["project", "list"],
         &["project", "create"],
         &["project", "ensure", "--name", "n"],
@@ -3533,9 +3654,19 @@ mod tests {
         }
     }
 
+    /// Table-driven: every existing mutating verb answers `{}`, and
+    /// `tab report` — the one whose reply is a real `TabAgentReportResult`,
+    /// not an empty ack — answers that shape instead, on the same fake
+    /// UI and the same `tab_id`/no-`identify` assertions.
     #[tokio::test]
     async fn roost_tab_id_or_the_flag_satisfies_a_mutating_verb() {
-        let ui = FakeUi::start("satisfied", |_| Ok(serde_json::json!({})));
+        let ui = FakeUi::start("satisfied", |op| {
+            if op == ops::TAB_AGENT_REPORT {
+                Ok(fake_tab_agent_report_result(true, "inactive", None))
+            } else {
+                Ok(serde_json::json!({}))
+            }
+        });
         for verb in MUTATING_TAB_VERBS {
             let argv: Vec<&str> = ["--socket", ui.socket.as_str()]
                 .into_iter()
@@ -3742,6 +3873,254 @@ mod tests {
 
     fn fake_tab_open_result() -> serde_json::Value {
         serde_json::json!({"tab": fake_tab(99, 42)})
+    }
+
+    /// A `tab.agent_report` reply: `accepted` plus a full `Tab` (the op
+    /// always returns the post-report tab, win or lose — see
+    /// `TabAgentReportResult`). `ownership` fills the tab's `ownership`
+    /// field when given, and leaves it absent (no owner) otherwise.
+    fn fake_tab_agent_report_result(
+        accepted: bool,
+        lifecycle: &str,
+        ownership: Option<(&str, &str)>,
+    ) -> serde_json::Value {
+        let mut tab = fake_tab(7, 1);
+        tab["agent_lifecycle"] = serde_json::json!(lifecycle);
+        if let Some((source, session_id)) = ownership {
+            tab["ownership"] = serde_json::json!({
+                "source": source,
+                "session_id": session_id,
+                "last_event_at": 0,
+                "detail": "",
+                "metadata": {},
+            });
+        }
+        serde_json::json!({ "accepted": accepted, "tab": tab })
+    }
+
+    // ------------------------------------------------------------------
+    // `tab report` (plan 067 §3.7)
+    // ------------------------------------------------------------------
+
+    /// The base argv every `tab report` test starts from: a non-reserved
+    /// source, a session id, and `--claim` (overridden per test).
+    fn report_argv(socket: &str) -> Vec<&str> {
+        vec![
+            "--socket",
+            socket,
+            "tab",
+            "report",
+            "--tab",
+            "7",
+            "--source",
+            "custom-agent",
+            "--session-id",
+            "s-1",
+            "--claim",
+        ]
+    }
+
+    #[tokio::test]
+    async fn tab_report_sends_the_exact_params_for_claim_preserve_and_release() {
+        for (flag, action) in [
+            ("--claim", "claim"),
+            ("--preserve", "preserve"),
+            ("--release", "release"),
+        ] {
+            let ui = FakeUi::start("report-wire", |_| {
+                Ok(fake_tab_agent_report_result(true, "inactive", None))
+            });
+            let argv = [
+                "--socket",
+                ui.socket.as_str(),
+                "tab",
+                "report",
+                "--tab",
+                "7",
+                "--source",
+                "custom-agent",
+                "--session-id",
+                "s-1",
+                flag,
+                "--lifecycle",
+                "working",
+                "--attention",
+                "set",
+                "--severity",
+                "warn",
+                "--title",
+                "t",
+                "--body",
+                "b",
+                "--detail",
+                "d",
+                "--metadata",
+                "k1=v1",
+                "--metadata",
+                "k2=v2",
+            ];
+            assert_eq!(run_argv(&argv, None).await, Ok(0), "{flag}");
+            let sent = ui.take();
+            assert_eq!(sent.len(), 1, "{flag}: {sent:?}");
+            let (op, params) = &sent[0];
+            assert_eq!(op, ops::TAB_AGENT_REPORT, "{flag}");
+            assert_eq!(
+                params,
+                &serde_json::json!({
+                    "tab_id": "7",
+                    "source": "custom-agent",
+                    "session_id": "s-1",
+                    "ownership_action": action,
+                    "lifecycle": "working",
+                    "attention": "set",
+                    "severity": "warn",
+                    "title": "t",
+                    "body": "b",
+                    "detail": "d",
+                    "metadata": {"k1": "v1", "k2": "v2"},
+                }),
+                "{flag}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tab_report_sends_lifecycle_if_only_when_given() {
+        let ui = FakeUi::start("report-if", |_| {
+            Ok(fake_tab_agent_report_result(true, "inactive", None))
+        });
+
+        assert_eq!(run_argv(&report_argv(&ui.socket), None).await, Ok(0));
+        let sent = ui.take();
+        assert!(
+            !sent[0].1.as_object().unwrap().contains_key("lifecycle_if"),
+            "{:?}",
+            sent
+        );
+
+        let mut with_if = report_argv(&ui.socket);
+        with_if.extend(["--if", "working", "--if", "waiting"]);
+        assert_eq!(run_argv(&with_if, None).await, Ok(0));
+        let sent = ui.take();
+        assert_eq!(
+            sent[0].1["lifecycle_if"],
+            serde_json::json!(["working", "waiting"])
+        );
+    }
+
+    /// The reserved list is `roost_agent::ALL_AGENTS` plus
+    /// `SOURCE_MANUAL`/`SOURCE_LEGACY`, read from those constants — not
+    /// a second list. One agent source plus `SOURCE_MANUAL` stand in for
+    /// the whole inventory here.
+    #[tokio::test]
+    async fn tab_report_refuses_a_reserved_source() {
+        let socket = nowhere("report-reserved");
+        for source in [
+            roost_agent::ALL_AGENTS[0].source(),
+            roost_ipc::agent::SOURCE_MANUAL,
+        ] {
+            let mut argv = report_argv(&socket);
+            *argv.iter_mut().find(|a| **a == "custom-agent").unwrap() = source;
+            let error = run_argv(&argv, None).await.expect_err(source);
+            assert!(matches!(error, CliError::Usage(_)), "{source}: {error:?}");
+            assert_eq!(error.exit_code(), 2, "{source}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tab_report_refuses_an_empty_source() {
+        let socket = nowhere("report-empty-source");
+        let mut argv = report_argv(&socket);
+        *argv.iter_mut().find(|a| **a == "custom-agent").unwrap() = "";
+        let error = run_argv(&argv, None).await.expect_err("empty source");
+        assert_eq!(error.exit_code(), 2, "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn tab_report_attention_set_requires_title_and_body() {
+        let socket = nowhere("report-set-needs");
+        let mut base = report_argv(&socket);
+        base.extend(["--attention", "set"]);
+
+        let mut without_title = base.clone();
+        without_title.extend(["--body", "b"]);
+        let error = run_argv(&without_title, None).await.expect_err("no title");
+        assert_eq!(error.exit_code(), 2, "{error:?}");
+
+        let mut without_body = base.clone();
+        without_body.extend(["--title", "t"]);
+        let error = run_argv(&without_body, None).await.expect_err("no body");
+        assert_eq!(error.exit_code(), 2, "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn tab_report_refuses_bad_metadata() {
+        let socket = nowhere("report-bad-metadata");
+        let base = report_argv(&socket);
+
+        let mut no_equals = base.clone();
+        no_equals.extend(["--metadata", "novalue"]);
+        let error = run_argv(&no_equals, None).await.expect_err("no =");
+        assert_eq!(error.exit_code(), 2, "{error:?}");
+
+        let mut empty_key = base.clone();
+        empty_key.extend(["--metadata", "=v"]);
+        let error = run_argv(&empty_key, None).await.expect_err("empty key");
+        assert_eq!(error.exit_code(), 2, "{error:?}");
+
+        let mut repeated = base.clone();
+        repeated.extend(["--metadata", "k=1", "--metadata", "k=2"]);
+        let error = run_argv(&repeated, None).await.expect_err("repeated key");
+        assert_eq!(error.exit_code(), 2, "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn tab_report_exits_zero_when_the_server_does_not_accept_the_report() {
+        for ownership in [None, Some(("claude", "sess-1"))] {
+            let ui = FakeUi::start("report-not-accepted", move |_| {
+                Ok(fake_tab_agent_report_result(false, "working", ownership))
+            });
+            assert_eq!(
+                run_argv(&report_argv(&ui.socket), None).await,
+                Ok(0),
+                "{ownership:?}"
+            );
+        }
+    }
+
+    /// The two human lines `run_on_ui` prints verbatim — pinned directly
+    /// since nothing in this file captures real stdout. `accepted: true`
+    /// names the **returned** lifecycle, e.g. what `release` forces to
+    /// `inactive` even with no `--lifecycle` on the command line.
+    #[test]
+    fn tab_report_human_lines() {
+        let accepted: roost_ipc::messages::Tab = serde_json::from_value(
+            fake_tab_agent_report_result(true, "inactive", None)["tab"].clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            report::accepted_line(7, &accepted),
+            "reported: tab 7 inactive"
+        );
+
+        let owned: roost_ipc::messages::Tab = serde_json::from_value(
+            fake_tab_agent_report_result(false, "working", Some(("claude", "sess-1")))["tab"]
+                .clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            report::not_accepted_line(7, &owned),
+            "not accepted: tab 7 is owned by claude/sess-1"
+        );
+
+        let unowned: roost_ipc::messages::Tab = serde_json::from_value(
+            fake_tab_agent_report_result(false, "working", None)["tab"].clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            report::not_accepted_line(7, &unowned),
+            "not accepted: tab 7 has no owner"
+        );
     }
 
     fn answer_ensure_and_open(op: &str) -> Result<serde_json::Value, (&'static str, &'static str)> {
