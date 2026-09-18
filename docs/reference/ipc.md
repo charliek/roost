@@ -725,6 +725,15 @@ unrelated numbered tab — a session's own ids are one bare id-space by
 design. `roostctl tab dump --tab h3.7` passes the spelling straight
 through.
 
+Under [`local-backend = session`](#a-ui-socket-under-local-backend-session),
+a slot tab this UI holds no client-side Terminal for (one the window
+has not shown) is dumped by the local session instead: the UI socket
+forwards the request under the session's bare id and returns the
+session's reply unchanged, errors included. That holds for a bare id and
+for the slot's own `h<n>.<id>` alike. A tab the window has shown is
+still read off its client-side Terminal, and an `h<n>.<id>` naming any
+other host stays `not-found`.
+
 ### `tab.dump_resolved`
 
 Companion to `tab.dump` — a richer read of the same viewport, but each

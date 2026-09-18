@@ -2394,9 +2394,10 @@ fn require_tab<T: TabRef>(
 ///
 /// A bare id is read off the socket that owns the tabs, the one `wait`
 /// reads ([`events::resolve`]): under `local-backend = session` the UI
-/// keeps a terminal only for the tab it is showing, and refuses the rest
-/// `not-found`. An `h<host>.<id>` names that client-side terminal itself,
-/// so it stays on the UI socket.
+/// keeps a terminal only for the tab it is showing, so every other tab is
+/// the session's to answer, and asking it there is one hop. An
+/// `h<host>.<id>` names that client-side terminal itself, so it stays on
+/// the UI socket.
 async fn dump_tab(
     ui: &mut UiSocket<'_>,
     flag: Option<WireTabRef>,

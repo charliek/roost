@@ -611,6 +611,12 @@ pub enum UiRequest {
     LocalSessionForward {
         op: String,
         params: serde_json::Value,
+        /// The slot incarnation the handler already addressed `params`
+        /// to, if it did. A reconnect between that choice and the send
+        /// would put one session's tab id to its replacement, where the
+        /// same number names an unrelated tab, so the app refuses the
+        /// forward `host-unavailable` instead.
+        expected_host: Option<u32>,
         reply: HostOpReply<serde_json::Value>,
     },
     /// `tab.reorder` for a host-qualified project: send that host's
@@ -3099,16 +3105,44 @@ async fn forward_to_local_session(
     h: &IpcHandler,
     op: &str,
     params: serde_json::Value,
+    expected_host: Option<u32>,
 ) -> Result<serde_json::Value, HandlerError> {
     let mut reply = h
         .ui_call(|reply| UiRequest::LocalSessionForward {
             op: op.to_string(),
             params,
+            expected_host,
             reply,
         })
         .await??;
     strip_ui_socket_fence(op, &mut reply);
     Ok(reply)
+}
+
+/// The slot tab a `tab.dump` names, as `(incarnation, the session's own
+/// id)`, when it names one on the slot this route is connected to.
+fn slot_tab(route: &LocalRoute, tab: WireTabRef) -> Option<(u32, i64)> {
+    match tab {
+        WireTabRef::Host { host, tab } if route.slot_host == Some(host) => Some((host, tab)),
+        _ => None,
+    }
+}
+
+/// #511: the app keeps a terminal only for the slot tab it has shown,
+/// and the session answers for every tab it runs, watched or not. The
+/// id goes bare because a session refuses the `h<n>.<id>` form
+/// ([`bare_tab`]).
+async fn dump_on_the_slot(
+    h: &IpcHandler,
+    host: u32,
+    tab: i64,
+    scrollback: u32,
+) -> Result<serde_json::Value, HandlerError> {
+    let params = encode(&TabDumpParams {
+        tab_id: WireTabRef::Local(tab),
+        scrollback,
+    })?;
+    forward_to_local_session(h, ops::TAB_DUMP, params, Some(host)).await
 }
 
 /// Take the session's `revision` back off a forwarded reply.
@@ -3146,7 +3180,7 @@ async fn dispatch(
     let params = if route.mode == LocalBackendMode::Session {
         match roost_ipc::local_route::classify(op) {
             Some(roost_ipc::OpClass::Forward) => {
-                return forward_to_local_session(h, op, params).await;
+                return forward_to_local_session(h, op, params, None).await;
             }
             Some(roost_ipc::OpClass::Rewrite(ids)) => {
                 let mut params = params;
@@ -3287,14 +3321,21 @@ async fn dispatch(
             let scrollback = p.scrollback.min(MAX_DUMP_SCROLLBACK);
             let data = match served::dump(h, p.tab_id, scrollback).await {
                 Some(served) => served?,
-                None => h
-                    .ui_call(|reply| UiRequest::Dump {
-                        tab_id: p.tab_id,
-                        scrollback,
-                        reply,
-                    })
-                    .await?
-                    .map_err(dump_err)?,
+                None => {
+                    let dumped = h
+                        .ui_call(|reply| UiRequest::Dump {
+                            tab_id: p.tab_id,
+                            scrollback,
+                            reply,
+                        })
+                        .await?;
+                    if let (Err(DumpError::NoTab(_)), Some((host, tab))) =
+                        (&dumped, slot_tab(&route, p.tab_id))
+                    {
+                        return dump_on_the_slot(h, host, tab, scrollback).await;
+                    }
+                    dumped.map_err(dump_err)?
+                }
             };
             encode(&TabDumpResult {
                 cols: data.cols,
@@ -5785,6 +5826,149 @@ mod tests {
             .await
             .expect("the slot answered");
         assert_eq!(listed, serde_json::json!({"projects": []}));
+    }
+
+    // ── #511: a `tab.dump` the app cannot answer, on the slot ────────
+
+    /// What a fake app was asked: the refs its terminals were dumped for,
+    /// and every forward that followed, as `(op, params, expected_host)`.
+    #[derive(Default)]
+    struct DumpAsks {
+        dumped: Vec<WireTabRef>,
+        forwarded: Vec<(String, serde_json::Value, Option<u32>)>,
+    }
+
+    /// An app that answers every `tab.dump` with `app`'s refusal and every
+    /// forward with `slot`.
+    fn dump_app(
+        h: IpcHandler,
+        app: fn(WireTabRef) -> DumpError,
+        slot: Result<serde_json::Value, HostOpFailure>,
+    ) -> (IpcHandler, Arc<std::sync::Mutex<DumpAsks>>) {
+        let (h, mut ui) = with_a_ui(h);
+        let asks = Arc::new(std::sync::Mutex::new(DumpAsks::default()));
+        let seen = Arc::clone(&asks);
+        tokio::spawn(async move {
+            while let Some(request) = ui.recv().await {
+                match request {
+                    UiRequest::Dump { tab_id, reply, .. } => {
+                        seen.lock().unwrap().dumped.push(tab_id);
+                        let _ = reply.send(Err(app(tab_id)));
+                    }
+                    UiRequest::LocalSessionForward {
+                        op,
+                        params,
+                        expected_host,
+                        reply,
+                    } => {
+                        seen.lock()
+                            .unwrap()
+                            .forwarded
+                            .push((op, params, expected_host));
+                        let _ = reply.send(slot.clone());
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (h, asks)
+    }
+
+    fn no_terminal(tab: WireTabRef) -> DumpError {
+        DumpError::NoTab(format!("tab {tab} has no live terminal"))
+    }
+
+    /// The app is asked first; a slot tab it has no terminal for goes to
+    /// the session under the session's own bare id, addressed to the
+    /// incarnation the ref named, and the session's reply is the answer.
+    #[tokio::test]
+    async fn a_slot_tab_the_app_has_no_terminal_for_is_dumped_by_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = serde_json::json!({"cols": 80, "rows": 1, "rows_text": ["$ on the session"]});
+        let (h, asks) = dump_app(
+            forwarding_handler(dir.path(), Some(2)),
+            no_terminal,
+            Ok(rows.clone()),
+        );
+
+        for tab_id in ["7", "h2.7"] {
+            let dumped = dispatch(
+                &h,
+                ops::TAB_DUMP,
+                serde_json::json!({"tab_id": tab_id, "scrollback": 50}),
+            )
+            .await
+            .expect("the session answered");
+            assert_eq!(dumped, rows, "{tab_id}");
+        }
+
+        let asks = asks.lock().unwrap();
+        assert_eq!(asks.dumped, [WireTabRef::Host { host: 2, tab: 7 }; 2]);
+        let forwarded = (
+            ops::TAB_DUMP.to_string(),
+            serde_json::json!({"tab_id": "7", "scrollback": 50}),
+            Some(2),
+        );
+        assert_eq!(asks.forwarded, [forwarded.clone(), forwarded]);
+    }
+
+    /// Only the slot's tabs: `h9` is some other host, which the slot's
+    /// session has never heard of, and in-process there is no slot.
+    #[tokio::test]
+    async fn a_tab_on_no_connected_slot_stays_not_found() {
+        let session = tempfile::tempdir().unwrap();
+        let in_process = tempfile::tempdir().unwrap();
+        for (h, tab_id) in [
+            (forwarding_handler(session.path(), Some(2)), "h9.7"),
+            (identify_handler(in_process.path()), "h2.7"),
+        ] {
+            let (h, asks) = dump_app(h, no_terminal, Ok(serde_json::json!({})));
+            let error = dispatch(&h, ops::TAB_DUMP, serde_json::json!({"tab_id": tab_id}))
+                .await
+                .expect_err("no terminal, and no slot to ask");
+            assert_eq!(error.code, "not-found", "{tab_id}: {error:?}");
+            assert_eq!(error.message, format!("tab {tab_id} has no live terminal"));
+            assert!(asks.lock().unwrap().forwarded.is_empty(), "{tab_id}");
+        }
+    }
+
+    /// A terminal that is there but failed to read is the app's own
+    /// failure, not a tab the session should be asked for.
+    #[tokio::test]
+    async fn a_dump_whose_read_failed_stays_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, asks) = dump_app(
+            forwarding_handler(dir.path(), Some(2)),
+            |_| DumpError::Read("read scrollback rows: vt error".into()),
+            Ok(serde_json::json!({})),
+        );
+        let error = dispatch(&h, ops::TAB_DUMP, serde_json::json!({"tab_id": "7"}))
+            .await
+            .expect_err("the read failed");
+        assert_eq!(error.code, "internal", "{error:?}");
+        assert_eq!(error.message, "read scrollback rows: vt error");
+        assert_eq!(asks.lock().unwrap().dumped.len(), 1);
+        assert!(asks.lock().unwrap().forwarded.is_empty());
+    }
+
+    /// The session's refusal crosses verbatim, including a code this
+    /// socket never mints on its own.
+    #[tokio::test]
+    async fn a_forwarded_dump_answers_with_the_sessions_own_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, _asks) = dump_app(
+            forwarding_handler(dir.path(), Some(2)),
+            no_terminal,
+            Err(HostOpFailure::new(
+                codes::SHUTTING_DOWN,
+                "session is shutting down",
+            )),
+        );
+        let error = dispatch(&h, ops::TAB_DUMP, serde_json::json!({"tab_id": "7"}))
+            .await
+            .expect_err("the session refused");
+        assert_eq!(error.code, "shutting-down", "{error:?}");
+        assert_eq!(error.message, "session is shutting down");
     }
 
     #[tokio::test]

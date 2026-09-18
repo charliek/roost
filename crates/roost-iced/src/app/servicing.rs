@@ -124,6 +124,13 @@ fn slot_unavailable() -> Result<serde_json::Value, HostOpFailure> {
     ))
 }
 
+/// The slot a forward is put to: the connected one, and only while it is
+/// still the incarnation the handler addressed, when it addressed one
+/// (`UiRequest::LocalSessionForward::expected_host`).
+fn forward_slot(connected: Option<HostId>, expected: Option<u32>) -> Option<HostId> {
+    connected.filter(|host| expected.is_none_or(|expected| host.raw() == expected))
+}
+
 /// A forwarded mutation refused because a local-backend switch is in
 /// flight (plan 063 §D8a).
 fn switch_busy() -> Result<serde_json::Value, HostOpFailure> {
@@ -3728,8 +3735,13 @@ impl App {
             // Plan 063 §D10: one bare-id op, put to the slot. Spawned
             // like every other host call — `update` never waits on a
             // round trip to a session.
-            UiRequest::LocalSessionForward { op, params, reply } => {
-                task = task.then(self.local_session_forward(op, params, reply));
+            UiRequest::LocalSessionForward {
+                op,
+                params,
+                expected_host,
+                reply,
+            } => {
+                task = task.then(self.local_session_forward(op, params, expected_host, reply));
             }
             UiRequest::HostTabReorder {
                 host,
@@ -3859,9 +3871,10 @@ impl App {
         &mut self,
         op: String,
         params: serde_json::Value,
+        expected_host: Option<u32>,
         reply: roost_engine::ipc::HostOpReply<serde_json::Value>,
     ) -> UiTask {
-        let Some(host) = self.connected_slot_host() else {
+        let Some(host) = forward_slot(self.connected_slot_host(), expected_host) else {
             let _ = reply.send(slot_unavailable());
             return UiTask::None;
         };
@@ -4203,6 +4216,21 @@ mod tests {
         assert_eq!(down.message, "local session is not connected");
         assert_eq!(busy.code, "busy");
         assert_eq!(busy.message, "a local-backend switch is in progress");
+    }
+
+    /// A forward addressed to incarnation 2 while incarnation 3 holds the
+    /// slot finds no slot, which `local_session_forward` answers with
+    /// [`slot_unavailable`]: `host-unavailable`, never tab 2's id put to
+    /// session 3.
+    #[test]
+    fn a_forward_addressed_to_a_replaced_slot_is_host_unavailable() {
+        let now = Some(HostId::new(3));
+        assert_eq!(forward_slot(now, Some(2)), None);
+        assert_eq!(forward_slot(None, Some(3)), None);
+        assert_eq!(forward_slot(now, Some(3)), now);
+        assert_eq!(forward_slot(now, None), now, "an unaddressed forward");
+        assert_eq!(forward_slot(None, None), None);
+        assert_eq!(slot_unavailable().unwrap_err().code, "host-unavailable");
     }
 
     /// `app.sidebar_dump`'s band strip, one row per plan 063 §D2
