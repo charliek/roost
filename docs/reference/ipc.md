@@ -330,7 +330,10 @@ write` / `send` / `state` with no `--tab` still have something to act
 on. `local_backend_switch` names the phase of a local-backend switch in
 progress (plan 063 §D8a) — one of `"preparing"`, `"replaying"`,
 `"committing"`, `"cleaning-up"` — and is absent whenever the UI is idle;
-a mutation refused `busy` can read this to see which phase is holding
+while it is present, every mutating op on a UI socket under `in-process`
+answers `busy` (reads keep answering), and one already under way when
+the switch began finishes before the switch copies anything. A mutation
+refused `busy` can read this to see which phase is holding
 it up, and a test can tell
 "before the commit point" from "after" it, since `local_backend` itself
 flips at exactly one point inside the sequence.

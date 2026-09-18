@@ -1584,14 +1584,14 @@ pub(crate) struct SwitchRun {
     /// When the phase this run is in stops being worth waiting for.
     /// Re-armed at every transition.
     deadline: std::time::Instant,
-}
-
-impl SwitchRun {
-    fn phase(&mut self, state: SwitchState) {
-        tracing::info!(?self.direction, from = ?self.state, to = ?state, "local-backend switch");
-        self.state = state;
-        self.deadline = phase_deadline();
-    }
+    /// The IPC socket's admission gate has drained for this run (plan
+    /// 067 §3.2). The forward snapshot and the reverse seed wait for it.
+    admission_drained: bool,
+    /// That drain, aborted when the run ends: one still queued behind a
+    /// mutation that never replies would, through the lock's write
+    /// preference, hold every later mutation on the socket behind it
+    /// long after the switch that asked for it was gone.
+    drain: Option<tokio::task::AbortHandle>,
 }
 
 /// How long any one phase may sit waiting on something outside this
@@ -1673,6 +1673,12 @@ impl super::App {
     /// the step is still writing to the destination.
     pub(crate) fn switch_step_in_flight(&self) -> bool {
         self.switch.as_ref().is_some_and(|run| run.step_in_flight)
+    }
+
+    fn switch_gate_drained(&self) -> bool {
+        self.switch
+            .as_ref()
+            .is_some_and(|run| run.admission_drained)
     }
 
     /// The stable refusal every local-backend mutation gets while a
@@ -1803,12 +1809,24 @@ impl super::App {
             wanted: None,
             kept: 0,
             deadline: phase_deadline(),
+            admission_drained: false,
+            drain: None,
         });
         // Before the first phase runs: the latch is what stops the
         // reconciles the phases trigger from auto-removing an emptied
         // slot or closing the window over an emptied source.
         self.publish_local_route();
         self.in_process_streams.end_for_backend_switch();
+        // After the store above, never before it — see
+        // `roost_engine::ipc::IpcHandler::switch_gate`.
+        let gate = std::sync::Arc::clone(&self.switch_gate);
+        let feed = self.feed_tx.clone();
+        let generation = self.switch_generation;
+        let drain = self.runtime_handle.spawn(async move {
+            drop(gate.write().await);
+            feed.send(crate::engine_feed::EngineFeed::SwitchAdmissionDrained { generation });
+        });
+        self.switch.as_mut().expect("a run").drain = Some(drain.abort_handle());
         tracing::info!(?direction, "local-backend switch started");
     }
 
@@ -1983,6 +2001,9 @@ impl super::App {
 
     /// Phase 2 + 3: snapshot, journal, replay.
     fn forward_begin_replay(&mut self) -> bool {
+        if !self.switch_gate_drained() {
+            return false;
+        }
         let Some(host) = self.connected_slot_host() else {
             return false;
         };
@@ -2047,8 +2068,8 @@ impl super::App {
         }
         let generation = run.generation;
         let journal = run.journal.clone();
-        run.phase(SwitchState::Replaying);
         run.step_in_flight = true;
+        self.switch_phase(SwitchState::Replaying);
 
         let feed = self.feed_tx.clone();
         let home = roost_engine::home_dir();
@@ -2130,10 +2151,9 @@ impl super::App {
         let deletable = run.journal.deletable_sources.clone();
         run.kept = run.created.len() - deletable.len();
         let kept = run.kept;
-        run.phase(SwitchState::Committing);
         run.step_in_flight = true;
         self.local_backend = LocalBackendMode::Session;
-        self.publish_local_route();
+        self.switch_phase(SwitchState::Committing);
         tracing::info!(
             migrated = deletable.len(),
             kept,
@@ -2351,7 +2371,7 @@ impl super::App {
             self.fail_switch(&format!("could not record the switch: {error}"));
             return false;
         }
-        run.phase(SwitchState::Committing);
+        self.switch_phase(SwitchState::Committing);
         true
     }
 
@@ -2381,9 +2401,8 @@ impl super::App {
         let run = self.switch.as_mut().expect("a run");
         // The record's own copy moved with the file it wrote.
         run.journal.phase = SwitchState::Committing;
-        run.phase(SwitchState::CleaningUp);
         self.local_backend = LocalBackendMode::InProcess;
-        self.publish_local_route();
+        self.switch_phase(SwitchState::CleaningUp);
         // The slot keeps its connection, its session and its projects —
         // it is simply an ordinary `LOCALHOST` band from here, which is
         // what flipping the mode makes it (`host_sidebar::sections`
@@ -2413,6 +2432,9 @@ impl super::App {
     /// `in-process` is exactly what §D9's exit rule closes the window
     /// for.
     fn reverse_finish(&mut self) -> bool {
+        if !self.switch_gate_drained() {
+            return false;
+        }
         let run = self.switch.as_mut().expect("a run");
         let generation = run.generation;
         run.step_in_flight = true;
@@ -2433,6 +2455,32 @@ impl super::App {
     }
 
     // ── step completions ────────────────────────────────────────────
+
+    /// Every transition goes through here, so `identify` names the phase
+    /// the moment it starts rather than at the next reconcile's tail.
+    fn switch_phase(&mut self, state: SwitchState) {
+        let run = self.switch.as_mut().expect("a run");
+        tracing::info!(
+            direction = ?run.direction,
+            from = ?run.state,
+            to = ?state,
+            "local-backend switch"
+        );
+        run.state = state;
+        run.deadline = phase_deadline();
+        self.publish_local_route();
+    }
+
+    pub(super) fn switch_admission_drained(&mut self, generation: u64) {
+        match self.switch.as_mut() {
+            Some(run) if run.generation == generation => run.admission_drained = true,
+            _ => {
+                tracing::debug!("an admission drain outlived the switch that asked for it");
+                return;
+            }
+        }
+        self.reconcile();
+    }
 
     pub(super) fn switch_step_completed(&mut self, done: SwitchStepDone) {
         let SwitchStepDone { generation, step } = done;
@@ -2468,10 +2516,7 @@ impl super::App {
                          the next launch finishes it"
                     );
                 }
-                self.switch
-                    .as_mut()
-                    .expect("a run")
-                    .phase(SwitchState::CleaningUp);
+                self.switch_phase(SwitchState::CleaningUp);
             }
             SwitchStep::DestCleared { complete } => {
                 match complete {
@@ -2572,7 +2617,9 @@ impl super::App {
     /// Drop the run and republish, which is what re-arms the exit rule,
     /// the auto-remove and both verbs.
     fn end_switch(&mut self) {
-        self.switch = None;
+        if let Some(drain) = self.switch.take().and_then(|run| run.drain) {
+            drain.abort();
+        }
         self.publish_local_route();
     }
 }

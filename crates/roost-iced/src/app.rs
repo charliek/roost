@@ -2523,6 +2523,9 @@ pub struct App {
     /// The IPC socket's in-process event streams, which a local-backend
     /// switch ends.
     in_process_streams: Arc<roost_engine::ipc::InProcessStreams>,
+    /// The IPC socket's admission gate, which a local-backend switch
+    /// drains before it copies anything.
+    switch_gate: Arc<tokio::sync::RwLock<()>>,
     /// The local-backend switch in flight (plan 063 §D8), or `None`.
     /// [`local_backend::SwitchState::Idle`] is spelled as the absence of
     /// a run, so nothing can be mid-phase with no phase data.
@@ -2946,6 +2949,7 @@ impl App {
         .with_local_route(Arc::clone(&local_route))
         .with_test_mode(test_mode);
         let in_process_streams = handler.in_process_streams();
+        let switch_gate = handler.switch_gate();
         let server = runtime
             .block_on(IpcServer::bind(&profile.socket_path, handler))
             .context("bind Iced IPC server")?;
@@ -3003,6 +3007,7 @@ impl App {
             local_backend: backend_mode,
             local_route,
             in_process_streams,
+            switch_gate,
             switch: None,
             pending_migration,
             pending_dest_cleanup: resumed.delete_dest,

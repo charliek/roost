@@ -2282,6 +2282,9 @@ impl App {
                 EngineFeed::HostBootstrap(event) => self.host_bootstrap_event(*event),
                 EngineFeed::HostEmptiness(reply) => self.host_emptiness_confirmed(*reply),
                 EngineFeed::LocalBackendSwitch(done) => self.switch_step_completed(*done),
+                EngineFeed::SwitchAdmissionDrained { generation } => {
+                    self.switch_admission_drained(generation)
+                }
                 // A signal reached the process (plan 039 §3.9). Same
                 // latch the macOS menu's Quit item uses — `take_exit_task`
                 // (called every `update()`) is what turns this into

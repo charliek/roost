@@ -61,6 +61,7 @@ use roost_ipc::{
     codes, CloseReason, ConnAction, ConnCloser, ConnCtx, Handler, HandlerError, HandlerOutcome,
     LocalBackendCell, LocalBackendMode, LocalRoute, StopFinalizer,
 };
+use tokio::sync::OwnedRwLockReadGuard;
 
 /// Text snapshot of a tab's terminal viewport, produced on the UI
 /// adapter's main thread for the `tab.dump` op. Neutral (lib-side) types so this crate
@@ -1411,17 +1412,21 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Ops that change workspace or PTY state — or hand out the authority to
-/// change it — and so must not run once a session has latched Stopping.
+/// change it — and so must not run once a session has latched Stopping,
+/// nor on an in-process UI socket while a local-backend switch is in
+/// flight ([`admit_mutation`]).
 ///
 /// Reads (`identify`, `tab.list`, `tab.dump*`, `session.identify`) stay
 /// answerable throughout, so a client can still find out what happened.
 /// The UI-only ops (`palette.*`, `window.*`, `app.*`, clipboard,
-/// selection) are not listed: they route through `ui_call`, and a
-/// session socket has no UI attached, so they already fail with
-/// `internal: no UI attached`. `tab.feed_pty_bytes` is the exception —
-/// on a session it writes into the tab task's terminal, which is a
-/// mutation like any other. This whole set is consulted only on a
-/// session socket, so listing it costs a UI nothing.
+/// selection, `sidebar.set_width`, `tab.dispatch_mouse_event`,
+/// `tab.feed_ime`) are not listed: they act on the UI rather than on the
+/// workspace a switch moves, and a session socket has no UI attached, so
+/// there they already fail with `internal: no UI attached`.
+/// `tab.feed_pty_bytes` is the exception — on a session it writes into
+/// the tab task's terminal, which is a mutation like any other — and so
+/// is `tab.send_file`, which pastes into a tab a switch is about to
+/// replay.
 ///
 /// Public because plan 063 §D10's forward arm asks the same question of
 /// the same set: a forwarded op that changes what the slot holds is the
@@ -1435,6 +1440,7 @@ pub fn is_mutating_op(op: &str) -> bool {
             | ops::TAB_WRITE
             | ops::TAB_RESIZE
             | ops::TAB_FOCUS
+            | ops::TAB_SEND_FILE
             | ops::TAB_SET_TITLE
             | ops::TAB_SET_STATE
             | ops::TAB_CLEAR_NOTIFICATION
@@ -1508,6 +1514,26 @@ pub struct IpcHandler {
     /// session's — so `identify` on a session socket keeps answering
     /// exactly what it always has.
     local_route: Option<Arc<LocalBackendCell>>,
+    /// The admission gate a local-backend switch drains before it copies
+    /// anything (plan 067 §3.2) — `SessionState::barrier`'s protocol,
+    /// with the cell's switch phase as the latch. A mutation on an
+    /// in-process UI socket holds a read guard from its re-check of
+    /// `local_route` until its reply is built ([`admit_mutation`]); the
+    /// switch stores its phase, then takes the write guard and drops it
+    /// at once, and snapshots only after that.
+    ///
+    /// Why that is enough: a mutation that re-checked before the store
+    /// still holds its read guard, so the drain — and the snapshot behind
+    /// it — waits for it; one that re-checks after the store sees the
+    /// phase and answers `busy`. Nothing deadlocks: the write guard is
+    /// held for no time, the UI thread never waits on it, and the
+    /// switch's own work never goes through `dispatch` (its replay goes
+    /// through `HostOps`, its teardown through `LocalClient`). `tokio`'s
+    /// lock is write-preferring, so a stream of mutations cannot starve
+    /// the drain.
+    switch_gate: Arc<tokio::sync::RwLock<()>>,
+    #[cfg(test)]
+    admission_pause: Option<AdmissionPause>,
     /// Whether the UI driving this socket was launched with
     /// `ROOST_TEST_MODE=1`, passed in for the reason
     /// [`SessionInfo::test_mode`] is. A session reads its own from there.
@@ -1539,6 +1565,9 @@ impl IpcHandler {
             agent_hooks: None,
             files: None,
             local_route: None,
+            switch_gate: Arc::default(),
+            #[cfg(test)]
+            admission_pause: None,
             test_mode: false,
             instance_id: mint_instance_id(),
         }
@@ -1642,6 +1671,12 @@ impl IpcHandler {
         Arc::clone(&self.in_process_streams)
     }
 
+    /// The gate a switch drains, for the UI to take once, after it has
+    /// stored the phase: `write().await`, then drop the guard.
+    pub fn switch_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
+        Arc::clone(&self.switch_gate)
+    }
+
     /// Register an in-process stream, or refuse it with what the route
     /// says now.
     ///
@@ -1655,12 +1690,7 @@ impl IpcHandler {
         let mut subscribers = lock(&self.in_process_streams.subscribers);
         let route = self.local_route();
         served_in_process(&route)?;
-        if route.switch.is_some() {
-            return Err(HandlerError::new(
-                codes::BUSY,
-                roost_ipc::local_route::SWITCH_BUSY_MESSAGE,
-            ));
-        }
+        refuse_mid_switch(&route)?;
         subscribers.retain(Subscriber::is_live);
         subscribers.push(Subscriber {
             conn_id: ctx.conn_id,
@@ -2918,6 +2948,70 @@ fn served_in_process(route: &LocalRoute) -> Result<(), HandlerError> {
     }
 }
 
+/// [`IpcHandler::switch_gate`] for one op: the route to dispatch it
+/// under, and — for a gated mutation — the read guard to hold until its
+/// reply is built.
+///
+/// The route handed back is the one re-loaded under the guard, never the
+/// one read before it: routing a mutation by a mode the gate did not
+/// check would let it land in a workspace the switch has since hidden.
+/// Reads never touch the gate, and neither does a handler with no route
+/// cell (a session daemon, which has its own stop latch) or a route under
+/// `session`, whose mutations leave through the forward arm, which
+/// refuses them itself.
+async fn admit_mutation(
+    h: &IpcHandler,
+    op: &str,
+) -> Result<(Arc<LocalRoute>, Option<OwnedRwLockReadGuard<()>>), HandlerError> {
+    let before = h.local_route();
+    if h.local_route.is_none() || before.mode != LocalBackendMode::InProcess || !is_mutating_op(op)
+    {
+        return Ok((before, None));
+    }
+    // Before the lock as well as under it: the lock is write-preferring,
+    // so a mutation reaching it while a drain waits would queue there
+    // rather than be refused.
+    refuse_mid_switch(&before)?;
+    let admitted = Arc::clone(&h.switch_gate).read_owned().await;
+    #[cfg(test)]
+    if let Some(pause) = &h.admission_pause {
+        pause.hold().await;
+    }
+    let route = h.local_route();
+    if route.mode == LocalBackendMode::InProcess {
+        refuse_mid_switch(&route)?;
+    }
+    Ok((route, Some(admitted)))
+}
+
+fn refuse_mid_switch(route: &LocalRoute) -> Result<(), HandlerError> {
+    if route.switch.is_some() {
+        return Err(HandlerError::new(
+            codes::BUSY,
+            roost_ipc::local_route::SWITCH_BUSY_MESSAGE,
+        ));
+    }
+    Ok(())
+}
+
+/// A test's hold on [`admit_mutation`] between taking the read guard and
+/// re-loading the route: the window a mutation crossing the switch's
+/// store lives in.
+#[cfg(test)]
+#[derive(Default)]
+struct AdmissionPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl AdmissionPause {
+    async fn hold(&self) {
+        self.reached.notify_one();
+        self.release.notified().await;
+    }
+}
+
 fn refuse_tab_id_filter(params: &EventsSubscribeParams) -> Result<(), HandlerError> {
     if params.tab_id_filter == 0 {
         return Ok(());
@@ -3048,7 +3142,7 @@ async fn dispatch(
     // own route parser below exactly as it does under `in-process`.
     // That is why this runs per-op off the table rather than as one
     // "session mode ⇒ forward" test.
-    let route = h.local_route();
+    let (route, _admitted) = admit_mutation(h, op).await?;
     let params = if route.mode == LocalBackendMode::Session {
         match roost_ipc::local_route::classify(op) {
             Some(roost_ipc::OpClass::Forward) => {
@@ -5759,21 +5853,154 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_subscribe_during_a_switch_is_refused_busy() {
         let dir = tempfile::tempdir().unwrap();
-        let h = identify_handler(dir.path()).with_local_route(Arc::new(LocalBackendCell::new(
+        let (h, _) = gated_handler(
+            dir.path(),
             LocalRoute {
                 switch: Some("preparing"),
                 ..LocalRoute::default()
             },
-        )));
-        let refused = refusal_of(&h, serde_json::json!({})).await;
-        assert_eq!(
-            (refused.code.as_str(), refused.message.as_str()),
-            (codes::BUSY, roost_ipc::local_route::SWITCH_BUSY_MESSAGE)
         );
+        assert_busy(&refusal_of(&h, serde_json::json!({})).await);
         assert_eq!(h.in_process_streams().count(), 0);
         wait_for("the refused relay to let go", || {
             h.workspace.versioned_receiver_count() == 0
         })
         .await;
+    }
+
+    // ── plan 067 §3.2: the admission gate ───────────────────────────
+
+    fn gated_handler(dir: &Path, route: LocalRoute) -> (IpcHandler, Arc<LocalBackendCell>) {
+        let cell = Arc::new(LocalBackendCell::new(route));
+        let h = identify_handler(dir).with_local_route(Arc::clone(&cell));
+        (h, cell)
+    }
+
+    fn create(name: &str) -> serde_json::Value {
+        serde_json::json!({"name": name, "cwd": "/tmp"})
+    }
+
+    fn assert_busy(error: &HandlerError) {
+        assert_eq!(
+            (error.code.as_str(), error.message.as_str()),
+            (codes::BUSY, roost_ipc::local_route::SWITCH_BUSY_MESSAGE)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_switch_in_flight_refuses_a_mutation_busy_and_still_answers_a_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, cell) = gated_handler(
+            dir.path(),
+            LocalRoute {
+                switch: Some("preparing"),
+                ..LocalRoute::default()
+            },
+        );
+        let before = h.workspace.snapshot();
+
+        let refused = dispatch(&h, ops::PROJECT_CREATE, create("ghost"))
+            .await
+            .expect_err("a switch is in flight");
+        assert_busy(&refused);
+        assert_eq!(h.workspace.snapshot(), before, "the refusal landed nothing");
+        dispatch(&h, ops::TAB_LIST, serde_json::json!({}))
+            .await
+            .expect("a read never touches the gate");
+
+        cell.store(LocalRoute::default());
+        dispatch(&h, ops::PROJECT_CREATE, create("real"))
+            .await
+            .expect("with no phase the create lands");
+        dispatch(&h, ops::TAB_LIST, serde_json::json!({}))
+            .await
+            .expect("and the read still answers");
+        assert_eq!(h.workspace.snapshot().len(), before.len() + 1);
+    }
+
+    #[tokio::test]
+    async fn under_session_a_switch_leaves_the_answer_to_the_forward_arm() {
+        let dir = tempfile::tempdir().unwrap();
+        let idle = LocalRoute {
+            mode: LocalBackendMode::Session,
+            slot_host: Some(2),
+            ..LocalRoute::default()
+        };
+        let (h, cell) = gated_handler(dir.path(), idle.clone());
+        async fn answers(h: &IpcHandler) -> Vec<(String, String)> {
+            let mut answers = Vec::new();
+            for (op, params) in [
+                (ops::PROJECT_CREATE, create("ghost")),
+                (ops::TAB_LIST, serde_json::json!({})),
+            ] {
+                let error = dispatch(h, op, params)
+                    .await
+                    .expect_err("there is no UI to forward to");
+                answers.push((error.code, error.message));
+            }
+            answers
+        }
+
+        let without = answers(&h).await;
+        assert_eq!(
+            without,
+            vec![("internal".to_string(), "no UI attached".to_string()); 2]
+        );
+        cell.store(LocalRoute {
+            switch: Some("preparing"),
+            ..idle
+        });
+        assert_eq!(answers(&h).await, without);
+    }
+
+    /// A create paused between taking its read guard and re-checking the
+    /// cell, while the switch stores its phase and asks for the write
+    /// guard.
+    #[tokio::test]
+    async fn the_drain_waits_out_a_mutation_that_crossed_the_phase_and_it_lands_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut h, cell) = gated_handler(dir.path(), LocalRoute::default());
+        h.admission_pause = Some(AdmissionPause::default());
+        let h = Arc::new(h);
+        let pause = h.admission_pause.as_ref().expect("the pause");
+        let before = h.workspace.snapshot();
+
+        let crossing = tokio::spawn({
+            let h = Arc::clone(&h);
+            async move { dispatch(&h, ops::PROJECT_CREATE, create("crossing")).await }
+        });
+        pause.reached.notified().await;
+
+        cell.store(LocalRoute {
+            switch: Some("preparing"),
+            ..LocalRoute::default()
+        });
+        let gate = h.switch_gate();
+        let mut drain = tokio::spawn(async move { drop(gate.write().await) });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut drain)
+                .await
+                .is_err(),
+            "the drain must wait for the create holding its read guard"
+        );
+
+        pause.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), &mut drain)
+            .await
+            .expect("the drain is granted once the create lets go")
+            .expect("the drain task");
+        assert!(crossing.is_finished(), "the create finished first");
+        let crossed = crossing.await.expect("the create task");
+        assert_busy(&crossed.expect_err("it re-checked under its guard"));
+        assert_eq!(h.workspace.snapshot(), before, "nothing landed");
+
+        assert_busy(
+            &dispatch(&h, ops::PROJECT_CREATE, create("after"))
+                .await
+                .expect_err("the phase is up"),
+        );
+        dispatch(&h, ops::TAB_LIST, serde_json::json!({}))
+            .await
+            .expect("reads still answer");
     }
 }

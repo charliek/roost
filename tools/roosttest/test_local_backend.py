@@ -946,6 +946,50 @@ def test_a_switch_ends_the_in_process_event_stream_and_refuses_a_new_one(lane: L
         subprocess.run(["pkill", "-f", str(stub)], check=False)
 
 
+def test_a_raw_mutation_is_refused_busy_while_a_switch_is_in_flight(lane: Lane):
+    """Plan 067 §3.2 (#501): the admission gate, as a raw client meets it.
+
+    Held in `preparing` the way the quiescence case above holds it, but
+    the stub is let go on cue: it then reports a failed start, the switch
+    gives up, and the very request it refused goes through.
+    """
+    release = _ROOT / "held-session-release"
+    stub = _ROOT / "held-session"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"while [ ! -e {release} ]; do sleep 0.1; done\n"
+        "echo 'error: released by the test'\n"
+        "exit 1\n"
+    )
+    stub.chmod(0o755)
+    roost = lane.start("in-process", extra_env={"ROOST_SESSION_BIN": str(stub)})
+    before = layout(roost.list())
+
+    raise_switch(roost, USE_SESSION)
+    roost.call("app.dialog_answer", {"action": "confirm"})
+    try:
+        wait_until(
+            lambda: roost.identify().get("local_backend_switch") == "preparing",
+            60.0,
+            "the switch to reach its first phase",
+        )
+        with pytest.raises(RoostError) as refused:
+            roost.create_project(name="gated", cwd="/tmp")
+        assert (refused.value.code, refused.value.message) == ("busy", BUSY_MESSAGE), refused.value
+        assert roost.identify().get("local_backend_switch") == "preparing"
+        assert layout(roost.list()) == before, "the refusal landed nothing, and a read answers"
+    finally:
+        release.touch()
+
+    wait_until(
+        lambda: settled(roost) == "in-process",
+        60.0,
+        "the switch to give up once its destination reports a failed start",
+    )
+    roost.create_project(name="gated", cwd="/tmp")
+    assert layout(roost.list()) == [*before, ("gated", ())]
+
+
 def test_under_session_mode_the_ui_socket_points_a_subscriber_at_the_session(lane: Lane):
     """Plan 063 §D10's `Unsupported`, as plan 066 left it: the in-process
     workspace is the hidden one, so the UI socket serves no stream of it
