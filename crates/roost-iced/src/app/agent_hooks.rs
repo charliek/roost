@@ -30,6 +30,8 @@
 
 use roost_agent::Agent;
 use roost_agent_install::{Guard, Home, InstallError, Mode};
+use roost_engine::ipc::HostOpFailure;
+use roost_ipc::codes;
 use roost_ipc::messages::{
     AgentHooksFailed, AgentHooksOutcome, AgentHooksSkipped, AgentSetHooksAgents,
     AgentSetHooksHostOutcome, AgentSetHooksResult,
@@ -223,8 +225,8 @@ impl AgentHooksApplies {
 
     pub(crate) fn send(&self, apply: AgentHooksApply) {
         if let Err(tokio::sync::mpsc::error::SendError(apply)) = self.tx.send(apply) {
-            let _ = apply.reply.send(Err(super::HostOpFailure::new(
-                "internal",
+            let _ = apply.reply.send(Err(HostOpFailure::new(
+                codes::INTERNAL,
                 "the agent-hooks worker went away".to_string(),
             )));
         }
@@ -299,7 +301,7 @@ async fn apply_set_hooks(apply: AgentHooksApply, feed: &EngineFeedSender) {
             // it; the log line is for the launches where the caller was
             // a dialog nobody was watching.
             tracing::warn!(error = %message, "agent.set_hooks could not set this machine's agent hooks");
-            let _ = reply.send(Err(super::HostOpFailure::new("internal", message)));
+            let _ = reply.send(Err(HostOpFailure::new(codes::INTERNAL, message)));
             return;
         }
     };
@@ -307,7 +309,7 @@ async fn apply_set_hooks(apply: AgentHooksApply, feed: &EngineFeedSender) {
         // The key landed and the rest of the run did not (#491): the
         // caller hears the failure, the main thread still takes the key,
         // and no host is raised.
-        let _ = reply.send(Err(super::HostOpFailure::new("internal", message.clone())));
+        let _ = reply.send(Err(HostOpFailure::new(codes::INTERNAL, message.clone())));
         feed.send(EngineFeed::AgentHooksSet(Box::new(done)));
         return;
     }

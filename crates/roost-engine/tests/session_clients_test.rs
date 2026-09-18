@@ -128,7 +128,9 @@ async fn a_second_client_gates_nothing_and_deposes_nobody() {
     let (handle, _seen) = recording_backend();
     let f = fixture_with(Some(handle));
     let project = f.workspace.create_project("p", "/tmp").unwrap();
-    f.workspace.open_tab(project.id, "/tmp", "sh").unwrap();
+    f.workspace
+        .open_tab(project.id, "/tmp", "sh", true)
+        .unwrap();
 
     let first = conn(1);
     let stream = conn(2);
@@ -311,7 +313,11 @@ async fn session_connect_and_a_lease_bearing_request_are_both_refused() {
     let f = fixture();
     let c = conn(1);
     let project = f.workspace.create_project("p", "/tmp").unwrap();
-    let tab = f.workspace.open_tab(project.id, "/tmp", "sh").unwrap().id;
+    let tab = f
+        .workspace
+        .open_tab(project.id, "/tmp", "sh", true)
+        .unwrap()
+        .id;
 
     let err = f
         .handler

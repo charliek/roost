@@ -194,11 +194,12 @@ def test_open_finds_or_creates_the_project_then_opens_a_tab(roost, target):
     the same name reuses the project (`created: false`, same id) and adds
     a second tab. `open` itself never raises a follow-up `tab.focus`
     unless `--focus` is given (which this test never passes) — but
-    `tab.open` always "steals" the active selection on its own
-    (`Workspace::open_tab`, workspace.rs: "New tabs steal the active
-    selection"), the same way the plain `tab open` verb does, so each
-    `open` call here still leaves the newly opened tab active. That is
-    existing `tab.open` behavior, not something this verb changes.
+    `tab.open` "steals" the active selection on its own unless it is sent
+    `activate: false` (`Workspace::open_tab`; `--no-activate`, which this
+    test never passes either), the same way the plain `tab open` verb
+    does, so each `open` call here still leaves the newly opened tab
+    active. That is existing `tab.open` behavior, not something this verb
+    changes.
 
     Target-gated the same way C4's `project.ensure` case is: the Mac app
     has no `project.ensure` yet, so `open` must **degrade** there rather
@@ -258,6 +259,35 @@ def test_open_finds_or_creates_the_project_then_opens_a_tab(roost, target):
         )
     finally:
         _cleanup_project(roost, pid)
+
+
+# -- tab.open activate (#503) -----------------------------------------------
+
+
+def test_tab_open_with_activate_false_leaves_the_selection(roost, target, project):
+    """`tab.open {activate: false}` appends the tab without selecting it:
+    the core's selection, the tab the window shows and the new row's own
+    `is_active` all stay where they were. The Mac app has no such field
+    and refuses it `unknown-field`."""
+    if target == "mac":
+        with pytest.raises(RoostError) as refused:
+            roost.open_tab(project, cwd="/tmp", activate=False)
+        assert refused.value.code == "unknown-field", refused.value
+        return
+
+    shown = roost.open_tab(project, cwd="/tmp")
+    assert roost.identify()["active_tab_id"] == shown
+    roost._wait(
+        lambda: roost.app_selected_tab_id() == shown,
+        4.0,
+        "the window to show the plainly opened tab",
+    )
+
+    quiet = roost.open_tab(project, cwd="/tmp", activate=False)
+    assert roost.project_tab_ids(project) == [shown, quiet], "appended at the end"
+    assert roost.identify()["active_tab_id"] == shown
+    assert roost.app_selected_tab_id() == shown
+    assert roost.tab(quiet)["is_active"] is False
 
 
 # -- tab.open cwd default (#266) -------------------------------------------

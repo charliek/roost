@@ -10,8 +10,8 @@ use roost_engine::{Workspace, WorkspaceEvent};
 async fn a_multi_event_commit_arrives_as_one_message_in_order() {
     let workspace = Workspace::new();
     let project = workspace.create_project("p", "/tmp").unwrap();
-    let first = workspace.open_tab(project.id, "/tmp", "one").unwrap();
-    let second = workspace.open_tab(project.id, "/tmp", "two").unwrap();
+    let first = workspace.open_tab(project.id, "/tmp", "one", true).unwrap();
+    let second = workspace.open_tab(project.id, "/tmp", "two", true).unwrap();
     let mut events = workspace.subscribe_versioned();
 
     // `delete_project` is the widest commit the workspace makes: both
@@ -55,14 +55,14 @@ async fn an_event_free_commit_still_publishes_its_revision() {
     // `ensure_default_project` commits with no events when a default
     // project already exists — the revision still moves, so the message
     // must still be sent or the stream grows an unexplained gap.
-    let first = workspace.ensure_default_project("/tmp");
+    let first = workspace.ensure_default_project("/tmp", true);
     let opening = events.recv().await.unwrap();
     assert!(
         !opening.events.is_empty(),
         "creating the default project emits events"
     );
 
-    let again = workspace.ensure_default_project("/tmp");
+    let again = workspace.ensure_default_project("/tmp", true);
     assert_eq!(again, first, "the second call reuses the same project");
     let fence = events.recv().await.unwrap();
     assert!(
@@ -81,7 +81,7 @@ async fn the_revision_stream_advances_by_exactly_one_per_commit() {
     let project = workspace.create_project("p", "/tmp").unwrap();
     for i in 0..8 {
         workspace
-            .open_tab(project.id, "/tmp", &format!("t{i}"))
+            .open_tab(project.id, "/tmp", &format!("t{i}"), true)
             .unwrap();
     }
     workspace.delete_project(project.id).unwrap();

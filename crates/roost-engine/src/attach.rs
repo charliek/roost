@@ -76,7 +76,7 @@ use roost_ipc::messages::{
     AttachAccepted, AttachHandshake, AttachHandshakeReply, AttachMode, AttachPayloadKind,
     ResponseError,
 };
-use roost_ipc::{CloseReason, ConnCloseWatch, ConnCtx, DataConn, CLOSE_LABEL_DEADLINE};
+use roost_ipc::{codes, CloseReason, ConnCloseWatch, ConnCtx, DataConn, CLOSE_LABEL_DEADLINE};
 use tokio::io::AsyncWriteExt;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
@@ -354,7 +354,12 @@ async fn fence_tab(
     tab_id: i64,
     kind: &AttachPayloadKind,
 ) -> Result<Attached, (&'static str, String)> {
-    let no_terminal = || ("not-found", "that tab has no live terminal".to_string());
+    let no_terminal = || {
+        (
+            codes::NOT_FOUND,
+            "that tab has no live terminal".to_string(),
+        )
+    };
     // Subscribed FIRST, before the snapshot is even asked for: the
     // encode runs on the tab task between two chunks, so a subscription
     // taken afterwards could miss whatever landed in between. Discarding
@@ -376,7 +381,7 @@ async fn fence_tab(
         .ok_or_else(no_terminal)?;
     if live_generation != tab_generation {
         return Err((
-            "not-found",
+            codes::NOT_FOUND,
             "that tab was respawned after this attach was admitted".to_string(),
         ));
     }
@@ -386,8 +391,8 @@ async fn fence_tab(
         .map_err(|error| match error {
             // Re-attach is the recovery: the failure is about the terminal's
             // state at this instant, not about the client.
-            TabError::SnapshotFailed(why) => ("snapshot-failed", why),
-            other => ("not-found", other.to_string()),
+            TabError::SnapshotFailed(why) => (codes::SNAPSHOT_FAILED, why),
+            other => (codes::NOT_FOUND, other.to_string()),
         })?;
 
     // The attach named a tab pipeline, not just a tab id: a respawn is a
@@ -396,7 +401,7 @@ async fn fence_tab(
     // prevent.
     if !generation_holds(h, tab_id, snapshot.tab_generation, tab_generation) {
         return Err((
-            "not-found",
+            codes::NOT_FOUND,
             "that tab was respawned while its snapshot was being taken".to_string(),
         ));
     }
@@ -411,7 +416,7 @@ async fn fence_tab(
     } else {
         roost_vt::ready_boundary(&snapshot.bytes).map_err(|error| {
             (
-                "snapshot-failed",
+                codes::SNAPSHOT_FAILED,
                 format!("the encoded snapshot has no READY record: {error}"),
             )
         })?
@@ -671,7 +676,7 @@ impl Pump {
             );
             return self
                 .finish(Ending::Fault {
-                    code: "desync",
+                    code: codes::DESYNC,
                     message,
                 })
                 .await;
@@ -747,7 +752,7 @@ impl Pump {
                         // that crossed it and by nothing more.
                         if tee.payload_bytes > FORWARDER_QUEUE_BYTES {
                             break 'pump Ending::Fault {
-                                code: "overflow",
+                                code: codes::OVERFLOW,
                                 message: format!(
                                     "{} bytes are queued for a peer that is not reading",
                                     tee.payload_bytes
@@ -796,7 +801,7 @@ impl Pump {
                 }
             } else if !tee.open {
                 break Ending::Fault {
-                    code: "desync",
+                    code: codes::DESYNC,
                     message: "the tab's stream ended without an exit".into(),
                 };
             }
@@ -805,7 +810,7 @@ impl Pump {
             if sent < self.snapshot.len() || terminator_due {
                 if self.started.elapsed() > ATTACH_TIME_BUDGET {
                     break Ending::Fault {
-                        code: "desync",
+                        code: codes::DESYNC,
                         message: format!(
                             "the snapshot did not finish within {ATTACH_TIME_BUDGET:?}"
                         ),
@@ -814,7 +819,7 @@ impl Pump {
                 let carried = self.snapshot.len().saturating_add(pty_before_snap);
                 if carried > ATTACH_BYTE_BUDGET {
                     break Ending::Fault {
-                        code: "desync",
+                        code: codes::DESYNC,
                         message: format!(
                             "this attach carried {carried} bytes before its snapshot \
                              finished, past the {ATTACH_BYTE_BUDGET}-byte attach budget"
@@ -936,7 +941,7 @@ impl Pump {
             ClientEvent::Frame(frame) => frame,
             ClientEvent::Fatal(message) => {
                 return Some(Ending::Fault {
-                    code: "protocol-error",
+                    code: codes::PROTOCOL_ERROR,
                     message,
                 })
             }
@@ -946,7 +951,7 @@ impl Pump {
             FRAME_INPUT => {
                 if frame.payload.is_empty() {
                     return Some(Ending::Fault {
-                        code: "protocol-error",
+                        code: codes::PROTOCOL_ERROR,
                         message: "an INPUT frame carried no bytes".into(),
                     });
                 }
@@ -964,7 +969,7 @@ impl Pump {
                 // bug rather than something to interpret generously.
                 let Ok(fields) = <[u8; 8]>::try_from(frame.payload.as_slice()) else {
                     return Some(Ending::Fault {
-                        code: "protocol-error",
+                        code: codes::PROTOCOL_ERROR,
                         message: format!(
                             "a RESIZE frame must carry exactly 8 bytes, got {}",
                             frame.payload.len()
@@ -1002,7 +1007,7 @@ impl Pump {
             }
             other => {
                 return Some(Ending::Fault {
-                    code: "protocol-error",
+                    code: codes::PROTOCOL_ERROR,
                     message: format!("unknown client frame type {other:#04x}"),
                 })
             }
@@ -1036,7 +1041,7 @@ impl Pump {
                 Some(Ending::ClientGone)
             }
             Err(_) => Some(Ending::Fault {
-                code: "overflow",
+                code: codes::OVERFLOW,
                 message: format!("the peer did not read a frame within {WRITE_DEADLINE:?}"),
             }),
         }
@@ -1136,7 +1141,7 @@ impl TeeState {
         }
         if seq != self.next_seq {
             return Err(Ending::Fault {
-                code: "desync",
+                code: codes::DESYNC,
                 message: format!("expected seq {} on this tab, got {seq}", self.next_seq),
             });
         }
@@ -1151,7 +1156,7 @@ impl TeeState {
                     .is_err()
                 {
                     return Err(Ending::Fault {
-                        code: "desync",
+                        code: codes::DESYNC,
                         message: "a PTY record exceeded the frame cap".into(),
                     });
                 }
@@ -1170,7 +1175,7 @@ impl TeeState {
 /// hole in the client's terminal is one it can never fill in.
 fn lagged(missed: u64) -> Ending {
     Ending::Fault {
-        code: "desync",
+        code: codes::DESYNC,
         message: format!("this attach fell {missed} records behind its tab"),
     }
 }

@@ -58,9 +58,10 @@ use roost_ipc::messages::{
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{AttachHandshake, SessionSetThemeResult};
 use roost_ipc::{
-    CloseReason, ConnAction, ConnCloser, ConnCtx, Handler, HandlerError, HandlerOutcome,
+    codes, CloseReason, ConnAction, ConnCloser, ConnCtx, Handler, HandlerError, HandlerOutcome,
     LocalBackendCell, LocalBackendMode, LocalRoute, StopFinalizer,
 };
+use tokio::sync::OwnedRwLockReadGuard;
 
 /// Text snapshot of a tab's terminal viewport, produced on the UI
 /// adapter's main thread for the `tab.dump` op. Neutral (lib-side) types so this crate
@@ -610,6 +611,12 @@ pub enum UiRequest {
     LocalSessionForward {
         op: String,
         params: serde_json::Value,
+        /// The slot incarnation the handler already addressed `params`
+        /// to, if it did. A reconnect between that choice and the send
+        /// would put one session's tab id to its replacement, where the
+        /// same number names an unrelated tab, so the app refuses the
+        /// forward `host-unavailable` instead.
+        expected_host: Option<u32>,
         reply: HostOpReply<serde_json::Value>,
     },
     /// `tab.reorder` for a host-qualified project: send that host's
@@ -918,7 +925,7 @@ impl FileStore {
                     path.display()
                 ),
             };
-            return Err(HandlerError::new("internal", message));
+            return Err(HandlerError::new(codes::INTERNAL, message));
         }
         Ok(path)
     }
@@ -933,7 +940,7 @@ impl FileStore {
             .filter(|after| *after <= self.0.cap)
             .ok_or_else(|| {
                 HandlerError::new(
-                    "store-full",
+                    codes::STORE_FULL,
                     format!(
                         "the host's file store holds {} of its {} byte cap and cannot take \
                          {bytes} more; restart the session to clear it",
@@ -946,7 +953,7 @@ impl FileStore {
         let dir = self.0.root.join(crate::workspace::random_hex(8));
         create_private_dir(&dir).map_err(|error| {
             HandlerError::new(
-                "internal",
+                codes::INTERNAL,
                 format!(
                     "could not create the upload directory {}: {error}",
                     dir.display()
@@ -1293,7 +1300,7 @@ impl Connections {
         });
         if self.data_conn_count() >= MAX_DATA_CONNS_PER_SESSION {
             return Err(HandlerError::new(
-                "too-many-attaches",
+                codes::TOO_MANY_ATTACHES,
                 format!(
                     "this session already serves {MAX_DATA_CONNS_PER_SESSION} data \
                      connections; detach one before attaching again"
@@ -1411,17 +1418,21 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Ops that change workspace or PTY state — or hand out the authority to
-/// change it — and so must not run once a session has latched Stopping.
+/// change it — and so must not run once a session has latched Stopping,
+/// nor on an in-process UI socket while a local-backend switch is in
+/// flight ([`admit_mutation`]).
 ///
 /// Reads (`identify`, `tab.list`, `tab.dump*`, `session.identify`) stay
 /// answerable throughout, so a client can still find out what happened.
 /// The UI-only ops (`palette.*`, `window.*`, `app.*`, clipboard,
-/// selection) are not listed: they route through `ui_call`, and a
-/// session socket has no UI attached, so they already fail with
-/// `internal: no UI attached`. `tab.feed_pty_bytes` is the exception —
-/// on a session it writes into the tab task's terminal, which is a
-/// mutation like any other. This whole set is consulted only on a
-/// session socket, so listing it costs a UI nothing.
+/// selection, `sidebar.set_width`, `tab.dispatch_mouse_event`,
+/// `tab.feed_ime`) are not listed: they act on the UI rather than on the
+/// workspace a switch moves, and a session socket has no UI attached, so
+/// there they already fail with `internal: no UI attached`.
+/// `tab.feed_pty_bytes` is the exception — on a session it writes into
+/// the tab task's terminal, which is a mutation like any other — and so
+/// is `tab.send_file`, which pastes into a tab a switch is about to
+/// replay.
 ///
 /// Public because plan 063 §D10's forward arm asks the same question of
 /// the same set: a forwarded op that changes what the slot holds is the
@@ -1435,6 +1446,7 @@ pub fn is_mutating_op(op: &str) -> bool {
             | ops::TAB_WRITE
             | ops::TAB_RESIZE
             | ops::TAB_FOCUS
+            | ops::TAB_SEND_FILE
             | ops::TAB_SET_TITLE
             | ops::TAB_SET_STATE
             | ops::TAB_CLEAR_NOTIFICATION
@@ -1466,7 +1478,7 @@ pub fn is_mutating_op(op: &str) -> bool {
 }
 
 fn shutting_down() -> HandlerError {
-    HandlerError::new("shutting-down", "session is shutting down")
+    HandlerError::new(codes::SHUTTING_DOWN, "session is shutting down")
 }
 
 /// Glue between the JSON IPC server and the in-process workspace +
@@ -1508,6 +1520,26 @@ pub struct IpcHandler {
     /// session's — so `identify` on a session socket keeps answering
     /// exactly what it always has.
     local_route: Option<Arc<LocalBackendCell>>,
+    /// The admission gate a local-backend switch drains before it copies
+    /// anything (plan 067 §3.2) — `SessionState::barrier`'s protocol,
+    /// with the cell's switch phase as the latch. A mutation on an
+    /// in-process UI socket holds a read guard from its re-check of
+    /// `local_route` until its reply is built ([`admit_mutation`]); the
+    /// switch stores its phase, then takes the write guard and drops it
+    /// at once, and snapshots only after that.
+    ///
+    /// Why that is enough: a mutation that re-checked before the store
+    /// still holds its read guard, so the drain — and the snapshot behind
+    /// it — waits for it; one that re-checks after the store sees the
+    /// phase and answers `busy`. Nothing deadlocks: the write guard is
+    /// held for no time, the UI thread never waits on it, and the
+    /// switch's own work never goes through `dispatch` (its replay goes
+    /// through `HostOps`, its teardown through `LocalClient`). `tokio`'s
+    /// lock is write-preferring, so a stream of mutations cannot starve
+    /// the drain.
+    switch_gate: Arc<tokio::sync::RwLock<()>>,
+    #[cfg(test)]
+    admission_pause: Option<AdmissionPause>,
     /// Whether the UI driving this socket was launched with
     /// `ROOST_TEST_MODE=1`, passed in for the reason
     /// [`SessionInfo::test_mode`] is. A session reads its own from there.
@@ -1539,6 +1571,9 @@ impl IpcHandler {
             agent_hooks: None,
             files: None,
             local_route: None,
+            switch_gate: Arc::default(),
+            #[cfg(test)]
+            admission_pause: None,
             test_mode: false,
             instance_id: mint_instance_id(),
         }
@@ -1642,6 +1677,12 @@ impl IpcHandler {
         Arc::clone(&self.in_process_streams)
     }
 
+    /// The gate a switch drains, for the UI to take once, after it has
+    /// stored the phase: `write().await`, then drop the guard.
+    pub fn switch_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
+        Arc::clone(&self.switch_gate)
+    }
+
     /// Register an in-process stream, or refuse it with what the route
     /// says now.
     ///
@@ -1655,12 +1696,7 @@ impl IpcHandler {
         let mut subscribers = lock(&self.in_process_streams.subscribers);
         let route = self.local_route();
         served_in_process(&route)?;
-        if route.switch.is_some() {
-            return Err(HandlerError::new(
-                roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
-                roost_ipc::local_route::SWITCH_BUSY,
-            ));
-        }
+        refuse_mid_switch(&route)?;
         subscribers.retain(Subscriber::is_live);
         subscribers.push(Subscriber {
             conn_id: ctx.conn_id,
@@ -1720,13 +1756,13 @@ impl IpcHandler {
         let tx = self
             .ui_tx
             .as_ref()
-            .ok_or_else(|| HandlerError::new("internal", "no UI attached"))?;
+            .ok_or_else(|| HandlerError::new(codes::INTERNAL, "no UI attached"))?;
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         tx.send(make(reply_tx))
-            .map_err(|_| HandlerError::new("internal", "UI gone"))?;
+            .map_err(|_| HandlerError::new(codes::INTERNAL, "UI gone"))?;
         reply_rx
             .await
-            .map_err(|_| HandlerError::new("internal", "UI dropped reply"))
+            .map_err(|_| HandlerError::new(codes::INTERNAL, "UI dropped reply"))
     }
 }
 
@@ -1760,7 +1796,7 @@ impl Handler for IpcHandler {
 
     /// A data connection is a session's business only. Without a
     /// [`SessionState`] this is a UI socket, and the answer is the same
-    /// "not-supported" the trait's default gives — restated here rather
+    /// `not-supported` the trait's default gives — restated here rather
     /// than delegated because overriding the method takes the default
     /// off the table.
     #[cfg(feature = "server-vt")]
@@ -1774,7 +1810,7 @@ impl Handler for IpcHandler {
             if self.session.is_none() {
                 crate::attach::refuse(
                     conn,
-                    "not-supported",
+                    codes::NOT_SUPPORTED,
                     "this socket does not serve attach data connections",
                 )
                 .await;
@@ -1812,7 +1848,7 @@ impl IpcHandler {
     ) -> Result<AdmittedAttach, HandlerError> {
         let session = self.session.as_ref().ok_or_else(|| {
             HandlerError::new(
-                "not-supported",
+                codes::NOT_SUPPORTED,
                 "this socket does not serve attach data connections",
             )
         })?;
@@ -1825,7 +1861,7 @@ impl IpcHandler {
         // and be served a tab nobody asked for.
         if terms.session_id != session.info.session_id {
             return Err(HandlerError::new(
-                "session-mismatch",
+                codes::SESSION_MISMATCH,
                 format!(
                     "this session is {:?}; the client attached to {:?}",
                     session.info.session_id, terms.session_id
@@ -1908,7 +1944,7 @@ pub(crate) fn tab_gone(tab_id: i64) -> HandlerError {
 /// worded to be true of both.
 fn no_server_vt() -> HandlerError {
     HandlerError::new(
-        "unsupported-kind",
+        codes::UNSUPPORTED_KIND,
         "this session has no server-VT data plane",
     )
 }
@@ -1944,7 +1980,7 @@ fn tab_err(e: crate::tab_task::TabError) -> HandlerError {
     match e {
         TabError::Gone | TabError::RingMiss { .. } => HandlerError::not_found(e.to_string()),
         TabError::SnapshotFailed(_) | TabError::Render(_) | TabError::WinsizeFailed(_) => {
-            HandlerError::new("internal", e.to_string())
+            HandlerError::new(codes::INTERNAL, e.to_string())
         }
     }
 }
@@ -1971,8 +2007,8 @@ pub(crate) fn attach_resize_refusal(
 ) -> HandlerError {
     use crate::tab_task::TabError;
     let code = match error {
-        TabError::WinsizeFailed(_) => "internal",
-        _ => "invalid-param",
+        TabError::WinsizeFailed(_) => codes::INTERNAL,
+        _ => codes::INVALID_PARAM,
     };
     HandlerError::new(
         code,
@@ -1989,7 +2025,7 @@ fn session_test_mode(h: &IpcHandler) -> Result<(), HandlerError> {
         return Ok(());
     }
     Err(HandlerError::new(
-        "not-enabled",
+        codes::NOT_ENABLED,
         "this op requires the session to have been started with ROOST_TEST_MODE=1",
     ))
 }
@@ -2465,7 +2501,7 @@ fn negotiate_kind(
         .collect();
     if servable.is_empty() {
         return Err(HandlerError::new(
-            "unsupported-kind",
+            codes::UNSUPPORTED_KIND,
             format!(
                 "this session serves {:?}; the client offered {kinds:?}",
                 info.payload_kinds
@@ -2488,7 +2524,7 @@ fn negotiate_kind(
             // served GHOSTSNP under another name.
             other => {
                 return Err(HandlerError::new(
-                    "internal",
+                    codes::INTERNAL,
                     format!("this session advertises {other:?}, which it cannot serve"),
                 ))
             }
@@ -2502,7 +2538,7 @@ fn negotiate_kind(
     // "mismatch" cannot tell which side to upgrade.
     eligible.ok_or_else(|| {
         HandlerError::new(
-            "build-mismatch",
+            codes::BUILD_MISMATCH,
             format!(
                 "this session is {:?}; the client is {libghostty_build:?}",
                 info.libghostty_build
@@ -2580,7 +2616,7 @@ async fn session_set_agent_hooks(
 ) -> Result<serde_json::Value, HandlerError> {
     let handle = h.agent_hooks.as_ref().ok_or_else(|| {
         HandlerError::new(
-            "not-supported",
+            codes::NOT_SUPPORTED,
             "this session cannot wire agent hooks: it was built without an install backend",
         )
     })?;
@@ -2591,8 +2627,8 @@ async fn session_set_agent_hooks(
         })
         .await
         .map_err(|error| match error {
-            AgentHooksError::InvalidParam(message) => HandlerError::new("invalid-param", message),
-            AgentHooksError::Failed(message) => HandlerError::new("internal", message),
+            AgentHooksError::InvalidParam(message) => HandlerError::invalid_param(message),
+            AgentHooksError::Failed(message) => HandlerError::new(codes::INTERNAL, message),
         })?;
     encode(&result)
 }
@@ -2612,7 +2648,7 @@ async fn session_put_file(
 ) -> Result<serde_json::Value, HandlerError> {
     let store = h.files.clone().ok_or_else(|| {
         HandlerError::new(
-            "not-supported",
+            codes::NOT_SUPPORTED,
             "this session cannot receive files: it was built without a file store",
         )
     })?;
@@ -2626,7 +2662,9 @@ async fn session_put_file(
     let SessionPutFileParams { name, data, .. } = p;
     let path = tokio::task::spawn_blocking(move || store.put(&name, &data))
         .await
-        .map_err(|error| HandlerError::new("internal", format!("the upload failed: {error}")))??;
+        .map_err(|error| {
+            HandlerError::new(codes::INTERNAL, format!("the upload failed: {error}"))
+        })??;
 
     encode(&SessionPutFileResult {
         // Lossy is not a repair here: the root came from a session that
@@ -2659,7 +2697,7 @@ fn put_file_size_guard(params: &serde_json::Value) -> Result<(), HandlerError> {
 
 fn too_large() -> HandlerError {
     HandlerError::new(
-        "too-large",
+        codes::TOO_LARGE,
         format!(
             "this file is over the {} byte cap on one upload",
             MAX_PUT_FILE_BYTES
@@ -2765,7 +2803,7 @@ fn resume_cut(
     if let Some(named) = &params.session_id {
         if *named != session.info.session_id {
             return Err(HandlerError::new(
-                "session-mismatch",
+                codes::SESSION_MISMATCH,
                 format!(
                     "this is session {}, not {named}: revisions restart with the process, so a \
                      fence from another incarnation cannot be resumed; snapshot with tab.list and \
@@ -2788,7 +2826,7 @@ fn resume_cut(
         .subscribe_from(from_revision)
         .map_err(|err| match err {
             ResumeError::Ahead { current } => HandlerError::new(
-                "revision-ahead",
+                codes::REVISION_AHEAD,
                 format!(
                     "this session never produced revision {from_revision} (current: {current}): a \
                  different incarnation, or a client bug; compare session.identify.session_id, \
@@ -2799,7 +2837,7 @@ fn resume_cut(
                 oldest_resumable_from,
                 current,
             } => HandlerError::new(
-                "replay-expired",
+                codes::REPLAY_EXPIRED,
                 format!(
                     "revision {from_revision} is outside the replay window (oldest resumable: \
                  {oldest_resumable_from}, current: {current}); snapshot with tab.list and \
@@ -2909,10 +2947,74 @@ fn served_in_process(route: &LocalRoute) -> Result<(), HandlerError> {
     match route.mode {
         LocalBackendMode::InProcess => Ok(()),
         LocalBackendMode::Session => Err(HandlerError::new(
-            "not-implemented",
+            codes::NOT_IMPLEMENTED,
             "events.subscribe is not served by a UI socket under local-backend = session; \
              for its tabs' events, dial identify.local_session_socket",
         )),
+    }
+}
+
+/// [`IpcHandler::switch_gate`] for one op: the route to dispatch it
+/// under, and — for a gated mutation — the read guard to hold until its
+/// reply is built.
+///
+/// The route handed back is the one re-loaded under the guard, never the
+/// one read before it: routing a mutation by a mode the gate did not
+/// check would let it land in a workspace the switch has since hidden.
+/// Reads never touch the gate, and neither does a handler with no route
+/// cell (a session daemon, which has its own stop latch) or a route under
+/// `session`, whose mutations leave through the forward arm, which
+/// refuses them itself.
+async fn admit_mutation(
+    h: &IpcHandler,
+    op: &str,
+) -> Result<(Arc<LocalRoute>, Option<OwnedRwLockReadGuard<()>>), HandlerError> {
+    let before = h.local_route();
+    if h.local_route.is_none() || before.mode != LocalBackendMode::InProcess || !is_mutating_op(op)
+    {
+        return Ok((before, None));
+    }
+    // Before the lock as well as under it: the lock is write-preferring,
+    // so a mutation reaching it while a drain waits would queue there
+    // rather than be refused.
+    refuse_mid_switch(&before)?;
+    let admitted = Arc::clone(&h.switch_gate).read_owned().await;
+    #[cfg(test)]
+    if let Some(pause) = &h.admission_pause {
+        pause.hold().await;
+    }
+    let route = h.local_route();
+    if route.mode == LocalBackendMode::InProcess {
+        refuse_mid_switch(&route)?;
+    }
+    Ok((route, Some(admitted)))
+}
+
+fn refuse_mid_switch(route: &LocalRoute) -> Result<(), HandlerError> {
+    if route.switch.is_some() {
+        return Err(HandlerError::new(
+            codes::BUSY,
+            roost_ipc::local_route::SWITCH_BUSY_MESSAGE,
+        ));
+    }
+    Ok(())
+}
+
+/// A test's hold on [`admit_mutation`] between taking the read guard and
+/// re-loading the route: the window a mutation crossing the switch's
+/// store lives in.
+#[cfg(test)]
+#[derive(Default)]
+struct AdmissionPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl AdmissionPause {
+    async fn hold(&self) {
+        self.reached.notify_one();
+        self.release.notified().await;
     }
 }
 
@@ -3003,16 +3105,44 @@ async fn forward_to_local_session(
     h: &IpcHandler,
     op: &str,
     params: serde_json::Value,
+    expected_host: Option<u32>,
 ) -> Result<serde_json::Value, HandlerError> {
     let mut reply = h
         .ui_call(|reply| UiRequest::LocalSessionForward {
             op: op.to_string(),
             params,
+            expected_host,
             reply,
         })
         .await??;
     strip_ui_socket_fence(op, &mut reply);
     Ok(reply)
+}
+
+/// The slot tab a `tab.dump` names, as `(incarnation, the session's own
+/// id)`, when it names one on the slot this route is connected to.
+fn slot_tab(route: &LocalRoute, tab: WireTabRef) -> Option<(u32, i64)> {
+    match tab {
+        WireTabRef::Host { host, tab } if route.slot_host == Some(host) => Some((host, tab)),
+        _ => None,
+    }
+}
+
+/// #511: the app keeps a terminal only for the slot tab it has shown,
+/// and the session answers for every tab it runs, watched or not. The
+/// id goes bare because a session refuses the `h<n>.<id>` form
+/// ([`bare_tab`]).
+async fn dump_on_the_slot(
+    h: &IpcHandler,
+    host: u32,
+    tab: i64,
+    scrollback: u32,
+) -> Result<serde_json::Value, HandlerError> {
+    let params = encode(&TabDumpParams {
+        tab_id: WireTabRef::Local(tab),
+        scrollback,
+    })?;
+    forward_to_local_session(h, ops::TAB_DUMP, params, Some(host)).await
 }
 
 /// Take the session's `revision` back off a forwarded reply.
@@ -3046,11 +3176,11 @@ async fn dispatch(
     // own route parser below exactly as it does under `in-process`.
     // That is why this runs per-op off the table rather than as one
     // "session mode ⇒ forward" test.
-    let route = h.local_route();
+    let (route, _admitted) = admit_mutation(h, op).await?;
     let params = if route.mode == LocalBackendMode::Session {
         match roost_ipc::local_route::classify(op) {
             Some(roost_ipc::OpClass::Forward) => {
-                return forward_to_local_session(h, op, params).await;
+                return forward_to_local_session(h, op, params, None).await;
             }
             Some(roost_ipc::OpClass::Rewrite(ids)) => {
                 let mut params = params;
@@ -3100,14 +3230,15 @@ async fn dispatch(
         }
         ops::TAB_OPEN => {
             let p: TabOpenParams = decode(params)?;
+            let activate = p.activate != Some(false);
             let project_id = if p.project_id == 0 {
-                h.workspace.ensure_default_project(&p.cwd)
+                h.workspace.ensure_default_project(&p.cwd, activate)
             } else {
                 p.project_id
             };
             let tab = h
                 .workspace
-                .open_tab(project_id, &p.cwd, &p.title)
+                .open_tab(project_id, &p.cwd, &p.title, activate)
                 .map_err(ws_err)?;
             // Spawn the PTY. Use the tab's cwd, the requested argv,
             // and a sensible default winsize when the caller doesn't
@@ -3141,7 +3272,7 @@ async fn dispatch(
             )
             .map_err(|err| match err.downcast_ref::<PtyError>() {
                 Some(pty) => pty_err(pty),
-                None => HandlerError::new("internal", format!("pty spawn failed: {err}")),
+                None => HandlerError::new(codes::INTERNAL, format!("pty spawn failed: {err}")),
             })?;
             encode(&TabOpenResult { tab })
         }
@@ -3191,14 +3322,21 @@ async fn dispatch(
             let scrollback = p.scrollback.min(MAX_DUMP_SCROLLBACK);
             let data = match served::dump(h, p.tab_id, scrollback).await {
                 Some(served) => served?,
-                None => h
-                    .ui_call(|reply| UiRequest::Dump {
-                        tab_id: p.tab_id,
-                        scrollback,
-                        reply,
-                    })
-                    .await?
-                    .map_err(dump_err)?,
+                None => {
+                    let dumped = h
+                        .ui_call(|reply| UiRequest::Dump {
+                            tab_id: p.tab_id,
+                            scrollback,
+                            reply,
+                        })
+                        .await?;
+                    if let (Err(DumpError::NoTab(_)), Some((host, tab))) =
+                        (&dumped, slot_tab(&route, p.tab_id))
+                    {
+                        return dump_on_the_slot(h, host, tab, scrollback).await;
+                    }
+                    dumped.map_err(dump_err)?
+                }
             };
             encode(&TabDumpResult {
                 cols: data.cols,
@@ -3425,7 +3563,7 @@ async fn dispatch(
                     reply,
                 })
                 .await?
-                .map_err(|m| HandlerError::new("internal", m))?;
+                .map_err(|m| HandlerError::new(codes::INTERNAL, m))?;
             // Preflight the 16 MiB IPC frame cap: the response rides one
             // newline-delimited JSON frame, and `png` dominates it once
             // base64-expanded (~4/3). Fail with a structured error here
@@ -3444,7 +3582,7 @@ async fn dispatch(
             let result = h
                 .ui_call(|reply| UiRequest::WindowMetrics { reply })
                 .await?
-                .map_err(|m| HandlerError::new("internal", m))?;
+                .map_err(|m| HandlerError::new(codes::INTERNAL, m))?;
             encode(&result)
         }
         ops::APP_RENDER_STATS => {
@@ -3455,7 +3593,7 @@ async fn dispatch(
                     reply,
                 })
                 .await?
-                .map_err(|m| HandlerError::new("internal", m))?;
+                .map_err(|m| HandlerError::new(codes::INTERNAL, m))?;
             encode(&result)
         }
         ops::SIDEBAR_DUMP => {
@@ -3463,7 +3601,7 @@ async fn dispatch(
             let result = h
                 .ui_call(|reply| UiRequest::SidebarDump { reply })
                 .await?
-                .map_err(|m| HandlerError::new("internal", m))?;
+                .map_err(|m| HandlerError::new(codes::INTERNAL, m))?;
             encode(&result)
         }
         ops::PALETTE_OPEN => {
@@ -3593,7 +3731,7 @@ async fn dispatch(
             let text = h
                 .ui_call(|reply| UiRequest::ClipboardDump { target, reply })
                 .await?
-                .map_err(|e| HandlerError::new("internal", e))?;
+                .map_err(|e| HandlerError::new(codes::INTERNAL, e))?;
             encode(&ClipboardDumpResult { text })
         }
         ops::CLIPBOARD_WRITE => {
@@ -3604,8 +3742,7 @@ async fn dispatch(
             // preferring `text` would drop an image the caller believed
             // it had written.
             if p.text.is_some() && p.image_png.is_some() {
-                return Err(HandlerError::new(
-                    "invalid-param",
+                return Err(HandlerError::invalid_param(
                     "clipboard.write takes `text` or `image_png`, not both",
                 ));
             }
@@ -3616,8 +3753,7 @@ async fn dispatch(
                 // reads. Refused here rather than in the UI so the
                 // headless dispatcher answers it too.
                 if target != ClipboardOp::System {
-                    return Err(HandlerError::new(
-                        "invalid-param",
+                    return Err(HandlerError::invalid_param(
                         "clipboard.write `image_png` requires target \"system\"",
                     ));
                 }
@@ -3626,7 +3762,7 @@ async fn dispatch(
                 return Ok(serde_json::json!({}));
             }
             let text = p.text.ok_or_else(|| {
-                HandlerError::new("missing-param", "clipboard.write requires `text`")
+                HandlerError::new(codes::MISSING_PARAM, "clipboard.write requires `text`")
             })?;
             // Fire-and-forget — matches the `app.activate` pattern.
             // Headless handler / dropped receiver: no-op.
@@ -3668,10 +3804,10 @@ async fn dispatch(
         ops::TAB_EXPAND_SELECTION_AT => {
             let p: TabExpandSelectionAtParams = decode(params)?;
             if p.click_count < 2 {
-                return Err(HandlerError::new(
-                    "invalid-param",
-                    format!("click_count must be >= 2 (got {})", p.click_count),
-                ));
+                return Err(HandlerError::invalid_param(format!(
+                    "click_count must be >= 2 (got {})",
+                    p.click_count
+                )));
             }
             let data = h
                 .ui_call(|reply| UiRequest::TabExpandSelectionAt {
@@ -3843,7 +3979,7 @@ async fn dispatch(
             let shape = h
                 .ui_call(|reply| UiRequest::AppCursorShape { reply })
                 .await?
-                .map_err(|e| HandlerError::new("internal", e))?;
+                .map_err(|e| HandlerError::new(codes::INTERNAL, e))?;
             encode(&AppCursorShapeResult { shape })
         }
         ops::APP_ACTIVE_TERMINAL_FOCUSED => {
@@ -3851,7 +3987,7 @@ async fn dispatch(
             let focused = h
                 .ui_call(|reply| UiRequest::AppActiveTerminalFocused { reply })
                 .await?
-                .map_err(|e| HandlerError::new("internal", e))?;
+                .map_err(|e| HandlerError::new(codes::INTERNAL, e))?;
             encode(&AppActiveTerminalFocusedResult { focused })
         }
         ops::APP_SELECTED_TAB_ID => {
@@ -3859,7 +3995,7 @@ async fn dispatch(
             let tab_id = h
                 .ui_call(|reply| UiRequest::AppSelectedTabId { reply })
                 .await?
-                .map_err(|e| HandlerError::new("internal", e))?;
+                .map_err(|e| HandlerError::new(codes::INTERNAL, e))?;
             encode(&AppSelectedTabIdResult { tab_id })
         }
         ops::APP_DOCK_BADGE => {
@@ -4248,9 +4384,9 @@ fn decode<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T,
         // "missing field `foo` at line ..." form.
         let msg = e.to_string();
         if msg.contains("unknown field") {
-            HandlerError::new("unknown-field", msg)
+            HandlerError::new(codes::UNKNOWN_FIELD, msg)
         } else if msg.contains("missing field") {
-            HandlerError::new("missing-param", msg)
+            HandlerError::new(codes::MISSING_PARAM, msg)
         } else {
             HandlerError::invalid_param(msg)
         }
@@ -4258,7 +4394,7 @@ fn decode<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T,
 }
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<serde_json::Value, HandlerError> {
-    serde_json::to_value(value).map_err(|e| HandlerError::new("internal", e.to_string()))
+    serde_json::to_value(value).map_err(|e| HandlerError::new(codes::INTERNAL, e.to_string()))
 }
 
 /// Format an (r,g,b) triple as `#RRGGBB` for the
@@ -4296,7 +4432,7 @@ fn rgb_hex(c: (u8, u8, u8)) -> String {
 /// error is the right move when the arms keep growing.
 fn map_test_op_err(err: String) -> HandlerError {
     if err.contains("ROOST_TEST_MODE") {
-        HandlerError::new("not-enabled", err)
+        HandlerError::new(codes::NOT_ENABLED, err)
     } else if err.contains("has no live terminal") || err.contains("no word/line span") {
         HandlerError::not_found(err)
     } else if err.contains("is not the active terminal")
@@ -4309,9 +4445,9 @@ fn map_test_op_err(err: String) -> HandlerError {
     {
         HandlerError::invalid_param(err)
     } else if err.contains("not supported on this UI") {
-        HandlerError::new("not-implemented", err)
+        HandlerError::new(codes::NOT_IMPLEMENTED, err)
     } else {
-        HandlerError::new("internal", err)
+        HandlerError::new(codes::INTERNAL, err)
     }
 }
 
@@ -4323,7 +4459,7 @@ fn screenshot_frame_guard(png_len: usize) -> Result<(), HandlerError> {
     let encoded = png_len.div_ceil(3) * 4;
     if encoded + ENVELOPE_MARGIN > roost_ipc::MAX_FRAME_BYTES {
         return Err(HandlerError::new(
-            "internal",
+            codes::INTERNAL,
             format!(
                 "screenshot too large: {encoded} base64 bytes exceeds the {} byte IPC frame cap (try --scale 1)",
                 roost_ipc::MAX_FRAME_BYTES
@@ -4341,7 +4477,7 @@ fn ws_err(e: WorkspaceError) -> HandlerError {
         }
         WorkspaceError::TabProjectMismatch { .. } => HandlerError::invalid_param(e.to_string()),
         WorkspaceError::Io(_) | WorkspaceError::Json(_) | WorkspaceError::Inconsistent(_) => {
-            HandlerError::new("internal", e.to_string())
+            HandlerError::new(codes::INTERNAL, e.to_string())
         }
         WorkspaceError::HostNotFound(_) => HandlerError::not_found(e.to_string()),
         WorkspaceError::HostLabelEmpty
@@ -4358,7 +4494,7 @@ fn ws_err(e: WorkspaceError) -> HandlerError {
 fn dump_err(e: DumpError) -> HandlerError {
     match e {
         DumpError::NoTab(msg) => HandlerError::not_found(msg),
-        DumpError::Read(msg) => HandlerError::new("internal", msg),
+        DumpError::Read(msg) => HandlerError::new(codes::INTERNAL, msg),
     }
 }
 
@@ -4368,7 +4504,7 @@ fn pty_err(e: &PtyError) -> HandlerError {
             HandlerError::not_found(e.to_string())
         }
         PtyError::DuplicateTab(_) => HandlerError::invalid_param(e.to_string()),
-        PtyError::ShuttingDown(_) => HandlerError::new("shutting-down", e.to_string()),
+        PtyError::ShuttingDown(_) => HandlerError::new(codes::SHUTTING_DOWN, e.to_string()),
     }
 }
 
@@ -4705,7 +4841,7 @@ mod tests {
         let workspace = Arc::new(Workspace::open(dir.join("state.json")));
         let project = workspace.create_project("p", "/tmp").expect("project");
         workspace
-            .open_tab(project.id, "/tmp", "t")
+            .open_tab(project.id, "/tmp", "t", true)
             .expect("open a tab");
         assert_ne!(workspace.active(), (0, 0), "the fixture needs a selection");
         IpcHandler::new(
@@ -4908,6 +5044,76 @@ mod tests {
             before,
             "the forward must not have created a project here"
         );
+    }
+
+    /// Hangs up every tab it holds when dropped, a failed assertion
+    /// included: the runtime otherwise waits out each child on the way
+    /// down.
+    struct HangUp(Arc<PtySupervisor>, Vec<i64>);
+
+    impl Drop for HangUp {
+        fn drop(&mut self) {
+            for tab in &self.1 {
+                self.0.close(*tab);
+            }
+        }
+    }
+
+    /// `tab.open`'s `activate` as the served arm reads it (#503): absent
+    /// and `true` select the new tab, `false` does not — and `false`
+    /// reaches the default-project step as well as the open.
+    #[tokio::test]
+    async fn tab_open_selects_unless_activate_is_false() {
+        async fn open(
+            h: &IpcHandler,
+            opened: &mut HangUp,
+            mut params: serde_json::Value,
+            activate: Option<bool>,
+        ) -> (roost_ipc::messages::Tab, bool) {
+            params["argv"] = serde_json::json!(["/bin/sh", "-c", "exec sleep 60"]);
+            if let Some(activate) = activate {
+                params["activate"] = activate.into();
+            }
+            let mut events = h.workspace.subscribe();
+            let result = dispatch(h, ops::TAB_OPEN, params).await.expect("tab.open");
+            let TabOpenResult { tab } = serde_json::from_value(result).expect("a tab");
+            opened.1.push(tab.id);
+            let moved = std::iter::from_fn(|| events.try_recv().ok())
+                .any(|event| matches!(event, crate::WorkspaceEvent::ActiveChanged { .. }));
+            (tab, moved)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path());
+        let mut opened = HangUp(h.supervisor.clone(), Vec::new());
+        let project = h.workspace.snapshot()[0].id;
+        for activate in [None, Some(true), Some(false)] {
+            let before = h.workspace.active();
+            let params = serde_json::json!({"project_id": project.to_string()});
+            let (tab, moved) = open(&h, &mut opened, params, activate).await;
+            if activate == Some(false) {
+                assert_eq!(h.workspace.active(), before, "{activate:?}");
+                assert!(!tab.is_active && !moved, "{activate:?}");
+            } else {
+                assert_eq!(h.workspace.active(), (project, tab.id), "{activate:?}");
+                assert!(tab.is_active && moved, "{activate:?}");
+            }
+        }
+
+        let empty = tempfile::tempdir().unwrap();
+        let bare = IpcHandler::new(
+            Arc::new(Workspace::open(empty.path().join("state.json"))),
+            Arc::new(PtySupervisor::new()),
+            empty.path().join("roost.sock"),
+            "Roost-test",
+            "ai.stridelabs.Roost.test",
+        );
+        let mut bare_opened = HangUp(bare.supervisor.clone(), Vec::new());
+        let params = serde_json::json!({"project_id": "0"});
+        let (tab, moved) = open(&bare, &mut bare_opened, params, Some(false)).await;
+        assert_eq!(bare.workspace.snapshot().len(), 1, "the default project");
+        assert_eq!(bare.workspace.active(), (0, 0));
+        assert!(!tab.is_active && !moved);
     }
 
     /// `project.create`'s twin, and the same assertion: nothing lands in
@@ -5693,6 +5899,149 @@ mod tests {
         assert_eq!(listed, serde_json::json!({"projects": []}));
     }
 
+    // ── #511: a `tab.dump` the app cannot answer, on the slot ────────
+
+    /// What a fake app was asked: the refs its terminals were dumped for,
+    /// and every forward that followed, as `(op, params, expected_host)`.
+    #[derive(Default)]
+    struct DumpAsks {
+        dumped: Vec<WireTabRef>,
+        forwarded: Vec<(String, serde_json::Value, Option<u32>)>,
+    }
+
+    /// An app that answers every `tab.dump` with `app`'s refusal and every
+    /// forward with `slot`.
+    fn dump_app(
+        h: IpcHandler,
+        app: fn(WireTabRef) -> DumpError,
+        slot: Result<serde_json::Value, HostOpFailure>,
+    ) -> (IpcHandler, Arc<std::sync::Mutex<DumpAsks>>) {
+        let (h, mut ui) = with_a_ui(h);
+        let asks = Arc::new(std::sync::Mutex::new(DumpAsks::default()));
+        let seen = Arc::clone(&asks);
+        tokio::spawn(async move {
+            while let Some(request) = ui.recv().await {
+                match request {
+                    UiRequest::Dump { tab_id, reply, .. } => {
+                        seen.lock().unwrap().dumped.push(tab_id);
+                        let _ = reply.send(Err(app(tab_id)));
+                    }
+                    UiRequest::LocalSessionForward {
+                        op,
+                        params,
+                        expected_host,
+                        reply,
+                    } => {
+                        seen.lock()
+                            .unwrap()
+                            .forwarded
+                            .push((op, params, expected_host));
+                        let _ = reply.send(slot.clone());
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (h, asks)
+    }
+
+    fn no_terminal(tab: WireTabRef) -> DumpError {
+        DumpError::NoTab(format!("tab {tab} has no live terminal"))
+    }
+
+    /// The app is asked first; a slot tab it has no terminal for goes to
+    /// the session under the session's own bare id, addressed to the
+    /// incarnation the ref named, and the session's reply is the answer.
+    #[tokio::test]
+    async fn a_slot_tab_the_app_has_no_terminal_for_is_dumped_by_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = serde_json::json!({"cols": 80, "rows": 1, "rows_text": ["$ on the session"]});
+        let (h, asks) = dump_app(
+            forwarding_handler(dir.path(), Some(2)),
+            no_terminal,
+            Ok(rows.clone()),
+        );
+
+        for tab_id in ["7", "h2.7"] {
+            let dumped = dispatch(
+                &h,
+                ops::TAB_DUMP,
+                serde_json::json!({"tab_id": tab_id, "scrollback": 50}),
+            )
+            .await
+            .expect("the session answered");
+            assert_eq!(dumped, rows, "{tab_id}");
+        }
+
+        let asks = asks.lock().unwrap();
+        assert_eq!(asks.dumped, [WireTabRef::Host { host: 2, tab: 7 }; 2]);
+        let forwarded = (
+            ops::TAB_DUMP.to_string(),
+            serde_json::json!({"tab_id": "7", "scrollback": 50}),
+            Some(2),
+        );
+        assert_eq!(asks.forwarded, [forwarded.clone(), forwarded]);
+    }
+
+    /// Only the slot's tabs: `h9` is some other host, which the slot's
+    /// session has never heard of, and in-process there is no slot.
+    #[tokio::test]
+    async fn a_tab_on_no_connected_slot_stays_not_found() {
+        let session = tempfile::tempdir().unwrap();
+        let in_process = tempfile::tempdir().unwrap();
+        for (h, tab_id) in [
+            (forwarding_handler(session.path(), Some(2)), "h9.7"),
+            (identify_handler(in_process.path()), "h2.7"),
+        ] {
+            let (h, asks) = dump_app(h, no_terminal, Ok(serde_json::json!({})));
+            let error = dispatch(&h, ops::TAB_DUMP, serde_json::json!({"tab_id": tab_id}))
+                .await
+                .expect_err("no terminal, and no slot to ask");
+            assert_eq!(error.code, "not-found", "{tab_id}: {error:?}");
+            assert_eq!(error.message, format!("tab {tab_id} has no live terminal"));
+            assert!(asks.lock().unwrap().forwarded.is_empty(), "{tab_id}");
+        }
+    }
+
+    /// A terminal that is there but failed to read is the app's own
+    /// failure, not a tab the session should be asked for.
+    #[tokio::test]
+    async fn a_dump_whose_read_failed_stays_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, asks) = dump_app(
+            forwarding_handler(dir.path(), Some(2)),
+            |_| DumpError::Read("read scrollback rows: vt error".into()),
+            Ok(serde_json::json!({})),
+        );
+        let error = dispatch(&h, ops::TAB_DUMP, serde_json::json!({"tab_id": "7"}))
+            .await
+            .expect_err("the read failed");
+        assert_eq!(error.code, "internal", "{error:?}");
+        assert_eq!(error.message, "read scrollback rows: vt error");
+        assert_eq!(asks.lock().unwrap().dumped.len(), 1);
+        assert!(asks.lock().unwrap().forwarded.is_empty());
+    }
+
+    /// The session's refusal crosses verbatim, including a code this
+    /// socket never mints on its own.
+    #[tokio::test]
+    async fn a_forwarded_dump_answers_with_the_sessions_own_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, _asks) = dump_app(
+            forwarding_handler(dir.path(), Some(2)),
+            no_terminal,
+            Err(HostOpFailure::new(
+                codes::SHUTTING_DOWN,
+                "session is shutting down",
+            )),
+        );
+        let error = dispatch(&h, ops::TAB_DUMP, serde_json::json!({"tab_id": "7"}))
+            .await
+            .expect_err("the session refused");
+        assert_eq!(error.code, "shutting-down", "{error:?}");
+        assert_eq!(error.message, "session is shutting down");
+    }
+
     #[tokio::test]
     async fn a_ui_socket_refuses_what_its_stream_cannot_be() {
         let dir = tempfile::tempdir().unwrap();
@@ -5759,24 +6108,154 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_subscribe_during_a_switch_is_refused_busy() {
         let dir = tempfile::tempdir().unwrap();
-        let h = identify_handler(dir.path()).with_local_route(Arc::new(LocalBackendCell::new(
+        let (h, _) = gated_handler(
+            dir.path(),
             LocalRoute {
                 switch: Some("preparing"),
                 ..LocalRoute::default()
             },
-        )));
-        let refused = refusal_of(&h, serde_json::json!({})).await;
-        assert_eq!(
-            (refused.code.as_str(), refused.message.as_str()),
-            (
-                roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
-                roost_ipc::local_route::SWITCH_BUSY
-            )
         );
+        assert_busy(&refusal_of(&h, serde_json::json!({})).await);
         assert_eq!(h.in_process_streams().count(), 0);
         wait_for("the refused relay to let go", || {
             h.workspace.versioned_receiver_count() == 0
         })
         .await;
+    }
+
+    // ── plan 067 §3.2: the admission gate ───────────────────────────
+
+    fn gated_handler(dir: &Path, route: LocalRoute) -> (IpcHandler, Arc<LocalBackendCell>) {
+        let cell = Arc::new(LocalBackendCell::new(route));
+        let h = identify_handler(dir).with_local_route(Arc::clone(&cell));
+        (h, cell)
+    }
+
+    fn create(name: &str) -> serde_json::Value {
+        serde_json::json!({"name": name, "cwd": "/tmp"})
+    }
+
+    fn assert_busy(error: &HandlerError) {
+        assert_eq!(
+            (error.code.as_str(), error.message.as_str()),
+            (codes::BUSY, roost_ipc::local_route::SWITCH_BUSY_MESSAGE)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_switch_in_flight_refuses_a_mutation_busy_and_still_answers_a_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, cell) = gated_handler(
+            dir.path(),
+            LocalRoute {
+                switch: Some("preparing"),
+                ..LocalRoute::default()
+            },
+        );
+        let before = h.workspace.snapshot();
+
+        let refused = dispatch(&h, ops::PROJECT_CREATE, create("ghost"))
+            .await
+            .expect_err("a switch is in flight");
+        assert_busy(&refused);
+        assert_eq!(h.workspace.snapshot(), before, "the refusal landed nothing");
+        dispatch(&h, ops::TAB_LIST, serde_json::json!({}))
+            .await
+            .expect("a read never touches the gate");
+
+        cell.store(LocalRoute::default());
+        dispatch(&h, ops::PROJECT_CREATE, create("real"))
+            .await
+            .expect("with no phase the create lands");
+        dispatch(&h, ops::TAB_LIST, serde_json::json!({}))
+            .await
+            .expect("and the read still answers");
+        assert_eq!(h.workspace.snapshot().len(), before.len() + 1);
+    }
+
+    #[tokio::test]
+    async fn under_session_a_switch_leaves_the_answer_to_the_forward_arm() {
+        let dir = tempfile::tempdir().unwrap();
+        let idle = LocalRoute {
+            mode: LocalBackendMode::Session,
+            slot_host: Some(2),
+            ..LocalRoute::default()
+        };
+        let (h, cell) = gated_handler(dir.path(), idle.clone());
+        async fn answers(h: &IpcHandler) -> Vec<(String, String)> {
+            let mut answers = Vec::new();
+            for (op, params) in [
+                (ops::PROJECT_CREATE, create("ghost")),
+                (ops::TAB_LIST, serde_json::json!({})),
+            ] {
+                let error = dispatch(h, op, params)
+                    .await
+                    .expect_err("there is no UI to forward to");
+                answers.push((error.code, error.message));
+            }
+            answers
+        }
+
+        let without = answers(&h).await;
+        assert_eq!(
+            without,
+            vec![("internal".to_string(), "no UI attached".to_string()); 2]
+        );
+        cell.store(LocalRoute {
+            switch: Some("preparing"),
+            ..idle
+        });
+        assert_eq!(answers(&h).await, without);
+    }
+
+    /// A create paused between taking its read guard and re-checking the
+    /// cell, while the switch stores its phase and asks for the write
+    /// guard.
+    #[tokio::test]
+    async fn the_drain_waits_out_a_mutation_that_crossed_the_phase_and_it_lands_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut h, cell) = gated_handler(dir.path(), LocalRoute::default());
+        h.admission_pause = Some(AdmissionPause::default());
+        let h = Arc::new(h);
+        let pause = h.admission_pause.as_ref().expect("the pause");
+        let before = h.workspace.snapshot();
+
+        let crossing = tokio::spawn({
+            let h = Arc::clone(&h);
+            async move { dispatch(&h, ops::PROJECT_CREATE, create("crossing")).await }
+        });
+        pause.reached.notified().await;
+
+        cell.store(LocalRoute {
+            switch: Some("preparing"),
+            ..LocalRoute::default()
+        });
+        let gate = h.switch_gate();
+        let mut drain = tokio::spawn(async move { drop(gate.write().await) });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut drain)
+                .await
+                .is_err(),
+            "the drain must wait for the create holding its read guard"
+        );
+
+        pause.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), &mut drain)
+            .await
+            .expect("the drain is granted once the create lets go")
+            .expect("the drain task");
+        assert!(crossing.is_finished(), "the create finished first");
+        let crossed = crossing.await.expect("the create task");
+        assert_busy(&crossed.expect_err("it re-checked under its guard"));
+        assert_eq!(h.workspace.snapshot(), before, "nothing landed");
+
+        assert_busy(
+            &dispatch(&h, ops::PROJECT_CREATE, create("after"))
+                .await
+                .expect_err("the phase is up"),
+        );
+        dispatch(&h, ops::TAB_LIST, serde_json::json!({}))
+            .await
+            .expect("reads still answer");
     }
 }

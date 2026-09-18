@@ -23,6 +23,7 @@ use anyhow::Context;
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, warn};
 
+use crate::codes;
 use crate::dataframe::DataFrameReader;
 use crate::framing::{write_frame, FrameReader};
 use crate::messages::{
@@ -94,7 +95,7 @@ pub trait Handler: Send + Sync + 'static {
             let (_reader, mut writer, _close) = conn.into_parts();
             let written = write_handshake_rejection(
                 &mut writer,
-                "not-supported",
+                codes::NOT_SUPPORTED,
                 "this socket does not serve attach data connections",
             )
             .await;
@@ -140,8 +141,8 @@ impl CloseReason {
     /// refuses a UI socket's ops with.
     pub fn error_code(self) -> &'static str {
         match self {
-            CloseReason::ShuttingDown => "shutting-down",
-            CloseReason::BackendSwitch => crate::local_route::SLOT_UNAVAILABLE_CODE,
+            CloseReason::ShuttingDown => codes::SHUTTING_DOWN,
+            CloseReason::BackendSwitch => codes::BUSY,
         }
     }
 }
@@ -428,15 +429,15 @@ impl HandlerError {
     }
 
     pub fn unknown_op(op: &str) -> Self {
-        Self::new("unknown-op", format!("no such op: {op}"))
+        Self::new(codes::UNKNOWN_OP, format!("no such op: {op}"))
     }
 
     pub fn invalid_param(message: impl Into<String>) -> Self {
-        Self::new("invalid-param", message)
+        Self::new(codes::INVALID_PARAM, message)
     }
 
     pub fn not_found(message: impl Into<String>) -> Self {
-        Self::new("not-found", message)
+        Self::new(codes::NOT_FOUND, message)
     }
 }
 
@@ -758,7 +759,7 @@ async fn serve_connection<H: Handler>(
                     .unwrap_or(0);
                 let body = serde_json::to_vec(&Response::err(
                     id,
-                    "parse-error",
+                    codes::PARSE_ERROR,
                     format!("envelope decode failed: {e}"),
                 ))?;
                 write_frame(&mut w, &body).await?;
@@ -788,7 +789,7 @@ async fn serve_connection<H: Handler>(
                 warn!(error = %e, id, op = %op, "response serialization failed; sending fallback");
                 let fallback = Response::err(
                     id,
-                    "internal",
+                    codes::INTERNAL,
                     format!("response serialization failed: {e}"),
                 );
                 match serde_json::to_vec(&fallback) {
@@ -901,7 +902,7 @@ async fn serve_data<H: Handler>(
         if offered != u64::from(SESSION_PROTOCOL_VERSION) {
             write_handshake_rejection(
                 &mut w,
-                "protocol-mismatch",
+                codes::PROTOCOL_MISMATCH,
                 format!(
                     "this session speaks session protocol {SESSION_PROTOCOL_VERSION}; \
                      the client offered {offered}"
@@ -917,7 +918,7 @@ async fn serve_data<H: Handler>(
         Err(e) => {
             write_handshake_rejection(
                 &mut w,
-                "parse-error",
+                codes::PARSE_ERROR,
                 format!("attach handshake decode failed: {e}"),
             )
             .await?;

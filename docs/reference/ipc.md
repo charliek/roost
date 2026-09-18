@@ -110,7 +110,7 @@ terminal from. It shares the socket path but not the framing; see
   `unknown-op`, `unknown-field`, `missing-param`, `invalid-param`,
   `parse-error`, `frame-too-large`, `duplicate-id`, `not-found`,
   `not-implemented`, `internal`, `too-large`, `store-full`,
-  `shutting-down`, `host-unavailable`.
+  `shutting-down`, `host-unavailable`, `not-enabled`, `busy`.
   Clients should treat unknown codes as fatal for the request and
   surface `message` to the user. `too-large` and `store-full` arrived
   with [`session.put_file`](#sessionput_file) and are both about **one
@@ -121,15 +121,25 @@ terminal from. It shares the socket path but not the framing; see
   `shutting-down`'s mirror image — **UI-socket only** — and says a
   host-routed op could not reach the session it named: the connection
   is gone, died mid-op, or its queue is full. A session's own refusal
-  crossing to a UI socket keeps its code when that code is one of the
-  twelve above that both sockets share; a session-scoped code (including
+  crossing to a UI socket keeps its code when that code is one of those
+  above that both sockets share (every one but `shutting-down`,
+  `host-unavailable` and `not-enabled`); a session-scoped code (including
   `shutting-down`) or one a newer session invents folds onto
   `host-unavailable`, its own code and sentence kept in `message`, so a
   UI socket never answers a code this list does not name. `too-large`
   and `store-full` are deliberately on the shared side of that line
   (`CODES_A_UI_SOCKET_ALSO_SPEAKS`, `app/servicing.rs`): folding them
   would tell a caller the host is gone when the host is right there and
-  one file did not fit.
+  one file did not fit. So is `busy`, the one refusal a caller retries.
+  `not-enabled` answers a test seam called on a server launched without
+  `ROOST_TEST_MODE=1`. `busy` says a local-backend switch is in flight
+  and the request did nothing: poll [`identify`](#identify) until
+  `local_backend_switch` is absent, then re-read any ids before retrying,
+  since a switch replays the tabs under new ones. A server older than
+  `busy` refused the same request `host-unavailable`, so on
+  `host-unavailable` re-read `identify` too: a present
+  `local_backend_switch` is that older spelling of `busy`, and an absent
+  one means the session really is down.
   `shutting-down` is **session-socket only**: once
   [`session.stop`](#sessionstop) latches, every mutating op answers it
   (reads still answer normally), and a second `session.stop` on the
@@ -320,8 +330,14 @@ write` / `send` / `state` with no `--tab` still have something to act
 on. `local_backend_switch` names the phase of a local-backend switch in
 progress (plan 063 §D8a) — one of `"preparing"`, `"replaying"`,
 `"committing"`, `"cleaning-up"` — and is absent whenever the UI is idle;
-a mutation refused with `busy: a local-backend switch is in progress`
-can read this to see which phase is holding it up, and a test can tell
+while it is present, every op that mutates the workspace on a UI socket
+under `in-process` answers `busy`, and one already under way when the
+switch began finishes before the switch copies anything. Reads keep
+answering, and so do the UI's own seams (the palette, the window, the
+clipboard, the selection), which act on the window rather than on the
+workspace the switch moves. A mutation
+refused `busy` can read this to see which phase is holding
+it up, and a test can tell
 "before the commit point" from "after" it, since `local_backend` itself
 flips at exactly one point inside the sequence.
 
@@ -378,17 +394,16 @@ by name if one is ever added without a row:
   have; the mode plays no part.
 
 A forwarded request that cannot reach the slot — nothing is connected
-yet, the connection dropped mid-op, or a local-backend switch (plan 063
-§D8a) has quiesced it — answers `host-unavailable` with the message
-`local session is not connected` (the same code and shape a host-routed
-[`tab.reorder`/`project.reorder`](#the-reorder-routing-matrix) already
-uses for an unreachable host: the slot *is* a host). During a switch,
-a Rewrite or Forward op instead answers the stable `busy: a
-local-backend switch is in progress`, which is also what
-[`identify.local_backend_switch`](#identify) names the phase of. A
-Forward op's own error code and message cross back unchanged — only
-this socket's own refusals (`host-unavailable`, the busy message) are
-this socket's.
+yet, or the connection dropped mid-op — answers `host-unavailable` with
+the message `local session is not connected` (the same code and shape a
+host-routed [`tab.reorder`/`project.reorder`](#the-reorder-routing-matrix)
+already uses for an unreachable host: the slot *is* a host). During a
+local-backend switch (plan 063 §D8a), a Rewrite or Forward op instead
+answers `busy` with the message `a local-backend switch is in
+progress`, and [`identify.local_backend_switch`](#identify) names the
+phase holding it up. A Forward op's own error code and message cross
+back unchanged — only this socket's own refusals (`host-unavailable`,
+`busy`) are this socket's.
 
 `tab.list`'s `revision` field is **stripped** at this boundary before
 the reply reaches the caller: [`revision`](#tablist) is the fence a
@@ -421,6 +436,18 @@ deliberately no opaque command string — callers wanting shell
 word-splitting must pass `["sh", "-c", "..."]` explicitly. This `argv` is
 reachable from the CLI as `roostctl tab open -- <cmd…>` (see
 [cli.md](cli.md)).
+
+**`activate` (optional, #503).** `false` opens the tab without
+selecting it: the tab is appended at the end of its project, and the
+active project, the active tab and each project's remembered tab stay
+where they were, so `tab.opened` arrives with no `active.changed` after
+it. With `project_id: "0"` the default project is found or created
+without being selected either. Omitted or `true`, the new tab is
+selected, as it always has been; an omitted field is not sent, so
+those requests are the bytes they were before the field existed. The
+Swift Mac app and servers that predate the field answer
+`unknown-field`. From the CLI: `--no-activate` on `tab open` and
+`open`.
 
 Response: `{"tab": <Tab>}`.
 
@@ -709,6 +736,15 @@ session tab ids are bare") rather than silently narrowing it to some
 unrelated numbered tab — a session's own ids are one bare id-space by
 design. `roostctl tab dump --tab h3.7` passes the spelling straight
 through.
+
+Under [`local-backend = session`](#a-ui-socket-under-local-backend-session),
+a slot tab this UI holds no client-side Terminal for (one the window
+has not shown) is dumped by the local session instead: the UI socket
+forwards the request under the session's bare id and returns the
+session's reply unchanged, errors included. That holds for a bare id and
+for the slot's own `h<n>.<id>` alike. A tab the window has shown is
+still read off its client-side Terminal, and an `h<n>.<id>` naming any
+other host stays `not-found`.
 
 ### `tab.dump_resolved`
 
@@ -2486,8 +2522,8 @@ the same catalog — with these differences:
   carries no `revision`, is exempt from the gap check, never enters a
   replay, and is always the last frame.
 * **Refusals around a switch.** While a switch is in flight a subscribe
-  is refused `host-unavailable` with `busy: a local-backend switch is
-  in progress` — the same answer a mutation gets then — rather than
+  is refused `busy` with `a local-backend switch is in progress` — the
+  same answer a mutation gets then — rather than
   handed a stream nothing would end. Under `local-backend = session`
   the op answers `not-implemented`, the message ending `dial
   identify.local_session_socket`: that session serves the stream, with
@@ -2504,7 +2540,9 @@ what `roostctl wait` does:
    else the server has no stream (the Swift Mac app, an older Roost):
    poll `tab.list`.
 2. **Subscribe first**, on connection A. Keep the ack's `revision` and
-   `session_id`.
+   `session_id`. A subscribe refused `busy` met a local-backend switch:
+   poll `identify` until `local_backend_switch` is absent, then start
+   again from step 1.
 3. **Then, on connection B**, check the process: `identify.instance_id`
    on a UI socket, `session.identify.session_id` on a session socket, must
    equal the ack's `session_id`. If not, the server restarted between the
@@ -3597,6 +3635,45 @@ rationale belongs with the change that made it, once.
 [`ipc-compatibility.md`](ipc-compatibility.md)** — what is additive in
 which direction, which enums are closed, when either integer bumps, and
 how an external project depends on `roost-ipc`.
+
+## Machine-readable schema
+
+[`docs/reference/api/roost-ipc.schema.json`](api/roost-ipc.schema.json)
+is a [JSON Schema](https://json-schema.org/) (draft 2020-12) bundle
+generated from the same serde types this page describes by hand, so a
+wire-shape change shows up in that file's diff — it cannot describe a
+shape the types this crate actually serializes don't accept. The bundle
+is one document:
+
+```json
+{"$schema": "https://json-schema.org/draft/2020-12/schema",
+ "schema_version": 1, "protocol_version": 1, "session_protocol_version": 6,
+ "envelopes": {"request": …, "response": …, "error": …, "event_batch": …,
+               "session_stopping": …, "stream_ended": …},
+ "ops": {"tab.open": {"params": …, "result": …}, …},
+ "events": {"tab.opened": …, …},
+ "$defs": {…}}
+```
+
+`envelopes` are the six frame shapes every op or event rides inside;
+`ops` and `events` name every `ops::`/`EVENT_*` constant's params/result
+or data type, each a `$ref` into `$defs`. **Which socket serves an op is
+not encoded here** — that is [`identify.ops`](#identify)'s job, not the
+schema's: a session socket and a UI socket can both appear in `ops` even
+though only one serves a given op at runtime.
+
+`roostctl schema` prints the file verbatim, with no running Roost and no
+`--json` distinction (the file already is the payload) — see
+[`schema`](cli.md#schema) in the CLI reference. The file is generated
+from `crates/roost-ipc/src/schema.rs`'s `bundle()`/`bundle_json()` and
+pinned byte-for-byte by `crates/roost-ipc/tests/schema_pin_test.rs`;
+coverage and fidelity tests (the latter validating every file in
+`tests/ipc-vectors/` against the bundle) are in the same crate — see
+[What enforces this](ipc-compatibility.md#what-enforces-this).
+
+**No consumer validates against this schema yet** — it exists so one
+can, this release ships the generator, the pin, and the file, not a
+client-side validator.
 
 ## See also
 

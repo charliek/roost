@@ -36,6 +36,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 
+use crate::codes;
 use crate::dataframe::{
     write_data_frame, DataFrame, DataFrameReader, FRAME_ERROR, FRAME_EXIT, FRAME_INPUT, FRAME_PTY,
     FRAME_RESIZE, FRAME_SNAP, MAX_DATA_FRAME_BYTES,
@@ -128,7 +129,7 @@ impl IpcClient {
             }
             if !resp.ok {
                 let err = resp.error.unwrap_or(ResponseError {
-                    code: "internal".into(),
+                    code: codes::INTERNAL.into(),
                     message: "server returned ok=false without error body".into(),
                 });
                 return Err(ClientError::Server {
@@ -686,7 +687,7 @@ pub enum ServerCode {
     Overflow,
     /// The client sent something the framing forbids.
     ProtocolError,
-    // -- host routing (UI socket only) -----------------------------------
+    // -- UI socket only ---------------------------------------------------
     /// A **UI** socket could not reach the host session an op named: the
     /// connection is gone, died mid-op, or its queue is full — and also
     /// what a session's own refusal folds onto when its code is one a UI
@@ -694,8 +695,16 @@ pub enum ServerCode {
     /// example; see `docs/reference/ipc.md`'s reorder matrix). The
     /// mirror of `shutting-down`: a session never sends this one.
     HostUnavailable,
+    /// A local-backend switch is in flight. Poll `identify` until
+    /// `local_backend_switch` is absent, then re-read ids.
+    Busy,
     // -- generic ----------------------------------------------------------
+    /// A test seam called without `ROOST_TEST_MODE=1` at launch.
+    NotEnabled,
     UnknownOp,
+    UnknownField,
+    MissingParam,
+    DuplicateId,
     NotImplemented,
     ParseError,
     FrameTooLarge,
@@ -708,29 +717,34 @@ impl ServerCode {
     /// Map a wire code onto a variant.
     pub fn from_wire(code: &str) -> ServerCode {
         match code {
-            "shutting-down" => ServerCode::ShuttingDown,
-            "replay-expired" => ServerCode::ReplayExpired,
-            "revision-ahead" => ServerCode::RevisionAhead,
-            "session-mismatch" => ServerCode::SessionMismatch,
-            "build-mismatch" => ServerCode::BuildMismatch,
-            "unsupported-kind" => ServerCode::UnsupportedKind,
-            "too-many-attaches" => ServerCode::TooManyAttaches,
-            "not-found" => ServerCode::NotFound,
-            "invalid-param" => ServerCode::InvalidParam,
-            "protocol-mismatch" => ServerCode::ProtocolMismatch,
-            "snapshot-failed" => ServerCode::SnapshotFailed,
-            "not-supported" => ServerCode::NotSupported,
-            "too-large" => ServerCode::TooLarge,
-            "store-full" => ServerCode::StoreFull,
-            "desync" => ServerCode::Desync,
-            "overflow" => ServerCode::Overflow,
-            "protocol-error" => ServerCode::ProtocolError,
-            "host-unavailable" => ServerCode::HostUnavailable,
-            "unknown-op" => ServerCode::UnknownOp,
-            "not-implemented" => ServerCode::NotImplemented,
-            "parse-error" => ServerCode::ParseError,
-            "frame-too-large" => ServerCode::FrameTooLarge,
-            "internal" => ServerCode::Internal,
+            codes::SHUTTING_DOWN => ServerCode::ShuttingDown,
+            codes::REPLAY_EXPIRED => ServerCode::ReplayExpired,
+            codes::REVISION_AHEAD => ServerCode::RevisionAhead,
+            codes::SESSION_MISMATCH => ServerCode::SessionMismatch,
+            codes::BUILD_MISMATCH => ServerCode::BuildMismatch,
+            codes::UNSUPPORTED_KIND => ServerCode::UnsupportedKind,
+            codes::TOO_MANY_ATTACHES => ServerCode::TooManyAttaches,
+            codes::NOT_FOUND => ServerCode::NotFound,
+            codes::INVALID_PARAM => ServerCode::InvalidParam,
+            codes::PROTOCOL_MISMATCH => ServerCode::ProtocolMismatch,
+            codes::SNAPSHOT_FAILED => ServerCode::SnapshotFailed,
+            codes::NOT_SUPPORTED => ServerCode::NotSupported,
+            codes::TOO_LARGE => ServerCode::TooLarge,
+            codes::STORE_FULL => ServerCode::StoreFull,
+            codes::DESYNC => ServerCode::Desync,
+            codes::OVERFLOW => ServerCode::Overflow,
+            codes::PROTOCOL_ERROR => ServerCode::ProtocolError,
+            codes::HOST_UNAVAILABLE => ServerCode::HostUnavailable,
+            codes::BUSY => ServerCode::Busy,
+            codes::NOT_ENABLED => ServerCode::NotEnabled,
+            codes::UNKNOWN_OP => ServerCode::UnknownOp,
+            codes::UNKNOWN_FIELD => ServerCode::UnknownField,
+            codes::MISSING_PARAM => ServerCode::MissingParam,
+            codes::DUPLICATE_ID => ServerCode::DuplicateId,
+            codes::NOT_IMPLEMENTED => ServerCode::NotImplemented,
+            codes::PARSE_ERROR => ServerCode::ParseError,
+            codes::FRAME_TOO_LARGE => ServerCode::FrameTooLarge,
+            codes::INTERNAL => ServerCode::Internal,
             other => ServerCode::Other(other.to_string()),
         }
     }
@@ -738,29 +752,34 @@ impl ServerCode {
     /// The wire spelling, round-tripping [`Self::from_wire`].
     pub fn as_str(&self) -> &str {
         match self {
-            ServerCode::ShuttingDown => "shutting-down",
-            ServerCode::ReplayExpired => "replay-expired",
-            ServerCode::RevisionAhead => "revision-ahead",
-            ServerCode::SessionMismatch => "session-mismatch",
-            ServerCode::BuildMismatch => "build-mismatch",
-            ServerCode::UnsupportedKind => "unsupported-kind",
-            ServerCode::TooManyAttaches => "too-many-attaches",
-            ServerCode::NotFound => "not-found",
-            ServerCode::InvalidParam => "invalid-param",
-            ServerCode::ProtocolMismatch => "protocol-mismatch",
-            ServerCode::SnapshotFailed => "snapshot-failed",
-            ServerCode::NotSupported => "not-supported",
-            ServerCode::TooLarge => "too-large",
-            ServerCode::StoreFull => "store-full",
-            ServerCode::Desync => "desync",
-            ServerCode::Overflow => "overflow",
-            ServerCode::ProtocolError => "protocol-error",
-            ServerCode::HostUnavailable => "host-unavailable",
-            ServerCode::UnknownOp => "unknown-op",
-            ServerCode::NotImplemented => "not-implemented",
-            ServerCode::ParseError => "parse-error",
-            ServerCode::FrameTooLarge => "frame-too-large",
-            ServerCode::Internal => "internal",
+            ServerCode::ShuttingDown => codes::SHUTTING_DOWN,
+            ServerCode::ReplayExpired => codes::REPLAY_EXPIRED,
+            ServerCode::RevisionAhead => codes::REVISION_AHEAD,
+            ServerCode::SessionMismatch => codes::SESSION_MISMATCH,
+            ServerCode::BuildMismatch => codes::BUILD_MISMATCH,
+            ServerCode::UnsupportedKind => codes::UNSUPPORTED_KIND,
+            ServerCode::TooManyAttaches => codes::TOO_MANY_ATTACHES,
+            ServerCode::NotFound => codes::NOT_FOUND,
+            ServerCode::InvalidParam => codes::INVALID_PARAM,
+            ServerCode::ProtocolMismatch => codes::PROTOCOL_MISMATCH,
+            ServerCode::SnapshotFailed => codes::SNAPSHOT_FAILED,
+            ServerCode::NotSupported => codes::NOT_SUPPORTED,
+            ServerCode::TooLarge => codes::TOO_LARGE,
+            ServerCode::StoreFull => codes::STORE_FULL,
+            ServerCode::Desync => codes::DESYNC,
+            ServerCode::Overflow => codes::OVERFLOW,
+            ServerCode::ProtocolError => codes::PROTOCOL_ERROR,
+            ServerCode::HostUnavailable => codes::HOST_UNAVAILABLE,
+            ServerCode::Busy => codes::BUSY,
+            ServerCode::NotEnabled => codes::NOT_ENABLED,
+            ServerCode::UnknownOp => codes::UNKNOWN_OP,
+            ServerCode::UnknownField => codes::UNKNOWN_FIELD,
+            ServerCode::MissingParam => codes::MISSING_PARAM,
+            ServerCode::DuplicateId => codes::DUPLICATE_ID,
+            ServerCode::NotImplemented => codes::NOT_IMPLEMENTED,
+            ServerCode::ParseError => codes::PARSE_ERROR,
+            ServerCode::FrameTooLarge => codes::FRAME_TOO_LARGE,
+            ServerCode::Internal => codes::INTERNAL,
             ServerCode::Other(code) => code,
         }
     }
@@ -829,33 +848,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_documented_code_maps_and_round_trips() {
-        // The catalogues in `ipc.md`: the response envelope's, the
-        // handshake rejection's, and the data-plane ERROR frame's.
-        for code in [
-            "shutting-down",
-            "build-mismatch",
-            "unsupported-kind",
-            "too-many-attaches",
-            "not-found",
-            "invalid-param",
-            "protocol-mismatch",
-            "snapshot-failed",
-            "not-supported",
-            "too-large",
-            "store-full",
-            "desync",
-            "overflow",
-            "protocol-error",
-            "unknown-op",
-            "not-implemented",
-            "parse-error",
-            "frame-too-large",
-            "internal",
-            "replay-expired",
-            "revision-ahead",
-            "session-mismatch",
-        ] {
+    fn every_code_has_a_variant_and_round_trips() {
+        for &code in codes::ALL {
             let mapped = ServerCode::from_wire(code);
             assert!(
                 !matches!(mapped, ServerCode::Other(_)),

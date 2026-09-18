@@ -16,7 +16,8 @@ pub enum CliError {
     NoTarget(String),
     /// Auto-detect found several UIs.
     AmbiguousTarget(String),
-    /// A dial, read or write failed, or the stream dropped.
+    /// A dial, read or write failed, the stream dropped, or a call went
+    /// unanswered for `wait`'s per-call ceiling.
     Connection(String),
     /// The server refused; `code` is the server's own, verbatim.
     Server { code: String, message: String },
@@ -30,6 +31,11 @@ pub enum CliError {
     NotRunning(String),
     /// `wait`'s condition did not hold in time.
     Timeout(String),
+    /// `tab prompt` wrote the text and the Enter, and the tab showed no
+    /// sign of a turn within `--activity-timeout`. CLI-local: no server
+    /// answers this code, and exit 4 is shared with [`Self::Timeout`]
+    /// because both mean "the condition did not hold in the time given".
+    Stalled(String),
     /// Something on this machine, outside the wire: a file that could not
     /// be written, a binary that could not be found, an unset `$HOME`.
     Failed(String),
@@ -40,7 +46,7 @@ impl CliError {
         match self {
             Self::Usage(_) => 2,
             Self::NotRunning(_) => crate::session::STATUS_NOT_RUNNING_EXIT,
-            Self::Timeout(_) => 4,
+            Self::Timeout(_) | Self::Stalled(_) => 4,
             Self::NoTarget(_)
             | Self::AmbiguousTarget(_)
             | Self::Connection(_)
@@ -62,6 +68,7 @@ impl CliError {
             Self::ChecksFailed(_) => "checks-failed",
             Self::NotRunning(_) => "not-running",
             Self::Timeout(_) => "timeout",
+            Self::Stalled(_) => "stalled",
             Self::Failed(_) => "failed",
         }
     }
@@ -77,6 +84,7 @@ impl CliError {
             | Self::ChecksFailed(message)
             | Self::NotRunning(message)
             | Self::Timeout(message)
+            | Self::Stalled(message)
             | Self::Failed(message) => message,
         }
     }
@@ -279,6 +287,11 @@ mod tests {
     #[test]
     fn timeout_exits_4() {
         assert_row(&CliError::Timeout("5s".into()), 4, "timeout");
+    }
+
+    #[test]
+    fn stalled_exits_4_under_its_own_code() {
+        assert_row(&CliError::Stalled("no running".into()), 4, "stalled");
     }
 
     #[test]

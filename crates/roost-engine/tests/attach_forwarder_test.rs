@@ -332,6 +332,7 @@ impl Harness {
                     cols,
                     rows,
                     title: String::new(),
+                    activate: None,
                 },
             )
             .await
@@ -1040,6 +1041,7 @@ async fn a_stop_labels_a_data_connection_that_only_ever_attached() {
                 cols: 0,
                 rows: 0,
                 title: String::new(),
+                activate: None,
             },
         )
         .await

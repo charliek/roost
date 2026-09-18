@@ -164,7 +164,7 @@ impl LocalClient {
         // cwd resolution (requested → project's cwd → $HOME → "/")
         // lives in `Workspace::open_tab` now, so every caller
         // (this, the facade, `ops::TAB_OPEN`) gets it once.
-        let tab = self.workspace.open_tab(project_id, cwd, title)?;
+        let tab = self.workspace.open_tab(project_id, cwd, title, true)?;
         // Clamp + validate PTY dims. Zero → terminal default; values
         // exceeding u16 surface as a clear error rather than
         // silently truncating via `as u16` (CR-flagged: a CLI
@@ -303,7 +303,7 @@ mod tests {
     fn client_with_tab() -> (LocalClient, i64) {
         let workspace = Arc::new(Workspace::new());
         let pid = workspace.create_project("p", "").unwrap().id;
-        let tab_id = workspace.open_tab(pid, "/", "").unwrap().id;
+        let tab_id = workspace.open_tab(pid, "/", "", true).unwrap().id;
         // Unfocused: these tests are about the OSC gate, not about
         // policy §3.5's focus suppression (covered in `daemon::state`).
         workspace.set_window_focused(false);

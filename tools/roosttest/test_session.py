@@ -1221,6 +1221,76 @@ def test_roostctl_events_and_wait_read_a_session_named_by_socket(env):
     assert all(line["data"].get("tab_id") == str(watched) for line in lines[:-1]), lines
 
 
+def test_roostctl_tab_prompt_submits_and_waits_for_the_turn(env):
+    """Plan 067 §3.8: `roostctl tab prompt` against a session, with this
+    test playing the agent.
+
+    The verb subscribes and fences the stream FIRST, then writes the text
+    and Enter on that subscription's request connection, then waits — the
+    gate for `running`, the settled wait for `idle`. Nothing here reports
+    a lifecycle until `tab.capture_pty_input` shows the prompt bytes with
+    the Enter right behind them, so the `working` that satisfies the gate
+    is provably a transition *after* the fence, not a state the snapshot
+    already held. The daemon runs in test mode for that one op.
+
+    `working` projects onto `running` and `finished` onto `idle`
+    (`roost_ipc::agent::effective`), which is what the verb waits on.
+    """
+    started(env, ROOST_TEST_MODE="1")
+    text = f"roost-prompt-{uuid.uuid4().hex[:8]}"
+
+    with env.client() as client:
+        tab = quiet_tab(client, first_project(client), env.launch_cwd)
+
+    prompt = subprocess.Popen(
+        [
+            sessionlib.roostctl_binary(),
+            "--socket", str(env.socket),
+            "tab", "prompt",
+            "--tab", str(tab),
+            "--timeout", str(sessionlib.scaled_timeout(120.0)),
+            "--json",
+            text,
+        ],
+        env=env.command_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        with env.client() as client:
+            captured = bytearray()
+
+            def submitted() -> bool:
+                captured.extend(client.tab_capture_pty_input(tab, drain=True))
+                # The Enter immediately behind the text is the two
+                # separate writes, in order, on the tab's input.
+                return text.encode() + b"\r" in bytes(captured)
+
+            sessionlib.wait_until(submitted, 60.0, "the prompt on the tab's input")
+            for lifecycle, ownership in [("working", "claim"), ("finished", "preserve")]:
+                reported = client.agent_report(
+                    tab, "e2e-tab-prompt", ownership,
+                    session_id="s-1", lifecycle=lifecycle,
+                )
+                assert reported["accepted"] is True, reported
+        out, err = prompt.communicate(timeout=sessionlib.scaled_timeout(120.0))
+    finally:
+        if prompt.poll() is None:
+            prompt.kill()
+            prompt.communicate()
+
+    assert prompt.returncode == 0, out + err
+    done = json.loads(out)
+    assert done["tab_id"] == str(tab), done
+    assert done["settled"] == {"state": "idle"}, done
+    # Both durations, both measured from the Enter write. The gate was
+    # not skipped, so the start is a number and not null.
+    assert isinstance(done["started_after_ms"], int), done
+    assert isinstance(done["after_ms"], int), done
+    assert done["started_after_ms"] <= done["after_ms"], done
+
+
 # ---------------------------------------------------------------------------
 # 17. `--target session` (#475): the same explicit route as `--socket`
 # ---------------------------------------------------------------------------

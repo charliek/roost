@@ -117,11 +117,14 @@ class Roost:
 
     def open_tab(self, project_id: int, cwd: str = "", title: str = "",
                  cols: int = 80, rows: int = 24,
-                 argv: list[str] | None = None) -> int:
+                 argv: list[str] | None = None,
+                 activate: bool | None = None) -> int:
         params = {"project_id": str(project_id), "cwd": cwd,
                   "title": title, "cols": cols, "rows": rows}
         if argv:
             params["argv"] = argv
+        if activate is not None:
+            params["activate"] = activate
         r = self.call("tab.open", params)
         return int(r["tab"]["id"])
 

@@ -10,6 +10,10 @@
 //! * [`messages`] — serde structs for every operation, response, and
 //!   event listed in the spec, plus shared types (`Tab`, `Project`,
 //!   `TabState`).
+//! * [`codes`] — every wire error code, one constant each, and
+//!   [`codes::ALL`].
+//! * [`schema`] — the JSON Schema bundle of every op, event and
+//!   envelope, generated from the types in [`messages`] and [`agent`].
 //! * [`agent`] — the agent state model (shell / lifecycle / ownership
 //!   axes) and the pure state machine that derives `TabState` from it.
 //!   Shared with the Swift port via `tests/agent-state-fixtures/`.
@@ -60,11 +64,13 @@
 
 pub mod agent;
 pub mod bootstrap;
+pub mod codes;
 pub mod dataframe;
 pub mod framing;
 pub mod local_route;
 pub mod messages;
 pub mod paths;
+pub mod schema;
 pub mod session_launch;
 pub mod socket_state;
 pub mod ssh;
@@ -148,20 +154,20 @@ impl Error {
     /// for malformed input.
     pub fn code(&self) -> &'static str {
         match self {
-            Error::FrameTooLarge => "frame-too-large",
-            Error::Parse(_) => "parse-error",
-            Error::Io(_) => "internal",
-            Error::UnexpectedEof => "internal",
-            Error::UnknownOp(_) => "unknown-op",
-            Error::InvalidId(_) => "invalid-param",
-            Error::EmbeddedNewline => "internal",
-            Error::DataFrameTooLarge => "frame-too-large",
+            Error::FrameTooLarge => codes::FRAME_TOO_LARGE,
+            Error::Parse(_) => codes::PARSE_ERROR,
+            Error::Io(_) => codes::INTERNAL,
+            Error::UnexpectedEof => codes::INTERNAL,
+            Error::UnknownOp(_) => codes::UNKNOWN_OP,
+            Error::InvalidId(_) => codes::INVALID_PARAM,
+            Error::EmbeddedNewline => codes::INTERNAL,
+            Error::DataFrameTooLarge => codes::FRAME_TOO_LARGE,
             // A bad preamble means the peer is not speaking this
             // protocol at all — the same class of failure as an
             // unparseable line.
-            Error::BadPreamble => "parse-error",
+            Error::BadPreamble => codes::PARSE_ERROR,
             // The data plane's own `ERROR` catalogue spells this one.
-            Error::DataProtocol(_) => "protocol-error",
+            Error::DataProtocol(_) => codes::PROTOCOL_ERROR,
         }
     }
 }

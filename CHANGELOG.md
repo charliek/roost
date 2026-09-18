@@ -13,6 +13,72 @@ release workflow asserts they agree).
 
 ### Added
 
+- **`roostctl tab prompt` submits a prompt and waits for the turn it starts,
+  race-free (plan 067)** — the verb closes the gap between a `tab send` and
+  a separate `wait --state running`: it subscribes and fences the event
+  stream first, writes the prompt then `\r` as a second write on that same
+  connection, waits behind an activity gate (`--activity-timeout`, 5s
+  default) for the tab to reach `running`, then waits for it to settle in
+  one of `--until` (`idle`/`needs_input` by default). `--timeout` is
+  required unless `--no-timeout` — a turn's length is not something the verb
+  can guess, so it has no default. Exits 4 `stalled` if nothing starts
+  within the gate; the gate is temporal, not causal, and a tab whose agent
+  reports nothing to Roost — no hooks, and not a direct reporter like
+  craze — never reaches `running` and stalls by design. No event stream
+  (the Mac app today) exits 1 `unsupported` rather than polling. See
+  [`cli.md#tab-prompt`](docs/reference/cli.md#tab-prompt).
+
+- **`roostctl tab report` reports an agent-hook event directly, for an agent
+  that installs no hook** — a verb over
+  [`tab.agent_report`](docs/reference/ipc.md#tabagent_report): `--source`,
+  `--session-id`, one of `--claim`/`--preserve`/`--release`, `--lifecycle`,
+  `--if` (sent only when given), `--attention`, `--severity`, `--title`,
+  `--body`, `--detail`, and repeated `--metadata KEY=VALUE`. Refuses
+  client-side, exit 2, a reserved or empty source, `--attention` with no
+  title or body, and malformed `--metadata`; an accepted report prints the
+  returned lifecycle and a refused one prints who owns the tab — both exit
+  0, since the op itself succeeded. craze, the first agent with no hook of
+  its own, is the worked example in [Agent
+  Hooks](docs/guides/agents.md#reporting-directly-without-a-hook).
+
+- **A machine-readable JSON Schema for the whole wire, checked in and pinned
+  (`docs/reference/api/roost-ipc.schema.json`)** — every op's params and
+  result, every event's data, draft 2020-12, generated from the same wire
+  types the server encodes and decodes. `roostctl schema` prints it
+  byte-for-byte with no socket and no running Roost, so a script or agent
+  can check a field's shape offline before sending it (`roostctl schema | jq
+  '.ops["tab.agent_report"].params'`). A required-list patch keeps the
+  schema honest where the derive would otherwise mark a field optional that
+  the server always writes, and the handshake's required fields mirror its
+  decoder line for line. `examples/ipc-consumer` builds against it
+  `--locked`. See [`ipc.md`'s "Machine-readable
+  schema"](docs/reference/ipc.md#machine-readable-schema) and
+  [`cli.md#schema`](docs/reference/cli.md#schema).
+
+- **`open` and `tab open` take `--no-activate`, so opening a tab no longer
+  has to steal the user's selection (#503)** — `tab.open` gains `activate:
+  Option<bool>` (unset is byte-identical to before); `Some(false)` appends
+  the new tab to its project without touching `active_project_id`,
+  `active_tab_id`, `active_tabs_by_project`, or the UI's selection,
+  including on an empty workspace's default project. A server that rejects
+  the field (the Mac app, an older Roost) answers `unknown-field` verbatim.
+  The skill's open recipe and rules now use it.
+
+- **A mutating op refused because a local-backend switch is in flight now
+  answers a dedicated `busy` code** — `{"code":"busy","message":"a
+  local-backend switch is in progress"}`, the one refusal worth retrying:
+  poll `identify` until `local_backend_switch` is absent, then retry,
+  re-reading ids first, since a switch replays the workspace under new ones.
+  See ["`busy`, and retrying across a mixed-version
+  fleet"](docs/guides/automation.md#busy-and-retrying-across-a-mixed-version-fleet).
+
+- **`roost_ipc::codes` is now the one source of every wire error code** —
+  `codes::ALL` lists all 28 the workspace produces or a client type names;
+  every producer across every crate and every consumer (`ServerCode`, the
+  doc catalogue in `ipc.md`) is scanned to prove it names its code from
+  there, not a literal string, so a code cannot drift out of the catalogue
+  unnoticed.
+
 - **A switchable local backend: local tabs can now run on a session
   instead of in-process (#426)** — a new `local-backend = in-process |
   session` config key, and two command-palette rows,
@@ -372,6 +438,21 @@ release workflow asserts they agree).
 
 ### Changed
 
+- **The switch-in-flight refusal's code is now `busy`, not
+  `host-unavailable`** — the UI's forward arm, `register_in_process_stream`,
+  and `CloseReason::error_code(BackendSwitch)` used to answer
+  `host-unavailable` with a message starting `busy:`, which a client was
+  told never to match on; all three now answer the dedicated `busy` code.
+  `host-unavailable` keeps one meaning: the local session is not connected.
+  An older server's `host-unavailable` plus a present
+  `identify.local_backend_switch` is that server's spelling of `busy` — see
+  the retry rule above.
+
+- **A call that never answers under `wait --timeout 0` or `--no-timeout` now
+  exits 1 `connection` after 30s, instead of hanging forever** — `roostctl
+  events`'s setup calls (subscribe, the second dial, identity, the fencing
+  `tab.list`) are bound by the same ceiling.
+
 - **Session protocol 2 → 6: the final generation-6 contract** — every wire
   change since v0.0.19's protocol 2 folds into one entry describing the
   contract as it now stands, not the history of getting here (the
@@ -497,6 +578,34 @@ release workflow asserts they agree).
   across.
 
 ### Fixed
+
+- **A mutation sent on the in-process UI socket during a local-backend
+  switch could land in the workspace the switch was about to copy and hide
+  (#501)** — an admission gate now takes a read guard, re-loads the route
+  under it, and refuses a mutating op `busy` while a switch is published,
+  then holds the guard until the reply is built; the drain that takes the
+  write guard for the snapshot now waits for every admitted mutation to
+  finish first. Reads are never gated, and a handler with no local route
+  (the session daemon) is never gated either.
+
+- **`roostctl wait` could hang forever against a server that accepted and
+  never answered (#502)** — every socket step (the dial, `identify`, both
+  legs of `events::open`, each `tab.dump`, the poll calls and sleep) is now
+  bounded by one `Bound`: the time remaining under `--timeout`, or a 30s
+  ceiling under `--timeout 0`/`--no-timeout`. The overall deadline elapsing
+  still exits 4 `timeout`; a call past the ceiling exits 1 `connection`
+  instead of hanging. `roostctl events`'s setup calls are bound by the same
+  ceiling.
+
+- **`tab.dump` of a tab the window doesn't hold a terminal for answered
+  `not-found` under `local-backend = session` (#511)** — the engine's
+  `tab.dump` arm now asks the window first and, when the tab is on the
+  connected session's slot but the window never built a terminal for it,
+  forwards the request to the session and returns its reply verbatim. A
+  stale `expected_host` — a reconnect since replaced the slot — answers
+  `host-unavailable` rather than forwarding to the wrong incarnation;
+  `tab.dump_resolved` is unchanged and still distinguishes an attached tab
+  from one the window has not built a terminal for.
 
 - **A tab's teardown could signal a recycled pid (#470)** —
   `terminate_child`'s immediate SIGHUP was a raw `kill(2)` with no

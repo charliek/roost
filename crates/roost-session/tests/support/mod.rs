@@ -259,6 +259,7 @@ pub async fn open_tab(
                 cols: 0,
                 rows: 0,
                 title: title.into(),
+                activate: None,
             },
         )
         .await

@@ -100,8 +100,12 @@ from test_host_local_spawn import roostctl_session, running_session_id  # noqa: 
 
 pytestmark = pytest.mark.host_client
 
-#: `crates/roost-ipc/src/local_route.rs`'s `SWITCH_BUSY`.
-BUSY = "busy: a local-backend switch is in progress"
+#: `crates/roost-iced/src/app/local_backend.rs`'s `SWITCH_BUSY_PALETTE`:
+#: what a palette row that would mutate the local backend answers mid-switch.
+BUSY_PALETTE = "busy: a local-backend switch is in progress"
+#: `crates/roost-ipc/src/local_route.rs`'s `SWITCH_BUSY_MESSAGE`, which a
+#: wire refusal carries under the code `busy`.
+BUSY_MESSAGE = "a local-backend switch is in progress"
 USE_SESSION = "local:use_session"
 USE_IN_PROCESS = "local:use_in_process"
 JOURNAL = "switch-journal.json"
@@ -456,10 +460,11 @@ def test_the_forward_switch_moves_the_layout_onto_an_empty_session(lane: Lane):
     # §D8 phase 6's *outcome* — the mapped tab is selected and attached —
     # asserted through the attachment itself: the UI holds a live client
     # terminal for exactly the host tab it is showing (`host_focus_tab`
-    # detaches every other), and `tab.dump` on a host-qualified key
-    # answers off that terminal, so it succeeds for the selected tab and
-    # is `not-found` for any other. Two-sided, which "a dump succeeded"
-    # alone would not be.
+    # detaches every other), and `tab.dump_resolved` on a host-qualified
+    # key answers off that terminal alone, so it succeeds for the selected
+    # tab and is `not-found` for any other. Two-sided, which "a dump
+    # succeeded" alone would not be. Not `tab.dump`: since #511 a slot tab
+    # with no client terminal is dumped by the session instead.
     #
     # NOT the fence's *ordering*. Phase 6 exists because a control reply
     # can precede its broadcast, and against a session on this machine
@@ -475,10 +480,10 @@ def test_the_forward_switch_moves_the_layout_onto_an_empty_session(lane: Lane):
         project["name"]: [tab["key"] for tab in project["tabs"]]
         for project in slot_rows["projects"]
     }
-    roost.call("tab.dump", {"tab_id": keys["beta"][0]})
+    roost.call("tab.dump_resolved", {"tab_id": keys["beta"][0]})
     for stale in keys["alpha"]:
         with pytest.raises(RoostError) as unattached:
-            roost.call("tab.dump", {"tab_id": stale})
+            roost.call("tab.dump_resolved", {"tab_id": stale})
         assert "no live terminal" in str(unattached.value), unattached.value
 
     # The verbs swapped over, and the session outlives the switch.
@@ -873,7 +878,7 @@ def test_a_switch_in_flight_hides_its_verb_and_refuses_local_mutations(lane: Lan
                 roost.palette_activate(USE_SESSION)
             finally:
                 roost.palette_dismiss()
-        assert "not-found" in raised.value.code or BUSY in str(raised.value), raised.value
+        assert "not-found" in raised.value.code or BUSY_PALETTE in str(raised.value), raised.value
 
         # Every local-backend mutation answers with the one stable
         # string, from the surface `roostctl` reaches — the four command
@@ -891,7 +896,7 @@ def test_a_switch_in_flight_hides_its_verb_and_refuses_local_mutations(lane: Lan
             try:
                 with pytest.raises(RoostError) as refused:
                     roost.palette_activate(row)
-                assert BUSY in str(refused.value), (row, refused.value)
+                assert BUSY_PALETTE in str(refused.value), (row, refused.value)
             finally:
                 roost.palette_dismiss()
 
@@ -934,12 +939,56 @@ def test_a_switch_ends_the_in_process_event_stream_and_refuses_a_new_one(lane: L
         with EventStream(ui.socket_path(lane.target)) as late:
             with pytest.raises(RoostError) as refused:
                 late.subscribe()
-        assert refused.value.code == "host-unavailable", refused.value
-        assert refused.value.message == BUSY, refused.value
+        assert refused.value.code == "busy", refused.value
+        assert refused.value.message == BUSY_MESSAGE, refused.value
     finally:
         stream.close()
         ui.quit(lane.target)
         subprocess.run(["pkill", "-f", str(stub)], check=False)
+
+
+def test_a_raw_mutation_is_refused_busy_while_a_switch_is_in_flight(lane: Lane):
+    """Plan 067 §3.2 (#501): the admission gate, as a raw client meets it.
+
+    Held in `preparing` the way the quiescence case above holds it, but
+    the stub is let go on cue: it then reports a failed start, the switch
+    gives up, and the very request it refused goes through.
+    """
+    release = _ROOT / "held-session-release"
+    stub = _ROOT / "held-session"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"while [ ! -e {release} ]; do sleep 0.1; done\n"
+        "echo 'error: released by the test'\n"
+        "exit 1\n"
+    )
+    stub.chmod(0o755)
+    roost = lane.start("in-process", extra_env={"ROOST_SESSION_BIN": str(stub)})
+    before = layout(roost.list())
+
+    raise_switch(roost, USE_SESSION)
+    roost.call("app.dialog_answer", {"action": "confirm"})
+    try:
+        wait_until(
+            lambda: roost.identify().get("local_backend_switch") == "preparing",
+            60.0,
+            "the switch to reach its first phase",
+        )
+        with pytest.raises(RoostError) as refused:
+            roost.create_project(name="gated", cwd="/tmp")
+        assert (refused.value.code, refused.value.message) == ("busy", BUSY_MESSAGE), refused.value
+        assert roost.identify().get("local_backend_switch") == "preparing"
+        assert layout(roost.list()) == before, "the refusal landed nothing, and a read answers"
+    finally:
+        release.touch()
+
+    wait_until(
+        lambda: settled(roost) == "in-process",
+        60.0,
+        "the switch to give up once its destination reports a failed start",
+    )
+    roost.create_project(name="gated", cwd="/tmp")
+    assert layout(roost.list()) == [*before, ("gated", ())]
 
 
 def test_under_session_mode_the_ui_socket_points_a_subscriber_at_the_session(lane: Lane):
@@ -1569,9 +1618,9 @@ def test_roostctl_dumps_a_session_tab_the_window_is_not_showing(lane: Lane):
     """`roostctl tab dump --tab N` from outside any tab, for a session tab
     the window has not attached.
 
-    The UI socket answers `tab.dump` off its own client-side terminal,
-    which exists only for the tab it shows, so for this tab its own answer
-    is `not-found … has no live terminal` — asserted first, so the dump
+    The UI keeps a client-side terminal only for the tab it shows, and
+    `tab.dump_resolved` reads that terminal alone, so for this tab it is
+    `not-found … has no live terminal` — asserted first, so the dump
     cannot be passing on a tab the window happened to attach. `roostctl`
     reads a bare id where `wait` does, off `identify.local_session_socket`.
     The typed line splits the token with quotes, so only the shell's output
@@ -1593,12 +1642,60 @@ def test_roostctl_dumps_a_session_tab_the_window_is_not_showing(lane: Lane):
     assert hidden in session_tab_ids(lane) and hidden != shown
     assert roost.identify()["active_tab_id"] == shown, "the window stayed on its tab"
     with pytest.raises(RoostError) as unattached:
-        roost.call("tab.dump", {"tab_id": str(hidden)})
+        roost.tab_dump_resolved(hidden)
     assert "no live terminal" in unattached.value.message, unattached.value
 
     dumped = roostctl("tab", "dump", "--tab", str(hidden))
     assert dumped.returncode == 0, dumped
     assert printed in dumped.stdout, dumped
+
+
+def test_a_raw_dump_of_a_session_tab_the_window_is_not_showing_reads_the_session(
+    lane: Lane,
+):
+    """#511: raw `tab.dump` on the UI socket, for a slot tab the window
+    holds no terminal for, is answered by the session.
+
+    The window builds a client-side terminal for a slot tab when it
+    focuses it (`host_focus_tab`); a tab opened on the session's own
+    socket moves no selection, so it never gets one. `tab.dump_resolved`
+    reads only those terminals, which makes it the proof: `not-found` for
+    the hidden tab, an answer for the shown one. The shown tab is still
+    dumped off its terminal — bytes fed to it alone are in the UI's dump
+    and not in the session's. An `h<n>.<id>` for an incarnation that is
+    not the slot (none other is connected in this lane, so a number no
+    host holds) stays `not-found` though the slot has a tab with that id.
+    """
+    roost = session_ui(lane)
+    shown = roost.identify()["active_tab_id"]
+    printed = token()
+    head, tail = printed.split("-", 1)
+    with lane.session() as c:
+        project = int(c.list()[0]["id"])
+        hidden = c.open_tab(project, cwd="/tmp", title="hidden")
+        c.send(hidden, f'echo {head}""-{tail}\n')
+        wait_until(
+            lambda: printed in c.dump_text(hidden),
+            scaled_timeout(30.0),
+            "the token to reach the hidden session tab",
+        )
+    assert roost.identify()["active_tab_id"] == shown, "the window stayed on its tab"
+    roost.tab_dump_resolved(shown)
+    with pytest.raises(RoostError) as unmirrored:
+        roost.tab_dump_resolved(hidden)
+    assert unmirrored.value.code == "not-found", unmirrored.value
+
+    assert printed in roost.dump_text(hidden)
+
+    fed = token()
+    roost.tab_feed_pty_bytes(shown, fed.encode())
+    assert fed in roost.dump_text(shown)
+    with lane.session() as c:
+        assert fed not in c.dump_text(shown), "only the window's terminal was fed"
+
+    with pytest.raises(RoostError) as elsewhere:
+        roost.call("tab.dump", {"tab_id": f"h9999.{hidden}"})
+    assert elsewhere.value.code == "not-found", elsewhere.value
 
 
 def test_a_forwarded_refusal_is_the_sessions_own_verdict(lane: Lane):
@@ -1644,6 +1741,27 @@ def test_the_ui_reports_the_tab_it_is_showing_not_the_hidden_workspaces(lane: La
     assert roost.app_selected_tab_id() == active
     assert active in session_tab_ids(lane)
     assert roost.list() != [], "and the list it came from is the slot's"
+
+
+def test_an_unactivated_tab_open_on_the_ui_socket_selects_nothing(lane: Lane):
+    """#503 under `session`: `tab.open {activate: false}` is forwarded
+    verbatim and the session's own engine honours it. The window stays on
+    its tab, and the session did not select the new one either — the row's
+    `is_active` is the session's verdict, since `tab.list` here is the
+    session's list, and it is read on the session's own socket too."""
+    roost = session_ui(lane)
+    shown = roost.identify()["active_tab_id"]
+    assert roost.app_selected_tab_id() == shown
+    project = int(roost.list()[0]["id"])
+
+    quiet = roost.open_tab(project, cwd="/tmp", title="quiet", activate=False)
+
+    assert quiet in session_tab_ids(lane)
+    assert roost.identify()["active_tab_id"] == shown
+    assert roost.app_selected_tab_id() == shown
+    assert roost.tab(quiet)["is_active"] is False
+    with lane.session() as c:
+        assert c.tab(quiet)["is_active"] is False
 
 
 def test_a_forwarded_delete_of_the_last_project_is_answered_before_the_exit(lane: Lane):
@@ -2057,8 +2175,8 @@ def test_a_hand_edited_key_moves_the_layout_at_launch(lane: Lane):
 
     # The band is the slot's, and the tab the migration selected is the
     # one that was active in the source — asserted through the
-    # attachment, as the forward switch's case is: `tab.dump` on a
-    # host-qualified key answers off the UI's own client terminal, and
+    # attachment, as the forward switch's case is: `tab.dump_resolved`
+    # answers off the UI's own client terminal alone, and
     # `host_focus_tab` detaches every other.
     band = local_band(roost)
     assert band["role"] == "session", band
@@ -2073,7 +2191,7 @@ def test_a_hand_edited_key_moves_the_layout_at_launch(lane: Lane):
     assert roost.identify()["active_tab_id"] == wanted, (
         "the source's active tab is the last tab of the last project"
     )
-    roost.call("tab.dump", {"tab_id": str(wanted)})
+    roost.call("tab.dump_resolved", {"tab_id": str(wanted)})
 
 
 def test_a_crashed_launch_migration_clears_its_copy_and_stays_on_session(lane: Lane):

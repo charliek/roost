@@ -1,17 +1,18 @@
 //! `roostctl wait`: block until a tab reaches a condition — on the tabs'
 //! event stream where the server serves one, else by polling.
 
+use std::future::Future;
 use std::time::Duration;
 
 use serde::Deserialize;
 use tokio::time::Instant;
 
-use roost_ipc::client::EventFrame;
+use roost_ipc::client::{EventFrame, EventStream};
 use roost_ipc::messages::{
     ops, EventBatch, IdentifyResult, TabClosedEvent, TabDumpParams, TabDumpResult, TabListResult,
     TabOpenedEvent, TabState, TabStateChangedEvent, WireTabRef,
 };
-use roost_ipc::{ClientError, IpcClient};
+use roost_ipc::{codes, ClientError, IpcClient};
 
 use crate::error::CliError;
 use crate::events::{self, Legs, Opened, Source};
@@ -36,10 +37,12 @@ pub(crate) struct Args {
     /// Wait until the tab no longer exists (closed).
     #[arg(long, default_value_t = false)]
     pub gone: bool,
-    /// Give up after this many seconds. `0` checks once.
+    /// Give up after this many seconds, every call to the socket
+    /// included. `0` checks once.
     #[arg(long, default_value_t = 5.0)]
     pub timeout: f64,
-    /// Wait for as long as it takes.
+    /// Wait for as long as it takes. A call the socket does not answer
+    /// within 30 s still ends the wait.
     #[arg(long, conflicts_with = "timeout")]
     pub no_timeout: bool,
     /// Poll interval in milliseconds, and how often `--text` re-reads
@@ -50,10 +53,11 @@ pub(crate) struct Args {
 
 /// The conditions, all of which must hold.
 #[derive(Debug, Default)]
-struct Want {
-    state: Option<TabState>,
-    text: Option<String>,
-    gone: bool,
+pub(crate) struct Want {
+    /// Any one of these. Empty: the state was not asked about.
+    pub states: Vec<TabState>,
+    pub text: Option<String>,
+    pub gone: bool,
 }
 
 impl Want {
@@ -62,9 +66,20 @@ impl Want {
             return !seen.exists;
         }
         seen.exists
-            && self.state.is_none_or(|want| seen.state == Some(want))
+            && (self.states.is_empty()
+                || seen.state.is_some_and(|seen| self.states.contains(&seen)))
             && (self.text.is_none() || seen.text)
     }
+}
+
+/// The tab's state in a `tab.list` snapshot, or `None` when the snapshot
+/// does not list it.
+pub(crate) fn state_in(list: &TabListResult, tab_id: i64) -> Option<TabState> {
+    list.projects
+        .iter()
+        .flat_map(|p| &p.tabs)
+        .find(|t| t.id == tab_id)
+        .map(|t| t.state)
 }
 
 /// What the wait knows about its tab.
@@ -78,14 +93,10 @@ struct Seen {
 
 impl Seen {
     fn listed(list: &TabListResult, tab_id: i64) -> Self {
-        let tab = list
-            .projects
-            .iter()
-            .flat_map(|p| &p.tabs)
-            .find(|t| t.id == tab_id);
+        let state = state_in(list, tab_id);
         Seen {
-            exists: tab.is_some(),
-            state: tab.map(|t| t.state),
+            exists: state.is_some(),
+            state,
             text: false,
         }
     }
@@ -142,7 +153,13 @@ pub(crate) async fn run(
         ));
     }
     let want = Want {
-        state: args.state.as_deref().map(crate::parse_state).transpose()?,
+        states: args
+            .state
+            .as_deref()
+            .map(crate::parse_state)
+            .transpose()?
+            .into_iter()
+            .collect(),
         text: args.text,
         gone: args.gone,
     };
@@ -150,17 +167,18 @@ pub(crate) async fn run(
     let named = crate::named_tab(flag, tab_env)?
         .map(|tab| events::local_tab("wait", tab))
         .transpose()?;
-    let identify = crate::identify(ui.client().await?).await?;
+    let bound = Bound::new(args.timeout, args.no_timeout)?;
+    let timeout = args.timeout.max(0.0);
+    let identify = identify(ui, bound, |op| cut_short(bound, timeout, named, op)).await?;
     let tab_id = match named {
         Some(tab_id) => tab_id,
         None => crate::active_tab(&identify)?,
     };
-    let deadline = budget(args.timeout, args.no_timeout).map(|budget| Instant::now() + budget);
     let waiting = Waiting {
         tab_id,
         want: &want,
-        deadline,
-        timeout: args.timeout,
+        bound,
+        timeout,
         interval: Duration::from_millis(args.interval_ms.max(10)),
     };
     let seen = waiting.run(ui, identify).await?;
@@ -170,13 +188,123 @@ pub(crate) async fn run(
     Ok(0)
 }
 
-/// How long to wait: `--timeout` seconds (a negative one is `0`, one check),
-/// or forever under `--no-timeout` or for a timeout too long to measure.
-fn budget(timeout: f64, no_timeout: bool) -> Option<Duration> {
-    if no_timeout {
-        return None;
+/// What bounds `wait`'s socket calls, decided once from `--timeout` and
+/// `--no-timeout` before anything is dialled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bound {
+    /// `--timeout N` for an `N` above `0`: every call, and the wait, ends
+    /// by then.
+    Deadline(Instant),
+    /// `--timeout 0` or `--no-timeout`: no deadline, so each call gets
+    /// [`call_ceiling`].
+    Ceiling,
+}
+
+/// How long one call may go unanswered under [`Bound::Ceiling`]. A server
+/// that accepted the call and answers nothing for this long is a dead
+/// connection.
+const CALL_CEILING: Duration = Duration::from_secs(30);
+
+fn call_ceiling() -> Duration {
+    if cfg!(test) {
+        Duration::from_secs(1)
+    } else {
+        CALL_CEILING
     }
-    Duration::try_from_secs_f64(timeout.max(0.0)).ok()
+}
+
+/// The step before an op's own call: resolving the socket and dialling it.
+pub(crate) const DIAL: &str = "the dial";
+
+impl Bound {
+    /// `--timeout`, or `--no-timeout`. A negative timeout is `0`; one that
+    /// is not a finite number of seconds, or is too long to set a deadline
+    /// by, is refused rather than read as "forever".
+    pub(crate) fn new(timeout: f64, no_timeout: bool) -> Result<Self, CliError> {
+        if no_timeout {
+            return Ok(Self::Ceiling);
+        }
+        if !timeout.is_finite() {
+            return Err(CliError::Usage(format!(
+                "--timeout must be a finite number of seconds, not {timeout}; use --no-timeout \
+                 to wait for as long as it takes"
+            )));
+        }
+        if timeout <= 0.0 {
+            return Ok(Self::Ceiling);
+        }
+        Duration::try_from_secs_f64(timeout)
+            .ok()
+            .and_then(|span| Instant::now().checked_add(span))
+            .map(Self::Deadline)
+            .ok_or_else(|| {
+                CliError::Usage(format!(
+                    "--timeout {timeout} is too long to wait for; use --no-timeout to wait for \
+                     as long as it takes"
+                ))
+            })
+    }
+
+    pub(crate) fn deadline(self) -> Option<Instant> {
+        match self {
+            Self::Deadline(deadline) => Some(deadline),
+            Self::Ceiling => None,
+        }
+    }
+
+    /// `step`'s outcome, or `None` when this bound cut it short.
+    pub(crate) async fn within<F: Future>(self, step: F) -> Option<F::Output> {
+        match self {
+            Self::Deadline(deadline) => tokio::time::timeout_at(deadline, step).await.ok(),
+            Self::Ceiling => tokio::time::timeout(call_ceiling(), step).await.ok(),
+        }
+    }
+}
+
+/// The failure for `op`, cut short by `bound` while waiting for `tab`
+/// (`None`: the active tab, not yet read). The deadline passing is a
+/// timeout. A call that outlived the ceiling went to a server that
+/// accepted it and stopped answering: a dead connection, not a timeout, so
+/// exit 4 keeps its one meaning — the condition did not hold in time.
+fn cut_short(bound: Bound, timeout: f64, tab: Option<i64>, op: &str) -> CliError {
+    match bound {
+        Bound::Deadline(_) => timed_out(timeout, tab, Some(op)),
+        Bound::Ceiling => unanswered(op),
+    }
+}
+
+/// The deadline passed — while `cut` was waiting on its answer, if a call
+/// was cut.
+fn timed_out(timeout: f64, tab: Option<i64>, cut: Option<&str>) -> CliError {
+    let tab = match tab {
+        Some(tab) => format!("tab {tab}"),
+        None => "the active tab".into(),
+    };
+    let cut = cut
+        .map(|op| format!(" ({op} did not answer)"))
+        .unwrap_or_default();
+    CliError::Timeout(format!("timed out after {timeout}s waiting for {tab}{cut}"))
+}
+
+/// `op` did not answer within [`call_ceiling`].
+pub(crate) fn unanswered(op: &str) -> CliError {
+    CliError::Connection(format!(
+        "{op} did not answer within {}s",
+        call_ceiling().as_secs_f64()
+    ))
+}
+
+/// `identify`, dialling first when the socket has not been; each step
+/// under `bound`, and `cut` the failure for one it cut short.
+pub(crate) async fn identify(
+    ui: &mut UiSocket<'_>,
+    bound: Bound,
+    cut: impl Fn(&str) -> CliError,
+) -> Result<IdentifyResult, CliError> {
+    let dialled = bound.within(ui.client()).await;
+    let client = dialled.unwrap_or_else(|| Err(cut(DIAL)))?;
+    let identified = bound.within(crate::identify(client)).await;
+    identified.unwrap_or_else(|| Err(cut(ops::IDENTIFY)))
 }
 
 /// `--json`'s success document. Each `satisfied` field is `null` unless
@@ -186,26 +314,49 @@ fn satisfied(tab_id: i64, want: &Want, seen: &Seen, after: Duration) -> serde_js
     serde_json::json!({
         "tab_id": tab_id.to_string(),
         "satisfied": {
-            "state": want.state.and(seen.state).map(crate::format_state),
+            "state": seen.state.filter(|_| !want.states.is_empty()).map(crate::format_state),
             "text": want.text.as_deref().filter(|_| seen.text),
             "gone": (want.gone && !seen.exists).then_some(true),
         },
-        "after_ms": u64::try_from(after.as_millis()).unwrap_or(u64::MAX),
+        "after_ms": crate::millis(after),
     })
 }
 
-struct Waiting<'a> {
-    tab_id: i64,
-    want: &'a Want,
-    deadline: Option<Instant>,
-    timeout: f64,
-    interval: Duration,
+pub(crate) struct Waiting<'a> {
+    pub tab_id: i64,
+    pub want: &'a Want,
+    pub bound: Bound,
+    /// `--timeout`, a negative one `0`: `0` checks once, and a timeout
+    /// names it.
+    pub timeout: f64,
+    pub interval: Duration,
+}
+
+/// A subscribed stream a wait is following: the two legs, the snapshot
+/// revision that fences it, and what it has shown about the tab so far.
+///
+/// A caller whose next condition is on the same stream holds this rather
+/// than subscribing again — commits keep arriving on it in between, so
+/// re-subscribing would be a second fence with a gap in front of it.
+pub(crate) struct Following {
+    stream: EventStream,
+    conn: IpcClient,
+    /// Commits at or below this revision are already in `seen`.
+    fence: u64,
+    seen: Seen,
+}
+
+impl Following {
+    /// The tab's state, as this stream and its snapshot last showed it.
+    pub(crate) fn state(&self) -> Option<TabState> {
+        self.seen.state
+    }
 }
 
 /// How following a stream ended: the condition held, or the stream was
 /// lost.
 enum Watched {
-    Held(Seen),
+    Held(Box<Following>),
     Lost(Loss),
 }
 
@@ -213,6 +364,15 @@ enum Watched {
 struct Loss {
     incarnation: String,
     why: String,
+}
+
+/// What a caller that needs the stream itself — to write on the request
+/// connection before it follows the stream — reached.
+pub(crate) enum Subscribed {
+    /// The two legs, in the order that fences them.
+    Legs(Source, Box<Legs>),
+    /// This server serves no stream at all.
+    None(Source),
 }
 
 /// Where resolving the source got to.
@@ -225,23 +385,82 @@ enum Reached {
 }
 
 impl Waiting<'_> {
-    /// Resolve the source and wait on it; after a lost stream, resolve
-    /// again, once.
-    ///
-    /// The wait carries on only against the process it started on. Tab ids
-    /// are that process's own: a local-backend switch replays the tabs onto
-    /// the destination under new ids, and a restart mints new ones, so on
-    /// any other process tab N is some other tab, or none — and a `--gone`
-    /// read off its snapshot would be a lie.
+    /// Resolve the source and wait on it.
     async fn run(&self, ui: &mut UiSocket<'_>, identify: IdentifyResult) -> Result<Seen, CliError> {
-        let lost = match self.reach(ui, identify).await? {
-            Reached::Poll(_) => return self.poll(ui.client().await?).await,
-            Reached::Stream(source, legs) => match self.watch(&source, *legs).await? {
-                Watched::Held(seen) => return Ok(seen),
-                Watched::Lost(lost) => lost,
-            },
-            Reached::Lost(_, lost) => lost,
+        let held = match self.reach(ui, identify).await? {
+            Reached::Poll(_) => return self.poll(ui).await,
+            Reached::Stream(source, legs) => self.follow(ui, &source, *legs).await?,
+            Reached::Lost(_, lost) => self.again(ui, lost).await?,
         };
+        Ok(held.seen)
+    }
+
+    /// The two legs of a subscribed stream, for a caller that writes on
+    /// the request connection before it follows the stream.
+    pub(crate) async fn subscribe(
+        &self,
+        ui: &mut UiSocket<'_>,
+        identify: IdentifyResult,
+    ) -> Result<Subscribed, CliError> {
+        let reached = match self.reach(ui, identify).await? {
+            // Nothing has been written yet, so a subscription dropped
+            // while it was still opening starts the whole sequence over
+            // rather than carrying one on: there is no observation on the
+            // old stream to keep, and no reason to hold the caller to the
+            // process that dropped it.
+            Reached::Lost(..) => self.reach_again(ui).await?,
+            reached => reached,
+        };
+        Ok(match reached {
+            Reached::Poll(source) => Subscribed::None(source),
+            Reached::Stream(source, legs) => Subscribed::Legs(source, legs),
+            Reached::Lost(source, again) => {
+                return Err(CliError::Connection(format!(
+                    "{}: the event stream was lost twice while it was being opened: {}",
+                    source.socket.display(),
+                    again.why
+                )))
+            }
+        })
+    }
+
+    /// Wait on a stream the caller holds; after a lost one, resolve again,
+    /// once.
+    pub(crate) async fn follow(
+        &self,
+        ui: &mut UiSocket<'_>,
+        source: &Source,
+        legs: Legs,
+    ) -> Result<Following, CliError> {
+        let watched = self.watch(source, legs).await?;
+        self.held(ui, watched).await
+    }
+
+    /// [`Self::follow`] for a stream already fenced and part-followed.
+    pub(crate) async fn follow_on(
+        &self,
+        ui: &mut UiSocket<'_>,
+        source: &Source,
+        following: Following,
+    ) -> Result<Following, CliError> {
+        let watched = self.tail(source, following).await?;
+        self.held(ui, watched).await
+    }
+
+    async fn held(&self, ui: &mut UiSocket<'_>, watched: Watched) -> Result<Following, CliError> {
+        match watched {
+            Watched::Held(following) => Ok(*following),
+            Watched::Lost(lost) => self.again(ui, lost).await,
+        }
+    }
+
+    /// Resolve the source again after a lost stream, and carry on only
+    /// against the process the wait started on. Tab ids are that process's
+    /// own: a local-backend switch replays the tabs onto the destination
+    /// under new ids, and a restart mints new ones, so on any other process
+    /// tab N is some other tab, or none — and a `--gone` read off its
+    /// snapshot would be a lie.
+    async fn again(&self, ui: &mut UiSocket<'_>, lost: Loss) -> Result<Following, CliError> {
         let reached = match self.reach_again(ui).await {
             Ok(reached) => reached,
             Err(error) => return Err(after_loss(&lost, error)),
@@ -253,7 +472,7 @@ impl Waiting<'_> {
                     return Err(self.changed(&source, &lost.why));
                 }
                 match self.watch(&source, *legs).await? {
-                    Watched::Held(seen) => return Ok(seen),
+                    Watched::Held(following) => return Ok(*following),
                     Watched::Lost(again) => (source, again),
                 }
             }
@@ -273,18 +492,32 @@ impl Waiting<'_> {
     }
 
     /// Once no local-backend switch is in flight, the source `identify`
-    /// names, subscribed to where it serves a stream.
+    /// names, subscribed to where it serves a stream. Until a switch
+    /// settles, which socket serves the stream is not yet decided; a
+    /// subscribe refused `busy` met a switch that began after that
+    /// `identify`, and is held off the same way.
     async fn reach(
         &self,
         ui: &mut UiSocket<'_>,
-        identify: IdentifyResult,
+        mut identify: IdentifyResult,
     ) -> Result<Reached, CliError> {
-        let identify = self.settled(ui, identify).await?;
-        let source = events::resolve(ui.socket_path(), &identify);
-        if !source.serves_stream {
-            return Ok(Reached::Poll(source));
-        }
-        Ok(match events::open(&source, true).await? {
+        let (source, opened) = loop {
+            if identify.local_backend_switch.is_some() {
+                identify = self.hold_off(ui).await?;
+                continue;
+            }
+            let source = events::resolve(ui.socket_path(), &identify);
+            if !source.serves_stream {
+                return Ok(Reached::Poll(source));
+            }
+            match events::open(&source, true, self.bound).await {
+                Err(CliError::Server { code, .. }) if code == codes::BUSY => {
+                    identify = self.hold_off(ui).await?;
+                }
+                opened => break (source, opened?),
+            }
+        };
+        Ok(match opened {
             Opened::Legs(legs) => Reached::Stream(source, legs),
             Opened::Dropped { acked, error } => Reached::Lost(
                 source,
@@ -293,13 +526,14 @@ impl Waiting<'_> {
                     why: error.message().to_string(),
                 },
             ),
+            Opened::Unanswered(op) => return Err(self.cut(op)),
         })
     }
 
     /// [`Self::reach`] from a fresh dial and a fresh `identify`.
     async fn reach_again(&self, ui: &mut UiSocket<'_>) -> Result<Reached, CliError> {
         ui.redial();
-        let identify = crate::identify(ui.client().await?).await?;
+        let identify = self.identify(ui).await?;
         self.reach(ui, identify).await
     }
 
@@ -314,52 +548,60 @@ impl Waiting<'_> {
         ))
     }
 
-    /// `identify` once no local-backend switch is in flight: until one
-    /// settles, a subscribe is refused busy, and which socket serves the
-    /// stream is not yet decided.
-    async fn settled(
-        &self,
-        ui: &mut UiSocket<'_>,
-        mut identify: IdentifyResult,
-    ) -> Result<IdentifyResult, CliError> {
-        while identify.local_backend_switch.is_some() {
-            self.check_deadline()?;
-            let wake = Instant::now() + self.interval;
-            tokio::time::sleep_until(self.deadline.map_or(wake, |deadline| deadline.min(wake)))
-                .await;
-            self.check_deadline()?;
-            identify = crate::identify(ui.client().await?).await?;
-        }
-        Ok(identify)
+    /// One interval, then `identify` again.
+    async fn hold_off(&self, ui: &mut UiSocket<'_>) -> Result<IdentifyResult, CliError> {
+        self.check_deadline()?;
+        self.pause().await;
+        self.check_deadline()?;
+        self.identify(ui).await
+    }
+
+    /// One interval, cut short by the deadline.
+    async fn pause(&self) {
+        let wake = Instant::now() + self.interval;
+        tokio::time::sleep_until(
+            self.bound
+                .deadline()
+                .map_or(wake, |deadline| deadline.min(wake)),
+        )
+        .await;
     }
 
     fn check_deadline(&self) -> Result<(), CliError> {
-        if self
-            .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            return Err(CliError::Timeout(format!(
-                "timed out after {}s waiting for tab {}",
-                self.timeout, self.tab_id
-            )));
+        let passed = match self.bound {
+            Bound::Deadline(deadline) => Instant::now() >= deadline,
+            Bound::Ceiling => self.timeout == 0.0,
+        };
+        if passed {
+            return Err(timed_out(self.timeout, Some(self.tab_id), None));
         }
         Ok(())
     }
 
-    /// The wait on the stream: the snapshot, then every commit after it.
+    pub(crate) fn cut(&self, op: &str) -> CliError {
+        cut_short(self.bound, self.timeout, Some(self.tab_id), op)
+    }
+
+    /// One socket call under the bound.
+    pub(crate) async fn call<T, E: Into<CliError>>(
+        &self,
+        op: &str,
+        step: impl Future<Output = Result<T, E>>,
+    ) -> Result<T, CliError> {
+        match self.bound.within(step).await {
+            Some(done) => done.map_err(Into::into),
+            None => Err(self.cut(op)),
+        }
+    }
+
+    async fn identify(&self, ui: &mut UiSocket<'_>) -> Result<IdentifyResult, CliError> {
+        identify(ui, self.bound, |op| self.cut(op)).await
+    }
+
+    /// The wait on the stream: the snapshot fences it, then every commit
+    /// after that.
     async fn watch(&self, source: &Source, legs: Legs) -> Result<Watched, CliError> {
-        let Legs {
-            mut stream,
-            mut conn,
-            tabs,
-        } = legs;
-        let incarnation = stream.session_id().to_string();
-        let lost = |why: String| {
-            Ok(Watched::Lost(Loss {
-                incarnation: incarnation.clone(),
-                why,
-            }))
-        };
+        let Legs { stream, conn, tabs } = legs;
         let tabs = tabs.unwrap_or_default();
         let Some(fence) = tabs.revision else {
             return Err(CliError::Failed(format!(
@@ -370,35 +612,61 @@ impl Waiting<'_> {
         };
         // Commits between the two would be on neither.
         if fence < stream.revision() {
-            return lost(format!(
-                "the tab.list snapshot (revision {fence}) is older than the subscription \
-                 (revision {})",
-                stream.revision()
-            ));
+            return Ok(Watched::Lost(Loss {
+                incarnation: stream.session_id().to_string(),
+                why: format!(
+                    "the tab.list snapshot (revision {fence}) is older than the subscription \
+                     (revision {})",
+                    stream.revision()
+                ),
+            }));
         }
-        let mut seen = Seen::listed(&tabs, self.tab_id);
+        let seen = Seen::listed(&tabs, self.tab_id);
+        self.tail(
+            source,
+            Following {
+                stream,
+                conn,
+                fence,
+                seen,
+            },
+        )
+        .await
+    }
+
+    /// Every commit past the fence, until the condition holds or the
+    /// stream goes away.
+    async fn tail(&self, source: &Source, mut following: Following) -> Result<Watched, CliError> {
+        let incarnation = following.stream.session_id().to_string();
+        let lost = |why: String| {
+            Ok(Watched::Lost(Loss {
+                incarnation: incarnation.clone(),
+                why,
+            }))
+        };
         let mut tick = tokio::time::interval_at(Instant::now() + self.interval, self.interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut reread = true;
         loop {
             if reread {
-                if let Some(dropped) = self.dump(&mut conn, &mut seen).await? {
+                if let Some(dropped) = self.dump(&mut following.conn, &mut following.seen).await? {
                     return lost(dropped);
                 }
                 tick.reset();
             }
-            if self.want.holds(&seen) {
-                return Ok(Watched::Held(seen));
+            if self.want.holds(&following.seen) {
+                return Ok(Watched::Held(Box::new(following)));
             }
             self.check_deadline()?;
             // `EventStream::next` keeps a part-read frame in its own
             // buffer, so losing the race to the tick or the deadline
             // drops nothing.
             reread = tokio::select! {
-                () = sleep_until(self.deadline) => false,
-                frame = stream.next() => match frame {
+                () = sleep_until(self.bound.deadline()) => false,
+                frame = following.stream.next() => match frame {
                     Ok(Some(EventFrame::Batch(batch))) => {
-                        batch.revision > fence && seen.apply(&batch, self.tab_id)
+                        batch.revision > following.fence
+                            && following.seen.apply(&batch, self.tab_id)
                     }
                     Ok(Some(EventFrame::Stopping(stopping))) => {
                         return Err(CliError::Connection(format!(
@@ -433,7 +701,14 @@ impl Waiting<'_> {
             seen.text = false;
             return Ok(None);
         }
-        match dump_contains(conn, self.tab_id, needle).await {
+        let dumped = self
+            .bound
+            .within(dump_contains(conn, self.tab_id, needle))
+            .await;
+        let Some(dumped) = dumped else {
+            return Err(self.cut(ops::TAB_DUMP));
+        };
+        match dumped {
             Ok(found) => {
                 seen.text = found;
                 Ok(None)
@@ -446,18 +721,22 @@ impl Waiting<'_> {
     }
 
     /// The poll loop, for a server with no stream.
-    async fn poll(&self, client: &mut IpcClient) -> Result<Seen, CliError> {
+    async fn poll(&self, ui: &mut UiSocket<'_>) -> Result<Seen, CliError> {
+        let client = self.call(DIAL, ui.client()).await?;
         loop {
-            let list = crate::list_tabs(client).await?;
+            let list = self.call(ops::TAB_LIST, crate::list_tabs(client)).await?;
             let mut seen = Seen::listed(&list, self.tab_id);
             if let (Some(needle), true) = (&self.want.text, seen.exists) {
-                seen.text = dump_contains(client, self.tab_id, needle).await?;
+                seen.text = self
+                    .call(ops::TAB_DUMP, dump_contains(client, self.tab_id, needle))
+                    .await?;
             }
             if self.want.holds(&seen) {
                 return Ok(seen);
             }
             self.check_deadline()?;
-            tokio::time::sleep(self.interval).await;
+            self.pause().await;
+            self.check_deadline()?;
         }
     }
 }
@@ -480,7 +759,7 @@ async fn dump_contains(
         .await;
     match dumped {
         Ok(dump) => Ok(dump.rows_text.join("\n").contains(needle)),
-        Err(ClientError::Server { code, .. }) if code == "not-found" => Ok(false),
+        Err(ClientError::Server { code, .. }) if code == codes::NOT_FOUND => Ok(false),
         Err(error) => Err(error),
     }
 }
@@ -515,8 +794,11 @@ mod tests {
     use serde_json::json;
 
     async fn wait(fake: &Fake, argv: &[&str], tab_env: Option<&str>) -> Result<i32, CliError> {
-        let socket = fake.socket();
-        let argv = ["roostctl", "--socket", &socket, "wait"]
+        wait_on(&fake.socket(), argv, tab_env).await
+    }
+
+    async fn wait_on(socket: &str, argv: &[&str], tab_env: Option<&str>) -> Result<i32, CliError> {
+        let argv = ["roostctl", "--socket", socket, "wait"]
             .into_iter()
             .chain(argv.iter().copied());
         let args = <crate::Args as clap::Parser>::try_parse_from(argv).expect("the argv parses");
@@ -950,6 +1232,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_subscribe_refused_busy_is_held_off_until_the_switch_settles() {
+        let fake = Fake::ui("busy");
+        fake.with(|world| world.tabs.insert(7, "idle"));
+        fake.on("identify", 1, Phase::After, |world| {
+            world.identify["local_backend_switch"] = json!("preparing");
+        });
+        fake.on("identify", 3, Phase::Before, |world| {
+            world.identify["local_backend_switch"] = serde_json::Value::Null;
+        });
+        let exit = wait(
+            &fake,
+            &[
+                "--tab",
+                "7",
+                "--state",
+                "idle",
+                "--interval-ms",
+                "10",
+                "--timeout",
+                "5",
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(exit, Ok(0));
+        assert_eq!(
+            fake.with(|world| world.ops().join(" ")),
+            "identify events.subscribe identify identify events.subscribe identify tab.list"
+        );
+    }
+
     /// The hold-off sleeps no further than the deadline, and a deadline
     /// that passed in it is a timeout — even for a switch that has settled
     /// by then onto a tab already in the state asked for.
@@ -1040,13 +1354,204 @@ mod tests {
         assert!(timed_out(&exit), "{exit:?}");
     }
 
+    /// Polling, the sleep ends at the deadline and the deadline is checked
+    /// again before another `tab.list`.
+    #[tokio::test]
+    async fn a_poll_interval_longer_than_the_timeout_times_out_on_time() {
+        let fake = Fake::without_stream("poll-late");
+        let argv = [
+            "--tab",
+            "7",
+            "--state",
+            "idle",
+            "--timeout",
+            "1",
+            "--interval-ms",
+            "60000",
+        ];
+        let started = std::time::Instant::now();
+        let exit = wait(&fake, &argv, None).await;
+        assert_eq!(
+            exit,
+            Err(CliError::Timeout(
+                "timed out after 1s waiting for tab 7".into()
+            ))
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(fake.with(|world| world.count("tab.list")), 1);
+    }
+
     #[test]
-    fn the_budget_is_the_timeout_or_nothing_at_all() {
-        assert_eq!(budget(2.5, false), Some(Duration::from_millis(2500)));
-        assert_eq!(budget(0.0, false), Some(Duration::ZERO));
-        assert_eq!(budget(-1.0, false), Some(Duration::ZERO));
-        assert_eq!(budget(5.0, true), None);
-        assert_eq!(budget(f64::INFINITY, false), None);
+    fn a_positive_timeout_is_a_deadline_and_the_rest_the_ceiling() {
+        let before = Instant::now();
+        let Ok(Bound::Deadline(deadline)) = Bound::new(2.5, false) else {
+            panic!("2.5 s is a deadline")
+        };
+        let span = Duration::from_millis(2500);
+        assert!(deadline >= before + span && deadline <= Instant::now() + span);
+        assert_eq!(Bound::new(0.0, false), Ok(Bound::Ceiling));
+        assert_eq!(Bound::new(-1.0, false), Ok(Bound::Ceiling));
+        assert_eq!(Bound::new(5.0, true), Ok(Bound::Ceiling));
+        for refused in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN, 1e300, 1e19] {
+            let error = Bound::new(refused, false).expect_err("never forever");
+            assert_eq!(error.exit_code(), 2, "{refused}: {error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timeout_that_is_not_a_finite_number_of_seconds_is_usage() {
+        let fake = Fake::ui("non-finite");
+        for timeout in ["--timeout=inf", "--timeout=nan", "--timeout=-inf"] {
+            let exit = wait(&fake, &["--tab", "7", "--gone", timeout], None).await;
+            let Err(error) = exit else {
+                panic!("{timeout}: {exit:?}")
+            };
+            assert_eq!((error.exit_code(), error.code()), (2, "usage"), "{error:?}");
+            assert!(error.message().contains("finite"), "{error:?}");
+        }
+        assert!(fake.with(|world| world.log.is_empty()));
+    }
+
+    /// Exit 4 for `--timeout 1`, inside two seconds, naming the call the
+    /// deadline cut.
+    fn cut_at_the_deadline(
+        exit: &Result<i32, CliError>,
+        started: std::time::Instant,
+        tab: &str,
+        op: &str,
+    ) {
+        let elapsed = started.elapsed();
+        let Err(error) = exit else { panic!("{exit:?}") };
+        assert_eq!(
+            (error.exit_code(), error.code()),
+            (4, "timeout"),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.message(),
+            format!("timed out after 1s waiting for {tab} ({op} did not answer)")
+        );
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    }
+
+    fn never_answers(fake: &Fake, op: &'static str) {
+        fake.hook(move |world, seen, phase| {
+            if seen == op && phase == Phase::Before {
+                world.instead = Some(Instead::Never);
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn a_dump_that_never_answers_times_out_on_time() {
+        for fake in [
+            Fake::ui("dump-never"),
+            Fake::without_stream("dump-never-poll"),
+        ] {
+            never_answers(&fake, "tab.dump");
+            let started = std::time::Instant::now();
+            let argv = ["--tab", "7", "--text", "OK", "--timeout", "1"];
+            let exit = wait(&fake, &argv, None).await;
+            cut_at_the_deadline(&exit, started, "tab 7", "tab.dump");
+            assert_eq!(fake.with(|world| world.count("tab.dump")), 1);
+        }
+    }
+
+    /// The first `identify`, whether or not `--tab` named the tab, and the
+    /// one that checks the stream's second connection.
+    #[tokio::test]
+    async fn an_identify_that_never_answers_times_out_on_time() {
+        for (nth, tab_flag, tab) in [
+            (1, &["--tab", "7"][..], "tab 7"),
+            (1, &[][..], "the active tab"),
+            (2, &["--tab", "7"][..], "tab 7"),
+        ] {
+            let fake = Fake::ui("identify-never");
+            fake.on("identify", nth, Phase::Before, |world| {
+                world.instead = Some(Instead::Never);
+            });
+            let started = std::time::Instant::now();
+            let argv = [tab_flag, &["--state", "idle", "--timeout", "1"]].concat();
+            let exit = wait(&fake, &argv, None).await;
+            cut_at_the_deadline(&exit, started, tab, "identify");
+            assert_eq!(fake.with(|world| world.count("identify")), nth, "{tab}");
+        }
+    }
+
+    /// A Unix socket completes a dial from its listen backlog, so a socket
+    /// that never accepts is cut at the `identify` the dial carries.
+    #[tokio::test]
+    async fn a_socket_that_never_accepts_times_out_on_time() {
+        let socket = crate::tests::short_socket_dir("never-accept").join("s.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let started = std::time::Instant::now();
+        let argv = ["--tab", "7", "--gone", "--timeout", "1"];
+        let exit = wait_on(&socket.display().to_string(), &argv, None).await;
+        cut_at_the_deadline(&exit, started, "tab 7", "identify");
+    }
+
+    /// A small budget can run out before the wait has read anything at all,
+    /// and that is a timeout too.
+    #[tokio::test]
+    async fn a_budget_spent_in_a_slow_identify_times_out() {
+        let fake = Fake::ui("identify-slow");
+        fake.on("identify", 1, Phase::Before, |world| {
+            world.instead = Some(Instead::Late(Duration::from_secs(2)));
+        });
+        let started = std::time::Instant::now();
+        let argv = ["--tab", "7", "--state", "running", "--timeout", "0.05"];
+        let Err(error) = wait(&fake, &argv, None).await else {
+            panic!("the answer came too late")
+        };
+        assert_eq!(
+            error,
+            CliError::Timeout(
+                "timed out after 0.05s waiting for tab 7 (identify did not answer)".into()
+            )
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// With no deadline to pass, a call left unanswered past the ceiling is
+    /// a dead connection, not a timeout — here the first call of all, and a
+    /// dump on a stream the wait already holds, which ends the wait rather
+    /// than resolving the stream again.
+    #[tokio::test]
+    async fn without_a_deadline_a_call_that_never_answers_is_a_dead_connection() {
+        for (bound, op) in [
+            (&["--timeout", "0"][..], "identify"),
+            (&["--no-timeout"][..], "identify"),
+            (&["--no-timeout"][..], "tab.dump"),
+        ] {
+            let fake = Fake::ui("dead");
+            never_answers(&fake, op);
+            let started = std::time::Instant::now();
+            let argv = [&["--tab", "7", "--text", "OK"][..], bound].concat();
+            let exit = wait(&fake, &argv, None).await;
+            let elapsed = started.elapsed();
+            let Err(error) = exit else {
+                panic!("{bound:?} {op}: {exit:?}")
+            };
+            assert_eq!(
+                (error.exit_code(), error.code()),
+                (1, "connection"),
+                "{error:?}"
+            );
+            assert_eq!(error.message(), format!("{op} did not answer within 1s"));
+            assert!(elapsed >= call_ceiling(), "{bound:?} {op}: {elapsed:?}");
+            assert_eq!(
+                fake.with(|world| world.count("events.subscribe")),
+                usize::from(op == "tab.dump")
+            );
+        }
     }
 
     #[test]
@@ -1150,7 +1655,7 @@ mod tests {
             text: true,
         };
         let want = Want {
-            state: Some(TabState::Idle),
+            states: vec![TabState::Idle],
             text: Some("OK".into()),
             gone: false,
         };

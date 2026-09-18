@@ -56,7 +56,7 @@ The automation guide is <https://charliek.github.io/roost/guides/automation/>.
 - Every tab has a `state`: `none`, `running`, `needs_input`, or `idle`. A plain shell sets it only through the OSC 133 prompt marks of shell integration, which Roost loads for zsh and bash 4.4 or newer: `running` while a foreground command runs, `none` at its prompt. A shell without the marks stays `none` while work runs (its `shell_state` in `tab list --json` stays `unknown`), so wait on a shell's output text, not its state. An agent whose hooks report to Roost drives the state itself: `running` during its turn, `needs_input` when it waits on the user or its turn failed, `idle` when its turn ended. `roostctl agent status` shows which agents have hooks installed.
 - Tab and project ids are integers, written as strings in JSON (`"7"`). A tab on a connected remote host is `h<host>.<id>` (`h2.7`); `--help` says which verbs take that form.
 - Ids belong to the running Roost. A restart, or a switch of its local backend, gives every tab a new id, so re-read ids after either.
-- `roostctl identify --json` lists `ops`, the operations this Roost serves right now. If `ops` is missing or lacks `project.ensure` (the macOS app today), `open` and `project ensure` refuse with `unsupported`; the manual route is `project list --json` and then `tab open --project-id`. If `ops` lacks `events.subscribe` and there is no `local_session_socket`, `wait` polls instead of following events, and `events` fails.
+- `roostctl identify --json` lists `ops`, the operations this Roost serves right now. If `ops` is missing or lacks `project.ensure` (the macOS app today), `open` and `project ensure` refuse with `unsupported`; the manual route is `project list --json` and then `tab open --project-id`. If `ops` lacks `events.subscribe` and there is no `local_session_socket`, `wait` polls instead of following events, and `events` fails. A session's own `identify` carries no `instance_id`; its identity is `session_id`.
 - `ops` can also list seams that exist for Roost's own UI and test suite: the `app.*` family, `tab.feed_*`, `tab.capture_pty_input`, and more under `ROOST_TEST_MODE=1`. Never call them.
 
 ## Recipes
@@ -68,7 +68,7 @@ The recipes run in bash and need `jq`; watching events also needs `timeout` from
 Only do this when the user asked for something to run in Roost. `open` finds the project named `X`, or creates it at `--cwd`, then opens a tab in it running the command after `--`. It prints `{"project","tab","created"}`. Keep that output and check the exit before taking the new tab's id from `.tab.id`, because a plain `jq` also succeeds on the empty output of a failed `open`:
 
 ```bash roost-recipe
-out=$(roostctl open --project X --cwd "$PWD" --title tests --hold --json -- sh -c 'make test; echo "make exited $?"') || exit 1
+out=$(roostctl open --project X --cwd "$PWD" --title tests --hold --no-activate --json -- sh -c 'make test; echo "make exited $?"') || exit 1
 tab=$(printf '%s' "$out" | jq -er .tab.id) || exit 1
 roostctl wait --tab "$tab" --text 'make exited' --timeout 600
 roostctl tab dump --tab "$tab" --scrollback 200
@@ -86,19 +86,17 @@ roostctl tab send --tab N --bytes "sh -c 'make test; echo \"make-done-\"$run \$?
 roostctl wait --tab N --text "make-done-$run" --timeout 600
 ```
 
-`--bytes` decodes escapes: `\r` is Enter (a shell also takes `\n`), `\x1b` is Escape. For an agent running in the tab, send the prompt and then Enter as a separate write, so an input box that detects pastes does not take Enter as part of the pasted text. An agent that finished its last turn is already `idle`, so wait for its turn to start, and wait for it to end only if it started:
+`--bytes` decodes escapes: `\r` is Enter (a shell also takes `\n`), `\x1b` is Escape. `--no-timeout` waits for as long as it takes; only use it when the user asked you to wait indefinitely.
+
+### Prompt an agent and wait for its turn
+
+`tab prompt` writes the prompt, then Enter as a separate write, then waits behind an activity gate before waiting for the turn to settle — one verb closing the race a `tab send` followed by a separate `wait --state running` can miss:
 
 ```bash roost-recipe
-roostctl tab send --tab N --bytes 'Summarize the failing tests in one paragraph.'
-roostctl tab send --tab N --bytes '\r'
-if roostctl wait --tab N --state running --timeout 30; then
-  roostctl wait --tab N --state idle --timeout 120
-else
-  roostctl tab dump --tab N
-fi
+roostctl tab prompt --tab N --timeout 600 'Summarize the failing tests in one paragraph.'
 ```
 
-`wait` exits 0 once the condition holds and 4 (`timeout`) if it does not in time. If the `running` wait fails, the turn may already have started and ended, or the prompt never submitted, and an `idle` wait could succeed at once on the previous turn, so read the tab and decide. A turn that stops on a permission prompt is `needs_input`, never `idle`, so an `idle` wait on it times out: read the tab before deciding what to send. `--no-timeout` waits for as long as it takes; only use it when the user asked you to wait indefinitely.
+`--timeout` is required unless you pass `--no-timeout`: a turn's length is not something this verb can guess. Two caveats. The gate is **temporal, not causal**: it only checks that the tab reached `running` after the prompt, not that this prompt is what caused it. And a tab whose agent reports nothing to Roost — no hooks installed, and not one of the agents that report directly — never reaches `running`, so the gate times out by design — exit 4 `stalled` still means the text and Enter *were* written, so read the tab with `tab dump` before sending anything again.
 
 ### Read what happened
 
@@ -137,16 +135,19 @@ roostctl notify --tab "$ROOST_TAB_ID" --title 'Review ready' --body 'Findings ar
 roostctl rpc identify '{}'
 ```
 
+`roostctl schema` prints the pinned JSON Schema for every op and event, with no socket needed — check a field's shape there before an `rpc` call or before hand-crafting raw-socket traffic.
+
 ## Rules
 
-- Always pass `--tab`. Without it, `notify`, `set-title`, `tab set-state`, `tab clear-notification`, `tab close`, `tab send`, `tab resize`, and `tab focus` act on `ROOST_TAB_ID`, which inside Roost is your own tab, and exit 2 when it is unset or empty. `tab dump` and `wait` also use `ROOST_TAB_ID` first, but when it is unset or empty they fall back to the UI's active tab, whichever tab the user last clicked.
+- Always pass `--tab`. Without it, `notify`, `set-title`, `tab set-state`, `tab clear-notification`, `tab close`, `tab send`, `tab resize`, `tab focus`, `tab report`, and `tab prompt` act on `ROOST_TAB_ID`, which inside Roost is your own tab, and exit 2 when it is unset or empty. `tab dump` and `wait` also use `ROOST_TAB_ID` first, but when it is unset or empty they fall back to the UI's active tab, whichever tab the user last clicked.
 - Parse ids from `--json` output. Never derive them from sidebar order, tab titles, or examples.
-- Never pass `--focus` or run `tab focus` unless the user asked to switch tabs. Opening a tab can make it the active tab even without `--focus` (an in-process Roost always does), so only open tabs when the user asked for something to run in Roost.
+- Never pass `--focus` or run `tab focus` unless the user asked to switch tabs. Opening a tab with `--no-activate` leaves the user's selection where it was; without it, opening may select the tab. A server that does not know the flag (the macOS app) refuses the whole command — `unknown-field` from `tab open`, `unsupported` from `open` — and opens no tab at all, so re-read `tab list --json` rather than assuming one exists.
 - Never close a tab or delete a project you did not open, unless the user explicitly asked.
 - A `wait` timeout does not prove the input was not delivered or the command did not run. Read the tab with `tab dump` before sending anything again.
 - `rpc` is not a way around `--tab`. Use the named verb for anything a verb covers, and only put ids in `rpc` params that you parsed from JSON.
 - Never call the test seams `identify` may list (`app.*`, `tab.feed_*`, `tab.capture_pty_input`).
 - Do not run `roostctl session stop`, `roostctl agent install`, or `roostctl agent uninstall` unless the user asked for exactly that.
+- `busy` is the one server code worth retrying: it means a local-backend switch is in flight. Poll `identify --json` until `local_backend_switch` is absent, then retry, re-reading any tab or project id first.
 - Branch on the exit code and the error `code`, never on the message. Exit 0 is success; every failure that prints an error envelope is one of these (the `agent` verbs' partial failure above prints none):
 
 | Exit | `code` | Meaning |
@@ -154,10 +155,11 @@ roostctl rpc identify '{}'
 | 2 | `usage` | A bad command line, including a tab-changing verb given no `--tab` and no `ROOST_TAB_ID` |
 | 1 | `no-target` | No Roost is listening at any known socket |
 | 1 | `ambiguous-target` | Several Roost UIs are running; pass `--target` |
-| 1 | `connection` | The socket failed or the stream dropped; a `wait` across a restart, a backend switch, or a session stop ends here, so re-read ids |
-| 1 | the server's own | The server refused (`not-found`, `invalid-param`, `unknown-op`, …); its code is passed through verbatim |
+| 1 | `connection` | The socket failed or the stream dropped, or a call went unanswered for 30s under `--no-timeout`; a `wait` across a restart, a backend switch, or a session stop ends here, so re-read ids |
+| 1 | the server's own | The server refused (`not-found`, `invalid-param`, `unknown-op`, `busy`, …); its code is passed through verbatim |
 | 1 | `unsupported` | This Roost does not serve an op the verb needs, such as `open` on the macOS app |
 | 1 | `checks-failed` | `roostctl doctor` found a failing check |
 | 1 | `failed` | Something local outside the socket failed: a file, a binary, `$HOME` |
 | 3 | `not-running` | `roostctl session status` found no session running |
-| 4 | `timeout` | `wait`'s condition did not hold before `--timeout` |
+| 4 | `timeout` | `wait`'s or `tab prompt`'s condition did not hold before `--timeout` |
+| 4 | `stalled` | `tab prompt` wrote the prompt, but the tab reached no `running` within `--activity-timeout` |

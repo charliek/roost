@@ -75,9 +75,11 @@ pulls in.
 | [`agent`](https://github.com/charliek/roost/blob/main/crates/roost-ipc/src/agent.rs) | Agent-report helpers shared by the hook adapters |
 
 The crate has **no workspace-internal dependencies** — its whole
-dependency set is serde, serde_json, base64, tokio, anyhow, thiserror,
-sha2, tracing, and libc. That is a property worth preserving: it is what
-makes the crate consumable at all. There is no feature gating today
+dependency set is serde, serde_json, base64, schemars, tokio, anyhow,
+thiserror, sha2, tracing, and libc, where schemars derives the wire's
+JSON Schema from the same serde types so the two cannot drift. That is
+a property worth preserving: it is what makes the crate consumable at
+all. There is no feature gating today
 (`ssh` and `bootstrap` come along whether or not a consumer wants them);
 splitting them behind features is a crates.io-era question, not a
 git-dependency one.
@@ -186,6 +188,11 @@ touching the protocol integer:
   open string for the same reason, and `TabEffect` above follows the
   same shape for a single value rather than a list: a client ignores
   what it does not recognize instead of preserving it forward.
+
+Error codes are an open set in the same way: a new code is a new string,
+every producer names it from `roost_ipc::codes`, and a client treats a
+code it does not know as fatal for the request, as the
+[catalogue](ipc.md#wire-format) already says.
 
 When a change can be expressed through one of these channels, it should
 be. A protocol generation is expensive; a map key is not.
@@ -437,7 +444,15 @@ Stated honestly, because overstating it would be worse than the gap:
   This is what makes individual files effectively frozen;
 * **the emptied-directory guard** — the loader fails if the vector
   directory comes back empty, catching the path-resolution failure that
-  would otherwise turn the whole corpus into a silent no-op.
+  would otherwise turn the whole corpus into a silent no-op;
+* **the schema pin, coverage and fidelity tests** — `schema_pin_test.rs`
+  pins `docs/reference/api/roost-ipc.schema.json` to
+  `roost_ipc::schema::bundle_json()`; a coverage test in `schema.rs`
+  asserts every `ops::`/event constant has an `OP_TYPES` row and vice
+  versa; a fidelity test validates every vector in this corpus against
+  the bundle, so the pin proves the schema matches the wire, not only
+  that it is deterministic. See [Machine-readable
+  schema](ipc.md#machine-readable-schema).
 
 There is deliberately **no hash manifest**. At this corpus size it would
 be ceremony: a second file to update on every legitimate addition,

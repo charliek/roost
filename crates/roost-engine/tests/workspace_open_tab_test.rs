@@ -57,7 +57,7 @@ fn open_tab_with_an_empty_cwd_uses_the_projects_cwd() {
     let workspace = Workspace::new();
     let project = workspace.create_project("proj", "/usr/local").unwrap();
 
-    let tab = workspace.open_tab(project.id, "", "").unwrap();
+    let tab = workspace.open_tab(project.id, "", "", true).unwrap();
 
     assert_eq!(tab.cwd, "/usr/local");
     assert_eq!(tab.title, "local");
@@ -74,9 +74,9 @@ fn open_tab_falls_back_to_home_when_the_project_has_none() {
     // for `project_id == 0`, so a fresh workspace's Default project
     // persists `cwd: ""` and every later bare `tab.open` into it resolves
     // to `$HOME`. That matches Mac and is correct, not a bug to fix.
-    let project_id = workspace.ensure_default_project("");
+    let project_id = workspace.ensure_default_project("", true);
 
-    let tab = workspace.open_tab(project_id, "", "").unwrap();
+    let tab = workspace.open_tab(project_id, "", "", true).unwrap();
 
     assert_eq!(tab.cwd, "/home/tester");
     assert_eq!(tab.title, "tester");
@@ -88,9 +88,9 @@ fn open_tab_falls_back_to_slash_without_home() {
     let _home = HomeVar::clear();
 
     let workspace = Workspace::new();
-    let project_id = workspace.ensure_default_project("");
+    let project_id = workspace.ensure_default_project("", true);
 
-    let tab = workspace.open_tab(project_id, "", "").unwrap();
+    let tab = workspace.open_tab(project_id, "", "", true).unwrap();
 
     assert_eq!(tab.cwd, "/");
     assert_eq!(tab.title, "/");

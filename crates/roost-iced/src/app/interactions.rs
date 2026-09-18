@@ -2950,9 +2950,9 @@ mod tests {
     fn rename_fixture() -> (Vec<Project>, i64, i64, i64) {
         let workspace = Workspace::new();
         let first = workspace.create_project("First", "/tmp").unwrap();
-        let first_tab = workspace.open_tab(first.id, "/tmp", "alpha").unwrap();
+        let first_tab = workspace.open_tab(first.id, "/tmp", "alpha", true).unwrap();
         let second = workspace.create_project("Second", "/var").unwrap();
-        let second_tab = workspace.open_tab(second.id, "/var", "beta").unwrap();
+        let second_tab = workspace.open_tab(second.id, "/var", "beta", true).unwrap();
         (workspace.snapshot(), first.id, first_tab.id, second_tab.id)
     }
 
@@ -4501,7 +4501,7 @@ mod tests {
         let mut ids = Vec::new();
         for name in ["first", "second", "third"] {
             let project = workspace.create_project(name, "/tmp").unwrap();
-            workspace.open_tab(project.id, "/tmp", name).unwrap();
+            workspace.open_tab(project.id, "/tmp", name, true).unwrap();
             ids.push(project.id);
         }
         let client = LocalClient::new(

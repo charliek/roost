@@ -30,6 +30,8 @@ roostctl [--socket <PATH>] [--target <mac|linux|iced|session>] [--json] <COMMAND
 | `wait` | Block until a tab reaches a state, shows a string, or closes |
 | `events` | Print the event stream, one JSON line per event |
 | `tab open` / `close` / `send` / `resize` / `reorder` | Tab lifecycle + I/O |
+| `tab report` | Report an agent-hook event straight to `tab.agent_report` |
+| `tab prompt` | Submit a prompt to a tab's agent and wait for the turn it starts |
 | `project list` / `create` / `ensure` / `rename` / `delete` / `reorder` | Project lifecycle |
 | `open` | Find-or-create a project by name, then open a tab in it — one call, atomic on the server |
 | `agent ensure` / `set` / `install` / `uninstall` / `status` | Wire Roost's hook entries into the supported agents' own configs |
@@ -40,6 +42,7 @@ roostctl [--socket <PATH>] [--target <mac|linux|iced|session>] [--json] <COMMAND
 | `session start` / `stop` / `status` | Start, stop, or inspect the headless `roost-session` daemon |
 | `rpc <op> [params]` | Call any IPC op directly by name, bypassing every named verb |
 | `skill` | Print the agent skill (`skills/roost/SKILL.md`), byte for byte as the plugin installs it |
+| `schema` | Print the wire's JSON Schema bundle (`docs/reference/api/roost-ipc.schema.json`), byte for byte |
 
 `--socket` overrides `ROOST_SOCKET`; one of the two must resolve to the running UI's socket. A
 session is not a UI: `session start|stop|status` address the session profile's own socket
@@ -79,6 +82,7 @@ stdout:
 | `rpc` | Not affected by the flag at all — see [`rpc`](#rpc) below |
 | `events` | Not affected either: always one JSON line per event — see [`events`](#events) |
 | `skill` | `{"topic": "roost", "format": "markdown", "content": "…"}` — always the same skill `--json` or not; see [`skill`](#skill) |
+| `schema` | Not affected by the flag at all: the printed file already is JSON — see [`schema`](#schema) |
 
 Without `--json`, every command prints what it always has. An error is
 never written to stdout either way — see [Exit codes](#exit-codes).
@@ -87,8 +91,9 @@ never written to stdout either way — see [Exit codes](#exit-codes).
 
 A command that **changes** a tab — `notify`, `set-title`, `tab set-state`,
 `tab clear-notification`, `tab close`, `tab send`, `tab resize`,
-`tab focus` — acts on `--tab`, or else on `$ROOST_TAB_ID`. With neither
-it refuses, before it dials anything, and exits 2:
+`tab focus`, `tab report`, `tab prompt` — acts on `--tab`, or else on
+`$ROOST_TAB_ID`. With neither it refuses, before it dials anything, and
+exits 2:
 
 ```text
 roostctl: usage: no --tab and ROOST_TAB_ID is unset; refusing to guess the active tab for a command that changes it — `roostctl tab list` shows ids
@@ -209,6 +214,127 @@ The first form relies on `ROOST_TAB_ID`, which only a shell inside a Roost tab h
 | `--state` | string | required | One of `none`, `running`, `needs_input`, `idle` |
 | `--tab` | int | `$ROOST_TAB_ID` | Target tab id; exits 2 when neither is set |
 
+## `tab report`
+
+```bash
+roostctl tab report --tab 3 --source my-agent --session-id s-1 --claim \
+  --lifecycle working
+roostctl tab report --tab 3 --source my-agent --session-id s-1 --preserve \
+  --attention set --title "Needs input" --body "waiting on a confirm"
+roostctl tab report --tab 3 --source my-agent --session-id s-1 --release
+```
+
+A thin wrapper over the `tab.agent_report` op — flags map one-to-one onto
+its params ([ipc.md](ipc.md)). For an agent with no adapter yet, or a
+script driving the op by hand; a wired adapter reports through
+`agent-hook`/`claude-hook` instead. Needs `--tab` or `ROOST_TAB_ID`
+([why](#which-tab-a-command-acts-on)).
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `--source` | string | required | Ownership identity, half one. Refused when it names a Roost agent adapter's own source, or `manual`/`legacy` |
+| `--session-id` | string | required | Ownership identity, half two. Pass `""` for a source with no session concept |
+| `--claim` / `--preserve` / `--release` | flag | — | Exactly one is required: take ownership, report without changing it, or give it up |
+| `--lifecycle` | string | unchanged | One of `inactive`, `working`, `waiting`, `finished`, `failed` |
+| `--if` | string, repeatable | unconditional | Guard: apply `--lifecycle` / `--attention set` only if the tab's *current* lifecycle is one of these |
+| `--attention` | string | `preserve` | One of `set`, `clear`, `preserve`. `set` requires non-empty `--title` and `--body` |
+| `--severity` | string | `info` | One of `info`, `warn`, `error` |
+| `--title` / `--body` / `--detail` | string | `""` | The attention banner's title/body, and a free-form reason recorded on the owner |
+| `--metadata` | `KEY=VALUE`, repeatable | — | Open extension data. An empty key, a value with no `=`, or a repeated key is `usage` |
+
+`--json` prints the `tab.agent_report` reply verbatim (`accepted`, `tab`).
+Otherwise: `reported: tab N <lifecycle>` on `accepted: true` (the
+**returned** lifecycle — `--release` forces `inactive` even with no
+`--lifecycle` given); `not accepted: tab N is owned by <source>/<session_id>`,
+or `not accepted: tab N has no owner`, on `accepted: false`. **Exit 0
+either way** — the op succeeded and the ownership answer is data for the
+caller. A server refusal (a bad param, an unknown tab) exits 1 with the
+server's own code, same as every other verb.
+
+## `tab prompt`
+
+Submit a prompt to the agent running in a tab and wait for the turn it
+starts. The race-free form of `tab send` followed by `wait`, and the one
+verb that needs no `if` around the `running` wait.
+
+```bash
+roostctl tab prompt --tab 3 --timeout 600 'Summarize the failing tests.'
+roostctl tab prompt --tab 3 --no-timeout --until needs_input --json 'Fix it.'
+```
+
+**The sequence.** No new op — the verb is two `tab.write`s and the
+[event stream](ipc.md#eventssubscribe), in the one order that closes the
+race between them:
+
+1. Subscribe to the stream and fence it with a `tab.list` snapshot,
+   exactly as [`wait`](#wait) does — **before** anything is written.
+2. `tab.write` the text, on the request connection that subscription
+   checked the identity of.
+3. `tab.write` `\r` on that same connection, as a separate write, so an
+   input box that reads one write as a paste does not swallow the Enter
+   into the text.
+4. **The activity gate**: within `--activity-timeout`, or whatever
+   `--timeout` has left, whichever is sooner, the tab must reach
+   `running`. Otherwise exit 4 `stalled`.
+5. **The settled wait**: until the tab's state is one of `--until`.
+   Then exit 0.
+
+Both writes go on the subscribed connection so the prompt and the wait
+cannot straddle a restart, and the stream is fenced first so a turn that
+starts and ends quickly cannot slip into the gap between them — which is
+exactly what a `tab send` and a separate `wait --state running` can miss.
+
+| Flag | Type | Default | Description |
+|---|---|---|---|
+| `<text>` | positional | required | The prompt. Written as-is; Enter follows as a second write |
+| `--tab` | bare id | `$ROOST_TAB_ID` | Target tab; exits 2 with neither ([why](#which-tab-a-command-acts-on)). A host tab (`h<host>.<id>`) is refused |
+| `--activity-timeout` | float | `5.0` | How long the tab has to reach `running` after the prompt. Never outlasts `--timeout` |
+| `--until` | string, repeatable | `idle`, `needs_input` | A state the turn may settle in (`none`/`running`/`needs_input`/`idle`) |
+| `--timeout` | float | — | Give up after this many seconds, every call to the socket included. **Required** unless `--no-timeout`: how long a turn takes is not something this verb can guess, so it has no default. `0`, a negative, `inf` and `nan` are all `usage` (exit 2) |
+| `--no-timeout` | flag | `false` | Wait for as long as the turn takes. Cannot be combined with `--timeout` |
+
+**Two caveats.** The gate is **temporal, not causal**: it asks whether
+the tab reached `running` after the fence, not whether this prompt is
+what took it there, so an unrelated turn starting in the window
+satisfies it. And a tab that was **already `running`** when the stream
+was fenced has no start left to catch: the writes still go through
+(queueing a prompt behind the one running is the agent's business), the
+gate is skipped, the settled wait begins at once, and
+`started_after_ms` is `null`.
+
+**The stream is required.** Against a server whose `identify.ops` lacks
+`events.subscribe` and that names no `local_session_socket` — the Swift
+Mac app today — the verb exits 1 `unsupported` and writes nothing. There
+is no polling fallback: a poll cannot see a turn that starts and ends
+between two `tab.list` calls, so it would report a stall that never
+happened. Use [`tab send`](#tab-open-close-send-resize-reorder-dump)
+and [`tab dump`](#tab-open-close-send-resize-reorder-dump) there.
+
+Every call to the socket is bounded the way [`wait`](#wait)'s are, and a
+stream lost after the writes follows `wait`'s rules — resolved again
+once, and only against the same process. The writes are never repeated.
+
+| Exit | When |
+|---|---|
+| 0 | The turn settled in one of `--until` |
+| 4 `stalled` | The tab reached no `running` within `--activity-timeout` of the prompt. The text and the Enter *were* written, so the turn may yet start — read the tab with `tab dump` before sending anything again |
+| 4 `timeout` | `--timeout` ran out, whether in the gate or in the settled wait. `--timeout` always wins over `--activity-timeout` and keeps its own code |
+| 2 `usage` | No `--tab` and no `ROOST_TAB_ID` (checked first, before the budget), a host `--tab`, a missing or non-positive `--timeout` with no `--no-timeout`, or a non-positive `--activity-timeout` |
+| 1 `unsupported` | This server serves no event stream |
+| 1 *the server's own* | Either `tab.write` was refused — `not-found` for a tab with no live PTY, say — passed through verbatim |
+| 1 `connection` | The stream was lost twice, the Roost serving the tab changed, or a call went unanswered for 30 s under `--no-timeout` |
+
+With `--json`, success prints:
+
+```json
+{"tab_id": "3", "started_after_ms": 412, "settled": {"state": "idle"}, "after_ms": 38104}
+```
+
+Both durations are measured from the **Enter write**, not from the
+command's start. `started_after_ms` is `null` when the gate was skipped.
+Without `--json` the same facts print as one line:
+`prompted: tab 3 started after 412ms, idle after 38104ms`.
+
 ## `tab open` / `close` / `send` / `resize` / `reorder` / `dump`
 
 Tab lifecycle and I/O for automation. `tab close`, `tab send` and `tab resize` act on `--tab` or `$ROOST_TAB_ID` and exit 2 with neither; `tab dump` falls back to the UI's active tab ([why](#which-tab-a-command-acts-on)). `tab send` needs an existing live PTY (a UI must have already attached); errors with `NotFound` otherwise. `--bytes` accepts Rust string-escape sequences (`\n`, `\r`, `\x1b`, …); pass `--raw` to disable escape decoding.
@@ -218,6 +344,7 @@ roostctl tab open --project-id 1 --cwd ~/projects/roost
 roostctl tab open --project-id 1 -- htop                       # run a command in the tab
 roostctl tab open --project-id 1 --hold -- make test           # keep the tab open after it exits
 roostctl tab open --project-id 1 --after-tab 5 --focus -- vim   # next to tab 5, then focus it
+roostctl tab open --project-id 1 --no-activate -- make test     # open it without selecting it
 roostctl tab close --tab 5
 roostctl tab send --tab 5 --bytes 'ls -la\n'
 roostctl tab resize --tab 5 --cols 120 --rows 40
@@ -235,6 +362,7 @@ roostctl tab dump --tab 5 --scrollback 200   # 200 rows of history, then the vie
 | `--hold` | Keep the tab open after the command exits, dropping to an interactive shell (mirrors `command = … hold=true`). Only meaningful with a command. |
 | `--after-tab <id>` | Place the new tab immediately after that tab (same project) instead of at the end. Best-effort: if that tab is gone by the time the reorder lands, the new tab stays at the end. |
 | `--focus` | Focus (activate) the new tab after opening. |
+| `--no-activate` | Open the tab without selecting it: the active project and tab stay where they were (`tab.open`'s `activate: false`). Without it, opening a tab selects it. Refused beside `--focus` (exit 2 `usage`). A server that predates the field — the Mac app today — answers `unknown-field`, which is reported verbatim; nothing retries without the flag. |
 
 These compose: `--after-tab X --focus -- <cmd>` is the "open a command in a tab right here and switch to it" primitive that providers and other scripts use. (`--after-tab`/`--focus` are CLI orchestration over `tab.reorder` / `tab.focus`; `-- <cmd>` fills the `tab.open` op's `argv` — see [ipc.md](ipc.md).)
 
@@ -318,7 +446,7 @@ roostctl wait --tab 5 --state idle --no-timeout --json
 | `--state` | string | — | Wait until the tab's agent state equals this (`none`/`running`/`needs_input`/`idle`) |
 | `--text` | string | — | Wait until the viewport (via `tab.dump`) contains this substring. Pick a needle from command *output*, not the echoed command |
 | `--gone` | flag | `false` | Wait until the tab no longer exists. Cannot be combined with `--state` or `--text` |
-| `--timeout` | float | `5.0` | Give up after this many seconds. `0` checks once: exit `0` if the condition already holds, `4` if not |
+| `--timeout` | float | `5.0` | Give up after this many seconds, every call to the socket included. `0` checks once: exit `0` if the condition already holds, `4` if not. A value that is not a finite number of seconds (`inf`, `nan`), or too long to set a deadline by, is `usage` (exit 2), never "forever" |
 | `--no-timeout` | flag | `false` | Wait for as long as it takes. Cannot be combined with `--timeout` (exit 2) |
 | `--interval-ms` | int | `100` | The poll interval where there is no stream, and how often `--text` re-reads the viewport where there is |
 | `--tab` | bare id | `$ROOST_TAB_ID`, then the UI's active tab | Target tab. A host tab (`h<host>.<id>`) is refused with `usage` (exit 2): the stream is the local workspace's |
@@ -369,10 +497,16 @@ between them), the sequence is retried three times and then exits 1
 
 **Exits.** `0` once the condition holds; **4** (`timeout`) if `--timeout`
 elapses first, including while a backend switch in flight holds the wait off
-(re-checked every `--interval-ms`, never past the deadline) — before plan
-066 it exited 1, which a script could not tell from a failed connection; 2
-`usage` for a bad command line; 1 for everything in [Exit
-codes](#exit-codes).
+(re-checked every `--interval-ms`, never past the deadline) and inside a call
+the socket has not answered — "timed out after 1s waiting for tab 5
+(tab.dump did not answer)" — before plan 066 it exited 1, which a script
+could not tell from a failed connection. Under `--timeout 0` and
+`--no-timeout` there is no deadline, so each call gets **30 s**: a call left
+unanswered that long exits 1 `connection` ("tab.dump did not answer within
+30s"), because a server that accepts a call and never answers it is a dead
+connection, not a condition still pending. 2 `usage` for a bad command line,
+including a `--timeout` that is not a finite number of seconds; 1 for
+everything in [Exit codes](#exit-codes).
 
 With `--json`, success prints:
 
@@ -474,7 +608,9 @@ another caller into a second project of the same name (#221). `--cwd`
 defaults to `$PWD` and is used for **both** calls: the project (if this call
 creates it) and the new tab. Without `-- cmd…` the tab opens the default
 shell, same as [`tab open`](#tab-open-close-send-resize-reorder-dump);
-`--hold` and `--focus` compose exactly as they do there.
+`--hold`, `--focus` and `--no-activate` compose exactly as they do there
+(`--focus` with `--no-activate` is exit 2 `usage`, before anything is
+sent).
 
 Always prints `{"project", "tab", "created"}` — the ensured project, the
 opened tab, and whether the project was just created — **with or
@@ -515,7 +651,7 @@ Prints one counter per line plus two derived averages (`ns_per_refresh`, `ns_per
 
 ## `palette` subcommands
 
-Drive the command-palette overlay: open it, inspect its rows, filter, activate a row, dismiss. Activating a row runs the **same** command its keybind would (a command row's id is its keybind action), so this is a command-dispatch surface, not just a UI poke. Each subcommand prints the resulting palette state (a `>` marks the highlighted row); `--json` emits the structured result.
+Drive the command-palette overlay: `palette open`, `palette state`, `palette query <text>`, `palette activate <id>`, `palette dismiss`, `palette present --items <json>`. Activating a row runs the **same** command its keybind would (a command row's id is its keybind action), so this is a command-dispatch surface, not just a UI poke. Each subcommand prints the resulting palette state (a `>` marks the highlighted row); `--json` emits the structured result.
 
 ```bash
 roostctl palette open                      # the command palette
@@ -580,7 +716,7 @@ files directly instead, the same way `ensure` does — with nothing
 running, and reaching no host at all, so a connected host's live session
 does not pick up the change until it reconnects.
 
-`install` and `uninstall` take an agent name or `--all`, and
+`agent install` and `agent uninstall` take an agent name or `--all`, and
 deliberately ignore `agent-hooks = off` — an explicit verb always wins.
 Both also *move* the key rather than leaving it alone: `install`
 unions the named agent(s) into it (so the next `ensure` does not treat
@@ -792,6 +928,22 @@ one. `--json` prints `{"topic": "roost", "format": "markdown",
 goes to stdout. See the [Agent Skill](../guides/agent-skill.md) guide
 for what the skill covers and how it relates to [Agent
 Hooks](../guides/agents.md).
+
+## `schema`
+
+Print the wire's JSON Schema bundle — the same
+`docs/reference/api/roost-ipc.schema.json` this repo checks in, byte for
+byte, so the binary and the file cannot disagree:
+
+```bash
+roostctl schema
+```
+
+Needs no running Roost and no socket. Always prints the same JSON
+document — `--json` changes nothing, because the printed file already
+is the payload. See [Machine-readable
+schema](ipc.md#machine-readable-schema) for the bundle's shape and how
+it is generated and pinned.
 
 ## `doctor`
 
@@ -1006,13 +1158,14 @@ failed), the line is a JSON envelope instead:
 | 2 | `usage` | A bad command line, including a command that changes a tab given no `--tab` and no `ROOST_TAB_ID`. A parser error keeps clap's usage text in the message; `--help` and `--version` print to stdout and exit 0 |
 | 1 | `no-target` | Auto-detect found nothing listening at any known socket |
 | 1 | `ambiguous-target` | Several Roost UIs are running; pass `--target` |
-| 1 | `connection` | Dialing, reading or writing the socket failed, or the stream dropped (`wait` after a second loss or a stopping session; `events` on any drop or gap) |
+| 1 | `connection` | Dialing, reading or writing the socket failed, or the stream dropped (`wait` after a second loss or a stopping session; `events` on any drop or gap), or a call went unanswered for 30 s (`wait --timeout 0` or `--no-timeout`) |
 | 1 | *the server's own* | The server refused the request; its code is passed through verbatim (`not-found`, `invalid-param`, `unknown-op`, …) |
 | 1 | `unsupported` | This server does not serve an op the command needs |
 | 1 | `checks-failed` | `doctor` found a failing check; the report itself is on stdout |
 | 1 | `failed` | Something on this machine outside the wire: a file that could not be written, a binary that could not be found, an unset `$HOME` |
 | 3 | `not-running` | `session status` found no session running |
-| 4 | `timeout` | `wait`'s condition did not hold before `--timeout` |
+| 4 | `timeout` | `wait`'s or `tab prompt`'s condition did not hold before `--timeout` |
+| 4 | `stalled` | `tab prompt` wrote the prompt and the tab reached no `running` within `--activity-timeout`. CLI-local: no server answers this code |
 
 A command can also exit 1 **without** an error line when it has a
 partial outcome to report: `agent install`/`uninstall`/`ensure`/`set`

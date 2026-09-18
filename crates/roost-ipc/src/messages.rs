@@ -14,9 +14,12 @@
 //! attribute — clients see them as permissive, allowing the server
 //! to add fields in a backwards-compatible way.
 
+use std::borrow::Cow;
 use std::fmt;
 
+use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::agent::{AgentLifecycle, AgentTabState, Ownership, ShellState};
 use crate::local_route::LocalBackendMode;
@@ -28,7 +31,7 @@ use crate::local_route::LocalBackendMode;
 /// `TabState` — JSON string enum. Values: `"none"`, `"running"`,
 /// `"needs_input"`, `"idle"`. The legacy proto's `TAB_STATE_UNSPECIFIED`
 /// is intentionally omitted; the server always picks a concrete state.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TabState {
     #[default]
@@ -49,11 +52,13 @@ pub enum TabState {
 /// The axes themselves carry `#[serde(default)]` without exception so an
 /// older client decoding a newer server — and the reverse — keeps
 /// working while the two UIs land in separate commits (plan 002 §3.6).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Tab {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub id: i64,
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub project_id: i64,
     pub title: String,
     pub cwd: String,
@@ -89,9 +94,10 @@ impl Tab {
 
 /// Project snapshot. Used in `project.create` / `tab.list` /
 /// `project.created` event.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Project {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub id: i64,
     pub name: String,
     pub cwd: String,
@@ -111,11 +117,12 @@ pub struct Project {
 /// `op` and re-parses `params` into the typed per-op struct below. This
 /// keeps the envelope decoder generic while still letting each op's
 /// param struct carry `#[serde(deny_unknown_fields)]`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RawRequest {
     /// Client-allocated correlation id. String-wrapped int64.
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub id: i64,
     /// Dotted-lowercase op name (e.g. `"tab.open"`).
     pub op: String,
@@ -138,9 +145,10 @@ fn empty_object() -> serde_json::Value {
 ///
 /// Permissive on the client side (unknown fields ignored) so the
 /// server can extend response payloads forward-compatibly.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Response {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub id: i64,
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,7 +158,7 @@ pub struct Response {
 }
 
 /// Error body — kebab-case stable `code`, human-readable `message`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ResponseError {
     pub code: String,
     pub message: String,
@@ -200,7 +208,7 @@ impl Response {
 /// per-event additions are already forward-compatible. The
 /// server-side strictness lives on the *request* path, not on the
 /// event-push path which is server→client only.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct EventEnvelope {
     pub event: String,
     pub data: serde_json::Value,
@@ -221,7 +229,7 @@ pub const SESSION_STOPPING_EVENT: &str = "session.stopping";
 ///
 /// `reason` is `"stop"`: the session is shutting down and the
 /// connection is over.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionStoppingEvent {
     pub reason: String,
 }
@@ -236,7 +244,7 @@ pub const STREAM_ENDED_EVENT: &str = "stream.ended";
 /// `reason` is `"backend-switch"`: the UI is moving its tabs to another
 /// local backend, and the workspace this stream reads is about to stop
 /// being the one on screen.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct StreamEndedEvent {
     pub reason: String,
 }
@@ -245,7 +253,7 @@ pub struct StreamEndedEvent {
 // Identify
 // ============================================================================
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IdentifyParams {
     #[serde(default)]
@@ -254,13 +262,15 @@ pub struct IdentifyParams {
     pub client_version: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct IdentifyResult {
     pub socket_path: String,
     pub pid: i32,
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub active_project_id: i64,
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub active_tab_id: i64,
     pub app_label: String,
     pub app_id: String,
@@ -279,11 +289,10 @@ pub struct IdentifyResult {
     /// The phase of a local-backend switch in flight (plan 063 §D8a),
     /// absent while the UI is idle.
     ///
-    /// Present so a client told `busy: a local-backend switch is in
-    /// progress` can see *why*, and so a test can tell the phases apart
-    /// — the mode above flips at one documented point inside the
-    /// sequence, and nothing else on the wire distinguishes "before" it
-    /// from "after".
+    /// Present so a client refused `busy` can see *why*, and so a test
+    /// can tell the phases apart — the mode above flips at one documented
+    /// point inside the sequence, and nothing else on the wire
+    /// distinguishes "before" it from "after".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_backend_switch: Option<String>,
     /// Why the last attempt to write `state.json` failed, absent while
@@ -307,10 +316,11 @@ pub struct IdentifyResult {
 // Tab lifecycle
 // ============================================================================
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabOpenParams {
     #[serde(with = "string_int64", default)]
+    #[schemars(with = "String")]
     pub project_id: i64,
     #[serde(default)]
     pub cwd: String,
@@ -322,21 +332,26 @@ pub struct TabOpenParams {
     pub rows: u32,
     #[serde(default)]
     pub title: String,
+    /// `Some(false)` opens the tab without selecting it or its project.
+    /// Absent and `Some(true)` both select it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activate: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabOpenResult {
     pub tab: Tab,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabCloseParams {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabListResult {
     pub projects: Vec<Project>,
     /// The commit revision this snapshot was taken at — the fence a
@@ -353,20 +368,23 @@ pub struct TabListResult {
     pub revision: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabWriteParams {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     /// Raw bytes encoded as base64. See `bytes_base64`.
     #[serde(with = "bytes_base64")]
+    #[schemars(with = "String")]
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabResizeParams {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     pub cols: u32,
     pub rows: u32,
@@ -380,7 +398,7 @@ pub struct TabResizeParams {
 /// text — the determinism backbone for content assertions in automated
 /// tests (assert on exact text instead of OCR / pixel-matching) — plus
 /// however many rows of history above it `scrollback` asks for.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabDumpParams {
     /// Bare engine id, or the `h<host>.<id>` wire spelling for an
@@ -411,7 +429,7 @@ pub const MAX_DUMP_SCROLLBACK: u32 = 10_000;
 
 /// Cursor position within the dumped viewport, 0-indexed from the top-left.
 /// Absent when the cursor is off-viewport or hidden by the terminal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabDumpCursor {
     pub row: u32,
     pub col: u32,
@@ -422,7 +440,7 @@ pub struct TabDumpCursor {
 /// trailing blanks trimmed, reconstructing what's on screen (a blank
 /// cell renders as a space so columns line up). Permissive on the wire
 /// so per-cell color fields can be added forward-compatibly.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabDumpResult {
     pub cols: u32,
     pub rows: u32,
@@ -459,7 +477,7 @@ pub struct TabDumpResult {
 /// `palette.open` params: which root frame to present. Empty or
 /// `"commands"` opens the command palette; `"launcher"` opens the
 /// custom-command launcher. An unknown kind is rejected `invalid-param`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PaletteOpenParams {
     #[serde(default)]
@@ -468,7 +486,7 @@ pub struct PaletteOpenParams {
 
 /// `palette.query` params: replace the current frame's filter text
 /// (resetting selection to the top match), as if the user typed it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PaletteQueryParams {
     pub query: String,
@@ -478,7 +496,7 @@ pub struct PaletteQueryParams {
 /// matches — exactly as pressing Enter on it would, running its command
 /// or drilling into its sub-frame. `not-found` if no visible row has
 /// that id.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PaletteActivateParams {
     pub id: String,
@@ -489,11 +507,11 @@ pub struct PaletteActivateParams {
 /// every other op rather than ACK-ing arbitrary payloads — same
 /// rationale as [`AppActivateParams`]. Distinct types keep each op's
 /// contract its own.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PaletteStateParams {}
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PaletteDismissParams {}
 
@@ -505,7 +523,7 @@ pub struct PaletteDismissParams {}
 /// (those rows render generic) — including a *malformed* one: the field
 /// decodes leniently to `None` rather than failing the request, matching
 /// the pre-agent behavior where the key was unknown and dropped.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PaletteItemView {
     pub id: String,
     pub title: String,
@@ -538,7 +556,7 @@ where
 /// ::agent_display_name` — folded into the row's own `title` too, so a
 /// caller that only reads the palette's flat item list still sees which
 /// agent a row belongs to.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PaletteAgentRow {
     pub effective_lifecycle: AgentLifecycle,
     pub agent: String,
@@ -556,7 +574,7 @@ pub struct PaletteAgentRow {
 /// `"themes"` | `"notifications"`), `query`/`selection` are the live
 /// filter + highlight, and `items` are the filtered rows in display
 /// order. Permissive on the wire for forward-compatible fields.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PaletteStateResult {
     pub open: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -585,7 +603,7 @@ pub struct PaletteStateResult {
 /// "present a list / read a list" contract is one schema. `title` and
 /// `placeholder` are optional chrome; `items` is required (an empty list
 /// is rejected `invalid-param` — nothing to present).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PalettePresentParams {
     #[serde(default)]
@@ -600,7 +618,7 @@ pub struct PalettePresentParams {
 /// palette without picking (Esc / focus loss / another palette opening
 /// over it). Exactly one is meaningful — `dismissed: true` leaves
 /// `selected_id` `None`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct PalettePresentResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_id: Option<String>,
@@ -623,7 +641,7 @@ pub struct PalettePresentResult {
 /// libghostty tracked grid ref, so the selection follows its content
 /// through scrolling, eviction and reflow (mirrors mouseDown /
 /// drag_begin).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SelectionPoint {
     pub col: u16,
     pub row: u16,
@@ -632,10 +650,11 @@ pub struct SelectionPoint {
 /// `selection.set` request: drop any existing selection and create a new
 /// one anchored at `anchor` with the cursor at `cursor`. Both are viewport
 /// (col, row); rows outside `[0, tab_rows)` are rejected `invalid-param`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SelectionSetParams {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     pub anchor: SelectionPoint,
     pub cursor: SelectionPoint,
@@ -643,18 +662,20 @@ pub struct SelectionSetParams {
 
 /// `selection.clear` request: drop the selection on this tab (no-op if
 /// none active).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SelectionClearParams {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
 }
 
 /// `selection.dump` request: read back the current selection.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SelectionDumpParams {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
 }
 
@@ -663,7 +684,7 @@ pub struct SelectionDumpParams {
 /// returns nothing — same lossy behavior as `⌘C` / Ctrl+Shift+C today).
 /// `anchor_visible` / `cursor_visible` report whether each endpoint is
 /// currently in the viewport — useful for asserting clip behavior.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SelectionDumpResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -675,13 +696,13 @@ pub struct SelectionDumpResult {
 /// clipboard (`NSPasteboard.general` / CLIPBOARD); `"selection"` reads
 /// the per-app selection pasteboard (named `NSPasteboard` on Mac /
 /// PRIMARY on Linux). Unknown values are rejected `invalid-param`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ClipboardDumpParams {
     pub target: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ClipboardDumpResult {
     /// `None` when the target has no text content (PRIMARY off Linux,
     /// or an empty pasteboard).
@@ -704,7 +725,7 @@ pub struct ClipboardDumpResult {
 /// The Mac UI is **text only** (`ipc.md`): its handler has no name for
 /// `image_png` and refuses the key with `unknown-field`, and a request
 /// carrying neither field is `invalid-param` there.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ClipboardWriteParams {
     pub target: String,
@@ -717,6 +738,7 @@ pub struct ClipboardWriteParams {
         with = "bytes_base64_opt",
         skip_serializing_if = "Option::is_none"
     )]
+    #[schemars(with = "Option<String>")]
     pub image_png: Option<Vec<u8>>,
 }
 
@@ -757,13 +779,15 @@ pub struct ClipboardWriteParams {
 /// drain as if the supervisor had emitted them. Indistinguishable
 /// from real PTY output to the OSC scanner + libghostty — same
 /// `TabOutput` channel, same downstream handlers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabFeedPtyBytesParams {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     /// Raw bytes encoded as base64. See `bytes_base64`.
     #[serde(with = "bytes_base64")]
+    #[schemars(with = "String")]
     pub data: Vec<u8>,
 }
 
@@ -771,7 +795,7 @@ pub struct TabFeedPtyBytesParams {
 /// queued onto this tab's PTY-input channel (keystrokes, paste,
 /// synthesized OSC replies). `drain=true` consumes the buffer;
 /// `drain=false` peeks.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabCapturePtyInputParams {
     /// Bare engine id, or the `h<host>.<id>` wire spelling for an
@@ -782,10 +806,11 @@ pub struct TabCapturePtyInputParams {
     pub drain: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabCapturePtyInputResult {
     /// Captured input bytes, base64-encoded on the wire.
     #[serde(with = "bytes_base64")]
+    #[schemars(with = "String")]
     pub data: Vec<u8>,
 }
 
@@ -797,10 +822,11 @@ pub struct TabCapturePtyInputResult {
 /// holding the route, so a stale/wrong id fails loudly instead of
 /// silently feeding the wrong tab. Gated like `tab.feed_pty_bytes`
 /// (ROOST_TEST_MODE=1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabFeedImeParams {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     /// `"preedit" | "commit" | "clear"`.
     pub action: String,
@@ -818,7 +844,7 @@ pub struct TabFeedImeParams {
 /// `app.dialog_dump` request: which host modal is on screen, and what
 /// it says. Gated on `ROOST_TEST_MODE=1`; see the section header above
 /// for why this is a test seam rather than a surface.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppDialogDumpParams {}
 
@@ -828,7 +854,7 @@ pub struct AppDialogDumpParams {}
 /// them: what a test needs to assert is that the user is being told the
 /// right thing, and re-deriving that from a state dump would be the
 /// test writing the copy rule a second time.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AppDialogDumpResult {
     /// `"add" | "confirm_stop" | "confirm_restart" | "bootstrap"`, or
     /// `null` when no host modal is up.
@@ -862,7 +888,7 @@ pub struct AppDialogDumpResult {
 }
 
 /// One agent's switch on the agent-hooks card.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AppDialogAgentRow {
     /// The canonical agent name — `claude`, `codex`, `grok`, `cursor`,
     /// `opencode` — the same spelling the `agent-hooks` key uses.
@@ -888,7 +914,7 @@ pub struct AppDialogAgentRow {
 /// `app.dialog_answer` request: press the visible host modal's primary
 /// button, or dismiss it. The same routes a click and the Enter/Escape
 /// keys take. Gated on `ROOST_TEST_MODE=1`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppDialogAnswerParams {
     /// `"confirm"`, `"cancel"`, or `"toggle:<agent>"` — the last being
@@ -911,7 +937,7 @@ pub struct AppDialogAnswerParams {
 /// route that can close a live terminal, mutate workspace state, or
 /// write the system clipboard. Widen this allowlist only alongside a
 /// concrete test need, one name at a time.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppKeybindDispatchParams {
     /// Must be `"paste"` — the only action this op will dispatch.
@@ -921,7 +947,7 @@ pub struct AppKeybindDispatchParams {
 /// `tab.dump_resolved` request: walk a tab's render state through
 /// the same resolver the production paint path uses (including the
 /// theme's bold-color override).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabDumpResolvedParams {
     /// Bare engine id, or the `h<host>.<id>` wire spelling for an
@@ -935,10 +961,11 @@ pub struct TabDumpResolvedParams {
 /// `tab.feed_pty_bytes` (ROOST_TEST_MODE=1) — promotes to a real op
 /// later if hooks need it. Mirrors the `handle_click_count` /
 /// `handleClickCount` shape on each port.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabExpandSelectionAtParams {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     pub col: u16,
     pub row: u16,
@@ -969,10 +996,11 @@ pub struct TabExpandSelectionAtParams {
 /// drives the encoder alone (`TerminalView.emitMouseTracking`), which is
 /// why the link case is a Linux-only E2E — `xdg-open` is resolved
 /// through `PATH` and macOS spawns `/usr/bin/open` by absolute path.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabDispatchMouseEventParams {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     /// `"press" | "release" | "motion"`.
     pub kind: String,
@@ -991,7 +1019,7 @@ pub struct TabDispatchMouseEventParams {
 /// UI writes `\x1b[I` / `\x1b[O` onto the tab's input channel; tests
 /// pick those up via `tab.capture_pty_input`. Gated by
 /// `ROOST_TEST_MODE=1`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppSetWindowFocusParams {
     pub focus: bool,
@@ -1003,11 +1031,11 @@ pub struct AppSetWindowFocusParams {
 /// `"default"` if no shape has been requested yet
 /// (and `"default"` for the empty-string reset form, so callers can
 /// always assert against a non-empty name). Not gated — read-only.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppCursorShapeParams {}
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AppCursorShapeResult {
     /// W3C cursor name (`default`, `pointer`, `text`, …).
     pub shape: String,
@@ -1018,11 +1046,11 @@ pub struct AppCursorShapeResult {
 /// intentionally separate from native toplevel/compositor focus, so
 /// callers can distinguish terminal input ownership from application
 /// activation. Not gated — read-only.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppActiveTerminalFocusedParams {}
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AppActiveTerminalFocusedResult {
     /// True when keyboard input is logically routed to the active
     /// terminal. False when an overlay owns input or no terminal exists.
@@ -1030,17 +1058,18 @@ pub struct AppActiveTerminalFocusedResult {
 }
 
 /// `app.selected_tab_id` params. Read-only, not gated.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppSelectedTabIdParams {}
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AppSelectedTabIdResult {
     /// The tab id currently selected in the active project's AdwTabView
     /// (the on-screen tab — UI truth, independent of the core's active
     /// tab). `0` when there is no selection. Lets tests assert the UI
     /// selection and the workspace core agree.
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
 }
 
@@ -1048,11 +1077,11 @@ pub struct AppSelectedTabIdResult {
 /// label. Gated like `tab.feed_pty_bytes` (ROOST_TEST_MODE=1), and
 /// implemented only by the macOS iced UI — every other UI answers
 /// `not-implemented`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppDockBadgeParams {}
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AppDockBadgeResult {
     /// The badge text AppKit currently holds — the notification-inbox
     /// count as a decimal string, or `null` when the badge is cleared
@@ -1065,11 +1094,11 @@ pub struct AppDockBadgeResult {
 /// macOS iced UI installed. Gated like `app.dock_badge`, and
 /// implemented only by the macOS iced UI — every other UI answers
 /// `not-implemented`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppMenuDumpParams {}
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AppMenuDumpResult {
     /// One entry per top-level menu bar item (App/File/View/Edit/
     /// Window), in `NSMenu` order.
@@ -1080,7 +1109,7 @@ pub struct AppMenuDumpResult {
 /// `NSMenu` — nothing here is re-derived from the keybind table, so a
 /// table/menu drift bug shows up as a dump mismatch instead of being
 /// papered over.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MenuDump {
     /// The submenu's own title. For the App menu this is the profile
     /// display name — AppKit substitutes it for display, but the title
@@ -1091,7 +1120,7 @@ pub struct MenuDump {
 }
 
 /// One menu item, read straight off the live `NSMenuItem`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MenuItemDump {
     pub title: String,
     /// The raw `keyEquivalent` string AppKit holds (empty when the item
@@ -1125,7 +1154,7 @@ pub struct MenuItemDump {
 /// or a disabled item (`performActionForItemAtIndex:` runs no
 /// validation itself, so this op checks `isEnabled` first). Gated and
 /// platform-restricted like `app.menu_dump`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppMenuActivateParams {
     pub path: Vec<String>,
@@ -1134,11 +1163,11 @@ pub struct AppMenuActivateParams {
 /// `app.update_status` request: read back the Sparkle updater's state
 /// from the macOS iced UI's seam. Gated and platform-restricted like
 /// `app.menu_dump`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppUpdateStatusParams {}
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AppUpdateStatusResult {
     /// Whether `Sparkle.framework` was found beside the executable and
     /// `dlopen`ed. False for every bare-binary build — the framework
@@ -1160,7 +1189,7 @@ pub struct AppUpdateStatusResult {
 
 /// The outcome of one completed update check, recorded by the seam's
 /// `SPUUpdaterDelegate` callbacks.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct UpdateCheckDump {
     /// `"found"` (a newer version is in the appcast), `"none"` (the
     /// feed parsed and offered nothing newer) or `"error"` (no feed, an
@@ -1179,7 +1208,7 @@ pub struct UpdateCheckDump {
 /// callers condition-wait on `check_id` advancing. Errors when the
 /// updater is unavailable. Gated and platform-restricted like
 /// `app.menu_dump`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppUpdateCheckParams {}
 
@@ -1190,11 +1219,11 @@ pub struct AppUpdateCheckParams {}
 /// the reason a backend is unavailable differs (the Swift app installs
 /// its delegate at construction and so is always available). Gated on
 /// `ROOST_TEST_MODE=1` like `app.menu_dump`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppNotificationStatusParams {}
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AppNotificationStatusResult {
     /// `"available"` once the UN delegate installed (a bundled launch
     /// that has reached `window_opened`), `"unavailable"` otherwise —
@@ -1215,7 +1244,7 @@ pub struct AppNotificationStatusResult {
 /// content (same path `selection.dump` uses), or `None` when the
 /// span turned out to be a single-cell selection that the renderer
 /// reports as empty.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabExpandSelectionAtResult {
     pub col0: u16,
     pub col1: u16,
@@ -1226,14 +1255,14 @@ pub struct TabExpandSelectionAtResult {
 /// terminal grid. Fg/bg are `#RRGGBB` to keep the JSON human-readable
 /// for test assertions. `has_explicit_bg` tracks whether the bg came
 /// from an SGR cell vs the default.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabDumpResolvedResult {
     pub cols: u16,
     pub rows: u16,
     pub cells: Vec<ResolvedCell>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ResolvedCell {
     pub row: u32,
     pub col: u16,
@@ -1252,7 +1281,7 @@ pub struct ResolvedCell {
 // Project lifecycle
 // ============================================================================
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectCreateParams {
     #[serde(default)]
@@ -1261,7 +1290,7 @@ pub struct ProjectCreateParams {
     pub cwd: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProjectCreateResult {
     pub project: Project,
 }
@@ -1269,7 +1298,7 @@ pub struct ProjectCreateResult {
 /// `project.ensure`: find the project with this exact name, or create it.
 /// `cwd` is read only on the create path, so a caller that knows the
 /// project exists may omit it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectEnsureParams {
     pub name: String,
@@ -1277,24 +1306,26 @@ pub struct ProjectEnsureParams {
     pub cwd: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProjectEnsureResult {
     pub project: Project,
     pub created: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectRenameParams {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub project_id: i64,
     pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectDeleteParams {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub project_id: i64,
 }
 
@@ -1310,7 +1341,7 @@ pub struct ProjectDeleteParams {
 /// ipc.md` for the routing matrix. Bare ids decode to `Local` and
 /// serialize bare, so local traffic is byte-identical to what it was
 /// before the qualified form existed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabReorderParams {
     pub project_id: WireProjectRef,
@@ -1318,7 +1349,7 @@ pub struct TabReorderParams {
 }
 
 /// See [`TabReorderParams`] for the host-qualified form.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectReorderParams {
     pub project_ids: Vec<WireProjectRef>,
@@ -1328,7 +1359,7 @@ pub struct ProjectReorderParams {
 // Control
 // ============================================================================
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabFocusParams {
     /// Bare engine id for a local tab, or the `h<host>.<id>` spelling to
@@ -1339,36 +1370,41 @@ pub struct TabFocusParams {
     pub tab_id: WireTabRef,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabFocusResult {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub previous_project_id: i64,
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub previous_tab_id: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabSetTitleParams {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     pub title: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabSetStateParams {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     pub state: TabState,
 }
 
 /// [`ops::TAB_CLEAR_NOTIFICATION`] params: take a tab's pending
 /// notification down.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabClearNotificationParams {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     /// The [`NotificationFiredEvent::generation`] this clear
     /// acknowledges, or `None` for "take it down whatever it is".
@@ -1386,7 +1422,7 @@ pub struct TabClearNotificationParams {
 }
 
 /// [`ops::TAB_CLEAR_NOTIFICATION`] reply.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabClearNotificationResult {
     /// Whether this call is what took a pending notification down.
     ///
@@ -1398,10 +1434,11 @@ pub struct TabClearNotificationResult {
     pub cleared: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabSetHookActiveParams {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     pub active: bool,
 }
@@ -1414,16 +1451,17 @@ pub struct TabSetHookActiveParams {
 /// §3.3) — the tab is then returned unchanged. Callers get the post-
 /// report `Tab` back so an adapter never needs a follow-up `tab.list`
 /// to see what its report did.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabAgentReportResult {
     pub accepted: bool,
     pub tab: Tab,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NotificationCreateParams {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     pub title: String,
     #[serde(default)]
@@ -1434,7 +1472,7 @@ pub struct NotificationCreateParams {
 // Events subscribe
 // ============================================================================
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EventsSubscribeParams {
     /// Restrict to a single tab. `"0"` (or absent) means all events.
@@ -1444,6 +1482,7 @@ pub struct EventsSubscribeParams {
     /// contract lie, and a client that believes it is filtered would
     /// mis-attribute every other tab's events. HS-2 scope.
     #[serde(with = "string_int64", default)]
+    #[schemars(with = "String")]
     pub tab_id_filter: i64,
     /// Resume instead of starting fresh: *the client already has
     /// everything at or below this revision* — the same sentence
@@ -1488,7 +1527,7 @@ pub struct EventsSubscribeParams {
 /// `revision + 1`. Plain `u64`, matching [`EventBatch::revision`] —
 /// revisions are in-process counters, not ids, so the string-int64
 /// convention does not apply.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct EventsSubscribeResult {
     pub revision: u64,
     /// The incarnation answering — [`SessionIdentify::session_id`].
@@ -1503,7 +1542,7 @@ pub struct EventsSubscribeResult {
 /// `app.activate` carries no params. Declared (empty + strict) so the
 /// handler validates the envelope like every other op rather than
 /// ACK-ing arbitrary payloads (#80).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppActivateParams {}
 
@@ -1511,7 +1550,7 @@ pub struct AppActivateParams {}
 /// renders at logical window size (the default; already the resolution
 /// a vision model consumes after its own downsample), `2` super-samples
 /// for a human zooming in. The UI rejects anything outside `1..=2`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScreenshotParams {
     #[serde(default = "default_screenshot_scale")]
@@ -1533,9 +1572,10 @@ impl Default for ScreenshotParams {
 /// `app.screenshot` response. `png` is the raw PNG bytes (base64 on the
 /// wire); `width`/`height` are the pixel dimensions actually rendered
 /// (== logical size × `scale`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ScreenshotResult {
     #[serde(with = "bytes_base64")]
+    #[schemars(with = "String")]
     pub png: Vec<u8>,
     pub width: u32,
     pub height: u32,
@@ -1545,14 +1585,14 @@ pub struct ScreenshotResult {
 /// `app.window_metrics` request — nullary envelope (`{}`). The struct
 /// is empty but `deny_unknown_fields` rejects strays so a typo in the
 /// client surfaces immediately, matching every other op's contract.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WindowMetricsParams {}
 
 /// `app.window_metrics` response — logical (point) measurements of the
 /// running UI's window + sidebar. Used by the sidebar layout regression
 /// tests to assert the sidebar holds its width across window resizes.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct WindowMetricsResult {
     pub window_width: f64,
     pub window_height: f64,
@@ -1572,15 +1612,16 @@ pub struct WindowMetricsResult {
 
 /// `app.sidebar_dump` request — nullary envelope (`{}`), matching
 /// `WindowMetricsParams`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SidebarDumpParams {}
 
 /// One agent row as actually rendered under a project in the sidebar
 /// (plan 007 §3.8), plus whether it is the active tab.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SidebarDumpAgentRow {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     pub name: String,
     pub lifecycle: AgentLifecycle,
@@ -1590,9 +1631,10 @@ pub struct SidebarDumpAgentRow {
 }
 
 /// One project's rendered agent rows, in sidebar order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SidebarDumpProject {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub project_id: i64,
     pub agents: Vec<SidebarDumpAgentRow>,
 }
@@ -1602,7 +1644,7 @@ pub struct SidebarDumpProject {
 /// `key` is the `h<incarnation>.<id>` spelling every host-qualified
 /// UI-socket op takes, so a caller that read this dump can focus or
 /// reorder the row without probing for the incarnation first.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SidebarDumpHostTab {
     pub key: String,
     pub title: String,
@@ -1610,7 +1652,7 @@ pub struct SidebarDumpHostTab {
 
 /// One project of a host section, with its tabs in the mirror's order.
 /// `key` is the host-qualified spelling, as on [`SidebarDumpHostTab`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SidebarDumpHostProject {
     pub key: String,
     pub name: String,
@@ -1622,7 +1664,7 @@ pub struct SidebarDumpHostProject {
 /// `id` is the saved host's stable id — what a `host.*` verb is
 /// addressed to — and `state` is the section's own wire spelling, the
 /// same string `host.status` reports.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SidebarDumpHost {
     pub id: String,
     pub label: String,
@@ -1642,7 +1684,7 @@ pub struct SidebarDumpHost {
 /// host below it. `saved_id` is the **only** pairing between a band and
 /// a saved host: under `session` the leading band is itself a host, so
 /// position says nothing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SidebarDumpSection {
     /// `"local"` | `"session"` | `"host"`.
     pub role: String,
@@ -1676,7 +1718,7 @@ pub struct SidebarDumpSection {
 /// off or mid-drag — those are transient UI state, not part of this
 /// contract. All projects appear, in sidebar order, including ones
 /// with zero agents.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SidebarDumpResult {
     pub agents_visible: bool,
     pub projects: Vec<SidebarDumpProject>,
@@ -1706,7 +1748,7 @@ pub struct SidebarDumpResult {
 /// `app.render_stats` request — read the running UI's render-path
 /// counters. `reset` zeroes them *after* the read, so a caller can
 /// read-reset, run a workload, then read the delta directly.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppRenderStatsParams {
     #[serde(default)]
@@ -1730,36 +1772,47 @@ pub struct AppRenderStatsParams {
 /// on top of `string_int64`: the mac Swift handler doesn't send them, so
 /// a decode against that response must still succeed (same tolerance
 /// pattern as `TabOpenParams.project_id`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AppRenderStatsResult {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub refresh_calls: i64,
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub refresh_nanos: i64,
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub rows_rebuilt: i64,
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub cells_walked: i64,
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub draw_calls: i64,
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub draw_nanos: i64,
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub fill_text_calls: i64,
     #[serde(with = "string_int64", default)]
+    #[schemars(with = "String")]
     pub view_calls: i64,
     #[serde(with = "string_int64", default)]
+    #[schemars(with = "String")]
     pub view_nanos: i64,
     #[serde(with = "string_int64", default)]
+    #[schemars(with = "String")]
     pub elide_calls: i64,
     #[serde(with = "string_int64", default)]
+    #[schemars(with = "String")]
     pub elide_nanos: i64,
 }
 
 /// `window.resize` request — programmatically set the window's logical
 /// size. Test-mode only (gated by `ROOST_TEST_MODE=1`); see the op
 /// const comment block below for the rationale.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WindowResizeParams {
     pub width: f64,
@@ -1772,7 +1825,7 @@ pub struct WindowResizeParams {
 /// lands at the nearest bound rather than being rejected. Test-mode
 /// only (gated by `ROOST_TEST_MODE=1`); see the op const comment block
 /// below for the rationale.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SidebarSetWidthParams {
     pub width: f64,
@@ -1782,98 +1835,112 @@ pub struct SidebarSetWidthParams {
 // Event data types
 // ============================================================================
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabOpenedEvent {
     pub tab: Tab,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabClosedEvent {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabStateChangedEvent {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     pub state: TabState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabTitleChangedEvent {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     pub title: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabCwdChangedEvent {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     pub cwd: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabNotificationEvent {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     pub has_pending: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProjectCreatedEvent {
     pub project: Project,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProjectRenamedEvent {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub project_id: i64,
     pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProjectDeletedEvent {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub project_id: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ActiveChangedEvent {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub project_id: i64,
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
 }
 
 /// `tabs.reordered` — the full post-reorder display order for one
 /// project, not a diff.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabsReorderedEvent {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub project_id: i64,
     #[serde(with = "vec_string_int64")]
+    #[schemars(with = "Vec<String>")]
     pub tab_ids: Vec<i64>,
 }
 
 /// `projects.reordered` — the full post-reorder sidebar order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ProjectsReorderedEvent {
     #[serde(with = "vec_string_int64")]
+    #[schemars(with = "Vec<String>")]
     pub project_ids: Vec<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HookActiveChangedEvent {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     pub active: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct NotificationFiredEvent {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     pub title: String,
     #[serde(default)]
@@ -1908,9 +1975,10 @@ pub struct NotificationFiredEvent {
 /// their (derived) slices so existing consumers keep working; this
 /// carries what those two projections lose — which lifecycle, whose
 /// session, and the shell axis underneath.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentReportChangedEvent {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     #[serde(default)]
     pub shell_state: ShellState,
@@ -1974,7 +2042,9 @@ pub const SESSION_PROTOCOL_VERSION: u32 = 6;
 /// recognize, and negotiate on the ones it does. A closed enum would
 /// make an unknown kind a decode error and turn "one extra kind" into
 /// a hard incompatibility.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct AttachPayloadKind(pub String);
 
@@ -2026,7 +2096,7 @@ impl std::fmt::Display for AttachPayloadKind {
 /// `libghostty_build` value is constructed by producers (`roost-session`
 /// for its own build, `roost-iced` for the client's expected value) that
 /// already depend on `roost-vt` for other reasons.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionBinaryIdentity {
     pub app_version: String,
     pub session_protocol: u32,
@@ -2042,7 +2112,7 @@ pub struct SessionBinaryIdentity {
 /// negotiable. `started_at` is an RFC3339 timestamp, carried as a
 /// string so the wire stays human-readable and free of a date-time
 /// dependency on either side.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionIdentify {
     pub app_version: String,
     pub session_protocol: u32,
@@ -2065,13 +2135,13 @@ pub struct SessionIdentify {
 /// `session.identify` params — empty today, a struct (not a bare
 /// `Value`) so the op rejects unknown fields the same way every other
 /// op does.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SessionIdentifyParams {}
 
 /// `session.stop` params — empty: stop takes no options. A future
 /// deadline override lands here rather than in a new op.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SessionStopParams {}
 
@@ -2086,13 +2156,16 @@ pub struct SessionStopParams {}
 ///
 /// Tab ids are string-encoded like every other id on this wire, so a
 /// JavaScript client can't round them through a lossy `Number`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionStopResult {
     #[serde(with = "vec_string_int64")]
+    #[schemars(with = "Vec<String>")]
     pub reaped: Vec<i64>,
     #[serde(with = "vec_string_int64")]
+    #[schemars(with = "Vec<String>")]
     pub killed: Vec<i64>,
     #[serde(with = "vec_string_int64")]
+    #[schemars(with = "Vec<String>")]
     pub abandoned: Vec<i64>,
 }
 
@@ -2107,7 +2180,7 @@ pub struct SessionStopResult {
 ///
 /// A commit that produced no events is pushed as an **empty** batch
 /// rather than skipped, so a gap on the wire always means loss.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct EventBatch {
     pub revision: u64,
     #[serde(default)]
@@ -2153,7 +2226,7 @@ pub struct AttachHandshake {
 /// client negotiated with: without it a dial released after a drop
 /// could land on a **replacement** session listening at the same socket
 /// path and stream a tab the client never asked for.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AttachHandshakeTerms {
     pub session_id: String,
     /// The client's preference order; the server serves the first entry
@@ -2211,7 +2284,7 @@ impl AttachHandshake {
 /// object as the rest of the line, and "all of them or none of them" is
 /// a rule serde cannot state on a nested struct while still naming the
 /// field that is missing.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 struct RawAttachHandshake {
     attach: String,
     protocol_version: u32,
@@ -2270,6 +2343,37 @@ impl TryFrom<RawAttachHandshake> for AttachHandshake {
     }
 }
 
+impl JsonSchema for AttachHandshake {
+    fn schema_name() -> Cow<'static, str> {
+        "AttachHandshake".into()
+    }
+
+    /// [`RawAttachHandshake`]'s derived schema, with `required` replaced
+    /// to match [`TryFrom<RawAttachHandshake>`] exactly: every terms
+    /// field the conversion `ok_or`s on, plus the two top-level fields
+    /// that are never optional. `cell_w_px`/`cell_h_px` stay out —
+    /// they default to 0 for a headless client — and so does the
+    /// all-or-nothing resume triple, which falls back to snapshot mode
+    /// rather than erroring.
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let mut schema = RawAttachHandshake::json_schema(generator);
+        schema.insert(
+            "required".to_string(),
+            json!([
+                "attach",
+                "protocol_version",
+                "session_id",
+                "kinds",
+                "cols",
+                "rows",
+                "libghostty_build",
+                "focus",
+            ]),
+        );
+        schema
+    }
+}
+
 impl From<AttachHandshake> for RawAttachHandshake {
     fn from(h: AttachHandshake) -> Self {
         let t = h.terms;
@@ -2292,7 +2396,7 @@ impl From<AttachHandshake> for RawAttachHandshake {
 }
 
 /// How the server chose to serve an accepted handshake.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AttachMode {
     /// Full snapshot stream, then live frames. The fallback for every
@@ -2327,7 +2431,7 @@ pub enum AttachMode {
 /// of what the bytes say. When the two agree the fields are a no-op.
 /// Never absent: under protocol equality every session that answers an
 /// accepted handshake states the geometry its bytes were written for.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AttachAccepted {
     pub kind: AttachPayloadKind,
     pub mode: AttachMode,
@@ -2369,7 +2473,7 @@ impl AttachHandshakeReply {
 /// Flat mirror of [`AttachHandshakeReply`] — serde has no bool-tagged
 /// enum representation, and a hand-written `Deserialize` would be a lot
 /// of code to say "look at `ok`".
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 struct RawAttachHandshakeReply {
     ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2425,6 +2529,54 @@ impl TryFrom<RawAttachHandshakeReply> for AttachHandshakeReply {
     }
 }
 
+impl JsonSchema for AttachHandshakeReply {
+    fn schema_name() -> Cow<'static, str> {
+        "AttachHandshakeReply".into()
+    }
+
+    /// Two arms over [`RawAttachHandshakeReply`]'s properties, matching
+    /// `TryFrom<RawAttachHandshakeReply>` field for field: `ok: true`
+    /// requires everything [`AttachAccepted`] carries, `ok: false`
+    /// requires only `error`. A single flat `required` list (what the
+    /// derive would produce) cannot state that — it would either demand
+    /// the accepted fields on a rejection or leave them all optional.
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let raw = RawAttachHandshakeReply::json_schema(generator);
+        let properties = raw
+            .get("properties")
+            .and_then(Value::as_object)
+            .cloned()
+            .expect("RawAttachHandshakeReply schema has properties");
+
+        let mut accepted_properties = properties.clone();
+        accepted_properties.insert("ok".to_string(), json!({"const": true}));
+        let accepted = json_schema!({
+            "type": "object",
+            "properties": accepted_properties,
+            "required": [
+                "ok",
+                "kind",
+                "mode",
+                "seq",
+                "server_epoch",
+                "tab_generation",
+                "snapshot_cols",
+                "snapshot_rows",
+            ],
+        });
+
+        let mut rejected_properties = properties;
+        rejected_properties.insert("ok".to_string(), json!({"const": false}));
+        let rejected = json_schema!({
+            "type": "object",
+            "properties": rejected_properties,
+            "required": ["ok", "error"],
+        });
+
+        json_schema!({"oneOf": [accepted, rejected]})
+    }
+}
+
 impl From<AttachHandshakeReply> for RawAttachHandshakeReply {
     fn from(reply: AttachHandshakeReply) -> Self {
         match reply {
@@ -2456,7 +2608,7 @@ impl From<AttachHandshakeReply> for RawAttachHandshakeReply {
 /// `roost-engine`'s `persistence::HostSnapshot` field-for-field; kept as
 /// a separate type because this crate does not depend on `roost-engine`
 /// (the wire is the shared vocabulary, not the storage struct).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Host {
     pub id: String,
     pub label: String,
@@ -2465,34 +2617,34 @@ pub struct Host {
     pub last_connected: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HostAddParams {
     pub label: String,
     pub target: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HostAddResult {
     pub host: Host,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HostRemoveParams {
     pub id: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HostListParams {}
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HostListResult {
     pub hosts: Vec<Host>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HostConnectParams {
     pub id: String,
@@ -2517,7 +2669,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HostDisconnectParams {
     pub id: String,
@@ -2533,7 +2685,7 @@ pub struct HostDisconnectParams {
 /// stream instead. A caller that wants the settled answer polls
 /// [`host.status`](HostStatus) — which reports the connection state the
 /// sidebar's band is drawn from, not the state a request asked for.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HostConnectionResult {
     pub host: Host,
     /// One of [`host_state`]'s spellings.
@@ -2541,14 +2693,14 @@ pub struct HostConnectionResult {
 }
 
 /// `host.status` request: every saved host, or just the one named.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HostStatusParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HostStatusResult {
     pub hosts: Vec<HostStatus>,
 }
@@ -2558,7 +2710,7 @@ pub struct HostStatusResult {
 ///
 /// The registry fields come first and verbatim from [`Host`], so a
 /// caller correlating state with a saved host needs no second op.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HostStatus {
     pub id: String,
     pub label: String,
@@ -2642,7 +2794,7 @@ pub struct HostStatus {
 /// before any tab has attached, which is what makes
 /// [`Self::reduced_fidelity`] readable earlier than
 /// [`HostStatus::payload_kind`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HostConnectStatus {
     /// The session's own id, as `session.identify` reports it.
     pub session_id: String,
@@ -2668,7 +2820,7 @@ pub struct HostConnectStatus {
 /// localhost retry is the connection task's own backoff and its counter
 /// never leaves the task, so those four are absent there and `delay_ms`
 /// is the whole story.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RetrySchedule {
     pub delay_ms: u64,
     /// The 1-based attempt number the band shows in `(3/10)`.
@@ -2733,7 +2885,9 @@ pub mod host_state {
 /// but a future addition costs a new constant, not a protocol
 /// generation. A client that receives a value it has no handler for
 /// debug-logs and ignores it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct TabEffect(pub String);
 
@@ -2775,7 +2929,7 @@ impl std::fmt::Display for TabEffect {
 ///
 /// Stays closed: a two-value set with no growth pressure, unlike
 /// [`TabEffect`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ClipboardEffectTarget {
     #[default]
@@ -2796,9 +2950,10 @@ pub enum ClipboardEffectTarget {
 /// `target` is present on clipboard writes too, so a primary-selection
 /// write does not land on the system clipboard. Absent means
 /// [`ClipboardEffectTarget::System`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabEffectEvent {
     #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
     pub tab_id: i64,
     pub effect: TabEffect,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2825,7 +2980,7 @@ pub const CLIPBOARD_EFFECT_MAX_BYTES: usize = 256 * 1024;
 /// Live-only: it rides the event stream and is never replayed. The
 /// standing value is [`SessionIdentify::persist_error`], which is what a
 /// client re-reads after a resync.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DurabilityChangedEvent {
     pub error: Option<String>,
 }
@@ -2836,7 +2991,7 @@ pub struct DurabilityChangedEvent {
 /// already uses, so a theme is readable in a wire trace. `palette` is
 /// exactly 256 entries — a short or long one is `invalid-param` rather
 /// than a partially applied theme.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OscColorsParams {
     pub foreground: String,
@@ -2852,7 +3007,7 @@ pub struct OscColorsParams {
 /// tabs that exist now **and** is remembered for tabs the session opens
 /// later, so a client sends it once on connecting (before it dials its
 /// first data connection) and again whenever its theme changes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSetThemeParams {
     pub osc_colors: OscColorsParams,
@@ -2861,7 +3016,7 @@ pub struct SessionSetThemeParams {
 /// [`ops::SESSION_SET_THEME`] result: how many live tabs were reseeded.
 /// Zero is a success — a session with no tabs still records the theme
 /// for the ones it opens next.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionSetThemeResult {
     pub tabs: u32,
 }
@@ -2882,7 +3037,7 @@ pub struct SessionSetThemeResult {
 /// The client sends it on **every** connect with its own `agent-hooks`
 /// value, because the op is idempotent and a config change made since
 /// the last connect has no other way to reach the host.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SessionSetAgentHooksParams {
     /// The agents the client's own `agent-hooks` key allows. Never
@@ -2907,7 +3062,7 @@ pub struct SessionSetAgentHooksParams {
 /// answering binary has no adapter for the name the client sent, plan
 /// 065 §3.1) — the two-mode-era `"skip-list"` spelling this field used
 /// to carry is gone with the mode it named.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentHooksSkipped {
     pub agent: String,
     pub reason: String,
@@ -2934,7 +3089,7 @@ impl AgentHooksSkipped {
 
 /// One agent the host tried and failed to wire. Reported, never
 /// swallowed — and never fatal to the connection that asked.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentHooksFailed {
     pub agent: String,
     pub error: String,
@@ -2957,7 +3112,7 @@ pub struct AgentHooksFailed {
 /// raise only ever widens, so there is nothing for that op to take out.
 /// The field stays on the shared shape because `agent.set_hooks` (an
 /// explicit local `set_hooks`, not a raise) can still populate it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentHooksOutcome {
     pub wired: Vec<String>,
     pub refreshed: Vec<String>,
@@ -3011,6 +3166,21 @@ impl<'de> Deserialize<'de> for AgentSetHooksAgents {
     }
 }
 
+impl JsonSchema for AgentSetHooksAgents {
+    fn schema_name() -> Cow<'static, str> {
+        "AgentSetHooksAgents".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "anyOf": [
+                {"const": "off"},
+                {"type": "array", "items": {"type": "string"}},
+            ]
+        })
+    }
+}
+
 /// [`ops::AGENT_SET_HOOKS`] params: set *this* client's own `agent-hooks`
 /// key — the UI-socket twin of [`SessionSetAgentHooksParams`], for the
 /// machine the UI is running on rather than a connected host.
@@ -3020,7 +3190,7 @@ impl<'de> Deserialize<'de> for AgentSetHooksAgents {
 /// which the user drives directly on their own machine, where
 /// [`SessionSetAgentHooksParams`]'s raise-only rule exists only because
 /// nobody is at the far end's keyboard to ask.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSetHooksParams {
     pub agents: AgentSetHooksAgents,
@@ -3028,7 +3198,7 @@ pub struct AgentSetHooksParams {
 
 /// One connected host's answer to the [`ops::AGENT_SET_HOOKS`] raise
 /// this UI pushed on to it, or why it could not be asked.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum AgentSetHooksHostOutcome {
     Result {
@@ -3044,7 +3214,7 @@ pub enum AgentSetHooksHostOutcome {
 /// [`ops::AGENT_SET_HOOKS`] result: what changed on this machine, and
 /// what every connected non-localhost host reported back once its own
 /// `agent-hooks` key was raised to match.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AgentSetHooksResult {
     /// Where this machine's `agent-hooks` key now lives, for the
     /// confirmation surface to name.
@@ -3090,12 +3260,13 @@ pub const MAX_PUT_FILE_BYTES: u64 = 10 * 1024 * 1024;
 /// Open to every same-UID connection — each one's uploads land in their
 /// own private directory — and in the session's mutating set: a
 /// `session.stop` racing an upload waits for it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SessionPutFileParams {
     pub name: String,
     /// Raw bytes encoded as base64. See `bytes_base64`.
     #[serde(with = "bytes_base64")]
+    #[schemars(with = "String")]
     pub data: Vec<u8>,
 }
 
@@ -3113,7 +3284,7 @@ pub struct SessionPutFileParams {
 /// again: nothing evicts it, because it may sit unsubmitted in an
 /// agent's composer for an hour. A store with no room answers
 /// `store-full` and deletes nothing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionPutFileResult {
     pub path: String,
     pub bytes: u64,
@@ -3132,7 +3303,7 @@ pub struct SessionPutFileResult {
 /// in the **UI process's** filesystem namespace. That is not a new
 /// security boundary: the socket is same-uid 0700, and `tab.write` /
 /// `tab.open` already let the same caller type or run anything.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TabSendFileParams {
     pub tab: String,
@@ -3148,7 +3319,7 @@ pub struct TabSendFileParams {
 ///
 /// `uploads` is empty for a local tab, where `pasted` is the escaped
 /// local path and nothing crossed a boundary.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct TabSendFileResult {
     pub pasted: String,
     pub uploads: Vec<SentFile>,
@@ -3161,7 +3332,7 @@ pub struct TabSendFileResult {
 /// `name` survives the crossing because the agents show it in their
 /// chips — `design.pdf` stays `design.pdf`, and the random directory
 /// above it is what keeps two drops of one name from colliding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SentFile {
     pub source: String,
     pub name: String,
@@ -3177,7 +3348,7 @@ pub struct SentFile {
 /// [`AgentHooksSkipped::reason`] is one: a result a client cannot
 /// decode at all is worse than one carrying a reason it has no name
 /// for, and the planner that mints these lives a crate away.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SkippedFile {
     pub path: String,
     pub reason: String,
@@ -3569,6 +3740,22 @@ impl<'de> Deserialize<'de> for WireTabRef {
     }
 }
 
+/// The grammar [`WireTabRef::parse`] and [`WireProjectRef::parse`] both
+/// accept, as a JSON Schema `pattern`: canonical integers only (no `+`,
+/// no leading zero, no `-0`), a non-zero host, and, because the ids are
+/// `i64`, a negative id. Only the `i64`/`u32` ranges escape it.
+const WIRE_REF_PATTERN: &str = r"^(0|-?[1-9][0-9]*|h[1-9][0-9]*\.(0|-?[1-9][0-9]*))$";
+
+impl JsonSchema for WireTabRef {
+    fn schema_name() -> Cow<'static, str> {
+        "WireTabRef".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({"type": "string", "pattern": WIRE_REF_PATTERN})
+    }
+}
+
 /// [`WireTabRef`]'s project twin: the bare string-wrapped engine id
 /// (`"4"`) or the host-qualified `h<host>.<id>` spelling (`"h3.4"`) —
 /// plan 044 §3.1 d6, which gave the reorder ops their host form.
@@ -3639,6 +3826,16 @@ impl<'de> Deserialize<'de> for WireProjectRef {
         let raw = String::deserialize(de)?;
         Self::parse(&raw)
             .ok_or_else(|| serde::de::Error::custom(format!("invalid project reference: {raw}")))
+    }
+}
+
+impl JsonSchema for WireProjectRef {
+    fn schema_name() -> Cow<'static, str> {
+        "WireProjectRef".into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({"type": "string", "pattern": WIRE_REF_PATTERN})
     }
 }
 
@@ -3976,6 +4173,31 @@ mod tests {
     fn tab_open_params_reject_unknown() {
         let bad = r#"{"project_id":"1","cols":100,"rows":30,"badfield":true}"#;
         assert!(serde_json::from_str::<TabOpenParams>(bad).is_err());
+    }
+
+    /// #503: absent, `activate` leaves the request the bytes it always was.
+    #[test]
+    fn tab_open_activate_is_on_the_wire_only_when_set() {
+        let mut params = TabOpenParams {
+            project_id: 17,
+            cwd: "/tmp".into(),
+            argv: vec!["/bin/zsh".into()],
+            cols: 120,
+            rows: 30,
+            title: String::new(),
+            activate: None,
+        };
+        let before = r#"{"project_id":"17","cwd":"/tmp","argv":["/bin/zsh"],"cols":120,"rows":30,"title":""}"#;
+        assert_eq!(serde_json::to_string(&params).unwrap(), before);
+        assert_eq!(
+            serde_json::from_str::<TabOpenParams>(before).unwrap(),
+            params
+        );
+
+        params.activate = Some(false);
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.ends_with(r#","title":"","activate":false}"#), "{json}");
+        round_trip(&params);
     }
 
     #[test]

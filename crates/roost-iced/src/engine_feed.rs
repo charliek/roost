@@ -171,6 +171,12 @@ pub(crate) enum EngineFeed {
     /// step's completion ordered against the host mirror batches the
     /// phase after it fences on. Boxed like every other host item.
     LocalBackendSwitch(Box<crate::app::local_backend::SwitchStepDone>),
+    /// The IPC socket's admission gate drained for the switch of this
+    /// generation (plan 067 §3.2). Tagged for
+    /// [`crate::app::local_backend::SwitchStepDone`]'s reason.
+    SwitchAdmissionDrained {
+        generation: u64,
+    },
     /// A host answered the confirming `tab.list` plan 063 §D6's
     /// auto-remove waits on. Same reason it rides the feed rather than
     /// an Iced task as the bootstrap above: it is started from a
@@ -269,6 +275,8 @@ impl EngineFeedReceiver {
                 // sidebar draws, and the selection — and it releases the
                 // guard the exit rule reads.
                 | EngineFeed::LocalBackendSwitch(..)
+                // It lets the switch take the snapshot it was holding.
+                | EngineFeed::SwitchAdmissionDrained { .. }
         );
         let tab_bytes = matches!(
             item,

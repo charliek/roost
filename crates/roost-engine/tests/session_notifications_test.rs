@@ -83,13 +83,19 @@ fn reply(outcome: HandlerOutcome) -> serde_json::Value {
 /// One tab in a fresh project.
 fn a_tab(f: &Fixture) -> i64 {
     let project = f.workspace.create_project("p", "/tmp").unwrap().id;
-    f.workspace.open_tab(project, "/tmp", "sh").unwrap().id
+    f.workspace
+        .open_tab(project, "/tmp", "sh", true)
+        .unwrap()
+        .id
 }
 
 /// Another tab beside `tab`, in the same project.
 fn sibling_tab(f: &Fixture, tab: i64) -> i64 {
     let project = f.workspace.tab(tab).unwrap().project_id;
-    f.workspace.open_tab(project, "/tmp", "sh").unwrap().id
+    f.workspace
+        .open_tab(project, "/tmp", "sh", true)
+        .unwrap()
+        .id
 }
 
 /// Whether a structured notification for `tab` gets through.
@@ -244,7 +250,7 @@ async fn a_connection_ending_retires_no_ones_attention() {
         "ai.stridelabs.Roost.test",
     );
     let project = workspace.create_project("p", "/tmp").unwrap().id;
-    let ui_tab = workspace.open_tab(project, "/tmp", "sh").unwrap().id;
+    let ui_tab = workspace.open_tab(project, "/tmp", "sh", true).unwrap().id;
     workspace.focus_tab(ui_tab).unwrap();
 
     handler.connection_ended(1);

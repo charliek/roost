@@ -8,12 +8,13 @@
 
 use std::sync::{Arc, RwLock};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::paths::BundleProfile;
 
 /// Which local backend the UI is running its own tabs on.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum LocalBackendMode {
     /// PTYs in the UI process — the original arrangement (DL-4).
@@ -336,30 +337,24 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
 ];
 
 /// The code a UI socket answers with when an op meant for the slot
-/// cannot be put to it (plan 063 §D10): the slot is down, the launch has
-/// not dialled it yet, or a switch has quiesced it.
+/// cannot be put to it because the slot is not connected (plan 063 §D10):
+/// it is down, or the launch has not dialled it yet.
 ///
-/// `host-unavailable` rather than a code of its own. The slot *is* a
-/// host, this is already that code's meaning, and
-/// `docs/reference/ipc.md` tells a client to treat any code outside the
-/// UI socket's documented list as fatal for the request — so inventing
-/// one here would put a code on the wire that this socket's own contract
-/// says cannot appear there.
-pub const SLOT_UNAVAILABLE_CODE: &str = "host-unavailable";
+/// `host-unavailable` rather than a code of its own because the slot *is*
+/// a host and this is already that code's one meaning. A switch in flight
+/// is not this, and answers [`crate::codes::BUSY`].
+pub use crate::codes::HOST_UNAVAILABLE as SLOT_UNAVAILABLE_CODE;
 
 /// Its sentence. One spelling, because the engine's handler and the UI's
 /// forward arm both answer it and a client matches on it.
 pub const SLOT_UNAVAILABLE: &str = "local session is not connected";
 
-/// What every local-backend mutation is answered with while a switch is
-/// in flight (plan 063 §D8a), under [`SLOT_UNAVAILABLE_CODE`].
+/// The message every local-backend mutation is refused with, under
+/// [`crate::codes::BUSY`], while a switch is in flight (plan 063 §D8a).
 ///
-/// One string, because it is a contract: a `roostctl`/`palette.activate`
-/// caller has to be able to tell "the UI is mid-switch, try again" from
-/// a real refusal, and a per-call-site wording could not be matched on.
 /// Here rather than beside the switch because the engine's handler
 /// answers it too, for a subscribe the switch would otherwise never end.
-pub const SWITCH_BUSY: &str = "busy: a local-backend switch is in progress";
+pub const SWITCH_BUSY_MESSAGE: &str = "a local-backend switch is in progress";
 
 /// The row for `op`, or `None` for a name no row covers.
 ///

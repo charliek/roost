@@ -1845,12 +1845,6 @@ const HASH_CHUNK: usize = 64 * 1024;
 /// The `kind` segment of a bootstrap job's scratch-directory name.
 const JOB_DIR_KIND: &str = "bootstrap";
 
-/// The one refusal code [`BootstrapJob::stop_over_the_wire`] reads as
-/// the stop it asked for. Spelled from
-/// [`crate::client::ServerCode::ShuttingDown`]'s wire form, which
-/// `the_stop_accepts_only_the_shutting_down_code` pins.
-const SHUTTING_DOWN_CODE: &str = "shutting-down";
-
 /// What one exec over the job master came back with.
 #[derive(Debug)]
 struct ExecOutcome {
@@ -2702,7 +2696,7 @@ impl BootstrapJob {
                 tracing::info!(host = %self.target, "bootstrap: nothing to stop over there");
                 Ok(())
             }
-            BridgeAnswer::Refused { code, detail } if code == SHUTTING_DOWN_CODE => {
+            BridgeAnswer::Refused { code, detail } if code == crate::codes::SHUTTING_DOWN => {
                 tracing::info!(host = %self.target, detail, "bootstrap: the session was already shutting down; waiting for it to go");
                 Ok(())
             }

@@ -334,7 +334,7 @@ impl Engine {
         validate_dimension(params.cols, "cols")?;
         validate_dimension(params.rows, "rows")?;
         if params.project_id == 0 {
-            params.project_id = self.workspace.ensure_default_project(&params.cwd);
+            params.project_id = self.workspace.ensure_default_project(&params.cwd, true);
         }
         self.client
             .open_tab(
@@ -586,8 +586,8 @@ mod tests {
     async fn reorder_commands_refuse_host_qualified_refs() {
         let workspace = Arc::new(Workspace::new());
         let project = workspace.create_project("p", "/tmp").unwrap();
-        let first = workspace.open_tab(project.id, "/tmp", "one").unwrap();
-        let second = workspace.open_tab(project.id, "/tmp", "two").unwrap();
+        let first = workspace.open_tab(project.id, "/tmp", "one", true).unwrap();
+        let second = workspace.open_tab(project.id, "/tmp", "two", true).unwrap();
         let engine = Engine::new(
             workspace.clone(),
             Arc::new(PtySupervisor::new()),
@@ -684,8 +684,8 @@ mod tests {
     async fn compound_events_share_revision_and_keep_commit_order() {
         let workspace = Arc::new(Workspace::new());
         let project = workspace.create_project("p", "/tmp").unwrap();
-        let first = workspace.open_tab(project.id, "/tmp", "one").unwrap();
-        let second = workspace.open_tab(project.id, "/tmp", "two").unwrap();
+        let first = workspace.open_tab(project.id, "/tmp", "one", true).unwrap();
+        let second = workspace.open_tab(project.id, "/tmp", "two", true).unwrap();
         let mut events = workspace.subscribe_versioned();
 
         workspace.delete_project(project.id).unwrap();
