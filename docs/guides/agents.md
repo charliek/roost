@@ -21,7 +21,7 @@ What differs is where each signal comes from:
 
 | Agent | `source` | Config file Roost writes into | Blocked signal | Turn-end signal | Interrupt signal |
 |---|---|---|---|---|---|
-| Claude Code | `claude` | `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`) — merged in beside your own hooks | `PermissionRequest` (immediate) | `Stop` | none — the post-turn `idle_prompt` notification is the only later signal, guarded so it can't overwrite a real `waiting`/`failed` |
+| Claude Code | `claude` | `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`) — merged in beside your own hooks | `PermissionRequest` (immediate); the `Notification` types `agent_needs_input` and `elicitation_dialog` also set it, unconditionally | `Stop` | none — the post-turn `idle_prompt` notification is the only later signal, guarded so it can't overwrite a real `waiting`/`failed` |
 | Codex | `codex` | `~/.codex/hooks.json` + `[hooks.state]` in `config.toml` (or `$CODEX_HOME`) | `PermissionRequest` | `Stop` | `Interrupt` |
 | grok / gx | `grok` | `$GROK_HOME/hooks/roost.json` (default `~/.grok`) — a file Roost owns outright | `Notification` `notificationType: permission_prompt` | `Stop` on its first fire; a fire with `stopHookActive: true` (a blocking Stop gate already continued the turn) keeps `working` instead, and the `idle_prompt` Notification settles it | `StopCancelled` |
 | cursor-agent | `cursor` | `~/.cursor/hooks.json` (or `$CURSOR_CONFIG_DIR`) — merged in beside your own hooks | none — an accepted gap, see [Per-agent caveats](#per-agent-caveats) | `stop` | `stop` (same event as turn-end; see caveats) |
@@ -318,6 +318,55 @@ substring test:
 Only a file Roost itself created is ever deleted on uninstall, and only
 the state record can say which those are; a `{}` or an empty file that
 predates Roost is written back empty rather than removed.
+
+## When a tab stays running
+
+An agent that is hard-killed — `kill -9`, a crash, a closed laptop lid
+over SSH — fires no `Stop`/`SessionEnd` hook, so the tab keeps whatever
+lifecycle it last reported (`running`, `needs_input`, …) with nothing to
+tell Roost otherwise.
+
+**What clears it.** Ownership is deliberately not TTL'd — Claude fires
+no periodic hook, so a long tool call would look stale and get released
+mid-turn — so the only thing that clears a stuck lifecycle is the
+shell's own OSC 133 prompt marks. Reaching a fresh prompt (`A`/`B`) or a
+command ending (`D`) drops the lifecycle to `inactive` while *keeping*
+ownership as a label, so the tab falls through to shell-derived state
+instead of staying stuck. The shell only reaches a prompt once the
+foreground command has exited, so an agent that owned the tab is
+necessarily gone by then.
+
+**Which shells emit those marks.** Roost's bundled integration
+(`crates/roost-engine/resources/shell-integration/`) wires them for zsh
+and bash: zsh's
+`preexec`/`precmd` hooks fire the `C` and `D` marks unconditionally;
+bash's `PROMPT_COMMAND` fires `D` on every version, but the `C`
+(command-start) mark needs bash ≥ 4.4 — `PS0` is silently ignored on
+older bash, including macOS's stock `/bin/bash` 3.2. A shell with no
+prompt marks at all — dash, plain `sh`, or bash/zsh with the
+integration disabled — never clears a stuck lifecycle on its own.
+
+**Manual clear.** From any shell:
+
+```bash
+roostctl tab set-state --tab <id> --state none
+```
+
+This claims ownership as `manual` and releases it in the same step,
+falling the tab through to shell-derived state (see
+[`cli.md`](../reference/cli.md#tab-set-state)).
+
+**fish.** Tested with fish 4.9.3: fish marks its own prompts and
+commands (OSC 133) with no Roost integration installed, so a fish tab's
+shell state reads `at_prompt` from the first prompt, and a tab left
+`running` by an agent that was killed clears as soon as fish draws its
+next prompt — the same as Roost's own bash integration. Older fish
+releases were not tested.
+
+There is no shell-agnostic failsafe today — nothing in `crates/` reads
+the PTY's foreground process group. A `tcgetpgrp`-based one, which would
+cover dash/`sh` too, is tracked as future work in
+[#519](https://github.com/charliek/roost/issues/519).
 
 ## Codex trust
 

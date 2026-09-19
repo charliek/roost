@@ -131,14 +131,21 @@ different places — only one is on `PATH`:
 | Platform | Path | On `PATH`? |
 |---|---|---|
 | **Linux (`.deb`)** | `/usr/bin/roostctl` | ✅ yes |
-| **macOS (`.dmg`)** | `Roost.app/Contents/Resources/bin/roostctl` (inside the bundle) | ❌ no — a Finder-launched app gets a minimal `PATH` |
+| **macOS, `Roost.app` (`.dmg`)** | `Roost.app/Contents/Resources/bin/roostctl` (inside the bundle) | ❌ no — a Finder-launched app gets a minimal `PATH` |
+| **macOS, `Roost-Iced.app` (`.dmg`)** | `Roost-Iced.app/Contents/Resources/bin/roostctl` (inside the bundle) | ❌ no — a Finder-launched app gets a minimal `PATH` |
 
 For your own shell on macOS, symlink it onto `PATH` once
 (`ln -s /Applications/Roost.app/Contents/Resources/bin/roostctl
-/usr/local/bin/roostctl`). **Provider scripts don't need to** — Roost
-sets `ROOST_ROOSTCTL` to the absolute path of its own `roostctl` when it
-runs them, so `"${ROOST_ROOSTCTL:-roostctl}"` is portable across both
-platforms. See [Extending Roost](../guides/extending.md#opening-tabs-from-activate).
+/usr/local/bin/roostctl`, or the equivalent `Roost-Iced.app` path if
+that is the build you drive agents through). **Provider scripts don't
+need to** — Roost sets `ROOST_ROOSTCTL` to the absolute path of its own
+`roostctl` when it runs them, so `"${ROOST_ROOSTCTL:-roostctl}"` is
+portable across both platforms. See [Extending Roost](../guides/extending.md#opening-tabs-from-activate).
+
+Running both apps at once, `roostctl` can't auto-detect which one you
+mean and exits 1 with `ambiguous-target` ([exit codes](#exit-codes)
+below); pass `--target mac` or `--target iced` (or set `ROOST_SOCKET`
+to the specific socket) to pick one.
 
 ## `notify`
 
@@ -587,8 +594,8 @@ roostctl project list
 roostctl project create --name "scratch" --cwd ~
 roostctl project ensure --name "scratch"                 # --cwd defaults to $PWD
 roostctl project ensure --name "scratch" --cwd ~/scratch
-roostctl project rename --project-id 1 --name "main"
-roostctl project delete --project-id 2
+roostctl project rename --id 1 --name "main"
+roostctl project delete --id 2
 roostctl project reorder --order 1,3,2
 ```
 

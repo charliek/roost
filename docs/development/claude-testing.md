@@ -27,7 +27,7 @@ The dot/stripe color is a **derived** projection of independent axes — shell s
 | idle (gray) | agent lifecycle `finished` | `tab set-state --state idle --tab N` |
 | failed (red) | agent lifecycle `failed` (collapses to `needs_input` on the legacy wire `state` field, but renders as its own color in the UI) | not reachable via `tab set-state` (its accepted values are `{none, running, needs_input, idle}`) — drive it with a `StopFailure` hook payload (T5b below) or a raw `tab.agent_report` |
 
-`tab set-state` claims ownership as `manual`, which **supersedes** whatever currently owns the tab, a live Claude session included — see [Notifications → Manual override](../guides/notifications.md#manual-override-tab-set-state). Claude's own hook → state mapping is documented in full in [Claude Code Hooks](../guides/claude-code.md); this doc's CLI cheatsheet below reproduces just enough of it to drive by hand.
+`tab set-state` claims ownership as `manual`, which **supersedes** whatever currently owns the tab, a live Claude session included — see [Notifications → Manual override](../guides/notifications.md#manual-override-tab-set-state). Claude's own hook → state mapping is documented in full in [Agent Hooks → Supported agents](../guides/agents.md#supported-agents), with Claude-specific detail in [Claude Code Hooks](../guides/claude-code.md); this doc's CLI cheatsheet below reproduces just enough of it to drive by hand.
 
 ## CLI cheatsheet
 
@@ -61,7 +61,7 @@ Pick any non-empty string and reuse it for the whole sequence:
 | `echo '{"session_id":"t1","error":"rate_limit"}' \| ROOST_TAB_ID=N roostctl claude-hook stop-failure` | Lifecycle → failed (red dot); fires an error banner naming the error. |
 | `echo '{"session_id":"t1"}' \| ROOST_TAB_ID=N roostctl claude-hook session-end` | Releases ownership; lifecycle → inactive; clears any pending notification. Tab falls back to shell-derived state. |
 
-Both the canonical `hook_event_name` spelling Claude Code itself sends (`SessionStart`, `UserPromptSubmit`, `Notification`, `Stop`, `StopFailure`, `SessionEnd`) and the kebab-case spelling used above (what `roostctl claude install` wrote before this event set existed) are accepted — see [Claude Code Hooks](../guides/claude-code.md).
+Both the canonical `hook_event_name` spelling Claude Code itself sends (`SessionStart`, `UserPromptSubmit`, `Notification`, `Stop`, `StopFailure`, `SessionEnd`) and the kebab-case spelling used above (what `roostctl claude install` wrote before this event set existed) are accepted — see [Agent Hooks](../guides/agents.md) for the shared mechanism and [Claude Code Hooks](../guides/claude-code.md#three-things-specific-to-claude) for this detail.
 
 ## Test checklist
 
@@ -193,7 +193,9 @@ baked into the entry. `roostctl agent status` says what is wired and
 
 Now every `claude` session inside a Roost tab automatically drives the
 integration — see
-[Claude Code Hooks](../guides/claude-code.md) for the full event →
-effect mapping, including the `background_tasks` / `StopFailure` /
+[Agent Hooks → Supported agents](../guides/agents.md#supported-agents)
+for the full event → effect mapping, and
+[Claude Code Hooks](../guides/claude-code.md) for the
+`background_tasks` / `StopFailure` /
 unrecognized-`notification_type` cases the manual cheatsheet above
 walks through by hand.

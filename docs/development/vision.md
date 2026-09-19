@@ -1114,6 +1114,28 @@ See [`guides/host-sessions.md`](../guides/host-sessions.md#switching-the-local-b
 for the user-facing shape and
 [`reference/ipc.md`](../reference/ipc.md#identify) for the wire fields.
 
+### DL-28: Roost-Iced becomes the recommended Mac install for agent-driving users (2026-09-19, pending)
+
+**This is a pending decision, not a shipped one.** From the release
+after v0.0.19, [`getting-started/installation.md`](../getting-started/installation.md)
+steers Mac users who drive Roost from an agent — the Claude skill,
+`roostctl open`/`wait`/`events`, `tab prompt` — onto `Roost-Iced.app`
+rather than the classic Swift `Roost.app`, because the Swift build does
+not serve that surface: no `project.ensure` (`open` is `unsupported`),
+no `activate` (`--no-activate` is `unknown-field`), and no event stream
+(`events` and `tab prompt` fail, `wait` polls) — see
+[`reference/cli.md`](../reference/cli.md).
+
+Charlie's own framing of what comes after this release, recorded here
+rather than decided: Roost will either sunset the Swift app and make
+Roost-Iced the Mac default, or rebuild the Swift UI as a thin layer over
+the same Rust core Roost-Iced already uses. Either branch puts the
+agent-control surface in the Rust core — this is additive to
+[DL-16](#dl-16-an-experimental-mac-iced-build-ships-beside-swift-2026-08-25)'s
+convergence hypothesis and the (a)/(b) branches in
+[Direction (under evaluation)](#direction-under-evaluation) below, not a
+resolution of it.
+
 ## Direction (under evaluation)
 
 **Status: under evaluation — not a commitment.** Nothing in this section

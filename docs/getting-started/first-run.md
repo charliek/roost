@@ -21,6 +21,50 @@ With no [host sessions](../guides/host-sessions.md) saved, the sidebar looks exa
 
 On first launch Roost creates a project named `default` with one tab. The tab's working directory is your home directory and the shell is whatever `$SHELL` is set to (falling back to `/bin/sh`).
 
+## Roost-Iced: a fresh install starts on a session
+
+**Roost-Iced / Linux only** — the Swift `Roost.app` never reads this key
+and always runs in-process (see below).
+
+A genuinely fresh Roost-Iced install — no `state.json` and no
+`config.conf` for that profile yet — starts its local tabs on a
+`localhost` **session** rather than running them in-process: your local
+project(s) live in a small headless `roost-session` daemon instead of
+inside the app itself, the same way an [added host](../guides/host-sessions.md)
+does, under an implicit **LOCALHOST** band in the sidebar. The practical
+effect is that closing the window doesn't end your shells — reopen Roost
+and they're still there. `local-backend = session` gets written to
+`config.conf` on that first launch so later launches don't decide again.
+Any setup that already has Roost on it (existing `state.json` or
+`config.conf`) keeps in-process local tabs exactly as before —
+this default only applies to a first-ever install.
+
+Either way, you can switch anytime from the command palette:
+**Use a session for local tabs** moves your in-process layout onto the
+session, and **Use in-process local tabs** flips back without copying
+anything back (your session-side work stays put, one click away under
+**LOCALHOST**). Only one of the two rows shows at a time. See [Host
+Sessions → Switching the local backend](../guides/host-sessions.md#switching-the-local-backend)
+for the full mechanics, including what a mid-switch failure does.
+
+The Swift `Roost.app` is unaffected by all of this: it always runs
+local tabs in-process, never reads `local-backend`, and has no session
+backend at all.
+
+## Agent hooks: the first-launch consent card
+
+The first time either UI starts with no answer on file yet and at least
+one supported coding agent (Claude Code, Codex, grok/gx, cursor-agent,
+OpenCode) installed on the machine, a consent dialog opens — the iced
+**Agent Hooks…** card, the Mac **Agent Hooks…** sheet — naming what it
+found and letting you choose which agents Roost wires notifications for,
+or none. Nothing is written into any agent's config file until you
+answer it, and it reopens on demand from the command palette (or, on
+Mac, the View menu). See [Agent Hooks → Roost asks
+once](../guides/agents.md#roost-asks-once) for the full behavior,
+including what each `agent-hooks` value (a list, `off`, or absent)
+means and how a startup that leaves an agent unwired is surfaced.
+
 ## Persistence
 
 Every project, tab, working directory, and tab title is persisted to a small `state.json` file written atomically by the UI. When you relaunch Roost, all of those come back. Each tab spawns a fresh shell at its saved working directory — Roost never re-runs your last command on its own.
