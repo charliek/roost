@@ -2677,11 +2677,21 @@ mod tests {
     // `case $- in *i*)` / `[[ -o interactive ]]` gates (and the PS0 install)
     // exercise the actual shipped bytes, not a stand-in.
 
+    // A PATH lookup only — never executes `bin`, so an inherited BASH_ENV or
+    // a zsh startup file (`~/.zshenv` etc., which `zsh -f` still reads for a
+    // login/interactive shell) can't run as a side effect of merely checking
+    // presence.
     fn shell_present(bin: &str) -> bool {
-        !matches!(
-            std::process::Command::new(bin).arg("-c").arg("true").output(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound
-        )
+        use std::os::unix::fs::PermissionsExt;
+        let Some(path) = std::env::var_os("PATH") else {
+            return false;
+        };
+        std::env::split_paths(&path).any(|dir| {
+            let candidate = dir.join(bin);
+            std::fs::metadata(&candidate)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
     }
 
     fn write_embedded(dir: &std::path::Path, name: &str, contents: &str) -> std::path::PathBuf {
@@ -2721,6 +2731,11 @@ mod tests {
             "_ROOST_BASH_LOADED",
             "_ROOST_ZSH_LOADED",
             "ROOST_ZSH_ZDOTDIR",
+            // bash only honours BASH_ENV for non-interactive shells, but
+            // strip both anyway: cheap, and keeps this hermetic against
+            // whatever the ambient environment happens to set.
+            "BASH_ENV",
+            "ENV",
         ] {
             cmd.env_remove(var);
         }
@@ -2794,7 +2809,7 @@ mod tests {
             return;
         };
         assert!(
-            run.stdout.contains("DEFINED"),
+            run.stdout.lines().any(|l| l == "DEFINED"),
             "Roost's own __roost_title was not defined:\n{}",
             run.stdout
         );
@@ -2883,16 +2898,22 @@ mod tests {
             .tempdir_in("/tmp")
             .expect("tempdir under /tmp");
         let script = write_embedded(dir.path(), "roost.zsh", ROOST_ZSH);
+        // `add-zsh-hook` unconditionally autoload-marks the hook name it's
+        // given (see `add-zsh-hook`'s trailing `autoload $autoopts -- $fn`),
+        // so `functions __roost_mark_c` comes back non-empty — an autoload
+        // placeholder body — even when roost.zsh never defined it. Invoking
+        // the function and checking its actual output is what tells a real
+        // definition apart from that placeholder (which errors instead).
         let body = "source \"$ROOST_SCRIPT\"\n\
-                    after=$(functions __roost_mark_c)\n\
-                    if [ -n \"$after\" ]; then echo DEFINED; else echo UNDEFINED; fi\n\
+                    output=$(__roost_mark_c 2>/dev/null)\n\
+                    if [ -n \"$output\" ]; then echo DEFINED; else echo UNDEFINED; fi\n\
                     echo \"HOOK=${preexec_functions[*]}\"\n";
         let Some(run) = run_zsh(&script, body) else {
             return;
         };
         assert!(
-            run.stdout.contains("DEFINED"),
-            "Roost's own __roost_mark_c was not defined:\n{}",
+            run.stdout.lines().any(|l| l == "DEFINED"),
+            "Roost's own __roost_mark_c did not run:\n{}",
             run.stdout
         );
         let hook = run

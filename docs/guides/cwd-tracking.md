@@ -171,9 +171,11 @@ On **Roost-Iced**, if you already define `__roost_osc7`, `__roost_title`,
 Roost's integration loads — your definition wins and Roost's own is never
 defined; the hook registration still calls the name, so your function is
 what runs. This ignores `no-title`/`no-marks` etc. (the feature switches
-live *inside* Roost's functions, which yours has replaced), and if you also
-add your function to `PROMPT_COMMAND` or a zsh hook yourself, it runs
-twice — once from your own registration, once from Roost's. Use a name
+live *inside* Roost's functions, which yours has replaced). On bash, if you
+also add your function to `PROMPT_COMMAND` yourself, it runs twice — once
+from your own registration, once from Roost's prepend; zsh's `add-zsh-hook`
+is idempotent per function name, so a zsh hook you registered yourself does
+not get a second entry. Use a name
 Roost doesn't own (like `__roost_fancy_title` below) unless you mean to
 replace the feature outright. The Swift `Roost.app` still defines its own
 functions unconditionally and has no such override.
