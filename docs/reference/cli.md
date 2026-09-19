@@ -111,6 +111,18 @@ tab when `ROOST_TAB_ID` is unset too. `tab send-file` has always required `--tab
 flag every event prints.
 A `ROOST_TAB_ID` that is not a tab id is refused the same way (exit 2).
 
+Only `tab focus`, `tab dump` and `tab send-file` take a host tab's
+`h<host>.<id>`. Every other `--tab` names a local tab and refuses a host
+ref, canonical or not, before it dials anything (exit 2):
+
+```text
+roostctl: usage: tab close acts on a local tab, so it cannot take the host tab h1.7; pass a bare tab id
+
+Usage: roostctl tab close [OPTIONS]
+
+For more information, try '--help'.
+```
+
 ### Where `roostctl` lives
 
 `roostctl` ships next to each UI, but the two platforms put it in

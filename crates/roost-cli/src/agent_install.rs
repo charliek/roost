@@ -85,6 +85,7 @@ pub enum AgentCmd {
     Install {
         /// `claude`, `codex`, `grok`, `cursor`, or `opencode`.
         agent: Option<String>,
+        /// Every supported agent, instead of one named.
         #[arg(long, default_value_t = false)]
         all: bool,
     },
@@ -93,7 +94,9 @@ pub enum AgentCmd {
     /// Roost wrote comes out — a hook you wrote that happens to mention
     /// `$ROOST_AGENT_HOOK` stays exactly where it is.
     Uninstall {
+        /// `claude`, `codex`, `grok`, `cursor`, or `opencode`.
         agent: Option<String>,
+        /// Every supported agent, instead of one named.
         #[arg(long, default_value_t = false)]
         all: bool,
     },
