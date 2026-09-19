@@ -20,7 +20,8 @@
 # accept LANG LC_*; users may need to extend `AcceptEnv` server-side
 # for the env to take effect).
 #
-# KEEP IN SYNC with mac/Sources/Roost/Resources/shell-integration/roost.zsh
+# The Mac copy under mac/Sources/Roost/Resources/shell-integration/roost.zsh
+# is frozen for this release and has diverged from this one.
 
 [[ -o interactive ]] || return 0
 [[ -n "${ROOST_TAB_ID:-}" ]] || return 0
@@ -57,20 +58,32 @@ if _roost_feature ssh-env; then
   }
 fi
 
+# Each function is skipped when the user already defined one under this
+# name (e.g. in their rc, sourced before Roost) — their definition then
+# takes over the feature, since the hook registration below still names
+# it unconditionally.
+if (( ! $+functions[__roost_osc7] )); then
 __roost_osc7() {
   _roost_feature cwd || return 0
   printf '\033]7;file://%s%s\033\\' "${HOST}" "$PWD"
 }
+fi
 
+if (( ! $+functions[__roost_title] )); then
 __roost_title() {
   _roost_feature title || return 0
   printf '\033]0;%s\033\\' "${PWD/#$HOME/~}"
 }
+fi
 
 # OSC 133 command marks: C before a command runs (preexec), D when it
 # ends / at the next prompt (precmd). Roost maps C -> running, D -> cleared.
+if (( ! $+functions[__roost_mark_c] )); then
 __roost_mark_c() { _roost_feature marks && printf '\033]133;C\033\\'; }
+fi
+if (( ! $+functions[__roost_mark_d] )); then
 __roost_mark_d() { _roost_feature marks && printf '\033]133;D\033\\'; }
+fi
 
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd __roost_osc7

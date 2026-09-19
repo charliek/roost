@@ -12,7 +12,8 @@
 # before this file and defeats the injection; such users source roost.zsh
 # manually instead.
 #
-# KEEP IN SYNC with mac/Sources/Roost/Resources/shell-integration/zsh/.zshenv
+# The Mac copy under mac/Sources/Roost/Resources/shell-integration/zsh/.zshenv
+# is frozen for this release and has diverged from this one.
 
 if [[ -n "${ROOST_ZSH_ZDOTDIR+X}" ]]; then
     export ZDOTDIR="$ROOST_ZSH_ZDOTDIR"

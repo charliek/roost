@@ -163,6 +163,21 @@ your rc first, so the override is picked up before Roost's hooks apply. The
 same opt-out works for `ssh-env`: `ROOST_SHELL_FEATURES=...,no-ssh-env` to
 disable.
 
+### Overriding a function instead of a flag (Roost-Iced)
+
+On **Roost-Iced**, if you already define `__roost_osc7`, `__roost_title`,
+`__roost_marks` (bash) or `__roost_osc7`, `__roost_title`, `__roost_mark_c`,
+`__roost_mark_d` (zsh) yourself — say, sourced from your own rc before
+Roost's integration loads — your definition wins and Roost's own is never
+defined; the hook registration still calls the name, so your function is
+what runs. This ignores `no-title`/`no-marks` etc. (the feature switches
+live *inside* Roost's functions, which yours has replaced), and if you also
+add your function to `PROMPT_COMMAND` or a zsh hook yourself, it runs
+twice — once from your own registration, once from Roost's. Use a name
+Roost doesn't own (like `__roost_fancy_title` below) unless you mean to
+replace the feature outright. The Swift `Roost.app` still defines its own
+functions unconditionally and has no such override.
+
 ## The environment Roost injects
 
 Every shell Roost spawns sees:

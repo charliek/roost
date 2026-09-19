@@ -1738,8 +1738,9 @@ fn cwd_of_pid(_pid: u32) -> Option<String> {
     None
 }
 
-/// Shell-integration scripts, embedded at build time. Kept byte-identical
-/// to the Mac copy under mac/Sources/Roost/Resources/shell-integration/.
+/// Shell-integration scripts, embedded at build time. The Mac copy under
+/// mac/Sources/Roost/Resources/shell-integration/ is frozen for this
+/// release and has diverged from these.
 const ROOST_BASH: &str = include_str!("../resources/shell-integration/roost.bash");
 const ROOST_ZSH: &str = include_str!("../resources/shell-integration/roost.zsh");
 const ROOST_ZSH_ZDOTENV: &str = include_str!("../resources/shell-integration/zsh/.zshenv");
@@ -2667,6 +2668,266 @@ mod tests {
         assert!(
             exited(&mut lifecycle, tab_id).await,
             "the replacement child was reaped too"
+        );
+    }
+
+    // #193: a user-defined `__roost_*` function must survive sourcing the
+    // embedded shell-integration resource, and still be the one the hook
+    // registration calls. These spawn real interactive bash/zsh so the
+    // `case $- in *i*)` / `[[ -o interactive ]]` gates (and the PS0 install)
+    // exercise the actual shipped bytes, not a stand-in.
+
+    fn shell_present(bin: &str) -> bool {
+        !matches!(
+            std::process::Command::new(bin).arg("-c").arg("true").output(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        )
+    }
+
+    fn write_embedded(dir: &std::path::Path, name: &str, contents: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap_or_else(|e| {
+            panic!("write embedded {name} for the shell-integration test: {e}")
+        });
+        path
+    }
+
+    struct ShellRun {
+        stdout: String,
+    }
+
+    // Runs `body` as the `-c` script of an interactive, non-rc-loading
+    // shell with `ROOST_TAB_ID` set and any env that would perturb the
+    // sourcing path (the bash inject block, prior loaded-guards) cleared.
+    // `None` means the binary isn't on PATH — the caller skips and says why.
+    fn run_shell(
+        bin: &str,
+        interactive_flags: &[&str],
+        script: &std::path::Path,
+        body: &str,
+    ) -> Option<ShellRun> {
+        if !shell_present(bin) {
+            eprintln!("skipping {bin} shell-integration test: {bin} not found on PATH");
+            return None;
+        }
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(interactive_flags).arg(body);
+        cmd.env("ROOST_TAB_ID", "1");
+        cmd.env("ROOST_SCRIPT", script);
+        for var in [
+            "ROOST_SHELL_FEATURES",
+            "ROOST_BASH_INJECT",
+            "ROOST_BASH_ENV",
+            "_ROOST_BASH_LOADED",
+            "_ROOST_ZSH_LOADED",
+            "ROOST_ZSH_ZDOTDIR",
+        ] {
+            cmd.env_remove(var);
+        }
+        let out = cmd
+            .output()
+            .unwrap_or_else(|e| panic!("spawn interactive {bin}: {e}"));
+        // Interactive shells with no controlling tty print job-control
+        // warnings on stderr; only stdout carries the assertions.
+        Some(ShellRun {
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        })
+    }
+
+    fn run_bash(script: &std::path::Path, body: &str) -> Option<ShellRun> {
+        run_shell("bash", &["--norc", "--noprofile", "-i", "-c"], script, body)
+    }
+
+    fn run_zsh(script: &std::path::Path, body: &str) -> Option<ShellRun> {
+        run_shell("zsh", &["-f", "-i", "-c"], script, body)
+    }
+
+    #[test]
+    fn bash_user_function_survives_embedded_source() {
+        let dir = tempfile::Builder::new()
+            .prefix("roost-shell-it-")
+            .tempdir_in("/tmp")
+            .expect("tempdir under /tmp");
+        let script = write_embedded(dir.path(), "roost.bash", ROOST_BASH);
+
+        for name in ["__roost_osc7", "__roost_title", "__roost_marks"] {
+            let body = format!(
+                "{name}() {{ echo user-defined; }}\n\
+                 before=$(declare -f {name})\n\
+                 source \"$ROOST_SCRIPT\"\n\
+                 after=$(declare -f {name})\n\
+                 if [ \"$before\" = \"$after\" ]; then echo MATCH; else echo MISMATCH; fi\n\
+                 echo \"HOOK=$PROMPT_COMMAND\"\n"
+            );
+            let Some(run) = run_bash(&script, &body) else {
+                return;
+            };
+            assert!(
+                run.stdout.lines().any(|l| l == "MATCH"),
+                "{name}: the user's body did not survive sourcing roost.bash:\n{}",
+                run.stdout
+            );
+            let hook = run
+                .stdout
+                .lines()
+                .find(|l| l.starts_with("HOOK="))
+                .unwrap_or_else(|| panic!("no HOOK= line for {name}:\n{}", run.stdout));
+            assert!(
+                hook.contains(name),
+                "{name}: not named in PROMPT_COMMAND: {hook}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_no_user_function_defines_roosts_own() {
+        let dir = tempfile::Builder::new()
+            .prefix("roost-shell-it-")
+            .tempdir_in("/tmp")
+            .expect("tempdir under /tmp");
+        let script = write_embedded(dir.path(), "roost.bash", ROOST_BASH);
+        let body = "source \"$ROOST_SCRIPT\"\n\
+                    after=$(declare -f __roost_title)\n\
+                    if [ -n \"$after\" ]; then echo DEFINED; else echo UNDEFINED; fi\n\
+                    echo \"HOOK=$PROMPT_COMMAND\"\n";
+        let Some(run) = run_bash(&script, body) else {
+            return;
+        };
+        assert!(
+            run.stdout.contains("DEFINED"),
+            "Roost's own __roost_title was not defined:\n{}",
+            run.stdout
+        );
+        let hook = run
+            .stdout
+            .lines()
+            .find(|l| l.starts_with("HOOK="))
+            .unwrap_or_else(|| panic!("no HOOK= line:\n{}", run.stdout));
+        assert!(
+            hook.contains("__roost_title"),
+            "__roost_title not named in PROMPT_COMMAND: {hook}"
+        );
+    }
+
+    #[test]
+    fn bash_source_twice_changes_nothing() {
+        let dir = tempfile::Builder::new()
+            .prefix("roost-shell-it-")
+            .tempdir_in("/tmp")
+            .expect("tempdir under /tmp");
+        let script = write_embedded(dir.path(), "roost.bash", ROOST_BASH);
+        let body = "source \"$ROOST_SCRIPT\"\n\
+                    after1=$(declare -f __roost_title)\n\
+                    hook1=\"$PROMPT_COMMAND\"\n\
+                    source \"$ROOST_SCRIPT\"\n\
+                    after2=$(declare -f __roost_title)\n\
+                    hook2=\"$PROMPT_COMMAND\"\n\
+                    if [ \"$after1\" = \"$after2\" ] && [ \"$hook1\" = \"$hook2\" ]; then \
+                      echo MATCH; else echo MISMATCH; fi\n";
+        let Some(run) = run_bash(&script, body) else {
+            return;
+        };
+        assert!(
+            run.stdout.lines().any(|l| l == "MATCH"),
+            "re-sourcing roost.bash changed the function or the hook:\n{}",
+            run.stdout
+        );
+    }
+
+    #[test]
+    fn zsh_user_function_survives_embedded_source() {
+        let dir = tempfile::Builder::new()
+            .prefix("roost-shell-it-")
+            .tempdir_in("/tmp")
+            .expect("tempdir under /tmp");
+        let script = write_embedded(dir.path(), "roost.zsh", ROOST_ZSH);
+
+        for (name, hook_array) in [
+            ("__roost_osc7", "precmd_functions"),
+            ("__roost_title", "precmd_functions"),
+            ("__roost_mark_c", "preexec_functions"),
+            ("__roost_mark_d", "precmd_functions"),
+        ] {
+            let body = format!(
+                "{name}() {{ echo user-defined }}\n\
+                 before=$(functions {name})\n\
+                 source \"$ROOST_SCRIPT\"\n\
+                 after=$(functions {name})\n\
+                 if [ \"$before\" = \"$after\" ]; then echo MATCH; else echo MISMATCH; fi\n\
+                 echo \"HOOK=${{{hook_array}[*]}}\"\n"
+            );
+            let Some(run) = run_zsh(&script, &body) else {
+                return;
+            };
+            assert!(
+                run.stdout.lines().any(|l| l == "MATCH"),
+                "{name}: the user's body did not survive sourcing roost.zsh:\n{}",
+                run.stdout
+            );
+            let hook = run
+                .stdout
+                .lines()
+                .find(|l| l.starts_with("HOOK="))
+                .unwrap_or_else(|| panic!("no HOOK= line for {name}:\n{}", run.stdout));
+            assert!(
+                hook.contains(name),
+                "{name}: not named in ${hook_array}: {hook}"
+            );
+        }
+    }
+
+    #[test]
+    fn zsh_no_user_function_defines_roosts_own() {
+        let dir = tempfile::Builder::new()
+            .prefix("roost-shell-it-")
+            .tempdir_in("/tmp")
+            .expect("tempdir under /tmp");
+        let script = write_embedded(dir.path(), "roost.zsh", ROOST_ZSH);
+        let body = "source \"$ROOST_SCRIPT\"\n\
+                    after=$(functions __roost_mark_c)\n\
+                    if [ -n \"$after\" ]; then echo DEFINED; else echo UNDEFINED; fi\n\
+                    echo \"HOOK=${preexec_functions[*]}\"\n";
+        let Some(run) = run_zsh(&script, body) else {
+            return;
+        };
+        assert!(
+            run.stdout.contains("DEFINED"),
+            "Roost's own __roost_mark_c was not defined:\n{}",
+            run.stdout
+        );
+        let hook = run
+            .stdout
+            .lines()
+            .find(|l| l.starts_with("HOOK="))
+            .unwrap_or_else(|| panic!("no HOOK= line:\n{}", run.stdout));
+        assert!(
+            hook.contains("__roost_mark_c"),
+            "__roost_mark_c not named in $preexec_functions: {hook}"
+        );
+    }
+
+    #[test]
+    fn zsh_source_twice_changes_nothing() {
+        let dir = tempfile::Builder::new()
+            .prefix("roost-shell-it-")
+            .tempdir_in("/tmp")
+            .expect("tempdir under /tmp");
+        let script = write_embedded(dir.path(), "roost.zsh", ROOST_ZSH);
+        let body = "source \"$ROOST_SCRIPT\"\n\
+                    after1=$(functions __roost_mark_c)\n\
+                    hook1=\"${preexec_functions[*]}\"\n\
+                    source \"$ROOST_SCRIPT\"\n\
+                    after2=$(functions __roost_mark_c)\n\
+                    hook2=\"${preexec_functions[*]}\"\n\
+                    if [ \"$after1\" = \"$after2\" ] && [ \"$hook1\" = \"$hook2\" ]; then \
+                      echo MATCH; else echo MISMATCH; fi\n";
+        let Some(run) = run_zsh(&script, body) else {
+            return;
+        };
+        assert!(
+            run.stdout.lines().any(|l| l == "MATCH"),
+            "re-sourcing roost.zsh changed the function or the hook:\n{}",
+            run.stdout
         );
     }
 }
