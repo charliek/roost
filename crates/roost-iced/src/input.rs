@@ -300,12 +300,21 @@ pub fn encode_press(
         return Vec::new();
     };
 
-    let chord = control_chord(
-        &key.as_ref(),
-        &modified_key.as_ref(),
-        modifiers,
-        text.as_deref(),
-    );
+    // A Super-held chord never recovers: libghostty's legacy CSI-u fallback
+    // has no Super bit to report, so a recovered ctrl+super+i would reach
+    // the PTY as `ESC[105;5u` — a plain ctrl+i with Super erased (mac
+    // `KeyEncoder.swift`'s "A Command chord never recovers" applies the same
+    // rule for Command).
+    let chord = if modifiers.logo() {
+        None
+    } else {
+        control_chord(
+            &key.as_ref(),
+            &modified_key.as_ref(),
+            modifiers,
+            text.as_deref(),
+        )
+    };
     let latin = key.to_latin(physical_key);
     let key = key.as_ref();
     // A logical key that is the C0 itself carries no libghostty key enum and
@@ -1362,5 +1371,66 @@ mod tests {
                 "accelerator for {key:?} + {modifiers:?}"
             );
         }
+    }
+
+    /// #494: unrecovered, legacy reports the C0's own codepoint (9) and
+    /// kitty keeps the Super bit (13) — neither is plain ctrl+i's `105;5u`.
+    #[test]
+    fn super_held_control_chord_does_not_recover() {
+        let ctrl_logo = keyboard::Modifiers::CTRL | keyboard::Modifiers::LOGO;
+        let event = || chord("i", "i", Code::KeyI, ctrl_logo, "\t");
+
+        let (mut encoder, terminal) = encoder_pair();
+        let legacy = encode_press(&mut encoder, &terminal, event(), false);
+        assert_eq!(legacy, b"\x1b[9;5u".to_vec(), "legacy ctrl+super+i");
+        assert_ne!(legacy, b"\x1b[105;5u".to_vec(), "must not be plain ctrl+i");
+
+        let (mut encoder, terminal) = kitty_encoder_pair();
+        let kitty = encode_press(&mut encoder, &terminal, event(), false);
+        assert_eq!(kitty, b"\x1b[105;13u".to_vec(), "kitty ctrl+super+i");
+        assert_ne!(kitty, b"\x1b[105;5u".to_vec(), "must not be plain ctrl+i");
+    }
+
+    #[test]
+    fn ctrl_i_alone_and_logo_i_alone_are_unaffected_by_the_super_guard() {
+        let ctrl = keyboard::Modifiers::CTRL;
+        let (mut encoder, terminal) = encoder_pair();
+        let ctrl_i = encode_press(
+            &mut encoder,
+            &terminal,
+            chord("i", "i", Code::KeyI, ctrl, "\t"),
+            false,
+        );
+        assert_eq!(ctrl_i, b"\x1b[105;5u".to_vec(), "ctrl+i alone");
+
+        let logo = keyboard::Modifiers::LOGO;
+        let (mut encoder, terminal) = encoder_pair();
+        let logo_i = encode_press(
+            &mut encoder,
+            &terminal,
+            key_press(character("i"), Physical::Code(Code::KeyI), logo),
+            false,
+        );
+        assert!(
+            logo_i.is_empty(),
+            "logo+i alone reaches the PTY as nothing today"
+        );
+    }
+
+    /// A configured `ctrl+super+<key>` keybind still resolves (#494).
+    #[test]
+    fn accelerator_for_ctrl_super_i_is_unaffected_by_the_super_guard() {
+        let event = key_press(
+            character("i"),
+            Physical::Code(Code::KeyI),
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::LOGO,
+        );
+        assert_eq!(
+            accelerator(&event),
+            Some(Accel {
+                modifiers: AccelMods::CTRL | AccelMods::SUPER,
+                key: "i".into(),
+            })
+        );
     }
 }
