@@ -320,11 +320,11 @@ verb above treats the same as an `ops` list missing the op it needs
   and ends between two `tab.list` calls) — it refuses `unsupported` the
   same way.
 
-**The Mac app predates `--no-activate`.** `tab open --no-activate`
+**The Swift `Roost.app` predates `--no-activate`.** `tab open --no-activate`
 answers `unknown-field` there — reported verbatim, same as any refusal
 from a server that doesn't recognize a field — rather than silently
 opening the tab active anyway. `open --no-activate` never gets that
-far: `open` needs `project.ensure`, which the Mac app does not serve,
+far: `open` needs `project.ensure`, which the Swift `Roost.app` does not serve,
 so it refuses `unsupported` after `identify`. Either way **no tab is
 created**, so there is nothing to wait on.
 

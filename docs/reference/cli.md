@@ -2,8 +2,10 @@
 
 Shell-integration CLI for the running Roost UI. Talks JSON over
 a Unix-domain socket directly to the UI process — no daemon by
-default. The one exception is opt-in: `roostctl session` starts,
-stops, and inspects a headless `roost-session` daemon (see
+default, except a fresh Roost-Iced install, which starts its local
+tabs on a `roost-session` it manages. The other exception is opt-in:
+`roostctl session` starts, stops, and inspects a headless
+`roost-session` daemon (see
 [`session` subcommands](#session-subcommands) below).
 Intended to be invoked from inside a Roost tab (typically by an
 [agent hook](../guides/agents.md)) but works from any shell that can
@@ -381,7 +383,7 @@ roostctl tab dump --tab 5 --scrollback 200   # 200 rows of history, then the vie
 | `--hold` | Keep the tab open after the command exits, dropping to an interactive shell (mirrors `command = … hold=true`). Only meaningful with a command. |
 | `--after-tab <id>` | Place the new tab immediately after that tab (same project) instead of at the end. Best-effort: if that tab is gone by the time the reorder lands, the new tab stays at the end. |
 | `--focus` | Focus (activate) the new tab after opening. |
-| `--no-activate` | Open the tab without selecting it: the active project and tab stay where they were (`tab.open`'s `activate: false`). Without it, opening a tab selects it. Refused beside `--focus` (exit 2 `usage`). A server that predates the field — the Mac app today — answers `unknown-field`, which is reported verbatim; nothing retries without the flag. |
+| `--no-activate` | Open the tab without selecting it: the active project and tab stay where they were (`tab.open`'s `activate: false`). Without it, opening a tab selects it. Refused beside `--focus` (exit 2 `usage`). A server that predates the field — the Swift `Roost.app` today — answers `unknown-field`, which is reported verbatim; nothing retries without the flag. |
 
 These compose: `--after-tab X --focus -- <cmd>` is the "open a command in a tab right here and switch to it" primitive that providers and other scripts use. (`--after-tab`/`--focus` are CLI orchestration over `tab.reorder` / `tab.focus`; `-- <cmd>` fills the `tab.open` op's `argv` — see [ipc.md](ipc.md).)
 
@@ -646,7 +648,7 @@ without `--json`**: this is an agent verb, not a human-typed one.
 
 | Exit | `code` | When |
 |---|---|---|
-| 1 | `unsupported` | This server's `identify --json` `ops` doesn't list `project.ensure` (the Mac app today) — names the manual route (`project list --json` + `tab open --project-id`) rather than racing it itself (#221) |
+| 1 | `unsupported` | This server's `identify --json` `ops` doesn't list `project.ensure` (the Swift `Roost.app` today) — names the manual route (`project list --json` + `tab open --project-id`) rather than racing it itself (#221) |
 | 2 | `usage` | `identify --json`'s `local_backend_switch` shows a backend switch in progress — the project set is mid-flight, so a name resolved against it may not hold; retry once it settles |
 | 1 | *the server's own* | `tab.open`'s own refusal, verbatim — most notably `not-found` if the ensured project vanished between the two calls (a backend switch landing in that window, say). **The two calls are not atomic with each other**, only each is atomic on the server, so this is possible even though `ensure` itself never races another `ensure` |
 

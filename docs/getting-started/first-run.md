@@ -26,18 +26,24 @@ On first launch Roost creates a project named `default` with one tab. The tab's 
 **Roost-Iced / Linux only** — the Swift `Roost.app` never reads this key
 and always runs in-process (see below).
 
-A genuinely fresh Roost-Iced install — no `state.json` and no
-`config.conf` for that profile yet — starts its local tabs on a
-`localhost` **session** rather than running them in-process: your local
-project(s) live in a small headless `roost-session` daemon instead of
-inside the app itself, the same way an [added host](../guides/host-sessions.md)
-does, under an implicit **LOCALHOST** band in the sidebar. The practical
-effect is that closing the window doesn't end your shells — reopen Roost
-and they're still there. `local-backend = session` gets written to
-`config.conf` on that first launch so later launches don't decide again.
-Any setup that already has Roost on it (existing `state.json` or
-`config.conf`) keeps in-process local tabs exactly as before —
-this default only applies to a first-ever install.
+One config key decides where local tabs run. If `config.conf` — a
+single file shared by every profile, not a per-profile one — already has
+a `local-backend` key, that value wins, however it got there.
+
+With no such key, and no `state.json` or `config.conf` on disk at all,
+the launch is a genuinely fresh install and local tabs start on a
+`localhost` **session**: they live in a small headless `roost-session`
+daemon rather than inside the app, the way an
+[added host](../guides/host-sessions.md) does, under an implicit
+**LOCALHOST** band in the sidebar. The practical effect is that closing
+the window doesn't end your shells — reopen Roost and they're still
+there. That launch then tries to write `local-backend = session` so
+later launches don't decide again; if the write fails, it runs
+in-process instead.
+
+Anything else — no key, but a `state.json` or `config.conf` already
+there — keeps in-process local tabs exactly as before. The default fires
+only on a launch with nothing yet on disk.
 
 Either way, you can switch anytime from the command palette:
 **Use a session for local tabs** moves your in-process layout onto the
@@ -67,7 +73,7 @@ means and how a startup that leaves an agent unwired is surfaced.
 
 ## Persistence
 
-Every project, tab, working directory, and tab title is persisted to a small `state.json` file written atomically by the UI. When you relaunch Roost, all of those come back. Each tab spawns a fresh shell at its saved working directory — Roost never re-runs your last command on its own.
+Every project, tab, working directory, and tab title is persisted to a small `state.json` file written atomically by the UI. When you relaunch Roost, all of those come back. Relaunching an in-process tab spawns a fresh shell at its saved working directory; a tab on a still-running session instead reconnects to the shell that's already there. Either way, Roost never re-runs your last command on its own.
 
 | State                | Persisted? | Notes                                                  |
 |----------------------|------------|--------------------------------------------------------|

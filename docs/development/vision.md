@@ -16,8 +16,10 @@ The same iced binary additionally ships an **experimental macOS build**,
 installs beside `Roost.app` and is not a third implementation, just the
 Linux UI on a different host. `libghostty-vt` is vendored once and
 linked into both for in-process VT parsing and rendering. There is no
-daemon by default — the one opt-in exception is `roost-session`, a
-headless daemon for host-sessions ([DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28)).
+daemon by default, except a fresh Roost-Iced install, which starts its
+local tabs on a `roost-session` it manages. The other opt-in exception
+is `roost-session`, a headless daemon for host-sessions
+([DL-17](#dl-17-an-opt-in-headless-roost-session-daemon-for-host-sessions-2026-08-28)).
 
 ## The command core (north star)
 

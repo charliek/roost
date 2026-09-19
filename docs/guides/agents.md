@@ -169,7 +169,7 @@ Roost never writes into an agent's config file before you've said yes.
 
 The iced UI also shows a one-line toast the first time any agent is
 *newly* wired on a machine, naming which ones and how to undo it; after
-that, refreshes on upgrade are silent. **The Mac app has no equivalent
+that, refreshes on upgrade are silent. **The Swift `Roost.app` has no equivalent
 toast** — its chrome has no transient status surface — so a machine
 wired only through the Swift app or `roostctl` stays unannounced until
 either the iced UI runs there too, or you check by hand.
@@ -332,9 +332,10 @@ mid-turn — so the only thing that clears a stuck lifecycle is the
 shell's own OSC 133 prompt marks. Reaching a fresh prompt (`A`/`B`) or a
 command ending (`D`) drops the lifecycle to `inactive` while *keeping*
 ownership as a label, so the tab falls through to shell-derived state
-instead of staying stuck. The shell only reaches a prompt once the
-foreground command has exited, so an agent that owned the tab is
-necessarily gone by then.
+instead of staying stuck. The marks clear the lifecycle because the
+shell has regained control of the terminal, not because the agent is
+proven gone — a suspended agent (`Ctrl-Z`) also returns the shell to a
+prompt while it's still alive in the background.
 
 **Which shells emit those marks.** Roost's bundled integration
 (`crates/roost-engine/resources/shell-integration/`) wires them for zsh
