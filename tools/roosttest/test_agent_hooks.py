@@ -1150,6 +1150,55 @@ def test_the_ui_wires_agent_hooks_at_startup_and_notices_once(short_root, iced_o
     assert jail.read_record() == record, "a silent relaunch rewrote the record"
 
 
+def test_a_startup_that_leaves_an_agent_unwired_says_so(short_root, iced_only):
+    """Plan 068 §3.6: an allowed, installed agent the startup ensure
+    could not wire is named in the toast, and never marked noticed.
+
+    Seeded through `roostctl agent ensure`, the Mac-app shape: all five
+    wired and unannounced, so the two broken agents have a `noticed:
+    false` entry a wrong `mark_noticed` would visibly flip. Then one of
+    each kind of problem: claude's settings file stops parsing (a skip),
+    and cursor's hooks file becomes a directory (a read that fails)."""
+    jail = Jail(short_root)
+    seeded = ensure_json(jail)
+    assert sorted(seeded["wired"]) == sorted(INSTALLABLE_AGENTS), seeded
+    (jail.agent_dirs["claude"] / "settings.json").write_text("{ not json\n")
+    cursor_hooks = jail.agent_dirs["cursor"] / "hooks.json"
+    cursor_hooks.unlink()
+    cursor_hooks.mkdir()
+    broken = ("claude", "cursor")
+    healthy = ("codex", "grok", "opencode")
+    before = jail.read_record()
+    for agent in broken:
+        assert before[agent]["noticed"] is False, before[agent]
+
+    with jailed_ui(jail) as (proc, log):
+        wait_for_jailed_window(jail, proc, log)
+        problem = wait_for_log_line(
+            log,
+            "agent hooks problem toast shown",
+            "the jailed UI to say which agents it could not wire",
+        )
+        announced = wait_for_log_line(
+            log,
+            "agent hooks toast shown",
+            "the jailed UI to announce the agents it did wire",
+        )
+        Roost._wait(
+            lambda: all(jail.read_record()[agent]["noticed"] is True for agent in healthy),
+            30.0,
+            f"the jailed UI to record the announcement in {jail.record}",
+        )
+
+    assert "couldn't set up claude, cursor — run roostctl agent status" in problem, problem
+    assert f"for {', '.join(healthy)} —" in announced, announced
+    after = jail.read_record()
+    for agent in broken:
+        assert after[agent] == before[agent], (
+            f"{agent}'s record moved though it was never announced: {after[agent]}"
+        )
+
+
 def test_the_ui_wires_nothing_when_agent_hooks_is_off(short_root, iced_only):
     """`agent-hooks = off` stops the startup ensure before it opens a
     file (W6).

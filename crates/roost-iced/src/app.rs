@@ -2478,7 +2478,7 @@ pub struct App {
     /// the same batch — a PTY error, an OSC action — can replace it
     /// before a frame ever renders it. See
     /// [`Self::show_agent_hooks_toast`].
-    pending_agent_hooks_toast: Option<(String, Vec<roost_agent::Agent>)>,
+    pending_agent_hooks_toast: Option<agent_hooks::AgentHooksToast>,
     rename_editor: Option<RenameEditor>,
     rename_input_id: Id,
     rename_focus_requested: bool,
@@ -3350,15 +3350,20 @@ impl App {
     /// The startup ensure came back. The toast names the agents the
     /// record says have never been announced — a refresh on upgrade is
     /// silent because those are already noticed — and `mark_noticed`
-    /// follows the toast, never precedes it.
+    /// follows the toast, never precedes it. It also names every agent
+    /// the run left unwired, on each launch until that is fixed.
     ///
     /// The toast is *held*, not shown: it goes up at the end of the
     /// drain (see [`Self::show_agent_hooks_toast`]) so a PTY error in
     /// the same batch cannot replace it before any frame has rendered
     /// it, which would consume `noticed` for a line nobody read.
     fn agent_hooks_ensured(&mut self, result: agent_hooks::AgentHooksEnsured) {
-        for error in &result.errors {
-            tracing::warn!(error, "agent hooks");
+        for problem in &result.problems {
+            tracing::warn!(
+                agent = problem.agent.map(roost_agent::Agent::source),
+                error = %problem.detail,
+                "agent hooks"
+            );
         }
         // One line per launch, whether or not there is anything to say —
         // it is what a support reader (and the E2E) has to tell "the
@@ -3366,13 +3371,13 @@ impl App {
         // never ran".
         tracing::info!(
             unannounced = result.unnoticed.len(),
-            errors = result.errors.len(),
+            problems = result.problems.len(),
             "agent hooks startup ensure finished"
         );
-        let Some(toast) = agent_hooks::wired_toast(&result.unnoticed, None) else {
+        let Some(toast) = agent_hooks::toast(result.unnoticed, &result.problems) else {
             return;
         };
-        self.pending_agent_hooks_toast = Some((toast, result.unnoticed));
+        self.pending_agent_hooks_toast = Some(toast);
     }
 
     /// Ask a host that has just connected to raise its agent hooks to at
@@ -3616,14 +3621,14 @@ impl App {
         if done.ticket != self.agent_hooks_applies {
             return;
         }
-        let Some(toast) = agent_hooks::wired_toast(&done.unnoticed, None) else {
+        let Some(toast) = agent_hooks::toast(done.unnoticed, &[]) else {
             return;
         };
         // Shown straight away rather than held like the startup toast:
         // this one answers a gesture the user just made, so a line that
         // lands behind another of this drain's `set_status` calls would
         // be a receipt for something they can no longer see.
-        self.show_wired_toast(toast, done.unnoticed);
+        self.show_hooks_toast(toast);
     }
 
     // ── the agent-hooks consent card (plan 064 §3.5) ────────────────
@@ -3806,21 +3811,27 @@ impl App {
     /// `set_status` that batch can reach — the mechanism that makes
     /// "shown" true before `mark_noticed` makes it permanent.
     pub(super) fn show_agent_hooks_toast(&mut self) {
-        let Some((toast, agents)) = self.pending_agent_hooks_toast.take() else {
+        let Some(toast) = self.pending_agent_hooks_toast.take() else {
             return;
         };
-        self.show_wired_toast(toast, agents);
+        self.show_hooks_toast(toast);
     }
 
-    /// Say what Roost wired, then let `mark_noticed` make it permanent —
-    /// the order `agent_hooks`'s own header pins.
+    /// Say what Roost wired and what it could not, then let
+    /// `mark_noticed` make the announcement permanent — the order
+    /// `agent_hooks`'s own header pins.
     ///
-    /// The log line is deliberate: no IPC op carries the status banner,
-    /// so it is the only thing the E2E can read the toast text out of.
-    fn show_wired_toast(&mut self, toast: String, agents: Vec<roost_agent::Agent>) {
-        tracing::info!(toast, "agent hooks toast shown");
-        self.set_status(toast);
-        agent_hooks::spawn_mark_noticed(&self.runtime_handle, agents);
+    /// The log lines are deliberate: no IPC op carries the status banner,
+    /// so they are the only thing the E2E can read the toast text out of.
+    fn show_hooks_toast(&mut self, toast: agent_hooks::AgentHooksToast) {
+        if let Some(announcement) = &toast.announcement {
+            tracing::info!(toast = announcement.as_str(), "agent hooks toast shown");
+        }
+        if let Some(problem) = &toast.problem {
+            tracing::info!(toast = problem.as_str(), "agent hooks problem toast shown");
+        }
+        self.set_status(toast.text());
+        agent_hooks::spawn_mark_noticed(&self.runtime_handle, toast.noticed);
     }
 
     /// Bring [`App::pill_labels`] up to date with the active project's

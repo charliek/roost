@@ -176,6 +176,17 @@ either the iced UI runs there too, or you check by hand.
 `roostctl agent status` and `roostctl doctor`'s `Agents` section are the
 durable way to see what's wired without waiting for a toast.
 
+If the startup wiring can't set up an agent that the list names and
+that is installed, the iced UI says so in the same toast, for example
+`Agent hooks: couldn't set up claude — run roostctl agent status`.
+This happens when the agent's config file doesn't parse, isn't the shape
+the agent documents, or is a file Roost owns by name but didn't write,
+or when the file can't be read or written at all. The toast
+comes back on every launch while the problem lasts. To silence it, fix
+the file (`roostctl agent status` names it), or drop the agent from the
+`agent-hooks` key. An agent Roost couldn't wire is never announced as
+wired, so its one-time announcement still comes once the file is fixed.
+
 Every entry Roost installs invokes `roostctl` (or `roost-session` on a
 host) indirectly, through the `$ROOST_AGENT_HOOK` environment variable
 every Roost tab is given — never a baked-in absolute path — so the exact

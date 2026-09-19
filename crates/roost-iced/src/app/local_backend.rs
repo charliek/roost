@@ -1531,7 +1531,7 @@ pub(crate) fn reverse_confirm_body(label: &str) -> String {
     )
 }
 
-fn plural(count: usize, noun: &str) -> String {
+pub(super) fn plural(count: usize, noun: &str) -> String {
     match count {
         1 => format!("1 {noun}"),
         n => format!("{n} {noun}s"),
