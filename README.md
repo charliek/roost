@@ -33,7 +33,7 @@ sudo apt install roost          # installs the `roost` UI + the `roostctl` CLI
 
 **macOS** — download `Roost-<version>.dmg` from the
 [latest release](https://github.com/charliek/roost/releases/latest), open it,
-and drag `Roost.app` to Applications. Release DMGs (v0.0.18 onward) are
+and drag `Roost.app` to Applications. Release DMGs are
 Developer-ID signed and notarized by Apple, so Roost opens with a normal
 double-click — no Gatekeeper detour. See
 [Installation](docs/getting-started/installation.md#shipping-builds)
@@ -41,7 +41,9 @@ for details.
 
 An experimental **`Roost-Iced-<version>.dmg`** is also published on the same
 release — the iced UI built for macOS, installed side by side with
-`Roost.app` under its own bundle id. See
+`Roost.app` under its own bundle id. If you drive Roost from an agent
+(the Claude skill, `roostctl open`/`wait`/`events`, `tab prompt`),
+install this one instead — see
 [Installation](docs/getting-started/installation.md) for details.
 
 ### Claude Code / agent skills

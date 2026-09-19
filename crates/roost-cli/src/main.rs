@@ -233,12 +233,15 @@ enum Cmd {
     /// Needs `--tab` or `ROOST_TAB_ID`: it never falls back to the UI's
     /// active tab.
     Notify {
+        /// The notification's title.
         #[arg(long)]
         title: String,
+        /// The notification's body.
         #[arg(long, default_value = "")]
         body: String,
-        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
-        #[arg(long)]
+        /// The tab: a bare id. Defaults to `$ROOST_TAB_ID`; exits 2 without
+        /// either. A host tab (`h<host>.<id>`) is refused.
+        #[arg(long, value_parser = LocalTab)]
         tab: Option<i64>,
     },
     /// Rename a tab (locks it from OSC overwrites).
@@ -246,10 +249,12 @@ enum Cmd {
     /// Needs `--tab` or `ROOST_TAB_ID`: it never falls back to the UI's
     /// active tab.
     SetTitle {
+        /// The tab's new title.
         #[arg(long)]
         title: String,
-        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
-        #[arg(long)]
+        /// The tab: a bare id. Defaults to `$ROOST_TAB_ID`; exits 2 without
+        /// either. A host tab (`h<host>.<id>`) is refused.
+        #[arg(long, value_parser = LocalTab)]
         tab: Option<i64>,
     },
     /// Print the running UI's identity (socket, pid, active tab,
@@ -283,6 +288,8 @@ enum Cmd {
     /// `revision`), and then it exits 0. A stream that drops or skips a
     /// revision exits 1 (`connection`); a server that does not serve the
     /// stream (the Mac app, an older Roost) exits 1 with its own refusal.
+    /// The one refusal not passed through is a local-backend switch in
+    /// flight: that is waited out, with one line on stderr saying so.
     /// Always JSON, with or without `--json`.
     ///
     /// Reads the same source `wait` does: the UI's in-process stream, or
@@ -346,6 +353,7 @@ enum Cmd {
         /// and the new tab. Defaults to `$PWD`.
         #[arg(long)]
         cwd: Option<String>,
+        /// The new tab's title.
         #[arg(long, default_value = "roostctl")]
         title: String,
         /// Focus (activate) the new tab after opening.
@@ -497,14 +505,14 @@ enum Cmd {
     /// check fails; the report is on stdout either way.
     Doctor {
         /// Inspect this tab instead of `$ROOST_TAB_ID` / the UI's active
-        /// tab.
+        /// tab. A host tab (`h<host>.<id>`) is refused.
         //
         // Doctor reads the env var itself rather than through
         // [`named_tab`] like every other per-tab command: that turns an
         // unparseable value into exit 2 where doctor owes a diagnostic,
         // and erases the difference between "the user passed --tab" and
         // "the env named a tab".
-        #[arg(long)]
+        #[arg(long, value_parser = LocalTab)]
         tab: Option<i64>,
         /// Print the full per-check report instead of one line per
         /// section. Ignored by `--json`, which always carries everything.
@@ -532,8 +540,10 @@ enum ProjectCmd {
     List,
     /// Create a project. Empty `--name` defaults to "Untitled <n>".
     Create {
+        /// The project's name.
         #[arg(long, default_value = "")]
         name: String,
+        /// The project's working directory, where its tabs start.
         #[arg(long, default_value = "")]
         cwd: String,
     },
@@ -565,13 +575,16 @@ enum ProjectCmd {
     },
     /// Rename a project.
     Rename {
+        /// The project to rename.
         #[arg(long)]
         id: i64,
+        /// Its new name.
         #[arg(long)]
         name: String,
     },
     /// Delete a project (cascade-deletes its tabs).
     Delete {
+        /// The project to delete.
         #[arg(long)]
         id: i64,
     },
@@ -580,6 +593,7 @@ enum ProjectCmd {
     /// order. Any project not listed keeps its prior position;
     /// duplicates / unknown ids fail with `invalid-param`.
     Reorder {
+        /// Project ids in the new display order, comma-separated.
         #[arg(long, value_delimiter = ',')]
         order: Vec<i64>,
     },
@@ -608,8 +622,12 @@ enum TabCmd {
     /// text is the only thing worth printing. Prints the pasted text;
     /// `--json` prints the whole result (uploads + skips).
     SendFile {
+        /// The tab: a bare id, or `h<host>.<id>` for a connected host's
+        /// tab. Never read from `$ROOST_TAB_ID`.
         #[arg(long)]
         tab: String,
+        /// The files to send, at least one. Resolved in this command's
+        /// own working directory.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
@@ -639,15 +657,17 @@ enum TabCmd {
         /// with that lifecycle.
         #[arg(long, value_parser = ["none", "running", "needs_input", "idle"])]
         state: String,
-        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
-        #[arg(long)]
+        /// The tab: a bare id. Defaults to `$ROOST_TAB_ID`; exits 2 without
+        /// either. A host tab (`h<host>.<id>`) is refused.
+        #[arg(long, value_parser = LocalTab)]
         tab: Option<i64>,
     },
     /// Clear a tab's pending notification. Needs `--tab` or
     /// `ROOST_TAB_ID`.
     ClearNotification {
-        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
-        #[arg(long)]
+        /// The tab: a bare id. Defaults to `$ROOST_TAB_ID`; exits 2 without
+        /// either. A host tab (`h<host>.<id>`) is refused.
+        #[arg(long, value_parser = LocalTab)]
         tab: Option<i64>,
     },
     /// Open a new tab in the given project. `--cwd` defaults to
@@ -661,14 +681,19 @@ enum TabCmd {
     /// closes when the command exits (hold=false); `--hold` keeps it
     /// open by dropping to an interactive shell afterward.
     Open {
+        /// The project to open the tab in.
         #[arg(long)]
         project_id: i64,
+        /// The tab's working directory. Empty ⇒ the project's cwd.
         #[arg(long, default_value = "")]
         cwd: String,
+        /// Columns to start the PTY at, until the UI sizes it to its grid.
         #[arg(long, default_value_t = 80)]
         cols: u32,
+        /// Rows to start the PTY at, until the UI sizes it to its grid.
         #[arg(long, default_value_t = 24)]
         rows: u32,
+        /// The new tab's title.
         #[arg(long, default_value = "roostctl")]
         title: String,
         /// Place the new tab immediately after this tab (same project).
@@ -696,8 +721,9 @@ enum TabCmd {
     /// Close a tab. The UI closes the PTY (if live) and emits
     /// `tab.closed`. Needs `--tab` or `ROOST_TAB_ID`.
     Close {
-        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
-        #[arg(long)]
+        /// The tab: a bare id. Defaults to `$ROOST_TAB_ID`; exits 2 without
+        /// either. A host tab (`h<host>.<id>`) is refused.
+        #[arg(long, value_parser = LocalTab)]
         tab: Option<i64>,
     },
     /// Write bytes into a tab's PTY without attaching a
@@ -709,9 +735,12 @@ enum TabCmd {
     /// bytes, not UTF-8) use `--bytes-base64` instead. Needs `--tab` or
     /// `ROOST_TAB_ID`.
     Send {
-        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
-        #[arg(long)]
+        /// The tab: a bare id. Defaults to `$ROOST_TAB_ID`; exits 2 without
+        /// either. A host tab (`h<host>.<id>`) is refused.
+        #[arg(long, value_parser = LocalTab)]
         tab: Option<i64>,
+        /// The bytes to write, with Rust-style escapes (`\n`, `\r`, `\t`,
+        /// `\x1b`) decoded unless `--raw` is given.
         #[arg(
             long,
             conflicts_with = "bytes_base64",
@@ -724,17 +753,21 @@ enum TabCmd {
         /// safely.
         #[arg(long, conflicts_with = "bytes")]
         bytes_base64: Option<String>,
+        /// Write `--bytes` exactly as given, decoding no escapes.
         #[arg(long, default_value_t = false)]
         raw: bool,
     },
     /// Resize a tab's PTY. Same constraints as `tab send` —
     /// needs an existing live PTY, and `--tab` or `ROOST_TAB_ID`.
     Resize {
-        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
-        #[arg(long)]
+        /// The tab: a bare id. Defaults to `$ROOST_TAB_ID`; exits 2 without
+        /// either. A host tab (`h<host>.<id>`) is refused.
+        #[arg(long, value_parser = LocalTab)]
         tab: Option<i64>,
+        /// The new width, in columns.
         #[arg(long)]
         cols: u32,
+        /// The new height, in rows.
         #[arg(long)]
         rows: u32,
     },
@@ -763,8 +796,10 @@ enum TabCmd {
     /// position; duplicates / cross-project ids fail
     /// `invalid-param`.
     Reorder {
+        /// The project whose tabs are reordered.
         #[arg(long)]
         project_id: i64,
+        /// Tab ids in the new display order, comma-separated.
         #[arg(long, value_delimiter = ',')]
         order: Vec<i64>,
     },
@@ -810,8 +845,9 @@ enum TabCmd {
     /// failure. A server refusal (a bad param, an unknown tab) exits 1
     /// with the server's own code, same as every other verb.
     Report {
-        /// The tab. Defaults to `$ROOST_TAB_ID`; exits 2 without either.
-        #[arg(long)]
+        /// The tab: a bare id. Defaults to `$ROOST_TAB_ID`; exits 2 without
+        /// either. A host tab (`h<host>.<id>`) is refused.
+        #[arg(long, value_parser = LocalTab)]
         tab: Option<i64>,
         /// Ownership identity, half one: who is reporting. Refused when
         /// it names a source a Roost agent adapter already owns, or
@@ -841,8 +877,11 @@ enum TabCmd {
         /// omitted means unconditional.
         #[arg(long = "if", value_parser = ["inactive", "working", "waiting", "finished", "failed"])]
         lifecycle_if: Vec<String>,
+        /// `set` raises the tab's attention banner (and needs `--title`
+        /// and `--body`), `clear` takes it down, `preserve` leaves it.
         #[arg(long, value_parser = ["set", "clear", "preserve"], default_value = "preserve")]
         attention: String,
+        /// The attention banner's severity.
         #[arg(long, value_parser = ["info", "warn", "error"], default_value = "info")]
         severity: String,
         /// Required (non-empty) when `--attention set`.
@@ -2637,6 +2676,45 @@ fn parse_tab_flag(raw: &str) -> Result<WireTabRef, CliError> {
     WireTabRef::parse(raw).ok_or_else(|| CliError::Usage(format!("invalid --tab reference: {raw}")))
 }
 
+/// The `--tab` of a verb that acts on a local tab only. Everything but a
+/// host ref goes to clap's own `i64` parser, so what parses (`007`, `+7`)
+/// and how the rest is refused are unchanged. A host ref — canonical or
+/// not, which is why this is not [`WireTabRef::parse`] — is refused by
+/// name, through the command so the refusal keeps clap's Usage block.
+#[derive(Clone)]
+struct LocalTab;
+
+impl clap::builder::TypedValueParser for LocalTab {
+    type Value = i64;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<i64, clap::Error> {
+        if let Some(host) = value.to_str().filter(|raw| names_a_host(raw)) {
+            let bin = cmd.get_bin_name().unwrap_or(cmd.get_name());
+            let verb = bin.split_once(' ').map_or(bin, |(_, verb)| verb);
+            return Err(cmd.clone().error(
+                clap::error::ErrorKind::ValueValidation,
+                format!(
+                    "{verb} acts on a local tab, so it cannot take the host tab {host}; \
+                     pass a bare tab id"
+                ),
+            ));
+        }
+        clap::value_parser!(i64).parse_ref(cmd, arg, value)
+    }
+}
+
+/// `h<digits>.…` in either case: a host ref's shape.
+fn names_a_host(raw: &str) -> bool {
+    raw.strip_prefix(['h', 'H'])
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(host, _)| !host.is_empty() && host.bytes().all(|b| b.is_ascii_digit()))
+}
+
 fn parse_state(s: &str) -> Result<TabState, CliError> {
     Ok(match s {
         "none" => TabState::None,
@@ -3428,6 +3506,29 @@ mod tests {
     }
 
     #[test]
+    fn every_argument_has_help() {
+        use clap::CommandFactory;
+        fn blank(cmd: &clap::Command, path: &str, found: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                if arg
+                    .get_help()
+                    .is_none_or(|help| help.to_string().trim().is_empty())
+                {
+                    found.push(format!("{path} {}", arg.get_id()));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                blank(sub, &format!("{path} {}", sub.get_name()), found);
+            }
+        }
+        let mut root = Args::command();
+        root.build();
+        let mut found = Vec::new();
+        blank(&root, "roostctl", &mut found);
+        assert!(found.is_empty(), "arguments with no help: {found:#?}");
+    }
+
+    #[test]
     fn every_verb_takes_json_before_and_after_itself() {
         let mut tabled: Vec<String> = EVERY_VERB.iter().map(|argv| verb_name(argv)).collect();
         tabled.sort();
@@ -3563,14 +3664,20 @@ mod tests {
     }
 
     /// A stand-in UI on a real socket. It answers each request through
-    /// `answer` and records what it was asked, so a test can say what
-    /// `roostctl` sent.
+    /// `answer` and records what it was asked, and how many connections
+    /// it accepted, so a test can say what `roostctl` sent and whether it
+    /// dialled at all.
     struct FakeUi {
         socket: String,
         requests: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     type Answer = Result<serde_json::Value, (&'static str, &'static str)>;
+
+    /// The op [`FakeUi::connections`] sends: answered, never recorded, and
+    /// its connection not counted.
+    const FENCE: &str = "test.fence";
 
     impl FakeUi {
         fn start(tag: &str, answer: impl Fn(&str) -> Answer + Send + Sync + 'static) -> Self {
@@ -3581,9 +3688,13 @@ mod tests {
             let listener = tokio::net::UnixListener::bind(&socket).expect("bind the fake UI");
             let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let seen = requests.clone();
+            let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = accepted.clone();
             let answer = std::sync::Arc::new(answer);
             tokio::spawn(async move {
                 while let Ok((stream, _)) = listener.accept().await {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let counted = counted.clone();
                     let seen = seen.clone();
                     let answer = answer.clone();
                     tokio::spawn(async move {
@@ -3592,12 +3703,19 @@ mod tests {
                         while let Ok(Some(line)) = lines.next_line().await {
                             let request: RawRequest =
                                 serde_json::from_str(&line).expect("a request frame");
-                            seen.lock()
-                                .unwrap()
-                                .push((request.op.clone(), request.params.clone()));
-                            let response = match answer(&request.op) {
-                                Ok(result) => Response::ok(request.id, result),
-                                Err((code, message)) => Response::err(request.id, code, message),
+                            let response = if request.op == FENCE {
+                                counted.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                Response::ok(request.id, serde_json::json!({}))
+                            } else {
+                                seen.lock()
+                                    .unwrap()
+                                    .push((request.op.clone(), request.params.clone()));
+                                match answer(&request.op) {
+                                    Ok(result) => Response::ok(request.id, result),
+                                    Err((code, message)) => {
+                                        Response::err(request.id, code, message)
+                                    }
+                                }
                             };
                             let mut frame = serde_json::to_vec(&response).unwrap();
                             frame.push(b'\n');
@@ -3611,11 +3729,27 @@ mod tests {
             Self {
                 socket: socket.display().to_string(),
                 requests,
+                accepted,
             }
         }
 
         fn take(&self) -> Vec<(String, serde_json::Value)> {
             std::mem::take(&mut self.requests.lock().unwrap())
+        }
+
+        /// Connections accepted so far. Fenced by a round trip of its own,
+        /// because a dial lands in the listen backlog before its accept
+        /// runs: the fence queues behind every earlier dial, so once it is
+        /// answered each of those has been counted.
+        async fn connections(&self) -> usize {
+            let mut fence = dial(Path::new(&self.socket))
+                .await
+                .expect("dial the fake UI");
+            let _: serde_json::Value = fence
+                .call(FENCE, serde_json::json!({}))
+                .await
+                .expect("the fence is answered");
+            self.accepted.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -3679,11 +3813,11 @@ mod tests {
         assert_eq!(error.code(), "timeout");
     }
 
-    fn mutating_argv(verb: &str) -> Vec<&'static str> {
+    fn verb_argv(verb: &str) -> Vec<&'static str> {
         EVERY_VERB
             .iter()
             .find(|argv| verb_name(argv) == verb)
-            .unwrap_or_else(|| panic!("{verb} is in MUTATING_TAB_VERBS with no argv in EVERY_VERB"))
+            .unwrap_or_else(|| panic!("{verb} has no argv in EVERY_VERB"))
             .to_vec()
     }
 
@@ -3695,7 +3829,7 @@ mod tests {
         for verb in MUTATING_TAB_VERBS {
             let argv: Vec<&str> = ["--socket", socket.as_str()]
                 .into_iter()
-                .chain(mutating_argv(verb))
+                .chain(verb_argv(verb))
                 .collect();
             for unset in [None, Some("")] {
                 let refused = run_argv(&argv, unset).await.expect_err(verb);
@@ -3731,7 +3865,7 @@ mod tests {
         {
             let argv: Vec<&str> = ["--socket", ui.socket.as_str()]
                 .into_iter()
-                .chain(mutating_argv(verb))
+                .chain(verb_argv(verb))
                 .collect();
             assert_eq!(run_argv(&argv, Some("7")).await, Ok(0), "{verb}");
             let flagged: Vec<&str> = argv.iter().copied().chain(["--tab", "8"]).collect();
@@ -3763,6 +3897,223 @@ mod tests {
                     "{argv:?}"
                 );
             }
+        }
+    }
+
+    /// The verbs whose `--tab` is a [`LocalTab`].
+    const LOCAL_TAB_VERBS: &[&str] = &[
+        "notify",
+        "set-title",
+        "doctor",
+        "tab set-state",
+        "tab clear-notification",
+        "tab close",
+        "tab send",
+        "tab resize",
+        "tab report",
+    ];
+
+    fn host_refusal(verb: &str, host: &str) -> String {
+        format!(
+            "{verb} acts on a local tab, so it cannot take the host tab {host}; pass a bare tab id"
+        )
+    }
+
+    /// What `main` does with a command line: clap's refusal through
+    /// [`CliError::from_clap`], else [`run`].
+    async fn command_line(argv: &[&str], tab_env: Option<&str>) -> Result<i32, CliError> {
+        match parse(argv) {
+            Ok(args) => run(args, tab_env, None).await,
+            Err(error) => Err(CliError::from_clap(&error)),
+        }
+    }
+
+    /// A local-only `--tab` parses everything but a host ref as clap's own
+    /// `i64` parser does — to the same id, or to the same refusal — and
+    /// refuses a host ref, canonical or not, by name, keeping the verb's
+    /// Usage block. Exactly the nine verbs do.
+    #[test]
+    fn a_local_only_tab_parses_as_i64_did_and_refuses_a_host_ref_by_name() {
+        use clap::CommandFactory;
+        fn leaf(matches: &clap::ArgMatches) -> &clap::ArgMatches {
+            matches.subcommand().map_or(matches, |(_, sub)| leaf(sub))
+        }
+        fn first_line(error: &clap::Error) -> String {
+            let usage = CliError::from_clap(error);
+            usage
+                .message()
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        }
+        let i64_tab = clap::Command::new("roostctl").arg(
+            clap::Arg::new("tab")
+                .long("tab")
+                .value_name("TAB")
+                .value_parser(clap::value_parser!(i64)),
+        );
+
+        for verb in LOCAL_TAB_VERBS {
+            let base = verb_argv(verb);
+            for value in [
+                "7",
+                "0",
+                "-3",
+                "007",
+                "+7",
+                "seven",
+                "",
+                "1.5",
+                "9223372036854775808",
+            ] {
+                let joined = format!("--tab={value}");
+                for spelled in [vec![joined.as_str()], vec!["--tab", value]] {
+                    let argv: Vec<&str> = std::iter::once("roostctl")
+                        .chain(base.iter().copied())
+                        .chain(spelled.iter().copied())
+                        .collect();
+                    let ours = Args::command().try_get_matches_from(&argv);
+                    let theirs = i64_tab
+                        .clone()
+                        .try_get_matches_from(std::iter::once("roostctl").chain(spelled));
+                    match (&ours, &theirs) {
+                        (Ok(ours), Ok(theirs)) => assert_eq!(
+                            leaf(ours).get_one::<i64>("tab"),
+                            theirs.get_one::<i64>("tab"),
+                            "{argv:?}"
+                        ),
+                        (Err(ours), Err(theirs)) => {
+                            assert_eq!(ours.kind(), theirs.kind(), "{argv:?}");
+                            assert_eq!(first_line(ours), first_line(theirs), "{argv:?}");
+                        }
+                        _ => panic!("{argv:?}: {ours:?} where i64 gave {theirs:?}"),
+                    }
+                }
+            }
+            for host in ["h1.7", "H1.7", "h1."] {
+                let argv: Vec<&str> = base.iter().copied().chain(["--tab", host]).collect();
+                let refused = CliError::from_clap(&parse(&argv).expect_err(host));
+                assert_eq!(
+                    (refused.exit_code(), refused.code()),
+                    (2, "usage"),
+                    "{argv:?}"
+                );
+                let message = refused.message();
+                assert!(
+                    message.starts_with(&format!("{}\n", host_refusal(verb, host))),
+                    "{message}"
+                );
+                assert!(
+                    message.contains(&format!("Usage: roostctl {verb} ")),
+                    "{message}"
+                );
+            }
+        }
+
+        let mut refusing: Vec<String> = leaf_verbs()
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| {
+                let argv: Vec<&str> = verb_argv(name)
+                    .into_iter()
+                    .chain(["--tab", "h1.7"])
+                    .collect();
+                parse(&argv).is_err_and(|error| first_line(&error) == host_refusal(name, "h1.7"))
+            })
+            .collect();
+        refusing.sort();
+        let mut nine = LOCAL_TAB_VERBS.to_vec();
+        nine.sort_unstable();
+        assert_eq!(refusing, nine);
+    }
+
+    /// The same refusals on `main`'s path — plus `ROOST_TAB_ID=h1.7` with
+    /// no flag, refused as it always was — are `usage`, exit 2, and dial
+    /// nothing; every id that parses reaches the server as that id. The
+    /// host-capable `tab focus`, `tab dump` and `tab send-file` still take
+    /// `h1.7`.
+    #[tokio::test]
+    async fn a_local_only_tab_refuses_before_dialling_and_sends_what_parses() {
+        let ui = FakeUi::start("local-tab", |op| match op {
+            ops::TAB_AGENT_REPORT => Ok(fake_tab_agent_report_result(true, "inactive", None)),
+            ops::TAB_DUMP => Ok(serde_json::json!({"cols": 80, "rows": 1, "rows_text": [""]})),
+            ops::TAB_SEND_FILE => {
+                Ok(serde_json::json!({"pasted": "p", "uploads": [], "skipped": []}))
+            }
+            _ => Ok(serde_json::json!({})),
+        });
+        let socket = ["--socket", ui.socket.as_str()];
+
+        for verb in LOCAL_TAB_VERBS {
+            let base: Vec<&str> = socket.into_iter().chain(verb_argv(verb)).collect();
+            let dialled = ui.connections().await;
+            for value in ["h1.7", "H1.7", "h1.", "seven"] {
+                let argv: Vec<&str> = base.iter().copied().chain(["--tab", value]).collect();
+                let refused = command_line(&argv, None).await.expect_err(value);
+                assert_eq!(
+                    (refused.exit_code(), refused.code()),
+                    (2, "usage"),
+                    "{argv:?}"
+                );
+            }
+            // `doctor` reads `ROOST_TAB_ID` itself, and would diagnose this
+            // machine for real past its parse.
+            if *verb == "doctor" {
+                assert_eq!(ui.connections().await, dialled, "{verb} dialled");
+                continue;
+            }
+            assert_eq!(
+                command_line(&base, Some("h1.7")).await,
+                Err(CliError::Usage("ROOST_TAB_ID=h1.7 is not a tab id".into())),
+                "{verb}"
+            );
+            assert_eq!(ui.connections().await, dialled, "{verb} dialled");
+
+            for (value, sent) in [
+                ("7", "7"),
+                ("0", "0"),
+                ("-3", "-3"),
+                ("007", "7"),
+                ("+7", "7"),
+            ] {
+                let flag = format!("--tab={value}");
+                let argv: Vec<&str> = base.iter().copied().chain([flag.as_str()]).collect();
+                assert_eq!(command_line(&argv, None).await, Ok(0), "{argv:?}");
+                let requests = ui.take();
+                assert_eq!(requests.len(), 1, "{argv:?}: {requests:?}");
+                assert_eq!(requests[0].1["tab_id"], sent, "{argv:?}");
+            }
+        }
+
+        let exe = std::env::current_exe().expect("the test binary is a real file");
+        let exe = exe.to_str().expect("a UTF-8 path");
+        for (argv, op, field) in [
+            (
+                vec!["tab", "focus", "--tab", "h1.7"],
+                ops::TAB_FOCUS,
+                "tab_id",
+            ),
+            (
+                vec!["tab", "dump", "--tab", "h1.7"],
+                ops::TAB_DUMP,
+                "tab_id",
+            ),
+            (
+                vec!["tab", "send-file", "--tab", "h1.7", exe],
+                ops::TAB_SEND_FILE,
+                "tab",
+            ),
+        ] {
+            let argv: Vec<&str> = socket.into_iter().chain(argv).collect();
+            assert_eq!(command_line(&argv, None).await, Ok(0), "{argv:?}");
+            let requests = ui.take();
+            assert_eq!(requests.len(), 1, "{argv:?}: {requests:?}");
+            assert_eq!(
+                (requests[0].0.as_str(), &requests[0].1[field]),
+                (op, &serde_json::json!("h1.7")),
+                "{argv:?}"
+            );
         }
     }
 

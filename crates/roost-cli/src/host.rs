@@ -49,10 +49,15 @@ pub enum HostCmd {
     /// incompatible session, mirroring the Add Host dialog's
     /// "Add & Connect" validation.
     Add {
+        /// The name the sidebar shows for the host.
         #[arg(long)]
         label: String,
+        /// Where the host's session is: an SSH destination, a socket
+        /// path, or `localhost`.
         #[arg(long)]
         target: String,
+        /// Ask `--target` for a `session.identify` first, and refuse to
+        /// save a host that does not answer as a compatible session.
         #[arg(long, default_value_t = false)]
         verify: bool,
     },
@@ -72,11 +77,13 @@ pub enum HostCmd {
     /// (`generation`, `reason`, `rollup`, `retry`); the human form is
     /// `id  label  state  rollup`.
     Status {
+        /// Report only this host. `host list` shows ids.
         #[arg(long)]
         id: Option<String>,
     },
     /// Forget a saved host by id.
     Remove {
+        /// The saved host's id. `host list` shows ids.
         #[arg(long)]
         id: String,
     },
@@ -85,12 +92,14 @@ pub enum HostCmd {
     /// the attempt is under way — watch the sidebar or poll `host status`
     /// for the settled state.
     Connect {
+        /// The saved host's id. `host list` shows ids.
         #[arg(long)]
         id: String,
     },
     /// Drop a saved host's connection. Never stops the session: its
     /// shells keep running and reconnecting picks them back up.
     Disconnect {
+        /// The saved host's id. `host list` shows ids.
         #[arg(long)]
         id: String,
     },

@@ -13,6 +13,16 @@ release workflow asserts they agree).
 
 ### Added
 
+- **iced: a toast when startup agent-hook setup leaves an agent unwired** —
+  a *problem* is anything that leaves an allowed, present agent unwired:
+  every `ensure` error, plus a skip for `Unparseable`, `UnexpectedShape` or
+  `ForeignFile` (`NotPresent`/`NotAllowed`/`ModeOff` stay silent — the
+  user's own choices, not problems). The toast reads `Agent hooks: couldn't
+  set up <agents> — run roostctl agent status`, alongside the existing
+  wiring announcement when there is one, shown once per launch while the
+  problem persists; fixing the file or dropping the agent from
+  `agent-hooks` silences it. See [Agent Hooks](docs/guides/agents.md).
+
 - **`roostctl tab prompt` submits a prompt and waits for the turn it starts,
   race-free (plan 067)** — the verb closes the gap between a `tab send` and
   a separate `wait --state running`: it subscribes and fences the event
@@ -579,6 +589,43 @@ release workflow asserts they agree).
 
 ### Fixed
 
+- **A raw UI-socket `tab.dump` of a slot tab the window showed and then
+  left answered from a stale, frozen client-side copy instead of the
+  session (#515)** — the engine's `tab.dump` now forwards to the session
+  when the tab is on the connected session's slot and the window's own
+  terminal for it isn't streaming (detached, requesting, hydrating, or
+  ended) — the #511 fall-through that never ran for a tab like this. No
+  wire change.
+- **`roostctl wait`, `tab prompt` and `events` now hold off on an older
+  server's `host-unavailable` refusal of a local-backend switch in
+  flight, not just `busy` (#517)** — a shared classifier treats
+  `host-unavailable` as a switch when `identify` still names one;
+  `events` gained its own hold-off loop (it previously failed hard on any
+  refusal, including a switch) and prints a one-line notice on stderr
+  while waiting so stdout stays JSON lines. A switch that settles between
+  the refusal and the `identify` re-read still exits 1 — accepted
+  residue.
+- **The nine local-only `--tab` verbs (`notify`, `set-title`, `doctor`,
+  and `tab set-state`/`clear-notification`/`close`/`send`/`resize`/`report`)
+  refuse a host tab ref (`h1.7`) with a designed message instead of
+  clap's raw "invalid digit" error** — matching the message `wait` and
+  `events` already give for the same mistake. Every `roostctl` flag now
+  has help text; a tree-walk test that checks for it found 35 without
+  any.
+- **Roost-Iced's bundled `roost.bash`/`roost.zsh` no longer overwrite a
+  user-defined `__roost_*` shell-integration function (#193)** —
+  `__roost_osc7`/`__roost_title`/`__roost_marks` (bash) and their zsh
+  equivalents are now defined only when the user hasn't already defined
+  one; the hook registration (`PROMPT_COMMAND`, `add-zsh-hook`) still
+  runs, so it's the user's own function that gets called. The Swift
+  `Roost.app`'s shell resources are unchanged this release, so #193
+  stays open there.
+- **iced: a Super-held control chord no longer reaches the PTY as a
+  plain `ctrl+<key>`, with Super silently dropped (#494)** —
+  `encode_press` no longer recovers a control chord when `logo()` is
+  held, matching the Swift encoder's existing refusal to recover a
+  Command chord. `ctrl+cmd+<key>` on macOS iced changes with it,
+  intentionally; a configured `ctrl+super+<key>` keybind still resolves.
 - **A mutation sent on the in-process UI socket during a local-backend
   switch could land in the workspace the switch was about to copy and hide
   (#501)** — an admission gate now takes a read guard, re-loads the route
@@ -790,6 +837,27 @@ release workflow asserts they agree).
   which renderer is live, and point at
   `tools/wayland/weston-run.sh` for a capture you can trust.
 
+### Documentation
+
+- **Roost-Iced is now the recommended macOS build for driving Roost from
+  an agent** — `installation.md`/README point Mac users who drive Roost
+  from an agent (the skill, `open`, `wait`, `events`, `tab prompt`) at
+  Roost-Iced, since the Swift `Roost.app` has no `project.ensure`,
+  refuses `--no-activate`, and serves no event stream; a direction note
+  (also `vision.md`'s decision log, DL-28) says Roost will either sunset
+  the Swift app in favor of iced or rebuild it as a thin layer over the
+  same Rust core the agent surface already lives in. `first-run.md`
+  documents Roost-Iced's fresh-install `session` default and the
+  agent-hooks consent card. `agents.md` gains a "When a tab stays
+  running" section — what clears a stuck lifecycle (the shell's own OSC
+  133 prompt marks), which shells emit them, the manual
+  `roostctl tab set-state` clear, and fish 4.9.3's own behavior — plus
+  Claude's `agent_needs_input`/`elicitation_dialog` blocked signals.
+  Every doc that said "the macOS app" meaning the Swift build now says
+  so explicitly. `skills/roost/SKILL.md` picked up the same
+  disambiguation, plus the `busy`-retry rule now covering an older
+  server's `host-unavailable` refusal of a switch in flight.
+
 ### Internal
 
 - **The close-cancels-a-pending-spawn branch is now under test, through a
@@ -816,6 +884,11 @@ release workflow asserts they agree).
   none — are lifted onto free functions over `ExitState`, `HostConnSet`,
   and `BootstrapsInFlight` in a new `app/host_lifecycle.rs`. Each now has
   a unit test that fails when the guard is deleted.
+
+### Known issues
+
+- **#351 — on Wayland, clicking a notification selects the tab but
+  cannot raise the window** (upstream winit).
 
 ## v0.0.19 — 2026-09-04
 

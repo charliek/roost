@@ -21,7 +21,7 @@ What differs is where each signal comes from:
 
 | Agent | `source` | Config file Roost writes into | Blocked signal | Turn-end signal | Interrupt signal |
 |---|---|---|---|---|---|
-| Claude Code | `claude` | `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`) — merged in beside your own hooks | `PermissionRequest` (immediate) | `Stop` | none — the post-turn `idle_prompt` notification is the only later signal, guarded so it can't overwrite a real `waiting`/`failed` |
+| Claude Code | `claude` | `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR`) — merged in beside your own hooks | `PermissionRequest` (immediate); the `Notification` types `agent_needs_input` and `elicitation_dialog` also set it, unconditionally | `Stop` | none — the post-turn `idle_prompt` notification is the only later signal, guarded so it can't overwrite a real `waiting`/`failed` |
 | Codex | `codex` | `~/.codex/hooks.json` + `[hooks.state]` in `config.toml` (or `$CODEX_HOME`) | `PermissionRequest` | `Stop` | `Interrupt` |
 | grok / gx | `grok` | `$GROK_HOME/hooks/roost.json` (default `~/.grok`) — a file Roost owns outright | `Notification` `notificationType: permission_prompt` | `Stop` on its first fire; a fire with `stopHookActive: true` (a blocking Stop gate already continued the turn) keeps `working` instead, and the `idle_prompt` Notification settles it | `StopCancelled` |
 | cursor-agent | `cursor` | `~/.cursor/hooks.json` (or `$CURSOR_CONFIG_DIR`) — merged in beside your own hooks | none — an accepted gap, see [Per-agent caveats](#per-agent-caveats) | `stop` | `stop` (same event as turn-end; see caveats) |
@@ -169,12 +169,23 @@ Roost never writes into an agent's config file before you've said yes.
 
 The iced UI also shows a one-line toast the first time any agent is
 *newly* wired on a machine, naming which ones and how to undo it; after
-that, refreshes on upgrade are silent. **The Mac app has no equivalent
+that, refreshes on upgrade are silent. **The Swift `Roost.app` has no equivalent
 toast** — its chrome has no transient status surface — so a machine
 wired only through the Swift app or `roostctl` stays unannounced until
 either the iced UI runs there too, or you check by hand.
 `roostctl agent status` and `roostctl doctor`'s `Agents` section are the
 durable way to see what's wired without waiting for a toast.
+
+If the startup wiring can't set up an agent that the list names and
+that is installed, the iced UI says so in the same toast, for example
+`Agent hooks: couldn't set up claude — run roostctl agent status`.
+This happens when the agent's config file doesn't parse, isn't the shape
+the agent documents, or is a file Roost owns by name but didn't write,
+or when the file can't be read or written at all. The toast
+comes back on every launch while the problem lasts. To silence it, fix
+the file (`roostctl agent status` names it), or drop the agent from the
+`agent-hooks` key. An agent Roost couldn't wire is never announced as
+wired, so its one-time announcement still comes once the file is fixed.
 
 Every entry Roost installs invokes `roostctl` (or `roost-session` on a
 host) indirectly, through the `$ROOST_AGENT_HOOK` environment variable
@@ -307,6 +318,57 @@ substring test:
 Only a file Roost itself created is ever deleted on uninstall, and only
 the state record can say which those are; a `{}` or an empty file that
 predates Roost is written back empty rather than removed.
+
+## When a tab stays running
+
+An agent that is hard-killed — `kill -9`, a crash, a closed laptop lid
+over SSH — fires no `Stop`/`SessionEnd` hook, so its last lifecycle
+(`working`, `waiting`) stands with nothing to tell Roost otherwise, and
+the tab keeps showing the state that projects from it (`running`,
+`needs_input`).
+
+**What clears it.** Ownership is deliberately not TTL'd — Claude fires
+no periodic hook, so a long tool call would look stale and get released
+mid-turn — so the only thing that clears a stuck lifecycle is the
+shell's own OSC 133 prompt marks. Reaching a fresh prompt (`A`/`B`) or a
+command ending (`D`) drops the lifecycle to `inactive` while *keeping*
+ownership as a label, so the tab falls through to shell-derived state
+instead of staying stuck. The marks clear the lifecycle because the
+shell has regained control of the terminal, not because the agent is
+proven gone — a suspended agent (`Ctrl-Z`) also returns the shell to a
+prompt while it's still alive in the background.
+
+**Which shells emit those marks.** Roost's bundled integration
+(`crates/roost-engine/resources/shell-integration/`) wires them for zsh
+and bash: zsh's
+`preexec`/`precmd` hooks fire the `C` and `D` marks unconditionally;
+bash's `PROMPT_COMMAND` fires `D` on every version, but the `C`
+(command-start) mark needs bash ≥ 4.4 — `PS0` is silently ignored on
+older bash, including macOS's stock `/bin/bash` 3.2. A shell with no
+prompt marks at all — dash, plain `sh`, or bash/zsh with the
+integration disabled — never clears a stuck lifecycle on its own.
+
+**Manual clear.** From any shell:
+
+```bash
+roostctl tab set-state --tab <id> --state none
+```
+
+This claims ownership as `manual` and releases it in the same step,
+falling the tab through to shell-derived state (see
+[`cli.md`](../reference/cli.md#tab-set-state)).
+
+**fish.** Tested with fish 4.9.3: fish marks its own prompts and
+commands (OSC 133) with no Roost integration installed, so a fish tab's
+shell state reads `at_prompt` from the first prompt, and a tab left
+`running` by an agent that was killed clears as soon as fish draws its
+next prompt — the same as Roost's own bash integration. Older fish
+releases were not tested.
+
+There is no shell-agnostic failsafe today — nothing in `crates/` reads
+the PTY's foreground process group. A `tcgetpgrp`-based one, which would
+cover dash/`sh` too, is tracked as future work in
+[#519](https://github.com/charliek/roost/issues/519).
 
 ## Codex trust
 

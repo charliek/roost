@@ -12,7 +12,7 @@
 //! engine feed, which is the same road every other off-thread result in
 //! this app travels.
 //!
-//! # Why the toast is at most once
+//! # Why the announcement is at most once
 //!
 //! `ensure` returns the agents the **state record** says are wired and
 //! have never been announced — `Outcome::unnoticed`, not the agents this
@@ -28,8 +28,8 @@
 //! is what drives the toast, a `mark_noticed` that never lands is simply
 //! a toast the next launch shows instead.
 
-use roost_agent::Agent;
-use roost_agent_install::{Guard, Home, InstallError, Mode};
+use roost_agent::{Agent, ALL_AGENTS};
+use roost_agent_install::{Guard, Home, InstallError, Mode, Outcome, SkipReason};
 use roost_engine::ipc::HostOpFailure;
 use roost_ipc::codes;
 use roost_ipc::messages::{
@@ -39,6 +39,7 @@ use roost_ipc::messages::{
 use roost_ui_model::config::{AgentHooks, RoostConfig};
 
 use super::agent_hooks_dialog::{AgentHooksRow, CardMode};
+use super::local_backend::plural;
 use crate::engine_feed::{EngineFeed, EngineFeedSender};
 use crate::host_conn::queue::HostOpError;
 use crate::host_conn::HostRaise;
@@ -51,13 +52,21 @@ const BY: &str = "local";
 /// What one background `ensure` had to say, as the UI needs it.
 #[derive(Debug, Default)]
 pub(crate) struct AgentHooksEnsured {
-    /// Agents the record says are wired and unannounced — the toast
-    /// list, and the list `mark_noticed` is then given.
+    /// Agents the record says are wired and unannounced — what the
+    /// toast announces, less any agent in [`Self::problems`].
     pub unnoticed: Vec<Agent>,
-    /// One line per agent that could not be wired. Rendered nowhere:
-    /// `roostctl agent status` and doctor are the durable surface, so
-    /// these are logged at the drain and left there.
-    pub errors: Vec<String>,
+    /// Everything that left an allowed, present agent unwired (plan 068
+    /// §3.6). Each is logged at the drain and named in the startup
+    /// toast, which only points at `roostctl agent status`: that and
+    /// doctor are where the detail lives.
+    pub problems: Vec<HookProblem>,
+}
+
+#[derive(Debug)]
+pub(crate) struct HookProblem {
+    /// `None` when the whole ensure failed before it reached an agent.
+    pub agent: Option<Agent>,
+    pub detail: String,
 }
 
 /// What `config.conf` asks for, or `None` when nobody has answered the
@@ -422,33 +431,56 @@ fn survey_blocking(mode: CardMode, fallback: &AgentHooks) -> Result<AgentHooksFo
     })
 }
 
-/// The blocking half. Every failure becomes a line in
-/// [`AgentHooksEnsured::errors`] rather than a panic or a swallow: this
-/// runs with nobody waiting on it, so the only honest thing to do with a
-/// failure is carry it back to a thread that can log it.
+/// The blocking half. Every failure becomes a [`HookProblem`] rather
+/// than a panic or a swallow: this runs with nobody waiting on it, so the
+/// only honest thing to do with a failure is carry it back to a thread
+/// that can log it and say so.
 fn ensure_blocking(guard: Guard) -> AgentHooksEnsured {
+    let failed = |error: InstallError| AgentHooksEnsured {
+        unnoticed: Vec::new(),
+        problems: vec![HookProblem {
+            agent: None,
+            detail: error.to_string(),
+        }],
+    };
     let home = match Home::from_env() {
         Ok(home) => home,
-        Err(error) => {
-            return AgentHooksEnsured {
-                unnoticed: Vec::new(),
-                errors: vec![error.to_string()],
-            }
-        }
+        Err(error) => return failed(error),
     };
     match roost_agent_install::ensure(&home, BY, guard) {
         Ok(outcome) => AgentHooksEnsured {
+            problems: problems(&outcome),
             unnoticed: outcome.unnoticed,
-            errors: outcome
-                .errors
-                .iter()
-                .map(|e| format!("{}: {}", e.agent.source(), e.error))
-                .collect(),
         },
-        Err(error) => AgentHooksEnsured {
-            unnoticed: Vec::new(),
-            errors: vec![error.to_string()],
-        },
+        Err(error) => failed(error),
+    }
+}
+
+fn problems(outcome: &Outcome) -> Vec<HookProblem> {
+    let failed = outcome.errors.iter().map(|failure| HookProblem {
+        agent: Some(failure.agent),
+        detail: failure.error.to_string(),
+    });
+    let refused = outcome
+        .skipped
+        .iter()
+        .filter(|skip| leaves_unwired(&skip.reason))
+        .map(|skip| HookProblem {
+            agent: Some(skip.agent),
+            detail: skip.reason.to_string(),
+        });
+    failed.chain(refused).collect()
+}
+
+/// The skips that are a defect in a file. The other three are the user's
+/// own answers — not installed, not in the key, `off` — and a toast about
+/// them would nag someone for a choice they made.
+fn leaves_unwired(reason: &SkipReason) -> bool {
+    match reason {
+        SkipReason::Unparseable { .. }
+        | SkipReason::UnexpectedShape { .. }
+        | SkipReason::ForeignFile { .. } => true,
+        SkipReason::NotPresent | SkipReason::NotAllowed | SkipReason::ModeOff => false,
     }
 }
 
@@ -763,6 +795,72 @@ pub(crate) fn wired_toast(agents: &[Agent], host: Option<&str>) -> Option<String
     ))
 }
 
+/// This machine's agent-hooks toast: what it says, and the agents it
+/// may spend `noticed` on.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AgentHooksToast {
+    /// [`wired_toast`]'s sentence, when anything is announced.
+    pub announcement: Option<String>,
+    /// [`problem_line`]'s sentence, when anything was left unwired.
+    pub problem: Option<String>,
+    /// Exactly the agents `announcement` names — never a problem.
+    pub noticed: Vec<Agent>,
+}
+
+impl AgentHooksToast {
+    /// One banner line, the announcement first.
+    pub(crate) fn text(&self) -> String {
+        [self.announcement.as_deref(), self.problem.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(". ")
+    }
+}
+
+/// The toast `unnoticed` and `problems` earn, or `None` when there is
+/// nothing to say.
+///
+/// An agent that is both is left out of the announcement: "wired" is not
+/// true of it right now, and `mark_noticed` would spend the one
+/// announcement it is owed once its file is fixed.
+pub(crate) fn toast(unnoticed: Vec<Agent>, problems: &[HookProblem]) -> Option<AgentHooksToast> {
+    let mut noticed = unnoticed;
+    noticed.retain(|agent| !problems.iter().any(|p| p.agent == Some(*agent)));
+    let announcement = wired_toast(&noticed, None);
+    let problem = problem_line(problems);
+    if announcement.is_none() && problem.is_none() {
+        return None;
+    }
+    Some(AgentHooksToast {
+        announcement,
+        problem,
+        noticed,
+    })
+}
+
+/// The agents `problems` name, in the announcement's order; a problem
+/// that names no agent is counted instead.
+fn problem_line(problems: &[HookProblem]) -> Option<String> {
+    if problems.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = ALL_AGENTS
+        .into_iter()
+        .filter(|agent| problems.iter().any(|p| p.agent == Some(*agent)))
+        .map(Agent::source)
+        .collect();
+    let unnamed = problems.iter().filter(|p| p.agent.is_none()).count();
+    let what = match (names.is_empty(), unnamed) {
+        (false, 0) => names.join(", "),
+        (true, n) => format!("agents ({})", plural(n, "problem")),
+        (false, n) => format!("{} (+{})", names.join(", "), plural(n, "problem")),
+    };
+    Some(format!(
+        "Agent hooks: couldn't set up {what} — run roostctl agent status"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -969,6 +1067,114 @@ mod tests {
     fn nothing_wired_is_no_toast() {
         assert_eq!(wired_toast(&[], None), None);
         assert_eq!(wired_toast(&[], Some("shed")), None);
+        assert_eq!(toast(Vec::new(), &[]), None);
+    }
+
+    fn problem(agent: Option<Agent>) -> HookProblem {
+        HookProblem {
+            agent,
+            detail: "settings.json: unreadable".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_clean_startup_toast_is_the_announcement_alone() {
+        let shown = toast(vec![Agent::Claude, Agent::Codex], &[]).unwrap();
+        assert_eq!(shown.problem, None);
+        assert_eq!(
+            shown.announcement,
+            wired_toast(&[Agent::Claude, Agent::Codex], None)
+        );
+        assert_eq!(Some(shown.text()), shown.announcement);
+        assert_eq!(shown.noticed, vec![Agent::Claude, Agent::Codex]);
+    }
+
+    #[test]
+    fn a_startup_that_only_failed_names_the_agents_and_notices_none() {
+        let shown = toast(
+            Vec::new(),
+            &[problem(Some(Agent::Cursor)), problem(Some(Agent::Claude))],
+        )
+        .unwrap();
+        assert_eq!(shown.announcement, None);
+        assert_eq!(
+            shown.text(),
+            "Agent hooks: couldn't set up claude, cursor — run roostctl agent status"
+        );
+        assert!(shown.noticed.is_empty());
+    }
+
+    #[test]
+    fn a_startup_with_both_says_both_on_one_line_and_notices_only_the_announced() {
+        let shown = toast(
+            vec![Agent::Claude, Agent::Codex, Agent::Grok],
+            &[problem(Some(Agent::Claude)), problem(Some(Agent::Cursor))],
+        )
+        .unwrap();
+        assert_eq!(
+            shown.text(),
+            format!(
+                "{}. Agent hooks: couldn't set up claude, cursor — run roostctl agent status",
+                wired_toast(&[Agent::Codex, Agent::Grok], None).unwrap()
+            )
+        );
+        assert!(!shown.text().contains('\n'));
+        assert_eq!(shown.noticed, vec![Agent::Codex, Agent::Grok]);
+    }
+
+    #[test]
+    fn a_failure_that_names_no_agent_is_counted() {
+        assert_eq!(
+            toast(Vec::new(), &[problem(None)]).unwrap().text(),
+            "Agent hooks: couldn't set up agents (1 problem) — run roostctl agent status"
+        );
+        assert_eq!(
+            problem_line(&[problem(Some(Agent::Grok)), problem(None), problem(None)]).unwrap(),
+            "Agent hooks: couldn't set up grok (+2 problems) — run roostctl agent status"
+        );
+    }
+
+    #[test]
+    fn only_failures_and_file_defects_are_problems() {
+        let path = std::path::PathBuf::from("/x");
+        let skip = |agent, reason| roost_agent_install::AgentSkip { agent, reason };
+        let outcome = Outcome {
+            skipped: vec![
+                skip(Agent::Claude, SkipReason::NotPresent),
+                skip(Agent::Claude, SkipReason::NotAllowed),
+                skip(Agent::Claude, SkipReason::ModeOff),
+                skip(
+                    Agent::Codex,
+                    SkipReason::Unparseable {
+                        path: path.clone(),
+                        detail: "eof".to_string(),
+                    },
+                ),
+                skip(
+                    Agent::Grok,
+                    SkipReason::UnexpectedShape {
+                        path: path.clone(),
+                        detail: "array".to_string(),
+                    },
+                ),
+                skip(Agent::Opencode, SkipReason::ForeignFile { path }),
+            ],
+            errors: vec![roost_agent_install::AgentError {
+                agent: Agent::Cursor,
+                error: InstallError::NoHome,
+            }],
+            ..Outcome::default()
+        };
+        let agents: Vec<Option<Agent>> = problems(&outcome).iter().map(|p| p.agent).collect();
+        assert_eq!(
+            agents,
+            vec![
+                Some(Agent::Cursor),
+                Some(Agent::Codex),
+                Some(Agent::Grok),
+                Some(Agent::Opencode)
+            ]
+        );
     }
 
     /// The ensure is a *startup* act. `window_opened` runs again on

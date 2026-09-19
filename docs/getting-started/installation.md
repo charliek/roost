@@ -19,15 +19,37 @@ downloaded — e.g. `sudo apt install ./roost_0.0.18_amd64.deb`.
 macOS — download `Roost-<version>.dmg` from the
 [latest GitHub release](https://github.com/charliek/roost/releases),
 open it, and drag `Roost.app` into `/Applications`. Release DMGs
-(v0.0.18 onward) are Developer-ID signed and notarized by Apple, so
+are Developer-ID signed and notarized by Apple, so
 Roost opens with a normal double-click — no Gatekeeper detour.
+
+**If you drive Roost from an agent** — the [Claude skill](https://github.com/charliek/roost/tree/main/skills/roost),
+`roostctl open`/`wait`/`events`, or `tab prompt` — install
+**`Roost-Iced.app`** below instead of `Roost.app`. `Roost.app` is the
+classic Swift + AppKit build, and it does not serve the agent-facing
+surface: it has no `project.ensure`, so `open` and `project ensure`
+refuse with `unsupported`; it refuses `--no-activate` (`unknown-field`);
+and it serves no event stream, so `events` and `tab prompt` fail and
+`wait` falls back to polling. `tab send-file` and the `host` verbs are
+iced-only too. Roost-Iced serves all of it. See the direction note
+below.
 
 ### `Roost-Iced.app` (experimental)
 
 The same release also publishes `Roost-Iced-<version>.dmg`. That is the
 **iced** UI — the Rust codebase Linux ships — built for macOS, packaged as
-`Roost-Iced.app`. It is experimental: `Roost.app` (Swift + AppKit) remains
-the supported Mac product.
+`Roost-Iced.app`. It's still experimental as a general daily driver —
+`Roost.app` (Swift + AppKit) remains the more polished, accessible Mac
+build — but for the agent-facing surface above, Roost-Iced is already
+the more complete of the two, which is why agent-driving users are
+pointed at it above.
+
+**Direction note.** After this release, Roost will either sunset the
+Swift app and make Roost-Iced the Mac default, or rebuild the Swift UI
+as a thin layer over the same Rust core Roost-Iced already uses. Either
+way, the agent-control surface lives in the Rust core going forward.
+Nothing is decided yet — this is recorded as a pending entry in
+[`development/vision.md`](../development/vision.md)'s decision log, not
+a commitment.
 
 It is deliberately built to sit **beside** the Swift app rather than
 replace it:
@@ -43,11 +65,13 @@ replace it:
 
 Install it the same way: open the DMG, drag `Roost-Iced.app` to
 `/Applications`. It is signed and notarized on the same terms as
-`Roost.app`. Try it if you want the newer renderer (iced + wgpu) or want to
-report parity gaps against the Swift app; stay on `Roost.app` otherwise.
+`Roost.app`. Beyond the agent-facing surface above, try it if you want
+the newer renderer (iced + wgpu) or want to report parity gaps against
+the Swift app.
 
 Note that `roostctl` auto-detects a single running UI, but with both apps
-running it will ask you to choose — pass `--target mac` or `--target iced`.
+running it will ask you to choose — pass `--target mac` or `--target iced`
+(see [CLI reference → Where `roostctl` lives](../reference/cli.md#where-roostctl-lives)).
 
 ### Updating
 

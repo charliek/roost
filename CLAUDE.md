@@ -6,10 +6,11 @@ Roost is a cross-platform (Mac + Linux) desktop terminal multiplexer
 built around libghostty-vt. It ships **two platform products** — Swift
 + AppKit on macOS and Rust + iced on Linux — that each embed the
 workspace + PTY supervisor in-process and serve a JSON IPC socket for
-external tooling (`roostctl`, Claude hooks). No daemon by default — the
-one opt-in exception is `roost-session` (`crates/roost-session/`), a
-headless daemon for host-sessions, started with `roostctl session
-start`.
+external tooling (`roostctl`, Claude hooks). No daemon by default,
+except a fresh Roost-Iced install, which starts its local tabs on a
+`roost-session` it manages. The other opt-in exception is
+`roost-session` (`crates/roost-session/`), a headless daemon for
+host-sessions, started with `roostctl session start`.
 
 * Mac UI: Swift + AppKit, `mac/` (bundle id `ai.stridelabs.Roost`).
 * Linux UI (shipped): Rust + iced, `crates/roost-iced/` (packaged as `/usr/bin/roost`).
@@ -128,7 +129,7 @@ libghostty-vt, it runs on the main thread.
 | libghostty-vt        | cgo via `roost-vt` (`--features ffi`)                          | Pinned Ghostty SHA in `third_party/ghostty/build.sh`.                                                |
 | JSON IPC             | `roost-ipc` (server + client + framing + paths + target picker) | Newline-delimited JSON, 16 MiB frame cap; client + server share the wire-types module.               |
 | swash (vendored patch) | `third_party/swash` via `[patch.crates-io]`                  | Pristine 0.2.10 pinned, plus a small set of malformed-font guards (issues #292 + #299 — debug SIGABRTs, an unbounded name-table read, and a hang when iced/cosmic-text shapes such a font). `README.roost.md` enumerates the deltas + removal condition. |
-| zbus (Linux notifications) | iced-side `org.freedesktop.Notifications` (`crates/roost-iced`) | Spec session-bus client, not a DE-specific stack. macOS backend deliberately absent — issue #303. |
+| zbus (Linux notifications) | iced-side `org.freedesktop.Notifications` (`crates/roost-iced`) | Spec session-bus client, not a DE-specific stack. macOS notifications use a separate, native `UNUserNotificationCenter` backend instead (`crates/roost-iced/src/macos/notifications.rs`, issue #303 closed), not zbus. |
 | arboard                | iced-side clipboard image read on paste (`crates/roost-iced`) | `image-data` + `wayland-data-control` with X11 fallback; PNG encoding stays on the existing `png` crate. |
 | Inter (bundled font)   | `third_party/inter` (`include_bytes!` via `roost-iced`)       | v4.1 static Regular/Medium/SemiBold, SIL OFL 1.1; iced chrome font only (terminal cells keep the configured monospace); single `chrome_font()` seam so a future config swap is small. `README.roost.md` has provenance + removal condition. |
 

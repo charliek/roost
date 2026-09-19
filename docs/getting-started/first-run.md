@@ -21,9 +21,60 @@ With no [host sessions](../guides/host-sessions.md) saved, the sidebar looks exa
 
 On first launch Roost creates a project named `default` with one tab. The tab's working directory is your home directory and the shell is whatever `$SHELL` is set to (falling back to `/bin/sh`).
 
+## Roost-Iced: a fresh install starts on a session
+
+**Roost-Iced only**, on both platforms (Linux's `roost` and macOS's
+`Roost-Iced.app`) — the Swift `Roost.app` never reads this key and always
+runs in-process (see below).
+
+One config key decides where local tabs run. If `config.conf` — a
+single file shared by every profile, not a per-profile one — already has
+a `local-backend` key, that value wins, however it got there.
+
+With no such key, and no `state.json` or `config.conf` on disk at all,
+the launch is a genuinely fresh install and local tabs start on a
+`localhost` **session**: they live in a small headless `roost-session`
+daemon rather than inside the app, the way an
+[added host](../guides/host-sessions.md) does, under an implicit
+**LOCALHOST** band in the sidebar. The practical effect is that closing
+the window doesn't end your shells — reopen Roost and they're still
+there. That launch then tries to write `local-backend = session` so
+later launches don't decide again; if the write fails, it runs
+in-process instead.
+
+Anything else — no key, but a `state.json` or `config.conf` already
+there — keeps in-process local tabs exactly as before. The default fires
+only on a launch with nothing yet on disk.
+
+Either way, you can switch anytime from the command palette:
+**Use a session for local tabs** moves your in-process layout onto the
+session, and **Use in-process local tabs** flips back without copying
+anything back (your session-side work stays put, one click away under
+**LOCALHOST**). Only one of the two rows shows at a time. See [Host
+Sessions → Switching the local backend](../guides/host-sessions.md#switching-the-local-backend)
+for the full mechanics, including what a mid-switch failure does.
+
+The Swift `Roost.app` is unaffected by all of this: it always runs
+local tabs in-process, never reads `local-backend`, and has no session
+backend at all.
+
+## Agent hooks: the first-launch consent card
+
+The first time either UI starts with no answer on file yet and at least
+one supported coding agent (Claude Code, Codex, grok/gx, cursor-agent,
+OpenCode) installed on the machine, a consent dialog opens — the iced
+**Agent Hooks…** card, the Mac **Agent Hooks…** sheet — naming what it
+found and letting you choose which agents Roost wires notifications for,
+or none. Nothing is written into any agent's config file until you
+answer it, and it reopens on demand from the command palette (or, on
+Mac, the View menu). See [Agent Hooks → Roost asks
+once](../guides/agents.md#roost-asks-once) for the full behavior,
+including what each `agent-hooks` value (a list, `off`, or absent)
+means and how a startup that leaves an agent unwired is surfaced.
+
 ## Persistence
 
-Every project, tab, working directory, and tab title is persisted to a small `state.json` file written atomically by the UI. When you relaunch Roost, all of those come back. Each tab spawns a fresh shell at its saved working directory — Roost never re-runs your last command on its own.
+Every project, tab, working directory, and tab title is persisted to a small `state.json` file written atomically by the UI. When you relaunch Roost, all of those come back. Relaunching an in-process tab spawns a fresh shell at its saved working directory; a tab on a still-running session instead reconnects to the shell that's already there. Either way, Roost never re-runs your last command on its own.
 
 | State                | Persisted? | Notes                                                  |
 |----------------------|------------|--------------------------------------------------------|

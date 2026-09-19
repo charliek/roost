@@ -1053,6 +1053,17 @@ impl HostAttach {
     }
 }
 
+/// Whether a `tab.dump` the engine flagged `defer_unless_streaming` is
+/// the session's to answer (#515): a slot tab keeps its terminal, frozen,
+/// after its stream stops, and before the stream is up it has not caught
+/// up yet — only a streaming one is current.
+pub(super) fn dump_defers_to_session(
+    defer_unless_streaming: bool,
+    attach: Option<&HostAttach>,
+) -> bool {
+    defer_unless_streaming && !attach.is_some_and(HostAttach::streaming)
+}
+
 fn frame_attempt(frame: &HostTabFrame) -> u64 {
     match frame {
         HostTabFrame::Accepted { attempt, .. }
@@ -2100,6 +2111,31 @@ mod tests {
             !attach.live(),
             "nothing will drain this queue; the route must go elsewhere"
         );
+    }
+
+    /// #515: flagged, only a streaming tab reads its kept terminal — a
+    /// dial or a hydration in flight does not. Unflagged (in-process, an
+    /// ssh host, the slot down), every tab does.
+    #[tokio::test]
+    async fn a_flagged_dump_defers_to_the_session_unless_the_tab_is_streaming() {
+        let defers = |attach: Option<&HostAttach>| {
+            [true, false].map(|flagged| dump_defers_to_session(flagged, attach))
+        };
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        assert_eq!(defers(None), [true, false], "detached");
+
+        assert!(matches!(attach.phase, Phase::Requesting));
+        assert_eq!(defers(Some(&attach)), [true, false], "requesting");
+
+        attach.on_frame(accepted(false, 100), &mut tab, &feed_tx);
+        assert!(matches!(attach.phase, Phase::Hydrating(_)));
+        assert_eq!(defers(Some(&attach)), [true, false], "hydrating");
+
+        attach.phase = Phase::Live;
+        assert_eq!(defers(Some(&attach)), [false, false], "streaming");
+
+        attach.phase = Phase::Ended;
+        assert_eq!(defers(Some(&attach)), [true, false], "ended");
     }
 
     /// A `vt` hydration has no READY to interleave live bytes from, so

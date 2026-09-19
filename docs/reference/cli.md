@@ -2,8 +2,10 @@
 
 Shell-integration CLI for the running Roost UI. Talks JSON over
 a Unix-domain socket directly to the UI process — no daemon by
-default. The one exception is opt-in: `roostctl session` starts,
-stops, and inspects a headless `roost-session` daemon (see
+default, except a fresh Roost-Iced install, which starts its local
+tabs on a `roost-session` it manages. The other exception is opt-in:
+`roostctl session` starts, stops, and inspects a headless
+`roost-session` daemon (see
 [`session` subcommands](#session-subcommands) below).
 Intended to be invoked from inside a Roost tab (typically by an
 [agent hook](../guides/agents.md)) but works from any shell that can
@@ -111,6 +113,18 @@ tab when `ROOST_TAB_ID` is unset too. `tab send-file` has always required `--tab
 flag every event prints.
 A `ROOST_TAB_ID` that is not a tab id is refused the same way (exit 2).
 
+Only `tab focus`, `tab dump` and `tab send-file` take a host tab's
+`h<host>.<id>`. Every other `--tab` names a local tab and refuses a host
+ref, canonical or not, before it dials anything (exit 2):
+
+```text
+roostctl: usage: tab close acts on a local tab, so it cannot take the host tab h1.7; pass a bare tab id
+
+Usage: roostctl tab close [OPTIONS]
+
+For more information, try '--help'.
+```
+
 ### Where `roostctl` lives
 
 `roostctl` ships next to each UI, but the two platforms put it in
@@ -119,14 +133,21 @@ different places — only one is on `PATH`:
 | Platform | Path | On `PATH`? |
 |---|---|---|
 | **Linux (`.deb`)** | `/usr/bin/roostctl` | ✅ yes |
-| **macOS (`.dmg`)** | `Roost.app/Contents/Resources/bin/roostctl` (inside the bundle) | ❌ no — a Finder-launched app gets a minimal `PATH` |
+| **macOS, `Roost.app` (`.dmg`)** | `Roost.app/Contents/Resources/bin/roostctl` (inside the bundle) | ❌ no — a Finder-launched app gets a minimal `PATH` |
+| **macOS, `Roost-Iced.app` (`.dmg`)** | `Roost-Iced.app/Contents/Resources/bin/roostctl` (inside the bundle) | ❌ no — a Finder-launched app gets a minimal `PATH` |
 
 For your own shell on macOS, symlink it onto `PATH` once
 (`ln -s /Applications/Roost.app/Contents/Resources/bin/roostctl
-/usr/local/bin/roostctl`). **Provider scripts don't need to** — Roost
-sets `ROOST_ROOSTCTL` to the absolute path of its own `roostctl` when it
-runs them, so `"${ROOST_ROOSTCTL:-roostctl}"` is portable across both
-platforms. See [Extending Roost](../guides/extending.md#opening-tabs-from-activate).
+/usr/local/bin/roostctl`, or the equivalent `Roost-Iced.app` path if
+that is the build you drive agents through). **Provider scripts don't
+need to** — Roost sets `ROOST_ROOSTCTL` to the absolute path of its own
+`roostctl` when it runs them, so `"${ROOST_ROOSTCTL:-roostctl}"` is
+portable across both platforms. See [Extending Roost](../guides/extending.md#opening-tabs-from-activate).
+
+Running both apps at once, `roostctl` can't auto-detect which one you
+mean and exits 1 with `ambiguous-target` ([exit codes](#exit-codes)
+below); pass `--target mac` or `--target iced` (or set `ROOST_SOCKET`
+to the specific socket) to pick one.
 
 ## `notify`
 
@@ -362,7 +383,7 @@ roostctl tab dump --tab 5 --scrollback 200   # 200 rows of history, then the vie
 | `--hold` | Keep the tab open after the command exits, dropping to an interactive shell (mirrors `command = … hold=true`). Only meaningful with a command. |
 | `--after-tab <id>` | Place the new tab immediately after that tab (same project) instead of at the end. Best-effort: if that tab is gone by the time the reorder lands, the new tab stays at the end. |
 | `--focus` | Focus (activate) the new tab after opening. |
-| `--no-activate` | Open the tab without selecting it: the active project and tab stay where they were (`tab.open`'s `activate: false`). Without it, opening a tab selects it. Refused beside `--focus` (exit 2 `usage`). A server that predates the field — the Mac app today — answers `unknown-field`, which is reported verbatim; nothing retries without the flag. |
+| `--no-activate` | Open the tab without selecting it: the active project and tab stay where they were (`tab.open`'s `activate: false`). Without it, opening a tab selects it. Refused beside `--focus` (exit 2 `usage`). A server that predates the field — the Swift `Roost.app` today — answers `unknown-field`, which is reported verbatim; nothing retries without the flag. |
 
 These compose: `--after-tab X --focus -- <cmd>` is the "open a command in a tab right here and switch to it" primitive that providers and other scripts use. (`--after-tab`/`--focus` are CLI orchestration over `tab.reorder` / `tab.focus`; `-- <cmd>` fills the `tab.open` op's `argv` — see [ipc.md](ipc.md).)
 
@@ -551,11 +572,18 @@ It reads the same socket [`wait`](#wait) does — the in-process UI, or the
 local session under `local-backend = session` — with the same identity check,
 and no snapshot. There is no poll fallback.
 
+A local-backend switch in flight is the one refusal not passed through:
+while `identify` names one, or the subscribe is refused `busy` (or
+`host-unavailable` from a server older than `busy`, with `identify` still
+naming the switch), `events` re-reads `identify` every 100 ms until the
+switch settles, with no deadline. It says so once on stderr — `waiting for a
+local-backend switch to settle` — so stdout stays JSON lines.
+
 | Exit | When |
 |---|---|
 | 0 | The terminal envelope arrived (printed as the last line), or the reader of stdout went away (`events \| head -n1`) |
 | 1 `connection` | The stream closed without a label or skipped a revision — nothing is resolved again; run it again |
-| 1 *the server's own* | The server does not serve the stream: the Swift Mac app, an older Roost. Its refusal is passed through verbatim (`not-implemented`, `unknown-op`) |
+| 1 *the server's own* | The server does not serve the stream: the Swift Mac app, an older Roost. Its refusal is passed through verbatim (`not-implemented`, `unknown-op`), as is every refusal but a switch in flight |
 | 2 `usage` | A bad command line, including a host `--tab` |
 
 `events` is always JSON, with or without `--json`; a failure still goes
@@ -568,8 +596,8 @@ roostctl project list
 roostctl project create --name "scratch" --cwd ~
 roostctl project ensure --name "scratch"                 # --cwd defaults to $PWD
 roostctl project ensure --name "scratch" --cwd ~/scratch
-roostctl project rename --project-id 1 --name "main"
-roostctl project delete --project-id 2
+roostctl project rename --id 1 --name "main"
+roostctl project delete --id 2
 roostctl project reorder --order 1,3,2
 ```
 
@@ -620,7 +648,7 @@ without `--json`**: this is an agent verb, not a human-typed one.
 
 | Exit | `code` | When |
 |---|---|---|
-| 1 | `unsupported` | This server's `identify --json` `ops` doesn't list `project.ensure` (the Mac app today) — names the manual route (`project list --json` + `tab open --project-id`) rather than racing it itself (#221) |
+| 1 | `unsupported` | This server's `identify --json` `ops` doesn't list `project.ensure` (the Swift `Roost.app` today) — names the manual route (`project list --json` + `tab open --project-id`) rather than racing it itself (#221) |
 | 2 | `usage` | `identify --json`'s `local_backend_switch` shows a backend switch in progress — the project set is mid-flight, so a name resolved against it may not hold; retry once it settles |
 | 1 | *the server's own* | `tab.open`'s own refusal, verbatim — most notably `not-found` if the ensured project vanished between the two calls (a backend switch landing in that window, say). **The two calls are not atomic with each other**, only each is atomic on the server, so this is possible even though `ensure` itself never races another `ensure` |
 

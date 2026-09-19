@@ -3151,9 +3151,15 @@ impl App {
             UiRequest::Dump {
                 tab_id,
                 scrollback,
+                defer_unless_streaming,
                 reply,
             } => {
-                let key = self.wire_tab_key(tab_id);
+                let key = self.wire_tab_key(tab_id).filter(|key| {
+                    !host_tab::dump_defers_to_session(
+                        defer_unless_streaming,
+                        self.host_attach.get(key),
+                    )
+                });
                 let result = match key.and_then(|key| self.tabs.get_mut(&key)) {
                     Some(tab) => tab
                         .dump(scrollback)

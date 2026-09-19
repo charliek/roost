@@ -279,6 +279,10 @@ pub enum UiRequest {
     Dump {
         tab_id: WireTabRef,
         scrollback: u32,
+        /// Set exactly when a [`DumpError::NoTab`] answer would be
+        /// forwarded to the slot's session, which is then the app's answer
+        /// for a tab it is not streaming (#515).
+        defer_unless_streaming: bool,
         reply: DumpReply,
     },
     /// Open a command-palette root frame and reply with its state.
@@ -3323,16 +3327,16 @@ async fn dispatch(
             let data = match served::dump(h, p.tab_id, scrollback).await {
                 Some(served) => served?,
                 None => {
+                    let on_the_slot = slot_tab(&route, p.tab_id);
                     let dumped = h
                         .ui_call(|reply| UiRequest::Dump {
                             tab_id: p.tab_id,
                             scrollback,
+                            defer_unless_streaming: on_the_slot.is_some(),
                             reply,
                         })
                         .await?;
-                    if let (Err(DumpError::NoTab(_)), Some((host, tab))) =
-                        (&dumped, slot_tab(&route, p.tab_id))
-                    {
+                    if let (Err(DumpError::NoTab(_)), Some((host, tab))) = (&dumped, on_the_slot) {
                         return dump_on_the_slot(h, host, tab, scrollback).await;
                     }
                     dumped.map_err(dump_err)?
@@ -5902,10 +5906,11 @@ mod tests {
     // ── #511: a `tab.dump` the app cannot answer, on the slot ────────
 
     /// What a fake app was asked: the refs its terminals were dumped for,
-    /// and every forward that followed, as `(op, params, expected_host)`.
+    /// each with its `defer_unless_streaming`, and every forward that
+    /// followed, as `(op, params, expected_host)`.
     #[derive(Default)]
     struct DumpAsks {
-        dumped: Vec<WireTabRef>,
+        dumped: Vec<(WireTabRef, bool)>,
         forwarded: Vec<(String, serde_json::Value, Option<u32>)>,
     }
 
@@ -5922,8 +5927,16 @@ mod tests {
         tokio::spawn(async move {
             while let Some(request) = ui.recv().await {
                 match request {
-                    UiRequest::Dump { tab_id, reply, .. } => {
-                        seen.lock().unwrap().dumped.push(tab_id);
+                    UiRequest::Dump {
+                        tab_id,
+                        defer_unless_streaming,
+                        reply,
+                        ..
+                    } => {
+                        seen.lock()
+                            .unwrap()
+                            .dumped
+                            .push((tab_id, defer_unless_streaming));
                         let _ = reply.send(Err(app(tab_id)));
                     }
                     UiRequest::LocalSessionForward {
@@ -5974,7 +5987,10 @@ mod tests {
         }
 
         let asks = asks.lock().unwrap();
-        assert_eq!(asks.dumped, [WireTabRef::Host { host: 2, tab: 7 }; 2]);
+        assert_eq!(
+            asks.dumped,
+            [(WireTabRef::Host { host: 2, tab: 7 }, true); 2]
+        );
         let forwarded = (
             ops::TAB_DUMP.to_string(),
             serde_json::json!({"tab_id": "7", "scrollback": 50}),
@@ -6000,6 +6016,35 @@ mod tests {
             assert_eq!(error.code, "not-found", "{tab_id}: {error:?}");
             assert_eq!(error.message, format!("tab {tab_id} has no live terminal"));
             assert!(asks.lock().unwrap().forwarded.is_empty(), "{tab_id}");
+        }
+    }
+
+    /// #515: a host ref under `in-process`, or while the slot is down,
+    /// keeps the app's own terminal — nothing would answer in its place.
+    #[tokio::test]
+    async fn the_app_defers_a_dump_exactly_when_the_slot_would_answer_it() {
+        let in_process: fn(&Path) -> IpcHandler = identify_handler;
+        let slot_up: fn(&Path) -> IpcHandler = |dir| forwarding_handler(dir, Some(2));
+        let slot_down: fn(&Path) -> IpcHandler = |dir| forwarding_handler(dir, None);
+        for (route, handler, tab_id, on_the_slot) in [
+            ("in-process", in_process, "7", false),
+            ("in-process", in_process, "h2.7", false),
+            ("slot h2", slot_up, "h2.7", true),
+            ("slot h2", slot_up, "h9.7", false),
+            ("slot down", slot_down, "h2.7", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (h, asks) = dump_app(handler(dir.path()), no_terminal, Ok(serde_json::json!({})));
+            let _ = dispatch(&h, ops::TAB_DUMP, serde_json::json!({"tab_id": tab_id})).await;
+
+            let asks = asks.lock().unwrap();
+            let asked = WireTabRef::parse(tab_id).unwrap();
+            assert_eq!(asks.dumped, [(asked, on_the_slot)], "{route} {tab_id}");
+            assert_eq!(
+                !asks.forwarded.is_empty(),
+                on_the_slot,
+                "{route} {tab_id}: the flag and the fall-through disagree"
+            );
         }
     }
 

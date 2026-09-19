@@ -56,7 +56,7 @@ The automation guide is <https://charliek.github.io/roost/guides/automation/>.
 - Every tab has a `state`: `none`, `running`, `needs_input`, or `idle`. A plain shell sets it only through the OSC 133 prompt marks of shell integration, which Roost loads for zsh and bash 4.4 or newer: `running` while a foreground command runs, `none` at its prompt. A shell without the marks stays `none` while work runs (its `shell_state` in `tab list --json` stays `unknown`), so wait on a shell's output text, not its state. An agent whose hooks report to Roost drives the state itself: `running` during its turn, `needs_input` when it waits on the user or its turn failed, `idle` when its turn ended. `roostctl agent status` shows which agents have hooks installed.
 - Tab and project ids are integers, written as strings in JSON (`"7"`). A tab on a connected remote host is `h<host>.<id>` (`h2.7`); `--help` says which verbs take that form.
 - Ids belong to the running Roost. A restart, or a switch of its local backend, gives every tab a new id, so re-read ids after either.
-- `roostctl identify --json` lists `ops`, the operations this Roost serves right now. If `ops` is missing or lacks `project.ensure` (the macOS app today), `open` and `project ensure` refuse with `unsupported`; the manual route is `project list --json` and then `tab open --project-id`. If `ops` lacks `events.subscribe` and there is no `local_session_socket`, `wait` polls instead of following events, and `events` fails. A session's own `identify` carries no `instance_id`; its identity is `session_id`.
+- `roostctl identify --json` lists `ops`, the operations this Roost serves right now. If `ops` is missing or lacks `project.ensure` (the Swift `Roost.app`; Roost-Iced running on macOS is not this and serves the full surface below), `open` and `project ensure` refuse with `unsupported`; the manual route is `project list --json` and then `tab open --project-id`. If `ops` lacks `events.subscribe` and there is no `local_session_socket`, `wait` polls instead of following events, and `events` fails. A session's own `identify` carries no `instance_id`; its identity is `session_id`.
 - `ops` can also list seams that exist for Roost's own UI and test suite: the `app.*` family, `tab.feed_*`, `tab.capture_pty_input`, and more under `ROOST_TEST_MODE=1`. Never call them.
 
 ## Recipes
@@ -141,13 +141,13 @@ roostctl rpc identify '{}'
 
 - Always pass `--tab`. Without it, `notify`, `set-title`, `tab set-state`, `tab clear-notification`, `tab close`, `tab send`, `tab resize`, `tab focus`, `tab report`, and `tab prompt` act on `ROOST_TAB_ID`, which inside Roost is your own tab, and exit 2 when it is unset or empty. `tab dump` and `wait` also use `ROOST_TAB_ID` first, but when it is unset or empty they fall back to the UI's active tab, whichever tab the user last clicked.
 - Parse ids from `--json` output. Never derive them from sidebar order, tab titles, or examples.
-- Never pass `--focus` or run `tab focus` unless the user asked to switch tabs. Opening a tab with `--no-activate` leaves the user's selection where it was; without it, opening may select the tab. A server that does not know the flag (the macOS app) refuses the whole command — `unknown-field` from `tab open`, `unsupported` from `open` — and opens no tab at all, so re-read `tab list --json` rather than assuming one exists.
+- Never pass `--focus` or run `tab focus` unless the user asked to switch tabs. Opening a tab with `--no-activate` leaves the user's selection where it was; without it, opening may select the tab. A server that does not know the flag (the Swift `Roost.app`, not Roost-Iced on macOS) refuses the whole command — `unknown-field` from `tab open`, `unsupported` from `open` — and opens no tab at all, so re-read `tab list --json` rather than assuming one exists.
 - Never close a tab or delete a project you did not open, unless the user explicitly asked.
 - A `wait` timeout does not prove the input was not delivered or the command did not run. Read the tab with `tab dump` before sending anything again.
 - `rpc` is not a way around `--tab`. Use the named verb for anything a verb covers, and only put ids in `rpc` params that you parsed from JSON.
 - Never call the test seams `identify` may list (`app.*`, `tab.feed_*`, `tab.capture_pty_input`).
 - Do not run `roostctl session stop`, `roostctl agent install`, or `roostctl agent uninstall` unless the user asked for exactly that.
-- `busy` is the one server code worth retrying: it means a local-backend switch is in flight. Poll `identify --json` until `local_backend_switch` is absent, then retry, re-reading any tab or project id first.
+- `busy` is the one server code worth retrying: it means a local-backend switch is in flight. An older Roost without `busy` refuses the same switch as `host-unavailable` instead; when `identify --json` still shows `local_backend_switch`, treat that the same as `busy`. `roostctl open` refuses a switch in flight as `usage` (exit 2), which otherwise means a bad command line: treat an `open` `usage` as retryable only when `identify --json` read straight after it still shows `local_backend_switch`. `wait`, `tab prompt`, and `events` already hold off on both refusals themselves, so this retry rule is for every other verb: poll `identify --json` until `local_backend_switch` is absent, then retry, re-reading any tab or project id first.
 - Branch on the exit code and the error `code`, never on the message. Exit 0 is success; every failure that prints an error envelope is one of these (the `agent` verbs' partial failure above prints none):
 
 | Exit | `code` | Meaning |
@@ -157,7 +157,7 @@ roostctl rpc identify '{}'
 | 1 | `ambiguous-target` | Several Roost UIs are running; pass `--target` |
 | 1 | `connection` | The socket failed or the stream dropped, or a call went unanswered for 30s under `--no-timeout`; a `wait` across a restart, a backend switch, or a session stop ends here, so re-read ids |
 | 1 | the server's own | The server refused (`not-found`, `invalid-param`, `unknown-op`, `busy`, …); its code is passed through verbatim |
-| 1 | `unsupported` | This Roost does not serve an op the verb needs, such as `open` on the macOS app |
+| 1 | `unsupported` | This Roost does not serve an op the verb needs, such as `open` on the Swift `Roost.app` (Roost-Iced on macOS serves it) |
 | 1 | `checks-failed` | `roostctl doctor` found a failing check |
 | 1 | `failed` | Something local outside the socket failed: a file, a binary, `$HOME` |
 | 3 | `not-running` | `roostctl session status` found no session running |
