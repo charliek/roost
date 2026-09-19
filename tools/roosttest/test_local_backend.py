@@ -1687,6 +1687,7 @@ def test_a_raw_dump_of_a_session_tab_the_window_is_not_showing_reads_the_session
 
     assert printed in roost.dump_text(hidden)
 
+    show(lane, roost, shown)
     fed = token()
     roost.tab_feed_pty_bytes(shown, fed.encode())
     assert fed in roost.dump_text(shown)
@@ -1696,6 +1697,87 @@ def test_a_raw_dump_of_a_session_tab_the_window_is_not_showing_reads_the_session
     with pytest.raises(RoostError) as elsewhere:
         roost.call("tab.dump", {"tab_id": f"h9999.{hidden}"})
     assert elsewhere.value.code == "not-found", elsewhere.value
+
+
+def mirrored(roost: Roost, tab: int) -> str:
+    """The window's own terminal for a slot tab, as text.
+    `tab.dump_resolved` reads that terminal and nothing else."""
+    dumped = roost.tab_dump_resolved(tab)
+    rows = [[" "] * dumped["cols"] for _ in range(dumped["rows"])]
+    for cell in dumped["cells"]:
+        rows[cell["row"]][cell["col"]] = cell["text"] or " "
+    return "\n".join("".join(row) for row in rows)
+
+
+def slot_key(roost: Roost, tab: int) -> str | None:
+    """The `h<n>.<id>` the window's sidebar lists a slot tab under, or
+    `None` until the window has heard of it."""
+    return next(
+        (
+            row["key"]
+            for host in roost.sidebar_hosts()
+            for project in host["projects"]
+            for row in project["tabs"]
+            if row["key"].endswith(f".{tab}")
+        ),
+        None,
+    )
+
+
+def show(lane: Lane, roost: Roost, tab: int) -> None:
+    """Select a slot tab in the window and wait until it is streaming.
+
+    A token written on the session's own socket reaching the window's
+    terminal is the proof: before the stream is up that terminal is the
+    one the window built blank, or the one it kept frozen."""
+    roost.focus(tab)
+    streamed = token()
+    with lane.session() as c:
+        c.send(tab, f"echo {streamed}\n")
+    wait_until(
+        lambda: streamed in mirrored(roost, tab),
+        scaled_timeout(30.0),
+        f"slot tab {tab} to stream into the window",
+    )
+
+
+def test_a_raw_dump_of_a_slot_tab_the_window_left_reads_the_session(lane: Lane):
+    """#515: raw `tab.dump` on the UI socket, for a slot tab the window
+    showed and then left, is answered by the session.
+
+    Leaving a tab stops its stream but keeps its terminal, frozen. The
+    token is written to A after the window moved to B, so the window's
+    terminal for A must not show it — asserted first, so the dumps cannot
+    be passing on a terminal that is still being fed — and both
+    spellings of A on the UI socket must.
+    """
+    roost = session_ui(lane)
+    with lane.session() as c:
+        project = int(c.list()[0]["id"])
+        a = c.open_tab(project, cwd="/tmp", title="left")
+        b = c.open_tab(project, cwd="/tmp", title="shown")
+    wait_until(
+        lambda: slot_key(roost, a) and slot_key(roost, b),
+        scaled_timeout(30.0),
+        "the window to list both slot tabs",
+    )
+    show(lane, roost, a)
+    show(lane, roost, b)
+
+    printed = token()
+    head, tail = printed.split("-", 1)
+    with lane.session() as c:
+        c.send(a, f'echo {head}""-{tail}\n')
+        wait_until(
+            lambda: printed in c.dump_text(a),
+            scaled_timeout(30.0),
+            "the token to reach the left tab's shell",
+        )
+    assert printed not in mirrored(roost, a), "the window left A: its terminal is frozen"
+
+    assert printed in roost.dump_text(a)
+    qualified = roost.call("tab.dump", {"tab_id": slot_key(roost, a)})
+    assert printed in "\n".join(qualified["rows_text"]), qualified
 
 
 def test_a_forwarded_refusal_is_the_sessions_own_verdict(lane: Lane):
@@ -1848,14 +1930,8 @@ def test_a_host_qualified_ref_is_never_re_addressed_to_the_slot(lane: Lane):
     """
     roost = session_ui(lane)
     bare = roost.identify()["active_tab_id"]
-    keys = [
-        tab["key"]
-        for host in roost.sidebar_hosts()
-        for project in host["projects"]
-        for tab in project["tabs"]
-    ]
-    qualified = next(key for key in keys if key.endswith(f".{bare}"))
-    assert qualified != str(bare), keys
+    qualified = slot_key(roost, bare)
+    assert qualified not in (None, str(bare)), roost.sidebar_hosts()
 
     bare_rows = roost.call("tab.dump", {"tab_id": str(bare)})["rows_text"]
     assert roost.call("tab.dump", {"tab_id": qualified})["rows_text"] == bare_rows, (
