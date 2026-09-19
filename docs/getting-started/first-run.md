@@ -23,8 +23,9 @@ On first launch Roost creates a project named `default` with one tab. The tab's 
 
 ## Roost-Iced: a fresh install starts on a session
 
-**Roost-Iced / Linux only** — the Swift `Roost.app` never reads this key
-and always runs in-process (see below).
+**Roost-Iced only**, on both platforms (Linux's `roost` and macOS's
+`Roost-Iced.app`) — the Swift `Roost.app` never reads this key and always
+runs in-process (see below).
 
 One config key decides where local tabs run. If `config.conf` — a
 single file shared by every profile, not a per-profile one — already has

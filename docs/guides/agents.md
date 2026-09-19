@@ -322,9 +322,10 @@ predates Roost is written back empty rather than removed.
 ## When a tab stays running
 
 An agent that is hard-killed — `kill -9`, a crash, a closed laptop lid
-over SSH — fires no `Stop`/`SessionEnd` hook, so the tab keeps whatever
-lifecycle it last reported (`running`, `needs_input`, …) with nothing to
-tell Roost otherwise.
+over SSH — fires no `Stop`/`SessionEnd` hook, so its last lifecycle
+(`working`, `waiting`) stands with nothing to tell Roost otherwise, and
+the tab keeps showing the state that projects from it (`running`,
+`needs_input`).
 
 **What clears it.** Ownership is deliberately not TTL'd — Claude fires
 no periodic hook, so a long tool call would look stale and get released
