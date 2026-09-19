@@ -17,7 +17,7 @@ use roost_ipc::messages::{ops, TabState, TabWriteParams};
 use roost_ipc::IpcClient;
 
 use crate::error::CliError;
-use crate::events::Source;
+use crate::events::{self, Source};
 use crate::millis;
 use crate::wait::{self, Bound, Following, Subscribed, Waiting, Want};
 use crate::UiSocket;
@@ -49,11 +49,6 @@ pub(crate) struct Args {
     #[arg(long, conflicts_with = "timeout")]
     pub no_timeout: bool,
 }
-
-/// How often a local-backend switch in flight is re-checked. No
-/// `--interval-ms`: nothing in this verb polls, because the stream is
-/// required, and this is the only wait that is not on it.
-const HOLD_OFF: Duration = Duration::from_millis(100);
 
 /// What the prompt did, once the turn settled.
 #[derive(Debug, PartialEq, Eq)]
@@ -159,7 +154,7 @@ async fn submit(ui: &mut UiSocket<'_>, args: Args, tab_id: i64) -> Result<Done, 
         want: &settled_want,
         bound,
         timeout: named,
-        interval: HOLD_OFF,
+        interval: events::HOLD_OFF,
     };
 
     let identify = wait::identify(ui, bound, |op| settled.cut(op)).await?;

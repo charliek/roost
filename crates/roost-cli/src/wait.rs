@@ -15,7 +15,7 @@ use roost_ipc::messages::{
 use roost_ipc::{codes, ClientError, IpcClient};
 
 use crate::error::CliError;
-use crate::events::{self, Legs, Opened, Source};
+use crate::events::{self, Legs, Opened, Refusal, Source};
 use crate::UiSocket;
 
 #[derive(clap::Args, Debug)]
@@ -494,8 +494,8 @@ impl Waiting<'_> {
     /// Once no local-backend switch is in flight, the source `identify`
     /// names, subscribed to where it serves a stream. Until a switch
     /// settles, which socket serves the stream is not yet decided; a
-    /// subscribe refused `busy` met a switch that began after that
-    /// `identify`, and is held off the same way.
+    /// subscribe refused for a switch that began after that `identify` is
+    /// held off the same way.
     async fn reach(
         &self,
         ui: &mut UiSocket<'_>,
@@ -511,10 +511,17 @@ impl Waiting<'_> {
                 return Ok(Reached::Poll(source));
             }
             match events::open(&source, true, self.bound).await {
-                Err(CliError::Server { code, .. }) if code == codes::BUSY => {
-                    identify = self.hold_off(ui).await?;
-                }
-                opened => break (source, opened?),
+                Ok(opened) => break (source, opened),
+                Err(refused) => match Refusal::of(&refused) {
+                    Refusal::Switching => identify = self.hold_off(ui).await?,
+                    Refusal::Recheck => {
+                        identify = self.identify(ui).await?;
+                        if identify.local_backend_switch.is_none() {
+                            return Err(refused);
+                        }
+                    }
+                    Refusal::Refused => return Err(refused),
+                },
             }
         };
         Ok(match opened {
@@ -1261,6 +1268,47 @@ mod tests {
         assert_eq!(
             fake.with(|world| world.ops().join(" ")),
             "identify events.subscribe identify identify events.subscribe identify tab.list"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_older_servers_host_unavailable_during_a_switch_is_held_off() {
+        let fake = Fake::ui("unavailable-switching");
+        fake.with(|world| world.tabs.insert(7, "idle"));
+        fake.refuses_unavailable_on_the_first_subscribe(true);
+        fake.on("identify", 3, Phase::Before, |world| {
+            world.identify["local_backend_switch"] = serde_json::Value::Null;
+        });
+        let argv = ["--tab", "7", "--state", "idle", "--interval-ms", "10"];
+        let exit = wait(&fake, &[&argv[..], &["--timeout", "5"]].concat(), None).await;
+        assert_eq!(exit, Ok(0));
+        assert_eq!(
+            fake.with(|world| world.ops().join(" ")),
+            "identify events.subscribe identify identify events.subscribe identify tab.list"
+        );
+    }
+
+    /// Tab 7 is already idle, so a subscribe tried again would succeed.
+    #[tokio::test]
+    async fn host_unavailable_with_no_switch_is_the_answer() {
+        let fake = Fake::ui("unavailable");
+        fake.with(|world| world.tabs.insert(7, "idle"));
+        fake.refuses_unavailable_on_the_first_subscribe(false);
+        let argv = ["--tab", "7", "--state", "idle", "--interval-ms", "10"];
+        let exit = wait(&fake, &[&argv[..], &["--timeout", "5"]].concat(), None).await;
+        let Err(error) = exit else { panic!("{exit:?}") };
+        assert_eq!(
+            error,
+            CliError::Server {
+                code: codes::HOST_UNAVAILABLE.into(),
+                message: roost_ipc::local_route::SLOT_UNAVAILABLE.into(),
+            }
+        );
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(
+            fake.with(|world| world.ops().join(" ")),
+            "identify events.subscribe identify",
+            "identify is read again once, and nothing is held off"
         );
     }
 

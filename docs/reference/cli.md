@@ -551,11 +551,18 @@ It reads the same socket [`wait`](#wait) does — the in-process UI, or the
 local session under `local-backend = session` — with the same identity check,
 and no snapshot. There is no poll fallback.
 
+A local-backend switch in flight is the one refusal not passed through:
+while `identify` names one, or the subscribe is refused `busy` (or
+`host-unavailable` from a server older than `busy`, with `identify` still
+naming the switch), `events` re-reads `identify` every 100 ms until the
+switch settles, with no deadline. It says so once on stderr — `waiting for a
+local-backend switch to settle` — so stdout stays JSON lines.
+
 | Exit | When |
 |---|---|
 | 0 | The terminal envelope arrived (printed as the last line), or the reader of stdout went away (`events \| head -n1`) |
 | 1 `connection` | The stream closed without a label or skipped a revision — nothing is resolved again; run it again |
-| 1 *the server's own* | The server does not serve the stream: the Swift Mac app, an older Roost. Its refusal is passed through verbatim (`not-implemented`, `unknown-op`) |
+| 1 *the server's own* | The server does not serve the stream: the Swift Mac app, an older Roost. Its refusal is passed through verbatim (`not-implemented`, `unknown-op`), as is every refusal but a switch in flight |
 | 2 `usage` | A bad command line, including a host `--tab` |
 
 `events` is always JSON, with or without `--json`; a failure still goes

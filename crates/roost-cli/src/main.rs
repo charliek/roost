@@ -283,6 +283,8 @@ enum Cmd {
     /// `revision`), and then it exits 0. A stream that drops or skips a
     /// revision exits 1 (`connection`); a server that does not serve the
     /// stream (the Mac app, an older Roost) exits 1 with its own refusal.
+    /// The one refusal not passed through is a local-backend switch in
+    /// flight: that is waited out, with one line on stderr saying so.
     /// Always JSON, with or without `--json`.
     ///
     /// Reads the same source `wait` does: the UI's in-process stream, or

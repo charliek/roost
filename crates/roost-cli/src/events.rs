@@ -9,6 +9,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -17,7 +18,7 @@ use roost_ipc::messages::{
     ops, EventEnvelope, IdentifyResult, SessionIdentify, SessionIdentifyParams, TabListResult,
     WireTabRef, SESSION_STOPPING_EVENT, STREAM_ENDED_EVENT,
 };
-use roost_ipc::IpcClient;
+use roost_ipc::{codes, IpcClient};
 
 use crate::error::CliError;
 use crate::wait::{self, Bound};
@@ -26,6 +27,34 @@ use crate::UiSocket;
 /// How many times a subscribe whose two legs reached different processes
 /// is retried before giving up.
 const IDENTITY_RETRIES: usize = 3;
+
+/// How often a verb with no `--interval-ms` — `events`, `tab prompt` —
+/// re-checks a local-backend switch in flight. Neither polls: each needs
+/// the stream, and a switch is the one thing either waits out off it.
+pub(crate) const HOLD_OFF: Duration = Duration::from_millis(100);
+
+/// What a refused subscribe says about a local-backend switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// `busy`: a switch is in flight.
+    Switching,
+    /// `host-unavailable`: a server older than `busy` refused a switch in
+    /// flight this way too, so `identify`, read again at once, decides —
+    /// a `local_backend_switch` there is a switch, and none is the answer.
+    Recheck,
+    /// The answer.
+    Refused,
+}
+
+impl Refusal {
+    pub(crate) fn of(error: &CliError) -> Self {
+        match error {
+            CliError::Server { code, .. } if code == codes::BUSY => Self::Switching,
+            CliError::Server { code, .. } if code == codes::HOST_UNAVAILABLE => Self::Recheck,
+            _ => Self::Refused,
+        }
+    }
+}
 
 /// Where the stream is, and how to ask that socket who it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,13 +278,16 @@ struct Line<'a> {
 
 /// `roostctl events [--tab N]`.
 pub(crate) async fn run(ui: &mut UiSocket<'_>, tab: Option<String>) -> Result<i32, CliError> {
-    stream_to(ui, tab, &mut std::io::stdout()).await
+    stream_to(ui, tab, &mut std::io::stdout(), &mut std::io::stderr()).await
 }
 
+/// `note` gets the one line saying a switch is being waited out — never
+/// stdout, which is the stream's alone, and never a reason to fail.
 async fn stream_to(
     ui: &mut UiSocket<'_>,
     tab: Option<String>,
     out: &mut impl Write,
+    note: &mut impl Write,
 ) -> Result<i32, CliError> {
     let filter = tab
         .as_deref()
@@ -263,11 +295,35 @@ async fn stream_to(
         .transpose()?
         .map(|tab| local_tab("events", tab))
         .transpose()?;
-    let identify = crate::identify(ui.client().await?).await?;
+    let mut identify = crate::identify(ui.client().await?).await?;
+    let mut noted = false;
     // No poll fallback: a server without the stream refuses the subscribe
     // in its own words, and that refusal is the answer.
-    let source = resolve(ui.socket_path(), &identify);
-    let mut stream = match open(&source, false, Bound::Ceiling).await? {
+    let (source, opened) = loop {
+        if identify.local_backend_switch.is_none() {
+            let source = resolve(ui.socket_path(), &identify);
+            match open(&source, false, Bound::Ceiling).await {
+                Ok(opened) => break (source, opened),
+                Err(refused) => match Refusal::of(&refused) {
+                    Refusal::Switching => {}
+                    Refusal::Recheck => {
+                        let reread = wait::identify(ui, Bound::Ceiling, wait::unanswered).await?;
+                        if reread.local_backend_switch.is_none() {
+                            return Err(refused);
+                        }
+                    }
+                    Refusal::Refused => return Err(refused),
+                },
+            }
+        }
+        if !noted {
+            let _ = writeln!(note, "waiting for a local-backend switch to settle");
+            noted = true;
+        }
+        tokio::time::sleep(HOLD_OFF).await;
+        identify = wait::identify(ui, Bound::Ceiling, wait::unanswered).await?;
+    };
+    let mut stream = match opened {
         Opened::Legs(legs) => legs.stream,
         Opened::Dropped { error, .. } => return Err(error),
         Opened::Unanswered(op) => return Err(wait::unanswered(op)),
@@ -647,6 +703,21 @@ pub(crate) mod fake {
             });
         }
 
+        /// The first subscribe refused `host-unavailable`. `switching`: as a
+        /// server older than `busy` refuses one during a switch, with its
+        /// `identify` naming the switch from then on.
+        pub fn refuses_unavailable_on_the_first_subscribe(&self, switching: bool) {
+            self.on("events.subscribe", 1, Phase::Before, move |world| {
+                world.instead = Some(Instead::Refuse(
+                    roost_ipc::codes::HOST_UNAVAILABLE,
+                    roost_ipc::local_route::SLOT_UNAVAILABLE,
+                ));
+                if switching {
+                    world.identify["local_backend_switch"] = json!("preparing");
+                }
+            });
+        }
+
         pub fn socket(&self) -> String {
             self.socket.display().to_string()
         }
@@ -711,10 +782,20 @@ mod tests {
         fake: &Fake,
         tab: Option<&str>,
     ) -> (Result<i32, CliError>, Vec<serde_json::Value>) {
+        let (exit, lines, _) = events_noting(fake, tab).await;
+        (exit, lines)
+    }
+
+    /// [`events`], and what it wrote to stderr.
+    async fn events_noting(
+        fake: &Fake,
+        tab: Option<&str>,
+    ) -> (Result<i32, CliError>, Vec<serde_json::Value>, String) {
         let selector = fake.selector();
         let mut out = Vec::new();
+        let mut note = Vec::new();
         let mut ui = UiSocket::new(&selector);
-        let run = stream_to(&mut ui, tab.map(str::to_string), &mut out);
+        let run = stream_to(&mut ui, tab.map(str::to_string), &mut out, &mut note);
         let exit = tokio::time::timeout(std::time::Duration::from_secs(10), run)
             .await
             .expect("events never ended");
@@ -723,7 +804,131 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).expect("one JSON document per line"))
             .collect();
-        (exit, lines)
+        (exit, lines, String::from_utf8(note).unwrap())
+    }
+
+    const HELD_OFF: &str = "waiting for a local-backend switch to settle\n";
+
+    fn not_switching(world: &mut super::fake::World) {
+        world.identify["local_backend_switch"] = serde_json::Value::Null;
+    }
+
+    /// Every subscribe taken with no switch in flight streams one commit,
+    /// then the stop — so one that should not have been retried, or was
+    /// sent too soon, shows in the answer rather than hanging. Set before
+    /// any [`Fake::on`], which adds to it.
+    fn streams_once_settled(fake: &Fake) {
+        fake.hook(|world, op, phase| {
+            if op == "events.subscribe"
+                && phase == Phase::After
+                && world.identify["local_backend_switch"].is_null()
+            {
+                world.retitle(7);
+                world.end_streams(Some(&stopping()));
+            }
+        });
+    }
+
+    fn streamed(exit: &Result<i32, CliError>, lines: &[serde_json::Value]) {
+        assert_eq!(exit, &Ok(0));
+        let events: Vec<&str> = lines
+            .iter()
+            .map(|line| line["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(events, ["tab.title_changed", "session.stopping"]);
+    }
+
+    #[test]
+    fn a_refusal_is_a_switch_only_as_busy_or_as_host_unavailable_checked_again() {
+        let server = |code: &str| CliError::Server {
+            code: code.into(),
+            message: "m".into(),
+        };
+        assert_eq!(Refusal::of(&server(codes::BUSY)), Refusal::Switching);
+        assert_eq!(
+            Refusal::of(&server(codes::HOST_UNAVAILABLE)),
+            Refusal::Recheck
+        );
+        for refused in [
+            server(codes::NOT_IMPLEMENTED),
+            server(codes::UNKNOWN_OP),
+            server(codes::NOT_FOUND),
+            CliError::Connection(codes::BUSY.into()),
+            CliError::Timeout(codes::HOST_UNAVAILABLE.into()),
+        ] {
+            assert_eq!(Refusal::of(&refused), Refusal::Refused, "{refused:?}");
+        }
+    }
+
+    /// Held off twice — the `identify` after the first still names the
+    /// switch — and said so once, on stderr alone.
+    #[tokio::test]
+    async fn a_subscribe_refused_busy_is_held_off_then_streams() {
+        let fake = Fake::ui("busy");
+        streams_once_settled(&fake);
+        fake.on("identify", 1, Phase::After, |world| {
+            world.identify["local_backend_switch"] = json!("preparing");
+        });
+        fake.on("identify", 3, Phase::Before, not_switching);
+        let (exit, lines, note) = events_noting(&fake, None).await;
+        streamed(&exit, &lines);
+        assert_eq!(note, HELD_OFF);
+        assert_eq!(
+            fake.with(|world| world.ops().join(" ")),
+            "identify events.subscribe identify identify events.subscribe identify"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_older_servers_host_unavailable_during_a_switch_is_held_off() {
+        let fake = Fake::ui("unavailable-switching");
+        streams_once_settled(&fake);
+        fake.refuses_unavailable_on_the_first_subscribe(true);
+        fake.on("identify", 3, Phase::Before, not_switching);
+        let (exit, lines, note) = events_noting(&fake, None).await;
+        streamed(&exit, &lines);
+        assert_eq!(note, HELD_OFF);
+        assert_eq!(
+            fake.with(|world| world.ops().join(" ")),
+            "identify events.subscribe identify identify events.subscribe identify"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_unavailable_with_no_switch_is_passed_through_verbatim() {
+        let fake = Fake::ui("unavailable");
+        streams_once_settled(&fake);
+        fake.refuses_unavailable_on_the_first_subscribe(false);
+        let (exit, lines, note) = events_noting(&fake, None).await;
+        assert_eq!(
+            exit,
+            Err(CliError::Server {
+                code: codes::HOST_UNAVAILABLE.into(),
+                message: roost_ipc::local_route::SLOT_UNAVAILABLE.into(),
+            })
+        );
+        assert!(lines.is_empty());
+        assert_eq!(note, "");
+        assert_eq!(
+            fake.with(|world| world.ops().join(" ")),
+            "identify events.subscribe identify",
+            "identify is read again once, and nothing is held off"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_switch_identify_already_names_is_held_off_before_any_subscribe() {
+        let fake = Fake::ui("already-switching");
+        streams_once_settled(&fake);
+        fake.with(|world| world.identify["local_backend_switch"] = json!("preparing"));
+        fake.on("identify", 2, Phase::Before, not_switching);
+        let (exit, lines, note) = events_noting(&fake, None).await;
+        streamed(&exit, &lines);
+        assert_eq!(note, HELD_OFF);
+        assert_eq!(
+            fake.with(|world| world.ops().join(" ")),
+            "identify identify events.subscribe identify"
+        );
     }
 
     fn stopping() -> serde_json::Value {
@@ -895,10 +1100,11 @@ mod tests {
         assert!(message.contains("skipped a revision"), "{message}");
     }
 
+    /// Refused verbatim, with nothing held off, read again or polled.
     #[tokio::test]
     async fn a_server_without_the_stream_refuses_in_its_own_words() {
         let fake = Fake::without_stream("refused");
-        let (exit, lines) = events(&fake, None).await;
+        let (exit, lines, note) = events_noting(&fake, None).await;
         assert_eq!(
             exit,
             Err(CliError::Server {
@@ -907,6 +1113,7 @@ mod tests {
             })
         );
         assert!(lines.is_empty());
+        assert_eq!(note, "");
         assert_eq!(
             fake.with(|world| world.ops().join(" ")),
             "identify events.subscribe"
