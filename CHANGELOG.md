@@ -589,6 +589,37 @@ release workflow asserts they agree).
 
 ### Fixed
 
+- **Closing the tab the window was showing left the window on nothing
+  under `local-backend = session` (plan 069)** — the fresh-install
+  default for Roost-Iced. Every close of the viewed tab — `exit` or
+  `tab.close`, whether or not a sibling survived, on the local slot or a
+  remote host — dropped the selection: blank pane, no highlighted row,
+  `identify` reporting `active_project=0 active_tab=0`, until the user
+  clicked a row. The client's own selection fell back to "the local
+  workspace's own selection, which never went anywhere", an assumption
+  plan 063 had made false — under `session` that workspace holds no live
+  tabs at all.
+
+  The same change settles **where** the selection lands, one rule on
+  every surface (iced, the Swift Mac app, and a session's own
+  `active.changed`), replacing two nobody would have chosen — the
+  *leftmost* sibling tab wherever the closed one sat, and the *lowest
+  project id*, which made a reordered sidebar look arbitrary:
+
+    * the tab's project survives → the nearest surviving tab to the
+      **right**, else the nearest to the **left**;
+    * the project is gone → the nearest surviving project **above** it in
+      the sidebar, else the nearest **below**, crossing host bands and
+      skipping rows that cannot be shown;
+    * nothing survives → the window closes and relaunch re-seeds, both
+      exactly as before.
+
+  A tab the user is moved onto still keeps its pending notification:
+  being landed on is not an acknowledgement. One known gap is unchanged
+  and deliberate: in the legacy **in-process** mode, closing the last
+  *local* project while a host band still lists projects still leaves
+  the window blank until a row is clicked — a different code path, and
+  not where the investment goes.
 - **A raw UI-socket `tab.dump` of a slot tab the window showed and then
   left answered from a stale, frozen client-side copy instead of the
   session (#515)** — the engine's `tab.dump` now forwards to the session

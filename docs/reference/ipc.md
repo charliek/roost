@@ -457,6 +457,11 @@ Close a tab; the PTY child is `SIGHUP`'d and reaped.
 
 Request: `{"params": {"tab_id": "3"}}`. Response: `{}`.
 
+Closing the tab that was **selected** moves the selection, by the one
+rule every surface follows — see
+[Where the selection lands](#where-the-selection-lands). Closing any
+other tab leaves it alone.
+
 ### `tab.list`
 
 Snapshot of the workspace. Same shape as the legacy
@@ -1018,6 +1023,38 @@ the project is dropped. Subscribers see `tab.closed` for each child
 tab followed by `project.deleted`.
 
 Request: `{"params": {"project_id": "1"}}`. Response: `{}`.
+
+Deleting the project that held the **selected** tab moves the selection
+— see [Where the selection lands](#where-the-selection-lands).
+
+### Where the selection lands
+
+When the selected tab goes away — `tab.close`, `project.delete`, or the
+shell simply exiting — the selection moves by one rule, and only when it
+pointed at what went away:
+
+* the tab's project survives → the nearest surviving tab to the
+  **right** in tab order, else the nearest to the **left**;
+* the project is gone → the nearest surviving project **above** it in
+  sidebar order, else the nearest **below**, skipping any project with
+  no tabs; within that project, its remembered tab, else its first;
+* nothing survives → no selection, and the UI's own empty-workspace rule
+  decides what that means.
+
+The asymmetry is deliberate: a closed tab hands the strip forward, the
+way a browser slides the next tab under the cursor, while a closed
+project hands the sidebar to the row above it.
+
+An `active.changed` carries the result. It is **not** an
+acknowledgement: a tab the user was moved onto keeps whatever
+notification it was holding, because nobody focused it.
+
+A host session publishes its own `active.changed` on the same rule, and
+that is what a client reads when it needs a project's tab. It is the
+*session's* selection, though, shared by every client attached to it —
+which tab a given client is showing is that client's alone, and
+[`tab.focus`](#tabfocus) on a host tab deliberately does not tell the
+session.
 
 ### `tab.reorder`
 
