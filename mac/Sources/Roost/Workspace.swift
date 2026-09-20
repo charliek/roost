@@ -325,9 +325,12 @@ final class Workspace {
     /// moved.
     @discardableResult
     func deleteProject(_ projectID: Int64) throws -> [Int64] {
-        guard projects[projectID] != nil else {
+        guard let departed = projects[projectID] else {
             throw WorkspaceError.projectNotFound(projectID)
         }
+        // The departed row's own place in display order, read before
+        // the removals below erase it.
+        let projectAnchor = (position: departed.position, id: departed.id)
         let cascaded = tabs.values
             .filter { $0.projectId == projectID }
             .map { $0.id }
@@ -338,18 +341,8 @@ final class Workspace {
 
         var activeChanged = false
         if activeProjectID == projectID || cascaded.contains(activeTabID) {
-            // Pick the first project + its first tab IN DISPLAY ORDER,
-            // not by id. Falling back by id ignores user-driven
-            // sidebar reorders; CR-flagged on PR #78.
-            let fallbackProject = projects.values
-                .sorted { ($0.position, $0.id) < ($1.position, $1.id) }
-                .first
-                .map { $0.id } ?? 0
-            let fallbackTab = tabs.values
-                .filter { $0.projectId == fallbackProject }
-                .sorted { ($0.position, $0.id) < ($1.position, $1.id) }
-                .first
-                .map { $0.id } ?? 0
+            let fallbackProject = neighbourProject(around: projectAnchor) ?? 0
+            let fallbackTab = tabs(in: fallbackProject).first.map { $0.id } ?? 0
             activeProjectID = fallbackProject
             activeTabID = fallbackTab
             activeChanged = true
@@ -479,11 +472,15 @@ final class Workspace {
             throw WorkspaceError.tabNotFound(tabID)
         }
         let projectID = row.projectId
+        // Each anchor is a departed row's own place in display order,
+        // read before the removals below erase it.
+        let tabAnchor = (position: row.position, id: row.id)
+        let projectAnchor = projects[projectID].map { (position: $0.position, id: $0.id) }
 
         // Last tab in the project? Cascade-close the project. Inlined
         // rather than delegating to `deleteProject` so the already-
         // removed tab isn't re-emitted.
-        let projectEmptied = projects[projectID] != nil
+        let projectEmptied = projectAnchor != nil
             && !tabs.values.contains { $0.projectId == projectID }
         if projectEmptied {
             projects.removeValue(forKey: projectID)
@@ -494,27 +491,17 @@ final class Workspace {
         var activeChanged = false
         if activeTabID == tabID || (projectEmptied && activeProjectID == projectID) {
             if projectEmptied {
-                // Project gone: fall back to another project's first
-                // tab, both in DISPLAY ORDER (not dictionary order).
-                let fallbackProject = projects.values
-                    .sorted { ($0.position, $0.id) < ($1.position, $1.id) }
-                    .first
-                    .map { $0.id } ?? 0
-                let fallbackTab = tabs.values
-                    .filter { $0.projectId == fallbackProject }
-                    .sorted { ($0.position, $0.id) < ($1.position, $1.id) }
-                    .first
-                    .map { $0.id } ?? 0
+                // Project gone: fall back to another project's tab.
+                let fallbackProject = projectAnchor
+                    .flatMap { neighbourProject(around: $0) } ?? 0
+                let fallbackTab = tabs(in: fallbackProject).first.map { $0.id } ?? 0
                 activeProjectID = fallbackProject
                 activeTabID = fallbackTab
             } else {
-                // Project survives: fall back to a sibling tab in
-                // display order, else any tab anywhere. CR-flagged on
-                // PR #78 (display order, not dictionary order).
-                let siblingsInProject = tabs.values
-                    .filter { $0.projectId == projectID }
-                    .sorted { ($0.position, $0.id) < ($1.position, $1.id) }
-                let next = siblingsInProject.first
+                // Project survives: fall back to a sibling tab, else
+                // any tab anywhere.
+                let next = neighbourTab(in: projectID, around: tabAnchor)
+                    .flatMap { tabs[$0] }
                     ?? tabs.values.sorted { ($0.position, $0.id) < ($1.position, $1.id) }.first
                 activeProjectID = next?.projectId ?? projectID
                 activeTabID = next?.id ?? 0
@@ -854,6 +841,74 @@ final class Workspace {
         activeProjectID = project.id
         commit([.activeChanged(projectID: project.id, tabID: 0)], persist: false)
         return project.id
+    }
+
+    // MARK: Selection fallback
+
+    /// The survivors a departed row leaves the selection to choose
+    /// from, split by side and **nearest first**: `anchor` is the
+    /// `(position, id)` the departed row itself occupied, and the two
+    /// halves are the rows before it and the rows after it in display
+    /// order. "Nearest" rather than "adjacent" because one commit can
+    /// take several rows with it.
+    ///
+    /// Its two callers below try opposite sides first, deliberately. A
+    /// closed tab hands the strip to the tab on its **right** — the
+    /// browser habit, where the next tab slides under the cursor. A
+    /// closed project hands the sidebar to the row **above** it. The
+    /// asymmetry is the pinned rule (plan 069 §3.1), not a slip: do not
+    /// "fix" one to match the other.
+    private static func neighbours(
+        of rows: [(position: Int32, id: Int64)],
+        around anchor: (position: Int32, id: Int64)
+    ) -> (before: [Int64], after: [Int64]) {
+        func precedes(
+            _ a: (position: Int32, id: Int64),
+            _ b: (position: Int32, id: Int64)
+        ) -> Bool {
+            (a.position, a.id) < (b.position, b.id)
+        }
+        let sorted = rows.sorted(by: precedes)
+        return (
+            before: sorted.reversed().filter { precedes($0, anchor) }.map { $0.id },
+            after: sorted.filter { precedes(anchor, $0) }.map { $0.id }
+        )
+    }
+
+    private func neighbourTab(
+        in projectID: Int64,
+        around anchor: (position: Int32, id: Int64)
+    ) -> Int64? {
+        let (left, right) = Self.neighbours(
+            of: tabs.values
+                .filter { $0.projectId == projectID }
+                .map { (position: $0.position, id: $0.id) },
+            around: anchor
+        )
+        return (right + left).first
+    }
+
+    /// A project with no tabs is skipped: the fallback tab within it
+    /// would be 0, seating the selection on a real project over a blank
+    /// pane — the symptom this rule exists to remove. `createProject`
+    /// leaves exactly such a project behind and nothing cascades it
+    /// away, so this is reachable, not theoretical.
+    ///
+    /// The final fall-through to the nearest row whatever its state is
+    /// load-bearing: when *every* survivor is tabless the old shape — a
+    /// project id paired with tab 0 — is kept rather than collapsing to
+    /// `(0, 0)`, which would hand a populated workspace to the exit rule.
+    private func neighbourProject(
+        around anchor: (position: Int32, id: Int64)
+    ) -> Int64? {
+        let (above, below) = Self.neighbours(
+            of: projects.values.map { (position: $0.position, id: $0.id) },
+            around: anchor
+        )
+        let candidates = above + below
+        return candidates.first { pid in
+            tabs.values.contains { $0.projectId == pid }
+        } ?? candidates.first
     }
 
     // MARK: Persistence

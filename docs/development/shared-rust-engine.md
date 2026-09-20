@@ -76,8 +76,13 @@ and non-blocking while the state lock establishes order. No UI callback runs
 under that lock, and persistence I/O happens after it is released.
 
 `Workspace` also owns the last selected live tab for each project. Its
-`preferred_tab` query falls back to display order and repairs preferences when
-tabs or projects close. Adapters therefore do not need a competing
+`preferred_tab` query falls back to display order, and a close repairs that
+project's preference to the *neighbour* of the tab that went away — the tab to
+its right, else its left. The **global** selection moves only when it pointed
+at what closed: to that same tab neighbour, or, when the project went with its
+last tab, to the project above it (else below), skipping projects with no tabs.
+Closing a background tab repairs its project's preference and leaves the global
+selection where it is. Adapters therefore do not need a competing
 per-project selection map, and project shortcuts can resolve against a fresh
 authoritative snapshot. Only the globally active project/tab position is
 persisted today; inactive-project preferences are intentionally runtime-only

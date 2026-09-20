@@ -1380,9 +1380,13 @@ impl Workspace {
     /// a `PtySupervisor` reference.
     pub fn delete_project(&self, project_id: i64) -> Result<Vec<i64>, WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
-        if !inner.projects.contains_key(&project_id) {
+        let Some(anchor) = inner
+            .projects
+            .get(&project_id)
+            .map(|project| (project.position, project.id))
+        else {
             return Err(WorkspaceError::ProjectNotFound(project_id));
-        }
+        };
         let tab_ids: Vec<i64> = inner
             .tabs
             .values()
@@ -1399,7 +1403,7 @@ impl Workspace {
         // project or one of its tabs.
         let mut active_changed = false;
         if inner.active_project_id == project_id || tab_ids.contains(&inner.active_tab_id) {
-            let fallback_project = inner.projects.keys().next().copied().unwrap_or(0);
+            let fallback_project = inner.neighbour_project(anchor).unwrap_or(0);
             let fallback_tab = inner.preferred_tab(fallback_project).unwrap_or(0);
             inner.active_project_id = fallback_project;
             inner.active_tab_id = fallback_tab;
@@ -1521,18 +1525,25 @@ impl Workspace {
             .remove(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
         let project_id = row.project_id;
+        // Each anchor is a departed row's own place in display order,
+        // read before the removals below erase it.
+        let tab_anchor = (row.position, row.id);
+        let project_anchor = inner
+            .projects
+            .get(&project_id)
+            .map(|project| (project.position, project.id));
 
         // Last tab in the project? Cascade-close the project. Inlined
         // rather than calling `delete_project` so the event order is
         // exactly TabClosed → ProjectDeleted → ActiveChanged (the tab
         // is already removed; `delete_project` would re-emit it).
-        let project_emptied = inner.projects.contains_key(&project_id)
-            && !inner.tabs.values().any(|t| t.project_id == project_id);
+        let project_emptied =
+            project_anchor.is_some() && !inner.tabs.values().any(|t| t.project_id == project_id);
         if project_emptied {
             inner.projects.remove(&project_id);
             inner.active_tabs_by_project.remove(&project_id);
         } else if inner.active_tabs_by_project.get(&project_id) == Some(&tab_id) {
-            let replacement = inner.first_tab(project_id);
+            let replacement = inner.neighbour_tab(project_id, tab_anchor);
             if let Some(replacement) = replacement {
                 inner.active_tabs_by_project.insert(project_id, replacement);
             } else {
@@ -1548,14 +1559,16 @@ impl Workspace {
         {
             let next = if project_emptied {
                 // Project gone: fall back to another project's tab.
-                let fallback_project = inner.projects.keys().next().copied().unwrap_or(0);
+                let fallback_project = project_anchor
+                    .and_then(|anchor| inner.neighbour_project(anchor))
+                    .unwrap_or(0);
                 let fallback_tab = inner.preferred_tab(fallback_project).unwrap_or(0);
                 (fallback_project, fallback_tab)
             } else {
                 // Project survives: fall back to a sibling tab, else
                 // any tab anywhere.
                 inner
-                    .preferred_tab(project_id)
+                    .neighbour_tab(project_id, tab_anchor)
                     .and_then(|tab_id| inner.tabs.get(&tab_id))
                     .or_else(|| inner.tabs.values().next())
                     .map(|t| (t.project_id, t.id))
@@ -2478,6 +2491,74 @@ impl Inner {
             .or_else(|| self.first_tab(project_id))
     }
 
+    /// The survivors a departed row leaves the selection to choose
+    /// from, split by side and **nearest first**: `anchor` is the
+    /// `(position, id)` the departed row itself occupied, and the two
+    /// halves are the rows before it and the rows after it in display
+    /// order. "Nearest" rather than "adjacent" because one commit can
+    /// take several rows with it.
+    ///
+    /// Its two callers below try opposite sides first, deliberately. A
+    /// closed tab hands the strip to the tab on its **right** — the
+    /// browser habit, where the next tab slides under the cursor. A
+    /// closed project hands the sidebar to the row **above** it. The
+    /// asymmetry is the pinned rule (plan 069 §3.1), not a slip: do not
+    /// "fix" one to match the other.
+    fn neighbours_of(
+        rows: impl IntoIterator<Item = (i32, i64)>,
+        anchor: (i32, i64),
+    ) -> (Vec<i64>, Vec<i64>) {
+        let mut rows: Vec<(i32, i64)> = rows.into_iter().collect();
+        rows.sort_unstable();
+        let before = rows
+            .iter()
+            .rev()
+            .filter(|row| **row < anchor)
+            .map(|row| row.1)
+            .collect();
+        let after = rows
+            .iter()
+            .filter(|row| **row > anchor)
+            .map(|row| row.1)
+            .collect();
+        (before, after)
+    }
+
+    fn neighbour_tab(&self, project_id: i64, anchor: (i32, i64)) -> Option<i64> {
+        let (left, right) = Self::neighbours_of(
+            self.tabs_in_display_order(project_id)
+                .into_iter()
+                .map(|tab| (tab.position, tab.id)),
+            anchor,
+        );
+        right.into_iter().chain(left).next()
+    }
+
+    /// A project with no tabs is skipped: `preferred_tab` answers `None`
+    /// for one, so landing there would seat the selection on a valid
+    /// project with a blank pane — the symptom this rule exists to
+    /// remove. `create_project` leaves exactly such a project behind and
+    /// nothing cascades it away, so this is reachable, not theoretical.
+    ///
+    /// The final fall-through to the nearest row whatever its state is
+    /// load-bearing: when *every* survivor is tabless the old shape — a
+    /// project id paired with tab 0 — is kept rather than collapsing to
+    /// `(0, 0)`, which would hand a populated workspace to the exit rule.
+    fn neighbour_project(&self, anchor: (i32, i64)) -> Option<i64> {
+        let (above, below) = Self::neighbours_of(
+            self.projects
+                .values()
+                .map(|project| (project.position, project.id)),
+            anchor,
+        );
+        let candidates: Vec<i64> = above.into_iter().chain(below).collect();
+        candidates
+            .iter()
+            .copied()
+            .find(|project_id| self.tabs.values().any(|tab| tab.project_id == *project_id))
+            .or_else(|| candidates.first().copied())
+    }
+
     /// Snapshot the persistable state plus a fresh commit sequence.
     /// The seq is assigned here — under the `inner` lock the caller
     /// holds — so it strictly reflects commit order; `persist()` uses
@@ -3138,7 +3219,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_active_preferred_tab_uses_one_display_ordered_replacement() {
+    fn closing_the_active_tab_takes_the_right_hand_neighbour_by_position_not_by_id() {
         let ws = Workspace::new();
         let project = ws.create_project("project", "").unwrap().id;
         let first = ws.open_tab(project, "/", "first", true).unwrap().id;
@@ -3148,8 +3229,216 @@ mod tests {
         ws.focus_tab(middle).unwrap();
 
         ws.close_tab(middle).unwrap();
-        assert_eq!(ws.active(), (project, last));
-        assert_eq!(ws.preferred_tab(project), Some(last));
+        assert_eq!(ws.active(), (project, first));
+        assert_eq!(ws.preferred_tab(project), Some(first));
+    }
+
+    /// Plan 069 §4.1's case table, on `P1[a b c]  P2[d]  P3[e f]`.
+    struct FallbackCase {
+        ws: Workspace,
+        p1: i64,
+        p2: i64,
+        p3: i64,
+        a: i64,
+        b: i64,
+        c: i64,
+        d: i64,
+        e: i64,
+        f: i64,
+    }
+
+    fn fallback_case() -> FallbackCase {
+        let ws = Workspace::new();
+        let p1 = ws.create_project("p1", "").unwrap().id;
+        let a = ws.open_tab(p1, "/", "a", true).unwrap().id;
+        let b = ws.open_tab(p1, "/", "b", true).unwrap().id;
+        let c = ws.open_tab(p1, "/", "c", true).unwrap().id;
+        let p2 = ws.create_project("p2", "").unwrap().id;
+        let d = ws.open_tab(p2, "/", "d", true).unwrap().id;
+        let p3 = ws.create_project("p3", "").unwrap().id;
+        let e = ws.open_tab(p3, "/", "e", true).unwrap().id;
+        let f = ws.open_tab(p3, "/", "f", true).unwrap().id;
+        FallbackCase {
+            ws,
+            p1,
+            p2,
+            p3,
+            a,
+            b,
+            c,
+            d,
+            e,
+            f,
+        }
+    }
+
+    #[test]
+    fn case_1_closing_the_middle_tab_lands_on_the_tab_to_its_right() {
+        let case = fallback_case();
+        case.ws.focus_tab(case.b).unwrap();
+
+        case.ws.close_tab(case.b).unwrap();
+        assert_eq!(case.ws.active(), (case.p1, case.c));
+        assert_eq!(case.ws.preferred_tab(case.p1), Some(case.c));
+    }
+
+    #[test]
+    fn case_2_closing_the_last_tab_of_the_strip_lands_on_the_tab_to_its_left() {
+        let case = fallback_case();
+        case.ws.focus_tab(case.c).unwrap();
+
+        case.ws.close_tab(case.c).unwrap();
+        assert_eq!(case.ws.active(), (case.p1, case.b));
+        assert_eq!(case.ws.preferred_tab(case.p1), Some(case.b));
+    }
+
+    #[test]
+    fn case_3_closing_the_first_tab_of_the_strip_lands_on_the_tab_to_its_right() {
+        let case = fallback_case();
+        case.ws.focus_tab(case.a).unwrap();
+
+        case.ws.close_tab(case.a).unwrap();
+        assert_eq!(case.ws.active(), (case.p1, case.b));
+        assert_eq!(case.ws.preferred_tab(case.p1), Some(case.b));
+    }
+
+    #[test]
+    fn case_4_closing_a_projects_last_tab_lands_on_the_projects_preferred_tab_above() {
+        let case = fallback_case();
+        case.ws.focus_tab(case.d).unwrap();
+
+        case.ws.close_tab(case.d).unwrap();
+        // P1 remembers c, so the project above contributes c, not a.
+        assert_eq!(case.ws.active(), (case.p1, case.c));
+    }
+
+    #[test]
+    fn case_4_deleting_the_shown_project_lands_on_the_project_above() {
+        let case = fallback_case();
+        case.ws.focus_tab(case.d).unwrap();
+
+        case.ws.delete_project(case.p2).unwrap();
+        assert_eq!(case.ws.active(), (case.p1, case.c));
+    }
+
+    #[test]
+    fn case_5_closing_the_top_projects_last_tab_lands_on_the_project_below() {
+        let ws = Workspace::new();
+        let p1 = ws.create_project("p1", "").unwrap().id;
+        let a = ws.open_tab(p1, "/", "a", true).unwrap().id;
+        let p2 = ws.create_project("p2", "").unwrap().id;
+        let d = ws.open_tab(p2, "/", "d", true).unwrap().id;
+        ws.focus_tab(a).unwrap();
+
+        ws.close_tab(a).unwrap();
+        assert_eq!(ws.active(), (p2, d));
+    }
+
+    #[test]
+    fn case_7_closing_the_only_remaining_tab_leaves_no_selection() {
+        let ws = Workspace::new();
+        let p2 = ws.create_project("p2", "").unwrap().id;
+        let d = ws.open_tab(p2, "/", "d", true).unwrap().id;
+
+        ws.close_tab(d).unwrap();
+        assert!(ws.snapshot().is_empty());
+        assert_eq!(ws.active(), (0, 0));
+    }
+
+    #[test]
+    fn case_8_closing_a_tab_that_is_not_shown_moves_nothing() {
+        let case = fallback_case();
+        case.ws.focus_tab(case.b).unwrap();
+
+        case.ws.close_tab(case.a).unwrap();
+        assert_eq!(case.ws.active(), (case.p1, case.b));
+        assert_eq!(case.ws.preferred_tab(case.p1), Some(case.b));
+    }
+
+    #[test]
+    fn case_9_the_project_above_is_found_by_position_not_by_id() {
+        let case = fallback_case();
+        // Sidebar `P1 P3 P2`: above P2 is P3, while the lowest id and
+        // the first remaining row are both P1.
+        case.ws
+            .reorder_projects(&[case.p1, case.p3, case.p2])
+            .unwrap();
+        case.ws.focus_tab(case.d).unwrap();
+
+        case.ws.close_tab(case.d).unwrap();
+        assert_eq!(case.ws.active(), (case.p3, case.f));
+    }
+
+    #[test]
+    fn case_9_deleting_the_shown_project_finds_the_one_above_by_position() {
+        let case = fallback_case();
+        case.ws
+            .reorder_projects(&[case.p1, case.p3, case.p2])
+            .unwrap();
+        case.ws.focus_tab(case.d).unwrap();
+
+        case.ws.delete_project(case.p2).unwrap();
+        assert_eq!(case.ws.active(), (case.p3, case.f));
+    }
+
+    #[test]
+    fn case_9b_closing_a_background_projects_remembered_tab_repairs_the_preference() {
+        let case = fallback_case();
+        case.ws.focus_tab(case.b).unwrap();
+        case.ws.focus_tab(case.e).unwrap();
+
+        case.ws.close_tab(case.b).unwrap();
+        assert_eq!(case.ws.active(), (case.p3, case.e));
+        assert_eq!(case.ws.preferred_tab(case.p1), Some(case.c));
+    }
+
+    #[test]
+    fn a_project_with_no_tabs_is_skipped_when_walking_to_the_project_above() {
+        let case = fallback_case();
+        let empty = case.ws.create_project("empty", "").unwrap().id;
+        // Sidebar `P1 P3 empty P2`: the row directly above P2 has no
+        // tab to show, so the walk keeps going up to P3.
+        case.ws
+            .reorder_projects(&[case.p1, case.p3, empty, case.p2])
+            .unwrap();
+        case.ws.focus_tab(case.d).unwrap();
+
+        case.ws.close_tab(case.d).unwrap();
+        assert_eq!(case.ws.active(), (case.p3, case.f));
+        assert_ne!(case.ws.active().1, 0);
+    }
+
+    #[test]
+    fn every_surviving_project_tabless_still_names_a_project() {
+        let ws = Workspace::new();
+        let above = ws.create_project("above", "").unwrap().id;
+        let shown = ws.create_project("shown", "").unwrap().id;
+        let tab = ws.open_tab(shown, "/", "only", true).unwrap().id;
+        let below = ws.create_project("below", "").unwrap().id;
+        ws.focus_tab(tab).unwrap();
+
+        ws.close_tab(tab).unwrap();
+        // `neighbour_project`'s fall-through: nothing has a tab to show,
+        // so the walk takes the nearest row anyway rather than answering
+        // `None` and handing a populated workspace to the exit rule.
+        assert_eq!(ws.active(), (above, 0));
+        assert_eq!(ws.snapshot().len(), 2);
+        assert!(ws.snapshot().iter().any(|p| p.id == below));
+    }
+
+    #[test]
+    fn neighbours_split_on_position_with_id_breaking_a_tie() {
+        // Colliding positions survive a load (`normalize_project_positions`
+        // repairs only what it can prove), so the split has to stay total
+        // when the anchor shares its position with a survivor.
+        let rows = [(0, 7), (1, 3), (1, 9), (2, 1)];
+        let (before, after) = Inner::neighbours_of(rows, (1, 3));
+        assert_eq!(before, vec![7]);
+        assert_eq!(after, vec![9, 1]);
+
+        let (before, after) = Inner::neighbours_of(rows, (1, 9));
+        assert_eq!(before, vec![3, 7], "nearest first, walking backwards");
+        assert_eq!(after, vec![1]);
     }
 
     #[test]

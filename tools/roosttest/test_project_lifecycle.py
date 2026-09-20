@@ -26,14 +26,18 @@ Engine references (verified this session, see plan 010 §2):
   pinned in `test_sidebar_collapse_persistence.py:180-183`. Activation is
   UI-flow behavior (iced's `new_project()` does an explicit
   `focus_tab`), not raw-op behavior.
-- `project.delete`'s active-fallback pick differs by engine: the Rust
-  workspace (Iced) falls back to `projects.keys().next()` — the
-  lowest remaining project id, a BTreeMap (workspace.rs:714). Mac's
-  `Workspace.deleteProject` picks the first project in DISPLAY order
-  (`(position, id)` sort, Workspace.swift:320-326 — deliberately not by
-  id, per a PR #78 CodeRabbit finding). So the cross-target assertion
-  here is "active is some remaining project," never "active is the
-  lowest id."
+- `project.delete` and `tab.close` move the active selection by ONE rule
+  on both engines (plan 069 §3.1), and only when the selection pointed at
+  what went away. The project is gone → the nearest surviving project
+  ABOVE it in sidebar order (`(position, id)`), else the nearest below,
+  skipping any project with no tabs (landing there would seat the
+  selection over a blank pane); within it, its first tab in display
+  order. The project survives → the nearest surviving tab to the RIGHT
+  of the closed one, else the nearest to its left. The asymmetry is
+  deliberate. So the assertions here name the neighbour, not "some
+  remaining project" — but they COMPUTE it from the order the app just
+  reported, because this suite shares one session that already holds
+  projects it did not create.
 - `project.reorder`'s partial-list semantics (listed ids as a prefix in
   the given order, unlisted ids appended after in their PRIOR relative
   order) are the same on the Rust engine (workspace.rs:1317-1358,
@@ -65,6 +69,24 @@ from util import roostctl_path, wait_shell_ready, wait_tab_attached
 
 def _project_ids(roost) -> list[int]:
     return [int(p["id"]) for p in roost.list()]
+
+
+def _neighbour_project(projects: list[dict], doomed: int) -> int:
+    """Plan 069 §3.1 rule 2 applied to the project list the app just
+    reported: the nearest survivor ABOVE `doomed`, else the nearest
+    below, skipping any project with no tabs, and falling through to the
+    nearest row of any kind when every survivor is tabless.
+
+    Computed rather than written down because this suite drives a shared
+    session whose other projects — their count, their order and whether
+    they hold tabs — belong to whoever launched it.
+    """
+    ids = [int(p["id"]) for p in projects]
+    index = ids.index(doomed)
+    candidates = list(reversed(projects[:index])) + projects[index + 1:]
+    assert candidates, "the workspace must keep a project besides the doomed one"
+    with_tabs = [int(p["id"]) for p in candidates if p["tabs"]]
+    return with_tabs[0] if with_tabs else int(candidates[0]["id"])
 
 
 def _cleanup_project(roost, project_id: int, timeout: float = 5.0) -> None:
@@ -340,18 +362,53 @@ def test_tab_open_with_no_cwd_resolves_to_the_projects_cwd(roost):
         _cleanup_project(roost, pid)
 
 
+# -- tab.close active fallback ---------------------------------------------
+
+
+def test_closing_the_focused_middle_tab_lands_on_its_right_hand_neighbour(roost, project):
+    """Plan 069 §4.1 case 1, cross-target: three tabs, the MIDDLE one
+    focused and closed. The strip goes to the tab on its right — the
+    layout is deliberately discriminating, since the leftmost tab and
+    the lowest id are both the *first* tab, which is what both engines
+    used to answer."""
+    first = roost.open_tab(project, cwd="/tmp")
+    middle = roost.open_tab(project, cwd="/tmp")
+    last = roost.open_tab(project, cwd="/tmp")
+    for tab_id in (first, middle, last):
+        wait_tab_attached(roost, tab_id)
+    roost._wait(
+        lambda: roost.project_tab_ids(project) == [first, middle, last],
+        5.0,
+        "the three tabs settle in open order",
+    )
+
+    roost.focus(middle)
+    roost._wait(
+        lambda: roost.identify()["active_tab_id"] == middle,
+        5.0,
+        "focus makes the middle tab active",
+    )
+
+    roost.close_tab(middle)
+    roost.wait_gone(middle)
+    # `identify` is its own surface and the selection can settle after
+    # the row has gone — poll it, never read it once.
+    roost._wait(
+        lambda: roost.identify()["active_tab_id"] == last,
+        5.0,
+        "the tab to the right of the closed one takes the strip",
+    )
+
+
 # -- project.delete --------------------------------------------------------
 
 
-def test_project_delete_cascades_tabs_and_active_falls_back_to_remaining(roost):
+def test_project_delete_cascades_tabs_and_active_falls_back_to_the_project_above(roost):
     """Deleting a project with live tabs removes the project AND its tabs
-    from `tab.list`, and the active selection falls back to some
-    remaining project.
-
-    Deliberately does NOT assert "the lowest remaining id" — the Rust
-    engine picks lowest-id (BTreeMap `.keys().next()`), Mac picks first
-    in display order (position, id); both are legitimate per-engine
-    fallbacks, so the cross-target bar is "some remaining project."
+    from `tab.list`, and the active selection lands on the neighbour the
+    module docstring's rule names — here the nearest project above the
+    doomed one that has a tab to show, so the tabless `keep` created
+    beside it is walked straight past.
     """
     keep = roost.create_project(name="", cwd="/tmp")
     doomed = roost.create_project(name="", cwd="/tmp")
@@ -369,8 +426,13 @@ def test_project_delete_cascades_tabs_and_active_falls_back_to_remaining(roost):
             "focus makes the doomed project active",
         )
 
-        before_ids = set(_project_ids(roost))
+        # The order + per-project tab counts as they stand at the moment
+        # of the delete — the rule reads exactly this.
+        before_projects = roost.list()
+        before_ids = {int(p["id"]) for p in before_projects}
         assert {keep, doomed} <= before_ids
+        expected_active = _neighbour_project(before_projects, doomed)
+        assert expected_active != keep, "the tabless project must be skipped, not chosen"
 
         roost.delete_project(doomed)
 
@@ -391,9 +453,10 @@ def test_project_delete_cascades_tabs_and_active_falls_back_to_remaining(roost):
         # after the cascade above has already landed) — poll it directly
         # rather than assuming it's already consistent.
         roost._wait(
-            lambda: roost.identify()["active_project_id"] in after_ids,
+            lambda: roost.identify()["active_project_id"] == expected_active,
             5.0,
-            "active project falls back to SOME remaining project after delete",
+            f"active project falls back to {expected_active}, the nearest "
+            "project above the deleted one that has a tab",
         )
     finally:
         _cleanup_project(roost, doomed)
@@ -599,6 +662,10 @@ def test_iced_deleting_a_project_keeps_the_remaining_workspace_live(roost, targe
     than on any project deletion. Mac terminates on the last project's
     window close (the now-removed GTK UI kept its empty-workspace state
     instead — recorded divergence).
+
+    The second project carries the shown tab, so its delete is also the
+    module's rule-2 assertion over a project the window was actually
+    looking at.
     """
     if target != "iced":
         pytest.skip(
@@ -614,7 +681,17 @@ def test_iced_deleting_a_project_keeps_the_remaining_workspace_live(roost, targe
             4.0,
             "both throwaway projects appear",
         )
+        shown = roost.open_tab(b, cwd="/tmp")
+        wait_tab_attached(roost, shown)
+        roost._wait(
+            lambda: roost.identify()["active_project_id"] == b,
+            5.0,
+            "the opened tab makes project b the shown one",
+        )
+
         _cleanup_project(roost, a)
+        before_projects = roost.list()
+        expected_active = _neighbour_project(before_projects, b)
         _cleanup_project(roost, b)
 
         # Projects remain (this suite never empties the workspace), so the
@@ -625,8 +702,11 @@ def test_iced_deleting_a_project_keeps_the_remaining_workspace_live(roost, targe
             5.0,
             "the deleted projects are gone from the workspace snapshot",
         )
-        assert roost.identify()["active_project_id"] in _project_ids(roost), (
-            "active selection falls back to a remaining project"
+        roost._wait(
+            lambda: roost.identify()["active_project_id"] == expected_active,
+            5.0,
+            f"active falls back to {expected_active}, the nearest project "
+            "above the deleted one that has a tab",
         )
     finally:
         for pid in (a, b):

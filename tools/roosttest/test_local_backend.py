@@ -2456,3 +2456,289 @@ def test_a_link_in_a_session_tab_opens_on_the_machine_the_window_is_on(lane: Lan
         "exactly one launch, from the modifier-held press — a press without "
         "the link modifier must open nothing"
     )
+
+
+# ---------------------------------------------------------------------------
+# 9. Plan 069: what the window shows once the row it was showing closes
+# ---------------------------------------------------------------------------
+#
+# Under `session` every tab on screen is a host tab, so the window's own
+# selection is the whole of what it is showing — and "fall back to the
+# local workspace's own selection" falls back to a workspace holding
+# nothing. Each case closes the row the window is *showing* and waits for
+# `identify` to name the neighbour plan 069 §3.1 names: the nearest
+# surviving tab to the right, else the nearest project above.
+#
+# Never `wait --gone` and then one read. A host tab's EXIT reaches this
+# window on the data plane and can beat the mirror's own `tab.closed`,
+# and until that event lands `identify` still names the tab that closed —
+# which is what made the first attempt at the §1 repro report a pass.
+
+
+def selected(roost: Roost) -> tuple[int, int]:
+    """The pair the window is showing, as §D1 publishes it."""
+    reply = roost.identify()
+    return reply["active_project_id"], reply["active_tab_id"]
+
+
+def lands_on(roost: Roost, project: int, tab: int, what: str) -> None:
+    """Wait for the window to be showing exactly this pair, and say what
+    it settled on instead when it never does — `(0, 0)` is the bug's own
+    signature, and a bare timeout would not name it."""
+    try:
+        wait_until(
+            lambda: selected(roost) == (project, tab),
+            scaled_timeout(60.0),
+            what,
+        )
+    except TimeoutError:
+        raise AssertionError(
+            f"waiting for {what}: the window is showing {selected(roost)}, "
+            f"not ({project}, {tab})"
+        ) from None
+
+
+def window_projects(roost: Roost) -> list[int]:
+    """The slot's project ids in the order the **window's** sidebar draws
+    them — which is the order the fallback walks, and not necessarily the
+    one a reorder has already landed on the session."""
+    band = local_band(roost)
+    rows = roost.sidebar_host(band["saved_id"])
+    assert rows is not None, roost.sidebar_dump()
+    return [int(project["key"].rsplit(".", 1)[-1]) for project in rows["projects"]]
+
+
+def attached(roost: Roost, tab: int) -> None:
+    """Assert the window holds a live client terminal for `tab`.
+
+    The lane's two-sided proof (`test_the_forward_switch_...`): under
+    `session` a plain `tab.dump` proves nothing about attachment, because
+    since #511 the session answers it for a slot tab the window holds no
+    terminal for. `tab.dump_resolved` reads the window's own terminal and
+    nothing else.
+    """
+    assert slot_key(roost, tab) is not None, roost.sidebar_dump()
+
+    # NOT merely "the resolved dump succeeds": `host_focus_tab` creates
+    # the client terminal *before* the attachment it starts has streamed
+    # anything, so that alone passes over a pane that is still blank —
+    # which is the very thing this is supposed to rule out. Put a token
+    # through the shell and wait for it to come back through this
+    # window's own terminal.
+    token = f"attached-{uuid.uuid4().hex[:8]}"
+    roost.run(tab, f"printf '{token}'")
+
+    def streamed() -> bool:
+        try:
+            return token in mirrored(roost, tab)
+        except RoostError:
+            # No client terminal yet: the answer is "not streaming", not
+            # an error — the wait below is what decides.
+            return False
+
+    wait_until(
+        streamed,
+        scaled_timeout(30.0),
+        f"the landed tab to stream {token} into this window's terminal",
+    )
+
+
+def never_attached(roost: Roost, tab: int) -> None:
+    """The other side of [`attached`], and only sound for a tab this
+    window has **never** shown: leaving a tab keeps its terminal frozen
+    rather than dropping it, so a tab it once showed answers a resolved
+    dump for ever after."""
+    key = slot_key(roost, tab)
+    assert key is not None, roost.sidebar_dump()
+    with pytest.raises(RoostError) as raised:
+        roost.call("tab.dump_resolved", {"tab_id": key})
+    assert "no live terminal" in str(raised.value), raised.value
+
+
+def a_strip(lane: Lane, roost: Roost) -> tuple[int, list[int]]:
+    """The slot's boot project with three more tabs in it, and every tab
+    id in strip order.
+
+    Three, so that closing the middle one lands on a tab that is neither
+    the strip's leftmost (the boot tab is) nor its lowest id — the two
+    answers the fallbacks this replaces gave.
+
+    Opened on the **session's** own socket, so the window never selects
+    or attaches them: that is what leaves [`never_attached`] something to
+    say afterwards.
+    """
+    project = int(roost.list()[0]["id"])
+    with lane.session() as c:
+        for name in ("left", "middle", "right"):
+            c.open_tab(project, cwd="/tmp", title=name)
+    # Written through the session socket and read back through the UI's:
+    # two connections, so the read can still be answered from the
+    # snapshot before the open. Poll for the count rather than asserting
+    # on the first answer.
+    wait_until(
+        lambda: len(roost.project_tab_ids(project)) == 4,
+        scaled_timeout(30.0),
+        "the window to list all four tabs of the strip",
+    )
+    tabs = roost.project_tab_ids(project)
+    wait_until(
+        lambda: all(slot_key(roost, tab) for tab in tabs),
+        scaled_timeout(30.0),
+        "the window to list every tab in the strip",
+    )
+    return project, tabs
+
+
+def above_and_viewed(lane: Lane, roost: Roost) -> tuple[int, int]:
+    """Three projects of ours, one tab each, drawn after the slot's seed
+    in the order `… above viewed below`.
+
+    That order is the whole point. `above` is created **last**, so it
+    holds the highest project id while sitting directly over `viewed`: it
+    is neither the first remaining row nor the lowest id, which is what
+    the two fallbacks this replaces answered with. `below` is there so
+    that landing above is distinguishable from landing anywhere at all.
+    """
+    order = [int(project["id"]) for project in roost.list()]
+    with lane.session() as c:
+        below = c.create_project(name="below", cwd="/tmp")
+        viewed = c.create_project(name="viewed", cwd="/tmp")
+        above = c.create_project(name="above", cwd="/tmp")
+        for project in (below, viewed, above):
+            c.open_tab(project, cwd="/tmp")
+    order += [above, viewed, below]
+    # The reorder names ids created on the *session's* connection, so it
+    # has to wait for this window to have heard of them — a reorder that
+    # arrives first would be validated against a snapshot missing three
+    # of its ids.
+    wait_until(
+        lambda: set(order) <= {int(project["id"]) for project in roost.list()},
+        scaled_timeout(30.0),
+        "the window to list every project before reordering them",
+    )
+    roost.reorder_projects(order)
+    wait_until(
+        lambda: window_projects(roost) == order,
+        scaled_timeout(30.0),
+        "the window's sidebar to draw the reordered projects",
+    )
+    return above, viewed
+
+
+def test_an_exit_in_the_shown_tab_shows_the_tab_to_its_right(lane: Lane):
+    """§3.1 rule 1, on the route a person takes: the shell exits.
+
+    And the tab it lands on is **attached**, which is the other half of
+    the bug — a selection pointing at a row the window holds no terminal
+    for is the blank pane by another name. `right` is proved to have no
+    terminal *before* the close, so the one it has afterwards can only be
+    the fallback's.
+    """
+    roost = session_ui(lane)
+    project, tabs = a_strip(lane, roost)
+    left, middle, right = tabs[1], tabs[2], tabs[3]
+    roost.focus(middle)
+    lands_on(roost, project, middle, "the window to show the middle tab")
+    never_attached(roost, right)
+
+    roost.run(middle, "exit", ready_timeout=30.0)
+
+    lands_on(roost, project, right, "the shown tab's shell to exit onto its right-hand neighbour")
+    attached(roost, right)
+    never_attached(roost, left)
+
+
+def test_an_exit_in_the_shown_projects_last_tab_shows_the_project_above(lane: Lane):
+    """§3.1 rule 2: the project goes with its last tab, so the walk
+    leaves the strip and goes up the sidebar."""
+    roost = session_ui(lane)
+    above, viewed = above_and_viewed(lane, roost)
+    above_tab = roost.project_tab_ids(above)[0]
+    shown = roost.project_tab_ids(viewed)[0]
+    roost.focus(shown)
+    lands_on(roost, viewed, shown, "the window to show the viewed project's only tab")
+
+    roost.run(shown, "exit", ready_timeout=30.0)
+
+    lands_on(roost, above, above_tab, "the viewed project to be replaced by the one above it")
+
+
+def test_closing_the_shown_tab_shows_the_tab_to_its_right(lane: Lane):
+    """The same rule from the other route: `tab.close` rather than an
+    EXIT the window hears about on the data plane first."""
+    roost = session_ui(lane)
+    project, tabs = a_strip(lane, roost)
+    middle, right = tabs[2], tabs[3]
+    roost.focus(middle)
+    lands_on(roost, project, middle, "the window to show the middle tab")
+
+    roost.close_tab(middle)
+
+    lands_on(roost, project, right, "the closed tab to be replaced by its right-hand neighbour")
+
+
+def test_closing_the_shown_projects_last_tab_shows_the_project_above(lane: Lane):
+    roost = session_ui(lane)
+    above, viewed = above_and_viewed(lane, roost)
+    above_tab = roost.project_tab_ids(above)[0]
+    shown = roost.project_tab_ids(viewed)[0]
+    roost.focus(shown)
+    lands_on(roost, viewed, shown, "the window to show the viewed project's only tab")
+
+    roost.close_tab(shown)
+
+    lands_on(roost, above, above_tab, "the viewed project to be replaced by the one above it")
+
+
+def test_deleting_the_shown_project_shows_the_project_above(lane: Lane):
+    """Rule 2 over a batch that takes several rows at once.
+
+    The project is deliberately **multi-tab**: its sibling tab is a row
+    rule 1 would have landed on, and it goes with the project, so passing
+    here means the walk crossed to another project rather than merely
+    finding the nearest surviving id.
+    """
+    roost = session_ui(lane)
+    above, viewed = above_and_viewed(lane, roost)
+    above_tab = roost.project_tab_ids(above)[0]
+    with lane.session() as c:
+        c.open_tab(viewed, cwd="/tmp", title="second")
+    # Same two-connection lag as `a_strip`: poll for the sibling rather
+    # than asserting on the first read.
+    wait_until(
+        lambda: len(roost.project_tab_ids(viewed)) == 2,
+        scaled_timeout(30.0),
+        "the window to list the sibling tab the project is deleted with",
+    )
+    shown = roost.project_tab_ids(viewed)
+    roost.focus(shown[0])
+    lands_on(roost, viewed, shown[0], "the window to show the multi-tab project")
+
+    roost.delete_project(viewed)
+
+    lands_on(roost, above, above_tab, "the deleted project to be replaced by the one above it")
+
+
+def test_closing_a_background_tab_leaves_the_window_where_it_is(lane: Lane):
+    """The fallback is for the row the window is *showing*; a close
+    anywhere else moves nothing.
+
+    The wait is on the window's **own** copy of the strip losing the
+    row — the same reconcile that decides the selection — so "it did not
+    move" is read after the decision rather than before the event that
+    would have made it.
+    """
+    roost = session_ui(lane)
+    project, tabs = a_strip(lane, roost)
+    left, middle = tabs[1], tabs[2]
+    roost.focus(middle)
+    lands_on(roost, project, middle, "the window to show the middle tab")
+
+    roost.close_tab(left)
+
+    wait_until(
+        lambda: slot_key(roost, left) is None,
+        scaled_timeout(30.0),
+        "the window to drop the closed row",
+    )
+    assert selected(roost) == (project, middle)

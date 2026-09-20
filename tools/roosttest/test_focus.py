@@ -238,9 +238,10 @@ def test_core_tracks_displayed_tab(roost):
     survivor. This pins the `selected-page` core-sync guard added for
     #228/#229: it must suppress the echo on our own programmatic selection
     changes (so no path desyncs core from UI) while still syncing genuine
-    gestures (covered by the real-input harness). Uses 3 tabs so a
-    survivor-policy mismatch (daemon HashMap order vs AdwTabView visual
-    order) on close would surface."""
+    gestures (covered by the real-input harness). Uses 3 tabs and closes
+    the MIDDLE one, where the survivor is a definite answer both engines
+    owe — the tab to its right (plan 069 §3.1 rule 1) — so a
+    survivor-policy mismatch between core and UI surfaces here."""
     a = b = None
     try:
         a = roost.create_project(name="coreui-a", cwd="/tmp")
@@ -278,9 +279,12 @@ def test_core_tracks_displayed_tab(roost):
                     timeout=4.0, what="a2 active again")
         roost.close_tab(a2)
         Roost._wait(lambda: roost.tab(a2) is None, timeout=5.0, what="a2 closed")
+        # Its own surface, and it can settle after the row has gone:
+        # poll `identify` for the neighbour rather than reading it once.
+        Roost._wait(lambda: roost.identify()["active_tab_id"] == a3,
+                    timeout=5.0,
+                    what="a3, the closed tab's right-hand neighbour, takes the strip")
         assert_core_eq_ui("closing active tab a2")
-        assert roost.identify()["active_tab_id"] in (a1, a3), \
-            "survivor must be a real surviving tab in project A"
     finally:
         for pid in (a, b):
             if pid is None:

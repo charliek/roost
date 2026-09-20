@@ -1604,11 +1604,12 @@ def _project_lifecycle(launch: Launch, home_project: int, home_tab: int) -> None
         "held Enter confirms the project delete",
     )
     _wait_confirm_delete_closed(launch, "confirm-project-delete")
-    # The engine's fallback is the lowest remaining project ID, which after the
-    # drag above is deliberately not the first sidebar row.
+    # The engine's fallback is the nearest surviving project above the deleted
+    # one in the sidebar (else below), which after the drag above is
+    # deliberately not the first sidebar row.
     _wait_until(
         lambda: int(launch.client.identify()["active_project_id"]) == home_project,
-        "lowest-remaining-ID project fallback after the confirmed delete",
+        "project-above fallback after the confirmed delete",
     )
     _assert_no_pty_input(launch, survivors, "confirmed project delete")
 

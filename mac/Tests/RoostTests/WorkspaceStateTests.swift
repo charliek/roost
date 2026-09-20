@@ -374,6 +374,182 @@ private func label(for event: Workspace.Event) -> String {
     }
 }
 
+/// Plan 069 §4.1's case table, on `P1[a b c]  P2[d]  P3[e f]`, written
+/// out here as it is in the Rust twin's `mod tests` — the two
+/// implementations of one rule share no code, so the table is what
+/// keeps them from drifting. Case 6 is client-only (one commit here
+/// removes one project) and case 9b's second half has no Swift half at
+/// all: the model holds only the global active pair, and the
+/// per-project remembered tab lives in the UI.
+@MainActor
+@Suite("Workspace close-selection fallback")
+struct WorkspaceCloseFallbackTests {
+    private struct Layout {
+        let ws: Workspace
+        let p1: Int64
+        let p2: Int64
+        let p3: Int64
+        let a: Int64
+        let b: Int64
+        let c: Int64
+        let d: Int64
+        let e: Int64
+        let f: Int64
+    }
+
+    private func layout() throws -> Layout {
+        let ws = Workspace()
+        let p1 = ws.createProject(name: "p1", cwd: "/").id
+        let a = try ws.openTab(projectID: p1, cwd: "/", title: "a").id
+        let b = try ws.openTab(projectID: p1, cwd: "/", title: "b").id
+        let c = try ws.openTab(projectID: p1, cwd: "/", title: "c").id
+        let p2 = ws.createProject(name: "p2", cwd: "/").id
+        let d = try ws.openTab(projectID: p2, cwd: "/", title: "d").id
+        let p3 = ws.createProject(name: "p3", cwd: "/").id
+        let e = try ws.openTab(projectID: p3, cwd: "/", title: "e").id
+        let f = try ws.openTab(projectID: p3, cwd: "/", title: "f").id
+        return Layout(ws: ws, p1: p1, p2: p2, p3: p3, a: a, b: b, c: c, d: d, e: e, f: f)
+    }
+
+    @Test func case1ClosingTheMiddleTabLandsOnTheTabToItsRight() throws {
+        let l = try layout()
+        _ = try l.ws.focusTab(l.b)
+
+        try l.ws.closeTab(l.b)
+        #expect(l.ws.activeProjectID == l.p1)
+        #expect(l.ws.activeTabID == l.c)
+    }
+
+    @Test func case2ClosingTheLastTabOfTheStripLandsOnTheTabToItsLeft() throws {
+        let l = try layout()
+        _ = try l.ws.focusTab(l.c)
+
+        try l.ws.closeTab(l.c)
+        #expect(l.ws.activeProjectID == l.p1)
+        #expect(l.ws.activeTabID == l.b)
+    }
+
+    @Test func case3ClosingTheFirstTabOfTheStripLandsOnTheTabToItsRight() throws {
+        let l = try layout()
+        _ = try l.ws.focusTab(l.a)
+
+        try l.ws.closeTab(l.a)
+        #expect(l.ws.activeProjectID == l.p1)
+        #expect(l.ws.activeTabID == l.b)
+    }
+
+    @Test func case4ClosingAProjectsLastTabLandsOnTheProjectAbove() throws {
+        let l = try layout()
+        _ = try l.ws.focusTab(l.d)
+
+        try l.ws.closeTab(l.d)
+        #expect(l.ws.activeProjectID == l.p1)
+        #expect(l.ws.activeTabID == l.a)
+    }
+
+    @Test func case4DeletingTheShownProjectLandsOnTheProjectAbove() throws {
+        let l = try layout()
+        _ = try l.ws.focusTab(l.d)
+
+        _ = try l.ws.deleteProject(l.p2)
+        #expect(l.ws.activeProjectID == l.p1)
+        #expect(l.ws.activeTabID == l.a)
+    }
+
+    @Test func case5ClosingTheTopProjectsLastTabLandsOnTheProjectBelow() throws {
+        let ws = Workspace()
+        let p1 = ws.createProject(name: "p1", cwd: "/").id
+        let a = try ws.openTab(projectID: p1, cwd: "/", title: "a").id
+        let p2 = ws.createProject(name: "p2", cwd: "/").id
+        let d = try ws.openTab(projectID: p2, cwd: "/", title: "d").id
+        _ = try ws.focusTab(a)
+
+        try ws.closeTab(a)
+        #expect(ws.activeProjectID == p2)
+        #expect(ws.activeTabID == d)
+    }
+
+    @Test func case7ClosingTheOnlyRemainingTabLeavesNoSelection() throws {
+        let ws = Workspace()
+        let p2 = ws.createProject(name: "p2", cwd: "/").id
+        let d = try ws.openTab(projectID: p2, cwd: "/", title: "d").id
+
+        try ws.closeTab(d)
+        #expect(ws.snapshot().isEmpty)
+        #expect(ws.activeProjectID == 0)
+        #expect(ws.activeTabID == 0)
+    }
+
+    @Test func case8ClosingATabThatIsNotShownMovesNothing() throws {
+        let l = try layout()
+        _ = try l.ws.focusTab(l.b)
+
+        try l.ws.closeTab(l.a)
+        #expect(l.ws.activeProjectID == l.p1)
+        #expect(l.ws.activeTabID == l.b)
+    }
+
+    @Test func case9TheProjectAboveIsFoundByPositionNotById() throws {
+        let l = try layout()
+        // Sidebar `P1 P3 P2`: above P2 is P3, while the lowest id and
+        // the first remaining row are both P1.
+        try l.ws.reorderProjects([l.p1, l.p3, l.p2])
+        _ = try l.ws.focusTab(l.d)
+
+        try l.ws.closeTab(l.d)
+        #expect(l.ws.activeProjectID == l.p3)
+        #expect(l.ws.activeTabID == l.e)
+    }
+
+    @Test func case9DeletingTheShownProjectFindsTheOneAboveByPosition() throws {
+        let l = try layout()
+        try l.ws.reorderProjects([l.p1, l.p3, l.p2])
+        _ = try l.ws.focusTab(l.d)
+
+        _ = try l.ws.deleteProject(l.p2)
+        #expect(l.ws.activeProjectID == l.p3)
+        #expect(l.ws.activeTabID == l.e)
+    }
+
+    @Test func case9bClosingABackgroundProjectsTabLeavesTheSelectionAlone() throws {
+        let l = try layout()
+        _ = try l.ws.focusTab(l.b)
+        _ = try l.ws.focusTab(l.e)
+
+        try l.ws.closeTab(l.b)
+        #expect(l.ws.activeProjectID == l.p3)
+        #expect(l.ws.activeTabID == l.e)
+        #expect(l.ws.tabs(in: l.p1).map(\.id) == [l.a, l.c])
+    }
+
+    @Test func aProjectWithNoTabsIsSkippedWhenWalkingToTheProjectAbove() throws {
+        let l = try layout()
+        let empty = l.ws.createProject(name: "empty", cwd: "/").id
+        // Sidebar `P1 P3 empty P2`: the row directly above P2 has no tab
+        // to show, so the walk keeps going up to P3.
+        try l.ws.reorderProjects([l.p1, l.p3, empty, l.p2])
+        _ = try l.ws.focusTab(l.d)
+
+        try l.ws.closeTab(l.d)
+        #expect(l.ws.activeProjectID == l.p3)
+        #expect(l.ws.activeTabID == l.e)
+    }
+
+    @Test func everySurvivingProjectTablessStillNamesAProject() throws {
+        let ws = Workspace()
+        let above = ws.createProject(name: "above", cwd: "/").id
+        let shown = ws.createProject(name: "shown", cwd: "/").id
+        let tab = try ws.openTab(projectID: shown, cwd: "/", title: "only").id
+        let below = ws.createProject(name: "below", cwd: "/").id
+        _ = try ws.focusTab(tab)
+
+        try ws.closeTab(tab)
+        #expect(ws.activeProjectID == above)
+        #expect(ws.activeTabID == 0)
+        #expect(ws.snapshot().map(\.id) == [above, below])
+    }
+}
+
 // Agent state model (plan 002). Mirrors the Rust workspace suite in
 // `crates/roost-engine/src/workspace.rs` case for case, so the two
 // implementations of the same op set can't drift.

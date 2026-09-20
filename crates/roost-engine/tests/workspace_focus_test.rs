@@ -135,3 +135,28 @@ async fn closing_the_active_tab_does_not_acknowledge_the_fallback_tabs_notificat
         "the fallback tab keeps its notification: it was selected for the user, not by them"
     );
 }
+
+/// The twin above with somewhere to go in both directions, so the tab
+/// the fallback lands on is the right-hand neighbour by the rule rather
+/// than the only survivor. Same reasoning as the doc above it.
+#[tokio::test]
+async fn closing_the_active_middle_tab_does_not_acknowledge_the_right_neighbours_notification() {
+    let workspace = Workspace::new();
+    let project = workspace.create_project("p", "/tmp").unwrap();
+    let _left = workspace
+        .open_tab(project.id, "/tmp", "left", true)
+        .unwrap();
+    let active = workspace
+        .open_tab(project.id, "/tmp", "active", true)
+        .unwrap();
+    let right = workspace
+        .open_tab(project.id, "/tmp", "right", true)
+        .unwrap();
+    workspace.focus_tab(active.id).unwrap();
+    workspace.set_tab_has_notification(right.id, true).unwrap();
+
+    workspace.close_tab(active.id).unwrap();
+
+    assert_eq!(workspace.active(), (project.id, right.id));
+    assert!(workspace.tab(right.id).unwrap().has_notification);
+}

@@ -1277,6 +1277,10 @@ impl App {
             }
             self.attach_tab_tracked(*key, now);
         }
+        // Last, so the frame the next close walks is the one this
+        // reconcile settled on, with whatever the clauses above did to
+        // the rows and to the selection already in it.
+        self.remember_selection_frame();
     }
 
     /// Mac parity: an empty workspace ends the app (App.swift closes the
@@ -2998,27 +3002,33 @@ impl App {
         }
         self.sidebar_agents = rows;
         // Last, because the rollups read the counts filled just above.
-        let slot = self.local_slot_saved_id();
-        self.host_sections = host_sidebar::sections(
-            host_sidebar::LocalSlot {
-                mode: self.local_backend,
-                slot_saved_id: slot.as_deref(),
-            },
-            &self
-                .host_views
-                .iter()
-                .map(|view| host_sidebar::HostInput {
-                    saved_id: view.saved_id.as_str(),
-                    label: view.label.as_str(),
-                    host: view.host,
-                    state: view.state,
-                    transport: view.transport,
-                    reduced_fidelity: view.reduced_fidelity,
-                    agents: view.agents,
-                    reason: view.reason.as_deref(),
-                })
-                .collect::<Vec<_>>(),
-        );
+        self.host_sections = self.host_sections_now();
+    }
+
+    /// The sidebar's bands, off the views this reconcile holds.
+    ///
+    /// One function because it has two callers that must not disagree:
+    /// `refresh_sidebar_agents` caches the answer for the draw, and
+    /// [`App::selection_frame`] asks the same question *before* that
+    /// cache is refreshed (the selection is reconciled first), so a
+    /// second copy of the mapping could silently order or gate bands
+    /// differently from the one on screen.
+    pub(super) fn host_sections_now(&self) -> Vec<host_sidebar::Section> {
+        let hosts: Vec<host_sidebar::HostInput<'_>> = self
+            .host_views
+            .iter()
+            .map(|view| host_sidebar::HostInput {
+                saved_id: view.saved_id.as_str(),
+                label: view.label.as_str(),
+                host: view.host,
+                state: view.state,
+                transport: view.transport,
+                reduced_fidelity: view.reduced_fidelity,
+                agents: view.agents,
+                reason: view.reason.as_deref(),
+            })
+            .collect();
+        host_sidebar::sections(self.local_slot_input(), &hosts)
     }
 
     fn sidebar_dump(&self) -> SidebarDumpResult {
