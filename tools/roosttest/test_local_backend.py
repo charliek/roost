@@ -2571,8 +2571,16 @@ def a_strip(lane: Lane, roost: Roost) -> tuple[int, list[int]]:
     with lane.session() as c:
         for name in ("left", "middle", "right"):
             c.open_tab(project, cwd="/tmp", title=name)
+    # Written through the session socket and read back through the UI's:
+    # two connections, so the read can still be answered from the
+    # snapshot before the open. Poll for the count rather than asserting
+    # on the first answer.
+    wait_until(
+        lambda: len(roost.project_tab_ids(project)) == 4,
+        scaled_timeout(30.0),
+        "the window to list all four tabs of the strip",
+    )
     tabs = roost.project_tab_ids(project)
-    assert len(tabs) == 4, tabs
     wait_until(
         lambda: all(slot_key(roost, tab) for tab in tabs),
         scaled_timeout(30.0),
@@ -2599,6 +2607,15 @@ def above_and_viewed(lane: Lane, roost: Roost) -> tuple[int, int]:
         for project in (below, viewed, above):
             c.open_tab(project, cwd="/tmp")
     order += [above, viewed, below]
+    # The reorder names ids created on the *session's* connection, so it
+    # has to wait for this window to have heard of them — a reorder that
+    # arrives first would be validated against a snapshot missing three
+    # of its ids.
+    wait_until(
+        lambda: set(order) <= {int(project["id"]) for project in roost.list()},
+        scaled_timeout(30.0),
+        "the window to list every project before reordering them",
+    )
     roost.reorder_projects(order)
     wait_until(
         lambda: window_projects(roost) == order,
@@ -2686,8 +2703,14 @@ def test_deleting_the_shown_project_shows_the_project_above(lane: Lane):
     above_tab = roost.project_tab_ids(above)[0]
     with lane.session() as c:
         c.open_tab(viewed, cwd="/tmp", title="second")
+    # Same two-connection lag as `a_strip`: poll for the sibling rather
+    # than asserting on the first read.
+    wait_until(
+        lambda: len(roost.project_tab_ids(viewed)) == 2,
+        scaled_timeout(30.0),
+        "the window to list the sibling tab the project is deleted with",
+    )
     shown = roost.project_tab_ids(viewed)
-    assert len(shown) == 2, shown
     roost.focus(shown[0])
     lands_on(roost, viewed, shown[0], "the window to show the multi-tab project")
 
