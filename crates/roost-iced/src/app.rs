@@ -50,7 +50,7 @@ use roost_ui_model::{
     keys::{HostId, ProjectKey, TabKey},
     notification_inbox, palette, provider,
     rollup::project_rollup,
-    window_title,
+    selection_fallback, window_title,
 };
 use roost_url::HoverUrl;
 use roost_vt::{
@@ -2662,12 +2662,26 @@ pub struct App {
     /// Every surface that asks "what is focused?" already goes through
     /// those two joints, so nothing else has to know.
     ///
-    /// Invalidated by [`Self::reconcile_host_selection`]: a tab that
-    /// closed, a host that dropped, or an incarnation that was replaced
-    /// all fall back to the local workspace's own selection. C7's
+    /// Moved or invalidated by [`Self::reconcile_host_selection`] when
+    /// the row it names goes away: a closed tab lands on a neighbour
+    /// (plan 069 §3.1), while a host that dropped or an incarnation that
+    /// was replaced fall back to the local workspace's own selection —
+    /// which is a *blank window* under `local-backend = session`, where
+    /// that workspace holds no live tabs at all (plan 063). C7's
     /// creation routing reads the same field to answer "which host does
     /// ⌘N create on?".
     host_selection: Option<HostSelection>,
+    /// The sidebar as it stood in the last reconcile `host_selection`
+    /// resolved in — still listed, or just chosen.
+    ///
+    /// The close fallback needs the order the user was looking at: by
+    /// the time a close is noticed, `reconcile` has already rebuilt both
+    /// the local snapshot and the host views, so the closed row and the
+    /// position it sat in are gone from every live source. Empty while
+    /// nothing is selected, which [`selection_fallback::decide`] reads
+    /// as "no place to walk from" — the same answer as a selection the
+    /// frame never held.
+    last_selection_frame: Vec<host_sidebar::RingSection>,
     /// The Add Host / Stop Session modal, when one is up (plan 037
     /// §3.1). One field for both: they are the same kind of thing — an
     /// answer the user still owes — and only one can be up at a time.
@@ -3075,6 +3089,7 @@ impl App {
             host_resume: HashMap::new(),
             host_bells: HashSet::new(),
             host_selection: None,
+            last_selection_frame: Vec::new(),
             host_dialog: None,
             host_restarts: crate::host_conn::restart::RestartsInFlight::default(),
             bootstraps: bootstrap::BootstrapsInFlight::default(),
@@ -6490,6 +6505,16 @@ impl App {
     /// host contributes its mirrored projects, and a section that is not
     /// connected is listed but never traversed (plan 037 §3.1).
     fn ring_sections(&self) -> Vec<host_sidebar::RingSection> {
+        self.ring_sections_over(&self.host_sections)
+    }
+
+    /// [`Self::ring_sections`] over a band list the caller names, which
+    /// is what lets [`Self::selection_frame`] ask the same question of
+    /// bands this reconcile has not cached yet.
+    fn ring_sections_over(
+        &self,
+        sections: &[host_sidebar::Section],
+    ) -> Vec<host_sidebar::RingSection> {
         // The local rows come off a fresh snapshot, not the reconciled
         // cache: `switch_project_N` resolved against `workspace.snapshot()`
         // before the ring existed, and a dispatch that arrives ahead of
@@ -6502,10 +6527,23 @@ impl App {
             navigable: true,
             projects: self.workspace.snapshot().iter().map(ring_project).collect(),
         };
-        if self.host_sections.is_empty() {
+        if sections.is_empty() {
             return vec![local];
         }
-        ring_sections_from(&self.host_sections, &local, &self.host_views)
+        ring_sections_from(sections, &local, &self.host_views)
+    }
+
+    /// The flattened sidebar as it stands **now** — the frame
+    /// [`selection_fallback`] judges survival against, and the one
+    /// [`Self::last_selection_frame`] remembers.
+    ///
+    /// The bands are rebuilt here rather than read from
+    /// `self.host_sections`, which `refresh_sidebar_agents` refreshes
+    /// *after* the selection is reconciled: at the decision point the
+    /// cached copy is one reconcile stale, and a fallback walking it
+    /// would place the closed row among the rows of the frame before.
+    fn selection_frame(&self) -> Vec<host_sidebar::RingSection> {
+        self.ring_sections_over(&self.host_sections_now())
     }
 
     fn switch_project_by_index(&mut self, index: u8) -> Result<(), String> {
@@ -6767,38 +6805,106 @@ impl App {
         Some(TabKey::new(project.host, tab.id))
     }
 
-    /// Drop a host selection the sidebar can no longer draw: its host
-    /// dropped, its incarnation was replaced, or its tab closed. Falls
-    /// back to the local workspace's own selection, which never went
-    /// anywhere.
+    /// Move a host selection the sidebar can no longer draw onto its
+    /// neighbour, or — when the row went away for a reason that is not a
+    /// close — drop it.
+    ///
+    /// Under `local-backend = session` every tab is a host tab, so this
+    /// is *the* close fallback: dropping to the local workspace's own
+    /// selection leaves the window blank, because since plan 063 that
+    /// workspace holds no live tabs to fall back to. What it does
+    /// instead is [`selection_fallback::decide`] over the frame the
+    /// selection was last valid in and the one this reconcile built.
+    ///
+    /// The three [`selection_fallback::Liveness`] facts are the
+    /// conditions this function used to test in its own body; everything
+    /// the two frames can answer is the policy's, so that the parts that
+    /// decide are testable without an `App`.
     fn reconcile_host_selection(&mut self) {
         let Some(selection) = self.host_selection else {
             return;
         };
-        if self.workspace.active().1 != selection.local_active {
-            tracing::debug!("host selection dropped: a local tab took the focus");
+        let live = selection_fallback::Liveness {
+            local_active_moved: self.workspace.active().1 != selection.local_active,
+            listed: self.host_project_of(selection.tab) == Some(selection.project),
+            // A stop leaves a frame nothing will ever update again — and
+            // that frame is the last true thing this window knows about
+            // that session, so it stays (plan 037 §3.1's "keeps its last
+            // frame dimmed") with the banner over it. The row must still
+            // be listed: a tab the mirror dropped before the connection
+            // died has nothing left to show.
+            frozen_and_listed: self.frozen_host_frame().is_some()
+                && self.host_listed_project_of(selection.tab) == Some(selection.project),
+        };
+        let was = selection_fallback::Selection {
+            project: selection.project,
+            tab: selection.tab,
+        };
+        let frame = self.selection_frame();
+        match selection_fallback::decide(&self.last_selection_frame, &frame, was, live) {
+            selection_fallback::Decision::Keep => {}
+            selection_fallback::Decision::DropToLocal => {
+                if live.local_active_moved {
+                    tracing::debug!("host selection dropped: a local tab took the focus");
+                } else {
+                    tracing::debug!(
+                        tab = %selection.tab,
+                        "host selection dropped: the tab is no longer listed"
+                    );
+                }
+                self.set_host_selection(None);
+            }
+            selection_fallback::Decision::Select(tab) => self.fall_back_to(Some(tab)),
+            selection_fallback::Decision::SelectProject(project) => {
+                // The same tab a click on that row would land on.
+                let tab = self.host_preferred_tab(project);
+                self.fall_back_to(tab);
+            }
+            selection_fallback::Decision::Clear => self.fall_back_to(None),
+        }
+    }
+
+    /// Show the row the fallback landed on, or nothing when it landed
+    /// nowhere — the window then has no selection and the exit rule
+    /// decides what that means.
+    ///
+    /// Deliberately neither of the two things a *click* on this row
+    /// would also do. `focus_host_tab_and_clear` ends in a reconcile and
+    /// this runs inside one (the reason at
+    /// [`Self::resolve_pending_host_selection`]), and it clears the
+    /// tab's attention marker — which nobody asked for here: an
+    /// automatic fallback is not an acknowledgement (plan 069 §3.4, and
+    /// the engine's own rule, `workspace_focus_test.rs`). The sidebar is
+    /// left as it is for the same reason.
+    fn fall_back_to(&mut self, tab: Option<TabKey>) {
+        let landed = tab.and_then(|tab| Some((tab, self.host_project_of(tab)?)));
+        let Some((tab, project)) = landed else {
+            tracing::debug!("host selection cleared: nothing left for the window to show");
             self.set_host_selection(None);
             return;
-        }
-        if self.host_project_of(selection.tab) == Some(selection.project) {
+        };
+        self.set_host_selection(Some(HostSelection {
+            project,
+            tab,
+            // Read now, never copied from the selection that closed: a
+            // stale value would blind the `local_active` watch above.
+            local_active: self.workspace.active().1,
+        }));
+        self.host_focus_tab(tab);
+        tracing::debug!(%tab, "host selection moved to the neighbour of a row that closed");
+    }
+
+    /// Store the frame the selection resolved in, for the next close to
+    /// walk. Runs at the end of [`Self::reconcile`], after every clause
+    /// that can move or drop the selection — and after the host views
+    /// the frame is drawn from are settled.
+    fn remember_selection_frame(&mut self) {
+        if self.host_selection.is_none() {
+            // Cleared by `set_host_selection`, which is where every
+            // route to `None` passes.
             return;
         }
-        // A stop leaves a frame nothing will ever update again — and
-        // that frame is the last true thing this window knows about that
-        // session, so it stays (plan 037 §3.1's
-        // "keeps its last frame dimmed") with the banner over it. The
-        // row must still be listed: a tab the mirror dropped before the
-        // connection died has nothing left to show.
-        if self.frozen_host_frame().is_some()
-            && self.host_listed_project_of(selection.tab) == Some(selection.project)
-        {
-            return;
-        }
-        tracing::debug!(
-            tab = %selection.tab,
-            "host selection dropped: the tab is no longer listed"
-        );
-        self.set_host_selection(None);
+        self.last_selection_frame = self.selection_frame();
     }
 
     /// The one writer of [`Self::host_selection`].
@@ -6817,6 +6923,11 @@ impl App {
     fn set_host_selection(&mut self, next: Option<HostSelection>) {
         let released = host_selection_detach(self.host_selection, next);
         self.host_selection = next;
+        if next.is_none() {
+            // The memo is "the frame the selection resolved in", so it
+            // goes with the selection — by whichever route it left.
+            self.last_selection_frame.clear();
+        }
         // Under `session` this *is* the local selection, so it is what
         // `identify.active_*` answers and what a bare-id op with no
         // `--tab` acts on (plan 063 §D1/§D10).
