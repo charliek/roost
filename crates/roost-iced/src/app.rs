@@ -11411,7 +11411,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_delete_cascades_tabs_and_ptys_with_the_engine_id_fallback() {
+    fn confirmed_delete_cascades_tabs_and_ptys_and_falls_back_to_the_project_above() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let workspace = Arc::new(Workspace::new());
         let supervisor = Arc::new(PtySupervisor::new());
@@ -11439,8 +11439,9 @@ mod tests {
         let doomed_second = open(doomed.id);
         let last_row = workspace.create_project("last row", "/tmp").unwrap();
         let last_row_tab = open(last_row.id);
-        // The engine falls back to the lowest remaining project id, not the
-        // first sidebar row — pin that after a reorder puts them at odds.
+        // The engine falls back to the sidebar row above the deleted one —
+        // pin that after a reorder puts it at odds with both the lowest
+        // remaining id and the first remaining row.
         workspace
             .reorder_projects(&[last_row.id, doomed.id, keeper.id])
             .unwrap();
@@ -11461,7 +11462,7 @@ mod tests {
         assert!(!supervisor.has(doomed_first.id));
         assert!(!supervisor.has(doomed_second.id));
         assert!(supervisor.has(keeper_tab.id));
-        assert_eq!(workspace.active(), (keeper.id, keeper_tab.id));
+        assert_eq!(workspace.active(), (last_row.id, last_row_tab.id));
 
         // A stale confirm settles as a silent dismiss, never as an error.
         assert_eq!(
