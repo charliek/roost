@@ -2673,6 +2673,45 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Where the sidebar lands after the shown project was deleted.
+    /// The workspace already chose, in the very commit that produced
+    /// this event, and its `.active` is right behind it — so read that
+    /// answer rather than picking a second one the user would see the
+    /// window swing through. The neighbour walk below is only for the
+    /// case where the workspace named nothing (its selection was
+    /// elsewhere, so no `.active` is coming), and it applies the same
+    /// rule the workspace does. `departedIndex` is where the deleted row
+    /// sat in `projects`, so after the removal `departedIndex - 1` is the
+    /// row above it and `departedIndex` the row below.
+    @MainActor
+    private func fallbackProjectAfterDelete(departedIndex: Int?) -> Int64? {
+        let named = RoostBackend.shared.workspace?.activeProjectID ?? 0
+        if named != 0, projects.contains(where: { $0.id == named }) {
+            return named
+        }
+        guard let departedIndex else { return projects.first?.id }
+        let above = projects.indices.contains(departedIndex - 1) ? departedIndex - 1 : nil
+        let below = projects.indices.contains(departedIndex) ? departedIndex : nil
+        return (above ?? below).map { projects[$0].id }
+    }
+
+    /// Where the tab strip lands after the shown tab closed, in the
+    /// project that survived it. Same contract as
+    /// `fallbackProjectAfterDelete`: follow the workspace's answer, and
+    /// only walk when it named nothing this strip can show. `remaining`
+    /// must be non-empty; after the removal the closed tab's own index
+    /// *is* its right-hand neighbour.
+    @MainActor
+    private func fallbackTabIndexAfterClose(
+        closedIndex: Int?,
+        remaining: [TabSession]
+    ) -> Int {
+        let named = RoostBackend.shared.workspace?.activeTabID ?? 0
+        if let idx = remaining.firstIndex(where: { $0.id == named }) { return idx }
+        guard let closedIndex else { return 0 }
+        return min(max(0, closedIndex), remaining.count - 1)
+    }
+
     /// Dispatch one event from the WatchEvents stream. Anything not
     /// surfaced visually in M1 is logged and dropped — later
     /// milestones (M3 tab strip, Phase 6b notifications) light up
@@ -2702,12 +2741,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             }
         case .projectDeleted(let e):
             let wasActive = activeProjectID == e.projectID
+            // Where the departed row sat, captured before the removal
+            // erases it: the fall-back below needs its neighbours.
+            let departedIndex = projects.firstIndex { $0.id == e.projectID }
             removeProjectLocally(id: e.projectID)
             rebuildSidebar()
             if wasActive {
                 activeProjectID = nil
-                if let next = projects.first {
-                    selectProject(id: next.id)
+                if let next = fallbackProjectAfterDelete(departedIndex: departedIndex) {
+                    selectProject(id: next)
                 }
                 // The empty-workspace close path is hoisted below so
                 // it also runs for the `deleteProjectFromMenu` flow,
@@ -2743,6 +2785,11 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             refreshDockBadge()
             let projectID = session.projectID
             let wasActive = activeSessionByProject[projectID] === session
+            // Where the departed pill sat, captured before the removal
+            // erases it: the fall-back below needs its neighbours.
+            let closedIndex = tabs
+                .filter { $0.projectID == projectID }
+                .firstIndex { $0 === session }
             // Round-3 R5: cancel any in-progress inline rename on the
             // condemned pill before dropping the cached view. The
             // edit's first responder is the pill's NSTextField — if
@@ -2776,7 +2823,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 if wasActive {
                     let remaining = tabsForActiveProject()
                     if !remaining.isEmpty {
-                        selectTab(at: 0)
+                        selectTab(
+                            at: fallbackTabIndexAfterClose(
+                                closedIndex: closedIndex,
+                                remaining: remaining
+                            )
+                        )
                     }
                 }
             }
@@ -3389,11 +3441,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             await deleteProject(socketPath: socketPath, projectID: id)
             await MainActor.run { [weak self] in
                 guard let self else { return }
+                let departedIndex = self.projects.firstIndex { $0.id == id }
                 self.projects.removeAll { $0.id == id }
                 self.rebuildSidebar()
                 if self.activeProjectID == id {
-                    if let next = self.projects.first {
-                        self.selectProject(id: next.id)
+                    if let next = self.fallbackProjectAfterDelete(departedIndex: departedIndex) {
+                        self.selectProject(id: next)
                     } else {
                         self.activeProjectID = nil
                         self.rebuildTabBar()
