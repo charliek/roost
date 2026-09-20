@@ -2517,9 +2517,30 @@ def attached(roost: Roost, tab: int) -> None:
     terminal for. `tab.dump_resolved` reads the window's own terminal and
     nothing else.
     """
-    key = slot_key(roost, tab)
-    assert key is not None, roost.sidebar_dump()
-    roost.call("tab.dump_resolved", {"tab_id": key})
+    assert slot_key(roost, tab) is not None, roost.sidebar_dump()
+
+    # NOT merely "the resolved dump succeeds": `host_focus_tab` creates
+    # the client terminal *before* the attachment it starts has streamed
+    # anything, so that alone passes over a pane that is still blank —
+    # which is the very thing this is supposed to rule out. Put a token
+    # through the shell and wait for it to come back through this
+    # window's own terminal.
+    token = f"attached-{uuid.uuid4().hex[:8]}"
+    roost.run(tab, f"printf '{token}'")
+
+    def streamed() -> bool:
+        try:
+            return token in mirrored(roost, tab)
+        except RoostError:
+            # No client terminal yet: the answer is "not streaming", not
+            # an error — the wait below is what decides.
+            return False
+
+    wait_until(
+        streamed,
+        scaled_timeout(30.0),
+        f"the landed tab to stream {token} into this window's terminal",
+    )
 
 
 def never_attached(roost: Roost, tab: int) -> None:

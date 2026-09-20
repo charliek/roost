@@ -94,6 +94,16 @@ pub fn pick(before: &[RingSection], after: &[RingSection], was: Selection) -> Op
     {
         return Some(Landing::Tab(TabKey::new(was.project.host, *tab)));
     }
+    // Nothing the memo knew about survived, but the project did, and it
+    // has tabs: they are all younger than the memo — another client
+    // opened one while this window was looking at a row that then
+    // closed, and both landed in one batch. The strip has no order to
+    // walk here, so take its first: staying in the project the window
+    // was in beats walking out of it, and anything beats the blank pane
+    // that answering "gone" would leave over a live tab.
+    if let Some(tab) = project_tabs(after, was.project).and_then(<[i64]>::first) {
+        return Some(Landing::Tab(TabKey::new(was.project.host, *tab)));
+    }
     // The project has nothing left to show, so it is the project that
     // went away as far as the window is concerned — rule 2.
     let rows = flattened(before);
@@ -274,6 +284,18 @@ mod tests {
     fn case_1_a_closed_tab_lands_on_its_right_hand_neighbour() {
         let after = slot(&[(P1, &[1, 3]), (P2, &[4]), (P3, &[5, 6])]);
         assert_eq!(pick(&three_projects(), &after, showing(P1, 2)), tab(3));
+    }
+
+    #[test]
+    fn a_sibling_opened_since_the_memo_is_still_somewhere_to_land() {
+        // One batch carries both another client's `tab.open` and the
+        // close of the only tab this window knew about, so every
+        // surviving tab is younger than the memo. Walking out of a
+        // project that is right there with a live tab would answer
+        // `Clear` — the blank window this whole rule exists to remove.
+        let before = slot(&[(P1, &[1])]);
+        let after = slot(&[(P1, &[7])]);
+        assert_eq!(pick(&before, &after, showing(P1, 1)), tab(7));
     }
 
     #[test]
