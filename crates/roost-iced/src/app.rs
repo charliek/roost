@@ -1581,6 +1581,13 @@ fn band_owns_local_strip(section: &host_sidebar::Section) -> bool {
     section.role == host_sidebar::SectionRole::Local
 }
 
+fn ring_project(project: &Project) -> host_sidebar::RingProject {
+    host_sidebar::RingProject {
+        id: project.id,
+        tabs: project.tabs.iter().map(|tab| tab.id).collect(),
+    }
+}
+
 fn ring_sections_from(
     sections: &[host_sidebar::Section],
     local: &host_sidebar::RingSection,
@@ -1603,9 +1610,10 @@ fn ring_sections_from(
                 .iter()
                 .find(|view| view.saved_id == saved_id)
                 .map(|view| host_sidebar::RingSection {
+                    saved_id: Some(view.saved_id.clone()),
                     host: view.host,
                     navigable: view.state.interactive(),
-                    projects: view.projects.iter().map(|row| row.id).collect(),
+                    projects: view.projects.iter().map(ring_project).collect(),
                 })
         })
         .collect()
@@ -6489,14 +6497,10 @@ impl App {
         // it did then. A host's rows have no such source — its mirror is
         // the only copy there is.
         let local = host_sidebar::RingSection {
+            saved_id: None,
             host: self.backend.host(),
             navigable: true,
-            projects: self
-                .workspace
-                .snapshot()
-                .iter()
-                .map(|project| project.id)
-                .collect(),
+            projects: self.workspace.snapshot().iter().map(ring_project).collect(),
         };
         if self.host_sections.is_empty() {
             return vec![local];
@@ -10029,9 +10033,10 @@ mod tests {
 
         let local_ring = |projects: &[Project]| {
             vec![host_sidebar::RingSection {
+                saved_id: None,
                 host: HostId::LOCAL,
                 navigable: true,
-                projects: projects.iter().map(|project| project.id).collect(),
+                projects: projects.iter().map(ring_project).collect(),
             }]
         };
         let at = |sections: &[host_sidebar::RingSection], index: u8| {
@@ -10383,16 +10388,21 @@ mod tests {
             })
             .collect();
         let local = RingSection {
+            saved_id: None,
             host: HostId::LOCAL,
             navigable: true,
-            projects: vec![1, 2],
+            projects: vec![
+                ring_project(&empty_project(1)),
+                ring_project(&empty_project(2)),
+            ],
         };
         let ring =
             |sections: &[host_sidebar::Section]| ring_sections_from(sections, &local, &views);
         let host_ring = |index: usize| RingSection {
+            saved_id: Some(views[index].saved_id.clone()),
             host: views[index].host,
             navigable: views[index].state.interactive(),
-            projects: views[index].projects.iter().map(|p| p.id).collect(),
+            projects: views[index].projects.iter().map(ring_project).collect(),
         };
 
         // In-process: LOCAL then the registry, which is what this

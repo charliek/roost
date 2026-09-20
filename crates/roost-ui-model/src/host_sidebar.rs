@@ -471,14 +471,34 @@ pub fn agent_rollup(count: usize) -> Option<String> {
     }
 }
 
+/// One project row of a [`RingSection`], with the tabs its strip draws.
+///
+/// The tabs are carried because a row with none cannot be selected onto:
+/// landing there would show a project over a blank pane, which is the
+/// bug [`crate::selection_fallback`] exists to avoid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RingProject {
+    pub id: i64,
+    /// The project's tab ids in strip order.
+    pub tabs: Vec<i64>,
+}
+
 /// One section's projects, as the navigation ring sees them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RingSection {
+    /// The saved host this band renders — the band's **stable** identity,
+    /// unchanged across a reconnect. `None` is the in-process local band.
+    ///
+    /// Carried beside `host`, which is the *incarnation*: reconnecting a
+    /// host mints a fresh [`HostId`], so `host` alone cannot tell "this
+    /// band was replaced" from "this band was removed"
+    /// ([`crate::selection_fallback`] is the one caller that must).
+    pub saved_id: Option<String>,
     pub host: HostId,
     /// A disconnected section is listed but never traversed.
     pub navigable: bool,
-    /// The section's project ids in sidebar order.
-    pub projects: Vec<i64>,
+    /// The section's project rows in sidebar order.
+    pub projects: Vec<RingProject>,
 }
 
 /// Every project the sidebar lists top to bottom, skipping the sections
@@ -498,7 +518,7 @@ fn ring_iter(sections: &[RingSection]) -> impl Iterator<Item = ProjectKey> + '_ 
             section
                 .projects
                 .iter()
-                .map(|project| ProjectKey::new(section.host, *project))
+                .map(|project| ProjectKey::new(section.host, project.id))
         })
 }
 
@@ -1152,21 +1172,32 @@ mod tests {
     }
 
     fn a_ring() -> Vec<RingSection> {
+        let rows = |ids: &[i64]| -> Vec<RingProject> {
+            ids.iter()
+                .map(|id| RingProject {
+                    id: *id,
+                    tabs: vec![id * 100],
+                })
+                .collect()
+        };
         vec![
             RingSection {
+                saved_id: None,
                 host: HostId::LOCAL,
                 navigable: true,
-                projects: vec![1, 2],
+                projects: rows(&[1, 2]),
             },
             RingSection {
+                saved_id: Some("hs-four".to_string()),
                 host: HostId::new(4),
                 navigable: false,
-                projects: vec![7, 8],
+                projects: rows(&[7, 8]),
             },
             RingSection {
+                saved_id: Some("hs-five".to_string()),
                 host: HostId::new(5),
                 navigable: true,
-                projects: vec![3],
+                projects: rows(&[3]),
             },
         ]
     }
