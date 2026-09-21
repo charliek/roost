@@ -48,7 +48,10 @@ runs `./mac/scripts/bundle.sh debug` — SwiftPM is incremental, so a no-op
 rebuild is cheap — and logs the bundle binary's mtime against the newest
 `mac/` source mtime, warning `stale Roost.app: sources are newer than the
 bundle` when the bundle is older. Set `ROOST_MAC_NO_BUNDLE=1` to skip the
-rebuild (still logs/warns); it errors if no bundle exists yet.
+rebuild (still logs/warns); it errors if no bundle exists yet. The harness
+refuses to rebuild over a Developer-ID-signed bundle — that is a release
+artifact, and `bundle.sh debug` would replace it with an ad-hoc debug build
+at the same path; set the opt-out to test it as it is.
 
 ## Layout
 
