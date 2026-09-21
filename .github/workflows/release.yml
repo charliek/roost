@@ -566,6 +566,12 @@ jobs:
           # exercised identically (test-only ops unlocked). --roost-fresh
           # owns a hermetic instance with an isolated, throwaway state dir.
           ROOST_TEST_MODE: "1"
+          # The harness otherwise runs `bundle.sh debug` before it launches
+          # (#493), which overwrites the release bundle this step exists to
+          # validate with a debug, AD-HOC-signed one at the same path — and
+          # notarization then refuses every binary in it for the two things
+          # ad-hoc signing lacks, a Developer ID cert and a secure timestamp.
+          ROOST_MAC_NO_BUNDLE: "1"
         # The marker expression: this step validates the Mac BUNDLE, and
         # neither daemon lane drives a bundle at all — collecting them
         # would only make the first case `cargo build roost-session`
@@ -577,6 +583,26 @@ jobs:
           uv run --group test pytest tools/roosttest
           -m 'not session_daemon and not host_client'
           --roost-target mac --roost-fresh -v
+
+      # Cheap, local proof that what we are about to submit still carries
+      # the Developer ID signature the bundle step applied. A step between
+      # the two that rewrites the bundle (#493 did exactly that) otherwise
+      # surfaces only as an opaque notary rejection minutes later.
+      - name: Assert the app still carries its Developer ID signature
+        if: env.CAN_NOTARIZE == 'true'
+        run: |
+          set -euo pipefail
+          authority="$(codesign -dvv "mac/build/Roost.app" 2>&1 \
+            | awk -F'=' '/^Authority=/ { print $2; exit }')"
+          case "${authority}" in
+            "Developer ID Application:"*)
+              echo "OK: mac/build/Roost.app signed by '${authority}'"
+              ;;
+            *)
+              echo "::error::mac/build/Roost.app is signed by '${authority:-nothing}', not a Developer ID Application certificate — a step after the bundle must have re-signed it. Notarization would reject every binary inside."
+              exit 1
+              ;;
+          esac
 
       # After E2E, before the DMG (#405): after so a bad build doesn't spend
       # an Apple submission on a bundle E2E is about to reject; before Make
@@ -936,6 +962,26 @@ jobs:
           tools/roosttest/test_smoke.py
           tools/roosttest/test_sparkle.py
           --roost-target iced --roost-fresh -v
+
+      # Cheap, local proof that what we are about to submit still carries
+      # the Developer ID signature the bundle step applied. A step between
+      # the two that rewrites the bundle (#493 did exactly that) otherwise
+      # surfaces only as an opaque notary rejection minutes later.
+      - name: Assert the app still carries its Developer ID signature
+        if: env.CAN_NOTARIZE == 'true'
+        run: |
+          set -euo pipefail
+          authority="$(codesign -dvv "mac/build/Roost-Iced.app" 2>&1 \
+            | awk -F'=' '/^Authority=/ { print $2; exit }')"
+          case "${authority}" in
+            "Developer ID Application:"*)
+              echo "OK: mac/build/Roost-Iced.app signed by '${authority}'"
+              ;;
+            *)
+              echo "::error::mac/build/Roost-Iced.app is signed by '${authority:-nothing}', not a Developer ID Application certificate — a step after the bundle must have re-signed it. Notarization would reject every binary inside."
+              exit 1
+              ;;
+          esac
 
       # See the `mac` job's twin step (#405): same reasoning, same position
       # (after E2E, before the DMG).
