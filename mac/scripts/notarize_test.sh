@@ -67,6 +67,17 @@ cat > "${bin_dir}/xcrun" <<'EOF'
 } >> "${NOTARIZE_TEST_LOG}"
 case "$1" in
   notarytool)
+    # Real `notarytool submit --wait` reports the verdict in its OUTPUT,
+    # not its exit status, so the shim has to speak that shape or the
+    # script's verdict check has nothing to read.
+    if [ "$2" = "submit" ]; then
+      echo "Submission ID received"
+      echo "  id: 00000000-0000-0000-0000-00000000cafe"
+      echo "Current status: In Progress..."
+      echo "Current status: ${FAKE_NOTARY_STATUS:-Accepted}.....Processing complete"
+      echo "  id: 00000000-0000-0000-0000-00000000cafe"
+      echo "  status: ${FAKE_NOTARY_STATUS:-Accepted}"
+    fi
     exit "${FAKE_NOTARYTOOL_EXIT:-0}"
     ;;
   stapler)
@@ -93,6 +104,7 @@ unset APPLE_ID APPLE_TEAM_ID APPLE_APP_SPECIFIC_PASSWORD 2>/dev/null || true
 reset_log() {
   : > "${log}"
   unset FAKE_DITTO_EXIT FAKE_NOTARYTOOL_EXIT FAKE_STAPLE_EXIT FAKE_VALIDATE_EXIT
+  unset FAKE_NOTARY_STATUS
 }
 
 # Rebuild the old single-line "cmd arg1 arg2 …" shape from an @@CALL/@@END
@@ -354,6 +366,36 @@ validate_line7="$(grep '^xcrun stapler validate ' <<< "${flat7}" | head -1)"
 [ "${validate_line7}" = "xcrun stapler validate ${dmg1}" ] \
   || fail "DMG form: stapler validate target was '${validate_line7}', expected the dmg '${dmg1}'"
 pass "DMG form submits/staples/validates the DMG path itself, with no ditto"
+
+# ---------------------------------------------------------------------
+# Case 8b: Apple answers Invalid. `notarytool submit --wait` still exits 0,
+# so the verdict has to be read out of its output — the run that found this
+# walked on to `stapler`, which failed with a bare "Record not found" and
+# exit 65 while Apple's actual reason stayed unfetched.
+# ---------------------------------------------------------------------
+for form in app dmg; do
+  reset_log
+  export FAKE_NOTARY_STATUS="Invalid"
+  if [ "${form}" = "app" ]; then
+    target="${work_dir}/Roost-invalid.app"
+    mkdir -p "${target}/Contents"
+    "${NOTARIZE_SCRIPT}" --app "${target}" >/dev/null 2>&1 \
+      && fail "Invalid verdict (--app): expected a non-zero exit"
+  else
+    target="${work_dir}/Roost-invalid.dmg"
+    : > "${target}"
+    "${NOTARIZE_SCRIPT}" "${target}" >/dev/null 2>&1 \
+      && fail "Invalid verdict (dmg): expected a non-zero exit"
+  fi
+  unset FAKE_NOTARY_STATUS
+
+  flat_invalid="$(flatten_log "${log}")"
+  grep -q '^xcrun notarytool log 00000000-0000-0000-0000-00000000cafe ' <<< "${flat_invalid}" \
+    || fail "Invalid verdict (${form}): Apple's reasons were never fetched (no notarytool log call)"
+  grep -q '^xcrun stapler ' <<< "${flat_invalid}" \
+    && fail "Invalid verdict (${form}): stapled a bundle Apple rejected"
+done
+pass "an Invalid verdict fetches Apple's log and stops before stapling, both forms"
 
 # ---------------------------------------------------------------------
 # Case 8: no credentials — both forms exit 0 and issue no xcrun/ditto.

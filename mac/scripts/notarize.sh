@@ -48,32 +48,65 @@ else
   exit 0
 fi
 
-if [ "${MODE}" = "app" ]; then
-  # BSD `mktemp` only substitutes the X's when they END the template, so a
-  # `roost-notarize-XXXXXX.zip` template produces that name *literally* on
-  # macOS — which is the only place this runs. Take the uniqueness from a
-  # directory, which BSD and GNU spell the same way, and put a plainly
-  # named zip inside it.
-  ZIP_DIR="$(mktemp -d)"
-  ZIP="${ZIP_DIR}/$(basename "${TARGET}").zip"
-  trap 'rm -rf "${ZIP_DIR}"' EXIT
+# One work dir for the whole run: the submission zip and notarytool's
+# captured output both live here, and one trap removes both.
+#
+# BSD `mktemp` only substitutes the X's when they END the template, so a
+# `roost-notarize-XXXXXX.zip` template produces that name *literally* on
+# macOS — which is the only place this runs. Take the uniqueness from a
+# directory, which BSD and GNU spell the same way, and put a plainly
+# named zip inside it.
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "${WORK_DIR}"' EXIT
 
+# `notarytool submit --wait` exits 0 even when Apple's verdict is Invalid —
+# the verdict is in its output, not its exit status. Left unchecked the run
+# walks on to `stapler`, which fails with a bare "Record not found" and
+# exit 65, hiding the actual reason behind a symptom. Read the verdict, and
+# on anything but Accepted print Apple's own issue list before stopping.
+submit_or_die() {
+  local archive="$1"
+  local out="${WORK_DIR}/notarytool-submit.out"
+  local rc id status
+
+  echo "==> notarytool submit (waits for Apple; usually a few minutes)…"
+  # tee, not command substitution, so a multi-minute wait still streams
+  # into the CI log instead of going silent until Apple answers.
+  set +e
+  xcrun notarytool submit "${archive}" "${AUTH[@]}" --wait 2>&1 | tee "${out}"
+  rc="${PIPESTATUS[0]}"
+  set -e
+
+  # The progress lines read `Current status: In Progress`, so anchoring on
+  # a line that STARTS with `status:` picks the final verdict only.
+  id="$(awk '/^[[:space:]]*id:/ { print $2; exit }' "${out}")"
+  status="$(awk '/^[[:space:]]*status:/ { s = $2 } END { print s }' "${out}")"
+
+  if [ "${rc}" -ne 0 ] || [ "${status}" != "Accepted" ]; then
+    if [ -n "${id}" ]; then
+      echo "==> notarytool log ${id} — Apple's own reasons:"
+      xcrun notarytool log "${id}" "${AUTH[@]}" || true
+    fi
+    echo "error: notarization failed for ${archive} (status=${status:-unknown}, notarytool exit ${rc})." >&2
+    exit 1
+  fi
+}
+
+staple_or_die() {
+  local bundle="$1"
+  echo "==> stapler staple"
+  xcrun stapler staple "${bundle}"
+  xcrun stapler validate "${bundle}"
+  echo "==> Notarized + stapled: ${bundle}"
+}
+
+if [ "${MODE}" = "app" ]; then
+  ZIP="${WORK_DIR}/$(basename "${TARGET}").zip"
   echo "==> ditto: zipping ${TARGET} for submission…"
   ditto -c -k --keepParent "${TARGET}" "${ZIP}"
-
-  echo "==> notarytool submit (waits for Apple; usually a few minutes)…"
-  xcrun notarytool submit "${ZIP}" "${AUTH[@]}" --wait
-
-  echo "==> stapler staple"
-  xcrun stapler staple "${TARGET}"
-  xcrun stapler validate "${TARGET}"
-  echo "==> Notarized + stapled: ${TARGET}"
+  submit_or_die "${ZIP}"
 else
-  echo "==> notarytool submit (waits for Apple; usually a few minutes)…"
-  xcrun notarytool submit "${TARGET}" "${AUTH[@]}" --wait
-
-  echo "==> stapler staple"
-  xcrun stapler staple "${TARGET}"
-  xcrun stapler validate "${TARGET}"
-  echo "==> Notarized + stapled: ${TARGET}"
+  submit_or_die "${TARGET}"
 fi
+
+staple_or_die "${TARGET}"
