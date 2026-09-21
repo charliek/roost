@@ -73,6 +73,49 @@ class MacBundleStalenessTests(unittest.TestCase):
             ["./scripts/bundle.sh", "debug"], cwd=mac_dir, check=True
         )
 
+    def test_a_release_bundle_is_never_rebuilt_over(self) -> None:
+        base = time.time() - 100
+        app = _make_bundle(self._root, base)
+        mac_dir = _make_mac_dir(self._root, base)
+        runner = Mock()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ROOST_MAC_NO_BUNDLE", None)
+            with self.assertRaisesRegex(RuntimeError, "ROOST_MAC_NO_BUNDLE=1"):
+                ui._ensure_mac_bundle(
+                    app,
+                    mac_dir,
+                    runner=runner,
+                    signing_authority=lambda _app: "Developer ID Application: X (TEAM)",
+                )
+        runner.assert_not_called()
+
+    def test_an_ad_hoc_bundle_is_rebuilt_as_before(self) -> None:
+        base = time.time() - 100
+        app = _make_bundle(self._root, base)
+        mac_dir = _make_mac_dir(self._root, base)
+        runner = Mock()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ROOST_MAC_NO_BUNDLE", None)
+            ui._ensure_mac_bundle(
+                app, mac_dir, runner=runner, signing_authority=lambda _app: ""
+            )
+        runner.assert_called_once()
+
+    def test_opting_out_tests_a_release_bundle_as_it_is(self) -> None:
+        base = time.time() - 100
+        app = _make_bundle(self._root, base)
+        mac_dir = _make_mac_dir(self._root, base)
+        runner = Mock()
+        with patch.dict(os.environ, {"ROOST_MAC_NO_BUNDLE": "1"}):
+            with redirect_stderr(io.StringIO()):
+                ui._ensure_mac_bundle(
+                    app,
+                    mac_dir,
+                    runner=runner,
+                    signing_authority=lambda _app: "Developer ID Application: X (TEAM)",
+                )
+        runner.assert_not_called()
+
     def test_opt_out_skips_the_rebuild_runner(self) -> None:
         base = time.time() - 100
         app = _make_bundle(self._root, base)

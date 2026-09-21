@@ -892,19 +892,53 @@ def _warn_if_mac_bundle_stale(app: Path, mac_dir: Path) -> None:
         warnings.warn("stale Roost.app: sources are newer than the bundle", stacklevel=2)
 
 
-def _ensure_mac_bundle(app: Path, mac_dir: Path, *, runner=subprocess.run) -> None:
+def _mac_bundle_signing_authority(app: Path) -> str:
+    """The leaf `Authority=` of `app`'s code signature, or "" when there is
+    none to read (no bundle, ad-hoc signed, or no `codesign` on this box)."""
+    try:
+        out = subprocess.run(
+            ["codesign", "-dvv", str(app)], capture_output=True, text=True, check=False
+        ).stderr
+    except OSError:
+        return ""
+    for line in out.splitlines():
+        if line.startswith("Authority="):
+            return line.partition("=")[2]
+    return ""
+
+
+def _ensure_mac_bundle(
+    app: Path,
+    mac_dir: Path,
+    *,
+    runner=subprocess.run,
+    signing_authority=_mac_bundle_signing_authority,
+) -> None:
     """Rebuild `Roost.app` via `bundle.sh` unless `ROOST_MAC_NO_BUNDLE=1`
     (SwiftPM is incremental, so the default path is cheap on a no-op
     rebuild). At most once per process — see `_MAC_BUNDLED_ONCE` — so a
     mid-test relaunch reuses what the first launch already did. Either way,
     logs the bundle binary's mtime against the newest source mtime and
     warns when the bundle is older.
+
+    Refuses to rebuild over a Developer-ID-signed bundle. `bundle.sh debug`
+    writes to the same path and signs ad-hoc, so rebuilding there silently
+    swaps a release artifact for a debug one — v0.0.20's release notarized
+    exactly that and Apple refused every binary in it.
     """
     global _MAC_BUNDLED_ONCE
     if _MAC_BUNDLED_ONCE:
         return
     opted_out = os.environ.get("ROOST_MAC_NO_BUNDLE") == "1"
     if not opted_out:
+        authority = signing_authority(app)
+        if authority.startswith("Developer ID Application:"):
+            raise RuntimeError(
+                f"{app} is a release bundle (signed by '{authority}') and the "
+                "harness was about to overwrite it with `bundle.sh debug`. Set "
+                "ROOST_MAC_NO_BUNDLE=1 to test the bundle as it is, or remove "
+                "it to test a fresh debug build."
+            )
         runner(["./scripts/bundle.sh", "debug"], cwd=mac_dir, check=True)
     # The executable, not the directory: a partial bundle has the one
     # without the other, and nothing can launch or stat it.
