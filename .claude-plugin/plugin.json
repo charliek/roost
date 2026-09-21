@@ -1,6 +1,6 @@
 {
   "name": "roost",
-  "version": "0.0.19",
+  "version": "0.0.20",
   "description": "Guidance for driving Roost, the terminal multiplexer for coding agents, through roostctl: open project tabs, send input, read a tab's screen, wait on tab state, watch events, and notify the user.",
   "author": {
     "name": "Charlie Knudsen",
