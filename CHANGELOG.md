@@ -11,6 +11,17 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+## v0.0.20 — 2026-09-20
+
+_The agent-control release: `roostctl open`, `rpc`, `events`, `tab prompt`
+and `tab report` give an agent a first-class surface over the same op set
+the UI drives; five coding agents get the tab dot, and Roost asks before it
+wires their hooks. The wire is pinned by a checked-in JSON Schema
+(`roostctl schema`, no socket needed) and one source of every error code,
+the session protocol reaches its final generation-6 contract with
+`ROOST_LEASE` retired and `events.subscribe` resumable, and local tabs can
+now run on a `roost-session` you switch to and from while the app is up._
+
 ### Added
 
 - **iced: a toast when startup agent-hook setup leaves an agent unwired** —
