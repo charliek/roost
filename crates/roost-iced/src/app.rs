@@ -2132,7 +2132,7 @@ fn observe_quit_signal(handled: &AtomicBool) -> QuitSignalAction {
 /// through `observe_quit_signal`, before the caller can be interrupted.
 ///
 /// Failure to register is treated as fatal to startup, like every other
-/// fallible step in `bootstrap()` (`?` throughout) — this call is *the*
+/// fallible step in `App::start_engine` — this call is *the*
 /// safety net C7 adds; starting anyway and logging-and-continuing would
 /// silently ship the app back into the pre-C7 bare-kill behavior with no
 /// visible signal that the protection is missing. `signal()` registration
@@ -2856,6 +2856,23 @@ struct HostSelection {
     local_active: i64,
 }
 
+const BOOT_ABORT_DEADLINE: Duration = Duration::from_secs(2);
+
+/// What [`App::start_engine`] built, for `bootstrap` to move into `App`.
+struct StartedEngine {
+    workspace: Arc<Workspace>,
+    client: LocalClient,
+    backend_mode: LocalBackendMode,
+    pending_migration: Option<local_backend::MigrationSource>,
+    pending_dest_cleanup: Vec<(i64, Option<usize>)>,
+    feed_tx: EngineFeedSender,
+    feed_rx: EngineFeedReceiver,
+    local_route: Arc<LocalBackendCell>,
+    in_process_streams: Arc<roost_engine::ipc::InProcessStreams>,
+    switch_gate: Arc<tokio::sync::RwLock<()>>,
+    test_mode: bool,
+}
+
 impl App {
     pub fn bootstrap(profile: &BundleProfile, locks: InstanceLocks) -> Result<Self> {
         let config = RoostConfig::load_default();
@@ -2901,91 +2918,38 @@ impl App {
             .enable_all()
             .build()
             .context("build Iced engine runtime")?;
-        // Plan 063 §D5's ladder, step 1: an unfinished switch decides
-        // the mode before anything else is asked, because it is the one
-        // input that knows the key on disk may not describe reality.
-        let resumed = resume_switch_journal(profile, &runtime);
-        // Both disk questions are asked **before** `Workspace::open`,
-        // which is what creates the very `state.json` the fresh-install
-        // clause is about.
-        let backend_mode = match resumed.mode {
-            Some(mode) => mode,
-            None => resolve_local_backend(profile, &config),
-        };
-        let workspace = Arc::new(Workspace::open(profile.state_json_path()));
-        workspace.set_window_focused(true);
-        if backend_mode == LocalBackendMode::Session {
-            ensure_local_slot(&workspace);
-        }
         let supervisor = Arc::new(PtySupervisor::new());
-        let client = LocalClient::new(
-            Arc::clone(&workspace),
-            Arc::clone(&supervisor),
-            profile.socket_path.clone(),
-        );
-
-        // After `Workspace::open` (there is nothing to delete before
-        // it) and before the hydrate, which would otherwise warn about
-        // a populated in-process workspace this is about to empty.
-        finish_switch_source_deletion(&runtime, &client, profile, &resumed);
-
-        hydrate_workspace(&runtime, &client, backend_mode)?;
-        // Plan 063 §D5: a `session` launch over a populated in-process
-        // workspace is an absent migration. Read here, while the
-        // retained layout is still whole and before anything can open a
-        // tab into it; run once the slot connects
-        // (`arm_pending_migration`).
-        let pending_migration = match backend_mode {
-            LocalBackendMode::Session => local_backend::retained_migration(
-                &workspace.snapshot(),
-                workspace.retained_layout().as_ref(),
-            ),
-            LocalBackendMode::InProcess => None,
-        };
-
-        let (feed_tx, feed_rx) = engine_feed::channel();
-        // One feed, one arrival order across sources — see engine_feed.
-        runtime.spawn(engine_feed::pump_workspace_events(
-            Arc::clone(&workspace),
-            feed_tx.clone(),
-        ));
-        let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
-        runtime.spawn(engine_feed::pump_ui_requests(ui_rx, feed_tx.clone()));
-        spawn_quit_signals(&runtime, &feed_tx)?;
-        // Seeded before the socket is bound: a client that dials during
-        // the rest of bootstrap must never be told the wrong backend.
-        let local_route = Arc::new(LocalBackendCell::new(local_backend::route_snapshot(
+        // Every fallible step from here on lives in `start_engine`. A
+        // dropped runtime waits for its blocking PTY readers, which wait
+        // on shells nobody hung up — so an error hangs the shells up and
+        // abandons the runtime instead of dropping it.
+        let StartedEngine {
+            workspace,
+            client,
             backend_mode,
-            local_backend::SlotSelection::default(),
-            local_backend::SwitchState::Idle,
-        )));
-        let test_mode = std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1");
-        let handler = IpcHandler::new(
-            Arc::clone(&workspace),
-            Arc::clone(&supervisor),
-            profile.socket_path.clone(),
-            profile.app_label,
-            profile.app_id,
-        )
-        .with_ui(ui_tx)
-        .with_local_route(Arc::clone(&local_route))
-        .with_test_mode(test_mode);
-        let in_process_streams = handler.in_process_streams();
-        let switch_gate = handler.switch_gate();
-        let server = runtime
-            .block_on(IpcServer::bind(&profile.socket_path, handler))
-            .context("bind Iced IPC server")?;
-        runtime.spawn(async move {
-            if let Err(error) = server.run().await {
-                tracing::warn!(?error, "Iced IPC server stopped");
+            pending_migration,
+            pending_dest_cleanup,
+            feed_tx,
+            feed_rx,
+            local_route,
+            in_process_streams,
+            switch_gate,
+            test_mode,
+        } = match Self::start_engine(profile, &config, &runtime, &supervisor) {
+            Ok(engine) => engine,
+            Err(error) => {
+                runtime.block_on(supervisor.shutdown_all(BOOT_ABORT_DEADLINE));
+                runtime.shutdown_background();
+                return Err(error);
             }
-        });
+        };
 
         let mut app = Self {
             workspace,
             // The engine keeps its direct supervisor reference (the
-            // clones handed to `LocalClient` and `IpcHandler` above);
-            // only UI-side terminal ops route through the backend.
+            // clones handed to `LocalClient` and `IpcHandler` in
+            // `start_engine`); only UI-side terminal ops route through
+            // the backend.
             backend: TabBackend::in_process(supervisor, test_mode),
             client,
             tabs: HashMap::new(),
@@ -3032,7 +2996,7 @@ impl App {
             switch_gate,
             switch: None,
             pending_migration,
-            pending_dest_cleanup: resumed.delete_dest,
+            pending_dest_cleanup,
             switch_driving: false,
             switch_generation: 0,
             state_dir: profile.state_dir.clone(),
@@ -3127,6 +3091,107 @@ impl App {
         app.reconnect_saved_hosts();
         tracing::info!(socket = %profile.socket_path.display(), "Iced walking skeleton ready");
         Ok(app)
+    }
+
+    /// Everything fallible `bootstrap` does once the runtime exists.
+    fn start_engine(
+        profile: &BundleProfile,
+        config: &RoostConfig,
+        runtime: &tokio::runtime::Runtime,
+        supervisor: &Arc<PtySupervisor>,
+    ) -> Result<StartedEngine> {
+        // Plan 063 §D5's ladder, step 1: an unfinished switch decides
+        // the mode before anything else is asked, because it is the one
+        // input that knows the key on disk may not describe reality.
+        let resumed = resume_switch_journal(profile, runtime);
+        // Both disk questions are asked **before** `Workspace::open`,
+        // which is what creates the very `state.json` the fresh-install
+        // clause is about.
+        let backend_mode = match resumed.mode {
+            Some(mode) => mode,
+            None => resolve_local_backend(profile, config),
+        };
+        let workspace = Arc::new(Workspace::open(profile.state_json_path()));
+        workspace.set_window_focused(true);
+        if backend_mode == LocalBackendMode::Session {
+            ensure_local_slot(&workspace);
+        }
+        let client = LocalClient::new(
+            Arc::clone(&workspace),
+            Arc::clone(supervisor),
+            profile.socket_path.clone(),
+        );
+
+        // After `Workspace::open` (there is nothing to delete before
+        // it) and before the hydrate, which would otherwise warn about
+        // a populated in-process workspace this is about to empty.
+        finish_switch_source_deletion(runtime, &client, profile, &resumed);
+
+        hydrate_workspace(runtime, &client, backend_mode)?;
+        // Plan 063 §D5: a `session` launch over a populated in-process
+        // workspace is an absent migration. Read here, while the
+        // retained layout is still whole and before anything can open a
+        // tab into it; run once the slot connects
+        // (`arm_pending_migration`).
+        let pending_migration = match backend_mode {
+            LocalBackendMode::Session => local_backend::retained_migration(
+                &workspace.snapshot(),
+                workspace.retained_layout().as_ref(),
+            ),
+            LocalBackendMode::InProcess => None,
+        };
+
+        let (feed_tx, feed_rx) = engine_feed::channel();
+        // One feed, one arrival order across sources — see engine_feed.
+        runtime.spawn(engine_feed::pump_workspace_events(
+            Arc::clone(&workspace),
+            feed_tx.clone(),
+        ));
+        let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime.spawn(engine_feed::pump_ui_requests(ui_rx, feed_tx.clone()));
+        spawn_quit_signals(runtime, &feed_tx)?;
+        // Seeded before the socket is bound: a client that dials during
+        // the rest of bootstrap must never be told the wrong backend.
+        let local_route = Arc::new(LocalBackendCell::new(local_backend::route_snapshot(
+            backend_mode,
+            local_backend::SlotSelection::default(),
+            local_backend::SwitchState::Idle,
+        )));
+        let test_mode = std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1");
+        let handler = IpcHandler::new(
+            Arc::clone(&workspace),
+            Arc::clone(supervisor),
+            profile.socket_path.clone(),
+            profile.app_label,
+            profile.app_id,
+        )
+        .with_ui(ui_tx)
+        .with_local_route(Arc::clone(&local_route))
+        .with_test_mode(test_mode);
+        let in_process_streams = handler.in_process_streams();
+        let switch_gate = handler.switch_gate();
+        let server = runtime
+            .block_on(IpcServer::bind(&profile.socket_path, handler))
+            .context("bind Iced IPC server")?;
+        runtime.spawn(async move {
+            if let Err(error) = server.run().await {
+                tracing::warn!(?error, "Iced IPC server stopped");
+            }
+        });
+
+        Ok(StartedEngine {
+            workspace,
+            client,
+            backend_mode,
+            pending_migration,
+            pending_dest_cleanup: resumed.delete_dest,
+            feed_tx,
+            feed_rx,
+            local_route,
+            in_process_streams,
+            switch_gate,
+            test_mode,
+        })
     }
 
     /// Republish the local-backend route for the IPC handler to read.
