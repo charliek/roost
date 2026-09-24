@@ -257,8 +257,9 @@ test-mac:  ## swift test (Mac)
 test-harness:  ## Fast unit tests for target/path/capability harness wiring
 	python3 -m unittest discover -s tools/roosttest_unit -v
 
-test-linux-scripts:  ## Shell tests for linux/scripts/*.sh release-artifact helpers (no cargo/deb build needed)
+test-linux-scripts:  ## Shell tests for linux/scripts/*.sh release-artifact + CI helpers (no cargo/deb build needed)
 	./linux/scripts/stage-session-artifact_test.sh
+	./linux/scripts/ci-apt-install_test.sh
 
 test-mac-scripts:  ## Shell tests for mac/scripts/notarize.sh against fake ditto/xcrun shims (no macOS needed)
 	./mac/scripts/notarize_test.sh
