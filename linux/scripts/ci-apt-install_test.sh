@@ -155,6 +155,49 @@ assert_update_then_install libclang-dev
 pass "an empty ubuntu.sources or a comment-only sources.list does not count as the archive"
 
 # ---------------------------------------------------------------------
+# Case 2c: a deb822 stanza marked `Enabled: no` is not an active archive,
+# while a disabled stanza beside an enabled one still leaves the archive
+# active.
+# ---------------------------------------------------------------------
+sources_dir2c="${work_dir}/case2c/sources.list.d"
+sources_list2c="${work_dir}/case2c/sources.list"
+mkdir -p "${sources_dir2c}"
+printf 'Types: deb\nURIs: http://archive.ubuntu.com/ubuntu/\nSuites: noble\nComponents: main\nEnabled: no\n' \
+  > "${sources_dir2c}/ubuntu.sources"
+: > "${sources_list2c}"
+: > "${sources_dir2c}/some-ppa.list"
+
+reset_apt_log
+CI_APT_SOURCES_DIR="${sources_dir2c}" CI_APT_SOURCES_LIST="${sources_list2c}" \
+  "${INSTALL_SCRIPT}" libclang-dev > /dev/null 2>&1
+[ -e "${sources_dir2c}/some-ppa.list" ] || fail "case2c: some-ppa.list was removed though the only Ubuntu stanza is disabled"
+
+printf '\nTypes: deb\nURIs: http://security.ubuntu.com/ubuntu/\nSuites: noble-security\nComponents: main\n' \
+  >> "${sources_dir2c}/ubuntu.sources"
+reset_apt_log
+CI_APT_SOURCES_DIR="${sources_dir2c}" CI_APT_SOURCES_LIST="${sources_list2c}" \
+  "${INSTALL_SCRIPT}" libclang-dev > /dev/null
+[ ! -e "${sources_dir2c}/some-ppa.list" ] || fail "case2c: some-ppa.list was kept though an enabled Ubuntu stanza remains"
+assert_update_then_install libclang-dev
+for disabled in 'Enabled:no' 'Enabled: 0' 'Enabled: without' $'Enabled: no\r'; do
+  printf 'Types: deb\nURIs: http://archive.ubuntu.com/ubuntu/\nSuites: noble\nComponents: main\n%s\n' "${disabled}" \
+    > "${sources_dir2c}/ubuntu.sources"
+  : > "${sources_dir2c}/some-ppa.list"
+  reset_apt_log
+  CI_APT_SOURCES_DIR="${sources_dir2c}" CI_APT_SOURCES_LIST="${sources_list2c}" \
+    "${INSTALL_SCRIPT}" libclang-dev > /dev/null 2>&1
+  [ -e "${sources_dir2c}/some-ppa.list" ] || fail "case2c: '${disabled}' did not count as disabled"
+done
+
+printf 'Types: deb\nURIs:http://archive.ubuntu.com/ubuntu/\nSuites: noble\nComponents: main\n' \
+  > "${sources_dir2c}/ubuntu.sources"
+reset_apt_log
+CI_APT_SOURCES_DIR="${sources_dir2c}" CI_APT_SOURCES_LIST="${sources_list2c}" \
+  "${INSTALL_SCRIPT}" libclang-dev > /dev/null
+[ ! -e "${sources_dir2c}/some-ppa.list" ] || fail "case2c: a URIs field with no space after the colon did not count"
+pass "a stanza marked Enabled: no (any spelling apt reads as false) does not count as the archive; an enabled one does"
+
+# ---------------------------------------------------------------------
 # Case 3: prunes when only a non-empty sources.list is present
 # (pre-24.04 layout, panel correction 22).
 # ---------------------------------------------------------------------

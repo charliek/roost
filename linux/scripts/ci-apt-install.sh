@@ -36,10 +36,31 @@ sources_list="${CI_APT_SOURCES_LIST:-/etc/apt/sources.list}"
 
 # Safety: prune only when the Ubuntu archive is an active source in one of
 # the two layouts, so apt is never left with nothing to install from. An
-# empty ubuntu.sources or a comment-only sources.list (24.04's own stub
-# says the sources "have moved") does not count.
+# empty ubuntu.sources, a stanza marked `Enabled: no`, or a comment-only
+# sources.list (24.04's own stub says the sources "have moved") does not
+# count.
+enabled_deb822_stanza() {
+  [ -f "$1" ] || return 1
+  awk '
+    BEGIN { uris = 0; enabled = 1; found = 0 }
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { if (uris && enabled) found = 1; uris = 0; enabled = 1; next }
+    /^[^[:space:]]/ {
+      colon = index($0, ":")
+      if (colon == 0) next
+      key = tolower(substr($0, 1, colon - 1))
+      value = tolower(substr($0, colon + 1))
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      if (key == "uris") uris = 1
+      if (key == "enabled" && value ~ /^(no|false|without|off|disable|0)$/) enabled = 0
+    }
+    END { if (uris && enabled) found = 1; exit !found }
+  ' "$1"
+}
+
 ubuntu_archive_present=0
-if grep -qsE '^[[:space:]]*URIs:' "${sources_dir}/ubuntu.sources"; then
+if enabled_deb822_stanza "${sources_dir}/ubuntu.sources"; then
   ubuntu_archive_present=1
 elif grep -qsE '^[[:space:]]*deb[[:space:]]' "${sources_list}"; then
   ubuntu_archive_present=1
