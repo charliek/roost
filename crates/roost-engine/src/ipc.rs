@@ -3233,16 +3233,12 @@ async fn dispatch(
             encode(&result)
         }
         ops::TAB_OPEN => {
-            let p: TabOpenParams = decode(params)?;
+            let mut p: TabOpenParams = decode(params)?;
             let activate = p.activate != Some(false);
-            let project_id = if p.project_id == 0 {
-                h.workspace.ensure_default_project(&p.cwd, activate)
-            } else {
-                p.project_id
-            };
+            crate::application::resolve_open_target(&h.workspace, &h.supervisor, &mut p, activate);
             let tab = h
                 .workspace
-                .open_tab(project_id, &p.cwd, &p.title, activate)
+                .open_tab(p.project_id, &p.cwd, &p.title, activate)
                 .map_err(ws_err)?;
             // Spawn the PTY. Use the tab's cwd, the requested argv,
             // and a sensible default winsize when the caller doesn't
@@ -4387,9 +4383,11 @@ fn decode<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T,
         // `serde_json::Error::Display` already includes a useful
         // "missing field `foo` at line ..." form.
         let msg = e.to_string();
-        if msg.contains("unknown field") {
+        // Prefix, not substring: a custom error that echoes a param's
+        // value (`invalid int64 string: …`) must not pass for serde's own.
+        if msg.starts_with("unknown field") {
             HandlerError::new(codes::UNKNOWN_FIELD, msg)
-        } else if msg.contains("missing field") {
+        } else if msg.starts_with("missing field") {
             HandlerError::new(codes::MISSING_PARAM, msg)
         } else {
             HandlerError::invalid_param(msg)
@@ -4540,6 +4538,7 @@ fn parse_clipboard_op(s: &str) -> Result<ClipboardOp, HandlerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::HangUp;
     use roost_ipc::paths::BundleProfile;
     use std::collections::BTreeSet;
 
@@ -5050,17 +5049,18 @@ mod tests {
         );
     }
 
-    /// Hangs up every tab it holds when dropped, a failed assertion
-    /// included: the runtime otherwise waits out each child on the way
-    /// down.
-    struct HangUp(Arc<PtySupervisor>, Vec<i64>);
-
-    impl Drop for HangUp {
-        fn drop(&mut self) {
-            for tab in &self.1 {
-                self.0.close(*tab);
-            }
-        }
+    /// `tab.open` through the served arm with a parked child, recorded
+    /// for hang-up.
+    async fn open_parked(
+        h: &IpcHandler,
+        opened: &mut HangUp,
+        mut params: serde_json::Value,
+    ) -> roost_ipc::messages::Tab {
+        params["argv"] = serde_json::json!(["/bin/sh", "-c", "exec sleep 60"]);
+        let result = dispatch(h, ops::TAB_OPEN, params).await.expect("tab.open");
+        let TabOpenResult { tab } = serde_json::from_value(result).expect("a tab");
+        opened.1.push(tab.id);
+        tab
     }
 
     /// `tab.open`'s `activate` as the served arm reads it (#503): absent
@@ -5074,14 +5074,11 @@ mod tests {
             mut params: serde_json::Value,
             activate: Option<bool>,
         ) -> (roost_ipc::messages::Tab, bool) {
-            params["argv"] = serde_json::json!(["/bin/sh", "-c", "exec sleep 60"]);
             if let Some(activate) = activate {
                 params["activate"] = activate.into();
             }
             let mut events = h.workspace.subscribe();
-            let result = dispatch(h, ops::TAB_OPEN, params).await.expect("tab.open");
-            let TabOpenResult { tab } = serde_json::from_value(result).expect("a tab");
-            opened.1.push(tab.id);
+            let tab = open_parked(h, opened, params).await;
             let moved = std::iter::from_fn(|| events.try_recv().ok())
                 .any(|event| matches!(event, crate::WorkspaceEvent::ActiveChanged { .. }));
             (tab, moved)
@@ -5118,6 +5115,111 @@ mod tests {
         assert_eq!(bare.workspace.snapshot().len(), 1, "the default project");
         assert_eq!(bare.workspace.active(), (0, 0));
         assert!(!tab.is_active && !moved);
+    }
+
+    /// The fixture's project, plus a tab (no child) whose tracked cwd is
+    /// `<dir>/source`, which exists.
+    fn source_tab(h: &IpcHandler, dir: &Path) -> (i64, i64, String) {
+        let cwd = dir.join("source");
+        std::fs::create_dir(&cwd).unwrap();
+        let cwd = cwd.to_string_lossy().into_owned();
+        let project = h.workspace.snapshot()[0].id;
+        let source = h.workspace.open_tab(project, &cwd, "src", false).unwrap();
+        (project, source.id, cwd)
+    }
+
+    /// A resolved `cwd_from_tab` replaces the request's `cwd`, and the
+    /// result's row is where the new tab really started.
+    #[tokio::test]
+    async fn tab_open_cwd_from_tab_beats_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path());
+        let mut opened = HangUp(h.supervisor.clone(), Vec::new());
+        let (project, source, source_cwd) = source_tab(&h, dir.path());
+
+        let params = serde_json::json!({
+            "project_id": project.to_string(),
+            "cwd": "/",
+            "cwd_from_tab": source.to_string(),
+        });
+        let tab = open_parked(&h, &mut opened, params).await;
+        assert_eq!(tab.cwd, source_cwd);
+        assert_eq!(h.workspace.tab(tab.id).unwrap().cwd, source_cwd);
+    }
+
+    /// Nothing to inherit leaves the request as sent: no field, a tab
+    /// that does not exist (not an error), and a source whose cwd is not
+    /// a directory. An empty `cwd` then resolves the usual way.
+    #[tokio::test]
+    async fn tab_open_without_a_resolvable_source_keeps_the_requested_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path());
+        let mut opened = HangUp(h.supervisor.clone(), Vec::new());
+        let project = h.workspace.snapshot()[0].id;
+        let gone = h
+            .workspace
+            .open_tab(project, "/no/such/dir", "gone", false)
+            .unwrap()
+            .id;
+
+        for source in [None, Some(424_242), Some(gone)] {
+            let mut params = serde_json::json!({"project_id": project.to_string(), "cwd": "/"});
+            if let Some(source) = source {
+                params["cwd_from_tab"] = source.to_string().into();
+            }
+            let tab = open_parked(&h, &mut opened, params).await;
+            assert_eq!(tab.cwd, "/", "{source:?}");
+        }
+
+        let params = serde_json::json!({
+            "project_id": project.to_string(),
+            "cwd_from_tab": "424242",
+        });
+        let tab = open_parked(&h, &mut opened, params).await;
+        assert_eq!(tab.cwd, "/tmp", "the project's cwd, as for any empty cwd");
+    }
+
+    #[tokio::test]
+    async fn tab_open_project_zero_carries_the_resolved_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path());
+        let mut opened = HangUp(h.supervisor.clone(), Vec::new());
+        let (project, source, source_cwd) = source_tab(&h, dir.path());
+
+        let params = serde_json::json!({
+            "project_id": "0",
+            "cwd_from_tab": source.to_string(),
+        });
+        let tab = open_parked(&h, &mut opened, params).await;
+        assert_eq!(tab.project_id, project);
+        assert_eq!(tab.cwd, source_cwd);
+    }
+
+    /// A malformed `cwd_from_tab` is `invalid-param`, refused before
+    /// anything is opened.
+    #[tokio::test]
+    async fn tab_open_refuses_a_cwd_from_tab_that_is_not_an_int64_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path());
+        let project = h.workspace.snapshot()[0].id;
+        let before = h.workspace.snapshot()[0].tabs.len();
+        for bad in [
+            serde_json::json!(7),
+            serde_json::json!("seven"),
+            serde_json::json!("unknown field"),
+            serde_json::json!("missing field"),
+        ] {
+            let params = serde_json::json!({
+                "project_id": project.to_string(),
+                "argv": ["/bin/sh", "-c", "exit 0"],
+                "cwd_from_tab": bad,
+            });
+            let error = dispatch(&h, ops::TAB_OPEN, params)
+                .await
+                .expect_err("a malformed id is refused");
+            assert_eq!(error.code, codes::INVALID_PARAM, "{bad}: {error:?}");
+        }
+        assert_eq!(h.workspace.snapshot()[0].tabs.len(), before);
     }
 
     /// `project.create`'s twin, and the same assertion: nothing lands in

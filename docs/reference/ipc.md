@@ -449,6 +449,29 @@ Swift Mac app and servers that predate the field answer
 `unknown-field`. From the CLI: `--no-activate` on `tab open` and
 `open`.
 
+**`cwd_from_tab` (optional, plan 070).** Names a tab whose working
+directory the new tab starts in — the way ⌘T / Alt+T follows the
+active tab ([cwd tracking](../guides/cwd-tracking.md)). It is a
+string-wrapped id like every other (`"cwd_from_tab": "5"`); `null`
+means unset, and an unset field is not sent, so a request without it
+is the bytes it always was. The server resolves the tab's cwd
+**natively first** — read from the tab's *direct* PTY child, the
+process the tab spawned, so a `cd` inside a nested shell or tmux is not
+seen — and falls back to the tab's tracked (OSC 7) `cwd`. A candidate
+counts only if it is an existing directory on the server's own
+machine, so a directory since removed, or an OSC 7 path from across an
+`ssh` hop that does not exist here, falls through. A resolved cwd **replaces** `cwd`,
+including for `project_id: "0"`, where it is resolved before the
+default project is found or created.
+When nothing resolves — no such tab, or neither candidate is a
+directory — it is **not an error**: `cwd` is used as sent, and an
+empty one resolves through the usual chain above. The result's
+`tab.cwd` carries the cwd the tab was opened with. Served by the Rust
+endpoints: sessions and Roost-Iced's UI socket. The Swift Mac app's
+socket and servers that predate the field answer `unknown-field` — see
+[the compatibility matrix](ipc-compatibility.md#the-compatibility-matrix).
+No CLI flag yet.
+
 Response: `{"tab": <Tab>}`.
 
 ### `tab.close`
@@ -832,6 +855,14 @@ arrives as several PTY frames, and the ordering caveat above applies
 unchanged. Unlike the UI path this op is a **mutation** on a session —
 it writes into the authoritative terminal — so it answers
 `shutting-down` once `session.stop` has latched.
+
+On a session the reply means the bytes are **queued** on the tab task,
+not processed. Whatever they cause — a bell or OSC 52 `tab.effect`, a
+title or cwd change — commits afterwards on the tab task and shows up
+only on the event stream. A caller that needs one of those commits must
+wait for it there: it cannot assume the commit precedes the reply, or a
+later op issued right after — even a synchronous one such as
+`tab.set_title`.
 
 ### `tab.capture_pty_input` *(test-only — gated)*
 

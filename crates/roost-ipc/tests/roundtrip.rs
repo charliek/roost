@@ -42,20 +42,22 @@ fn tab_open_request_envelope_uses_string_ids() {
         rows: 30,
         title: "".into(),
         activate: None,
+        cwd_from_tab: None,
     };
     let json = serde_json::to_value(&params).unwrap();
     assert_eq!(json["project_id"], "17");
     assert_eq!(json["cols"], 120);
 }
 
-/// Both `tab.open` request vectors decode as the typed params and
-/// re-encode to their own params: the recorded one has no `activate` and
-/// keeps not having one (#503).
+/// Every `tab.open` request vector decodes as the typed params and
+/// re-encodes to its own params: an optional field a vector does not
+/// carry stays absent.
 #[test]
-fn tab_open_vectors_decode_with_and_without_activate() {
-    for (name, activate) in [
-        ("tab.open.request.json", None),
-        ("tab.open.activate-false.request.json", Some(false)),
+fn tab_open_vectors_decode_and_re_encode_to_themselves() {
+    for (name, activate, cwd_from_tab) in [
+        ("tab.open.request.json", None, None),
+        ("tab.open.activate-false.request.json", Some(false), None),
+        ("tab.open.cwd-from-tab.request.json", None, Some(5)),
     ] {
         let path = format!(
             "{}/../../tests/ipc-vectors/{name}",
@@ -66,6 +68,7 @@ fn tab_open_vectors_decode_with_and_without_activate() {
         assert_eq!(request.op, ops::TAB_OPEN, "{name}");
         let params: TabOpenParams = serde_json::from_value(request.params.clone()).expect(name);
         assert_eq!(params.activate, activate, "{name}");
+        assert_eq!(params.cwd_from_tab, cwd_from_tab, "{name}");
         assert_eq!(
             serde_json::to_value(&params).unwrap(),
             request.params,

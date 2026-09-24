@@ -2,9 +2,9 @@
 //!
 //! Two layers, because one enum value cannot serve both scopes:
 //! [`TabBackend`] is app-scoped (`App` holds one) and answers the
-//! questions asked before a terminal exists — attach, is this tab live,
-//! what is it running in; [`TabHandle`] is per-tab (`TerminalTab` holds
-//! one) and carries everything a live tab does to its backend.
+//! questions asked before a terminal exists — attach, is this tab live;
+//! [`TabHandle`] is per-tab (`TerminalTab` holds one) and carries
+//! everything a live tab does to its backend.
 //!
 //! Only the in-process backend exists today. HS-2 adds a `Host` variant
 //! whose attach is async and snapshot-driven, which is why attach is a
@@ -104,14 +104,6 @@ impl TabBackend {
     pub(super) fn is_live(&self, tab_id: i64) -> bool {
         match self {
             Self::InProcess(backend) => backend.supervisor.has(tab_id),
-        }
-    }
-
-    /// The working directory of the tab's foreground process, when the
-    /// backend can see it.
-    pub(super) fn foreground_cwd(&self, tab_id: i64) -> Option<String> {
-        match self {
-            Self::InProcess(backend) => backend.supervisor.foreground_cwd(tab_id),
         }
     }
 }
@@ -515,19 +507,11 @@ mod tests {
         supervisor.close(8_606);
     }
 
-    /// `is_live` and `foreground_cwd` answer for the backend's own
-    /// sessions and for nothing else.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn is_live_and_foreground_cwd_answer_for_the_backends_sessions() {
+    async fn is_live_answers_for_the_backends_sessions() {
         let (backend, handle, _feed, supervisor) = cat(8_607);
         assert!(backend.is_live(8_607));
         assert!(!backend.is_live(8_608), "an unknown tab is not live");
-        assert_eq!(backend.foreground_cwd(8_608), None);
-        assert_eq!(
-            backend.foreground_cwd(8_607),
-            supervisor.foreground_cwd(8_607),
-            "foreground_cwd is the supervisor's answer"
-        );
         drop(handle);
         supervisor.close(8_607);
         assert!(!backend.is_live(8_607), "a closed tab stops being live");

@@ -1406,6 +1406,7 @@ async fn run_on_ui(
                         rows,
                         title,
                         activate: no_activate.then_some(false),
+                        cwd_from_tab: None,
                     },
                 )
                 .await?;
@@ -1494,6 +1495,7 @@ async fn run_on_ui(
                         rows: 24,
                         title,
                         activate: no_activate.then_some(false),
+                        cwd_from_tab: None,
                     },
                 )
                 .await?;

@@ -2716,7 +2716,7 @@ async fn replay_onto_slot(
             let opened: Result<TabOpenResult, String> = super::host_call(
                 ops,
                 wire::TAB_OPEN,
-                super::host_tab_open_params(made.id, &cwd, &tab.title, &[]),
+                super::host_tab_open_params(made.id, &cwd, &tab.title, &[], None),
             )
             .await;
             let opened = match opened {
@@ -4619,17 +4619,27 @@ mod switch_tests {
     /// reach the "this one op failed" branches at all, since a *live*
     /// session refuses these ops only for reasons a test cannot
     /// manufacture on demand.
+    ///
+    /// The worker hands back the params of every `tab.open` it was sent,
+    /// once the replay has dropped its `HostOps`.
     fn fake_slot(
         refuse: impl Fn(&str, usize) -> bool + Send + 'static,
-    ) -> (crate::host_conn::HostOps, tokio::task::JoinHandle<()>) {
+    ) -> (
+        crate::host_conn::HostOps,
+        tokio::task::JoinHandle<Vec<serde_json::Value>>,
+    ) {
         use roost_ipc::messages::ops as wire;
 
         let (ops, mut rx) = crate::host_conn::HostOps::channel();
         let worker = tokio::spawn(async move {
             let mut next_id = 100_i64;
             let mut seen: HashMap<String, usize> = HashMap::new();
+            let mut opened = Vec::new();
             while let Some(intent) = rx.recv().await {
                 let op = intent.op.to_string();
+                if op == wire::TAB_OPEN {
+                    opened.push(intent.params.clone());
+                }
                 let index = {
                     let count = seen.entry(op.clone()).or_insert(0);
                     let index = *count;
@@ -4656,6 +4666,7 @@ mod switch_tests {
                 };
                 intent.answer(Ok(answer));
             }
+            opened
         });
         (ops, worker)
     }
@@ -4665,16 +4676,19 @@ mod switch_tests {
         refuse: impl Fn(&str, usize) -> bool + Send + 'static,
     ) -> ReplayOutcome {
         let dir = tempfile::tempdir().unwrap();
-        replay_journalled_at(&journal_path(dir.path()), snapshot, refuse).await
+        replay_journalled_at(&journal_path(dir.path()), snapshot, refuse)
+            .await
+            .0
     }
 
     /// The same replay with the journal somewhere the caller chose —
-    /// which is the only way to drive a journal write that *fails*.
+    /// which is the only way to drive a journal write that *fails* —
+    /// beside the params of every `tab.open` it sent.
     async fn replay_journalled_at(
         path: &Path,
         snapshot: Vec<SwitchProject>,
         refuse: impl Fn(&str, usize) -> bool + Send + 'static,
-    ) -> ReplayOutcome {
+    ) -> (ReplayOutcome, Vec<serde_json::Value>) {
         let home = tempfile::tempdir().unwrap();
         let (ops, worker) = fake_slot(refuse);
         let journal = SwitchJournal::new(SwitchDirection::ToSession, snapshot.clone());
@@ -4687,8 +4701,7 @@ mod switch_tests {
         )
         .await;
         drop(ops);
-        let _ = worker.await;
-        outcome
+        (outcome, worker.await.unwrap_or_default())
     }
 
     /// A journal path nothing can be written to, arranged by **creating**
@@ -4733,7 +4746,8 @@ mod switch_tests {
             replay_journalled_at(&an_unwritable_journal_path(dir.path()), snapshot, |_, _| {
                 false
             })
-            .await;
+            .await
+            .0;
 
         assert!(
             outcome.error.is_some(),
@@ -4831,6 +4845,25 @@ mod switch_tests {
         );
         assert!(!outcome.created[0].complete);
         assert!(deletable_sources(&outcome.created).is_empty());
+    }
+
+    /// Plan 070 §D2: the tab a replay copies ran on the other backend,
+    /// so the snapshot's own cwd is the whole answer.
+    #[tokio::test]
+    async fn a_replayed_tab_names_no_source_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = vec![source(11, &[("a", false), ("b", true)])];
+        let (outcome, opened) =
+            replay_journalled_at(&journal_path(dir.path()), snapshot, |_, _| false).await;
+
+        assert!(outcome.error.is_none(), "{outcome:?}");
+        assert_eq!(opened.len(), 2, "both tabs were replayed: {opened:?}");
+        for params in &opened {
+            assert!(
+                params.get("cwd_from_tab").is_none(),
+                "a replayed tab.open must not carry the key at all: {params}"
+            );
+        }
     }
 
     /// A project-level failure is different in kind: the tabs under it

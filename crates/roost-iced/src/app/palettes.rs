@@ -2271,7 +2271,7 @@ impl App {
             active_tab_id: (tab_id != 0).then_some(tab_id),
             active_project_id: (project_id != 0).then_some(project_id),
             active_cwd: if project_id != 0 {
-                self.launch_cwd(project_id)
+                self.launch_cwd()
             } else {
                 String::new()
             },

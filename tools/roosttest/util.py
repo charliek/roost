@@ -540,6 +540,33 @@ def run_printf_probe(
     )
 
 
+def press_new_tab(roost) -> None:
+    """⌘T, through the command palette's `new_tab` row: the same
+    `new_tab_dispatch` the keybind runs. `app.keybind_dispatch` drives
+    `paste` and nothing else."""
+    roost.palette_open("commands")
+    try:
+        roost.palette_activate("new_tab")
+    finally:
+        roost.palette_dismiss()
+
+
+def assert_opened_in(roost, tab_id: int, directory) -> None:
+    """Assert `tab_id` started in `directory` — by its row's `cwd`, and by
+    its own shell's `pwd -P`, since the row keeps the cwd it was asked
+    for even when the spawn fell back to `$HOME`."""
+    want = os.path.realpath(directory)
+    row = roost.tab(tab_id)
+    assert row is not None and os.path.realpath(row["cwd"]) == want, (row, want)
+    text = run_printf_probe(roost, tab_id, [("PWD", "$(pwd -P)")])
+    # The value runs from its `PWD=` row to the probe's own sentinel row,
+    # so a path that wraps at the grid's width still reads whole.
+    rows = [row.rstrip() for row in text.splitlines()]
+    start = max(i for i, row in enumerate(rows) if row.startswith("PWD=/"))
+    end = next(i for i in range(start + 1, len(rows)) if rows[i].startswith("roost_done="))
+    assert "".join(rows[start:end]) == f"PWD={want}", (want, text)
+
+
 def drain(roost, tab_id: int) -> bytes:
     """One-shot drain. Returns whatever bytes the UI has queued
     onto the input channel since the last drain — including empty

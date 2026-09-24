@@ -208,8 +208,7 @@ jobs:
       # under Xvfb.
       - name: Install Iced + build deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          sudo linux/scripts/ci-apt-install.sh \
             pkg-config \
             libclang-dev \
             fonts-noto-cjk \
@@ -1309,8 +1308,7 @@ jobs:
         run: |
           set -euo pipefail
           command -v xmllint >/dev/null || {
-            sudo apt-get update
-            sudo apt-get install -y libxml2-utils
+            sudo linux/scripts/ci-apt-install.sh libxml2-utils
           }
 
       - name: Mint release-bot App token
@@ -1444,8 +1442,7 @@ jobs:
         run: |
           set -euo pipefail
           command -v xmllint >/dev/null || {
-            sudo apt-get update
-            sudo apt-get install -y libxml2-utils
+            sudo linux/scripts/ci-apt-install.sh libxml2-utils
           }
 
       - name: Mint release-bot App token

@@ -2742,3 +2742,47 @@ def test_closing_a_background_tab_leaves_the_window_where_it_is(lane: Lane):
         "the window to drop the closed row",
     )
     assert selected(roost) == (project, middle)
+
+
+# ---------------------------------------------------------------------------
+# 10. Plan 070: a new tab opens where the shown tab is
+# ---------------------------------------------------------------------------
+
+
+def test_a_new_tab_opens_in_the_shown_tabs_own_cwd_without_osc7(lane: Lane):
+    """Plan 070 AC1 on the fresh-install default: ⌘T opens in the shown
+    tab's direct-child cwd, read natively. The child `cd`s and emits no
+    OSC 7, so the session's tracked cwd still names the directory the tab
+    was opened in."""
+    roost = session_ui(lane)
+    opened_in, moved_to = (
+        Path(tempfile.mkdtemp(prefix=prefix, dir=lane.env.launch_cwd))
+        for prefix in ("opened-", "moved-")
+    )
+    with lane.session() as c:
+        project = int(c.list()[0]["id"])
+        source = c.open_tab(
+            project,
+            cwd=str(opened_in),
+            argv=["/bin/sh", "-c", f"cd '{moved_to}' && echo READY && exec sleep 300"],
+        )
+        wait_until(
+            lambda: "READY" in c.dump_text(source),
+            30.0,
+            "the tab's child to cd",
+        )
+        assert c.tab(source)["cwd"] == str(opened_in), c.tab(source)
+    wait_until(
+        lambda: slot_key(roost, source),
+        30.0,
+        "the window to list the tab",
+    )
+    roost.focus(source)
+    lands_on(roost, project, source, "the window to show the tab")
+
+    with lane.session() as c:
+        before = set(session_tab_ids(lane))
+        util.press_new_tab(roost)
+        tab = util.spawned_tab_id(c, before, "the new tab to open on the session", timeout=30.0)
+
+        util.assert_opened_in(c, tab, moved_to)

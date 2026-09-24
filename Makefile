@@ -69,7 +69,7 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 .PHONY: test test-rust which-runner test-iced test-mac test-harness test-linux-scripts e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-session e2e-host-client e2e-host-client-ci e2e-host-ssh e2e-host-ssh-ci e2e-host-missing-daemon e2e-host-missing-daemon-ci e2e-host-local-spawn e2e-host-local-spawn-ci e2e-host-localhost e2e-host-localhost-ci e2e-local-backend e2e-local-backend-ci e2e-host-bootstrap e2e-host-bootstrap-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle smoke-iced smoke-mac visual-parity smoke-mac-launch test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
 
-ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_agent_lifecycle.py tools/roosttest/test_agent_hooks.py tools/roosttest/test_agent_hooks_dialog.py tools/roosttest/test_agent_palette.py tools/roosttest/test_doctor.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_palette_256.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py tools/roosttest/test_tab_dump_scrollback.py tools/roosttest/test_dock_badge.py tools/roosttest/test_menu_bar.py tools/roosttest/test_sparkle.py tools/roosttest/test_view_perf.py
+ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_agent_lifecycle.py tools/roosttest/test_agent_hooks.py tools/roosttest/test_agent_hooks_dialog.py tools/roosttest/test_agent_palette.py tools/roosttest/test_doctor.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_palette_256.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py tools/roosttest/test_tab_dump_scrollback.py tools/roosttest/test_dock_badge.py tools/roosttest/test_menu_bar.py tools/roosttest/test_sparkle.py tools/roosttest/test_view_perf.py tools/roosttest/test_boot_failure.py
 # `test_tab_dump_scrollback.py` needs no lane entry for Mac: `e2e-mac`
 # collects the whole `tools/roosttest` directory (minus the two daemon
 # markers), so a new UI-socket module runs on both required gates the
@@ -83,6 +83,9 @@ ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walkin
 # macOS AND the target is iced (the native menu bar + Dock badge are both
 # macOS-iced-only seams — plan 027 § 6b / plan 028 § 6d), so they cost a
 # skip line on the Linux lanes and run for real on the macOS ones.
+# `test_boot_failure.py` is the reverse: Linux-only, it self-skips on
+# macOS. It launches its own UI (one whose boot must fail) beside the
+# session's, so it shares the list without touching the shared instance.
 # `selection.*` reads UI state over IPC and never touches the host
 # pasteboard, so `test_selection.py` belongs in the list above and runs
 # under headless Wayland too. Only files that read/write the real
@@ -257,8 +260,9 @@ test-mac:  ## swift test (Mac)
 test-harness:  ## Fast unit tests for target/path/capability harness wiring
 	python3 -m unittest discover -s tools/roosttest_unit -v
 
-test-linux-scripts:  ## Shell tests for linux/scripts/*.sh release-artifact helpers (no cargo/deb build needed)
+test-linux-scripts:  ## Shell tests for linux/scripts/*.sh release-artifact + CI helpers (no cargo/deb build needed)
 	./linux/scripts/stage-session-artifact_test.sh
+	./linux/scripts/ci-apt-install_test.sh
 
 test-mac-scripts:  ## Shell tests for mac/scripts/notarize.sh against fake ditto/xcrun shims (no macOS needed)
 	./mac/scripts/notarize_test.sh

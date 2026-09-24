@@ -1179,10 +1179,16 @@ async fn host_call<T: serde::de::DeserializeOwned>(
     op: &'static str,
     params: serde_json::Value,
 ) -> Result<T, String> {
-    let value = ops
-        .call(op, params)
-        .await
-        .map_err(|error| format!("{op}: {error}"))?;
+    host_reply(op, ops.call(op, params).await)
+}
+
+/// [`host_call`]'s reading of a reply, for a caller that has to look at
+/// the typed error before it becomes a string.
+fn host_reply<T: serde::de::DeserializeOwned>(
+    op: &str,
+    reply: Result<serde_json::Value, crate::host_conn::HostOpError>,
+) -> Result<T, String> {
+    let value = reply.map_err(|error| format!("{op}: {error}"))?;
     serde_json::from_value(value).map_err(|error| format!("{op} answered unexpectedly: {error}"))
 }
 
@@ -1226,7 +1232,7 @@ async fn create_host_project_flow(ops: crate::host_conn::HostOps) -> Result<(i64
     let opened: Result<TabOpenResult, String> = host_call(
         &ops,
         wire::TAB_OPEN,
-        host_tab_open_params(project.id, &project.cwd, "", &[]),
+        host_tab_open_params(project.id, &project.cwd, "", &[], None),
     )
     .await;
     match opened {
@@ -1330,21 +1336,78 @@ async fn delete_host_project_flow(
     .await
 }
 
+/// Where a new tab on a host project starts (plan 070 §D2): the session
+/// resolves `cwd_from_tab` when it can, else the tab lands in `cwd`.
+#[derive(Debug, PartialEq, Eq)]
+struct HostTabOrigin {
+    cwd: String,
+    cwd_from_tab: Option<i64>,
+}
+
+/// [`HostTabOrigin`] for a new tab on `project`, off the window's
+/// selection and the project's mirror row.
+///
+/// Only a selection on the project's own connection is named: a tab on
+/// another host or on the local backend has an id from another id-space
+/// and a path that means nothing there, so it gets the project's cwd.
+///
+/// The mirror cwd rides as `cwd` because it is where a session older
+/// than `cwd_from_tab` lands on [`open_host_tab_flow`]'s retry.
+fn host_tab_origin(project: ProjectKey, selected: TabKey, row: Option<&Project>) -> HostTabOrigin {
+    let cwd_from_tab = (selected.host == project.host).then_some(selected.tab);
+    let cwd = row.map_or("", |row| match cwd_from_tab {
+        Some(tab) => listed_tab_cwd(row, tab),
+        None => &row.cwd,
+    });
+    HostTabOrigin {
+        cwd: cwd.to_string(),
+        cwd_from_tab,
+    }
+}
+
 /// Open one tab on a host, in an existing project.
+///
+/// Both attempts are fenced at the project's incarnation: the ids they
+/// name are rows of that connection, so a reconnect fails them
+/// `Disconnected` rather than landing on whatever the new one numbers
+/// the same.
+///
+/// A session older than `cwd_from_tab` refuses the request as
+/// `unknown-field` having created nothing (its arm decodes every param
+/// before it mutates), so that one refusal is asked once more without
+/// the field.
 async fn open_host_tab_flow(
     ops: crate::host_conn::HostOps,
-    project_id: i64,
-    cwd: String,
+    project: ProjectKey,
+    origin: HostTabOrigin,
     title: String,
     argv: Vec<String>,
 ) -> Result<i64, String> {
+    use crate::host_conn::HostOpError;
+    use roost_ipc::client::ServerCode;
     use roost_ipc::messages::{ops as wire, TabOpenResult};
-    let opened: TabOpenResult = host_call(
-        &ops,
-        wire::TAB_OPEN,
-        host_tab_open_params(project_id, &cwd, &title, &argv),
-    )
-    .await?;
+    let open = |cwd_from_tab| {
+        ops.call_at(
+            project.host,
+            wire::TAB_OPEN,
+            host_tab_open_params(project.project, &origin.cwd, &title, &argv, cwd_from_tab),
+        )
+    };
+    let reply = match open(origin.cwd_from_tab).await {
+        Err(HostOpError::Rejected {
+            code: ServerCode::UnknownField,
+            ..
+        }) if origin.cwd_from_tab.is_some() => {
+            tracing::info!(
+                %project,
+                cwd = %origin.cwd,
+                "the session predates tab.open's cwd_from_tab; asking again without it"
+            );
+            open(None).await
+        }
+        reply => reply,
+    };
+    let opened: TabOpenResult = host_reply(wire::TAB_OPEN, reply)?;
     Ok(opened.tab.id)
 }
 
@@ -1359,20 +1422,27 @@ async fn open_host_tab_flow(
 /// launcher row's command when one runs on a host — the same two fields
 /// `open_tab_flow` passes locally, so a launcher row does the same thing
 /// on the slot as it does in-process.
+///
+/// Built through `TabOpenParams` so an unset `cwd_from_tab` is absent:
+/// the request an older session accepts.
 fn host_tab_open_params(
     project_id: i64,
     cwd: &str,
     title: &str,
     argv: &[String],
+    cwd_from_tab: Option<i64>,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "project_id": project_id.to_string(),
-        "cwd": cwd,
-        "cols": u32::from(DEFAULT_COLS),
-        "rows": u32::from(DEFAULT_ROWS),
-        "title": title,
-        "argv": argv,
+    serde_json::to_value(roost_ipc::messages::TabOpenParams {
+        project_id,
+        cwd: cwd.to_string(),
+        argv: argv.to_vec(),
+        cols: u32::from(DEFAULT_COLS),
+        rows: u32::from(DEFAULT_ROWS),
+        title: title.to_string(),
+        activate: None,
+        cwd_from_tab,
     })
+    .expect("tab.open params serialize")
 }
 
 /// One clear on a host tab, as a queued intent **fenced at the
@@ -2132,7 +2202,7 @@ fn observe_quit_signal(handled: &AtomicBool) -> QuitSignalAction {
 /// through `observe_quit_signal`, before the caller can be interrupted.
 ///
 /// Failure to register is treated as fatal to startup, like every other
-/// fallible step in `bootstrap()` (`?` throughout) — this call is *the*
+/// fallible step in `App::start_engine` — this call is *the*
 /// safety net C7 adds; starting anyway and logging-and-continuing would
 /// silently ship the app back into the pre-C7 bare-kill behavior with no
 /// visible signal that the protection is missing. `signal()` registration
@@ -2289,6 +2359,17 @@ fn listed_project_of(view: &HostView, tab: TabKey) -> Option<ProjectKey> {
         .iter()
         .find(|project| project.tabs.iter().any(|row| row.id == tab.tab))?;
     Some(ProjectKey::new(tab.host, project.id))
+}
+
+/// Where a listed tab is: its own cwd once it has reported one, else its
+/// project's.
+fn listed_tab_cwd(row: &Project, tab: i64) -> &str {
+    row.tabs
+        .iter()
+        .find(|listed| listed.id == tab)
+        .map(|listed| listed.cwd.as_str())
+        .filter(|cwd| !cwd.is_empty())
+        .unwrap_or(&row.cwd)
 }
 
 /// Pure half of [`App::window_title`]: `project` is the active project's
@@ -2856,6 +2937,23 @@ struct HostSelection {
     local_active: i64,
 }
 
+const BOOT_ABORT_DEADLINE: Duration = Duration::from_secs(2);
+
+/// What [`App::start_engine`] built, for `bootstrap` to move into `App`.
+struct StartedEngine {
+    workspace: Arc<Workspace>,
+    client: LocalClient,
+    backend_mode: LocalBackendMode,
+    pending_migration: Option<local_backend::MigrationSource>,
+    pending_dest_cleanup: Vec<(i64, Option<usize>)>,
+    feed_tx: EngineFeedSender,
+    feed_rx: EngineFeedReceiver,
+    local_route: Arc<LocalBackendCell>,
+    in_process_streams: Arc<roost_engine::ipc::InProcessStreams>,
+    switch_gate: Arc<tokio::sync::RwLock<()>>,
+    test_mode: bool,
+}
+
 impl App {
     pub fn bootstrap(profile: &BundleProfile, locks: InstanceLocks) -> Result<Self> {
         let config = RoostConfig::load_default();
@@ -2901,91 +2999,38 @@ impl App {
             .enable_all()
             .build()
             .context("build Iced engine runtime")?;
-        // Plan 063 §D5's ladder, step 1: an unfinished switch decides
-        // the mode before anything else is asked, because it is the one
-        // input that knows the key on disk may not describe reality.
-        let resumed = resume_switch_journal(profile, &runtime);
-        // Both disk questions are asked **before** `Workspace::open`,
-        // which is what creates the very `state.json` the fresh-install
-        // clause is about.
-        let backend_mode = match resumed.mode {
-            Some(mode) => mode,
-            None => resolve_local_backend(profile, &config),
-        };
-        let workspace = Arc::new(Workspace::open(profile.state_json_path()));
-        workspace.set_window_focused(true);
-        if backend_mode == LocalBackendMode::Session {
-            ensure_local_slot(&workspace);
-        }
         let supervisor = Arc::new(PtySupervisor::new());
-        let client = LocalClient::new(
-            Arc::clone(&workspace),
-            Arc::clone(&supervisor),
-            profile.socket_path.clone(),
-        );
-
-        // After `Workspace::open` (there is nothing to delete before
-        // it) and before the hydrate, which would otherwise warn about
-        // a populated in-process workspace this is about to empty.
-        finish_switch_source_deletion(&runtime, &client, profile, &resumed);
-
-        hydrate_workspace(&runtime, &client, backend_mode)?;
-        // Plan 063 §D5: a `session` launch over a populated in-process
-        // workspace is an absent migration. Read here, while the
-        // retained layout is still whole and before anything can open a
-        // tab into it; run once the slot connects
-        // (`arm_pending_migration`).
-        let pending_migration = match backend_mode {
-            LocalBackendMode::Session => local_backend::retained_migration(
-                &workspace.snapshot(),
-                workspace.retained_layout().as_ref(),
-            ),
-            LocalBackendMode::InProcess => None,
-        };
-
-        let (feed_tx, feed_rx) = engine_feed::channel();
-        // One feed, one arrival order across sources — see engine_feed.
-        runtime.spawn(engine_feed::pump_workspace_events(
-            Arc::clone(&workspace),
-            feed_tx.clone(),
-        ));
-        let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
-        runtime.spawn(engine_feed::pump_ui_requests(ui_rx, feed_tx.clone()));
-        spawn_quit_signals(&runtime, &feed_tx)?;
-        // Seeded before the socket is bound: a client that dials during
-        // the rest of bootstrap must never be told the wrong backend.
-        let local_route = Arc::new(LocalBackendCell::new(local_backend::route_snapshot(
+        // Every fallible step from here on lives in `start_engine`. A
+        // dropped runtime waits for its blocking PTY readers, which wait
+        // on shells nobody hung up — so an error hangs the shells up and
+        // abandons the runtime instead of dropping it.
+        let StartedEngine {
+            workspace,
+            client,
             backend_mode,
-            local_backend::SlotSelection::default(),
-            local_backend::SwitchState::Idle,
-        )));
-        let test_mode = std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1");
-        let handler = IpcHandler::new(
-            Arc::clone(&workspace),
-            Arc::clone(&supervisor),
-            profile.socket_path.clone(),
-            profile.app_label,
-            profile.app_id,
-        )
-        .with_ui(ui_tx)
-        .with_local_route(Arc::clone(&local_route))
-        .with_test_mode(test_mode);
-        let in_process_streams = handler.in_process_streams();
-        let switch_gate = handler.switch_gate();
-        let server = runtime
-            .block_on(IpcServer::bind(&profile.socket_path, handler))
-            .context("bind Iced IPC server")?;
-        runtime.spawn(async move {
-            if let Err(error) = server.run().await {
-                tracing::warn!(?error, "Iced IPC server stopped");
+            pending_migration,
+            pending_dest_cleanup,
+            feed_tx,
+            feed_rx,
+            local_route,
+            in_process_streams,
+            switch_gate,
+            test_mode,
+        } = match Self::start_engine(profile, &config, &runtime, &supervisor) {
+            Ok(engine) => engine,
+            Err(error) => {
+                runtime.block_on(supervisor.shutdown_all(BOOT_ABORT_DEADLINE));
+                runtime.shutdown_background();
+                return Err(error);
             }
-        });
+        };
 
         let mut app = Self {
             workspace,
             // The engine keeps its direct supervisor reference (the
-            // clones handed to `LocalClient` and `IpcHandler` above);
-            // only UI-side terminal ops route through the backend.
+            // clones handed to `LocalClient` and `IpcHandler` in
+            // `start_engine`); only UI-side terminal ops route through
+            // the backend.
             backend: TabBackend::in_process(supervisor, test_mode),
             client,
             tabs: HashMap::new(),
@@ -3032,7 +3077,7 @@ impl App {
             switch_gate,
             switch: None,
             pending_migration,
-            pending_dest_cleanup: resumed.delete_dest,
+            pending_dest_cleanup,
             switch_driving: false,
             switch_generation: 0,
             state_dir: profile.state_dir.clone(),
@@ -3127,6 +3172,107 @@ impl App {
         app.reconnect_saved_hosts();
         tracing::info!(socket = %profile.socket_path.display(), "Iced walking skeleton ready");
         Ok(app)
+    }
+
+    /// Everything fallible `bootstrap` does once the runtime exists.
+    fn start_engine(
+        profile: &BundleProfile,
+        config: &RoostConfig,
+        runtime: &tokio::runtime::Runtime,
+        supervisor: &Arc<PtySupervisor>,
+    ) -> Result<StartedEngine> {
+        // Plan 063 §D5's ladder, step 1: an unfinished switch decides
+        // the mode before anything else is asked, because it is the one
+        // input that knows the key on disk may not describe reality.
+        let resumed = resume_switch_journal(profile, runtime);
+        // Both disk questions are asked **before** `Workspace::open`,
+        // which is what creates the very `state.json` the fresh-install
+        // clause is about.
+        let backend_mode = match resumed.mode {
+            Some(mode) => mode,
+            None => resolve_local_backend(profile, config),
+        };
+        let workspace = Arc::new(Workspace::open(profile.state_json_path()));
+        workspace.set_window_focused(true);
+        if backend_mode == LocalBackendMode::Session {
+            ensure_local_slot(&workspace);
+        }
+        let client = LocalClient::new(
+            Arc::clone(&workspace),
+            Arc::clone(supervisor),
+            profile.socket_path.clone(),
+        );
+
+        // After `Workspace::open` (there is nothing to delete before
+        // it) and before the hydrate, which would otherwise warn about
+        // a populated in-process workspace this is about to empty.
+        finish_switch_source_deletion(runtime, &client, profile, &resumed);
+
+        hydrate_workspace(runtime, &client, backend_mode)?;
+        // Plan 063 §D5: a `session` launch over a populated in-process
+        // workspace is an absent migration. Read here, while the
+        // retained layout is still whole and before anything can open a
+        // tab into it; run once the slot connects
+        // (`arm_pending_migration`).
+        let pending_migration = match backend_mode {
+            LocalBackendMode::Session => local_backend::retained_migration(
+                &workspace.snapshot(),
+                workspace.retained_layout().as_ref(),
+            ),
+            LocalBackendMode::InProcess => None,
+        };
+
+        let (feed_tx, feed_rx) = engine_feed::channel();
+        // One feed, one arrival order across sources — see engine_feed.
+        runtime.spawn(engine_feed::pump_workspace_events(
+            Arc::clone(&workspace),
+            feed_tx.clone(),
+        ));
+        let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime.spawn(engine_feed::pump_ui_requests(ui_rx, feed_tx.clone()));
+        spawn_quit_signals(runtime, &feed_tx)?;
+        // Seeded before the socket is bound: a client that dials during
+        // the rest of bootstrap must never be told the wrong backend.
+        let local_route = Arc::new(LocalBackendCell::new(local_backend::route_snapshot(
+            backend_mode,
+            local_backend::SlotSelection::default(),
+            local_backend::SwitchState::Idle,
+        )));
+        let test_mode = std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1");
+        let handler = IpcHandler::new(
+            Arc::clone(&workspace),
+            Arc::clone(supervisor),
+            profile.socket_path.clone(),
+            profile.app_label,
+            profile.app_id,
+        )
+        .with_ui(ui_tx)
+        .with_local_route(Arc::clone(&local_route))
+        .with_test_mode(test_mode);
+        let in_process_streams = handler.in_process_streams();
+        let switch_gate = handler.switch_gate();
+        let server = runtime
+            .block_on(IpcServer::bind(&profile.socket_path, handler))
+            .context("bind Iced IPC server")?;
+        runtime.spawn(async move {
+            if let Err(error) = server.run().await {
+                tracing::warn!(?error, "Iced IPC server stopped");
+            }
+        });
+
+        Ok(StartedEngine {
+            workspace,
+            client,
+            backend_mode,
+            pending_migration,
+            pending_dest_cleanup: resumed.delete_dest,
+            feed_tx,
+            feed_rx,
+            local_route,
+            in_process_streams,
+            switch_gate,
+            test_mode,
+        })
     }
 
     /// Republish the local-backend route for the IPC handler to read.
@@ -6116,7 +6262,7 @@ impl App {
         if project_id == 0 {
             return EngineDispatch::default();
         }
-        let cwd = self.launch_cwd(project_id);
+        let cwd = self.launch_cwd();
         self.open_tab_dispatch(project_id, cwd, title, argv)
     }
 
@@ -6144,18 +6290,15 @@ impl App {
             self.set_status("that host is not accepting operations".to_string());
             return EngineDispatch::default();
         };
-        // The project's own cwd, off the mirror — the host's answer to
-        // "where does a new tab here start", and the only cwd this side
-        // knows that means anything over there.
-        let cwd = self
-            .host_project_row(project)
-            .map(|(_, row)| row.cwd.clone())
-            .unwrap_or_default();
+        let origin = host_tab_origin(
+            project,
+            self.active_tab_key(),
+            self.host_project_row(project).map(|(_, row)| row),
+        );
         let op = self.take_host_op_id(project.host, local_backend::HostOpKind::Other);
-        let project_id = project.project;
         EngineDispatch {
             task: self.engine_op(
-                async move { open_host_tab_flow(ops, project_id, cwd, title, argv).await },
+                async move { open_host_tab_flow(ops, project, origin, title, argv).await },
                 move |result| EngineOpResult::TabOpened {
                     op,
                     project,
@@ -8505,41 +8648,26 @@ impl App {
         let named = rows
             .iter()
             .find(|row| row.id == project.project)
-            .map(|row| {
-                let cwd = row
-                    .tabs
-                    .iter()
-                    .find(|row| row.id == tab.tab)
-                    .map(|row| row.cwd.as_str())
-                    .filter(|cwd| !cwd.is_empty())
-                    .unwrap_or(row.cwd.as_str());
-                (row.name.as_str(), cwd)
-            });
+            .map(|row| (row.name.as_str(), listed_tab_cwd(row, tab.tab)));
         compose_window_title(self.title_fallback, named, host, home)
     }
 
-    /// The cwd a new local tab launches in.
+    /// The cwd a new in-process tab launches in: the active tab's, else
+    /// empty, which the open resolves to the project's.
     ///
-    /// Deliberately local-only, and a no-op for a host selection: every
-    /// caller is a *local* open (`new_tab_dispatch` routes a host project
-    /// to the op queue before it gets here, and a custom-command launcher
-    /// row opens on the local workspace by construction). A host tab's
-    /// cwd lives in that session's mirror and is the server's to answer
-    /// when the op queue opens a tab there.
-    fn launch_cwd(&self, project_id: i64) -> String {
-        let active_tab = self.workspace.active().1;
-        if let Some(native) = self.backend.foreground_cwd(active_tab) {
-            if !native.is_empty() {
-                return native;
-            }
-        }
-        self.projects
-            .iter()
-            .find(|project| project.id == project_id)
-            .and_then(|project| project.tabs.iter().find(|tab| tab.id == active_tab))
-            .map(|tab| tab.cwd.clone())
-            .unwrap_or_default()
+    /// Local only: `open_tab_here` sends a creation on a host project,
+    /// ⌘T and launcher row alike, to `open_host_tab_dispatch` first.
+    fn launch_cwd(&self) -> String {
+        local_launch_cwd(&self.workspace, &self.client.supervisor)
     }
+}
+
+/// [`App::launch_cwd`] without an `App` to build. It is `tab.open`'s
+/// `cwd_from_tab` resolver, so a new tab lands by one rule in-process
+/// and on a session.
+fn local_launch_cwd(workspace: &Workspace, supervisor: &PtySupervisor) -> String {
+    roost_engine::application::inherited_cwd(workspace, supervisor, workspace.active().1)
+        .unwrap_or_default()
 }
 
 /// Which question a confirmed restart prompt was asking — the two
@@ -10848,6 +10976,11 @@ mod tests {
 
         let open = rx.recv().await.expect("tab.open sent");
         assert_eq!(open.op, wire::TAB_OPEN);
+        assert!(
+            open.params.get("cwd_from_tab").is_none(),
+            "a new project's seed tab names no source tab, so the key is absent: {}",
+            open.params
+        );
         let tab = Tab {
             id: 8,
             project_id: 7,
@@ -10880,6 +11013,376 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "a successful create must never be rolled back"
+        );
+    }
+
+    /// A host tab row, as a mirror lists it.
+    fn listed_tab(id: i64, project_id: i64, cwd: &str) -> roost_ipc::messages::Tab {
+        roost_ipc::messages::Tab {
+            id,
+            project_id,
+            title: String::new(),
+            cwd: cwd.into(),
+            state: roost_ipc::messages::TabState::None,
+            has_notification: false,
+            is_active: false,
+            user_titled: false,
+            position: 0,
+            created_at: 0,
+            last_active: 0,
+            hook_active: false,
+            shell_state: Default::default(),
+            agent_lifecycle: Default::default(),
+            ownership: None,
+        }
+    }
+
+    /// Plan 070 §D2.
+    #[test]
+    fn a_host_new_tab_starts_from_the_selected_tab_only_on_its_own_connection() {
+        let host = HostId::new(3);
+        let project = ProjectKey::new(host, 42);
+        let mut row = empty_project(42);
+        row.tabs = vec![listed_tab(7, 42, "/srv/where-7-is")];
+        let project_only = HostTabOrigin {
+            cwd: row.cwd.clone(),
+            cwd_from_tab: None,
+        };
+
+        assert_eq!(
+            host_tab_origin(project, TabKey::new(host, 7), Some(&row)),
+            HostTabOrigin {
+                cwd: "/srv/where-7-is".into(),
+                cwd_from_tab: Some(7),
+            },
+            "the session resolves tab 7, and its mirror cwd is the fallback"
+        );
+        assert_eq!(
+            host_tab_origin(project, TabKey::new(HostId::new(4), 7), Some(&row)),
+            project_only,
+            "tab 7 of another host is not this host's tab 7"
+        );
+        assert_eq!(
+            host_tab_origin(project, TabKey::local(7), Some(&row)),
+            project_only,
+            "an in-process tab's path means nothing on the host"
+        );
+    }
+
+    /// The tab is still named: the session's native read does not wait on
+    /// OSC 7.
+    #[test]
+    fn a_host_new_tab_falls_back_to_the_projects_cwd_without_a_mirror_cwd() {
+        let host = HostId::new(3);
+        let project = ProjectKey::new(host, 42);
+        let mut row = empty_project(42);
+        row.tabs = vec![listed_tab(7, 42, "")];
+
+        assert_eq!(
+            host_tab_origin(project, TabKey::new(host, 7), Some(&row)),
+            HostTabOrigin {
+                cwd: row.cwd.clone(),
+                cwd_from_tab: Some(7),
+            }
+        );
+        assert_eq!(
+            host_tab_origin(project, TabKey::new(host, 7), None),
+            HostTabOrigin {
+                cwd: String::new(),
+                cwd_from_tab: Some(7),
+            }
+        );
+    }
+
+    #[test]
+    fn host_tab_open_params_carry_cwd_from_tab_only_when_there_is_one() {
+        let argv = vec!["/bin/sh".to_string(), "-c".into(), "htop".into()];
+        let before_070 = serde_json::json!({
+            "project_id": "42",
+            "cwd": "/home/x",
+            "cols": u32::from(DEFAULT_COLS),
+            "rows": u32::from(DEFAULT_ROWS),
+            "title": "htop",
+            "argv": argv,
+        });
+        assert_eq!(
+            serde_json::to_string(&host_tab_open_params(42, "/home/x", "htop", &argv, None))
+                .unwrap(),
+            serde_json::to_string(&before_070).unwrap()
+        );
+
+        let mut with_source = before_070;
+        with_source["cwd_from_tab"] = "7".into();
+        assert_eq!(
+            host_tab_open_params(42, "/home/x", "htop", &argv, Some(7)),
+            with_source
+        );
+    }
+
+    /// One `tab.open` attempt, as the stand-in session received it.
+    struct SentOpen {
+        op: String,
+        fence: Option<HostId>,
+        params: serde_json::Value,
+    }
+
+    fn opened_reply(tab_id: i64) -> serde_json::Value {
+        serde_json::to_value(roost_ipc::messages::TabOpenResult {
+            tab: listed_tab(tab_id, 42, "/home/x"),
+        })
+        .unwrap()
+    }
+
+    /// Run [`open_host_tab_flow`] against a stand-in session that answers
+    /// its attempts from `answers`, in order, and records each one.
+    ///
+    /// An attempt past the script is answered with a successful open, so
+    /// a flow that asks once too often returns — and the record names the
+    /// extra attempt — rather than hanging on a reply that never comes.
+    async fn run_host_tab_open(
+        project: ProjectKey,
+        origin: HostTabOrigin,
+        title: &str,
+        argv: &[&str],
+        answers: Vec<Result<serde_json::Value, crate::host_conn::HostOpError>>,
+    ) -> (Result<i64, String>, Vec<SentOpen>) {
+        let (ops, mut rx) = crate::host_conn::HostOps::channel();
+        let session = tokio::spawn(async move {
+            let mut answers = answers.into_iter();
+            let mut sent = Vec::new();
+            while let Some(intent) = rx.recv().await {
+                sent.push(SentOpen {
+                    op: intent.op.to_string(),
+                    fence: intent.fence,
+                    params: intent.params.clone(),
+                });
+                intent.answer(answers.next().unwrap_or_else(|| Ok(opened_reply(99))));
+            }
+            sent
+        });
+        let argv = argv.iter().map(|arg| arg.to_string()).collect();
+        let result = open_host_tab_flow(ops, project, origin, title.into(), argv).await;
+        (
+            result,
+            session.await.expect("the stand-in session must not panic"),
+        )
+    }
+
+    fn refused(
+        code: roost_ipc::client::ServerCode,
+        message: &str,
+    ) -> crate::host_conn::HostOpError {
+        crate::host_conn::HostOpError::Rejected {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn named_origin() -> HostTabOrigin {
+        HostTabOrigin {
+            cwd: "/srv/where-7-is".into(),
+            cwd_from_tab: Some(7),
+        }
+    }
+
+    /// Plan 070 §D2: exactly one retry, with the first attempt's cwd,
+    /// fence, and a launcher row's title and command.
+    #[tokio::test]
+    async fn a_host_tab_open_asks_an_older_session_again_without_cwd_from_tab() {
+        use roost_ipc::client::ServerCode;
+
+        let host = HostId::new(3);
+        let (result, sent) = run_host_tab_open(
+            ProjectKey::new(host, 42),
+            named_origin(),
+            "htop",
+            &["/bin/sh", "-c", "htop"],
+            vec![
+                Err(refused(
+                    ServerCode::UnknownField,
+                    "unknown field `cwd_from_tab`",
+                )),
+                Ok(opened_reply(8)),
+            ],
+        )
+        .await;
+
+        assert_eq!(result, Ok(8));
+        assert_eq!(sent.len(), 2, "exactly one retry");
+        assert_eq!(sent[0].params["cwd_from_tab"], "7");
+        assert!(
+            sent[1].params.get("cwd_from_tab").is_none(),
+            "the retry drops the field: {}",
+            sent[1].params
+        );
+        for attempt in &sent {
+            assert_eq!(attempt.op, roost_ipc::messages::ops::TAB_OPEN);
+            assert_eq!(
+                attempt.fence,
+                Some(host),
+                "both attempts are fenced at the project's own connection"
+            );
+            assert_eq!(attempt.params["project_id"], "42");
+            assert_eq!(attempt.params["cwd"], "/srv/where-7-is");
+            assert_eq!(attempt.params["title"], "htop");
+            assert_eq!(
+                attempt.params["argv"],
+                serde_json::json!(["/bin/sh", "-c", "htop"])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_tab_open_never_retries_any_other_refusal() {
+        use roost_ipc::client::ServerCode;
+
+        for refusal in [
+            refused(ServerCode::InvalidParam, "cwd_from_tab: not an id"),
+            refused(ServerCode::NotFound, "no such project"),
+        ] {
+            let (result, sent) = run_host_tab_open(
+                ProjectKey::new(HostId::new(3), 42),
+                named_origin(),
+                "",
+                &[],
+                vec![Err(refusal.clone())],
+            )
+            .await;
+            assert_eq!(result, Err(format!("tab.open: {refusal}")));
+            assert_eq!(sent.len(), 1, "{refusal} must not be retried");
+        }
+    }
+
+    /// A reconnect answers a fenced intent `Disconnected` — before the
+    /// first attempt is admitted, or between the refusal and the retry.
+    /// Either way that is the error, and nothing is sent after it.
+    #[tokio::test]
+    async fn a_reconnect_on_either_side_of_the_retry_surfaces_disconnected() {
+        use crate::host_conn::HostOpError;
+        use roost_ipc::client::ServerCode;
+
+        let host = HostId::new(3);
+        for answers in [
+            vec![Err(HostOpError::Disconnected)],
+            vec![
+                Err(refused(
+                    ServerCode::UnknownField,
+                    "unknown field `cwd_from_tab`",
+                )),
+                Err(HostOpError::Disconnected),
+            ],
+        ] {
+            let attempts = answers.len();
+            let (result, sent) =
+                run_host_tab_open(ProjectKey::new(host, 42), named_origin(), "", &[], answers)
+                    .await;
+            assert_eq!(
+                result,
+                Err(format!("tab.open: {}", HostOpError::Disconnected))
+            );
+            assert_eq!(sent.len(), attempts, "nothing after the disconnect");
+            assert!(sent.iter().all(|attempt| attempt.fence == Some(host)));
+        }
+    }
+
+    /// No source tab was sent, so an `unknown-field` is not about it and
+    /// is the caller's to hear.
+    #[tokio::test]
+    async fn a_host_tab_open_without_a_source_tab_never_retries() {
+        use roost_ipc::client::ServerCode;
+
+        let refusal = refused(ServerCode::UnknownField, "unknown field `argv`");
+        let (result, sent) = run_host_tab_open(
+            ProjectKey::new(HostId::new(3), 42),
+            HostTabOrigin {
+                cwd: "/home/x".into(),
+                cwd_from_tab: None,
+            },
+            "",
+            &[],
+            vec![Err(refusal.clone())],
+        )
+        .await;
+        assert_eq!(result, Err(format!("tab.open: {refusal}")));
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].params.get("cwd_from_tab").is_none());
+    }
+
+    /// Hangs its tab up on drop, a failed assertion included, so no test
+    /// leaves its `sleep` behind.
+    struct ChildIn(Arc<PtySupervisor>, i64);
+
+    impl Drop for ChildIn {
+        fn drop(&mut self) {
+            self.0.close(self.1);
+        }
+    }
+
+    /// A child for `tab_id` whose own cwd is `dir`.
+    fn child_in(supervisor: &Arc<PtySupervisor>, tab_id: i64, dir: &std::path::Path) -> ChildIn {
+        let guard = ChildIn(Arc::clone(supervisor), tab_id);
+        let argv = ["/bin/sh", "-c", "exec sleep 30"].map(String::from);
+        supervisor
+            .spawn(
+                tab_id,
+                &dir.to_string_lossy(),
+                &argv,
+                DEFAULT_COLS,
+                DEFAULT_ROWS,
+                std::path::Path::new("/tmp/roost-iced-launch-cwd-test.sock"),
+            )
+            .expect("spawn");
+        guard
+    }
+
+    /// A workspace whose active tab's row tracks `tracked`.
+    fn workspace_tracking(tracked: &std::path::Path) -> (Workspace, i64) {
+        let workspace = Workspace::new();
+        let project = workspace.create_project("p", "/").unwrap().id;
+        let tab = workspace
+            .open_tab(project, &tracked.to_string_lossy(), "", true)
+            .unwrap()
+            .id;
+        assert_eq!(workspace.active(), (project, tab));
+        (workspace, tab)
+    }
+
+    fn canonical(dir: &std::path::Path) -> String {
+        std::fs::canonicalize(dir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// AC3: in-process ⌘T and `provider_context`'s `active_cwd` still
+    /// open where the active tab is, when its shell and its row agree.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_cwd_is_the_active_tabs_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (workspace, tab) = workspace_tracking(dir.path());
+        let supervisor = Arc::new(PtySupervisor::new());
+        let _child = child_in(&supervisor, tab, dir.path());
+
+        assert_eq!(
+            local_launch_cwd(&workspace, &supervisor),
+            canonical(dir.path())
+        );
+    }
+
+    /// …and the shell's own directory still beats the one its row
+    /// tracks: a `cd` without OSC 7 is followed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_cwd_prefers_the_shells_directory_to_the_tracked_one() {
+        let (tracked, native) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (workspace, tab) = workspace_tracking(tracked.path());
+        let supervisor = Arc::new(PtySupervisor::new());
+        let _child = child_in(&supervisor, tab, native.path());
+
+        assert_eq!(
+            local_launch_cwd(&workspace, &supervisor),
+            canonical(native.path()),
+            "the child's cwd must win over the row's {}",
+            tracked.path().display()
         );
     }
 

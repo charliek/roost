@@ -956,6 +956,29 @@ def _ensure_mac_bundle(
     _warn_if_mac_bundle_stale(app, mac_dir)
 
 
+def _stop_owned_ui(proc: "subprocess.Popen[bytes]") -> None:
+    """Stop and reap a UI this harness spawned whose boot wait failed.
+
+    SIGTERM twice before SIGKILL: a UI wedged before its event loop absorbs
+    the first SIGTERM by design, and the second escalates to `exit(1)`.
+    Only this `Popen`'s pid is signalled — never a group or a name.
+    """
+    for _attempt in (1, 2):
+        if proc.poll() is not None:
+            break
+        proc.terminate()
+        try:
+            proc.wait(timeout=scaled_timeout(3.0))
+        except subprocess.TimeoutExpired:
+            pass
+    if proc.poll() is None:
+        proc.kill()
+    try:
+        proc.wait(timeout=scaled_timeout(5.0))
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"harness-launched UI (pid {proc.pid}) survived SIGKILL") from error
+
+
 def launch(
     target: str,
     *,
@@ -1061,7 +1084,13 @@ def launch(
         finally:
             log_fh.close()  # the child holds its own dup of the fd
         _ICED_PROC, _ICED_LOG = proc, log_path
-        wait_alive(target)
+        try:
+            wait_alive(target)
+        except Exception:
+            # `_ICED_PROC`/`_ICED_LOG` stay set: the log is the failure's
+            # diagnostic, and teardown's `wait()` on a reaped child is instant.
+            _stop_owned_ui(proc)
+            raise
     else:
         raise ValueError(f"unknown target {target!r}")
 
@@ -1314,7 +1343,16 @@ def _launch_mac(app: Path, *, state_dir: Path | None = None) -> None:
             return
         except TimeoutError as e:
             last = e
-    raise last  # type: ignore[misc]
+        except Exception:
+            _quit_mac_process()
+            raise
+    # `open` leaves no `Popen` to hand `_stop_owned_ui`; this is the Mac
+    # app's own confirmed-dead stop. In `finally`, so a failing stop chains
+    # onto the boot error instead of replacing it.
+    try:
+        raise last  # type: ignore[misc]
+    finally:
+        _quit_mac_process()
 
 
 def _roost_running() -> bool:

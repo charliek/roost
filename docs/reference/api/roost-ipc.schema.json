@@ -3340,6 +3340,12 @@
           "default": "",
           "type": "string"
         },
+        "cwd_from_tab": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "project_id": {
           "default": "0",
           "type": "string"
