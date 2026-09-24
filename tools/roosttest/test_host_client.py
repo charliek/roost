@@ -1094,13 +1094,20 @@ def test_a_bell_reaches_the_attached_client_and_a_second_subscriber_too(host, ro
             fence = second.subscribe()
 
             session.tab_feed_pty_bytes(tab, b"\x07")
-            # Read past the commit the bell produced. A title change
-            # afterwards is the sentinel: reaching it proves the effect
-            # commit was delivered in full, rather than proving only
-            # that nothing has arrived yet.
+            # `tab.feed_pty_bytes` replies once the bytes are queued on the
+            # tab task, before the bell commits, so a synchronous op issued
+            # right after can overtake it (#528). Wait on the effect itself;
+            # only then is a title sentinel a sound end marker for the
+            # exactly-one-effect check below.
+            bell_batches, bell_envelope = second.recv_until("tab.effect", timeout=30.0)
+            assert bell_envelope["data"]["effect"] == "bell", bell_envelope
+            assert bell_envelope["data"]["tab_id"] == str(tab), bell_envelope
+
             sentinel = marker("SENTINEL")
             session.set_title(tab, sentinel)
-            batches, _title = second.recv_until("tab.title_changed", timeout=30.0)
+            title_batches, _title = second.recv_until("tab.title_changed", timeout=30.0)
+
+            batches = bell_batches + title_batches
             second.expect_contiguous(batches, fence)
             effects = [
                 envelope

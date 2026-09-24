@@ -833,6 +833,14 @@ unchanged. Unlike the UI path this op is a **mutation** on a session —
 it writes into the authoritative terminal — so it answers
 `shutting-down` once `session.stop` has latched.
 
+On a session the reply means the bytes are **queued** on the tab task,
+not processed. Whatever they cause — a bell or OSC 52 `tab.effect`, a
+title or cwd change — commits afterwards on the tab task and shows up
+only on the event stream. A caller that needs one of those commits must
+wait for it there: it cannot assume the commit precedes the reply, or a
+later op issued right after — even a synchronous one such as
+`tab.set_title`.
+
 ### `tab.capture_pty_input` *(test-only — gated)*
 
 **Requires `ROOST_TEST_MODE=1` at UI launch.** Returns (and by default
