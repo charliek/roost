@@ -13,10 +13,24 @@ tab's shell working directory directly — natively, via `proc_pidinfo` on macOS
 and `/proc/<pid>/cwd` on Linux — and spawns the new tab there. No shell
 configuration required; works for any shell, including stock `/bin/bash`.
 
-One caveat: a new tab spawns a *local* shell, so if the active tab is `ssh`'d to
-a remote host, the new tab opens in the local directory, not the remote one. To
-track a remote cwd, use the shell integration below — the remote shell emits
-OSC 7 over the connection.
+The read is of the tab's *direct* child, the shell Roost started, so a `cd`
+inside a nested shell or inside tmux isn't seen: the new tab opens where that
+outer shell is. When the read gives no usable directory, Roost uses the cwd
+the shell last reported over OSC 7 instead (see the shell integration below).
+
+**Tabs on a session follow the same rule.** For a tab on a `roost-session` —
+Roost-Iced's local session, the fresh-install default, or a saved host — the
+session reads the directory on its own machine. A session started by an older
+Roost, still running after an upgrade, can't; until it restarts, a new tab
+opens in the active tab's tracked cwd — where OSC 7 last put it, else where the
+tab was opened (or at the host's home directory, if that path isn't there).
+
+One caveat: a new tab's shell starts on the same machine as the active tab's —
+this one for a local tab, the host's for a tab on a host — so if the active tab
+has `ssh`'d somewhere else, the new tab opens in the directory `ssh` was run
+from, not the remote one. The shell integration below still tracks the remote
+cwd in the header and tab label: the remote shell emits OSC 7 over the
+connection.
 
 ## What the shell integration adds
 
@@ -241,7 +255,7 @@ slow disk that's worth knowing about.
 
 | Surface         | Behavior                                                                              |
 |-----------------|---------------------------------------------------------------------------------------|
-| New-tab cwd     | Always follows the active tab's current dir (native read) — integration or not.       |
+| New-tab cwd     | Follows the active tab's dir (native read), local or session — integration or not.    |
 | Header subtitle | Follows `cd` once OSC 7 is flowing (shell integration).                                |
 | Tab label       | Same — unless you renamed the tab or the running program set its own title (it wins).  |
 

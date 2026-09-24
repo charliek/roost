@@ -59,6 +59,7 @@ import os
 import re
 import socket as socketlib
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -80,7 +81,13 @@ from agent_jail import (
 from client import Roost, RoostError, scaled_timeout
 from eventstream import EventStream
 from host_probe import host_key, sibling_key  # noqa: F401  (re-exported)
-from util import drain, drain_until_match
+from util import (
+    assert_opened_in,
+    drain,
+    drain_until_match,
+    press_new_tab,
+    spawned_tab_id,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "screenshot"))
 import pngtool  # noqa: E402  — pure stdlib PNG decoder, imported not shelled out
@@ -3078,3 +3085,69 @@ def test_roostctl_tab_send_file_prints_the_host_path_it_pasted(
     landed = in_the_jail(host, pasted)
     assert landed.read_bytes() == source.read_bytes(), f"roostctl printed {pasted}"
     drain_until_match(roost, key, re.escape(pasted.encode()), timeout=60.0)
+
+
+# ---------------------------------------------------------------------------
+# 15. Plan 070 — a new tab on a host opens where the active tab is
+# ---------------------------------------------------------------------------
+
+
+def fresh_dirs(parent: Path) -> tuple[Path, Path]:
+    """Where a source tab is opened, and where its child moves to."""
+    return tuple(
+        Path(tempfile.mkdtemp(prefix=prefix, dir=parent)) for prefix in ("opened-", "moved-")
+    )
+
+
+def new_tab_from(roost: Roost, session: Roost, source: int) -> int:
+    """Select host tab `source` in the client, press ⌘T, and return the
+    tab that opened on the session."""
+    host_key(roost, source)
+    before = {int(row["id"]) for row in session.tabs()}
+    press_new_tab(roost)
+    return spawned_tab_id(session, before, "the new tab to open on the session", timeout=30.0)
+
+
+def test_a_new_tab_on_a_host_opens_where_the_active_tab_reported_it_is(host, roost):
+    """Plan 070 AC1, with the integration's report: the active tab's
+    shell `cd`s and says so with OSC 7, and ⌘T opens there."""
+    host.connect_and_wait()
+    opened_in, moved_to = fresh_dirs(host.env.launch_cwd)
+    report = r'''printf '\033]7;file://%s%s\007' "$(uname -n)" "$PWD"'''
+    with host.client() as session:
+        project = first_project(session)
+        source = session.open_tab(
+            project,
+            cwd=str(opened_in),
+            argv=["/bin/sh", "-c", f"cd '{moved_to}' && {report} && exec sleep 300"],
+        )
+        wait_until(
+            lambda: (session.tab(source) or {}).get("cwd") == str(moved_to),
+            30.0,
+            "the session's row to take the tab's OSC 7 cwd",
+        )
+
+        tab = new_tab_from(roost, session, source)
+
+        assert_opened_in(session, tab, moved_to)
+
+
+def test_a_new_tab_on_a_host_opens_in_the_active_tabs_own_cwd_without_osc7(host, roost):
+    """Plan 070 AC1: ⌘T opens in the active tab's direct-child cwd, read
+    natively. The child `cd`s and emits no OSC 7, so the session's
+    tracked cwd still names the directory the tab was opened in."""
+    host.connect_and_wait()
+    opened_in, moved_to = fresh_dirs(host.env.launch_cwd)
+    with host.client() as session:
+        project = first_project(session)
+        source = session.open_tab(
+            project,
+            cwd=str(opened_in),
+            argv=["/bin/sh", "-c", f"cd '{moved_to}' && echo READY && exec sleep 300"],
+        )
+        wait_session_dump_contains(session, source, "READY")
+        assert session.tab(source)["cwd"] == str(opened_in), session.tab(source)
+
+        tab = new_tab_from(roost, session, source)
+
+        assert_opened_in(session, tab, moved_to)

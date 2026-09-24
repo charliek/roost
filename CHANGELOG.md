@@ -11,6 +11,40 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+### Added
+
+- **`tab.open` takes `cwd_from_tab`, to open a tab where another one is
+  (plan 070)** — the server starts the new tab in the named tab's
+  working directory: its direct PTY child's cwd first, then its OSC
+  7-tracked cwd, each only if it is a directory on the server's own
+  machine. A resolved cwd replaces `cwd`; nothing resolving is not an
+  error, and `cwd` is used as sent. Unset, the request is the bytes it
+  always was. Served by sessions and Roost-Iced's UI socket; the Swift
+  Mac app and servers that predate the field answer `unknown-field`. No
+  CLI flag yet. See [`ipc.md#tabopen`](docs/reference/ipc.md#tabopen).
+
+### Fixed
+
+- **A new tab on a session-backed project opened in the project's
+  directory instead of the active tab's (#530)** — ⌘T / Alt+T, the tab
+  bar's "+", the macOS menu's New Tab, the palette's New Tab and launcher
+  rows, on a project whose tabs run on a `roost-session`: every local tab
+  on a fresh Roost-Iced install, and every saved host. The new tab now
+  follows the active tab the way an in-process one does — the UI names
+  the active tab (`cwd_from_tab`), and the session reads that tab's cwd
+  natively on its own machine, then falls back to its OSC 7-tracked cwd.
+  A session older than the field, still running after an upgrade,
+  refuses it; the UI asks once more without it, so until that session
+  restarts the new tab opens in the active tab's tracked cwd. See
+  [cwd tracking](docs/guides/cwd-tracking.md).
+- **An in-process Roost-Iced whose startup failed after its first shell
+  spawned hung forever instead of exiting (#531)** — under
+  `local-backend = in-process`, an error after the workspace was hydrated
+  (a UI socket path too long to bind, say) left the process running with
+  no window and no message. Every startup step after the runtime exists
+  now shares one error path: it hangs up the shells already spawned,
+  then exits non-zero with the error printed.
+
 ## v0.0.20 — 2026-09-20
 
 _The agent-control release: `roostctl open`, `rpc`, `events`, `tab prompt`
