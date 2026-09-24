@@ -333,6 +333,7 @@ impl Harness {
                     rows,
                     title: String::new(),
                     activate: None,
+                    cwd_from_tab: None,
                 },
             )
             .await
@@ -1042,6 +1043,7 @@ async fn a_stop_labels_a_data_connection_that_only_ever_attached() {
                 rows: 0,
                 title: String::new(),
                 activate: None,
+                cwd_from_tab: None,
             },
         )
         .await

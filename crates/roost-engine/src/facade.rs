@@ -333,9 +333,12 @@ impl Engine {
     async fn open_tab(&self, mut params: TabOpenParams) -> Result<Tab, EngineError> {
         validate_dimension(params.cols, "cols")?;
         validate_dimension(params.rows, "rows")?;
-        if params.project_id == 0 {
-            params.project_id = self.workspace.ensure_default_project(&params.cwd, true);
-        }
+        crate::application::resolve_open_target(
+            &self.workspace,
+            &self.supervisor,
+            &mut params,
+            true,
+        );
         self.client
             .open_tab(
                 params.project_id,
@@ -527,6 +530,49 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(invalid_dimension.code(), "invalid_argument");
+    }
+
+    /// `TabOpen` starts where `cwd_from_tab` resolves, and leaves `cwd`
+    /// alone when it resolves nowhere — the served arm's rule.
+    #[tokio::test]
+    async fn tab_open_starts_where_the_source_tab_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_cwd = dir.path().to_string_lossy().into_owned();
+        let workspace = Arc::new(Workspace::new());
+        let project = workspace.create_project("p", "/").unwrap().id;
+        let source = workspace
+            .open_tab(project, &source_cwd, "src", false)
+            .unwrap()
+            .id;
+        let supervisor = Arc::new(PtySupervisor::new());
+        let mut opened = crate::application::HangUp(supervisor.clone(), Vec::new());
+        let engine = Engine::new(
+            workspace,
+            supervisor,
+            PathBuf::from("/tmp/roost-engine-test.sock"),
+        );
+
+        for (cwd_from_tab, want) in [
+            (Some(source), source_cwd.as_str()),
+            (Some(source + 1_000), "/"),
+            (None, "/"),
+        ] {
+            let result = engine
+                .execute(EngineCommand::TabOpen(TabOpenParams {
+                    project_id: project,
+                    cwd: "/".into(),
+                    argv: vec!["/bin/sh".into(), "-c".into(), "exec sleep 60".into()],
+                    cwd_from_tab,
+                    ..Default::default()
+                }))
+                .await
+                .expect("tab open");
+            let CommandResult::Tab(tab) = result else {
+                panic!("TabOpen answers a tab, not {result:?}");
+            };
+            opened.1.push(tab.id);
+            assert_eq!(tab.cwd, want, "{cwd_from_tab:?}");
+        }
     }
 
     #[tokio::test]

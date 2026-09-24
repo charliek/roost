@@ -260,6 +260,7 @@ pub async fn open_tab(
                 rows: 0,
                 title: title.into(),
                 activate: None,
+                cwd_from_tab: None,
             },
         )
         .await

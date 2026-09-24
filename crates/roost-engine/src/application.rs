@@ -10,11 +10,11 @@
 //! `roost_ipc::messages` types (which have the same fields as the
 //! retired proto types they replace).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use roost_ipc::messages::{Project, Tab};
+use roost_ipc::messages::{Project, Tab, TabOpenParams};
 
 use crate::{AttentionSource, PtyError, PtySupervisor, Workspace, WorkspaceError};
 
@@ -36,6 +36,49 @@ pub fn close_tab(
     let removed = workspace.close_tab(tab_id);
     supervisor.close(tab_id);
     removed
+}
+
+/// Where a tab opened from `tab_id` starts — `tab.open`'s
+/// `cwd_from_tab`, answered once for every surface that honours it.
+///
+/// Native first, because the direct PTY child's own cwd follows a `cd`
+/// in a shell that emits no OSC 7, and is a path on this machine — an
+/// OSC 7 cwd reported across an `ssh` hop is the remote's. Either
+/// candidate counts only if it is a directory here: portable-pty spawns
+/// at `$HOME` for a cwd that is not one, without a word, and Linux
+/// reports a removed cwd as `… (deleted)`. No row means `None`, even
+/// while the supervisor still holds the tab's session — a closing tab
+/// leaves the workspace first ([`close_tab`]).
+pub fn inherited_cwd(
+    workspace: &Workspace,
+    supervisor: &PtySupervisor,
+    tab_id: i64,
+) -> Option<String> {
+    let tracked = workspace.tab(tab_id).ok()?.cwd;
+    [supervisor.foreground_cwd(tab_id), Some(tracked)]
+        .into_iter()
+        .flatten()
+        .find(|cwd| Path::new(cwd).is_dir())
+}
+
+/// Where a `tab.open` lands, settled in `params` itself, shared by the
+/// served handler and the facade: `cwd_from_tab` replaces `cwd` before
+/// anything reads it, `ensure_default_project` included.
+pub fn resolve_open_target(
+    workspace: &Workspace,
+    supervisor: &PtySupervisor,
+    params: &mut TabOpenParams,
+    activate: bool,
+) {
+    if let Some(cwd) = params
+        .cwd_from_tab
+        .and_then(|source| inherited_cwd(workspace, supervisor, source))
+    {
+        params.cwd = cwd;
+    }
+    if params.project_id == 0 {
+        params.project_id = workspace.ensure_default_project(&params.cwd, activate);
+    }
 }
 
 /// The one `tab.open` spawn sequence, shared by the served handler and
@@ -292,6 +335,20 @@ fn parse_notification_payload(command: u32, payload: &str) -> (String, String) {
     }
 }
 
+/// Hangs its tabs up when dropped, a failed assertion included: a test
+/// runtime otherwise waits out each child on the way down.
+#[cfg(test)]
+pub(crate) struct HangUp(pub(crate) Arc<PtySupervisor>, pub(crate) Vec<i64>);
+
+#[cfg(test)]
+impl Drop for HangUp {
+    fn drop(&mut self) {
+        for tab in &self.1 {
+            self.0.close(*tab);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +466,110 @@ mod tests {
         // as the path — that's the CR-flagged regression. Returns
         // None so the workspace cwd is left unchanged.
         assert_eq!(parse_osc7_path("file://host"), None);
+    }
+
+    fn string(path: &Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
+    /// A child for `tab_id` whose own cwd is `dir`, hung up on drop.
+    fn spawn_in(supervisor: &Arc<PtySupervisor>, tab_id: i64, dir: &Path) -> HangUp {
+        let guard = HangUp(supervisor.clone(), vec![tab_id]);
+        let argv = ["/bin/sh", "-c", "exec sleep 30"].map(String::from);
+        let socket = Path::new("/tmp/roost-inherited-cwd-test.sock");
+        let _rx = supervisor
+            .spawn(tab_id, &string(dir), &argv, 80, 24, socket)
+            .expect("spawn");
+        guard
+    }
+
+    /// A workspace holding one tab whose tracked cwd is `tracked`.
+    fn workspace_with_tab(tracked: &str) -> (Workspace, i64) {
+        let workspace = Workspace::new();
+        let project = workspace.create_project("p", "/").unwrap().id;
+        let tab = workspace.open_tab(project, tracked, "", true).unwrap().id;
+        (workspace, tab)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inherited_cwd_prefers_the_childs_own_cwd_to_the_tracked_one() {
+        let (native, tracked) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (workspace, tab) = workspace_with_tab(&string(tracked.path()));
+        let supervisor = Arc::new(PtySupervisor::new());
+        let _guard = spawn_in(&supervisor, tab, native.path());
+
+        let want = string(&std::fs::canonicalize(native.path()).unwrap());
+        assert_eq!(
+            inherited_cwd(&workspace, &supervisor, tab),
+            Some(want),
+            "the native cwd must win over the row's {}",
+            tracked.path().display()
+        );
+    }
+
+    #[test]
+    fn inherited_cwd_falls_back_to_the_tracked_cwd_without_a_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let tracked = string(dir.path());
+        let (workspace, tab) = workspace_with_tab(&tracked);
+        assert_eq!(
+            inherited_cwd(&workspace, &PtySupervisor::new(), tab),
+            Some(tracked)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inherited_cwd_skips_a_native_cwd_that_is_no_longer_a_directory() {
+        let (native, dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let tracked = string(dir.path());
+        let (workspace, tab) = workspace_with_tab(&tracked);
+        let supervisor = Arc::new(PtySupervisor::new());
+        let _guard = spawn_in(&supervisor, tab, native.path());
+
+        native.close().expect("remove the child's cwd");
+        let native = supervisor.foreground_cwd(tab).expect("a native read");
+        assert!(
+            !Path::new(&native).is_dir(),
+            "the precondition: the native read is not a directory ({native})"
+        );
+        assert_eq!(inherited_cwd(&workspace, &supervisor, tab), Some(tracked));
+    }
+
+    #[test]
+    fn inherited_cwd_is_none_when_the_tracked_cwd_is_not_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        for tracked in [dir.path().join("missing"), file] {
+            let (workspace, tab) = workspace_with_tab(&string(&tracked));
+            assert_eq!(
+                inherited_cwd(&workspace, &PtySupervisor::new(), tab),
+                None,
+                "{}",
+                tracked.display()
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_cwd_is_none_for_an_unknown_tab() {
+        let (workspace, tab) = workspace_with_tab("/");
+        assert_eq!(
+            inherited_cwd(&workspace, &PtySupervisor::new(), tab + 1),
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inherited_cwd_is_none_for_a_session_without_a_row() {
+        let native = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new();
+        let supervisor = Arc::new(PtySupervisor::new());
+        let orphan = 99;
+        let _guard = spawn_in(&supervisor, orphan, native.path());
+
+        assert_eq!(inherited_cwd(&workspace, &supervisor, orphan), None);
     }
 
     #[test]

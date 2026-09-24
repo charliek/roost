@@ -336,6 +336,15 @@ pub struct TabOpenParams {
     /// Absent and `Some(true)` both select it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activate: Option<bool>,
+    /// The tab whose working directory the new tab starts in, when the
+    /// server can resolve one; see `ipc.md`'s `tab.open` for precedence.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_string_int64"
+    )]
+    #[schemars(with = "Option<String>")]
+    pub cwd_from_tab: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -3653,9 +3662,32 @@ pub mod string_int64 {
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<i64, D::Error> {
-        let raw = String::deserialize(de)?;
+        parse(&String::deserialize(de)?)
+    }
+
+    pub(super) fn parse<E: serde::de::Error>(raw: &str) -> Result<i64, E> {
         raw.parse::<i64>()
-            .map_err(|_| serde::de::Error::custom(format!("invalid int64 string: {raw}")))
+            .map_err(|_| E::custom(format!("invalid int64 string: {raw}")))
+    }
+}
+
+/// [`string_int64`] for an optional id: `None` is `null` (or, with
+/// `skip_serializing_if`, an absent key), and a bare JSON number is
+/// refused exactly as the required form refuses one.
+pub mod opt_string_int64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Option<i64>, ser: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(id) => super::string_int64::serialize(id, ser),
+            None => ser.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<i64>, D::Error> {
+        Option::<String>::deserialize(de)?
+            .map(|raw| super::string_int64::parse(&raw))
+            .transpose()
     }
 }
 
@@ -3852,12 +3884,9 @@ pub mod vec_string_int64 {
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<i64>, D::Error> {
-        let raw = Vec::<String>::deserialize(de)?;
-        raw.into_iter()
-            .map(|s| {
-                s.parse::<i64>()
-                    .map_err(|_| serde::de::Error::custom(format!("invalid int64 string: {s}")))
-            })
+        Vec::<String>::deserialize(de)?
+            .iter()
+            .map(|raw| super::string_int64::parse(raw))
             .collect()
     }
 }
@@ -4186,6 +4215,7 @@ mod tests {
             rows: 30,
             title: String::new(),
             activate: None,
+            cwd_from_tab: None,
         };
         let before = r#"{"project_id":"17","cwd":"/tmp","argv":["/bin/zsh"],"cols":120,"rows":30,"title":""}"#;
         assert_eq!(serde_json::to_string(&params).unwrap(), before);
@@ -4198,6 +4228,69 @@ mod tests {
         let json = serde_json::to_string(&params).unwrap();
         assert!(json.ends_with(r#","title":"","activate":false}"#), "{json}");
         round_trip(&params);
+    }
+
+    /// `cwd_from_tab` rides as a string-wrapped id, and is off the wire
+    /// entirely when unset — a server that predates it refuses the key.
+    #[test]
+    fn tab_open_cwd_from_tab_is_a_string_id_on_the_wire_only_when_set() {
+        let mut params = TabOpenParams {
+            project_id: 17,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&params).unwrap();
+        assert!(json.get("cwd_from_tab").is_none(), "{json}");
+
+        for id in [7, 0, -3, i64::MAX, i64::MIN] {
+            params.cwd_from_tab = Some(id);
+            let json = serde_json::to_value(&params).unwrap();
+            assert_eq!(json["cwd_from_tab"], id.to_string(), "{json}");
+            round_trip(&params);
+        }
+    }
+
+    #[test]
+    fn tab_open_cwd_from_tab_decodes_a_string_id_and_treats_null_as_unset() {
+        let decode = |cwd_from_tab: &str| {
+            serde_json::from_str::<TabOpenParams>(&format!(
+                r#"{{"project_id":"1","cwd_from_tab":{cwd_from_tab}}}"#
+            ))
+        };
+        assert_eq!(decode(r#""7""#).unwrap().cwd_from_tab, Some(7));
+        assert_eq!(
+            decode(&format!(r#""{}""#, i64::MAX)).unwrap().cwd_from_tab,
+            Some(i64::MAX)
+        );
+        assert_eq!(decode("null").unwrap().cwd_from_tab, None);
+        assert_eq!(
+            serde_json::from_str::<TabOpenParams>(r#"{"project_id":"1"}"#)
+                .unwrap()
+                .cwd_from_tab,
+            None
+        );
+    }
+
+    #[test]
+    fn tab_open_cwd_from_tab_refuses_anything_but_an_int64_string() {
+        for bad in [
+            "7",
+            "7.0",
+            r#""""#,
+            r#""seven""#,
+            r#""7x""#,
+            r#""9223372036854775808""#,
+            "true",
+            "[]",
+        ] {
+            let text = format!(r#"{{"project_id":"1","cwd_from_tab":{bad}}}"#);
+            let error = serde_json::from_str::<TabOpenParams>(&text)
+                .expect_err(&format!("{bad} must be refused"));
+            let message = error.to_string();
+            assert!(
+                !message.contains("unknown field") && !message.contains("missing field"),
+                "{bad} must surface as invalid-param, not {message}"
+            );
+        }
     }
 
     #[test]
