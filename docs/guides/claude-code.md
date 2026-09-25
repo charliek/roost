@@ -67,7 +67,7 @@ Open a fresh Roost tab, source your rc if needed, then:
 roostctl identify
 ```
 
-You should see a handful of `key=value` lines (`socket`, `pid`, `active_tab`, `ui_version`, …) describing the running app — not JSON. If it errors, the GUI isn't running or `ROOST_SOCKET` is unset — re-launch `roost` and try again.
+You should see a handful of `key=value` lines (`socket`, `pid`, `active_tab`, `ui_version`, …) describing the running app — not JSON. If it errors, the process `ROOST_SOCKET` points at isn't running (the GUI for a local tab, or the host's `roost-session` for a tab on a [host session](host-sessions.md)) or the variable is unset — re-launch `roost` and try again.
 
 Now run `claude` and submit a prompt. Watch the tab indicator:
 

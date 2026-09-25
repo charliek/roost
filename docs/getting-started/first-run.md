@@ -19,7 +19,7 @@ With no [host sessions](../guides/host-sessions.md) saved, the sidebar looks exa
 
 ## Default state
 
-On first launch Roost creates a project named `default` with one tab. The tab's working directory is your home directory and the shell is whatever `$SHELL` is set to (falling back to `/bin/sh`).
+On first launch Roost creates a project named `Untitled 1` with one tab. The tab's working directory is your home directory and the shell is whatever `$SHELL` is set to (falling back to `/bin/sh`).
 
 ## Roost-Iced: a fresh install starts on a session
 
