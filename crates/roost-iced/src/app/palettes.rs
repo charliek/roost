@@ -2251,16 +2251,46 @@ impl App {
     /// ids a script would send back through it. A host tab's id belongs
     /// to another process's id-space — handing it over would name
     /// whichever local tab happens to share the number.
+    ///
+    /// Under `session`, "local" is the slot's own tab rather than this
+    /// process's workspace, which holds nothing (plan 071 D14, #533):
+    /// [`local_backend::provider_selection`] reads the slot's listing
+    /// when the window's selection is on the slot's own incarnation, and
+    /// this falls back to the in-process reading otherwise — in-process
+    /// mode, no slot selection yet, or a remote-host row showing, whose
+    /// ids and cwd belong to another machine.
     fn provider_context(&self, selected_id: Option<String>) -> provider::ProviderContext {
-        let (project_id, tab_id) = self.workspace.active();
-        let active_title = self
-            .workspace
-            .snapshot()
-            .into_iter()
-            .flat_map(|project| project.tabs)
-            .find(|tab| tab.id == tab_id)
-            .map(|tab| tab.title)
-            .unwrap_or_default();
+        let slot_rows = self
+            .local_slot_view()
+            .map(|view| view.projects.as_slice())
+            .unwrap_or(&[]);
+        let slot =
+            local_backend::provider_selection(self.local_backend, self.slot_selection(), slot_rows);
+        let (project_id, tab_id, active_cwd, active_title) = match slot {
+            Some(selection) => (
+                selection.project_id,
+                selection.tab_id,
+                selection.active_cwd,
+                selection.active_title,
+            ),
+            None => {
+                let (project_id, tab_id) = self.workspace.active();
+                let active_title = self
+                    .workspace
+                    .snapshot()
+                    .into_iter()
+                    .flat_map(|project| project.tabs)
+                    .find(|tab| tab.id == tab_id)
+                    .map(|tab| tab.title)
+                    .unwrap_or_default();
+                let active_cwd = if project_id != 0 {
+                    self.launch_cwd()
+                } else {
+                    String::new()
+                };
+                (project_id, tab_id, active_cwd, active_title)
+            }
+        };
         provider::ProviderContext {
             socket: self.client.socket_path.to_string_lossy().into_owned(),
             query: self
@@ -2271,11 +2301,7 @@ impl App {
             selected_id,
             active_tab_id: (tab_id != 0).then_some(tab_id),
             active_project_id: (project_id != 0).then_some(project_id),
-            active_cwd: if project_id != 0 {
-                self.launch_cwd()
-            } else {
-                String::new()
-            },
+            active_cwd,
             active_title,
             roostctl: process::roostctl_path(),
         }

@@ -642,6 +642,48 @@ pub(super) fn slot_selection(
     }
 }
 
+/// What a provider script should be told is "the active tab" (plan 071
+/// D14, #533).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProviderSelection {
+    pub(super) project_id: i64,
+    pub(super) tab_id: i64,
+    pub(super) active_cwd: String,
+    pub(super) active_title: String,
+}
+
+/// The slot's own tab, when that is what the window is showing.
+///
+/// `provider_context` used to read `workspace.active()` unconditionally,
+/// which answers `(0, 0)` under `session` — that workspace holds nothing
+/// while the slot's tabs run in another process, so a provider spawned
+/// there with no cwd. A selection on a *remote* host is left alone (this
+/// returns `None`): its id space and cwd belong to another machine, and
+/// a provider handed those ids would send `roostctl` calls or a spawn
+/// cwd that don't exist here.
+pub(super) fn provider_selection(
+    mode: LocalBackendMode,
+    selection: SlotSelection,
+    rows: &[Project],
+) -> Option<ProviderSelection> {
+    if mode != LocalBackendMode::Session {
+        return None;
+    }
+    let (project_id, tab_id) = selection.active?;
+    let tab = rows
+        .iter()
+        .find(|project| project.id == project_id)?
+        .tabs
+        .iter()
+        .find(|tab| tab.id == tab_id)?;
+    Some(ProviderSelection {
+        project_id,
+        tab_id,
+        active_cwd: tab.cwd.clone(),
+        active_title: tab.title.clone(),
+    })
+}
+
 /// The snapshot for `mode`.
 ///
 /// Every derived field hangs off the mode: in-process has no slot, so it
@@ -3802,6 +3844,104 @@ mod tests {
                 tab: 21
             },
             "the facts landed: the memory decides"
+        );
+    }
+
+    fn tab_with(id: i64, project_id: i64, cwd: &str, title: &str) -> roost_ipc::messages::Tab {
+        use roost_ipc::messages::{Tab, TabState};
+        Tab {
+            id,
+            project_id,
+            title: title.into(),
+            cwd: cwd.into(),
+            state: TabState::Idle,
+            has_notification: false,
+            is_active: false,
+            user_titled: false,
+            position: 0,
+            created_at: 0,
+            last_active: 0,
+            hook_active: false,
+            shell_state: Default::default(),
+            agent_lifecycle: Default::default(),
+            ownership: None,
+        }
+    }
+
+    fn project_with(id: i64, tabs: Vec<roost_ipc::messages::Tab>) -> Project {
+        Project {
+            id,
+            name: format!("p{id}"),
+            cwd: "/tmp".into(),
+            position: 0,
+            created_at: 0,
+            tabs,
+        }
+    }
+
+    /// D14 (#533): the slot's own tab, read off its listing, once the
+    /// window's selection is on the slot's own incarnation.
+    #[test]
+    fn provider_selection_reads_the_slots_listed_tab() {
+        let rows = [project_with(
+            2,
+            vec![
+                tab_with(9, 2, "/repo/one", "one"),
+                tab_with(10, 2, "/repo/two", "two"),
+            ],
+        )];
+        let selection = SlotSelection {
+            host: Some(1),
+            active: Some((2, 10)),
+        };
+        let picked = provider_selection(LocalBackendMode::Session, selection, &rows)
+            .expect("the selected tab is listed");
+        assert_eq!(picked.project_id, 2);
+        assert_eq!(picked.tab_id, 10);
+        assert_eq!(picked.active_cwd, "/repo/two");
+        assert_eq!(picked.active_title, "two");
+    }
+
+    /// In-process has no slot listing to read at all — the caller keeps
+    /// its existing `workspace.active()` path.
+    #[test]
+    fn provider_selection_is_none_off_session() {
+        let rows = [project_with(2, vec![tab_with(10, 2, "/repo", "t")])];
+        let selection = SlotSelection {
+            host: Some(1),
+            active: Some((2, 10)),
+        };
+        assert_eq!(
+            provider_selection(LocalBackendMode::InProcess, selection, &rows),
+            None
+        );
+    }
+
+    /// A remote-host selection never reaches here with an `active` pair:
+    /// `slot_selection` already filtered it to `None` (its own tests
+    /// above), so the caller's fallback runs unchanged.
+    #[test]
+    fn provider_selection_is_none_with_no_slot_active() {
+        let rows = [project_with(2, vec![tab_with(10, 2, "/repo", "t")])];
+        assert_eq!(
+            provider_selection(LocalBackendMode::Session, SlotSelection::default(), &rows),
+            None
+        );
+    }
+
+    /// A selection naming a tab the slot's mirror no longer lists (torn
+    /// down between the click and this read) falls back rather than
+    /// handing a provider a stale cwd.
+    #[test]
+    fn provider_selection_is_none_when_the_tab_is_not_listed() {
+        let rows = [project_with(2, vec![tab_with(10, 2, "/repo", "t")])];
+        let selection = SlotSelection {
+            host: Some(1),
+            active: Some((2, 999)),
+        };
+        assert_eq!(
+            provider_selection(LocalBackendMode::Session, selection, &rows),
+            None
         );
     }
 }

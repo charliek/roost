@@ -151,6 +151,17 @@ release workflow asserts they agree).
   session and saved-host projects alike. Tabs opened elsewhere keep their
   own starting size: a session's own first and restored tabs (120×40)
   and `roostctl tab open` (80×24).
+- **Palette providers got no active tab or cwd on a session-backed
+  project (#533)** — under `local-backend = session`, `provider_context`
+  read the in-process workspace, which holds nothing while the local
+  band's tabs run on the session: every provider saw an empty
+  `ROOST_ACTIVE_CWD` and no `ROOST_ACTIVE_TAB_ID`/`ROOST_ACTIVE_PROJECT_ID`,
+  and spawned with no cwd at all. It now reads the slot's own listing
+  when the window is showing the slot's own tab, so a provider gets that
+  tab's real ids, title and tracked cwd, and spawns there while that is
+  still a directory. A remote
+  host's selection is unchanged. See
+  [Extending Roost](docs/guides/extending.md).
 
 ## v0.0.20 — 2026-09-20
 

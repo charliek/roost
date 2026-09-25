@@ -3009,3 +3009,47 @@ def test_closing_the_last_tab_below_lands_on_the_tab_last_viewed_above(lane: Lan
     roost.close_tab(shown)
 
     lands_on(roost, project, viewed, "the fallback to open P on the tab last viewed there")
+
+
+# ---------------------------------------------------------------------------
+# 14. Plan 071 §D14 (#533): providers see the slot's active tab
+# ---------------------------------------------------------------------------
+
+
+def test_provider_context_reads_the_slots_active_tab(lane: Lane):
+    """D14 (#533): under `session`, a provider sees the slot's own active
+    tab — its ids and tracked cwd — rather than the in-process workspace,
+    which holds nothing here. `fixture-active-context.sh` echoes exactly
+    what `provider_context` handed it, and spawns with that cwd, so the
+    `pwd` item proves the spawn actually landed there and not merely that
+    the env var was set."""
+    roost = session_ui(lane)
+    active = roost.identify()["active_tab_id"]
+    with lane.session() as c:
+        active_row = c.tab(active)
+    assert active_row is not None, "the slot's own tab is listed on its own socket"
+
+    items = roost.palette_open(kind="custom")["items"]
+    by_title = {it["title"]: it["id"] for it in items}
+    util.precondition(
+        "Active Context Probe" in by_title,
+        "seed config / providers dir not active (UI not launched by the harness)",
+    )
+    roost.palette_activate(by_title["Active Context Probe"])
+    wait_until(
+        lambda: any(
+            it["title"].startswith("cwd:") for it in roost.palette_state()["items"]
+        ),
+        scaled_timeout(15.0),
+        "the probe to run and report",
+    )
+    probed = {
+        it["title"].split(":", 1)[0]: it["title"].split(":", 1)[1]
+        for it in roost.palette_state()["items"]
+    }
+    assert probed["tab"] == str(active), probed
+    assert probed["cwd"] == active_row["cwd"], probed
+    assert probed["pwd"] == active_row["cwd"], (
+        "the provider actually spawned in the active tab's cwd, not just "
+        f"saw it in an env var: {probed}"
+    )
