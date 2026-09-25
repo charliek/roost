@@ -1207,10 +1207,6 @@ impl App {
         // construction — the same reason the palette refresh below sits
         // here.
         self.sync_dock_badge();
-        // Same reasoning, one surface over: the Window menu's rows are
-        // project/tab state, so hanging them off the authoritative resync
-        // covers open, close, rename, reorder and select by construction.
-        self.sync_window_menu();
         self.refresh_notification_palette();
         // Before the selection check, which decides whether the window
         // is still showing a row that exists: whatever this selects is
@@ -1219,6 +1215,12 @@ impl App {
         self.resolve_pending_host_selection();
         let focused = self.resolve_awaited_listings();
         self.reconcile_host_selection();
+        // After selection resolution, not before it (plan 071 D15): the
+        // active checkmark reads `active_project_key`/`active_tab_key`,
+        // and syncing on the pre-resolution reads left a relaunch or an
+        // async project creation with a stale check — the one this ran
+        // against a selection about to move again this same reconcile.
+        self.sync_window_menu();
         // Both of this snapshot's inputs are settled here: the views
         // were rebuilt at the top of this reconcile and the selection
         // just now. A *connection* change publishes through no other
@@ -2752,26 +2754,31 @@ impl App {
             if self.window_id.is_none() {
                 return;
             }
-            let host = self.backend.host();
+            let slot = self
+                .local_slot_view()
+                .map(|view| (view.host, view.projects.as_slice()));
+            let (host, rows) =
+                local_backend::window_menu_rows(self.local_backend, slot, &self.projects);
             let active_project = self.active_project_key();
             let active_tab = self.active_tab_key();
             if self
                 .menu_window_rows
-                .matches(&self.projects, host, active_project, active_tab)
+                .matches(rows, host, active_project, active_tab)
             {
                 return;
             }
-            let rows = crate::macos::menu::WindowRows::derive(
-                &self.projects,
-                host,
-                active_project,
-                active_tab,
-            );
+            let derived =
+                crate::macos::menu::WindowRows::derive(rows, host, active_project, active_tab);
             let Some(mtm) = seam_on_main("window-menu rebuild") else {
                 return;
             };
-            crate::macos::menu::sync_window_menu(mtm, &rows, &self.keybindings, self.menu_gating());
-            self.menu_window_rows = rows;
+            crate::macos::menu::sync_window_menu(
+                mtm,
+                &derived,
+                &self.keybindings,
+                self.menu_gating(),
+            );
+            self.menu_window_rows = derived;
         }
     }
 

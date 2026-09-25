@@ -1372,6 +1372,58 @@ mod tests {
         );
     }
 
+    /// Plan 071 D15 (#pending: the macOS Window menu under `session`):
+    /// `app::local_backend::window_menu_rows` hands this the slot's own
+    /// `(HostId, &[Project])` under `session`, in place of the always-
+    /// empty in-process snapshot — nothing here has to change for that,
+    /// because `derive`/`matches` are already host-generic (proven above
+    /// for a remote host); this pins the slot's checkmarks explicitly so
+    /// a regression in either function shows up against the exact shape
+    /// that bug was in.
+    #[test]
+    fn slot_rows_render_with_their_own_checkmarks() {
+        let slot_host = HostId::new(7);
+        let slot_rows = vec![
+            project(1, "Untitled 1", vec![tab(10, 1), tab(11, 1)]),
+            project(2, "shed", vec![tab(20, 2)]),
+        ];
+        let rows = WindowRows::derive(
+            &slot_rows,
+            slot_host,
+            ProjectKey::new(slot_host, 2),
+            TabKey::new(slot_host, 20),
+        );
+        assert_eq!(
+            rows.projects
+                .iter()
+                .map(|row| (row.id, row.title.as_str(), row.active))
+                .collect::<Vec<_>>(),
+            vec![
+                (ProjectKey::new(slot_host, 1), "Untitled 1", false),
+                (ProjectKey::new(slot_host, 2), "shed", true),
+            ]
+        );
+        assert_eq!(
+            rows.tabs,
+            vec![WindowRow {
+                id: TabKey::new(slot_host, 20),
+                title: "Tab 1".into(),
+                active: true,
+            }]
+        );
+        // The slot's id-space and the local one stay disjoint even at
+        // the same numeric project/tab id — an in-process key must not
+        // check a slot row, matching the existing remote-host pin above.
+        let unchecked = WindowRows::derive(
+            &slot_rows,
+            slot_host,
+            ProjectKey::local(2),
+            TabKey::local(20),
+        );
+        assert!(unchecked.projects.iter().all(|row| !row.active));
+        assert!(unchecked.tabs.iter().all(|row| !row.active));
+    }
+
     /// The change detection reconcile leans on: every field the menu
     /// renders is part of the comparison, and nothing else is.
     #[test]

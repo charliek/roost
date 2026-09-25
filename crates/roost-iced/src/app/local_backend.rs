@@ -684,6 +684,38 @@ pub(super) fn provider_selection(
     })
 }
 
+/// Which rows the macOS Window menu draws, and the host they are keyed
+/// under (plan 071 D15, P9).
+///
+/// Picked by **backend mode**, not by whichever section the window
+/// happens to be showing (panel correction 11): a remote host's own
+/// rows never appear here, matching what `in-process` already does when
+/// a remote host is showing (the menu stays on the local list, with no
+/// row checked). Under `session` "the local list" is the slot's own
+/// mirror rather than the in-process workspace, which holds nothing —
+/// reading it left the menu empty for the whole mode. With no slot view
+/// yet, there is nothing to show.
+///
+/// Its only call site is `App::sync_window_menu`, which is macOS-only,
+/// so a non-macOS build never reaches it outside its own unit tests —
+/// kept a plain, portable function anyway (rather than
+/// `#[cfg(target_os = "macos")]` on the definition) so those tests run
+/// on every CI cell, not only the macOS one.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(super) fn window_menu_rows<'a>(
+    mode: LocalBackendMode,
+    slot: Option<(HostId, &'a [Project])>,
+    in_process: &'a [Project],
+) -> (HostId, &'a [Project]) {
+    match mode {
+        LocalBackendMode::InProcess => (HostId::LOCAL, in_process),
+        LocalBackendMode::Session => match slot {
+            Some((host, rows)) => (host, rows),
+            None => (HostId::LOCAL, &[]),
+        },
+    }
+}
+
 /// The snapshot for `mode`.
 ///
 /// Every derived field hangs off the mode: in-process has no slot, so it
@@ -3943,6 +3975,49 @@ mod tests {
             provider_selection(LocalBackendMode::Session, selection, &rows),
             None
         );
+    }
+
+    /// D15 (P9): in-process draws its own workspace, ignoring whatever a
+    /// slot happens to hold — there is no slot under this mode.
+    #[test]
+    fn window_menu_rows_reads_the_workspace_off_process() {
+        let workspace = [project_with(1, vec![tab_with(10, 1, "/tmp", "t")])];
+        let slot_rows = [project_with(9, vec![tab_with(90, 9, "/tmp", "s")])];
+        let (host, rows) = window_menu_rows(
+            LocalBackendMode::InProcess,
+            Some((HostId::new(3), &slot_rows)),
+            &workspace,
+        );
+        assert_eq!(host, HostId::LOCAL);
+        assert_eq!(rows, &workspace);
+    }
+
+    /// D15 (P9): under `session` the menu is the slot's own mirror, not
+    /// the in-process workspace — which holds nothing under this mode,
+    /// and reading it is what left the menu empty (the bug this fixes).
+    #[test]
+    fn window_menu_rows_reads_the_slots_mirror_under_session() {
+        let workspace = [project_with(1, vec![tab_with(10, 1, "/tmp", "t")])];
+        let slot_rows = [project_with(9, vec![tab_with(90, 9, "/tmp", "s")])];
+        let slot_host = HostId::new(3);
+        let (host, rows) = window_menu_rows(
+            LocalBackendMode::Session,
+            Some((slot_host, &slot_rows)),
+            &workspace,
+        );
+        assert_eq!(host, slot_host);
+        assert_eq!(rows, &slot_rows);
+    }
+
+    /// No slot view yet (not connected): nothing to show. Falling back
+    /// to the in-process workspace here would be showing rows from a
+    /// backend the window isn't running on under `session`.
+    #[test]
+    fn window_menu_rows_is_empty_with_no_slot_view() {
+        let workspace = [project_with(1, vec![tab_with(10, 1, "/tmp", "t")])];
+        let (host, rows) = window_menu_rows(LocalBackendMode::Session, None, &workspace);
+        assert_eq!(host, HostId::LOCAL);
+        assert!(rows.is_empty());
     }
 }
 

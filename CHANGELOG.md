@@ -162,6 +162,15 @@ release workflow asserts they agree).
   still a directory. A remote
   host's selection is unchanged. See
   [Extending Roost](docs/guides/extending.md).
+- **The macOS Window menu listed nothing on a session-backed project
+  (#550)** — it read the in-process workspace's project/tab rows, which
+  under `local-backend = session` are empty, or a stale layout with no
+  live tabs, since the local band's tabs run on the session. It now picks rows by backend mode: the slot's own
+  mirror under `session`, the in-process workspace otherwise — a remote
+  host's rows still never appear, matching `in-process`. The rebuild also
+  moved to run after the window's selection settles each reconcile, so a
+  relaunch or an in-flight project creation doesn't leave a stale
+  checkmark.
 
 ## v0.0.20 — 2026-09-20
 
