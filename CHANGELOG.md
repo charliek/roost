@@ -105,6 +105,13 @@ release workflow asserts they agree).
   says "the local session is not connected", and a failed rename or
   reorder names the local session instead of "the host". The wire
   replies `roostctl` and other tools see are unchanged.
+- **A new session tab's first frame was a hardcoded dark color instead of
+  the active theme (#545)** — before a session-backed tab's hydration
+  landed (⌘T / Alt+T on a local session tab or a saved host), the
+  pre-attach frame always painted `TerminalSnapshot::blank`'s fixed
+  background, foreground and selection colors and never a cursor,
+  clashing with every non-default theme. It now starts from the active
+  theme's colors instead, still with no cursor drawn.
 
 ## v0.0.20 — 2026-09-20
 

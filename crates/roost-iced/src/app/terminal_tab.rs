@@ -351,6 +351,7 @@ impl TerminalTab {
         terminal
             .set_write_pty_buffer(Arc::clone(&reply_buffer))
             .context("install libghostty PTY reply buffer")?;
+        let snapshot = TerminalSnapshot::blank_themed(cols, rows, &theme);
         Ok(Self {
             terminal,
             render_state: RenderState::new()?,
@@ -372,7 +373,7 @@ impl TerminalTab {
             pointer_shape: "default".into(),
             theme,
             preedit: None,
-            snapshot: TerminalSnapshot::blank(cols, rows),
+            snapshot,
             // Left empty on purpose: the first `refresh_snapshot` finds no
             // cached grid size, sizes the grid and forces a full rebuild.
             grid: Vec::new(),
@@ -1286,5 +1287,28 @@ impl TerminalTab {
             rows: self.rows,
             cells,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D9 (#545): a session tab's first frame — before the host's
+    /// hydration replaces it — must read as the active theme, not the
+    /// hardcoded dark placeholder `TerminalSnapshot::blank` carries.
+    #[test]
+    fn host_attach_first_frame_uses_the_theme() {
+        let (input_tx, _input_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tab, _capture) = attach_test_host_terminal(80, 24, input_tx);
+
+        assert_eq!(tab.snapshot.background, tab.theme.background);
+        assert_eq!(tab.snapshot.foreground, tab.theme.foreground);
+        assert_eq!(tab.snapshot.cursor_color, tab.theme.cursor);
+        assert_eq!(
+            tab.snapshot.selection_background,
+            tab.theme.selection_background
+        );
+        assert!(tab.snapshot.cursor.is_none());
     }
 }
