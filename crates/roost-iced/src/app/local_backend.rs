@@ -545,27 +545,50 @@ pub(crate) enum InitialSelection {
     Select { project: i64, tab: i64 },
 }
 
-/// Decide it (plan 063 §D5).
+/// The slot as [`initial_selection`] reads it: its live rows, its own
+/// active tab id, and what this client remembers showing there.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SlotRows<'a> {
+    pub(crate) projects: &'a [Project],
+    pub(crate) active_tab_id: i64,
+    /// `None` between the connection's `Connected` and its facts.
+    pub(crate) session_id: Option<&'a str>,
+    pub(crate) memory: Option<&'a roost_engine::persistence::HostTabMemory>,
+}
+
+/// Decide it (plan 063 §D5, plan 071 §D11).
 ///
-/// `slot` is the slot's live rows and its own active tab id, and is
-/// `None` until the slot is connected and interactive. The acceptance
-/// criterion is a *visible, attached* tab, not "≥1 project", which is
-/// why this resolves to a tab rather than to a project.
+/// `slot` is `None` until the slot is connected and interactive. The
+/// acceptance criterion is a *visible, attached* tab, not "≥1 project",
+/// which is why this resolves to a tab rather than to a project.
+///
+/// It also waits for the session id, without which the memory cannot be
+/// read ([`super::tab_memory::recall`]).
 pub(crate) fn initial_selection(
     mode: LocalBackendMode,
     selection_held: bool,
-    slot: Option<(&[Project], i64)>,
+    slot: Option<SlotRows<'_>>,
 ) -> InitialSelection {
     if mode != LocalBackendMode::Session || selection_held {
         return InitialSelection::Settled;
     }
-    let Some((projects, active_tab_id)) = slot else {
+    let Some(SlotRows {
+        projects,
+        active_tab_id,
+        session_id: Some(session_id),
+        memory,
+    }) = slot
+    else {
         return InitialSelection::Wait;
     };
-    // The session's own active tab wins, so a relaunch lands where the
-    // last client left it; its project is found by holding that tab
-    // rather than by position, because the session's project order is
-    // not this client's.
+    let remembered = super::tab_memory::recall(memory, Some(session_id))
+        .and_then(|recall| recall.last_shown(projects, active_tab_id));
+    if let Some((project, tab)) = remembered {
+        return InitialSelection::Select { project, tab };
+    }
+    // Otherwise the session's own active tab. Its project is found by
+    // holding that tab rather than by position, because the session's
+    // project order is not this client's.
     let project = projects
         .iter()
         .find(|project| project.tabs.iter().any(|tab| tab.id == active_tab_id))
@@ -573,15 +596,10 @@ pub(crate) fn initial_selection(
     let Some(project) = project else {
         return InitialSelection::Wait;
     };
-    let tab = project
-        .tabs
-        .iter()
-        .find(|tab| tab.id == active_tab_id)
-        .or_else(|| project.tabs.first());
-    match tab {
+    match super::tab_memory::preferred_listed_tab(project, active_tab_id, None) {
         Some(tab) => InitialSelection::Select {
             project: project.id,
-            tab: tab.id,
+            tab,
         },
         None => InitialSelection::Wait,
     }
@@ -2883,9 +2901,11 @@ pub(crate) fn tab_counts(projects: &[Project]) -> std::collections::HashMap<i64,
 
 #[cfg(test)]
 mod tests {
+    use super::super::tab_memory::{self, fixtures::project};
     use super::*;
+    use roost_engine::persistence::{HostTabMemory, TabMemo};
     use roost_ipc::paths::BundleProfile;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     #[test]
     fn the_session_snapshot_carries_the_profile_socket_and_the_slot_selection() {
@@ -3616,38 +3636,6 @@ mod tests {
         assert_eq!(slot_label(|_| false), None);
     }
 
-    fn project(id: i64, tabs: &[i64]) -> Project {
-        use roost_ipc::messages::{Tab, TabState};
-        Project {
-            id,
-            name: format!("p{id}"),
-            cwd: "/tmp".into(),
-            position: 0,
-            created_at: 0,
-            tabs: tabs
-                .iter()
-                .enumerate()
-                .map(|(index, tab)| Tab {
-                    id: *tab,
-                    project_id: id,
-                    title: String::new(),
-                    cwd: "/tmp".into(),
-                    state: TabState::Idle,
-                    has_notification: false,
-                    is_active: false,
-                    user_titled: false,
-                    position: index as i32,
-                    created_at: 0,
-                    last_active: 0,
-                    hook_active: false,
-                    shell_state: Default::default(),
-                    agent_lifecycle: Default::default(),
-                    ownership: None,
-                })
-                .collect(),
-        }
-    }
-
     /// Plan 063 §D5's initial selection, and AC2's "attached, not merely
     /// present": the answer is a tab.
     #[test]
@@ -3656,7 +3644,7 @@ mod tests {
 
         // The session's active tab, wherever it lives.
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, Some((&rows, 21))),
+            initial_selection(LocalBackendMode::Session, false, slot(&rows, 21)),
             InitialSelection::Select {
                 project: 2,
                 tab: 21
@@ -3665,7 +3653,7 @@ mod tests {
         // No active tab of its own (or one that closed): the first row
         // with something in it.
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, Some((&rows, 0))),
+            initial_selection(LocalBackendMode::Session, false, slot(&rows, 0)),
             InitialSelection::Select {
                 project: 1,
                 tab: 10
@@ -3674,7 +3662,7 @@ mod tests {
         // A project with no tabs is not somewhere to land.
         let empty = [project(1, &[]), project(2, &[20])];
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, Some((&empty, 0))),
+            initial_selection(LocalBackendMode::Session, false, slot(&empty, 0)),
             InitialSelection::Select {
                 project: 2,
                 tab: 20
@@ -3689,12 +3677,12 @@ mod tests {
     fn the_launch_selection_waits_for_the_slot_and_yields_to_a_held_one() {
         let rows = [project(1, &[10])];
         assert_eq!(
-            initial_selection(LocalBackendMode::InProcess, false, Some((&rows, 10))),
+            initial_selection(LocalBackendMode::InProcess, false, slot(&rows, 10)),
             InitialSelection::Settled,
             "in-process never had a slot to select from"
         );
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, true, Some((&rows, 10))),
+            initial_selection(LocalBackendMode::Session, true, slot(&rows, 10)),
             InitialSelection::Settled,
             "an unrelated remote-host selection is preserved"
         );
@@ -3704,9 +3692,112 @@ mod tests {
             "the slot is not connected yet"
         );
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, Some((&[], 0))),
+            initial_selection(LocalBackendMode::Session, false, slot(&[], 0)),
             InitialSelection::Wait,
             "connected but empty: the seed has not landed yet"
+        );
+    }
+
+    /// An identified slot with nothing remembered.
+    fn slot(projects: &[Project], active_tab_id: i64) -> Option<SlotRows<'_>> {
+        Some(SlotRows {
+            projects,
+            active_tab_id,
+            session_id: Some("s-1"),
+            memory: None,
+        })
+    }
+
+    /// `s-1` last showed tab 21, the second tab of project 2.
+    fn shown_21() -> HostTabMemory {
+        let memo = TabMemo {
+            tab_id: 21,
+            position: 1,
+        };
+        HostTabMemory {
+            session_id: "s-1".into(),
+            last_viewed: BTreeMap::from([(2, memo)]),
+            last_shown: Some((2, memo)),
+        }
+    }
+
+    /// Plan 071 §D11: the relaunch lands where this window last looked,
+    /// which is neither the session's active tab nor a project's first.
+    #[test]
+    fn the_launch_selection_lands_on_the_tab_last_shown() {
+        let rows = [project(1, &[10, 11]), project(2, &[20, 21, 22])];
+        let memory = shown_21();
+        let remembered = |session_id, projects| {
+            initial_selection(
+                LocalBackendMode::Session,
+                false,
+                Some(SlotRows {
+                    projects,
+                    active_tab_id: 11,
+                    session_id: Some(session_id),
+                    memory: Some(&memory),
+                }),
+            )
+        };
+
+        assert_eq!(
+            remembered("s-1", &rows),
+            InitialSelection::Select {
+                project: 2,
+                tab: 21
+            }
+        );
+        let restarted = [project(1, &[40, 41]), project(2, &[50, 51, 52])];
+        assert_eq!(
+            remembered("s-2", &restarted),
+            InitialSelection::Select {
+                project: 2,
+                tab: 51
+            },
+            "a restarted session keeps the project and uses the position"
+        );
+        let deleted = [project(1, &[10, 11])];
+        assert_eq!(
+            remembered("s-1", &deleted),
+            InitialSelection::Select {
+                project: 1,
+                tab: 11
+            },
+            "the remembered project is gone: the session's own active tab"
+        );
+    }
+
+    /// Plan 071 correction 6: `Connected` and the connection's facts are
+    /// separate feed items.
+    #[test]
+    fn the_launch_selection_neither_decides_nor_writes_before_the_session_id() {
+        let rows = [project(1, &[10, 11]), project(2, &[20, 21, 22])];
+        let memory = shown_21();
+        let arrived = |session_id| SlotRows {
+            projects: &rows,
+            active_tab_id: 11,
+            session_id,
+            memory: Some(&memory),
+        };
+
+        assert_eq!(
+            initial_selection(LocalBackendMode::Session, false, Some(arrived(None))),
+            InitialSelection::Wait,
+            "connected, facts not yet"
+        );
+        assert_eq!(
+            tab_memory::remember_shown(Some(&memory), None, &rows, 1, 11),
+            None,
+            "and a selection made by anything else in that window writes nothing"
+        );
+
+        assert_eq!(
+            initial_selection(LocalBackendMode::Session, false, Some(arrived(Some("s-1")))),
+            InitialSelection::Select {
+                project: 2,
+                tab: 21
+            },
+            "the facts landed: the memory decides"
         );
     }
 }

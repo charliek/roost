@@ -90,6 +90,7 @@ pub(crate) mod local_backend;
 mod palettes;
 mod servicing;
 mod tab_backend;
+mod tab_memory;
 mod terminal_tab;
 // The in-crate `#[ignore]`d perf harness — see `tools/perf/README.md` for
 // how to run it. Gated on `cfg(test)` like `terminal_tab`'s test-only
@@ -7065,17 +7066,38 @@ impl App {
         Some((view, row))
     }
 
-    /// The tab a host project row selects: the host's own active tab when
-    /// it lives in that project, else the project's first. Mirrors
-    /// `Workspace::preferred_tab`, read off the mirror instead.
+    /// The tab a host project row selects, by
+    /// [`tab_memory::preferred_listed_tab`]. `Workspace::preferred_tab`'s
+    /// counterpart, read off the mirror and this client's memory instead.
     fn host_preferred_tab(&self, project: ProjectKey) -> Option<TabKey> {
         let (view, rows) = self.host_project_row(project)?;
-        let tab = rows
-            .tabs
-            .iter()
-            .find(|tab| tab.id == view.active_tab_id)
-            .or_else(|| rows.tabs.first())?;
-        Some(TabKey::new(project.host, tab.id))
+        let memory = self.workspace.host_tab_memory(&view.saved_id);
+        let recall = tab_memory::recall(memory.as_ref(), self.hosts.session_id_for(view.host));
+        let tab = tab_memory::preferred_listed_tab(rows, view.active_tab_id, recall)?;
+        Some(TabKey::new(project.host, tab))
+    }
+
+    fn remember_host_selection(&self, selection: HostSelection) {
+        let host = selection.tab.host;
+        if host.is_local() {
+            return;
+        }
+        let Some(view) = self.host_view(host) else {
+            return;
+        };
+        let stored = self.workspace.host_tab_memory(&view.saved_id);
+        let Some(next) = tab_memory::remember_shown(
+            stored.as_ref(),
+            self.hosts.session_id_for(host),
+            &view.projects,
+            selection.project.project,
+            selection.tab.tab,
+        ) else {
+            return;
+        };
+        if let Err(error) = self.workspace.set_host_tab_memory(&view.saved_id, next) {
+            tracing::debug!(host = %view.saved_id, %error, "could not remember the host tab");
+        }
     }
 
     /// Move a host selection the sidebar can no longer draw onto its
@@ -7115,7 +7137,11 @@ impl App {
         };
         let frame = self.selection_frame();
         match selection_fallback::decide(&self.last_selection_frame, &frame, was, live) {
-            selection_fallback::Decision::Keep => {}
+            // Recorded here as well as where it is set: a selection made
+            // before the session's identity arrived, or one whose tab
+            // moved under it, is only rememberable now. Unchanged, it
+            // writes nothing.
+            selection_fallback::Decision::Keep => self.remember_host_selection(selection),
             selection_fallback::Decision::DropToLocal => {
                 if live.local_active_moved {
                     tracing::debug!("host selection dropped: a local tab took the focus");
@@ -7196,10 +7222,11 @@ impl App {
     fn set_host_selection(&mut self, next: Option<HostSelection>) {
         let released = host_selection_detach(self.host_selection, next);
         self.host_selection = next;
-        if next.is_none() {
+        match next {
             // The memo is "the frame the selection resolved in", so it
             // goes with the selection — by whichever route it left.
-            self.last_selection_frame.clear();
+            None => self.last_selection_frame.clear(),
+            Some(selection) => self.remember_host_selection(selection),
         }
         // Under `session` this *is* the local selection, so it is what
         // `identify.active_*` answers and what a bare-id op with no
@@ -8661,21 +8688,29 @@ impl App {
     /// Unbounded, unlike the pending-creation wait: there is no round
     /// trip that might not come back, only a session that might be
     /// empty until something seeds it — and the moment it has a tab,
-    /// this is the selection the window should be showing.
+    /// this is the selection the window should be showing. The wait for
+    /// the session id adds none: a connection publishes its facts right
+    /// behind `Connected`, on the same feed.
     fn resolve_initial_local_selection(&mut self) {
         if !self.pending_initial_local_selection {
             return;
         }
-        let slot = self
+        let view = self
             .local_slot_host()
             .filter(|host| !host.is_local())
-            .and_then(|host| self.interactive_host_view(host))
-            .map(|view| (view.projects.as_slice(), view.active_tab_id, view.host));
-        let host = slot.map(|(_, _, host)| host);
+            .and_then(|host| self.interactive_host_view(host));
+        let host = view.map(|view| view.host);
+        let memory = view.and_then(|view| self.workspace.host_tab_memory(&view.saved_id));
+        let slot = view.map(|view| local_backend::SlotRows {
+            projects: &view.projects,
+            active_tab_id: view.active_tab_id,
+            session_id: self.hosts.session_id_for(view.host),
+            memory: memory.as_ref(),
+        });
         match local_backend::initial_selection(
             self.local_backend,
             self.host_selection.is_some(),
-            slot.map(|(projects, active, _)| (projects, active)),
+            slot,
         ) {
             local_backend::InitialSelection::Wait => {}
             local_backend::InitialSelection::Settled => {

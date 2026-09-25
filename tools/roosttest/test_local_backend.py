@@ -2880,3 +2880,79 @@ def test_a_replayed_tab_the_window_never_showed_starts_at_the_windows_grid(lane:
             "the replayed tab to print its size",
         )
     assert printed == f"{window['rows']} {window['cols']}", printed
+
+
+# 13. Plan 071 §D11: a session project remembers the tab you last viewed
+# ---------------------------------------------------------------------------
+#
+# The remembered tab must be neither fallback — the session's active tab
+# (the one last *opened* there) or a project's first — so the window is
+# left on the strip's second tab, with the session's active tab in
+# another project.
+
+
+def viewed_while_the_session_is_elsewhere(lane: Lane, roost: Roost) -> tuple[int, int]:
+    """[`a_strip`]'s project `P` with the window showing its second tab,
+    and then a tab opened in a second project through the **session's**
+    socket, so the window stays where it is while the session's active
+    tab moves away from `P`.
+
+    Returns `P` and the tab the window showed there."""
+    project, tabs = a_strip(lane, roost)
+    viewed = tabs[1]
+    roost.focus(viewed)
+    lands_on(roost, project, viewed, "the window to show P's second tab")
+
+    with lane.session() as c:
+        elsewhere = c.create_project(name="elsewhere", cwd="/tmp")
+        active = c.open_tab(elsewhere, cwd="/tmp")
+        assert c.tab(active)["is_active"] is True, "the session's active tab left P"
+    wait_until(
+        lambda: slot_key(roost, active),
+        scaled_timeout(30.0),
+        "the window to list the tab the session made active",
+    )
+    assert selected(roost) == (project, viewed), "opening on the session moved the window"
+    return project, viewed
+
+
+def test_a_relaunch_lands_on_the_tab_last_viewed(lane: Lane):
+    """AC11: the window comes back to the tab it was showing, not to the
+    session's active tab — which is what a launch landed on before."""
+    roost = session_ui(lane)
+    project, viewed = viewed_while_the_session_is_elsewhere(lane, roost)
+
+    roost = lane.restart()
+
+    lands_on(roost, project, viewed, "the relaunch to land on the tab last viewed")
+
+
+def test_closing_the_last_tab_below_lands_on_the_tab_last_viewed_above(lane: Lane):
+    """AC11's close fallback: a shown project's last tab closes, the walk
+    goes up to `P`, and `P` opens on the tab last viewed there rather than
+    on its first tab or the session's active one."""
+    roost = session_ui(lane)
+    project, viewed = viewed_while_the_session_is_elsewhere(lane, roost)
+    with lane.session() as c:
+        below = c.create_project(name="below", cwd="/tmp")
+        shown = c.open_tab(below, cwd="/tmp")
+    wait_until(
+        lambda: slot_key(roost, shown),
+        scaled_timeout(30.0),
+        "the window to list the project below P",
+    )
+    order = window_projects(roost)
+    order.remove(below)
+    order.insert(order.index(project) + 1, below)
+    roost.reorder_projects(order)
+    wait_until(
+        lambda: window_projects(roost) == order,
+        scaled_timeout(30.0),
+        "the window's sidebar to draw the project directly below P",
+    )
+    roost.focus(shown)
+    lands_on(roost, below, shown, "the window to show the project below P")
+
+    roost.close_tab(shown)
+
+    lands_on(roost, project, viewed, "the fallback to open P on the tab last viewed there")

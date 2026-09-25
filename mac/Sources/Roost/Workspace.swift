@@ -1304,17 +1304,14 @@ final class Workspace {
             let label: String
             let target: String
             let lastConnected: String?
-
-            init(id: String, label: String, target: String, lastConnected: String? = nil) {
-                self.id = id
-                self.label = label
-                self.target = target
-                self.lastConnected = lastConnected
-            }
+            /// The Rust UI's memory of the tab it last showed on this
+            /// host (plan 071 §D11). Carried, never read here.
+            let tabMemory: JSONValue?
 
             enum CodingKeys: String, CodingKey {
                 case id, label, target
                 case lastConnected = "last_connected"
+                case tabMemory = "tab_memory"
             }
 
             // Custom decode so a missing or null `last_connected`
@@ -1326,6 +1323,51 @@ final class Workspace {
                 label = try c.decode(String.self, forKey: .label)
                 target = try c.decode(String.self, forKey: .target)
                 lastConnected = try c.decodeIfPresent(String.self, forKey: .lastConnected)
+                tabMemory = try c.decodeIfPresent(JSONValue.self, forKey: .tabMemory)
+            }
+        }
+
+        /// A JSON value carried through a rewrite without being
+        /// interpreted, for a field this UI keeps only so it is not lost.
+        enum JSONValue: Codable, Equatable, Sendable {
+            case null
+            case bool(Bool)
+            case int(Int64)
+            case double(Double)
+            case string(String)
+            case array([JSONValue])
+            case object([String: JSONValue])
+
+            init(from decoder: Decoder) throws {
+                let c = try decoder.singleValueContainer()
+                if c.decodeNil() {
+                    self = .null
+                } else if let value = try? c.decode(Bool.self) {
+                    self = .bool(value)
+                } else if let value = try? c.decode(Int64.self) {
+                    self = .int(value)
+                } else if let value = try? c.decode(Double.self) {
+                    self = .double(value)
+                } else if let value = try? c.decode(String.self) {
+                    self = .string(value)
+                } else if let value = try? c.decode([JSONValue].self) {
+                    self = .array(value)
+                } else {
+                    self = .object(try c.decode([String: JSONValue].self))
+                }
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var c = encoder.singleValueContainer()
+                switch self {
+                case .null: try c.encodeNil()
+                case .bool(let value): try c.encode(value)
+                case .int(let value): try c.encode(value)
+                case .double(let value): try c.encode(value)
+                case .string(let value): try c.encode(value)
+                case .array(let value): try c.encode(value)
+                case .object(let value): try c.encode(value)
+                }
             }
         }
 

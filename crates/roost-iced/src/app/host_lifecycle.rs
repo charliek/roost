@@ -313,6 +313,7 @@ mod tests {
             label: "one".to_string(),
             target: "workbox".to_string(),
             last_connected: None,
+            tab_memory: None,
         }
     }
 

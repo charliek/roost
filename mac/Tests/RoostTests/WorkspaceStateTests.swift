@@ -1229,6 +1229,72 @@ struct WorkspaceStatePersistenceTests {
         #expect(back.hosts.count == 1, "and the saved hosts beside them")
     }
 
+    /// The Rust UI's `tab_memory` as it writes one (plan 071 §D11).
+    private static let tabMemory = """
+    {"session_id": "s-1",
+     "last_viewed": {"7": {"tab_id": 71, "position": 1}},
+     "last_shown": [7, {"tab_id": 71, "position": 1}]}
+    """
+
+    @Test func hostTabMemoryRoundTripsThroughDecodeAndEncode() throws {
+        let host = """
+        {"id": "h1", "label": "laptop", "target": "localhost",
+         "tab_memory": \(Self.tabMemory)}
+        """
+        let decoded = try JSONDecoder().decode(
+            Workspace.SnapshotFile.HostSnapshot.self, from: Data(host.utf8)
+        )
+        #expect(decoded.tabMemory != nil)
+        let reencoded = try JSONEncoder().encode(decoded)
+        let again = try JSONDecoder().decode(
+            Workspace.SnapshotFile.HostSnapshot.self, from: reencoded
+        )
+        #expect(again == decoded)
+
+        let object = try #require(
+            JSONSerialization.jsonObject(with: reencoded) as? [String: Any]
+        )
+        let want = try #require(
+            JSONSerialization.jsonObject(with: Data(Self.tabMemory.utf8)) as? NSDictionary
+        )
+        #expect(object["tab_memory"] as? NSDictionary == want)
+    }
+
+    /// Carried like `recent_hosts`: a Mac write-through of a shared
+    /// `state.json` must not erase it, and a host without one must not
+    /// grow the key.
+    @Test func hostTabMemorySurvivesAnOrdinaryRewrite() async throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let seeded = """
+        {
+            "next_id": 3,
+            "projects": [],
+            "hosts": [
+                { "id": "h1", "label": "laptop", "target": "localhost",
+                  "tab_memory": \(Self.tabMemory) },
+                { "id": "h2", "label": "shed", "target": "test1@localhost" }
+            ]
+        }
+        """
+        try seeded.write(toFile: path, atomically: true, encoding: .utf8)
+
+        let ws = await Workspace(statePath: path)
+        _ = await ws.createProject(name: "Roost", cwd: "/tmp")
+
+        let raw = try #require(
+            JSONSerialization.jsonObject(
+                with: Data(contentsOf: URL(fileURLWithPath: path))
+            ) as? [String: Any]
+        )
+        let hosts = try #require(raw["hosts"] as? [[String: Any]])
+        let want = try #require(
+            JSONSerialization.jsonObject(with: Data(Self.tabMemory.utf8)) as? NSDictionary
+        )
+        #expect(hosts[0]["tab_memory"] as? NSDictionary == want, "carried value for value")
+        #expect(hosts[1]["tab_memory"] == nil, "no key for a host that had none")
+    }
+
     @Test func legacyStateWithoutHostsLoadsAndRewritesEmpty() async throws {
         let path = tempPath()
         defer { try? FileManager.default.removeItem(atPath: path) }

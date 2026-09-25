@@ -29,6 +29,7 @@
 //! costs only power-loss durability within the kernel writeback
 //! window; the atomic rename means the file is never torn.
 
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -124,6 +125,36 @@ pub struct HostSnapshot {
     pub target: String,
     #[serde(default)]
     pub last_connected: Option<String>,
+    /// The tab this client last showed in each of the host's projects
+    /// (plan 071 §D11). Client-side like the rest of the entry, and
+    /// never sent to the session. Omitted while `None`, so a host
+    /// nobody has viewed a tab on writes the entry older builds wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_memory: Option<HostTabMemory>,
+}
+
+/// What a client remembers about the tabs it showed on one host.
+///
+/// Tab ids are only meaningful to the session process that minted
+/// them, so the memory is stamped with that process's `session_id`,
+/// and each tab also carries its dense index within its project: a
+/// restarted session re-opens a project's tabs in order under new ids,
+/// and the position is what still names the same tab there.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostTabMemory {
+    pub session_id: String,
+    /// Keyed by project id, which a session keeps across a restart.
+    #[serde(default)]
+    pub last_viewed: BTreeMap<i64, TabMemo>,
+    /// The one the window was showing last, for a relaunch to land on.
+    #[serde(default)]
+    pub last_shown: Option<(i64, TabMemo)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabMemo {
+    pub tab_id: i64,
+    pub position: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,12 +330,39 @@ mod tests {
                     label: "laptop".into(),
                     target: "localhost".into(),
                     last_connected: Some("2026-08-27T00:00:00Z".into()),
+                    tab_memory: Some(HostTabMemory {
+                        session_id: "s-1".into(),
+                        last_viewed: BTreeMap::from([
+                            (
+                                7,
+                                TabMemo {
+                                    tab_id: 71,
+                                    position: 1,
+                                },
+                            ),
+                            (
+                                9,
+                                TabMemo {
+                                    tab_id: 90,
+                                    position: 0,
+                                },
+                            ),
+                        ]),
+                        last_shown: Some((
+                            7,
+                            TabMemo {
+                                tab_id: 71,
+                                position: 1,
+                            },
+                        )),
+                    }),
                 },
                 HostSnapshot {
                     id: "h2".into(),
                     label: "shed".into(),
                     target: "test1@localhost".into(),
                     last_connected: None,
+                    tab_memory: None,
                 },
             ],
             // Plan 063 §D7's forgotten hosts: a separate list with the
@@ -315,6 +373,7 @@ mod tests {
                 label: "old-box".into(),
                 target: "user@old-box".into(),
                 last_connected: Some("2026-09-01T00:00:00Z".into()),
+                tab_memory: None,
             }],
             projects: vec![ProjectSnapshot {
                 id: 1,
@@ -392,6 +451,26 @@ mod tests {
         assert_eq!(back.hosts[0].label, "shed");
         assert_eq!(back.hosts[0].last_connected, None);
         assert_eq!(back.hosts[1].last_connected, None);
+    }
+
+    #[test]
+    fn a_host_without_tab_memory_loads_as_none_and_writes_no_key() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("state.json");
+        std::fs::write(
+            &p,
+            br#"{"next_id":5,"hosts":[{"id":"h1","label":"shed","target":"localhost"}]}"#,
+        )
+        .unwrap();
+        let back = read_state(&p).unwrap().expect("present");
+        assert_eq!(back.hosts[0].tab_memory, None);
+
+        persist_state(&p, &back, false).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            !raw.contains("tab_memory"),
+            "an unremembered host must not grow the file: {raw}"
+        );
     }
 
     #[test]

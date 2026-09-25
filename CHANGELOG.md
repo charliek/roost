@@ -22,6 +22,16 @@ release workflow asserts they agree).
   always was. Served by sessions and Roost-Iced's UI socket; the Swift
   Mac app and servers that predate the field answer `unknown-field`. No
   CLI flag yet. See [`ipc.md#tabopen`](docs/reference/ipc.md#tabopen).
+- **A session-backed project remembers the tab you last viewed in it
+  (#547)** — on the local session a fresh Roost-Iced install runs its tabs
+  on, and on every saved host: a project click, ⌘1–9, the fallback when
+  the shown project's last tab closes, and a relaunch now land on the tab
+  you were last looking at there, as an in-process project does, instead
+  of on the tab the session last opened. The memory is the window's own,
+  saved per host in `state.json`; nothing is sent to the session. After
+  the session restarts, the remembered tab is found by its position in
+  the project. The Swift Mac app keeps the new field intact when it
+  rewrites a shared `state.json`.
 
 ### Fixed
 
