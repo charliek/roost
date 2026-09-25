@@ -1803,6 +1803,12 @@ impl App {
                     self.notification_inbox.remove(tab);
                     self.desktop_notifications.retire(tab);
                     self.awaiting_listing.closed(tab);
+                    if self
+                        .pending_host_selection
+                        .is_some_and(|pending| pending.tab == tab)
+                    {
+                        self.pending_host_selection = None;
+                    }
                 }
                 HostEnvelopeAction::ProjectDeleted(project_id) => {
                     self.retire_project_notifications(ProjectKey::new(host, project_id));
@@ -2450,13 +2456,17 @@ impl App {
                 self.desktop_notifications.retire(tab);
             }
             // The local workspace asserted its selection, so the host
-            // override is over. Reconcile's `local_active` watch catches
+            // override is over, and so is a host creation's claim to
+            // take it. Reconcile's `local_active` watch catches
             // the cases where the id moved; this catches the one where it
             // did not — an IPC `tab.focus` of the tab that is already
             // active is still a focus intent, and it must win the window
             // back from the host row (`Workspace::focus_tab` emits this
             // unconditionally, which is what makes it a reliable seam).
-            WorkspaceEvent::ActiveChanged { .. } => self.set_host_selection(None),
+            WorkspaceEvent::ActiveChanged { .. } => {
+                self.note_user_focus();
+                self.set_host_selection(None);
+            }
             WorkspaceEvent::ProjectDeleted { project_id } => {
                 self.retire_project_notifications(ProjectKey::new(self.backend.host(), project_id));
             }
@@ -3928,6 +3938,7 @@ impl App {
         };
         self.forward_replies.insert(op_id, reply);
         let forwarded = op.clone();
+        let focus_generation = self.focus_generation;
         let call = queue.call_at(host, op, params);
         self.engine_op(
             async move { Ok::<_, String>(call.await.map_err(|error| forwarded_failure(&error))) },
@@ -3942,6 +3953,7 @@ impl App {
                     host,
                     forwarded,
                     selects,
+                    focus_generation,
                     answer: Box::new(answer),
                 }
             },

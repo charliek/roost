@@ -2165,6 +2165,10 @@ class RecordingRelay:
     crosses unharmed; only the client→server half is parsed, only for
     whole JSON lines, and anything that is not one is skipped rather than
     an error.
+
+    [`hold`] is the one thing it does besides pump: it holds the server's
+    answer on the connection that sends a named op, which is how a case
+    puts a request in flight for as long as it needs.
     """
 
     def __init__(self, path: Path, upstream: Path):
@@ -2172,6 +2176,7 @@ class RecordingRelay:
         self._upstream = upstream
         self._ops: list[str] = []
         self._overflows = 0
+        self._hold: tuple[str, threading.Event] | None = None
         self._threads: list[threading.Thread] = []
         self._recorders: list[threading.Thread] = []
         self._live: list[socketlib.socket] = []
@@ -2220,8 +2225,26 @@ class RecordingRelay:
     def client(self, timeout: float = 30.0) -> Roost:
         return Roost(self.path, timeout=scaled_timeout(timeout))
 
+    def hold(self, op: str) -> threading.Event:
+        """Hold everything the server sends back on the next connection
+        that sends `op`, from the moment the frame is seen until the
+        returned event is set. The server still receives and runs the
+        request; only its answer waits.
+
+        Armed before the frame it names is forwarded, so the answer
+        cannot slip past it. One connection, once: the other connections
+        (the event stream, an attach) keep flowing."""
+        release = threading.Event()
+        with self._lock:
+            self._hold = (op, release)
+        return release
+
     def close(self) -> None:
         self._closing = True
+        with self._lock:
+            hold, self._hold = self._hold, None
+        if hold is not None:
+            hold[1].set()
         with contextlib.suppress(OSError):
             self._listener.close()
         with self._lock:
@@ -2261,12 +2284,15 @@ class RecordingRelay:
                 continue
             with self._lock:
                 self._live.extend((downstream, upstream))
-            reader = self._spawn(self._pump, downstream, upstream, True)
+            # Shared by the connection's two pumps: the recorder arms it,
+            # the answering half waits on it.
+            held: list[threading.Event] = []
+            reader = self._spawn(self._pump, downstream, upstream, True, held)
             with self._lock:
                 self._recorders.append(reader)
-            self._spawn(self._pump, upstream, downstream, False)
+            self._spawn(self._pump, upstream, downstream, False, held)
 
-    def _pump(self, src, dst, record: bool) -> None:
+    def _pump(self, src, dst, record: bool, held: list[threading.Event]) -> None:
         carry = b""
         try:
             while True:
@@ -2278,7 +2304,9 @@ class RecordingRelay:
                 # relay has not written down yet, or "no frame was
                 # sent" would be racing the reader that proves it.
                 if record:
-                    carry = self._record(carry + chunk)
+                    carry = self._record(carry + chunk, held)
+                elif held:
+                    held.pop().wait(timeout=scaled_timeout(60.0))
                 dst.sendall(chunk)
         except OSError:
             pass
@@ -2287,7 +2315,7 @@ class RecordingRelay:
                 with contextlib.suppress(OSError):
                     sock.shutdown(socketlib.SHUT_RDWR)
 
-    def _record(self, buffered: bytes) -> bytes:
+    def _record(self, buffered: bytes, held: list[threading.Event]) -> bytes:
         *lines, rest = buffered.split(b"\n")
         for line in lines:
             try:
@@ -2297,6 +2325,9 @@ class RecordingRelay:
             if isinstance(frame, dict) and isinstance(frame.get("op"), str):
                 with self._lock:
                     self._ops.append(frame["op"])
+                    if self._hold is not None and self._hold[0] == frame["op"]:
+                        held.append(self._hold[1])
+                        self._hold = None
         # A data connection stops being newline-framed after its
         # handshake, so the carry is capped: an attach's payload must not
         # grow this without bound. Dropping bytes silently is what would
@@ -3215,3 +3246,84 @@ def test_new_tab_on_a_saved_host_leaves_a_collapsed_sidebar_collapsed(host, roos
         )
     finally:
         set_sidebar_collapsed(roost, False)
+
+
+# ---------------------------------------------------------------------------
+# 17. Plan 071 D13 (#549): your own click wins over a new tab in flight
+# ---------------------------------------------------------------------------
+
+
+def new_tab_answered_late(roost: Roost, session: Roost, relay, saved_id: str, click=None) -> int:
+    """⌘T on the selected host tab, with the session's answer held at the
+    relay — and, when `click` names a tab, that tab focused while it is.
+    Returns the new tab once the client lists it.
+
+    The listing is the fence. A host connection reads no event while one
+    of its ops is in flight, so the row is listed only after the answer,
+    and the reconcile that lists it is the one that selects it if the
+    answer armed a selection.
+    """
+    before = {int(row["id"]) for row in session.tabs()}
+    release = relay.hold("tab.open")
+    failed: list[BaseException] = []
+
+    def press() -> None:
+        try:
+            with Roost(roost.path, timeout=scaled_timeout(60.0)) as presser:
+                press_new_tab(presser)
+        except BaseException as error:  # re-raised on the test's thread
+            failed.append(error)
+
+    pressing = threading.Thread(target=press, daemon=True)
+    pressing.start()
+    try:
+        tab = spawned_tab_id(session, before, "the new tab to open on the session", timeout=30.0)
+        if click is not None:
+            focus(roost, click)
+    finally:
+        release.set()
+        pressing.join(timeout=scaled_timeout(60.0))
+    assert not pressing.is_alive(), "⌘T never answered after the relay let go"
+    if failed:
+        raise failed[0]
+    wait_until(
+        lambda: tab in listed_host_tabs(roost, saved_id),
+        30.0,
+        "the client to list the new tab",
+    )
+    return tab
+
+
+def test_a_click_while_a_new_host_tab_is_in_flight_keeps_the_window(roost, session_env):
+    """Plan 071 D13 (#549): a new tab on a host is selected only once the
+    session has answered and the client lists it, and a tab the user
+    focuses before the answer lands must keep the window.
+
+    The relay holds the session's answer to `tab.open`, so the click is
+    made while the request is provably in flight. The first ⌘T clicks
+    nothing and lands on the new tab — the proof that a held answer still
+    selects. The second clicks another tab first, and stays there.
+    """
+    require_test_mode(roost)
+    start_session(session_env)
+    with recording_relay(session_env) as relay:
+        with saved_host(roost, session_env, target=relay.path) as host:
+            host.connect_and_wait()
+            with host.client() as session:
+                project = first_project(session)
+                source = session.open_tab(project, cwd="/tmp")
+                clicked = session.open_tab(project, cwd="/tmp")
+                key = host_key(roost, source)
+
+                landed = new_tab_answered_late(roost, session, relay, host.saved_id)
+                assert roost.app_selected_tab_id() == landed, (
+                    "a held answer no longer selects the new tab, so the click below proves nothing"
+                )
+
+                focus(roost, key)
+                opened = new_tab_answered_late(
+                    roost, session, relay, host.saved_id, click=sibling_key(key, clicked)
+                )
+                assert roost.app_selected_tab_id() == clicked, (
+                    f"the new tab {opened} took the window from the tab clicked while it opened"
+                )

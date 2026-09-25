@@ -89,6 +89,7 @@ pub(crate) mod host_tab;
 mod interactions;
 pub(crate) mod local_backend;
 mod palettes;
+mod pending_selection;
 mod servicing;
 mod tab_backend;
 mod tab_memory;
@@ -115,6 +116,7 @@ use self::palettes::{
     FontSizeTransition, PaletteAgentColumn, PaletteAgentSegment, PaletteReplyRoute,
     PaletteVisibilityRequest,
 };
+use self::pending_selection::{Creation, PendingHostSelection, PendingStep};
 pub(crate) use self::servicing::{AgentMetricsResult, ATTACH_RETRY_INTERVAL};
 use self::tab_backend::{TabBackend, TabHandle};
 use self::terminal_tab::{
@@ -352,29 +354,10 @@ fn new_project_route(
 /// short enough that nothing waits on a row which is never coming.
 const PENDING_HOST_SELECTION_DEADLINE: Duration = Duration::from_secs(10);
 
-/// A creation on a host, parked until the mirror lists it (plan 037
-/// §3.9).
-#[derive(Debug, Clone, Copy)]
-struct PendingHostSelection {
-    tab: TabKey,
-    /// When the wait started.
-    ///
-    /// The wait has to be bounded, because "the row will appear" is an
-    /// assumption and not a guarantee: a tab whose command exits the
-    /// instant it spawns is closed again before any batch lists it, and
-    /// a creation that fails after its intent was enqueued never
-    /// produces one at all. Neither ends the connection, so nothing else
-    /// here would ever clear the entry.
-    armed: Instant,
-}
-
-impl PendingHostSelection {
-    /// Whether this wait has run out. Terminal: an expired entry is
-    /// abandoned, never re-armed.
-    fn expired(&self, now: Instant) -> bool {
-        host_wait_expired(self.armed, now)
-    }
-}
+/// How often an idle window re-runs reconcile while a creation or a
+/// parked focus waits on a mirror (plan 071 §D13). Nothing else drives
+/// the deadline above when no event arrives.
+pub(crate) const PENDING_SELECTION_TICK_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Whether a wait for a host's mirror to list a row, started at
 /// `armed`, has run out.
@@ -908,15 +891,21 @@ pub enum EngineOpResult {
     /// The engine mints the new id in its own id-space; the dispatch
     /// qualifies it at the backend it dispatched to, which is the only
     /// thing that knows which one that was.
+    ///
+    /// `focus_generation`, here and on `ProjectCreated` and
+    /// `LocalForward`, is [`App::focus_generation`] as the dispatch
+    /// found it.
     TabOpened {
         op: u64,
         project: ProjectKey,
+        focus_generation: u64,
         result: Result<TabKey, String>,
     },
     /// A project and its first tab, from the one compound op that
     /// creates both.
     ProjectCreated {
         op: u64,
+        focus_generation: u64,
         result: Result<(ProjectKey, TabKey), String>,
     },
     /// `op` is the id the editor recorded at dispatch: a completion that
@@ -1000,6 +989,7 @@ pub enum EngineOpResult {
         host: HostId,
         forwarded: String,
         selects: bool,
+        focus_generation: u64,
         answer: Box<Result<serde_json::Value, roost_engine::ipc::HostOpFailure>>,
     },
 }
@@ -2893,6 +2883,11 @@ pub struct App {
     /// message and may land after. The key is parked here and resolved
     /// by the first reconcile that can see the row.
     pending_host_selection: Option<PendingHostSelection>,
+    /// Bumped by every user focus, and captured by every creation
+    /// dispatch that may arm [`Self::pending_host_selection`], so that a
+    /// click made while the request is in flight, or while its row is
+    /// awaited, is never overridden by the creation (plan 071 §D13).
+    focus_generation: u64,
     awaiting_listing: forwarded_open::AwaitingListing,
     /// Whether the launch still owes the slot's tab a select + attach
     /// (plan 063 §D5). Armed at bootstrap under `session` and cleared by
@@ -3273,6 +3268,7 @@ impl App {
             add_host_socket_id: Id::unique(),
             add_host_focus_requested: false,
             pending_host_selection: None,
+            focus_generation: 0,
             awaiting_listing: forwarded_open::AwaitingListing::default(),
             pending_initial_local_selection: backend_mode == LocalBackendMode::Session,
             connect_purposes: HashMap::new(),
@@ -4458,6 +4454,19 @@ impl App {
     /// A tab whose budget ran out stays tracked but stops arming this.
     pub fn attach_retry_pending(&self) -> bool {
         self.pending_attachments.has_retryable()
+    }
+
+    /// A creation or a parked `tab.focus` is waiting on a mirror, so its
+    /// deadline needs a clock (plan 071 §D13).
+    pub fn pending_selection_waiting(&self) -> bool {
+        self.pending_host_selection.is_some() || !self.awaiting_listing.is_empty()
+    }
+
+    /// The wait's own tick — [`Self::pending_selection_waiting`] armed
+    /// it. A whole reconcile, because that is where both waits resolve,
+    /// ordered against the selection check and the route publish.
+    pub fn pending_selection_tick(&mut self) {
+        self.reconcile();
     }
 
     /// A host reorder is holding its preview, so the belt needs a clock.
@@ -6458,12 +6467,14 @@ impl App {
         );
         let grid = self.current_grid();
         let op = self.take_host_op_id(project.host, local_backend::HostOpKind::Other);
+        let focus_generation = self.focus_generation;
         EngineDispatch {
             task: self.engine_op(
                 async move { open_host_tab_flow(ops, project, origin, title, argv, grid).await },
                 move |result| EngineOpResult::TabOpened {
                     op,
                     project,
+                    focus_generation,
                     result: result.map(|tab_id| TabKey::new(project.host, tab_id)),
                 },
             ),
@@ -6480,11 +6491,13 @@ impl App {
         };
         let grid = self.current_grid();
         let op = self.take_host_op_id(host, local_backend::HostOpKind::Create);
+        let focus_generation = self.focus_generation;
         EngineDispatch {
             task: self.engine_op(
                 async move { create_host_project_flow(ops, grid).await },
                 move |result| EngineOpResult::ProjectCreated {
                     op,
+                    focus_generation,
                     result: result.map(|(project_id, tab_id)| {
                         (ProjectKey::new(host, project_id), TabKey::new(host, tab_id))
                     }),
@@ -6506,12 +6519,14 @@ impl App {
         let client = self.client.clone();
         let host = self.backend.host();
         let project = ProjectKey::new(host, project_id);
+        let focus_generation = self.focus_generation;
         EngineDispatch {
             task: self.engine_op(
                 async move { open_tab_flow(&client, project_id, cwd, title, argv, grid).await },
                 move |result| EngineOpResult::TabOpened {
                     op,
                     project,
+                    focus_generation,
                     result: result.map(|tab_id| TabKey::new(host, tab_id)),
                 },
             ),
@@ -6575,11 +6590,13 @@ impl App {
         let op = self.take_engine_op_id();
         let client = self.client.clone();
         let host = self.backend.host();
+        let focus_generation = self.focus_generation;
         EngineDispatch {
             task: self.engine_op(
                 async move { create_project_flow(&client, grid).await },
                 move |result| EngineOpResult::ProjectCreated {
                     op,
+                    focus_generation,
                     result: result.map(|(project_id, tab_id)| {
                         (ProjectKey::new(host, project_id), TabKey::new(host, tab_id))
                     }),
@@ -6901,6 +6918,7 @@ impl App {
         // selection, and the local workspace is the one that persists it.
         self.set_host_selection(None);
         focus_tab_in_core(&self.workspace, tab)?;
+        self.note_user_focus();
         if reveal_sidebar {
             self.set_sidebar_collapsed(false);
         }
@@ -6929,6 +6947,7 @@ impl App {
         let Some(project) = self.host_project_of(tab) else {
             return Err(format!("tab {tab} is not listed by a connected host"));
         };
+        self.note_user_focus();
         self.set_host_selection(Some(HostSelection {
             project,
             tab,
@@ -6941,6 +6960,12 @@ impl App {
         self.host_focus_tab(tab);
         self.reconcile();
         Ok(())
+    }
+
+    /// A focus the user asked for, which outranks any creation still
+    /// waiting to select its tab ([`Self::focus_generation`]).
+    fn note_user_focus(&mut self) {
+        self.focus_generation = self.focus_generation.wrapping_add(1);
     }
 
     /// The "and clear" half for a host tab — `focus_tab_in_core`'s
@@ -8697,25 +8722,37 @@ impl App {
     /// host's rows only exist once its event batch lands, which is a
     /// different message from the op's own reply and may arrive after.
     fn arm_pending_host_selection(&mut self, result: &EngineOpResult) {
-        let tab = match result {
+        let (tab, creation, dispatched) = match result {
             EngineOpResult::TabOpened {
-                result: Ok(tab), ..
-            } => *tab,
+                result: Ok(tab),
+                focus_generation,
+                ..
+            } => (*tab, Creation::Tab, *focus_generation),
             EngineOpResult::ProjectCreated {
                 result: Ok((_, tab)),
+                focus_generation,
                 ..
-            } => *tab,
-            EngineOpResult::LocalForward { .. } => match result.forwarded_open() {
-                Some((tab, true)) => tab,
+            } => (*tab, Creation::Project, *focus_generation),
+            EngineOpResult::LocalForward {
+                focus_generation, ..
+            } => match result.forwarded_open() {
+                Some((tab, true)) => (tab, Creation::Tab, *focus_generation),
                 _ => return,
             },
             _ => return,
         };
-        if !tab.is_local() {
-            self.pending_host_selection = Some(PendingHostSelection {
-                tab,
-                armed: Instant::now(),
-            });
+        match pending_selection::arm(
+            tab,
+            creation,
+            dispatched,
+            self.focus_generation,
+            Instant::now(),
+        ) {
+            Some(pending) => self.pending_host_selection = Some(pending),
+            None if !tab.is_local() => {
+                tracing::debug!(%tab, "a focus while the creation was in flight kept its place");
+            }
+            None => {}
         }
     }
 
@@ -8773,13 +8810,10 @@ impl App {
         }
     }
 
-    /// Resolve a pending host creation, if the mirror has caught up.
+    /// Resolve a pending host creation, by [`pending_selection::pending_step`].
     ///
-    /// Four outcomes, all terminal-or-wait: the row is listed (select
-    /// it), its host is no longer connected (drop it — a selection
-    /// waiting on a session nothing is attached to would never resolve),
-    /// the wait ran out (drop it — see [`PendingHostSelection::armed`]),
-    /// or none of those yet (wait for the next reconcile).
+    /// A host that is no longer connected drops it: a selection waiting
+    /// on a session nothing is attached to would never resolve.
     ///
     /// Deliberately not `focus_host_tab_and_clear`: this runs *inside*
     /// reconcile, and that helper ends with a reconcile of its own.
@@ -8794,30 +8828,42 @@ impl App {
         // a row the user can click cannot be one this refuses to land on.
         // Anything else — dropped, reconnecting, gone — can no longer
         // answer for this row.
-        let connected = self
+        let view = self
             .host_views
             .iter()
-            .any(|view| view.host == tab.host && view.state.interactive());
-        if !connected {
-            tracing::debug!(%tab, "dropped a pending selection whose host is no longer connected");
-            self.pending_host_selection = None;
-            return;
+            .find(|view| view.host == tab.host && view.state.interactive());
+        let project = self.host_project_of(tab);
+        let step = pending_selection::pending_step(
+            &pending,
+            view.is_some(),
+            project.is_some(),
+            Instant::now(),
+            self.focus_generation,
+        );
+        match (step, project) {
+            (PendingStep::Drop, _) => {
+                tracing::debug!(%tab, connected = view.is_some(), "dropped a pending selection");
+                self.pending_host_selection = None;
+            }
+            (PendingStep::Expired, _) => {
+                self.pending_host_selection = None;
+                let label = view.map_or("its host", |view| view.label.as_str());
+                let on_slot = self.is_local_slot(tab.host);
+                let status = pending_selection::never_appeared(pending.creation, on_slot, label);
+                tracing::info!(%tab, "{status}");
+                self.set_status(status);
+            }
+            (PendingStep::Select, Some(project)) => {
+                self.pending_host_selection = None;
+                self.set_host_selection(Some(HostSelection {
+                    project,
+                    tab,
+                    local_active: self.workspace.active().1,
+                }));
+                self.host_focus_tab(tab);
+            }
+            (PendingStep::Wait, _) | (PendingStep::Select, None) => {}
         }
-        if pending.expired(Instant::now()) {
-            tracing::debug!(%tab, "abandoned a pending selection the mirror never listed");
-            self.pending_host_selection = None;
-            return;
-        }
-        let Some(project) = self.host_project_of(tab) else {
-            return;
-        };
-        self.pending_host_selection = None;
-        self.set_host_selection(Some(HostSelection {
-            project,
-            tab,
-            local_active: self.workspace.active().1,
-        }));
-        self.host_focus_tab(tab);
     }
 
     /// Settle the tabs forwarded opens are waiting on, and select each
@@ -8843,6 +8889,7 @@ impl App {
             if focuses.is_empty() {
                 continue;
             }
+            self.note_user_focus();
             self.set_host_selection(Some(HostSelection {
                 project,
                 tab,
@@ -10568,31 +10615,6 @@ mod tests {
         );
     }
 
-    /// The pending-selection wait is bounded. A tab that exits the
-    /// instant it spawns is closed again before any batch lists it, and
-    /// the connection stays up throughout — so without a deadline the
-    /// entry would sit armed for the rest of the session.
-    #[test]
-    fn a_pending_host_selection_gives_up_eventually() {
-        let armed = Instant::now();
-        let pending = PendingHostSelection {
-            tab: TabKey::new(HostId::new(3), 7),
-            armed,
-        };
-        assert!(
-            !pending.expired(armed),
-            "the round trip has not happened yet"
-        );
-        assert!(
-            !pending.expired(armed + PENDING_HOST_SELECTION_DEADLINE - Duration::from_millis(1))
-        );
-        assert!(pending.expired(armed + PENDING_HOST_SELECTION_DEADLINE));
-        assert!(
-            !pending.expired(armed - Duration::from_secs(1)),
-            "a clock that reads backwards waits rather than abandoning"
-        );
-    }
-
     /// `switch_project_N` resolves against the navigation ring now, and
     /// the ring's local section is the authoritative snapshot order — so
     /// the numbering a bare install sees is unchanged.
@@ -10883,6 +10905,7 @@ mod tests {
         assert!(
             engine_op_status(EngineOpResult::ProjectCreated {
                 op: 1,
+                focus_generation: 0,
                 result: Err(error),
             })
             .is_some(),
@@ -11786,6 +11809,7 @@ mod tests {
             engine_op_status(EngineOpResult::TabOpened {
                 op: 1,
                 project: ProjectKey::local(3),
+                focus_generation: 0,
                 result: Ok(TabKey::local(9)),
             }),
             None
@@ -11794,6 +11818,7 @@ mod tests {
             engine_op_status(EngineOpResult::TabOpened {
                 op: 1,
                 project: ProjectKey::local(3),
+                focus_generation: 0,
                 result: Err("spawn shell failed".into()),
             }),
             Some("spawn shell failed".to_string())
@@ -11801,6 +11826,7 @@ mod tests {
         assert_eq!(
             engine_op_status(EngineOpResult::ProjectCreated {
                 op: 2,
+                focus_generation: 0,
                 result: Ok((ProjectKey::local(3), TabKey::local(9))),
             }),
             None
@@ -11808,6 +11834,7 @@ mod tests {
         assert_eq!(
             engine_op_status(EngineOpResult::ProjectCreated {
                 op: 2,
+                focus_generation: 0,
                 result: Err("create exploded".into()),
             }),
             Some("create exploded".to_string())
@@ -11834,6 +11861,7 @@ mod tests {
             EngineOpResult::TabOpened {
                 op: 5,
                 project: ProjectKey::local(3),
+                focus_generation: 0,
                 result: Ok(TabKey::local(9)),
             }
             .palette_op(),
@@ -11842,6 +11870,7 @@ mod tests {
         assert_eq!(
             EngineOpResult::ProjectCreated {
                 op: 6,
+                focus_generation: 0,
                 result: Ok((ProjectKey::local(3), TabKey::local(9))),
             }
             .palette_op(),

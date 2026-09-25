@@ -35,6 +35,16 @@ release workflow asserts they agree).
 
 ### Fixed
 
+- **A new tab on a session-backed project could take the window away
+  from a tab you clicked while it opened, and one that never appeared
+  was dropped silently (#549)** — on the local session and on saved
+  hosts, a new tab or project waits for the session to list it before
+  the window selects it. A tab you focus in the meantime, by click, key,
+  palette or `tab.focus`, now keeps the window, whether the focus comes
+  before or after the session answers. A new tab or project still not
+  listed after 10 seconds now says so on the status bar — "the new tab
+  never appeared on the local session", or the host's name in place of
+  the local session — even when the window is otherwise idle.
 - **A tab opened through the UI socket on the local session was never
   selected in the window (#548)** — under `local-backend = session`,
   `tab.open` and `roostctl tab open`/`open` from outside a Roost tab now

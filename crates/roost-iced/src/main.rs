@@ -73,6 +73,9 @@ enum Message {
     /// A host reorder is holding its preview and the belt needs a clock.
     /// Armed only while a hold is up.
     ReorderHoldTick,
+    /// A creation or a parked focus is waiting on a mirror. Armed only
+    /// while one is.
+    PendingSelectionTick,
     /// A file-drop debounce window elapsed — a one-shot, not a timer.
     FileDropDeadline,
     WindowOpened(window::Id),
@@ -513,6 +516,10 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             app.reorder_hold_tick();
             Task::none()
         }
+        Message::PendingSelectionTick => {
+            app.pending_selection_tick();
+            Task::none()
+        }
         Message::FileDropDeadline => app.file_drop_deadline().map_task(),
         Message::WindowOpened(id) => app.window_opened(id).map_task(),
         Message::WindowResized(id, size) => app.window_resized(id, size).map_task(),
@@ -683,6 +690,7 @@ struct ArmedTimers {
     attach_retry: bool,
     reorder_hold: bool,
     add_host_pointer: bool,
+    pending_selection: bool,
 }
 
 impl ArmedTimers {
@@ -693,6 +701,7 @@ impl ArmedTimers {
             attach_retry: app.attach_retry_pending(),
             reorder_hold: app.reorder_hold_pending(),
             add_host_pointer: app.add_host_dialog_open(),
+            pending_selection: app.pending_selection_waiting(),
         }
     }
 
@@ -705,6 +714,7 @@ impl ArmedTimers {
             + usize::from(self.attach_retry)
             + usize::from(self.reorder_hold)
             + usize::from(self.add_host_pointer)
+            + usize::from(self.pending_selection)
     }
 }
 
@@ -752,6 +762,12 @@ fn subscription_with(wake: Arc<tokio::sync::Notify>, armed: ArmedTimers) -> Subs
     }
     if armed.reorder_hold {
         members.push(time::every(app::host_reorder_hold_tick()).map(|_| Message::ReorderHoldTick));
+    }
+    if armed.pending_selection {
+        members.push(
+            time::every(app::PENDING_SELECTION_TICK_INTERVAL)
+                .map(|_| Message::PendingSelectionTick),
+        );
     }
     if armed.add_host_pointer {
         // Deliberately status-blind, unlike the keyboard member above: a
@@ -1094,6 +1110,7 @@ mod tests {
         attach_retry: bool,
         reorder_hold: bool,
         add_host_pointer: bool,
+        pending_selection: bool,
     ) -> ArmedTimers {
         ArmedTimers {
             status,
@@ -1101,6 +1118,7 @@ mod tests {
             attach_retry,
             reorder_hold,
             add_host_pointer,
+            pending_selection,
         }
     }
 
@@ -1129,13 +1147,14 @@ mod tests {
 
         // Every combination, so a member that forgot its own arming
         // condition (or shares a recipe id with another) is caught.
-        for bits in 0u8..32 {
+        for bits in 0u8..64 {
             let timers = armed(
                 bits & 1 != 0,
                 bits & 2 != 0,
                 bits & 4 != 0,
                 bits & 8 != 0,
                 bits & 16 != 0,
+                bits & 32 != 0,
             );
             let ids = recipe_ids(subscription_with(Arc::clone(&wake), timers));
             let unique: HashSet<u64> = ids.iter().copied().collect();
