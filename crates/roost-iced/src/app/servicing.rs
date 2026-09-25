@@ -1538,11 +1538,7 @@ impl App {
         if self.host_attach.contains_key(&key) {
             return;
         }
-        let (cols, rows) = super::terminal_grid(
-            self.window_size,
-            self.effective_sidebar_width(),
-            self.terminal_metrics,
-        );
+        let (cols, rows) = self.current_grid();
         let geometry = self.host_geometry(cols, rows);
         let attach =
             host_tab::HostAttach::new(key, geometry).with_resume(self.host_resume.remove(&key));
@@ -2017,11 +2013,7 @@ impl App {
                 return false;
             }
         };
-        let (cols, rows) = terminal_grid(
-            self.window_size,
-            self.effective_sidebar_width(),
-            self.terminal_metrics,
-        );
+        let (cols, rows) = self.current_grid();
         match tab.apply_geometry(cols, rows, self.terminal_metrics, self.metric_generation) {
             Ok(Some(change)) => {
                 tab.commit_geometry(change);

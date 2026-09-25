@@ -46,6 +46,7 @@ import contextlib
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import stat
@@ -2832,3 +2833,50 @@ def test_new_tab_on_the_session_leaves_a_collapsed_sidebar_collapsed(lane: Lane)
         )
     finally:
         util.set_sidebar_collapsed(roost, False)
+
+
+# ---------------------------------------------------------------------------
+# 12. Plan 071 §D10 (#546): a new tab spawns at the window's grid
+# ---------------------------------------------------------------------------
+
+
+#: One line of `stty size`: rows, then cols.
+STTY_SIZE = re.compile(r"^\s*(\d+ \d+)\s*$", re.MULTILINE)
+
+
+def stty_size(text: str) -> str | None:
+    found = STTY_SIZE.search(text)
+    return found and found.group(1)
+
+
+def test_a_replayed_tab_the_window_never_showed_starts_at_the_windows_grid(lane: Lane):
+    """The forward switch replays every tab, but the window attaches only
+    the one it shows. Alpha's tabs therefore keep the size their
+    `tab.open` spawned them at — the one route where no attach resize can
+    stand in for the spawn size, so this is not a race.
+    """
+    roost = lane.start("in-process")
+    source_layout(roost)
+    switch(roost, USE_SESSION, "session")
+
+    slot_rows = roost.sidebar_host(local_band(roost)["saved_id"])
+    assert slot_rows is not None, roost.sidebar_dump()
+    keys = {
+        project["name"]: [tab["key"] for tab in project["tabs"]]
+        for project in slot_rows["projects"]
+    }
+    window = roost.call("tab.dump_resolved", {"tab_id": keys["beta"][0]})
+    unshown = keys["alpha"][0]
+    with pytest.raises(RoostError) as unattached:
+        roost.call("tab.dump_resolved", {"tab_id": unshown})
+    assert "no live terminal" in str(unattached.value), unattached.value
+
+    tab = int(unshown.rsplit(".", 1)[-1])
+    with lane.session() as c:
+        c.run(tab, "stty size", ready_timeout=30.0)
+        printed = wait_until(
+            lambda: stty_size(c.dump_text(tab)),
+            scaled_timeout(30.0),
+            "the replayed tab to print its size",
+        )
+    assert printed == f"{window['rows']} {window['cols']}", printed

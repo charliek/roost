@@ -127,6 +127,13 @@ use self::terminal_tab::{
 
 const DEFAULT_COLS: u16 = 100;
 const DEFAULT_ROWS: u16 = 32;
+/// The grid the spawn tests ask for. Not the fallback's, so a spawn
+/// that ignored it cannot pass for one that used it.
+#[cfg(test)]
+const SPAWN_GRID: (u16, u16) = (137, 43);
+/// The size the window opens at, before the first resize reports the
+/// one the window manager actually gave it.
+pub(crate) const INITIAL_WINDOW_SIZE: Size = Size::new(1100.0, 720.0);
 const STATUS_BANNER_DURATION: Duration = Duration::from_secs(5);
 /// How often the banner's expiry is checked while one is up. Coarse
 /// against the five-second life it polices — the banner is allowed to
@@ -1153,13 +1160,13 @@ impl EngineOpResult {
 /// opened, and closing a project's last tab deletes the project. The
 /// error is reported and the completion's reconcile shows the rollback,
 /// exactly as the blocking version behaved when its second call failed.
-async fn create_project_flow(client: &LocalClient) -> Result<(i64, i64), String> {
+async fn create_project_flow(client: &LocalClient, grid: (u16, u16)) -> Result<(i64, i64), String> {
     let cwd = roost_engine::home_dir();
     let project = client
         .create_project("", &cwd)
         .await
         .map_err(|error| error.to_string())?;
-    let tab_id = open_tab_flow(client, project.id, cwd, String::new(), Vec::new()).await?;
+    let tab_id = open_tab_flow(client, project.id, cwd, String::new(), Vec::new(), grid).await?;
     // `open_tab` already steals the selection, but create's activation must
     // not depend on another op's side effect.
     client
@@ -1239,7 +1246,10 @@ fn host_op_error_text(error: &crate::host_conn::HostOpError, on_slot: bool) -> S
 /// A rollback that itself fails is logged, not surfaced: the caller
 /// already has the tab-open error to report, and a project the rollback
 /// declined or could not remove is visible for the user to delete.
-async fn create_host_project_flow(ops: crate::host_conn::HostOps) -> Result<(i64, i64), String> {
+async fn create_host_project_flow(
+    ops: crate::host_conn::HostOps,
+    grid: (u16, u16),
+) -> Result<(i64, i64), String> {
     use roost_ipc::messages::{ops as wire, ProjectCreateResult, TabOpenResult};
     let created: ProjectCreateResult = host_call(
         &ops,
@@ -1251,7 +1261,7 @@ async fn create_host_project_flow(ops: crate::host_conn::HostOps) -> Result<(i64
     let opened: Result<TabOpenResult, String> = host_call(
         &ops,
         wire::TAB_OPEN,
-        host_tab_open_params(project.id, &project.cwd, "", &[], None),
+        host_tab_open_params(project.id, &project.cwd, "", &[], None, grid),
     )
     .await;
     match opened {
@@ -1401,6 +1411,7 @@ async fn open_host_tab_flow(
     origin: HostTabOrigin,
     title: String,
     argv: Vec<String>,
+    grid: (u16, u16),
 ) -> Result<i64, String> {
     use crate::host_conn::HostOpError;
     use roost_ipc::client::ServerCode;
@@ -1409,7 +1420,14 @@ async fn open_host_tab_flow(
         ops.call_at(
             project.host,
             wire::TAB_OPEN,
-            host_tab_open_params(project.project, &origin.cwd, &title, &argv, cwd_from_tab),
+            host_tab_open_params(
+                project.project,
+                &origin.cwd,
+                &title,
+                &argv,
+                cwd_from_tab,
+                grid,
+            ),
         )
     };
     let reply = match open(origin.cwd_from_tab).await {
@@ -1432,11 +1450,6 @@ async fn open_host_tab_flow(
 
 /// `tab.open` params for a host, geometry included.
 ///
-/// The same defaults the local path opens with: the tab is resized to
-/// the window's real grid at attach (the attach handshake carries the
-/// geometry and the server resizes there), so this only has to be a legal
-/// starting size, not the right one.
-///
 /// `title` + `argv` are empty for an ordinary new tab and carry the
 /// launcher row's command when one runs on a host — the same two fields
 /// `open_tab_flow` passes locally, so a launcher row does the same thing
@@ -1450,13 +1463,14 @@ fn host_tab_open_params(
     title: &str,
     argv: &[String],
     cwd_from_tab: Option<i64>,
+    (cols, rows): (u16, u16),
 ) -> serde_json::Value {
     serde_json::to_value(roost_ipc::messages::TabOpenParams {
         project_id,
         cwd: cwd.to_string(),
         argv: argv.to_vec(),
-        cols: u32::from(DEFAULT_COLS),
-        rows: u32::from(DEFAULT_ROWS),
+        cols: u32::from(cols),
+        rows: u32::from(rows),
         title: title.to_string(),
         activate: None,
         cwd_from_tab,
@@ -1503,6 +1517,7 @@ async fn open_tab_flow(
     cwd: String,
     title: String,
     argv: Vec<String>,
+    (cols, rows): (u16, u16),
 ) -> Result<i64, String> {
     client
         .open_tab(
@@ -1510,8 +1525,8 @@ async fn open_tab_flow(
             &cwd,
             &title,
             &argv,
-            u32::from(DEFAULT_COLS),
-            u32::from(DEFAULT_ROWS),
+            u32::from(cols),
+            u32::from(rows),
         )
         .await
         .map(|tab| tab.id)
@@ -1554,6 +1569,21 @@ fn effective_sidebar_width(collapsed: bool, width: f32) -> f32 {
     } else {
         width
     }
+}
+
+/// [`App::current_grid`] for the launch's restored tabs, which spawn
+/// before the window exists: the grid it opens at, beside the sidebar
+/// `state.json` restores.
+fn initial_grid(
+    sidebar_collapsed: bool,
+    sidebar_width: f32,
+    metrics: TerminalMetrics,
+) -> (u16, u16) {
+    terminal_grid(
+        INITIAL_WINDOW_SIZE,
+        effective_sidebar_width(sidebar_collapsed, sidebar_width),
+        metrics,
+    )
 }
 
 /// A published drag width is worth applying only while the grip exists — a
@@ -3084,7 +3114,7 @@ impl App {
             in_process_streams,
             switch_gate,
             test_mode,
-        } = match Self::start_engine(profile, &config, &runtime, &supervisor) {
+        } = match Self::start_engine(profile, &config, &runtime, &supervisor, terminal_metrics) {
             Ok(engine) => engine,
             Err(error) => {
                 runtime.block_on(supervisor.shutdown_all(BOOT_ABORT_DEADLINE));
@@ -3108,7 +3138,7 @@ impl App {
             window_id: None,
             pending_window_resize: None,
             screenshots: ScreenshotQueue::default(),
-            window_size: Size::new(1100.0, 720.0),
+            window_size: INITIAL_WINDOW_SIZE,
             sidebar_drag_width: None,
             window_focused: true,
             title_fallback: title_fallback(profile.kind),
@@ -3248,6 +3278,7 @@ impl App {
         config: &RoostConfig,
         runtime: &tokio::runtime::Runtime,
         supervisor: &Arc<PtySupervisor>,
+        terminal_metrics: TerminalMetrics,
     ) -> Result<StartedEngine> {
         // Plan 063 §D5's ladder, step 1: an unfinished switch decides
         // the mode before anything else is asked, because it is the one
@@ -3276,7 +3307,12 @@ impl App {
         // a populated in-process workspace this is about to empty.
         finish_switch_source_deletion(runtime, &client, profile, &resumed);
 
-        hydrate_workspace(runtime, &client, backend_mode)?;
+        let grid = initial_grid(
+            workspace.sidebar_collapsed(),
+            workspace.sidebar_width() as f32,
+            terminal_metrics,
+        );
+        hydrate_workspace(runtime, &client, backend_mode, grid)?;
         // Plan 063 §D5: a `session` launch over a populated in-process
         // workspace is an absent migration. Read here, while the
         // retained layout is still whole and before anything can open a
@@ -4424,11 +4460,26 @@ impl App {
         )
     }
 
+    /// The terminal grid the window has room for right now — and the one
+    /// every new tab spawns at (#546). The attach resize would correct a
+    /// default later, but a program that reads its size as it starts (a
+    /// launcher row, a TUI's first frame) has already drawn at the wrong
+    /// one by then.
+    ///
+    /// Read at the dispatch, after any reveal the gesture makes, so the
+    /// width it subtracts is the sidebar the tab will appear beside.
+    fn current_grid(&self) -> (u16, u16) {
+        terminal_grid(
+            self.window_size,
+            self.effective_sidebar_width(),
+            self.terminal_metrics,
+        )
+    }
+
     pub fn resize(&mut self, size: Size) {
         let changed = self.window_size != size;
         self.window_size = size;
-        let (cols, rows) =
-            terminal_grid(size, self.effective_sidebar_width(), self.terminal_metrics);
+        let (cols, rows) = self.current_grid();
         // The attached host tab's server must follow the grid too — the
         // machine decides when (immediately while live; withheld during
         // hydration, where a mid-snapshot resize forfeits history).
@@ -6366,10 +6417,11 @@ impl App {
             self.active_tab_key(),
             self.host_project_row(project).map(|(_, row)| row),
         );
+        let grid = self.current_grid();
         let op = self.take_host_op_id(project.host, local_backend::HostOpKind::Other);
         EngineDispatch {
             task: self.engine_op(
-                async move { open_host_tab_flow(ops, project, origin, title, argv).await },
+                async move { open_host_tab_flow(ops, project, origin, title, argv, grid).await },
                 move |result| EngineOpResult::TabOpened {
                     op,
                     project,
@@ -6387,10 +6439,11 @@ impl App {
             self.set_status(file_transfer::unavailable_text(self.is_local_slot(host)).to_string());
             return EngineDispatch::default();
         };
+        let grid = self.current_grid();
         let op = self.take_host_op_id(host, local_backend::HostOpKind::Create);
         EngineDispatch {
             task: self.engine_op(
-                async move { create_host_project_flow(ops).await },
+                async move { create_host_project_flow(ops, grid).await },
                 move |result| EngineOpResult::ProjectCreated {
                     op,
                     result: result.map(|(project_id, tab_id)| {
@@ -6409,13 +6462,14 @@ impl App {
         title: String,
         argv: Vec<String>,
     ) -> EngineDispatch {
+        let grid = self.current_grid();
         let op = self.take_engine_op_id();
         let client = self.client.clone();
         let host = self.backend.host();
         let project = ProjectKey::new(host, project_id);
         EngineDispatch {
             task: self.engine_op(
-                async move { open_tab_flow(&client, project_id, cwd, title, argv).await },
+                async move { open_tab_flow(&client, project_id, cwd, title, argv, grid).await },
                 move |result| EngineOpResult::TabOpened {
                     op,
                     project,
@@ -6478,12 +6532,13 @@ impl App {
         // because this is the dispatch plan 063 §D3 exists to keep out of
         // the invisible workspace.
         debug_assert_eq!(self.local_backend, LocalBackendMode::InProcess);
+        let grid = self.current_grid();
         let op = self.take_engine_op_id();
         let client = self.client.clone();
         let host = self.backend.host();
         EngineDispatch {
             task: self.engine_op(
-                async move { create_project_flow(&client).await },
+                async move { create_project_flow(&client, grid).await },
                 move |result| EngineOpResult::ProjectCreated {
                     op,
                     result: result.map(|(project_id, tab_id)| {
@@ -9390,6 +9445,7 @@ fn hydrate_workspace(
     runtime: &tokio::runtime::Runtime,
     client: &LocalClient,
     mode: LocalBackendMode,
+    grid: (u16, u16),
 ) -> Result<()> {
     if mode == LocalBackendMode::Session {
         // Nothing is seeded, and nothing is opened: the local band is
@@ -9410,7 +9466,7 @@ fn hydrate_workspace(
         }
         return Ok(());
     }
-    runtime.block_on(hydrate_local_workspace(client))
+    runtime.block_on(hydrate_local_workspace(client, grid))
 }
 
 /// Bring the in-process workspace up: seed it if it is empty, open the
@@ -9430,7 +9486,7 @@ fn hydrate_workspace(
 /// launch behaviour it replaced; on a reverse it is true of exactly the
 /// rows that need shells, and `take_restore_layout` being a one-shot
 /// means a second pass finds nothing to restore and adds nothing.
-async fn hydrate_local_workspace(client: &LocalClient) -> Result<()> {
+async fn hydrate_local_workspace(client: &LocalClient, (cols, rows): (u16, u16)) -> Result<()> {
     let mut projects = client.list_projects().await?;
     if projects.is_empty() {
         let cwd = roost_engine::home_dir();
@@ -9469,8 +9525,8 @@ async fn hydrate_local_workspace(client: &LocalClient) -> Result<()> {
                     &spec.cwd,
                     &spec.title,
                     &[],
-                    u32::from(DEFAULT_COLS),
-                    u32::from(DEFAULT_ROWS),
+                    u32::from(cols),
+                    u32::from(rows),
                 )
                 .await
             {
@@ -9888,6 +9944,24 @@ mod tests {
             "300px sidebar must yield fewer columns than 220px: {wide_cols} vs {default_cols}"
         );
         assert_eq!(wide_rows, default_rows, "sidebar width must not touch rows");
+    }
+
+    #[test]
+    fn restored_tabs_spawn_at_the_first_windows_grid_beside_the_persisted_sidebar() {
+        let metrics = TerminalMetrics::measure(13.0).expect("test metrics");
+        let expanded = initial_grid(false, 300.0, metrics);
+        let collapsed = initial_grid(true, 300.0, metrics);
+        assert_eq!(
+            expanded,
+            terminal_grid(INITIAL_WINDOW_SIZE, 300.0, metrics),
+            "an expanded sidebar takes its persisted width off the first window"
+        );
+        assert_eq!(
+            collapsed,
+            terminal_grid(INITIAL_WINDOW_SIZE, 0.0, metrics),
+            "a collapsed sidebar takes nothing, whatever width it remembers"
+        );
+        assert!(collapsed.0 > expanded.0, "{collapsed:?} vs {expanded:?}");
     }
 
     #[test]
@@ -10631,7 +10705,9 @@ mod tests {
             "/tmp/roost-iced-create-project-test.sock".into(),
         );
 
-        let (project_id, tab_id) = runtime.block_on(create_project_flow(&client)).unwrap();
+        let (project_id, tab_id) = runtime
+            .block_on(create_project_flow(&client, SPAWN_GRID))
+            .unwrap();
 
         let snapshot = workspace.snapshot();
         let created = snapshot
@@ -10689,7 +10765,7 @@ mod tests {
             .expect("occupy the id the seed tab will be allocated");
 
         let error = runtime
-            .block_on(create_project_flow(&client))
+            .block_on(create_project_flow(&client, SPAWN_GRID))
             .expect_err("the seed tab cannot spawn");
 
         assert!(
@@ -10711,6 +10787,55 @@ mod tests {
         );
 
         supervisor.close(doomed_tab_id);
+    }
+
+    #[test]
+    fn a_local_tab_spawns_at_the_grid_it_is_given() {
+        use roost_engine::PtyOutputEvent;
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let workspace = Arc::new(Workspace::new());
+        let supervisor = Arc::new(PtySupervisor::new());
+        let client = LocalClient::new(
+            Arc::clone(&workspace),
+            Arc::clone(&supervisor),
+            "/tmp/roost-iced-spawn-grid-test.sock".into(),
+        );
+        let project = workspace.create_project("p", "/tmp").unwrap();
+        let argv = ["/bin/sh", "-c", "stty size; exec cat"].map(String::from);
+        let tab_id = runtime
+            .block_on(open_tab_flow(
+                &client,
+                project.id,
+                "/tmp".into(),
+                String::new(),
+                Vec::from(argv),
+                SPAWN_GRID,
+            ))
+            .unwrap();
+        let _hang_up = ChildIn(Arc::clone(&supervisor), tab_id);
+        let mut output = supervisor
+            .take_initial_receiver(tab_id)
+            .expect("the spawn's own receiver");
+
+        let said = runtime.block_on(async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let mut said = String::new();
+            while !said.contains('\n') {
+                match tokio::time::timeout_at(deadline, output.recv()).await {
+                    Ok(Ok(PtyOutputEvent::Bytes { data, .. })) => {
+                        said.push_str(&String::from_utf8_lossy(&data));
+                    }
+                    _ => break,
+                }
+            }
+            said
+        });
+        assert_eq!(
+            said.lines().next().map(str::trim),
+            Some(format!("{} {}", SPAWN_GRID.1, SPAWN_GRID.0).as_str()),
+            "`stty size`, as rows then cols"
+        );
     }
 
     /// The navigation ring walks the bands the sidebar drew, paired to
@@ -11004,7 +11129,7 @@ mod tests {
             );
         });
 
-        let error = create_host_project_flow(ops)
+        let error = create_host_project_flow(ops, SPAWN_GRID)
             .await
             .expect_err("the tab.open failed");
         assert!(error.contains("no such directory"), "{error}");
@@ -11031,7 +11156,7 @@ mod tests {
         use roost_ipc::messages::{ops as wire, ProjectCreateResult, Tab, TabListResult, TabState};
 
         let (ops, mut rx) = crate::host_conn::HostOps::channel();
-        let flow = tokio::spawn(create_host_project_flow(ops));
+        let flow = tokio::spawn(create_host_project_flow(ops, SPAWN_GRID));
 
         let create = rx.recv().await.expect("project.create sent");
         create.answer(Ok(serde_json::to_value(ProjectCreateResult {
@@ -11109,7 +11234,7 @@ mod tests {
         // worker that already exited would silently swallow a stray
         // call rather than exposing it.
         let (ops, mut rx) = crate::host_conn::HostOps::channel();
-        let flow = tokio::spawn(create_host_project_flow(ops));
+        let flow = tokio::spawn(create_host_project_flow(ops, SPAWN_GRID));
 
         let create = rx.recv().await.expect("project.create sent");
         assert_eq!(create.op, wire::PROJECT_CREATE);
@@ -11132,6 +11257,8 @@ mod tests {
             "a new project's seed tab names no source tab, so the key is absent: {}",
             open.params
         );
+        assert_eq!(open.params["cols"], SPAWN_GRID.0);
+        assert_eq!(open.params["rows"], SPAWN_GRID.1);
         let tab = Tab {
             id: 8,
             project_id: 7,
@@ -11251,21 +11378,23 @@ mod tests {
         let before_070 = serde_json::json!({
             "project_id": "42",
             "cwd": "/home/x",
-            "cols": u32::from(DEFAULT_COLS),
-            "rows": u32::from(DEFAULT_ROWS),
+            "cols": SPAWN_GRID.0,
+            "rows": SPAWN_GRID.1,
             "title": "htop",
             "argv": argv,
         });
         assert_eq!(
-            serde_json::to_string(&host_tab_open_params(42, "/home/x", "htop", &argv, None))
-                .unwrap(),
+            serde_json::to_string(&host_tab_open_params(
+                42, "/home/x", "htop", &argv, None, SPAWN_GRID
+            ))
+            .unwrap(),
             serde_json::to_string(&before_070).unwrap()
         );
 
         let mut with_source = before_070;
         with_source["cwd_from_tab"] = "7".into();
         assert_eq!(
-            host_tab_open_params(42, "/home/x", "htop", &argv, Some(7)),
+            host_tab_open_params(42, "/home/x", "htop", &argv, Some(7), SPAWN_GRID),
             with_source
         );
     }
@@ -11312,7 +11441,7 @@ mod tests {
             sent
         });
         let argv = argv.iter().map(|arg| arg.to_string()).collect();
-        let result = open_host_tab_flow(ops, project, origin, title.into(), argv).await;
+        let result = open_host_tab_flow(ops, project, origin, title.into(), argv, SPAWN_GRID).await;
         (
             result,
             session.await.expect("the stand-in session must not panic"),
@@ -11380,6 +11509,8 @@ mod tests {
                 attempt.params["argv"],
                 serde_json::json!(["/bin/sh", "-c", "htop"])
             );
+            assert_eq!(attempt.params["cols"], SPAWN_GRID.0);
+            assert_eq!(attempt.params["rows"], SPAWN_GRID.1);
         }
     }
 

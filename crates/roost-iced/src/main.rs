@@ -457,7 +457,7 @@ fn forced_test_panic() {
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 fn window_settings(profile: &BundleProfile) -> window::Settings {
     window::Settings {
-        size: Size::new(1100.0, 720.0),
+        size: app::INITIAL_WINDOW_SIZE,
         min_size: Some(Size::new(640.0, 360.0)),
         #[cfg(target_os = "macos")]
         platform_specific: window::settings::PlatformSpecific {

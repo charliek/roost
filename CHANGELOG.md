@@ -112,6 +112,16 @@ release workflow asserts they agree).
   background, foreground and selection colors and never a cursor,
   clashing with every non-default theme. It now starts from the active
   theme's colors instead, still with no cursor drawn.
+- **A new Roost-Iced tab started at 100×32 whatever the window's size
+  (#546)** — a program that reads its size as it starts (a launcher row,
+  a TUI's first frame, `stty size`) saw 100 columns by 32 rows until the
+  tab was shown and resized. Every tab the window opens — ⌘T, ⌘N,
+  launcher rows, a relaunch's restored tabs, and the tabs a backend
+  switch copies or restores — now spawns at the grid the window has room
+  for, beside the sidebar as it is (collapsed or not), on in-process,
+  session and saved-host projects alike. Tabs opened elsewhere keep their
+  own starting size: a session's own first and restored tabs (120×40)
+  and `roostctl tab open` (80×24).
 
 ## v0.0.20 — 2026-09-20
 

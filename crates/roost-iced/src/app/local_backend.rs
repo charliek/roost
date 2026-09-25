@@ -2073,8 +2073,9 @@ impl super::App {
 
         let feed = self.feed_tx.clone();
         let home = roost_engine::home_dir();
+        let grid = self.current_grid();
         self.runtime_handle.spawn(async move {
-            let outcome = replay_onto_slot(&ops, snapshot, &path, journal, &home).await;
+            let outcome = replay_onto_slot(&ops, snapshot, &path, journal, &home, grid).await;
 
             feed.send(crate::engine_feed::EngineFeed::LocalBackendSwitch(
                 Box::new(SwitchStepDone {
@@ -2440,8 +2441,9 @@ impl super::App {
         run.step_in_flight = true;
         let client = self.client.clone();
         let feed = self.feed_tx.clone();
+        let grid = self.current_grid();
         self.runtime_handle.spawn(async move {
-            let seeded = super::hydrate_local_workspace(&client)
+            let seeded = super::hydrate_local_workspace(&client, grid)
                 .await
                 .map_err(|error| error.to_string());
             feed.send(crate::engine_feed::EngineFeed::LocalBackendSwitch(
@@ -2635,6 +2637,7 @@ async fn replay_onto_slot(
     path: &Path,
     mut journal: SwitchJournal,
     home: &str,
+    grid: (u16, u16),
 ) -> ReplayOutcome {
     use roost_ipc::messages::{ops as wire, ProjectCreateResult, TabOpenResult};
     let mut created: Vec<CreatedProject> = Vec::with_capacity(snapshot.len());
@@ -2716,7 +2719,7 @@ async fn replay_onto_slot(
             let opened: Result<TabOpenResult, String> = super::host_call(
                 ops,
                 wire::TAB_OPEN,
-                super::host_tab_open_params(made.id, &cwd, &tab.title, &[], None),
+                super::host_tab_open_params(made.id, &cwd, &tab.title, &[], None, grid),
             )
             .await;
             let opened = match opened {
@@ -3710,6 +3713,7 @@ mod tests {
 
 #[cfg(test)]
 mod switch_tests {
+    use super::super::SPAWN_GRID;
     use super::*;
     use roost_ipc::messages::{Tab, TabState};
     use std::collections::HashMap;
@@ -4693,6 +4697,7 @@ mod switch_tests {
             path,
             journal,
             &home.path().to_string_lossy(),
+            SPAWN_GRID,
         )
         .await;
         drop(ops);
@@ -4858,6 +4863,21 @@ mod switch_tests {
                 params.get("cwd_from_tab").is_none(),
                 "a replayed tab.open must not carry the key at all: {params}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replayed_tab_spawns_at_the_grid_it_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = vec![source(11, &[("a", false)]), source(22, &[("b", true)])];
+        let (outcome, opened) =
+            replay_journalled_at(&journal_path(dir.path()), snapshot, |_, _| false).await;
+
+        assert!(outcome.error.is_none(), "{outcome:?}");
+        assert_eq!(opened.len(), 2, "both tabs were replayed: {opened:?}");
+        for params in &opened {
+            assert_eq!(params["cols"], SPAWN_GRID.0, "{params}");
+            assert_eq!(params["rows"], SPAWN_GRID.1, "{params}");
         }
     }
 
