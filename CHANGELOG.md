@@ -77,6 +77,16 @@ release workflow asserts they agree).
   `roost-session` started by an older Roost, still running after an
   upgrade, keeps the old behavior until it restarts. See
   [`ipc.md#tabopen`](docs/reference/ipc.md#tabopen).
+- **A directory whose name holds a `%` or a control character lost its
+  tracked cwd, or came back as a different path (#535)** — Roost's bash
+  and zsh integration sent the raw `$PWD` over OSC 7, so after a `cd`
+  into `a%zz` or `100%` the header subtitle and `tab.list` kept the
+  previous directory, `100%2Fdone` came back as `100/done`, and an ESC
+  or BEL byte in a name cut the report short. The integration now sends
+  `%` as `%25` and every control byte as `%XX` (on both apps, including
+  macOS's bash 3.2), and both apps' decoders keep a `%` that doesn't
+  start a valid escape instead of dropping the update. A `roost-session`
+  that was already running keeps the old behavior until it restarts.
 
 ## v0.0.20 — 2026-09-20
 

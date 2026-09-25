@@ -59,7 +59,23 @@ fi
 
 __roost_osc7() {
   _roost_feature cwd || return 0
-  printf '\033]7;file://%s%s\033\\' "${HOST}" "$PWD"
+  # The reader percent-decodes, so a literal `%` goes out as %25, and a
+  # control byte as %XX (a terminal ends or aborts an OSC on BEL, ESC,
+  # CAN or SUB). `\%` and `$i` stop zsh reading an anchor and a modifier.
+  local p c o i q=
+  p=${PWD//\%/%25}
+  if [[ $p == *[[:cntrl:]]* ]]; then
+    for (( i = 0; i < ${#p}; i++ )); do
+      c=${p:$i:1}
+      printf -v o '%d' "'$c"
+      if (( o > 0 && o < 32 || o == 127 )); then
+        printf -v c '%%%02X' "$o"
+      fi
+      q+=$c
+    done
+    p=$q
+  fi
+  printf '\033]7;file://%s%s\033\\' "${HOST}" "$p"
 }
 
 __roost_title() {

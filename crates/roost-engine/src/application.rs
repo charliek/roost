@@ -339,6 +339,7 @@ pub fn apply_osc(workspace: &Workspace, tab_id: i64, command: u32, payload: &str
     }
 }
 
+/// The payload's path is already percent-decoded (`osc::map_events`).
 fn parse_osc7_path(payload: &str) -> Option<String> {
     // OSC 7 carries `file://host/abs/path`. The path portion starts
     // at the FIRST `/` after the host (or at index 0 if the host is

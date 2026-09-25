@@ -337,7 +337,6 @@ private func isConEmuBody(_ body: String) -> Bool {
     return i == bytes.count || bytes[i] == UInt8(ascii: ";")
 }
 
-/// Decode an OSC 7 body of the form `file://[host]/path` into the
 /// Decode an OSC 52 body of the form `Ps;Pc` into a `.clipboard`
 /// event. Returns nil for read requests (`Pc == "?"`), invalid
 /// base64, non-UTF-8 payloads, empty payloads, or unrecognized
@@ -374,19 +373,47 @@ private func parseOsc52(_ body: String) -> OscEvent? {
     return .clipboard(target: target, text: text)
 }
 
-/// percent-decoded path. Returns nil for non-file URIs or
-/// malformed percent-encoding.
+/// Decode an OSC 7 body of the form `file://[host]/path` into the
+/// percent-decoded path. Returns nil for non-file URIs.
 private func parseOsc7(_ body: String) -> String? {
     guard body.hasPrefix("file://") else { return nil }
     let rest = String(body.dropFirst("file://".count))
     guard let slash = rest.firstIndex(of: "/") else { return nil }
-    let path = String(rest[slash...])
-    // Foundation's `removingPercentEncoding` returns nil on
-    // malformed encoding — a nil/None return on a decode failure,
-    // matching the Linux UI's `percent_decode` path.
-    return path.removingPercentEncoding
+    return percentDecode(String(rest[slash...]))
+}
+
+/// Percent-decode a path leniently, since plenty of emitters send a raw
+/// `$PWD`: a `%` not followed by two hex digits stays literal, and a
+/// decode that isn't UTF-8 keeps the raw path. Mirrors the Rust
+/// `percent_decode`; Foundation's `removingPercentEncoding` is
+/// all-or-nothing.
+private func percentDecode(_ path: String) -> String {
+    let bytes = Array(path.utf8)
+    var out: [UInt8] = []
+    out.reserveCapacity(bytes.count)
+    var i = 0
+    while i < bytes.count {
+        if bytes[i] == UInt8(ascii: "%"), i + 2 < bytes.count,
+           let hi = bytes[i + 1].hexValue, let lo = bytes[i + 2].hexValue {
+            out.append((hi << 4) | lo)
+            i += 3
+        } else {
+            out.append(bytes[i])
+            i += 1
+        }
+    }
+    return String(bytes: out, encoding: .utf8) ?? path
 }
 
 private extension UInt8 {
     var isAsciiDigit: Bool { (UInt8(ascii: "0")...UInt8(ascii: "9")).contains(self) }
+
+    var hexValue: UInt8? {
+        switch self {
+        case UInt8(ascii: "0")...UInt8(ascii: "9"): return self - UInt8(ascii: "0")
+        case UInt8(ascii: "a")...UInt8(ascii: "f"): return self - UInt8(ascii: "a") + 10
+        case UInt8(ascii: "A")...UInt8(ascii: "F"): return self - UInt8(ascii: "A") + 10
+        default: return nil
+        }
+    }
 }

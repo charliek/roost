@@ -77,10 +77,8 @@ pub enum OscEvent {
     Title(String),
 
     /// OSC 7 — set working directory. Path has been extracted from
-    /// the `file://[host]/path` URI form and percent-decoded.
-    /// Emitted only for syntactically valid bodies; malformed
-    /// percent-encoding (`%`, `%ZZ`) drops silently rather than
-    /// shipping gibberish through the chrome.
+    /// the `file://[host]/path` URI form and percent-decoded
+    /// leniently (see `percent_decode`).
     Pwd(String),
 
     /// OSC 9 (iTerm2 notification, title-only) or OSC 777 (Konsole
@@ -554,27 +552,26 @@ fn decode_osc52_base64(pc: &str) -> Option<Vec<u8>> {
 
 /// Decode an OSC 7 body of the form `file://[host]/path` into the
 /// percent-decoded path. Returns `None` for bodies that aren't a
-/// recognized file URI or that fail percent-decoding.
+/// recognized file URI.
 fn parse_osc7(body: &str) -> Option<String> {
     let rest = body.strip_prefix("file://")?;
     let slash = rest.find('/')?;
-    let path = &rest[slash..];
-    percent_decode(path)
+    Some(percent_decode(&rest[slash..]))
 }
 
-/// Percent-decode a path. Returns `None` on malformed encoding
-/// (trailing `%`, `%ZZ`).
-fn percent_decode(s: &str) -> Option<String> {
+/// Percent-decode a path leniently, since plenty of emitters send a raw
+/// `$PWD`: a `%` not followed by two hex digits stays literal, and a
+/// decode that isn't UTF-8 keeps the raw path.
+fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 >= bytes.len() {
-                return None;
-            }
-            let hi = hex_digit(bytes[i + 1])?;
-            let lo = hex_digit(bytes[i + 2])?;
+        let escape = match bytes.get(i..i + 3) {
+            Some([b'%', hi, lo]) => hex_digit(*hi).zip(hex_digit(*lo)),
+            _ => None,
+        };
+        if let Some((hi, lo)) = escape {
             out.push((hi << 4) | lo);
             i += 3;
         } else {
@@ -582,7 +579,7 @@ fn percent_decode(s: &str) -> Option<String> {
             i += 1;
         }
     }
-    String::from_utf8(out).ok()
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
 /// Parse an OSC 4 body into its set pairs and its queried indices.
@@ -897,15 +894,33 @@ mod tests {
     }
 
     #[test]
-    fn osc7_malformed_percent_dropped() {
-        let events = feed_all(b"\x1b]7;file:///bad%ZZ\x07");
-        assert!(events.is_empty());
+    fn osc7_escapes_decode() {
+        let events = feed_all(b"\x1b]7;file:///100%25%2Fdone%20now%1B\x07");
+        assert_eq!(events, vec![OscEvent::Pwd("/100%/done now\x1b".into())]);
     }
 
     #[test]
-    fn osc7_trailing_percent_dropped() {
+    fn osc7_malformed_percent_passes_through() {
+        let events = feed_all(b"\x1b]7;file:///a%zz/b%2\x07");
+        assert_eq!(events, vec![OscEvent::Pwd("/a%zz/b%2".into())]);
+    }
+
+    #[test]
+    fn osc7_trailing_percent_passes_through() {
         let events = feed_all(b"\x1b]7;file:///bad%\x07");
-        assert!(events.is_empty());
+        assert_eq!(events, vec![OscEvent::Pwd("/bad%".into())]);
+    }
+
+    #[test]
+    fn osc7_non_utf8_decode_keeps_raw_path() {
+        let events = feed_all(b"\x1b]7;file:///a%FF%20b\x07");
+        assert_eq!(events, vec![OscEvent::Pwd("/a%FF%20b".into())]);
+    }
+
+    #[test]
+    fn osc7_escaped_multibyte_decodes() {
+        let events = feed_all(b"\x1b]7;file:///%C3%A9t%C3%A9\x07");
+        assert_eq!(events, vec![OscEvent::Pwd("/\u{e9}t\u{e9}".into())]);
     }
 
     #[test]
