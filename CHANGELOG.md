@@ -178,6 +178,14 @@ release workflow asserts they agree).
   moved to run after the window's selection settles each reconcile, so a
   relaunch or an in-flight project creation doesn't leave a stale
   checkmark.
+- **The Mac app started a tab asked for a directory that isn't there in
+  `Roost.app`'s own launch directory (#541)** — `roostctl tab open --cwd
+  /nope`, ⌘T from a tab whose directory had been deleted, and restoring a
+  saved tab whose directory is gone. A cwd that is not a directory now
+  falls back to the project's directory, else `$HOME`, and the tab's row
+  says where the shell started, as on Roost-Iced. A directory that exists
+  but can't be entered now fails the shell's start and the tab closes, as
+  on Linux, instead of the shell running on in the launch directory.
 
 ## v0.0.20 — 2026-09-20
 

@@ -203,7 +203,7 @@ actor IPCHandlerImpl: IPCHandler {
         let cwd = p.cwdFromTab.flatMap { client.inheritedCwd(tabID: $0) } ?? p.cwd
         var projectID = p.projectID
         if projectID == 0 {
-            projectID = client.workspace.ensureDefaultProject(cwd: cwd, activate: activate)
+            projectID = client.ensureDefaultProject(cwd: cwd, activate: activate)
         }
         do {
             let tab = try client.openTab(

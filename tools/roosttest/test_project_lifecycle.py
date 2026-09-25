@@ -413,6 +413,66 @@ def test_tab_open_with_no_cwd_resolves_to_the_projects_cwd(roost):
         _cleanup_project(roost, pid)
 
 
+# -- tab.open cwd that is not a directory (#541) ---------------------------
+
+
+def test_tab_open_with_a_missing_cwd_starts_in_the_projects_cwd(roost):
+    """A requested cwd that is not a directory falls back as an empty one
+    does: to the project's cwd, by the row and by the shell's own
+    `pwd -P`. On both targets (#541). `/usr` for the reason the #266 test
+    above gives."""
+    project_cwd = "/usr"
+    pid = roost.create_project(name=f"pytest-gone-{uuid.uuid4().hex[:8]}", cwd=project_cwd)
+    try:
+        missing = f"/roost-no-such-dir-{uuid.uuid4().hex[:8]}"
+        assert not os.path.exists(missing)
+        tab = roost.call(
+            "tab.open",
+            {"project_id": str(pid), "cwd": missing, "title": "", "cols": 80, "rows": 24},
+        )["tab"]
+        assert tab["cwd"] == project_cwd, tab
+
+        tab_id = int(tab["id"])
+        wait_tab_attached(roost, tab_id)
+        wait_shell_ready(roost, tab_id)
+        marker = f"GONE_PWD_{uuid.uuid4().hex[:8]}"
+        roost.run(tab_id, f"echo {marker}=$(pwd -P)")
+        roost.wait_text(tab_id, f"{marker}={os.path.realpath(project_cwd)}", timeout=8)
+    finally:
+        _cleanup_project(roost, pid)
+
+
+def test_tab_open_in_a_directory_the_shell_cannot_enter_closes_the_tab(roost, target, tmp_path):
+    """A directory the shell cannot enter (mode 000) is still a directory,
+    so nothing falls back: the spawn fails and the tab closes, on both
+    targets (#541). Only the reply differs. Rust's spawn fails inside the
+    call, which answers an error; the Mac's forked child exits on the
+    failed `chdir` after the call has answered, and that exit closes the
+    tab. The project keeps the tab it already had, because closing a
+    project's last tab deletes the project."""
+    pid = roost.create_project(name=f"pytest-locked-{uuid.uuid4().hex[:8]}", cwd="/usr")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    try:
+        kept = roost.open_tab(pid, cwd="/usr")
+        wait_tab_attached(roost, kept)
+        locked.chmod(0)
+        if target == "mac":
+            roost.wait_gone(roost.open_tab(pid, cwd=str(locked)))
+        else:
+            with pytest.raises(RoostError) as failed:
+                roost.open_tab(pid, cwd=str(locked))
+            assert failed.value.code == "internal", failed.value
+        roost._wait(
+            lambda: roost.project_tab_ids(pid) == [kept],
+            5.0,
+            "the project to hold only the tab it already had",
+        )
+    finally:
+        locked.chmod(0o755)
+        _cleanup_project(roost, pid)
+
+
 # -- tab.close active fallback ---------------------------------------------
 
 
