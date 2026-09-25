@@ -53,7 +53,7 @@ async fn exited(lifecycle: &mut broadcast::Receiver<SupervisorEvent>, tab_id: i6
 /// the interleaving under test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_close_that_beats_the_reservation_still_tears_the_child_down() {
-    let (workspace, supervisor, socket, tab) = fixture();
+    let (workspace, supervisor, socket, mut tab) = fixture();
     let mut lifecycle = supervisor.subscribe_lifecycle();
 
     close_tab(&workspace, &supervisor, tab.id).expect("the row was there to close");
@@ -61,7 +61,7 @@ async fn a_close_that_beats_the_reservation_still_tears_the_child_down() {
     let err = spawn_for_row(
         &workspace,
         &supervisor,
-        &tab,
+        &mut tab,
         &quiet_argv(),
         80,
         24,
@@ -82,12 +82,12 @@ async fn a_close_that_beats_the_reservation_still_tears_the_child_down() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_uncontended_open_keeps_its_row_and_its_session() {
-    let (workspace, supervisor, socket, tab) = fixture();
+    let (workspace, supervisor, socket, mut tab) = fixture();
 
     spawn_for_row(
         &workspace,
         &supervisor,
-        &tab,
+        &mut tab,
         &quiet_argv(),
         80,
         24,

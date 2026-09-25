@@ -1647,11 +1647,30 @@ impl Workspace {
     }
 
     pub fn set_tab_cwd(&self, tab_id: i64, cwd: &str) -> Result<(), WorkspaceError> {
+        self.update_tab_cwd(tab_id, cwd, false)
+    }
+
+    /// Where a tab's shell really starts, when that is not the cwd its
+    /// row was opened with ([`crate::application::spawn_for_row`]).
+    /// Unlike [`Self::set_tab_cwd`], a title the opener supplied stays:
+    /// only a title derived from the old cwd follows the move.
+    pub fn set_tab_start_cwd(&self, tab_id: i64, cwd: &str) -> Result<(), WorkspaceError> {
+        self.update_tab_cwd(tab_id, cwd, true)
+    }
+
+    fn update_tab_cwd(
+        &self,
+        tab_id: i64,
+        cwd: &str,
+        keep_supplied_title: bool,
+    ) -> Result<(), WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
         let row = inner
             .tabs
             .get_mut(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
+        let title_follows =
+            !row.user_titled && (!keep_supplied_title || row.title == derive_title(&row.cwd));
         let cwd_owned = cwd.to_string();
         row.cwd = cwd_owned.clone();
         // Shell-driven (OSC 7 fires per `cd`) but write-through: each
@@ -1668,7 +1687,7 @@ impl Workspace {
         // shells, the next prompt's OSC 0 refines this basename to the
         // tilde-abbreviated path via `set_tab_title_from_osc` —
         // latest-wins. Event order is cwd-then-title (cause-then-effect).
-        if !row.user_titled {
+        if title_follows {
             let new_title = derive_title(cwd);
             if row.title != new_title {
                 row.title = new_title.clone();
@@ -2121,6 +2140,11 @@ impl Workspace {
             Persist::Write,
         );
         Ok(())
+    }
+
+    pub fn project_cwd(&self, project_id: i64) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        inner.projects.get(&project_id).map(|row| row.cwd.clone())
     }
 
     pub fn tab(&self, tab_id: i64) -> Result<Tab, WorkspaceError> {
@@ -3770,6 +3794,20 @@ mod tests {
                 if tab_id == tid && title == "usr"
         ));
         assert_eq!(ws.tab(tid).unwrap().title, "usr");
+    }
+
+    #[test]
+    fn set_tab_start_cwd_keeps_a_supplied_title_and_moves_a_derived_one() {
+        let ws = Workspace::new();
+        let pid = ws.create_project("p", "").unwrap().id;
+        let supplied = ws.open_tab(pid, "/gone", "build", true).unwrap().id;
+        let derived = ws.open_tab(pid, "/gone", "", true).unwrap().id;
+        for tid in [supplied, derived] {
+            ws.set_tab_start_cwd(tid, "/usr").unwrap();
+            assert_eq!(ws.tab(tid).unwrap().cwd, "/usr");
+        }
+        assert_eq!(ws.tab(supplied).unwrap().title, "build");
+        assert_eq!(ws.tab(derived).unwrap().title, "usr");
     }
 
     /// `set_tab_cwd` does NOT touch the title when the user has

@@ -430,8 +430,12 @@ Request:
 ```
 
 `argv` empty means `[$SHELL]`. `cwd` empty means resolve it: the
-project's cwd, then `$HOME`, then `/`. `title` empty means derive from
-the resolved `cwd`. There is
+project's cwd, then `$HOME`, then `/`. A `cwd` that is not a directory
+on the server's machine — a typo, or a directory since deleted — is
+treated as empty (#541): the tab starts in the project's cwd if that is
+a directory, else at `$HOME`, and the result's `tab.cwd` says which. A
+directory that exists but cannot be entered still fails the open.
+`title` empty means derive from the resolved `cwd`. There is
 deliberately no opaque command string — callers wanting shell
 word-splitting must pass `["sh", "-c", "..."]` explicitly. This `argv` is
 reachable from the CLI as `roostctl tab open -- <cmd…>` (see
@@ -464,11 +468,12 @@ machine, so a directory since removed, or an OSC 7 path from across an
 including for `project_id: "0"`, where it is resolved before the
 default project is found or created.
 When nothing resolves — no such tab, or neither candidate is a
-directory — it is **not an error**: `cwd` is used as sent, and an
-empty one resolves through the usual chain above. The result's
-`tab.cwd` carries the cwd the tab was opened with. Served by the Rust
-endpoints: sessions and Roost-Iced's UI socket. The Swift Mac app's
-socket and servers that predate the field answer `unknown-field` — see
+directory — it is **not an error**: `cwd` is used as sent, and one
+that is empty or not a directory resolves through the usual chain
+above. The result's `tab.cwd` carries the cwd the tab started in.
+Served by the Rust endpoints: sessions and Roost-Iced's UI socket. The
+Swift Mac app's socket and servers that predate the field answer
+`unknown-field` — see
 [the compatibility matrix](ipc-compatibility.md#the-compatibility-matrix).
 No CLI flag yet.
 

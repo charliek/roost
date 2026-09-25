@@ -344,13 +344,13 @@ impl Engine {
             crate::application::pty_dim(params.cols, 80, "cols").map_err(application_error)?;
         let rows =
             crate::application::pty_dim(params.rows, 24, "rows").map_err(application_error)?;
-        let tab =
+        let mut tab =
             self.workspace
                 .open_tab(params.project_id, &params.cwd, &params.title, activate)?;
         crate::application::spawn_for_row(
             &self.workspace,
             &self.supervisor,
-            &tab,
+            &mut tab,
             &params.argv,
             cols,
             rows,

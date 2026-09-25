@@ -375,7 +375,7 @@ roostctl tab dump --tab 5 --json   # full result: dims + cursor + rows
 roostctl tab dump --tab 5 --scrollback 200   # 200 rows of history, then the viewport
 ```
 
-`tab open` prints the new tab id on stdout (so `id=$(roostctl tab open …)`); `--json` prints the `tab.open` result instead. A **command** can follow `--`; without one the tab opens the default shell. The command's working directory is `--cwd` (default: the project's cwd).
+`tab open` prints the new tab id on stdout (so `id=$(roostctl tab open …)`); `--json` prints the `tab.open` result instead. A **command** can follow `--`; without one the tab opens the default shell. The command's working directory is `--cwd` (default: the project's cwd); a `--cwd` that is not a directory falls back the same way, to the project's cwd (else `$HOME`).
 
 | Flag | Effect |
 |---|---|

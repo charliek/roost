@@ -66,6 +66,17 @@ release workflow asserts they agree).
   SIGTERM ends it. A process the shell started that ignores SIGHUP can
   still outlive the quit. Session-backed tabs are untouched: they belong
   to the `roost-session`.
+- **A tab asked to start in a directory that isn't there started at
+  `$HOME` while its row claimed the missing path (#541)** — ⌘T on a
+  session-backed project whose active tab's directory had been deleted,
+  `roostctl tab open --cwd /nope`, and restoring a saved tab whose
+  directory is gone. On Roost-Iced and on a session, a cwd that is not
+  a directory now counts as empty wherever a tab opens: the tab starts
+  in the project's directory, else at `$HOME`, and its row says so. A
+  directory that exists but can't be entered still fails the open. A
+  `roost-session` started by an older Roost, still running after an
+  upgrade, keeps the old behavior until it restarts. See
+  [`ipc.md#tabopen`](docs/reference/ipc.md#tabopen).
 
 ## v0.0.20 — 2026-09-20
 

@@ -3151,3 +3151,26 @@ def test_a_new_tab_on_a_host_opens_in_the_active_tabs_own_cwd_without_osc7(host,
         tab = new_tab_from(roost, session, source)
 
         assert_opened_in(session, tab, moved_to)
+
+
+def test_a_new_tab_from_a_tab_whose_directory_is_gone_opens_in_the_projects_cwd(host, roost):
+    """#541: ⌘T on a tab whose directory was deleted. Neither the tab the
+    UI names (`cwd_from_tab`) nor the mirror cwd beside it is a directory
+    any more, so the new tab opens in the project's cwd, by its row and
+    by its shell. The project gets a cwd of its own because the seeded
+    one is `$HOME`, where the spawn used to fall back to anyway."""
+    host.connect_and_wait()
+    project_dir = Path(tempfile.mkdtemp(prefix="project-", dir=host.env.launch_cwd))
+    doomed = Path(tempfile.mkdtemp(prefix="doomed-", dir=host.env.launch_cwd))
+    with host.client() as session:
+        project = session.create_project("gone-cwd", str(project_dir))
+        source = session.open_tab(
+            project,
+            cwd=str(doomed),
+            argv=["/bin/sh", "-c", "exec sleep 300"],
+        )
+        doomed.rmdir()
+
+        tab = new_tab_from(roost, session, source)
+
+        assert_opened_in(session, tab, project_dir)

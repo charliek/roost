@@ -2774,12 +2774,7 @@ async fn replay_onto_slot(
 /// machine, so the check is a real one — this is the only replay
 /// destination for which that is true, and the only one §D8 asks it of.
 fn replay_cwd(tab: &str, project: &str, home: &str) -> String {
-    for candidate in [tab, project, home] {
-        if !candidate.is_empty() && Path::new(candidate).is_dir() {
-            return candidate.to_string();
-        }
-    }
-    home.to_string()
+    roost_engine::application::usable_cwd_or(tab, project, home)
 }
 
 /// Phase 5. Answers how many are left, because that is what decides
