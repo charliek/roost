@@ -313,7 +313,7 @@ fn parse_osc7_path(payload: &str) -> Option<String> {
 /// produce e.g. cols=34464 for cols=100000). Mirrors the Rust
 /// IPC handler's `u16::try_from` validation in `crates/roost-
 /// linux/src/ipc.rs`.
-fn pty_dim(value: u32, default: u16, field: &str) -> Result<u16> {
+pub(crate) fn pty_dim(value: u32, default: u16, field: &str) -> Result<u16> {
     if value == 0 {
         return Ok(default);
     }
