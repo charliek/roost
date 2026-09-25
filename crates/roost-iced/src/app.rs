@@ -1192,6 +1192,25 @@ fn host_reply<T: serde::de::DeserializeOwned>(
     serde_json::from_value(value).map_err(|error| format!("{op} answered unexpectedly: {error}"))
 }
 
+/// A [`crate::host_conn::HostOpError`] as a status banner says it (plan
+/// 071 D8). On the session slot, `Rejected` is the session's own refusal
+/// and needs no code repeated back, and every other variant says "the
+/// local session" where a real host's wording says "the host". A real
+/// host's wording is unchanged.
+fn host_op_error_text(error: &crate::host_conn::HostOpError, on_slot: bool) -> String {
+    use crate::host_conn::HostOpError;
+    if !on_slot {
+        return error.to_string();
+    }
+    match error {
+        HostOpError::Rejected { message, .. } | HostOpError::Local(message) => message.clone(),
+        HostOpError::Disconnected => "the local session disconnected before this ran".into(),
+        HostOpError::Transport(detail) => format!("connection to the local session lost: {detail}"),
+        HostOpError::QueueFull => "the local session has too many operations queued".into(),
+        HostOpError::WorkerGone => "the local session connection is gone".into(),
+    }
+}
+
 /// [`create_project_flow`]'s host twin: the same two ops, in the same
 /// order, on the host's queue instead of the local client.
 ///
@@ -2398,6 +2417,28 @@ fn compose_window_title(
     // "Roost-Iced (pop-os)" is more use than "Roost-Iced".
     let named = if name.is_empty() { fallback } else { name };
     window_title::window_title_with_fallback(fallback, &format!("{named} ({host})"), cwd, home)
+}
+
+/// Whether a host project's title should carry its host suffix at all.
+///
+/// `None` only for the session slot — its tabs are what the in-process
+/// backend calls its own, so titling them like a remote host would
+/// contradict "the local session reads as local" (plan 071 D8). `slot_host`
+/// is [`App::local_slot_view`]'s own host id, taken whether or not that
+/// view is currently interactive: a disconnected slot is still the slot.
+/// Gated on `mode` as well as the id match, because under `in-process` a
+/// user-added `localhost` host has the same transport `local_slot_view`
+/// keys on, and that one keeps its suffix.
+fn title_host(
+    mode: LocalBackendMode,
+    slot_host: Option<HostId>,
+    project_host: HostId,
+    label: &str,
+) -> Option<&str> {
+    if mode == LocalBackendMode::Session && slot_host == Some(project_host) {
+        return None;
+    }
+    Some(label)
 }
 
 fn title_fallback(kind: BundleProfileKind) -> &'static str {
@@ -6315,7 +6356,9 @@ impl App {
         argv: Vec<String>,
     ) -> EngineDispatch {
         let Some(ops) = self.hosts.ops_for(project.host).cloned() else {
-            self.set_status("that host is not accepting operations".to_string());
+            self.set_status(
+                file_transfer::unavailable_text(self.is_local_slot(project.host)).to_string(),
+            );
             return EngineDispatch::default();
         };
         let origin = host_tab_origin(
@@ -6341,7 +6384,7 @@ impl App {
     /// and every row of the ⌘⇧N picker but LOCAL.
     fn create_host_project_dispatch(&mut self, host: HostId) -> EngineDispatch {
         let Some(ops) = self.hosts.ops_for(host).cloned() else {
-            self.set_status("that host is not accepting operations".to_string());
+            self.set_status(file_transfer::unavailable_text(self.is_local_slot(host)).to_string());
             return EngineDispatch::default();
         };
         let op = self.take_host_op_id(host, local_backend::HostOpKind::Create);
@@ -6549,7 +6592,9 @@ impl App {
             // "refused" is something the user is told rather than
             // something only the log knows.
             let Some(ops) = self.hosts.ops_for(project.host).cloned() else {
-                self.set_status("that host is not accepting operations".to_string());
+                self.set_status(
+                    file_transfer::unavailable_text(self.is_local_slot(project.host)).to_string(),
+                );
                 return UiTask::None;
             };
             let host_project_id = project.project;
@@ -6608,7 +6653,9 @@ impl App {
     /// immediate "fine" the host may be about to contradict.
     fn close_host_tab_dispatch(&mut self, tab: TabKey) -> EngineDispatch {
         let Some(ops) = self.hosts.ops_for(tab.host).cloned() else {
-            self.set_status("that host is not accepting operations".to_string());
+            self.set_status(
+                file_transfer::unavailable_text(self.is_local_slot(tab.host)).to_string(),
+            );
             return EngineDispatch::default();
         };
         let op = self.take_host_op_id(tab.host, local_backend::HostOpKind::Other);
@@ -8669,7 +8716,15 @@ impl App {
             self.host_view(project.host)
         };
         let (rows, host) = match host_view {
-            Some(view) => (view.projects.as_slice(), Some(view.label.as_str())),
+            Some(view) => (
+                view.projects.as_slice(),
+                title_host(
+                    self.local_backend,
+                    self.local_slot_view().map(|slot| slot.host),
+                    project.host,
+                    &view.label,
+                ),
+            ),
             None => (self.projects.as_slice(), None),
         };
         let named = rows
@@ -9589,6 +9644,70 @@ mod tests {
         assert_eq!(
             compose_window_title(fallback, None, Some("pop-os"), "/Users/me"),
             "Roost-Iced"
+        );
+    }
+
+    /// Plan 071 D8 (#544): the session slot's title carries no host
+    /// suffix at all — it reads exactly like an in-process project.
+    #[test]
+    fn title_host_drops_the_suffix_only_for_the_session_slot() {
+        let slot = HostId::new(4);
+        let other = HostId::new(5);
+
+        assert_eq!(
+            title_host(LocalBackendMode::Session, Some(slot), slot, "localhost"),
+            None,
+            "the slot itself, under session, loses its suffix"
+        );
+        // A `localhost`-transport host under `in-process` is not the
+        // slot at all (the mode never draws one) — it keeps its suffix
+        // exactly like any other host.
+        assert_eq!(
+            title_host(LocalBackendMode::InProcess, Some(slot), slot, "localhost"),
+            Some("localhost"),
+            "a localhost host under in-process keeps its suffix"
+        );
+        // A real, non-slot host is unaffected either way.
+        assert_eq!(
+            title_host(LocalBackendMode::Session, Some(slot), other, "pop-os"),
+            Some("pop-os"),
+            "a real host keeps its suffix"
+        );
+        assert_eq!(
+            title_host(LocalBackendMode::Session, None, other, "pop-os"),
+            Some("pop-os"),
+            "no slot at all is the ordinary host case"
+        );
+    }
+
+    /// Plan 071 D8 (#544): `Rejected` is the session's own refusal —
+    /// bare, with no `{op}:`/code lead-in — and the slot flag decides
+    /// only the noun the other variants name.
+    #[test]
+    fn host_op_error_text_bares_rejections_and_localizes_the_rest() {
+        use crate::host_conn::HostOpError;
+
+        let rejected = HostOpError::Rejected {
+            code: roost_ipc::client::ServerCode::NotFound,
+            message: "project 4 is gone".to_string(),
+        };
+        assert_eq!(
+            host_op_error_text(&rejected, false),
+            "not-found: project 4 is gone",
+            "a real host keeps its wording"
+        );
+        assert_eq!(host_op_error_text(&rejected, true), "project 4 is gone");
+        assert_eq!(
+            host_op_error_text(&HostOpError::Disconnected, false),
+            "the host disconnected before this ran"
+        );
+        assert_eq!(
+            host_op_error_text(&HostOpError::Disconnected, true),
+            "the local session disconnected before this ran"
+        );
+        assert_eq!(
+            host_op_error_text(&HostOpError::QueueFull, true),
+            "the local session has too many operations queued"
         );
     }
 

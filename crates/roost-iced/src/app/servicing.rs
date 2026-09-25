@@ -2914,7 +2914,7 @@ impl App {
     /// The one definition of "which saved host is the slot";
     /// [`Self::local_slot_saved_id`] and [`Self::local_slot_host`] are
     /// both this lookup, so they cannot name different hosts.
-    fn local_slot_view(&self) -> Option<&super::HostView> {
+    pub(super) fn local_slot_view(&self) -> Option<&super::HostView> {
         self.host_views
             .iter()
             .find(|view| view.transport.localhost())
@@ -2970,6 +2970,19 @@ impl App {
         self.local_slot_view()
             .filter(|view| view.state.interactive())
             .map(|view| view.host)
+    }
+
+    /// Whether `host` is the session slot — the fact [`title_host`] and
+    /// the host-unavailable status banners share for "this reads as
+    /// local, not as some machine across the network" (plan 071 D8).
+    /// Unlike [`Self::connected_slot_host`] this does not require the
+    /// slot to be interactive: a disconnected slot is still the slot,
+    /// and its banner should still say so. Gated on the mode too — under
+    /// `in-process` a user-added `localhost` host is an ordinary host,
+    /// not the slot's stand-in.
+    pub(super) fn is_local_slot(&self, host: HostId) -> bool {
+        self.local_backend == LocalBackendMode::Session
+            && self.local_slot_view().is_some_and(|slot| slot.host == host)
     }
 
     fn refresh_sidebar_agents(&mut self) {

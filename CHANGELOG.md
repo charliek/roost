@@ -95,6 +95,16 @@ release workflow asserts they agree).
   tab, a launcher row, and the launch/connect seed on a host no longer
   touch it. Jumping to a notification and renaming a project still
   reveal it, as before.
+- **The local session's tab read as a remote host, in the title and in
+  status banners (#544)** — a fresh install's local tabs, running on a
+  `roost-session`, put a `(localhost)` suffix on the window title and
+  said "that host is not accepting operations" when it was unreachable.
+  Both now read as local: the title carries no host suffix for the
+  session's own tabs (a real host, and a `localhost` host under
+  `local-backend = in-process`, keep theirs), the unreachable banner
+  says "the local session is not connected", and a failed rename or
+  reorder names the local session instead of "the host". The wire
+  replies `roostctl` and other tools see are unchanged.
 
 ## v0.0.20 — 2026-09-20
 
