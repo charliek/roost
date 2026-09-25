@@ -52,6 +52,11 @@ release workflow asserts they agree).
   already mid-wakeup lost that race to its own feed ending. That stream
   now gets its envelope too, best-effort like every other close. See
   [`events.subscribe`](docs/reference/ipc.md#eventssubscribe).
+- **iced: a startup error after logging starts reached stderr only, never
+  the log file (#538)** — the state-lock failures and a bind error such
+  as `bind Iced IPC server` returned straight out of `main` without going
+  through `tracing`, so `roost.log` had no record of why the process
+  exited. `main` now logs the full error chain once before returning it.
 
 ## v0.0.20 — 2026-09-20
 

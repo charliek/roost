@@ -338,8 +338,15 @@ fn main() -> anyhow::Result<()> {
         bundle_id.as_deref(),
     ))?;
     init_logging(&profile)?;
+    // Everything past this point can log, so route its `Err` through
+    // tracing before it reaches `main`'s return — without this, an error
+    // from here on reaches stderr only, never the log file.
+    run(&profile, bundle_id.as_deref()).inspect_err(|error| tracing::error!("{error:#}"))
+}
+
+fn run(profile: &BundleProfile, bundle_id: Option<&str>) -> anyhow::Result<()> {
     tracing::info!(
-        bundle_id = bundle_id.as_deref().unwrap_or("unbundled"),
+        bundle_id = bundle_id.unwrap_or("unbundled"),
         profile = profile.kind.as_str(),
         "resolved bundle identity"
     );
@@ -369,7 +376,7 @@ fn main() -> anyhow::Result<()> {
     let locks = match attempt {
         Ok(locks) => locks,
         Err(single_instance::LocksError::SocketHeld { pid, .. }) => {
-            activate_existing(&profile, pid);
+            activate_existing(profile, pid);
             return Ok(());
         }
         Err(single_instance::LocksError::StateHeld { pid, path }) => {
@@ -385,7 +392,7 @@ fn main() -> anyhow::Result<()> {
         Err(error) => return Err(anyhow::anyhow!("single-instance lock failed: {error}")),
     };
 
-    let initial = Arc::new(Mutex::new(Some(App::bootstrap(&profile, locks)?)));
+    let initial = Arc::new(Mutex::new(Some(App::bootstrap(profile, locks)?)));
     let boot = {
         let initial = Arc::clone(&initial);
         move || {
@@ -405,7 +412,7 @@ fn main() -> anyhow::Result<()> {
         .font(include_bytes!("../../../third_party/inter/Inter-Medium.ttf").as_slice())
         .font(include_bytes!("../../../third_party/inter/Inter-SemiBold.ttf").as_slice())
         .default_font(chrome::chrome_font(iced::font::Weight::Normal))
-        .window(window_settings(&profile))
+        .window(window_settings(profile))
         .run()
         .context("run Iced application")
 }
@@ -850,7 +857,11 @@ fn activate_existing(profile: &BundleProfile, pid: i32) {
             })
         });
     if let Err(error) = result {
-        eprintln!("Roost (Iced) is already running (pid {pid}), but activation failed: {error}");
+        tracing::warn!(
+            pid,
+            error = %error,
+            "Roost (Iced) is already running, but activating it failed"
+        );
     }
 }
 
