@@ -781,6 +781,7 @@ jobs:
           tools/roosttest/test_sparkle.py
           tools/roosttest/test_view_perf.py
           tools/roosttest/test_boot_failure.py
+          tools/roosttest/test_quit_with_foreground_job.py
           tools/roosttest/test_osc52.py
           --roost-target iced --roost-fresh -v
 
@@ -1045,6 +1046,7 @@ jobs:
           tools/roosttest/test_sparkle.py
           tools/roosttest/test_view_perf.py
           tools/roosttest/test_boot_failure.py
+          tools/roosttest/test_quit_with_foreground_job.py
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced exit-on-empty E2E (Linux Wayland)

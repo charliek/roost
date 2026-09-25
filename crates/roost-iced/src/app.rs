@@ -2856,8 +2856,8 @@ pub struct App {
     // Field order is intentional: terminal sessions and the engine feed
     // (whose receiver carries the wake every sender notifies on) are
     // dropped before the runtime — a dropped receiver is how the adapter
-    // tasks learn to stop. The locks are held until every runtime task
-    // has been cancelled and joined by Runtime::drop, so they stay last.
+    // tasks learn to stop. The locks outlive the runtime's drop (see
+    // [`OwnedRuntime`] for what it waits on), so they stay last.
     // `InstanceLocks` owns the release *order* between the two locks
     // (state before socket, the reverse of acquisition) in its own field
     // order — one field here, so no ordering trap at this seam.
@@ -2866,7 +2866,7 @@ pub struct App {
     /// Drops immediately before `runtime` — see
     /// [`RestoreDefaultQuitSignalsOnDrop`] for why that position matters.
     _restore_quit_signals: RestoreDefaultQuitSignalsOnDrop,
-    runtime: tokio::runtime::Runtime,
+    runtime: OwnedRuntime,
     _locks: InstanceLocks,
 }
 
@@ -2938,6 +2938,33 @@ struct HostSelection {
 }
 
 const BOOT_ABORT_DEADLINE: Duration = Duration::from_secs(2);
+const QUIT_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
+const QUIT_RUNTIME_GRACE: Duration = Duration::from_secs(1);
+
+/// The engine runtime, whose drop gives up on blocking tasks after
+/// [`QUIT_RUNTIME_GRACE`].
+///
+/// A plain `Runtime` drop waits on every blocking task, and a PTY reader
+/// runs until the last holder of its pty slave closes it. Quit hangs up
+/// each tab's direct child, but a descendant that ignores SIGHUP keeps the
+/// slave open, and would keep the process from ever exiting.
+struct OwnedRuntime(Option<tokio::runtime::Runtime>);
+
+impl std::ops::Deref for OwnedRuntime {
+    type Target = tokio::runtime::Runtime;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("the runtime is taken only by drop")
+    }
+}
+
+impl Drop for OwnedRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_timeout(QUIT_RUNTIME_GRACE);
+        }
+    }
+}
 
 /// What [`App::start_engine`] built, for `bootstrap` to move into `App`.
 struct StartedEngine {
@@ -3163,7 +3190,7 @@ impl App {
             feed_rx,
             feed_tx,
             _restore_quit_signals: RestoreDefaultQuitSignalsOnDrop,
-            runtime,
+            runtime: OwnedRuntime(Some(runtime)),
             _locks: locks,
         };
         app.publish_local_route();
@@ -8951,6 +8978,11 @@ impl Drop for App {
                 tracing::error!(%error, "the workspace layout could not be written on shutdown")
             }
         }
+        // Hang the in-process shells up so their PTY readers finish before
+        // the runtime drops. A session's tabs belong to its daemon, never
+        // to this supervisor, so they are untouched.
+        self.runtime
+            .block_on(self.client.supervisor.shutdown_all(QUIT_SHUTDOWN_DEADLINE));
     }
 }
 

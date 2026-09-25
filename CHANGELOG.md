@@ -57,6 +57,15 @@ release workflow asserts they agree).
   as `bind Iced IPC server` returned straight out of `main` without going
   through `tracing`, so `roost.log` had no record of why the process
   exited. `main` now logs the full error chain once before returning it.
+- **An in-process Roost-Iced quit with a job running in a tab never
+  finished (#522)** — under `local-backend = in-process`, quitting while
+  something like `sleep 300` ran in a tab's foreground left the process
+  running with no window, and a SIGTERM did the same. Quit now hangs up
+  every in-process shell, kills one that ignores the hangup, and waits at
+  most a second on a terminal something else still holds open, so one
+  SIGTERM ends it. A process the shell started that ignores SIGHUP can
+  still outlive the quit. Session-backed tabs are untouched: they belong
+  to the `roost-session`.
 
 ## v0.0.20 — 2026-09-20
 
