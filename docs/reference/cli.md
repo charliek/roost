@@ -382,7 +382,7 @@ roostctl tab dump --tab 5 --scrollback 200   # 200 rows of history, then the vie
 | `-- <cmd…>` | Run this command in the tab. The tab **closes when the command exits** (hold=false) — standard terminal behavior. |
 | `--hold` | Keep the tab open after the command exits, dropping to an interactive shell (mirrors `command = … hold=true`). Only meaningful with a command. |
 | `--after-tab <id>` | Place the new tab immediately after that tab (same project) instead of at the end. Best-effort: if that tab is gone by the time the reorder lands, the new tab stays at the end. |
-| `--focus` | Focus (activate) the new tab after opening. |
+| `--focus` | Focus (activate) the new tab after opening. Under `local-backend = session` the focus waits, on the UI socket, for the window to list the new tab rather than answering `not-found`. |
 | `--no-activate` | Open the tab without selecting it: the active project and tab stay where they were (`tab.open`'s `activate: false`). Without it, opening a tab selects it. Refused beside `--focus` (exit 2 `usage`). A server that predates the field — the Swift `Roost.app` today — answers `unknown-field`, which is reported verbatim; nothing retries without the flag. |
 
 These compose: `--after-tab X --focus -- <cmd>` is the "open a command in a tab right here and switch to it" primitive that providers and other scripts use. (`--after-tab`/`--focus` are CLI orchestration over `tab.reorder` / `tab.focus`; `-- <cmd>` fills the `tab.open` op's `argv` — see [ipc.md](ipc.md).)

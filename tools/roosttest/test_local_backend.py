@@ -1847,6 +1847,59 @@ def test_an_unactivated_tab_open_on_the_ui_socket_selects_nothing(lane: Lane):
         assert c.tab(quiet)["is_active"] is False
 
 
+def test_a_tab_open_on_the_ui_socket_selects_and_attaches_the_new_tab(lane: Lane):
+    """#548: the positive twin of the case above. A forwarded `tab.open`
+    that did not say `activate: false` lands the window on the new tab,
+    as the in-process backend always has, and attaches it."""
+    roost = session_ui(lane)
+    shown = roost.identify()["active_tab_id"]
+    project = int(roost.list()[0]["id"])
+
+    opened = roost.open_tab(project, cwd="/tmp", title="loud")
+
+    assert opened != shown
+    lands_on(roost, project, opened, "the window to select the tab the UI socket opened")
+    assert roost.app_selected_tab_id() == opened
+    attached(roost, opened)
+
+
+def test_roostctl_open_with_focus_on_the_ui_socket_lands(lane: Lane):
+    """#548: `--focus` sends `tab.focus` the moment `tab.open` answers,
+    which can beat the batch that lists the tab in the window. It exits
+    0 and lands, for `tab open` and for `open`."""
+    roost = session_ui(lane)
+    project = int(roost.list()[0]["id"])
+
+    opened = roostctl("tab", "open", "--project-id", str(project), "--cwd", "/tmp", "--focus")
+    assert opened.returncode == 0, opened
+    tab = int(opened.stdout.strip())
+    lands_on(roost, project, tab, "the window to land on `tab open --focus`'s tab")
+
+    ensured = roostctl("open", "--project", "focused", "--cwd", "/tmp", "--focus")
+    assert ensured.returncode == 0, ensured
+    reply = json.loads(ensured.stdout)
+    lands_on(
+        roost,
+        int(reply["project"]["id"]),
+        int(reply["tab"]["id"]),
+        "the window to land on `open --focus`'s tab",
+    )
+
+
+def test_a_focus_right_after_an_unactivated_open_on_the_ui_socket_lands(lane: Lane):
+    """#548: `activate: false` keeps the window where it is, and a
+    `tab.focus` sent the moment the open answers still lands rather than
+    answering `not-found` for a tab the window has yet to list."""
+    roost = session_ui(lane)
+    project = int(roost.list()[0]["id"])
+
+    quiet = roost.open_tab(project, cwd="/tmp", title="quiet", activate=False)
+    roost.focus(quiet)
+
+    assert selected(roost) == (project, quiet)
+    assert roost.app_selected_tab_id() == quiet
+
+
 def test_a_forwarded_delete_of_the_last_project_is_answered_before_the_exit(lane: Lane):
     """AC7 on the far side of §D10: the deletion reply is written before
     the process goes.

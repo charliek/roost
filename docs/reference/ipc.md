@@ -393,6 +393,21 @@ by name if one is ever added without a row:
   event name answer `unknown-op` on a UI socket exactly as they always
   have; the mode plays no part.
 
+A forwarded `tab.open` is also **selected in this UI's window**, as it
+is under `in-process`, unless it carried `activate: false`. The reply is
+the session's, written the moment the session answers; the window
+selects the new tab when its copy of the slot's workspace lists it,
+which can be a moment later. For that gap, every tab a forwarded
+`tab.open` opened — with or without `activate` — is tracked until it is
+listed: a [`tab.focus`](#tabfocus) naming it waits for the listing
+instead of answering `not-found`, and answers `not-found` only if the
+tab closes first, the slot's connection drops, or 10 seconds pass. So
+`roostctl tab open --focus` and `roostctl open --focus` land on the new
+tab. This is the UI socket's behavior only: a client on the session's
+own socket — `roostctl` run inside a session tab, whose `ROOST_SOCKET`
+names the session — changes the session's active tab (the reply's
+`is_active`) and never the window's.
+
 A forwarded request that cannot reach the slot — nothing is connected
 yet, or the connection dropped mid-op — answers `host-unavailable` with
 the message `local session is not connected` (the same code and shape a
@@ -451,7 +466,10 @@ selected, as it always has been; an omitted field is not sent, so
 those requests are the bytes they were before the field existed. The
 Swift Mac app and servers that predate the field answer
 `unknown-field`. From the CLI: `--no-activate` on `tab open` and
-`open`.
+`open`. On a UI socket under [`local-backend =
+session`](#a-ui-socket-under-local-backend-session) the request is
+forwarded to the local session, and the window selects the new tab once
+it lists it — unless `activate` is `false`.
 
 **`cwd_from_tab` (optional, plan 070).** Names a tab whose working
 directory the new tab starts in — the way ⌘T / Alt+T follows the
@@ -1179,6 +1197,13 @@ active row, and this client only moved which one it is looking at. A
 **session socket** answers `invalid-param` for the qualified form
 ("a host-qualified tab.focus needs a UI: host selection is client
 state") — there is no UI there to hold a selection.
+
+Under [`local-backend = session`](#a-ui-socket-under-local-backend-session)
+a bare `tab_id` on a UI socket is rewritten to the slot's `h<n>.<id>`
+and answered the same way. A tab a forwarded `tab.open` just opened may
+not be listed by the window yet; a focus on it waits for the listing,
+and answers `not-found` only if the tab closes first, the slot's
+connection drops, or 10 seconds pass.
 
 ### `tab.set_title`
 

@@ -35,6 +35,15 @@ release workflow asserts they agree).
 
 ### Fixed
 
+- **A tab opened through the UI socket on the local session was never
+  selected in the window (#548)** — under `local-backend = session`,
+  `tab.open` and `roostctl tab open`/`open` from outside a Roost tab now
+  select the new tab in the window, as in-process does, unless
+  `activate: false` / `--no-activate` was passed. `tab.focus` on a tab
+  opened that way, such as `--focus` sends, waits for the window to list
+  it instead of answering `not-found`. A `roostctl` run inside a session
+  tab dials the session and still moves only the session's own active
+  tab.
 - **A new tab on a session-backed project opened in the project's
   directory instead of the active tab's (#530)** — ⌘T / Alt+T, the tab
   bar's "+", the macOS menu's New Tab, the palette's New Tab and launcher

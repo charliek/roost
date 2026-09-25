@@ -2427,8 +2427,12 @@ impl super::App {
         // what flipping the mode makes it (`host_sidebar::sections`
         // reads `local_slot_input`). What does move is the *selection*:
         // "local tabs start fresh" means the window comes back to the
-        // in-process band rather than staying on a session tab.
+        // in-process band rather than staying on a session tab — and a
+        // new tab or a parked focus the session has yet to list must not
+        // pull it back there once it does.
         self.set_host_selection(None);
+        self.pending_host_selection = None;
+        self.awaiting_listing.clear();
         tracing::info!("local-backend committed to in-process");
     }
 

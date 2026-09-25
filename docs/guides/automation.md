@@ -229,11 +229,15 @@ An in-process Roost that selects it — the default — makes `--focus`
 change only whether the window is raised and switched to, not whether
 the new tab becomes the active one in the sidebar; `--no-activate` is
 what actually keeps the *previous* tab active there. Under
-`local-backend = session` the window's own visible tab never follows a
-session-side `tab.open` either way, but `open`'s reply still marks the
-new tab `is_active` unless `--no-activate` was passed — `is_active` is
-what separates the two outcomes there, since the window's display
-doesn't.
+`local-backend = session`, a `roostctl` that dials the UI's socket —
+from a plain shell or a script — gets the same selection: the window
+selects the new tab unless `--no-activate` was passed. A `roostctl`
+run *inside* a session tab dials the session instead, because that
+tab's `ROOST_SOCKET` names the session. There, `tab open` and `open`
+move the session's own active tab — the reply marks the new tab
+`is_active` unless `--no-activate` was passed — but never the
+window's, so `is_active` is what separates the two outcomes, since the
+window's display doesn't.
 
 ## Target policy: which tab a command acts on
 

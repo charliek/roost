@@ -81,6 +81,7 @@ pub(crate) mod agent_hooks;
 pub(crate) mod agent_hooks_dialog;
 pub(crate) mod bootstrap;
 pub(crate) mod file_transfer;
+mod forwarded_open;
 mod host_dialog;
 pub(crate) mod host_lifecycle;
 pub(crate) mod host_notice;
@@ -371,8 +372,14 @@ impl PendingHostSelection {
     /// Whether this wait has run out. Terminal: an expired entry is
     /// abandoned, never re-armed.
     fn expired(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.armed) >= PENDING_HOST_SELECTION_DEADLINE
+        host_wait_expired(self.armed, now)
     }
+}
+
+/// Whether a wait for a host's mirror to list a row, started at
+/// `armed`, has run out.
+fn host_wait_expired(armed: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(armed) >= PENDING_HOST_SELECTION_DEADLINE
 }
 
 /// The localhost policy applied where a connection is *started*, rather
@@ -985,8 +992,14 @@ pub enum EngineOpResult {
     ///
     /// Boxed because this enum is `Clone`, and a whole reply value on
     /// every clone of every completion is not worth the inline word.
+    ///
+    /// `forwarded` is the wire op put to `host`, the slot incarnation;
+    /// `selects` is [`forwarded_open::forward_selects`].
     LocalForward {
         op: u64,
+        host: HostId,
+        forwarded: String,
+        selects: bool,
         answer: Box<Result<serde_json::Value, roost_engine::ipc::HostOpFailure>>,
     },
 }
@@ -1149,6 +1162,24 @@ impl EngineOpResult {
             | Self::HostVerified { .. }
             | Self::HostRestarted { .. } => None,
         }
+    }
+
+    /// The slot tab a successful forwarded `tab.open` opened, and whether
+    /// the window selects it.
+    fn forwarded_open(&self) -> Option<(TabKey, bool)> {
+        let Self::LocalForward {
+            host,
+            forwarded,
+            selects,
+            answer,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let reply = answer.as_ref().as_ref().ok()?;
+        let tab = forwarded_open::opened_tab(forwarded, reply)?;
+        Some((TabKey::new(*host, tab), *selects))
     }
 }
 
@@ -2862,6 +2893,7 @@ pub struct App {
     /// message and may land after. The key is parked here and resolved
     /// by the first reconcile that can see the row.
     pending_host_selection: Option<PendingHostSelection>,
+    awaiting_listing: forwarded_open::AwaitingListing,
     /// Whether the launch still owes the slot's tab a select + attach
     /// (plan 063 §D5). Armed at bootstrap under `session` and cleared by
     /// the first reconcile that can answer — either by selecting, or by
@@ -3241,6 +3273,7 @@ impl App {
             add_host_socket_id: Id::unique(),
             add_host_focus_requested: false,
             pending_host_selection: None,
+            awaiting_listing: forwarded_open::AwaitingListing::default(),
             pending_initial_local_selection: backend_mode == LocalBackendMode::Session,
             connect_purposes: HashMap::new(),
             host_ops: local_backend::HostOpsInFlight::default(),
@@ -4232,6 +4265,11 @@ impl App {
         // Before the match consumes it: a creation on a host owes the
         // selection the local path gets for free (plan 037 §3.9).
         self.arm_pending_host_selection(&result);
+        // Before the forwarded reply below is sent: the caller's next
+        // request may be a `tab.focus` on this tab.
+        if let Some((tab, _)) = result.forwarded_open() {
+            self.awaiting_listing.track(tab, Instant::now());
+        }
         // Strictly before the retirement below: a forwarded op's caller
         // is handed its answer, and only then does the op stop holding
         // §D6's auto-remove off (plan 063 §D10). One main-thread step,
@@ -4244,7 +4282,7 @@ impl App {
         // local or forwarded — can observe that. The one mitigation is
         // framework-wide and pre-existing: `main.rs` puts a message hop
         // between `UiTask::Exit` and `iced::exit()` for exactly this.
-        if let EngineOpResult::LocalForward { op, answer } = &result {
+        if let EngineOpResult::LocalForward { op, answer, .. } = &result {
             if let Some(reply) = self.forward_replies.remove(op) {
                 let _ = reply.send((**answer).clone());
             }
@@ -8667,6 +8705,10 @@ impl App {
                 result: Ok((_, tab)),
                 ..
             } => *tab,
+            EngineOpResult::LocalForward { .. } => match result.forwarded_open() {
+                Some((tab, true)) => tab,
+                _ => return,
+            },
             _ => return,
         };
         if !tab.is_local() {
@@ -8776,6 +8818,41 @@ impl App {
             local_active: self.workspace.active().1,
         }));
         self.host_focus_tab(tab);
+    }
+
+    /// Settle the tabs forwarded opens are waiting on, and select each
+    /// one a parked `tab.focus` named. Returns those focuses' replies,
+    /// owed once the selection is published.
+    ///
+    /// The selection half of `focus_host_tab_and_clear`, for the reason
+    /// [`Self::resolve_pending_host_selection`] gives.
+    fn resolve_awaited_listings(&mut self) -> Vec<roost_engine::ipc::HostReply<()>> {
+        if self.awaiting_listing.is_empty() {
+            return Vec::new();
+        }
+        let mut awaiting = std::mem::take(&mut self.awaiting_listing);
+        let listed = awaiting.settle(Instant::now(), |tab| {
+            (
+                self.interactive_host_view(tab.host).is_some(),
+                self.host_project_of(tab),
+            )
+        });
+        self.awaiting_listing = awaiting;
+        let mut answered = Vec::new();
+        for (tab, project, focuses) in listed {
+            if focuses.is_empty() {
+                continue;
+            }
+            self.set_host_selection(Some(HostSelection {
+                project,
+                tab,
+                local_active: self.workspace.active().1,
+            }));
+            self.host_clear_notification(tab);
+            self.host_focus_tab(tab);
+            answered.extend(focuses);
+        }
+        answered
     }
 
     /// The window title, recomposed from live state on every update batch

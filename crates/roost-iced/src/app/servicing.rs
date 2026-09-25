@@ -1217,12 +1217,18 @@ impl App {
         // then validated exactly as any other selection would be.
         self.resolve_initial_local_selection();
         self.resolve_pending_host_selection();
+        let focused = self.resolve_awaited_listings();
         self.reconcile_host_selection();
         // Both of this snapshot's inputs are settled here: the views
         // were rebuilt at the top of this reconcile and the selection
         // just now. A *connection* change publishes through no other
         // edge (plan 063 §D10), and the write is change-detected.
         self.publish_local_route();
+        // After the publish: a caller answered here may read `identify`
+        // next, off the route it just published.
+        for reply in focused {
+            let _ = reply.send(Ok(()));
+        }
         self.refresh_sidebar_agents();
         self.refresh_agent_palette();
         // Host verbs are live state too: a host that connected while the
@@ -1658,6 +1664,7 @@ impl App {
         {
             self.pending_host_selection = None;
         }
+        self.awaiting_listing.purge(incarnation);
     }
 
     /// The tab is over (EXIT, or its whole connection incarnation went):
@@ -1795,6 +1802,7 @@ impl App {
                     let tab = TabKey::new(host, tab_id);
                     self.notification_inbox.remove(tab);
                     self.desktop_notifications.retire(tab);
+                    self.awaiting_listing.closed(tab);
                 }
                 HostEnvelopeAction::ProjectDeleted(project_id) => {
                     self.retire_project_notifications(ProjectKey::new(host, project_id));
@@ -3725,10 +3733,12 @@ impl App {
                 // The same two steps the sidebar click takes, in the
                 // same order: the selection first (so the view and the
                 // keyboard route move together), then the attach.
-                let result = self
-                    .focus_host_tab_and_clear(key, false)
-                    .map_err(|_| roost_engine::WorkspaceError::TabNotFound(tab_id));
-                let _ = reply.send(result);
+                if let Some(reply) = self.awaiting_listing.park(key, reply) {
+                    let result = self
+                        .focus_host_tab_and_clear(key, false)
+                        .map_err(|_| roost_engine::WorkspaceError::TabNotFound(tab_id));
+                    let _ = reply.send(result);
+                }
             }
             // Plan 047 §3.4: the op *is* the drop, minus the window
             // event — same `send_files`, same gesture queue, same
@@ -3903,6 +3913,7 @@ impl App {
             let _ = reply.send(slot_unavailable());
             return UiTask::None;
         };
+        let selects = forwarded_open::forward_selects(&op, &params);
         let mutating = roost_engine::ipc::is_mutating_op(&op);
         if mutating && self.switch_in_flight() {
             let _ = reply.send(switch_busy());
@@ -3916,6 +3927,7 @@ impl App {
             false => self.take_engine_op_id(),
         };
         self.forward_replies.insert(op_id, reply);
+        let forwarded = op.clone();
         let call = queue.call_at(host, op, params);
         self.engine_op(
             async move { Ok::<_, String>(call.await.map_err(|error| forwarded_failure(&error))) },
@@ -3927,6 +3939,9 @@ impl App {
                     joined.unwrap_or_else(|error| Err(HostOpFailure::new(codes::INTERNAL, error)));
                 EngineOpResult::LocalForward {
                     op: op_id,
+                    host,
+                    forwarded,
+                    selects,
                     answer: Box::new(answer),
                 }
             },
