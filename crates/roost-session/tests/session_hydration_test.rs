@@ -8,7 +8,9 @@
 
 mod support;
 
-use roost_ipc::messages::{ops, TabFocusParams, TabFocusResult, WireTabRef};
+use roost_ipc::messages::{
+    ops, TabFocusParams, TabFocusResult, TabOpenParams, TabOpenResult, WireTabRef,
+};
 
 /// Run 1 builds a layout; run 2 must come back to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -241,4 +243,70 @@ async fn a_first_start_seeds_its_project_at_home() {
 
     support::session_stop(&mut client).await;
     served.await.expect("join").expect("serve");
+}
+
+/// A saved tab whose directory was deleted since (#541) reopens in its
+/// project's directory — the row, and the shell behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_saved_tab_whose_directory_is_gone_reopens_in_the_projects() {
+    let layout = support::Layout::new();
+    let project_dir = layout.subdir("project");
+    let doomed = layout.subdir("doomed");
+
+    // ---- run 1 -------------------------------------------------------
+    let first = layout.spawn();
+    let mut client = support::connect(&layout.socket_path()).await;
+    let project = support::create_project(&mut client, "kept", &project_dir).await;
+    support::open_tab(
+        &mut client,
+        project,
+        &doomed,
+        "",
+        &["/bin/sh", "-c", "exec cat"],
+    )
+    .await;
+    support::session_stop(&mut client).await;
+    first.await.expect("join").expect("run 1");
+    std::fs::remove_dir(&doomed).expect("remove the saved tab's directory");
+
+    // ---- run 2 -------------------------------------------------------
+    let second = layout.spawn();
+    let mut client = support::connect(&layout.socket_path()).await;
+    let restored = support::wait_for_tabs(&mut client, "the saved tab to reopen", |tabs| {
+        tabs.iter().any(|tab| tab.project_id == project)
+    })
+    .await;
+    let reopened = restored
+        .iter()
+        .find(|tab| tab.project_id == project)
+        .expect("the saved tab");
+
+    // The shell's own cwd, read the way ⌘T reads it: a probe opened
+    // from the restored tab starts where that tab's shell is.
+    let report = layout.root().join("where.txt");
+    let probe = format!("pwd -P > '{}'", report.display());
+    let _: TabOpenResult = client
+        .call(
+            ops::TAB_OPEN,
+            TabOpenParams {
+                project_id: project,
+                argv: ["/bin/sh", "-c", &probe].map(String::from).to_vec(),
+                cwd_from_tab: Some(reopened.id),
+                ..TabOpenParams::default()
+            },
+        )
+        .await
+        .expect("tab.open");
+    let shell = support::canonical(support::wait_for_file(&report).await);
+
+    // Asserted after the stop: a failing assert with the restored shells
+    // still running would hang the runtime's drop instead of failing.
+    support::session_stop(&mut client).await;
+    second.await.expect("join").expect("run 2");
+    assert_eq!(
+        support::canonical(&reopened.cwd),
+        support::canonical(&project_dir),
+        "the row"
+    );
+    assert_eq!(shell, support::canonical(&project_dir), "the shell");
 }

@@ -3236,7 +3236,7 @@ async fn dispatch(
             let mut p: TabOpenParams = decode(params)?;
             let activate = p.activate != Some(false);
             crate::application::resolve_open_target(&h.workspace, &h.supervisor, &mut p, activate);
-            let tab = h
+            let mut tab = h
                 .workspace
                 .open_tab(p.project_id, &p.cwd, &p.title, activate)
                 .map_err(ws_err)?;
@@ -3264,7 +3264,7 @@ async fn dispatch(
             crate::application::spawn_for_row(
                 &h.workspace,
                 &h.supervisor,
-                &tab,
+                &mut tab,
                 &p.argv,
                 cols,
                 rows,
@@ -5177,6 +5177,55 @@ mod tests {
         });
         let tab = open_parked(&h, &mut opened, params).await;
         assert_eq!(tab.cwd, "/tmp", "the project's cwd, as for any empty cwd");
+    }
+
+    /// ⌘T on a session whose active tab's directory was deleted (#541):
+    /// the UI names the tab and sends its mirror cwd, neither of which is
+    /// a directory any more, and the tab lands in the project's cwd.
+    #[tokio::test]
+    async fn tab_open_from_a_tab_whose_directory_is_gone_lands_in_the_projects_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path());
+        let mut opened = HangUp(h.supervisor.clone(), Vec::new());
+        let project = h.workspace.snapshot()[0].id.to_string();
+        let doomed = dir.path().join("doomed");
+        std::fs::create_dir(&doomed).unwrap();
+        let doomed = doomed.to_string_lossy().into_owned();
+        let source = open_parked(
+            &h,
+            &mut opened,
+            serde_json::json!({"project_id": project, "cwd": doomed}),
+        )
+        .await;
+        std::fs::remove_dir(&doomed).unwrap();
+
+        let params = serde_json::json!({
+            "project_id": project,
+            "cwd": doomed,
+            "cwd_from_tab": source.id.to_string(),
+        });
+        let tab = open_parked(&h, &mut opened, params).await;
+        assert_eq!(tab.cwd, "/tmp");
+        assert_eq!(h.workspace.tab(tab.id).unwrap().cwd, "/tmp");
+    }
+
+    /// `roostctl tab open --cwd /nope` (#541), and a `cwd` that names a
+    /// file: each lands in the project's cwd.
+    #[tokio::test]
+    async fn tab_open_with_a_cwd_that_is_not_a_directory_lands_in_the_projects_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = identify_handler(dir.path());
+        let mut opened = HangUp(h.supervisor.clone(), Vec::new());
+        let project = h.workspace.snapshot()[0].id.to_string();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+
+        for cwd in ["/nope".into(), file.to_string_lossy().into_owned()] {
+            let params = serde_json::json!({"project_id": project, "cwd": cwd});
+            let tab = open_parked(&h, &mut opened, params).await;
+            assert_eq!(tab.cwd, "/tmp", "{cwd}");
+            assert_eq!(h.workspace.tab(tab.id).unwrap().cwd, "/tmp", "{cwd}");
+        }
     }
 
     #[tokio::test]

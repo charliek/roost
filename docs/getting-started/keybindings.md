@@ -21,7 +21,7 @@ Every binding is overridable in `config.conf` (see [Custom keybindings](#custom-
 
 | Shortcut             | Action                                       |
 |----------------------|----------------------------------------------|
-| `Cmd-N`              | Create a new project (`untitled`, `untitled 2`, …) — on a [host session](../guides/host-sessions.md), creates on the currently selected project's host |
+| `Cmd-N`              | Create a new project (`Untitled 1`, `Untitled 2`, …) — on a [host session](../guides/host-sessions.md), creates on the currently selected project's host |
 | `Cmd-Shift-N`        | "New Project on…" — pick which host (or LOCAL) to create on; offered once at least one host is saved, and the picker lists the connected ones |
 | `Cmd-Shift-R`        | Rename the active project                   |
 | `Cmd-Shift-W`        | Close the active project (confirms when the project has 2+ tabs) |
@@ -77,7 +77,7 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 
 | Shortcut             | Action                                       |
 |----------------------|----------------------------------------------|
-| `Alt-N`              | Create a new project (`untitled`, `untitled 2`, …) — on a [host session](../guides/host-sessions.md), creates on the currently selected project's host |
+| `Alt-N`              | Create a new project (`Untitled 1`, `Untitled 2`, …) — on a [host session](../guides/host-sessions.md), creates on the currently selected project's host |
 | `Alt-Shift-N`        | "New Project on…" — pick which host (or LOCAL) to create on; offered once at least one host is saved, and the picker lists the connected ones |
 | `Alt-Shift-R`        | Rename the active project                   |
 | `Alt-Shift-W`        | Close the active project (confirms when the project has 2+ tabs) |

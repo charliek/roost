@@ -550,6 +550,75 @@ struct WorkspaceCloseFallbackTests {
     }
 }
 
+/// `tab.open`'s `activate` (#551), at the two workspace steps it reaches.
+@MainActor
+@Suite("Workspace open without activating")
+struct WorkspaceOpenActivateTests {
+    @Test func openTabWithActivateFalseLeavesTheSelectionAndEmitsOnlyTabOpened() throws {
+        let ws = Workspace()
+        let shown = ws.createProject(name: "shown", cwd: "/").id
+        let other = ws.createProject(name: "other", cwd: "/").id
+        let active = try ws.openTab(projectID: shown, cwd: "/", title: "a").id
+        let captured = EventCapture()
+        ws.subscribe { captured.append(label(for: $0)) }
+
+        let sibling = try ws.openTab(projectID: shown, cwd: "/", title: "b", activate: false)
+        let elsewhere = try ws.openTab(projectID: other, cwd: "/", title: "c", activate: false)
+
+        #expect(ws.activeProjectID == shown)
+        #expect(ws.activeTabID == active)
+        #expect(captured.snapshot() == ["tabOpened", "tabOpened"])
+        #expect(ws.tabs(in: shown).map(\.id) == [active, sibling.id])
+        #expect(ws.tabs(in: other).map(\.id) == [elsewhere.id])
+    }
+
+    @Test func openTabWithActivateTrueSelectsTheNewTab() throws {
+        let ws = Workspace()
+        let shown = ws.createProject(name: "shown", cwd: "/").id
+        let other = ws.createProject(name: "other", cwd: "/").id
+        _ = try ws.openTab(projectID: shown, cwd: "/", title: "a")
+        let captured = EventCapture()
+        ws.subscribe { captured.append(label(for: $0)) }
+
+        let opened = try ws.openTab(projectID: other, cwd: "/", title: "b", activate: true)
+
+        #expect(ws.activeProjectID == other)
+        #expect(ws.activeTabID == opened.id)
+        #expect(captured.snapshot() == ["tabOpened", "activeChanged"])
+    }
+
+    @Test func ensureDefaultProjectWithActivateFalseCreatesItUnselected() {
+        let ws = Workspace()
+        let captured = EventCapture()
+        ws.subscribe { captured.append(label(for: $0)) }
+
+        let made = ws.ensureDefaultProject(cwd: "/tmp", activate: false)
+        #expect(ws.snapshot().map(\.id) == [made])
+        #expect(ws.project(made)?.cwd == "/tmp")
+        #expect(ws.activeProjectID == 0)
+        #expect(captured.snapshot() == ["projectCreated"])
+
+        let found = ws.ensureDefaultProject(cwd: "/elsewhere", activate: false)
+        #expect(found == made)
+        #expect(ws.activeProjectID == 0)
+        #expect(captured.snapshot() == ["projectCreated"])
+
+        #expect(ws.ensureDefaultProject(cwd: "", activate: true) == made)
+        #expect(ws.activeProjectID == made)
+        #expect(captured.snapshot() == ["projectCreated", "activeChanged"])
+    }
+
+    @Test func ensureDefaultProjectWithActivateTrueCreatesItSelected() {
+        let ws = Workspace()
+        let captured = EventCapture()
+        ws.subscribe { captured.append(label(for: $0)) }
+
+        let made = ws.ensureDefaultProject(cwd: "/tmp", activate: true)
+        #expect(ws.activeProjectID == made)
+        #expect(captured.snapshot() == ["projectCreated", "activeChanged"])
+    }
+}
+
 // Agent state model (plan 002). Mirrors the Rust workspace suite in
 // `crates/roost-engine/src/workspace.rs` case for case, so the two
 // implementations of the same op set can't drift.
@@ -1227,6 +1296,72 @@ struct WorkspaceStatePersistenceTests {
         #expect(back.recentHosts[0].label == "old-box")
         #expect(back.recentHosts[0].target == "user@old-box")
         #expect(back.hosts.count == 1, "and the saved hosts beside them")
+    }
+
+    /// The Rust UI's `tab_memory` as it writes one (plan 071 §D11).
+    private static let tabMemory = """
+    {"session_id": "s-1",
+     "last_viewed": {"7": {"tab_id": 71, "position": 1}},
+     "last_shown": [7, {"tab_id": 71, "position": 1}]}
+    """
+
+    @Test func hostTabMemoryRoundTripsThroughDecodeAndEncode() throws {
+        let host = """
+        {"id": "h1", "label": "laptop", "target": "localhost",
+         "tab_memory": \(Self.tabMemory)}
+        """
+        let decoded = try JSONDecoder().decode(
+            Workspace.SnapshotFile.HostSnapshot.self, from: Data(host.utf8)
+        )
+        #expect(decoded.tabMemory != nil)
+        let reencoded = try JSONEncoder().encode(decoded)
+        let again = try JSONDecoder().decode(
+            Workspace.SnapshotFile.HostSnapshot.self, from: reencoded
+        )
+        #expect(again == decoded)
+
+        let object = try #require(
+            JSONSerialization.jsonObject(with: reencoded) as? [String: Any]
+        )
+        let want = try #require(
+            JSONSerialization.jsonObject(with: Data(Self.tabMemory.utf8)) as? NSDictionary
+        )
+        #expect(object["tab_memory"] as? NSDictionary == want)
+    }
+
+    /// Carried like `recent_hosts`: a Mac write-through of a shared
+    /// `state.json` must not erase it, and a host without one must not
+    /// grow the key.
+    @Test func hostTabMemorySurvivesAnOrdinaryRewrite() async throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let seeded = """
+        {
+            "next_id": 3,
+            "projects": [],
+            "hosts": [
+                { "id": "h1", "label": "laptop", "target": "localhost",
+                  "tab_memory": \(Self.tabMemory) },
+                { "id": "h2", "label": "shed", "target": "test1@localhost" }
+            ]
+        }
+        """
+        try seeded.write(toFile: path, atomically: true, encoding: .utf8)
+
+        let ws = await Workspace(statePath: path)
+        _ = await ws.createProject(name: "Roost", cwd: "/tmp")
+
+        let raw = try #require(
+            JSONSerialization.jsonObject(
+                with: Data(contentsOf: URL(fileURLWithPath: path))
+            ) as? [String: Any]
+        )
+        let hosts = try #require(raw["hosts"] as? [[String: Any]])
+        let want = try #require(
+            JSONSerialization.jsonObject(with: Data(Self.tabMemory.utf8)) as? NSDictionary
+        )
+        #expect(hosts[0]["tab_memory"] as? NSDictionary == want, "carried value for value")
+        #expect(hosts[1]["tab_memory"] == nil, "no key for a host that had none")
     }
 
     @Test func legacyStateWithoutHostsLoadsAndRewritesEmpty() async throws {

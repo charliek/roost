@@ -109,6 +109,9 @@ jobs:
               - 'mac/scripts/bundle-lib.sh'
               - 'mac/scripts/bundle-iced.sh'
               - 'mac/Resources/Info-iced.plist.template'
+              # test_osc7_emitters.py sources all four in real bash and zsh.
+              - 'crates/roost-engine/resources/shell-integration/**'
+              - 'mac/Sources/Roost/Resources/shell-integration/**'
             # roost-cli's `doc_anchors_resolve` test reads the site nav and
             # every page it links, so those files are inputs to a RUST test
             # even though no Rust file changes when they move. Without this,
@@ -263,6 +266,9 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+      - name: Install zsh
+        # test_osc7_emitters.py runs the zsh integration in real zsh.
+        run: command -v zsh >/dev/null || sudo linux/scripts/ci-apt-install.sh zsh
       - name: Functional harness target contract
         run: python3 -m unittest discover -s tools/roosttest_unit -v
 
@@ -780,7 +786,10 @@ jobs:
           tools/roosttest/test_menu_bar.py
           tools/roosttest/test_sparkle.py
           tools/roosttest/test_view_perf.py
+          tools/roosttest/test_shell_integration.py
+          tools/roosttest/test_newtab_cwd.py
           tools/roosttest/test_boot_failure.py
+          tools/roosttest/test_quit_with_foreground_job.py
           tools/roosttest/test_osc52.py
           --roost-target iced --roost-fresh -v
 
@@ -1044,7 +1053,10 @@ jobs:
           tools/roosttest/test_menu_bar.py
           tools/roosttest/test_sparkle.py
           tools/roosttest/test_view_perf.py
+          tools/roosttest/test_shell_integration.py
+          tools/roosttest/test_newtab_cwd.py
           tools/roosttest/test_boot_failure.py
+          tools/roosttest/test_quit_with_foreground_job.py
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced exit-on-empty E2E (Linux Wayland)

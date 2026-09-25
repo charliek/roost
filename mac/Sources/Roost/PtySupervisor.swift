@@ -128,6 +128,13 @@ final class PtySupervisor {
     ///
     /// Throws `duplicateTab` if `tabID` already has a live PTY
     /// (caller must `close()` first).
+    ///
+    /// `cwd` is used as given: the caller resolves it
+    /// (`LocalClient.spawnCwd`). A child that cannot enter it — an
+    /// unenterable directory, a race, an empty `cwd` — exits 126
+    /// before `execve` instead of running on in Roost.app's own launch
+    /// directory, so the tab ends through the ordinary exit path, as a
+    /// Rust spawn whose `chdir` fails ends its tab.
     func spawn(
         tabID: Int64,
         cwd: String,
@@ -163,23 +170,8 @@ final class PtySupervisor {
         // The classic POSIX rule: only async-signal-safe functions
         // after fork. `strdup` and `Dictionary` traversal here run
         // in the parent, which is multithreaded-safe; the child
-        // then only calls `chdir` / `execve` (both safe).
-        //
-        // If the caller passed an empty cwd (or one we can't
-        // resolve), fall back to $HOME. Otherwise the child
-        // inherits whatever process cwd Roost.app was launched
-        // with — `/` for Finder-launched bundles, or the dev's
-        // checkout root for `swift run`. Both are user-hostile
-        // defaults; tabs should open in the user's home like the
-        // pre-refactor Go binary and like a fresh interactive
-        // shell.
-        let resolvedCwd: String
-        if cwd.isEmpty {
-            resolvedCwd = ProcessInfo.processInfo.environment["HOME"] ?? ""
-        } else {
-            resolvedCwd = cwd
-        }
-        let cwdCopy = strdup(resolvedCwd)
+        // then only calls `chdir` / `execve` / `_exit` (all safe).
+        let cwdCopy = strdup(cwd)
         let cArgv = buildArgv(argv: argv)
         let cEnv = buildEnv(tabID: tabID, socketPath: socketPath, argv: argv)
 
@@ -204,8 +196,8 @@ final class PtySupervisor {
             // into the child's own address space. We don't free
             // them in the child — execve replaces the whole
             // image including the heap.
-            if let cwdCopy = cwdCopy, cwdCopy.pointee != 0 {
-                _ = Darwin.chdir(cwdCopy)
+            if Darwin.chdir(cwdCopy) != 0 {
+                _exit(126)
             }
             // argv[0] is the program path. execve(2) signature:
             // execve(const char *path, char *const argv[], char *const envp[]).

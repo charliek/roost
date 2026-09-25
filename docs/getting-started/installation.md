@@ -27,11 +27,10 @@ Roost opens with a normal double-click — no Gatekeeper detour.
 **`Roost-Iced.app`** below instead of `Roost.app`. `Roost.app` is the
 classic Swift + AppKit build, and it does not serve the agent-facing
 surface: it has no `project.ensure`, so `open` and `project ensure`
-refuse with `unsupported`; it refuses `--no-activate` (`unknown-field`);
-and it serves no event stream, so `events` and `tab prompt` fail and
-`wait` falls back to polling. `tab send-file` and the `host` verbs are
-iced-only too. Roost-Iced serves all of it. See the direction note
-below.
+refuse with `unsupported`, and it serves no event stream, so `events`
+and `tab prompt` fail and `wait` falls back to polling. `tab send-file`
+and the `host` verbs are iced-only too. Roost-Iced serves all of it.
+See the direction note below.
 
 ### `Roost-Iced.app` (experimental)
 

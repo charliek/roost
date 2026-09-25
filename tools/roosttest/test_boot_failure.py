@@ -45,6 +45,10 @@ if sys.platform != "linux":
 # `app.rs`'s own `.context(...)` for the failing step, never Rust std's
 # SUN_LEN wording.
 BIND_CONTEXT = "bind Iced IPC server"
+# Rust std's own wording for a `UnixListener::bind` path too long for
+# `sockaddr_un.sun_path` — the underlying cause `main`'s error chain must
+# also carry into the log file, not just its `.context(...)` wrapper.
+UNDERLYING_CAUSE = "SUN_LEN"
 # `sizeof(sockaddr_un.sun_path)` on Linux.
 SUN_PATH_MAX = 108
 MARKER_ENV = "ROOST_BOOT_FAILURE_MARKER"
@@ -156,6 +160,23 @@ def test_a_bind_failure_after_hydrate_exits_and_reaps_the_shell(tmp_path):
         )
         assert proc.returncode != 0, _tail(log_path)
         assert BIND_CONTEXT in log_path.read_text(errors="replace"), _tail(log_path)
+
+        # `log_path` above is the harness's own capture of the child's
+        # stdout+stderr, not the UI's persistent log file. The UI also
+        # tees to `$XDG_STATE_HOME/<namespace>/roost.log` (`init_logging`
+        # in `main.rs`); this is the assertion that can actually fail if
+        # `main` stops routing a startup error through `tracing` before
+        # returning it (#538).
+        ui_log = dirs["state"] / spec.linux_namespace / "roost.log"
+        ui_log_text = ui_log.read_text(errors="replace") if ui_log.is_file() else ""
+        assert BIND_CONTEXT in ui_log_text and UNDERLYING_CAUSE in ui_log_text, (
+            f"the bind failure's error chain ({BIND_CONTEXT!r} + "
+            f"{UNDERLYING_CAUSE!r}) never reached the UI's own log file at "
+            f"{ui_log}, only the captured stdout/stderr\n"
+            f"UI log file contents:\n{ui_log_text or '(missing or empty)'}\n"
+            f"{_tail(log_path)}"
+        )
+
         left = _wait_unmarked(marker, scaled_timeout(ABORT_DEADLINE + ABORT_MARGIN))
         assert not left, f"the UI's shell outlived its boot abort: {left}\n{_tail(log_path)}"
     finally:

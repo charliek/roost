@@ -141,6 +141,132 @@ struct LocalClientOSCRoutingTests {
     }
 }
 
+/// `inheritedCwd` with no live PTY, so the native read has nothing to
+/// offer and only the tracked cwd is in play — the PTY-free half of Rust's
+/// `inherited_cwd` tests in `crates/roost-engine/src/application.rs`.
+@MainActor
+@Suite("LocalClient inherited cwd")
+struct LocalClientInheritedCwdTests {
+    private func clientWithTab(tracking cwd: String) throws -> (LocalClient, Int64) {
+        let workspace = Workspace()
+        let project = workspace.createProject(name: "p", cwd: "/")
+        let tab = try workspace.openTab(projectID: project.id, cwd: cwd, title: "")
+        let client = LocalClient(
+            workspace: workspace,
+            supervisor: PtySupervisor(),
+            socketPath: "/tmp/roost-localclient-cwd-test.sock"
+        )
+        return (client, tab.id)
+    }
+
+    private func scratchPath(_ kind: String) -> String {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("roost-inherit-\(kind)-\(UUID().uuidString)").path
+    }
+
+    @Test func fallsBackToTheTrackedCwdWithoutAChild() throws {
+        let dir = scratchPath("dir")
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+
+        let (client, tabID) = try clientWithTab(tracking: dir)
+        #expect(client.inheritedCwd(tabID: tabID) == dir)
+    }
+
+    @Test func aTrackedCwdThatIsNotADirectoryInheritsNothing() throws {
+        let file = scratchPath("file")
+        #expect(FileManager.default.createFile(atPath: file, contents: Data()))
+        defer { try? FileManager.default.removeItem(atPath: file) }
+
+        for cwd in ["/no/such/dir", file, ""] {
+            let (client, tabID) = try clientWithTab(tracking: cwd)
+            #expect(client.inheritedCwd(tabID: tabID) == nil, "\(cwd)")
+        }
+    }
+
+    @Test func anUnknownTabInheritsNothing() throws {
+        let (client, _) = try clientWithTab(tracking: "/")
+        #expect(client.inheritedCwd(tabID: 424_242) == nil)
+    }
+}
+
+/// `spawnCwd`, the Swift twin of Rust's `usable_cwd` tests in
+/// `crates/roost-engine/src/application.rs`: once against the real
+/// filesystem, once with the predicate injected.
+@Suite("LocalClient spawn cwd")
+struct LocalClientSpawnCwdTests {
+    private let home = "/roost-test-home"
+
+    private func isDirectoryOnDisk(_ path: String) -> Bool {
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
+    }
+
+    private func onDisk(requested: String, projectCwd: String) -> String {
+        LocalClient.spawnCwd(
+            requested: requested, projectCwd: projectCwd, home: home, isDirectory: isDirectoryOnDisk
+        )
+    }
+
+    @Test func aRequestedDirectoryIsWhereTheShellStarts() {
+        #expect(onDisk(requested: "/usr", projectCwd: "/") == "/usr")
+    }
+
+    @Test func aRequestedCwdThatIsNotADirectoryFallsBackToTheProjects() {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("roost-spawn-cwd-\(UUID().uuidString)").path
+        #expect(FileManager.default.createFile(atPath: file, contents: Data()))
+        defer { try? FileManager.default.removeItem(atPath: file) }
+
+        for requested in ["/no/such/dir", file, ""] {
+            #expect(onDisk(requested: requested, projectCwd: "/usr") == "/usr", "\(requested)")
+        }
+    }
+
+    @Test func aProjectCwdThatIsNotADirectoryFallsBackToHome() {
+        for projectCwd in ["/no/such/project", ""] {
+            #expect(onDisk(requested: "/no/such/dir", projectCwd: projectCwd) == home, "\(projectCwd)")
+        }
+    }
+
+    @Test func thePredicateDecidesWhatCounts() {
+        func resolve(_ isDirectory: (String) -> Bool) -> String {
+            LocalClient.spawnCwd(
+                requested: "/asked", projectCwd: "/project", home: home, isDirectory: isDirectory
+            )
+        }
+        #expect(resolve { _ in true } == "/asked")
+        #expect(resolve { $0 == "/project" } == "/project")
+        #expect(resolve { _ in false } == home)
+    }
+}
+
+/// `ensureDefaultProject` gives a new project the requested cwd only if it
+/// is a directory. PTY-free: finding or creating a project spawns nothing.
+@MainActor
+@Suite("LocalClient default project")
+struct LocalClientDefaultProjectTests {
+    private func makeClient() -> LocalClient {
+        LocalClient(
+            workspace: Workspace(),
+            supervisor: PtySupervisor(),
+            socketPath: "/tmp/roost-localclient-default-test.sock"
+        )
+    }
+
+    @Test func aNewProjectKeepsARequestedDirectory() {
+        let client = makeClient()
+        let id = client.ensureDefaultProject(cwd: "/usr", activate: false)
+        #expect(client.workspace.project(id)?.cwd == "/usr")
+    }
+
+    @Test func aNewProjectRecordsNoCwdThatIsNotADirectory() {
+        let client = makeClient()
+        let id = client.ensureDefaultProject(cwd: "/no/such/dir", activate: false)
+        #expect(client.workspace.project(id)?.cwd == "")
+    }
+}
+
 @Suite("LocalClient delegation")
 struct LocalClientDelegationTests {
     // Same SIGTRAP-in-swift-testing concern as PtySupervisorTests'

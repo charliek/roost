@@ -545,27 +545,50 @@ pub(crate) enum InitialSelection {
     Select { project: i64, tab: i64 },
 }
 
-/// Decide it (plan 063 §D5).
+/// The slot as [`initial_selection`] reads it: its live rows, its own
+/// active tab id, and what this client remembers showing there.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SlotRows<'a> {
+    pub(crate) projects: &'a [Project],
+    pub(crate) active_tab_id: i64,
+    /// `None` between the connection's `Connected` and its facts.
+    pub(crate) session_id: Option<&'a str>,
+    pub(crate) memory: Option<&'a roost_engine::persistence::HostTabMemory>,
+}
+
+/// Decide it (plan 063 §D5, plan 071 §D11).
 ///
-/// `slot` is the slot's live rows and its own active tab id, and is
-/// `None` until the slot is connected and interactive. The acceptance
-/// criterion is a *visible, attached* tab, not "≥1 project", which is
-/// why this resolves to a tab rather than to a project.
+/// `slot` is `None` until the slot is connected and interactive. The
+/// acceptance criterion is a *visible, attached* tab, not "≥1 project",
+/// which is why this resolves to a tab rather than to a project.
+///
+/// It also waits for the session id, without which the memory cannot be
+/// read ([`super::tab_memory::recall`]).
 pub(crate) fn initial_selection(
     mode: LocalBackendMode,
     selection_held: bool,
-    slot: Option<(&[Project], i64)>,
+    slot: Option<SlotRows<'_>>,
 ) -> InitialSelection {
     if mode != LocalBackendMode::Session || selection_held {
         return InitialSelection::Settled;
     }
-    let Some((projects, active_tab_id)) = slot else {
+    let Some(SlotRows {
+        projects,
+        active_tab_id,
+        session_id: Some(session_id),
+        memory,
+    }) = slot
+    else {
         return InitialSelection::Wait;
     };
-    // The session's own active tab wins, so a relaunch lands where the
-    // last client left it; its project is found by holding that tab
-    // rather than by position, because the session's project order is
-    // not this client's.
+    let remembered = super::tab_memory::recall(memory, Some(session_id))
+        .and_then(|recall| recall.last_shown(projects, active_tab_id));
+    if let Some((project, tab)) = remembered {
+        return InitialSelection::Select { project, tab };
+    }
+    // Otherwise the session's own active tab. Its project is found by
+    // holding that tab rather than by position, because the session's
+    // project order is not this client's.
     let project = projects
         .iter()
         .find(|project| project.tabs.iter().any(|tab| tab.id == active_tab_id))
@@ -573,15 +596,10 @@ pub(crate) fn initial_selection(
     let Some(project) = project else {
         return InitialSelection::Wait;
     };
-    let tab = project
-        .tabs
-        .iter()
-        .find(|tab| tab.id == active_tab_id)
-        .or_else(|| project.tabs.first());
-    match tab {
+    match super::tab_memory::preferred_listed_tab(project, active_tab_id, None) {
         Some(tab) => InitialSelection::Select {
             project: project.id,
-            tab: tab.id,
+            tab,
         },
         None => InitialSelection::Wait,
     }
@@ -621,6 +639,80 @@ pub(super) fn slot_selection(
         active: selection
             .filter(|showing| Some(showing.tab.host) == slot)
             .map(|showing| (showing.project.project, showing.tab.tab)),
+    }
+}
+
+/// What a provider script should be told is "the active tab" (plan 071
+/// D14, #533).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProviderSelection {
+    pub(super) project_id: i64,
+    pub(super) tab_id: i64,
+    pub(super) active_cwd: String,
+    pub(super) active_title: String,
+}
+
+/// The slot's own tab, when that is what the window is showing.
+///
+/// `provider_context` used to read `workspace.active()` unconditionally,
+/// which answers `(0, 0)` under `session` — that workspace holds nothing
+/// while the slot's tabs run in another process, so a provider spawned
+/// there with no cwd. A selection on a *remote* host is left alone (this
+/// returns `None`): its id space and cwd belong to another machine, and
+/// a provider handed those ids would send `roostctl` calls or a spawn
+/// cwd that don't exist here.
+pub(super) fn provider_selection(
+    mode: LocalBackendMode,
+    selection: SlotSelection,
+    rows: &[Project],
+) -> Option<ProviderSelection> {
+    if mode != LocalBackendMode::Session {
+        return None;
+    }
+    let (project_id, tab_id) = selection.active?;
+    let tab = rows
+        .iter()
+        .find(|project| project.id == project_id)?
+        .tabs
+        .iter()
+        .find(|tab| tab.id == tab_id)?;
+    Some(ProviderSelection {
+        project_id,
+        tab_id,
+        active_cwd: tab.cwd.clone(),
+        active_title: tab.title.clone(),
+    })
+}
+
+/// Which rows the macOS Window menu draws, and the host they are keyed
+/// under (plan 071 D15, P9).
+///
+/// Picked by **backend mode**, not by whichever section the window
+/// happens to be showing (panel correction 11): a remote host's own
+/// rows never appear here, matching what `in-process` already does when
+/// a remote host is showing (the menu stays on the local list, with no
+/// row checked). Under `session` "the local list" is the slot's own
+/// mirror rather than the in-process workspace, which holds nothing —
+/// reading it left the menu empty for the whole mode. With no slot view
+/// yet, there is nothing to show.
+///
+/// Its only call site is `App::sync_window_menu`, which is macOS-only,
+/// so a non-macOS build never reaches it outside its own unit tests —
+/// kept a plain, portable function anyway (rather than
+/// `#[cfg(target_os = "macos")]` on the definition) so those tests run
+/// on every CI cell, not only the macOS one.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(super) fn window_menu_rows<'a>(
+    mode: LocalBackendMode,
+    slot: Option<(HostId, &'a [Project])>,
+    in_process: &'a [Project],
+) -> (HostId, &'a [Project]) {
+    match mode {
+        LocalBackendMode::InProcess => (HostId::LOCAL, in_process),
+        LocalBackendMode::Session => match slot {
+            Some((host, rows)) => (host, rows),
+            None => (HostId::LOCAL, &[]),
+        },
     }
 }
 
@@ -2073,8 +2165,9 @@ impl super::App {
 
         let feed = self.feed_tx.clone();
         let home = roost_engine::home_dir();
+        let grid = self.current_grid();
         self.runtime_handle.spawn(async move {
-            let outcome = replay_onto_slot(&ops, snapshot, &path, journal, &home).await;
+            let outcome = replay_onto_slot(&ops, snapshot, &path, journal, &home, grid).await;
 
             feed.send(crate::engine_feed::EngineFeed::LocalBackendSwitch(
                 Box::new(SwitchStepDone {
@@ -2408,8 +2501,12 @@ impl super::App {
         // what flipping the mode makes it (`host_sidebar::sections`
         // reads `local_slot_input`). What does move is the *selection*:
         // "local tabs start fresh" means the window comes back to the
-        // in-process band rather than staying on a session tab.
+        // in-process band rather than staying on a session tab — and a
+        // new tab or a parked focus the session has yet to list must not
+        // pull it back there once it does.
         self.set_host_selection(None);
+        self.pending_host_selection = None;
+        self.awaiting_listing.clear();
         tracing::info!("local-backend committed to in-process");
     }
 
@@ -2440,8 +2537,9 @@ impl super::App {
         run.step_in_flight = true;
         let client = self.client.clone();
         let feed = self.feed_tx.clone();
+        let grid = self.current_grid();
         self.runtime_handle.spawn(async move {
-            let seeded = super::hydrate_local_workspace(&client)
+            let seeded = super::hydrate_local_workspace(&client, grid)
                 .await
                 .map_err(|error| error.to_string());
             feed.send(crate::engine_feed::EngineFeed::LocalBackendSwitch(
@@ -2635,6 +2733,7 @@ async fn replay_onto_slot(
     path: &Path,
     mut journal: SwitchJournal,
     home: &str,
+    grid: (u16, u16),
 ) -> ReplayOutcome {
     use roost_ipc::messages::{ops as wire, ProjectCreateResult, TabOpenResult};
     let mut created: Vec<CreatedProject> = Vec::with_capacity(snapshot.len());
@@ -2716,7 +2815,7 @@ async fn replay_onto_slot(
             let opened: Result<TabOpenResult, String> = super::host_call(
                 ops,
                 wire::TAB_OPEN,
-                super::host_tab_open_params(made.id, &cwd, &tab.title, &[], None),
+                super::host_tab_open_params(made.id, &cwd, &tab.title, &[], None, grid),
             )
             .await;
             let opened = match opened {
@@ -2774,12 +2873,7 @@ async fn replay_onto_slot(
 /// machine, so the check is a real one — this is the only replay
 /// destination for which that is true, and the only one §D8 asks it of.
 fn replay_cwd(tab: &str, project: &str, home: &str) -> String {
-    for candidate in [tab, project, home] {
-        if !candidate.is_empty() && Path::new(candidate).is_dir() {
-            return candidate.to_string();
-        }
-    }
-    home.to_string()
+    roost_engine::application::usable_cwd_or(tab, project, home)
 }
 
 /// Phase 5. Answers how many are left, because that is what decides
@@ -2885,9 +2979,11 @@ pub(crate) fn tab_counts(projects: &[Project]) -> std::collections::HashMap<i64,
 
 #[cfg(test)]
 mod tests {
+    use super::super::tab_memory::{self, fixtures::project};
     use super::*;
+    use roost_engine::persistence::{HostTabMemory, TabMemo};
     use roost_ipc::paths::BundleProfile;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     #[test]
     fn the_session_snapshot_carries_the_profile_socket_and_the_slot_selection() {
@@ -3618,38 +3714,6 @@ mod tests {
         assert_eq!(slot_label(|_| false), None);
     }
 
-    fn project(id: i64, tabs: &[i64]) -> Project {
-        use roost_ipc::messages::{Tab, TabState};
-        Project {
-            id,
-            name: format!("p{id}"),
-            cwd: "/tmp".into(),
-            position: 0,
-            created_at: 0,
-            tabs: tabs
-                .iter()
-                .enumerate()
-                .map(|(index, tab)| Tab {
-                    id: *tab,
-                    project_id: id,
-                    title: String::new(),
-                    cwd: "/tmp".into(),
-                    state: TabState::Idle,
-                    has_notification: false,
-                    is_active: false,
-                    user_titled: false,
-                    position: index as i32,
-                    created_at: 0,
-                    last_active: 0,
-                    hook_active: false,
-                    shell_state: Default::default(),
-                    agent_lifecycle: Default::default(),
-                    ownership: None,
-                })
-                .collect(),
-        }
-    }
-
     /// Plan 063 §D5's initial selection, and AC2's "attached, not merely
     /// present": the answer is a tab.
     #[test]
@@ -3658,7 +3722,7 @@ mod tests {
 
         // The session's active tab, wherever it lives.
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, Some((&rows, 21))),
+            initial_selection(LocalBackendMode::Session, false, slot(&rows, 21)),
             InitialSelection::Select {
                 project: 2,
                 tab: 21
@@ -3667,7 +3731,7 @@ mod tests {
         // No active tab of its own (or one that closed): the first row
         // with something in it.
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, Some((&rows, 0))),
+            initial_selection(LocalBackendMode::Session, false, slot(&rows, 0)),
             InitialSelection::Select {
                 project: 1,
                 tab: 10
@@ -3676,7 +3740,7 @@ mod tests {
         // A project with no tabs is not somewhere to land.
         let empty = [project(1, &[]), project(2, &[20])];
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, Some((&empty, 0))),
+            initial_selection(LocalBackendMode::Session, false, slot(&empty, 0)),
             InitialSelection::Select {
                 project: 2,
                 tab: 20
@@ -3691,12 +3755,12 @@ mod tests {
     fn the_launch_selection_waits_for_the_slot_and_yields_to_a_held_one() {
         let rows = [project(1, &[10])];
         assert_eq!(
-            initial_selection(LocalBackendMode::InProcess, false, Some((&rows, 10))),
+            initial_selection(LocalBackendMode::InProcess, false, slot(&rows, 10)),
             InitialSelection::Settled,
             "in-process never had a slot to select from"
         );
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, true, Some((&rows, 10))),
+            initial_selection(LocalBackendMode::Session, true, slot(&rows, 10)),
             InitialSelection::Settled,
             "an unrelated remote-host selection is preserved"
         );
@@ -3706,15 +3770,260 @@ mod tests {
             "the slot is not connected yet"
         );
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, Some((&[], 0))),
+            initial_selection(LocalBackendMode::Session, false, slot(&[], 0)),
             InitialSelection::Wait,
             "connected but empty: the seed has not landed yet"
         );
+    }
+
+    /// An identified slot with nothing remembered.
+    fn slot(projects: &[Project], active_tab_id: i64) -> Option<SlotRows<'_>> {
+        Some(SlotRows {
+            projects,
+            active_tab_id,
+            session_id: Some("s-1"),
+            memory: None,
+        })
+    }
+
+    /// `s-1` last showed tab 21, the second tab of project 2.
+    fn shown_21() -> HostTabMemory {
+        let memo = TabMemo {
+            tab_id: 21,
+            position: 1,
+        };
+        HostTabMemory {
+            session_id: "s-1".into(),
+            last_viewed: BTreeMap::from([(2, memo)]),
+            last_shown: Some((2, memo)),
+        }
+    }
+
+    /// Plan 071 §D11: the relaunch lands where this window last looked,
+    /// which is neither the session's active tab nor a project's first.
+    #[test]
+    fn the_launch_selection_lands_on_the_tab_last_shown() {
+        let rows = [project(1, &[10, 11]), project(2, &[20, 21, 22])];
+        let memory = shown_21();
+        let remembered = |session_id, projects| {
+            initial_selection(
+                LocalBackendMode::Session,
+                false,
+                Some(SlotRows {
+                    projects,
+                    active_tab_id: 11,
+                    session_id: Some(session_id),
+                    memory: Some(&memory),
+                }),
+            )
+        };
+
+        assert_eq!(
+            remembered("s-1", &rows),
+            InitialSelection::Select {
+                project: 2,
+                tab: 21
+            }
+        );
+        let restarted = [project(1, &[40, 41]), project(2, &[50, 51, 52])];
+        assert_eq!(
+            remembered("s-2", &restarted),
+            InitialSelection::Select {
+                project: 2,
+                tab: 51
+            },
+            "a restarted session keeps the project and uses the position"
+        );
+        let deleted = [project(1, &[10, 11])];
+        assert_eq!(
+            remembered("s-1", &deleted),
+            InitialSelection::Select {
+                project: 1,
+                tab: 11
+            },
+            "the remembered project is gone: the session's own active tab"
+        );
+    }
+
+    /// Plan 071 correction 6: `Connected` and the connection's facts are
+    /// separate feed items.
+    #[test]
+    fn the_launch_selection_neither_decides_nor_writes_before_the_session_id() {
+        let rows = [project(1, &[10, 11]), project(2, &[20, 21, 22])];
+        let memory = shown_21();
+        let arrived = |session_id| SlotRows {
+            projects: &rows,
+            active_tab_id: 11,
+            session_id,
+            memory: Some(&memory),
+        };
+
+        assert_eq!(
+            initial_selection(LocalBackendMode::Session, false, Some(arrived(None))),
+            InitialSelection::Wait,
+            "connected, facts not yet"
+        );
+        assert_eq!(
+            tab_memory::remember_shown(Some(&memory), None, &rows, 1, 11),
+            None,
+            "and a selection made by anything else in that window writes nothing"
+        );
+
+        assert_eq!(
+            initial_selection(LocalBackendMode::Session, false, Some(arrived(Some("s-1")))),
+            InitialSelection::Select {
+                project: 2,
+                tab: 21
+            },
+            "the facts landed: the memory decides"
+        );
+    }
+
+    fn tab_with(id: i64, project_id: i64, cwd: &str, title: &str) -> roost_ipc::messages::Tab {
+        use roost_ipc::messages::{Tab, TabState};
+        Tab {
+            id,
+            project_id,
+            title: title.into(),
+            cwd: cwd.into(),
+            state: TabState::Idle,
+            has_notification: false,
+            is_active: false,
+            user_titled: false,
+            position: 0,
+            created_at: 0,
+            last_active: 0,
+            hook_active: false,
+            shell_state: Default::default(),
+            agent_lifecycle: Default::default(),
+            ownership: None,
+        }
+    }
+
+    fn project_with(id: i64, tabs: Vec<roost_ipc::messages::Tab>) -> Project {
+        Project {
+            id,
+            name: format!("p{id}"),
+            cwd: "/tmp".into(),
+            position: 0,
+            created_at: 0,
+            tabs,
+        }
+    }
+
+    /// D14 (#533): the slot's own tab, read off its listing, once the
+    /// window's selection is on the slot's own incarnation.
+    #[test]
+    fn provider_selection_reads_the_slots_listed_tab() {
+        let rows = [project_with(
+            2,
+            vec![
+                tab_with(9, 2, "/repo/one", "one"),
+                tab_with(10, 2, "/repo/two", "two"),
+            ],
+        )];
+        let selection = SlotSelection {
+            host: Some(1),
+            active: Some((2, 10)),
+        };
+        let picked = provider_selection(LocalBackendMode::Session, selection, &rows)
+            .expect("the selected tab is listed");
+        assert_eq!(picked.project_id, 2);
+        assert_eq!(picked.tab_id, 10);
+        assert_eq!(picked.active_cwd, "/repo/two");
+        assert_eq!(picked.active_title, "two");
+    }
+
+    /// In-process has no slot listing to read at all — the caller keeps
+    /// its existing `workspace.active()` path.
+    #[test]
+    fn provider_selection_is_none_off_session() {
+        let rows = [project_with(2, vec![tab_with(10, 2, "/repo", "t")])];
+        let selection = SlotSelection {
+            host: Some(1),
+            active: Some((2, 10)),
+        };
+        assert_eq!(
+            provider_selection(LocalBackendMode::InProcess, selection, &rows),
+            None
+        );
+    }
+
+    /// A remote-host selection never reaches here with an `active` pair:
+    /// `slot_selection` already filtered it to `None` (its own tests
+    /// above), so the caller's fallback runs unchanged.
+    #[test]
+    fn provider_selection_is_none_with_no_slot_active() {
+        let rows = [project_with(2, vec![tab_with(10, 2, "/repo", "t")])];
+        assert_eq!(
+            provider_selection(LocalBackendMode::Session, SlotSelection::default(), &rows),
+            None
+        );
+    }
+
+    /// A selection naming a tab the slot's mirror no longer lists (torn
+    /// down between the click and this read) falls back rather than
+    /// handing a provider a stale cwd.
+    #[test]
+    fn provider_selection_is_none_when_the_tab_is_not_listed() {
+        let rows = [project_with(2, vec![tab_with(10, 2, "/repo", "t")])];
+        let selection = SlotSelection {
+            host: Some(1),
+            active: Some((2, 999)),
+        };
+        assert_eq!(
+            provider_selection(LocalBackendMode::Session, selection, &rows),
+            None
+        );
+    }
+
+    /// D15 (P9): in-process draws its own workspace, ignoring whatever a
+    /// slot happens to hold — there is no slot under this mode.
+    #[test]
+    fn window_menu_rows_reads_the_workspace_off_process() {
+        let workspace = [project_with(1, vec![tab_with(10, 1, "/tmp", "t")])];
+        let slot_rows = [project_with(9, vec![tab_with(90, 9, "/tmp", "s")])];
+        let (host, rows) = window_menu_rows(
+            LocalBackendMode::InProcess,
+            Some((HostId::new(3), &slot_rows)),
+            &workspace,
+        );
+        assert_eq!(host, HostId::LOCAL);
+        assert_eq!(rows, &workspace);
+    }
+
+    /// D15 (P9): under `session` the menu is the slot's own mirror, not
+    /// the in-process workspace — which holds nothing under this mode,
+    /// and reading it is what left the menu empty (the bug this fixes).
+    #[test]
+    fn window_menu_rows_reads_the_slots_mirror_under_session() {
+        let workspace = [project_with(1, vec![tab_with(10, 1, "/tmp", "t")])];
+        let slot_rows = [project_with(9, vec![tab_with(90, 9, "/tmp", "s")])];
+        let slot_host = HostId::new(3);
+        let (host, rows) = window_menu_rows(
+            LocalBackendMode::Session,
+            Some((slot_host, &slot_rows)),
+            &workspace,
+        );
+        assert_eq!(host, slot_host);
+        assert_eq!(rows, &slot_rows);
+    }
+
+    /// No slot view yet (not connected): nothing to show. Falling back
+    /// to the in-process workspace here would be showing rows from a
+    /// backend the window isn't running on under `session`.
+    #[test]
+    fn window_menu_rows_is_empty_with_no_slot_view() {
+        let workspace = [project_with(1, vec![tab_with(10, 1, "/tmp", "t")])];
+        let (host, rows) = window_menu_rows(LocalBackendMode::Session, None, &workspace);
+        assert_eq!(host, HostId::LOCAL);
+        assert!(rows.is_empty());
     }
 }
 
 #[cfg(test)]
 mod switch_tests {
+    use super::super::SPAWN_GRID;
     use super::*;
     use roost_ipc::messages::{Tab, TabState};
     use std::collections::HashMap;
@@ -4698,6 +5007,7 @@ mod switch_tests {
             path,
             journal,
             &home.path().to_string_lossy(),
+            SPAWN_GRID,
         )
         .await;
         drop(ops);
@@ -4863,6 +5173,21 @@ mod switch_tests {
                 params.get("cwd_from_tab").is_none(),
                 "a replayed tab.open must not carry the key at all: {params}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replayed_tab_spawns_at_the_grid_it_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = vec![source(11, &[("a", false)]), source(22, &[("b", true)])];
+        let (outcome, opened) =
+            replay_journalled_at(&journal_path(dir.path()), snapshot, |_, _| false).await;
+
+        assert!(outcome.error.is_none(), "{outcome:?}");
+        assert_eq!(opened.len(), 2, "both tabs were replayed: {opened:?}");
+        for params in &opened {
+            assert_eq!(params["cols"], SPAWN_GRID.0, "{params}");
+            assert_eq!(params["rows"], SPAWN_GRID.1, "{params}");
         }
     }
 

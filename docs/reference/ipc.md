@@ -393,6 +393,21 @@ by name if one is ever added without a row:
   event name answer `unknown-op` on a UI socket exactly as they always
   have; the mode plays no part.
 
+A forwarded `tab.open` is also **selected in this UI's window**, as it
+is under `in-process`, unless it carried `activate: false`. The reply is
+the session's, written the moment the session answers; the window
+selects the new tab when its copy of the slot's workspace lists it,
+which can be a moment later. For that gap, every tab a forwarded
+`tab.open` opened — with or without `activate` — is tracked until it is
+listed: a [`tab.focus`](#tabfocus) naming it waits for the listing
+instead of answering `not-found`, and answers `not-found` only if the
+tab closes first, the slot's connection drops, or 10 seconds pass. So
+`roostctl tab open --focus` and `roostctl open --focus` land on the new
+tab. This is the UI socket's behavior only: a client on the session's
+own socket — `roostctl` run inside a session tab, whose `ROOST_SOCKET`
+names the session — changes the session's active tab (the reply's
+`is_active`) and never the window's.
+
 A forwarded request that cannot reach the slot — nothing is connected
 yet, or the connection dropped mid-op — answers `host-unavailable` with
 the message `local session is not connected` (the same code and shape a
@@ -430,8 +445,12 @@ Request:
 ```
 
 `argv` empty means `[$SHELL]`. `cwd` empty means resolve it: the
-project's cwd, then `$HOME`, then `/`. `title` empty means derive from
-the resolved `cwd`. There is
+project's cwd, then `$HOME`, then `/`. A `cwd` that is not a directory
+on the server's machine — a typo, or a directory since deleted — is
+treated as empty (#541): the tab starts in the project's cwd if that is
+a directory, else at `$HOME`, and the result's `tab.cwd` says which. A
+directory that exists but cannot be entered still fails the open.
+`title` empty means derive from the resolved `cwd`. There is
 deliberately no opaque command string — callers wanting shell
 word-splitting must pass `["sh", "-c", "..."]` explicitly. This `argv` is
 reachable from the CLI as `roostctl tab open -- <cmd…>` (see
@@ -444,10 +463,13 @@ where they were, so `tab.opened` arrives with no `active.changed` after
 it. With `project_id: "0"` the default project is found or created
 without being selected either. Omitted or `true`, the new tab is
 selected, as it always has been; an omitted field is not sent, so
-those requests are the bytes they were before the field existed. The
-Swift Mac app and servers that predate the field answer
-`unknown-field`. From the CLI: `--no-activate` on `tab open` and
-`open`.
+those requests are the bytes they were before the field existed. A
+server that predates the field — `Roost.app` through v0.0.20 among
+them — answers `unknown-field`. From the CLI: `--no-activate` on `tab
+open` and `open`. On a UI socket under [`local-backend =
+session`](#a-ui-socket-under-local-backend-session) the request is
+forwarded to the local session, and the window selects the new tab once
+it lists it — unless `activate` is `false`.
 
 **`cwd_from_tab` (optional, plan 070).** Names a tab whose working
 directory the new tab starts in — the way ⌘T / Alt+T follows the
@@ -464,11 +486,12 @@ machine, so a directory since removed, or an OSC 7 path from across an
 including for `project_id: "0"`, where it is resolved before the
 default project is found or created.
 When nothing resolves — no such tab, or neither candidate is a
-directory — it is **not an error**: `cwd` is used as sent, and an
-empty one resolves through the usual chain above. The result's
-`tab.cwd` carries the cwd the tab was opened with. Served by the Rust
-endpoints: sessions and Roost-Iced's UI socket. The Swift Mac app's
-socket and servers that predate the field answer `unknown-field` — see
+directory — it is **not an error**: `cwd` is used as sent, and one
+that is empty or not a directory resolves through the usual chain
+above. The result's `tab.cwd` carries the cwd the tab started in.
+Served by sessions, Roost-Iced's UI socket and the Swift Mac app's
+socket. A server that predates the field — `Roost.app` through v0.0.20
+among them — answers `unknown-field`; see
 [the compatibility matrix](ipc-compatibility.md#the-compatibility-matrix).
 No CLI flag yet.
 
@@ -1174,6 +1197,13 @@ active row, and this client only moved which one it is looking at. A
 **session socket** answers `invalid-param` for the qualified form
 ("a host-qualified tab.focus needs a UI: host selection is client
 state") — there is no UI there to hold a selection.
+
+Under [`local-backend = session`](#a-ui-socket-under-local-backend-session)
+a bare `tab_id` on a UI socket is rewritten to the slot's `h<n>.<id>`
+and answered the same way. A tab a forwarded `tab.open` just opened may
+not be listed by the window yet; a focus on it waits for the listing,
+and answers `not-found` only if the tab closes first, the slot's
+connection drops, or 10 seconds pass.
 
 ### `tab.set_title`
 

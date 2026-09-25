@@ -46,6 +46,7 @@ import contextlib
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import stat
@@ -1846,6 +1847,59 @@ def test_an_unactivated_tab_open_on_the_ui_socket_selects_nothing(lane: Lane):
         assert c.tab(quiet)["is_active"] is False
 
 
+def test_a_tab_open_on_the_ui_socket_selects_and_attaches_the_new_tab(lane: Lane):
+    """#548: the positive twin of the case above. A forwarded `tab.open`
+    that did not say `activate: false` lands the window on the new tab,
+    as the in-process backend always has, and attaches it."""
+    roost = session_ui(lane)
+    shown = roost.identify()["active_tab_id"]
+    project = int(roost.list()[0]["id"])
+
+    opened = roost.open_tab(project, cwd="/tmp", title="loud")
+
+    assert opened != shown
+    lands_on(roost, project, opened, "the window to select the tab the UI socket opened")
+    assert roost.app_selected_tab_id() == opened
+    attached(roost, opened)
+
+
+def test_roostctl_open_with_focus_on_the_ui_socket_lands(lane: Lane):
+    """#548: `--focus` sends `tab.focus` the moment `tab.open` answers,
+    which can beat the batch that lists the tab in the window. It exits
+    0 and lands, for `tab open` and for `open`."""
+    roost = session_ui(lane)
+    project = int(roost.list()[0]["id"])
+
+    opened = roostctl("tab", "open", "--project-id", str(project), "--cwd", "/tmp", "--focus")
+    assert opened.returncode == 0, opened
+    tab = int(opened.stdout.strip())
+    lands_on(roost, project, tab, "the window to land on `tab open --focus`'s tab")
+
+    ensured = roostctl("open", "--project", "focused", "--cwd", "/tmp", "--focus")
+    assert ensured.returncode == 0, ensured
+    reply = json.loads(ensured.stdout)
+    lands_on(
+        roost,
+        int(reply["project"]["id"]),
+        int(reply["tab"]["id"]),
+        "the window to land on `open --focus`'s tab",
+    )
+
+
+def test_a_focus_right_after_an_unactivated_open_on_the_ui_socket_lands(lane: Lane):
+    """#548: `activate: false` keeps the window where it is, and a
+    `tab.focus` sent the moment the open answers still lands rather than
+    answering `not-found` for a tab the window has yet to list."""
+    roost = session_ui(lane)
+    project = int(roost.list()[0]["id"])
+
+    quiet = roost.open_tab(project, cwd="/tmp", title="quiet", activate=False)
+    roost.focus(quiet)
+
+    assert selected(roost) == (project, quiet)
+    assert roost.app_selected_tab_id() == quiet
+
+
 def test_a_forwarded_delete_of_the_last_project_is_answered_before_the_exit(lane: Lane):
     """AC7 on the far side of §D10: the deletion reply is written before
     the process goes.
@@ -2786,3 +2840,216 @@ def test_a_new_tab_opens_in_the_shown_tabs_own_cwd_without_osc7(lane: Lane):
         tab = util.spawned_tab_id(c, before, "the new tab to open on the session", timeout=30.0)
 
         util.assert_opened_in(c, tab, moved_to)
+
+
+# ---------------------------------------------------------------------------
+# 11. Plan 071 D7 (#543): opening a tab never expands the sidebar
+# ---------------------------------------------------------------------------
+
+
+def test_new_tab_on_the_session_leaves_a_collapsed_sidebar_collapsed(lane: Lane):
+    """Plan 071 D7 (#543): the bug lived in
+    `resolve_pending_host_selection`, which every session-backed tab
+    open — a fresh install's local tabs included — resolves through, so
+    ⌘T on the slot must leave a collapsed sidebar collapsed exactly like
+    the in-process backend. This lane's UI and daemon are wiped at
+    teardown regardless, but the sidebar is still restored so a failure
+    here reads cleanly against the fixture's own expectations.
+    """
+    roost = session_ui(lane)
+    try:
+        util.set_sidebar_collapsed(roost, True)
+        before = roost.identify()["active_tab_id"]
+        util.press_new_tab(roost)
+        # The palette's `new_tab` reply can arrive before the session's
+        # selection lands (§2.2's Test constraints) — identify() is the
+        # condition that actually settled.
+        Roost._wait(
+            lambda: roost.identify()["active_tab_id"] != before,
+            timeout=scaled_timeout(30.0),
+            what="the new tab to become active",
+        )
+        assert roost.window_metrics()["sidebar_collapsed"], (
+            "opening a tab on the session slot expanded a collapsed sidebar"
+        )
+
+        # ⌘N still reveals it — only project creation does (D7).
+        roost.palette_open(kind="commands")
+        try:
+            roost.palette_activate("new_project")
+        finally:
+            roost.palette_dismiss()
+        Roost._wait(
+            lambda: not roost.window_metrics()["sidebar_collapsed"],
+            timeout=scaled_timeout(30.0),
+            what="new_project to reveal the sidebar",
+        )
+    finally:
+        util.set_sidebar_collapsed(roost, False)
+
+
+# ---------------------------------------------------------------------------
+# 12. Plan 071 §D10 (#546): a new tab spawns at the window's grid
+# ---------------------------------------------------------------------------
+
+
+#: One line of `stty size`: rows, then cols.
+STTY_SIZE = re.compile(r"^\s*(\d+ \d+)\s*$", re.MULTILINE)
+
+
+def stty_size(text: str) -> str | None:
+    found = STTY_SIZE.search(text)
+    return found and found.group(1)
+
+
+def test_a_replayed_tab_the_window_never_showed_starts_at_the_windows_grid(lane: Lane):
+    """The forward switch replays every tab, but the window attaches only
+    the one it shows. Alpha's tabs therefore keep the size their
+    `tab.open` spawned them at — the one route where no attach resize can
+    stand in for the spawn size, so this is not a race.
+    """
+    roost = lane.start("in-process")
+    source_layout(roost)
+    switch(roost, USE_SESSION, "session")
+
+    slot_rows = roost.sidebar_host(local_band(roost)["saved_id"])
+    assert slot_rows is not None, roost.sidebar_dump()
+    keys = {
+        project["name"]: [tab["key"] for tab in project["tabs"]]
+        for project in slot_rows["projects"]
+    }
+    window = roost.call("tab.dump_resolved", {"tab_id": keys["beta"][0]})
+    unshown = keys["alpha"][0]
+    with pytest.raises(RoostError) as unattached:
+        roost.call("tab.dump_resolved", {"tab_id": unshown})
+    assert "no live terminal" in str(unattached.value), unattached.value
+
+    tab = int(unshown.rsplit(".", 1)[-1])
+    with lane.session() as c:
+        c.run(tab, "stty size", ready_timeout=30.0)
+        printed = wait_until(
+            lambda: stty_size(c.dump_text(tab)),
+            scaled_timeout(30.0),
+            "the replayed tab to print its size",
+        )
+    assert printed == f"{window['rows']} {window['cols']}", printed
+
+
+# 13. Plan 071 §D11: a session project remembers the tab you last viewed
+# ---------------------------------------------------------------------------
+#
+# The remembered tab must be neither fallback — the session's active tab
+# (the one last *opened* there) or a project's first — so the window is
+# left on the strip's second tab, with the session's active tab in
+# another project.
+
+
+def viewed_while_the_session_is_elsewhere(lane: Lane, roost: Roost) -> tuple[int, int]:
+    """[`a_strip`]'s project `P` with the window showing its second tab,
+    and then a tab opened in a second project through the **session's**
+    socket, so the window stays where it is while the session's active
+    tab moves away from `P`.
+
+    Returns `P` and the tab the window showed there."""
+    project, tabs = a_strip(lane, roost)
+    viewed = tabs[1]
+    roost.focus(viewed)
+    lands_on(roost, project, viewed, "the window to show P's second tab")
+
+    with lane.session() as c:
+        elsewhere = c.create_project(name="elsewhere", cwd="/tmp")
+        active = c.open_tab(elsewhere, cwd="/tmp")
+        assert c.tab(active)["is_active"] is True, "the session's active tab left P"
+    wait_until(
+        lambda: slot_key(roost, active),
+        scaled_timeout(30.0),
+        "the window to list the tab the session made active",
+    )
+    assert selected(roost) == (project, viewed), "opening on the session moved the window"
+    return project, viewed
+
+
+def test_a_relaunch_lands_on_the_tab_last_viewed(lane: Lane):
+    """AC11: the window comes back to the tab it was showing, not to the
+    session's active tab — which is what a launch landed on before."""
+    roost = session_ui(lane)
+    project, viewed = viewed_while_the_session_is_elsewhere(lane, roost)
+
+    roost = lane.restart()
+
+    lands_on(roost, project, viewed, "the relaunch to land on the tab last viewed")
+
+
+def test_closing_the_last_tab_below_lands_on_the_tab_last_viewed_above(lane: Lane):
+    """AC11's close fallback: a shown project's last tab closes, the walk
+    goes up to `P`, and `P` opens on the tab last viewed there rather than
+    on its first tab or the session's active one."""
+    roost = session_ui(lane)
+    project, viewed = viewed_while_the_session_is_elsewhere(lane, roost)
+    with lane.session() as c:
+        below = c.create_project(name="below", cwd="/tmp")
+        shown = c.open_tab(below, cwd="/tmp")
+    wait_until(
+        lambda: slot_key(roost, shown),
+        scaled_timeout(30.0),
+        "the window to list the project below P",
+    )
+    order = window_projects(roost)
+    order.remove(below)
+    order.insert(order.index(project) + 1, below)
+    roost.reorder_projects(order)
+    wait_until(
+        lambda: window_projects(roost) == order,
+        scaled_timeout(30.0),
+        "the window's sidebar to draw the project directly below P",
+    )
+    roost.focus(shown)
+    lands_on(roost, below, shown, "the window to show the project below P")
+
+    roost.close_tab(shown)
+
+    lands_on(roost, project, viewed, "the fallback to open P on the tab last viewed there")
+
+
+# ---------------------------------------------------------------------------
+# 14. Plan 071 §D14 (#533): providers see the slot's active tab
+# ---------------------------------------------------------------------------
+
+
+def test_provider_context_reads_the_slots_active_tab(lane: Lane):
+    """D14 (#533): under `session`, a provider sees the slot's own active
+    tab — its ids and tracked cwd — rather than the in-process workspace,
+    which holds nothing here. `fixture-active-context.sh` echoes exactly
+    what `provider_context` handed it, and spawns with that cwd, so the
+    `pwd` item proves the spawn actually landed there and not merely that
+    the env var was set."""
+    roost = session_ui(lane)
+    active = roost.identify()["active_tab_id"]
+    with lane.session() as c:
+        active_row = c.tab(active)
+    assert active_row is not None, "the slot's own tab is listed on its own socket"
+
+    items = roost.palette_open(kind="custom")["items"]
+    by_title = {it["title"]: it["id"] for it in items}
+    util.precondition(
+        "Active Context Probe" in by_title,
+        "seed config / providers dir not active (UI not launched by the harness)",
+    )
+    roost.palette_activate(by_title["Active Context Probe"])
+    wait_until(
+        lambda: any(
+            it["title"].startswith("cwd:") for it in roost.palette_state()["items"]
+        ),
+        scaled_timeout(15.0),
+        "the probe to run and report",
+    )
+    probed = {
+        it["title"].split(":", 1)[0]: it["title"].split(":", 1)[1]
+        for it in roost.palette_state()["items"]
+    }
+    assert probed["tab"] == str(active), probed
+    assert probed["cwd"] == active_row["cwd"], probed
+    assert probed["pwd"] == active_row["cwd"], (
+        "the provider actually spawned in the active tab's cwd, not just "
+        f"saw it in an env var: {probed}"
+    )

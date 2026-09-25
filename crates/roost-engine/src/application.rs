@@ -44,11 +44,10 @@ pub fn close_tab(
 /// Native first, because the direct PTY child's own cwd follows a `cd`
 /// in a shell that emits no OSC 7, and is a path on this machine — an
 /// OSC 7 cwd reported across an `ssh` hop is the remote's. Either
-/// candidate counts only if it is a directory here: portable-pty spawns
-/// at `$HOME` for a cwd that is not one, without a word, and Linux
-/// reports a removed cwd as `… (deleted)`. No row means `None`, even
-/// while the supervisor still holds the tab's session — a closing tab
-/// leaves the workspace first ([`close_tab`]).
+/// candidate counts only if it is a directory here, as in
+/// [`usable_cwd`], and Linux reports a removed cwd as `… (deleted)`.
+/// No row means `None`, even while the supervisor still holds the tab's
+/// session — a closing tab leaves the workspace first ([`close_tab`]).
 pub fn inherited_cwd(
     workspace: &Workspace,
     supervisor: &PtySupervisor,
@@ -61,9 +60,33 @@ pub fn inherited_cwd(
         .find(|cwd| Path::new(cwd).is_dir())
 }
 
+/// Where a shell asked to start in `requested` really starts: there if
+/// it is a directory, else in the project's cwd if that is one, else at
+/// `$HOME` ([`crate::home_dir`]).
+///
+/// A cwd counts only if it is a directory because portable-pty spawns at
+/// `$HOME` for one that is not, without a word, and the row would then
+/// record a cwd the shell never started in (#541). An existing directory
+/// the shell cannot enter still counts, and still fails the spawn.
+pub fn usable_cwd(requested: &str, project_cwd: &str) -> String {
+    usable_cwd_or(requested, project_cwd, &crate::home_dir())
+}
+
+/// [`usable_cwd`] with `$HOME` stated, so the rule is testable without
+/// the process-global environment.
+pub fn usable_cwd_or(requested: &str, project_cwd: &str, home: &str) -> String {
+    [requested, project_cwd]
+        .into_iter()
+        .find(|cwd| Path::new(cwd).is_dir())
+        .unwrap_or(home)
+        .to_string()
+}
+
 /// Where a `tab.open` lands, settled in `params` itself, shared by the
 /// served handler and the facade: `cwd_from_tab` replaces `cwd` before
-/// anything reads it, `ensure_default_project` included.
+/// anything reads it, `ensure_default_project` included, and a `cwd`
+/// that is not a directory ([`usable_cwd`]) is dropped so the empty
+/// chain places the tab.
 pub fn resolve_open_target(
     workspace: &Workspace,
     supervisor: &PtySupervisor,
@@ -75,6 +98,9 @@ pub fn resolve_open_target(
         .and_then(|source| inherited_cwd(workspace, supervisor, source))
     {
         params.cwd = cwd;
+    }
+    if !Path::new(&params.cwd).is_dir() {
+        params.cwd.clear();
     }
     if params.project_id == 0 {
         params.project_id = workspace.ensure_default_project(&params.cwd, activate);
@@ -103,17 +129,34 @@ pub fn resolve_open_target(
 /// recycled pid: `terminate_child` signals under the child's reap
 /// latch, which refuses once the child has been reaped (#470).
 ///
+/// The shell starts in [`usable_cwd`], and a row that names anywhere
+/// else is moved there first, with `tab` refreshed to match: every
+/// spawn passes here, restores and in-process opens included, and none
+/// of them may leave a row that says where the shell did not start.
+///
 /// `pub` for the same reason [`close_tab`] is: the race test lives in
 /// `tests/` with a real PTY and a multi-thread runtime.
 pub fn spawn_for_row(
     workspace: &Workspace,
     supervisor: &PtySupervisor,
-    tab: &Tab,
+    tab: &mut Tab,
     argv: &[String],
     cols: u16,
     rows: u16,
     socket_path: &std::path::Path,
 ) -> Result<()> {
+    let project_cwd = workspace.project_cwd(tab.project_id).unwrap_or_default();
+    let cwd = usable_cwd(&tab.cwd, &project_cwd);
+    if cwd != tab.cwd {
+        match workspace
+            .set_tab_start_cwd(tab.id, &cwd)
+            .and_then(|()| workspace.tab(tab.id))
+        {
+            Ok(row) => *tab = row,
+            Err(WorkspaceError::TabNotFound(_)) => return Err(PtyError::Cancelled(tab.id).into()),
+            Err(err) => return Err(err.into()),
+        }
+    }
     match supervisor.spawn(tab.id, &tab.cwd, argv, cols, rows, socket_path) {
         // The pre-subscribed receiver `spawn` returns is dropped; the
         // supervisor's stashed twin (`take_initial_receiver`) is what an
@@ -204,10 +247,11 @@ impl LocalClient {
         cols: u32,
         rows: u32,
     ) -> Result<Tab> {
-        // cwd resolution (requested → project's cwd → $HOME → "/")
-        // lives in `Workspace::open_tab` now, so every caller
-        // (this, the facade, `ops::TAB_OPEN`) gets it once.
-        let tab = self.workspace.open_tab(project_id, cwd, title, true)?;
+        // An empty cwd resolves in `Workspace::open_tab` (project's cwd
+        // → $HOME → "/"), and one that is not a directory in
+        // `spawn_for_row`, so every caller (this, the facade,
+        // `ops::TAB_OPEN`) gets both once.
+        let mut tab = self.workspace.open_tab(project_id, cwd, title, true)?;
         // Clamp + validate PTY dims. Zero → terminal default; values
         // exceeding u16 surface as a clear error rather than
         // silently truncating via `as u16` (CR-flagged: a CLI
@@ -223,7 +267,7 @@ impl LocalClient {
         spawn_for_row(
             &self.workspace,
             &self.supervisor,
-            &tab,
+            &mut tab,
             argv,
             cols,
             rows,
@@ -295,6 +339,7 @@ pub fn apply_osc(workspace: &Workspace, tab_id: i64, command: u32, payload: &str
     }
 }
 
+/// The payload's path is already percent-decoded (`osc::map_events`).
 fn parse_osc7_path(payload: &str) -> Option<String> {
     // OSC 7 carries `file://host/abs/path`. The path portion starts
     // at the FIRST `/` after the host (or at index 0 if the host is
@@ -313,7 +358,7 @@ fn parse_osc7_path(payload: &str) -> Option<String> {
 /// produce e.g. cols=34464 for cols=100000). Mirrors the Rust
 /// IPC handler's `u16::try_from` validation in `crates/roost-
 /// linux/src/ipc.rs`.
-fn pty_dim(value: u32, default: u16, field: &str) -> Result<u16> {
+pub(crate) fn pty_dim(value: u32, default: u16, field: &str) -> Result<u16> {
     if value == 0 {
         return Ok(default);
     }
@@ -570,6 +615,110 @@ mod tests {
         let _guard = spawn_in(&supervisor, orphan, native.path());
 
         assert_eq!(inherited_cwd(&workspace, &supervisor, orphan), None);
+    }
+
+    #[test]
+    fn usable_cwd_is_the_requested_directory_else_the_projects_else_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let [requested, project] = ["requested", "project"].map(|name| {
+            let path = dir.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            string(&path)
+        });
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        let file = string(&file);
+        let gone = string(&dir.path().join("gone"));
+        let home = "/home-as-given";
+
+        assert_eq!(usable_cwd_or(&requested, &project, home), requested);
+        for not_a_directory in [gone.as_str(), file.as_str(), ""] {
+            assert_eq!(
+                usable_cwd_or(not_a_directory, &project, home),
+                project,
+                "{not_a_directory:?}"
+            );
+            assert_eq!(
+                usable_cwd_or(not_a_directory, &gone, home),
+                home,
+                "{not_a_directory:?}"
+            );
+        }
+        assert_eq!(usable_cwd(&gone, &gone), crate::home_dir());
+    }
+
+    /// The request half of #541: a `cwd` that is not a directory is
+    /// dropped before anything reads it, `ensure_default_project`
+    /// included, whether it was sent as is or beside a `cwd_from_tab`
+    /// that resolved nothing.
+    #[test]
+    fn resolve_open_target_drops_a_cwd_that_is_not_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = string(&dir.path().join("gone"));
+        let (workspace, source) = workspace_with_tab(&gone);
+        let project = workspace.tab(source).unwrap().project_id;
+        let supervisor = PtySupervisor::new();
+
+        for cwd_from_tab in [None, Some(source)] {
+            let mut params = TabOpenParams {
+                project_id: project,
+                cwd: gone.clone(),
+                cwd_from_tab,
+                ..TabOpenParams::default()
+            };
+            resolve_open_target(&workspace, &supervisor, &mut params, true);
+            assert_eq!(params.cwd, "", "{cwd_from_tab:?}");
+        }
+
+        let kept = string(dir.path());
+        let mut params = TabOpenParams {
+            project_id: project,
+            cwd: kept.clone(),
+            ..TabOpenParams::default()
+        };
+        resolve_open_target(&workspace, &supervisor, &mut params, true);
+        assert_eq!(params.cwd, kept, "a directory is kept");
+
+        let empty = Workspace::new();
+        let mut params = TabOpenParams {
+            cwd: gone.clone(),
+            ..TabOpenParams::default()
+        };
+        resolve_open_target(&empty, &supervisor, &mut params, true);
+        assert_eq!(
+            empty.project_cwd(params.project_id).as_deref(),
+            Some(""),
+            "the default project is not created at {gone}"
+        );
+    }
+
+    /// The spawn half of #541: a row whose cwd is not a directory is
+    /// moved to where the shell really starts, and so is the caller's
+    /// copy of it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_for_row_records_where_the_shell_really_started() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let project_cwd = string(project_dir.path());
+        let gone = string(&project_dir.path().join("gone"));
+        let workspace = Workspace::new();
+        let project = workspace.create_project("p", &project_cwd).unwrap().id;
+        let mut tab = workspace.open_tab(project, &gone, "", true).unwrap();
+        assert_eq!(tab.cwd, gone, "the precondition: the row names {gone}");
+        let supervisor = Arc::new(PtySupervisor::new());
+        let _guard = HangUp(supervisor.clone(), vec![tab.id]);
+
+        let argv = ["/bin/sh", "-c", "exec sleep 30"].map(String::from);
+        let socket = Path::new("/tmp/roost-spawn-for-row-test.sock");
+        spawn_for_row(&workspace, &supervisor, &mut tab, &argv, 80, 24, socket).expect("spawn");
+
+        assert_eq!(workspace.tab(tab.id).unwrap().cwd, project_cwd, "the row");
+        assert_eq!(tab.cwd, project_cwd, "the caller's copy");
+        let started = string(&std::fs::canonicalize(project_dir.path()).unwrap());
+        assert_eq!(
+            supervisor.foreground_cwd(tab.id),
+            Some(started),
+            "the shell"
+        );
     }
 
     #[test]

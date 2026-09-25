@@ -3487,13 +3487,12 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         selectTab(at: insertedIndex)
     }
 
-    /// Open a tab in `projectID` starting at `cwd` (empty → the
-    /// project's cwd, then $HOME, so a Finder-launched app doesn't
-    /// drop the shell at `/`) with placeholder `title`, append + start
-    /// its session. Does NOT change the active selection or rebuild the
-    /// tab bar — the caller decides whether to focus it. Returns the
-    /// new session. Shared by `openNewTab` (active project) and session
-    /// restore (which passes each saved tab's cwd + title).
+    /// Open a tab in `projectID` asking for `cwd` (`LocalClient.openTab`
+    /// settles where the shell really starts) with placeholder `title`,
+    /// append + start its session. Does NOT change the active selection
+    /// or rebuild the tab bar — the caller decides whether to focus it.
+    /// Returns the new session. Shared by `openNewTab` (active project)
+    /// and session restore (which passes each saved tab's cwd + title).
     @discardableResult
     private func openTab(
         inProject projectID: Int64,
@@ -3514,22 +3513,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             clipboardWrite: config.clipboardWrite,
             wordBreakChars: config.wordBreakChars
         )
-        let resolvedCwd: String
-        if !cwd.isEmpty {
-            resolvedCwd = cwd
-        } else {
-            let projectCwd = projects.first(where: { $0.id == projectID })?.cwd ?? ""
-            resolvedCwd = projectCwd.isEmpty
-                ? (ProcessInfo.processInfo.environment["HOME"] ?? "")
-                : projectCwd
-        }
-        // Pre-seed `liveCwd` so the new pill renders the
-        // tilde-abbreviated path on frame 1, instead of flashing
-        // "Tab N" while waiting for the shell's OSC 7. OSC 7 will
-        // refine if the shell starts in a different directory.
-        session.liveCwd = resolvedCwd.isEmpty ? nil : resolvedCwd
         tabs.append(session)
-        session.start(socketPath: socketPath, title: title, cwd: resolvedCwd, argv: argv) { [weak self] tabID in
+        session.start(socketPath: socketPath, title: title, cwd: cwd, argv: argv) { [weak self, weak session] tabID in
+            // Seeded from the row, which holds the directory the shell
+            // starts in, so the pill and subtitle show the path instead
+            // of "Tab N" until the shell's first OSC 7.
+            session?.liveCwd = RoostBackend.shared.workspace?.tab(tabID)?.cwd
+            self?.updateWindowTitle()
             // The id is now known; keep the window menu in sync so its
             // tag-driven ⌘1..⌘9 routes to the current tab order.
             // Also rebuild the tab bar so the pill that was created

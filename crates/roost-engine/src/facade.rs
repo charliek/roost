@@ -333,23 +333,31 @@ impl Engine {
     async fn open_tab(&self, mut params: TabOpenParams) -> Result<Tab, EngineError> {
         validate_dimension(params.cols, "cols")?;
         validate_dimension(params.rows, "rows")?;
+        let activate = params.activate != Some(false);
         crate::application::resolve_open_target(
             &self.workspace,
             &self.supervisor,
             &mut params,
-            true,
+            activate,
         );
-        self.client
-            .open_tab(
-                params.project_id,
-                &params.cwd,
-                &params.title,
-                &params.argv,
-                params.cols,
-                params.rows,
-            )
-            .await
-            .map_err(application_error)
+        let cols =
+            crate::application::pty_dim(params.cols, 80, "cols").map_err(application_error)?;
+        let rows =
+            crate::application::pty_dim(params.rows, 24, "rows").map_err(application_error)?;
+        let mut tab =
+            self.workspace
+                .open_tab(params.project_id, &params.cwd, &params.title, activate)?;
+        crate::application::spawn_for_row(
+            &self.workspace,
+            &self.supervisor,
+            &mut tab,
+            &params.argv,
+            cols,
+            rows,
+            &self.client.socket_path,
+        )
+        .map_err(|error| application_error(error.context("pty spawn failed")))?;
+        Ok(tab)
     }
 
     async fn resize_tab(&self, params: TabResizeParams) -> Result<(), EngineError> {
@@ -572,6 +580,50 @@ mod tests {
             };
             opened.1.push(tab.id);
             assert_eq!(tab.cwd, want, "{cwd_from_tab:?}");
+        }
+    }
+
+    /// `TabOpen`'s `activate` as the facade reads it (#539, mirrors
+    /// `ipc::tests::tab_open_selects_unless_activate_is_false`): absent and
+    /// `true` select the new tab, `false` does not.
+    #[tokio::test]
+    async fn tab_open_selects_unless_activate_is_false() {
+        let workspace = Arc::new(Workspace::new());
+        let project = workspace.create_project("p", "/").unwrap().id;
+        let supervisor = Arc::new(PtySupervisor::new());
+        let mut opened = crate::application::HangUp(supervisor.clone(), Vec::new());
+        let engine = Engine::new(
+            workspace.clone(),
+            supervisor,
+            PathBuf::from("/tmp/roost-engine-test.sock"),
+        );
+
+        for activate in [None, Some(true), Some(false)] {
+            let before = workspace.active();
+            let mut events = workspace.subscribe();
+            let result = engine
+                .execute(EngineCommand::TabOpen(TabOpenParams {
+                    project_id: project,
+                    argv: vec!["/bin/sh".into(), "-c".into(), "exec sleep 60".into()],
+                    activate,
+                    ..Default::default()
+                }))
+                .await
+                .expect("tab open");
+            let CommandResult::Tab(tab) = result else {
+                panic!("TabOpen answers a tab, not {result:?}");
+            };
+            opened.1.push(tab.id);
+            let moved = std::iter::from_fn(|| events.try_recv().ok())
+                .any(|event| matches!(event, WorkspaceEvent::ActiveChanged { .. }));
+
+            if activate == Some(false) {
+                assert_eq!(workspace.active(), before, "{activate:?}");
+                assert!(!tab.is_active && !moved, "{activate:?}");
+            } else {
+                assert_eq!(workspace.active(), (project, tab.id), "{activate:?}");
+                assert!(tab.is_active && moved, "{activate:?}");
+            }
         }
     }
 

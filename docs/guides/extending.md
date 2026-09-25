@@ -142,6 +142,11 @@ is convenient:
   `roostctl` when it can resolve one — best-effort, so keep the
   `"${ROOST_ROOSTCTL:-roostctl}"` fallback; [see below](#opening-tabs-from-activate)),
   and on activate `ROOST_SELECTED_ID`.
+
+  On a tab whose project runs on a `roost-session` (the default local
+  backend), `ROOST_ACTIVE_CWD` is that tab's **tracked** cwd — its direct
+  child's cwd, read natively, or its OSC 7-tracked one — not something
+  read from this process, which holds no PTY for it.
 - **Stdin JSON:**
   ```json
   { "v": 1, "phase": "activate", "selected_id": "api", "query": "ap",

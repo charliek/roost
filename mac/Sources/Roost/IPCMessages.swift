@@ -621,6 +621,14 @@ func decodeStringInt64<K: CodingKey>(
     return v
 }
 
+func decodeOptionalStringInt64<K: CodingKey>(
+    _ c: KeyedDecodingContainer<K>,
+    _ key: K
+) throws -> Int64? {
+    guard c.contains(key), try !c.decodeNil(forKey: key) else { return nil }
+    return try decodeStringInt64(c, key)
+}
+
 private func encodeStringInt64<K: CodingKey>(
     _ c: inout KeyedEncodingContainer<K>,
     _ key: K,

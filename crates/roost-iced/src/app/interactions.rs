@@ -399,9 +399,10 @@ impl App {
             self.hosts.owner_of(target.host()),
             local_backend::HostOpKind::Other,
         );
+        let on_slot = self.is_local_slot(target.host());
         let Some(ops) = self.hosts.ops_for(target.host()).cloned() else {
             return self.engine_op(
-                async move { Err("that host is not accepting operations".to_string()) },
+                async move { Err(file_transfer::unavailable_text(on_slot).to_string()) },
                 move |result| EngineOpResult::Renamed { op, target, result },
             );
         };
@@ -412,7 +413,7 @@ impl App {
                 ops.call(wire_op, params)
                     .await
                     .map(drop)
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| host_op_error_text(&error, on_slot))
             },
             move |result| EngineOpResult::Renamed { op, target, result },
         )
@@ -1233,13 +1234,17 @@ impl App {
             self.hosts.owner_of(host),
             local_backend::HostOpKind::Other,
         );
+        let on_slot = self.is_local_slot(host);
         match host_reorder_call(&self.hosts, host, target, &ordered_ids) {
             Some(call) => self.engine_op(
-                async move { call.await.map_err(|error| error.to_string()) },
+                async move {
+                    call.await
+                        .map_err(|error| host_op_error_text(&error, on_slot))
+                },
                 move |result| reorder_op_result(target, host, op, ordered_ids, result),
             ),
             None => self.engine_op(
-                async move { Err("that host is not accepting operations".to_string()) },
+                async move { Err(file_transfer::unavailable_text(on_slot).to_string()) },
                 move |result| reorder_op_result(target, host, op, ordered_ids, result),
             ),
         }
@@ -2713,7 +2718,9 @@ impl App {
                 };
                 terminal.paste(value.as_deref());
                 if !probe_allowed && probe_wanted(target, value.as_deref()) {
-                    self.set_status(file_transfer::HOST_UNAVAILABLE.to_string());
+                    self.set_status(
+                        file_transfer::unavailable_text(self.is_local_slot(tab.host)).to_string(),
+                    );
                 }
                 paste_read_followup(
                     &mut self.clipboard,

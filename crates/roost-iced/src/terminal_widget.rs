@@ -13,6 +13,7 @@ use iced::{
 };
 use roost_engine::pointer::{PointerAction, PointerButton};
 use roost_ui_model::sprite::{sprite_geometry, tessellate, SpriteGeometry, SpritePrimitive};
+use roost_ui_model::theme::Theme as AppTheme;
 use roost_vt::{ColorRgb, CursorInfo, CursorVisualStyle, SelectionSpan};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -342,6 +343,20 @@ impl TerminalSnapshot {
             link_hover: None,
             pointer_shape: "default".into(),
             preedit: None,
+        }
+    }
+
+    /// A pre-attach frame in the active theme's colors, no cursor drawn —
+    /// what a new tab (local or session-backed) shows before its first
+    /// real snapshot arrives. `blank` stays hardcoded for the widget
+    /// tests below, which don't carry a `Theme`.
+    pub fn blank_themed(cols: u16, rows: u16, theme: &AppTheme) -> Self {
+        Self {
+            foreground: theme.foreground,
+            background: theme.background,
+            cursor_color: theme.cursor,
+            selection_background: theme.selection_background,
+            ..Self::blank(cols, rows)
         }
     }
 }

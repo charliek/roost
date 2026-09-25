@@ -1207,22 +1207,30 @@ impl App {
         // construction — the same reason the palette refresh below sits
         // here.
         self.sync_dock_badge();
-        // Same reasoning, one surface over: the Window menu's rows are
-        // project/tab state, so hanging them off the authoritative resync
-        // covers open, close, rename, reorder and select by construction.
-        self.sync_window_menu();
         self.refresh_notification_palette();
         // Before the selection check, which decides whether the window
         // is still showing a row that exists: whatever this selects is
         // then validated exactly as any other selection would be.
         self.resolve_initial_local_selection();
         self.resolve_pending_host_selection();
+        let focused = self.resolve_awaited_listings();
         self.reconcile_host_selection();
+        // After selection resolution, not before it (plan 071 D15): the
+        // active checkmark reads `active_project_key`/`active_tab_key`,
+        // and syncing on the pre-resolution reads left a relaunch or an
+        // async project creation with a stale check — the one this ran
+        // against a selection about to move again this same reconcile.
+        self.sync_window_menu();
         // Both of this snapshot's inputs are settled here: the views
         // were rebuilt at the top of this reconcile and the selection
         // just now. A *connection* change publishes through no other
         // edge (plan 063 §D10), and the write is change-detected.
         self.publish_local_route();
+        // After the publish: a caller answered here may read `identify`
+        // next, off the route it just published.
+        for reply in focused {
+            let _ = reply.send(Ok(()));
+        }
         self.refresh_sidebar_agents();
         self.refresh_agent_palette();
         // Host verbs are live state too: a host that connected while the
@@ -1538,11 +1546,7 @@ impl App {
         if self.host_attach.contains_key(&key) {
             return;
         }
-        let (cols, rows) = super::terminal_grid(
-            self.window_size,
-            self.effective_sidebar_width(),
-            self.terminal_metrics,
-        );
+        let (cols, rows) = self.current_grid();
         let geometry = self.host_geometry(cols, rows);
         let attach =
             host_tab::HostAttach::new(key, geometry).with_resume(self.host_resume.remove(&key));
@@ -1662,6 +1666,7 @@ impl App {
         {
             self.pending_host_selection = None;
         }
+        self.awaiting_listing.purge(incarnation);
     }
 
     /// The tab is over (EXIT, or its whole connection incarnation went):
@@ -1799,6 +1804,13 @@ impl App {
                     let tab = TabKey::new(host, tab_id);
                     self.notification_inbox.remove(tab);
                     self.desktop_notifications.retire(tab);
+                    self.awaiting_listing.closed(tab);
+                    if self
+                        .pending_host_selection
+                        .is_some_and(|pending| pending.tab == tab)
+                    {
+                        self.pending_host_selection = None;
+                    }
                 }
                 HostEnvelopeAction::ProjectDeleted(project_id) => {
                     self.retire_project_notifications(ProjectKey::new(host, project_id));
@@ -2017,11 +2029,7 @@ impl App {
                 return false;
             }
         };
-        let (cols, rows) = terminal_grid(
-            self.window_size,
-            self.effective_sidebar_width(),
-            self.terminal_metrics,
-        );
+        let (cols, rows) = self.current_grid();
         match tab.apply_geometry(cols, rows, self.terminal_metrics, self.metric_generation) {
             Ok(Some(change)) => {
                 tab.commit_geometry(change);
@@ -2450,13 +2458,17 @@ impl App {
                 self.desktop_notifications.retire(tab);
             }
             // The local workspace asserted its selection, so the host
-            // override is over. Reconcile's `local_active` watch catches
+            // override is over, and so is a host creation's claim to
+            // take it. Reconcile's `local_active` watch catches
             // the cases where the id moved; this catches the one where it
             // did not — an IPC `tab.focus` of the tab that is already
             // active is still a focus intent, and it must win the window
             // back from the host row (`Workspace::focus_tab` emits this
             // unconditionally, which is what makes it a reliable seam).
-            WorkspaceEvent::ActiveChanged { .. } => self.set_host_selection(None),
+            WorkspaceEvent::ActiveChanged { .. } => {
+                self.note_user_focus();
+                self.set_host_selection(None);
+            }
             WorkspaceEvent::ProjectDeleted { project_id } => {
                 self.retire_project_notifications(ProjectKey::new(self.backend.host(), project_id));
             }
@@ -2742,26 +2754,31 @@ impl App {
             if self.window_id.is_none() {
                 return;
             }
-            let host = self.backend.host();
+            let slot = self
+                .local_slot_view()
+                .map(|view| (view.host, view.projects.as_slice()));
+            let (host, rows) =
+                local_backend::window_menu_rows(self.local_backend, slot, &self.projects);
             let active_project = self.active_project_key();
             let active_tab = self.active_tab_key();
             if self
                 .menu_window_rows
-                .matches(&self.projects, host, active_project, active_tab)
+                .matches(rows, host, active_project, active_tab)
             {
                 return;
             }
-            let rows = crate::macos::menu::WindowRows::derive(
-                &self.projects,
-                host,
-                active_project,
-                active_tab,
-            );
+            let derived =
+                crate::macos::menu::WindowRows::derive(rows, host, active_project, active_tab);
             let Some(mtm) = seam_on_main("window-menu rebuild") else {
                 return;
             };
-            crate::macos::menu::sync_window_menu(mtm, &rows, &self.keybindings, self.menu_gating());
-            self.menu_window_rows = rows;
+            crate::macos::menu::sync_window_menu(
+                mtm,
+                &derived,
+                &self.keybindings,
+                self.menu_gating(),
+            );
+            self.menu_window_rows = derived;
         }
     }
 
@@ -2914,7 +2931,7 @@ impl App {
     /// The one definition of "which saved host is the slot";
     /// [`Self::local_slot_saved_id`] and [`Self::local_slot_host`] are
     /// both this lookup, so they cannot name different hosts.
-    fn local_slot_view(&self) -> Option<&super::HostView> {
+    pub(super) fn local_slot_view(&self) -> Option<&super::HostView> {
         self.host_views
             .iter()
             .find(|view| view.transport.localhost())
@@ -2970,6 +2987,19 @@ impl App {
         self.local_slot_view()
             .filter(|view| view.state.interactive())
             .map(|view| view.host)
+    }
+
+    /// Whether `host` is the session slot — the fact [`title_host`] and
+    /// the host-unavailable status banners share for "this reads as
+    /// local, not as some machine across the network" (plan 071 D8).
+    /// Unlike [`Self::connected_slot_host`] this does not require the
+    /// slot to be interactive: a disconnected slot is still the slot,
+    /// and its banner should still say so. Gated on the mode too — under
+    /// `in-process` a user-added `localhost` host is an ordinary host,
+    /// not the slot's stand-in.
+    pub(super) fn is_local_slot(&self, host: HostId) -> bool {
+        self.local_backend == LocalBackendMode::Session
+            && self.local_slot_view().is_some_and(|slot| slot.host == host)
     }
 
     fn refresh_sidebar_agents(&mut self) {
@@ -3720,10 +3750,12 @@ impl App {
                 // The same two steps the sidebar click takes, in the
                 // same order: the selection first (so the view and the
                 // keyboard route move together), then the attach.
-                let result = self
-                    .focus_host_tab_and_clear(key, false)
-                    .map_err(|_| roost_engine::WorkspaceError::TabNotFound(tab_id));
-                let _ = reply.send(result);
+                if let Some(reply) = self.awaiting_listing.park(key, reply) {
+                    let result = self
+                        .focus_host_tab_and_clear(key, false)
+                        .map_err(|_| roost_engine::WorkspaceError::TabNotFound(tab_id));
+                    let _ = reply.send(result);
+                }
             }
             // Plan 047 §3.4: the op *is* the drop, minus the window
             // event — same `send_files`, same gesture queue, same
@@ -3898,6 +3930,7 @@ impl App {
             let _ = reply.send(slot_unavailable());
             return UiTask::None;
         };
+        let selects = forwarded_open::forward_selects(&op, &params);
         let mutating = roost_engine::ipc::is_mutating_op(&op);
         if mutating && self.switch_in_flight() {
             let _ = reply.send(switch_busy());
@@ -3911,6 +3944,8 @@ impl App {
             false => self.take_engine_op_id(),
         };
         self.forward_replies.insert(op_id, reply);
+        let forwarded = op.clone();
+        let focus_generation = self.focus_generation;
         let call = queue.call_at(host, op, params);
         self.engine_op(
             async move { Ok::<_, String>(call.await.map_err(|error| forwarded_failure(&error))) },
@@ -3922,6 +3957,10 @@ impl App {
                     joined.unwrap_or_else(|error| Err(HostOpFailure::new(codes::INTERNAL, error)));
                 EngineOpResult::LocalForward {
                     op: op_id,
+                    host,
+                    forwarded,
+                    selects,
+                    focus_generation,
                     answer: Box::new(answer),
                 }
             },

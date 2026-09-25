@@ -331,6 +331,70 @@ struct IPCHandlerDispatchTests {
     }
 }
 
+/// `tab.open`'s `activate` and `cwd_from_tab` decode as Rust's
+/// `TabOpenParams` does (#532, #551). Every request names a project that
+/// does not exist, so one that decodes stops at `not-found` before the
+/// spawn: that answer is the proof the keys were accepted, where a
+/// refused key would be `unknown-field` or `invalid-param`.
+@Suite("IPC handler: tab.open params")
+struct IPCTabOpenParamsTests {
+    private let socket = "/tmp/roost-ipc-tab-open-params-test.sock"
+
+    @MainActor
+    private func makeHandler() -> IPCHandlerImpl {
+        makeTestHandler(socket: socket).0
+    }
+
+    private func params(_ extra: [String: Any]) -> AnyCodable {
+        AnyCodable(extra.merging(["project_id": "999999"]) { $1 })
+    }
+
+    @Test func activateAndCwdFromTabAreAccepted() async {
+        let handler = await makeHandler()
+        for activate in [true, false] {
+            await expectError(
+                "not-found", "tab.open",
+                params(["activate": activate, "cwd_from_tab": "7"]),
+                on: handler
+            )
+        }
+    }
+
+    @Test func nullLeavesBothUnset() async {
+        let handler = await makeHandler()
+        await expectError(
+            "not-found", "tab.open",
+            params(["activate": NSNull(), "cwd_from_tab": NSNull()]),
+            on: handler
+        )
+    }
+
+    @Test func cwdFromTabMustBeAStringWrappedInt64() async {
+        let handler = await makeHandler()
+        let refused: [Any] = [7, "seven", "7x", "", "9223372036854775808", true, [String]()]
+        for bad in refused {
+            await expectError("invalid-param", "tab.open", params(["cwd_from_tab": bad]), on: handler)
+        }
+    }
+
+    @Test func activateMustBeAJSONBool() async {
+        let handler = await makeHandler()
+        let refused: [Any] = ["false", "true", 0, 1, [Bool]()]
+        for bad in refused {
+            await expectError("invalid-param", "tab.open", params(["activate": bad]), on: handler)
+        }
+    }
+
+    @Test func anUnknownKeyIsStillRefused() async {
+        let handler = await makeHandler()
+        await expectError(
+            "unknown-field", "tab.open",
+            params(["activate": false, "cwd_from_tab": "7", "bogus": 1]),
+            on: handler
+        )
+    }
+}
+
 // `tab.agent_report` (plan 002 §3.6) + the `Tab` wire fields it moves.
 @Suite("IPC agent report dispatch")
 struct IPCAgentReportDispatchTests {

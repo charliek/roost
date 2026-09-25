@@ -229,11 +229,15 @@ An in-process Roost that selects it — the default — makes `--focus`
 change only whether the window is raised and switched to, not whether
 the new tab becomes the active one in the sidebar; `--no-activate` is
 what actually keeps the *previous* tab active there. Under
-`local-backend = session` the window's own visible tab never follows a
-session-side `tab.open` either way, but `open`'s reply still marks the
-new tab `is_active` unless `--no-activate` was passed — `is_active` is
-what separates the two outcomes there, since the window's display
-doesn't.
+`local-backend = session`, a `roostctl` that dials the UI's socket —
+from a plain shell or a script — gets the same selection: the window
+selects the new tab unless `--no-activate` was passed. A `roostctl`
+run *inside* a session tab dials the session instead, because that
+tab's `ROOST_SOCKET` names the session. There, `tab open` and `open`
+move the session's own active tab — the reply marks the new tab
+`is_active` unless `--no-activate` was passed — but never the
+window's, so `is_active` is what separates the two outcomes, since the
+window's display doesn't.
 
 ## Target policy: which tab a command acts on
 
@@ -320,12 +324,13 @@ verb above treats the same as an `ops` list missing the op it needs
   and ends between two `tab.list` calls) — it refuses `unsupported` the
   same way.
 
-**The Swift `Roost.app` predates `--no-activate`.** `tab open --no-activate`
-answers `unknown-field` there — reported verbatim, same as any refusal
-from a server that doesn't recognize a field — rather than silently
-opening the tab active anyway. `open --no-activate` never gets that
-far: `open` needs `project.ensure`, which the Swift `Roost.app` does not serve,
-so it refuses `unsupported` after `identify`. Either way **no tab is
+**`Roost.app` through v0.0.20 predates `--no-activate`.** `tab open
+--no-activate` answers `unknown-field` there — reported verbatim, same
+as any refusal from a server that doesn't recognize a field — rather
+than silently opening the tab active anyway; later builds serve it.
+`open --no-activate` never gets that far on any Swift build: `open`
+needs `project.ensure`, which the Swift `Roost.app` does not serve, so
+it refuses `unsupported` after `identify`. Either way **no tab is
 created**, so there is nothing to wait on.
 
 Everything else in this guide — `identify`, the target policy, `tab

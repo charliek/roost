@@ -19,12 +19,48 @@ release workflow asserts they agree).
   7-tracked cwd, each only if it is a directory on the server's own
   machine. A resolved cwd replaces `cwd`; nothing resolving is not an
   error, and `cwd` is used as sent. Unset, the request is the bytes it
-  always was. Served by sessions and Roost-Iced's UI socket; the Swift
-  Mac app and servers that predate the field answer `unknown-field`. No
+  always was. Served by sessions, Roost-Iced's UI socket and the Swift
+  Mac app; servers that predate the field answer `unknown-field`. No
   CLI flag yet. See [`ipc.md#tabopen`](docs/reference/ipc.md#tabopen).
+- **A session-backed project remembers the tab you last viewed in it
+  (#547)** — on the local session a fresh Roost-Iced install runs its tabs
+  on, and on every saved host: a project click, ⌘1–9, the fallback when
+  the shown project's last tab closes, and a relaunch now land on the tab
+  you were last looking at there, as an in-process project does, instead
+  of on the tab the session last opened. The memory is the window's own,
+  saved per host in `state.json`; nothing is sent to the session. After
+  the session restarts, the remembered tab is found by its position in
+  the project. The Swift Mac app keeps the new field intact when it
+  rewrites a shared `state.json`.
+- **The Swift Mac app's `tab.open` accepts `activate` and `cwd_from_tab`
+  (#532, #551)** — `activate: false` opens the tab without selecting it
+  or its project, and the reply's `is_active` now says whether the tab
+  was selected instead of always `true`; `cwd_from_tab` resolves as the
+  plan 070 entry above describes. Both decode as the Rust endpoints do,
+  so `tab open --no-activate` works against `Roost.app` instead of
+  answering `unknown-field`.
 
 ### Fixed
 
+- **A new tab on a session-backed project could take the window away
+  from a tab you clicked while it opened, and one that never appeared
+  was dropped silently (#549)** — on the local session and on saved
+  hosts, a new tab or project waits for the session to list it before
+  the window selects it. A tab you focus in the meantime, by click, key,
+  palette or `tab.focus`, now keeps the window, whether the focus comes
+  before or after the session answers. A new tab or project still not
+  listed after 10 seconds now says so on the status bar — "the new tab
+  never appeared on the local session", or the host's name in place of
+  the local session — even when the window is otherwise idle.
+- **A tab opened through the UI socket on the local session was never
+  selected in the window (#548)** — under `local-backend = session`,
+  `tab.open` and `roostctl tab open`/`open` from outside a Roost tab now
+  select the new tab in the window, as in-process does, unless
+  `activate: false` / `--no-activate` was passed. `tab.focus` on a tab
+  opened that way, such as `--focus` sends, waits for the window to list
+  it instead of answering `not-found`. A `roostctl` run inside a session
+  tab dials the session and still moves only the session's own active
+  tab.
 - **A new tab on a session-backed project opened in the project's
   directory instead of the active tab's (#530)** — ⌘T / Alt+T, the tab
   bar's "+", the macOS menu's New Tab, the palette's New Tab and launcher
@@ -44,6 +80,112 @@ release workflow asserts they agree).
   no window and no message. Every startup step after the runtime exists
   now shares one error path: it hangs up the shells already spawned,
   then exits non-zero with the error printed.
+- **An event stream ended by a session stop or a local-backend switch
+  could close without its final envelope (#542)** — rarely, and mostly
+  under load, an `events.subscribe` stream got a bare EOF instead of
+  `session.stopping` or `stream.ended`. The server fires every close,
+  then ends the streams' feeds. A close that landed while a stream was
+  already mid-wakeup lost that race to its own feed ending. That stream
+  now gets its envelope too, best-effort like every other close. See
+  [`events.subscribe`](docs/reference/ipc.md#eventssubscribe).
+- **iced: a startup error after logging starts reached stderr only, never
+  the log file (#538)** — the state-lock failures and a bind error such
+  as `bind Iced IPC server` returned straight out of `main` without going
+  through `tracing`, so `roost.log` had no record of why the process
+  exited. `main` now logs the full error chain once before returning it.
+- **An in-process Roost-Iced quit with a job running in a tab never
+  finished (#522)** — under `local-backend = in-process`, quitting while
+  something like `sleep 300` ran in a tab's foreground left the process
+  running with no window, and a SIGTERM did the same. Quit now hangs up
+  every in-process shell, kills one that ignores the hangup, and waits at
+  most a second on a terminal something else still holds open, so one
+  SIGTERM ends it. A process the shell started that ignores SIGHUP can
+  still outlive the quit. Session-backed tabs are untouched: they belong
+  to the `roost-session`.
+- **A tab asked to start in a directory that isn't there started at
+  `$HOME` while its row claimed the missing path (#541)** — ⌘T on a
+  session-backed project whose active tab's directory had been deleted,
+  `roostctl tab open --cwd /nope`, and restoring a saved tab whose
+  directory is gone. On Roost-Iced and on a session, a cwd that is not
+  a directory now counts as empty wherever a tab opens: the tab starts
+  in the project's directory, else at `$HOME`, and its row says so. A
+  directory that exists but can't be entered still fails the open. A
+  `roost-session` started by an older Roost, still running after an
+  upgrade, keeps the old behavior until it restarts. See
+  [`ipc.md#tabopen`](docs/reference/ipc.md#tabopen).
+- **A directory whose name holds a `%` or a control character lost its
+  tracked cwd, or came back as a different path (#535)** — Roost's bash
+  and zsh integration sent the raw `$PWD` over OSC 7, so after a `cd`
+  into `a%zz` or `100%` the header subtitle and `tab.list` kept the
+  previous directory, `100%2Fdone` came back as `100/done`, and an ESC
+  or BEL byte in a name cut the report short. The integration now sends
+  `%` as `%25` and every control byte as `%XX` (on both apps, including
+  macOS's bash 3.2), and both apps' decoders keep a `%` that doesn't
+  start a valid escape instead of dropping the update. A `roost-session`
+  that was already running keeps the old behavior until it restarts.
+- **Opening a tab expanded a collapsed sidebar (#543)** — on a
+  session-backed project (a fresh install's local tabs, or a saved
+  host), a new tab landing revealed the sidebar even though the
+  in-process backend never does. Only creating a project (⌘N, "+ New
+  Project", or connecting to create on a host) reveals it now; opening a
+  tab, a launcher row, and the launch/connect seed on a host no longer
+  touch it. Jumping to a notification and renaming a project still
+  reveal it, as before.
+- **The local session's tab read as a remote host, in the title and in
+  status banners (#544)** — a fresh install's local tabs, running on a
+  `roost-session`, put a `(localhost)` suffix on the window title and
+  said "that host is not accepting operations" when it was unreachable.
+  Both now read as local: the title carries no host suffix for the
+  session's own tabs (a real host, and a `localhost` host under
+  `local-backend = in-process`, keep theirs), the unreachable banner
+  says "the local session is not connected", and a failed rename or
+  reorder names the local session instead of "the host". The wire
+  replies `roostctl` and other tools see are unchanged.
+- **A new session tab's first frame was a hardcoded dark color instead of
+  the active theme (#545)** — before a session-backed tab's hydration
+  landed (⌘T / Alt+T on a local session tab or a saved host), the
+  pre-attach frame always painted `TerminalSnapshot::blank`'s fixed
+  background, foreground and selection colors and never a cursor,
+  clashing with every non-default theme. It now starts from the active
+  theme's colors instead, still with no cursor drawn.
+- **A new Roost-Iced tab started at 100×32 whatever the window's size
+  (#546)** — a program that reads its size as it starts (a launcher row,
+  a TUI's first frame, `stty size`) saw 100 columns by 32 rows until the
+  tab was shown and resized. Every tab the window opens — ⌘T, ⌘N,
+  launcher rows, a relaunch's restored tabs, and the tabs a backend
+  switch copies or restores — now spawns at the grid the window has room
+  for, beside the sidebar as it is (collapsed or not), on in-process,
+  session and saved-host projects alike. Tabs opened elsewhere keep their
+  own starting size: a session's own first and restored tabs (120×40)
+  and `roostctl tab open` (80×24).
+- **Palette providers got no active tab or cwd on a session-backed
+  project (#533)** — under `local-backend = session`, `provider_context`
+  read the in-process workspace, which holds nothing while the local
+  band's tabs run on the session: every provider saw an empty
+  `ROOST_ACTIVE_CWD` and no `ROOST_ACTIVE_TAB_ID`/`ROOST_ACTIVE_PROJECT_ID`,
+  and spawned with no cwd at all. It now reads the slot's own listing
+  when the window is showing the slot's own tab, so a provider gets that
+  tab's real ids, title and tracked cwd, and spawns there while that is
+  still a directory. A remote
+  host's selection is unchanged. See
+  [Extending Roost](docs/guides/extending.md).
+- **The macOS Window menu listed nothing on a session-backed project
+  (#550)** — it read the in-process workspace's project/tab rows, which
+  under `local-backend = session` are empty, or a stale layout with no
+  live tabs, since the local band's tabs run on the session. It now picks rows by backend mode: the slot's own
+  mirror under `session`, the in-process workspace otherwise — a remote
+  host's rows still never appear, matching `in-process`. The rebuild also
+  moved to run after the window's selection settles each reconcile, so a
+  relaunch or an in-flight project creation doesn't leave a stale
+  checkmark.
+- **The Mac app started a tab asked for a directory that isn't there in
+  `Roost.app`'s own launch directory (#541)** — `roostctl tab open --cwd
+  /nope`, ⌘T from a tab whose directory had been deleted, and restoring a
+  saved tab whose directory is gone. A cwd that is not a directory now
+  falls back to the project's directory, else `$HOME`, and the tab's row
+  says where the shell started, as on Roost-Iced. A directory that exists
+  but can't be entered now fails the shell's start and the tab closes, as
+  on Linux, instead of the shell running on in the launch directory.
 
 ## v0.0.20 — 2026-09-20
 

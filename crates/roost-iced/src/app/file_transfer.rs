@@ -348,10 +348,11 @@ pub(super) fn refuse(
     label: &str,
     frozen: Option<&'static str>,
     reply: Option<GestureReply>,
+    on_slot: bool,
 ) -> Option<String> {
     let status = match &refusal {
         Refusal::Frozen => frozen.map(str::to_string),
-        Refusal::Unavailable => Some(HOST_UNAVAILABLE.to_string()),
+        Refusal::Unavailable => Some(unavailable_text(on_slot).to_string()),
         // Today's `FileDropDisposition::Invalid`: a drop with nothing
         // safe in it has always been silent.
         Refusal::Empty => None,
@@ -365,6 +366,20 @@ pub(super) fn refuse(
 /// How the rest of the app words a host that cannot take work
 /// (`app.rs`'s reorder, close and open refusals).
 pub(super) const HOST_UNAVAILABLE: &str = "that host is not accepting operations";
+
+/// The banner half of a host that cannot take work. Plan 071 D8: on the
+/// session slot this reads as local — "that host" would send a user
+/// looking for a machine that was never remote — while a real host keeps
+/// [`HOST_UNAVAILABLE`] verbatim. The wire's own `HOST_UNAVAILABLE`
+/// reply (`servicing.rs`) is untouched; only the words a person reads
+/// change.
+pub(super) fn unavailable_text(on_slot: bool) -> &'static str {
+    if on_slot {
+        "the local session is not connected"
+    } else {
+        HOST_UNAVAILABLE
+    }
+}
 
 /// A2: a lane already at [`MAX_QUEUED_GESTURES`] refuses at admission
 /// rather than growing without bound. Answers the reply and returns the
@@ -1115,7 +1130,7 @@ impl super::App {
         let label = self.transfer_host_label(tab.host);
         let frozen = self.paste_refusal_for(tab);
         tracing::debug!(?tab, ?refusal, "refused a file gesture");
-        if let Some(line) = refuse(refusal, &label, frozen, reply) {
+        if let Some(line) = refuse(refusal, &label, frozen, reply, self.is_local_slot(tab.host)) {
             self.set_status(line);
         }
     }
@@ -1177,7 +1192,9 @@ impl super::App {
         }
         Some(
             self.frozen_host_frame_for(tab)
-                .map_or(HOST_UNAVAILABLE, |frame| frame.paste_refusal()),
+                .map_or(unavailable_text(self.is_local_slot(tab.host)), |frame| {
+                    frame.paste_refusal()
+                }),
         )
     }
 
@@ -1952,7 +1969,7 @@ mod tests {
     fn every_terminal_path_answers_the_reply_exactly_once() {
         // Refusal.
         let (tx, mut rx) = tokio::sync::oneshot::channel();
-        let line = refuse(Refusal::Unavailable, "workbox", None, Some(tx));
+        let line = refuse(Refusal::Unavailable, "workbox", None, Some(tx), false);
         assert_eq!(line.as_deref(), Some(HOST_UNAVAILABLE));
         assert!(matches!(
             outcome(&mut rx),
@@ -2133,10 +2150,17 @@ mod tests {
     #[test]
     fn refusals_say_what_happened() {
         assert_eq!(
-            refuse(Refusal::Frozen, "workbox", Some("this session ended"), None).as_deref(),
+            refuse(
+                Refusal::Frozen,
+                "workbox",
+                Some("this session ended"),
+                None,
+                false
+            )
+            .as_deref(),
             Some("this session ended")
         );
-        assert_eq!(refuse(Refusal::Empty, "workbox", None, None), None);
+        assert_eq!(refuse(Refusal::Empty, "workbox", None, None, false), None);
         assert_eq!(
             refuse(
                 Refusal::GestureOverBudget {
@@ -2144,7 +2168,8 @@ mod tests {
                 },
                 "workbox",
                 None,
-                None
+                None,
+                false
             )
             .as_deref(),
             Some("That drop is 540 MiB, over the 256 MiB per-drop limit")
@@ -2157,11 +2182,28 @@ mod tests {
                 }]),
                 "workbox",
                 None,
-                None
+                None,
+                false
             )
             .as_deref(),
             Some("Nothing to send to workbox (skipped: build/ is a directory)")
         );
+    }
+
+    /// Plan 071 D8: the same refusal, on the session slot, reads as
+    /// local rather than naming a host that was never remote.
+    #[test]
+    fn an_unavailable_refusal_on_the_slot_says_local_session() {
+        assert_eq!(
+            refuse(Refusal::Unavailable, "workbox", None, None, true).as_deref(),
+            Some("the local session is not connected")
+        );
+    }
+
+    #[test]
+    fn unavailable_text_is_slot_aware() {
+        assert_eq!(unavailable_text(false), HOST_UNAVAILABLE);
+        assert_eq!(unavailable_text(true), "the local session is not connected");
     }
 
     /// S14's pin: a host tab with nothing attached never reaches an
@@ -2184,7 +2226,7 @@ mod tests {
         let refusal = upload_plan(plan).expect_err("a frozen target uploads nothing");
         assert_eq!(refusal, Refusal::Frozen);
         assert_eq!(
-            refuse(refusal, "workbox", frozen.frozen, None).as_deref(),
+            refuse(refusal, "workbox", frozen.frozen, None, false).as_deref(),
             Some(REFUSAL)
         );
     }

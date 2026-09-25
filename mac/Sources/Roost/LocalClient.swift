@@ -72,33 +72,25 @@ final class LocalClient {
         argv: [String] = [],
         cols: UInt16 = 80,
         rows: UInt16 = 24,
-        title: String = ""
+        title: String = "",
+        activate: Bool = true
     ) throws -> Workspace.Tab {
-        // Resolve the starting cwd: caller-supplied → project's cwd
-        // → $HOME. Ensures `roostctl tab open --project-id N`
-        // (which omits --cwd) lands in the project's directory or
-        // at minimum the user's home, not Finder's `/`. The Mac UI
-        // already does the same fallback in `openNewTab`; this
-        // covers the IPC entry point (which `roostctl` uses).
-        let resolvedCwd: String
-        if !cwd.isEmpty {
-            resolvedCwd = cwd
-        } else if let project = workspace.snapshot().first(where: { $0.id == projectID }),
-                  !project.cwd.isEmpty {
-            resolvedCwd = project.cwd
-        } else {
-            resolvedCwd = ProcessInfo.processInfo.environment["HOME"] ?? ""
-        }
-
+        let startCwd = Self.spawnCwd(
+            requested: cwd,
+            projectCwd: workspace.project(projectID)?.cwd ?? "",
+            home: homeDirectory(),
+            isDirectory: isDirectory
+        )
         let tab = try workspace.openTab(
             projectID: projectID,
-            cwd: resolvedCwd,
-            title: title
+            cwd: startCwd,
+            title: title,
+            activate: activate
         )
         do {
             try supervisor.spawn(
                 tabID: tab.id,
-                cwd: resolvedCwd,
+                cwd: startCwd,
                 argv: argv,
                 cols: cols,
                 rows: rows,
@@ -109,6 +101,43 @@ final class LocalClient {
             throw error
         }
         return tab
+    }
+
+    /// Where a shell asked to start in `requested` really starts: there
+    /// if it is a directory, else in the project's cwd if that is one,
+    /// else `home` — Rust's `application::usable_cwd`. `openTab` resolves
+    /// it once and both records it in the row and hands it to the spawn,
+    /// because a cwd that is not a directory would otherwise leave the
+    /// child in Roost.app's own launch directory while the row names
+    /// another (#541). An existing directory the shell cannot enter still
+    /// counts, and fails the spawn.
+    nonisolated static func spawnCwd(
+        requested: String,
+        projectCwd: String,
+        home: String,
+        isDirectory: (String) -> Bool
+    ) -> String {
+        [requested, projectCwd].first(where: isDirectory) ?? home
+    }
+
+    /// `tab.open`'s `project_id: 0`. A new project records the requested
+    /// cwd only if it is a directory, and otherwise none, as Rust's does;
+    /// its tabs then take the `$HOME` fallback when they spawn.
+    @discardableResult
+    func ensureDefaultProject(cwd: String, activate: Bool) -> Int64 {
+        workspace.ensureDefaultProject(
+            cwd: Self.spawnCwd(requested: cwd, projectCwd: "", home: "", isDirectory: isDirectory),
+            activate: activate
+        )
+    }
+
+    /// Where a tab opened from `tabID` starts — `tab.open`'s
+    /// `cwd_from_tab`, mirroring Rust's `application::inherited_cwd`.
+    func inheritedCwd(tabID: Int64) -> String? {
+        guard let row = workspace.tab(tabID) else { return nil }
+        return [supervisor.foregroundCwd(tabID: tabID), row.cwd]
+            .compactMap { $0 }
+            .first(where: isDirectory)
     }
 
     func closeTab(_ tabID: Int64) throws {
@@ -215,6 +244,18 @@ final class LocalClient {
             break
         }
     }
+}
+
+private func isDirectory(_ path: String) -> Bool {
+    var isDir: ObjCBool = false
+    return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
+}
+
+/// `$HOME` if it is an absolute path, else `/` — Rust's `home_dir` — so a
+/// spawn cwd is never empty.
+private func homeDirectory() -> String {
+    let home = ProcessInfo.processInfo.environment["HOME"] ?? ""
+    return home.hasPrefix("/") ? home : "/"
 }
 
 /// Strip the `file://` scheme + host segment from an OSC 7

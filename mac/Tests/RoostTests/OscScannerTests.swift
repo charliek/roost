@@ -117,15 +117,33 @@ func osc7_percent_decoded() {
 }
 
 @Test
-func osc7_malformed_percent_dropped() {
-    let bytes: [UInt8] = [0x1B, 0x5D] + Array("7;file:///bad%ZZ".utf8) + [0x07]
-    #expect(feedAll(bytes).isEmpty)
+func osc7_escapes_decode() {
+    let bytes: [UInt8] = [0x1B, 0x5D] + Array("7;file:///100%25%2Fdone%20now%1B".utf8) + [0x07]
+    #expect(feedAll(bytes) == [.pwd("/100%/done now\u{1B}")])
 }
 
 @Test
-func osc7_trailing_percent_dropped() {
+func osc7_malformed_percent_passes_through() {
+    let bytes: [UInt8] = [0x1B, 0x5D] + Array("7;file:///a%zz/b%2".utf8) + [0x07]
+    #expect(feedAll(bytes) == [.pwd("/a%zz/b%2")])
+}
+
+@Test
+func osc7_trailing_percent_passes_through() {
     let bytes: [UInt8] = [0x1B, 0x5D] + Array("7;file:///bad%".utf8) + [0x07]
-    #expect(feedAll(bytes).isEmpty)
+    #expect(feedAll(bytes) == [.pwd("/bad%")])
+}
+
+@Test
+func osc7_non_utf8_decode_keeps_raw_path() {
+    let bytes: [UInt8] = [0x1B, 0x5D] + Array("7;file:///a%FF%20b".utf8) + [0x07]
+    #expect(feedAll(bytes) == [.pwd("/a%FF%20b")])
+}
+
+@Test
+func osc7_escaped_multibyte_decodes() {
+    let bytes: [UInt8] = [0x1B, 0x5D] + Array("7;file:///%C3%A9t%C3%A9".utf8) + [0x07]
+    #expect(feedAll(bytes) == [.pwd("/\u{E9}t\u{E9}")])
 }
 
 @Test

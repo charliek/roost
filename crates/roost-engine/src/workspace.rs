@@ -38,7 +38,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::warn;
 
-use crate::persistence::{persist_state, read_state, HostSnapshot, ProjectSnapshot, SnapshotFile};
+use crate::persistence::{
+    persist_state, read_state, HostSnapshot, HostTabMemory, ProjectSnapshot, SnapshotFile,
+};
 
 /// How many events the broadcast channel buffers per subscriber.
 /// Subscribers that fall behind get a `Lagged` and resync via
@@ -1033,6 +1035,7 @@ impl Workspace {
             label: label.to_string(),
             target: target.to_string(),
             last_connected: None,
+            tab_memory: None,
         };
         inner.hosts.push(host.clone());
         self.commit(inner, Vec::new(), Persist::Write);
@@ -1071,13 +1074,49 @@ impl Workspace {
     /// UI dropped is one palette gesture from being saved again. Written
     /// here rather than at the two call sites so an explicit Remove and
     /// an auto-remove cannot disagree about it.
+    ///
+    /// Its tab memory does not go along: putting a recent back saves a
+    /// new host, and the tabs it remembered were another connection's.
     pub fn remove_host(&self, id: &str) -> Result<(), WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
         let Some(at) = inner.hosts.iter().position(|h| h.id == id) else {
             return Err(WorkspaceError::HostNotFound(id.to_string()));
         };
-        let removed = inner.hosts.remove(at);
+        let mut removed = inner.hosts.remove(at);
+        removed.tab_memory = None;
         remember_forgotten_host(&mut inner.recent_hosts, removed);
+        self.commit(inner, Vec::new(), Persist::Write);
+        Ok(())
+    }
+
+    /// A saved host's tab memory (plan 071 §D11).
+    pub fn host_tab_memory(&self, id: &str) -> Option<HostTabMemory> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .hosts
+            .iter()
+            .find(|h| h.id == id)
+            .and_then(|host| host.tab_memory.clone())
+    }
+
+    /// Record a saved host's tab memory and persist it. Emits no event,
+    /// like [`Self::set_sidebar_collapsed`], and does not write when
+    /// nothing changed.
+    pub fn set_host_tab_memory(
+        &self,
+        id: &str,
+        memory: HostTabMemory,
+    ) -> Result<(), WorkspaceError> {
+        let mut inner = self.inner.lock().unwrap();
+        let host = inner
+            .hosts
+            .iter_mut()
+            .find(|h| h.id == id)
+            .ok_or_else(|| WorkspaceError::HostNotFound(id.to_string()))?;
+        if host.tab_memory.as_ref() == Some(&memory) {
+            return Ok(());
+        }
+        host.tab_memory = Some(memory);
         self.commit(inner, Vec::new(), Persist::Write);
         Ok(())
     }
@@ -1647,11 +1686,30 @@ impl Workspace {
     }
 
     pub fn set_tab_cwd(&self, tab_id: i64, cwd: &str) -> Result<(), WorkspaceError> {
+        self.update_tab_cwd(tab_id, cwd, false)
+    }
+
+    /// Where a tab's shell really starts, when that is not the cwd its
+    /// row was opened with ([`crate::application::spawn_for_row`]).
+    /// Unlike [`Self::set_tab_cwd`], a title the opener supplied stays:
+    /// only a title derived from the old cwd follows the move.
+    pub fn set_tab_start_cwd(&self, tab_id: i64, cwd: &str) -> Result<(), WorkspaceError> {
+        self.update_tab_cwd(tab_id, cwd, true)
+    }
+
+    fn update_tab_cwd(
+        &self,
+        tab_id: i64,
+        cwd: &str,
+        keep_supplied_title: bool,
+    ) -> Result<(), WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
         let row = inner
             .tabs
             .get_mut(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
+        let title_follows =
+            !row.user_titled && (!keep_supplied_title || row.title == derive_title(&row.cwd));
         let cwd_owned = cwd.to_string();
         row.cwd = cwd_owned.clone();
         // Shell-driven (OSC 7 fires per `cd`) but write-through: each
@@ -1668,7 +1726,7 @@ impl Workspace {
         // shells, the next prompt's OSC 0 refines this basename to the
         // tilde-abbreviated path via `set_tab_title_from_osc` —
         // latest-wins. Event order is cwd-then-title (cause-then-effect).
-        if !row.user_titled {
+        if title_follows {
             let new_title = derive_title(cwd);
             if row.title != new_title {
                 row.title = new_title.clone();
@@ -2121,6 +2179,11 @@ impl Workspace {
             Persist::Write,
         );
         Ok(())
+    }
+
+    pub fn project_cwd(&self, project_id: i64) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        inner.projects.get(&project_id).map(|row| row.cwd.clone())
     }
 
     pub fn tab(&self, tab_id: i64) -> Result<Tab, WorkspaceError> {
@@ -2887,6 +2950,7 @@ mod tests {
             label: label.to_string(),
             target: target.to_string(),
             last_connected: None,
+            tab_memory: None,
         }
     }
 
@@ -3010,6 +3074,74 @@ mod tests {
         let again = ws.add_host("box", "user@box").unwrap();
         assert_ne!(again.id, saved.id);
         assert_eq!(ws.recent_hosts().len(), 1);
+    }
+
+    fn a_tab_memory(session_id: &str, project: i64, tab_id: i64) -> HostTabMemory {
+        let memo = crate::persistence::TabMemo {
+            tab_id,
+            position: 1,
+        };
+        HostTabMemory {
+            session_id: session_id.to_string(),
+            last_viewed: BTreeMap::from([(project, memo)]),
+            last_shown: Some((project, memo)),
+        }
+    }
+
+    #[test]
+    fn forgetting_a_host_leaves_its_tab_memory_behind() {
+        let ws = Workspace::new();
+        let saved = ws.add_host("box", "user@box").unwrap();
+        ws.set_host_tab_memory(&saved.id, a_tab_memory("s-1", 3, 30))
+            .unwrap();
+        assert!(ws.host_tab_memory(&saved.id).is_some());
+
+        ws.remove_host(&saved.id).unwrap();
+
+        let recents = ws.recent_hosts();
+        assert_eq!(recents.len(), 1, "the host is still remembered");
+        assert_eq!(recents[0].tab_memory, None, "but not the tabs it showed");
+    }
+
+    #[test]
+    fn a_host_tab_memory_is_written_only_when_it_changes_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let id = {
+            let ws = Workspace::open(path.clone());
+            let saved = ws.add_host("box", "user@box").unwrap();
+            ws.set_host_tab_memory(&saved.id, a_tab_memory("s-1", 3, 30))
+                .unwrap();
+            assert_eq!(
+                read_state(&path).unwrap().unwrap().hosts[0].tab_memory,
+                Some(a_tab_memory("s-1", 3, 30)),
+                "written through"
+            );
+
+            // With the file gone, only a write can bring it back.
+            std::fs::remove_file(&path).unwrap();
+            ws.set_host_tab_memory(&saved.id, a_tab_memory("s-1", 3, 30))
+                .unwrap();
+            assert!(
+                !path.exists(),
+                "an unchanged memory must not rewrite state.json"
+            );
+
+            ws.set_host_tab_memory(&saved.id, a_tab_memory("s-1", 3, 31))
+                .unwrap();
+            assert!(path.exists(), "a changed one does");
+            saved.id
+        };
+
+        let reopened = Workspace::open(path);
+        assert_eq!(
+            reopened.host_tab_memory(&id),
+            Some(a_tab_memory("s-1", 3, 31))
+        );
+        assert!(matches!(
+            reopened.set_host_tab_memory("nope", a_tab_memory("s-1", 3, 30)),
+            Err(WorkspaceError::HostNotFound(_))
+        ));
     }
 
     /// Two saved entries answering one id is pathological input, and
@@ -3770,6 +3902,20 @@ mod tests {
                 if tab_id == tid && title == "usr"
         ));
         assert_eq!(ws.tab(tid).unwrap().title, "usr");
+    }
+
+    #[test]
+    fn set_tab_start_cwd_keeps_a_supplied_title_and_moves_a_derived_one() {
+        let ws = Workspace::new();
+        let pid = ws.create_project("p", "").unwrap().id;
+        let supplied = ws.open_tab(pid, "/gone", "build", true).unwrap().id;
+        let derived = ws.open_tab(pid, "/gone", "", true).unwrap().id;
+        for tid in [supplied, derived] {
+            ws.set_tab_start_cwd(tid, "/usr").unwrap();
+            assert_eq!(ws.tab(tid).unwrap().cwd, "/usr");
+        }
+        assert_eq!(ws.tab(supplied).unwrap().title, "build");
+        assert_eq!(ws.tab(derived).unwrap().title, "usr");
     }
 
     /// `set_tab_cwd` does NOT touch the title when the user has

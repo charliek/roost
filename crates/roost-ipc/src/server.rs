@@ -986,19 +986,37 @@ async fn serve_push(
             break Ok(());
         }
         tokio::select! {
-            // Biased, closer first, for the same reason the sticky check
-            // above exists: a server that closes a connection also aborts
-            // whatever feeds it, so the closer and an exhausted source go
-            // ready in the same pass. Unbiased, the peer would lose its
-            // label on a coin flip.
+            // Closer first, for the reason the sticky check above gives.
             biased;
             reason = close_watch.closed() => {
                 write_terminal_envelope(&mut w, reason).await;
                 break Ok(());
             }
-            _ = &mut eof => break Ok(()),
+            // A peer hanging up is an ordinary end. After the closer
+            // fired it costs that peer its label, and a peer that has
+            // gone cannot be told, so it is only logged.
+            _ = &mut eof => {
+                if let Some(reason) = close_watch.reason() {
+                    warn!(
+                        path = "eof-after-close",
+                        ?reason,
+                        "push peer hung up after the closer fired; closed unlabeled"
+                    );
+                }
+                break Ok(());
+            }
             item = source.next() => match item {
-                None => break Ok(()),
+                // A server that closes a connection also aborts whatever
+                // feeds it, and `biased` only orders the polls within one
+                // pass: a close that lands after its arm was polled, with
+                // the abort right behind it, ends the source here. The
+                // peer is owed its label all the same (#542).
+                None => {
+                    if let Some(reason) = close_watch.reason() {
+                        write_terminal_envelope(&mut w, reason).await;
+                    }
+                    break Ok(());
+                }
                 Some(value) => {
                     let body = match serde_json::to_vec(&value) {
                         Ok(b) => b,
@@ -1049,7 +1067,8 @@ async fn serve_push(
                         (Some(Ok(())), None) => {}
                         (Some(Err(e)), _) => break Err(e),
                         (None, Some(reason)) => {
-                            debug!(
+                            warn!(
+                                path = "close-mid-write",
                                 ?reason,
                                 "push write did not finish within the close deadline; closing unlabeled"
                             );
@@ -1090,14 +1109,29 @@ async fn write_terminal_envelope(w: &mut tokio::net::unix::OwnedWriteHalf, reaso
     let body = match encoded {
         Ok(b) => b,
         Err(e) => {
-            warn!(error = %e, "terminal envelope failed to serialize");
+            warn!(
+                path = "label-encode-failed",
+                ?reason,
+                error = %e,
+                "terminal envelope failed to serialize; closing unlabeled"
+            );
             return;
         }
     };
     match tokio::time::timeout(CLOSE_LABEL_DEADLINE, write_frame(w, &body)).await {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => debug!(error = %e, "terminal envelope could not be written; closing anyway"),
-        Err(_) => debug!("terminal envelope stalled past its deadline; closing anyway"),
+        Ok(Err(e)) => warn!(
+            path = "label-write-failed",
+            ?reason,
+            error = %e,
+            "terminal envelope could not be written; closing unlabeled"
+        ),
+        Err(_) => warn!(
+            path = "label-deadline",
+            ?reason,
+            deadline_ms = CLOSE_LABEL_DEADLINE.as_millis(),
+            "terminal envelope stalled past its deadline; closing unlabeled"
+        ),
     }
 }
 

@@ -420,7 +420,12 @@ final class Workspace {
 
     // MARK: Tab mutators
 
-    func openTab(projectID: Int64, cwd: String, title: String) throws -> Tab {
+    func openTab(
+        projectID: Int64,
+        cwd: String,
+        title: String,
+        activate: Bool = true
+    ) throws -> Tab {
         guard projects[projectID] != nil else {
             throw WorkspaceError.projectNotFound(projectID)
         }
@@ -451,12 +456,13 @@ final class Workspace {
             lastActive: now
         )
         tabs[id] = tab
-        activeProjectID = projectID
-        activeTabID = id
-        commit(
-            [.tabOpened(tab), .activeChanged(projectID: projectID, tabID: id)],
-            persist: true
-        )
+        var events: [Event] = [.tabOpened(tab)]
+        if activate {
+            activeProjectID = projectID
+            activeTabID = id
+            events.append(.activeChanged(projectID: projectID, tabID: id))
+        }
+        commit(events, persist: true)
         return tab
     }
 
@@ -818,14 +824,15 @@ final class Workspace {
 
     /// Ensure a default project exists; return its id. Used by
     /// `tab.open` when the caller passes `project_id = 0` and the
-    /// workspace is empty.
+    /// workspace is empty. With `activate` false the project is found
+    /// or created without becoming the active one.
     @discardableResult
-    func ensureDefaultProject(cwd: String) -> Int64 {
+    func ensureDefaultProject(cwd: String, activate: Bool) -> Int64 {
         if let first = projects.values.sorted(by: {
             ($0.position, $0.id) < ($1.position, $1.id)
         }).first {
             var events: [Event] = []
-            if activeProjectID == 0 {
+            if activate && activeProjectID == 0 {
                 activeProjectID = first.id
                 events.append(.activeChanged(projectID: first.id, tabID: 0))
             }
@@ -838,8 +845,10 @@ final class Workspace {
         // change is emit-only (captured by `flush()` on exit) to
         // preserve the prior behavior here.
         let project = createProject(name: "Default", cwd: cwd)
-        activeProjectID = project.id
-        commit([.activeChanged(projectID: project.id, tabID: 0)], persist: false)
+        if activate {
+            activeProjectID = project.id
+            commit([.activeChanged(projectID: project.id, tabID: 0)], persist: false)
+        }
         return project.id
     }
 
@@ -1304,17 +1313,14 @@ final class Workspace {
             let label: String
             let target: String
             let lastConnected: String?
-
-            init(id: String, label: String, target: String, lastConnected: String? = nil) {
-                self.id = id
-                self.label = label
-                self.target = target
-                self.lastConnected = lastConnected
-            }
+            /// The Rust UI's memory of the tab it last showed on this
+            /// host (plan 071 §D11). Carried, never read here.
+            let tabMemory: JSONValue?
 
             enum CodingKeys: String, CodingKey {
                 case id, label, target
                 case lastConnected = "last_connected"
+                case tabMemory = "tab_memory"
             }
 
             // Custom decode so a missing or null `last_connected`
@@ -1326,6 +1332,51 @@ final class Workspace {
                 label = try c.decode(String.self, forKey: .label)
                 target = try c.decode(String.self, forKey: .target)
                 lastConnected = try c.decodeIfPresent(String.self, forKey: .lastConnected)
+                tabMemory = try c.decodeIfPresent(JSONValue.self, forKey: .tabMemory)
+            }
+        }
+
+        /// A JSON value carried through a rewrite without being
+        /// interpreted, for a field this UI keeps only so it is not lost.
+        enum JSONValue: Codable, Equatable, Sendable {
+            case null
+            case bool(Bool)
+            case int(Int64)
+            case double(Double)
+            case string(String)
+            case array([JSONValue])
+            case object([String: JSONValue])
+
+            init(from decoder: Decoder) throws {
+                let c = try decoder.singleValueContainer()
+                if c.decodeNil() {
+                    self = .null
+                } else if let value = try? c.decode(Bool.self) {
+                    self = .bool(value)
+                } else if let value = try? c.decode(Int64.self) {
+                    self = .int(value)
+                } else if let value = try? c.decode(Double.self) {
+                    self = .double(value)
+                } else if let value = try? c.decode(String.self) {
+                    self = .string(value)
+                } else if let value = try? c.decode([JSONValue].self) {
+                    self = .array(value)
+                } else {
+                    self = .object(try c.decode([String: JSONValue].self))
+                }
+            }
+
+            func encode(to encoder: Encoder) throws {
+                var c = encoder.singleValueContainer()
+                switch self {
+                case .null: try c.encodeNil()
+                case .bool(let value): try c.encode(value)
+                case .int(let value): try c.encode(value)
+                case .double(let value): try c.encode(value)
+                case .string(let value): try c.encode(value)
+                case .array(let value): try c.encode(value)
+                case .object(let value): try c.encode(value)
+                }
             }
         }
 
