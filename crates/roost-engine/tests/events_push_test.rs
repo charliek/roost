@@ -66,6 +66,7 @@ async fn harness_with(
     limits: Option<PushLimits>,
     route: Option<Arc<LocalBackendCell>>,
 ) -> Harness {
+    init_tracing();
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("roost.sock");
     let workspace = Arc::new(Workspace::open(dir.path().join("state.json")).with_replay(
@@ -113,6 +114,17 @@ async fn harness_with(
         handler,
         _dir: dir,
     }
+}
+
+/// Route the server's `warn` lines into libtest's captured output, so a
+/// failing stream test prints the path that closed a stream unlabeled.
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("roost_ipc=warn,roost_engine=warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_env_filter(filter)
+        .try_init();
 }
 
 impl Harness {

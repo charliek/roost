@@ -44,6 +44,14 @@ release workflow asserts they agree).
   no window and no message. Every startup step after the runtime exists
   now shares one error path: it hangs up the shells already spawned,
   then exits non-zero with the error printed.
+- **An event stream ended by a session stop or a local-backend switch
+  could close without its final envelope (#542)** — rarely, and mostly
+  under load, an `events.subscribe` stream got a bare EOF instead of
+  `session.stopping` or `stream.ended`. The server fires every close,
+  then ends the streams' feeds. A close that landed while a stream was
+  already mid-wakeup lost that race to its own feed ending. That stream
+  now gets its envelope too, best-effort like every other close. See
+  [`events.subscribe`](docs/reference/ipc.md#eventssubscribe).
 
 ## v0.0.20 — 2026-09-20
 

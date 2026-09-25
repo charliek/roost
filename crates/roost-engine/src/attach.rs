@@ -1066,28 +1066,50 @@ impl Pump {
         if !matches!(ending, Ending::Closed(_)) {
             warn!(tab_id = self.tab_id, code = %error.code, message = %error.message, "attach failed");
         }
-        let Ok(payload) = serde_json::to_vec(&error) else {
-            return ending;
+        let payload = match serde_json::to_vec(&error) {
+            Ok(payload) => payload,
+            Err(e) => {
+                warn!(
+                    tab_id = self.tab_id,
+                    path = "attach-label-encode-failed",
+                    code = %error.code,
+                    error = %e,
+                    "the final ERROR frame failed to serialize; closing unlabeled"
+                );
+                return ending;
+            }
         };
         let mut frame = Vec::new();
-        if write_data_frame(&mut frame, FRAME_ERROR, &payload)
-            .await
-            .is_err()
-        {
+        if let Err(e) = write_data_frame(&mut frame, FRAME_ERROR, &payload).await {
+            warn!(
+                tab_id = self.tab_id,
+                path = "attach-label-frame-failed",
+                code = %error.code,
+                error = %e,
+                "the final ERROR frame could not be framed; closing unlabeled"
+            );
             return ending;
         }
         let write = async {
-            let _ = self.writer.write_all(&frame).await;
-            let _ = self.writer.flush().await;
+            self.writer.write_all(&frame).await?;
+            self.writer.flush().await
         };
-        if tokio::time::timeout(CLOSE_LABEL_DEADLINE, write)
-            .await
-            .is_err()
-        {
-            debug!(
+        match tokio::time::timeout(CLOSE_LABEL_DEADLINE, write).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(
                 tab_id = self.tab_id,
+                path = "attach-label-write-failed",
+                code = %error.code,
+                error = %e,
+                "the final ERROR frame could not be written; closing unlabeled"
+            ),
+            Err(_) => warn!(
+                tab_id = self.tab_id,
+                path = "attach-label-deadline",
+                code = %error.code,
+                deadline_ms = CLOSE_LABEL_DEADLINE.as_millis(),
                 "the final ERROR frame stalled; closing unlabeled"
-            );
+            ),
         }
         ending
     }
