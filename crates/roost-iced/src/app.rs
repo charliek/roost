@@ -4755,7 +4755,8 @@ impl App {
             // The Window menu's rows take the same paths the sidebar and
             // tab strip take (`Message::ProjectSelected`/`TabSelected`) —
             // including their lack of Swift's `ensureSidebarVisible`,
-            // which no iced selection route performs.
+            // which no iced selection route performs, including opening
+            // a tab on a host (`resolve_pending_host_selection`).
             MenuEvent::SelectProject(project_id) => {
                 if !command_enabled(self.menu_gating(), false) {
                     return UiTask::None;
@@ -8637,7 +8638,6 @@ impl App {
             tab,
             local_active: self.workspace.active().1,
         }));
-        self.set_sidebar_collapsed(false);
         self.host_focus_tab(tab);
     }
 

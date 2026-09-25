@@ -86,6 +86,7 @@ from util import (
     drain,
     drain_until_match,
     press_new_tab,
+    set_sidebar_collapsed,
     spawned_tab_id,
 )
 
@@ -3174,3 +3175,43 @@ def test_a_new_tab_from_a_tab_whose_directory_is_gone_opens_in_the_projects_cwd(
         tab = new_tab_from(roost, session, source)
 
         assert_opened_in(session, tab, project_dir)
+
+
+# ---------------------------------------------------------------------------
+# 16. Plan 071 D7 (#543): opening a tab never expands the sidebar
+# ---------------------------------------------------------------------------
+
+
+def test_new_tab_on_a_saved_host_leaves_a_collapsed_sidebar_collapsed(host, roost):
+    """Plan 071 D7 (#543): ⌘T on a saved, connected host must not expand
+    a collapsed sidebar. The bug lived in `resolve_pending_host_selection`
+    — the same function that lands every session-backed tab open, a
+    saved host's included — which used to reveal the sidebar the moment
+    the mirror listed the new tab and the window selected it.
+
+    `app_selected_tab_id()` (not `identify().active_tab_id`, which under
+    `in-process` never moves off the local workspace's own selection) is
+    the UI-truth read that only becomes true once that same resolution
+    has run — the same synchronous step that used to carry the reveal —
+    so this is race-free against the fix and against its control.
+    """
+    host.connect_and_wait()
+    with host.client() as session:
+        project = first_project(session)
+        source = session.open_tab(project, cwd="/tmp")
+
+    host_key(roost, source)
+    try:
+        set_sidebar_collapsed(roost, True)
+        with host.client() as session:
+            tab = new_tab_from(roost, session, source)
+        Roost._wait(
+            lambda: roost.app_selected_tab_id() == tab,
+            timeout=scaled_timeout(30.0),
+            what="the window to select the new host tab",
+        )
+        assert roost.window_metrics()["sidebar_collapsed"], (
+            "opening a tab on a saved host expanded a collapsed sidebar"
+        )
+    finally:
+        set_sidebar_collapsed(roost, False)

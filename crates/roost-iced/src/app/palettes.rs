@@ -1796,6 +1796,7 @@ impl App {
         saved_id: &str,
         origin: crate::host_conn::RequestOrigin,
     ) -> EngineDispatch {
+        self.set_sidebar_collapsed(false);
         // Connected already: this row should have carried the ordinary
         // create-on-a-host id, but the frame may have been built a
         // moment ago — create now rather than dialing a live connection.

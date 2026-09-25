@@ -87,6 +87,14 @@ release workflow asserts they agree).
   macOS's bash 3.2), and both apps' decoders keep a `%` that doesn't
   start a valid escape instead of dropping the update. A `roost-session`
   that was already running keeps the old behavior until it restarts.
+- **Opening a tab expanded a collapsed sidebar (#543)** — on a
+  session-backed project (a fresh install's local tabs, or a saved
+  host), a new tab landing revealed the sidebar even though the
+  in-process backend never does. Only creating a project (⌘N, "+ New
+  Project", or connecting to create on a host) reveals it now; opening a
+  tab, a launcher row, and the launch/connect seed on a host no longer
+  touch it. Jumping to a notification and renaming a project still
+  reveal it, as before.
 
 ## v0.0.20 — 2026-09-20
 

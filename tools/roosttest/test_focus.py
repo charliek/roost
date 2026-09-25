@@ -19,7 +19,13 @@ import time
 import pytest
 
 from client import Roost, RoostError, scaled_timeout
-from util import drain, drain_until_match, wait_tab_attached
+from util import (
+    drain,
+    drain_until_match,
+    press_new_tab,
+    set_sidebar_collapsed,
+    wait_tab_attached,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -339,3 +345,34 @@ def test_crossproject_focus_not_overwritten(roost):
                 roost.delete_project(pid)
             except RoostError:
                 pass
+
+
+def test_new_tab_leaves_a_collapsed_sidebar_collapsed(roost, project):
+    """#543: opening a tab must never expand the sidebar on the
+    in-process backend — only creating a project does (⌘N, "+ New
+    Project"). Plan 071 D7: the reveal that used to fire while resolving
+    a pending host selection was the bug; the in-process path never had
+    one, so this pins the reference behavior every backend must match.
+    """
+    seed = roost.open_tab(project, cwd="/tmp")
+    wait_tab_attached(roost, seed)
+    roost.focus(seed)
+    Roost._wait(
+        lambda: roost.identify()["active_project_id"] == project,
+        timeout=4.0,
+        what="the fixture project to become active",
+    )
+    try:
+        set_sidebar_collapsed(roost, True)
+        before = roost.identify()["active_tab_id"]
+        press_new_tab(roost)
+        Roost._wait(
+            lambda: roost.identify()["active_tab_id"] != before,
+            timeout=scaled_timeout(10.0),
+            what="the new tab to become active",
+        )
+        assert roost.window_metrics()["sidebar_collapsed"], (
+            "opening a tab expanded a collapsed sidebar"
+        )
+    finally:
+        set_sidebar_collapsed(roost, False)

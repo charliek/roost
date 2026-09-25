@@ -2786,3 +2786,49 @@ def test_a_new_tab_opens_in_the_shown_tabs_own_cwd_without_osc7(lane: Lane):
         tab = util.spawned_tab_id(c, before, "the new tab to open on the session", timeout=30.0)
 
         util.assert_opened_in(c, tab, moved_to)
+
+
+# ---------------------------------------------------------------------------
+# 11. Plan 071 D7 (#543): opening a tab never expands the sidebar
+# ---------------------------------------------------------------------------
+
+
+def test_new_tab_on_the_session_leaves_a_collapsed_sidebar_collapsed(lane: Lane):
+    """Plan 071 D7 (#543): the bug lived in
+    `resolve_pending_host_selection`, which every session-backed tab
+    open — a fresh install's local tabs included — resolves through, so
+    ⌘T on the slot must leave a collapsed sidebar collapsed exactly like
+    the in-process backend. This lane's UI and daemon are wiped at
+    teardown regardless, but the sidebar is still restored so a failure
+    here reads cleanly against the fixture's own expectations.
+    """
+    roost = session_ui(lane)
+    try:
+        util.set_sidebar_collapsed(roost, True)
+        before = roost.identify()["active_tab_id"]
+        util.press_new_tab(roost)
+        # The palette's `new_tab` reply can arrive before the session's
+        # selection lands (§2.2's Test constraints) — identify() is the
+        # condition that actually settled.
+        Roost._wait(
+            lambda: roost.identify()["active_tab_id"] != before,
+            timeout=scaled_timeout(30.0),
+            what="the new tab to become active",
+        )
+        assert roost.window_metrics()["sidebar_collapsed"], (
+            "opening a tab on the session slot expanded a collapsed sidebar"
+        )
+
+        # ⌘N still reveals it — only project creation does (D7).
+        roost.palette_open(kind="commands")
+        try:
+            roost.palette_activate("new_project")
+        finally:
+            roost.palette_dismiss()
+        Roost._wait(
+            lambda: not roost.window_metrics()["sidebar_collapsed"],
+            timeout=scaled_timeout(30.0),
+            what="new_project to reveal the sidebar",
+        )
+    finally:
+        util.set_sidebar_collapsed(roost, False)

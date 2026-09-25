@@ -551,6 +551,21 @@ def press_new_tab(roost) -> None:
         roost.palette_dismiss()
 
 
+def set_sidebar_collapsed(roost, collapsed: bool) -> None:
+    """Collapse or expand the sidebar through the palette's
+    `toggle_sidebar` row, and wait until the window says so."""
+    if roost.window_metrics()["sidebar_collapsed"] == collapsed:
+        return
+    roost.palette_open()
+    roost.palette_query("toggle sidebar")
+    roost.palette_activate("toggle_sidebar")
+    Roost._wait(
+        lambda: roost.window_metrics()["sidebar_collapsed"] == collapsed,
+        timeout=2.0,
+        what="the sidebar to " + ("collapse" if collapsed else "expand"),
+    )
+
+
 def assert_opened_in(roost, tab_id: int, directory) -> None:
     """Assert `tab_id` started in `directory` — by its row's `cwd`, and by
     its own shell's `pwd -P`, since the row keeps the cwd it was asked
