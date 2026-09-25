@@ -7,6 +7,8 @@
 //! ([`HostTabMemory`]); the rules for reading and writing that memory are
 //! these functions, over a mirror's rows.
 
+use std::collections::BTreeMap;
+
 use roost_engine::persistence::{HostTabMemory, TabMemo};
 use roost_ipc::messages::Project;
 
@@ -91,8 +93,9 @@ pub(crate) fn preferred_listed_tab(
 /// the session is not identified yet — writing then could keep a memory
 /// stamped with a session that is gone, or reset one that is still valid.
 ///
-/// A memory from another session is dropped first, and so are entries
-/// for projects `projects` no longer lists.
+/// A memory from another session is carried over by position
+/// ([`by_position`]) first, and entries for projects `projects` no
+/// longer lists are dropped.
 pub(crate) fn remember_shown(
     stored: Option<&HostTabMemory>,
     session_id: Option<&str>,
@@ -113,7 +116,12 @@ pub(crate) fn remember_shown(
     };
     let mut next = match stored {
         Some(stored) if stored.session_id == session_id => stored.clone(),
-        _ => HostTabMemory {
+        Some(stored) => HostTabMemory {
+            session_id: session_id.to_string(),
+            last_viewed: by_position(&stored.last_viewed, projects),
+            last_shown: None,
+        },
+        None => HostTabMemory {
             session_id: session_id.to_string(),
             ..HostTabMemory::default()
         },
@@ -123,6 +131,25 @@ pub(crate) fn remember_shown(
     next.last_viewed.insert(project, memo);
     next.last_shown = Some((project, memo));
     (stored != Some(&next)).then_some(next)
+}
+
+/// Another session's memos re-read against what this session lists: its
+/// tab ids name nothing here, but the positions still do.
+fn by_position(memos: &BTreeMap<i64, TabMemo>, projects: &[Project]) -> BTreeMap<i64, TabMemo> {
+    memos
+        .iter()
+        .filter_map(|(&id, memo)| {
+            let project = projects.iter().find(|row| row.id == id)?;
+            let tab = project.tabs.get(usize::try_from(memo.position).ok()?)?;
+            Some((
+                id,
+                TabMemo {
+                    tab_id: tab.id,
+                    position: memo.position,
+                },
+            ))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -299,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn a_write_prunes_deleted_projects_and_resets_a_replaced_session() {
+    fn a_write_prunes_deleted_projects_and_carries_a_replaced_session_by_position() {
         let stored = memory();
 
         let without_two = [project(1, &[10, 11])];
@@ -310,13 +337,21 @@ mod tests {
             "project 2 is gone from the mirror, so from the memory"
         );
 
-        let rows = [project(1, &[13, 14]), project(2, &[15])];
+        let rows = [project(1, &[13, 14]), project(2, &[15, 16, 17])];
         let reset = remember_shown(Some(&stored), Some("s-2"), &rows, 1, 14).unwrap();
         assert_eq!(reset.session_id, "s-2");
         assert_eq!(
             reset.last_viewed,
+            BTreeMap::from([(1, memo(14, 1)), (2, memo(17, 2))]),
+            "s-1's other projects carry over by position, under s-2's ids"
+        );
+
+        let short = [project(1, &[13, 14]), project(2, &[15])];
+        let reset = remember_shown(Some(&stored), Some("s-2"), &short, 1, 14).unwrap();
+        assert_eq!(
+            reset.last_viewed,
             BTreeMap::from([(1, memo(14, 1))]),
-            "nothing s-1 remembered survives into s-2's memory"
+            "a position the project no longer has is dropped"
         );
     }
 }
