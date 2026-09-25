@@ -19,8 +19,8 @@ release workflow asserts they agree).
   7-tracked cwd, each only if it is a directory on the server's own
   machine. A resolved cwd replaces `cwd`; nothing resolving is not an
   error, and `cwd` is used as sent. Unset, the request is the bytes it
-  always was. Served by sessions and Roost-Iced's UI socket; the Swift
-  Mac app and servers that predate the field answer `unknown-field`. No
+  always was. Served by sessions, Roost-Iced's UI socket and the Swift
+  Mac app; servers that predate the field answer `unknown-field`. No
   CLI flag yet. See [`ipc.md#tabopen`](docs/reference/ipc.md#tabopen).
 - **A session-backed project remembers the tab you last viewed in it
   (#547)** — on the local session a fresh Roost-Iced install runs its tabs
@@ -32,6 +32,13 @@ release workflow asserts they agree).
   the session restarts, the remembered tab is found by its position in
   the project. The Swift Mac app keeps the new field intact when it
   rewrites a shared `state.json`.
+- **The Swift Mac app's `tab.open` accepts `activate` and `cwd_from_tab`
+  (#532, #551)** — `activate: false` opens the tab without selecting it
+  or its project, and the reply's `is_active` now says whether the tab
+  was selected instead of always `true`; `cwd_from_tab` resolves as the
+  plan 070 entry above describes. Both decode as the Rust endpoints do,
+  so `tab open --no-activate` works against `Roost.app` instead of
+  answering `unknown-field`.
 
 ### Fixed
 

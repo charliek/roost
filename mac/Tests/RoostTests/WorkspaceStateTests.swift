@@ -550,6 +550,75 @@ struct WorkspaceCloseFallbackTests {
     }
 }
 
+/// `tab.open`'s `activate` (#551), at the two workspace steps it reaches.
+@MainActor
+@Suite("Workspace open without activating")
+struct WorkspaceOpenActivateTests {
+    @Test func openTabWithActivateFalseLeavesTheSelectionAndEmitsOnlyTabOpened() throws {
+        let ws = Workspace()
+        let shown = ws.createProject(name: "shown", cwd: "/").id
+        let other = ws.createProject(name: "other", cwd: "/").id
+        let active = try ws.openTab(projectID: shown, cwd: "/", title: "a").id
+        let captured = EventCapture()
+        ws.subscribe { captured.append(label(for: $0)) }
+
+        let sibling = try ws.openTab(projectID: shown, cwd: "/", title: "b", activate: false)
+        let elsewhere = try ws.openTab(projectID: other, cwd: "/", title: "c", activate: false)
+
+        #expect(ws.activeProjectID == shown)
+        #expect(ws.activeTabID == active)
+        #expect(captured.snapshot() == ["tabOpened", "tabOpened"])
+        #expect(ws.tabs(in: shown).map(\.id) == [active, sibling.id])
+        #expect(ws.tabs(in: other).map(\.id) == [elsewhere.id])
+    }
+
+    @Test func openTabWithActivateTrueSelectsTheNewTab() throws {
+        let ws = Workspace()
+        let shown = ws.createProject(name: "shown", cwd: "/").id
+        let other = ws.createProject(name: "other", cwd: "/").id
+        _ = try ws.openTab(projectID: shown, cwd: "/", title: "a")
+        let captured = EventCapture()
+        ws.subscribe { captured.append(label(for: $0)) }
+
+        let opened = try ws.openTab(projectID: other, cwd: "/", title: "b", activate: true)
+
+        #expect(ws.activeProjectID == other)
+        #expect(ws.activeTabID == opened.id)
+        #expect(captured.snapshot() == ["tabOpened", "activeChanged"])
+    }
+
+    @Test func ensureDefaultProjectWithActivateFalseCreatesItUnselected() {
+        let ws = Workspace()
+        let captured = EventCapture()
+        ws.subscribe { captured.append(label(for: $0)) }
+
+        let made = ws.ensureDefaultProject(cwd: "/tmp", activate: false)
+        #expect(ws.snapshot().map(\.id) == [made])
+        #expect(ws.project(made)?.cwd == "/tmp")
+        #expect(ws.activeProjectID == 0)
+        #expect(captured.snapshot() == ["projectCreated"])
+
+        let found = ws.ensureDefaultProject(cwd: "/elsewhere", activate: false)
+        #expect(found == made)
+        #expect(ws.activeProjectID == 0)
+        #expect(captured.snapshot() == ["projectCreated"])
+
+        #expect(ws.ensureDefaultProject(cwd: "", activate: true) == made)
+        #expect(ws.activeProjectID == made)
+        #expect(captured.snapshot() == ["projectCreated", "activeChanged"])
+    }
+
+    @Test func ensureDefaultProjectWithActivateTrueCreatesItSelected() {
+        let ws = Workspace()
+        let captured = EventCapture()
+        ws.subscribe { captured.append(label(for: $0)) }
+
+        let made = ws.ensureDefaultProject(cwd: "/tmp", activate: true)
+        #expect(ws.activeProjectID == made)
+        #expect(captured.snapshot() == ["projectCreated", "activeChanged"])
+    }
+}
+
 // Agent state model (plan 002). Mirrors the Rust workspace suite in
 // `crates/roost-engine/src/workspace.rs` case for case, so the two
 // implementations of the same op set can't drift.

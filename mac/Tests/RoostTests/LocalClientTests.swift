@@ -141,6 +141,55 @@ struct LocalClientOSCRoutingTests {
     }
 }
 
+/// `inheritedCwd` with no live PTY, so the native read has nothing to
+/// offer and only the tracked cwd is in play — the PTY-free half of Rust's
+/// `inherited_cwd` tests in `crates/roost-engine/src/application.rs`.
+@MainActor
+@Suite("LocalClient inherited cwd")
+struct LocalClientInheritedCwdTests {
+    private func clientWithTab(tracking cwd: String) throws -> (LocalClient, Int64) {
+        let workspace = Workspace()
+        let project = workspace.createProject(name: "p", cwd: "/")
+        let tab = try workspace.openTab(projectID: project.id, cwd: cwd, title: "")
+        let client = LocalClient(
+            workspace: workspace,
+            supervisor: PtySupervisor(),
+            socketPath: "/tmp/roost-localclient-cwd-test.sock"
+        )
+        return (client, tab.id)
+    }
+
+    private func scratchPath(_ kind: String) -> String {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("roost-inherit-\(kind)-\(UUID().uuidString)").path
+    }
+
+    @Test func fallsBackToTheTrackedCwdWithoutAChild() throws {
+        let dir = scratchPath("dir")
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+
+        let (client, tabID) = try clientWithTab(tracking: dir)
+        #expect(client.inheritedCwd(tabID: tabID) == dir)
+    }
+
+    @Test func aTrackedCwdThatIsNotADirectoryInheritsNothing() throws {
+        let file = scratchPath("file")
+        #expect(FileManager.default.createFile(atPath: file, contents: Data()))
+        defer { try? FileManager.default.removeItem(atPath: file) }
+
+        for cwd in ["/no/such/dir", file, ""] {
+            let (client, tabID) = try clientWithTab(tracking: cwd)
+            #expect(client.inheritedCwd(tabID: tabID) == nil, "\(cwd)")
+        }
+    }
+
+    @Test func anUnknownTabInheritsNothing() throws {
+        let (client, _) = try clientWithTab(tracking: "/")
+        #expect(client.inheritedCwd(tabID: 424_242) == nil)
+    }
+}
+
 @Suite("LocalClient delegation")
 struct LocalClientDelegationTests {
     // Same SIGTRAP-in-swift-testing concern as PtySupervisorTests'

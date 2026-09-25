@@ -72,7 +72,8 @@ final class LocalClient {
         argv: [String] = [],
         cols: UInt16 = 80,
         rows: UInt16 = 24,
-        title: String = ""
+        title: String = "",
+        activate: Bool = true
     ) throws -> Workspace.Tab {
         // Resolve the starting cwd: caller-supplied → project's cwd
         // → $HOME. Ensures `roostctl tab open --project-id N`
@@ -93,7 +94,8 @@ final class LocalClient {
         let tab = try workspace.openTab(
             projectID: projectID,
             cwd: resolvedCwd,
-            title: title
+            title: title,
+            activate: activate
         )
         do {
             try supervisor.spawn(
@@ -109,6 +111,15 @@ final class LocalClient {
             throw error
         }
         return tab
+    }
+
+    /// Where a tab opened from `tabID` starts — `tab.open`'s
+    /// `cwd_from_tab`, mirroring Rust's `application::inherited_cwd`.
+    func inheritedCwd(tabID: Int64) -> String? {
+        guard let row = workspace.tab(tabID) else { return nil }
+        return [supervisor.foregroundCwd(tabID: tabID), row.cwd]
+            .compactMap { $0 }
+            .first(where: isDirectory)
     }
 
     func closeTab(_ tabID: Int64) throws {
@@ -215,6 +226,11 @@ final class LocalClient {
             break
         }
     }
+}
+
+private func isDirectory(_ path: String) -> Bool {
+    var isDir: ObjCBool = false
+    return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
 }
 
 /// Strip the `file://` scheme + host segment from an OSC 7

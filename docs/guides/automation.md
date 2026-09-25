@@ -324,12 +324,13 @@ verb above treats the same as an `ops` list missing the op it needs
   and ends between two `tab.list` calls) — it refuses `unsupported` the
   same way.
 
-**The Swift `Roost.app` predates `--no-activate`.** `tab open --no-activate`
-answers `unknown-field` there — reported verbatim, same as any refusal
-from a server that doesn't recognize a field — rather than silently
-opening the tab active anyway. `open --no-activate` never gets that
-far: `open` needs `project.ensure`, which the Swift `Roost.app` does not serve,
-so it refuses `unsupported` after `identify`. Either way **no tab is
+**`Roost.app` through v0.0.20 predates `--no-activate`.** `tab open
+--no-activate` answers `unknown-field` there — reported verbatim, same
+as any refusal from a server that doesn't recognize a field — rather
+than silently opening the tab active anyway; later builds serve it.
+`open --no-activate` never gets that far on any Swift build: `open`
+needs `project.ensure`, which the Swift `Roost.app` does not serve, so
+it refuses `unsupported` after `identify`. Either way **no tab is
 created**, so there is nothing to wait on.
 
 Everything else in this guide — `identify`, the target policy, `tab

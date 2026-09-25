@@ -420,7 +420,12 @@ final class Workspace {
 
     // MARK: Tab mutators
 
-    func openTab(projectID: Int64, cwd: String, title: String) throws -> Tab {
+    func openTab(
+        projectID: Int64,
+        cwd: String,
+        title: String,
+        activate: Bool = true
+    ) throws -> Tab {
         guard projects[projectID] != nil else {
             throw WorkspaceError.projectNotFound(projectID)
         }
@@ -451,12 +456,13 @@ final class Workspace {
             lastActive: now
         )
         tabs[id] = tab
-        activeProjectID = projectID
-        activeTabID = id
-        commit(
-            [.tabOpened(tab), .activeChanged(projectID: projectID, tabID: id)],
-            persist: true
-        )
+        var events: [Event] = [.tabOpened(tab)]
+        if activate {
+            activeProjectID = projectID
+            activeTabID = id
+            events.append(.activeChanged(projectID: projectID, tabID: id))
+        }
+        commit(events, persist: true)
         return tab
     }
 
@@ -818,14 +824,15 @@ final class Workspace {
 
     /// Ensure a default project exists; return its id. Used by
     /// `tab.open` when the caller passes `project_id = 0` and the
-    /// workspace is empty.
+    /// workspace is empty. With `activate` false the project is found
+    /// or created without becoming the active one.
     @discardableResult
-    func ensureDefaultProject(cwd: String) -> Int64 {
+    func ensureDefaultProject(cwd: String, activate: Bool) -> Int64 {
         if let first = projects.values.sorted(by: {
             ($0.position, $0.id) < ($1.position, $1.id)
         }).first {
             var events: [Event] = []
-            if activeProjectID == 0 {
+            if activate && activeProjectID == 0 {
                 activeProjectID = first.id
                 events.append(.activeChanged(projectID: first.id, tabID: 0))
             }
@@ -838,8 +845,10 @@ final class Workspace {
         // change is emit-only (captured by `flush()` on exit) to
         // preserve the prior behavior here.
         let project = createProject(name: "Default", cwd: cwd)
-        activeProjectID = project.id
-        commit([.activeChanged(projectID: project.id, tabID: 0)], persist: false)
+        if activate {
+            activeProjectID = project.id
+            commit([.activeChanged(projectID: project.id, tabID: 0)], persist: false)
+        }
         return project.id
     }
 

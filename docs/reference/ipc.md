@@ -463,10 +463,10 @@ where they were, so `tab.opened` arrives with no `active.changed` after
 it. With `project_id: "0"` the default project is found or created
 without being selected either. Omitted or `true`, the new tab is
 selected, as it always has been; an omitted field is not sent, so
-those requests are the bytes they were before the field existed. The
-Swift Mac app and servers that predate the field answer
-`unknown-field`. From the CLI: `--no-activate` on `tab open` and
-`open`. On a UI socket under [`local-backend =
+those requests are the bytes they were before the field existed. A
+server that predates the field — `Roost.app` through v0.0.20 among
+them — answers `unknown-field`. From the CLI: `--no-activate` on `tab
+open` and `open`. On a UI socket under [`local-backend =
 session`](#a-ui-socket-under-local-backend-session) the request is
 forwarded to the local session, and the window selects the new tab once
 it lists it — unless `activate` is `false`.
@@ -489,9 +489,9 @@ When nothing resolves — no such tab, or neither candidate is a
 directory — it is **not an error**: `cwd` is used as sent, and one
 that is empty or not a directory resolves through the usual chain
 above. The result's `tab.cwd` carries the cwd the tab started in.
-Served by the Rust endpoints: sessions and Roost-Iced's UI socket. The
-Swift Mac app's socket and servers that predate the field answer
-`unknown-field` — see
+Served by sessions, Roost-Iced's UI socket and the Swift Mac app's
+socket. A server that predates the field — `Roost.app` through v0.0.20
+among them — answers `unknown-field`; see
 [the compatibility matrix](ipc-compatibility.md#the-compatibility-matrix).
 No CLI flag yet.
 

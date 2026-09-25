@@ -195,22 +195,29 @@ actor IPCHandlerImpl: IPCHandler {
     private func tabOpen(params: AnyCodable?) async throws -> IPCTabOpenResult {
         let p = try decodeParams(
             params, as: IPCTabOpenParams.self,
-            expected: ["project_id", "cwd", "argv", "cols", "rows", "title"]
+            expected: [
+                "project_id", "cwd", "argv", "cols", "rows", "title", "activate", "cwd_from_tab",
+            ]
         )
+        let activate = p.activate ?? true
+        let cwd = p.cwdFromTab.flatMap { client.inheritedCwd(tabID: $0) } ?? p.cwd
         var projectID = p.projectID
         if projectID == 0 {
-            projectID = client.workspace.ensureDefaultProject(cwd: p.cwd)
+            projectID = client.workspace.ensureDefaultProject(cwd: cwd, activate: activate)
         }
         do {
             let tab = try client.openTab(
                 projectID: projectID,
-                cwd: p.cwd,
+                cwd: cwd,
                 argv: p.argv,
                 cols: try ipcDim(p.cols, defaultValue: 80, field: "cols"),
                 rows: try ipcDim(p.rows, defaultValue: 24, field: "rows"),
-                title: p.title
+                title: p.title,
+                activate: activate
             )
-            return IPCTabOpenResult(tab: tab.toIPC(isActive: true))
+            return IPCTabOpenResult(
+                tab: tab.toIPC(isActive: tab.id == client.workspace.activeTabID)
+            )
         } catch let err as Workspace.WorkspaceError {
             throw mapWorkspace(err)
         } catch let err as PtySupervisor.PtyError {
@@ -1317,28 +1324,25 @@ private struct IPCTabOpenParams: Codable, Sendable {
     var cols: UInt32 = 0
     var rows: UInt32 = 0
     var title: String = ""
+    var activate: Bool?
+    var cwdFromTab: Int64?
 
     enum CodingKeys: String, CodingKey {
         case projectID = "project_id"
-        case cwd, argv, cols, rows, title
+        case cwd, argv, cols, rows, title, activate
+        case cwdFromTab = "cwd_from_tab"
     }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        if let pid = try c.decodeIfPresent(String.self, forKey: .projectID) {
-            guard let v = Int64(pid) else {
-                throw DecodingError.dataCorruptedError(
-                    forKey: .projectID, in: c,
-                    debugDescription: "project_id must be a string-wrapped int64"
-                )
-            }
-            self.projectID = v
-        }
+        self.projectID = try decodeOptionalStringInt64(c, .projectID) ?? 0
         self.cwd = try c.decodeIfPresent(String.self, forKey: .cwd) ?? ""
         self.argv = try c.decodeIfPresent([String].self, forKey: .argv) ?? []
         self.cols = try c.decodeIfPresent(UInt32.self, forKey: .cols) ?? 0
         self.rows = try c.decodeIfPresent(UInt32.self, forKey: .rows) ?? 0
         self.title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
+        self.activate = try c.decodeIfPresent(Bool.self, forKey: .activate)
+        self.cwdFromTab = try decodeOptionalStringInt64(c, .cwdFromTab)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -1349,6 +1353,8 @@ private struct IPCTabOpenParams: Codable, Sendable {
         try c.encode(cols, forKey: .cols)
         try c.encode(rows, forKey: .rows)
         try c.encode(title, forKey: .title)
+        try c.encodeIfPresent(activate, forKey: .activate)
+        try c.encodeIfPresent(cwdFromTab.map(String.init), forKey: .cwdFromTab)
     }
 }
 

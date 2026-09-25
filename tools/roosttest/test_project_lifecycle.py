@@ -289,27 +289,78 @@ def test_open_finds_or_creates_the_project_then_opens_a_tab(roost, target):
 def test_tab_open_with_activate_false_leaves_the_selection(roost, target, project):
     """`tab.open {activate: false}` appends the tab without selecting it:
     the core's selection, the tab the window shows and the new row's own
-    `is_active` all stay where they were. The Mac app has no such field
-    and refuses it `unknown-field`."""
-    if target == "mac":
-        with pytest.raises(RoostError) as refused:
-            roost.open_tab(project, cwd="/tmp", activate=False)
-        assert refused.value.code == "unknown-field", refused.value
-        return
+    `is_active` — in the reply and in `tab.list` — all stay where they
+    were. On both targets (#551); only iced serves `app.selected_tab_id`,
+    so the window's half is read there alone."""
 
-    shown = roost.open_tab(project, cwd="/tmp")
-    assert roost.identify()["active_tab_id"] == shown
-    roost._wait(
-        lambda: roost.app_selected_tab_id() == shown,
-        4.0,
-        "the window to show the plainly opened tab",
-    )
+    def open_tab(**extra) -> dict:
+        params = {"project_id": str(project), "cwd": "/tmp", **extra}
+        return roost.call("tab.open", params)["tab"]
 
-    quiet = roost.open_tab(project, cwd="/tmp", activate=False)
-    assert roost.project_tab_ids(project) == [shown, quiet], "appended at the end"
-    assert roost.identify()["active_tab_id"] == shown
-    assert roost.app_selected_tab_id() == shown
-    assert roost.tab(quiet)["is_active"] is False
+    shown = open_tab()
+    assert shown["is_active"] is True, shown
+    shown_id = int(shown["id"])
+    assert roost.identify()["active_tab_id"] == shown_id
+    if target == "iced":
+        roost._wait(
+            lambda: roost.app_selected_tab_id() == shown_id,
+            4.0,
+            "the window to show the plainly opened tab",
+        )
+
+    quiet = open_tab(activate=False)
+    assert quiet["is_active"] is False, quiet
+    quiet_id = int(quiet["id"])
+    assert roost.project_tab_ids(project) == [shown_id, quiet_id], "appended at the end"
+    assert roost.identify()["active_tab_id"] == shown_id
+    if target == "iced":
+        assert roost.app_selected_tab_id() == shown_id
+    assert roost.tab(quiet_id)["is_active"] is False
+
+
+# -- tab.open cwd_from_tab (plan 070, #532) ---------------------------------
+
+
+def test_tab_open_cwd_from_tab_starts_where_the_source_tab_is(roost):
+    """`cwd_from_tab` opens the new tab in the named tab's directory,
+    replacing the `cwd` sent beside it; naming a tab that does not exist
+    is not an error and leaves `cwd` as sent. On both targets (#532).
+
+    The source's shell `cd`s and then `exec`s, so no prompt reports the
+    move: its own cwd is `/usr/bin` while its tracked one is still
+    `/usr`, and only the native-first read lands the new tab in the
+    right one. Neither is a symlink on either target (the #266 test
+    below gives why that matters)."""
+    tracked_cwd, native_cwd = "/usr", "/usr/bin"
+    pid = roost.create_project(name=f"pytest-inherit-{uuid.uuid4().hex[:8]}", cwd="/")
+    try:
+        source = roost.open_tab(pid, cwd=tracked_cwd)
+        wait_tab_attached(roost, source)
+        wait_shell_ready(roost, source)
+        roost.run(source, f"cd {native_cwd} && echo MOVED$((6*7)) && exec sleep 300")
+        roost.wait_text(source, "MOVED42", timeout=8)
+        assert (roost.tab(source) or {}).get("cwd") == tracked_cwd, "no prompt reported the cd"
+
+        inherited = roost.open_tab(pid, cwd="/", cwd_from_tab=source)
+        roost._wait(
+            lambda: (roost.tab(inherited) or {}).get("cwd") == native_cwd,
+            4.0,
+            "the inheriting tab's row to carry the source shell's own cwd",
+        )
+        wait_tab_attached(roost, inherited)
+        wait_shell_ready(roost, inherited)
+        marker = f"INHERIT_PWD_{uuid.uuid4().hex[:8]}"
+        roost.run(inherited, f"echo {marker}=$(pwd -P)")
+        roost.wait_text(inherited, f"{marker}={os.path.realpath(native_cwd)}", timeout=8)
+
+        unresolved = roost.open_tab(pid, cwd=tracked_cwd, cwd_from_tab=2**63 - 1)
+        roost._wait(
+            lambda: (roost.tab(unresolved) or {}).get("cwd") == tracked_cwd,
+            4.0,
+            "a tab that does not exist to leave the requested cwd",
+        )
+    finally:
+        _cleanup_project(roost, pid)
 
 
 # -- tab.open cwd default (#266) -------------------------------------------
