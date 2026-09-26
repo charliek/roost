@@ -792,9 +792,10 @@ mod tests {
         tab: Option<&str>,
     ) -> (Result<i32, CliError>, Vec<serde_json::Value>, String) {
         let selector = fake.selector();
+        let environment = crate::window::Environment::default();
         let mut out = Vec::new();
         let mut note = Vec::new();
-        let mut ui = UiSocket::new(&selector);
+        let mut ui = UiSocket::new(&selector, &environment, false);
         let run = stream_to(&mut ui, tab.map(str::to_string), &mut out, &mut note);
         let exit = tokio::time::timeout(std::time::Duration::from_secs(10), run)
             .await

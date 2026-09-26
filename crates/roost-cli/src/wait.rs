@@ -809,7 +809,9 @@ mod tests {
             .into_iter()
             .chain(argv.iter().copied());
         let args = <crate::Args as clap::Parser>::try_parse_from(argv).expect("the argv parses");
-        tokio::time::timeout(Duration::from_secs(20), crate::run(args, tab_env, None))
+        let environment = crate::window::Environment::default();
+        let run = crate::run(args, tab_env, None, &environment);
+        tokio::time::timeout(Duration::from_secs(20), run)
             .await
             .expect("the wait never returned")
     }

@@ -44,10 +44,10 @@ full contract, including `--hold`/`--focus` and its exit codes.
 
 A script launched *inside* a Roost tab can call back without any discovery
 — Roost injects `ROOST_SOCKET` and `ROOST_TAB_ID` into every tab's
-environment:
+environment, and `roostctl` reads both:
 
 ```bash
-roostctl --socket "$ROOST_SOCKET" set-title --tab "$ROOST_TAB_ID" --title "building…"
+roostctl set-title --title "building…"
 ```
 
 See the [CLI reference](../reference/cli.md) and the

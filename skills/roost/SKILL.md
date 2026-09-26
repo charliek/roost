@@ -23,6 +23,8 @@ printf '%s\n' "${ROOST_TAB_ID:-not in a Roost tab}"
 
 A verb that takes `--tab` falls back to `ROOST_TAB_ID` when you leave the flag out, so inside Roost an omitted `--tab` means your own tab. Two verbs never read `ROOST_TAB_ID`: `events`, whose `--tab` is only a filter, and `tab send-file`, which exits 2 without an explicit `--tab`.
 
+Leave `--socket` and `--target` out inside a Roost tab. In a tab on the local session, `ROOST_SOCKET` names the session, and without either flag `roostctl` reaches the window that owns it, so `palette`, `screenshot` and `tab focus` work there too. `--socket "$ROOST_SOCKET"` would keep a command on the session instead.
+
 ## Learn the current CLI
 
 The installed binary is the authority for command syntax. Start with:

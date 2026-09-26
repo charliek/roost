@@ -85,7 +85,7 @@ Roost injects these environment variables into every spawned shell:
 | `ROOST_TAB_ID`     | The integer tab id this shell is bound to                          |
 | `ROOST_SOCKET`     | The Unix-socket path of whatever spawned the tab (the GUI, or a session) |
 
-So `roostctl` invoked from inside any tab needs no flags or config — it knows where to send and which tab to mark. On a project living on a [host session](host-sessions.md), a tab's shell is spawned by that `roost-session` daemon, not the GUI, so `ROOST_SOCKET` there is the session's own socket — `roostctl` still just works, but it's dialing the host, not the window.
+So `roostctl` invoked from inside any tab needs no flags or config — it knows where to send and which tab to mark. On a project living on a [host session](host-sessions.md), a tab's shell is spawned by that `roost-session` daemon, not the GUI, so `ROOST_SOCKET` there is the session's own socket. For this machine's local session `roostctl` sends each command to the window that owns the session, except the hooks, `events`, `wait` and `tab prompt`, which stay on the session ([why](../reference/cli.md#inside-a-session-tab)). On a remote host it dials the host, not the window.
 
 ## Hook-session OSC suppression
 

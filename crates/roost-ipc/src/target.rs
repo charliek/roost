@@ -24,6 +24,7 @@
 //! short timeout (~50ms per profile) and immediately close on
 //! success.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -74,6 +75,32 @@ impl std::fmt::Display for LiveProfiles {
     }
 }
 
+/// The two environment variables the ladder reads, as values.
+///
+/// [`TargetSelector::resolve`] and [`TargetSelector::diagnose`] read them
+/// from the process on every call. A caller that decides more than one
+/// thing from them reads them once with [`Self::from_process`] and passes
+/// the same values to [`TargetSelector::resolve_in`] and
+/// [`TargetSelector::diagnose_in`], so its decisions cannot disagree —
+/// and a test can hand them in without writing to the process
+/// environment.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TargetEnv {
+    /// `ROOST_SOCKET`.
+    pub socket: Option<OsString>,
+    /// `ROOST_BUNDLE_PROFILE`.
+    pub profile: Option<String>,
+}
+
+impl TargetEnv {
+    pub fn from_process() -> Self {
+        Self {
+            socket: std::env::var_os("ROOST_SOCKET"),
+            profile: std::env::var("ROOST_BUNDLE_PROFILE").ok(),
+        }
+    }
+}
+
 /// Resolved target — a socket path plus the profile kind that
 /// produced it (or `None` if the path came from `--socket` /
 /// `ROOST_SOCKET` directly).
@@ -111,7 +138,7 @@ impl TargetOrigin {
 }
 
 /// [`TargetSelector::resolve`]'s outcome plus the inputs that produced
-/// it. Non-wire, diagnostic-only.
+/// it. Non-wire.
 #[derive(Debug)]
 pub struct TargetDiagnosis {
     pub origin: TargetOrigin,
@@ -133,7 +160,17 @@ impl TargetSelector {
     /// commands like `claude-hook session-start` that should exit 0
     /// even when no UI is running (the hook silently no-ops).
     pub async fn resolve(&self, probe_alive: bool) -> Result<ResolvedTarget, TargetError> {
-        self.resolve_inner(probe_alive).await.1
+        self.resolve_in(probe_alive, &TargetEnv::from_process())
+            .await
+    }
+
+    /// [`Self::resolve`] over `env` rather than the process environment.
+    pub async fn resolve_in(
+        &self,
+        probe_alive: bool,
+        env: &TargetEnv,
+    ) -> Result<ResolvedTarget, TargetError> {
+        self.resolve_inner(probe_alive, env).await.1
     }
 
     /// [`Self::resolve`] with `probe_alive = true`, plus which input won
@@ -142,7 +179,12 @@ impl TargetSelector {
     /// Additive: `resolve`'s behavior is untouched and no existing caller
     /// changes.
     pub async fn diagnose(&self) -> TargetDiagnosis {
-        let (origin, resolved) = self.resolve_inner(true).await;
+        self.diagnose_in(&TargetEnv::from_process()).await
+    }
+
+    /// [`Self::diagnose`] over `env` rather than the process environment.
+    pub async fn diagnose_in(&self, env: &TargetEnv) -> TargetDiagnosis {
+        let (origin, resolved) = self.resolve_inner(true, env).await;
         TargetDiagnosis {
             origin,
             // Best-effort: when the profile paths themselves fail to
@@ -152,8 +194,7 @@ impl TargetSelector {
         }
     }
 
-    /// Read the environment, run it through [`classify`], and act on the
-    /// rung that fired.
+    /// Run `env` through [`classify`], and act on the rung that fired.
     ///
     /// [`TargetOrigin`] exists so a diagnostic doesn't have to re-derive
     /// the precedence rule; deriving it a second time *here* would be no
@@ -162,14 +203,13 @@ impl TargetSelector {
     async fn resolve_inner(
         &self,
         probe_alive: bool,
+        env: &TargetEnv,
     ) -> (TargetOrigin, Result<ResolvedTarget, TargetError>) {
-        let socket_env = std::env::var_os("ROOST_SOCKET");
-        let profile_env = std::env::var("ROOST_BUNDLE_PROFILE").ok();
         match classify(
             self.socket_override.as_deref(),
-            socket_env.as_deref(),
+            env.socket.as_deref(),
             self.kind_override,
-            profile_env.as_deref(),
+            env.profile.as_deref(),
         ) {
             Step::Socket(socket_path, origin) => (
                 origin,
@@ -491,6 +531,43 @@ mod tests {
             !diagnosis.candidates.is_empty(),
             "auto-detect candidates must be reported whatever the origin"
         );
+    }
+
+    /// The `_in` twins decide from the values they are handed, never the
+    /// process's own, so this holds whatever the ambient environment is.
+    /// A handed `ROOST_SOCKET` wins beside `--target` as the process's
+    /// would.
+    #[tokio::test]
+    async fn the_in_twins_decide_from_the_env_they_are_handed() {
+        let handed = TargetEnv {
+            socket: Some("/tmp/handed.sock".into()),
+            profile: Some("bogus".into()),
+        };
+        let with_target = TargetSelector {
+            socket_override: None,
+            kind_override: Some(BundleProfileKind::Iced),
+        };
+        let diagnosis = with_target.diagnose_in(&handed).await;
+        assert_eq!(diagnosis.origin, TargetOrigin::SocketEnv);
+        assert_eq!(
+            diagnosis.resolved.expect("resolved").socket_path,
+            PathBuf::from("/tmp/handed.sock")
+        );
+        let resolved = with_target
+            .resolve_in(false, &handed)
+            .await
+            .expect("resolved");
+        assert_eq!(resolved.socket_path, PathBuf::from("/tmp/handed.sock"));
+        assert_eq!(resolved.kind, None);
+
+        let no_socket = TargetEnv {
+            socket: None,
+            profile: Some("bogus".into()),
+        };
+        assert!(matches!(
+            TargetSelector::default().resolve_in(false, &no_socket).await,
+            Err(TargetError::UnknownProfile(value)) if value == "bogus"
+        ));
     }
 
     // On non-macOS the production profiles intentionally share one socket

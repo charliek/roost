@@ -62,6 +62,11 @@
 //! session profile's socket directly, since `start` must work when
 //! nothing is listening yet. Any other op reaches a session either via
 //! `--target session` or an explicit `--socket`.
+//!
+//! Inside a local session tab `ROOST_SOCKET` names that session. There,
+//! with no `--socket` or `--target`, every verb but the hooks, `events`,
+//! `wait` and `tab prompt` goes to the window that owns the session
+//! instead (see [`window`]).
 
 mod agent_install;
 mod doctor;
@@ -72,6 +77,7 @@ mod prompt;
 mod report;
 mod session;
 mod wait;
+mod window;
 
 use std::ffi::OsString;
 use std::io::{IsTerminal, Read, Write};
@@ -102,10 +108,11 @@ use roost_ipc::messages::{
 };
 use roost_ipc::paths::BundleProfileKind;
 use roost_ipc::session_launch::timeout_scale;
-use roost_ipc::target::TargetSelector;
+use roost_ipc::target::{TargetEnv, TargetSelector};
 use roost_ipc::IpcClient;
 
 use crate::error::CliError;
+use crate::window::Environment;
 
 const CLIENT_NAME: &str = "roostctl";
 
@@ -162,7 +169,11 @@ const NO_TAB: &str = "no --tab and ROOST_TAB_ID is unset; refusing to guess the 
                   session tab, and so does the active tab `tab dump` and \
                   `wait` fall back to; `--tab h<n>.<id>` still names a saved \
                   host's tab and is never re-addressed. `roostctl identify` \
-                  prints the backend and the session socket.\n\n\
+                  prints the backend and the session socket. Inside a \
+                  session tab, whose ROOST_SOCKET names the session, a \
+                  verb goes to the window that owns it, except the hooks, \
+                  events, wait and tab prompt; --socket or --target keeps \
+                  it on the socket named.\n\n\
                   A command that changes a tab (notify, set-title, tab \
                   set-state, tab clear-notification, tab close, tab send, \
                   tab resize, tab focus, tab report, tab prompt) needs \
@@ -178,7 +189,10 @@ const NO_TAB: &str = "no --tab and ROOST_TAB_ID is unset; refusing to guess the 
 )]
 struct Args {
     /// Explicit socket path. Highest precedence; overrides
-    /// `--target`, `ROOST_SOCKET`, and auto-detect.
+    /// `--target`, `ROOST_SOCKET`, and auto-detect. Inside a local
+    /// session tab, whose `ROOST_SOCKET` names the session, a verb goes
+    /// to the window that owns it; `--socket` (or `--target`) keeps it
+    /// on the socket named.
     #[arg(long)]
     socket: Option<PathBuf>,
 
@@ -978,7 +992,8 @@ async fn main() {
             .ok()
             .map(|p| p.display().to_string())
     });
-    let code = match run(args, tab_env.as_deref(), cwd_env.as_deref()).await {
+    let environment = Environment::from_process();
+    let code = match run(args, tab_env.as_deref(), cwd_env.as_deref(), &environment).await {
         Ok(code) => code,
         Err(error) => report(&error, json),
     };
@@ -1031,11 +1046,16 @@ fn asks_for_json(argv: &[OsString]) -> bool {
 /// to render.
 ///
 /// `tab_env` is `ROOST_TAB_ID`, `cwd_env` is `$PWD` (falling back to the
-/// process cwd), both as `main` read them — parameters so the target
-/// policy and `open`/`project ensure`'s `--cwd` default are tested
-/// without writing to the process environment every other test in this
-/// binary reads.
-async fn run(args: Args, tab_env: Option<&str>, cwd_env: Option<&str>) -> Result<i32, CliError> {
+/// process cwd), and `environment` what target selection reads, all as
+/// `main` read them — parameters so the target policy and `open`/`project
+/// ensure`'s `--cwd` default are tested without writing to the process
+/// environment every other test in this binary reads.
+async fn run(
+    args: Args,
+    tab_env: Option<&str>,
+    cwd_env: Option<&str>,
+    environment: &Environment,
+) -> Result<i32, CliError> {
     let json = args.json;
     let selector = selector(&args);
     match args.command {
@@ -1047,16 +1067,25 @@ async fn run(args: Args, tab_env: Option<&str>, cwd_env: Option<&str>) -> Result
         // offline UI doesn't make the hook itself fail, and they ignore
         // `--json`: `{}` is already the only answer they give.
         //
+        // Each drains stdin before anything else: the agent is writing
+        // into that pipe right now, and an early return that left it
+        // unread would hand it an EPIPE from a hook that is supposed to
+        // be invisible. They stay on whatever socket the tab named even
+        // inside a local session tab ([`window`]): a hook has to report
+        // with the window closed.
+        //
         // `claude-hook EVENT` is the alias `agent-hook claude` grew out
         // of: it takes its event from argv instead of the payload, which
         // is what every already-installed `claude-settings.json` writes.
         Cmd::ClaudeHook { event } => {
-            run_claude_hook(&event, &selector, tab_env).await;
+            let stdin = drain_stdin();
+            run_claude_hook(&event, &selector, &environment.target, tab_env, &stdin).await;
             hook_answer();
             Ok(0)
         }
         Cmd::AgentHook { agent } => {
-            run_agent_hook(&agent, &selector, tab_env).await;
+            let stdin = drain_stdin();
+            run_agent_hook(&agent, &selector, &environment.target, tab_env, &stdin).await;
             hook_answer();
             Ok(0)
         }
@@ -1089,11 +1118,12 @@ async fn run(args: Args, tab_env: Option<&str>, cwd_env: Option<&str>) -> Result
             tab,
             verbose,
             color,
-        } => run_doctor(&selector, tab, json, verbose, color).await,
+        } => run_doctor(&selector, environment, tab, json, verbose, color).await,
         command => {
+            let follows_window = follows_window(&command);
             run_on_ui(
                 command,
-                &mut UiSocket::new(&selector),
+                &mut UiSocket::new(&selector, environment, follows_window),
                 tab_env,
                 cwd_env,
                 json,
@@ -1103,8 +1133,23 @@ async fn run(args: Args, tab_env: Option<&str>, cwd_env: Option<&str>) -> Result
     }
 }
 
+/// Whether a verb run inside a local session tab goes to the window that
+/// owns the session ([`window`]).
+///
+/// The stream verbs stay: each subscribes to the session's own stream,
+/// which the window would only point it back at, and on the session they
+/// keep working with the window closed. The hooks and `session …` never
+/// reach [`UiSocket`] at all.
+fn follows_window(command: &Cmd) -> bool {
+    !matches!(
+        command,
+        Cmd::Events { .. } | Cmd::Wait(_) | Cmd::Tab(TabCmd::Prompt(_))
+    )
+}
+
 async fn run_doctor(
     selector: &TargetSelector,
+    environment: &Environment,
     tab: Option<i64>,
     json: bool,
     verbose: bool,
@@ -1123,7 +1168,7 @@ async fn run_doctor(
             term.as_deref(),
         ),
     };
-    let report = doctor::evaluate(&doctor::collect(selector, tab).await);
+    let report = doctor::evaluate(&doctor::collect(selector, environment, tab).await);
     let rendered = doctor::render(&report, json, style, verbose).map_err(CliError::failed)?;
     let mut stdout = std::io::stdout().lock();
     stdout
@@ -1137,14 +1182,23 @@ async fn run_doctor(
 /// for it — so a verb that refuses its own arguments has dialled nothing.
 struct UiSocket<'a> {
     selector: &'a TargetSelector,
+    environment: &'a Environment,
+    /// [`follows_window`] of the verb this serves.
+    follows_window: bool,
     client: Option<IpcClient>,
     path: PathBuf,
 }
 
 impl<'a> UiSocket<'a> {
-    fn new(selector: &'a TargetSelector) -> Self {
+    fn new(
+        selector: &'a TargetSelector,
+        environment: &'a Environment,
+        follows_window: bool,
+    ) -> Self {
         Self {
             selector,
+            environment,
+            follows_window,
             client: None,
             path: PathBuf::new(),
         }
@@ -1154,9 +1208,10 @@ impl<'a> UiSocket<'a> {
         let client = match self.client.take() {
             Some(client) => client,
             None => {
-                let target = self.selector.resolve(true).await?;
-                let client = dial(&target.socket_path).await?;
-                self.path = target.socket_path;
+                let socket =
+                    window::route(self.selector, self.environment, self.follows_window).await?;
+                let client = dial(&socket).await?;
+                self.path = socket;
                 client
             }
         };
@@ -2011,23 +2066,22 @@ fn resolve_cwd(explicit: Option<String>, cwd_env: Option<&str>) -> Result<String
         .ok_or_else(|| CliError::Failed("no --cwd, and $PWD could not be resolved".into()))
 }
 
-/// Claude Code hook dispatch. Reads the JSON payload from stdin
-/// (Claude's contract), maps the event to the reports
+/// Claude Code hook dispatch. Takes the JSON payload `run` drained from
+/// stdin (Claude's contract), maps the event to the reports
 /// `roost-agent`'s pure adapter derives, and sends each as a
 /// `tab.agent_report`. Best-effort — failures don't surface to Claude,
 /// and the caller always exits 0.
-async fn run_claude_hook(event: &str, selector: &TargetSelector, tab_env: Option<&str>) {
-    // Drained first and unconditionally, exactly as in
-    // [`run_agent_hook`]: Claude is writing into this pipe right now,
-    // and returning on an unset `ROOST_TAB_ID` without consuming a byte
-    // would hand it an EPIPE from a hook that is supposed to be
-    // invisible.
-    let stdin_buf = drain_stdin();
-
+async fn run_claude_hook(
+    event: &str,
+    selector: &TargetSelector,
+    target_env: &TargetEnv,
+    tab_env: Option<&str>,
+    stdin_buf: &[u8],
+) {
     let Some(tab_id) = tab_env.and_then(parse_tab_id) else {
         return;
     };
-    let Some(payload) = hook_payload(&stdin_buf, tab_id) else {
+    let Some(payload) = hook_payload(stdin_buf, tab_id) else {
         hook_debug(&format!(
             "claude-hook: unparseable payload for event: {event}"
         ));
@@ -2051,7 +2105,7 @@ async fn run_claude_hook(event: &str, selector: &TargetSelector, tab_env: Option
     // (`docs/development/claude-testing.md`) that is driven outside a
     // Roost tab, where the default profile path is the only answer
     // there is.
-    let Ok(target) = selector.resolve(false).await else {
+    let Ok(target) = selector.resolve_in(false, target_env).await else {
         return;
     };
     deliver_reports(reports, &target.socket_path).await;
@@ -2097,12 +2151,13 @@ fn hook_answer() {
 /// contract of this path is exit 0 with `{}` on stdout — a hook that
 /// reports its own trouble to a decision dialog may be read as a block —
 /// so the only diagnostic channel is `ROOST_DEBUG` on stderr.
-async fn run_agent_hook(agent: &str, selector: &TargetSelector, tab_env: Option<&str>) {
-    // Drained first and unconditionally: the agent is writing into this
-    // pipe right now, and every early return below would otherwise leave
-    // it with an EPIPE from a hook that is supposed to be invisible.
-    let stdin_buf = drain_stdin();
-
+async fn run_agent_hook(
+    agent: &str,
+    selector: &TargetSelector,
+    target_env: &TargetEnv,
+    tab_env: Option<&str>,
+    stdin_buf: &[u8],
+) {
     let Some(adapter) = Agent::parse(agent) else {
         hook_debug(&format!("agent-hook: no adapter for agent: {agent}"));
         return;
@@ -2110,11 +2165,11 @@ async fn run_agent_hook(agent: &str, selector: &TargetSelector, tab_env: Option<
     let Some(tab_id) = tab_env.and_then(parse_tab_id) else {
         return;
     };
-    let Some(socket) = agent_hook_socket(selector) else {
+    let Some(socket) = agent_hook_socket(selector, target_env) else {
         hook_debug(&format!("agent-hook {agent}: no ROOST_SOCKET"));
         return;
     };
-    let Some(payload) = hook_payload(&stdin_buf, tab_id) else {
+    let Some(payload) = hook_payload(stdin_buf, tab_id) else {
         hook_debug(&format!("agent-hook {agent}: unparseable payload"));
         return;
     };
@@ -2150,9 +2205,11 @@ async fn run_agent_hook(agent: &str, selector: &TargetSelector, tab_env: Option<
 /// as a by-hand debugging verb driven from outside a tab
 /// (`docs/development/claude-testing.md`), where the default path is the
 /// only answer there is.
-fn agent_hook_socket(selector: &TargetSelector) -> Option<PathBuf> {
+fn agent_hook_socket(selector: &TargetSelector, target_env: &TargetEnv) -> Option<PathBuf> {
     selector.socket_override.clone().or_else(|| {
-        std::env::var_os("ROOST_SOCKET")
+        target_env
+            .socket
+            .clone()
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
     })
@@ -3639,6 +3696,7 @@ mod tests {
             parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}")),
             tab_env,
             cwd_env,
+            &Environment::default(),
         )
         .await
     }
@@ -3766,6 +3824,294 @@ mod tests {
             "ui_version": "0",
             "protocol_version": 1,
         })
+    }
+
+    // ------------------------------------------------------------------
+    // Plan 072 D3: a local session tab's `roostctl` talks to its window
+    // ------------------------------------------------------------------
+
+    /// A window on `session` whose local session is `owns`.
+    fn window_owning(tag: &str, owns: &str) -> FakeUi {
+        let owns = owns.to_string();
+        FakeUi::start(tag, move |op| match op {
+            ops::IDENTIFY => {
+                let mut identify = fake_identify(7);
+                identify["local_session_socket"] = owns.clone().into();
+                Ok(identify)
+            }
+            _ => Ok(serde_json::json!({})),
+        })
+    }
+
+    /// The socket a tab's `ROOST_SOCKET` names — a session, or an
+    /// in-process window — answering `{}` to everything.
+    fn tab_socket(tag: &str) -> FakeUi {
+        FakeUi::start(tag, |_| Ok(serde_json::json!({})))
+    }
+
+    /// A window that accepts every connection and never answers.
+    pub(crate) fn hung_window(tag: &str) -> (PathBuf, tokio::task::JoinHandle<()>) {
+        let socket = short_socket_dir(tag).join("ui.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind the hung window");
+        let holding = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        (socket, holding)
+    }
+
+    /// A tab whose `ROOST_SOCKET` is `socket`, on a machine whose local
+    /// session listens at `session`, with `windows` running.
+    pub(crate) fn tab_env_of(socket: &str, session: &str, windows: &[&Path]) -> Environment {
+        Environment {
+            target: TargetEnv {
+                socket: Some(socket.into()),
+                profile: None,
+            },
+            windows: window::Windows::Given {
+                session: PathBuf::from(session),
+                sockets: windows.iter().map(|w| w.to_path_buf()).collect(),
+            },
+        }
+    }
+
+    async fn run_in(argv: &[&str], environment: &Environment) -> Result<i32, CliError> {
+        let args = parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            run(args, Some("7"), None, environment),
+        )
+        .await
+        .expect("the verb never returned")
+    }
+
+    fn ops_of(fake: &FakeUi) -> Vec<String> {
+        fake.take().into_iter().map(|(op, _)| op).collect()
+    }
+
+    /// #561: from inside a session tab, the verb reaches the window that
+    /// owns the session, never the session itself or a window on another
+    /// one — `rpc` and `identify` included.
+    #[tokio::test]
+    async fn in_a_session_tab_a_verb_goes_to_the_window_that_owns_the_session() {
+        let session = tab_socket("d3-session");
+        let owner = window_owning("d3-owner", &session.socket);
+        let decoy = window_owning("d3-decoy", "/elsewhere/roost.sock");
+        let environment = tab_env_of(
+            &session.socket,
+            &session.socket,
+            &[Path::new(&decoy.socket), Path::new(&owner.socket)],
+        );
+
+        assert_eq!(run_in(&["tab", "focus"], &environment).await, Ok(0));
+        assert_eq!(ops_of(&owner), [ops::IDENTIFY, ops::TAB_FOCUS]);
+        assert_eq!(ops_of(&decoy), [ops::IDENTIFY]);
+
+        assert_eq!(run_in(&["rpc", "app.activate"], &environment).await, Ok(0));
+        assert_eq!(ops_of(&owner), [ops::IDENTIFY, "app.activate"]);
+        assert_eq!(run_in(&["identify"], &environment).await, Ok(0));
+        assert_eq!(ops_of(&owner), [ops::IDENTIFY, ops::IDENTIFY]);
+
+        assert_eq!(ops_of(&decoy), [ops::IDENTIFY, ops::IDENTIFY]);
+        assert_eq!(session.connections().await, 0);
+    }
+
+    /// A window that never answers claims nothing within its budget: with
+    /// no other owner the verb stays on the session, and beside an owner it
+    /// goes to the owner.
+    #[tokio::test]
+    async fn a_window_that_never_answers_is_passed_over() {
+        let session = tab_socket("d3-hung-s");
+        let (hung, holding) = hung_window("d3-hung-w");
+
+        let alone = tab_env_of(&session.socket, &session.socket, &[&hung]);
+        assert_eq!(run_in(&["tab", "focus"], &alone).await, Ok(0));
+        assert_eq!(ops_of(&session), [ops::TAB_FOCUS]);
+
+        let owner = window_owning("d3-hung-o", &session.socket);
+        let beside = tab_env_of(
+            &session.socket,
+            &session.socket,
+            &[&hung, Path::new(&owner.socket)],
+        );
+        assert_eq!(run_in(&["tab", "focus"], &beside).await, Ok(0));
+        assert_eq!(ops_of(&owner), [ops::IDENTIFY, ops::TAB_FOCUS]);
+        assert!(ops_of(&session).is_empty());
+        holding.abort();
+    }
+
+    /// Two windows claiming one session is refused before any verb is
+    /// sent, naming both, and neither the session nor a window acts.
+    #[tokio::test]
+    async fn two_windows_owning_the_session_is_a_usage_error() {
+        let session = tab_socket("d3-two-s");
+        let one = window_owning("d3-two-1", &session.socket);
+        let two = window_owning("d3-two-2", &session.socket);
+        let environment = tab_env_of(
+            &session.socket,
+            &session.socket,
+            &[Path::new(&one.socket), Path::new(&two.socket)],
+        );
+
+        let error = run_in(&["tab", "focus"], &environment)
+            .await
+            .expect_err("two windows own it");
+        assert_eq!((error.exit_code(), error.code()), (2, "usage"));
+        assert!(
+            error.message().contains(&one.socket) && error.message().contains(&two.socket),
+            "{error:?}"
+        );
+        assert!(error.message().contains("pass --socket"), "{error:?}");
+        assert_eq!(ops_of(&one), [ops::IDENTIFY]);
+        assert_eq!(ops_of(&two), [ops::IDENTIFY]);
+        assert_eq!(session.connections().await, 0);
+    }
+
+    /// A script that names its socket gets that socket: `--socket`, and
+    /// `--target` beside `ROOST_SOCKET` (which the ladder still resolves to
+    /// `ROOST_SOCKET`), are never redirected and ask no window anything.
+    #[tokio::test]
+    async fn a_named_target_is_never_redirected() {
+        let session = tab_socket("d3-named-s");
+        let owner = window_owning("d3-named-o", &session.socket);
+        let from_tab = tab_env_of(
+            &session.socket,
+            &session.socket,
+            &[Path::new(&owner.socket)],
+        );
+        let outside = Environment {
+            target: TargetEnv::default(),
+            ..from_tab.clone()
+        };
+
+        for (argv, environment) in [
+            (&["--socket", &session.socket, "tab", "focus"][..], &outside),
+            (
+                &["--socket", &session.socket, "tab", "focus"][..],
+                &from_tab,
+            ),
+            (&["--target", "session", "tab", "focus"][..], &from_tab),
+            (&["--target", "iced", "tab", "focus"][..], &from_tab),
+        ] {
+            assert_eq!(run_in(argv, environment).await, Ok(0), "{argv:?}");
+            assert_eq!(ops_of(&session), [ops::TAB_FOCUS], "{argv:?}");
+        }
+        assert_eq!(owner.connections().await, 0);
+    }
+
+    /// An in-process tab's `ROOST_SOCKET` is its window's own socket, not
+    /// the local session's, so it costs a string compare and nothing else.
+    #[tokio::test]
+    async fn an_in_process_tab_never_asks_a_window() {
+        let in_process = tab_socket("d3-inproc-ui");
+        let session = tab_socket("d3-inproc-s");
+        let owner = window_owning("d3-inproc-o", &session.socket);
+        let environment = tab_env_of(
+            &in_process.socket,
+            &session.socket,
+            &[Path::new(&owner.socket)],
+        );
+
+        assert_eq!(run_in(&["tab", "focus"], &environment).await, Ok(0));
+        assert_eq!(ops_of(&in_process), [ops::TAB_FOCUS]);
+        assert_eq!(owner.connections().await, 0);
+        assert_eq!(session.connections().await, 0);
+    }
+
+    /// `events` and `wait` stay on the session and ask no window.
+    #[tokio::test]
+    async fn the_stream_verbs_stay_on_the_session() {
+        use crate::events::fake::{Fake, Phase};
+
+        let session = Fake::session("d3-stream-s");
+        let owner = window_owning("d3-stream-o", &session.socket());
+        let environment = tab_env_of(
+            &session.socket(),
+            &session.socket(),
+            &[Path::new(&owner.socket)],
+        );
+
+        assert_eq!(
+            run_in(
+                &["wait", "--state", "running", "--timeout", "10"],
+                &environment
+            )
+            .await,
+            Ok(0)
+        );
+        session.hook(|world, op, phase| {
+            if op == "events.subscribe" && phase == Phase::After {
+                world.end_streams(Some(&serde_json::json!({
+                    "event": "session.stopping", "data": { "reason": "stop" }
+                })));
+            }
+        });
+        assert_eq!(run_in(&["events"], &environment).await, Ok(0));
+        assert_eq!(owner.connections().await, 0);
+        assert_eq!(session.with(|world| world.count("events.subscribe")), 2);
+    }
+
+    /// The hooks report to the socket the tab named even when a window
+    /// owns it.
+    #[tokio::test]
+    async fn the_hooks_report_to_the_session_a_window_owns() {
+        let session = tab_socket("d3-hook-s");
+        let owner = window_owning("d3-hook-o", &session.socket);
+        let environment = tab_env_of(
+            &session.socket,
+            &session.socket,
+            &[Path::new(&owner.socket)],
+        );
+        let selector = TargetSelector::default();
+        let payload =
+            br#"{"hook_event_name":"SessionStart","session_id":"s-1","source":"startup"}"#;
+
+        run_agent_hook("claude", &selector, &environment.target, Some("7"), payload).await;
+        run_claude_hook(
+            "SessionStart",
+            &selector,
+            &environment.target,
+            Some("7"),
+            payload,
+        )
+        .await;
+
+        let reported = ops_of(&session);
+        assert!(
+            reported.len() >= 2 && reported.iter().all(|op| op == ops::TAB_AGENT_REPORT),
+            "{reported:?}"
+        );
+        assert_eq!(owner.connections().await, 0);
+    }
+
+    /// Which verbs follow a session tab's socket to its window: all but
+    /// the three that read the session's stream.
+    #[test]
+    fn every_verb_but_the_stream_ones_follows_the_window() {
+        for argv in [
+            &["events"][..],
+            &["wait", "--state", "idle"],
+            &["tab", "prompt", "--tab", "7", "--timeout", "5", "hi"],
+        ] {
+            let args = parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert!(!follows_window(&args.command), "{argv:?}");
+        }
+        for argv in [
+            &["identify"][..],
+            &["rpc", "identify"],
+            &["palette", "state"],
+            &["screenshot"],
+            &["tab", "focus"],
+            &["tab", "open", "--project-id", "1"],
+            &["open", "--project", "x"],
+            &["tab", "dump"],
+            &["host", "list"],
+        ] {
+            let args = parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert!(follows_window(&args.command), "{argv:?}");
+        }
     }
 
     #[tokio::test]
@@ -3925,7 +4271,7 @@ mod tests {
     /// [`CliError::from_clap`], else [`run`].
     async fn command_line(argv: &[&str], tab_env: Option<&str>) -> Result<i32, CliError> {
         match parse(argv) {
-            Ok(args) => run(args, tab_env, None).await,
+            Ok(args) => run(args, tab_env, None, &Environment::default()).await,
             Err(error) => Err(CliError::from_clap(&error)),
         }
     }

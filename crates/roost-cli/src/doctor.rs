@@ -44,6 +44,7 @@ use roost_ipc::target::{TargetError, TargetOrigin, TargetSelector};
 use roost_ipc::{ClientError, IpcClient};
 
 use crate::error::CliError;
+use crate::window::{self, Environment};
 
 /// `IpcClient` has no read/write timeout of its own, so every leg of the
 /// conversation gets one here — "Roost is hung" must render as a failed
@@ -601,6 +602,21 @@ pub enum TargetFailure {
     Ambiguous(Vec<String>),
     UnknownProfile(String),
     Path(String),
+    /// More than one window claims the session `ROOST_SOCKET` names.
+    Windows(Vec<PathBuf>),
+}
+
+impl From<TargetError> for TargetFailure {
+    fn from(error: TargetError) -> Self {
+        match error {
+            TargetError::Ambiguous { live } => {
+                Self::Ambiguous(live.0.iter().map(|kind| kind.as_str().to_owned()).collect())
+            }
+            TargetError::NoLiveTarget { tried } => Self::NoLiveTarget(tried),
+            TargetError::UnknownProfile(v) => Self::UnknownProfile(v),
+            TargetError::Path(e) => Self::Path(e.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -673,6 +689,9 @@ pub struct Inputs {
     pub target_origin: TargetOrigin,
     pub target_candidates: Vec<PathBuf>,
     pub target: Result<PathBuf, TargetFailure>,
+    /// The local session `ROOST_SOCKET` named, when [`Self::target`] is
+    /// the window that owns it rather than the session itself.
+    pub target_session: Option<PathBuf>,
     pub sockets: Vec<SocketProbe>,
 
     pub identify: Result<IdentifyResult, IdentifyFailure>,
@@ -736,6 +755,7 @@ impl Default for Inputs {
             target_origin: TargetOrigin::AutoDetect,
             target_candidates: Vec::new(),
             target: Err(TargetFailure::NoLiveTarget(Vec::new())),
+            target_session: None,
             sockets: Vec::new(),
             identify: Err(IdentifyFailure::NoConnection("no socket".into())),
             tab_list: Err("no connection".into()),
@@ -758,7 +778,11 @@ impl Default for Inputs {
 // collect — ALL the I/O, never returns Err
 // ============================================================================
 
-pub async fn collect(selector: &TargetSelector, explicit_tab: Option<i64>) -> Inputs {
+pub async fn collect(
+    selector: &TargetSelector,
+    environment: &Environment,
+    explicit_tab: Option<i64>,
+) -> Inputs {
     let shell_path = non_empty_env("SHELL");
     let shell_usable = shell_path.as_deref().is_some_and(executable_regular_file);
     let parent_pid = std::os::unix::process::parent_id();
@@ -781,7 +805,7 @@ pub async fn collect(selector: &TargetSelector, explicit_tab: Option<i64>) -> In
         shell_version(shell_path.as_deref(), shell_usable, subprocess_budget),
         parent_comm(parent_pid, subprocess_budget),
         capture_version("claude", subprocess_budget),
-        probe_ui(selector, ipc_budget(scale)),
+        probe_ui(selector, environment, ipc_budget(scale)),
     );
 
     let claude_settings_path = crate::claude_settings_path().ok();
@@ -833,6 +857,7 @@ pub async fn collect(selector: &TargetSelector, explicit_tab: Option<i64>) -> In
         target_origin: ui.origin,
         target_candidates: ui.candidates,
         target: ui.target,
+        target_session: ui.session,
         sockets: ui.sockets,
         identify: ui.identify,
         tab_list: ui.tab_list,
@@ -999,21 +1024,29 @@ struct UiProbe {
     origin: TargetOrigin,
     candidates: Vec<PathBuf>,
     target: Result<PathBuf, TargetFailure>,
+    session: Option<PathBuf>,
     sockets: Vec<SocketProbe>,
     identify: Result<IdentifyResult, IdentifyFailure>,
     tab_list: Result<serde_json::Value, String>,
 }
 
-async fn probe_ui(selector: &TargetSelector, budget: Duration) -> UiProbe {
-    let diagnosis = selector.diagnose().await;
-    let target = match diagnosis.resolved {
-        Ok(t) => Ok(t.socket_path),
-        Err(TargetError::Ambiguous { live }) => Err(TargetFailure::Ambiguous(
-            live.0.iter().map(|kind| kind.as_str().to_owned()).collect(),
-        )),
-        Err(TargetError::NoLiveTarget { tried }) => Err(TargetFailure::NoLiveTarget(tried)),
-        Err(TargetError::UnknownProfile(v)) => Err(TargetFailure::UnknownProfile(v)),
-        Err(TargetError::Path(e)) => Err(TargetFailure::Path(e.to_string())),
+/// Diagnoses what any other verb would dial, so from inside a local
+/// session tab that is the window that owns the session ([`window`]).
+async fn probe_ui(
+    selector: &TargetSelector,
+    environment: &Environment,
+    budget: Duration,
+) -> UiProbe {
+    let diagnosis = selector.diagnose_in(&environment.target).await;
+    let followed = window::follow(selector, environment, &diagnosis).await;
+    let resolved = diagnosis
+        .resolved
+        .map(|t| t.socket_path)
+        .map_err(TargetFailure::from);
+    let (target, session) = match followed {
+        Err(window::Ambiguous(claimants)) => (Err(TargetFailure::Windows(claimants)), None),
+        Ok(Some(window)) => (Ok(window), resolved.ok()),
+        Ok(None) => (resolved, None),
     };
 
     // `resolve(probe_alive=false)` is a trap here: with nothing set on
@@ -1027,7 +1060,9 @@ async fn probe_ui(selector: &TargetSelector, budget: Duration) -> UiProbe {
             profile: None,
             outcome: classify_socket(path, budget).await,
         }],
-        Err(TargetFailure::NoLiveTarget(_)) | Err(TargetFailure::Ambiguous(_)) => {
+        Err(TargetFailure::NoLiveTarget(_))
+        | Err(TargetFailure::Ambiguous(_))
+        | Err(TargetFailure::Windows(_)) => {
             let mut probes = Vec::with_capacity(diagnosis.candidates.len());
             for (kind, path) in &diagnosis.candidates {
                 probes.push(SocketProbe {
@@ -1053,6 +1088,7 @@ async fn probe_ui(selector: &TargetSelector, budget: Duration) -> UiProbe {
         origin: diagnosis.origin,
         candidates: diagnosis.candidates.into_iter().map(|(_, p)| p).collect(),
         target,
+        session,
         sockets,
         identify,
         tab_list,
@@ -2035,14 +2071,23 @@ fn ui_checks(inputs: &Inputs, tab_list: &TabList, model: AgentModel) -> Vec<Chec
         const TITLE: &str = "Target resolution";
         let candidates = paths(&inputs.target_candidates);
         let (status, detail) = match &inputs.target {
-            Ok(path) => (
-                Status::Ok,
-                format!(
-                    "{} → {} (auto-detect would try: {candidates})",
-                    inputs.target_origin.as_str(),
-                    redact_path(path)
-                ),
-            ),
+            Ok(path) => {
+                let hop = inputs
+                    .target_session
+                    .as_deref()
+                    .map(|session| {
+                        format!("{}, a local session; its window → ", redact_path(session))
+                    })
+                    .unwrap_or_default();
+                (
+                    Status::Ok,
+                    format!(
+                        "{} → {hop}{} (auto-detect would try: {candidates})",
+                        inputs.target_origin.as_str(),
+                        redact_path(path)
+                    ),
+                )
+            }
             Err(TargetFailure::NoLiveTarget(tried)) => (
                 Status::Fail,
                 format!("no Roost UI is listening (tried: {})", paths(tried)),
@@ -2066,6 +2111,14 @@ fn ui_checks(inputs: &Inputs, tab_list: &TabList, model: AgentModel) -> Vec<Chec
             Err(TargetFailure::Path(e)) => (
                 Status::Fail,
                 format!("path resolution failed: {}", redact(e)),
+            ),
+            Err(TargetFailure::Windows(claimants)) => (
+                Status::Fail,
+                format!(
+                    "more than one Roost window uses the session ROOST_SOCKET names ({}); pass \
+                     --socket",
+                    paths(claimants)
+                ),
             ),
         };
         check(ID, TITLE, status, detail)
@@ -4203,6 +4256,68 @@ mod tests {
         assert!(detail.contains("linux + iced"), "{detail}");
         assert!(!detail.contains("mac + linux"), "{detail}");
         assert!(detail.contains("--target mac|linux|iced"), "{detail}");
+    }
+
+    /// #561: from inside a local session tab doctor diagnoses what every
+    /// other verb there now dials — the window that owns the session — and
+    /// the target line says it hopped.
+    #[tokio::test]
+    async fn in_a_session_tab_doctor_diagnoses_the_window_that_owns_the_session() {
+        use crate::events::fake::Fake;
+
+        let session = Fake::session("doc-d3-s");
+        let owner = Fake::ui("doc-d3-o");
+        owner.with(|world| world.identify["local_session_socket"] = session.socket().into());
+        let environment =
+            crate::tests::tab_env_of(&session.socket(), &session.socket(), &[&owner.socket]);
+
+        let probe = probe_ui(
+            &TargetSelector::default(),
+            &environment,
+            ipc_budget(timeout_scale()),
+        )
+        .await;
+        assert_eq!(probe.origin, TargetOrigin::SocketEnv);
+        assert_eq!(probe.target, Ok(owner.socket.clone()));
+        assert_eq!(probe.session, Some(session.socket.clone()));
+        let identify = probe.identify.expect("the window answers identify");
+        assert_eq!(identify.instance_id.as_deref(), Some("ui-1"));
+        assert!(session.with(|world| world.log.is_empty()));
+
+        let report = evaluate(&Inputs {
+            target_origin: probe.origin,
+            target: probe.target,
+            target_session: probe.session,
+            ..Inputs::default()
+        });
+        assert_status(&report, "ui.target", Status::Ok);
+        let detail = &find(&report, "ui.target").detail;
+        assert!(
+            detail.starts_with(&format!(
+                "ROOST_SOCKET → {}, a local session; its window → {} ",
+                session.socket(),
+                owner.socket()
+            )),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn two_windows_owning_the_session_fail_target_resolution_by_name() {
+        let report = evaluate(&Inputs {
+            target_origin: TargetOrigin::SocketEnv,
+            target: Err(TargetFailure::Windows(vec![
+                PathBuf::from("/linux/roost.sock"),
+                PathBuf::from("/iced/roost.sock"),
+            ])),
+            ..Inputs::default()
+        });
+        assert_status(&report, "ui.target", Status::Fail);
+        let detail = &find(&report, "ui.target").detail;
+        assert!(
+            detail.contains("(/linux/roost.sock, /iced/roost.sock); pass --socket"),
+            "{detail}"
+        );
     }
 
     // -------------------------------------------- old server / zero tabs
@@ -7716,7 +7831,7 @@ mod tests {
         let started = std::time::Instant::now();
         let inputs = tokio::time::timeout(
             ipc_budget(scale) * ipc_round_trips + Duration::from_secs(26),
-            collect(&selector, None),
+            collect(&selector, &Environment::default(), None),
         )
         .await
         .expect("doctor must not hang on a silent UI");
@@ -7796,7 +7911,7 @@ mod tests {
         let ipc_round_trips: u32 = 2;
         let inputs = tokio::time::timeout(
             ipc_budget(scale) * ipc_round_trips + Duration::from_secs(26),
-            collect(&selector, None),
+            collect(&selector, &Environment::default(), None),
         )
         .await
         .expect("doctor must not hang on a slow UI");
@@ -7830,7 +7945,7 @@ mod tests {
         let _lc = EnvVar::set("LC_ALL", "de_DE.UTF-8");
         let _lang = EnvVar::set("LANG", "de_DE.UTF-8");
 
-        let inputs = collect(&dead_socket(&dir), None).await;
+        let inputs = collect(&dead_socket(&dir), &Environment::default(), None).await;
 
         assert_eq!(
             inputs.shell_version,
@@ -7862,7 +7977,7 @@ mod tests {
         let _shell = EnvVar::set("SHELL", &script);
 
         let started = std::time::Instant::now();
-        let inputs = collect(&dead_socket(&dir), None).await;
+        let inputs = collect(&dead_socket(&dir), &Environment::default(), None).await;
         let elapsed = started.elapsed();
 
         assert_eq!(inputs.shell_version, SubprocessOutcome::TimedOut);
@@ -7914,7 +8029,7 @@ mod tests {
             !before.is_empty(),
             "the fixture must have something to lose"
         );
-        let inputs = collect(&dead_socket(&home), None).await;
+        let inputs = collect(&dead_socket(&home), &Environment::default(), None).await;
         assert_eq!(
             snapshot(&home.0),
             before,
@@ -7946,10 +8061,12 @@ mod tests {
         let _path = EnvVar::set("PATH", home.join("empty-bin"));
         let _shell = EnvVar::set("SHELL", "/bin/sh");
 
-        let inputs =
-            tokio::time::timeout(Duration::from_secs(20), collect(&dead_socket(&home), None))
-                .await
-                .expect("doctor must not block on a FIFO");
+        let inputs = tokio::time::timeout(
+            Duration::from_secs(20),
+            collect(&dead_socket(&home), &Environment::default(), None),
+        )
+        .await
+        .expect("doctor must not block on a FIFO");
 
         let SettingsProbe::Unreadable(why) = &inputs.claude_settings else {
             panic!("{:?}", inputs.claude_settings);

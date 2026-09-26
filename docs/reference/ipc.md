@@ -404,9 +404,11 @@ instead of answering `not-found`, and answers `not-found` only if the
 tab closes first, the slot's connection drops, or 10 seconds pass. So
 `roostctl tab open --focus` and `roostctl open --focus` land on the new
 tab. This is the UI socket's behavior only: a client on the session's
-own socket — `roostctl` run inside a session tab, whose `ROOST_SOCKET`
-names the session — changes the session's active tab (the reply's
-`is_active`) and never the window's.
+own socket changes the session's active tab (the reply's `is_active`)
+and never the window's. `roostctl` run inside a session tab, whose
+`ROOST_SOCKET` names the session, dials the window that owns the
+session instead unless told otherwise, so it gets the UI socket's
+behavior ([`cli.md`](cli.md#inside-a-session-tab)).
 
 A forwarded request that cannot reach the slot — nothing is connected
 yet, or the connection dropped mid-op — answers `host-unavailable` with
@@ -1205,7 +1207,10 @@ a bare `tab_id` on a UI socket is rewritten to the slot's `h<n>.<id>`
 and answered the same way. A tab a forwarded `tab.open` just opened may
 not be listed by the window yet; a focus on it waits for the listing,
 and answers `not-found` only if the tab closes first, the slot's
-connection drops, or 10 seconds pass.
+connection drops, or 10 seconds pass. A `tab.focus` on a session's own
+socket moves only the session's active tab; `roostctl tab focus` run
+inside a session tab reaches the window instead
+([`cli.md`](cli.md#inside-a-session-tab)).
 
 ### `tab.set_title`
 

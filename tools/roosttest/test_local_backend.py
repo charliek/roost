@@ -2012,6 +2012,51 @@ def test_a_focus_right_after_an_unactivated_open_on_the_ui_socket_lands(lane: La
     assert roost.app_selected_tab_id() == quiet
 
 
+def roostctl_in_session_tab(
+    roost: Roost, *args: str, tab: int, timeout: float = 60.0
+) -> subprocess.CompletedProcess:
+    """`roostctl` as a shell inside session tab `tab` runs it: `ROOST_SOCKET`
+    is the session's own socket — the path the window names as
+    `local_session_socket` — and nothing on the command line names a
+    target."""
+    env = _without_roost_env()
+    env["ROOST_SOCKET"] = roost.identify()["local_session_socket"]
+    env["ROOST_TAB_ID"] = str(tab)
+    return subprocess.run(
+        [util.roostctl_path(), *args],
+        capture_output=True,
+        text=True,
+        timeout=scaled_timeout(timeout),
+        env=env,
+    )
+
+
+def test_roostctl_in_a_session_tab_talks_to_its_window(lane: Lane):
+    """#561 (plan 072 D3): inside a session tab `ROOST_SOCKET` names the
+    session, which has no palette and no window to move. `roostctl` there
+    now reaches the window that owns the session, as it does from a plain
+    terminal: `palette state` answers, `tab open` selects the new tab in
+    the window, and a bare `tab focus` brings the window back to the tab
+    it ran in."""
+    roost = session_ui(lane)
+    project, home = selected(roost)
+
+    palette = roostctl_in_session_tab(roost, "palette", "state", "--json", tab=home)
+    assert palette.returncode == 0, palette
+    assert json.loads(palette.stdout)["open"] is False, palette.stdout
+
+    opened = roostctl_in_session_tab(
+        roost, "tab", "open", "--project-id", str(project), "--cwd", "/tmp", tab=home
+    )
+    assert opened.returncode == 0, opened
+    new = int(opened.stdout.strip())
+    lands_on(roost, project, new, "the window to select the tab a session tab's `tab open` opened")
+
+    focused = roostctl_in_session_tab(roost, "tab", "focus", tab=home)
+    assert focused.returncode == 0, focused
+    lands_on(roost, project, home, "the window to move to the session tab `tab focus` ran in")
+
+
 def test_a_forwarded_delete_of_the_last_project_is_answered_before_the_exit(lane: Lane):
     """AC7 on the far side of §D10: the deletion reply is written before
     the process goes.

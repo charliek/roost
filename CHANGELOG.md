@@ -70,6 +70,21 @@ release workflow asserts they agree).
   ([`ipc.md#appkey_event`](docs/reference/ipc.md#appkey_event-test-only-gated));
   the Swift Mac app, which already kept these keys, answers it
   `unknown-op`.
+- **`roostctl` inside a local session tab talks to its window (#561)** —
+  a tab on the local session a fresh Roost-Iced install runs its tabs on
+  gets the session's socket as `ROOST_SOCKET`, so until now `roostctl`
+  there reached the session: `palette`, `screenshot`, `host`, `agent set`
+  and `tab send-file` failed, and `tab focus`, `tab open` and
+  `open --focus` exited 0 without moving the window. It now sends the
+  command to the window that owns the session, as from a plain terminal —
+  `rpc`, `identify` and `doctor` included. The hooks, `events`, `wait` and
+  `tab prompt` stay on the session, so they work with the window closed.
+  `--socket` or `--target` keeps a command on the socket it names; with
+  no window running, or on an in-process or remote tab, nothing changes;
+  two windows on one session exit 2 `usage`. Finding the window costs one
+  `identify` per running window, at most 500 ms each, and only in a local
+  session tab. See
+  [`cli.md#inside-a-session-tab`](docs/reference/cli.md#inside-a-session-tab).
 
 ### Fixed
 
