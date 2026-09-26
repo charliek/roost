@@ -2963,6 +2963,29 @@ impl App {
         }
     }
 
+    /// What the switch to in-process may say about the session it leaves
+    /// behind (plan 072 D7a): the palette row, the confirm card and the
+    /// un-save of a slot that never connected all read this one answer.
+    ///
+    /// A build mismatch counts as answering: a session is running there,
+    /// only not one this build can attach to.
+    pub(super) fn local_slot_history(&self) -> roost_ui_model::host_verbs::SlotHistory {
+        use roost_ui_model::host_verbs::SlotHistory;
+        let Some(view) = self.local_slot_view() else {
+            return SlotHistory::NeverConnected;
+        };
+        if matches!(
+            view.state,
+            host_sidebar::SectionState::Connected | host_sidebar::SectionState::NeedsRestart
+        ) {
+            return SlotHistory::Connected;
+        }
+        match self.saved_host(&view.saved_id) {
+            Ok(host) if host.last_connected.is_some() => SlotHistory::ConnectedBefore,
+            _ => SlotHistory::NeverConnected,
+        }
+    }
+
     /// **The only seam that resolves "the local target"** (plan 063
     /// §D3): the in-process workspace under `in-process`, the slot's
     /// live incarnation under `session`, and `None` when the slot is not

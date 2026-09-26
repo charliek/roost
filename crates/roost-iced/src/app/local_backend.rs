@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use roost_ipc::messages::Project;
 use roost_ipc::{LocalBackendMode, LocalRoute};
 use roost_ui_model::config::RoostConfig;
+use roost_ui_model::host_verbs::SlotHistory;
 use roost_ui_model::keybind::KeybindAction;
 use roost_ui_model::keys::{HostId, ProjectKey, TabKey};
 
@@ -1397,6 +1398,20 @@ fn retire_failed_journal(path: &Path, journal: &SwitchJournal) -> Vec<(i64, Opti
     adopted
 }
 
+/// [`retire_failed_journal`]'s twin, for a reverse that finished (plan
+/// 072 D7a): a committed journal the next launch would otherwise find,
+/// warn about and resolve.
+///
+/// Kept, like its twin, while it names an adopted copy: a reverse copies
+/// nothing and so never clears one, and the launch's
+/// [`JournalRecovery::Finish`] arm is what deletes it. Kept too before the
+/// commit point, where the launch has to roll the key back.
+fn retire_committed_journal(path: &Path, journal: &SwitchJournal) {
+    if journal.phase.committed() && journal.inherited_dest.is_empty() {
+        clear_journal(path);
+    }
+}
+
 /// The reverse's commit point as the two writes it is: the key, then the
 /// journal that says the key may be trusted.
 ///
@@ -1614,13 +1629,17 @@ pub(crate) fn forward_confirm_body(projects: usize, tabs: usize) -> String {
 }
 
 /// What the reverse confirm card says — No-Replay stated plainly, since
-/// the surprising part is what does *not* happen (§D8's "Reverse").
-pub(crate) fn reverse_confirm_body(label: &str) -> String {
-    format!(
-        "Local tabs go back to running inside Roost and start fresh — \
-         nothing is copied back. The session keeps running and its \
-         projects stay one click away under {label}."
-    )
+/// the surprising part is what does *not* happen (§D8's "Reverse") — and
+/// a running session claimed only while one answers (plan 072 D7a).
+pub(crate) fn reverse_confirm_body(label: &str, slot: SlotHistory) -> String {
+    match roost_ui_model::host_verbs::unanswered_switch_copy(slot) {
+        Some(copy) => copy.to_string(),
+        None => format!(
+            "Local tabs go back to running inside Roost and start fresh — \
+             nothing is copied back. The session keeps running and its \
+             projects stay one click away under {label}."
+        ),
+    }
 }
 
 pub(super) fn plural(count: usize, noun: &str) -> String {
@@ -1825,7 +1844,7 @@ impl super::App {
                     .unwrap_or_else(|| roost_ui_model::host_verbs::SEED_LABEL.to_string());
                 (
                     "Use in-process local tabs?".to_string(),
-                    reverse_confirm_body(&label),
+                    reverse_confirm_body(&label, self.local_slot_history()),
                     "Use in-process tabs",
                 )
             }
@@ -2709,7 +2728,31 @@ impl super::App {
 
     fn finish_switch_quietly(&mut self) {
         tracing::info!(mode = %self.local_backend, "local-backend switch finished");
+        let reversed = self
+            .switch
+            .as_ref()
+            .filter(|run| {
+                run.direction == SwitchDirection::ToInProcess && run.journal.phase.committed()
+            })
+            .map(|run| run.journal.clone());
+        if let Some(journal) = &reversed {
+            retire_committed_journal(&self.journal_path(), journal);
+        }
+        // A slot no session has ever answered holds nothing of the
+        // user's, and left saved it is a dead `localhost` row.
+        let forget = reversed
+            .filter(|_| self.local_slot_history() == SlotHistory::NeverConnected)
+            .and_then(|_| self.local_slot_saved_id());
         self.end_switch();
+        if let Some(saved_id) = forget {
+            if let Err(error) = self.host_remove_requested(&saved_id) {
+                tracing::warn!(
+                    %error,
+                    host = %saved_id,
+                    "could not un-save a slot that never connected"
+                );
+            }
+        }
     }
 
     /// Drop the run and republish, which is what re-arms the exit rule,
@@ -4463,6 +4506,42 @@ mod switch_tests {
         );
     }
 
+    /// Plan 072 D7a: a finished reverse takes its journal with it — unless
+    /// the journal names an adopted copy, which only a launch's `Finish`
+    /// arm deletes, or the run never reached the commit point.
+    #[test]
+    fn a_finished_reverse_retires_its_journal_unless_it_names_an_adopted_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = journal_path(dir.path());
+        let mut journal = SwitchJournal::new(SwitchDirection::ToInProcess, Vec::new());
+        journal.phase = SwitchState::Committing;
+
+        write_journal(&path, &journal).unwrap();
+        retire_committed_journal(&path, &journal);
+        assert!(read_journal(&path).is_none(), "nothing adopted: it goes");
+
+        journal.inherited_dest = vec![InheritedDest {
+            project: 7,
+            tabs: Some(2),
+        }];
+        write_journal(&path, &journal).unwrap();
+        retire_committed_journal(&path, &journal);
+        assert_eq!(
+            read_journal(&path).map(|kept| kept.inherited_dest),
+            Some(journal.inherited_dest.clone()),
+            "an adopted copy keeps it for the launch that deletes the copy"
+        );
+
+        journal.inherited_dest.clear();
+        journal.phase = SwitchState::Preparing;
+        write_journal(&path, &journal).unwrap();
+        retire_committed_journal(&path, &journal);
+        assert!(
+            read_journal(&path).is_some(),
+            "before the commit point the launch still has a key to roll back"
+        );
+    }
+
     /// What the `local-backend` line in a config file says, if any.
     fn backend_key(path: &Path) -> Option<String> {
         std::fs::read_to_string(path)
@@ -4914,9 +4993,30 @@ mod switch_tests {
         assert!(forward_confirm_body(0, 0).contains("0 projects and 0 tabs"));
 
         // Reverse says the thing that surprises: nothing comes back.
-        let back = reverse_confirm_body("localhost");
+        let back = reverse_confirm_body("localhost", SlotHistory::Connected);
         assert!(back.contains("nothing is copied back"), "{back}");
         assert!(back.contains("localhost"), "{back}");
+    }
+
+    /// Plan 072 D7a: the card claims a running session only while one
+    /// answers — the palette row's three states, on the card.
+    #[test]
+    fn the_reverse_card_claims_a_running_session_only_while_one_answers() {
+        assert_eq!(
+            reverse_confirm_body("localhost", SlotHistory::Connected),
+            "Local tabs go back to running inside Roost and start fresh — nothing is copied \
+             back. The session keeps running and its projects stay one click away under \
+             localhost."
+        );
+        assert_eq!(
+            reverse_confirm_body("localhost", SlotHistory::ConnectedBefore),
+            "Local tabs will run inside Roost. The local session isn't running; its projects \
+             stay under LOCALHOST for when it starts."
+        );
+        assert_eq!(
+            reverse_confirm_body("localhost", SlotHistory::NeverConnected),
+            "Local tabs will run inside Roost."
+        );
     }
 
     /// A stand-in session on the far end of a `HostOps` queue.

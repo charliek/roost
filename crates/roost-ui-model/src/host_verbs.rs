@@ -294,13 +294,15 @@ fn is_connected(state: SectionState) -> bool {
 ///   whichever names the backend this client is *not* on — and neither
 ///   while a switch is in flight (§D8a) or where the policy withholds
 ///   the localhost surface, since both directions are about a session
-///   on this machine.
+///   on this machine. What the in-process row says the switch leaves
+///   behind depends on `slot` (plan 072 D7a).
 pub fn verbs(
     hosts: &[HostRow<'_>],
     recents: &[RecentRow<'_>],
     local: LocalSlot<'_>,
     policy: VerbPolicy,
     switching: bool,
+    slot: SlotHistory,
 ) -> Vec<VerbItem> {
     let mut items = vec![VerbItem::new(
         ADD_ID,
@@ -394,7 +396,7 @@ pub fn verbs(
     // Last: it is the heaviest row in the frame — it ends every running
     // local shell — and the family above is what a person opens this
     // palette for.
-    items.extend(switch_row(local.mode, policy, switching));
+    items.extend(switch_row(local.mode, policy, switching, slot));
     items
 }
 
@@ -404,7 +406,12 @@ pub fn verbs(
 /// A single row rather than a pair with one greyed out: a verb that
 /// names the backend you are already on has nothing to do, and the
 /// palette's rule is that verbs appear only when they apply.
-fn switch_row(mode: LocalBackendMode, policy: VerbPolicy, switching: bool) -> Option<VerbItem> {
+fn switch_row(
+    mode: LocalBackendMode,
+    policy: VerbPolicy,
+    switching: bool,
+    slot: SlotHistory,
+) -> Option<VerbItem> {
     if switching || !policy.localhost_surface {
         return None;
     }
@@ -417,9 +424,37 @@ fn switch_row(mode: LocalBackendMode, policy: VerbPolicy, switching: bool) -> Op
         LocalBackendMode::Session => VerbItem::new(
             USE_IN_PROCESS_ID,
             "Use in-process local tabs",
-            "session keeps running as LOCALHOST; local tabs start fresh",
+            unanswered_switch_copy(slot)
+                .unwrap_or("session keeps running as LOCALHOST; local tabs start fresh"),
         ),
     })
+}
+
+/// How far the local session has ever got with this client — what the
+/// switch to in-process may claim about the session it leaves behind
+/// (plan 072 D7a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotHistory {
+    /// A session answers the slot right now.
+    Connected,
+    /// None does, but one has before (the registry's `last_connected`).
+    ConnectedBefore,
+    /// None ever has, or there is no slot saved at all.
+    NeverConnected,
+}
+
+/// The in-process switch's copy for a slot nothing answers: one spelling
+/// for the palette row's subtitle and the confirm card's body. `None`
+/// while a session answers, where each surface keeps its own copy.
+pub fn unanswered_switch_copy(slot: SlotHistory) -> Option<&'static str> {
+    match slot {
+        SlotHistory::Connected => None,
+        SlotHistory::ConnectedBefore => Some(
+            "Local tabs will run inside Roost. The local session isn't running; \
+             its projects stay under LOCALHOST for when it starts.",
+        ),
+        SlotHistory::NeverConnected => Some("Local tabs will run inside Roost."),
+    }
 }
 
 /// Whether Remove is offered for this host at all (plan 063 §D7).
@@ -604,6 +639,10 @@ mod tests {
         slot_saved_id: None,
     };
 
+    /// The slot history every case not about the switch's copy reads:
+    /// the one the copy was first written for.
+    const ANSWERED: SlotHistory = SlotHistory::Connected;
+
     /// `session`, with `saved_id` holding the slot.
     fn session(saved_id: &str) -> LocalSlot<'_> {
         LocalSlot {
@@ -640,11 +679,11 @@ mod tests {
     #[test]
     fn a_fresh_registry_offers_add_always_and_the_seed_only_with_the_surface() {
         assert_eq!(
-            ids(&verbs(&[], NO_RECENTS, IN_PROCESS, FULL, false)),
+            ids(&verbs(&[], NO_RECENTS, IN_PROCESS, FULL, false, ANSWERED)),
             vec![ADD_ID, CONNECT_SEED_ID, NEW_PROJECT_ON_ID, USE_SESSION_ID]
         );
         assert_eq!(
-            ids(&verbs(&[], NO_RECENTS, IN_PROCESS, GATED, false)),
+            ids(&verbs(&[], NO_RECENTS, IN_PROCESS, GATED, false, ANSWERED)),
             vec![ADD_ID]
         );
     }
@@ -660,7 +699,8 @@ mod tests {
             NO_RECENTS,
             IN_PROCESS,
             FULL,
-            false
+            false,
+            ANSWERED
         ))
         .contains(&CONNECT_SEED_ID));
         assert!(!ids(&verbs(
@@ -668,7 +708,8 @@ mod tests {
             NO_RECENTS,
             IN_PROCESS,
             FULL,
-            false
+            false,
+            ANSWERED
         ))
         .contains(&CONNECT_SEED_ID));
     }
@@ -720,7 +761,8 @@ mod tests {
                     NO_RECENTS,
                     IN_PROCESS,
                     FULL,
-                    false
+                    false,
+                    ANSWERED
                 )),
                 expected,
                 "{state:?}"
@@ -745,7 +787,14 @@ mod tests {
             SectionState::NeedsRestart,
             SectionState::Stopped,
         ] {
-            let items = verbs(&[host("h", state)], NO_RECENTS, IN_PROCESS, FULL, false);
+            let items = verbs(
+                &[host("h", state)],
+                NO_RECENTS,
+                IN_PROCESS,
+                FULL,
+                false,
+                ANSWERED,
+            );
             let has = |prefix: &str| items.iter().any(|item| item.id.starts_with(prefix));
             assert_eq!(
                 has(REMOVE_PREFIX),
@@ -762,6 +811,7 @@ mod tests {
             IN_PROCESS,
             FULL,
             false,
+            ANSWERED,
         );
         assert_eq!(
             connected
@@ -783,7 +833,7 @@ mod tests {
             localhost_host("slot", SectionState::Connected),
             host("box", SectionState::Connected),
         ];
-        let session_items = verbs(&hosts, NO_RECENTS, session("slot"), FULL, false);
+        let session_items = verbs(&hosts, NO_RECENTS, session("slot"), FULL, false, ANSWERED);
         let under_session = ids(&session_items);
         assert!(
             !under_session.contains(&"host:remove:slot"),
@@ -803,6 +853,7 @@ mod tests {
             },
             FULL,
             false,
+            ANSWERED,
         );
         let under_in_process = ids(&in_process_items);
         assert!(
@@ -827,7 +878,14 @@ mod tests {
         };
         let remote = host("h2", SectionState::Disconnected);
 
-        let gated = verbs(&[local, remote], NO_RECENTS, IN_PROCESS, GATED, false);
+        let gated = verbs(
+            &[local, remote],
+            NO_RECENTS,
+            IN_PROCESS,
+            GATED,
+            false,
+            ANSWERED,
+        );
         assert!(
             !ids(&gated).contains(&"host:connect:h1"),
             "a client without the surface must not offer a session it cannot reach"
@@ -849,7 +907,8 @@ mod tests {
             NO_RECENTS,
             IN_PROCESS,
             FULL,
-            false
+            false,
+            ANSWERED
         ))
         .contains(&"host:connect:h1"));
     }
@@ -880,7 +939,7 @@ mod tests {
             // restart one either.
             fidelity: Some(FidelityAction::Restart),
         };
-        let offered = verbs(&[connected], NO_RECENTS, IN_PROCESS, GATED, false);
+        let offered = verbs(&[connected], NO_RECENTS, IN_PROCESS, GATED, false, ANSWERED);
         let items = ids(&offered);
         assert!(!items.contains(&"host:disconnect:h1"));
         assert!(!items.contains(&"host:stop:h1"));
@@ -896,11 +955,13 @@ mod tests {
     #[test]
     fn the_picker_row_appears_only_when_the_picker_offers_a_choice() {
         assert!(
-            ids(&verbs(&[], NO_RECENTS, IN_PROCESS, FULL, false)).contains(&NEW_PROJECT_ON_ID),
+            ids(&verbs(&[], NO_RECENTS, IN_PROCESS, FULL, false, ANSWERED))
+                .contains(&NEW_PROJECT_ON_ID),
             "LOCAL plus localhost is already two destinations"
         );
         assert!(
-            !ids(&verbs(&[], NO_RECENTS, IN_PROCESS, GATED, false)).contains(&NEW_PROJECT_ON_ID),
+            !ids(&verbs(&[], NO_RECENTS, IN_PROCESS, GATED, false, ANSWERED))
+                .contains(&NEW_PROJECT_ON_ID),
             "without the surface a fresh registry has LOCAL alone"
         );
         assert!(
@@ -909,7 +970,8 @@ mod tests {
                 NO_RECENTS,
                 session("nothing-saved"),
                 FULL,
-                false
+                false,
+                ANSWERED
             ))
             .contains(&NEW_PROJECT_ON_ID),
             "session mode with only the localhost row is not a choice"
@@ -919,7 +981,8 @@ mod tests {
             NO_RECENTS,
             session("nothing-saved"),
             FULL,
-            false
+            false,
+            ANSWERED
         ))
         .contains(&NEW_PROJECT_ON_ID));
     }
@@ -1087,7 +1150,14 @@ mod tests {
                 ..host("h", state)
             };
             assert_eq!(
-                ids(&verbs(&[row], NO_RECENTS, IN_PROCESS, FULL, false)),
+                ids(&verbs(
+                    &[row],
+                    NO_RECENTS,
+                    IN_PROCESS,
+                    FULL,
+                    false,
+                    ANSWERED
+                )),
                 expect(transport, rest),
                 "{transport:?} {state:?} reduced={reduced_fidelity}"
             );
@@ -1114,7 +1184,7 @@ mod tests {
                     fidelity: Some(action),
                     ..host("h", state)
                 };
-                let offered = verbs(&[row], NO_RECENTS, IN_PROCESS, FULL, false);
+                let offered = verbs(&[row], NO_RECENTS, IN_PROCESS, FULL, false, ANSWERED);
                 let items = ids(&offered);
                 assert!(
                     !items
@@ -1143,6 +1213,7 @@ mod tests {
                 IN_PROCESS,
                 FULL,
                 false,
+                ANSWERED,
             )
             .into_iter()
             .find(|item| item.id.starts_with(UPDATE_PREFIX) || item.id.starts_with(RESTART_PREFIX))
@@ -1169,7 +1240,7 @@ mod tests {
     #[test]
     fn exactly_the_switch_row_for_the_other_backend_is_offered() {
         let row = |local, switching| {
-            ids(&verbs(&[], NO_RECENTS, local, FULL, switching))
+            ids(&verbs(&[], NO_RECENTS, local, FULL, switching, ANSWERED))
                 .into_iter()
                 .find(|id| {
                     parse(id).is_some_and(|verb| {
@@ -1196,7 +1267,7 @@ mod tests {
         // A build that cannot reach a session on this machine offers
         // neither direction: both are about one.
         assert_eq!(
-            ids(&verbs(&[], NO_RECENTS, IN_PROCESS, GATED, false)),
+            ids(&verbs(&[], NO_RECENTS, IN_PROCESS, GATED, false, ANSWERED)),
             vec![ADD_ID]
         );
     }
@@ -1205,20 +1276,63 @@ mod tests {
     /// irreversible part out loud (plan 063 §D8's table).
     #[test]
     fn each_switch_row_says_what_it_ends_and_what_it_keeps() {
-        let subtitle = |local| {
-            verbs(&[], NO_RECENTS, local, FULL, false)
+        let subtitle = |local, slot| {
+            verbs(&[], NO_RECENTS, local, FULL, false, slot)
                 .into_iter()
                 .find(|item| item.id == USE_SESSION_ID || item.id == USE_IN_PROCESS_ID)
                 .and_then(|item| item.subtitle)
                 .expect("a switch row")
         };
         assert_eq!(
-            subtitle(IN_PROCESS),
+            subtitle(IN_PROCESS, ANSWERED),
             "running local shells end; layout moves; survives quit"
         );
         assert_eq!(
-            subtitle(session("mine")),
+            subtitle(session("mine"), ANSWERED),
             "session keeps running as LOCALHOST; local tabs start fresh"
+        );
+    }
+
+    /// Plan 072 D7a: the way back claims a running session only while
+    /// one answers. With only the history moving, each of the three
+    /// states reads differently.
+    #[test]
+    fn the_way_back_claims_a_running_session_only_while_one_answers() {
+        let subtitle = |slot| {
+            verbs(&[], NO_RECENTS, session("mine"), FULL, false, slot)
+                .into_iter()
+                .find(|item| item.id == USE_IN_PROCESS_ID)
+                .and_then(|item| item.subtitle)
+                .expect("the way back")
+        };
+        assert_eq!(
+            subtitle(SlotHistory::Connected),
+            "session keeps running as LOCALHOST; local tabs start fresh"
+        );
+        assert_eq!(
+            subtitle(SlotHistory::ConnectedBefore),
+            "Local tabs will run inside Roost. The local session isn't running; \
+             its projects stay under LOCALHOST for when it starts."
+        );
+        assert_eq!(
+            subtitle(SlotHistory::NeverConnected),
+            "Local tabs will run inside Roost."
+        );
+        // The way onto a session makes no claim about one.
+        assert_eq!(
+            verbs(
+                &[],
+                NO_RECENTS,
+                IN_PROCESS,
+                FULL,
+                false,
+                SlotHistory::NeverConnected
+            )
+            .into_iter()
+            .find(|item| item.id == USE_SESSION_ID)
+            .and_then(|item| item.subtitle)
+            .as_deref(),
+            Some("running local shells end; layout moves; survives quit")
         );
     }
 
@@ -1227,7 +1341,7 @@ mod tests {
     #[test]
     fn a_forgotten_host_is_offered_back_in_both_surfaces() {
         let recents = [recent("old-box", "user@old-box")];
-        let items = verbs(&[], &recents, IN_PROCESS, FULL, false);
+        let items = verbs(&[], &recents, IN_PROCESS, FULL, false, ANSWERED);
         assert_eq!(
             ids(&items),
             vec![
@@ -1282,7 +1396,7 @@ mod tests {
             ..host("back", SectionState::Connected)
         };
 
-        let offered_items = verbs(&[saved], &recents, IN_PROCESS, FULL, false);
+        let offered_items = verbs(&[saved], &recents, IN_PROCESS, FULL, false, ANSWERED);
         let offered = ids(&offered_items);
         assert!(
             !offered.contains(&"host:recent:user@old-box"),
@@ -1299,7 +1413,7 @@ mod tests {
         assert!(picker.contains(&"host:create_on_recent:shed"));
 
         // The control: with that host not saved, the row is there.
-        let control = verbs(&[], &recents, IN_PROCESS, FULL, false);
+        let control = verbs(&[], &recents, IN_PROCESS, FULL, false, ANSWERED);
         assert!(ids(&control).contains(&"host:recent:user@old-box"));
     }
 
@@ -1310,7 +1424,7 @@ mod tests {
     fn a_recents_row_id_round_trips_a_target_with_colons() {
         let target = "/run/user/1000/roost:2/roost.sock";
         let recents = [recent("forwarded", target)];
-        for item in verbs(&[], &recents, IN_PROCESS, FULL, false)
+        for item in verbs(&[], &recents, IN_PROCESS, FULL, false, ANSWERED)
             .into_iter()
             .chain(create_targets(&[], &recents, IN_PROCESS, FULL, "Local"))
             .filter(|item| item.id.contains("recent"))
@@ -1346,9 +1460,16 @@ mod tests {
                 ..host("mine", SectionState::Connected)
             },
         ];
-        let mut items = verbs(&hosts, NO_RECENTS, IN_PROCESS, FULL, false);
-        items.extend(verbs(&[], NO_RECENTS, IN_PROCESS, FULL, false));
-        items.extend(verbs(&hosts, NO_RECENTS, session("mine"), FULL, false));
+        let mut items = verbs(&hosts, NO_RECENTS, IN_PROCESS, FULL, false, ANSWERED);
+        items.extend(verbs(&[], NO_RECENTS, IN_PROCESS, FULL, false, ANSWERED));
+        items.extend(verbs(
+            &hosts,
+            NO_RECENTS,
+            session("mine"),
+            FULL,
+            false,
+            ANSWERED,
+        ));
         items.extend(create_targets(
             &hosts, NO_RECENTS, IN_PROCESS, FULL, "Local",
         ));
@@ -1356,7 +1477,7 @@ mod tests {
         // not-yet-saved `localhost` row.
         items.extend(create_targets(&[], NO_RECENTS, IN_PROCESS, FULL, "Local"));
         let recents = [recent("old-box", "user@old-box")];
-        items.extend(verbs(&hosts, &recents, IN_PROCESS, FULL, false));
+        items.extend(verbs(&hosts, &recents, IN_PROCESS, FULL, false, ANSWERED));
         items.extend(create_targets(&hosts, &recents, IN_PROCESS, FULL, "Local"));
         for item in &items {
             assert!(parse(&item.id).is_some(), "{} does not parse", item.id);

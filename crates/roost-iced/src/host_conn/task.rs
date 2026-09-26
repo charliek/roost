@@ -314,8 +314,9 @@ enum SpawnStage {
     Locate,
     /// Reading the launch cwd.
     Cwd,
-    /// [`session_launch::spawn_and_read_verdict`] — the exec itself, or
-    /// the read of the line it prints.
+    /// [`session_launch::spawn_and_read_verdict_capturing_stderr`] — the
+    /// exec itself, the read of the line it prints, or the launcher dying
+    /// before it printed one.
     Launch,
     /// The daemon's own [`session_launch::Verdict::Error`].
     Verdict,
@@ -330,7 +331,8 @@ enum SpawnStage {
 /// | `Locate` | unrecoverable | `cannot find roost-session` |
 /// | `Cwd` | unrecoverable | `roost-session failed to start` |
 /// | `Launch`, exec-time io error | unrecoverable | `roost-session failed to start` |
-/// | `Launch`, anything else (verdict timeout, EOF, an over-long line) | transport | *(the error)* |
+/// | `Launch`, the launcher exited with no verdict | unrecoverable | `roost-session exited early (status N)`, or `(signal N)` |
+/// | `Launch`, anything else (verdict timeout, EOF from a live launcher, an over-long line) | transport | *(the error)* |
 /// | `Verdict` | unrecoverable | `roost-session failed to start` |
 /// | `Confirm` | transport | *(the error)* |
 ///
@@ -343,24 +345,31 @@ enum SpawnStage {
 /// loop, and ↻ Reconnect is the recovery. A future policy that let a
 /// retry spawn would revisit this table first.
 ///
-/// The two timeout rows stay retryable for the mirror-image reason: the
-/// daemon *was* exec'd and may still be on its way to binding, and a
-/// dial is exactly the right retry for that.
+/// A launcher that **exited** with no verdict settles for the same
+/// reason, once [`launch_session`]'s one confirm has found nothing
+/// answering: nothing is left to bind, and a dial would overwrite its
+/// status with "no session is running" every few seconds forever.
+///
+/// The rows that stay retryable are the ones whose daemon may still be
+/// on its way to binding — a launcher still alive when its verdict ran
+/// out, and a confirm that expired — and a dial is exactly the right
+/// retry for those.
 ///
 /// This is the localhost half. The ssh transport's equivalent verdict
 /// lives in [`retryable`](super::reconnect::retryable).
 ///
 /// **How `Launch` tells an exec failure from a verdict-read timeout.**
-/// [`session_launch::spawn_and_read_verdict`] attaches a real
-/// `io::Error` as a source exactly once — `Command::spawn`'s, through
-/// `with_context`. Every other failure it can return is a bare
+/// [`session_launch::spawn_and_read_verdict_capturing_stderr`] attaches
+/// a real `io::Error` as a source exactly once — `Command::spawn`'s,
+/// through `with_context`. Every other failure it can return is a bare
 /// `anyhow!` string, the read's own io error included
 /// ([`session_launch::VerdictRead::Io`] stringifies before it leaves
-/// the reader). So an `io::Error` anywhere in the chain *is* the exec,
-/// and that stays true only while `VerdictRead::Io` carries a `String`.
+/// the reader), or a [`session_launch::LauncherExited`]. So an
+/// `io::Error` anywhere in the chain *is* the exec, and that stays true
+/// only while `VerdictRead::Io` carries a `String`.
 ///
-/// Both settled `reason`s are written for the band's ~45 characters, not
-/// for the operator — what actually happened travels beside them as
+/// Every settled `reason` is written for the band's ~45 characters, not
+/// for the operator — what actually happened travels beside it as
 /// `detail`.
 fn spawn_failure(stage: SpawnStage, error: &anyhow::Error) -> AttemptError {
     let bin = session_launch::BIN_NAME;
@@ -371,9 +380,23 @@ fn spawn_failure(stage: SpawnStage, error: &anyhow::Error) -> AttemptError {
         SpawnStage::Launch if error.chain().any(|cause| cause.is::<std::io::Error>()) => {
             format!("{bin} failed to start")
         }
-        SpawnStage::Launch | SpawnStage::Confirm => return AttemptError::Transport(detail),
+        SpawnStage::Launch => match launcher_exited(error) {
+            Some(exited) => exited_early(exited.status),
+            None => return AttemptError::Transport(detail),
+        },
+        SpawnStage::Confirm => return AttemptError::Transport(detail),
     };
     AttemptError::Unrecoverable { reason, detail }
+}
+
+fn exited_early(status: std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    let bin = session_launch::BIN_NAME;
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("{bin} exited early (status {code})"),
+        (None, Some(signal)) => format!("{bin} exited early (signal {signal})"),
+        (None, None) => format!("{bin} exited early"),
+    }
 }
 
 /// The copy for a socket with nothing behind it — one spelling, shared
@@ -850,15 +873,49 @@ async fn spawn_session(
     // own `state.lock` (#397).
     let seam = std::env::var_os(roost_ipc::paths::STATE_DIR_ENV);
 
-    let verdict = session_launch::spawn_and_read_verdict(
+    launch_session(
         &bin.path,
         &cwd,
         seam.as_deref(),
         first_project,
+        &config.socket,
         SPAWN_VERDICT_BUDGET.mul_f64(scale),
+        SPAWN_CONFIRM_BUDGET.mul_f64(scale),
     )
     .await
-    .map_err(|error| spawn_failure(SpawnStage::Launch, &error))?;
+}
+
+/// Run a located launcher and confirm what it says.
+async fn launch_session(
+    bin: &Path,
+    cwd: &Path,
+    seam: Option<&std::ffi::OsStr>,
+    first_project: FirstProject,
+    socket: &Path,
+    verdict_budget: Duration,
+    confirm_budget: Duration,
+) -> Result<(), AttemptError> {
+    let verdict = match session_launch::spawn_and_read_verdict_capturing_stderr(
+        bin,
+        cwd,
+        seam,
+        first_project,
+        verdict_budget,
+    )
+    .await
+    {
+        Ok(verdict) => verdict,
+        // A launcher that forked before it died can have left a daemon
+        // still on its way to binding. One confirm tells that apart from
+        // a session that never came up, which no dial can bring back.
+        Err(error) if launcher_exited(&error).is_some() => {
+            return match session_launch::confirm_serving(socket, confirm_budget).await {
+                Ok(_) => Ok(()),
+                Err(_) => Err(spawn_failure(SpawnStage::Launch, &error)),
+            };
+        }
+        Err(error) => return Err(spawn_failure(SpawnStage::Launch, &error)),
+    };
     if let session_launch::Verdict::Error(reason) = &verdict {
         return Err(spawn_failure(
             SpawnStage::Verdict,
@@ -867,10 +924,14 @@ async fn spawn_session(
     }
     // Both success verdicts are confirmed rather than trusted: the
     // `already-running` loser can print before the winner has bound.
-    session_launch::confirm_serving(&config.socket, SPAWN_CONFIRM_BUDGET.mul_f64(scale))
+    session_launch::confirm_serving(socket, confirm_budget)
         .await
         .map_err(|error| spawn_failure(SpawnStage::Confirm, &error))?;
     Ok(())
+}
+
+fn launcher_exited(error: &anyhow::Error) -> Option<&session_launch::LauncherExited> {
+    error.chain().find_map(|cause| cause.downcast_ref())
 }
 
 /// Is something answering there?
@@ -1544,6 +1605,18 @@ mod tests {
             "an exec that failed can never be retried: only the first attempt may spawn"
         );
         assert!(settled(&launched).1.contains("spawn /nope/roost-session"));
+
+        let died = anyhow::Error::new(session_launch::LauncherExited {
+            status: std::os::unix::process::ExitStatusExt::from_raw(1 << 8),
+            stderr: "boom\n".into(),
+        });
+        assert_eq!(
+            settled(&spawn_failure(SpawnStage::Launch, &died)),
+            (
+                "roost-session exited early (status 1)",
+                "roost-session exited before it was ready (exit status 1): boom"
+            )
+        );
     }
 
     /// The invariant [`spawn_failure`]'s `Launch` arm rests on, against
@@ -1552,15 +1625,13 @@ mod tests {
     /// arrives does not.
     #[tokio::test]
     async fn only_a_failed_exec_puts_an_io_error_in_the_verdict_chain() {
-        let budget = Duration::from_secs(5);
-        let cwd = Path::new("/");
-
-        let missing = session_launch::spawn_and_read_verdict(
+        let dir = short_dir();
+        let missing = session_launch::spawn_and_read_verdict_capturing_stderr(
             Path::new("/nonexistent/roost-session"),
-            cwd,
+            dir.path(),
             None,
             FirstProject::Seed,
-            budget,
+            Duration::from_secs(5),
         )
         .await
         .expect_err("a binary that is not there cannot be exec'd");
@@ -1569,19 +1640,161 @@ mod tests {
             "roost-session failed to start"
         );
 
-        // `true start` exec's fine and closes its stdout without a
-        // readiness line — the shape of a daemon that died on startup
-        // *after* the exec, which stays retryable.
-        let no_verdict = session_launch::spawn_and_read_verdict(
+        let no_verdict = session_launch::spawn_and_read_verdict_capturing_stderr(
             Path::new("/usr/bin/true"),
-            cwd,
+            dir.path(),
             None,
             FirstProject::Seed,
-            budget,
+            Duration::from_secs(5),
         )
         .await
         .expect_err("no line, so no verdict");
-        transport(&spawn_failure(SpawnStage::Launch, &no_verdict));
+        assert!(!no_verdict.chain().any(|cause| cause.is::<std::io::Error>()));
+    }
+
+    /// A private directory under `/tmp`: short enough for a socket on
+    /// macOS, whose `temp_dir()` is not.
+    fn short_dir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("r-tk")
+            .tempdir_in("/tmp")
+            .expect("a temp dir under /tmp")
+    }
+
+    /// A launcher that runs `body`, through the committed fixture rather
+    /// than a script written here — see the fixture's header for the
+    /// ETXTBSY race a written script would run.
+    fn fake_launcher(dir: &Path, body: &str) -> PathBuf {
+        let path = dir.join(session_launch::BIN_NAME);
+        std::fs::write(path.with_extension("conf"), format!("{body}\n")).expect("write the body");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/roosttest/fixtures/fake-roost-session.sh")
+            .canonicalize()
+            .expect("the fake-roost-session fixture must exist");
+        std::os::unix::fs::symlink(fixture, &path).expect("link the fixture");
+        path
+    }
+
+    /// A launch against a socket nothing will ever bind, with a confirm
+    /// short enough for a test.
+    async fn launch_into_nothing(bin: &Path, dir: &Path, verdict: Duration) -> AttemptError {
+        launch_session(
+            bin,
+            dir,
+            None,
+            FirstProject::Seed,
+            &dir.join("s.sock"),
+            verdict,
+            Duration::from_millis(300),
+        )
+        .await
+        .expect_err("nothing answers")
+    }
+
+    /// Plan 042 C3 pinned this retryable; plan 072 D7a settles it. A
+    /// launcher that exited with nothing listening behind it has nothing
+    /// left to bind, and retrying it only replaced its status with "no
+    /// session is running" every few seconds, forever.
+    #[tokio::test]
+    async fn a_launcher_that_exits_without_a_verdict_settles_with_its_status() {
+        let dir = short_dir();
+        let error = launch_into_nothing(
+            Path::new("/usr/bin/true"),
+            dir.path(),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            settled(&error),
+            (
+                "roost-session exited early (status 0)",
+                "roost-session exited before it was ready (exit status 0)"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn what_a_dying_launcher_said_on_stderr_is_in_the_detail() {
+        let dir = short_dir();
+        let bin = fake_launcher(dir.path(), "echo boom >&2; exit 1");
+        let error = launch_into_nothing(&bin, dir.path(), Duration::from_secs(5)).await;
+        assert_eq!(
+            settled(&error),
+            (
+                "roost-session exited early (status 1)",
+                "roost-session exited before it was ready (exit status 1): boom"
+            )
+        );
+    }
+
+    /// The likeliest crash on start. `ExitStatus::code` is `None` for it,
+    /// so a status-only reading would have nothing to say.
+    #[tokio::test]
+    async fn a_launcher_killed_by_a_signal_names_the_signal() {
+        let dir = short_dir();
+        let bin = fake_launcher(dir.path(), "kill -SEGV $$");
+        let error = launch_into_nothing(&bin, dir.path(), Duration::from_secs(5)).await;
+        assert_eq!(
+            settled(&error),
+            (
+                "roost-session exited early (signal 11)",
+                "roost-session exited before it was ready (signal 11)"
+            )
+        );
+    }
+
+    /// A launcher that has not exited may still be starting a daemon, so
+    /// neither its closed stdout nor its silence settles anything.
+    #[tokio::test]
+    async fn a_launcher_still_alive_past_its_verdict_budget_stays_retryable() {
+        for body in ["exec >&-\nexec sleep 30", "exec sleep 30"] {
+            let dir = short_dir();
+            let bin = fake_launcher(dir.path(), body);
+            let error = launch_into_nothing(&bin, dir.path(), Duration::from_millis(500)).await;
+            transport(&error);
+        }
+    }
+
+    /// The one confirm is there for this: a launcher that forked its
+    /// daemon and then died before relaying the verdict. The daemon binds
+    /// after the launcher is gone, and the attempt connects to it.
+    #[tokio::test]
+    async fn a_launcher_that_dies_after_forking_its_daemon_still_connects() {
+        let dir = short_dir();
+        let socket = dir.path().join("s.sock");
+        let bound = dir.path().join("bind-now");
+        let bin = fake_launcher(
+            dir.path(),
+            &format!(
+                "( sleep 0.3; : > '{}' ) </dev/null >/dev/null 2>&1 &\nexit 0",
+                bound.display()
+            ),
+        );
+        let fake = Fake::naming(SESSION_ID);
+        let daemon = {
+            let fake = fake.clone();
+            let socket = socket.clone();
+            tokio::spawn(async move {
+                while !bound.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                fake.serve(&socket);
+            })
+        };
+
+        launch_session(
+            &bin,
+            dir.path(),
+            None,
+            FirstProject::Seed,
+            &socket,
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("the confirm finds the daemon the launcher left behind");
+        daemon.await.expect("the daemon bound");
+        assert!(fake.identifies() >= 1, "and it was asked who it is");
     }
 
     /// The launch-path twin: a redial of a socket that was never there

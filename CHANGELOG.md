@@ -42,6 +42,17 @@ release workflow asserts they agree).
 
 ### Fixed
 
+- **A local session that dies on start is named, and no longer retried
+  forever (#520)** — when `roost-session` exits before it is ready, the
+  local band now reads "roost-session exited early (status N)", or
+  "(signal N)" for a crash, instead of "no session is running", and
+  `roostctl host status` shows the exit and the last 4 KiB it wrote to
+  stderr; Roost logs it once and stops dialling until ↻ Reconnect. The
+  **Use in-process local tabs** row and its confirm card no longer claim
+  the session "keeps running" when it isn't, and switching away from a
+  session that never started forgets its dead `localhost` host. A switch
+  back to in-process no longer leaves its journal behind for the next
+  launch to warn about. `roost-session start`'s own output is unchanged.
 - **A new tab on a session-backed project could take the window away
   from a tab you clicked while it opened, and one that never appeared
   was dropped silently (#549)** — on the local session and on saved

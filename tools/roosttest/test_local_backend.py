@@ -119,6 +119,13 @@ NOT_RUNNING_EXIT = 3
 #: workspace to hold still. It is the same lever `test_a_destination_
 #: that_cannot_start_changes_nothing` pulls on the verb.
 NO_SESSION = {"ROOST_SESSION_BIN": str(_ROOT / "no-such-session")}
+#: `host_verbs::unanswered_switch_copy` for a slot no session ever
+#: answered — the palette row's subtitle and the confirm card's body.
+#: User-facing wording, restated so a change has to be made twice.
+NEVER_RAN_COPY = "Local tabs will run inside Roost."
+#: `spawn_failure`'s row for a launcher that exited with no verdict
+#: (`task.rs`), for the exit-1 stub the dies-on-start case writes.
+EXITED_EARLY = "roost-session exited early (status 1)"
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +652,51 @@ def test_the_reverse_switch_flips_the_key_and_copies_nothing_back(lane: Lane):
     assert running_session_id() is not None
     sections = roost.sidebar_sections()
     assert [s["role"] for s in sections] == ["local", "host"], sections
+    # Plan 072 D7a: a reverse that finished takes its journal with it,
+    # rather than leaving `committing` for the next launch to warn about.
+    assert lane.journal() is None, lane.journal()
+
+
+def test_leaving_a_session_that_never_ran_forgets_its_slot(lane: Lane):
+    """Plan 072 D7a (#520): the way out of a session that never started.
+
+    Both surfaces stop claiming a session "keeps running" when none ever
+    has, and the switch un-saves the slot rather than leaving a dead
+    `localhost` row behind it. Nothing is lost by that: no session ever
+    held a project there.
+    """
+    roost = lane.start("session", extra_env=NO_SESSION)
+    slot = wait_until(
+        lambda: next(
+            (
+                h
+                for h in roost.host_status()["hosts"]
+                if h["target"] == "localhost"
+                and h["state"] == "disconnected"
+                and "retry" not in h
+            ),
+            None,
+        ),
+        60.0,
+        "the slot's launch to settle",
+    )
+    assert "last_connected" not in slot, slot
+
+    roost.palette_open("commands")
+    try:
+        row = next(i for i in roost.palette_state()["items"] if i["id"] == USE_IN_PROCESS)
+    finally:
+        roost.palette_dismiss()
+    assert row["subtitle"] == NEVER_RAN_COPY, row
+    card = raise_switch(roost, USE_IN_PROCESS)
+    assert card["body"] == NEVER_RAN_COPY, card
+
+    roost.call("app.dialog_answer", {"action": "confirm"})
+    wait_until(lambda: settled(roost) == "in-process", 120.0, "the flip back")
+
+    hosts = roost.call("host.list", {})["hosts"]
+    assert slot["id"] not in [h["id"] for h in hosts], hosts
+    assert lane.journal() is None, lane.journal()
 
 
 def test_reverse_over_a_retained_layout_hydrates_it_rather_than_counting_it(lane: Lane):
@@ -736,6 +788,50 @@ def test_two_round_trips_move_the_work_once_and_the_seed_once(lane: Lane):
 # ---------------------------------------------------------------------------
 # 3. Failures, cancel, and quiescence
 # ---------------------------------------------------------------------------
+
+
+def test_a_session_that_dies_on_start_is_named_and_not_dialled_again(lane: Lane):
+    """Plan 072 D7a (#520): the likeliest way a fresh install's session
+    fails — a binary that dies before it can print a verdict.
+
+    Before D7a it read as "no session is running at …" with nothing
+    else, and a retry was armed every few seconds forever. Now the band
+    names the exit, `detail` carries what the launcher said on stderr,
+    and nothing dials again — held over a window, because "no retry"
+    has no edge to wait on. The settle waits out the one confirm a dead
+    launcher gets, for a daemon it may have left binding.
+    """
+    stub = _ROOT / "crashing-session"
+    stub.write_text("#!/bin/sh\necho 'boom: died on start' >&2\nexit 1\n")
+    stub.chmod(0o755)
+    roost = lane.start("session", extra_env={"ROOST_SESSION_BIN": str(stub)})
+
+    last: dict | None = None
+
+    def the_slot() -> dict | None:
+        nonlocal last
+        last = next((h for h in roost.host_status()["hosts"] if h["target"] == "localhost"), None)
+        return last
+
+    def named() -> dict | None:
+        row = the_slot()
+        if row is None or row["state"] != "disconnected":
+            return None
+        return row if row.get("reason") == EXITED_EARLY else None
+
+    try:
+        row = wait_until(named, 60.0, "the slot to name the exit")
+    except TimeoutError as timed_out:
+        raise AssertionError(f"the slot never named the exit; last row: {last}") from timed_out
+    assert "retry" not in row, row
+    assert row["detail"] == (
+        "roost-session exited before it was ready (exit status 1): boom: died on start"
+    ), row
+
+    deadline = time.monotonic() + scaled_timeout(5.0)
+    while time.monotonic() < deadline:
+        assert the_slot() == row, "the slot moved after it settled"
+        time.sleep(0.1)
 
 
 def test_a_destination_that_cannot_start_changes_nothing(lane: Lane):

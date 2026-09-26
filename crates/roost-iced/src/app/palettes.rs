@@ -214,6 +214,9 @@ fn accel_order(left: &Accel, right: &Accel) -> std::cmp::Ordering {
     (left.modifiers.bits(), &left.key).cmp(&(right.modifiers.bits(), &right.key))
 }
 
+// One over clippy's bar: the last five are `host_verbs::verbs`' own
+// inputs, passed through, and bundling them here would only rename them.
+#[allow(clippy::too_many_arguments)]
 fn command_palette_frame(
     notification_count: usize,
     providers: &[provider::Provider],
@@ -222,6 +225,7 @@ fn command_palette_frame(
     recents: &[host_verbs::RecentRow<'_>],
     local: host_sidebar::LocalSlot<'_>,
     switching: bool,
+    slot: host_verbs::SlotHistory,
 ) -> palette::PaletteFrame {
     let mut bindings = keybindings.iter().collect::<Vec<_>>();
     bindings.sort_by(|(left, _), (right, _)| accel_order(left, right));
@@ -266,6 +270,7 @@ fn command_palette_frame(
         recents,
         local,
         switching,
+        slot,
         picker_shortcut.as_deref(),
     ));
     palette::PaletteFrame::new(COMMANDS_FRAME_ID, "Execute a command…", items)
@@ -281,6 +286,7 @@ fn host_verb_items(
     recents: &[host_verbs::RecentRow<'_>],
     local: host_sidebar::LocalSlot<'_>,
     switching: bool,
+    slot: host_verbs::SlotHistory,
     new_project_on_shortcut: Option<&str>,
 ) -> Vec<palette::PaletteItem> {
     host_verbs::verbs(
@@ -289,6 +295,7 @@ fn host_verb_items(
         local,
         host_verbs::VerbPolicy::current(),
         switching,
+        slot,
     )
     .into_iter()
     .map(|verb| {
@@ -929,6 +936,7 @@ impl App {
                 &self.host_recent_rows(),
                 self.local_slot_input(),
                 self.switch_in_flight(),
+                self.local_slot_history(),
             ),
             "launcher" => launcher_palette_frame(&self.config),
             "agents" => self.agent_frame_now(),
@@ -1890,8 +1898,14 @@ impl App {
             .find(|frame| frame.id == COMMANDS_FRAME_ID)
             .and_then(|frame| {
                 let shortcut = self.shortcut_for(KeybindAction::NewProjectOnHost);
-                let verbs =
-                    host_verb_items(&hosts, &recents, local, switching, shortcut.as_deref());
+                let verbs = host_verb_items(
+                    &hosts,
+                    &recents,
+                    local,
+                    switching,
+                    self.local_slot_history(),
+                    shortcut.as_deref(),
+                );
                 // The family is one contiguous tail (`command_palette_frame`
                 // appends it last), so the splice is everything before the
                 // first host row followed by the new block — and the
@@ -3083,6 +3097,7 @@ mod tests {
             &[],
             IN_PROCESS,
             false,
+            host_verbs::SlotHistory::Connected,
         ));
         let ids: Vec<String> = state
             .matches()
@@ -3142,6 +3157,7 @@ mod tests {
             &[],
             IN_PROCESS,
             false,
+            host_verbs::SlotHistory::Connected,
         );
         let ids: Vec<&str> = frame.items.iter().map(|item| item.id.as_str()).collect();
         let first_host = ids
@@ -3165,8 +3181,16 @@ mod tests {
         // the block is Add Host, the seed where the platform has a
         // session to reach, and the picker over LOCAL + localhost
         // (plan 063 §D3).
-        let bare =
-            command_palette_frame(0, &config.providers, &bindings, &[], &[], IN_PROCESS, false);
+        let bare = command_palette_frame(
+            0,
+            &config.providers,
+            &bindings,
+            &[],
+            &[],
+            IN_PROCESS,
+            false,
+            host_verbs::SlotHistory::Connected,
+        );
         let bare_ids: Vec<&str> = bare.items.iter().map(|item| item.id.as_str()).collect();
         assert!(bare_ids.contains(&host_verbs::ADD_ID));
         assert!(bare_ids.contains(&host_verbs::CONNECT_SEED_ID));
@@ -3209,7 +3233,14 @@ mod tests {
             transport: host_sidebar::HostTransportKind::Ssh,
             fidelity: None,
         }];
-        let items = host_verb_items(&hosts, &[], IN_PROCESS, false, Some("Alt+Shift+N"));
+        let items = host_verb_items(
+            &hosts,
+            &[],
+            IN_PROCESS,
+            false,
+            host_verbs::SlotHistory::Connected,
+            Some("Alt+Shift+N"),
+        );
         for item in &items {
             let expected = (item.id == host_verbs::NEW_PROJECT_ON_ID).then_some("Alt+Shift+N");
             assert_eq!(item.trailing_text.as_deref(), expected, "{}", item.id);
