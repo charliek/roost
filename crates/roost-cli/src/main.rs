@@ -13,7 +13,7 @@
 //!   roostctl tab focus [--tab ID]
 //!   roostctl tab list
 //!   roostctl tab set-state --state STATE [--tab ID]
-//!   roostctl tab open --project-id N [--cwd …] [--after-tab ID] [--focus | --no-activate] [--hold] [-- <cmd…>]
+//!   roostctl tab open --project-id N [--cwd … | --cwd-from-tab ID | --here] [--after-tab ID] [--focus | --no-activate] [--hold] [-- <cmd…>]
 //!   roostctl tab close [--tab ID]
 //!   roostctl tab send [--tab ID] --bytes 'echo hi\n' [--raw]
 //!   roostctl tab send [--tab ID] --bytes-base64 BASE64
@@ -727,6 +727,22 @@ enum TabCmd {
         /// meaningful with a command after `--`.
         #[arg(long, default_value_t = false)]
         hold: bool,
+        /// Start the new tab where this tab's working directory is,
+        /// when the server can resolve one (see `ipc.md`'s `tab.open`).
+        /// Omitted ⇒ the key is absent on the wire, not `null`. A host
+        /// tab (`h<host>.<id>`) is refused: `cwd_from_tab` never crosses
+        /// a host. A server that predates the field refuses it with
+        /// `unknown-field`, same as `--no-activate`.
+        #[arg(long, value_parser = LocalTab, conflicts_with = "here")]
+        cwd_from_tab: Option<i64>,
+        /// `--cwd-from-tab $ROOST_TAB_ID`: start where the calling tab
+        /// already is. Only accepted with no explicit `--socket` or
+        /// `--target` naming another target — `$ROOST_TAB_ID` is only
+        /// this call's own id space then, inside a local session tab
+        /// included, where the call still reaches the window that owns
+        /// it (plan 072 D3). Anything else exits 2.
+        #[arg(long, default_value_t = false, conflicts_with = "cwd_from_tab")]
+        here: bool,
         /// Command + args to run in the tab, after `--`. Empty ⇒ the
         /// default shell.
         #[arg(last = true)]
@@ -1438,8 +1454,18 @@ async fn run_on_ui(
             focus,
             no_activate,
             hold,
+            cwd_from_tab,
+            here,
             argv,
         }) => {
+            // `--here` before anything is dialled, same as a mutating
+            // verb's `--tab`/`ROOST_TAB_ID` refusal: it is a pure check
+            // over the target selector and the process environment.
+            let cwd_from_tab = if here {
+                Some(here_tab(ui, tab_env).await?)
+            } else {
+                cwd_from_tab
+            };
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
             // `--hold` wraps the command so a fresh interactive shell takes
             // over when it exits (tab persists). Without it, the argv runs
@@ -1461,7 +1487,7 @@ async fn run_on_ui(
                         rows,
                         title,
                         activate: no_activate.then_some(false),
-                        cwd_from_tab: None,
+                        cwd_from_tab,
                     },
                 )
                 .await?;
@@ -2680,6 +2706,30 @@ fn require_tab<T: TabRef>(
         "{verb} requires a tab but is missing from MUTATING_TAB_VERBS"
     );
     named_tab(flag, tab_env)?.ok_or_else(|| CliError::Usage(NO_TAB.to_string()))
+}
+
+/// `tab open --here`'s `$ROOST_TAB_ID`: refused unless the target is this
+/// call's inherited `ROOST_SOCKET`, with no `--socket`/`--target` naming
+/// another one ([`window::inherited`]) — the only case where
+/// `ROOST_TAB_ID` names a tab in this call's own address space (a local
+/// session tab included, which [`window::follow`] still redirects to the
+/// window that owns it). Otherwise the id space would be wrong, so this
+/// is `usage`, exit 2, before anything is dialled.
+async fn here_tab(ui: &UiSocket<'_>, tab_env: Option<&str>) -> Result<i64, CliError> {
+    // Without ROOST_SOCKET the ladder would auto-detect, which dials.
+    let inherited = ui.environment.target.socket.is_some()
+        && window::inherited(
+            ui.selector,
+            ui.selector.diagnose_in(&ui.environment.target).await.origin,
+        );
+    if !inherited {
+        return Err(CliError::Usage(
+            "--here needs ROOST_SOCKET with no --socket or --target naming another target: \
+             ROOST_TAB_ID would name a tab in the wrong address space"
+                .into(),
+        ));
+    }
+    named_tab::<i64>(None, tab_env)?.ok_or_else(|| CliError::Usage(NO_TAB.to_string()))
 }
 
 /// `tab dump` of `--tab`, `ROOST_TAB_ID`, or else the UI's active tab.
@@ -5036,6 +5086,147 @@ mod tests {
             "{sent:?}"
         );
         assert_eq!(sent[3].1["tab_id"], "99", "focuses the newly opened tab");
+    }
+
+    // ------------------------------------------------------------------
+    // Plan 072 D12 / #536: `tab open --cwd-from-tab` and `--here`
+    // ------------------------------------------------------------------
+
+    /// `--cwd-from-tab <id>` sends the id as the wire's string-wrapped
+    /// `cwd_from_tab`; without the flag the key is absent, not `null`.
+    #[tokio::test]
+    async fn cwd_from_tab_flag_sends_the_id_and_is_absent_without_it() {
+        let ui = FakeUi::start("cwd-from-tab-flag", answer_ensure_and_open);
+        assert_eq!(
+            run_argv(
+                &[
+                    "--socket",
+                    &ui.socket,
+                    "tab",
+                    "open",
+                    "--project-id",
+                    "1",
+                    "--cwd-from-tab",
+                    "7",
+                ],
+                None,
+            )
+            .await,
+            Ok(0)
+        );
+        let sent = ui.take();
+        assert_eq!(sent[0].0, ops::TAB_OPEN, "{sent:?}");
+        assert_eq!(sent[0].1["cwd_from_tab"], "7", "{sent:?}");
+
+        assert_eq!(
+            run_argv(
+                &["--socket", &ui.socket, "tab", "open", "--project-id", "1"],
+                None,
+            )
+            .await,
+            Ok(0)
+        );
+        let sent = ui.take();
+        assert!(
+            sent[0].1.get("cwd_from_tab").is_none(),
+            "no flag ⇒ the key is absent: {:?}",
+            sent[0].1
+        );
+    }
+
+    /// `--cwd-from-tab` is a [`LocalTab`]: a host ref is refused by name,
+    /// same as every other local-only `--tab`.
+    #[test]
+    fn cwd_from_tab_refuses_a_host_ref() {
+        let error = parse(&["tab", "open", "--project-id", "1", "--cwd-from-tab", "h1.7"])
+            .expect_err("a host ref is refused");
+        let refused = CliError::from_clap(&error);
+        assert_eq!((refused.exit_code(), refused.code()), (2, "usage"));
+        assert!(
+            refused
+                .message()
+                .starts_with(&format!("{}\n", host_refusal("tab open", "h1.7"))),
+            "{}",
+            refused.message()
+        );
+    }
+
+    /// `--here` sends `$ROOST_TAB_ID` as `cwd_from_tab` when the target is
+    /// this call's inherited `ROOST_SOCKET` — a local session tab
+    /// included, which still reaches the window that owns it (D3).
+    #[tokio::test]
+    async fn here_sends_the_inherited_socket_tab_id() {
+        let ui = FakeUi::start("here-ok", answer_ensure_and_open);
+        let environment = tab_env_of(&ui.socket, "/not/the/session", &[]);
+        let args = parse(&["tab", "open", "--project-id", "1", "--here"]).expect("parses");
+        assert_eq!(run(args, Some("9"), None, &environment).await, Ok(0));
+        let sent = ui.take();
+        assert_eq!(sent[0].0, ops::TAB_OPEN, "{sent:?}");
+        assert_eq!(sent[0].1["cwd_from_tab"], "9", "{sent:?}");
+    }
+
+    /// `--here` is `usage`, exit 2, before anything is dialled, whenever
+    /// `$ROOST_TAB_ID` would not name a tab in this call's own address
+    /// space: no `ROOST_SOCKET` origin at all, or an explicit `--socket`
+    /// or `--target` naming the target instead (`ROOST_SOCKET` still wins
+    /// the ladder against a bare `--target`, so "explicit" has to be
+    /// checked separately from the winning origin — see
+    /// [`window::inherited`]).
+    #[tokio::test]
+    async fn here_without_the_inherited_socket_is_a_usage_error() {
+        let error = run(
+            parse(&["tab", "open", "--project-id", "1", "--here"]).expect("parses"),
+            Some("9"),
+            None,
+            &Environment::default(),
+        )
+        .await
+        .expect_err("no ROOST_SOCKET origin at all");
+        assert_eq!((error.exit_code(), error.code()), (2, "usage"), "{error:?}");
+
+        let ui = FakeUi::start("here-explicit-socket", answer_ensure_and_open);
+        let environment = tab_env_of(&ui.socket, "/not/the/session", &[]);
+        let error = run(
+            parse(&[
+                "--socket",
+                &ui.socket,
+                "tab",
+                "open",
+                "--project-id",
+                "1",
+                "--here",
+            ])
+            .expect("parses"),
+            Some("9"),
+            None,
+            &environment,
+        )
+        .await
+        .expect_err("--socket names the target explicitly");
+        assert_eq!((error.exit_code(), error.code()), (2, "usage"), "{error:?}");
+        assert!(ui.take().is_empty(), "refused before dialling");
+
+        let error = run(
+            parse(&[
+                "--target",
+                "iced",
+                "tab",
+                "open",
+                "--project-id",
+                "1",
+                "--here",
+            ])
+            .expect("parses"),
+            Some("9"),
+            None,
+            &environment,
+        )
+        .await
+        .expect_err(
+            "--target names the target explicitly, though ROOST_SOCKET still wins the ladder",
+        );
+        assert_eq!((error.exit_code(), error.code()), (2, "usage"), "{error:?}");
+        assert!(ui.take().is_empty(), "refused before dialling");
     }
 
     /// #503: `--no-activate` is refused beside `--focus` before anything

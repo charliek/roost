@@ -497,7 +497,11 @@ Served by sessions, Roost-Iced's UI socket and the Swift Mac app's
 socket. A server that predates the field — `Roost.app` through v0.0.20
 among them — answers `unknown-field`; see
 [the compatibility matrix](ipc-compatibility.md#the-compatibility-matrix).
-No CLI flag yet.
+From the CLI: `--cwd-from-tab <id>` on `tab open` (plan 072, #536), or
+`--here` for `$ROOST_TAB_ID` — accepted only with no explicit
+`--socket`/`--target` naming another target, since `$ROOST_TAB_ID` is
+otherwise not necessarily this call's own id space; see
+[cli.md](cli.md#tab-open-close-send-resize-reorder-dump).
 
 Response: `{"tab": <Tab>}`.
 

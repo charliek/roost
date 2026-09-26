@@ -21,7 +21,9 @@ release workflow asserts they agree).
   nothing resolving is not an error, and `cwd` is used as sent. Unset,
   the request is the bytes it always was. Served by sessions,
   Roost-Iced's UI socket and the Swift Mac app; servers that predate
-  the field answer `unknown-field`. No CLI flag yet. See [`ipc.md#tabopen`](docs/reference/ipc.md#tabopen).
+  the field answer `unknown-field`. `roostctl tab open --cwd-from-tab`
+  and `--here` spell it (#536, below). See
+  [`ipc.md#tabopen`](docs/reference/ipc.md#tabopen).
 - **A session-backed project remembers the tab you last viewed in it
   (#547)** — on the local session a fresh Roost-Iced install runs its tabs
   on, and on every saved host: a project click, ⌘1–9, the fallback when
@@ -85,6 +87,15 @@ release workflow asserts they agree).
   `identify` per running window, at most 500 ms each, and only in a local
   session tab. See
   [`cli.md#inside-a-session-tab`](docs/reference/cli.md#inside-a-session-tab).
+- **`roostctl tab open` gets a spelling for `cwd_from_tab` (#536)** —
+  `--cwd-from-tab <id>` starts the new tab where that tab's working
+  directory is; `--here` does the same for `$ROOST_TAB_ID`, accepted only
+  with no explicit `--socket`/`--target` naming another target (inside a
+  local session tab too, which still reaches the window that owns it).
+  Omitted, the wire field stays absent, not `null`; a host tab
+  (`h<host>.<id>`) is refused, and a server that predates the field
+  answers `unknown-field`, same as `--no-activate`. See
+  [`cli.md#tab-open-close-send-resize-reorder-dump`](docs/reference/cli.md#tab-open-close-send-resize-reorder-dump).
 
 ### Fixed
 

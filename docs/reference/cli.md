@@ -398,6 +398,8 @@ roostctl tab open --project-id 1 -- htop                       # run a command i
 roostctl tab open --project-id 1 --hold -- make test           # keep the tab open after it exits
 roostctl tab open --project-id 1 --after-tab 5 --focus -- vim   # next to tab 5, then focus it
 roostctl tab open --project-id 1 --no-activate -- make test     # open it without selecting it
+roostctl tab open --project-id 1 --cwd-from-tab 5 -- vim         # start where tab 5's cwd is
+roostctl tab open --project-id 1 --here -- vim                   # start where $ROOST_TAB_ID's cwd is
 roostctl tab close --tab 5
 roostctl tab send --tab 5 --bytes 'ls -la\n'
 roostctl tab resize --tab 5 --cols 120 --rows 40
@@ -416,6 +418,8 @@ roostctl tab dump --tab 5 --scrollback 200   # 200 rows of history, then the vie
 | `--after-tab <id>` | Place the new tab immediately after that tab (same project) instead of at the end. Best-effort: if that tab is gone by the time the reorder lands, the new tab stays at the end. |
 | `--focus` | Focus (activate) the new tab after opening. Under `local-backend = session` the focus waits, on the UI socket, for the window to list the new tab rather than answering `not-found` — from inside a session tab too, which [dials the window](#inside-a-session-tab). |
 | `--no-activate` | Open the tab without selecting it: the active project and tab stay where they were (`tab.open`'s `activate: false`). Without it, opening a tab selects it. Refused beside `--focus` (exit 2 `usage`). A server that predates the field — `Roost.app` through v0.0.20 among them — answers `unknown-field`, which is reported verbatim; nothing retries without the flag. |
+| `--cwd-from-tab <id>` | Start the new tab where that tab's working directory is, when the server can resolve one (`tab.open`'s `cwd_from_tab`; see [ipc.md](ipc.md)). Omitted ⇒ the field is absent on the wire, not sent as `null`. A host tab (`h<host>.<id>`) is refused: `cwd_from_tab` never crosses a host. A server that predates the field answers `unknown-field`, same as `--no-activate`. Refused beside `--here`. |
+| `--here` | `--cwd-from-tab $ROOST_TAB_ID`: start where the calling tab already is. Only accepted with no explicit `--socket`/`--target` naming another target — `$ROOST_TAB_ID` is otherwise not necessarily this call's own id space — including from inside a session tab, which still [dials the window](#inside-a-session-tab) that owns it. Anything else is exit 2 `usage`. Refused beside `--cwd-from-tab`. |
 
 These compose: `--after-tab X --focus -- <cmd>` is the "open a command in a tab right here and switch to it" primitive that providers and other scripts use. (`--after-tab`/`--focus` are CLI orchestration over `tab.reorder` / `tab.focus`; `-- <cmd>` fills the `tab.open` op's `argv` — see [ipc.md](ipc.md).)
 
