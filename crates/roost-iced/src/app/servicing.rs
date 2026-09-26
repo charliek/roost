@@ -1215,6 +1215,7 @@ impl App {
         self.resolve_pending_host_selection();
         let focused = self.resolve_awaited_listings();
         self.reconcile_host_selection();
+        self.reconcile_background_resize();
         // After selection resolution, not before it (plan 071 D15): the
         // active checkmark reads `active_project_key`/`active_tab_key`,
         // and syncing on the pre-resolution reads left a relaunch or an
@@ -1609,6 +1610,7 @@ impl App {
             }
         }
         self.host_attach.insert(key, attach);
+        self.background_resize.attached(key);
         self.host_begin_attach(key);
     }
 
@@ -1623,11 +1625,22 @@ impl App {
         }
     }
 
+    /// The attached host tabs' sessions follow the window's grid too —
+    /// the machine decides when (immediately while live; withheld during
+    /// hydration, where a mid-snapshot resize forfeits history).
+    pub(super) fn note_host_grid(&mut self, (cols, rows): (u16, u16)) {
+        let geometry = self.host_geometry(cols, rows);
+        for attach in self.host_attach.values_mut() {
+            attach.note_resize(geometry);
+        }
+    }
+
     /// Detach a host tab (focus moved away, or its stream told us to let
     /// go). The rendering state survives in `tabs` — disconnect is not
     /// stop, and refocus resumes from the point saved here.
     pub(super) fn host_detach_tab(&mut self, key: TabKey) {
         if let Some(attach) = self.host_attach.remove(&key) {
+            self.background_resize.detached(key, Instant::now());
             let kept = self.tabs.get(&key).map(TerminalTab::grid);
             if let Some(resume) = attach.detach(kept) {
                 self.host_resume.insert(key, resume);
@@ -1806,6 +1819,7 @@ impl App {
                     self.notification_inbox.remove(tab);
                     self.desktop_notifications.retire(tab);
                     self.awaiting_listing.closed(tab);
+                    self.background_resize.closed(tab);
                     if self
                         .pending_host_selection
                         .is_some_and(|pending| pending.tab == tab)
@@ -3009,9 +3023,12 @@ impl App {
     /// the mode-aware seam there would answer `HostId::LOCAL` — the
     /// workspace it is migrating *away* from.
     pub(super) fn connected_slot_host(&self) -> Option<HostId> {
+        self.connected_slot_view().map(|view| view.host)
+    }
+
+    pub(super) fn connected_slot_view(&self) -> Option<&super::HostView> {
         self.local_slot_view()
             .filter(|view| view.state.interactive())
-            .map(|view| view.host)
     }
 
     /// Whether `host` is the session slot — the fact [`title_host`] and

@@ -80,6 +80,7 @@ use crate::{chrome, input};
 // `palettes` (it hosts the command/agent/provider/notification palettes).
 pub(crate) mod agent_hooks;
 pub(crate) mod agent_hooks_dialog;
+pub(crate) mod background_resize;
 pub(crate) mod bootstrap;
 pub(crate) mod file_transfer;
 mod forwarded_open;
@@ -1029,6 +1030,12 @@ pub enum EngineOpResult {
         focus_generation: u64,
         answer: Box<Result<serde_json::Value, roost_engine::ipc::HostOpFailure>>,
     },
+    /// A background resize wave on the local session, answered (plan 072
+    /// D5). `connection` is the incarnation it went to.
+    BackgroundResized {
+        connection: HostId,
+        outcomes: Vec<background_resize::Outcome>,
+    },
 }
 
 /// Build the future behind [`UiTask::EngineOp`]: the op runs on the
@@ -1109,12 +1116,14 @@ fn engine_op_status(result: EngineOpResult) -> Option<String> {
         // so `host_restart_completed` puts that on the status bar itself.
         // And a forward has already answered the client it belongs to:
         // there is no second surface that owes anything.
+        // And a background resize is nothing the user asked for.
         EngineOpResult::Renamed { .. }
         | EngineOpResult::TabsReordered { .. }
         | EngineOpResult::ProjectsReordered { .. }
         | EngineOpResult::HostVerified { .. }
         | EngineOpResult::HostRestarted { .. }
-        | EngineOpResult::LocalForward { .. } => None,
+        | EngineOpResult::LocalForward { .. }
+        | EngineOpResult::BackgroundResized { .. } => None,
         EngineOpResult::TabOpened {
             project, result, ..
         } => match result {
@@ -1159,7 +1168,9 @@ impl EngineOpResult {
             | Self::LocalForward { op, .. } => Some(*op),
             // Not workspace mutations: a verify dials a target that may
             // not even be saved, and a restart is keyed by saved id.
-            Self::HostVerified { .. } | Self::HostRestarted { .. } => None,
+            Self::HostVerified { .. }
+            | Self::HostRestarted { .. }
+            | Self::BackgroundResized { .. } => None,
         }
     }
 
@@ -1187,7 +1198,8 @@ impl EngineOpResult {
             // opens, so the `palette.activate` that opened it was
             // answered then.
             | Self::HostVerified { .. }
-            | Self::HostRestarted { .. } => None,
+            | Self::HostRestarted { .. }
+            | Self::BackgroundResized { .. } => None,
         }
     }
 
@@ -1207,6 +1219,21 @@ impl EngineOpResult {
         let reply = answer.as_ref().as_ref().ok()?;
         let tab = forwarded_open::opened_tab(forwarded, reply)?;
         Some((TabKey::new(*host, tab), *selects))
+    }
+
+    /// The tab an open this window dispatched or forwarded made.
+    fn opened_tab(&self) -> Option<TabKey> {
+        match self {
+            Self::TabOpened {
+                result: Ok(tab), ..
+            }
+            | Self::ProjectCreated {
+                result: Ok((_, tab)),
+                ..
+            } => Some(*tab),
+            Self::LocalForward { .. } => self.forwarded_open().map(|(tab, _)| tab),
+            _ => None,
+        }
     }
 }
 
@@ -1663,6 +1690,29 @@ fn regrid_window(
                     rows,
                     "terminal resize failed"
                 )
+            }
+        }
+    }
+}
+
+/// A background resize wave's half of D4: the session writes for the
+/// wave's grid from here on, so a resume point for another would replay
+/// at the wrong one. Only a point the wave moves off its grid goes. A
+/// detached tab keeps one only while its kept terminal is at the grid the
+/// session last heard from this window (`HostAttach::detach`, and the
+/// re-grid sites forget it after), and the wave every detach arms sends
+/// that very grid: forgetting the point there would make every refocus a
+/// snapshot.
+fn forget_resumes_moved_by_wave(
+    tabs: &HashMap<TabKey, TerminalTab>,
+    host_resume: &mut HashMap<TabKey, host_tab::ResumePoint>,
+    targets: &[(TabKey, (u16, u16))],
+) {
+    for &(key, grid) in targets {
+        match tabs.get(&key) {
+            Some(tab) => host_tab::forget_resume_on_regrid(host_resume, key, tab.grid(), grid),
+            None => {
+                host_resume.remove(&key);
             }
         }
     }
@@ -2274,6 +2324,9 @@ pub enum UiTask {
     /// One-shot: wake once the file-drop gesture's debounce window has
     /// elapsed. Scheduled where the deadline is set, never polled.
     FileDropDeadline(Duration),
+    /// One-shot: wake when the local session's background resize wave
+    /// may be due — [`App::take_background_resize_task`].
+    BackgroundResizeDeadline(Duration),
     PaletteVisibility {
         scroll_id: Id,
         row_id: Id,
@@ -2809,6 +2862,7 @@ pub struct App {
     confirm_delete: Option<ConfirmDeleteProject>,
     pending_attachments: servicing::PendingAttachments,
     file_drops: FileDropQueue,
+    background_resize: background_resize::BackgroundResize,
     /// Per-host upload gestures (plan 047 §3.3). Holds the reply
     /// oneshots C6's `tab.send_file` waits on, so it must be dropped
     /// while those callers can still hear the answer — its `Drop`
@@ -3317,6 +3371,7 @@ impl App {
             confirm_delete: None,
             pending_attachments: servicing::PendingAttachments::default(),
             file_drops: FileDropQueue::default(),
+            background_resize: background_resize::BackgroundResize::default(),
             gestures: file_transfer::Gestures::default(),
             config,
             local_backend: backend_mode,
@@ -4389,6 +4444,9 @@ impl App {
         if let Some((tab, _)) = result.forwarded_open() {
             self.awaiting_listing.track(tab, Instant::now());
         }
+        if let Some(tab) = result.opened_tab() {
+            self.background_resize.opened(tab, Instant::now());
+        }
         // Strictly before the retirement below: a forwarded op's caller
         // is handed its answer, and only then does the op stop holding
         // §D6's auto-remove off (plan 063 §D10). One main-thread step,
@@ -4457,6 +4515,12 @@ impl App {
             // `reconcile()`, which is how a forwarded mutation's effect
             // on the slot reaches the auto-remove and the exit rule.
             EngineOpResult::LocalForward { .. } => {}
+            EngineOpResult::BackgroundResized {
+                connection,
+                outcomes,
+            } => self
+                .background_resize
+                .settle(connection, outcomes, Instant::now()),
         }
         self.reconcile();
         if let Some((op, error)) = deferred_activation {
@@ -4496,6 +4560,72 @@ impl App {
             Some(batch) => self.send_files(batch.tab, batch.paths, None),
             None => UiTask::None,
         }
+    }
+
+    /// The background resize wave's drain, run after every message (plan
+    /// 072 D5). After, because an attach an edge starts takes its place
+    /// in the local session's queue as it starts, and the wave must not
+    /// hold it up.
+    pub fn take_background_resize_task(&mut self) -> UiTask {
+        match self.background_resize.poll(Instant::now()) {
+            background_resize::Poll::Idle => UiTask::None,
+            background_resize::Poll::Arm(delay) => UiTask::BackgroundResizeDeadline(delay),
+            background_resize::Poll::Wave => self.background_resize_wave(),
+        }
+    }
+
+    pub fn background_resize_deadline(&mut self) {
+        self.background_resize.fired();
+    }
+
+    fn local_session_listing(&self) -> Option<(HostId, Vec<TabKey>)> {
+        let view = self.connected_slot_view()?;
+        let listed = view
+            .projects
+            .iter()
+            .flat_map(|project| project.tabs.iter())
+            .map(|tab| TabKey::new(view.host, tab.id))
+            .collect();
+        Some((view.host, listed))
+    }
+
+    /// Reconcile's half: which connection the local session is on, and
+    /// whether it now lists a tab this window opened.
+    fn reconcile_background_resize(&mut self) {
+        let now = Instant::now();
+        self.background_resize
+            .connected(self.connected_slot_host(), now);
+        if !self.background_resize.awaits_listing() {
+            return;
+        }
+        if let Some((_, listed)) = self.local_session_listing() {
+            self.background_resize.listed(&listed, now);
+        }
+    }
+
+    fn background_resize_wave(&mut self) -> UiTask {
+        let Some((connection, listed)) = self.local_session_listing() else {
+            return UiTask::None;
+        };
+        let Some(queue) = self.hosts.ops_for(connection) else {
+            return UiTask::None;
+        };
+        let attached: HashSet<TabKey> = self.host_attach.keys().copied().collect();
+        let targets =
+            self.background_resize
+                .wave(connection, &listed, &attached, self.current_grid());
+        if targets.is_empty() {
+            return UiTask::None;
+        }
+        let sent = background_resize::send_wave(queue, &targets);
+        forget_resumes_moved_by_wave(&self.tabs, &mut self.host_resume, &targets);
+        self.engine_op(
+            async move { Ok::<_, String>(sent.await) },
+            move |outcomes| EngineOpResult::BackgroundResized {
+                connection,
+                outcomes: outcomes.unwrap_or_default(),
+            },
+        )
     }
 
     /// The status banner is up, so its expiry is due — `Message::StatusTick`.
@@ -4659,21 +4789,16 @@ impl App {
     pub fn resize(&mut self, size: Size) {
         let changed = self.window_size != size;
         self.window_size = size;
-        let (cols, rows) = self.current_grid();
-        // The attached host tab's server must follow the grid too — the
-        // machine decides when (immediately while live; withheld during
-        // hydration, where a mid-snapshot resize forfeits history).
-        let host_geometry = self.host_geometry(cols, rows);
-        for attach in self.host_attach.values_mut() {
-            attach.note_resize(host_geometry);
-        }
+        let grid = self.current_grid();
+        self.note_host_grid(grid);
         regrid_window(
             &mut self.tabs,
             &mut self.host_resume,
-            (cols, rows),
+            grid,
             self.terminal_metrics,
             self.metric_generation,
         );
+        self.background_resize.resized(Instant::now());
         if changed && self.palette.is_some() {
             self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
         }
@@ -10396,6 +10521,34 @@ mod tests {
             !resumes.contains_key(&key),
             "the terminal left the grid the session wrote for, so the next attach is a snapshot"
         );
+    }
+
+    #[test]
+    fn a_background_wave_forgets_only_a_resume_point_it_moves_off_its_grid() {
+        let metrics = TerminalMetrics::measure(13.0).expect("test metrics");
+        let point = host_tab::ResumePoint {
+            server_epoch: 11,
+            tab_generation: 2,
+            next_seq: 42,
+        };
+        let (same, moved, gone) = (
+            TabKey::new(HostId::new(3), 7),
+            TabKey::new(HostId::new(3), 8),
+            TabKey::new(HostId::new(3), 9),
+        );
+        let tabs = HashMap::from([
+            (same, laid_out_host_terminal(80, 24, metrics)),
+            (moved, laid_out_host_terminal(120, 24, metrics)),
+        ]);
+        let mut resumes = HashMap::from([(same, point), (moved, point), (gone, point)]);
+
+        let grid = (80, 24);
+        forget_resumes_moved_by_wave(
+            &tabs,
+            &mut resumes,
+            &[(same, grid), (moved, grid), (gone, grid)],
+        );
+        assert_eq!(resumes.keys().collect::<Vec<_>>(), vec![&same]);
     }
 
     #[test]

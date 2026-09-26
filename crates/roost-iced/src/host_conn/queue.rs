@@ -334,10 +334,26 @@ impl HostOps {
     /// Enqueue. The intent's own reply channel carries the outcome; the
     /// `Err` here is only the enqueue failing.
     pub(crate) fn send(&self, intent: HostIntent) -> Result<(), HostOpError> {
+        self.enqueue(intent, |intent| {
+            tracing::warn!(op = %intent.op, "host op queue is full");
+        })
+    }
+
+    /// [`Self::send`] for a caller that retries a full queue itself, and
+    /// logs it at its own level.
+    pub(crate) fn send_quiet(&self, intent: HostIntent) -> Result<(), HostOpError> {
+        self.enqueue(intent, |_| {})
+    }
+
+    fn enqueue(
+        &self,
+        intent: HostIntent,
+        on_full: impl FnOnce(&HostIntent),
+    ) -> Result<(), HostOpError> {
         match self.tx.try_send(intent) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(intent)) => {
-                tracing::warn!(op = %intent.op, "host op queue is full");
+                on_full(&intent);
                 intent.answer(Err(HostOpError::QueueFull));
                 Err(HostOpError::QueueFull)
             }

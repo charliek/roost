@@ -78,6 +78,8 @@ enum Message {
     PendingSelectionTick,
     /// A file-drop debounce window elapsed — a one-shot, not a timer.
     FileDropDeadline,
+    /// The background resize wave may be due — a one-shot, not a timer.
+    BackgroundResizeDeadline,
     WindowOpened(window::Id),
     WindowResized(window::Id, Size),
     WindowFocus(window::Id, bool),
@@ -485,7 +487,8 @@ fn window_settings(profile: &BundleProfile) -> window::Settings {
 /// macOS menu-bar gate rides here for the same reason: every route
 /// transition passes through some message, and only one of them is the
 /// one that moved it. So does the terminal notice's generation, which
-/// must see a notice that went away before it comes back.
+/// must see a notice that went away before it comes back, and the local
+/// session's background resize wave, whose triggers are as scattered.
 fn update(app: &mut App, message: Message) -> Task<Message> {
     let dispatched = dispatch(app, message);
     app.sync_menu_gating();
@@ -494,6 +497,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         dispatched,
         app.take_tab_reveal_task().map_task(),
         app.take_exit_task().map_task(),
+        app.take_background_resize_task().map_task(),
     ])
 }
 
@@ -522,6 +526,10 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::FileDropDeadline => app.file_drop_deadline().map_task(),
+        Message::BackgroundResizeDeadline => {
+            app.background_resize_deadline();
+            Task::none()
+        }
         Message::WindowOpened(id) => app.window_opened(id).map_task(),
         Message::WindowResized(id, size) => app.window_resized(id, size).map_task(),
         Message::WindowFocus(id, focused) => {
@@ -1014,6 +1022,11 @@ impl UiTask for app::UiTask {
             }),
             app::UiTask::FileDropDeadline(delay) => {
                 Task::perform(tokio::time::sleep(delay), |()| Message::FileDropDeadline)
+            }
+            app::UiTask::BackgroundResizeDeadline(delay) => {
+                Task::perform(tokio::time::sleep(delay), |()| {
+                    Message::BackgroundResizeDeadline
+                })
             }
             app::UiTask::PaletteVisibility {
                 scroll_id,

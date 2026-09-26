@@ -142,6 +142,20 @@ bearing frame (a focused attach handshake, `tab.resize`, or a
 data-plane `INPUT`/`RESIZE`) sizes the tab. Nothing elects a size
 holder; the PTY simply has the size the last such frame asked for.
 
+**A window keeps its local session's unshown tabs at its grid** (#563).
+The shown tab follows the window through its attach's `RESIZE`, font
+changes included. Every other tab the local session lists gets a
+`tab.resize` from the window, in one wave: when a window or sidebar
+resize has held still for 150 ms, on a font change, on connect, when a
+tab the window opened (or forwarded an open for) is listed, and 150 ms
+after the window stops showing a tab, whose attach may have ended before
+its last `RESIZE` was written. The wave goes after any attach the same
+edge starts, skips a tab already at the grid, and retries a full queue
+with backoff. A tab it moves to a new grid forgets its resume point, as a
+re-gridded one does. A remote host's unshown tabs keep
+their size until shown (#568): its op queue is strictly sequential, so a
+wave would hold the next attach for a round trip per tab.
+
 **`session.stop` still closes everything, from any client.** It labels
 and closes every control connection, every data connection, and every
 event stream this session ever admitted, regardless of who opened it —

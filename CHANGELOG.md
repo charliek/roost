@@ -263,6 +263,21 @@ release workflow asserts they agree).
   `roost-session`. The session's half — it also refuses to replay across
   a resize another window made — reaches a `roost-session` that was
   already running only after it restarts.
+- **Session tabs the window wasn't showing kept the size they started at,
+  and a font-size change never reached the shown one's shell (#563)** —
+  on the local session, a tab you weren't looking at ran at 80×24 when
+  `roostctl tab open` made it, or 120×40 when the session did, until you
+  showed it, so programs in it drew for a terminal that wasn't there and
+  `roostctl tab dump` read them at that width. After a font-size change
+  the window drew the shown tab at its new size while the shell in it
+  kept the old one, on the local session and on saved hosts alike. Every
+  local-session tab now follows the window's grid, shown or not: when a
+  window or sidebar resize settles, on a font-size change, when the
+  window connects to the session, and when a tab it opened or `roostctl`
+  opened through it appears. Background programs there now get a resize
+  signal at those moments, as in-process tabs always have. A font-size
+  change now reaches the shown tab's shell on every host. The background
+  tabs of a remote host still keep their size until shown (#568).
 
 ## v0.0.20 — 2026-09-20
 

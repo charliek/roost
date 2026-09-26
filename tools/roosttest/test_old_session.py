@@ -730,16 +730,19 @@ def marks(dumped: dict) -> list[tuple[int, int]]:
 
 @pytest.mark.parametrize("widen", ["window", "font"])
 def test_7_a_refocused_tab_never_replays_at_the_width_it_left(compatible_latest: World, widen: str):
-    """A tab detached at a narrow grid; the window's grid widened past 100
-    columns — by the window, or by the font; the old session writing at
-    the grid it still has; the tab focused again. The window must then
-    draw what the session holds.
+    """A tab detached at a narrow grid; the old session writing at that
+    grid; the window's grid widened past 100 columns — by the window, or
+    by the font; the tab focused again. The window must then draw what the
+    session holds.
 
     A released session cuts the resume after resizing to the attach's
     grid, and has no D4b to refuse it, so only the client can: this is
-    D4a's end-to-end control. With the re-grid site's forgetting removed,
-    the marker lands at column 100 in the window and at the narrow grid's
-    last column in the session.
+    D4a's end-to-end control. The marker is written before the widen
+    because the window resizes the session's unshown tabs along with
+    itself (D5), forgetting their resume points as it does — at once on a
+    font change, so there the re-grid site's forgetting and the wave's
+    cover for each other. With both removed, the marker lands at column
+    100 in the window and at the narrow grid's last column in the session.
     """
     w = compatible_latest
     roost = w.ready()
@@ -755,6 +758,13 @@ def test_7_a_refocused_tab_never_replays_at_the_width_it_left(compatible_latest:
         # The window streams one tab at a time: this detaches `tab` with a
         # resume point at the narrow grid.
         w.show(away)
+        with w.env.client() as c:
+            c.send(tab, WIDTH_MARKER + "\n")
+            wait_until(
+                lambda: marks(c.tab_dump_resolved(tab)) == [(4, narrow - 1)],
+                30.0,
+                "the old session to write the marker at its narrow grid",
+            )
 
         if widen == "window":
             roost.window_resize(*WIDE_WINDOW)
@@ -765,14 +775,6 @@ def test_7_a_refocused_tab_never_replays_at_the_width_it_left(compatible_latest:
             30.0,
             f"the {widen} to widen the detached tab's terminal past 100 columns",
         )
-
-        with w.env.client() as c:
-            c.send(tab, WIDTH_MARKER + "\n")
-            wait_until(
-                lambda: marks(c.tab_dump_resolved(tab)) == [(4, narrow - 1)],
-                30.0,
-                "the old session to write the marker at its narrow grid",
-            )
 
         roost.focus(tab)
 

@@ -3429,3 +3429,98 @@ def test_a_local_session_that_cannot_start_says_so_and_offers_the_way_out(
     assert lane.journal() is None, lane.journal()
     hosts = roost.call("host.list", {})["hosts"]
     assert slot not in [h["id"] for h in hosts], hosts
+
+
+# ---------------------------------------------------------------------------
+# 17. Plan 072 §D5 (#563): the session's tabs follow the window's grid
+# ---------------------------------------------------------------------------
+
+
+def window_grid(roost: Roost, tab: int) -> str:
+    """The grid the window draws a slot tab at, as `stty size` prints it.
+    Only the window's own terminal answers `tab.dump_resolved`."""
+    dumped = roost.tab_dump_resolved(tab)
+    return f"{dumped['rows']} {dumped['cols']}"
+
+
+def shell_grid(lane: Lane, tab: int, expected: str) -> str:
+    """What the tab's own shell reads as its size, asked until it reads
+    `expected` or the wait runs out: the last answer either way.
+
+    Asked on the session's socket, which needs no attach, and marked per
+    attempt so an earlier attempt's answer can never pass for this one's."""
+    deadline = time.monotonic() + scaled_timeout(30.0)
+    with lane.session() as c:
+        while True:
+            mark = uuid.uuid4().hex[:8]
+            printed = re.compile(rf"SIZE-{mark}=(\d+ \d+)")
+            c.run(tab, f"echo SIZE-{mark}=$(stty size)", ready_timeout=30.0)
+            answer = wait_until(
+                lambda: printed.search(c.dump_text(tab)),
+                30.0,
+                f"tab {tab} to print its size",
+            ).group(1)
+            if answer == expected or time.monotonic() >= deadline:
+                return answer
+
+
+def test_a_session_tab_the_window_is_not_showing_follows_its_grid(lane: Lane):
+    """#563: a slot tab opened from `roostctl` without being shown runs at
+    the window's grid, not the 80x24 the CLI spawns it at — and follows
+    the window when it resizes, still unshown."""
+    roost = session_ui(lane)
+    shown = roost.identify()["active_tab_id"]
+    project = int(roost.list()[0]["id"])
+
+    opened = roostctl(
+        "tab", "open", "--project-id", str(project), "--cwd", "/tmp", "--no-activate"
+    )
+    assert opened.returncode == 0, opened
+    quiet = int(opened.stdout.strip())
+    assert roost.identify()["active_tab_id"] == shown
+
+    grid = window_grid(roost, shown)
+    assert shell_grid(lane, quiet, grid) == grid
+
+    roost.window_resize(820, 520)
+    wait_until(
+        lambda: window_grid(roost, shown) != grid,
+        30.0,
+        "the window to draw at its new grid",
+    )
+    resized = window_grid(roost, shown)
+    assert shell_grid(lane, quiet, resized) == resized
+    assert roost.identify()["active_tab_id"] == shown, "the window never showed it"
+
+
+def test_a_font_change_reaches_every_session_tabs_shell(lane: Lane):
+    """#563: three font-size steps re-grid the window, and the shell of
+    the tab it shows follows (its attach carries the new grid), as does
+    the shell of a tab it does not."""
+    roost = session_ui(lane)
+    shown = roost.identify()["active_tab_id"]
+    project = int(roost.list()[0]["id"])
+    quiet = roost.open_tab(project, cwd="/tmp", title="quiet", activate=False)
+    grid = window_grid(roost, shown)
+    assert shell_grid(lane, shown, grid) == grid
+
+    try:
+        for _ in range(3):
+            util.palette_command(roost, "font_increase")
+        enlarged = window_grid(roost, shown)
+        assert enlarged != grid, "three font steps re-grid the window"
+
+        assert shell_grid(lane, shown, enlarged) == enlarged
+        assert shell_grid(lane, quiet, enlarged) == enlarged
+    finally:
+        # The steps were written to the config every later case launches
+        # with.
+        ui.quit(lane.target)
+        lines = lane.config.read_text().splitlines()
+        lane.config.write_text(
+            "".join(
+                f"{line}\n"
+                for line in lines
+                if not line.strip().startswith("font-size")
+            )
+        )

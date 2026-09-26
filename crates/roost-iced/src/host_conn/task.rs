@@ -2359,6 +2359,33 @@ mod tests {
         assert!(admit(dead, intent).is_some());
     }
 
+    /// Plan 072 D5: a background resize queued for the local session
+    /// before it restarted must not resize whatever the replacement has
+    /// since minted under the same tab id.
+    #[tokio::test]
+    async fn a_background_resize_queued_before_a_reconnect_never_lands_on_its_replacement() {
+        let (queue, mut worker) = super::super::queue::HostOps::channel();
+        let dead = HostId::new(4);
+        let tab = roost_ui_model::keys::TabKey::new(dead, 3);
+        let targets = [(tab, (120, 40))];
+
+        let refused = crate::app::background_resize::send_wave(&queue, &targets);
+        let intent = worker.recv().await.expect("the resize is on the queue");
+        assert_eq!(intent.op, ops::TAB_RESIZE);
+        assert!(
+            admit(HostId::new(5), intent).is_none(),
+            "the replacement session must never serve a resize built for its predecessor"
+        );
+        let answered = tokio::time::timeout(Duration::from_secs(5), refused)
+            .await
+            .expect("a refused resize must still be answered");
+        assert_eq!(answered[0].result, Err(HostOpError::Disconnected));
+
+        let _alive = crate::app::background_resize::send_wave(&queue, &targets);
+        let intent = worker.recv().await.expect("the second resize");
+        assert!(admit(dead, intent).is_some());
+    }
+
     /// The disconnect contract end to end, and what lets `HostConn::drop`
     /// signal instead of aborting: the task ends, and everything on its
     /// queue is *answered* rather than dropped with its reply channel.
