@@ -953,6 +953,83 @@ pub struct AppKeybindDispatchParams {
     pub action: String,
 }
 
+/// `app.notice_dump` request — nullary envelope (`{}`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppNoticeDumpParams {}
+
+/// What `app.notice_dump` answers: what the window is telling the user
+/// right now, as the rendered strings — the same rule
+/// [`AppDialogDumpResult`] follows.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AppNoticeDumpResult {
+    /// Which showing of `terminal` this is. Bumped whenever the shown
+    /// notice changes, including to none and back to the same one;
+    /// `app.notice_answer` must name it.
+    pub generation: u64,
+    /// The notice in the terminal area, or `null`.
+    #[serde(default)]
+    pub terminal: Option<AppNoticeTerminal>,
+    /// The bottom-right line — the transient toast, or the standing
+    /// durability failure it uncovers — or `null`.
+    #[serde(default)]
+    pub bottom_line: Option<AppNoticeBottomLine>,
+}
+
+/// One terminal-area notice, as drawn.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AppNoticeTerminal {
+    /// What the notice is about — `"session_ended"` today. An open set:
+    /// a newer UI may send a kind this build has no name for.
+    pub kind: String,
+    /// The saved host's id the notice is about — the value `host.*`
+    /// ops take, not its label.
+    pub subject: String,
+    /// `"info" | "warning" | "error"`.
+    pub severity: String,
+    /// `"over_frame" | "empty_area"`.
+    pub placement: String,
+    pub message: String,
+    /// The second line, or `null` when the notice draws none.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Every button, in render order.
+    pub actions: Vec<AppNoticeAction>,
+}
+
+/// One button on a terminal-area notice.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AppNoticeAction {
+    /// What `app.notice_answer`'s `action` names.
+    pub id: String,
+    pub label: String,
+    pub primary: bool,
+}
+
+/// The bottom-right line, as drawn.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AppNoticeBottomLine {
+    pub text: String,
+    /// `"info" | "warning" | "error"`.
+    pub severity: String,
+    /// `"status"` for the toast, `"durability"` for a standing failure
+    /// to save.
+    pub source: String,
+}
+
+/// `app.notice_answer` request: press one action of the terminal notice
+/// `app.notice_dump` returned. Gated on `ROOST_TEST_MODE=1`. Answers
+/// `not-found` unless that notice — the same `kind`, `subject` and
+/// `generation` — is still the one on screen and still offers `action`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppNoticeAnswerParams {
+    pub kind: String,
+    pub subject: String,
+    pub generation: u64,
+    pub action: String,
+}
+
 /// `tab.dump_resolved` request: walk a tab's render state through
 /// the same resolver the production paint path uses (including the
 /// theme's bold-color override).
@@ -3585,6 +3662,16 @@ pub mod ops {
     /// rule as `app.dialog_dump` — it exists because the paste
     /// accelerator (issue #376's regression) has no other IPC seam.
     pub const APP_KEYBIND_DISPATCH: &str = "app.keybind_dispatch";
+
+    /// What the window is telling the user: the terminal area's notice
+    /// and the bottom-right line, as rendered strings (plan 072 §D7b).
+    /// Read-only, ungated, like `app.sidebar_dump`.
+    pub const APP_NOTICE_DUMP: &str = "app.notice_dump";
+    /// Test-only press of an action on the terminal notice
+    /// `app.notice_dump` returned, named by its kind, subject and
+    /// generation. Same gate and the same "test seam, not a surface"
+    /// rule as `app.dialog_answer`.
+    pub const APP_NOTICE_ANSWER: &str = "app.notice_answer";
 
     /// Set *this* machine's own `agent-hooks` key — the consent
     /// dialog's Apply and `roostctl agent set`'s wire path — and raise

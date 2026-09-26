@@ -48,6 +48,7 @@ use roost_ui_model::{
     custom_command, host_sidebar, host_verbs,
     keybind::{self, Accel, AccelMods, KeybindAction},
     keys::{HostId, ProjectKey, TabKey},
+    notice::{self, BottomLineSource, Notice, Severity},
     notification_inbox, palette, provider,
     rollup::project_rollup,
     selection_fallback, window_title,
@@ -158,13 +159,13 @@ fn tab_pill_id(tab: TabKey) -> Id {
 
 #[derive(Debug, Default)]
 struct StatusBanner {
-    message: Option<String>,
+    message: Option<(String, Severity)>,
     expires_at: Option<Instant>,
 }
 
 impl StatusBanner {
-    fn set_at(&mut self, message: impl Into<String>, now: Instant) {
-        self.message = Some(message.into());
+    fn set_at(&mut self, message: impl Into<String>, severity: Severity, now: Instant) {
+        self.message = Some((message.into(), severity));
         self.expires_at = Some(now + STATUS_BANNER_DURATION);
     }
 
@@ -179,8 +180,10 @@ impl StatusBanner {
         }
     }
 
-    fn message(&self) -> Option<&str> {
-        self.message.as_deref()
+    fn message(&self) -> Option<(&str, Severity)> {
+        self.message
+            .as_ref()
+            .map(|(message, severity)| (message.as_str(), *severity))
     }
 
     fn is_active(&self) -> bool {
@@ -213,15 +216,38 @@ pub(crate) enum DurabilitySource {
 fn bottom_line<'a>(
     status: &'a StatusBanner,
     durability: &'a BTreeMap<DurabilitySource, String>,
-) -> Option<Cow<'a, str>> {
-    if let Some(status) = status.message() {
-        return Some(Cow::Borrowed(status));
+) -> Option<BottomLine<'a>> {
+    if let Some((text, severity)) = status.message() {
+        return Some(BottomLine {
+            text: Cow::Borrowed(text),
+            severity,
+            source: BottomLineSource::Status,
+        });
     }
     let (source, error) = durability.iter().next()?;
-    Some(Cow::Owned(match source {
-        DurabilitySource::Local => format!("Roost couldn't save your workspace: {error}"),
-        DurabilitySource::Host(host) => format!("on {host}: last save failed: {error}"),
-    }))
+    Some(BottomLine {
+        text: Cow::Owned(match source {
+            DurabilitySource::Local => format!("Roost couldn't save your workspace: {error}"),
+            DurabilitySource::Host(host) => format!("on {host}: last save failed: {error}"),
+        }),
+        severity: Severity::Error,
+        source: BottomLineSource::Durability,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BottomLine<'a> {
+    text: Cow<'a, str>,
+    severity: Severity,
+    source: BottomLineSource,
+}
+
+fn bottom_line_color(severity: Severity) -> Color {
+    match severity {
+        Severity::Info => chrome::TEXT,
+        Severity::Warning => chrome::HOST_BANNER_TEXT,
+        Severity::Error => chrome::ERROR_TEXT,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -659,54 +685,65 @@ fn agent_hooks_row<'a>(
     .into()
 }
 
-/// A host tab's last frame, kept on screen under a scrim and a banner:
-/// the session ended and nothing will update these pixels again.
+/// The terminal area with its notice drawn in.
 ///
 /// Not a modal: the rest of the window stays live, because the user's
-/// local tabs and every other host are unaffected — only *this* frame
-/// stopped being true. The scrim is a layer rather than a recolor
-/// because the terminal draws from an owned snapshot; the banner sits
-/// above it so its own text is not dimmed with the frame it describes.
-fn frozen_frame<'a>(
-    content: Element<'a, Message>,
-    saved_id: &str,
-    frame: host_notice::FrozenFrame,
-    banner: host_notice::HostBanner,
-) -> Element<'a, Message> {
-    // The frame travels with the press: the button's promise is this
-    // frame's, and honoring it against a host that has since moved on
-    // would mean aborting a connect already running.
-    let press = Message::HostFrameReconnect {
-        saved_id: saved_id.to_string(),
-        frame,
+/// local tabs and every other host are unaffected. Over a frame, the
+/// scrim is a layer rather than a recolor because the terminal draws
+/// from an owned snapshot, and the strip sits above it so its own text
+/// is not dimmed with the frame it describes.
+fn with_notice<'a>(content: Element<'a, Message>, notice: Notice) -> Element<'a, Message> {
+    let placement = notice.placement;
+    let strip = notice_strip(notice);
+    let layers = match placement {
+        notice::Placement::OverFrame => {
+            let scrim = container(iced::widget::Space::new().width(Fill).height(Fill))
+                .style(chrome::host_frame_scrim);
+            stack![content, scrim, strip]
+        }
+        notice::Placement::EmptyArea => stack![content, strip],
     };
-    let scrim = container(iced::widget::Space::new().width(Fill).height(Fill))
-        .style(chrome::host_frame_scrim);
-    stack![content, scrim, host_strip(banner, press)]
-        .width(Fill)
-        .height(Fill)
-        .into()
+    layers.width(Fill).height(Fill).into()
 }
 
-/// The strip itself: a sentence, a button, and the hairline under it.
-fn host_strip<'a>(banner: host_notice::HostBanner, press: Message) -> Column<'a, Message> {
-    let strip = container(
-        row![
-            text(banner.message)
-                .size(chrome::HOST_BANNER_TEXT_SIZE)
-                .color(chrome::HOST_BANNER_TEXT),
-            iced::widget::Space::new().width(Fill),
-            button(text(banner.action).size(chrome::HOST_BANNER_ACTION_SIZE))
+/// The strip itself: a sentence, its buttons, an optional second line,
+/// and the hairline under it. Each button carries the notice it was drawn
+/// on, for [`notice::click_still_lands`].
+fn notice_strip<'a>(notice: Notice) -> Column<'a, Message> {
+    let mut line = row![
+        text(notice.message)
+            .size(chrome::HOST_BANNER_TEXT_SIZE)
+            .color(chrome::HOST_BANNER_TEXT),
+        iced::widget::Space::new().width(Fill),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    for action in &notice.actions {
+        line = line.push(
+            button(text(action.label).size(chrome::HOST_BANNER_ACTION_SIZE))
                 .padding([2, 9])
                 .style(chrome::host_banner_button)
-                .on_press(press),
+                .on_press(Message::NoticeAction {
+                    key: notice.key.clone(),
+                    action: action.id,
+                }),
+        );
+    }
+    let body: Element<'a, Message> = match notice.detail {
+        None => line.into(),
+        Some(detail) => column![
+            line,
+            text(detail)
+                .size(chrome::HOST_BANNER_ACTION_SIZE)
+                .color(chrome::HOST_BANNER_TEXT),
         ]
-        .spacing(10)
-        .align_y(Alignment::Center),
-    )
-    .width(Fill)
-    .padding([6, 12])
-    .style(chrome::host_banner);
+        .spacing(2)
+        .into(),
+    };
+    let strip = container(body)
+        .width(Fill)
+        .padding([6, 12])
+        .style(chrome::host_banner);
     let edge = container(iced::widget::Space::new().width(Fill).height(1.0))
         .style(chrome::host_banner_edge);
     column![strip, edge]
@@ -2636,6 +2673,11 @@ pub struct App {
     /// another's. `BTreeMap` so the first entry is the one
     /// [`bottom_line`] names.
     durability: BTreeMap<DurabilitySource, String>,
+    /// Which showing of the terminal notice is on screen — what
+    /// `app.notice_dump` reports and `app.notice_answer` must name.
+    notice_generation: notice::NoticeGeneration,
+    /// This profile's UI log, as a notice names it.
+    log_path: String,
     /// The one startup agent-hooks ensure has been started (plan 046
     /// §3.7). `window_opened` also runs on every focus change, so this
     /// is what keeps a startup act from becoming a focus act.
@@ -3174,6 +3216,8 @@ impl App {
             modifiers: keyboard::Modifiers::default(),
             test_mode,
             status: StatusBanner::default(),
+            notice_generation: notice::NoticeGeneration::default(),
+            log_path: profile.log_path().display().to_string(),
             durability: BTreeMap::new(),
             agent_hooks_started: false,
             agent_hooks_card_raised: false,
@@ -4124,8 +4168,9 @@ impl App {
     /// `mark_noticed` make the announcement permanent — the order
     /// `agent_hooks`'s own header pins.
     ///
-    /// The log lines are deliberate: no IPC op carries the status banner,
-    /// so they are the only thing the E2E can read the toast text out of.
+    /// The log lines are deliberate: `app.notice_dump` reads the toast
+    /// only while it is up, and the log is where an E2E reads it back
+    /// after it expired.
     fn show_hooks_toast(&mut self, toast: agent_hooks::AgentHooksToast) {
         if let Some(announcement) = &toast.announcement {
             tracing::info!(toast = announcement.as_str(), "agent hooks toast shown");
@@ -4384,7 +4429,7 @@ impl App {
         self.status.is_active()
     }
 
-    fn bottom_line(&self) -> Option<Cow<'_, str>> {
+    fn bottom_line(&self) -> Option<BottomLine<'_>> {
         bottom_line(&self.status, &self.durability)
     }
 
@@ -4493,7 +4538,7 @@ impl App {
         // A toast restructures the root widget tree, which drops the grip's
         // widget state — a live drag would never publish its end.
         self.commit_sidebar_drag();
-        self.status.set_at(message, Instant::now());
+        self.status.set_at(message, Severity::Error, Instant::now());
     }
 
     fn live_sidebar_width(&self) -> f32 {
@@ -6092,11 +6137,8 @@ impl App {
                     .into()
             }
         };
-        // A frozen host frame keeps its pixels and says why (plan 037
-        // §3.1). With no host selection this is `None` and the terminal
-        // element goes through untouched.
-        let terminal = match self.host_frame_banner() {
-            Some((saved_id, frame, banner)) => frozen_frame(terminal, saved_id, frame, banner),
+        let terminal = match self.terminal_notice() {
+            Some(notice) => with_notice(terminal, notice),
             None => terminal,
         };
         let main = column![tab_bar, terminal].width(Fill).height(Fill);
@@ -6109,11 +6151,15 @@ impl App {
             )
             .into()
         };
-        let content: Element<'_, Message> = if let Some(status) = self.bottom_line() {
-            let toast = container(text(status).size(12).color(chrome::ERROR_TEXT))
-                .max_width(520)
-                .padding([8, 12])
-                .style(chrome::status_toast);
+        let content: Element<'_, Message> = if let Some(line) = self.bottom_line() {
+            let toast = container(
+                text(line.text)
+                    .size(12)
+                    .color(bottom_line_color(line.severity)),
+            )
+            .max_width(520)
+            .padding([8, 12])
+            .style(chrome::status_toast);
             let overlay = container(toast)
                 .width(Fill)
                 .height(Fill)
@@ -7038,11 +7084,19 @@ impl App {
     /// of the two terminal states — so with no host selection, and on
     /// every ordinary connected frame, this costs one `Option` check.
     fn frozen_host_frame(&self) -> Option<(&HostView, host_notice::FrozenFrame)> {
-        let selection = self.host_selection?;
-        let view = self.host_view(selection.tab.host)?;
-        let section = self.hosts.section(&view.saved_id)?;
+        let (view, section) = self.host_section(self.host_selection?.tab.host)?;
         let frozen = host_notice::frozen_frame(section.state)?;
         Some((view, frozen))
+    }
+
+    /// The cached view of the host serving an incarnation, and its
+    /// section, whatever state the section is in.
+    fn host_section(
+        &self,
+        host: HostId,
+    ) -> Option<(&HostView, crate::host_conn::HostSectionView<'_>)> {
+        let view = self.host_view(host)?;
+        Some((view, self.hosts.section(&view.saved_id)?))
     }
 
     /// [`Self::frozen_host_frame`]'s twin for a specific tab rather than
@@ -7056,50 +7110,149 @@ impl App {
         if tab.is_local() {
             return None;
         }
-        let view = self.host_view(tab.host)?;
-        let section = self.hosts.section(&view.saved_id)?;
+        let (_, section) = self.host_section(tab.host)?;
         host_notice::frozen_frame(section.state)
     }
 
-    /// The banner the window owes the frame it is showing, the host its
-    /// button reconnects, and the frame that button is a promise about.
-    /// The wording is composed here, at the draw, so the reconcile can
-    /// ask the same question without it.
-    fn host_frame_banner(
-        &self,
-    ) -> Option<(&str, host_notice::FrozenFrame, host_notice::HostBanner)> {
-        let selection = self.host_selection?;
-        let view = self.host_view(selection.tab.host)?;
-        let section = self.hosts.section(&view.saved_id)?;
-        let frozen = host_notice::frozen_frame(section.state)?;
-        let banner = frozen.banner(&view.label);
-        Some((view.saved_id.as_str(), frozen, banner))
+    /// Everything the terminal area's notice is decided from, read off
+    /// the live connection state the way the band reads it.
+    fn notice_input(&self) -> notice::NoticeInput<'_> {
+        let shown = self
+            .host_selection
+            .and_then(|selection| self.host_section(selection.tab.host))
+            .map(|(view, section)| {
+                host_notice::shown_host(&view.saved_id, &view.label, section.state)
+            });
+        let slot = self.local_slot_view().map(|view| notice::SlotFacts {
+            saved_id: &view.saved_id,
+            state: view.state,
+            reason: view.reason.as_deref(),
+            detail: self.hosts.section_detail(&view.saved_id),
+            retry_armed: self.hosts.retry_schedule(&view.saved_id).is_some(),
+        });
+        notice::NoticeInput {
+            mode: self.local_backend,
+            shown,
+            slot,
+            area_empty: self.active_tab_key().tab == 0,
+            switching: self.switch_in_flight(),
+            log_path: &self.log_path,
+        }
     }
 
-    /// The frozen-frame banner's button (plan 037 §3.1).
+    /// What the terminal area is saying — [`notice::terminal_notice`]
+    /// over [`Self::notice_input`], and nothing of its own.
+    fn terminal_notice(&self) -> Option<Notice> {
+        notice::terminal_notice(&self.notice_input())
+    }
+
+    /// Record which notice is on screen now, so the next dump or answer
+    /// names the showing it read. Every update turn passes through here.
+    pub fn observe_notice(&mut self) -> (u64, Option<Notice>) {
+        let current = self.terminal_notice();
+        let generation = self
+            .notice_generation
+            .observe(current.as_ref().map(|notice| &notice.key));
+        (generation, current)
+    }
+
+    /// A button on the terminal notice.
     ///
-    /// Re-checked against the host's state **now**, not against the
-    /// frame that was drawn: see [`host_notice::click_still_lands`] for
-    /// the two ways a stale click does damage.
-    pub fn host_frame_reconnect_requested(
+    /// Re-checked against the notice on screen **now**, not the one
+    /// that was drawn: see [`notice::click_still_lands`].
+    pub fn notice_action_requested(
         &mut self,
-        saved_id: &str,
-        frame: host_notice::FrozenFrame,
+        key: &notice::NoticeKey,
+        action: notice::NoticeActionId,
     ) {
-        let current = self
-            .hosts
-            .section(saved_id)
-            .and_then(|section| host_notice::frozen_frame(section.state));
-        if !host_notice::click_still_lands(frame, current) {
+        let current = self.terminal_notice();
+        if !notice::click_still_lands(key, action, current.as_ref()) {
             tracing::debug!(
-                host = %saved_id,
-                ?frame,
-                ?current,
-                "banner click ignored: the host is no longer showing that frame"
+                ?key,
+                ?action,
+                current = ?current.as_ref().map(|notice| &notice.key),
+                "notice click ignored: the window is no longer showing that notice"
             );
             return;
         }
-        self.host_connect_requested(saved_id, crate::host_conn::RequestOrigin::User);
+        self.run_notice_action(key, action);
+    }
+
+    fn run_notice_action(&mut self, key: &notice::NoticeKey, action: notice::NoticeActionId) {
+        match action {
+            notice::NoticeActionId::Start => {
+                self.host_connect_requested(&key.subject, crate::host_conn::RequestOrigin::User)
+            }
+        }
+    }
+
+    /// What the window is telling the user, as the widgets draw it.
+    pub(crate) fn notice_dump(&mut self) -> roost_ipc::messages::AppNoticeDumpResult {
+        use roost_ipc::messages::{
+            AppNoticeAction, AppNoticeBottomLine, AppNoticeDumpResult, AppNoticeTerminal,
+        };
+        let (generation, current) = self.observe_notice();
+        let terminal = current.map(|notice| AppNoticeTerminal {
+            kind: notice.key.kind.as_str().to_string(),
+            subject: notice.key.subject,
+            severity: notice.severity.as_str().to_string(),
+            placement: notice.placement.as_str().to_string(),
+            message: notice.message,
+            detail: notice.detail,
+            actions: notice
+                .actions
+                .into_iter()
+                .map(|action| AppNoticeAction {
+                    id: action.id.as_str().to_string(),
+                    label: action.label.to_string(),
+                    primary: action.primary,
+                })
+                .collect(),
+        });
+        let bottom_line = self.bottom_line().map(|line| AppNoticeBottomLine {
+            text: line.text.into_owned(),
+            severity: line.severity.as_str().to_string(),
+            source: line.source.as_str().to_string(),
+        });
+        AppNoticeDumpResult {
+            generation,
+            terminal,
+            bottom_line,
+        }
+    }
+
+    /// Press an action of the notice a dump returned, through the same
+    /// route its button takes — but only while that very showing is on
+    /// screen and still offers the action.
+    pub(crate) fn notice_answer(
+        &mut self,
+        kind: &str,
+        subject: &str,
+        generation: u64,
+        action: &str,
+    ) -> Result<(), String> {
+        let current = self.terminal_notice();
+        let pressed = notice::NoticeKind::from_wire(kind)
+            .zip(notice::NoticeActionId::from_wire(action))
+            .map(|(kind, action)| {
+                let key = notice::NoticeKey {
+                    kind,
+                    subject: subject.to_string(),
+                };
+                (key, action)
+            })
+            .filter(|(key, action)| {
+                self.notice_generation
+                    .answer_lands(key, generation, *action, current.as_ref())
+            });
+        let Some((key, action)) = pressed else {
+            return Err(format!(
+                "{kind} on {subject:?} at generation {generation} offering {action:?} \
+                 is not the notice on screen"
+            ));
+        };
+        self.run_notice_action(&key, action);
+        Ok(())
     }
 
     /// The project a host *lists* a tab under, whatever state its
@@ -7188,7 +7341,7 @@ impl App {
             // A stop leaves a frame nothing will ever update again — and
             // that frame is the last true thing this window knows about
             // that session, so it stays (plan 037 §3.1's "keeps its last
-            // frame dimmed") with the banner over it. The row must still
+            // frame dimmed") with the notice over it. The row must still
             // be listed: a tab the mirror dropped before the connection
             // died has nothing left to show.
             frozen_and_listed: self.frozen_host_frame().is_some()
@@ -7310,8 +7463,8 @@ impl App {
         host_focus_claim(self.window_focused, self.host_selection)
     }
 
-    /// The gated Connect: the sidebar's ↻ row, the stopped banner's
-    /// button, and the `Connect Host` palette verb — which
+    /// The gated Connect: the sidebar's ↻ row, the ended session's
+    /// notice, and the `Connect Host` palette verb — which
     /// `palette.activate` also reaches over the IPC socket, hence the
     /// `origin`.
     ///
@@ -9735,9 +9888,7 @@ impl Message {
                 // A widget press, so a person by construction.
                 app.host_connect_requested(&saved_id, crate::host_conn::RequestOrigin::User)
             }
-            Self::HostFrameReconnect { saved_id, frame } => {
-                app.host_frame_reconnect_requested(&saved_id, frame)
-            }
+            Self::NoticeAction { key, action } => app.notice_action_requested(&key, action),
             Self::HostFidelityAction(saved_id) => app.host_fidelity_action_requested(&saved_id),
             Self::AddHostNameChanged(value) => app.add_host_name_changed(value),
             Self::AddHostSocketChanged(value) => app.add_host_socket_changed(value),
@@ -10131,11 +10282,11 @@ mod tests {
             !status.is_active(),
             "an app with no banner arms no expiry timer"
         );
-        status.set_at("first", now);
-        assert_eq!(status.message(), Some("first"));
+        status.set_at("first", Severity::Error, now);
+        assert_eq!(status.message(), Some(("first", Severity::Error)));
         assert!(status.is_active());
-        status.set_at("replacement", now + Duration::from_secs(1));
-        assert_eq!(status.message(), Some("replacement"));
+        status.set_at("replacement", Severity::Info, now + Duration::from_secs(1));
+        assert_eq!(status.message(), Some(("replacement", Severity::Info)));
         status.expire_at(now + Duration::from_secs(1));
         assert!(
             status.is_active(),
@@ -10145,7 +10296,7 @@ mod tests {
         assert_eq!(status.message(), None);
         assert!(!status.is_active(), "expiry disarms the timer");
 
-        status.set_at("clear me", now);
+        status.set_at("clear me", Severity::Error, now);
         status.clear();
         assert_eq!(status.message(), None);
         assert!(!status.is_active());
@@ -10158,6 +10309,13 @@ mod tests {
             .collect()
     }
 
+    fn bottom_text<'a>(
+        status: &'a StatusBanner,
+        durability: &'a BTreeMap<DurabilitySource, String>,
+    ) -> Option<Cow<'a, str>> {
+        bottom_line(status, durability).map(|line| line.text)
+    }
+
     #[test]
     fn a_host_recovering_leaves_the_other_hosts_failure_on_the_line() {
         let quiet = StatusBanner::default();
@@ -10166,13 +10324,13 @@ mod tests {
             (DurabilitySource::Host("beta".into()), "read-only"),
         ]);
         assert_eq!(
-            bottom_line(&quiet, &failing).as_deref(),
+            bottom_text(&quiet, &failing).as_deref(),
             Some("on alpha: last save failed: disk full")
         );
 
         failing.remove(&DurabilitySource::Host("alpha".into()));
         assert_eq!(
-            bottom_line(&quiet, &failing).as_deref(),
+            bottom_text(&quiet, &failing).as_deref(),
             Some("on beta: last save failed: read-only")
         );
 
@@ -10191,13 +10349,13 @@ mod tests {
             (DurabilitySource::Local, "read-only"),
         ]);
         assert_eq!(
-            bottom_line(&quiet, &failing).as_deref(),
+            bottom_text(&quiet, &failing).as_deref(),
             Some("Roost couldn't save your workspace: read-only")
         );
 
         failing.remove(&DurabilitySource::Local);
         assert_eq!(
-            bottom_line(&quiet, &failing).as_deref(),
+            bottom_text(&quiet, &failing).as_deref(),
             Some("on alpha: last save failed: disk full"),
             "the host's failure was never overwritten, only covered"
         );
@@ -10208,17 +10366,40 @@ mod tests {
         let now = Instant::now();
         let failing = durability(&[(DurabilitySource::Local, "read-only")]);
         let mut status = StatusBanner::default();
-        status.set_at("agent hooks wired", now);
+        status.set_at("agent hooks wired", Severity::Info, now);
 
         assert_eq!(
-            bottom_line(&status, &failing).as_deref(),
+            bottom_text(&status, &failing).as_deref(),
             Some("agent hooks wired")
         );
 
         status.expire_at(now + STATUS_BANNER_DURATION);
         assert_eq!(
-            bottom_line(&status, &failing).as_deref(),
+            bottom_text(&status, &failing).as_deref(),
             Some("Roost couldn't save your workspace: read-only")
+        );
+    }
+
+    /// `app.notice_dump` names which of the two the line is showing, and
+    /// in what tone — the toast's own, and a failure to save always as
+    /// an error.
+    #[test]
+    fn the_bottom_line_says_whose_it_is_and_how_serious() {
+        let now = Instant::now();
+        let failing = durability(&[(DurabilitySource::Local, "read-only")]);
+        let mut status = StatusBanner::default();
+        status.set_at("local tabs run in Roost again", Severity::Info, now);
+        let line = bottom_line(&status, &failing).expect("the toast is up");
+        assert_eq!(
+            (line.severity, line.source),
+            (Severity::Info, BottomLineSource::Status)
+        );
+
+        status.clear();
+        let line = bottom_line(&status, &failing).expect("the failure stands");
+        assert_eq!(
+            (line.severity, line.source),
+            (Severity::Error, BottomLineSource::Durability)
         );
     }
 

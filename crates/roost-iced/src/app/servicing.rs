@@ -3504,6 +3504,27 @@ impl App {
                     Err(error) => Err(error),
                 });
             }
+            UiRequest::AppNoticeDump { reply } => {
+                let _ = reply.send(Ok(self.notice_dump()));
+            }
+            UiRequest::AppNoticeAnswer {
+                kind,
+                subject,
+                generation,
+                action,
+                reply,
+            } => {
+                let result = if self.test_mode {
+                    self.notice_answer(&kind, &subject, generation, &action)
+                        .map_err(|message| HostOpFailure::new(codes::NOT_FOUND, message))
+                } else {
+                    Err(HostOpFailure::new(
+                        codes::NOT_ENABLED,
+                        "ROOST_TEST_MODE=1 is required",
+                    ))
+                };
+                let _ = reply.send(result);
+            }
             UiRequest::AppKeybindDispatch { action, reply } => {
                 let result = if !self.test_mode {
                     Err("ROOST_TEST_MODE=1 is required".into())

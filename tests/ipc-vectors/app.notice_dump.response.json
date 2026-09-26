@@ -1,0 +1,27 @@
+{
+  "id": "31",
+  "ok": true,
+  "result": {
+    "generation": 3,
+    "terminal": {
+      "kind": "session_ended",
+      "subject": "hs-2f1c",
+      "severity": "warning",
+      "placement": "over_frame",
+      "message": "The session on workbench ended.",
+      "detail": null,
+      "actions": [
+        {
+          "id": "start",
+          "label": "Start a new session",
+          "primary": true
+        }
+      ]
+    },
+    "bottom_line": {
+      "text": "the local session is not connected",
+      "severity": "error",
+      "source": "status"
+    }
+  }
+}

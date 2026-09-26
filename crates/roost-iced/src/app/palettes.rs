@@ -661,7 +661,7 @@ fn report_palette_query_result(
     now: Instant,
 ) {
     if let Err(error) = result {
-        status.set_at(error, now);
+        status.set_at(error, Severity::Error, now);
     }
 }
 
@@ -2467,7 +2467,11 @@ mod tests {
     fn typed_palette_query_errors_are_visible_without_hiding_prior_state() {
         let now = Instant::now();
         let mut status = StatusBanner::default();
-        status.set_at("prior status", now - Duration::from_secs(1));
+        status.set_at(
+            "prior status",
+            Severity::Error,
+            now - Duration::from_secs(1),
+        );
         report_palette_query_result(
             &mut status,
             Err("font preview rollback: injected failure".to_string()),
@@ -2475,7 +2479,7 @@ mod tests {
         );
         assert_eq!(
             status.message(),
-            Some("font preview rollback: injected failure")
+            Some(("font preview rollback: injected failure", Severity::Error))
         );
         assert_eq!(status.expires_at, Some(now + STATUS_BANNER_DURATION));
     }

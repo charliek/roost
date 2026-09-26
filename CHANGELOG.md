@@ -39,6 +39,13 @@ release workflow asserts they agree).
   plan 070 entry above describes. Both decode as the Rust endpoints do,
   so `tab open --no-activate` works against `Roost.app` instead of
   answering `unknown-field`.
+- **`app.notice_dump` reads what the window is telling you (plan 072)** —
+  a new read-only op on Roost-Iced's UI socket that returns the notice
+  drawn in the terminal area (today, "The session on … ended." over a
+  frame whose session stopped, with its button) and the bottom-right
+  line (the five-second toast, or a standing failure to save), as the
+  strings on screen. Nothing on screen changes. The Swift Mac app answers
+  `unknown-op`. See [`ipc.md#appnotice_dump`](docs/reference/ipc.md#appnotice_dump).
 
 ### Fixed
 

@@ -144,13 +144,12 @@ enum Message {
     /// verb lands on the same app entry — the one that raises the
     /// upgrade prompt for a mismatched build rather than re-dialing it.
     HostReconnect(String),
-    /// The banner over a frozen host frame (plan 037 §3.1). Separate
-    /// from [`Self::HostReconnect`] because it carries the frame it was
-    /// drawn on: a click that lands after the host moved on is dropped
-    /// rather than aborting the reconnect already under way.
-    HostFrameReconnect {
-        saved_id: String,
-        frame: app::host_notice::FrozenFrame,
+    /// A button on the terminal area's notice (plan 072 §D7b). Separate
+    /// from [`Self::HostReconnect`] because it carries the notice it was
+    /// drawn on, for [`roost_ui_model::notice::click_still_lands`].
+    NoticeAction {
+        key: roost_ui_model::notice::NoticeKey,
+        action: roost_ui_model::notice::NoticeActionId,
     },
     /// The band's `reduced fidelity` pill and the inline row under it,
     /// carrying the saved host's stable id (plan 056 §3.4). The palette's
@@ -485,10 +484,12 @@ fn window_settings(profile: &BundleProfile) -> window::Settings {
 /// long-lived engine future, and neither drain must wait behind it. The
 /// macOS menu-bar gate rides here for the same reason: every route
 /// transition passes through some message, and only one of them is the
-/// one that moved it.
+/// one that moved it. So does the terminal notice's generation, which
+/// must see a notice that went away before it comes back.
 fn update(app: &mut App, message: Message) -> Task<Message> {
     let dispatched = dispatch(app, message);
     app.sync_menu_gating();
+    app.observe_notice();
     Task::batch([
         dispatched,
         app.take_tab_reveal_task().map_task(),
@@ -652,7 +653,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         | Message::NewTab
         | Message::NewProject
         | Message::HostReconnect(_)
-        | Message::HostFrameReconnect { .. }
+        | Message::NoticeAction { .. }
         | Message::HostFidelityAction(_)
         | Message::AddHostNameChanged(_)
         | Message::AddHostSocketChanged(_)

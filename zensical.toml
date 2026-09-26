@@ -68,6 +68,7 @@ nav = [
     { "Host sessions" = "development/host-sessions.md" },
     { "Shared Rust engine" = "development/shared-rust-engine.md" },
     { "Test automation" = "development/test-automation.md" },
+    { "User messaging" = "development/user-messaging.md" },
     { "Setup" = "development/setup.md" },
     { "Claude integration testing" = "development/claude-testing.md" },
   ] },

@@ -29,7 +29,8 @@ use roost_ipc::messages::{
     AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
     AppCursorShapeParams, AppCursorShapeResult, AppDialogAnswerParams, AppDialogDumpParams,
     AppDialogDumpResult, AppDockBadgeParams, AppDockBadgeResult, AppKeybindDispatchParams,
-    AppMenuActivateParams, AppMenuDumpParams, AppMenuDumpResult, AppNotificationStatusParams,
+    AppMenuActivateParams, AppMenuDumpParams, AppMenuDumpResult, AppNoticeAnswerParams,
+    AppNoticeDumpParams, AppNoticeDumpResult, AppNotificationStatusParams,
     AppNotificationStatusResult, AppRenderStatsParams, AppRenderStatsResult,
     AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams, AppUpdateCheckParams,
     AppUpdateStatusParams, AppUpdateStatusResult, AttachPayloadKind, ClipboardDumpParams,
@@ -512,6 +513,22 @@ pub enum UiRequest {
     AppKeybindDispatch {
         action: String,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// `app.notice_dump` — what the window is telling the user: the
+    /// terminal area's notice and the bottom line, as drawn. Ungated
+    /// (read-only).
+    AppNoticeDump {
+        reply: tokio::sync::oneshot::Sender<Result<AppNoticeDumpResult, String>>,
+    },
+    /// `app.notice_answer` — press one action of the terminal notice a
+    /// dump returned, through the same route its button takes. Gated
+    /// like `AppDialogDump`.
+    AppNoticeAnswer {
+        kind: String,
+        subject: String,
+        generation: u64,
+        action: String,
+        reply: HostOpReply<()>,
     },
     /// `app.update_status` — read back the macOS iced UI's Sparkle
     /// updater state (framework loaded, updater started, last completed
@@ -4069,6 +4086,31 @@ async fn dispatch(
             .map_err(map_test_op_err)?;
             Ok(serde_json::json!({}))
         }
+        ops::APP_NOTICE_DUMP => {
+            let _: AppNoticeDumpParams = decode(params)?;
+            let result = h
+                .ui_call(|reply| UiRequest::AppNoticeDump { reply })
+                .await?
+                .map_err(|m| HandlerError::new(codes::INTERNAL, m))?;
+            encode(&result)
+        }
+        ops::APP_NOTICE_ANSWER => {
+            let p: AppNoticeAnswerParams = decode(params)?;
+            if p.kind.is_empty() || p.subject.is_empty() || p.action.is_empty() {
+                return Err(HandlerError::invalid_param(
+                    "kind, subject and action must not be empty",
+                ));
+            }
+            h.ui_call(|reply| UiRequest::AppNoticeAnswer {
+                kind: p.kind,
+                subject: p.subject,
+                generation: p.generation,
+                action: p.action,
+                reply,
+            })
+            .await??;
+            Ok(serde_json::json!({}))
+        }
         ops::APP_UPDATE_STATUS => {
             let _: AppUpdateStatusParams = decode(params)?;
             let result = h
@@ -4301,6 +4343,8 @@ const DISPATCHED_OPS: &[(&str, &[Withheld])] = {
         (ops::APP_DIALOG_DUMP, &[NeedsUi, TestMode]),
         (ops::APP_DIALOG_ANSWER, &[NeedsUi, TestMode]),
         (ops::APP_KEYBIND_DISPATCH, &[NeedsUi, TestMode]),
+        (ops::APP_NOTICE_DUMP, &[NeedsUi]),
+        (ops::APP_NOTICE_ANSWER, &[NeedsUi, TestMode]),
         (ops::APP_UPDATE_STATUS, &[NeedsUi, TestMode, MacosOnly]),
         (ops::APP_UPDATE_CHECK, &[NeedsUi, TestMode, MacosOnly]),
         (
@@ -5495,6 +5539,7 @@ mod tests {
         "app.render_stats",
         "app.screenshot",
         "app.selected_tab_id",
+        "app.notice_dump",
         "app.sidebar_dump",
         "app.window_metrics",
         "clipboard.dump",
@@ -5546,6 +5591,7 @@ mod tests {
         "app.dialog_answer",
         "app.dialog_dump",
         "app.keybind_dispatch",
+        "app.notice_answer",
         "app.set_window_focus",
         "sidebar.set_width",
         "tab.capture_pty_input",

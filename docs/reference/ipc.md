@@ -1593,6 +1593,80 @@ the same absent-tolerant contract `hosts` uses, for the same reason.
 
 Ungated, read-only — always available, matching `app.window_metrics`.
 
+### `app.notice_dump`
+
+What the window is telling the user right now: the notice in the
+terminal area, and the bottom-right line. Like
+[`app.dialog_dump`](#host-bootstrap-test-ops-appdialog_dump-appdialog_answer-appkeybind_dispatch-test-only-gated),
+these are the **rendered** strings — the dump reads what the widgets
+read, so a test asserting "the user is told the right thing" does not
+re-derive the copy rule a second time. Which surface carries which kind
+of message is [User messaging](../development/user-messaging.md).
+
+Request: `{"params": {}}`. Response:
+
+```json
+{ "generation": 3,
+  "terminal": { "kind": "session_ended", "subject": "hs-2f1c", "severity": "warning",
+                "placement": "over_frame", "message": "The session on workbench ended.",
+                "detail": null,
+                "actions": [ { "id": "start", "label": "Start a new session",
+                               "primary": true } ] },
+  "bottom_line": { "text": "the local session is not connected", "severity": "error",
+                   "source": "status" } }
+```
+
+- `terminal` — the notice drawn in the terminal area, or `null`.
+    - `kind` says what it is about: `"session_ended"` is a host whose
+      session ended under the frame the window is still showing. Read it
+      as an open set — a newer build may add kinds.
+    - `subject` is the saved host's **id**, the value `host.*` takes —
+      not its label, which `message` interpolates.
+    - `severity` is `"info"`, `"warning"` or `"error"`.
+    - `placement` is `"over_frame"` (over a kept frame, under a scrim) or
+      `"empty_area"` (at the top of a terminal area with nothing in it).
+    - `detail` is the second line, or `null` when the notice draws none.
+    - `actions` is every button in render order; its `id` is what
+      [`app.notice_answer`](#appnotice_answer-test-only-gated) presses.
+- `bottom_line` — the bottom-right line, or `null`. `source` is
+  `"status"` for the toast that follows something you just did, or
+  `"durability"` for a standing failure to save the workspace, which a
+  toast covers while it is up. `severity` is its tone. **The toast is
+  gone after five seconds**, so read it right after the action that
+  raised it.
+- `generation` — which showing of `terminal` this is. It is bumped every
+  time the notice on screen changes, including when it goes away and when
+  the same notice comes back, so two dumps with the same `kind` and
+  `subject` under different generations are two different showings.
+
+Ungated and read-only. The Swift Mac app answers `unknown-op`.
+
+### `app.notice_answer` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Presses one action of the
+terminal notice [`app.notice_dump`](#appnotice_dump) returned, through
+the same handler its button's click reaches. A test seam, not a
+surface: `roostctl` has no verb for it.
+
+Request:
+`{"params": {"kind": "session_ended", "subject": "hs-2f1c", "generation": 3, "action": "start"}}`.
+Response: `{}`.
+
+`kind`, `subject` and `generation` are the ones the dump returned, and
+`action` one of its `actions[].id`. If the notice on screen is not that
+showing — another notice, none at all, or the same notice gone and back
+under a newer generation — or it no longer offers that action, the
+answer is `not-found` and nothing is pressed. An empty `kind`,
+`subject` or `action` is rejected `invalid-param` before anything else
+runs.
+
+| `kind` | `action` | What it does |
+|---|---|---|
+| `session_ended` | `start` | Starts a new session on `subject`, the Connect the sidebar's ↻ runs. |
+
+The Swift Mac app answers `unknown-op`.
+
 ### `app.set_window_focus` *(test-only — gated)*
 
 **Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**

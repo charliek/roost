@@ -40,9 +40,11 @@ answers, which is both the discovery and the attach.
 
 # What is deliberately not here
 
-The upgrade dialog's "Restart session" button and the frozen-frame
-banner are view state with no op behind them; their logic is unit-tested
-in `roost-iced`. What this lane proves is the *state* the button acts on
+The upgrade dialog's "Restart session" button is view state with no op
+behind it; its logic is unit-tested in `roost-iced`. (The frozen frame's
+notice is read and pressed through `app.notice_dump` /
+`app.notice_answer`, in `test_local_backend.py`.) What this lane proves
+is the *state* the button acts on
 (a host really does reach `needs-restart` against a mismatched build)
 and the *composition* the button runs (stop → gone → relaunch really
 does bring the layout back). See [`test_a_build_mismatch_reaches_needs_restart_and_a_restart_restores_the_layout`].

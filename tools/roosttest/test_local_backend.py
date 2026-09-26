@@ -3149,3 +3149,109 @@ def test_provider_context_reads_the_slots_active_tab(lane: Lane):
         "the provider actually spawned in the active tab's cwd, not just "
         f"saw it in an env var: {probed}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 15. Plan 072 §D7b: what the window is telling the user, read off the wire
+# ---------------------------------------------------------------------------
+
+
+def shown_notice(roost: Roost, what: str, after: int | None = None) -> dict:
+    """The dump once the terminal area says something — under a newer
+    generation than `after`, when given."""
+
+    def dumped() -> dict | None:
+        reply = roost.notice_dump()
+        if reply["terminal"] is None:
+            return None
+        if after is not None and reply["generation"] <= after:
+            return None
+        return reply
+
+    return wait_until(dumped, 60.0, what)
+
+
+def test_a_session_that_ends_under_the_shown_tab_says_so_and_only_that_showing_answers(
+    lane: Lane,
+):
+    """The frame the window keeps when its session stops carries the
+    words it always has, and its button starts a new session — pressed
+    through `app.notice_answer`, which reaches the same handler the
+    button does.
+
+    An answer names the showing it read. The same notice gone and back
+    is a newer generation, so an answer read off the first is refused
+    `not-found` and presses nothing; so is one naming another host."""
+    roost = session_ui(lane)
+    slot = local_band(roost)["saved_id"]
+    assert roost.notice_dump()["terminal"] is None, "a live tab says nothing"
+
+    lane.stop_daemon()
+    first = shown_notice(roost, "the ended session's notice")
+    label = roost.host_status(slot)["hosts"][0]["label"]
+    assert first["terminal"] == {
+        "kind": "session_ended",
+        "subject": slot,
+        "severity": "warning",
+        "placement": "over_frame",
+        "message": f"The session on {label} ended.",
+        "detail": None,
+        "actions": [{"id": "start", "label": "Start a new session", "primary": True}],
+    }
+
+    roost.notice_answer("session_ended", slot, first["generation"], "start")
+    wait_until(
+        lambda: local_band(roost)["state"] == "connected",
+        120.0,
+        "Start a new session to bring the slot back",
+    )
+    wait_until(
+        lambda: roost.notice_dump()["terminal"] is None,
+        30.0,
+        "the notice to go once the session is back",
+    )
+    # Shown again by hand, so what follows needs nothing from whether the
+    # window re-selects on its own after a restart.
+    tab = wait_until(
+        lambda: next(
+            (t for t in session_tab_ids(lane) if slot_key(roost, t) is not None), None
+        ),
+        60.0,
+        "the restarted session's tab to reach the window",
+    )
+    show(lane, roost, tab)
+
+    lane.stop_daemon()
+    again = shown_notice(roost, "the same notice, shown again", after=first["generation"])
+    assert again["terminal"]["subject"] == slot
+
+    for subject, generation, why in [
+        (slot, first["generation"], "an earlier showing"),
+        ("hs-nonesuch", again["generation"], "another host"),
+    ]:
+        with pytest.raises(RoostError) as refused:
+            roost.notice_answer("session_ended", subject, generation, "start")
+        assert refused.value.code == "not-found", (why, refused.value)
+    assert local_band(roost)["state"] == "stopped", "a refused answer pressed nothing"
+    assert roost.notice_dump()["generation"] == again["generation"]
+
+
+def test_a_refusal_with_the_local_session_down_is_on_the_bottom_line(lane: Lane):
+    """The toast is five seconds long, so it is read right after the
+    press that raised it. The palette's own reply and the toast are one
+    verdict, so the line says exactly what the refusal said."""
+    roost = session_ui(lane)
+    lane.stop_daemon()
+    shown_notice(roost, "the slot's session to end under the shown tab")
+
+    with pytest.raises(RoostError) as refused:
+        util.press_new_tab(roost)
+    dumped = roost.notice_dump()
+    assert dumped["bottom_line"] == {
+        "text": refused.value.message,
+        "severity": "error",
+        "source": "status",
+    }, dumped
+    assert dumped["terminal"]["kind"] == "session_ended", (
+        "the toast and the terminal notice are two surfaces, both on screen"
+    )

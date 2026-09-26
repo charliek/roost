@@ -424,6 +424,48 @@ fn a_sidebar_dump_response_without_hosts_still_decodes() {
     assert_eq!(result.projects.len(), 2);
 }
 
+/// `app.notice_dump` into its typed shapes: `generation` is a plain
+/// number (`app.notice_answer` echoes it back), and `terminal.detail`
+/// is an explicit `null` rather than an absent field.
+#[test]
+fn notice_dump_vectors_decode_into_their_typed_shapes() {
+    use roost_ipc::messages::{ops, AppNoticeDumpParams, AppNoticeDumpResult, RawRequest};
+
+    let mut path = vectors_dir();
+    path.push("app.notice_dump.request.json");
+    let raw = fs::read_to_string(&path).expect("read request vector");
+    let req: RawRequest = serde_json::from_str(&raw).expect("decode envelope");
+    assert_eq!(req.op, ops::APP_NOTICE_DUMP);
+    let _params: AppNoticeDumpParams =
+        serde_json::from_value(req.params).expect("decode notice_dump params");
+
+    let mut path = vectors_dir();
+    path.push("app.notice_dump.response.json");
+    let raw = fs::read_to_string(&path).expect("read response vector");
+    let resp: serde_json::Value = serde_json::from_str(&raw).expect("decode envelope");
+    assert_eq!(
+        resp["result"]["terminal"].get("detail"),
+        Some(&serde_json::Value::Null),
+        "the vector spells an absent detail as an explicit null"
+    );
+    let result: AppNoticeDumpResult =
+        serde_json::from_value(resp["result"].clone()).expect("decode result");
+
+    assert_eq!(result.generation, 3);
+    let terminal = result.terminal.expect("a terminal notice");
+    assert_eq!(terminal.kind, "session_ended");
+    assert_eq!(terminal.subject, "hs-2f1c");
+    assert_eq!(terminal.placement, "over_frame");
+    assert_eq!(terminal.message, "The session on workbench ended.");
+    assert_eq!(terminal.detail, None);
+    assert_eq!(terminal.actions.len(), 1);
+    assert_eq!(terminal.actions[0].id, "start");
+    assert!(terminal.actions[0].primary);
+    let line = result.bottom_line.expect("a bottom line");
+    assert_eq!(line.source, "status");
+    assert_eq!(line.severity, "error");
+}
+
 /// `app.render_stats` is the one op whose *every* result field is a
 /// string-wrapped int64. Generic round-tripping would happily accept a
 /// vector that wrote them as JSON numbers, which is exactly the drift

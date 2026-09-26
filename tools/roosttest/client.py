@@ -373,6 +373,28 @@ class Roost:
             None,
         )
 
+    # -- what the window is telling the user ------------------------------
+    def notice_dump(self) -> dict:
+        """{generation, terminal: {kind, subject, severity, placement,
+        message, detail, actions: [{id, label, primary}]} | None,
+        bottom_line: {text, severity, source} | None} — the rendered
+        strings, ungated (plan 072 §D7b).
+
+        `bottom_line` with `source: "status"` is a five-second toast:
+        read it right after the action that raised it, never after a
+        wait. `generation` is what `notice_answer` must echo back."""
+        return self.call("app.notice_dump", {})
+
+    def notice_answer(self, kind: str, subject: str, generation: int, action: str) -> None:
+        """Test-mode only — press `action` on the terminal notice a
+        `notice_dump` returned. Raises `RoostError('not-found')` unless
+        that very showing (kind, subject *and* generation) is still on
+        screen and still offers the action."""
+        self.call(
+            "app.notice_answer",
+            {"kind": kind, "subject": subject, "generation": generation, "action": action},
+        )
+
     # -- host sessions ----------------------------------------------------
     def host_status(self, id: str | None = None) -> dict:
         """Every saved host's live connection state, or just `id`'s.
