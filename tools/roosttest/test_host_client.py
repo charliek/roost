@@ -3530,3 +3530,121 @@ def test_a_resize_while_a_resume_is_in_flight_never_replays_at_the_old_width(
                 finally:
                     release.set()
                 assert_the_window_shows_the_sessions_screen(roost, session, tab, key)
+
+
+# ---------------------------------------------------------------------------
+# 19. Plan 072 D2 (#562): keys typed while a new tab opens land in it
+# ---------------------------------------------------------------------------
+
+#: The new-tab shortcut as `app.key_event` spells it: `primary+t`, which is
+#: ⌘T on macOS and Alt+T everywhere else.
+NEW_TAB_KEY = ("t", ["super"] if sys.platform == "darwin" else ["alt"])
+
+#: Typed ahead of the new tab. Only a shell that ran it prints `MARK_42`;
+#: the line as typed reads `MARK_$((6*7))`.
+TYPED_AHEAD = "echo MARK_$((6*7))"
+
+
+def type_ahead(roost: Roost) -> None:
+    """The shortcut, then `TYPED_AHEAD` and Enter."""
+    roost.key_event(*NEW_TAB_KEY)
+    roost.type_text(TYPED_AHEAD)
+    roost.key_event("Enter")
+
+
+def test_keys_typed_while_a_new_host_tab_opens_land_in_it(roost, session_env):
+    """Plan 072 D2 (#562): the relay holds the answer to ⌘T's `tab.open`,
+    so every key typed after the shortcut is typed before the window has
+    a new tab to send it to. The whole line must reach the new tab's
+    shell, which runs it, and none of it the tab that was on screen."""
+    require_test_mode(roost)
+    start_session(session_env)
+    with recording_relay(session_env) as relay:
+        with saved_host(roost, session_env, target=relay.path) as host:
+            host.connect_and_wait()
+            with host.client() as session:
+                project = first_project(session)
+                source = session.open_tab(project, cwd="/tmp")
+                key = host_key(roost, source)
+                roost.tab_capture_pty_input(key)
+                before = {int(row["id"]) for row in session.tabs()}
+                release = relay.hold("tab.open")
+                try:
+                    type_ahead(roost)
+                    opened = spawned_tab_id(
+                        session, before, "the new tab to open on the session", timeout=30.0
+                    )
+                finally:
+                    release.set()
+
+                wait_session_dump_contains(session, opened, "MARK_42")
+                assert "MARK" not in "\n".join(session.dump(source)["rows_text"]), (
+                    "the tab that was on screen ran the line"
+                )
+                assert b"MARK" not in roost.tab_capture_pty_input(key), (
+                    "the tab that was on screen was sent the keys"
+                )
+
+
+def test_keys_typed_for_a_new_host_tab_that_does_not_open_are_named(roost, session_env):
+    """Plan 072 D2 (#562): the held `tab.open` then fails — the session
+    can't start the shell a plain new tab runs — so the keys typed for it
+    have nowhere to go. The bottom line says so and how many, and the tab
+    that was on screen got none of them."""
+    require_test_mode(roost)
+    # The shell a tab with no argv runs. The quiet tab below names its
+    # own, so only the shortcut's tab fails.
+    start_session(session_env, SHELL="/nonexistent/roost-no-shell")
+    with session_env.client() as session:
+        project = session.create_project("typed-ahead", "/tmp")
+        source = quiet_tab(session, project, "/tmp")
+    with recording_relay(session_env) as relay:
+        with saved_host(roost, session_env, target=relay.path) as host:
+            host.connect_and_wait()
+            key = host_key(roost, source)
+            roost.tab_capture_pty_input(key)
+            release = relay.hold("tab.open")
+            try:
+                type_ahead(roost)
+            finally:
+                release.set()
+
+            def unsent() -> str | None:
+                line = roost.notice_dump()["bottom_line"] or {}
+                text = line.get("text", "")
+                return text if "were not sent" in text else None
+
+            # Polled, not read once: the failure lands after the release,
+            # and the toast is up for five seconds from then.
+            text = wait_until(unsent, 30.0, "the bottom line to name the unsent keys")
+            assert text.startswith("the new tab didn't open"), text
+            assert text.endswith(f"; {len(TYPED_AHEAD) + 1} keys were not sent"), text
+            assert roost.tab_capture_pty_input(key) == b"", (
+                "the tab that was on screen was sent the keys"
+            )
+
+
+def test_a_paste_while_a_new_host_tab_opens_is_refused(roost, session_env):
+    """Plan 072 D2 (#562): a paste has no tab to go to while the new one
+    opens — the one on screen is not where the user is typing any more,
+    and whether the new one brackets it is decided when it arrives, by a
+    mode its shell hasn't set yet. It is refused, and says so."""
+    require_test_mode(roost)
+    start_session(session_env)
+    with recording_relay(session_env) as relay:
+        with saved_host(roost, session_env, target=relay.path) as host:
+            host.connect_and_wait()
+            with host.client() as session:
+                source = quiet_tab(session, first_project(session), "/tmp")
+            key = host_key(roost, source)
+            roost.tab_capture_pty_input(key)
+            release = relay.hold("tab.open")
+            try:
+                roost.key_event(*NEW_TAB_KEY)
+                roost.call("app.keybind_dispatch", {"action": "paste"})
+                # Read at once: the toast is up for five seconds.
+                line = roost.notice_dump()["bottom_line"] or {}
+            finally:
+                release.set()
+            assert line.get("text") == "the new tab isn't ready yet", line
+            assert roost.tab_capture_pty_input(key) == b"", "the paste reached the old tab"

@@ -459,6 +459,16 @@ impl HostAttach {
         !matches!(self.phase, Phase::Ended)
     }
 
+    /// Whether the keys typed while this tab opened can go (plan 072
+    /// §D2). They are encoded against the terminal's modes (DECCKM,
+    /// kitty), and an accepted snapshot attach is still rendering the
+    /// stand-in, so only the stream live on the terminal the session
+    /// hydrated will do. An attempt that ends first leaves them in the
+    /// pending buffer — not in the input queue — for its retry.
+    pub(super) fn takes_typed_ahead(&self) -> bool {
+        self.streaming()
+    }
+
     /// Whether the stream is actually up — the handshake accepted and
     /// the snapshot hydrated.
     ///
@@ -1577,7 +1587,8 @@ mod tests {
         feed_rx: &mut EngineFeedReceiver,
         bytes: Vec<u8>,
     ) -> AttachStep {
-        let mut step = attach.on_frame(HostTabFrame::Snap { attempt: 1, bytes }, tab, feed_tx);
+        let attempt = attach.attempt;
+        let mut step = attach.on_frame(HostTabFrame::Snap { attempt, bytes }, tab, feed_tx);
         loop {
             let mut batch = crate::engine_feed::EngineBatch::default();
             let Some(item) = feed_rx.try_next(&mut batch) else {
@@ -2109,6 +2120,100 @@ mod tests {
         let sent = attach.test_drain_input();
         assert!(matches!(sent[0], HostDataMsg::Input(ref bytes) if bytes == b"typed"));
         assert!(matches!(sent[1], HostDataMsg::Resize { cols: 90, .. }));
+    }
+
+    /// Keys typed while a new host tab opens reach it only once its
+    /// attach is live on the terminal the session hydrated (plan 072
+    /// §D2), and are encoded in that terminal's modes. An attempt that
+    /// ends first keeps them in the pending buffer — not in its queue —
+    /// for the retry, which then carries them.
+    #[tokio::test]
+    async fn typed_ahead_waits_for_the_hydrated_terminal_across_a_failed_attach() {
+        use super::super::pending_input::{deliver, Facts, PendingInput, PendingKeyboard, Step};
+
+        let (mut attach, mut tab, feed_tx, mut feed_rx) = rig();
+        let target = key();
+        let now = std::time::Instant::now();
+        let mut keyboard = PendingKeyboard::default();
+        keyboard.arm(Some((5, target.host)), 0, now);
+        for key in ["e", "c", "h", "o", "ArrowUp"] {
+            let press = crate::input::synthetic_press(key, None, &[]).expect("a key");
+            keyboard.push(PendingInput::Key(press));
+        }
+        keyboard.answered(5, Ok(target), now);
+        let step = |keyboard: &PendingKeyboard, attach: &HostAttach| {
+            keyboard.step(&Facts {
+                now,
+                focus_generation: 0,
+                connected: true,
+                active: target,
+                ready: attach.takes_typed_ahead(),
+            })
+        };
+        assert_eq!(step(&keyboard, &attach), Some(Step::Wait), "requesting");
+
+        let failed = attach.on_frame(
+            HostTabFrame::Failed {
+                attempt: 1,
+                reason: FailReason::Retryable("dial refused".into()),
+            },
+            &mut tab,
+            &feed_tx,
+        );
+        assert!(matches!(failed, AttachStep::Reattach { .. }));
+        assert_eq!(
+            step(&keyboard, &attach),
+            Some(Step::Wait),
+            "an attach that ended before it was live"
+        );
+        assert!(attach.test_drain_input().is_empty());
+
+        attach.attempt = 2;
+        attach.on_frame(
+            HostTabFrame::Accepted {
+                attempt: 2,
+                resumed: false,
+                kind: PayloadKind::GhosttySnapshot,
+                fence: 0,
+                server_epoch: 11,
+                tab_generation: 2,
+                snapshot_size: None,
+            },
+            &mut tab,
+            &feed_tx,
+        );
+        assert!(matches!(attach.phase, Phase::Hydrating(_)));
+        assert_eq!(
+            step(&keyboard, &attach),
+            Some(Step::Wait),
+            "accepted, but the tab still renders the stand-in"
+        );
+        assert!(attach.test_drain_input().is_empty());
+
+        // The session's shell has application cursor keys (DECCKM) on.
+        let hydrated = hydrate_fully(
+            &mut attach,
+            &mut tab,
+            &feed_tx,
+            &mut feed_rx,
+            snapshot_with("\x1b[?1h$ "),
+        );
+        assert_eq!(hydrated, AttachStep::Refresh);
+        assert_eq!(step(&keyboard, &attach), Some(Step::Flush(target)));
+        let (_, entries) = keyboard.take().expect("armed");
+        deliver(&mut tab, target.tab, entries);
+        let sent: Vec<u8> = attach
+            .test_drain_input()
+            .into_iter()
+            .flat_map(|msg| match msg {
+                HostDataMsg::Input(bytes) => bytes,
+                HostDataMsg::Resize { .. } => Vec::new(),
+            })
+            .collect();
+        assert_eq!(
+            sent, b"echo\x1bOA",
+            "the retry carries the kept keys, the arrow in the hydrated cursor-key mode"
+        );
     }
 
     /// EXIT renders the close; its ordinal is one past the last PTY seq.

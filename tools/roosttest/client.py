@@ -395,6 +395,24 @@ class Roost:
             {"kind": kind, "subject": subject, "generation": generation, "action": action},
         )
 
+    # -- the keyboard (test mode) ------------------------------------------
+    def key_event(self, key: str, modifiers=(), text: str | None = None) -> None:
+        """Test-mode only — press `key` in the window, through the handler
+        a real press reaches: shortcuts first, then whatever owns the
+        keyboard. `key` is one character or a named key (`"Enter"`,
+        `"Escape"`, `"ArrowUp"`, …); `modifiers` any of `shift`, `ctrl`,
+        `alt`, `super`. The press only — no release. Iced-only; the
+        Swift app answers `unknown-op`."""
+        params: dict = {"key": key, "modifiers": list(modifiers)}
+        if text is not None:
+            params["text"] = text
+        self.call("app.key_event", params)
+
+    def type_text(self, text: str) -> None:
+        """[`key_event`] once per character of `text`, unmodified."""
+        for char in text:
+            self.key_event(char)
+
     # -- host sessions ----------------------------------------------------
     def host_status(self, id: str | None = None) -> dict:
         """Every saved host's live connection state, or just `id`'s.

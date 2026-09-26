@@ -392,7 +392,8 @@ pub(crate) const ATTACH_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 /// counter with the timer, so a burst of workspace events could otherwise
 /// spend forty attempts in milliseconds and give up inside the very race
 /// this waits out. Giving up needs both halves.
-const ATTACH_RETRY_WINDOW: Duration = ATTACH_RETRY_INTERVAL.saturating_mul(ATTACH_RETRY_LIMIT);
+pub(super) const ATTACH_RETRY_WINDOW: Duration =
+    ATTACH_RETRY_INTERVAL.saturating_mul(ATTACH_RETRY_LIMIT);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AttachRetryVerdict {
@@ -1286,6 +1287,8 @@ impl App {
             }
             self.attach_tab_tracked(*key, now);
         }
+        // After the selection and the attaches: its rules read both.
+        self.settle_pending_keyboard();
         // Last, so the frame the next close walks is the one this
         // reconcile settled on, with whatever the clauses above did to
         // the rows and to the selection already in it.
@@ -1680,6 +1683,7 @@ impl App {
         {
             self.pending_host_selection = None;
         }
+        self.pending_keyboard_host_gone(incarnation);
         self.awaiting_listing.purge(incarnation);
     }
 
@@ -1774,6 +1778,9 @@ impl App {
                 pty.touched.remove(&key);
                 self.host_drop_tab(key);
             }
+        }
+        if self.pending_keyboard.target() == Some(key) {
+            self.settle_pending_keyboard();
         }
     }
 
@@ -2053,6 +2060,7 @@ impl App {
                 // emits its first bytes.
                 refresh_or_warn(tab_id, &mut tab, "newly attached tab");
                 self.tabs.insert(key, tab);
+                self.settle_pending_keyboard();
                 true
             }
             Ok(None) => {
@@ -3350,7 +3358,8 @@ impl App {
                         | KeyboardRoute::Confirm
                         | KeyboardRoute::HostDialog
                         | KeyboardRoute::Editor
-                        | KeyboardRoute::Palette => Err(format!(
+                        | KeyboardRoute::Palette
+                        | KeyboardRoute::Pending => Err(format!(
                             "tab {tab_id} is not the active terminal \
                                  (keyboard route is not a terminal)"
                         )),
@@ -3543,6 +3552,25 @@ impl App {
                     ))
                 };
                 let _ = reply.send(result);
+            }
+            UiRequest::AppKeyEvent {
+                key,
+                text,
+                modifiers,
+                reply,
+            } => {
+                let result = if !self.test_mode {
+                    Err("ROOST_TEST_MODE=1 is required".into())
+                } else {
+                    crate::input::synthetic_press(&key, text.as_deref(), &modifiers)
+                };
+                let _ = reply.send(match result {
+                    Ok(event) => {
+                        task = task.then(self.keyboard(event));
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                });
             }
             UiRequest::AppKeybindDispatch { action, reply } => {
                 let result = if !self.test_mode {

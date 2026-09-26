@@ -28,9 +28,9 @@ use roost_ipc::messages::{
     ops, AgentHooksOutcome, AgentSetHooksAgents, AgentSetHooksParams, AgentSetHooksResult,
     AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
     AppCursorShapeParams, AppCursorShapeResult, AppDialogAnswerParams, AppDialogDumpParams,
-    AppDialogDumpResult, AppDockBadgeParams, AppDockBadgeResult, AppKeybindDispatchParams,
-    AppMenuActivateParams, AppMenuDumpParams, AppMenuDumpResult, AppNoticeAnswerParams,
-    AppNoticeDumpParams, AppNoticeDumpResult, AppNotificationStatusParams,
+    AppDialogDumpResult, AppDockBadgeParams, AppDockBadgeResult, AppKeyEventParams,
+    AppKeybindDispatchParams, AppMenuActivateParams, AppMenuDumpParams, AppMenuDumpResult,
+    AppNoticeAnswerParams, AppNoticeDumpParams, AppNoticeDumpResult, AppNotificationStatusParams,
     AppNotificationStatusResult, AppRenderStatsParams, AppRenderStatsResult,
     AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams, AppUpdateCheckParams,
     AppUpdateStatusParams, AppUpdateStatusResult, AttachPayloadKind, ClipboardDumpParams,
@@ -529,6 +529,16 @@ pub enum UiRequest {
         generation: u64,
         action: String,
         reply: HostOpReply<()>,
+    },
+    /// `app.key_event` — one key press, handed to the window's keyboard
+    /// handler as a real one is. `modifiers` holds only `shift`, `ctrl`,
+    /// `alt` and `super`; the key name is the UI's to resolve. Gated like
+    /// `AppDialogDump`.
+    AppKeyEvent {
+        key: String,
+        text: Option<String>,
+        modifiers: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     /// `app.update_status` — read back the macOS iced UI's Sparkle
     /// updater state (framework loaded, updater started, last completed
@@ -4113,6 +4123,30 @@ async fn dispatch(
             .await??;
             Ok(serde_json::json!({}))
         }
+        ops::APP_KEY_EVENT => {
+            let p: AppKeyEventParams = decode(params)?;
+            if p.key.is_empty() {
+                return Err(HandlerError::invalid_param("key must not be empty"));
+            }
+            if let Some(unknown) = p
+                .modifiers
+                .iter()
+                .find(|name| !matches!(name.as_str(), "shift" | "ctrl" | "alt" | "super"))
+            {
+                return Err(HandlerError::invalid_param(format!(
+                    "modifiers take shift, ctrl, alt and super (got {unknown:?})"
+                )));
+            }
+            h.ui_call(|reply| UiRequest::AppKeyEvent {
+                key: p.key,
+                text: p.text,
+                modifiers: p.modifiers,
+                reply,
+            })
+            .await?
+            .map_err(map_test_op_err)?;
+            Ok(serde_json::json!({}))
+        }
         ops::APP_UPDATE_STATUS => {
             let _: AppUpdateStatusParams = decode(params)?;
             let result = h
@@ -4347,6 +4381,7 @@ const DISPATCHED_OPS: &[(&str, &[Withheld])] = {
         (ops::APP_KEYBIND_DISPATCH, &[NeedsUi, TestMode]),
         (ops::APP_NOTICE_DUMP, &[NeedsUi]),
         (ops::APP_NOTICE_ANSWER, &[NeedsUi, TestMode]),
+        (ops::APP_KEY_EVENT, &[NeedsUi, TestMode]),
         (ops::APP_UPDATE_STATUS, &[NeedsUi, TestMode, MacosOnly]),
         (ops::APP_UPDATE_CHECK, &[NeedsUi, TestMode, MacosOnly]),
         (
@@ -4490,6 +4525,7 @@ fn map_test_op_err(err: String) -> HandlerError {
         || err.contains("has no submenu to descend into")
         || err.contains("must not be empty")
         || err.contains("unknown keybind action")
+        || err.contains("unknown key name")
     {
         HandlerError::invalid_param(err)
     } else if err.contains("not supported on this UI") {
@@ -5592,6 +5628,7 @@ mod tests {
     const UI_TEST_SEAMS: &[&str] = &[
         "app.dialog_answer",
         "app.dialog_dump",
+        "app.key_event",
         "app.keybind_dispatch",
         "app.notice_answer",
         "app.set_window_focus",

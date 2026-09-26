@@ -299,6 +299,7 @@ const OP_TYPES: &[Row] = &[
     op::<AppKeybindDispatchParams, EmptyResult>(ops::APP_KEYBIND_DISPATCH),
     op::<AppNoticeDumpParams, AppNoticeDumpResult>(ops::APP_NOTICE_DUMP),
     op::<AppNoticeAnswerParams, EmptyResult>(ops::APP_NOTICE_ANSWER),
+    op::<AppKeyEventParams, EmptyResult>(ops::APP_KEY_EVENT),
     op::<AgentSetHooksParams, AgentSetHooksResult>(ops::AGENT_SET_HOOKS),
     op::<HostAddParams, HostAddResult>(ops::HOST_ADD),
     op::<HostRemoveParams, EmptyResult>(ops::HOST_REMOVE),

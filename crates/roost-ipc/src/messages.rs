@@ -1031,6 +1031,25 @@ pub struct AppNoticeAnswerParams {
     pub action: String,
 }
 
+/// `app.key_event` request: one key press, delivered to the window as if
+/// the keyboard had sent it — accelerators first, then whatever owns the
+/// keyboard. Gated on `ROOST_TEST_MODE=1`, and the same "test seam, not
+/// a surface" rule as `app.dialog_answer`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppKeyEventParams {
+    /// One character (`"t"`, `"M"`, `"$"`) or a named key (`"Enter"`,
+    /// `"Escape"`, `"ArrowUp"`, …).
+    pub key: String,
+    /// The text the press produces. Omitted, the UI derives it from
+    /// `key` and `modifiers` as a platform keyboard would.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Any of `"shift"`, `"ctrl"`, `"alt"`, `"super"`.
+    #[serde(default)]
+    pub modifiers: Vec<String>,
+}
+
 /// `tab.dump_resolved` request: walk a tab's render state through
 /// the same resolver the production paint path uses (including the
 /// theme's bold-color override).
@@ -3673,6 +3692,11 @@ pub mod ops {
     /// generation. Same gate and the same "test seam, not a surface"
     /// rule as `app.dialog_answer`.
     pub const APP_NOTICE_ANSWER: &str = "app.notice_answer";
+
+    /// Test-only key press into the window, through the same handler a
+    /// real one reaches (plan 072 §D2). Same gate and the same "test
+    /// seam, not a surface" rule as `app.dialog_answer`.
+    pub const APP_KEY_EVENT: &str = "app.key_event";
 
     /// Set *this* machine's own `agent-hooks` key — the consent
     /// dialog's Apply and `roostctl agent set`'s wire path — and raise

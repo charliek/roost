@@ -1316,8 +1316,9 @@ impl App {
     /// the op id whose completion owes that answer.
     ///
     /// `origin` is who is asking — see [`Self::CLICK_ACTIVATION_ORIGIN`].
-    /// Only the host rows read it, and only to refuse to raise a modal
-    /// at a machine.
+    /// The host rows read it to refuse to raise a modal at a machine, and
+    /// `new_tab` so that only a person's press keeps the keys typed after
+    /// it for the new tab (plan 072 §D2).
     pub(super) fn activate_palette(
         &mut self,
         id: &str,
@@ -1449,6 +1450,9 @@ impl App {
                 "new_tab" => {
                     self.clear_palette_state();
                     dispatch = self.new_tab_dispatch();
+                    if origin == Self::CLICK_ACTIVATION_ORIGIN {
+                        self.arm_pending_keyboard(&dispatch);
+                    }
                 }
                 "new_project" => {
                     self.clear_palette_state();

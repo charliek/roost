@@ -466,6 +466,24 @@ fn notice_dump_vectors_decode_into_their_typed_shapes() {
     assert_eq!(line.severity, "error");
 }
 
+/// `app.key_event` into its typed params: `text` may be omitted, and
+/// `modifiers` is a list of names rather than a bit mask.
+#[test]
+fn key_event_vector_decodes_into_its_typed_params() {
+    use roost_ipc::messages::{ops, AppKeyEventParams, RawRequest};
+
+    let mut path = vectors_dir();
+    path.push("app.key_event.request.json");
+    let raw = fs::read_to_string(&path).expect("read request vector");
+    let req: RawRequest = serde_json::from_str(&raw).expect("decode envelope");
+    assert_eq!(req.op, ops::APP_KEY_EVENT);
+    let params: AppKeyEventParams =
+        serde_json::from_value(req.params).expect("decode key_event params");
+    assert_eq!(params.key, "t");
+    assert_eq!(params.text, None);
+    assert_eq!(params.modifiers, vec!["alt".to_string()]);
+}
+
 /// `app.render_stats` is the one op whose *every* result field is a
 /// string-wrapped int64. Generic round-tripping would happily accept a
 /// vector that wrote them as JSON numbers, which is exactly the drift

@@ -58,6 +58,18 @@ release workflow asserts they agree).
   switch that succeeds reports it in the normal text colour rather than
   the error red. `app.notice_dump` reports the notice as
   `local_session_cannot_start`.
+- **Keys typed while a new tab opens land in it (#562)** — in Roost-Iced,
+  what you type right after Alt+T (⌘T on macOS), the tab strip's "+", the
+  palette's New Tab, ⌘N or "+ New Project" is kept until the new tab can
+  take it, then typed there, instead of the first few keys going to the
+  tab you left — which on a session-backed or remote project split a
+  command between the two. If the tab doesn't open, or you move to
+  another tab first, the bottom line says how many keys weren't sent.
+  A paste in that moment is refused with "the new tab isn't ready yet".
+  A test-mode `app.key_event` op presses a key in the window
+  ([`ipc.md#appkey_event`](docs/reference/ipc.md#appkey_event-test-only-gated));
+  the Swift Mac app, which already kept these keys, answers it
+  `unknown-op`.
 
 ### Fixed
 

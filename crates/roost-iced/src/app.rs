@@ -91,6 +91,7 @@ pub(crate) mod host_tab;
 mod interactions;
 pub(crate) mod local_backend;
 mod palettes;
+mod pending_input;
 mod pending_selection;
 mod servicing;
 mod tab_backend;
@@ -118,6 +119,7 @@ use self::palettes::{
     FontSizeTransition, PaletteAgentColumn, PaletteAgentSegment, PaletteReplyRoute,
     PaletteVisibilityRequest,
 };
+use self::pending_input::{PendingInput, PendingKeyboard};
 use self::pending_selection::{Creation, PendingHostSelection, PendingStep};
 pub(crate) use self::servicing::{AgentMetricsResult, ATTACH_RETRY_INTERVAL};
 use self::tab_backend::{TabBackend, TabHandle};
@@ -1150,6 +1152,18 @@ fn engine_op_status(result: EngineOpResult) -> Option<String> {
 }
 
 impl EngineOpResult {
+    /// A creation's op id and the tab it made, or why it made none.
+    fn creation(&self) -> Option<(u64, Result<TabKey, String>)> {
+        match self {
+            Self::TabOpened { op, result, .. } => Some((*op, result.clone())),
+            Self::ProjectCreated { op, result, .. } => Some((
+                *op,
+                result.as_ref().map(|(_, tab)| *tab).map_err(String::clone),
+            )),
+            _ => None,
+        }
+    }
+
     /// The dispatch id this completion carries, where it has one.
     ///
     /// Wider than [`Self::palette_op`] on purpose: this is what retires
@@ -2047,6 +2061,9 @@ enum KeyboardRoute {
     HostDialog,
     Editor,
     Palette,
+    /// A new tab is opening, and the keys typed meanwhile are kept for
+    /// it (plan 072 §D2).
+    Pending,
     /// The terminal that owns the keyboard, host-qualified so a
     /// composition or a keystroke can never be delivered to another
     /// instance's tab of the same number.
@@ -2063,7 +2080,8 @@ fn ime_preedit_target(route: KeyboardRoute) -> Option<TabKey> {
         | KeyboardRoute::Confirm
         | KeyboardRoute::HostDialog
         | KeyboardRoute::Editor
-        | KeyboardRoute::Palette => None,
+        | KeyboardRoute::Palette
+        | KeyboardRoute::Pending => None,
     }
 }
 
@@ -2147,14 +2165,24 @@ fn set_preedit_in(
     }
 }
 
+/// Where [`commit_ime_in`] left a commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImeCommit {
+    /// Delivered, or dropped with nowhere to go.
+    Settled,
+    /// No tab holds a composition and a new tab is opening: the commit
+    /// is the new tab's, to keep with the keys typed for it.
+    ForPendingTab,
+}
+
 fn commit_ime_in(
     tabs: &mut HashMap<TabKey, TerminalTab>,
     discard: &mut ImeDiscard,
     route: KeyboardRoute,
     text: &str,
-) {
+) -> ImeCommit {
     if discard.claims_commit() {
-        return;
+        return ImeCommit::Settled;
     }
     // The holder's WHOLE key travels to the lookup: reducing it to a
     // number here and re-qualifying it below would hand the commit to
@@ -2164,14 +2192,19 @@ fn commit_ime_in(
         .find(|(_, tab)| tab.preedit.is_some())
         .map(|(key, _)| *key);
     let Some(key) = ime_commit_target(holder, route) else {
-        return;
+        return if route == KeyboardRoute::Pending {
+            ImeCommit::ForPendingTab
+        } else {
+            ImeCommit::Settled
+        };
     };
     let Some(tab) = tabs.get_mut(&key) else {
-        return;
+        return ImeCommit::Settled;
     };
     if let Err(error) = tab.commit_ime(text) {
         tracing::warn!(?error, tab_id = key.tab, "terminal IME commit failed");
     }
+    ImeCommit::Settled
 }
 
 /// Whether the terminal for `active_tab` should ask the platform for an
@@ -2187,6 +2220,50 @@ fn terminal_ime_active(route: KeyboardRoute, active_tab: TabKey, window_focused:
 /// focused` IPC op (`test_focus.py`), which stays unchanged.
 fn terminal_cursor_focused(route: KeyboardRoute, window_focused: bool) -> bool {
     window_focused && matches!(route, KeyboardRoute::Terminal(_))
+}
+
+/// One key press into the terminal it is typed at, encoded with that
+/// tab's own encoder and modes. `tracked` is the window's modifier state,
+/// which disqualifies a bare page key just as the event's own bits do.
+fn type_into(
+    tab: &mut TerminalTab,
+    tab_id: i64,
+    event: keyboard::Event,
+    tracked: keyboard::Modifiers,
+    composing: bool,
+) {
+    // A bare page key scrolls this tab's own scrollback whenever the shared
+    // policy keeps it local — no snap, no encode, nothing on the PTY. The
+    // bypass is the policy's decision, never the key's: `Forward` (mouse
+    // tracking, alternate screen) falls through to the normal encode below.
+    let page_direction = if composing {
+        None
+    } else {
+        input::bare_page_direction(&event, tracked)
+    };
+    if let Some(direction) = page_direction {
+        match tab.handle_page(direction) {
+            Ok(PageRoute::LocalViewport { .. }) => return,
+            Ok(PageRoute::Forward) => {}
+            Err(error) => {
+                // Only the repaint after a completed local move can fail,
+                // so the key is still consumed; the next refresh recovers.
+                tracing::warn!(?error, active_tab = tab_id, "terminal page scroll failed");
+                return;
+            }
+        }
+    }
+    if input::non_modifier_press(&event) {
+        if let Err(error) = tab.snap_to_bottom_for_input() {
+            tracing::warn!(
+                ?error,
+                active_tab = tab_id,
+                "terminal snap-to-bottom failed"
+            );
+        }
+    }
+    let bytes = input::encode_press(&mut tab.encoder, &tab.terminal, event, composing);
+    tab.session.send_input(bytes);
 }
 
 /// Whether the terminal the window is drawing can take a keystroke: it
@@ -2210,6 +2287,7 @@ fn resolve_keyboard_route(
     host_dialog_open: bool,
     editor_open: bool,
     palette_open: bool,
+    pending_tab: bool,
     active_tab: TabKey,
     active_terminal_live: bool,
 ) -> KeyboardRoute {
@@ -2221,6 +2299,8 @@ fn resolve_keyboard_route(
         KeyboardRoute::Editor
     } else if palette_open {
         KeyboardRoute::Palette
+    } else if pending_tab {
+        KeyboardRoute::Pending
     } else if active_terminal_live {
         KeyboardRoute::Terminal(active_tab)
     } else {
@@ -2542,6 +2622,10 @@ impl Drop for RestoreDefaultQuitSignalsOnDrop {
 struct EngineDispatch {
     task: UiTask,
     op: Option<u64>,
+    /// Where a creation — a tab, or a project and its tab — went: the
+    /// incarnation, or the local backend's host. What a gesture binds the
+    /// keys typed after it to (plan 072 §D2).
+    created_on: Option<HostId>,
 }
 
 impl UiTask {
@@ -3061,6 +3145,8 @@ pub struct App {
     /// click made while the request is in flight, or while its row is
     /// awaited, is never overridden by the creation (plan 071 §D13).
     focus_generation: u64,
+    /// The keys typed while a new tab opens, for it (plan 072 §D2).
+    pending_keyboard: PendingKeyboard,
     awaiting_listing: forwarded_open::AwaitingListing,
     /// Whether the window still owes the slot's tab a select + attach
     /// (plan 063 §D5). Armed at bootstrap under `session`, and again when
@@ -3446,6 +3532,7 @@ impl App {
             add_host_focus_requested: false,
             pending_host_selection: None,
             focus_generation: 0,
+            pending_keyboard: PendingKeyboard::default(),
             awaiting_listing: forwarded_open::AwaitingListing::default(),
             pending_initial_local_selection: backend_mode == LocalBackendMode::Session,
             connect_purposes: HashMap::new(),
@@ -4470,6 +4557,7 @@ impl App {
         if let Some(op) = result.op_id() {
             self.host_ops.finish(op);
         }
+        let creation = result.creation();
         match result {
             simple @ (EngineOpResult::TabClosed { .. }
             | EngineOpResult::ProjectDeleted { .. }
@@ -4522,6 +4610,10 @@ impl App {
                 .background_resize
                 .settle(connection, outcomes, Instant::now()),
         }
+        // After the match put a failed creation's error on the status
+        // line: a buffer that held keys replaces it with a line that names
+        // them as well.
+        self.pending_keyboard_answered(creation);
         self.reconcile();
         if let Some((op, error)) = deferred_activation {
             settle_palette_activation(&mut self.palette_activate_replies, op, error);
@@ -4709,14 +4801,17 @@ impl App {
         self.pending_attachments.has_retryable()
     }
 
-    /// A creation or a parked `tab.focus` is waiting on a mirror, so its
-    /// deadline needs a clock (plan 071 §D13).
+    /// A creation or a parked `tab.focus` is waiting on a mirror, or keys
+    /// wait for a new tab, so its deadline needs a clock (plan 071 §D13,
+    /// plan 072 §D2).
     pub fn pending_selection_waiting(&self) -> bool {
-        self.pending_host_selection.is_some() || !self.awaiting_listing.is_empty()
+        self.pending_host_selection.is_some()
+            || !self.awaiting_listing.is_empty()
+            || self.pending_keyboard.armed()
     }
 
     /// The wait's own tick — [`Self::pending_selection_waiting`] armed
-    /// it. A whole reconcile, because that is where both waits resolve,
+    /// it. A whole reconcile, because that is where the waits resolve,
     /// ordered against the selection check and the route publish.
     pub fn pending_selection_tick(&mut self) {
         self.reconcile();
@@ -4998,41 +5093,18 @@ impl App {
             }
         }
 
-        let KeyboardRoute::Terminal(active_key) = self.keyboard_route() else {
-            return UiTask::None;
+        let active_key = match self.keyboard_route() {
+            KeyboardRoute::Terminal(active_key) => active_key,
+            KeyboardRoute::Pending => {
+                self.buffer_pending_input(PendingInput::Key(event));
+                return UiTask::None;
+            }
+            _ => return UiTask::None,
         };
-        let active_tab = active_key.tab;
         let Some(tab) = self.tabs.get_mut(&active_key) else {
             return UiTask::None;
         };
-        // A bare page key scrolls this tab's own scrollback whenever the shared
-        // policy keeps it local — no snap, no encode, nothing on the PTY. The
-        // bypass is the policy's decision, never the key's: `Forward` (mouse
-        // tracking, alternate screen) falls through to the normal encode below.
-        let page_direction = if composing {
-            None
-        } else {
-            input::bare_page_direction(&event, self.modifiers)
-        };
-        if let Some(direction) = page_direction {
-            match tab.handle_page(direction) {
-                Ok(PageRoute::LocalViewport { .. }) => return UiTask::None,
-                Ok(PageRoute::Forward) => {}
-                Err(error) => {
-                    // Only the repaint after a completed local move can fail,
-                    // so the key is still consumed; the next refresh recovers.
-                    tracing::warn!(?error, active_tab, "terminal page scroll failed");
-                    return UiTask::None;
-                }
-            }
-        }
-        if input::non_modifier_press(&event) {
-            if let Err(error) = tab.snap_to_bottom_for_input() {
-                tracing::warn!(?error, active_tab, "terminal snap-to-bottom failed");
-            }
-        }
-        let bytes = input::encode_press(&mut tab.encoder, &tab.terminal, event, composing);
-        tab.session.send_input(bytes);
+        type_into(tab, active_key.tab, event, self.modifiers, composing);
         UiTask::None
     }
 
@@ -5062,7 +5134,11 @@ impl App {
 
     pub fn ime_commit(&mut self, text: &str) {
         let route = self.keyboard_route();
-        commit_ime_in(&mut self.tabs, &mut self.ime_discard, route, text);
+        if commit_ime_in(&mut self.tabs, &mut self.ime_discard, route, text)
+            == ImeCommit::ForPendingTab
+        {
+            self.buffer_pending_input(PendingInput::Text(text.to_string()));
+        }
     }
 
     /// Handle the one captured text-input key that belongs to application
@@ -5087,7 +5163,9 @@ impl App {
                 self.cancel_confirm_delete();
                 UiTask::None
             }
-            KeyboardRoute::None | KeyboardRoute::Terminal(_) => UiTask::None,
+            KeyboardRoute::None | KeyboardRoute::Pending | KeyboardRoute::Terminal(_) => {
+                UiTask::None
+            }
         }
     }
 
@@ -5213,7 +5291,11 @@ impl App {
             self.refuse_during_switch()?;
         }
         match action {
-            KeybindAction::NewTab => Ok(self.new_tab_dispatch().task),
+            KeybindAction::NewTab => {
+                let dispatch = self.new_tab_dispatch();
+                self.arm_pending_keyboard(&dispatch);
+                Ok(dispatch.task)
+            }
             KeybindAction::CloseTab => {
                 // The selection, not the local workspace's: with a host
                 // row showing, the tab under the keybind is that host's,
@@ -5227,7 +5309,11 @@ impl App {
                 }
                 Ok(self.close_tab_dispatch(tab).task)
             }
-            KeybindAction::NewProject => Ok(self.new_project_dispatch().task),
+            KeybindAction::NewProject => {
+                let dispatch = self.new_project_dispatch();
+                self.arm_pending_keyboard(&dispatch);
+                Ok(dispatch.task)
+            }
             KeybindAction::RenameProject => {
                 self.begin_rename_target(RenameTarget::Project(self.active_project_key()))?;
                 Ok(self.take_rename_focus_task())
@@ -5356,6 +5442,7 @@ impl App {
             self.host_dialog.is_some(),
             self.rename_editor.is_some(),
             self.palette.is_some(),
+            self.pending_keyboard.armed(),
             active_tab,
             active_terminal_live(
                 self.tabs.contains_key(&active_tab),
@@ -6646,7 +6733,9 @@ impl App {
     pub fn new_tab(&mut self) -> UiTask {
         self.cancel_drags();
         self.cancel_editor_for_interaction();
-        self.new_tab_dispatch().task
+        let dispatch = self.new_tab_dispatch();
+        self.arm_pending_keyboard(&dispatch);
+        dispatch.task
     }
 
     /// The new-tab route every surface shares. Nothing follows the
@@ -6732,6 +6821,7 @@ impl App {
                 },
             ),
             op: Some(op),
+            created_on: Some(project.host),
         }
     }
 
@@ -6757,6 +6847,7 @@ impl App {
                 },
             ),
             op: Some(op),
+            created_on: Some(host),
         }
     }
 
@@ -6784,13 +6875,16 @@ impl App {
                 },
             ),
             op: Some(op),
+            created_on: Some(host),
         }
     }
 
     pub fn new_project(&mut self) -> UiTask {
         self.cancel_drags();
         self.cancel_editor_for_interaction();
-        self.new_project_dispatch().task
+        let dispatch = self.new_project_dispatch();
+        self.arm_pending_keyboard(&dispatch);
+        dispatch.task
     }
 
     /// The sidebar is expanded here, at the dispatch, rather than when
@@ -6815,7 +6909,11 @@ impl App {
                         UiTask::None
                     }
                 };
-                EngineDispatch { task, op: None }
+                EngineDispatch {
+                    task,
+                    op: None,
+                    created_on: None,
+                }
             }
         }
     }
@@ -6856,6 +6954,7 @@ impl App {
                 },
             ),
             op: Some(op),
+            created_on: Some(host),
         }
     }
 
@@ -7002,6 +7101,7 @@ impl App {
                 move |result| EngineOpResult::TabClosed { op, tab, result },
             ),
             op: Some(op),
+            created_on: None,
         }
     }
 
@@ -7030,6 +7130,7 @@ impl App {
                 move |result| EngineOpResult::TabClosed { op, tab, result },
             ),
             op: Some(op),
+            created_on: None,
         }
     }
 
@@ -7170,7 +7271,8 @@ impl App {
         // A local focus ends any host selection: the two are one
         // selection, and the local workspace is the one that persists it.
         self.set_host_selection(None);
-        focus_tab_in_core(&self.workspace, tab)?;
+        let landed = focus_tab_in_core(&self.workspace, tab);
+        self.pending_keyboard_user_focus(landed)?;
         self.note_user_focus();
         if reveal_sidebar {
             self.set_sidebar_collapsed(false);
@@ -7197,9 +7299,10 @@ impl App {
         tab: TabKey,
         reveal_sidebar: bool,
     ) -> Result<(), String> {
-        let Some(project) = self.host_project_of(tab) else {
-            return Err(format!("tab {tab} is not listed by a connected host"));
-        };
+        let landed = self
+            .host_project_of(tab)
+            .ok_or_else(|| format!("tab {tab} is not listed by a connected host"));
+        let project = self.pending_keyboard_user_focus(landed)?;
         self.note_user_focus();
         self.set_host_selection(Some(HostSelection {
             project,
@@ -12558,37 +12661,115 @@ mod tests {
     #[test]
     fn keyboard_route_requires_a_live_terminal_and_gives_editor_precedence() {
         assert_eq!(
-            resolve_keyboard_route(false, false, false, false, TabKey::local(7), false),
+            resolve_keyboard_route(false, false, false, false, false, TabKey::local(7), false),
             KeyboardRoute::None
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, false, false, TabKey::local(7), true),
+            resolve_keyboard_route(false, false, false, false, false, TabKey::local(7), true),
             KeyboardRoute::Terminal(TabKey::local(7))
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, false, true, TabKey::local(7), true),
+            resolve_keyboard_route(false, false, false, true, false, TabKey::local(7), true),
             KeyboardRoute::Palette
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, true, true, TabKey::local(7), true),
+            resolve_keyboard_route(false, false, true, true, false, TabKey::local(7), true),
             KeyboardRoute::Editor
         );
         // A host dialog owns the keyboard over the editor and the
         // palette, both of which it dismisses on the way up (plan 037
         // §3.1) — and yields only to the delete confirmation.
         assert_eq!(
-            resolve_keyboard_route(false, true, true, true, TabKey::local(7), true),
+            resolve_keyboard_route(false, true, true, true, false, TabKey::local(7), true),
             KeyboardRoute::HostDialog
         );
         // An open confirm outranks every other surface, so no keystroke can
         // reach an accelerator or the active PTY while it is up.
         assert_eq!(
-            resolve_keyboard_route(true, true, true, true, TabKey::local(7), true),
+            resolve_keyboard_route(true, true, true, true, false, TabKey::local(7), true),
             KeyboardRoute::Confirm
         );
         assert_eq!(
-            resolve_keyboard_route(true, false, false, false, TabKey::local(7), true),
+            resolve_keyboard_route(true, false, false, false, false, TabKey::local(7), true),
             KeyboardRoute::Confirm
+        );
+    }
+
+    /// A new tab that is opening takes the keys over the live terminal
+    /// (plan 072 §D2) — including the dimmed one's `None` — and yields to
+    /// every modal surface.
+    #[test]
+    fn a_pending_tab_outranks_the_terminal_but_no_modal() {
+        let tab = TabKey::local(7);
+        assert_eq!(
+            resolve_keyboard_route(false, false, false, false, true, tab, true),
+            KeyboardRoute::Pending
+        );
+        assert_eq!(
+            resolve_keyboard_route(false, false, false, false, true, tab, false),
+            KeyboardRoute::Pending
+        );
+        for (confirm, dialog, editor, palette, route) in [
+            (true, false, false, false, KeyboardRoute::Confirm),
+            (false, true, false, false, KeyboardRoute::HostDialog),
+            (false, false, true, false, KeyboardRoute::Editor),
+            (false, false, false, true, KeyboardRoute::Palette),
+        ] {
+            assert_eq!(
+                resolve_keyboard_route(confirm, dialog, editor, palette, true, tab, true),
+                route
+            );
+        }
+        assert_eq!(ime_preedit_target(KeyboardRoute::Pending), None);
+        assert!(
+            !terminal_ime_active(KeyboardRoute::Pending, tab, true),
+            "no composition starts while the keys go to a tab that isn't there yet"
+        );
+        assert!(
+            !terminal_cursor_focused(KeyboardRoute::Pending, true),
+            "and the old tab's cursor goes hollow"
+        );
+    }
+
+    /// A commit while a new tab opens is that tab's — unless a tab still
+    /// holds the composition it ends, which keeps it (plan 072 §D2).
+    #[test]
+    fn a_commit_while_a_tab_opens_is_kept_unless_the_old_tab_composed_it() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let old = TabKey::new(HostId::new(3), 7);
+        let (tab, capture) = terminal_tab::attach_test_host_terminal(80, 24, tx);
+        let mut tabs = HashMap::from([(old, tab)]);
+        let mut discard = ImeDiscard::default();
+        let captured = |capture: &InputCapture| capture.lock().expect("capture").clone();
+
+        assert_eq!(
+            commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Pending, "新"),
+            ImeCommit::ForPendingTab
+        );
+        assert!(captured(&capture).is_empty(), "nothing reached the old tab");
+
+        tabs.get_mut(&old)
+            .expect("the old tab")
+            .set_preedit("こ".into(), None)
+            .expect("preedit");
+        assert_eq!(
+            commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Pending, "こ"),
+            ImeCommit::Settled
+        );
+        assert_eq!(
+            captured(&capture),
+            "こ".as_bytes(),
+            "the composition's tab keeps its commit"
+        );
+
+        assert_eq!(
+            commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Terminal(old), "x"),
+            ImeCommit::Settled
+        );
+        assert_eq!(
+            captured(&capture),
+            "こx".as_bytes(),
+            "and a live terminal takes one"
         );
     }
 
@@ -12618,6 +12799,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 host,
                 active_terminal_live(true, false)
             ),
@@ -12628,6 +12810,7 @@ mod tests {
             resolve_keyboard_route(
                 false,
                 true,
+                false,
                 false,
                 false,
                 host,

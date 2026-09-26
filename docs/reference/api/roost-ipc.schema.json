@@ -368,6 +368,32 @@
       ],
       "type": "object"
     },
+    "AppKeyEventParams": {
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "modifiers": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "text": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
     "AppKeybindDispatchParams": {
       "additionalProperties": false,
       "properties": {
@@ -4009,6 +4035,14 @@
       },
       "result": {
         "$ref": "#/$defs/AppDockBadgeResult"
+      }
+    },
+    "app.key_event": {
+      "params": {
+        "$ref": "#/$defs/AppKeyEventParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
       }
     },
     "app.keybind_dispatch": {
