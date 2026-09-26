@@ -8,7 +8,7 @@ never say the same thing in different words.
 |---|---|---|---|---|
 | **Toast** (bottom right) | The outcome of something you just did: a refusal, an error, a receipt | 5 s | `error` or `info` | [`app.notice_dump`](../reference/ipc.md#appnotice_dump) `bottom_line`, `source: "status"` |
 | **Bottom line** (the same slot) | A standing condition of the workspace: the last save failed | Until it clears; a toast covers it while up | `error` | `app.notice_dump` `bottom_line`, `source: "durability"` |
-| **Terminal notice** | A condition that takes over the terminal area and has actions: the session under this frame ended | While the condition holds | `info`, `warning` or `error` | `app.notice_dump` `terminal` |
+| **Terminal notice** | A condition that takes over the terminal area and has actions: the session under this frame ended, or the local session can't start | While the condition holds | `info`, `warning` or `error` | `app.notice_dump` `terminal` |
 | **Sidebar band** | A host's connection state, and a short reason | While the state holds | The band's dot | [`app.sidebar_dump`](../reference/ipc.md#appsidebar_dump) `sections`, and [`host.status`](../reference/ipc.md#host-registry-host) for the full reason |
 | **Dialog** | A decision that must be made now | Until answered | — | [`app.dialog_dump`](../reference/ipc.md#host-bootstrap-test-ops-appdialog_dump-appdialog_answer-appkeybind_dispatch-test-only-gated) (test mode) |
 | **Desktop notification** | An agent event: a tab wants attention | The desktop's | — | The [`notification.fired`](../reference/ipc.md#events) event |
@@ -16,7 +16,13 @@ never say the same thing in different words.
 A terminal notice draws in one of two places. **Over a frame**, it sits
 at the top of a frame the window keeps on screen, under a scrim, because
 nothing will update those pixels again. **In an empty area**, it sits at
-the top of a terminal area with nothing selected, with no scrim.
+the top of a terminal area with nothing selected, with no scrim. The first
+notice drawn there is "Roost couldn't start its local session.": under
+`local-backend = session`, a launch that settled without a session would
+otherwise leave the window blank, with only a band line to explain it. It
+names the reason and the log that has the rest, and offers **Try again**
+and **Use in-process tabs**. It never switches on its own; the second
+button raises the same confirm card the palette's row does.
 
 ## Three rules
 

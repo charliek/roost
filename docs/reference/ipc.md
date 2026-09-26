@@ -1617,9 +1617,16 @@ Request: `{"params": {}}`. Response:
 ```
 
 - `terminal` — the notice drawn in the terminal area, or `null`.
-    - `kind` says what it is about: `"session_ended"` is a host whose
-      session ended under the frame the window is still showing. Read it
-      as an open set — a newer build may add kinds.
+    - `kind` says what it is about. Read it as an open set — a newer
+      build may add kinds.
+        - `"session_ended"`: a host whose session ended under the frame
+          the window is still showing (`placement: "over_frame"`).
+        - `"local_session_cannot_start"`: under `local-backend = session`,
+          the local session's launch settled without a session and nothing
+          is retrying it, and the terminal area has nothing selected to
+          show (`placement: "empty_area"`, `severity: "error"`). `detail`
+          is the band's reason and the path of the UI's log. Not shown
+          while a local-backend switch is in flight.
     - `subject` is the saved host's **id**, the value `host.*` takes —
       not its label, which `message` interpolates.
     - `severity` is `"info"`, `"warning"` or `"error"`.
@@ -1664,6 +1671,8 @@ runs.
 | `kind` | `action` | What it does |
 |---|---|---|
 | `session_ended` | `start` | Starts a new session on `subject`, the Connect the sidebar's ↻ runs. |
+| `local_session_cannot_start` | `reconnect` | Tries the local session again, the Connect the sidebar's ↻ runs. |
+| `local_session_cannot_start` | `use_in_process` | Raises the **Use in-process local tabs?** confirm card, as the palette's row does. Nothing switches until the card is confirmed. |
 
 The Swift Mac app answers `unknown-op`.
 

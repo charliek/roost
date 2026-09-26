@@ -2351,16 +2351,15 @@ impl super::App {
         }) {
             return false;
         }
-        let kept = self.switch.as_ref().map_or(0, |run| run.kept);
-        self.finish_switch(&match kept {
-            0 => "local tabs now run in a session on this machine".to_string(),
-            n => format!(
+        match self.switch.as_ref().map_or(0, |run| run.kept) {
+            0 => self.finish_switch_with_receipt("local tabs now run in a session on this machine"),
+            n => self.finish_switch(&format!(
                 "local tabs now run in a session on this machine — {} did not copy \
                  completely and {} left where they were",
                 plural(n, "project"),
                 if n == 1 { "was" } else { "were" },
-            ),
-        });
+            )),
+        }
         false
     }
 
@@ -2668,7 +2667,7 @@ impl super::App {
                     self.finish_switch_quietly();
                     return;
                 }
-                self.finish_switch("local tabs run in Roost again");
+                self.finish_switch_with_receipt("local tabs run in Roost again");
             }
         }
         self.reconcile();
@@ -2723,6 +2722,12 @@ impl super::App {
 
     fn finish_switch(&mut self, said: &str) {
         self.set_status(said.to_string());
+        self.finish_switch_quietly();
+    }
+
+    /// [`Self::finish_switch`] for a switch that did all it was asked to.
+    fn finish_switch_with_receipt(&mut self, receipt: &str) {
+        self.set_status_info(receipt);
         self.finish_switch_quietly();
     }
 

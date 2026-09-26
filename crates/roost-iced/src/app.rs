@@ -1797,6 +1797,10 @@ fn ring_sections_from(
         .collect()
 }
 
+const SIDEBAR_BAND_PADDING_X: f32 = 12.0;
+const SIDEBAR_BAND_LABEL_SIZE: f32 = 11.0;
+const FIDELITY_PILL_PADDING_X: f32 = 6.0;
+
 /// The sidebar's band strip. The "PROJECTS" header and every host band
 /// are the same chrome, so the height and insets live in one place —
 /// that parity is the whole reason a host section reads as a band and
@@ -1805,18 +1809,53 @@ fn sidebar_band<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Mes
     container(content)
         .center_y(chrome::BAND_HEIGHT)
         .width(Fill)
-        .padding([0, 12])
+        .padding([0.0, SIDEBAR_BAND_PADDING_X])
         .style(chrome::band)
         .into()
+}
+
+fn sidebar_band_label_font() -> Font {
+    chrome::chrome_font(font::Weight::Semibold)
 }
 
 /// A band's label, in the one weight and size every band uses.
 fn sidebar_band_label(label: &str) -> Element<'_, Message> {
     text(label)
-        .size(11)
+        .size(SIDEBAR_BAND_LABEL_SIZE)
         .color(chrome::MUTED_TEXT)
-        .font(chrome::chrome_font(font::Weight::Semibold))
+        .font(sidebar_band_label_font())
         .into()
+}
+
+/// How wide a host band's rollup may draw and keep the band one line:
+/// the sidebar, less everything else [`App::host_band`] lays out beside
+/// it. `fidelity` is the band's `reduced fidelity` pill, if it draws one,
+/// and whether it is a button.
+///
+/// A row does not shrink its text to fit, so a rollup wider than this
+/// wraps down over "PROJECTS" and the rows under it; it is elided to this
+/// instead (#520).
+fn host_rollup_budget(sidebar_width: f32, label: &str, fidelity: Option<bool>) -> f32 {
+    let label = chrome::text_width(label, sidebar_band_label_font(), SIDEBAR_BAND_LABEL_SIZE);
+    let pill = fidelity.map_or(0.0, |pressable| {
+        chrome::HOST_BAND_SPACING
+            + chrome::text_width(
+                host_notice::FIDELITY_PILL,
+                chrome::chrome_font(font::Weight::Normal),
+                chrome::HOST_ROLLUP_SIZE,
+            )
+            + if pressable {
+                2.0 * FIDELITY_PILL_PADDING_X
+            } else {
+                0.0
+            }
+    });
+    // Dot, label, spacer and rollup: three gaps.
+    let fixed = chrome::DIVIDER_WIDTH
+        + 2.0 * SIDEBAR_BAND_PADDING_X
+        + chrome::HOST_DOT_SIZE
+        + 3.0 * chrome::HOST_BAND_SPACING;
+    (sidebar_width - fixed - label - pill).max(0.0)
 }
 
 /// One column of an agents-palette row, in the treatment its role
@@ -4535,10 +4574,19 @@ impl App {
     }
 
     fn set_status(&mut self, message: impl Into<String>) {
+        self.set_status_as(message, Severity::Error);
+    }
+
+    /// A receipt: the toast in the normal text colour.
+    fn set_status_info(&mut self, message: impl Into<String>) {
+        self.set_status_as(message, Severity::Info);
+    }
+
+    fn set_status_as(&mut self, message: impl Into<String>, severity: Severity) {
         // A toast restructures the root widget tree, which drops the grip's
         // widget state — a live drag would never publish its end.
         self.commit_sidebar_drag();
-        self.status.set_at(message, Severity::Error, Instant::now());
+        self.status.set_at(message, severity, Instant::now());
     }
 
     fn live_sidebar_width(&self) -> f32 {
@@ -5618,10 +5666,22 @@ impl App {
             band = band.push(self.host_fidelity_pill(saved_id, &section.label, action));
         }
         if let Some(rollup) = &section.rollup {
+            let font = chrome::chrome_font(font::Weight::Normal);
+            let pill = section
+                .fidelity
+                .filter(|_| section.saved_id.is_some())
+                .map(|action| host_notice::fidelity_chrome(action, &section.label).pressable);
+            let budget = host_rollup_budget(self.live_sidebar_width(), &section.label, pill);
+            let (rollup, _) =
+                chrome::elide_to_width(rollup, font, chrome::HOST_ROLLUP_SIZE, budget);
             band = band.push(
-                text(rollup.as_str())
+                text(rollup)
                     .size(chrome::HOST_ROLLUP_SIZE)
-                    .color(chrome::HOST_ROLLUP_TEXT),
+                    .color(chrome::HOST_ROLLUP_TEXT)
+                    .font(font)
+                    // Measured with Advanced shaping, as the pill titles are.
+                    .shaping(iced::widget::text::Shaping::Advanced)
+                    .wrapping(iced::widget::text::Wrapping::None),
             );
         }
         sidebar_band(band)
@@ -5648,7 +5708,7 @@ impl App {
             return pill.into();
         }
         button(pill)
-            .padding([chrome::BAND_PILL_PADDING_Y, 6.0])
+            .padding([chrome::BAND_PILL_PADDING_Y, FIDELITY_PILL_PADDING_X])
             .style(chrome::transparent_button)
             .on_press(Message::HostFidelityAction(saved_id.to_string()))
             .into()
@@ -6152,14 +6212,11 @@ impl App {
             .into()
         };
         let content: Element<'_, Message> = if let Some(line) = self.bottom_line() {
-            let toast = container(
-                text(line.text)
-                    .size(12)
-                    .color(bottom_line_color(line.severity)),
-            )
-            .max_width(520)
-            .padding([8, 12])
-            .style(chrome::status_toast);
+            let color = bottom_line_color(line.severity);
+            let toast = container(text(line.text).size(12).color(color))
+                .max_width(520)
+                .padding([8, 12])
+                .style(chrome::status_toast(color));
             let overlay = container(toast)
                 .width(Fill)
                 .height(Fill)
@@ -7180,8 +7237,15 @@ impl App {
 
     fn run_notice_action(&mut self, key: &notice::NoticeKey, action: notice::NoticeActionId) {
         match action {
-            notice::NoticeActionId::Start => {
+            notice::NoticeActionId::Start | notice::NoticeActionId::Reconnect => {
                 self.host_connect_requested(&key.subject, crate::host_conn::RequestOrigin::User)
+            }
+            notice::NoticeActionId::UseInProcess => {
+                if let Err(error) =
+                    self.open_local_switch_dialog(local_backend::SwitchDirection::ToInProcess)
+                {
+                    self.set_status(error);
+                }
             }
         }
     }
@@ -10400,6 +10464,53 @@ mod tests {
         assert_eq!(
             (line.severity, line.source),
             (Severity::Error, BottomLineSource::Durability)
+        );
+    }
+
+    /// The #520 overrun: a slot that cannot start names why in its band,
+    /// and in the narrowest sidebar and the default one the reason is cut
+    /// to the room left beside the label, one line, rather than wrapping
+    /// over "PROJECTS".
+    #[test]
+    fn a_band_reason_is_elided_to_one_line_beside_its_label() {
+        let rollup = "disconnected — roost-session exited early (status 1)";
+        let label = "PROJECTS";
+        let rollup_font = chrome::chrome_font(font::Weight::Normal);
+        for sidebar in [
+            roost_engine::SIDEBAR_MIN_WIDTH,
+            roost_engine::SIDEBAR_DEFAULT_WIDTH,
+        ] {
+            let sidebar = sidebar as f32;
+            let (drawn, width) = chrome::elide_to_width(
+                rollup,
+                rollup_font,
+                chrome::HOST_ROLLUP_SIZE,
+                host_rollup_budget(sidebar, label, None),
+            );
+            assert!(drawn.ends_with(chrome::ELLIPSIS), "{sidebar}: {drawn}");
+            let row = chrome::DIVIDER_WIDTH
+                + 2.0 * SIDEBAR_BAND_PADDING_X
+                + chrome::HOST_DOT_SIZE
+                + chrome::text_width(label, sidebar_band_label_font(), SIDEBAR_BAND_LABEL_SIZE)
+                + 3.0 * chrome::HOST_BAND_SPACING
+                + width;
+            assert!(row <= sidebar, "{sidebar}: the band needs {row}");
+        }
+        let wide = roost_engine::SIDEBAR_MAX_WIDTH as f32;
+        assert_eq!(
+            chrome::elide_to_width(
+                rollup,
+                rollup_font,
+                chrome::HOST_ROLLUP_SIZE,
+                host_rollup_budget(wide, label, None),
+            )
+            .0,
+            rollup,
+            "a reason with room is drawn whole"
+        );
+        assert!(
+            host_rollup_budget(wide, label, Some(true)) < host_rollup_budget(wide, label, None),
+            "a fidelity pill takes its share of the band"
         );
     }
 

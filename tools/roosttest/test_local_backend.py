@@ -124,8 +124,27 @@ NO_SESSION = {"ROOST_SESSION_BIN": str(_ROOT / "no-such-session")}
 #: User-facing wording, restated so a change has to be made twice.
 NEVER_RAN_COPY = "Local tabs will run inside Roost."
 #: `spawn_failure`'s row for a launcher that exited with no verdict
-#: (`task.rs`), for the exit-1 stub the dies-on-start case writes.
+#: (`task.rs`), for the exit-1 stub `crashing_session` writes.
 EXITED_EARLY = "roost-session exited early (status 1)"
+#: `notice::local_session_cannot_start`'s words and buttons. User-facing
+#: wording, restated so a change has to be made twice.
+CANNOT_START = "local_session_cannot_start"
+CANNOT_START_MESSAGE = "Roost couldn't start its local session."
+CANNOT_START_ACTIONS = [
+    {"id": "reconnect", "label": "Try again", "primary": False},
+    {"id": "use_in_process", "label": "Use in-process tabs", "primary": True},
+]
+#: The reverse switch's receipt (`local_backend.rs`).
+BACK_IN_ROOST = "local tabs run in Roost again"
+
+
+def crashing_session() -> dict[str, str]:
+    """A `roost-session` that dies before it can print a verdict — the
+    likeliest way a fresh install's session fails."""
+    stub = _ROOT / "crashing-session"
+    stub.write_text("#!/bin/sh\necho 'boom: died on start' >&2\nexit 1\n")
+    stub.chmod(0o755)
+    return {"ROOST_SESSION_BIN": str(stub)}
 
 
 # ---------------------------------------------------------------------------
@@ -801,10 +820,7 @@ def test_a_session_that_dies_on_start_is_named_and_not_dialled_again(lane: Lane)
     has no edge to wait on. The settle waits out the one confirm a dead
     launcher gets, for a daemon it may have left binding.
     """
-    stub = _ROOT / "crashing-session"
-    stub.write_text("#!/bin/sh\necho 'boom: died on start' >&2\nexit 1\n")
-    stub.chmod(0o755)
-    roost = lane.start("session", extra_env={"ROOST_SESSION_BIN": str(stub)})
+    roost = lane.start("session", extra_env=crashing_session())
 
     last: dict | None = None
 
@@ -3255,3 +3271,75 @@ def test_a_refusal_with_the_local_session_down_is_on_the_bottom_line(lane: Lane)
     assert dumped["terminal"]["kind"] == "session_ended", (
         "the toast and the terminal notice are two surfaces, both on screen"
     )
+
+
+# ---------------------------------------------------------------------------
+# 16. Plan 072 §D7c (#520): the local session that cannot start
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "launch, reason",
+    [("missing", "cannot find roost-session"), ("crash", EXITED_EARLY)],
+)
+def test_a_local_session_that_cannot_start_says_so_and_offers_the_way_out(
+    lane: Lane, launch: str, reason: str
+):
+    """A window under `session` whose session cannot start is no longer
+    an empty grey area: the terminal area says so, names why and where
+    the rest is written, and offers the two ways out.
+
+    Both are pressed here. "Try again" runs the launch once more, which
+    settles where it was — the same notice, a newer showing. "Use
+    in-process tabs" raises the confirm card the palette's row does, in
+    the words for a session that never ran, and nothing moves until it
+    is confirmed. Confirming lands in-process with a tab to show, the
+    key written, no journal left, and the dead slot forgotten.
+    """
+    env = NO_SESSION if launch == "missing" else crashing_session()
+    roost = lane.start("session", extra_env=env)
+    first = shown_notice(roost, "the notice in the empty window")
+    slot = local_band(roost)["saved_id"]
+    notice = first["terminal"]
+    pointer = re.fullmatch(
+        rf"{re.escape(reason)}\. Details are in (/.+)\.", notice["detail"] or ""
+    )
+    assert pointer, notice
+    log = Path(pointer[1])
+    assert log.is_file() and log.is_relative_to(_ROOT / "state"), log
+    assert notice == {
+        "kind": CANNOT_START,
+        "subject": slot,
+        "severity": "error",
+        "placement": "empty_area",
+        "message": CANNOT_START_MESSAGE,
+        "detail": notice["detail"],
+        "actions": CANNOT_START_ACTIONS,
+    }
+
+    roost.notice_answer(CANNOT_START, slot, first["generation"], "reconnect")
+    again = shown_notice(roost, "the notice back after trying again", after=first["generation"])
+    assert again["terminal"] == notice, again
+
+    roost.notice_answer(CANNOT_START, slot, again["generation"], "use_in_process")
+    card = roost.call("app.dialog_dump", {})
+    assert card["dialog"] == "confirm_switch" and card["body"] == NEVER_RAN_COPY, card
+    assert settled(roost) == "session", "raising the card switches nothing"
+
+    roost.call("app.dialog_answer", {"action": "confirm"})
+    wait_until(lambda: settled(roost) == "in-process", 120.0, "the switch to in-process")
+    # At once: the receipt is a five-second toast.
+    landed = roost.notice_dump()
+    assert landed["bottom_line"] == {
+        "text": BACK_IN_ROOST,
+        "severity": "info",
+        "source": "status",
+    }, landed
+    wait_until(lambda: int(roost.identify()["active_tab_id"]) != 0, 60.0, "a tab to show")
+    assert roost.notice_dump()["terminal"] is None
+    config = lane.config.read_text()
+    assert "local-backend = in-process" in config, config
+    assert "local-backend = session" not in config, config
+    assert lane.journal() is None, lane.journal()
+    hosts = roost.call("host.list", {})["hosts"]
+    assert slot not in [h["id"] for h in hosts], hosts

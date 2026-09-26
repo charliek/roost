@@ -979,8 +979,9 @@ pub struct AppNoticeDumpResult {
 /// One terminal-area notice, as drawn.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AppNoticeTerminal {
-    /// What the notice is about — `"session_ended"` today. An open set:
-    /// a newer UI may send a kind this build has no name for.
+    /// What the notice is about — `"session_ended"` or
+    /// `"local_session_cannot_start"`. An open set: a newer UI may send a
+    /// kind this build has no name for.
     pub kind: String,
     /// The saved host's id the notice is about — the value `host.*`
     /// ops take, not its label.

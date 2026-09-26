@@ -68,6 +68,10 @@ impl Severity {
 pub enum NoticeActionId {
     /// Start a fresh session on the notice's host.
     Start,
+    /// Try the notice's host again: the Connect the sidebar's ↻ runs.
+    Reconnect,
+    /// Raise the confirm card that switches local tabs to in-process.
+    UseInProcess,
 }
 
 impl NoticeActionId {
@@ -75,11 +79,13 @@ impl NoticeActionId {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Start => "start",
+            Self::Reconnect => "reconnect",
+            Self::UseInProcess => "use_in_process",
         }
     }
 
     pub fn from_wire(value: &str) -> Option<Self> {
-        [Self::Start]
+        [Self::Start, Self::Reconnect, Self::UseInProcess]
             .into_iter()
             .find(|action| action.as_str() == value)
     }
@@ -152,11 +158,31 @@ pub struct NoticeInput<'a> {
     pub log_path: &'a str,
 }
 
+impl SlotFacts<'_> {
+    /// Down, and staying down until someone acts: the launch could not
+    /// produce a session, and nothing will try again on its own. A
+    /// `detail` is written only by a settled launch failure, so this is
+    /// that settle and never a drop between retries.
+    fn cannot_start(&self) -> bool {
+        self.state == SectionState::Disconnected && self.detail.is_some() && !self.retry_armed
+    }
+}
+
 /// What the terminal area says, if anything, in priority order: a frame
 /// on screen speaks for its own host first.
 pub fn terminal_notice(input: &NoticeInput<'_>) -> Option<Notice> {
-    match input.shown {
-        Some(shown) if shown.state == SectionState::Stopped => Some(session_ended(shown)),
+    match input {
+        NoticeInput {
+            shown: Some(shown), ..
+        } if shown.state == SectionState::Stopped => Some(session_ended(*shown)),
+        NoticeInput {
+            mode: LocalBackendMode::Session,
+            slot: Some(slot),
+            area_empty: true,
+            switching: false,
+            log_path,
+            ..
+        } if slot.cannot_start() => Some(local_session_cannot_start(slot, log_path)),
         _ => None,
     }
 }
@@ -178,6 +204,39 @@ fn session_ended(shown: ShownHost<'_>) -> Notice {
             label: "Start a new session",
             primary: true,
         }],
+    }
+}
+
+/// Plan 072 D7c (#520). The band's reason is a headline with no room for
+/// the launch's own words; those are in the log, so the notice says where.
+/// Nothing switches on its own (pinned decision 3): the way out is offered,
+/// and taking it is the user's.
+fn local_session_cannot_start(slot: &SlotFacts<'_>, log_path: &str) -> Notice {
+    let pointer = format!("Details are in {log_path}.");
+    Notice {
+        key: NoticeKey {
+            kind: NoticeKind::LocalSessionCannotStart,
+            subject: slot.saved_id.to_string(),
+        },
+        severity: Severity::Error,
+        placement: Placement::EmptyArea,
+        message: "Roost couldn't start its local session.".into(),
+        detail: Some(match slot.reason {
+            Some(reason) => format!("{reason}. {pointer}"),
+            None => pointer,
+        }),
+        actions: vec![
+            NoticeAction {
+                id: NoticeActionId::Reconnect,
+                label: "Try again",
+                primary: false,
+            },
+            NoticeAction {
+                id: NoticeActionId::UseInProcess,
+                label: "Use in-process tabs",
+                primary: true,
+            },
+        ],
     }
 }
 
@@ -323,10 +382,12 @@ mod tests {
 
     /// The whole decision, row by row: every state the shown host (and
     /// the slot) can be in, a frame on screen or an empty area, a switch
-    /// in flight or not, under either backend. Only a frame whose session
-    /// ended says anything, and it says so whatever else is true.
+    /// in flight or not, under either backend. A frame whose session
+    /// ended says so whatever else is true; an empty area under `session`
+    /// speaks for a slot that cannot start, and only while nothing is
+    /// switching.
     #[test]
-    fn only_a_frame_whose_session_ended_puts_a_notice_in_the_terminal_area() {
+    fn the_terminal_area_speaks_for_an_ended_frame_and_for_a_local_session_that_cannot_start() {
         for state in STATES {
             for on_screen in [true, false] {
                 for switching in [false, true] {
@@ -337,10 +398,19 @@ mod tests {
                             Some(settled_slot(state)),
                             switching,
                         ));
-                        let expected =
-                            (on_screen && state == SectionState::Stopped).then(session_ended_key);
+                        let expected = if on_screen && state == SectionState::Stopped {
+                            Some(NoticeKind::SessionEnded)
+                        } else if !on_screen
+                            && !switching
+                            && mode == LocalBackendMode::Session
+                            && state == SectionState::Disconnected
+                        {
+                            Some(NoticeKind::LocalSessionCannotStart)
+                        } else {
+                            None
+                        };
                         assert_eq!(
-                            notice.map(|notice| notice.key),
+                            notice.map(|notice| notice.key.kind),
                             expected,
                             "{state:?}, on screen {on_screen}, switching {switching}, {mode:?}"
                         );
@@ -453,11 +523,137 @@ mod tests {
         ] {
             assert_eq!(NoticeKind::from_wire(kind.as_str()), Some(kind));
         }
-        assert_eq!(
-            NoticeActionId::from_wire(NoticeActionId::Start.as_str()),
-            Some(NoticeActionId::Start)
-        );
+        for action in [
+            NoticeActionId::Start,
+            NoticeActionId::Reconnect,
+            NoticeActionId::UseInProcess,
+        ] {
+            assert_eq!(NoticeActionId::from_wire(action.as_str()), Some(action));
+        }
         assert_eq!(NoticeKind::from_wire("nonesuch"), None);
-        assert_eq!(NoticeActionId::from_wire("reconnect"), None);
+        assert_eq!(NoticeActionId::from_wire("nonesuch"), None);
+    }
+
+    const LOG: &str = "/home/u/.local/state/roost/roost.log";
+
+    /// Under `session`, nothing selected, nothing switching: what the
+    /// window shows a user whose local session cannot start.
+    fn empty_session_window(slot: SlotFacts<'static>) -> NoticeInput<'static> {
+        input(LocalBackendMode::Session, None, Some(slot), false)
+    }
+
+    /// The notice in the words it is drawn with, compared as literals.
+    fn cannot_start(reason: &str) -> Notice {
+        Notice {
+            key: NoticeKey {
+                kind: NoticeKind::LocalSessionCannotStart,
+                subject: "hs-0".into(),
+            },
+            severity: Severity::Error,
+            placement: Placement::EmptyArea,
+            message: "Roost couldn't start its local session.".into(),
+            detail: Some(format!(
+                "{reason}. Details are in /home/u/.local/state/roost/roost.log."
+            )),
+            actions: vec![
+                NoticeAction {
+                    id: NoticeActionId::Reconnect,
+                    label: "Try again",
+                    primary: false,
+                },
+                NoticeAction {
+                    id: NoticeActionId::UseInProcess,
+                    label: "Use in-process tabs",
+                    primary: true,
+                },
+            ],
+        }
+    }
+
+    /// A fresh install: the launch ladder found no `roost-session` to run,
+    /// and no session has ever answered.
+    #[test]
+    fn a_fresh_install_whose_session_cannot_start_is_told_so_and_offered_the_way_out() {
+        let slot = SlotFacts {
+            reason: Some("cannot find roost-session"),
+            detail: Some(
+                "ROOST_SESSION_BIN=/opt/roost-session is not a file this user can execute",
+            ),
+            ..settled_slot(SectionState::Disconnected)
+        };
+        assert_eq!(
+            terminal_notice(&empty_session_window(slot)),
+            Some(cannot_start("cannot find roost-session"))
+        );
+        assert_eq!(
+            terminal_notice(&empty_session_window(SlotFacts {
+                reason: None,
+                ..slot
+            }))
+            .and_then(|notice| notice.detail),
+            Some(format!("Details are in {LOG}.")),
+            "with no reason to name, it still says where to look"
+        );
+    }
+
+    /// An existing user: the session that used to start now dies before
+    /// it is ready. The input carries no history, so the window says the
+    /// same thing it says on a fresh install.
+    #[test]
+    fn an_existing_user_whose_session_stops_starting_is_told_the_same() {
+        let slot = SlotFacts {
+            reason: Some("roost-session exited early (signal 11)"),
+            detail: Some("roost-session exited before it was ready (signal 11): "),
+            ..settled_slot(SectionState::Disconnected)
+        };
+        assert_eq!(
+            terminal_notice(&empty_session_window(slot)),
+            Some(cannot_start("roost-session exited early (signal 11)"))
+        );
+    }
+
+    #[test]
+    fn nothing_is_said_about_the_local_session_while_a_switch_is_in_flight() {
+        let window = NoticeInput {
+            switching: true,
+            ..empty_session_window(settled_slot(SectionState::Disconnected))
+        };
+        assert_eq!(terminal_notice(&window), None);
+    }
+
+    /// A tab on screen — another host's, say — is what the terminal area
+    /// is showing, and the slot's trouble is the band's to tell.
+    #[test]
+    fn nothing_is_said_about_the_local_session_over_a_selection_the_window_holds() {
+        let window = NoticeInput {
+            shown: Some(shown(SectionState::Connected)),
+            area_empty: false,
+            ..empty_session_window(settled_slot(SectionState::Disconnected))
+        };
+        assert_eq!(terminal_notice(&window), None);
+    }
+
+    /// A drop that will be retried is not a session that cannot start.
+    #[test]
+    fn nothing_is_said_about_the_local_session_while_a_retry_is_armed() {
+        let between_retries = SlotFacts {
+            reason: Some("no session is running at /run/user/1000/roost-session/roost.sock"),
+            detail: None,
+            retry_armed: true,
+            ..settled_slot(SectionState::Disconnected)
+        };
+        assert_eq!(
+            terminal_notice(&empty_session_window(between_retries)),
+            None
+        );
+        let armed = SlotFacts {
+            retry_armed: true,
+            ..settled_slot(SectionState::Disconnected)
+        };
+        assert_eq!(
+            terminal_notice(&empty_session_window(armed)),
+            None,
+            "an armed retry alone keeps the notice down"
+        );
     }
 }

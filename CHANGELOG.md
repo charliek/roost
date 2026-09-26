@@ -46,6 +46,18 @@ release workflow asserts they agree).
   line (the five-second toast, or a standing failure to save), as the
   strings on screen. Nothing on screen changes. The Swift Mac app answers
   `unknown-op`. See [`ipc.md#appnotice_dump`](docs/reference/ipc.md#appnotice_dump).
+- **The window says when its local session can't start, and offers the
+  way out (#520)** — under `local-backend = session` (a fresh
+  Roost-Iced install's default), a session that cannot be started no
+  longer leaves an empty window with only a band line to explain it. The
+  terminal area says "Roost couldn't start its local session.", names
+  the reason and the log that has the rest, and offers **Try again** and
+  **Use in-process tabs**, which raises the usual confirm card. Nothing
+  switches on its own. The band's reason is cut to one line with an
+  ellipsis instead of wrapping over the sidebar, and a local-backend
+  switch that succeeds reports it in the normal text colour rather than
+  the error red. `app.notice_dump` reports the notice as
+  `local_session_cannot_start`.
 
 ### Fixed
 

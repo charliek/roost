@@ -516,11 +516,13 @@ pub fn palette_panel(_: &Theme) -> container::Style {
     }
 }
 
-pub fn status_toast(_: &Theme) -> container::Style {
-    container::Style {
+/// The bottom-right line's surface, framed in its text's own colour so a
+/// receipt does not wear an error's red.
+pub fn status_toast(accent: Color) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
         background: Some(Background::Color(PALETTE_SURFACE)),
         border: Border {
-            color: ERROR_TEXT.scale_alpha(0.55),
+            color: accent.scale_alpha(0.55),
             width: 1.0,
             radius: 6.0.into(),
         },
@@ -940,11 +942,15 @@ mod tests {
     }
 
     #[test]
-    fn status_toast_is_a_neutral_surface_with_an_error_accent() {
-        let style = status_toast(&Theme::Dark);
+    fn status_toast_is_a_neutral_surface_framed_in_its_lines_colour() {
+        let style = status_toast(ERROR_TEXT)(&Theme::Dark);
         assert_eq!(style.background, Some(Background::Color(PALETTE_SURFACE)));
         assert_eq!(style.border.color, ERROR_TEXT.scale_alpha(0.55));
         assert_eq!(style.border.width, 1.0);
+        assert_eq!(
+            status_toast(TEXT)(&Theme::Dark).border.color,
+            TEXT.scale_alpha(0.55)
+        );
     }
 
     #[test]
