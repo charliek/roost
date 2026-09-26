@@ -1753,33 +1753,24 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         return "provider:items:\(providerFrameSeq)"
     }
 
-    /// The launch cwd: the active tab's live (OSC 7-tracked) cwd, else
-    /// the project's cwd, else "" (the open-tab path then resolves
-    /// $HOME). Mirrors `updateWindowTitle`'s cwd resolution.
+    /// The launch cwd: `LocalClient.inheritedCwd(tabID:)`'s answer for
+    /// the active tab (the same rule `tab.open`'s `cwd_from_tab` uses,
+    /// #556), else the project's cwd. One rule for ⌘T and providers
+    /// alike, instead of a second, looser one that skipped the
+    /// directory check.
     @MainActor
     private func activeLaunchCwd(projectID: Int64) -> String {
-        let session = activeSessionByProject[projectID]
-        // Prefer a native read of the active tab's shell cwd: it reflects
-        // the *current* directory even for shells that don't emit OSC 7
-        // (e.g. stock /bin/bash), and a new tab spawns a LOCAL shell, so
-        // the local path is what it should inherit. Fall back to the
-        // OSC 7-tracked cwd, then the project's stored cwd.
-        var native: String?
-        if let tabID = session?.id {
-            native = RoostBackend.shared.supervisor?.foregroundCwd(tabID: tabID)
-        }
-        let live = session?.liveCwd ?? ""
+        let tabID = activeSessionByProject[projectID]?.id
+        let inherited = tabID.flatMap { RoostBackend.shared.localClient?.inheritedCwd(tabID: $0) }
         let project = projects.first(where: { $0.id == projectID })?.cwd ?? ""
-        return Self.resolveLaunchCwd(native: native, live: live, project: project)
+        return Self.launchCwd(inherited: inherited, project: project)
     }
 
-    /// New-tab cwd precedence: native shell cwd (current, local) →
-    /// OSC 7-tracked cwd → project cwd. Pure + `nonisolated` so it's
-    /// unit-testable without standing up the app.
-    nonisolated static func resolveLaunchCwd(native: String?, live: String, project: String) -> String {
-        if let native, !native.isEmpty { return native }
-        if !live.isEmpty { return live }
-        return project
+    /// New-tab cwd precedence: the client's inherited-cwd answer, else
+    /// the project's cwd. Pure + `nonisolated` so it's unit-testable
+    /// without standing up the app.
+    nonisolated static func launchCwd(inherited: String?, project: String) -> String {
+        inherited ?? project
     }
 
     @MainActor
@@ -3174,9 +3165,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     /// Pure data mutation: swap the active project + reconcile tabs.
     /// Does NOT touch sidebar visibility — call sites that want the
-    /// sidebar revealed (user-action paths like ⌘1-9, sidebar-row
-    /// click, palette confirm) must invoke `ensureSidebarVisible()`
-    /// themselves before this call. Mirrors GTK's
+    /// sidebar revealed (user-action paths like sidebar-row click,
+    /// palette confirm) must invoke `ensureSidebarVisible()`
+    /// themselves before this call. ⌘1-9 / the Window menu does not:
+    /// opening a tab never expands the sidebar (071's ruling). Mirrors GTK's
     /// `set_active_project` and the vision.md DL-11 principle: "the
     /// UI is a reaction to the core's events, not a parallel source
     /// of truth." Programmatic callers (bootstrap, event reconcile,
@@ -4139,9 +4131,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func selectProjectFromMenu(_ sender: NSMenuItem) {
         let id = Int64(sender.tag)
         guard id != activeProjectID else { return }
-        // User action (⌘1-9): reveal the sidebar so the user can see
-        // which project they landed on.
-        ensureSidebarVisible()
         selectProject(id: id)
     }
 
@@ -4756,12 +4745,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// Force the sidebar visible without toggling. Called from the
     /// user-action paths that auto-expand the sidebar so the user sees
     /// the affected row:
-    /// `newProject` (freshly-created project), `selectProjectFromMenu`
-    /// (⌘1-9 reveals the focused project), `renameActiveProject`
+    /// `newProject` (freshly-created project), `renameActiveProject`
     /// (rename popover needs the row to anchor against), plus the
-    /// notification jumps (banner click, palette confirm, ⌘⇧U). The
-    /// underlying `selectProject` / `focusTab` are pure data mutators
-    /// per DL-11; reveal is a per-call-site concern.
+    /// notification jumps (banner click, palette confirm, ⌘⇧U).
+    /// `selectProjectFromMenu` (⌘1-9) does NOT call this: opening a tab
+    /// never expands the sidebar (071's ruling). The underlying
+    /// `selectProject` / `focusTab` are pure data mutators per DL-11;
+    /// reveal is a per-call-site concern.
     ///
     /// Round-7 R7.A: collapse is now a width-0 state, not
     /// `isHidden = true`. Delegate to `toggleSidebar` when the pane

@@ -240,6 +240,15 @@ release workflow asserts they agree).
   says where the shell started, as on Roost-Iced. A directory that exists
   but can't be entered now fails the shell's start and the tab closes, as
   on Linux, instead of the shell running on in the launch directory.
+- **Mac: ⌘T and `cwd_from_tab` could pick different directories (#556)**
+  — ⌘T, the launcher and providers now resolve the new-tab cwd through
+  the same `LocalClient.inheritedCwd(tabID:)` rule `tab.open`'s
+  `cwd_from_tab` uses, instead of a second rule with no directory
+  check. A stale project cwd with no live directory to inherit now
+  falls through to `$HOME`, as intended, instead of landing in a
+  directory that no longer exists. ⌘1–9 and the Window menu no longer
+  reveal a hidden sidebar when switching projects, matching Roost-Iced
+  and 071's ruling that opening a tab never expands it.
 
 ## v0.0.20 — 2026-09-20
 

@@ -4988,9 +4988,10 @@ impl App {
             }
             // The Window menu's rows take the same paths the sidebar and
             // tab strip take (`Message::ProjectSelected`/`TabSelected`) —
-            // including their lack of Swift's `ensureSidebarVisible`,
-            // which no iced selection route performs, including opening
-            // a tab on a host (`resolve_pending_host_selection`).
+            // never revealing the sidebar, matching Swift's ⌘1-9 (plan
+            // 072 D10): opening a tab never expands the sidebar (071's
+            // ruling), including opening a tab on a host
+            // (`resolve_pending_host_selection`).
             MenuEvent::SelectProject(project_id) => {
                 if !command_enabled(self.menu_gating(), false) {
                     return UiTask::None;
