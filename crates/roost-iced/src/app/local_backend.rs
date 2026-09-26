@@ -539,8 +539,9 @@ pub(crate) enum InitialSelection {
     /// Nothing left to do: the mode is not `session`, or a selection is
     /// already held and an unrelated one is preserved.
     Settled,
-    /// The slot has published no rows to select yet. A fresh session
-    /// seeds one; a session started empty gets one when it is seeded.
+    /// The slot has published no rows to select yet, or a switch is in
+    /// flight. A fresh session seeds one; a session started empty gets
+    /// one when it is seeded.
     Wait,
     /// Select this project/tab pair and attach to the tab.
     Select { project: i64, tab: i64 },
@@ -564,13 +565,25 @@ pub(crate) struct SlotRows<'a> {
 /// which is why this resolves to a tab rather than to a project.
 ///
 /// It also waits for the session id, without which the memory cannot be
-/// read ([`super::tab_memory::recall`]).
+/// read ([`super::tab_memory::recall`]), and for a switch to finish: a
+/// switch in flight owns the selection — the forward fence makes its own,
+/// the reverse clears it at the commit — and one made under it would
+/// fight it (plan 072 §D8).
+///
+/// `selection_held` is [`live_selection_held`]'s reading.
 pub(crate) fn initial_selection(
     mode: LocalBackendMode,
+    switch_in_flight: bool,
     selection_held: bool,
     slot: Option<SlotRows<'_>>,
 ) -> InitialSelection {
-    if mode != LocalBackendMode::Session || selection_held {
+    if mode != LocalBackendMode::Session {
+        return InitialSelection::Settled;
+    }
+    if switch_in_flight {
+        return InitialSelection::Wait;
+    }
+    if selection_held {
         return InitialSelection::Settled;
     }
     let Some(SlotRows {
@@ -604,6 +617,45 @@ pub(crate) fn initial_selection(
         },
         None => InitialSelection::Wait,
     }
+}
+
+/// Whether the window holds a selection the initial selection must leave
+/// alone: one whose `TabKey.host` is still a live incarnation (`live`).
+///
+/// A selection on a replaced incarnation counts as none (#525). The drain
+/// applies a batched `Connecting` + `Connected` before the reconcile that
+/// drops such a selection, so the `Connected` edge still sees it, and so
+/// does the initial selection, which resolves ahead of that drop in the
+/// same reconcile. Counting it would settle the latch just before the
+/// window is left with nothing selected.
+pub(super) fn live_selection_held(
+    selection: Option<super::HostSelection>,
+    live: impl Fn(HostId) -> bool,
+) -> bool {
+    selection.is_some_and(|selection| live(selection.tab.host))
+}
+
+/// What the slot's `Connected` edge reads to re-arm the initial
+/// selection (plan 072 §D8).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RearmGate {
+    /// The host that connected is the slot.
+    pub(crate) slot: bool,
+    pub(crate) mode: LocalBackendMode,
+    pub(crate) switch_in_flight: bool,
+    /// [`live_selection_held`].
+    pub(crate) selection_held: bool,
+}
+
+/// Whether the slot connecting owes the window the launch's selection
+/// again: a restarted or reconnected session comes back under a new
+/// incarnation with its tabs renumbered, and the launch-only latch would
+/// leave the window blank (#525).
+pub(crate) fn rearms_initial_selection(gate: RearmGate) -> bool {
+    gate.slot
+        && gate.mode == LocalBackendMode::Session
+        && !gate.switch_in_flight
+        && !gate.selection_held
 }
 
 /// What the UI knows about the slot, as one reading (plan 063
@@ -3770,7 +3822,7 @@ mod tests {
 
         // The session's active tab, wherever it lives.
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, slot(&rows, 21)),
+            initial_selection(LocalBackendMode::Session, false, false, slot(&rows, 21)),
             InitialSelection::Select {
                 project: 2,
                 tab: 21
@@ -3779,7 +3831,7 @@ mod tests {
         // No active tab of its own (or one that closed): the first row
         // with something in it.
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, slot(&rows, 0)),
+            initial_selection(LocalBackendMode::Session, false, false, slot(&rows, 0)),
             InitialSelection::Select {
                 project: 1,
                 tab: 10
@@ -3788,7 +3840,7 @@ mod tests {
         // A project with no tabs is not somewhere to land.
         let empty = [project(1, &[]), project(2, &[20])];
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, slot(&empty, 0)),
+            initial_selection(LocalBackendMode::Session, false, false, slot(&empty, 0)),
             InitialSelection::Select {
                 project: 2,
                 tab: 20
@@ -3803,22 +3855,22 @@ mod tests {
     fn the_launch_selection_waits_for_the_slot_and_yields_to_a_held_one() {
         let rows = [project(1, &[10])];
         assert_eq!(
-            initial_selection(LocalBackendMode::InProcess, false, slot(&rows, 10)),
+            initial_selection(LocalBackendMode::InProcess, false, false, slot(&rows, 10)),
             InitialSelection::Settled,
             "in-process never had a slot to select from"
         );
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, true, slot(&rows, 10)),
+            initial_selection(LocalBackendMode::Session, false, true, slot(&rows, 10)),
             InitialSelection::Settled,
             "an unrelated remote-host selection is preserved"
         );
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, None),
+            initial_selection(LocalBackendMode::Session, false, false, None),
             InitialSelection::Wait,
             "the slot is not connected yet"
         );
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, slot(&[], 0)),
+            initial_selection(LocalBackendMode::Session, false, false, slot(&[], 0)),
             InitialSelection::Wait,
             "connected but empty: the seed has not landed yet"
         );
@@ -3856,6 +3908,7 @@ mod tests {
         let remembered = |session_id, projects| {
             initial_selection(
                 LocalBackendMode::Session,
+                false,
                 false,
                 Some(SlotRows {
                     projects,
@@ -3907,7 +3960,7 @@ mod tests {
         };
 
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, Some(arrived(None))),
+            initial_selection(LocalBackendMode::Session, false, false, Some(arrived(None))),
             InitialSelection::Wait,
             "connected, facts not yet"
         );
@@ -3918,12 +3971,141 @@ mod tests {
         );
 
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, Some(arrived(Some("s-1")))),
+            initial_selection(
+                LocalBackendMode::Session,
+                false,
+                false,
+                Some(arrived(Some("s-1")))
+            ),
             InitialSelection::Select {
                 project: 2,
                 tab: 21
             },
             "the facts landed: the memory decides"
+        );
+    }
+
+    #[test]
+    fn the_initial_selection_waits_out_a_switch_in_flight() {
+        let rows = [project(1, &[10])];
+        assert_eq!(
+            initial_selection(LocalBackendMode::Session, true, false, slot(&rows, 10)),
+            InitialSelection::Wait,
+            "nothing selected mid-switch: the switch owns the selection"
+        );
+        assert_eq!(
+            initial_selection(LocalBackendMode::Session, true, true, slot(&rows, 10)),
+            InitialSelection::Wait,
+            "a selection the switch may still clear does not settle the latch"
+        );
+        assert_eq!(
+            initial_selection(LocalBackendMode::Session, false, false, slot(&rows, 10)),
+            InitialSelection::Select {
+                project: 1,
+                tab: 10
+            },
+            "the same slot once the switch is over"
+        );
+    }
+
+    #[test]
+    fn a_selection_on_a_dead_incarnation_is_not_held() {
+        let (dead, live) = (HostId::new(3), HostId::new(4));
+        let owns = |host: HostId| host == live;
+        assert!(
+            !live_selection_held(Some(showing(dead, 1, 10)), owns),
+            "the replaced incarnation's tab is no selection"
+        );
+        assert!(live_selection_held(Some(showing(live, 1, 10)), owns));
+        assert!(!live_selection_held(None, owns));
+    }
+
+    #[test]
+    fn only_the_slot_connecting_under_session_with_nothing_live_selected_rearms() {
+        let owed = RearmGate {
+            slot: true,
+            mode: LocalBackendMode::Session,
+            switch_in_flight: false,
+            selection_held: false,
+        };
+        assert!(rearms_initial_selection(owed));
+        assert!(
+            !rearms_initial_selection(RearmGate {
+                slot: false,
+                ..owed
+            }),
+            "another saved host connecting"
+        );
+        assert!(
+            !rearms_initial_selection(RearmGate {
+                mode: LocalBackendMode::InProcess,
+                ..owed
+            }),
+            "under in-process the slot is an ordinary host"
+        );
+        assert!(
+            !rearms_initial_selection(RearmGate {
+                switch_in_flight: true,
+                ..owed
+            }),
+            "a switch owns the selection"
+        );
+        assert!(
+            !rearms_initial_selection(RearmGate {
+                selection_held: true,
+                ..owed
+            }),
+            "a live selection is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batched_reconnect_under_a_new_incarnation_rearms() {
+        use crate::app::bootstrap::BootstrapsInFlight;
+        use crate::app::host_lifecycle::settle_host_state;
+        use crate::host_conn::fixtures::{a_connected_socket_host, a_set, next_incarnation};
+        use crate::host_conn::{HostConnState, HostTransport};
+
+        let (mut set, _feed) = a_set();
+        let mut bootstraps = BootstrapsInFlight::default();
+        let old = a_connected_socket_host(
+            &mut set,
+            "slot",
+            "/nonexistent/roost-rearm.sock",
+            HostTransport::LocalSession,
+        );
+        let window = Some(showing(old, 1, 10));
+        assert!(live_selection_held(window, |host| set.owns(host)));
+
+        let new = next_incarnation(&set, "slot");
+        let replacing = settle_host_state(
+            &mut set,
+            &mut bootstraps,
+            new,
+            HostConnState::Connecting {
+                previous: Some(old),
+            },
+        )
+        .expect("the retry is the slot's");
+        assert_eq!(replacing.previous, Some(old));
+        let landed = settle_host_state(&mut set, &mut bootstraps, new, HostConnState::Connected)
+            .expect("the landing is the slot's");
+        assert!(landed.connected);
+
+        let held = live_selection_held(window, |host| set.owns(host));
+        assert!(
+            !held,
+            "the window's tab is on the incarnation just replaced"
+        );
+        assert!(rearms_initial_selection(RearmGate {
+            slot: landed.host == "slot",
+            mode: LocalBackendMode::Session,
+            switch_in_flight: false,
+            selection_held: held,
+        }));
+        assert!(
+            live_selection_held(Some(showing(new, 1, 10)), |host| set.owns(host)),
+            "a tab on the incarnation that landed is held"
         );
     }
 

@@ -3123,6 +3123,56 @@ def test_closing_the_last_tab_below_lands_on_the_tab_last_viewed_above(lane: Lan
     lands_on(roost, project, viewed, "the fallback to open P on the tab last viewed there")
 
 
+def start_the_stopped_session(lane: Lane) -> None:
+    """[`Lane.start_daemon`], retried until the stopped daemon lets go.
+
+    `roostctl session stop` returns once the socket is gone, which is
+    before that daemon releases its state lock, and a start inside that
+    window refuses rather than write `state.json` from two processes.
+    """
+    verdicts: list[str] = []
+
+    def started() -> bool:
+        launch = lane.env.start_daemonized()
+        verdicts.append(launch.verdict.raw.strip())
+        if launch.verdict.kind != "ready":
+            return False
+        lane.pid = launch.verdict.pid
+        return True
+
+    try:
+        wait_until(started, scaled_timeout(30.0), "the stopped session to start again")
+    except TimeoutError:
+        raise AssertionError(
+            f"the stopped session never started again; last verdicts: {verdicts[-3:]}"
+        ) from None
+
+
+def test_a_restarted_session_reconnects_onto_the_tab_last_viewed(lane: Lane):
+    """Plan 072 §D8 (#525): stop the slot's session, start it again and
+    reconnect, and the window selects and attaches the tab it was
+    showing — found by its position, since the restarted session has
+    renumbered every tab — rather than selecting nothing, `(0, 0)`."""
+    roost = session_ui(lane)
+    project, viewed = viewed_while_the_session_is_elsewhere(lane, roost)
+    position = roost.project_tab_ids(project).index(viewed)
+
+    lane.stop_daemon()
+    wait_until(
+        lambda: local_band(roost)["state"] != "connected",
+        scaled_timeout(60.0),
+        "the slot's band to leave connected",
+    )
+    start_the_stopped_session(lane)
+    roost.call("host.connect", {"id": local_band(roost)["saved_id"]})
+
+    restarted = next(p for p in lane.session_projects() if int(p["id"]) == project)
+    remembered = int(restarted["tabs"][position]["id"])
+    assert remembered != viewed, "the restarted session reused the old tab ids"
+    lands_on(roost, project, remembered, "the reconnected window to land on the tab last viewed")
+    attached(roost, remembered)
+
+
 # ---------------------------------------------------------------------------
 # 14. Plan 071 §D14 (#533): providers see the slot's active tab
 # ---------------------------------------------------------------------------

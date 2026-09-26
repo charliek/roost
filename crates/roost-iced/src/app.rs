@@ -2970,10 +2970,11 @@ pub struct App {
     /// awaited, is never overridden by the creation (plan 071 §D13).
     focus_generation: u64,
     awaiting_listing: forwarded_open::AwaitingListing,
-    /// Whether the launch still owes the slot's tab a select + attach
-    /// (plan 063 §D5). Armed at bootstrap under `session` and cleared by
-    /// the first reconcile that can answer — either by selecting, or by
-    /// finding a selection already held.
+    /// Whether the window still owes the slot's tab a select + attach
+    /// (plan 063 §D5). Armed at bootstrap under `session`, and again when
+    /// the slot connects with nothing live selected (plan 072 §D8);
+    /// cleared by the first reconcile that can answer — either by
+    /// selecting, or by finding a selection already held.
     pending_initial_local_selection: bool,
     /// Why each connect this client started was started (plan 063
     /// §D12), keyed by saved host and drained on the edge where it
@@ -8973,8 +8974,9 @@ impl App {
         }
     }
 
-    /// The launch's own selection under `session` (plan 063 §D5): once
-    /// the slot's mirror lists a tab, select it and attach.
+    /// The launch's own selection under `session` (plan 063 §D5), owed
+    /// again whenever the slot reconnects (plan 072 §D8): once the
+    /// slot's mirror lists a tab, select it and attach.
     ///
     /// Same shape and the same reason as
     /// [`Self::resolve_pending_host_selection`] below, including why it
@@ -9005,7 +9007,8 @@ impl App {
         });
         match local_backend::initial_selection(
             self.local_backend,
-            self.host_selection.is_some(),
+            self.switch_in_flight(),
+            self.live_selection_held(),
             slot,
         ) {
             local_backend::InitialSelection::Wait => {}
@@ -9022,9 +9025,29 @@ impl App {
                     local_active: self.workspace.active().1,
                 }));
                 self.host_focus_tab(tab);
-                tracing::info!(%tab, "attached the local session's tab at launch");
+                tracing::info!(%tab, "attached the local session's tab");
             }
         }
+    }
+
+    /// Owe the window the launch's selection again when the slot
+    /// connects with nothing live selected (plan 072 §D8), by
+    /// [`local_backend::rearms_initial_selection`].
+    fn rearm_initial_local_selection(&mut self, saved_id: &str) {
+        let rearm = local_backend::rearms_initial_selection(local_backend::RearmGate {
+            slot: self.local_slot_saved_id().as_deref() == Some(saved_id),
+            mode: self.local_backend,
+            switch_in_flight: self.switch_in_flight(),
+            selection_held: self.live_selection_held(),
+        });
+        if rearm && !self.pending_initial_local_selection {
+            tracing::info!(host = %saved_id, "the slot connected with nothing selected; selecting its tab");
+            self.pending_initial_local_selection = true;
+        }
+    }
+
+    fn live_selection_held(&self) -> bool {
+        local_backend::live_selection_held(self.host_selection, |host| self.hosts.owns(host))
     }
 
     /// Resolve a pending host creation, by [`pending_selection::pending_step`].

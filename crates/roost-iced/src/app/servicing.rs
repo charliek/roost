@@ -2240,6 +2240,7 @@ impl App {
                             // 063 §D12). Drained on the edge, so it is
                             // spent exactly once per connect.
                             task = task.then(self.settle_connect_purpose(host));
+                            self.rearm_initial_local_selection(host);
                         } else {
                             // #481. Kept while the ladder is still
                             // climbing — see `retire_host_durability`.

@@ -72,6 +72,12 @@ release workflow asserts they agree).
   session that never started forgets its dead `localhost` host. A switch
   back to in-process no longer leaves its journal behind for the next
   launch to warn about. `roost-session start`'s own output is unchanged.
+- **The window was blank after the local session came back (#525)** —
+  under `local-backend = session`, when the session a fresh Roost-Iced
+  install runs its tabs on was stopped or killed and then reconnected,
+  the window selected nothing until a row was clicked. It now lands on
+  the tab you were last viewing, found by its position in the project,
+  as a relaunch does.
 - **A new tab on a session-backed project could take the window away
   from a tab you clicked while it opened, and one that never appeared
   was dropped silently (#549)** — on the local session and on saved
