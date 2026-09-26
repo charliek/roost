@@ -103,6 +103,7 @@ _UI_ENV_SANITIZE = (
     "ROOST_BUNDLE_PROFILE",
     "ROOST_STATE_DIR",
     "ROOST_CONFIG",
+    "ROOST_TEST_SESSION_DIR_NAMES",
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

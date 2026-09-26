@@ -452,7 +452,18 @@ Stated honestly, because overstating it would be worse than the gap:
   versa; a fidelity test validates every vector in this corpus against
   the bundle, so the pin proves the schema matches the wire, not only
   that it is deterministic. See [Machine-readable
-  schema](ipc.md#machine-readable-schema).
+  schema](ipc.md#machine-readable-schema);
+* **the old-session lane** — `make e2e-old-session`
+  (`tools/roosttest/test_old_session.py`, in CI's `session-e2e` job on
+  Linux) runs this tree's UI and `roostctl` against a **released**
+  `roost-session` that is already running when the UI starts. The latest
+  release gets the compatibility checks while it speaks this tree's
+  `SESSION_PROTOCOL_VERSION`, and the forced update — `needs-restart`,
+  the restart, the layout kept — once it does not; v0.0.19 is pinned for
+  the forced update and v0.0.20 for `tab.open`'s `unknown-field` retry.
+  The vectors pin shapes; this is the one check that a real old binary
+  still talks to the current client. It skips, with a warning, when
+  GitHub cannot serve the release and nothing is cached.
 
 There is deliberately **no hash manifest**. At this corpus size it would
 be ceremony: a second file to update on every legitimate addition,

@@ -84,18 +84,36 @@ impl BundleProfileKind {
     }
 }
 
+/// Test-only: points a **debug** build's session profile at the shipped
+/// directory names (`release`) or its own (`dev`), so today's debug UI,
+/// the debug session it restarts into, and a debug `roostctl` can all
+/// reach a released `roost-session` (plan 072 D13).
+const SESSION_DIR_NAMES_ENV: &str = "ROOST_TEST_SESSION_DIR_NAMES";
+
 /// The session profile's `(app_label, linux_namespace)` pair.
 ///
-/// Parameterized rather than a bare `#[cfg]` at the use site so both
-/// cells are unit-testable in a single build. Debug builds get their own
+/// Parameterized rather than a bare `#[cfg]` at the use site so every
+/// cell is unit-testable in a single build. Debug builds get their own
 /// directories — `roost-session` and a dev session must never share a
 /// socket, a `state.json`, or a log (host-sessions architecture §8).
-fn session_dir_names(debug_build: bool) -> (&'static str, &'static str) {
-    if debug_build {
+///
+/// `requested` is [`SESSION_DIR_NAMES_ENV`]'s value, and only a debug
+/// build honours it: a packaged binary keeps the shipped names whatever
+/// it inherits. An unknown value is the build's own pair.
+fn session_dir_names(debug_build: bool, requested: Option<&str>) -> (&'static str, &'static str) {
+    if debug_build && requested != Some("release") {
         ("RoostSessionDev", "roost-session-dev")
     } else {
         ("RoostSession", "roost-session")
     }
+}
+
+/// This build's session directory names, override included.
+fn build_session_dir_names() -> (&'static str, &'static str) {
+    session_dir_names(
+        cfg!(debug_assertions),
+        std::env::var(SESSION_DIR_NAMES_ENV).ok().as_deref(),
+    )
 }
 
 /// Resolved paths for one bundle profile.
@@ -143,10 +161,9 @@ impl BundleProfile {
                 },
             ),
             BundleProfileKind::Iced => ("Roost-iced", "ai.stridelabs.Roost.iced"),
-            BundleProfileKind::Session => (
-                session_dir_names(cfg!(debug_assertions)).0,
-                "ai.stridelabs.Roost.session",
-            ),
+            BundleProfileKind::Session => {
+                (build_session_dir_names().0, "ai.stridelabs.Roost.session")
+            }
         };
         let (socket_path, state_dir, log_dir) = resolve_paths(kind, app_label)?;
         // Redirect ONLY the state dir when `ROOST_STATE_DIR` is set, so
@@ -530,7 +547,7 @@ fn linux_namespace(kind: BundleProfileKind) -> &'static str {
     match kind {
         BundleProfileKind::Mac | BundleProfileKind::Linux => "roost",
         BundleProfileKind::Iced => "roost-iced",
-        BundleProfileKind::Session => session_dir_names(cfg!(debug_assertions)).1,
+        BundleProfileKind::Session => build_session_dir_names().1,
     }
 }
 
@@ -626,24 +643,41 @@ mod tests {
 
         let session = BundleProfile::session().expect("session profile");
         assert_eq!(session.app_id, "ai.stridelabs.Roost.session");
-        assert_eq!(
-            session.app_label,
-            session_dir_names(cfg!(debug_assertions)).0
-        );
+        assert_eq!(session.app_label, build_session_dir_names().0);
     }
 
     #[test]
     fn session_dir_names_split_dev_from_prod() {
         assert_eq!(
-            session_dir_names(false),
+            session_dir_names(false, None),
             ("RoostSession", "roost-session"),
             "the shipped session profile owns these exact directory names"
         );
         assert_eq!(
-            session_dir_names(true),
+            session_dir_names(true, None),
             ("RoostSessionDev", "roost-session-dev"),
             "a debug session must never land in the shipped session's directories"
         );
+    }
+
+    #[test]
+    fn the_dir_names_override_moves_a_debug_build_and_never_a_packaged_one() {
+        const SHIPPED: (&str, &str) = ("RoostSession", "roost-session");
+        const DEV: (&str, &str) = ("RoostSessionDev", "roost-session-dev");
+        for (debug_build, requested, want) in [
+            (true, Some("release"), SHIPPED),
+            (true, Some("dev"), DEV),
+            (true, Some("Release"), DEV),
+            (false, Some("dev"), SHIPPED),
+            (false, Some("release"), SHIPPED),
+        ] {
+            assert_eq!(
+                session_dir_names(debug_build, requested),
+                want,
+                "debug_build={debug_build} requested={requested:?}"
+            );
+        }
+        assert_eq!(SESSION_DIR_NAMES_ENV, "ROOST_TEST_SESSION_DIR_NAMES");
     }
 
     #[test]
@@ -794,7 +828,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn session_paths_live_under_their_own_mac_library_dirs() {
-        let label = session_dir_names(cfg!(debug_assertions)).0;
+        let label = build_session_dir_names().0;
         let session = BundleProfile::session().expect("session profile");
         let Some(home) = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -994,7 +1028,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn golden_session_paths_stay_in_their_own_namespace() {
-        let ns = session_dir_names(cfg!(debug_assertions)).1;
+        let ns = build_session_dir_names().1;
         let (socket, state, log) =
             resolve_paths_linux(BundleProfileKind::Session, &golden_env(), 1000).expect("resolve");
         assert_eq!(
@@ -1023,7 +1057,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn golden_session_paths_without_a_runtime_dir() {
-        let ns = session_dir_names(cfg!(debug_assertions)).1;
+        let ns = build_session_dir_names().1;
         let env = LinuxPathEnv {
             home: Some("/home/tester".into()),
             ..LinuxPathEnv::default()
@@ -1046,7 +1080,7 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn golden_linux_files_dirs_hang_off_the_cache_root() {
-        let ns = session_dir_names(cfg!(debug_assertions)).1;
+        let ns = build_session_dir_names().1;
         let session_want = format!("/home/tester/.cache/{ns}/files");
         for (kind, want) in [
             (BundleProfileKind::Linux, "/home/tester/.cache/roost/files"),
@@ -1094,7 +1128,7 @@ mod tests {
             resolve_cache_dir_mac("Roost", Some(&home)).join("files"),
             PathBuf::from("/Users/tester/Library/Caches/Roost/files")
         );
-        let label = session_dir_names(cfg!(debug_assertions)).0;
+        let label = build_session_dir_names().0;
         let session = resolve_cache_dir_mac(label, Some(&home)).join("files");
         assert_eq!(
             session,

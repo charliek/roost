@@ -2338,8 +2338,9 @@ jobs:
         if: steps.cache-ghostty.outputs.cache-hit != 'true'
         run: ./third_party/ghostty/build.sh
 
-      - name: Cache cargo registry + target
-        uses: actions/cache@v5
+      - name: Restore cargo registry + target
+        id: cargo-cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.cargo/registry
@@ -2355,6 +2356,82 @@ jobs:
           # runner's slowness widens both sides of every handshake.
           ROOST_TEST_TIMEOUT_SCALE: "3"
         run: make e2e-session
+
+      # Saved here, before the Linux leg builds roost-iced below: that
+      # build would grow this cache several-fold, and the repo's Actions
+      # cache sits near its 10 GiB cap, where growth evicts other jobs'.
+      - name: Save cargo registry + target
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
+
+      # Plan 072 D13's old-session lane (#537): this tree's UI against a
+      # released `roost-session` that is already running when it starts
+      # (`make e2e-old-session`). Linux only — releases ship roost-session
+      # for Linux alone — and here rather than in `iced-build-e2e`, which is
+      # the long pole. The UI build is its own step with its own budget, so
+      # a cold compile cannot eat the lane's.
+      - name: Install Iced native dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo linux/scripts/ci-apt-install.sh \
+            fonts-noto-cjk libclang-dev libxkbcommon-x11-0 libwayland-client0 \
+            mesa-vulkan-drivers weston xvfb xdotool zsh
+
+      - name: Build Iced + roostctl + roost-session (Linux)
+        if: runner.os == 'Linux'
+        timeout-minutes: 12
+        run: cargo build -p roost-iced -p roost-cli -p roost-session
+
+      # The version "latest" names today, for the cache key and the lane
+      # alike: each release downloads once, the day a new one ships it is
+      # fetched afresh, and the lane runs the release the key names.
+      - name: Resolve the latest release (Linux)
+        id: released
+        if: runner.os == 'Linux'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          latest="$(tools/roosttest/old_session/fetch.sh --resolve latest | sed -n 's/^version=//p')"
+          echo "latest=${latest}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache released sessions (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/cache@v5
+        with:
+          path: target/old-session
+          # The pinned releases live in the test module, so its hash
+          # carries a pin change into the key.
+          key: old-session-${{ runner.os }}-${{ runner.arch }}-${{ steps.released.outputs.latest }}-${{ hashFiles('tools/roosttest/test_old_session.py') }}
+          restore-keys: old-session-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Run old-session E2E (Linux X11)
+        if: runner.os == 'Linux'
+        timeout-minutes: 8
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ROOST_OLD_SESSION_VERSION: ${{ steps.released.outputs.latest }}
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_E2E_LOG_DIR: ${{ runner.temp }}/roost-old-session-logs
+        run: >
+          xvfb-run -a --server-args="-screen 0 1920x1080x24"
+          make e2e-old-session
+
+      - name: Upload old-session E2E UI log (Linux)
+        if: failure() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-old-session-diagnostics
+          path: ${{ runner.temp }}/roost-old-session-logs/
+          if-no-files-found: ignore
+          retention-days: 14
 
   # Single required check. Always runs; passes iff no gated job failed (skipped
   # jobs are fine — that's the path-filter doing its job).
