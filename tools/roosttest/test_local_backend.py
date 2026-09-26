@@ -2915,6 +2915,27 @@ def test_closing_a_background_tab_leaves_the_window_where_it_is(lane: Lane):
 # ---------------------------------------------------------------------------
 
 
+def assert_new_tab_opens_in(
+    lane: Lane, roost: Roost, project: int, source: int, directory: Path
+) -> None:
+    """Show `source`, press ⌘T, and assert the tab it opens on the
+    session starts in `directory`."""
+    wait_until(
+        lambda: slot_key(roost, source),
+        30.0,
+        "the window to list the tab",
+    )
+    roost.focus(source)
+    lands_on(roost, project, source, "the window to show the tab")
+
+    with lane.session() as c:
+        before = set(session_tab_ids(lane))
+        util.press_new_tab(roost)
+        tab = util.spawned_tab_id(c, before, "the new tab to open on the session", timeout=30.0)
+
+        util.assert_opened_in(c, tab, directory)
+
+
 def test_a_new_tab_opens_in_the_shown_tabs_own_cwd_without_osc7(lane: Lane):
     """Plan 070 AC1 on the fresh-install default: ⌘T opens in the shown
     tab's direct-child cwd, read natively. The child `cd`s and emits no
@@ -2938,20 +2959,35 @@ def test_a_new_tab_opens_in_the_shown_tabs_own_cwd_without_osc7(lane: Lane):
             "the tab's child to cd",
         )
         assert c.tab(source)["cwd"] == str(opened_in), c.tab(source)
-    wait_until(
-        lambda: slot_key(roost, source),
-        30.0,
-        "the window to list the tab",
+    assert_new_tab_opens_in(lane, roost, project, source, moved_to)
+
+
+def test_a_new_tab_opens_in_the_shown_tabs_foreground_job_cwd(lane: Lane):
+    """#534 on the fresh-install default: ⌘T opens where the shown tab's
+    foreground job is. The tab's shell stays in the directory it was
+    opened in, which is also its tracked cwd, while the job it runs
+    `cd`s elsewhere and emits no OSC 7; the session reads the job's
+    group leader."""
+    roost = session_ui(lane)
+    opened_in, moved_to = (
+        Path(tempfile.mkdtemp(prefix=prefix, dir=lane.env.launch_cwd))
+        for prefix in ("opened-", "moved-")
     )
-    roost.focus(source)
-    lands_on(roost, project, source, "the window to show the tab")
-
     with lane.session() as c:
-        before = set(session_tab_ids(lane))
-        util.press_new_tab(roost)
-        tab = util.spawned_tab_id(c, before, "the new tab to open on the session", timeout=30.0)
-
-        util.assert_opened_in(c, tab, moved_to)
+        project = int(c.list()[0]["id"])
+        source = c.open_tab(
+            project,
+            cwd=str(opened_in),
+            argv=["bash", "--norc", "--noprofile", "-i"],
+        )
+        c.run(source, util.foreground_job(moved_to), ready_timeout=30.0)
+        wait_until(
+            lambda: "JOB_READY" in c.dump_text(source),
+            30.0,
+            "the tab's job to cd",
+        )
+        assert c.tab(source)["cwd"] == str(opened_in), c.tab(source)
+    assert_new_tab_opens_in(lane, roost, project, source, moved_to)
 
 
 # ---------------------------------------------------------------------------

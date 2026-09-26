@@ -41,11 +41,14 @@ pub fn close_tab(
 /// Where a tab opened from `tab_id` starts — `tab.open`'s
 /// `cwd_from_tab`, answered once for every surface that honours it.
 ///
-/// Native first, because the direct PTY child's own cwd follows a `cd`
-/// in a shell that emits no OSC 7, and is a path on this machine — an
-/// OSC 7 cwd reported across an `ssh` hop is the remote's. Either
-/// candidate counts only if it is a directory here, as in
-/// [`usable_cwd`], and Linux reports a removed cwd as `… (deleted)`.
+/// Native first, because the tab's own processes follow a `cd` in a
+/// shell that emits no OSC 7, and their cwds are paths on this machine —
+/// an OSC 7 cwd reported across an `ssh` hop is the remote's. The native
+/// candidates are [`PtySupervisor::native_cwds`], the foreground job's
+/// leader and then the shell, so a job whose directory was removed falls
+/// to the shell's rather than past it to the tracked one. Each candidate
+/// counts only if it is a directory here, as in [`usable_cwd`], and
+/// Linux reports a removed cwd as `… (deleted)`.
 /// No row means `None`, even while the supervisor still holds the tab's
 /// session — a closing tab leaves the workspace first ([`close_tab`]).
 pub fn inherited_cwd(
@@ -54,9 +57,10 @@ pub fn inherited_cwd(
     tab_id: i64,
 ) -> Option<String> {
     let tracked = workspace.tab(tab_id).ok()?.cwd;
-    [supervisor.foreground_cwd(tab_id), Some(tracked)]
+    supervisor
+        .native_cwds(tab_id)
         .into_iter()
-        .flatten()
+        .chain([tracked])
         .find(|cwd| Path::new(cwd).is_dir())
 }
 
@@ -579,6 +583,33 @@ mod tests {
             "the precondition: the native read is not a directory ({native})"
         );
         assert_eq!(inherited_cwd(&workspace, &supervisor, tab), Some(tracked));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inherited_cwd_falls_from_a_removed_job_directory_to_the_shells() {
+        let [shell, job, tracked] = [(); 3].map(|()| tempfile::tempdir().unwrap());
+        let (workspace, tab) = workspace_with_tab(&string(tracked.path()));
+        let supervisor = Arc::new(PtySupervisor::new());
+        let Some(_guard) =
+            crate::pty::spawn_foreground_job(&supervisor, tab, shell.path(), job.path()).await
+        else {
+            return;
+        };
+        let shell_cwd = string(&std::fs::canonicalize(shell.path()).unwrap());
+
+        job.close().expect("remove the job's cwd");
+        let native = supervisor.native_cwds(tab);
+        assert!(
+            native.len() == 2 && !Path::new(&native[0]).is_dir() && native[1] == shell_cwd,
+            "the precondition: a leader cwd that is no longer a directory, then the shell's: {native:?}"
+        );
+        assert_eq!(
+            inherited_cwd(&workspace, &supervisor, tab),
+            Some(shell_cwd),
+            "the shell's cwd, not the row's {}",
+            tracked.path().display()
+        );
     }
 
     #[test]

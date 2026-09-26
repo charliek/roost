@@ -489,6 +489,14 @@ def wait_shell_ready(
     )
 
 
+def foreground_job(directory) -> str:
+    """A command whose subshell `cd`s to `directory`, prints `JOB_READY`,
+    and stays there as the shell's foreground job — so the job's cwd is
+    not the shell's, and nothing emits OSC 7. The echoed command line
+    shows `JOB_%s`, so only the job's own output matches `JOB_READY`."""
+    return f"(cd '{directory}' && printf 'JOB_%s\\n' READY && exec sleep 300)"
+
+
 def run_printf_probe(
     roost,
     tab_id: int,

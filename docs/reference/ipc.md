@@ -477,9 +477,11 @@ active tab ([cwd tracking](../guides/cwd-tracking.md)). It is a
 string-wrapped id like every other (`"cwd_from_tab": "5"`); `null`
 means unset, and an unset field is not sent, so a request without it
 is the bytes it always was. The server resolves the tab's cwd
-**natively first** — read from the tab's *direct* PTY child, the
-process the tab spawned, so a `cd` inside a nested shell or tmux is not
-seen — and falls back to the tab's tracked (OSC 7) `cwd`. A candidate
+**natively first** — read from the leader of the tab's foreground
+process group, so a `cd` inside a nested interactive shell is seen
+(inside tmux it is not: the job is the tmux client, which stays where
+it started); then from the tab's *direct* PTY child, the process the
+tab spawned — and falls back to the tab's tracked (OSC 7) `cwd`. A candidate
 counts only if it is an existing directory on the server's own
 machine, so a directory since removed, or an OSC 7 path from across an
 `ssh` hop that does not exist here, falls through. A resolved cwd **replaces** `cwd`,

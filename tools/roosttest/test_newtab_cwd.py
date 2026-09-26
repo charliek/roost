@@ -17,8 +17,11 @@ the *live* cwd, not the project cwd.
 
 from __future__ import annotations
 
+import pytest
+
 from util import (
     cwd_reaches,
+    foreground_job,
     precondition,
     spawned_tab_id,
     wait_shell_ready,
@@ -54,26 +57,54 @@ def _active_tab_in_live_cwd(roost, project):
     return tab
 
 
-def test_new_tab_inherits_active_cwd(roost, project, palette):
-    """Cmd-T / Ctrl-T (palette `new_tab`) opens the new tab in the active
-    tab's live cwd (/usr), not the project cwd (/tmp)."""
-    _active_tab_in_live_cwd(roost, project)
-
+def _press_new_tab(roost, palette) -> int:
+    """Cmd-T / Ctrl-T through the palette's `new_tab`; the new tab's id."""
     before = {int(t["id"]) for t in roost.tabs()}
     state = palette.palette_open(kind="commands")
     assert "new_tab" in roost.palette_item_ids(state), roost.palette_item_ids(state)
     state = palette.palette_activate("new_tab")
     assert state["open"] is False  # activating new_tab confirms + closes
+    return spawned_tab_id(roost, before, "new_tab spawned a tab")
 
-    new_id = spawned_tab_id(roost, before, "new_tab spawned a tab")
+
+def _assert_shell_in(roost, tab: int, cwd: str) -> None:
     # The send needs a live, interactable shell: anchor on attach, then
     # on the shell actually executing a command, before driving it.
-    wait_tab_attached(roost, new_id)
-    wait_shell_ready(roost, new_id)
+    wait_tab_attached(roost, tab)
+    wait_shell_ready(roost, tab)
     # Ask the new shell where it is — proves the *spawn* cwd directly,
     # independent of the new tab's own OSC 7 timing.
-    roost.run(new_id, "echo NEWTAB_PWD=$(pwd)")
-    roost.wait_text(new_id, f"NEWTAB_PWD={LIVE_CWD}", timeout=8)
+    roost.run(tab, "echo NEWTAB_PWD=$(pwd)")
+    roost.wait_text(tab, f"NEWTAB_PWD={cwd}", timeout=8)
+
+
+def test_new_tab_inherits_active_cwd(roost, project, palette):
+    """Cmd-T / Ctrl-T (palette `new_tab`) opens the new tab in the active
+    tab's live cwd (/usr), not the project cwd (/tmp)."""
+    _active_tab_in_live_cwd(roost, project)
+
+    _assert_shell_in(roost, _press_new_tab(roost, palette), LIVE_CWD)
+
+
+def test_new_tab_follows_the_foreground_job_not_the_shell(roost, project, palette, target):
+    """#534: Cmd-T opens where the active tab's foreground job is. The
+    shell stays in /tmp, which is also its tracked cwd, while the job it
+    runs `cd`s to /usr and emits no OSC 7."""
+    if target == "mac":
+        pytest.skip("the Swift app still reads the shell, not its foreground job")
+    tab = roost.open_tab(project, cwd="/tmp")
+    roost.focus(tab)
+    wait_tab_attached(roost, tab)
+    wait_shell_ready(roost, tab)
+    roost.run(tab, foreground_job(LIVE_CWD))
+    roost.wait_text(tab, "JOB_READY", timeout=8)
+    tracked = roost.tab(tab)["cwd"]
+    assert tracked != LIVE_CWD, f"the precondition: the tracked cwd is not the job's ({tracked})"
+
+    new_id = _press_new_tab(roost, palette)
+    row = roost.tab(new_id)
+    assert row is not None and row["cwd"] == LIVE_CWD, row
+    _assert_shell_in(roost, new_id, LIVE_CWD)
 
 
 def test_launcher_runs_in_active_cwd(roost, project, palette):

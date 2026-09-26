@@ -9,14 +9,23 @@ Three places in Roost care what directory a tab is "in":
 ## What works out of the box
 
 **New tabs open where you are.** On `Alt-T` / `Cmd-T`, Roost reads the active
-tab's shell working directory directly — natively, via `proc_pidinfo` on macOS
-and `/proc/<pid>/cwd` on Linux — and spawns the new tab there. No shell
-configuration required; works for any shell, including stock `/bin/bash`.
+tab's working directory directly — natively, via `proc_pidinfo` on macOS and
+`/proc` on Linux — and spawns the new tab there. No shell configuration
+required; works for any shell, including stock `/bin/bash`.
 
-The read is of the tab's *direct* child, the shell Roost started, so a `cd`
-inside a nested shell or inside tmux isn't seen: the new tab opens where that
-outer shell is. When the read gives no usable directory, Roost uses the cwd
-the shell last reported over OSC 7 instead (see the shell integration below).
+The read is of the tab's *foreground job*: the leader of the process group
+running in the terminal's foreground. While the shell Roost started sits at its
+prompt, that is the shell itself. Inside a nested interactive shell (`bash`,
+`nix develop`, …) it is that shell, so a `cd` there is seen. A foreground program that changes its own
+directory moves it too: `git` running under its pager reads as the
+repository's root. tmux is the exception: the job is the tmux client, whose
+directory is where you started it, so a `cd` inside a tmux pane still isn't
+seen.
+
+When the job's directory can't be read, or is no longer a directory — a job run
+under `sudo -s`, say — Roost reads the shell it started instead. When that
+gives no usable directory either, Roost uses the cwd the shell last reported
+over OSC 7 (see the shell integration below).
 
 **Tabs on a session follow the same rule.** For a tab on a `roost-session` —
 Roost-Iced's local session, the fresh-install default, or a saved host — the

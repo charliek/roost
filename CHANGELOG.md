@@ -15,13 +15,13 @@ release workflow asserts they agree).
 
 - **`tab.open` takes `cwd_from_tab`, to open a tab where another one is
   (plan 070)** — the server starts the new tab in the named tab's
-  working directory: its direct PTY child's cwd first, then its OSC
-  7-tracked cwd, each only if it is a directory on the server's own
-  machine. A resolved cwd replaces `cwd`; nothing resolving is not an
-  error, and `cwd` is used as sent. Unset, the request is the bytes it
-  always was. Served by sessions, Roost-Iced's UI socket and the Swift
-  Mac app; servers that predate the field answer `unknown-field`. No
-  CLI flag yet. See [`ipc.md#tabopen`](docs/reference/ipc.md#tabopen).
+  working directory: its foreground job's cwd (#534, below), then its
+  direct PTY child's, then its OSC 7-tracked cwd, each only if it is a
+  directory on the server's own machine. A resolved cwd replaces `cwd`;
+  nothing resolving is not an error, and `cwd` is used as sent. Unset,
+  the request is the bytes it always was. Served by sessions,
+  Roost-Iced's UI socket and the Swift Mac app; servers that predate
+  the field answer `unknown-field`. No CLI flag yet. See [`ipc.md#tabopen`](docs/reference/ipc.md#tabopen).
 - **A session-backed project remembers the tab you last viewed in it
   (#547)** — on the local session a fresh Roost-Iced install runs its tabs
   on, and on every saved host: a project click, ⌘1–9, the fallback when
@@ -78,6 +78,19 @@ release workflow asserts they agree).
   the window selected nothing until a row was clicked. It now lands on
   the tab you were last viewing, found by its position in the project,
   as a relaunch does.
+- **A new tab opened from a nested shell started in the outer shell's
+  directory (#534)** — ⌘T / Alt+T, the launcher, and `tab.open`'s
+  `cwd_from_tab` read the directory of the tab's foreground job instead
+  of the shell Roost started, so after `bash`, `nix develop` or another
+  interactive shell `cd`s, the new tab opens there. A foreground program
+  that changes its own directory moves it too (`git` under its pager
+  reads as the repository root). A tmux pane is still not seen: the job
+  is the tmux client, which stays where it started. A job that can't be
+  read (`sudo -s`) or whose directory is gone falls back to the shell's
+  directory, then to the OSC 7-tracked one, as before. Roost-Iced
+  in-process and every `roost-session`; a session already running picks
+  this up when it restarts. See
+  [cwd tracking](docs/guides/cwd-tracking.md).
 - **A new tab on a session-backed project could take the window away
   from a tab you clicked while it opened, and one that never appeared
   was dropped silently (#549)** — on the local session and on saved

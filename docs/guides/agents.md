@@ -365,10 +365,11 @@ shell state reads `at_prompt` from the first prompt, and a tab left
 next prompt — the same as Roost's own bash integration. Older fish
 releases were not tested.
 
-There is no shell-agnostic failsafe today — nothing in `crates/` reads
-the PTY's foreground process group. A `tcgetpgrp`-based one, which would
-cover dash/`sh` too, is tracked as future work in
-[#519](https://github.com/charliek/roost/issues/519).
+There is no shell-agnostic failsafe today — the PTY's foreground
+process group is read only for a new tab's directory
+([cwd tracking](cwd-tracking.md)), never for a tab's state. A
+`tcgetpgrp`-based one, which would cover dash/`sh` too, is tracked as
+future work in [#519](https://github.com/charliek/roost/issues/519).
 
 ## Codex trust
 
