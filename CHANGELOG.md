@@ -88,9 +88,14 @@ release workflow asserts they agree).
   is the tmux client, which stays where it started. A job that can't be
   read (`sudo -s`) or whose directory is gone falls back to the shell's
   directory, then to the OSC 7-tracked one, as before. Roost-Iced
-  in-process and every `roost-session`; a session already running picks
-  this up when it restarts. See
+  in-process, the Swift Mac app, and every `roost-session`; a session
+  already running picks this up when it restarts. See
   [cwd tracking](docs/guides/cwd-tracking.md).
+- **Mac: a tab whose shell exited at once could leave its output reader
+  on a reused descriptor (#557)** — the Swift Mac app closed a tab's PTY
+  while its reader could still run, so, rarely, the next tab or socket
+  given the same descriptor number could lose bytes to it. The PTY now
+  closes only once its reader has stopped.
 - **A new tab on a session-backed project could take the window away
   from a tab you clicked while it opened, and one that never appeared
   was dropped silently (#549)** — on the local session and on saved

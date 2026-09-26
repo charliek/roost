@@ -132,12 +132,14 @@ final class LocalClient {
     }
 
     /// Where a tab opened from `tabID` starts — `tab.open`'s
-    /// `cwd_from_tab`, mirroring Rust's `application::inherited_cwd`.
+    /// `cwd_from_tab`, mirroring Rust's `application::inherited_cwd`: the
+    /// supervisor's native candidates (the foreground job's leader, then
+    /// the shell), then the tracked cwd, the first that is a directory. So
+    /// a job whose directory was removed falls to the shell's rather than
+    /// past it to the tracked one.
     func inheritedCwd(tabID: Int64) -> String? {
         guard let row = workspace.tab(tabID) else { return nil }
-        return [supervisor.foregroundCwd(tabID: tabID), row.cwd]
-            .compactMap { $0 }
-            .first(where: isDirectory)
+        return (supervisor.nativeCwds(tabID: tabID) + [row.cwd]).first(where: isDirectory)
     }
 
     func closeTab(_ tabID: Int64) throws {

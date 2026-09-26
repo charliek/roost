@@ -17,8 +17,6 @@ the *live* cwd, not the project cwd.
 
 from __future__ import annotations
 
-import pytest
-
 from util import (
     cwd_reaches,
     foreground_job,
@@ -86,12 +84,10 @@ def test_new_tab_inherits_active_cwd(roost, project, palette):
     _assert_shell_in(roost, _press_new_tab(roost, palette), LIVE_CWD)
 
 
-def test_new_tab_follows_the_foreground_job_not_the_shell(roost, project, palette, target):
+def test_new_tab_follows_the_foreground_job_not_the_shell(roost, project, palette):
     """#534: Cmd-T opens where the active tab's foreground job is. The
     shell stays in /tmp, which is also its tracked cwd, while the job it
     runs `cd`s to /usr and emits no OSC 7."""
-    if target == "mac":
-        pytest.skip("the Swift app still reads the shell, not its foreground job")
     tab = roost.open_tab(project, cwd="/tmp")
     roost.focus(tab)
     wait_tab_attached(roost, tab)

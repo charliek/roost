@@ -129,6 +129,122 @@ struct PtySupervisorTests {
         }
     }
 
+    /// #534: the shell stays in its own directory while the job it runs
+    /// `cd`s elsewhere, and the native read follows the job — the Swift
+    /// twin of Rust's `the_foreground_cwd_is_the_foreground_jobs_not_the_shells`.
+    /// `JOB_%s` + a separate value: the terminal's echo of the command
+    /// line shows `%s`, so only the job's own output matches.
+    @MainActor
+    @Test func theForegroundCwdIsTheForegroundJobsNotTheShells() async throws {
+        let bash = "/bin/bash"
+        guard FileManager.default.isExecutableFile(atPath: bash) else { return }
+        let shellDir = try scratchDirectory("shell")
+        let jobDir = try scratchDirectory("job")
+        defer {
+            for dir in [shellDir, jobDir] { try? FileManager.default.removeItem(atPath: dir) }
+        }
+
+        let sup = PtySupervisor()
+        let output = ByteCapture()
+        sup.subscribe { event in
+            if case .bytes(_, let data) = event { output.append(data) }
+        }
+        let tabID: Int64 = 534
+        try sup.spawn(
+            tabID: tabID,
+            cwd: shellDir,
+            argv: [bash, "--norc", "--noprofile", "-i"],
+            cols: 80,
+            rows: 24,
+            socketPath: "/tmp/roost-pty-fg-job.sock"
+        )
+        defer { sup.close(tabID: tabID) }
+        // The first prompt: the line editor is up, so the job isn't typed
+        // into a shell still starting.
+        let prompted = await output.waitFor(["$ ", "# "])
+        try #require(prompted, "no prompt: \(output.text())")
+        try sup.write(
+            tabID: tabID,
+            data: Data("(cd '\(jobDir)' && printf 'JOB_%s\\n' READY && exec sleep 30)\n".utf8)
+        )
+        let ran = await output.waitFor(["JOB_READY"])
+        try #require(ran, "the job never ran: \(output.text())")
+
+        let (job, shell) = (realPath(jobDir), realPath(shellDir))
+        let deadline = Date().addingTimeInterval(10)
+        while sup.foregroundCwd(tabID: tabID) != job {
+            guard Date() < deadline else {
+                Issue.record(
+                    "the foreground cwd stayed \(sup.foregroundCwd(tabID: tabID) ?? "nil"), never the job's \(job)"
+                )
+                return
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        #expect(
+            sup.nativeCwds(tabID: tabID) == [job, shell],
+            "the job's cwd, then the shell's, which never left its own"
+        )
+    }
+
+    /// A seam, not the race: #557's descriptor reuse can't be provoked
+    /// from a test, and the master fd being closed only in the read
+    /// source's cancel handler is verified by reading
+    /// `installReadHandler`. This pins the step that makes that close
+    /// happen when the child exits: the EOF path cancels the source.
+    @MainActor
+    @Test func seamTheEofPathCancelsTheReadSource() async throws {
+        let sup = PtySupervisor()
+        let tabID: Int64 = 557
+        try sup.spawn(
+            tabID: tabID,
+            cwd: "/",
+            argv: ["/bin/sh", "-c", "exit 0"],
+            cols: 80,
+            rows: 24,
+            socketPath: "/tmp/roost-pty-eof.sock"
+        )
+        let source = try #require(sup.readSourceForTesting(tabID: tabID))
+        #expect(!source.isCancelled, "the precondition: the source is live until the child exits")
+
+        let deadline = Date().addingTimeInterval(10)
+        while sup.has(tabID) {
+            guard Date() < deadline else {
+                Issue.record("the child's exit never reached the EOF path")
+                sup.close(tabID: tabID)
+                return
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        #expect(source.isCancelled, "the EOF path left the read source live")
+    }
+
+    @Test func sameLeaderRefusesAnotherStartSessionOrTerminal() {
+        let (childSID, childTTY): (pid_t, UInt32) = (500, 34816)
+        let leader = ProcStamp(
+            pid: 700, pgid: 700, session: childSID, tty: childTTY,
+            startSec: 1_700_000_000, startUsec: 250)
+        #expect(
+            sameLeader(leader, leader, childSID: childSID, childTTY: childTTY),
+            "the precondition: a leader read twice unchanged is kept")
+
+        var restarted = leader
+        restarted.startUsec += 1
+        #expect(
+            !sameLeader(leader, restarted, childSID: childSID, childTTY: childTTY),
+            "a different start time is a reused pid")
+        let changes: [(String, (inout ProcStamp) -> Void)] = [
+            ("a different session", { $0.session += 1 }),
+            ("a different terminal", { $0.tty += 1 }),
+            ("not its group's leader", { $0.pgid += 1 }),
+        ]
+        for (what, change) in changes {
+            var stamp = leader
+            change(&stamp)
+            #expect(!sameLeader(stamp, stamp, childSID: childSID, childTTY: childTTY), "\(what)")
+        }
+    }
+
     @Test func emptyArgvBecomesLoginShell() {
         // Default-shell case: $SHELL + `-l` (login) so profile files load.
         #expect(loginShellArgv([], shell: "/bin/zsh") == ["/bin/zsh", "-l"])
@@ -263,6 +379,34 @@ private final class ByteCapture: @unchecked Sendable {
         defer { lock.unlock() }
         return bytes
     }
+    func text() -> String {
+        String(decoding: snapshot(), as: UTF8.self)
+    }
+    /// Whether the capture holds one of `needles` within 20 s.
+    func waitFor(_ needles: [String]) async -> Bool {
+        let deadline = Date().addingTimeInterval(20)
+        while Date() < deadline {
+            let seen = text()
+            if needles.contains(where: { seen.contains($0) }) { return true }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return false
+    }
+}
+
+private func scratchDirectory(_ kind: String) throws -> String {
+    let path = FileManager.default.temporaryDirectory
+        .appendingPathComponent("roost-fg-\(kind)-\(UUID().uuidString.prefix(8))").path
+    try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: false)
+    return path
+}
+
+/// `path` with every symlink resolved, as the kernel reports a cwd
+/// (`/var` → `/private/var` on macOS).
+private func realPath(_ path: String) -> String {
+    guard let resolved = realpath(path, nil) else { return path }
+    defer { free(resolved) }
+    return String(cString: resolved)
 }
 
 private final class ExitCapture: @unchecked Sendable {
