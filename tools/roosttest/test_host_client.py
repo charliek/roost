@@ -87,9 +87,11 @@ from util import (
     assert_opened_in,
     drain,
     drain_until_match,
+    palette_command,
     press_new_tab,
     set_sidebar_collapsed,
     spawned_tab_id,
+    widen_by_font,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "screenshot"))
@@ -2233,6 +2235,10 @@ class RecordingRelay:
         returned event is set. The server still receives and runs the
         request; only its answer waits.
 
+        `op` is an op name, or `"attach"` for a data connection's
+        handshake, which names no op: holding it holds the accepted reply
+        and every frame of the stream behind it.
+
         Armed before the frame it names is forwarded, so the answer
         cannot slip past it. One connection, once: the other connections
         (the event stream, an attach) keep flowing."""
@@ -2240,6 +2246,17 @@ class RecordingRelay:
         with self._lock:
             self._hold = (op, release)
         return release
+
+    def wait_holding(self, timeout: float = 30.0) -> None:
+        """Wait until the frame the armed [`hold`] names has been seen:
+        from then on the request is at the server and its answer is held
+        here."""
+
+        def taken() -> bool:
+            with self._lock:
+                return self._hold is None
+
+        wait_until(taken, timeout, "the held request to reach the relay")
 
     def close(self) -> None:
         self._closing = True
@@ -2324,12 +2341,17 @@ class RecordingRelay:
                 frame = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(frame, dict) and isinstance(frame.get("op"), str):
-                with self._lock:
-                    self._ops.append(frame["op"])
-                    if self._hold is not None and self._hold[0] == frame["op"]:
-                        held.append(self._hold[1])
-                        self._hold = None
+            if not isinstance(frame, dict):
+                continue
+            op = frame.get("op")
+            with self._lock:
+                if isinstance(op, str):
+                    self._ops.append(op)
+                elif "attach" in frame:
+                    op = "attach"
+                if self._hold is not None and self._hold[0] == op:
+                    held.append(self._hold[1])
+                    self._hold = None
         # A data connection stops being newline-framed after its
         # handshake, so the carry is capped: an attach's payload must not
         # grow this without bound. Dropping bytes silently is what would
@@ -3329,3 +3351,182 @@ def test_a_click_while_a_new_host_tab_is_in_flight_keeps_the_window(roost, sessi
                 assert roost.app_selected_tab_id() == clicked, (
                     f"the new tab {opened} took the window from the tab clicked while it opened"
                 )
+
+
+# ---------------------------------------------------------------------------
+# 18. Plan 072 D4 (#564): a refocused tab never replays at an older width
+# ---------------------------------------------------------------------------
+
+#: Window sizes whose terminals sit on either side of 100 columns, so
+#: [`WIDTH_MARKER`] lands in different cells at the two: clamped to the
+#: last column of the narrow one, at column 100 of the wide one. The
+#: grids they give are asserted where they are used, not assumed.
+NARROW_WINDOW = (760.0, 560.0)
+WIDE_WINDOW = (1600.0, 560.0)
+WIDTH_MARKER = b"\x1b[5;100H#"
+
+
+@contextlib.contextmanager
+def window_restored(roost: Roost):
+    """Put the window back the size it was: the UI outlives this test."""
+    before = roost.window_metrics()
+    try:
+        yield
+    finally:
+        roost.window_resize(before["window_width"], before["window_height"])
+
+
+def cols_of(roost: Roost, key: str) -> int:
+    return roost.tab_dump_resolved(key)["cols"]
+
+
+def width_marks(dumped: dict) -> list[tuple[int, int]]:
+    return sorted((cell["row"], cell["col"]) for cell in dumped["cells"] if cell["text"] == "#")
+
+
+def screen_text(dumped: dict) -> dict[tuple[int, int], str]:
+    return {
+        (cell["row"], cell["col"]): cell["text"]
+        for cell in dumped["cells"]
+        if cell["text"].strip()
+    }
+
+
+def detached_at_narrow(roost: Roost, session: Roost, cwd) -> tuple[int, str]:
+    """A tab attached at the narrow window's grid, then left for another
+    — detached, with a resume point at that width.
+
+    The second marker is load-bearing, not a settle. The attach resized
+    the tab, and a session refuses a resume from a point before a resize
+    on its own (D4b) — so the resume point has to be past output the tab
+    wrote *after* that resize. The first marker can land ahead of it (the
+    attach is still dialing); one written once the window shows the
+    first cannot. Without it every case below would be a snapshot
+    whatever the client did.
+    """
+    roost.window_resize(*NARROW_WINDOW)
+    project = first_project(session)
+    tab = quiet_tab(session, project, cwd)
+    other = quiet_tab(session, project, cwd)
+    key = host_key(roost, tab)
+    for prefix in ("ATTACHED", "NARROW"):
+        written = marker(prefix)
+        session.tab_feed_pty_bytes(tab, f"{written}\r\n".encode())
+        wait_dump_contains(roost, key, written)
+    narrow = cols_of(roost, key)
+    assert narrow < 100, f"the narrow window gave {narrow} columns"
+
+    other_key = sibling_key(key, other)
+    focus(roost, other_key)
+    away = marker("AWAY")
+    session.tab_feed_pty_bytes(other, f"{away}\r\n".encode())
+    # The window attaches one tab at a time, so the other one streaming
+    # means this one has let go.
+    wait_dump_contains(roost, other_key, away)
+    return tab, key
+
+
+def feed_width_marker(session: Roost, tab: int) -> None:
+    """Write the marker while the tab is at the session's narrow grid."""
+    session.tab_feed_pty_bytes(tab, WIDTH_MARKER)
+    wait_until(
+        lambda: width_marks(session.tab_dump_resolved(tab)),
+        30.0,
+        f"the width marker in the session's terminal for tab {tab}",
+    )
+
+
+def assert_the_window_shows_the_sessions_screen(
+    roost: Roost, session: Roost, tab: int, key: str
+) -> None:
+    """Once the refocus has drawn the marker, the window's terminal and
+    the session's agree cell for cell — the marker's coordinates first,
+    since they are what a replay at the old width moves."""
+    wait_until(
+        lambda: width_marks(roost.tab_dump_resolved(key)),
+        30.0,
+        f"the width marker in the window's terminal for {key}",
+    )
+    shown = roost.tab_dump_resolved(key)
+    served = session.tab_dump_resolved(tab)
+    assert (shown["cols"], shown["rows"]) == (served["cols"], served["rows"]), (shown, served)
+    assert width_marks(shown) == width_marks(served), (
+        f"the window drew the marker at {width_marks(shown)}, the session at "
+        f"{width_marks(served)}, on a {served['cols']}-column grid"
+    )
+    assert screen_text(shown) == screen_text(served)
+
+
+def test_a_refocus_after_a_window_resize_never_replays_at_the_old_width(host, roost):
+    """#564: a tab detached at a narrow width, the window widened past 100
+    columns, output written at the width the session still has, and the
+    tab focused again. The window must show what the session shows.
+
+    The client forgets the resume point when the re-grid moves the
+    detached tab (D4a), and the session refuses one across the attach's
+    own resize (D4b), so this holds with either half alone — the
+    old-session lane's check 7 is the client half's own end-to-end
+    control.
+    """
+    host.connect_and_wait()
+    with window_restored(roost), host.client() as session:
+        tab, key = detached_at_narrow(roost, session, host.env.launch_cwd)
+        roost.window_resize(*WIDE_WINDOW)
+        wait_until(lambda: cols_of(roost, key) > 100, 30.0, "the kept terminal to widen")
+        feed_width_marker(session, tab)
+        focus(roost, key)
+        assert_the_window_shows_the_sessions_screen(roost, session, tab, key)
+
+
+def test_a_refocus_after_a_font_change_never_replays_at_the_old_width(host, roost):
+    """The same, with the font as what moves the detached tab's grid
+    (panel correction 21)."""
+    host.connect_and_wait()
+    with window_restored(roost), host.client() as session:
+        tab, key = detached_at_narrow(roost, session, host.env.launch_cwd)
+        try:
+            widen_by_font(roost, key, 100)
+            wait_until(
+                lambda: cols_of(roost, key) > 100, 30.0, "the font to widen the kept terminal"
+            )
+            feed_width_marker(session, tab)
+            focus(roost, key)
+            assert_the_window_shows_the_sessions_screen(roost, session, tab, key)
+        finally:
+            palette_command(roost, "font_reset")
+
+
+def test_a_resize_while_a_resume_is_in_flight_never_replays_at_the_old_width(
+    roost, session_env
+):
+    """The in-flight half (panel correction 1): the refocus's handshake
+    carries the resume point at the narrow width, and the relay holds the
+    session's answer. The window widens while it is held — the resize is
+    only withheld from the wire, but the kept terminal re-grids at once —
+    and the marker is written, at the session's narrow grid, onto the
+    held stream. Released, the resume must be refused and the tab
+    attached again from a snapshot.
+
+    The session answered for the grid the handshake carried and saw no
+    change, so only the client can refuse this one: D4a's in-flight rule
+    end to end, against today's session.
+    """
+    require_test_mode(roost)
+    start_session(session_env)
+    with recording_relay(session_env) as relay, window_restored(roost):
+        with saved_host(roost, session_env, target=relay.path) as host:
+            host.connect_and_wait()
+            with host.client() as session:
+                tab, key = detached_at_narrow(roost, session, host.env.launch_cwd)
+                release = relay.hold("attach")
+                try:
+                    focus(roost, key)
+                    relay.wait_holding()
+                    roost.window_resize(*WIDE_WINDOW)
+                    wait_until(
+                        lambda: cols_of(roost, key) > 100, 30.0, "the kept terminal to widen"
+                    )
+                    feed_width_marker(session, tab)
+                finally:
+                    release.set()
+                assert_the_window_shows_the_sessions_screen(roost, session, tab, key)

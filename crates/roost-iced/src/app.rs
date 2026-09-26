@@ -122,11 +122,11 @@ pub(crate) use self::servicing::{AgentMetricsResult, ATTACH_RETRY_INTERVAL};
 use self::tab_backend::{TabBackend, TabHandle};
 use self::terminal_tab::{
     apply_geometry_batch, clear_preedit_or_warn, pointer_origin_tab, refresh_or_warn,
-    terminal_grid, GeometryBatchOperation, NativePointerDispatch, TerminalTab,
+    terminal_grid, GeometryBatchOperation, GeometryChange, NativePointerDispatch, TerminalTab,
 };
 #[cfg(test)]
 use self::terminal_tab::{
-    attach_test_terminal, feed_text_until, GeometryBatchFailure, GeometryChange,
+    attach_test_terminal, feed_text_until, laid_out_host_terminal, GeometryBatchFailure,
     LocalPointerGesture, NativePointerOutcome, TerminalGeometry,
 };
 
@@ -1627,6 +1627,44 @@ fn effective_sidebar_width(collapsed: bool, width: f32) -> f32 {
         0.0
     } else {
         width
+    }
+}
+
+/// [`App::resize`]'s re-grid of every kept terminal: window resizes,
+/// sidebar width drags and collapse all land here.
+fn regrid_window(
+    tabs: &mut HashMap<TabKey, TerminalTab>,
+    host_resume: &mut HashMap<TabKey, host_tab::ResumePoint>,
+    (cols, rows): (u16, u16),
+    metrics: TerminalMetrics,
+    metric_generation: u64,
+) {
+    for (key, tab) in tabs {
+        match tab.apply_geometry(cols, rows, metrics, metric_generation) {
+            Ok(Some(change)) => {
+                host_tab::forget_resume_on_regrid(
+                    host_resume,
+                    *key,
+                    change.previous_grid,
+                    change.grid(),
+                );
+                tab.commit_geometry(change);
+                // A re-grid rewrites the viewport and drops hover, so the
+                // snapshot the widget draws describes the old dimensions
+                // until it is rebuilt.
+                refresh_or_warn(key.tab, tab, "window re-grid");
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    tab_id = key.tab,
+                    cols,
+                    rows,
+                    "terminal resize failed"
+                )
+            }
+        }
     }
 }
 
@@ -4629,28 +4667,13 @@ impl App {
         for attach in self.host_attach.values_mut() {
             attach.note_resize(host_geometry);
         }
-        for (key, tab) in &mut self.tabs {
-            match tab.apply_geometry(cols, rows, self.terminal_metrics, self.metric_generation) {
-                Ok(Some(change)) => {
-                    tab.commit_geometry(change);
-                    // A re-grid rewrites the viewport and drops hover, so
-                    // the snapshot the widget draws describes the old
-                    // dimensions until it is rebuilt. Window resizes,
-                    // sidebar width drags and collapse all land here.
-                    refresh_or_warn(key.tab, tab, "window re-grid");
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        ?error,
-                        tab_id = key.tab,
-                        cols,
-                        rows,
-                        "terminal resize failed"
-                    )
-                }
-            }
-        }
+        regrid_window(
+            &mut self.tabs,
+            &mut self.host_resume,
+            (cols, rows),
+            self.terminal_metrics,
+            self.metric_generation,
+        );
         if changed && self.palette.is_some() {
             self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
         }
@@ -10344,6 +10367,37 @@ mod tests {
         assert_eq!(wide_rows, default_rows, "sidebar width must not touch rows");
     }
 
+    /// #564 (plan 072 D4a): a window re-grid that moves a detached host
+    /// tab's terminal takes its resume point with it, so the next focus
+    /// attaches from a snapshot. One that moves no cell — the same grid,
+    /// or only the cell pixels — leaves it.
+    #[test]
+    fn a_window_regrid_forgets_a_detached_host_tabs_resume_point() {
+        let metrics = TerminalMetrics::measure(13.0).expect("test metrics");
+        let key = TabKey::new(HostId::new(3), 7);
+        let mut tabs = HashMap::from([(key, laid_out_host_terminal(80, 24, metrics))]);
+        let point = host_tab::ResumePoint {
+            server_epoch: 11,
+            tab_generation: 2,
+            next_seq: 42,
+        };
+        let mut resumes = HashMap::from([(key, point)]);
+
+        let other_pixels = TerminalMetrics::measure(14.0).expect("other test metrics");
+        regrid_window(&mut tabs, &mut resumes, (80, 24), other_pixels, 2);
+        assert!(
+            resumes.contains_key(&key),
+            "a re-grid that moves no cell keeps the resume point"
+        );
+
+        regrid_window(&mut tabs, &mut resumes, (120, 24), other_pixels, 2);
+        assert_eq!(tabs[&key].grid(), (120, 24));
+        assert!(
+            !resumes.contains_key(&key),
+            "the terminal left the grid the session wrote for, so the next attach is a snapshot"
+        );
+    }
+
     #[test]
     fn restored_tabs_spawn_at_the_first_windows_grid_beside_the_persisted_sidebar() {
         let metrics = TerminalMetrics::measure(13.0).expect("test metrics");
@@ -13016,8 +13070,8 @@ mod tests {
                     );
                     Ok(Some(GeometryChange {
                         previous,
+                        previous_grid: (0, 0),
                         current: states[&tab],
-                        grid_changed: true,
                         metrics_changed: true,
                         deferred_replies: Vec::new(),
                     }))

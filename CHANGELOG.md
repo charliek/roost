@@ -249,6 +249,20 @@ release workflow asserts they agree).
   directory that no longer exists. ⌘1–9 and the Window menu no longer
   reveal a hidden sidebar when switching projects, matching Roost-Iced
   and 071's ruling that opening a tab never expands it.
+- **Coming back to a session tab after a window resize or a font-size
+  change could replay what it missed at the old width (#564)** — on the
+  local session and on saved hosts, a tab you leave keeps its screen, and
+  coming back replays only the output written while you were away. That
+  output was written for the width the tab had when you left, so after
+  the window, the sidebar or the font changed the width, cursor-placed
+  text and right-aligned prompts landed in the wrong columns, on the
+  primary screen and in scrollback, until something redrew them. A tab
+  whose grid changed while you were on it, while you were away, or while
+  it was still reconnecting, now comes back from a fresh copy of the
+  session's screen. The window's half of the fix works against every
+  `roost-session`. The session's half — it also refuses to replay across
+  a resize another window made — reaches a `roost-session` that was
+  already running only after it restarts.
 
 ## v0.0.20 — 2026-09-20
 

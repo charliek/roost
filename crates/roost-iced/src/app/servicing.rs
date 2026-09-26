@@ -1628,7 +1628,8 @@ impl App {
     /// stop, and refocus resumes from the point saved here.
     pub(super) fn host_detach_tab(&mut self, key: TabKey) {
         if let Some(attach) = self.host_attach.remove(&key) {
-            if let Some(resume) = attach.detach() {
+            let kept = self.tabs.get(&key).map(TerminalTab::grid);
+            if let Some(resume) = attach.detach(kept) {
                 self.host_resume.insert(key, resume);
             }
         }
@@ -6444,7 +6445,7 @@ mod tests {
             .expect("apply a width-only geometry change")
             .expect("cols moved, so this is a real geometry change");
         assert!(
-            change.grid_changed,
+            change.grid_changed(),
             "cols moved, so the grid-changed flag must fire even though rows did not"
         );
         tab.commit_geometry(change);

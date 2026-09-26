@@ -3439,9 +3439,10 @@ because raw input is open and any other client may resize the tab
 between this connection's own resize and the encode. A `vt` client
 builds its terminal at that size before replaying, then resizes it to
 its own; a resuming client replays the ring into the terminal it kept,
-and the geometry it was away for may not be the one it left. An
-accepted reply that states no geometry is a truncated reply, and a
-client refuses it.
+and an unfocused one may not be at the tab's grid (a served resume
+never straddles a grid change — see [Resume](#resume)). An accepted
+reply that states no geometry is a truncated reply, and a client
+refuses it.
 
 #### Preamble and frames
 
@@ -3646,10 +3647,23 @@ Resume is honored only when **all** of these hold:
 * `ring_front <= resume_from_seq <= last_assigned + 1`. The upper bound
   is inclusive: `last_assigned + 1` is a valid **empty-slice** resume —
   the client missed nothing and simply carries on.
+* The tab's grid has not changed since `resume_from_seq` (#564) —
+  whoever changed it, this attach's own `focus: true` resize included.
+  The ring holds records written for the grid the tab had, and replayed
+  into a terminal the client kept at another width they land in the
+  wrong cells. The rule is conservative: a resize with no output after
+  it refuses every resume point before it, since the seqs cannot say
+  whether the client saw it.
 
 Every miss — `resume_from_seq` of `0`, a seq past the end, an evicted
-range, an identity mismatch, a tab task that went away — falls back to
-`mode: "snapshot"` and a full attach **in the same reply**. A resume
+range, an identity mismatch, a grid change inside the range, a tab task
+that went away — falls back to `mode: "snapshot"` and a full attach
+**in the same reply**. A session older than the grid rule can still
+answer `resume` across a grid change, which is why Roost's own client
+also stops asking: it forgets a detached tab's resume point when it
+re-grids that tab's terminal, gives up the point of an attach that sent
+a resize while live, and discards a `resume` answered for a grid its
+terminal has left while the handshake was in flight. A resume
 failure is never an error, and a client never has to handle one: it
 reads `mode` and does what it says.
 

@@ -704,8 +704,101 @@ def test_6_todays_roostctl_drives_the_old_session(compatible_latest: World):
 
 
 # ---------------------------------------------------------------------------
-# 7. D4's width scenario joins the compatibility checks here (plan 072 C9).
+# 7. D4 (#564): a refocused tab never replays at the width it left
 # ---------------------------------------------------------------------------
+
+#: Window sizes whose terminals sit on either side of 100 columns, so the
+#: marker [`WIDTH_MARKER`] writes at `CUP 5;100` lands in different cells
+#: at the two: the narrow grid's last column, or column 100 of the wide one.
+NARROW_WINDOW = (760.0, 560.0)
+WIDE_WINDOW = (1600.0, 560.0)
+#: `\043` rather than `#`, so the command line the shell echoes carries no
+#: marker of its own.
+WIDTH_MARKER = "printf '\\033[5;100H\\043'"
+
+
+def screen(dumped: dict) -> tuple[int, int, dict[tuple[int, int], str]]:
+    """A resolved dump's grid and its text, cell for cell."""
+    cells = {(c["row"], c["col"]): c["text"] for c in dumped["cells"] if c["text"].strip()}
+    return dumped["cols"], dumped["rows"], cells
+
+
+def marks(dumped: dict) -> list[tuple[int, int]]:
+    """Where the marker's row holds a `#`."""
+    return sorted((c["row"], c["col"]) for c in dumped["cells"] if c["row"] == 4 and c["text"] == "#")
+
+
+@pytest.mark.parametrize("widen", ["window", "font"])
+def test_7_a_refocused_tab_never_replays_at_the_width_it_left(compatible_latest: World, widen: str):
+    """A tab detached at a narrow grid; the window's grid widened past 100
+    columns — by the window, or by the font; the old session writing at
+    the grid it still has; the tab focused again. The window must then
+    draw what the session holds.
+
+    A released session cuts the resume after resizing to the attach's
+    grid, and has no D4b to refuse it, so only the client can: this is
+    D4a's end-to-end control. With the re-grid site's forgetting removed,
+    the marker lands at column 100 in the window and at the narrow grid's
+    last column in the session.
+    """
+    w = compatible_latest
+    roost = w.ready()
+    before = roost.window_metrics()
+    with w.env.client() as c:
+        tab = c.open_tab(w.project, cwd=str(DIR_A), title="width")
+        away = c.open_tab(w.project, cwd=str(DIR_A), title="away")
+    try:
+        roost.window_resize(*NARROW_WINDOW)
+        w.show(tab)
+        narrow = roost.tab_dump_resolved(tab)["cols"]
+        assert narrow < 100, f"the narrow window gave {narrow} columns"
+        # The window streams one tab at a time: this detaches `tab` with a
+        # resume point at the narrow grid.
+        w.show(away)
+
+        if widen == "window":
+            roost.window_resize(*WIDE_WINDOW)
+        else:
+            util.widen_by_font(roost, tab, 100)
+        wait_until(
+            lambda: roost.tab_dump_resolved(tab)["cols"] > 100,
+            30.0,
+            f"the {widen} to widen the detached tab's terminal past 100 columns",
+        )
+
+        with w.env.client() as c:
+            c.send(tab, WIDTH_MARKER + "\n")
+            wait_until(
+                lambda: marks(c.tab_dump_resolved(tab)) == [(4, narrow - 1)],
+                30.0,
+                "the old session to write the marker at its narrow grid",
+            )
+
+        roost.focus(tab)
+
+        def served() -> dict:
+            with w.env.client() as c:
+                return c.tab_dump_resolved(tab)
+
+        try:
+            wait_until(
+                lambda: screen(roost.tab_dump_resolved(tab)) == screen(served()),
+                30.0,
+                "the refocused tab to show the old session's screen",
+            )
+        except TimeoutError:
+            raise AssertionError(
+                f"the window drew the marker at {marks(roost.tab_dump_resolved(tab))}, "
+                f"the old session at {marks(served())}: the resume replayed records "
+                f"written for {narrow} columns at the widened grid"
+            ) from None
+    finally:
+        if widen == "font":
+            util.palette_command(roost, "font_reset")
+        roost.window_resize(before["window_width"], before["window_height"])
+        with contextlib.suppress(Exception), w.env.client() as c:
+            c.close_tab(tab)
+            c.close_tab(away)
 
 
 # ---------------------------------------------------------------------------

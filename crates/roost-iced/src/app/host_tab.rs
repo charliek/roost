@@ -24,7 +24,7 @@
 //! contract), so neither a stale attempt nor a stale incarnation can
 //! touch a live terminal.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -82,6 +82,12 @@ pub(super) struct Geometry {
     pub(crate) cell_h: u32,
 }
 
+impl Geometry {
+    fn grid(&self) -> (u16, u16) {
+        (self.cols, self.rows)
+    }
+}
+
 /// Which of [`CLIENT_PAYLOAD_KINDS`] an attach was accepted as, and so
 /// which hydration its payload gets.
 ///
@@ -124,6 +130,34 @@ pub(super) struct ResumePoint {
     pub(crate) server_epoch: u64,
     pub(crate) tab_generation: u64,
     pub(crate) next_seq: u64,
+}
+
+/// Whether a resume point still holds for a terminal re-gridded from
+/// `before` to `after`.
+///
+/// A resume replays the records the session wrote after the point, and
+/// it wrote them for the grid the session last heard from this client —
+/// the one the terminal was at. Replayed into a terminal at another grid,
+/// every absolute cursor move and every wrapped line lands somewhere the
+/// session's terminal did not put it, and nothing heals the primary
+/// screen or the scrollback afterwards (#564). Cell pixels move no cell,
+/// so only the grid counts.
+pub(super) fn resume_survives_regrid(before: (u16, u16), after: (u16, u16)) -> bool {
+    before == after
+}
+
+/// Drop `key`'s resume point when its terminal was re-gridded from
+/// `before` to `after`, so the next attach is a snapshot. A detached tab
+/// is the only one with a point in `resumes`: an attach holds its own.
+pub(super) fn forget_resume_on_regrid(
+    resumes: &mut HashMap<TabKey, ResumePoint>,
+    key: TabKey,
+    before: (u16, u16),
+    after: (u16, u16),
+) {
+    if !resume_survives_regrid(before, after) {
+        resumes.remove(&key);
+    }
 }
 
 /// One item of an attached host tab's traffic, riding the engine feed.
@@ -349,6 +383,20 @@ pub(super) struct HostAttach {
     withheld: Option<Geometry>,
     /// The geometry the current attempt negotiated (or is negotiating).
     geometry: Geometry,
+    /// The grid the current attempt's handshake carried — what a
+    /// session that answers `resume` wrote the records it replays for.
+    /// The terminal can move past it while the handshake is in flight: a
+    /// resize then is only withheld from the wire.
+    handshake_grid: (u16, u16),
+    /// Whether a RESIZE was queued for the session after the current
+    /// attempt's handshake. The session applies it somewhere among the
+    /// records already in flight, so the records past the resume point
+    /// were written at a grid this client can't identify — and an old
+    /// session's `Accepted` reports only the grid at the handoff, not the
+    /// one each record it replays was written at. So the resume point
+    /// goes no further than this attempt: neither a detach nor a
+    /// re-attach carries it, and the next attach is a snapshot (#564).
+    resized_since_handshake: bool,
     /// The persistent input queue: keystrokes survive re-attach windows
     /// here. The sender side also lives in the tab's `TabHandle`.
     input_tx: mpsc::UnboundedSender<HostDataMsg>,
@@ -373,6 +421,8 @@ impl HostAttach {
             kind: None,
             withheld: None,
             geometry,
+            handshake_grid: geometry.grid(),
+            resized_since_handshake: false,
             input_tx,
             input_rx: Arc::new(tokio::sync::Mutex::new(input_rx)),
             tasks: Vec::new(),
@@ -447,6 +497,10 @@ impl HostAttach {
         let attempt = self.attempt;
         let key = self.key;
         let geometry = self.geometry;
+        self.handshake_grid = geometry.grid();
+        if std::mem::take(&mut self.resized_since_handshake) {
+            self.resume = None;
+        }
         let resume = self.resume;
         let Some(session_id) = session_id else {
             feed.send(EngineFeed::HostTab(
@@ -523,6 +577,7 @@ impl HostAttach {
     /// already waiting, so the wire sees the two in submission order.
     fn queue_geometry(&mut self, geometry: Geometry) {
         self.geometry = geometry;
+        self.resized_since_handshake = true;
         let _ = self.input_tx.send(HostDataMsg::Resize {
             cols: geometry.cols,
             rows: geometry.rows,
@@ -572,6 +627,9 @@ impl HostAttach {
                 snapshot_size,
                 ..
             } => {
+                if resumed && !resume_survives_regrid(self.handshake_grid, tab.grid()) {
+                    return self.discard_resume(tab.grid());
+                }
                 self.kind = Some(kind);
                 let identity = ResumePoint {
                     server_epoch,
@@ -606,8 +664,7 @@ impl HostAttach {
                     // its lines and misplaces its absolute cursor moves,
                     // so the terminal is built at the payload's size and
                     // resized to this client's afterwards.
-                    let built_at =
-                        snapshot_size.unwrap_or((self.geometry.cols, self.geometry.rows));
+                    let built_at = snapshot_size.unwrap_or(self.geometry.grid());
                     let hydrator = match kind {
                         PayloadKind::GhosttySnapshot => Hydrator::Snapshot(SnapshotDecoder::new(
                             SnapshotDecodeOptions::default(),
@@ -756,13 +813,41 @@ impl HostAttach {
     /// Detach: abort this attempt's tasks and abandon a mid-flight
     /// decoder on this thread — never dropping it mid-`feed` from an
     /// aborted task, which is why the decoder lives here and not there.
-    /// The resume point survives in the return value.
-    pub(super) fn detach(mut self) -> Option<ResumePoint> {
+    ///
+    /// The resume point survives in the return value only while no
+    /// RESIZE went after the handshake and `kept`, the grid of the
+    /// terminal the tab keeps, is still the handshake's. A resize
+    /// withheld behind a handshake that never landed, or a re-grid that
+    /// sent no RESIZE, leaves the session writing for a grid the kept
+    /// terminal has left.
+    pub(super) fn detach(mut self, kept: Option<(u16, u16)>) -> Option<ResumePoint> {
         self.abort_tasks();
         if let Phase::Hydrating(hydration) = std::mem::replace(&mut self.phase, Phase::Ended) {
             hydration.hydrator.abandon();
         }
-        self.resume
+        let given = self.handshake_grid;
+        self.resume.filter(|_| {
+            !self.resized_since_handshake
+                && kept.is_some_and(|kept| resume_survives_regrid(given, kept))
+        })
+    }
+
+    /// Refuse an accepted resume written for [`Self::handshake_grid`]
+    /// once the terminal has left it: the attempt ends, and a fresh one
+    /// goes at the terminal's grid with no resume point — a snapshot.
+    fn discard_resume(&mut self, grid: (u16, u16)) -> AttachStep {
+        tracing::debug!(key = %self.key, "a resume for a grid the terminal has left; attaching fresh");
+        self.abort_tasks();
+        self.resume = None;
+        let latest = self.withheld.take().unwrap_or(self.geometry);
+        self.geometry = Geometry {
+            cols: grid.0,
+            rows: grid.1,
+            ..latest
+        };
+        AttachStep::Reattach {
+            delay: Duration::ZERO,
+        }
     }
 
     fn abort_tasks(&mut self) {
@@ -1041,7 +1126,7 @@ impl HostAttach {
         // way nothing else would ever correct it — no later resize pass
         // runs unless the window moves again.
         let target = self.geometry;
-        if built_at != (target.cols, target.rows) {
+        if built_at != target.grid() {
             if let Err(error) =
                 tab.resize_for_host(target.cols, target.rows, target.cell_w, target.cell_h)
             {
@@ -1529,6 +1614,144 @@ mod tests {
         );
     }
 
+    const POINT: ResumePoint = ResumePoint {
+        server_epoch: 11,
+        tab_generation: 2,
+        next_seq: 42,
+    };
+
+    const WIDER: Geometry = Geometry {
+        cols: 120,
+        ..GEOMETRY
+    };
+
+    /// The window resizing under `tab` the way `App::resize` does it: the
+    /// attach hears the new geometry, and the kept terminal re-grids at
+    /// once whatever the attach does with it.
+    fn resize_window(attach: &mut HostAttach, tab: &mut TerminalTab, to: Geometry) {
+        attach.note_resize(to);
+        tab.resize_for_host(to.cols, to.rows, to.cell_w, to.cell_h)
+            .expect("re-grid the kept terminal");
+    }
+
+    fn widen(attach: &mut HostAttach, tab: &mut TerminalTab) {
+        resize_window(attach, tab, WIDER);
+    }
+
+    #[test]
+    fn a_resume_survives_only_a_regrid_that_moves_no_cell() {
+        assert!(resume_survives_regrid((80, 24), (80, 24)));
+        assert!(!resume_survives_regrid((80, 24), (120, 24)), "wider");
+        assert!(!resume_survives_regrid((80, 24), (80, 30)), "taller");
+
+        let moved = key();
+        let other = TabKey::new(HostId::new(3), 8);
+        let mut resumes = HashMap::from([(moved, POINT), (other, POINT)]);
+        forget_resume_on_regrid(&mut resumes, moved, (80, 24), (80, 24));
+        assert_eq!(resumes.len(), 2, "no cell moved");
+        forget_resume_on_regrid(&mut resumes, moved, (80, 24), (120, 24));
+        assert_eq!(
+            resumes,
+            HashMap::from([(other, POINT)]),
+            "only the re-gridded tab forgets its point"
+        );
+    }
+
+    /// Plan 072 D4a, the in-flight half (#564).
+    #[tokio::test]
+    async fn an_accepted_resume_for_a_grid_the_terminal_left_is_discarded() {
+        let (attach, mut tab, feed_tx, _feed_rx) = rig();
+        let mut attach = attach.with_resume(Some(POINT));
+        widen(&mut attach, &mut tab);
+
+        assert_eq!(
+            attach.on_frame(accepted(true, 41), &mut tab, &feed_tx),
+            AttachStep::Reattach {
+                delay: Duration::ZERO
+            },
+            "the resumed stream is refused and a fresh attach goes at once"
+        );
+        assert_eq!(attach.resume, None, "the fresh attach asks for a snapshot");
+        assert_eq!(attach.geometry, WIDER, "at the grid the terminal is at");
+        assert!(matches!(attach.phase, Phase::Requesting));
+    }
+
+    /// Plan 072 D4a, the detach guard (#564).
+    #[tokio::test]
+    async fn a_detach_keeps_the_resume_point_only_at_the_grid_the_session_was_given() {
+        let (attach, mut tab, _feed_tx, _feed_rx) = rig();
+        let mut attach = attach.with_resume(Some(POINT));
+        widen(&mut attach, &mut tab);
+        assert_eq!(
+            attach.detach(Some(tab.grid())),
+            None,
+            "the resize waited on a handshake that never landed"
+        );
+
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
+        tab.resize_for_host(WIDER.cols, WIDER.rows, WIDER.cell_w, WIDER.cell_h)
+            .expect("re-grid the kept terminal");
+        assert_eq!(
+            attach.detach(Some(tab.grid())),
+            None,
+            "a live terminal re-gridded with no RESIZE sent"
+        );
+    }
+
+    /// Plan 072 D4a, a live resize (#564): the kept terminal ends at the
+    /// grid the attach sent, but the records past the point may have
+    /// been written at the one before it.
+    #[tokio::test]
+    async fn an_attach_resized_after_its_handshake_carries_no_resume_point() {
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
+        attach.on_frame(pty(42, b"at the handshake's grid"), &mut tab, &feed_tx);
+        assert_eq!(
+            attach.detach(Some(tab.grid())),
+            Some(ResumePoint {
+                next_seq: 43,
+                ..POINT
+            }),
+            "never resized: the refocus resumes"
+        );
+
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
+        widen(&mut attach, &mut tab);
+        assert_eq!(
+            attach.detach(Some(tab.grid())),
+            None,
+            "resized live: the refocus takes a snapshot"
+        );
+
+        let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+        attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
+        widen(&mut attach, &mut tab);
+        resize_window(&mut attach, &mut tab, GEOMETRY);
+        assert_eq!(
+            attach.detach(Some(tab.grid())),
+            None,
+            "resized away and back: the grid is the handshake's again, not the records'"
+        );
+
+        let (ops, _worker) = HostOps::channel();
+        let nowhere = std::path::PathBuf::from("/nonexistent/roost-resize-resume.sock");
+        for (resize, expected) in [(false, Some(POINT)), (true, None)] {
+            let (mut attach, mut tab, feed_tx, _feed_rx) = rig();
+            attach.on_frame(accepted(true, 41), &mut tab, &feed_tx);
+            if resize {
+                widen(&mut attach, &mut tab);
+            }
+            assert!(matches!(
+                attach.on_frame(HostTabFrame::Closed { attempt: 1 }, &mut tab, &feed_tx),
+                AttachStep::Reattach { .. }
+            ));
+            attach.begin(&ops, None, nowhere.clone(), "gb", &feed_tx);
+            assert_eq!(attach.resume, expected, "a re-attach after resize={resize}");
+        }
+    }
+
     /// `mode: "snapshot"` (the resume-miss fallback rides the same
     /// reply) hydrates: the old terminal keeps rendering until FINISH
     /// swaps the decoded one in.
@@ -1941,7 +2164,7 @@ mod tests {
         attach.on_frame(accepted(false, 100), &mut tab, &feed_tx);
         attach.on_frame(pty(101, b"progress"), &mut tab, &feed_tx);
         assert_eq!(
-            attach.detach(),
+            attach.detach(Some(tab.grid())),
             None,
             "no fence was ever true of the rendered terminal"
         );
@@ -1965,7 +2188,7 @@ mod tests {
             AttachStep::Reattach { .. }
         ));
         assert_eq!(
-            attach.detach(),
+            attach.detach(Some(tab.grid())),
             Some(ResumePoint {
                 server_epoch: 11,
                 tab_generation: 2,
@@ -2006,7 +2229,7 @@ mod tests {
         assert!(text.contains("fresh-host-screen"), "{text:?}");
         assert!(!text.contains("old-screen"));
         assert_eq!(
-            attach.detach(),
+            attach.detach(Some(tab.grid())),
             Some(ResumePoint {
                 server_epoch: 11,
                 tab_generation: 2,
@@ -2680,7 +2903,7 @@ mod tests {
             snapshot_with("done"),
         );
         assert_eq!(
-            attach.detach(),
+            attach.detach(Some(tab.grid())),
             Some(ResumePoint {
                 server_epoch: 11,
                 tab_generation: 2,

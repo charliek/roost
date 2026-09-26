@@ -688,6 +688,28 @@ fn font_size_candidate(
     Ok(Some((candidate, metrics)))
 }
 
+/// The commit half of a font or typography change's re-grid, once every
+/// tab has taken the new geometry.
+fn commit_typography_regrid(
+    tabs: &mut HashMap<TabKey, TerminalTab>,
+    host_resume: &mut HashMap<TabKey, host_tab::ResumePoint>,
+    applied: Vec<(TabKey, GeometryChange)>,
+    operation: &str,
+) {
+    for (key, change) in applied {
+        if let Some(tab) = tabs.get_mut(&key) {
+            host_tab::forget_resume_on_regrid(
+                host_resume,
+                key,
+                change.previous_grid,
+                change.grid(),
+            );
+            tab.commit_geometry(change);
+            refresh_or_warn(key.tab, tab, operation);
+        }
+    }
+}
+
 impl App {
     pub(super) fn open_bound_palette_result(&mut self, kind: &str) -> Result<UiTask, String> {
         self.open_palette(kind)?;
@@ -823,12 +845,7 @@ impl App {
                 tab.commit_pointer_cancel(release);
             }
         }
-        for (key, change) in applied {
-            if let Some(tab) = self.tabs.get_mut(&key) {
-                tab.commit_geometry(change);
-                refresh_or_warn(key.tab, tab, operation);
-            }
-        }
+        commit_typography_regrid(&mut self.tabs, &mut self.host_resume, applied, operation);
         Ok(())
     }
 
@@ -3330,6 +3347,50 @@ mod tests {
                 .expect("changed candidate");
         assert_eq!(candidate.0.current_size_pt(), 71.0);
         assert_eq!(current, before);
+    }
+
+    /// #564 (plan 072 D4a) through the font path, which re-grids every
+    /// kept terminal the way a window resize does: a detached host tab
+    /// whose terminal moves loses its resume point, and one whose grid
+    /// the new font happens to keep does not.
+    #[test]
+    fn a_font_regrid_forgets_a_detached_host_tabs_resume_point() {
+        let metrics = TerminalMetrics::measure(13.0).expect("test metrics");
+        let bigger = TerminalMetrics::measure(18.0).expect("bigger test metrics");
+        let moved = TabKey::new(HostId::new(3), 7);
+        let kept = TabKey::new(HostId::new(3), 8);
+        let mut tabs = HashMap::from([
+            (moved, laid_out_host_terminal(80, 24, metrics)),
+            (kept, laid_out_host_terminal(80, 24, metrics)),
+        ]);
+        let point = host_tab::ResumePoint {
+            server_epoch: 11,
+            tab_generation: 2,
+            next_seq: 42,
+        };
+        let mut resumes = HashMap::from([(moved, point), (kept, point)]);
+
+        let applied = [(moved, (58, 17)), (kept, (80, 24))]
+            .map(|(key, (cols, rows))| {
+                let change = tabs
+                    .get_mut(&key)
+                    .expect("tab")
+                    .apply_geometry(cols, rows, bigger, 2)
+                    .expect("apply the new font")
+                    .expect("new metrics are a change");
+                (key, change)
+            })
+            .to_vec();
+        commit_typography_regrid(&mut tabs, &mut resumes, applied, "font size");
+
+        assert!(
+            !resumes.contains_key(&moved),
+            "the font moved this terminal off the grid the session wrote for"
+        );
+        assert!(
+            resumes.contains_key(&kept),
+            "a font change that keeps the grid moves no cell"
+        );
     }
 
     #[test]

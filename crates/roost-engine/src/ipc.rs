@@ -1999,7 +1999,9 @@ async fn tab_ask<T>(
 fn tab_err(e: crate::tab_task::TabError) -> HandlerError {
     use crate::tab_task::TabError;
     match e {
-        TabError::Gone | TabError::RingMiss { .. } => HandlerError::not_found(e.to_string()),
+        TabError::Gone | TabError::RingMiss { .. } | TabError::Regridded { .. } => {
+            HandlerError::not_found(e.to_string())
+        }
         TabError::SnapshotFailed(_) | TabError::Render(_) | TabError::WinsizeFailed(_) => {
             HandlerError::new(codes::INTERNAL, e.to_string())
         }

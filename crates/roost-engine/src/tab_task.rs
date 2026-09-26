@@ -335,10 +335,10 @@ pub struct ResumeAt {
     /// Set once the tab has exited, so a late resume still ends in EXIT.
     pub stored_exit: Option<(u64, i32)>,
     /// The tab's grid at the handoff, read on the task in the same turn
-    /// the slice was cut. A resuming client replays these records into
-    /// the terminal it kept, and any other client may have resized the
-    /// tab while it was away — so the reply names the size the records
-    /// were written for rather than leaving it to guess.
+    /// the slice was cut — the grid every record in it was written for,
+    /// because the task refuses a slice that straddles a grid change. An
+    /// unfocused client can still be at another size, so the reply names
+    /// this one rather than leaving it to guess.
     pub cols: u16,
     pub rows: u16,
 }
@@ -386,6 +386,8 @@ pub enum TabError {
         front: u64,
         last_assigned: u64,
     },
+    #[error("resume from seq {from_seq} straddles the grid change at seq {changed_at}")]
+    Regridded { from_seq: u64, changed_at: u64 },
 }
 
 impl From<roost_vt::Error> for TabError {
@@ -595,6 +597,7 @@ impl TabVt {
             writer_gone: false,
             next_seq: 1,
             last_byte_seq: 0,
+            grid_changed_at: 0,
             ring: VecDeque::new(),
             ring_bytes: 0,
             pending: VecDeque::new(),
@@ -667,6 +670,26 @@ struct TabTask {
     /// `next_seq - 1`: `Exit` consumes an ordinal too, and a resume
     /// window that counted it would call `final_seq` a byte record.
     last_byte_seq: u64,
+    /// The seq the next PTY record would carry when the grid last
+    /// changed: every record below it was written for an older grid.
+    ///
+    /// A client that resumes from at or below it would replay records
+    /// composed for one width into a terminal it kept at another — a
+    /// resize by another client while it was away, or one away and back
+    /// again — and put every absolute cursor move and wrapped line
+    /// somewhere this terminal did not (#564). [`Self::resume`] refuses
+    /// that, and the attach falls back to a snapshot.
+    ///
+    /// `next_seq` and not `last_byte_seq`, because a resize consumes no
+    /// seq: a resize landing right after the last record a client saw
+    /// would otherwise sit below the seq it resumes from. The same holds
+    /// for the resuming attach's own focused resize — it runs on this
+    /// task before the `Resume` it precedes, and leaves the marker at or
+    /// above every seq the ring could still serve. The price is a client
+    /// whose snapshot was taken after a change, with nothing written
+    /// since, being refused too: the seqs cannot tell it from one that
+    /// left before the change.
+    grid_changed_at: u64,
     ring: VecDeque<(u64, Vec<u8>)>,
     ring_bytes: usize,
     pending: VecDeque<WriterCmd>,
@@ -1121,6 +1144,9 @@ impl TabTask {
         // program that reads the report and then asks `TIOCGWINSZ` must
         // not be told two different sizes.
         let queued = if applied.is_ok() {
+            if (cols, rows) != (self.vt.geometry.cols, self.vt.geometry.rows) {
+                self.grid_changed_at = self.next_seq;
+            }
             self.vt.geometry = geometry;
             // Pixel geometry stays 0 on the PTY winsize, matching
             // `PtySupervisor::resize`; libghostty gets the real cell
@@ -1337,6 +1363,12 @@ impl TabTask {
                 from_seq,
                 front,
                 last_assigned,
+            });
+        }
+        if self.grid_changed_at >= from_seq {
+            return Err(TabError::Regridded {
+                from_seq,
+                changed_at: self.grid_changed_at,
             });
         }
         let slice = self

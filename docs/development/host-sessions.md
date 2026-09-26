@@ -47,13 +47,13 @@ flowchart LR
 
 ## The attach sequence
 
-Attach is **on-focus**: a tab dials its data connection only while it's the one you're looking at, and detaches (dropping the connection, never the session) the moment you switch away. Re-focusing resumes from where it left off when the server's replay ring still covers the gap, and silently re-snapshots when it doesn't — the wire guarantees the fallback in the same reply, so the client never has to ask twice.
+Attach is **on-focus**: a tab dials its data connection only while it's the one you're looking at, and detaches (dropping the connection, never the session) the moment you switch away. Re-focusing resumes from where it left off when the server's replay ring still covers the gap and the tab's grid hasn't changed since, and silently re-snapshots when it doesn't — the wire guarantees the fallback in the same reply, so the client never has to ask twice. The client guards the grid half on its own too, for a session older than that rule (#564): a detached tab whose terminal a window resize or a font change re-grids forgets its resume point, and so does one detached while its terminal is at a grid it never sent the session, or after it sent the session a resize while attached — the output in flight across a live resize was written at a grid the client can't tell.
 
 ```mermaid
 flowchart LR
   Focus["tab gains focus"] --> Permit["op-queue permit<br/>(every queued op answered)"]
   Permit --> Handshake["data-plane handshake<br/>(tab + terms + resume point)<br/>→ accepted line → ROOSTDP2 preamble"]
-  Handshake --> Check{"resume_from_seq<br/>covered by the<br/>replay ring?"}
+  Handshake --> Check{"resume_from_seq<br/>covered by the<br/>replay ring, and<br/>no grid change since?"}
   Check -- "no (first attach,<br/>or a miss)" --> Snap["SNAP frames<br/>(encoded snapshot bytes)"]
   Check -- "yes" --> ResumeMode["mode: resume<br/>(no SNAP at all)"]
   Snap -.->|"PTY frames arriving<br/>pre-READY are deferred"| Deferred["deferred PTY queue"]
@@ -67,7 +67,7 @@ flowchart LR
 
 **The terminal swaps at FINISH, not READY.** `SnapshotDecoder` (`crates/roost-vt/src/snapshot.rs`) owns its terminal until `finish()` completes, so the client keeps rendering the **previous** terminal — the old frame, or nothing on a first attach — until the new one is fully hydrated. This is a recorded deviation from the plan's original swap-at-READY: a swap-at-READY would need a second render path into the published snapshot for a terminal the decoder still owns, and it was deferred as unbuilt because a retry loop must never blank the tab either way, and a fresh tab's READY and FINISH arrive close enough together that the difference isn't visible in practice. Live PTY bytes interleave into the decoder throughout, so nothing arriving between READY and FINISH is lost — it's simply replayed in decode order once the terminal exists to receive it.
 
-**Resize is withheld, not sent live, until the hydration settles.** A user resize between attach and FINISH is queued (latest-wins) and sent once — at FINISH, or after a 2s timeout, whichever comes first — because resizing a decoder that hasn't finished producing a terminal would forfeit the history pages still in flight. Once live, `seq` must be exactly `last + 1`; a gap, duplicate, wrong epoch/generation, or an `EOF` before `FINISH` all mean the same thing — the stream can no longer be trusted — and the client drops the attach and re-attaches with capped backoff, which resets only once the connection reaches `Live` again.
+**Resize is withheld, not sent live, until the hydration settles.** A user resize between attach and FINISH is queued (latest-wins) and sent once — at FINISH, or after a 2s timeout, whichever comes first — because resizing a decoder that hasn't finished producing a terminal would forfeit the history pages still in flight. The kept terminal re-grids at once regardless, so a `resume` answered for the grid the handshake carried is discarded when the terminal has left it by the time the answer lands: the attach ends and the next one goes at the terminal's grid, from a snapshot. Once live, `seq` must be exactly `last + 1`; a gap, duplicate, wrong epoch/generation, or an `EOF` before `FINISH` all mean the same thing — the stream can no longer be trusted — and the client drops the attach and re-attaches with capped backoff, which resets only once the connection reaches `Live` again.
 
 ## Multiple clients {: #the-leasetakeover-lifecycle }
 
