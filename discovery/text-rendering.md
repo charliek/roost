@@ -99,7 +99,8 @@ text on a dark background.
 
 Run on a Mac. With no arguments it captures both installed apps; pass
 `roost` or `roost-iced` to capture one. Set `OUT` to keep before/after runs
-apart. After the cutover, `roost` is the iced build. Every `roostctl` call
+apart. After the cutover, `roost` is the iced build under the production
+identity, still reached with `--target mac`. Every `roostctl` call
 is wrapped in a timeout that also fails if the command can't start: a
 wedged socket (see #573) otherwise hangs forever.
 
@@ -139,16 +140,22 @@ capture() { # $1 = roost | roost-iced
   local tab
   tab=$(T "$ctl" --target "$target" tab list --json | jq -re '.projects[0].tabs[0].id') \
     || { echo "$1: no tab" >&2; osascript -e "quit app \"$name\""; return 1; }
-  T "$ctl" --target "$target" tab send --tab "$tab" --bytes "clear; cat $OUT/sample.txt\n"
+  local rc=0
+  T "$ctl" --target "$target" tab send --tab "$tab" \
+    --bytes "clear; cat '$OUT/sample.txt'\n" || rc=1
   perl -e 'select(undef,undef,undef,2.5)'
   for s in 1 2; do
-    T "$ctl" --target "$target" screenshot --scale "$s" --out "$OUT/$1-${s}x.png"
+    [ "$rc" -eq 0 ] || break
+    T "$ctl" --target "$target" screenshot --scale "$s" --out "$OUT/$1-${s}x.png" || rc=1
   done
   osascript -e "quit app \"$name\""
+  return "$rc"
 }
 
 [ $# -eq 0 ] && set -- roost roost-iced
-for a in "$@"; do capture "$a"; done
+status=0
+for a in "$@"; do capture "$a" || { echo "$a: capture failed" >&2; status=1; }; done
+exit "$status"
 ```
 
 **Measuring.** `tools/screenshot/pngtool.py crop` cuts matching regions
