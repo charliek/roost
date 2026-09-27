@@ -97,18 +97,19 @@ text on a dark background.
 
 ### Capture recipe
 
-Run on a Mac with both apps installed (or, after the cutover, one app at a
-time before and after a change). Every `roostctl` call is wrapped in a
-timeout: a wedged socket (see #573) otherwise hangs forever.
+Run on a Mac. With no arguments it captures both installed apps; pass
+`roost` or `roost-iced` to capture one. Set `OUT` to keep before/after runs
+apart. After the cutover, `roost` is the iced build. Every `roostctl` call
+is wrapped in a timeout that also fails if the command can't start: a
+wedged socket (see #573) otherwise hangs forever.
 
 ```bash
 #!/bin/bash
-# Runs on the Mac. Production apps only; quits them at the end.
+# Usage: capture.sh [roost] [roost-iced]   (default: both)
+# Production apps only; quits each app after capturing it.
 set -u
-RS=/Applications/Roost.app/Contents/Resources/bin/roostctl
-RI=/Applications/Roost-Iced.app/Contents/Resources/bin/roostctl
-T() { perl -e 'alarm 8; exec @ARGV' "$@"; }
-OUT=/tmp/roost-render-cmp; mkdir -p "$OUT"; rm -f "$OUT"/*.png
+T() { perl -e 'alarm 8; exec @ARGV or die "exec failed: $!\n"' "$@"; }
+OUT=${OUT:-/tmp/roost-render-cmp}; mkdir -p "$OUT"
 
 printf '%s\n' \
   'The quick brown fox jumps over the lazy dog  0123456789' \
@@ -121,19 +122,33 @@ printf '%s\n' \
   "$(printf '\033[38;5;214mansi orange\033[0m \033[38;5;39mblue\033[0m \033[38;5;114mgreen\033[0m \033[38;5;203mred\033[0m')" \
   > "$OUT/sample.txt"
 
-open -a /Applications/Roost.app; open -a /Applications/Roost-Iced.app
-wait_for() { for _ in $(seq 1 20); do T "$1" --target "$2" tab list --json >/dev/null 2>&1 && return 0; perl -e 'select(undef,undef,undef,0.5)'; done; return 1; }
-wait_for "$RS" mac && wait_for "$RI" iced || exit 1
-tab_of() { T "$1" --target "$2" tab list --json | jq -r '.projects[0].tabs[0].id'; }
-TS=$(tab_of "$RS" mac); TI=$(tab_of "$RI" iced)
-T "$RS" --target mac  tab send --tab "$TS" --bytes "clear; cat $OUT/sample.txt\n"
-T "$RI" --target iced tab send --tab "$TI" --bytes "clear; cat $OUT/sample.txt\n"
-perl -e 'select(undef,undef,undef,2.5)'
-for s in 1 2; do
-  T "$RS" --target mac  screenshot --scale $s --out "$OUT/swift-${s}x.png"
-  T "$RI" --target iced screenshot --scale $s --out "$OUT/iced-${s}x.png"
-done
-osascript -e 'quit app "Roost"' -e 'quit app "Roost-Iced"'
+capture() { # $1 = roost | roost-iced
+  local name app target
+  case "$1" in
+    roost)      name=Roost;      target=mac ;;
+    roost-iced) name=Roost-Iced; target=iced ;;
+    *) echo "unknown app: $1" >&2; return 1 ;;
+  esac
+  app="/Applications/$name.app"
+  local ctl="$app/Contents/Resources/bin/roostctl"
+  open -a "$app"
+  for _ in $(seq 1 20); do
+    T "$ctl" --target "$target" tab list --json >/dev/null 2>&1 && break
+    perl -e 'select(undef,undef,undef,0.5)'
+  done
+  local tab
+  tab=$(T "$ctl" --target "$target" tab list --json | jq -re '.projects[0].tabs[0].id') \
+    || { echo "$1: no tab" >&2; osascript -e "quit app \"$name\""; return 1; }
+  T "$ctl" --target "$target" tab send --tab "$tab" --bytes "clear; cat $OUT/sample.txt\n"
+  perl -e 'select(undef,undef,undef,2.5)'
+  for s in 1 2; do
+    T "$ctl" --target "$target" screenshot --scale "$s" --out "$OUT/$1-${s}x.png"
+  done
+  osascript -e "quit app \"$name\""
+}
+
+[ $# -eq 0 ] && set -- roost roost-iced
+for a in "$@"; do capture "$a"; done
 ```
 
 **Measuring.** `tools/screenshot/pngtool.py crop` cuts matching regions
