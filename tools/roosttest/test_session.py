@@ -520,6 +520,37 @@ def test_the_layout_is_restored_across_a_restart(env):
     ], after
 
 
+def test_a_saved_tab_in_a_directory_no_shell_can_enter_keeps_its_project(env):
+    """#559: a project whose only saved tab sits in a directory that has
+    since become unenterable comes back, with that tab in the project's
+    cwd. Restored where it was saved, the spawn would fail, and closing a
+    project's last tab deletes the project. The hydrate runs before the
+    session serves, so the first `tab.list` is the restore's answer."""
+    if os.geteuid() == 0:
+        pytest.skip("root enters a directory whatever its mode, so none is locked to it")
+    started(env)
+    project_cwd = env.root / "project"
+    locked = env.root / "locked"
+    project_cwd.mkdir()
+    locked.mkdir()
+    try:
+        with env.client() as client:
+            project = client.create_project(name="locked", cwd=str(project_cwd))
+            client.open_tab(project, cwd=str(locked))
+        settled_ids(env.stop_over_the_wire())
+        env.wait_socket_gone()
+        locked.chmod(0)
+
+        started(env)
+        with env.client() as client:
+            restored = client.project(project)
+            assert restored is not None, f"the project was deleted: {client.list()}"
+            assert [tab["cwd"] for tab in restored["tabs"]] == [str(project_cwd)], restored
+        settled_ids(env.stop_over_the_wire())
+    finally:
+        locked.chmod(0o755)
+
+
 # ---------------------------------------------------------------------------
 # 11. A shell that exits closes its row, headlessly
 # ---------------------------------------------------------------------------

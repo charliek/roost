@@ -241,6 +241,58 @@ struct LocalClientSpawnCwdTests {
     }
 }
 
+/// `restoreCwd`, the Swift twin of Rust's `restorable_cwd` test in
+/// `crates/roost-engine/src/application.rs` (#559): a restored tab starts
+/// only where a shell can enter. A directory of mode 000 is still a
+/// directory, which is all `spawnCwd` asks.
+@Suite("LocalClient restore cwd")
+struct LocalClientRestoreCwdTests {
+    private let home = "/roost-test-home"
+
+    private func onDisk(saved: String, projectCwd: String) -> String {
+        LocalClient.restoreCwd(
+            saved: saved, projectCwd: projectCwd, home: home, isEnterable: LocalClient.isEnterable
+        )
+    }
+
+    @Test func aSavedDirectoryNoShellCanEnterRestoresIntoTheProjectsElseHome() throws {
+        // root enters a directory whatever its mode, so there is no
+        // directory here it could not restore into.
+        guard geteuid() != 0 else { return }
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("roost-restore-cwd-\(UUID().uuidString)").path
+        let (saved, project, locked) = (root + "/saved", root + "/project", root + "/locked")
+        for dir in [saved, project, locked] {
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: locked)
+            try? FileManager.default.removeItem(atPath: root)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked)
+
+        #expect(onDisk(saved: saved, projectCwd: project) == saved)
+        #expect(
+            onDisk(saved: locked, projectCwd: project) == project,
+            "a saved directory no shell can enter restores into the project's"
+        )
+        for unenterable in [locked, root + "/gone", ""] {
+            #expect(onDisk(saved: locked, projectCwd: unenterable) == home, "\(unenterable)")
+        }
+    }
+
+    @Test func thePredicateDecidesWhatCounts() {
+        func resolve(_ isEnterable: (String) -> Bool) -> String {
+            LocalClient.restoreCwd(
+                saved: "/saved", projectCwd: "/project", home: home, isEnterable: isEnterable
+            )
+        }
+        #expect(resolve { _ in true } == "/saved")
+        #expect(resolve { $0 == "/project" } == "/project")
+        #expect(resolve { _ in false } == home)
+    }
+}
+
 /// `ensureDefaultProject` gives a new project the requested cwd only if it
 /// is a directory. PTY-free: finding or creating a project spawns nothing.
 @MainActor

@@ -2441,9 +2441,11 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 // or a state.json predating tab persistence — seeds a
                 // single tab. Eager (not lazy-on-select) so `tab list`
                 // and screenshots reflect every project's tabs, and so
-                // the Mac and iced builds restore identically. Each open
-                // selects its tab as it lands, so `LayoutRestore` puts
-                // back each project's remembered tab and the saved
+                // the Mac and iced builds restore identically. A saved
+                // directory a shell can no longer enter restores into the
+                // project's (`restoreCwd`), so every saved tab opens. Each
+                // open selects its tab as it lands, so `LayoutRestore`
+                // puts back each project's remembered tab and the saved
                 // selection once all of them have.
                 if let workspace = RoostBackend.shared.workspace {
                     let layoutRestore = LayoutRestore(workspace: workspace, layout: restore)
@@ -2452,7 +2454,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                         open: { projectID, tab, settled in
                             let session = self.openTab(
                                 inProject: projectID,
-                                cwd: tab.cwd,
+                                cwd: LocalClient.restoreCwd(
+                                    saved: tab.cwd,
+                                    projectCwd: workspace.project(projectID)?.cwd ?? ""
+                                ),
                                 title: tab.title,
                                 userTitled: tab.userTitled,
                                 onOpened: settled

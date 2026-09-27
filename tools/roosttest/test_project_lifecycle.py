@@ -63,8 +63,8 @@ import uuid
 import pytest
 
 import ui
-from client import RoostError, scaled_timeout
-from util import roostctl_path, wait_shell_ready, wait_tab_attached
+from client import Roost, RoostError, scaled_timeout
+from util import roostctl_path, skip_on_ci, wait_shell_ready, wait_tab_attached
 
 
 def _project_ids(roost) -> list[int]:
@@ -471,6 +471,65 @@ def test_tab_open_in_a_directory_the_shell_cannot_enter_closes_the_tab(roost, ta
     finally:
         locked.chmod(0o755)
         _cleanup_project(roost, pid)
+
+
+def test_a_restored_tab_in_a_directory_the_shell_cannot_enter_keeps_its_project(
+    roost, target, tmp_path
+):
+    """The restore half of the test above (#559). A saved tab whose
+    directory can no longer be entered comes back in its project's cwd,
+    so a project whose only tab it is survives the relaunch. Restoring it
+    where it was saved would fail its spawn, and closing a project's last
+    tab deletes the project. On both targets."""
+    if os.geteuid() == 0:
+        pytest.skip("root enters a directory whatever its mode, so none is locked to it")
+    if ui.owned_session_config_path() is None:
+        pytest.skip(
+            "quit + relaunch would close a developer's own UI; requires a "
+            "harness-owned instance (--roost-fresh / ROOST_TEST_FRESH=1)"
+        )
+    skip_on_ci(
+        "quit + relaunch is unreliable on CI: iced xvfb has no WM, and the slow "
+        "macOS LaunchServices respawn pushes wait_alive past its 90s budget",
+        alt_coverage="test_session.py's restore of an unenterable directory, "
+        "Rust restorable_cwd and Swift LocalClientRestoreCwdTests",
+    )
+    project_cwd = "/usr"
+    pid = roost.create_project(name=f"pytest-restore-locked-{uuid.uuid4().hex[:8]}", cwd=project_cwd)
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    relaunched = None
+    try:
+        wait_tab_attached(roost, roost.open_tab(pid, cwd=str(locked)))
+        locked.chmod(0)
+        roost.close()
+        ui.quit(target)
+        ui.launch(target)
+        relaunched = Roost(ui.socket_path(target))
+
+        def restored() -> list[dict]:
+            project = relaunched.project(pid)
+            return project["tabs"] if project else []
+
+        relaunched._wait(
+            lambda: [tab["cwd"] for tab in restored()] == [project_cwd],
+            15.0,
+            "the project to come back with its one tab, in the project's cwd",
+        )
+        tab_id = int(restored()[0]["id"])
+        wait_tab_attached(relaunched, tab_id)
+        wait_shell_ready(relaunched, tab_id)
+        marker = f"RESTORED_PWD_{uuid.uuid4().hex[:8]}"
+        relaunched.run(tab_id, f"echo {marker}=$(pwd -P)")
+        relaunched.wait_text(tab_id, f"{marker}={os.path.realpath(project_cwd)}", timeout=8)
+    finally:
+        locked.chmod(0o755)
+        if not ui.is_alive(target):
+            ui.launch(target)
+        with Roost(ui.socket_path(target)) as cleanup:
+            _cleanup_project(cleanup, pid)
+        if relaunched is not None:
+            relaunched.close()
 
 
 # -- tab.close active fallback ---------------------------------------------

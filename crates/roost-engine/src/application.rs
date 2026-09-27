@@ -89,6 +89,33 @@ pub fn usable_cwd_or(requested: &str, project_cwd: &str, home: &str) -> String {
         .to_string()
 }
 
+/// Where a restored tab starts: its saved cwd if a shell can enter it,
+/// else the project's cwd if one can, else `$HOME` (#559).
+///
+/// Restore-only. [`usable_cwd`] keeps a directory the shell cannot
+/// enter, so an interactive `tab.open` there fails as it should; a
+/// restore that failed would close the project's only tab, and closing a
+/// project's last tab deletes the project. Every saved tab opening also
+/// keeps the saved positions lined up for the tab each project remembers.
+fn restorable_cwd(saved: &str, project_cwd: &str) -> String {
+    restorable_cwd_or(saved, project_cwd, &crate::home_dir())
+}
+
+/// [`restorable_cwd`] with `$HOME` stated.
+fn restorable_cwd_or(saved: &str, project_cwd: &str, home: &str) -> String {
+    [saved, project_cwd]
+        .into_iter()
+        .find(|cwd| is_enterable(Path::new(cwd)))
+        .unwrap_or(home)
+        .to_string()
+}
+
+/// A directory this user may search, which is what `chdir` needs:
+/// `access(2)`'s `X_OK` on a directory is search permission.
+fn is_enterable(path: &Path) -> bool {
+    path.is_dir() && crate::process::is_executable_by_current_user(path)
+}
+
 /// Where a `tab.open` lands, settled in `params` itself, shared by the
 /// served handler and the facade: `cwd_from_tab` replaces `cwd` before
 /// anything reads it, `ensure_default_project` included, and a `cwd`
@@ -338,8 +365,9 @@ impl OnRestoreError {
 /// `$HOME` — the one restore the UI's launch and a session's start share
 /// (plan 072 §D6).
 ///
-/// Every saved tab comes back as a **fresh shell in its directory**; no
-/// process or scrollback survives. In order:
+/// Every saved tab comes back as a **fresh shell in its directory**, or
+/// where `restorable_cwd` falls back to when a shell can no longer enter
+/// it; no process or scrollback survives. In order:
 ///
 /// 1. Each project with no live tabs re-opens its saved tabs (one tab at
 ///    the project's cwd if it saved none), recording which saved position
@@ -403,7 +431,11 @@ where
         for (position, spec) in specs.into_iter().enumerate() {
             let title_lock =
                 (spec.user_titled && !spec.title.is_empty()).then(|| spec.title.clone());
-            let cwd = spec.cwd.clone();
+            let cwd = restorable_cwd(&spec.cwd, &project.cwd);
+            let spec = RestoreTab {
+                cwd: cwd.clone(),
+                ..spec
+            };
             match open(project.id, spec).await {
                 Ok(tab) => {
                     if let Some(title) = title_lock {
@@ -844,6 +876,57 @@ mod tests {
         assert_eq!(usable_cwd(&gone, &gone), crate::home_dir());
     }
 
+    /// #559: a restored tab starts only where a shell can enter. A
+    /// directory of mode 000 is still a directory, which is all
+    /// [`usable_cwd`] asks.
+    #[test]
+    fn restorable_cwd_is_the_saved_directory_a_shell_can_enter_else_the_projects_else_home() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: a read of the caller's own effective uid.
+        if unsafe { libc::geteuid() } == 0 {
+            // root enters a directory whatever its mode, so there is no
+            // directory here it could not restore into.
+            return;
+        }
+
+        /// Gives a locked directory its mode back, so the temp dir can
+        /// remove it, however the test ends.
+        struct Unlock(PathBuf);
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let [saved, project, locked] = ["saved", "project", "locked"].map(|name| {
+            let path = dir.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            path
+        });
+        let _unlock = Unlock(locked.clone());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let [saved, project, locked] = [saved, project, locked].map(|path| string(&path));
+        let gone = string(&dir.path().join("gone"));
+        let home = "/home-as-given";
+
+        assert_eq!(restorable_cwd_or(&saved, &project, home), saved);
+        assert_eq!(
+            restorable_cwd_or(&locked, &project, home),
+            project,
+            "a saved directory no shell can enter restores into the project's"
+        );
+        for unenterable in [locked.as_str(), gone.as_str(), ""] {
+            assert_eq!(
+                restorable_cwd_or(&locked, unenterable, home),
+                home,
+                "{unenterable:?}"
+            );
+        }
+        assert_eq!(restorable_cwd(&locked, &locked), crate::home_dir());
+    }
+
     /// The request half of #541: a `cwd` that is not a directory is
     /// dropped before anything reads it, `ensure_default_project`
     /// included, whether it was sent as is or beside a `cwd_from_tab`
@@ -935,8 +1018,8 @@ mod tests {
     }
 
     /// `LocalClient::open_tab` without the PTY: the row opens selected,
-    /// and one whose cwd is in `failing` closes again, as a failed spawn
-    /// leaves it.
+    /// and one whose cwd ends in a name in `failing` closes again, as a
+    /// failed spawn leaves it.
     fn open_rows<'a>(
         workspace: &'a Workspace,
         failing: &'a [&'a str],
@@ -946,7 +1029,7 @@ mod tests {
                 .open_tab(project_id, &spec.cwd, &spec.title, true)
                 .map_err(anyhow::Error::from)
                 .and_then(|tab| {
-                    if failing.contains(&spec.cwd.as_str()) {
+                    if failing.iter().any(|name| spec.cwd.ends_with(name)) {
                         let _ = workspace.close_tab(tab.id);
                         anyhow::bail!("the spawn at {} failed", spec.cwd);
                     }
@@ -968,26 +1051,33 @@ mod tests {
     }
 
     /// Saved to `path`: `P1 [tabs…]` showing `viewed` when the user left
-    /// it, then `P2 [/x]`, which is active and was opened last.
+    /// it, then `P2 [/x]`, which is active and was opened last. Each tab
+    /// is a directory made beside `path`, so a restore can enter it, and
+    /// is named by the directory's last component.
     fn save_two_projects(path: &Path, tabs: &[&str], viewed: &str) -> (i64, i64) {
+        let dir = |name: &str| {
+            let dir = path.with_file_name(name.trim_start_matches('/'));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir.to_string_lossy().into_owned()
+        };
         let ws = Workspace::open(path.to_path_buf());
         let p1 = ws.create_project("p1", "/p1").unwrap().id;
-        for cwd in tabs {
-            ws.open_tab(p1, cwd, "", true).unwrap();
+        for name in tabs {
+            ws.open_tab(p1, &dir(name), "", true).unwrap();
         }
         ws.focus_tab(tab_at(&ws, p1, viewed)).unwrap();
         let p2 = ws.create_project("p2", "/p2").unwrap().id;
-        ws.open_tab(p2, "/x", "", true).unwrap();
+        ws.open_tab(p2, &dir("/x"), "", true).unwrap();
         (p1, p2)
     }
 
-    fn tab_at(workspace: &Workspace, project_id: i64, cwd: &str) -> i64 {
+    fn tab_at(workspace: &Workspace, project_id: i64, name: &str) -> i64 {
         workspace
             .snapshot()
             .into_iter()
             .find(|project| project.id == project_id)
-            .and_then(|project| project.tabs.into_iter().find(|tab| tab.cwd == cwd))
-            .unwrap_or_else(|| panic!("no tab at {cwd} in project {project_id}"))
+            .and_then(|project| project.tabs.into_iter().find(|tab| tab.cwd.ends_with(name)))
+            .unwrap_or_else(|| panic!("no tab at {name} in project {project_id}"))
             .id
     }
 
@@ -1062,21 +1152,26 @@ mod tests {
     async fn an_active_tab_that_exits_while_the_rest_restore_falls_back_to_a_live_one() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
+        let dir = |name: &str| {
+            let dir = path.with_file_name(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir.to_string_lossy().into_owned()
+        };
         let p1 = {
             let ws = Workspace::open(path.clone());
             let p1 = ws.create_project("p1", "/p1").unwrap().id;
-            ws.open_tab(p1, "/a", "", true).unwrap();
-            ws.open_tab(p1, "/b", "", true).unwrap();
+            ws.open_tab(p1, &dir("a"), "", true).unwrap();
+            ws.open_tab(p1, &dir("b"), "", true).unwrap();
             let p2 = ws.create_project("p2", "/p2").unwrap().id;
-            ws.open_tab(p2, "/x", "", true).unwrap();
+            ws.open_tab(p2, &dir("x"), "", true).unwrap();
             ws.focus_tab(tab_at(&ws, p1, "/a")).unwrap();
             p1
         };
 
-        let ws = Workspace::open(path);
+        let ws = Workspace::open(path.clone());
         let mut rows = open_rows(&ws, &[]);
         let exits_early = |project_id: i64, spec: RestoreTab| {
-            if spec.cwd == "/x" {
+            if spec.cwd.ends_with("/x") {
                 let _ = ws.close_tab(tab_at(&ws, p1, "/a"));
             }
             rows(project_id, spec)

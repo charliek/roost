@@ -330,6 +330,16 @@ release workflow asserts they agree).
   on Roost-Iced. A `roost-session` restores its own projects' memory the
   same way; one started by an older Roost, still running after an
   upgrade, does so only after it restarts.
+- **Restoring a tab whose directory can't be entered deleted its project
+  (#559)** — on both apps, a saved tab whose directory still exists but
+  that the shell can no longer enter (mode 000, or a permission change
+  since the last run) failed to start at a relaunch and closed, and when
+  it was its project's only tab the project was deleted with it, for
+  good and without a word. A restored tab now starts in its project's
+  directory instead, else in `$HOME`. Opening a tab in such a directory
+  still fails, as before. A `roost-session` restores its own layout the
+  same way; one started by an older Roost, still running after an
+  upgrade, does so only after it restarts.
 
 ## v0.0.20 — 2026-09-20
 
