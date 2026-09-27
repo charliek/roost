@@ -144,6 +144,16 @@ release workflow asserts they agree).
   cwd payload. The Mac copies now also skip redefining a function the
   user already defined under the same name, matching the Rust copies —
   closing #193 on macOS too.
+- **A failed open, close or upload on the local session's slot could say
+  "the host" instead of "the local session" (#555)** — a `tab.open`,
+  `project.create`, `tab.close`, `project.delete` refusal, or a failed
+  paste upload, on the slot a fresh Roost-Iced install runs its local
+  tabs on, now reads as local, matching the title and the other banners
+  plan 071 already localized. A real, saved host's wording is unchanged.
+- **The agents palette tagged the local session's rows "localhost"
+  (#567)** — its rows now carry no host label, like the in-process
+  source. A real host the user actually named "localhost" under
+  in-process mode keeps its own label.
 - **A new tab on a session-backed project could take the window away
   from a tab you clicked while it opened, and one that never appeared
   was dropped silently (#549)** — on the local session and on saved

@@ -2868,6 +2868,7 @@ async fn replay_onto_slot(
             // the *destination's* count, which would rename an
             // `Untitled 2` that moved onto an empty session (§D4).
             serde_json::json!({ "name": project.name, "cwd": project.cwd }),
+            true,
         )
         .await;
         let made = match made {
@@ -2911,6 +2912,7 @@ async fn replay_onto_slot(
                 ops,
                 wire::TAB_OPEN,
                 super::host_tab_open_params(made.id, &cwd, &tab.title, &[], None, grid),
+                true,
             )
             .await;
             let opened = match opened {
@@ -2935,6 +2937,7 @@ async fn replay_onto_slot(
                     ops,
                     wire::TAB_SET_TITLE,
                     serde_json::json!({ "tab_id": opened.id.to_string(), "title": tab.title }),
+                    true,
                 )
                 .await
                 {
@@ -3024,7 +3027,7 @@ async fn delete_dest_projects(
     // somebody else's work, and deleting on the strength of a remembered
     // id is exactly what `rollback_is_still_ours` exists to stop.
     let listed: Result<TabListResult, String> =
-        super::host_call(ops, wire::TAB_LIST, serde_json::json!({})).await;
+        super::host_call(ops, wire::TAB_LIST, serde_json::json!({}), true).await;
     let found = match listed {
         Ok(listed) => tab_counts(&listed.projects),
         Err(error) => {
@@ -3054,6 +3057,7 @@ async fn delete_dest_projects(
             ops,
             wire::PROJECT_DELETE,
             serde_json::json!({ "project_id": id.to_string() }),
+            true,
         )
         .await
         {

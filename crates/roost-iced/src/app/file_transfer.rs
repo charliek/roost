@@ -687,6 +687,7 @@ impl Gestures {
         index: usize,
         result: UploadResult,
         gate: PasteGate,
+        on_slot: bool,
     ) -> Vec<Effect> {
         let Some(lane) = self.lanes.get_mut(&host) else {
             tracing::debug!(
@@ -733,7 +734,7 @@ impl Gestures {
             return Vec::new();
         };
         let mut effects = match failure {
-            Some((name, error)) => finish_failed(finished, name, error),
+            Some((name, error)) => finish_failed(finished, name, error, on_slot),
             None => finish_pasted(finished, gate),
         };
         effects.extend(self.start_head(host));
@@ -895,9 +896,9 @@ fn first_name(sent: &[Sent]) -> Option<String> {
 
 /// Upload `name` failed: nothing is pasted, the files already up there
 /// stay (harmless, swept at stop), and the line names the file.
-fn finish_failed(active: Active, name: String, error: HostOpError) -> Vec<Effect> {
+fn finish_failed(active: Active, name: String, error: HostOpError, on_slot: bool) -> Vec<Effect> {
     let Gesture { label, reply, .. } = active.gesture;
-    let line = status::failed(&name, &label, &error.to_string());
+    let line = status::failed(&name, &label, &super::host_op_error_text(&error, on_slot));
     answer(reply, GestureOutcome::Failed { name, error });
     vec![Effect::Status(line)]
 }
@@ -1122,7 +1123,10 @@ impl super::App {
             Some(tab) => paste_gate(&self.transfer_facts(tab)),
             None => PasteGate::TabClosed,
         };
-        let effects = self.gestures.settled(host, gesture, index, result, gate);
+        let on_slot = self.is_local_slot(host);
+        let effects = self
+            .gestures
+            .settled(host, gesture, index, result, gate, on_slot);
         self.run_transfer_effects(effects)
     }
 
@@ -1541,6 +1545,7 @@ mod tests {
             0,
             landed("/files/a.txt", 1),
             PasteGate::Disconnected,
+            false,
         );
         assert!(pastes(&effects).is_empty(), "nothing reaches a dead link");
         assert_eq!(
@@ -1579,6 +1584,7 @@ mod tests {
             0,
             landed("/home/me/.cache/roost-session/files/ab/shot.png", 4),
             PasteGate::Ready,
+            false,
         );
         assert_eq!(
             pastes(&effects),
@@ -1606,11 +1612,25 @@ mod tests {
         );
         assert_eq!(started(&effects), vec![(host(3), id, 0, "a.txt".into())]);
 
-        let effects = gestures.settled(host(3), id, 0, landed("/files/a.txt", 1), PasteGate::Ready);
+        let effects = gestures.settled(
+            host(3),
+            id,
+            0,
+            landed("/files/a.txt", 1),
+            PasteGate::Ready,
+            false,
+        );
         assert!(pastes(&effects).is_empty(), "nothing pastes mid-gesture");
         assert_eq!(started(&effects), vec![(host(3), id, 1, "b.txt".into())]);
 
-        let effects = gestures.settled(host(3), id, 1, landed("/files/b.txt", 2), PasteGate::Ready);
+        let effects = gestures.settled(
+            host(3),
+            id,
+            1,
+            landed("/files/b.txt", 2),
+            PasteGate::Ready,
+            false,
+        );
         assert_eq!(
             pastes(&effects),
             vec![(key, "/files/a.txt\n/files/b.txt".to_string())]
@@ -1658,6 +1678,7 @@ mod tests {
             0,
             landed("/files/a.txt", 1),
             PasteGate::Ready,
+            false,
         );
         assert_eq!(
             started(&effects),
@@ -1702,6 +1723,7 @@ mod tests {
             0,
             landed("/files/a.txt", 1),
             PasteGate::Ready,
+            false,
         );
         let next = started(&effects);
         let [(_, _, _, name)] = next.as_slice() else {
@@ -1849,6 +1871,7 @@ mod tests {
             0,
             landed("/files/a.txt", 1),
             PasteGate::Ready,
+            false,
         );
         let effects = gestures.settled(
             host(3),
@@ -1859,6 +1882,7 @@ mod tests {
                 message: "over the 10 MiB limit".into(),
             }),
             PasteGate::Ready,
+            false,
         );
         assert!(pastes(&effects).is_empty(), "an all-or-nothing gesture");
         assert_eq!(
@@ -1871,6 +1895,36 @@ mod tests {
         assert_eq!(
             started(&effects),
             vec![(host(3), second, 0, "d.txt".into())]
+        );
+    }
+
+    /// #555: a failed upload on the session slot says "the local
+    /// session", never "the host" — `finish_failed`'s own wording, not
+    /// the wire's `HostOpError` echoed verbatim.
+    #[test]
+    fn a_failed_upload_on_the_slot_reads_as_local() {
+        let mut gestures = Gestures::default();
+        let (id, _) = begun(
+            &mut gestures,
+            tab(3, 7),
+            "workbox",
+            &[("a.txt", "/tmp/a.txt", 1)],
+            None,
+        );
+        let effects = gestures.settled(
+            host(3),
+            id,
+            0,
+            Err(HostOpError::Disconnected),
+            PasteGate::Ready,
+            true,
+        );
+        assert_eq!(
+            statuses(&effects),
+            vec![
+                "Could not send a.txt to workbox: the local session disconnected before this ran"
+                    .to_string()
+            ]
         );
     }
 
@@ -1890,6 +1944,7 @@ mod tests {
             0,
             landed("/files/a.txt", 1),
             PasteGate::Frozen("this session ended — start a new session to paste"),
+            false,
         );
         assert!(pastes(&effects).is_empty());
         assert_eq!(
@@ -1914,6 +1969,7 @@ mod tests {
             0,
             landed("/files/a.txt", 1),
             PasteGate::Reconnected,
+            false,
         );
         assert!(pastes(&effects).is_empty());
         assert_eq!(
@@ -1933,13 +1989,27 @@ mod tests {
             None,
         );
         assert!(gestures
-            .settled(host(3), id, 4, landed("/files/x", 1), PasteGate::Ready)
+            .settled(
+                host(3),
+                id,
+                4,
+                landed("/files/x", 1),
+                PasteGate::Ready,
+                false
+            )
             .is_empty());
         assert!(gestures
-            .settled(host(3), id + 99, 0, landed("/files/x", 1), PasteGate::Ready)
+            .settled(
+                host(3),
+                id + 99,
+                0,
+                landed("/files/x", 1),
+                PasteGate::Ready,
+                false
+            )
             .is_empty());
         assert!(gestures
-            .settled(HOST, id, 0, landed("/files/x", 1), PasteGate::Ready)
+            .settled(HOST, id, 0, landed("/files/x", 1), PasteGate::Ready, false)
             .is_empty());
         assert_eq!(gestures.active_tab(host(3), id), Some(tab(3, 7)));
     }
@@ -1993,6 +2063,7 @@ mod tests {
             0,
             Err(HostOpError::Disconnected),
             PasteGate::Ready,
+            false,
         );
         assert!(matches!(
             outcome(&mut rx),
@@ -2018,7 +2089,7 @@ mod tests {
                 &[("a.txt", "/tmp/a.txt", 1)],
                 Some(tx),
             );
-            gestures.settled(host(3), id, 0, landed("/files/a.txt", 1), gate);
+            gestures.settled(host(3), id, 0, landed("/files/a.txt", 1), gate, false);
             assert!(
                 matches!(outcome(&mut rx), GestureOutcome::Lost { reason, .. } if reason == expected),
                 "{gate:?} must answer {expected:?}"
@@ -2035,7 +2106,14 @@ mod tests {
             &[("a.txt", "/tmp/a.txt", 1)],
             Some(tx),
         );
-        run_answers(gestures.settled(host(3), id, 0, landed("/files/a.txt", 1), PasteGate::Ready));
+        run_answers(gestures.settled(
+            host(3),
+            id,
+            0,
+            landed("/files/a.txt", 1),
+            PasteGate::Ready,
+            false,
+        ));
         let GestureOutcome::Pasted {
             text,
             uploads,
@@ -2073,7 +2151,14 @@ mod tests {
             &[("a.txt", "/tmp/a.txt", 1)],
             Some(tx),
         );
-        let effects = gestures.settled(host(3), id, 0, landed("/files/a.txt", 1), PasteGate::Ready);
+        let effects = gestures.settled(
+            host(3),
+            id,
+            0,
+            landed("/files/a.txt", 1),
+            PasteGate::Ready,
+            false,
+        );
 
         let order: Vec<&str> = effects
             .iter()
@@ -2256,6 +2341,7 @@ mod tests {
             0,
             landed("/home/remote/.cache/roost-session/files/ab/shot.png", 1),
             PasteGate::Ready,
+            false,
         );
         let landed_pastes = pastes(&effects);
         let [(pasted, text)] = landed_pastes.as_slice() else {
@@ -2309,6 +2395,7 @@ mod tests {
             0,
             landed("/files/roost-image-1-0123456789abcdef.png", 2048),
             PasteGate::Ready,
+            false,
         );
         assert_eq!(
             pastes(&effects),

@@ -2175,7 +2175,7 @@ impl App {
                 .map(|view| agent_palette::AgentSource {
                     projects: &view.projects,
                     host: view.host,
-                    label: Some(view.label.as_str()),
+                    label: agent_source_label(&view.label, self.is_local_slot(view.host)),
                 }),
         );
         sources
@@ -2407,6 +2407,14 @@ impl App {
     }
 }
 
+/// [`App::agent_sources`]'s label for one host view (#567): the session
+/// slot reads as local everywhere else (plan 071 D8), so its agent rows
+/// carry no host label either. A real host the user named "localhost"
+/// under in-process mode keeps its own.
+fn agent_source_label(label: &str, on_slot: bool) -> Option<&str> {
+    (!on_slot).then_some(label)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2418,6 +2426,15 @@ mod tests {
         mode: roost_ipc::LocalBackendMode::InProcess,
         slot_saved_id: None,
     };
+
+    /// #567: the slot's agent rows carry no host label, and a real host
+    /// the user actually named "localhost" (under in-process mode) keeps
+    /// its own.
+    #[test]
+    fn agent_source_label_drops_only_for_the_slot() {
+        assert_eq!(agent_source_label("localhost", true), None);
+        assert_eq!(agent_source_label("localhost", false), Some("localhost"));
+    }
 
     /// Every row that dispatches an engine op dismisses the palette
     /// first, so a synchronous version of it would have read this exact

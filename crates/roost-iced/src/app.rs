@@ -1286,8 +1286,9 @@ async fn host_call<T: serde::de::DeserializeOwned>(
     ops: &crate::host_conn::HostOps,
     op: &'static str,
     params: serde_json::Value,
+    on_slot: bool,
 ) -> Result<T, String> {
-    host_reply(op, ops.call(op, params).await)
+    host_reply(op, ops.call(op, params).await, on_slot)
 }
 
 /// [`host_call`]'s reading of a reply, for a caller that has to look at
@@ -1295,8 +1296,9 @@ async fn host_call<T: serde::de::DeserializeOwned>(
 fn host_reply<T: serde::de::DeserializeOwned>(
     op: &str,
     reply: Result<serde_json::Value, crate::host_conn::HostOpError>,
+    on_slot: bool,
 ) -> Result<T, String> {
-    let value = reply.map_err(|error| format!("{op}: {error}"))?;
+    let value = reply.map_err(|error| format!("{op}: {}", host_op_error_text(&error, on_slot)))?;
     serde_json::from_value(value).map_err(|error| format!("{op} answered unexpectedly: {error}"))
 }
 
@@ -1350,12 +1352,14 @@ fn host_op_error_text(error: &crate::host_conn::HostOpError, on_slot: bool) -> S
 async fn create_host_project_flow(
     ops: crate::host_conn::HostOps,
     grid: (u16, u16),
+    on_slot: bool,
 ) -> Result<(i64, i64), String> {
     use roost_ipc::messages::{ops as wire, ProjectCreateResult, TabOpenResult};
     let created: ProjectCreateResult = host_call(
         &ops,
         wire::PROJECT_CREATE,
         serde_json::json!({ "name": "", "cwd": "" }),
+        on_slot,
     )
     .await?;
     let project = created.project;
@@ -1363,12 +1367,15 @@ async fn create_host_project_flow(
         &ops,
         wire::TAB_OPEN,
         host_tab_open_params(project.id, &project.cwd, "", &[], None, grid),
+        on_slot,
     )
     .await;
     match opened {
         Ok(opened) => Ok((project.id, opened.tab.id)),
         Err(error) => {
-            if let Err(rollback_error) = roll_back_empty_host_project(&ops, project.id).await {
+            if let Err(rollback_error) =
+                roll_back_empty_host_project(&ops, project.id, on_slot).await
+            {
                 tracing::warn!(
                     project_id = project.id,
                     %rollback_error,
@@ -1386,9 +1393,11 @@ async fn create_host_project_flow(
 async fn roll_back_empty_host_project(
     ops: &crate::host_conn::HostOps,
     project_id: i64,
+    on_slot: bool,
 ) -> Result<(), String> {
     use roost_ipc::messages::{ops as wire, TabListResult};
-    let listed: TabListResult = host_call(ops, wire::TAB_LIST, serde_json::json!({})).await?;
+    let listed: TabListResult =
+        host_call(ops, wire::TAB_LIST, serde_json::json!({}), on_slot).await?;
     match listed.projects.iter().find(|p| p.id == project_id) {
         None => Ok(()),
         Some(project) if !project.tabs.is_empty() => {
@@ -1403,6 +1412,7 @@ async fn roll_back_empty_host_project(
             ops,
             wire::PROJECT_DELETE,
             serde_json::json!({ "project_id": project_id.to_string() }),
+            on_slot,
         )
         .await
         .map(|_| ()),
@@ -1423,6 +1433,7 @@ async fn host_remove_call<T>(
     params: serde_json::Value,
     removed: T,
     already_gone: T,
+    on_slot: bool,
 ) -> Result<T, String> {
     match ops.call(op, params).await {
         Ok(_) => Ok(removed),
@@ -1430,7 +1441,7 @@ async fn host_remove_call<T>(
             code: roost_ipc::client::ServerCode::NotFound,
             ..
         }) => Ok(already_gone),
-        Err(error) => Err(format!("{op}: {error}")),
+        Err(error) => Err(format!("{op}: {}", host_op_error_text(&error, on_slot))),
     }
 }
 
@@ -1440,6 +1451,7 @@ async fn host_remove_call<T>(
 async fn close_host_tab_flow(
     ops: crate::host_conn::HostOps,
     tab_id: i64,
+    on_slot: bool,
 ) -> Result<CloseTabOutcome, String> {
     host_remove_call(
         &ops,
@@ -1447,6 +1459,7 @@ async fn close_host_tab_flow(
         serde_json::json!({ "tab_id": tab_id.to_string() }),
         CloseTabOutcome::Closed,
         CloseTabOutcome::AlreadyGone,
+        on_slot,
     )
     .await
 }
@@ -1455,6 +1468,7 @@ async fn close_host_tab_flow(
 async fn delete_host_project_flow(
     ops: crate::host_conn::HostOps,
     project_id: i64,
+    on_slot: bool,
 ) -> Result<DeleteProjectOutcome, String> {
     host_remove_call(
         &ops,
@@ -1462,6 +1476,7 @@ async fn delete_host_project_flow(
         serde_json::json!({ "project_id": project_id.to_string() }),
         DeleteProjectOutcome::Deleted,
         DeleteProjectOutcome::AlreadyGone,
+        on_slot,
     )
     .await
 }
@@ -1513,6 +1528,7 @@ async fn open_host_tab_flow(
     title: String,
     argv: Vec<String>,
     grid: (u16, u16),
+    on_slot: bool,
 ) -> Result<i64, String> {
     use crate::host_conn::HostOpError;
     use roost_ipc::client::ServerCode;
@@ -1545,7 +1561,7 @@ async fn open_host_tab_flow(
         }
         reply => reply,
     };
-    let opened: TabOpenResult = host_reply(wire::TAB_OPEN, reply)?;
+    let opened: TabOpenResult = host_reply(wire::TAB_OPEN, reply, on_slot)?;
     Ok(opened.tab.id)
 }
 
@@ -6811,9 +6827,12 @@ impl App {
         let grid = self.current_grid();
         let op = self.take_host_op_id(project.host, local_backend::HostOpKind::Other);
         let focus_generation = self.focus_generation;
+        let on_slot = self.is_local_slot(project.host);
         EngineDispatch {
             task: self.engine_op(
-                async move { open_host_tab_flow(ops, project, origin, title, argv, grid).await },
+                async move {
+                    open_host_tab_flow(ops, project, origin, title, argv, grid, on_slot).await
+                },
                 move |result| EngineOpResult::TabOpened {
                     op,
                     project,
@@ -6836,9 +6855,10 @@ impl App {
         let grid = self.current_grid();
         let op = self.take_host_op_id(host, local_backend::HostOpKind::Create);
         let focus_generation = self.focus_generation;
+        let on_slot = self.is_local_slot(host);
         EngineDispatch {
             task: self.engine_op(
-                async move { create_host_project_flow(ops, grid).await },
+                async move { create_host_project_flow(ops, grid, on_slot).await },
                 move |result| EngineOpResult::ProjectCreated {
                     op,
                     focus_generation,
@@ -7063,8 +7083,9 @@ impl App {
             };
             let host_project_id = project.project;
             let op = self.take_host_op_id(project.host, local_backend::HostOpKind::Other);
+            let on_slot = self.is_local_slot(project.host);
             return self.engine_op(
-                async move { delete_host_project_flow(ops, host_project_id).await },
+                async move { delete_host_project_flow(ops, host_project_id, on_slot).await },
                 move |result| EngineOpResult::ProjectDeleted {
                     op,
                     project,
@@ -7125,9 +7146,10 @@ impl App {
         };
         let op = self.take_host_op_id(tab.host, local_backend::HostOpKind::Other);
         let tab_id = tab.tab;
+        let on_slot = self.is_local_slot(tab.host);
         EngineDispatch {
             task: self.engine_op(
-                async move { close_host_tab_flow(ops, tab_id).await },
+                async move { close_host_tab_flow(ops, tab_id, on_slot).await },
                 move |result| EngineOpResult::TabClosed { op, tab, result },
             ),
             op: Some(op),
@@ -10341,6 +10363,76 @@ mod tests {
         );
     }
 
+    /// #555: `host_call`/`host_reply` format a refusal through
+    /// [`host_op_error_text`] rather than the `HostOpError`'s own
+    /// `Display`, so the slot's wording matches every other banner. A
+    /// real host's text is byte-identical to before.
+    #[test]
+    fn host_reply_localizes_only_on_the_slot() {
+        use crate::host_conn::HostOpError;
+
+        let real: Result<serde_json::Value, String> =
+            host_reply("tab.open", Err(HostOpError::Disconnected), false);
+        assert_eq!(
+            real.unwrap_err(),
+            "tab.open: the host disconnected before this ran"
+        );
+        let slot: Result<serde_json::Value, String> =
+            host_reply("tab.open", Err(HostOpError::Disconnected), true);
+        assert_eq!(
+            slot.unwrap_err(),
+            "tab.open: the local session disconnected before this ran"
+        );
+    }
+
+    /// #555's `host_remove_call` twin: its own `Err` arm formatted the
+    /// `HostOpError`'s `Display` directly, so the slot's close/delete
+    /// refusals still said "the host". A real host's text is
+    /// byte-identical.
+    #[tokio::test]
+    async fn host_remove_call_localizes_only_on_the_slot() {
+        use crate::host_conn::HostOpError;
+
+        let (ops, mut rx) = crate::host_conn::HostOps::channel();
+        let worker = tokio::spawn(async move {
+            let call = rx.recv().await.expect("op sent");
+            call.answer(Err(HostOpError::Disconnected));
+        });
+        let error = host_remove_call(
+            &ops,
+            "tab.close",
+            serde_json::json!({}),
+            "removed",
+            "gone",
+            true,
+        )
+        .await
+        .expect_err("the host refused");
+        assert_eq!(
+            error,
+            "tab.close: the local session disconnected before this ran"
+        );
+        worker.await.expect("the mock host task must not panic");
+
+        let (ops, mut rx) = crate::host_conn::HostOps::channel();
+        let worker = tokio::spawn(async move {
+            let call = rx.recv().await.expect("op sent");
+            call.answer(Err(HostOpError::Disconnected));
+        });
+        let error = host_remove_call(
+            &ops,
+            "tab.close",
+            serde_json::json!({}),
+            "removed",
+            "gone",
+            false,
+        )
+        .await
+        .expect_err("the host refused");
+        assert_eq!(error, "tab.close: the host disconnected before this ran");
+        worker.await.expect("the mock host task must not panic");
+    }
+
     #[test]
     fn terminal_geometry_never_produces_zero_grid() {
         let size = Size::new(1.0, 1.0);
@@ -11815,7 +11907,7 @@ mod tests {
             );
         });
 
-        let error = create_host_project_flow(ops, SPAWN_GRID)
+        let error = create_host_project_flow(ops, SPAWN_GRID, false)
             .await
             .expect_err("the tab.open failed");
         assert!(error.contains("no such directory"), "{error}");
@@ -11842,7 +11934,7 @@ mod tests {
         use roost_ipc::messages::{ops as wire, ProjectCreateResult, Tab, TabListResult, TabState};
 
         let (ops, mut rx) = crate::host_conn::HostOps::channel();
-        let flow = tokio::spawn(create_host_project_flow(ops, SPAWN_GRID));
+        let flow = tokio::spawn(create_host_project_flow(ops, SPAWN_GRID, false));
 
         let create = rx.recv().await.expect("project.create sent");
         create.answer(Ok(serde_json::to_value(ProjectCreateResult {
@@ -11920,7 +12012,7 @@ mod tests {
         // worker that already exited would silently swallow a stray
         // call rather than exposing it.
         let (ops, mut rx) = crate::host_conn::HostOps::channel();
-        let flow = tokio::spawn(create_host_project_flow(ops, SPAWN_GRID));
+        let flow = tokio::spawn(create_host_project_flow(ops, SPAWN_GRID, false));
 
         let create = rx.recv().await.expect("project.create sent");
         assert_eq!(create.op, wire::PROJECT_CREATE);
@@ -12127,7 +12219,8 @@ mod tests {
             sent
         });
         let argv = argv.iter().map(|arg| arg.to_string()).collect();
-        let result = open_host_tab_flow(ops, project, origin, title.into(), argv, SPAWN_GRID).await;
+        let result =
+            open_host_tab_flow(ops, project, origin, title.into(), argv, SPAWN_GRID, false).await;
         (
             result,
             session.await.expect("the stand-in session must not panic"),
