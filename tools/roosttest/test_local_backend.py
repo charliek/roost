@@ -1520,6 +1520,56 @@ def test_a_relaunch_under_session_reattaches_the_same_tabs(lane: Lane):
     )
 
 
+def test_an_in_process_relaunch_keeps_the_tab_each_project_last_showed(lane: Lane):
+    """Plan 072 §D6 (#565): an in-process project remembers its tab.
+
+    `P1 [a b c]` is left on `b`. A relaunch re-opens every tab, and each
+    open selects the tab it opens, so without the saved memory `P1` comes
+    back on `c`. Closing `P2`'s only tab while it is shown removes `P2`,
+    and the selection falls back onto `P1`'s remembered tab.
+
+    `P1` is kept off the first row: the harness's readiness probe opens
+    and closes a tab in the first project at every launch, which moves
+    that project's memory and the selection with it. The Swift half
+    (plan 072 C15) is not reachable from this lane, which is iced-only.
+    """
+    dirs = {name: _ROOT / "d6" / name for name in ("a", "b", "c", "x")}
+    for path in dirs.values():
+        path.mkdir(parents=True, exist_ok=True)
+    roost = lane.start("in-process")
+    p1 = roost.create_project(name="p1", cwd=str(dirs["a"]))
+    opened = {name: roost.open_tab(p1, cwd=str(dirs[name])) for name in ("a", "b", "c")}
+    roost.focus(opened["b"])
+    p2 = roost.create_project(name="p2", cwd=str(dirs["x"]))
+    roost.open_tab(p2, cwd=str(dirs["x"]))
+    assert int(roost.list()[0]["id"]) not in (p1, p2), roost.list()
+
+    ui.quit(lane.target)
+    roost = lane.restart()
+    assert roost.identify()["local_backend"] == "in-process"
+
+    def restored(project_id: int) -> list[dict]:
+        project = roost.project(project_id)
+        assert project is not None, roost.list()
+        return project["tabs"]
+
+    wait_until(
+        lambda: [t["cwd"] for t in restored(p1)] == [str(dirs[n]) for n in ("a", "b", "c")]
+        and len(restored(p2)) == 1,
+        30.0,
+        "both projects' tabs to reopen in order",
+    )
+    b, c = (int(t["id"]) for t in restored(p1)[1:])
+    x = int(restored(p2)[0]["id"])
+
+    roost.focus(x)
+    roost.close_tab(x)
+    active = roost.identify()
+    assert (active["active_project_id"], active["active_tab_id"]) == (p1, b), (
+        f"P1 must come back on b ({b}), the tab it last showed, not c ({c})"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 6. §D10: what `roostctl` and a hook reach on the UI socket under `session`
 # ---------------------------------------------------------------------------

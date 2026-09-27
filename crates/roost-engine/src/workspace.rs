@@ -125,11 +125,13 @@ struct TabRow {
 struct Inner {
     projects: BTreeMap<i64, ProjectRow>,
     tabs: BTreeMap<i64, TabRow>,
-    /// Last selected live tab per project. This is runtime navigation state,
-    /// not a second workspace authority: every write happens alongside the
-    /// global active selection under this same lock. Only the globally-active
-    /// project position is persisted today, matching the existing restoration
-    /// contract; other projects rebuild their preference as tabs are restored.
+    /// Last selected live tab per project. This is navigation state, not a
+    /// second workspace authority: every write happens alongside the global
+    /// active selection under this same lock, except through
+    /// [`Workspace::restore_preferred_tab`], whose one caller, the
+    /// engine's restore, re-selects the saved active pair right after.
+    /// Persisted per project as `ProjectSnapshot::last_tab_position`
+    /// (plan 072 §D6).
     active_tabs_by_project: BTreeMap<i64, i64>,
     next_id: i64,
     active_project_id: i64,
@@ -277,11 +279,20 @@ pub struct RestoreLayout {
     pub active_tab_position: i32,
 }
 
+impl RestoreLayout {
+    pub fn project(&self, project_id: i64) -> Option<&RestoreProject> {
+        self.projects.iter().find(|p| p.project_id == project_id)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestoreProject {
     pub project_id: i64,
     /// Tabs in display (position) order.
     pub tabs: Vec<RestoreTab>,
+    /// Index into `tabs` of the tab the project last showed, if it
+    /// remembered one.
+    pub last_tab_position: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -897,6 +908,7 @@ impl Workspace {
                     RestoreProject {
                         project_id: p.id,
                         tabs: tabs.into_iter().map(|(_, t)| t).collect(),
+                        last_tab_position: p.last_tab_position,
                     }
                 })
                 .collect(),
@@ -1274,6 +1286,22 @@ impl Workspace {
     /// selection policy remains authoritative and toolkit-neutral.
     pub fn preferred_tab(&self, project_id: i64) -> Option<i64> {
         self.inner.lock().unwrap().preferred_tab(project_id)
+    }
+
+    /// Make `tab_id` the tab its project remembers, without selecting it.
+    ///
+    /// A restore's setter, and silent on purpose: no event, because no
+    /// selection moved, and no write, because a restore sets one per
+    /// project and then persists once ([`Workspace::write_through`]).
+    pub(crate) fn restore_preferred_tab(&self, tab_id: i64) -> Result<(), WorkspaceError> {
+        let mut inner = self.inner.lock().unwrap();
+        let project_id = inner
+            .tabs
+            .get(&tab_id)
+            .ok_or(WorkspaceError::TabNotFound(tab_id))?
+            .project_id;
+        inner.active_tabs_by_project.insert(project_id, tab_id);
+        Ok(())
     }
 
     /// Ensure a default project exists; return its id. Used by
@@ -2283,6 +2311,14 @@ impl Workspace {
         self.persist_guard.lock().unwrap().error.clone()
     }
 
+    /// Write the current layout through, as a commit would, with no
+    /// event: for a caller whose changes are silent ones, such as
+    /// [`Workspace::restore_preferred_tab`].
+    pub(crate) fn write_through(&self) -> PersistOutcome {
+        let (snapshot, seq) = self.inner.lock().unwrap().snapshot_for_persist();
+        self.persist(seq, &snapshot, false)
+    }
+
     /// Persist the current layout with `fsync` and then freeze further
     /// persistence. Call once on a clean exit (each UI wires it into
     /// its app-quit hook). The `fsync` re-asserts physical durability
@@ -2627,35 +2663,28 @@ impl Inner {
     /// holds — so it strictly reflects commit order; `persist()` uses
     /// it to drop stale out-of-order writes (#80). Each project
     /// carries its tab layout (title + cwd + position) so a relaunch
-    /// can re-open the tabs in their saved directories.
+    /// can re-open the tabs in their saved directories, and the tab it
+    /// last showed.
     ///
     /// A project with no live tabs falls back to the retained
-    /// [`Inner::restore_layout`] when one is still un-hydrated, so a
-    /// bootstrap that loads a layout and deliberately does not re-open
-    /// it (the `session` local backend) cannot erase the user's tabs on
-    /// its first commit. The active selection falls back on the same
-    /// terms and for a sharper reason than a lost preference: plan 063
-    /// §D8's forward switch snapshots the in-process layout *including*
-    /// the active project and tab, and holds its fence until the mapped
-    /// active tab is selected and attached — so zeroing this pair
-    /// degrades the migration in exactly the case the migration exists
-    /// for.
+    /// [`Inner::restore_layout`], its remembered tab included, when one
+    /// is still un-hydrated, so a bootstrap that loads a layout and
+    /// deliberately does not re-open it (the `session` local backend)
+    /// cannot erase the user's tabs on its first commit. The active
+    /// selection falls back on the same terms and for a sharper reason
+    /// than a lost preference: plan 063 §D8's forward switch snapshots
+    /// the in-process layout *including* the active project and tab, and
+    /// holds its fence until the mapped active tab is selected and
+    /// attached — so zeroing this pair degrades the migration in exactly
+    /// the case the migration exists for.
     fn snapshot_for_persist(&mut self) -> (SnapshotFile, u64) {
         use crate::persistence::{ProjectSnapshot, TabSnapshot};
         self.persist_seq += 1;
-        // Active tab restored by its DENSE index within the active
-        // project's display-ordered tabs — not the raw `position`
-        // field, which goes sparse after a mid-project close and
-        // wouldn't match the re-opened tabs' contiguous 0..n indices
-        // on restore (the UI selects the nth tab). #95 review.
         let active_tab_position = self
             .tabs
             .get(&self.active_tab_id)
-            .map(|active| {
-                self.tabs_in_display_order(active.project_id)
-                    .into_iter()
-                    .position(|t| t.id == active.id)
-                    .unwrap_or(0) as i32
+            .and_then(|active| {
+                dense_index(&self.tabs_in_display_order(active.project_id), active.id)
             })
             .unwrap_or(0);
         // The selection half of the un-hydrated fallback. Three
@@ -2696,19 +2725,26 @@ impl Inner {
                 .projects
                 .values()
                 .map(|p| {
-                    let mut tabs: Vec<TabSnapshot> = self
-                        .tabs_in_display_order(p.id)
-                        .into_iter()
-                        .map(|t| TabSnapshot {
-                            title: t.title.clone(),
-                            cwd: t.cwd.clone(),
-                            position: t.position,
-                            user_titled: t.user_titled,
-                        })
-                        .collect();
-                    if tabs.is_empty() {
-                        tabs = retained_tabs(self.restore_layout.as_ref(), p.id);
-                    }
+                    let rows = self.tabs_in_display_order(p.id);
+                    let retained = self.restore_layout.as_ref().and_then(|l| l.project(p.id));
+                    let (tabs, last_tab_position) = match retained {
+                        Some(saved) if rows.is_empty() => {
+                            (retained_tabs(saved), saved.last_tab_position)
+                        }
+                        _ => (
+                            rows.iter()
+                                .map(|t| TabSnapshot {
+                                    title: t.title.clone(),
+                                    cwd: t.cwd.clone(),
+                                    position: t.position,
+                                    user_titled: t.user_titled,
+                                })
+                                .collect(),
+                            self.active_tabs_by_project
+                                .get(&p.id)
+                                .and_then(|remembered| dense_index(&rows, *remembered)),
+                        ),
+                    };
                     ProjectSnapshot {
                         id: p.id,
                         name: p.name.clone(),
@@ -2716,6 +2752,7 @@ impl Inner {
                         position: p.position,
                         created_at: p.created_at,
                         tabs,
+                        last_tab_position,
                     }
                 })
                 .collect(),
@@ -2724,33 +2761,32 @@ impl Inner {
     }
 }
 
-/// The saved tab descriptors `layout` still holds for `project_id`, as
-/// persistable snapshots. Empty when the layout was already drained or
-/// never held that project.
+/// Where `tab_id` sits in `rows`, counting from 0 — the index a restore
+/// re-opens it at, whatever sparse `position` it holds now.
+fn dense_index(rows: &[&TabRow], tab_id: i64) -> Option<i32> {
+    rows.iter()
+        .position(|t| t.id == tab_id)
+        .map(|index| index as i32)
+}
+
+/// A retained project's tab descriptors, as persistable snapshots.
 ///
 /// Positions are re-numbered densely from the layout's display order
 /// rather than carried: `RestoreTab` does not keep the raw `position`
 /// (hydration re-opens them at 0..n through `next_tab_position`), so a
 /// dense rewrite is what a hydrating launch would have written anyway.
-fn retained_tabs(
-    layout: Option<&RestoreLayout>,
-    project_id: i64,
-) -> Vec<crate::persistence::TabSnapshot> {
-    layout
-        .and_then(|l| l.projects.iter().find(|p| p.project_id == project_id))
-        .map(|p| {
-            p.tabs
-                .iter()
-                .enumerate()
-                .map(|(index, t)| crate::persistence::TabSnapshot {
-                    title: t.title.clone(),
-                    cwd: t.cwd.clone(),
-                    position: index as i32,
-                    user_titled: t.user_titled,
-                })
-                .collect()
+fn retained_tabs(saved: &RestoreProject) -> Vec<crate::persistence::TabSnapshot> {
+    saved
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(index, t)| crate::persistence::TabSnapshot {
+            title: t.title.clone(),
+            cwd: t.cwd.clone(),
+            position: index as i32,
+            user_titled: t.user_titled,
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn wire_tab(row: &TabRow, is_active: bool) -> Tab {
@@ -4875,6 +4911,73 @@ mod tests {
         assert_eq!(
             rp.tabs.iter().map(|t| t.cwd.as_str()).collect::<Vec<_>>(),
             vec!["/a", "/b"]
+        );
+    }
+
+    /// Plan 072 §D6: each project's remembered tab rides the same
+    /// un-hydrated fallback, so a `session`-mode launch leaves it for the
+    /// in-process launch that hydrates next.
+    #[test]
+    fn an_unhydrated_layout_keeps_each_projects_remembered_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let (first, second) = {
+            let ws = Workspace::open(path.clone());
+            let first = ws.create_project("first", "/first").unwrap().id;
+            ws.open_tab(first, "/a", "a", true).unwrap();
+            let b = ws.open_tab(first, "/b", "b", true).unwrap().id;
+            ws.open_tab(first, "/c", "c", true).unwrap();
+            ws.focus_tab(b).unwrap();
+            let second = ws.create_project("second", "/second").unwrap().id;
+            ws.open_tab(second, "/x", "x", true).unwrap();
+            (first, second)
+        };
+
+        let ws2 = Workspace::open(path.clone());
+        let retained = ws2.retained_layout().expect("a layout the launch keeps");
+        let remembered = |id: i64| retained.project(id).and_then(|p| p.last_tab_position);
+        assert_eq!(remembered(first), Some(1));
+        assert_eq!(remembered(second), Some(0));
+
+        ws2.add_host("box", "ssh://box").unwrap();
+        let on_disk = read_state(&path).unwrap().unwrap();
+        let saved = |id: i64| {
+            on_disk
+                .projects
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .last_tab_position
+        };
+        assert_eq!(
+            (saved(first), saved(second)),
+            (Some(1), Some(0)),
+            "an unrelated commit over an un-hydrated layout erased the remembered tabs"
+        );
+    }
+
+    #[test]
+    fn each_project_writes_its_remembered_tab_as_a_dense_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let ws = Workspace::open(path.clone());
+        let first = ws.create_project("first", "/first").unwrap().id;
+        let a = ws.open_tab(first, "/a", "a", true).unwrap().id;
+        ws.open_tab(first, "/b", "b", true).unwrap();
+        let c = ws.open_tab(first, "/c", "c", true).unwrap().id;
+        ws.open_tab(first, "/d", "d", true).unwrap();
+        ws.close_tab(a).unwrap();
+        ws.focus_tab(c).unwrap();
+        assert_eq!(ws.tab(c).unwrap().position, 2, "the precondition: sparse");
+        let second = ws.create_project("second", "/second").unwrap().id;
+        ws.open_tab(second, "/x", "x", true).unwrap();
+
+        let on_disk = read_state(&path).unwrap().unwrap();
+        let saved = on_disk.projects.iter().find(|p| p.id == first).unwrap();
+        assert_eq!(
+            saved.last_tab_position,
+            Some(1),
+            "/c is the second of [/b /c /d]: {saved:?}"
         );
     }
 

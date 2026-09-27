@@ -27,7 +27,8 @@ use roost_engine::process::{self, ProcessRequest};
 use roost_engine::session::{InputCapture, TabOutput, TabSession};
 use roost_engine::single_instance::InstanceLocks;
 use roost_engine::{
-    LocalClient, PtySupervisor, RestoreTab, Workspace, WorkspaceError, WorkspaceEvent,
+    Hydration, LocalClient, OnRestoreError, PtySupervisor, Workspace, WorkspaceError,
+    WorkspaceEvent,
 };
 use roost_ipc::agent;
 use roost_ipc::messages::{
@@ -10120,96 +10121,20 @@ fn hydrate_workspace(
     runtime.block_on(hydrate_local_workspace(client, grid))
 }
 
-/// Bring the in-process workspace up: seed it if it is empty, open the
-/// saved tabs of every project that has none, and restore the selection.
-///
-/// **Two callers, one spelling** — the launch under `in-process`, and
-/// the reverse switch (plan 063 §D8), which is a launch of this
-/// workspace in every respect that matters. Coming back from `session`
-/// over a `state.json` the session-mode launch loaded but deliberately
-/// did **not** hydrate leaves project rows carrying no live tabs, and a
-/// reverse that only counted projects would hand the user a band of
-/// empty rows — then a forward switch would snapshot those empty tab
-/// lists and delete the originals for good.
-///
-/// The `tabs.is_empty()` guard is what makes it safe to run twice. At
-/// bootstrap it is true of every project, so this is byte-for-byte the
-/// launch behaviour it replaced; on a reverse it is true of exactly the
-/// rows that need shells, and `take_restore_layout` being a one-shot
-/// means a second pass finds nothing to restore and adds nothing.
-async fn hydrate_local_workspace(client: &LocalClient, (cols, rows): (u16, u16)) -> Result<()> {
-    let mut projects = client.list_projects().await?;
-    if projects.is_empty() {
-        let cwd = roost_engine::home_dir();
-        projects.push(client.create_project("", &cwd).await?);
-    }
-    let restore = client.workspace.take_restore_layout();
-    for project in &projects {
-        if !project.tabs.is_empty() {
-            continue;
-        }
-        let saved = restore
-            .as_ref()
-            .and_then(|layout| {
-                layout
-                    .projects
-                    .iter()
-                    .find(|item| item.project_id == project.id)
-            })
-            .map(|item| item.tabs.as_slice())
-            .unwrap_or(&[]);
-        let fallback;
-        let specs = if saved.is_empty() {
-            fallback = vec![RestoreTab {
-                cwd: project.cwd.clone(),
-                title: String::new(),
-                user_titled: false,
-            }];
-            fallback.as_slice()
-        } else {
-            saved
-        };
-        for spec in specs {
-            match client
-                .open_tab(
-                    project.id,
-                    &spec.cwd,
-                    &spec.title,
-                    &[],
-                    u32::from(cols),
-                    u32::from(rows),
-                )
-                .await
-            {
-                Ok(tab) if spec.user_titled && !spec.title.is_empty() => {
-                    client.workspace.set_tab_title(tab.id, &spec.title)?;
-                }
-                Ok(_) => {}
-                Err(error) => tracing::warn!(project_id = project.id, ?error, "restore tab failed"),
-            }
-        }
-    }
-
-    let snapshot = client.workspace.snapshot();
-    let active_project = restore
-        .as_ref()
-        .map(|layout| layout.active_project_id)
-        .filter(|id| snapshot.iter().any(|project| project.id == *id))
-        .or_else(|| snapshot.first().map(|project| project.id));
-    if let Some(project_id) = active_project {
-        let position = restore
-            .as_ref()
-            .map_or(0, |layout| layout.active_tab_position.max(0) as usize);
-        if let Some(tab_id) = snapshot
-            .iter()
-            .find(|project| project.id == project_id)
-            .and_then(|project| project.tabs.get(position).or_else(|| project.tabs.first()))
-            .map(|tab| tab.id)
-        {
-            client.workspace.focus_tab(tab_id)?;
-        }
-    }
-    Ok(())
+/// Bring the in-process workspace up ([`roost_engine::hydrate`]) at the
+/// window's grid. **Two callers, one spelling** — the launch under
+/// `in-process`, and the reverse switch (plan 063 §D8), which is a
+/// launch of this workspace in every respect that matters.
+async fn hydrate_local_workspace(client: &LocalClient, grid: (u16, u16)) -> Result<()> {
+    roost_engine::hydrate(
+        client,
+        Hydration {
+            first_project: roost_ipc::session_launch::FirstProject::Seed,
+            grid,
+            on_error: OnRestoreError::Propagate,
+        },
+    )
+    .await
 }
 
 impl Message {

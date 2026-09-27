@@ -316,6 +316,17 @@ release workflow asserts they agree).
   signal at those moments, as in-process tabs always have. A font-size
   change now reaches the shown tab's shell on every host. The background
   tabs of a remote host still keep their size until shown (#568).
+- **An in-process project forgot the tab you last viewed in it across a
+  relaunch (#565)** — under `local-backend = in-process`, Roost-Iced
+  reopened every project on its last tab, so a project click, ⌘1–9 and
+  the fallback when the shown project's last tab closes landed there
+  instead of on the tab you were last looking at. Each project's
+  last-viewed tab is now saved in `state.json` by its position and
+  restored with the layout; if that tab fails to reopen, the project
+  stays on the tab the restore ended on rather than the one after it. A
+  `roost-session` restores its own projects' memory the same way; one
+  started by an older Roost, still running after an upgrade, does so only
+  after it restarts.
 
 ## v0.0.20 — 2026-09-20
 

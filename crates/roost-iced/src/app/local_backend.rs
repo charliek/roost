@@ -1138,12 +1138,7 @@ pub(crate) fn retained_migration(
     }
     let retained = |project_id: i64| {
         layout
-            .and_then(|layout| {
-                layout
-                    .projects
-                    .iter()
-                    .find(|row| row.project_id == project_id)
-            })
+            .and_then(|layout| layout.project(project_id))
             .map(|row| row.tabs.as_slice())
             .unwrap_or(&[])
     };
@@ -5588,6 +5583,7 @@ mod migration_tests {
                             user_titled: *user_titled,
                         })
                         .collect(),
+                    last_tab_position: None,
                 })
                 .collect(),
             active_project_id: active.0,
