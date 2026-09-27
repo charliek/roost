@@ -133,13 +133,15 @@ final class TabSession {
     ///
     /// `onIDAssigned` lets the window splice the new tab into the
     /// tab bar with its real workspace-assigned id. Fires on the
-    /// main actor.
+    /// main actor; `onOpenFailed` fires there instead when the open
+    /// failed and no id will come.
     func start(
         socketPath: String,
         title: String,
         cwd: String = "",
         argv: [String] = [],
-        onIDAssigned: @escaping @MainActor (Int64) -> Void
+        onIDAssigned: @escaping @MainActor (Int64) -> Void,
+        onOpenFailed: @escaping @MainActor () -> Void = {}
     ) {
         let (keystrokes, kCont) = AsyncStream<PtyClientEvent>.makeStream()
         let (output, oCont) = AsyncStream<Data>.makeStream()
@@ -192,6 +194,9 @@ final class TabSession {
                         self?.id = tabID
                         onIDAssigned(tabID)
                     }
+                },
+                onOpenFailed: {
+                    Task { @MainActor in onOpenFailed() }
                 }
             ) { data in
                 oCont.yield(data)

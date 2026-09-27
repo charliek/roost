@@ -31,8 +31,8 @@ Engine references (verified this session, see plan 010 §2):
   what went away. The project is gone → the nearest surviving project
   ABOVE it in sidebar order (`(position, id)`), else the nearest below,
   skipping any project with no tabs (landing there would seat the
-  selection over a blank pane); within it, its first tab in display
-  order. The project survives → the nearest surviving tab to the RIGHT
+  selection over a blank pane); within it, the tab it last showed
+  (plan 072 D6), else its first tab in display order. The project survives → the nearest surviving tab to the RIGHT
   of the closed one, else the nearest to its left. The asymmetry is
   deliberate. So the assertions here name the neighbour, not "some
   remaining project" — but they COMPUTE it from the order the app just

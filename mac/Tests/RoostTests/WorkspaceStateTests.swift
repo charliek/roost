@@ -378,9 +378,9 @@ private func label(for event: Workspace.Event) -> String {
 /// out here as it is in the Rust twin's `mod tests` — the two
 /// implementations of one rule share no code, so the table is what
 /// keeps them from drifting. Case 6 is client-only (one commit here
-/// removes one project) and case 9b's second half has no Swift half at
-/// all: the model holds only the global active pair, and the
-/// per-project remembered tab lives in the UI.
+/// removes one project). A project the selection falls back onto lands
+/// on the tab it remembers (plan 072 §D6): opening `a b c` in turn
+/// leaves `P1` on `c`, and `P3` on `f`.
 @MainActor
 @Suite("Workspace close-selection fallback")
 struct WorkspaceCloseFallbackTests {
@@ -418,6 +418,7 @@ struct WorkspaceCloseFallbackTests {
         try l.ws.closeTab(l.b)
         #expect(l.ws.activeProjectID == l.p1)
         #expect(l.ws.activeTabID == l.c)
+        #expect(l.ws.preferredTab(l.p1) == l.c)
     }
 
     @Test func case2ClosingTheLastTabOfTheStripLandsOnTheTabToItsLeft() throws {
@@ -427,6 +428,7 @@ struct WorkspaceCloseFallbackTests {
         try l.ws.closeTab(l.c)
         #expect(l.ws.activeProjectID == l.p1)
         #expect(l.ws.activeTabID == l.b)
+        #expect(l.ws.preferredTab(l.p1) == l.b)
     }
 
     @Test func case3ClosingTheFirstTabOfTheStripLandsOnTheTabToItsRight() throws {
@@ -436,24 +438,25 @@ struct WorkspaceCloseFallbackTests {
         try l.ws.closeTab(l.a)
         #expect(l.ws.activeProjectID == l.p1)
         #expect(l.ws.activeTabID == l.b)
+        #expect(l.ws.preferredTab(l.p1) == l.b)
     }
 
-    @Test func case4ClosingAProjectsLastTabLandsOnTheProjectAbove() throws {
+    @Test func case4ClosingAProjectsLastTabLandsOnTheProjectsRememberedTabAbove() throws {
         let l = try layout()
         _ = try l.ws.focusTab(l.d)
 
         try l.ws.closeTab(l.d)
         #expect(l.ws.activeProjectID == l.p1)
-        #expect(l.ws.activeTabID == l.a)
+        #expect(l.ws.activeTabID == l.c, "P1 remembers c, so it lands there, not on its first tab a")
     }
 
-    @Test func case4DeletingTheShownProjectLandsOnTheProjectAbove() throws {
+    @Test func case4DeletingTheShownProjectLandsOnTheProjectsRememberedTabAbove() throws {
         let l = try layout()
         _ = try l.ws.focusTab(l.d)
 
         _ = try l.ws.deleteProject(l.p2)
         #expect(l.ws.activeProjectID == l.p1)
-        #expect(l.ws.activeTabID == l.a)
+        #expect(l.ws.activeTabID == l.c, "P1 remembers c, so it lands there, not on its first tab a")
     }
 
     @Test func case5ClosingTheTopProjectsLastTabLandsOnTheProjectBelow() throws {
@@ -487,6 +490,7 @@ struct WorkspaceCloseFallbackTests {
         try l.ws.closeTab(l.a)
         #expect(l.ws.activeProjectID == l.p1)
         #expect(l.ws.activeTabID == l.b)
+        #expect(l.ws.preferredTab(l.p1) == l.b)
     }
 
     @Test func case9TheProjectAboveIsFoundByPositionNotById() throws {
@@ -498,7 +502,7 @@ struct WorkspaceCloseFallbackTests {
 
         try l.ws.closeTab(l.d)
         #expect(l.ws.activeProjectID == l.p3)
-        #expect(l.ws.activeTabID == l.e)
+        #expect(l.ws.activeTabID == l.f)
     }
 
     @Test func case9DeletingTheShownProjectFindsTheOneAboveByPosition() throws {
@@ -508,10 +512,10 @@ struct WorkspaceCloseFallbackTests {
 
         _ = try l.ws.deleteProject(l.p2)
         #expect(l.ws.activeProjectID == l.p3)
-        #expect(l.ws.activeTabID == l.e)
+        #expect(l.ws.activeTabID == l.f)
     }
 
-    @Test func case9bClosingABackgroundProjectsTabLeavesTheSelectionAlone() throws {
+    @Test func case9bClosingABackgroundProjectsRememberedTabRepairsTheMemory() throws {
         let l = try layout()
         _ = try l.ws.focusTab(l.b)
         _ = try l.ws.focusTab(l.e)
@@ -520,6 +524,7 @@ struct WorkspaceCloseFallbackTests {
         #expect(l.ws.activeProjectID == l.p3)
         #expect(l.ws.activeTabID == l.e)
         #expect(l.ws.tabs(in: l.p1).map(\.id) == [l.a, l.c])
+        #expect(l.ws.preferredTab(l.p1) == l.c, "b's right-hand neighbour takes its place")
     }
 
     @Test func aProjectWithNoTabsIsSkippedWhenWalkingToTheProjectAbove() throws {
@@ -532,7 +537,7 @@ struct WorkspaceCloseFallbackTests {
 
         try l.ws.closeTab(l.d)
         #expect(l.ws.activeProjectID == l.p3)
-        #expect(l.ws.activeTabID == l.e)
+        #expect(l.ws.activeTabID == l.f)
     }
 
     @Test func everySurvivingProjectTablessStillNamesAProject() throws {
@@ -547,6 +552,263 @@ struct WorkspaceCloseFallbackTests {
         #expect(ws.activeProjectID == above)
         #expect(ws.activeTabID == 0)
         #expect(ws.snapshot().map(\.id) == [above, below])
+    }
+}
+
+/// `LocalClient.openTab` as the launch restore meets it, minus the PTY:
+/// each open is held until the test lands it, like a session whose id
+/// arrives later through its own task. Landing opens the row selected,
+/// as the real open does — or closes it again, as a failed spawn leaves
+/// it — and only then settles.
+@MainActor
+private final class DelayedOpens {
+    private let workspace: Workspace
+    private var held: [(projectID: Int64, cwd: String, settled: @MainActor (Int64?) -> Void)] = []
+
+    init(workspace: Workspace) {
+        self.workspace = workspace
+    }
+
+    func open(
+        _ projectID: Int64,
+        _ tab: Workspace.RestoreTab,
+        _ settled: @escaping @MainActor (Int64?) -> Void
+    ) {
+        held.append((projectID, tab.cwd, settled))
+    }
+
+    func land(_ cwd: String, failing: Bool = false) throws {
+        let index = try #require(held.firstIndex { $0.cwd == cwd }, "no open held for \(cwd)")
+        let open = held.remove(at: index)
+        let tab = try workspace.openTab(projectID: open.projectID, cwd: cwd, title: "")
+        if failing {
+            try workspace.closeTab(tab.id)
+            open.settled(nil)
+        } else {
+            open.settled(tab.id)
+        }
+    }
+}
+
+/// What a finished restore handed its caller.
+@MainActor
+private final class Landed {
+    var calls = 0
+    var tabID: Int64?
+}
+
+/// Plan 072 §D6's Swift restore barrier. The Mac's restore opens land
+/// asynchronously and each selects the tab it opens, so the saved
+/// memory and selection go back once, after the last, by saved position.
+/// The twin is Rust's `hydrate_with` tests in `application.rs`.
+@MainActor
+@Suite("Workspace layout restore")
+struct WorkspaceLayoutRestoreTests {
+    private func tempPath() -> String {
+        (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("roost-restore-test-\(UUID().uuidString).json")
+    }
+
+    /// Saved to `path`: `P1 [tabs…]` showing `viewed` when the user left
+    /// it, then `P2 [/x]`, which is active and was opened last.
+    private func saveTwoProjects(
+        _ path: String,
+        tabs: [String],
+        viewed: String
+    ) throws -> (p1: Int64, p2: Int64) {
+        let ws = Workspace(statePath: path)
+        let p1 = ws.createProject(name: "p1", cwd: "/p1").id
+        for cwd in tabs {
+            _ = try ws.openTab(projectID: p1, cwd: cwd, title: "")
+        }
+        _ = try ws.focusTab(try tabAt(ws, p1, viewed))
+        let p2 = ws.createProject(name: "p2", cwd: "/p2").id
+        _ = try ws.openTab(projectID: p2, cwd: "/x", title: "")
+        return (p1, p2)
+    }
+
+    /// Saved to `path`: `P1 [/a /b /c]` showing `/b`, then `P2 [/x /y]`
+    /// showing `/x`, the active tab.
+    private func saveTwoWideProjects(_ path: String) throws -> (p1: Int64, p2: Int64) {
+        let ws = Workspace(statePath: path)
+        let p1 = ws.createProject(name: "p1", cwd: "/p1").id
+        for cwd in ["/a", "/b", "/c"] {
+            _ = try ws.openTab(projectID: p1, cwd: cwd, title: "")
+        }
+        _ = try ws.focusTab(try tabAt(ws, p1, "/b"))
+        let p2 = ws.createProject(name: "p2", cwd: "/p2").id
+        for cwd in ["/x", "/y"] {
+            _ = try ws.openTab(projectID: p2, cwd: cwd, title: "")
+        }
+        _ = try ws.focusTab(try tabAt(ws, p2, "/x"))
+        return (p1, p2)
+    }
+
+    /// What the window does when the user selects `tabID` mid-restore:
+    /// push it to the workspace, and tell the restore.
+    private func userPicks(_ tabID: Int64, _ ws: Workspace, _ restore: LayoutRestore) throws {
+        _ = try ws.focusTab(tabID)
+        restore.userSelected(tabID)
+    }
+
+    private func tabAt(_ ws: Workspace, _ projectID: Int64, _ cwd: String) throws -> Int64 {
+        try #require(ws.tabs(in: projectID).first { $0.cwd == cwd }, "no tab at \(cwd)").id
+    }
+
+    /// Start `ws`'s restore over its saved layout with every open held.
+    private func startRestore(
+        _ ws: Workspace,
+        _ opens: DelayedOpens,
+        _ landed: Landed
+    ) -> LayoutRestore {
+        let restore = LayoutRestore(workspace: ws, layout: ws.takeRestoreLayout())
+        restore.start(projects: ws.snapshot().map(\.id), open: opens.open) { tabID in
+            landed.calls += 1
+            landed.tabID = tabID
+        }
+        return restore
+    }
+
+    @Test func eachProjectLandsOnItsSavedTabOnceTheLastOpenHasLanded() throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let (p1, p2) = try saveTwoProjects(path, tabs: ["/a", "/b", "/c"], viewed: "/b")
+
+        let ws = Workspace(statePath: path)
+        let opens = DelayedOpens(workspace: ws)
+        let landed = Landed()
+        let restore = startRestore(ws, opens, landed)
+        #expect(restore.isRestoring)
+
+        // Nothing has landed when the restore starts, and the last to
+        // land is P1's /c, which each open selecting its tab leaves both
+        // P1 and the window on.
+        for cwd in ["/a", "/x", "/b"] {
+            try opens.land(cwd)
+        }
+        #expect(restore.isRestoring, "one open is still in flight")
+        try opens.land("/c")
+
+        #expect(!restore.isRestoring)
+        let (b, x) = (try tabAt(ws, p1, "/b"), try tabAt(ws, p2, "/x"))
+        #expect(ws.preferredTab(p1) == b, "P1 must land on /b, the tab it showed, not /c")
+        #expect(ws.activeProjectID == p2)
+        #expect(ws.activeTabID == x, "the saved selection, not /c, the last to open")
+        #expect(landed.calls == 1)
+        #expect(landed.tabID == x)
+
+        let file = try JSONDecoder().decode(
+            Workspace.SnapshotFile.self,
+            from: Data(contentsOf: URL(fileURLWithPath: path))
+        )
+        #expect(file.activeProjectID == p2)
+        #expect(file.activeTabPosition == 0)
+        #expect(
+            file.projects.first { $0.id == p1 }?.lastTabPosition == 1,
+            "the restored memory is written through without a flush"
+        )
+    }
+
+    @Test func aSavedTabThatFailsToReopenIsNotShiftedOntoTheNext() throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let (p1, _) = try saveTwoProjects(path, tabs: ["/a", "/b", "/c", "/d"], viewed: "/b")
+
+        let ws = Workspace(statePath: path)
+        let opens = DelayedOpens(workspace: ws)
+        let restore = startRestore(ws, opens, Landed())
+        try opens.land("/a")
+        try opens.land("/b", failing: true)
+        for cwd in ["/c", "/d", "/x"] {
+            try opens.land(cwd)
+        }
+
+        #expect(!restore.isRestoring)
+        let (c, d) = (try tabAt(ws, p1, "/c"), try tabAt(ws, p1, "/d"))
+        #expect(
+            ws.preferredTab(p1) == d,
+            "with /b gone P1 keeps the tab the reopening left it on (/d), never /c, which took /b's index"
+        )
+        #expect(ws.preferredTab(p1) != c)
+    }
+
+    @Test func aSavedActiveTabThatClosesBeforeTheLastOpenLandsGivesWayToALiveOne() throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let (p1, p2) = try saveTwoWideProjects(path)
+
+        let ws = Workspace(statePath: path)
+        let opens = DelayedOpens(workspace: ws)
+        let landed = Landed()
+        let restore = startRestore(ws, opens, landed)
+        // The saved active /x opens and its shell exits at once; P1's /c
+        // lands last, leaving the workspace on it.
+        try opens.land("/x")
+        try opens.land("/y")
+        try ws.closeTab(try tabAt(ws, p2, "/x"))
+        for cwd in ["/a", "/b", "/c"] {
+            try opens.land(cwd)
+        }
+
+        #expect(!restore.isRestoring)
+        let (b, y) = (try tabAt(ws, p1, "/b"), try tabAt(ws, p2, "/y"))
+        #expect(ws.activeProjectID == p2, "the saved active project, not P1, where the last open landed")
+        #expect(ws.activeTabID == y, "/x closed, so the tab P2 remembers now")
+        #expect(landed.tabID == y)
+        #expect(ws.preferredTab(p2) == y, "a closed saved tab leaves the project's memory alone")
+        #expect(ws.preferredTab(p1) == b)
+    }
+
+    @Test func aTabTheUserSelectsWhileRestoringKeepsTheSelectionAndItsProjectsMemory() throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let (p1, p2) = try saveTwoWideProjects(path)
+
+        let ws = Workspace(statePath: path)
+        let opens = DelayedOpens(workspace: ws)
+        let landed = Landed()
+        let restore = startRestore(ws, opens, landed)
+        try opens.land("/a")
+        try opens.land("/b")
+        // The user clicks P1's /a; P1's /c then lands and selects itself,
+        // and P2's /y lands last.
+        let a = try tabAt(ws, p1, "/a")
+        try userPicks(a, ws, restore)
+        for cwd in ["/c", "/x", "/y"] {
+            try opens.land(cwd)
+        }
+
+        #expect(!restore.isRestoring)
+        let x = try tabAt(ws, p2, "/x")
+        #expect(ws.activeProjectID == p1)
+        #expect(ws.activeTabID == a, "the user's pick, not the saved /x")
+        #expect(landed.tabID == a)
+        #expect(ws.preferredTab(p1) == a, "not P1's saved /b, nor /c, which landed after the pick")
+        #expect(ws.preferredTab(p2) == x, "a project the user left alone still gets its saved tab, not /y")
+    }
+
+    @Test func everyProjectTheUserPickedInKeepsItsPickNotOnlyTheLast() throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        let (p1, p2) = try saveTwoWideProjects(path)
+
+        let ws = Workspace(statePath: path)
+        let opens = DelayedOpens(workspace: ws)
+        let restore = startRestore(ws, opens, Landed())
+        for cwd in ["/a", "/b", "/y"] {
+            try opens.land(cwd)
+        }
+        // The user picks P1's /a, then P2's /y; P1's /c lands in between.
+        let (a, y) = (try tabAt(ws, p1, "/a"), try tabAt(ws, p2, "/y"))
+        try userPicks(a, ws, restore)
+        try opens.land("/c")
+        try userPicks(y, ws, restore)
+        try opens.land("/x")
+
+        #expect(!restore.isRestoring)
+        #expect(ws.activeTabID == y)
+        #expect(ws.preferredTab(p1) == a, "not /c, which landed after the pick in P1")
+        #expect(ws.preferredTab(p2) == y)
     }
 }
 
@@ -1024,6 +1286,53 @@ struct WorkspaceStatePersistenceTests {
         #expect(again == nil)
     }
 
+    /// Plan 072 §D6: each project's remembered tab is written by where
+    /// it sits in its project — a restore re-opens the tabs at 0..n, so
+    /// the raw `position` a close left sparse would name the wrong one —
+    /// and a project that remembers none leaves the key out, as Rust
+    /// does. The twin is Rust's
+    /// `each_project_writes_its_remembered_tab_as_a_dense_index`.
+    @Test func lastTabPositionRoundTripsAsADenseIndex() async throws {
+        let path = tempPath()
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        let (first, second, unviewed) = try await {
+            let ws = await Workspace(statePath: path)
+            let first = await ws.createProject(name: "first", cwd: "/first").id
+            let a = try await ws.openTab(projectID: first, cwd: "/a", title: "").id
+            _ = try await ws.openTab(projectID: first, cwd: "/b", title: "")
+            let c = try await ws.openTab(projectID: first, cwd: "/c", title: "").id
+            _ = try await ws.openTab(projectID: first, cwd: "/d", title: "")
+            try await ws.closeTab(a)
+            _ = try await ws.focusTab(c)
+            #expect(await ws.tab(c)?.position == 2, "the precondition: sparse")
+            let unviewed = await ws.createProject(name: "unviewed", cwd: "/u").id
+            _ = try await ws.openTab(projectID: unviewed, cwd: "/u", title: "", activate: false)
+            let second = await ws.createProject(name: "second", cwd: "/second").id
+            _ = try await ws.openTab(projectID: second, cwd: "/x", title: "")
+            return (first, second, unviewed)
+        }()
+
+        let raw = try String(contentsOfFile: path, encoding: .utf8)
+        let file = try JSONDecoder().decode(Workspace.SnapshotFile.self, from: Data(raw.utf8))
+        let saved = { (id: Int64) in file.projects.first { $0.id == id }?.lastTabPosition }
+        #expect(saved(first) == 1, "/c is the second of [/b /c /d]")
+        #expect(saved(second) == 0)
+        #expect(saved(unviewed) == nil)
+        #expect(
+            raw.components(separatedBy: "last_tab_position").count == 3,
+            "only the two projects that remember a tab write the key: \(raw)"
+        )
+
+        let restore = try #require(await Workspace(statePath: path).takeRestoreLayout())
+        let remembered = { (id: Int64) in
+            restore.projects.first { $0.projectID == id }?.lastTabPosition
+        }
+        #expect(remembered(first) == 1)
+        #expect(remembered(second) == 0)
+        #expect(remembered(unviewed) == nil)
+    }
+
     /// Tied persisted tab positions are reachable — the `state.json`
     /// captured for #262 holds `[2, 3, 3]` — and the restore layout is
     /// the order the bootstrap re-opens tabs in, so the tie decides the
@@ -1124,6 +1433,7 @@ struct WorkspaceStatePersistenceTests {
         let restore = await ws.takeRestoreLayout()
         #expect(restore?.activeProjectID == 0)
         #expect(restore?.projects.first?.tabs.isEmpty == true)
+        #expect(restore?.projects.first?.lastTabPosition == nil)
     }
 
     @Test func corruptedStateStartsEmpty() async {

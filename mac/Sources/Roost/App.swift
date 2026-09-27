@@ -167,14 +167,29 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// Workspace model. `projects` mirrors the daemon's project list
     /// in display order; `tabs` is a flat list of every open
     /// TabSession across all projects, filtered into the tab bar by
-    /// `activeProjectID`. `activeSessionByProject` remembers each
-    /// project's last-focused TabSession by reference (rather than by
-    /// daemon tab id) so the active marker survives the window
-    /// between `OpenTab` being called and the daemon assigning an id.
+    /// `activeProjectID`. `shownSession` is the one whose terminal the
+    /// window shows, held by reference so the active marker survives
+    /// the window between `OpenTab` being called and the daemon
+    /// assigning an id.
     private var projects: [ProjectSnapshot] = []
     private var tabs: [TabSession] = []
     private var activeProjectID: Int64?
-    private var activeSessionByProject: [Int64: TabSession] = [:]
+    private var shownSession: TabSession?
+
+    /// The shown session while it is the active project's — the tab the
+    /// window shows. Which tab each project *remembers* is not kept here:
+    /// that is the workspace's `preferredTab` (plan 072 §D6), which a
+    /// project selection reads (`rememberedTabIndex`).
+    private var activeSession: TabSession? {
+        guard let shownSession, shownSession.projectID == activeProjectID else { return nil }
+        return shownSession
+    }
+
+    /// The launch's layout restore while its opens are in flight.
+    private var layoutRestore: LayoutRestore?
+    /// A tab the user selected during the layout restore before its open
+    /// named it, handed to the restore once its id arrives.
+    private var restorePickAwaitingID: TabSession?
 
     /// True while `handleEvent` applies a core-driven change. UI
     /// selection is pushed back to the core (`syncCoreActiveTab`), and
@@ -1185,7 +1200,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             tab.close(socketPath: socketPath)
         }
         tabs.removeAll()
-        activeSessionByProject.removeAll()
+        shownSession = nil
     }
 
     /// Two things happen on reactivation.
@@ -1216,9 +1231,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// the active project has no live tab. Safe to call repeatedly.
     @MainActor
     private func focusActiveTerminal() {
-        guard let activeProjectID,
-              let session = activeSessionByProject[activeProjectID]
-        else { return }
+        guard let session = activeSession else { return }
         window?.makeFirstResponder(session.terminalView)
     }
 
@@ -1717,7 +1730,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         if let pid = activeProjectID {
             ctx.activeProjectID = pid
             ctx.activeCwd = activeLaunchCwd(projectID: pid)
-            if let session = activeSessionByProject[pid] {
+            if let session = activeSession {
                 ctx.activeTabID = session.id
                 ctx.activeTitle = session.liveTitle ?? ""
             }
@@ -1760,7 +1773,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// directory check.
     @MainActor
     private func activeLaunchCwd(projectID: Int64) -> String {
-        let tabID = activeSessionByProject[projectID]?.id
+        let tabID = shownSession.flatMap { $0.projectID == projectID ? $0.id : nil }
         let inherited = tabID.flatMap { RoostBackend.shared.localClient?.inheritedCwd(tabID: $0) }
         let project = projects.first(where: { $0.id == projectID })?.cwd ?? ""
         return Self.launchCwd(inherited: inherited, project: project)
@@ -2410,10 +2423,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 self.projects = fetched
                 self.rebuildSidebar()
 
-                // Determine the active project + tab index up-front so
-                // the right tab can be focused in the workspace as it's
-                // opened. Fall back to the first project (tab 0) when
-                // the saved active id is gone/unset.
+                // Where the window points while the restore is in
+                // flight: the saved active tab, else the first project's
+                // first tab when the saved active id is gone/unset.
                 let activeID: Int64?
                 let activePos: Int
                 if let r = restore, self.projects.contains(where: { $0.id == r.activeProjectID }) {
@@ -2429,34 +2441,43 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 // or a state.json predating tab persistence — seeds a
                 // single tab. Eager (not lazy-on-select) so `tab list`
                 // and screenshots reflect every project's tabs, and so
-                // the Mac and iced builds restore identically.
-                for project in self.projects {
-                    let saved = restore?.projects
-                        .first(where: { $0.projectID == project.id })?.tabs ?? []
-                    let specs: [(cwd: String, title: String, userTitled: Bool)] =
-                        saved.isEmpty
-                            ? [("", "", false)]
-                            : saved.map { ($0.cwd, $0.title, $0.userTitled) }
-                    for (idx, spec) in specs.enumerated() {
-                        let isActive = project.id == activeID && idx == activePos
-                        self.openTab(
-                            inProject: project.id,
-                            cwd: spec.cwd,
-                            title: spec.title,
-                            userTitled: spec.userTitled,
-                            focusInWorkspaceWhenReady: isActive
-                        )
+                // the Mac and iced builds restore identically. Each open
+                // selects its tab as it lands, so `LayoutRestore` puts
+                // back each project's remembered tab and the saved
+                // selection once all of them have.
+                if let workspace = RoostBackend.shared.workspace {
+                    let layoutRestore = LayoutRestore(workspace: workspace, layout: restore)
+                    layoutRestore.start(
+                        projects: self.projects.map(\.id),
+                        open: { projectID, tab, settled in
+                            let session = self.openTab(
+                                inProject: projectID,
+                                cwd: tab.cwd,
+                                title: tab.title,
+                                userTitled: tab.userTitled,
+                                onOpened: settled
+                            )
+                            if session == nil { settled(nil) }
+                        },
+                        done: { [weak self] active in
+                            self?.layoutRestore = nil
+                            self?.restorePickAwaitingID = nil
+                            if let active { self?.focusTab(tabID: active, activate: false) }
+                        }
+                    )
+                    // Show the saved active tab right away; its session
+                    // has no id yet, so only the window moves. This is a
+                    // launch-time restore, not a user action — and
+                    // `selectProject` is pure data mutation, so the user's
+                    // collapsed-sidebar preference is preserved
+                    // automatically.
+                    if layoutRestore.isRestoring {
+                        if let pid = activeID {
+                            self.selectProject(id: pid)
+                            self.selectTabByPosition(in: pid, position: Int32(activePos))
+                        }
+                        self.layoutRestore = layoutRestore
                     }
-                }
-
-                // Restore the UI active project + tab selection. This
-                // is a launch-time restore, not a user action — and
-                // `selectProject` is now pure data mutation, so the
-                // user's collapsed-sidebar preference is preserved
-                // automatically.
-                if let pid = activeID {
-                    self.selectProject(id: pid)
-                    self.selectTabByPosition(in: pid, position: Int32(activePos))
                 }
                 // The subscription emits a `.resync` as its first event,
                 // which reconciles any tab opened during the boot gap —
@@ -2546,7 +2567,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         }
         refreshDockBadge()
         tabs.removeAll { $0.projectID == id }
-        activeSessionByProject.removeValue(forKey: id)
+        if shownSession?.projectID == id { shownSession = nil }
         projects.removeAll { $0.id == id }
         // M5 of `goal-mac-parity-2026-05-18.md`: drop the cached cell
         // view for this project so the per-project map doesn't grow
@@ -2775,7 +2796,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             notificationInbox.remove(e.tabID)
             refreshDockBadge()
             let projectID = session.projectID
-            let wasActive = activeSessionByProject[projectID] === session
+            let wasActive = shownSession === session
             // Where the departed pill sat, captured before the removal
             // erases it: the fall-back below needs its neighbours.
             let closedIndex = tabs
@@ -2794,8 +2815,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             if let id = session.id {
                 tabPillViews.removeValue(forKey: id)
             }
-            if wasActive {
-                activeSessionByProject.removeValue(forKey: projectID)
+            if shownSession === session {
+                shownSession = nil
             }
             session.terminalView.removeFromSuperview()
             session.close(socketPath: socketPath)
@@ -2855,9 +2876,15 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // `focusTab` cleared it in the commit that produced this
             // event — and the `.tabNotification` right behind this one
             // retires the badge the UI is still showing.
+            //
+            // Not while the launch's layout restore is in flight: each of
+            // its opens selects the tab it opens, and `LayoutRestore`
+            // selects the saved tab once they have all landed, so
+            // following them would only walk the window across the
+            // restored tabs.
             let alreadyShown = activeProjectID == e.projectID
-                && activeSessionByProject[e.projectID]?.id == e.tabID
-            if !alreadyShown, e.tabID != 0,
+                && activeSession?.id == e.tabID
+            if !alreadyShown, e.tabID != 0, layoutRestore == nil,
                tabs.contains(where: { $0.id == e.tabID })
             {
                 focusTab(tabID: e.tabID, activate: false)
@@ -2887,9 +2914,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                 session.liveCwd = e.cwd
                 if session.projectID == activeProjectID {
                     rebuildTabBar()
-                    if let activeProjectID,
-                       activeSessionByProject[activeProjectID] === session
-                    {
+                    if activeSession === session {
                         updateWindowTitle()
                     }
                 }
@@ -3098,8 +3123,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func activeSidebarTabID() -> Int64? {
-        guard let activeProjectID else { return nil }
-        return activeSessionByProject[activeProjectID]?.id
+        activeSession?.id
     }
 
     /// Repaint the old and new active agent rows without a full sidebar
@@ -3198,11 +3222,26 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             return
         }
 
-        // Restore the project's last-active TabSession, falling back
-        // to the first if the remembered one was closed.
-        let preferred = activeSessionByProject[id]
-        let index = projectTabs.firstIndex(where: { $0 === preferred }) ?? 0
-        selectTab(at: index)
+        selectTab(at: Self.rememberedTabIndex(
+            tabIDs: projectTabs.map(\.id),
+            preferred: RoostBackend.shared.workspace?.preferredTab(id),
+            shown: projectTabs.firstIndex { $0 === shownSession }
+        ))
+    }
+
+    /// Where selecting a project lands among its tabs — `tabIDs`, its
+    /// sessions' ids in display order, `nil` for one whose open has not
+    /// named it yet. The workspace's `preferred` tab is the one memory of
+    /// which tab a project shows (plan 072 §D6), so it wins even over the
+    /// tab on screen: the window can trail it, as when `tab focus`
+    /// moved it and the `.active` behind that has not arrived. The shown
+    /// tab (`shown`, its index when it is this project's) answers only
+    /// where the workspace can't — while it has no id, or when the
+    /// remembered tab has no session here — and else the first tab.
+    nonisolated static func rememberedTabIndex(tabIDs: [Int64?], preferred: Int64?, shown: Int?) -> Int {
+        if let shown, tabIDs.indices.contains(shown), tabIDs[shown] == nil { return shown }
+        if let preferred, let index = tabIDs.firstIndex(of: preferred) { return index }
+        return shown ?? 0
     }
 
     @objc @MainActor
@@ -3426,7 +3465,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         }
         refreshDockBadge()
         tabs.removeAll { $0.projectID == id }
-        activeSessionByProject.removeValue(forKey: id)
+        if shownSession?.projectID == id { shownSession = nil }
 
         let socketPath = self.socketPath
         Task { [weak self] in
@@ -3484,7 +3523,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// append + start its session. Does NOT change the active selection
     /// or rebuild the tab bar — the caller decides whether to focus it.
     /// Returns the new session. Shared by `openNewTab` (active project)
-    /// and session restore (which passes each saved tab's cwd + title).
+    /// and session restore (which passes each saved tab's cwd + title,
+    /// and hears through `onOpened` which id the tab opened as, or `nil`
+    /// when the open failed).
     @discardableResult
     private func openTab(
         inProject projectID: Int64,
@@ -3492,7 +3533,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         title: String,
         argv: [String] = [],
         userTitled: Bool = false,
-        focusInWorkspaceWhenReady: Bool = false
+        onOpened: (@MainActor (Int64?) -> Void)? = nil
     ) -> TabSession? {
         guard daemonReachable else { return nil }
         let session = TabSession(
@@ -3522,14 +3563,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             // `tabPillViews[tabID]` returns nil.
             self?.rebuildWindowMenu()
             self?.rebuildTabBar()
-            // Restore: sync the WORKSPACE's active selection to this
-            // tab once its real id exists, so the next persist (and
-            // IPC `identify`) record the restored active tab, not the
-            // last-opened one. The UI selection is set separately by
-            // `selectTabByPosition`. #95 review.
-            if focusInWorkspaceWhenReady {
-                _ = try? RoostBackend.shared.workspace?.focusTab(tabID)
-            }
             // Restore: re-assert the manual-rename lock. `openTab`
             // always seeds `userTitled=false` (the supplied title is
             // treated as a placeholder); `setTabTitle` flips it back
@@ -3547,6 +3580,13 @@ final class RoostApp: NSObject, NSApplicationDelegate {
                     )
                 }
             }
+            if let self, let session, self.restorePickAwaitingID === session {
+                self.restorePickAwaitingID = nil
+                if self.shownSession === session { self.layoutRestore?.userSelected(tabID) }
+            }
+            onOpened?(tabID)
+        } onOpenFailed: {
+            onOpened?(nil)
         }
         return session
     }
@@ -3566,9 +3606,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func closeActiveTabImpl() {
-        guard let activeProjectID else { return }
         let projectTabs = tabsForActiveProject()
-        guard let active = activeSessionByProject[activeProjectID],
+        guard let active = activeSession,
               let activeTabIndexInProject = projectTabs.firstIndex(where: { $0 === active })
         else { return }
         let session = projectTabs[activeTabIndexInProject]
@@ -3587,7 +3626,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         if let id = session.id {
             tabPillViews.removeValue(forKey: id)
         }
-        activeSessionByProject.removeValue(forKey: activeProjectID)
+        if shownSession === session { shownSession = nil }
         session.terminalView.removeFromSuperview()
         session.close(socketPath: socketPath)
 
@@ -3671,7 +3710,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func selectTab(at indexInActiveProject: Int) {
-        guard let activeProjectID else { return }
+        guard activeProjectID != nil else { return }
         let projectTabs = tabsForActiveProject()
         guard projectTabs.indices.contains(indexInActiveProject) else { return }
         guard let container = terminalContainer else { return }
@@ -3697,7 +3736,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
             view.bottomAnchor.constraint(equalTo: container.bottomAnchor),
         ])
 
-        activeSessionByProject[activeProjectID] = session
+        shownSession = session
+        noteRestorePick(session)
         window?.makeFirstResponder(view)
         // The local selection is committed *before* this, so the
         // `.active` echo the core fires back finds `alreadyShown` true
@@ -3732,6 +3772,18 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         refreshAgentRowActiveStates()
     }
 
+    /// A selection the window makes while the launch's layout restore is
+    /// in flight is the user's, and outranks the saved one
+    /// (`LayoutRestore.userSelected`); the restore's own first show runs
+    /// before `layoutRestore` is set. A tab with no id yet is handed over
+    /// when its open names it.
+    @MainActor
+    private func noteRestorePick(_ session: TabSession) {
+        guard let layoutRestore, !applyingCoreEvent else { return }
+        if let tabID = session.id { layoutRestore.userSelected(tabID) }
+        restorePickAwaitingID = session.id == nil ? session : nil
+    }
+
     /// Pure helper extracted so unit tests can hit the pill-index math
     /// without an AppKit dependency. Returns the index of `active`
     /// inside `tabs` (the active project's tab list in display order),
@@ -3751,10 +3803,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// pending and `scrollToVisible` lands on the wrong rect).
     @MainActor
     private func scrollActiveTabIntoView() {
-        guard let tabBar,
-              let activeProjectID,
-              let active = activeSessionByProject[activeProjectID]
-        else { return }
+        guard let tabBar, let active = activeSession else { return }
         let projectTabs = tabsForActiveProject()
         guard let activeIdx = Self.activeTabIndex(tabs: projectTabs, active: active)
         else { return }
@@ -3769,7 +3818,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         guard let tabBar = tabBar, let addTabButton = addTabButton else { return }
 
         let projectTabs = tabsForActiveProject()
-        let activeSession = activeProjectID.flatMap { activeSessionByProject[$0] }
 
         // Round-3 R5: build the desired pill list, reusing cached
         // pill views per daemon tab id. Pills without a daemon id
@@ -3998,11 +4046,10 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// `⌘W` shortcut.
     @MainActor
     private func closeTab(at indexInActiveProject: Int) {
-        guard let activeProjectID else { return }
         let projectTabs = tabsForActiveProject()
         guard projectTabs.indices.contains(indexInActiveProject) else { return }
         let session = projectTabs[indexInActiveProject]
-        let wasActive = activeSessionByProject[activeProjectID] === session
+        let wasActive = activeSession === session
 
         // Round-3 R5: cancel any mid-edit so the pill's NSTextField
         // stops being first responder before we tear the view down.
@@ -4017,8 +4064,8 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         if let id = session.id {
             tabPillViews.removeValue(forKey: id)
         }
-        if wasActive {
-            activeSessionByProject.removeValue(forKey: activeProjectID)
+        if shownSession === session {
+            shownSession = nil
         }
         session.terminalView.removeFromSuperview()
         session.close(socketPath: socketPath)
@@ -4075,7 +4122,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         // Tab switching — defaults to ⌃1..⌃9 via `switch_tab_N` in
         // `defaultBindingsMac()`. Same keybind-table path.
         let projectTabs = tabsForActiveProject()
-        let activeSession = activeProjectID.flatMap { activeSessionByProject[$0] }
         for (index, session) in projectTabs.enumerated() {
             let item = NSMenuItem(
                 title: "Tab \(index + 1)",
@@ -4489,7 +4535,6 @@ final class RoostApp: NSObject, NSApplicationDelegate {
         }
         window.title = project.name.isEmpty ? "Roost" : project.name
 
-        let activeSession = activeSessionByProject[activeProjectID]
         let liveCwd = activeSession?.liveCwd ?? ""
         let cwd = liveCwd.isEmpty ? project.cwd : liveCwd
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -4595,11 +4640,9 @@ final class RoostApp: NSObject, NSApplicationDelegate {
 
     @MainActor
     private func cycleTab(delta: Int) {
-        guard let activeProjectID else { return }
         let projectTabs = tabsForActiveProject()
         guard !projectTabs.isEmpty else { return }
-        let active = activeSessionByProject[activeProjectID]
-        let currentIdx = projectTabs.firstIndex(where: { $0 === active }) ?? 0
+        let currentIdx = projectTabs.firstIndex(where: { $0 === activeSession }) ?? 0
         let n = projectTabs.count
         // Round-4 R2: clamp at endpoints instead of wrapping. ⌘⇧[ on
         // the first tab is a no-op; ⌘⇧] on the last tab is a no-op.
@@ -4617,8 +4660,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     /// shell-emitted OSC 1/2 stops overwriting. ⌘R by default.
     @objc @MainActor
     private func renameActiveTab(_ sender: Any?) {
-        guard let activeProjectID,
-              let session = activeSessionByProject[activeProjectID],
+        guard let session = activeSession,
               let tabID = session.id
         else {
             return
@@ -4796,7 +4838,7 @@ final class RoostApp: NSObject, NSApplicationDelegate {
     private func nextUnreadTab() -> TabSession? {
         if let activeID = activeProjectID {
             let activeTabs = tabs.filter { $0.projectID == activeID }
-            let activeFocus = activeSessionByProject[activeID]
+            let activeFocus = activeSession
             let startIdx =
                 activeFocus
                 .flatMap { f in activeTabs.firstIndex(where: { $0 === f }) }
@@ -6181,9 +6223,7 @@ extension RoostApp: UiBridge {
         // false` because the bridge already targeted the active
         // session; the real OS focus may be elsewhere (the e2e
         // suite runs without taking the window key for itself).
-        guard let pid = activeProjectID,
-              let session = activeSessionByProject[pid]
-        else { return false }
+        guard let session = activeSession else { return false }
         session.terminalView.emitFocusEvent(
             focused: focused,
             requireFirstResponder: false
@@ -6192,9 +6232,7 @@ extension RoostApp: UiBridge {
     }
 
     func currentCursorShape() -> String {
-        guard let pid = activeProjectID,
-              let session = activeSessionByProject[pid]
-        else { return "default" }
+        guard let session = activeSession else { return "default" }
         return session.terminalView.currentCursorShapeName()
     }
 
@@ -6217,9 +6255,7 @@ extension RoostApp: UiBridge {
     /// which carries the actual derivation and IS unit-testable
     /// without a live window (`WindowMetricsTests.swift`).
     func terminalMetrics() -> (top: CGFloat, fontFamily: String)? {
-        guard let pid = activeProjectID,
-              let session = activeSessionByProject[pid]
-        else { return nil }
+        guard let session = activeSession else { return nil }
         return Self.terminalMetrics(
             contentView: window?.contentView,
             terminalView: session.terminalView,

@@ -95,8 +95,9 @@ enum PtyClientEvent: Sendable {
 /// half-shutdown.
 ///
 /// `onTabOpened` fires once with the workspace-assigned tab id as
-/// soon as the workspace insert returns, before any output arrives.
-/// Both callbacks may run on the main actor; consumers that touch
+/// soon as the workspace insert returns, before any output arrives;
+/// `onOpenFailed` fires once instead when the open fails.
+/// These callbacks may run on the main actor; consumers that touch
 /// AppKit views from them should not hop again.
 func runShellSession(
     socketPath: String,
@@ -108,6 +109,7 @@ func runShellSession(
     argv: [String] = [],
     keystrokes: AsyncStream<PtyClientEvent>,
     onTabOpened: @escaping @Sendable (Int64) -> Void,
+    onOpenFailed: @escaping @Sendable () -> Void = {},
     onOutput: @escaping @Sendable (Data) -> Void
 ) async {
     // Open the tab + spawn the PTY on the main actor. The
@@ -175,6 +177,7 @@ func runShellSession(
     }
 
     guard let (tabID, token, exitStream) = opened else {
+        onOpenFailed()
         return
     }
 
