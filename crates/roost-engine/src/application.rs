@@ -1187,6 +1187,58 @@ mod tests {
         assert_eq!(ws.active(), (p1, tab_at(&ws, p1, "/b")));
     }
 
+    /// The UI's policy: the title lock of a tab whose shell exits right
+    /// after it reopens fails, and that must not cost the rest of the
+    /// layout — the saved layout was already taken, so an abort here
+    /// would leave the next write holding only what restored first.
+    #[tokio::test]
+    async fn a_title_lock_on_a_tab_that_already_exited_warns_and_the_restore_goes_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let folder = |name: &str| {
+            let folder = path.with_file_name(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            folder.to_string_lossy().into_owned()
+        };
+        let p1 = {
+            let ws = Workspace::open(path.clone());
+            let p1 = ws.create_project("p1", "/p1").unwrap().id;
+            ws.open_tab(p1, &folder("b"), "", true).unwrap();
+            let pinned = ws.open_tab(p1, &folder("a"), "", true).unwrap().id;
+            ws.set_tab_title(pinned, "Pinned").unwrap();
+            ws.open_tab(p1, &folder("c"), "", true).unwrap();
+            p1
+        };
+
+        let ws = Workspace::open(path.clone());
+        let mut rows = open_rows(&ws, &[]);
+        let exits_at_once = |project_id: i64, spec: RestoreTab| {
+            let title = spec.title.clone();
+            let opened = rows(project_id, spec);
+            std::future::ready(opened.into_inner().inspect(|tab| {
+                if title == "Pinned" {
+                    let _ = ws.close_tab(tab.id);
+                }
+            }))
+        };
+        let launch = Hydration {
+            first_project: FirstProject::Seed,
+            grid: (80, 24),
+            on_error: OnRestoreError::Warn,
+        };
+        hydrate_with(&ws, launch, exits_at_once)
+            .await
+            .expect("a title lock that fails only warns");
+        tab_at(&ws, p1, "/c");
+        let on_disk = crate::persistence::read_state(&path).unwrap().unwrap();
+        let saved = on_disk.projects.iter().find(|p| p.id == p1).unwrap();
+        assert!(
+            saved.tabs.iter().any(|tab| tab.cwd.ends_with("/c")),
+            "the tab after the failed lock restored and was written: {:?}",
+            saved.tabs
+        );
+    }
+
     #[tokio::test]
     async fn a_second_hydration_adds_nothing() {
         let dir = tempfile::tempdir().unwrap();

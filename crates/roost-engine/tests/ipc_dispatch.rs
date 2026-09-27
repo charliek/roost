@@ -803,7 +803,7 @@ async fn app_key_event_rejects_an_empty_key_and_an_unknown_modifier() {
     for params in [
         serde_json::json!({"key": ""}),
         serde_json::json!({"key": "t", "modifiers": ["meta"]}),
-        serde_json::json!({"key": "t", "modifiers": ["alt", "Alt"]}),
+        serde_json::json!({"key": "t", "modifiers": ["Alt"]}),
     ] {
         let err = client
             .call_raw(ops::APP_KEY_EVENT, params.clone())

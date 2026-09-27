@@ -10153,7 +10153,7 @@ async fn hydrate_local_workspace(client: &LocalClient, grid: (u16, u16)) -> Resu
         Hydration {
             first_project: roost_ipc::session_launch::FirstProject::Seed,
             grid,
-            on_error: OnRestoreError::Propagate,
+            on_error: OnRestoreError::Warn,
         },
     )
     .await
