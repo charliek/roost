@@ -20,8 +20,10 @@
 # accept LANG LC_*; users may need to extend `AcceptEnv` server-side
 # for the env to take effect).
 #
-# The Mac copy under mac/Sources/Roost/Resources/shell-integration/roost.zsh
-# is frozen for this release and has diverged from this one.
+# KEEP IN SYNC (shared functions only — __roost_osc7, __roost_title,
+# __roost_mark_c, __roost_mark_d) with
+# mac/Sources/Roost/Resources/shell-integration/roost.zsh.
+# tools/roosttest_unit/test_osc7_emitters.py compares the shared bodies.
 
 [[ -o interactive ]] || return 0
 [[ -n "${ROOST_TAB_ID:-}" ]] || return 0
@@ -88,7 +90,22 @@ fi
 if (( ! $+functions[__roost_title] )); then
 __roost_title() {
   _roost_feature title || return 0
-  printf '\033]0;%s\033\\' "${PWD/#$HOME/~}"
+  # A title needs no round trip, so a control byte is just dropped in
+  # favor of a placeholder — no %-encoding as in __roost_osc7.
+  local p c o i q=
+  p=${PWD/#$HOME/~}
+  if [[ $p == *[[:cntrl:]]* ]]; then
+    for (( i = 0; i < ${#p}; i++ )); do
+      c=${p:$i:1}
+      printf -v o '%d' "'$c"
+      if (( o > 0 && o < 32 || o == 127 )); then
+        c='?'
+      fi
+      q+=$c
+    done
+    p=$q
+  fi
+  printf '\033]0;%s\033\\' "$p"
 }
 fi
 

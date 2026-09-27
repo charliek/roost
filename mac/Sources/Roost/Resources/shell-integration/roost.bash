@@ -33,7 +33,11 @@
 # The inject block is adapted from Ghostty's ghostty.bash (GPLv3 header
 # below); the integration body is Roost's.
 #
-# KEEP IN SYNC with crates/roost-engine/resources/shell-integration/roost.bash (shared by iced)
+# KEEP IN SYNC (shared functions only — __roost_osc7, __roost_title,
+# __roost_marks) with crates/roost-engine/resources/shell-integration/roost.bash
+# (shared by iced); the inject block and prompt default are Mac-only and
+# needn't match. tools/roosttest_unit/test_osc7_emitters.py compares the
+# shared bodies.
 #
 # Parts of the inject block are based on Ghostty's bash integration, which
 # is based on Kitty's. Kitty is distributed under GPLv3, so that block is
@@ -147,6 +151,11 @@ if _roost_feature ssh-env; then
   }
 fi
 
+# Each function is skipped when the user already defined one under this
+# name (e.g. in their rc, sourced before Roost) — their definition then
+# takes over the feature, since the hook registration below still calls
+# it by name unconditionally.
+if ! declare -F __roost_osc7 >/dev/null; then
 __roost_osc7() {
   _roost_feature cwd || return 0
   # The reader percent-decodes, so a literal `%` goes out as %25, and a
@@ -167,18 +176,38 @@ __roost_osc7() {
   fi
   printf '\033]7;file://%s%s\033\\' "${HOSTNAME:-}" "$p"
 }
+fi
 
+if ! declare -F __roost_title >/dev/null; then
 __roost_title() {
   _roost_feature title || return 0
-  printf '\033]0;%s\033\\' "${PWD/#$HOME/~}"
+  # A title needs no round trip, so a control byte is just dropped in
+  # favor of a placeholder — no %-encoding as in __roost_osc7.
+  local p c o i q=
+  p=${PWD/#$HOME/~}
+  if [[ $p == *[[:cntrl:]]* ]]; then
+    for (( i = 0; i < ${#p}; i++ )); do
+      c=${p:$i:1}
+      printf -v o '%d' "'$c"
+      if (( o > 0 && o < 32 || o == 127 )); then
+        c='?'
+      fi
+      q+=$c
+    done
+    p=$q
+  fi
+  printf '\033]0;%s\033\\' "$p"
 }
+fi
 
 # OSC 133 command marks: C on command start (PS0), D when it ends (the
 # next prompt's PROMPT_COMMAND). Roost maps C -> running, D -> cleared.
+if ! declare -F __roost_marks >/dev/null; then
 __roost_marks() {
   _roost_feature marks || return 0
   printf '\033]133;D\033\\'
 }
+fi
 # C via PS0 needs bash >= 4.4; older bash (e.g. macOS /bin/bash 3.2)
 # silently ignores PS0, so only the D (command-end) mark fires there.
 if _roost_feature marks && { [ "${BASH_VERSINFO[0]:-0}" -gt 4 ] ||

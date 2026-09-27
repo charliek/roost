@@ -134,6 +134,16 @@ release workflow asserts they agree).
   while its reader could still run, so, rarely, the next tab or socket
   given the same descriptor number could lose bytes to it. The PTY now
   closes only once its reader has stopped.
+- **A directory name with a control byte cut the tab title short and
+  leaked live escape sequences to the terminal, and a hand-rolled
+  `__roost_title`/`__roost_osc7`/`__roost_marks` in `~/.bashrc` or
+  `~/.zshrc` was silently overwritten by the Mac app's shell integration
+  (#554, #193)** — `__roost_title` now replaces each control byte in the
+  title with `?`, in all four shipped shell-integration copies (Rust
+  bash/zsh, Mac bash/zsh); a title needs no `%`-encoding, unlike OSC 7's
+  cwd payload. The Mac copies now also skip redefining a function the
+  user already defined under the same name, matching the Rust copies —
+  closing #193 on macOS too.
 - **A new tab on a session-backed project could take the window away
   from a tab you clicked while it opened, and one that never appeared
   was dropped silently (#549)** — on the local session and on saved

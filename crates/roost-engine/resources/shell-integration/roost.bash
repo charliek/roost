@@ -33,8 +33,10 @@
 # The inject block is adapted from Ghostty's ghostty.bash (GPLv3 header
 # below); the integration body is Roost's.
 #
-# The Mac copy under mac/Sources/Roost/Resources/shell-integration/roost.bash
-# is frozen for this release and has diverged from this one.
+# KEEP IN SYNC (shared functions only — __roost_osc7, __roost_title,
+# __roost_marks) with mac/Sources/Roost/Resources/shell-integration/roost.bash;
+# the inject block and prompt default are Linux/iced-only and needn't match.
+# tools/roosttest_unit/test_osc7_emitters.py compares the shared bodies.
 #
 # Parts of the inject block are based on Ghostty's bash integration, which
 # is based on Kitty's. Kitty is distributed under GPLv3, so that block is
@@ -178,7 +180,22 @@ fi
 if ! declare -F __roost_title >/dev/null; then
 __roost_title() {
   _roost_feature title || return 0
-  printf '\033]0;%s\033\\' "${PWD/#$HOME/~}"
+  # A title needs no round trip, so a control byte is just dropped in
+  # favor of a placeholder — no %-encoding as in __roost_osc7.
+  local p c o i q=
+  p=${PWD/#$HOME/~}
+  if [[ $p == *[[:cntrl:]]* ]]; then
+    for (( i = 0; i < ${#p}; i++ )); do
+      c=${p:$i:1}
+      printf -v o '%d' "'$c"
+      if (( o > 0 && o < 32 || o == 127 )); then
+        c='?'
+      fi
+      q+=$c
+    done
+    p=$q
+  fi
+  printf '\033]0;%s\033\\' "$p"
 }
 fi
 
