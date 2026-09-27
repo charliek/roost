@@ -25,7 +25,7 @@
 //!   that never hydrates cannot write the saved tabs away.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -2258,6 +2258,14 @@ impl Workspace {
     /// `flush` snapshots under `inner` in a scope of its own and
     /// persists after it, and `commit(Persist::Skip)` — the only commit
     /// made from here — produces no snapshot and never persists.
+    ///
+    /// Re-checks `shutting_down` once more **after** taking the guard
+    /// (#553): `flush` holds the same guard across its own write and its
+    /// freeze, so a write that passed the check above and then waited on
+    /// the guard `flush` held would otherwise land right after it,
+    /// un-frozen. `flush` cannot be this function's caller for its own
+    /// write — `std::sync::Mutex` isn't reentrant — so the write itself
+    /// is factored into [`Self::persist_locked`], which both share.
     fn persist(&self, seq: u64, snapshot: &SnapshotFile, sync: bool) -> PersistOutcome {
         // Frozen by `flush()` on clean exit: ignore any later write so
         // a teardown cascade can't overwrite the flushed layout.
@@ -2267,14 +2275,33 @@ impl Workspace {
         let Some(path) = self.state_path.clone() else {
             return PersistOutcome::InMemory; // in-memory variant; no persistence
         };
+        #[cfg(test)]
+        run_persist_guard_seam();
         let mut state = self.persist_guard.lock().unwrap();
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return PersistOutcome::Frozen;
+        }
+        self.persist_locked(&mut state, &path, seq, snapshot, sync)
+    }
+
+    /// The write itself, run by a caller already holding `persist_guard`
+    /// (#553's factored-out primitive; see [`Self::persist`] and
+    /// [`Self::flush`]).
+    fn persist_locked(
+        &self,
+        state: &mut PersistState,
+        path: &Path,
+        seq: u64,
+        snapshot: &SnapshotFile,
+        sync: bool,
+    ) -> PersistOutcome {
         if seq <= state.last_seq {
             // A newer commit already persisted; this write is stale,
             // and so is whatever it would have had to say about the
             // disk.
             return PersistOutcome::Superseded;
         }
-        let error = match persist_state(&path, snapshot, sync) {
+        let error = match persist_state(path, snapshot, sync) {
             Ok(()) => None,
             Err(err) => {
                 warn!(?err, "failed to persist state.json");
@@ -2324,18 +2351,39 @@ impl Workspace {
     /// its app-quit hook). The `fsync` re-asserts physical durability
     /// at quit time — belt-and-suspenders, since the session's
     /// write-through already left the latest layout in the page cache,
-    /// readable by a relaunch even without it. Setting `shutting_down`
-    /// *after* the write means `flush`'s own `persist` isn't blocked
-    /// while every subsequent one is, so a teardown-induced PTY-exit
-    /// cascade can't clobber the flushed layout. Idempotent: a second
-    /// call is a no-op (the freeze short-circuits its `persist`).
+    /// readable by a relaunch even without it. Idempotent: a second
+    /// call is a no-op (the freeze short-circuits it up front).
+    ///
+    /// Holds `persist_guard` itself, across both the write and the
+    /// freeze (#553): a higher-seq write already past `persist`'s first
+    /// `shutting_down` check, and waiting on this same guard, must see
+    /// the freeze the instant it gets in — not race this store against
+    /// the moment the guard releases. `std::sync::Mutex` isn't
+    /// reentrant, so this cannot simply call `persist` while holding the
+    /// guard; both share the write itself through
+    /// [`Self::persist_locked`].
     pub fn flush(&self) -> Result<(), String> {
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let (snapshot, seq) = {
             let mut inner = self.inner.lock().unwrap();
             inner.snapshot_for_persist()
         };
-        let outcome = self.persist(seq, &snapshot, true);
+        let Some(path) = self.state_path.clone() else {
+            self.shutting_down.store(true, Ordering::Relaxed);
+            return Ok(()); // in-memory variant; no persistence
+        };
+        #[cfg(test)]
+        run_persist_guard_seam();
+        let mut state = self.persist_guard.lock().unwrap();
+        // A concurrent `flush` that got in first already wrote and froze.
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let outcome = self.persist_locked(&mut state, &path, seq, &snapshot, true);
         self.shutting_down.store(true, Ordering::Relaxed);
+        drop(state);
         match outcome {
             PersistOutcome::Failed(error) => Err(error),
             _ => Ok(()),
@@ -2466,6 +2514,26 @@ fn run_persist_emit_seam() {
     // Taken, not borrowed across the call: the hook blocks, and a live
     // `RefCell` borrow would outlive it.
     if let Some(seam) = PERSIST_EMIT_SEAM.with(|seam| seam.borrow_mut().take()) {
+        seam();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam for the freeze race (#553): a one-shot hook run on the
+    /// calling thread right before it takes `persist_guard`, in both
+    /// `persist` (after its first `shutting_down` check) and `flush`
+    /// (after its snapshot). Each thread installs its own hook, so a
+    /// test can hold a would-be writer parked here while `flush` runs
+    /// its write and freeze on another thread, then release the writer
+    /// onto a guard that is free but a workspace that is now frozen.
+    static PERSIST_GUARD_SEAM: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_persist_guard_seam() {
+    if let Some(seam) = PERSIST_GUARD_SEAM.with(|seam| seam.borrow_mut().take()) {
         seam();
     }
 }
@@ -6204,6 +6272,142 @@ mod tests {
         assert!(
             !overtook,
             "seq 2 persisted while seq 1 was still holding the publish"
+        );
+    }
+
+    /// #553's freeze race. `flush` used to set `shutting_down` only
+    /// *after* its own `persist` released `persist_guard`, so a write
+    /// that had already passed the `shutting_down` check and was
+    /// waiting on that same guard could land right after the "final"
+    /// flush, unfrozen.
+    ///
+    /// Both threads are held at the guard's edge, on purpose: `flush`
+    /// right after its snapshot, the writer right after it clears
+    /// `persist`'s first `shutting_down` check — exactly the race
+    /// window. `flush` is released first and runs to completion (its
+    /// own guarded write, then the freeze); only then is the writer
+    /// released onto a guard that is free but a workspace that is now
+    /// frozen. A lower- or equal-seq writer would be dropped as
+    /// `Superseded` on `persist_guard`'s ordinary check alone and would
+    /// prove nothing about the freeze; this one's seq is far past
+    /// anything `flush` itself could have written.
+    #[test]
+    fn a_higher_seq_write_racing_flushs_freeze_is_dropped_not_written() {
+        use std::sync::{mpsc, Arc};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let ws = Arc::new(Workspace::open(path.clone()));
+        let pid = ws.create_project("p", "/").unwrap().id;
+        ws.open_tab(pid, "/flushed", "", true).unwrap();
+
+        let (flush_parked, flush_reached) = mpsc::channel::<()>();
+        let (release_flush, flush_released) = mpsc::channel::<()>();
+        let flush = {
+            let ws = Arc::clone(&ws);
+            std::thread::spawn(move || {
+                PERSIST_GUARD_SEAM.with(|seam| {
+                    *seam.borrow_mut() = Some(Box::new(move || {
+                        flush_parked.send(()).unwrap();
+                        flush_released.recv().unwrap();
+                    }));
+                });
+                ws.flush()
+            })
+        };
+        flush_reached
+            .recv()
+            .expect("flush reached the guard, snapshot in hand");
+
+        let (writer_parked, writer_reached) = mpsc::channel::<()>();
+        let (release_writer, writer_released) = mpsc::channel::<()>();
+        let writer = {
+            let ws = Arc::clone(&ws);
+            std::thread::spawn(move || {
+                PERSIST_GUARD_SEAM.with(|seam| {
+                    *seam.borrow_mut() = Some(Box::new(move || {
+                        writer_parked.send(()).unwrap();
+                        writer_released.recv().unwrap();
+                    }));
+                });
+                let stray = SnapshotFile {
+                    next_id: 999,
+                    ..Default::default()
+                };
+                ws.persist(1_000_000, &stray, false)
+            })
+        };
+        writer_reached
+            .recv()
+            .expect("the racing writer reached the guard, past the freeze check");
+
+        release_flush.send(()).unwrap();
+        assert_eq!(flush.join().unwrap(), Ok(()), "the flush itself lands");
+
+        release_writer.send(()).unwrap();
+        assert_eq!(
+            writer.join().unwrap(),
+            PersistOutcome::Frozen,
+            "a write parked on the guard must see the freeze the instant it gets in"
+        );
+
+        let on_disk = read_state(&path).unwrap().unwrap();
+        assert_eq!(
+            on_disk.projects[0].tabs[0].cwd, "/flushed",
+            "the file on disk is exactly what flush wrote"
+        );
+        assert_ne!(
+            on_disk.next_id, 999,
+            "the racing write must never reach the file"
+        );
+    }
+
+    /// Two `flush` calls racing: the second holds the higher seq, so
+    /// without its own check under the guard it would write after the
+    /// first froze. Every real write replaces the file through a rename,
+    /// so a write after the freeze shows up as a new inode.
+    #[test]
+    fn a_flush_racing_another_flush_never_writes_after_the_freeze() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::{mpsc, Arc};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let ws = Arc::new(Workspace::open(path.clone()));
+        let pid = ws.create_project("p", "/").unwrap().id;
+        ws.open_tab(pid, "/flushed", "", true).unwrap();
+
+        let parked_flush = |ws: &Arc<Workspace>| {
+            let (parked, reached) = mpsc::channel::<()>();
+            let (release, released) = mpsc::channel::<()>();
+            let ws = Arc::clone(ws);
+            let flush = std::thread::spawn(move || {
+                PERSIST_GUARD_SEAM.with(|seam| {
+                    *seam.borrow_mut() = Some(Box::new(move || {
+                        parked.send(()).unwrap();
+                        released.recv().unwrap();
+                    }));
+                });
+                ws.flush()
+            });
+            reached
+                .recv()
+                .expect("the flush reached the guard, snapshot in hand");
+            (flush, release)
+        };
+        let (first, release_first) = parked_flush(&ws);
+        let (second, release_second) = parked_flush(&ws);
+
+        release_first.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), Ok(()));
+        let frozen_at = std::fs::metadata(&path).unwrap().ino();
+
+        release_second.send(()).unwrap();
+        assert_eq!(second.join().unwrap(), Ok(()));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            frozen_at,
+            "the second flush must not write after the first froze"
         );
     }
 

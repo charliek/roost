@@ -154,6 +154,13 @@ release workflow asserts they agree).
   (#567)** — its rows now carry no host label, like the in-process
   source. A real host the user actually named "localhost" under
   in-process mode keeps its own label.
+- **A write that raced a clean exit's final flush could still land on
+  disk afterward (#553)** — `Workspace::flush` now holds its write and
+  the freeze that follows it under the same lock, so a write already
+  past the freeze check and waiting on that lock sees the freeze the
+  instant it gets in, instead of a window where it could land right
+  after "the last write". The settle-in-`Drop` parts of #553 are
+  unchanged and stay open.
 - **A new tab on a session-backed project could take the window away
   from a tab you clicked while it opened, and one that never appeared
   was dropped silently (#549)** — on the local session and on saved
