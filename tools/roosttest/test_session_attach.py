@@ -1349,6 +1349,17 @@ def test_a_restarted_daemon_never_resumes_a_stale_stream(env):
         assert fresh_identity.server_epoch != old_identity.server_epoch, (
             "a restarted session reused its predecessor's epoch"
         )
+        # The attach resized the restored tab, and the session refuses a
+        # resume from before output written after a grid change (plan 072
+        # D4b) — so the point both dials below ask for has to be past a
+        # record written after it, or the honest one would come back
+        # `snapshot` too.
+        client.tab_feed_pty_bytes(tab, b"PAST-THE-RESIZE\r\n")
+        first.read_frames_until(
+            lambda f: b"PAST-THE-RESIZE" in pty_payload([f]),
+            timeout=20.0,
+            what="a record written after the attach's resize",
+        )
         first.close()
 
         # Ring content behind the seq both handshakes below will ask for.

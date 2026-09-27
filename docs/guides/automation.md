@@ -28,12 +28,24 @@ turn, `needs_input` when it's waiting on you or its turn failed,
 ## Ids and environment
 
 Every shell Roost spawns gets `ROOST_TAB_ID` (its own tab) and
-`ROOST_SOCKET` (the socket to dial) in its environment:
+`ROOST_SOCKET` (the socket to dial) in its environment, and `roostctl`
+reads both:
 
 ```bash
 printf '%s\n' "${ROOST_TAB_ID:-not in a Roost tab}"
-roostctl --socket "$ROOST_SOCKET" set-title --tab "$ROOST_TAB_ID" --title "building…"
+roostctl set-title --title "building…"
 ```
+
+In a tab on a local session (`local-backend = session`, a fresh
+install's default) `ROOST_SOCKET` names the session rather than the
+window. `roostctl` there still talks to the window that owns the
+session, as it does from a plain terminal, so `palette`, `screenshot`,
+`tab focus` and `tab open` reach and move the window. The hooks,
+`events`, `wait` and `tab prompt` stay on the session, which keeps them
+working with the window closed. A command that names its target with
+`--socket` or `--target` gets exactly that socket — `--socket
+"$ROOST_SOCKET"` is the session itself. The whole rule is in
+[Inside a session tab](../reference/cli.md#inside-a-session-tab).
 
 Tab and project ids are integers, written as JSON strings (`"7"`).
 They belong to **this running Roost**: a restart, or a switch of the
@@ -229,15 +241,14 @@ An in-process Roost that selects it — the default — makes `--focus`
 change only whether the window is raised and switched to, not whether
 the new tab becomes the active one in the sidebar; `--no-activate` is
 what actually keeps the *previous* tab active there. Under
-`local-backend = session`, a `roostctl` that dials the UI's socket —
-from a plain shell or a script — gets the same selection: the window
-selects the new tab unless `--no-activate` was passed. A `roostctl`
-run *inside* a session tab dials the session instead, because that
-tab's `ROOST_SOCKET` names the session. There, `tab open` and `open`
-move the session's own active tab — the reply marks the new tab
-`is_active` unless `--no-activate` was passed — but never the
-window's, so `is_active` is what separates the two outcomes, since the
-window's display doesn't.
+`local-backend = session`, `roostctl` gets the same selection from a
+plain shell, a script, or inside a session tab, which [talks to the
+window](#ids-and-environment): the window selects the new tab unless
+`--no-activate` was passed. Only a client on the session's own socket —
+`--socket "$ROOST_SOCKET"` inside a session tab, or `--target session`
+— moves the session's own active tab instead: the reply marks the new
+tab `is_active` unless `--no-activate` was passed, but the window
+doesn't move.
 
 ## Target policy: which tab a command acts on
 

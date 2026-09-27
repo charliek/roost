@@ -25,7 +25,7 @@
 //!   that never hydrates cannot write the saved tabs away.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -125,11 +125,13 @@ struct TabRow {
 struct Inner {
     projects: BTreeMap<i64, ProjectRow>,
     tabs: BTreeMap<i64, TabRow>,
-    /// Last selected live tab per project. This is runtime navigation state,
-    /// not a second workspace authority: every write happens alongside the
-    /// global active selection under this same lock. Only the globally-active
-    /// project position is persisted today, matching the existing restoration
-    /// contract; other projects rebuild their preference as tabs are restored.
+    /// Last selected live tab per project. This is navigation state, not a
+    /// second workspace authority: every write happens alongside the global
+    /// active selection under this same lock, except through
+    /// [`Workspace::restore_preferred_tab`], whose one caller, the
+    /// engine's restore, re-selects the saved active pair right after.
+    /// Persisted per project as `ProjectSnapshot::last_tab_position`
+    /// (plan 072 §D6).
     active_tabs_by_project: BTreeMap<i64, i64>,
     next_id: i64,
     active_project_id: i64,
@@ -277,11 +279,20 @@ pub struct RestoreLayout {
     pub active_tab_position: i32,
 }
 
+impl RestoreLayout {
+    pub fn project(&self, project_id: i64) -> Option<&RestoreProject> {
+        self.projects.iter().find(|p| p.project_id == project_id)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestoreProject {
     pub project_id: i64,
     /// Tabs in display (position) order.
     pub tabs: Vec<RestoreTab>,
+    /// Index into `tabs` of the tab the project last showed, if it
+    /// remembered one.
+    pub last_tab_position: Option<i32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -897,6 +908,7 @@ impl Workspace {
                     RestoreProject {
                         project_id: p.id,
                         tabs: tabs.into_iter().map(|(_, t)| t).collect(),
+                        last_tab_position: p.last_tab_position,
                     }
                 })
                 .collect(),
@@ -1274,6 +1286,22 @@ impl Workspace {
     /// selection policy remains authoritative and toolkit-neutral.
     pub fn preferred_tab(&self, project_id: i64) -> Option<i64> {
         self.inner.lock().unwrap().preferred_tab(project_id)
+    }
+
+    /// Make `tab_id` the tab its project remembers, without selecting it.
+    ///
+    /// A restore's setter, and silent on purpose: no event, because no
+    /// selection moved, and no write, because a restore sets one per
+    /// project and then persists once ([`Workspace::write_through`]).
+    pub(crate) fn restore_preferred_tab(&self, tab_id: i64) -> Result<(), WorkspaceError> {
+        let mut inner = self.inner.lock().unwrap();
+        let project_id = inner
+            .tabs
+            .get(&tab_id)
+            .ok_or(WorkspaceError::TabNotFound(tab_id))?
+            .project_id;
+        inner.active_tabs_by_project.insert(project_id, tab_id);
+        Ok(())
     }
 
     /// Ensure a default project exists; return its id. Used by
@@ -2230,6 +2258,14 @@ impl Workspace {
     /// `flush` snapshots under `inner` in a scope of its own and
     /// persists after it, and `commit(Persist::Skip)` — the only commit
     /// made from here — produces no snapshot and never persists.
+    ///
+    /// Re-checks `shutting_down` once more **after** taking the guard
+    /// (#553): `flush` holds the same guard across its own write and its
+    /// freeze, so a write that passed the check above and then waited on
+    /// the guard `flush` held would otherwise land right after it,
+    /// un-frozen. `flush` cannot be this function's caller for its own
+    /// write — `std::sync::Mutex` isn't reentrant — so the write itself
+    /// is factored into [`Self::persist_locked`], which both share.
     fn persist(&self, seq: u64, snapshot: &SnapshotFile, sync: bool) -> PersistOutcome {
         // Frozen by `flush()` on clean exit: ignore any later write so
         // a teardown cascade can't overwrite the flushed layout.
@@ -2239,14 +2275,33 @@ impl Workspace {
         let Some(path) = self.state_path.clone() else {
             return PersistOutcome::InMemory; // in-memory variant; no persistence
         };
+        #[cfg(test)]
+        run_persist_guard_seam();
         let mut state = self.persist_guard.lock().unwrap();
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return PersistOutcome::Frozen;
+        }
+        self.persist_locked(&mut state, &path, seq, snapshot, sync)
+    }
+
+    /// The write itself, run by a caller already holding `persist_guard`
+    /// (#553's factored-out primitive; see [`Self::persist`] and
+    /// [`Self::flush`]).
+    fn persist_locked(
+        &self,
+        state: &mut PersistState,
+        path: &Path,
+        seq: u64,
+        snapshot: &SnapshotFile,
+        sync: bool,
+    ) -> PersistOutcome {
         if seq <= state.last_seq {
             // A newer commit already persisted; this write is stale,
             // and so is whatever it would have had to say about the
             // disk.
             return PersistOutcome::Superseded;
         }
-        let error = match persist_state(&path, snapshot, sync) {
+        let error = match persist_state(path, snapshot, sync) {
             Ok(()) => None,
             Err(err) => {
                 warn!(?err, "failed to persist state.json");
@@ -2283,23 +2338,52 @@ impl Workspace {
         self.persist_guard.lock().unwrap().error.clone()
     }
 
+    /// Write the current layout through, as a commit would, with no
+    /// event: for a caller whose changes are silent ones, such as
+    /// [`Workspace::restore_preferred_tab`].
+    pub(crate) fn write_through(&self) -> PersistOutcome {
+        let (snapshot, seq) = self.inner.lock().unwrap().snapshot_for_persist();
+        self.persist(seq, &snapshot, false)
+    }
+
     /// Persist the current layout with `fsync` and then freeze further
     /// persistence. Call once on a clean exit (each UI wires it into
     /// its app-quit hook). The `fsync` re-asserts physical durability
     /// at quit time — belt-and-suspenders, since the session's
     /// write-through already left the latest layout in the page cache,
-    /// readable by a relaunch even without it. Setting `shutting_down`
-    /// *after* the write means `flush`'s own `persist` isn't blocked
-    /// while every subsequent one is, so a teardown-induced PTY-exit
-    /// cascade can't clobber the flushed layout. Idempotent: a second
-    /// call is a no-op (the freeze short-circuits its `persist`).
+    /// readable by a relaunch even without it. Idempotent: a second
+    /// call is a no-op (the freeze short-circuits it up front).
+    ///
+    /// Holds `persist_guard` itself, across both the write and the
+    /// freeze (#553): a higher-seq write already past `persist`'s first
+    /// `shutting_down` check, and waiting on this same guard, must see
+    /// the freeze the instant it gets in — not race this store against
+    /// the moment the guard releases. `std::sync::Mutex` isn't
+    /// reentrant, so this cannot simply call `persist` while holding the
+    /// guard; both share the write itself through
+    /// [`Self::persist_locked`].
     pub fn flush(&self) -> Result<(), String> {
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let (snapshot, seq) = {
             let mut inner = self.inner.lock().unwrap();
             inner.snapshot_for_persist()
         };
-        let outcome = self.persist(seq, &snapshot, true);
+        let Some(path) = self.state_path.clone() else {
+            self.shutting_down.store(true, Ordering::Relaxed);
+            return Ok(()); // in-memory variant; no persistence
+        };
+        #[cfg(test)]
+        run_persist_guard_seam();
+        let mut state = self.persist_guard.lock().unwrap();
+        // A concurrent `flush` that got in first already wrote and froze.
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let outcome = self.persist_locked(&mut state, &path, seq, &snapshot, true);
         self.shutting_down.store(true, Ordering::Relaxed);
+        drop(state);
         match outcome {
             PersistOutcome::Failed(error) => Err(error),
             _ => Ok(()),
@@ -2430,6 +2514,26 @@ fn run_persist_emit_seam() {
     // Taken, not borrowed across the call: the hook blocks, and a live
     // `RefCell` borrow would outlive it.
     if let Some(seam) = PERSIST_EMIT_SEAM.with(|seam| seam.borrow_mut().take()) {
+        seam();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam for the freeze race (#553): a one-shot hook run on the
+    /// calling thread right before it takes `persist_guard`, in both
+    /// `persist` (after its first `shutting_down` check) and `flush`
+    /// (after its snapshot). Each thread installs its own hook, so a
+    /// test can hold a would-be writer parked here while `flush` runs
+    /// its write and freeze on another thread, then release the writer
+    /// onto a guard that is free but a workspace that is now frozen.
+    static PERSIST_GUARD_SEAM: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_persist_guard_seam() {
+    if let Some(seam) = PERSIST_GUARD_SEAM.with(|seam| seam.borrow_mut().take()) {
         seam();
     }
 }
@@ -2627,35 +2731,28 @@ impl Inner {
     /// holds — so it strictly reflects commit order; `persist()` uses
     /// it to drop stale out-of-order writes (#80). Each project
     /// carries its tab layout (title + cwd + position) so a relaunch
-    /// can re-open the tabs in their saved directories.
+    /// can re-open the tabs in their saved directories, and the tab it
+    /// last showed.
     ///
     /// A project with no live tabs falls back to the retained
-    /// [`Inner::restore_layout`] when one is still un-hydrated, so a
-    /// bootstrap that loads a layout and deliberately does not re-open
-    /// it (the `session` local backend) cannot erase the user's tabs on
-    /// its first commit. The active selection falls back on the same
-    /// terms and for a sharper reason than a lost preference: plan 063
-    /// §D8's forward switch snapshots the in-process layout *including*
-    /// the active project and tab, and holds its fence until the mapped
-    /// active tab is selected and attached — so zeroing this pair
-    /// degrades the migration in exactly the case the migration exists
-    /// for.
+    /// [`Inner::restore_layout`], its remembered tab included, when one
+    /// is still un-hydrated, so a bootstrap that loads a layout and
+    /// deliberately does not re-open it (the `session` local backend)
+    /// cannot erase the user's tabs on its first commit. The active
+    /// selection falls back on the same terms and for a sharper reason
+    /// than a lost preference: plan 063 §D8's forward switch snapshots
+    /// the in-process layout *including* the active project and tab, and
+    /// holds its fence until the mapped active tab is selected and
+    /// attached — so zeroing this pair degrades the migration in exactly
+    /// the case the migration exists for.
     fn snapshot_for_persist(&mut self) -> (SnapshotFile, u64) {
         use crate::persistence::{ProjectSnapshot, TabSnapshot};
         self.persist_seq += 1;
-        // Active tab restored by its DENSE index within the active
-        // project's display-ordered tabs — not the raw `position`
-        // field, which goes sparse after a mid-project close and
-        // wouldn't match the re-opened tabs' contiguous 0..n indices
-        // on restore (the UI selects the nth tab). #95 review.
         let active_tab_position = self
             .tabs
             .get(&self.active_tab_id)
-            .map(|active| {
-                self.tabs_in_display_order(active.project_id)
-                    .into_iter()
-                    .position(|t| t.id == active.id)
-                    .unwrap_or(0) as i32
+            .and_then(|active| {
+                dense_index(&self.tabs_in_display_order(active.project_id), active.id)
             })
             .unwrap_or(0);
         // The selection half of the un-hydrated fallback. Three
@@ -2696,19 +2793,26 @@ impl Inner {
                 .projects
                 .values()
                 .map(|p| {
-                    let mut tabs: Vec<TabSnapshot> = self
-                        .tabs_in_display_order(p.id)
-                        .into_iter()
-                        .map(|t| TabSnapshot {
-                            title: t.title.clone(),
-                            cwd: t.cwd.clone(),
-                            position: t.position,
-                            user_titled: t.user_titled,
-                        })
-                        .collect();
-                    if tabs.is_empty() {
-                        tabs = retained_tabs(self.restore_layout.as_ref(), p.id);
-                    }
+                    let rows = self.tabs_in_display_order(p.id);
+                    let retained = self.restore_layout.as_ref().and_then(|l| l.project(p.id));
+                    let (tabs, last_tab_position) = match retained {
+                        Some(saved) if rows.is_empty() => {
+                            (retained_tabs(saved), saved.last_tab_position)
+                        }
+                        _ => (
+                            rows.iter()
+                                .map(|t| TabSnapshot {
+                                    title: t.title.clone(),
+                                    cwd: t.cwd.clone(),
+                                    position: t.position,
+                                    user_titled: t.user_titled,
+                                })
+                                .collect(),
+                            self.active_tabs_by_project
+                                .get(&p.id)
+                                .and_then(|remembered| dense_index(&rows, *remembered)),
+                        ),
+                    };
                     ProjectSnapshot {
                         id: p.id,
                         name: p.name.clone(),
@@ -2716,6 +2820,7 @@ impl Inner {
                         position: p.position,
                         created_at: p.created_at,
                         tabs,
+                        last_tab_position,
                     }
                 })
                 .collect(),
@@ -2724,33 +2829,32 @@ impl Inner {
     }
 }
 
-/// The saved tab descriptors `layout` still holds for `project_id`, as
-/// persistable snapshots. Empty when the layout was already drained or
-/// never held that project.
+/// Where `tab_id` sits in `rows`, counting from 0 — the index a restore
+/// re-opens it at, whatever sparse `position` it holds now.
+fn dense_index(rows: &[&TabRow], tab_id: i64) -> Option<i32> {
+    rows.iter()
+        .position(|t| t.id == tab_id)
+        .map(|index| index as i32)
+}
+
+/// A retained project's tab descriptors, as persistable snapshots.
 ///
 /// Positions are re-numbered densely from the layout's display order
 /// rather than carried: `RestoreTab` does not keep the raw `position`
 /// (hydration re-opens them at 0..n through `next_tab_position`), so a
 /// dense rewrite is what a hydrating launch would have written anyway.
-fn retained_tabs(
-    layout: Option<&RestoreLayout>,
-    project_id: i64,
-) -> Vec<crate::persistence::TabSnapshot> {
-    layout
-        .and_then(|l| l.projects.iter().find(|p| p.project_id == project_id))
-        .map(|p| {
-            p.tabs
-                .iter()
-                .enumerate()
-                .map(|(index, t)| crate::persistence::TabSnapshot {
-                    title: t.title.clone(),
-                    cwd: t.cwd.clone(),
-                    position: index as i32,
-                    user_titled: t.user_titled,
-                })
-                .collect()
+fn retained_tabs(saved: &RestoreProject) -> Vec<crate::persistence::TabSnapshot> {
+    saved
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(index, t)| crate::persistence::TabSnapshot {
+            title: t.title.clone(),
+            cwd: t.cwd.clone(),
+            position: index as i32,
+            user_titled: t.user_titled,
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn wire_tab(row: &TabRow, is_active: bool) -> Tab {
@@ -4878,6 +4982,73 @@ mod tests {
         );
     }
 
+    /// Plan 072 §D6: each project's remembered tab rides the same
+    /// un-hydrated fallback, so a `session`-mode launch leaves it for the
+    /// in-process launch that hydrates next.
+    #[test]
+    fn an_unhydrated_layout_keeps_each_projects_remembered_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let (first, second) = {
+            let ws = Workspace::open(path.clone());
+            let first = ws.create_project("first", "/first").unwrap().id;
+            ws.open_tab(first, "/a", "a", true).unwrap();
+            let b = ws.open_tab(first, "/b", "b", true).unwrap().id;
+            ws.open_tab(first, "/c", "c", true).unwrap();
+            ws.focus_tab(b).unwrap();
+            let second = ws.create_project("second", "/second").unwrap().id;
+            ws.open_tab(second, "/x", "x", true).unwrap();
+            (first, second)
+        };
+
+        let ws2 = Workspace::open(path.clone());
+        let retained = ws2.retained_layout().expect("a layout the launch keeps");
+        let remembered = |id: i64| retained.project(id).and_then(|p| p.last_tab_position);
+        assert_eq!(remembered(first), Some(1));
+        assert_eq!(remembered(second), Some(0));
+
+        ws2.add_host("box", "ssh://box").unwrap();
+        let on_disk = read_state(&path).unwrap().unwrap();
+        let saved = |id: i64| {
+            on_disk
+                .projects
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .last_tab_position
+        };
+        assert_eq!(
+            (saved(first), saved(second)),
+            (Some(1), Some(0)),
+            "an unrelated commit over an un-hydrated layout erased the remembered tabs"
+        );
+    }
+
+    #[test]
+    fn each_project_writes_its_remembered_tab_as_a_dense_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let ws = Workspace::open(path.clone());
+        let first = ws.create_project("first", "/first").unwrap().id;
+        let a = ws.open_tab(first, "/a", "a", true).unwrap().id;
+        ws.open_tab(first, "/b", "b", true).unwrap();
+        let c = ws.open_tab(first, "/c", "c", true).unwrap().id;
+        ws.open_tab(first, "/d", "d", true).unwrap();
+        ws.close_tab(a).unwrap();
+        ws.focus_tab(c).unwrap();
+        assert_eq!(ws.tab(c).unwrap().position, 2, "the precondition: sparse");
+        let second = ws.create_project("second", "/second").unwrap().id;
+        ws.open_tab(second, "/x", "x", true).unwrap();
+
+        let on_disk = read_state(&path).unwrap().unwrap();
+        let saved = on_disk.projects.iter().find(|p| p.id == first).unwrap();
+        assert_eq!(
+            saved.last_tab_position,
+            Some(1),
+            "/c is the second of [/b /c /d]: {saved:?}"
+        );
+    }
+
     /// The selection half of the same launch, and plan 063 §D8's reason
     /// for wanting it: the forward switch snapshots the active project
     /// and tab and fences on the mapped active tab being selected, so a
@@ -6101,6 +6272,142 @@ mod tests {
         assert!(
             !overtook,
             "seq 2 persisted while seq 1 was still holding the publish"
+        );
+    }
+
+    /// #553's freeze race. `flush` used to set `shutting_down` only
+    /// *after* its own `persist` released `persist_guard`, so a write
+    /// that had already passed the `shutting_down` check and was
+    /// waiting on that same guard could land right after the "final"
+    /// flush, unfrozen.
+    ///
+    /// Both threads are held at the guard's edge, on purpose: `flush`
+    /// right after its snapshot, the writer right after it clears
+    /// `persist`'s first `shutting_down` check — exactly the race
+    /// window. `flush` is released first and runs to completion (its
+    /// own guarded write, then the freeze); only then is the writer
+    /// released onto a guard that is free but a workspace that is now
+    /// frozen. A lower- or equal-seq writer would be dropped as
+    /// `Superseded` on `persist_guard`'s ordinary check alone and would
+    /// prove nothing about the freeze; this one's seq is far past
+    /// anything `flush` itself could have written.
+    #[test]
+    fn a_higher_seq_write_racing_flushs_freeze_is_dropped_not_written() {
+        use std::sync::{mpsc, Arc};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let ws = Arc::new(Workspace::open(path.clone()));
+        let pid = ws.create_project("p", "/").unwrap().id;
+        ws.open_tab(pid, "/flushed", "", true).unwrap();
+
+        let (flush_parked, flush_reached) = mpsc::channel::<()>();
+        let (release_flush, flush_released) = mpsc::channel::<()>();
+        let flush = {
+            let ws = Arc::clone(&ws);
+            std::thread::spawn(move || {
+                PERSIST_GUARD_SEAM.with(|seam| {
+                    *seam.borrow_mut() = Some(Box::new(move || {
+                        flush_parked.send(()).unwrap();
+                        flush_released.recv().unwrap();
+                    }));
+                });
+                ws.flush()
+            })
+        };
+        flush_reached
+            .recv()
+            .expect("flush reached the guard, snapshot in hand");
+
+        let (writer_parked, writer_reached) = mpsc::channel::<()>();
+        let (release_writer, writer_released) = mpsc::channel::<()>();
+        let writer = {
+            let ws = Arc::clone(&ws);
+            std::thread::spawn(move || {
+                PERSIST_GUARD_SEAM.with(|seam| {
+                    *seam.borrow_mut() = Some(Box::new(move || {
+                        writer_parked.send(()).unwrap();
+                        writer_released.recv().unwrap();
+                    }));
+                });
+                let stray = SnapshotFile {
+                    next_id: 999,
+                    ..Default::default()
+                };
+                ws.persist(1_000_000, &stray, false)
+            })
+        };
+        writer_reached
+            .recv()
+            .expect("the racing writer reached the guard, past the freeze check");
+
+        release_flush.send(()).unwrap();
+        assert_eq!(flush.join().unwrap(), Ok(()), "the flush itself lands");
+
+        release_writer.send(()).unwrap();
+        assert_eq!(
+            writer.join().unwrap(),
+            PersistOutcome::Frozen,
+            "a write parked on the guard must see the freeze the instant it gets in"
+        );
+
+        let on_disk = read_state(&path).unwrap().unwrap();
+        assert_eq!(
+            on_disk.projects[0].tabs[0].cwd, "/flushed",
+            "the file on disk is exactly what flush wrote"
+        );
+        assert_ne!(
+            on_disk.next_id, 999,
+            "the racing write must never reach the file"
+        );
+    }
+
+    /// Two `flush` calls racing: the second holds the higher seq, so
+    /// without its own check under the guard it would write after the
+    /// first froze. Every real write replaces the file through a rename,
+    /// so a write after the freeze shows up as a new inode.
+    #[test]
+    fn a_flush_racing_another_flush_never_writes_after_the_freeze() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::{mpsc, Arc};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let ws = Arc::new(Workspace::open(path.clone()));
+        let pid = ws.create_project("p", "/").unwrap().id;
+        ws.open_tab(pid, "/flushed", "", true).unwrap();
+
+        let parked_flush = |ws: &Arc<Workspace>| {
+            let (parked, reached) = mpsc::channel::<()>();
+            let (release, released) = mpsc::channel::<()>();
+            let ws = Arc::clone(ws);
+            let flush = std::thread::spawn(move || {
+                PERSIST_GUARD_SEAM.with(|seam| {
+                    *seam.borrow_mut() = Some(Box::new(move || {
+                        parked.send(()).unwrap();
+                        released.recv().unwrap();
+                    }));
+                });
+                ws.flush()
+            });
+            reached
+                .recv()
+                .expect("the flush reached the guard, snapshot in hand");
+            (flush, release)
+        };
+        let (first, release_first) = parked_flush(&ws);
+        let (second, release_second) = parked_flush(&ws);
+
+        release_first.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), Ok(()));
+        let frozen_at = std::fs::metadata(&path).unwrap().ino();
+
+        release_second.send(()).unwrap();
+        assert_eq!(second.join().unwrap(), Ok(()));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            frozen_at,
+            "the second flush must not write after the first froze"
         );
     }
 

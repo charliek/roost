@@ -27,7 +27,8 @@ use roost_engine::process::{self, ProcessRequest};
 use roost_engine::session::{InputCapture, TabOutput, TabSession};
 use roost_engine::single_instance::InstanceLocks;
 use roost_engine::{
-    LocalClient, PtySupervisor, RestoreTab, Workspace, WorkspaceError, WorkspaceEvent,
+    Hydration, LocalClient, OnRestoreError, PtySupervisor, Workspace, WorkspaceError,
+    WorkspaceEvent,
 };
 use roost_ipc::agent;
 use roost_ipc::messages::{
@@ -48,6 +49,7 @@ use roost_ui_model::{
     custom_command, host_sidebar, host_verbs,
     keybind::{self, Accel, AccelMods, KeybindAction},
     keys::{HostId, ProjectKey, TabKey},
+    notice::{self, BottomLineSource, Notice, Severity},
     notification_inbox, palette, provider,
     rollup::project_rollup,
     selection_fallback, window_title,
@@ -79,6 +81,7 @@ use crate::{chrome, input};
 // `palettes` (it hosts the command/agent/provider/notification palettes).
 pub(crate) mod agent_hooks;
 pub(crate) mod agent_hooks_dialog;
+pub(crate) mod background_resize;
 pub(crate) mod bootstrap;
 pub(crate) mod file_transfer;
 mod forwarded_open;
@@ -89,6 +92,7 @@ pub(crate) mod host_tab;
 mod interactions;
 pub(crate) mod local_backend;
 mod palettes;
+mod pending_input;
 mod pending_selection;
 mod servicing;
 mod tab_backend;
@@ -116,16 +120,17 @@ use self::palettes::{
     FontSizeTransition, PaletteAgentColumn, PaletteAgentSegment, PaletteReplyRoute,
     PaletteVisibilityRequest,
 };
+use self::pending_input::{PendingInput, PendingKeyboard};
 use self::pending_selection::{Creation, PendingHostSelection, PendingStep};
 pub(crate) use self::servicing::{AgentMetricsResult, ATTACH_RETRY_INTERVAL};
 use self::tab_backend::{TabBackend, TabHandle};
 use self::terminal_tab::{
     apply_geometry_batch, clear_preedit_or_warn, pointer_origin_tab, refresh_or_warn,
-    terminal_grid, GeometryBatchOperation, NativePointerDispatch, TerminalTab,
+    terminal_grid, GeometryBatchOperation, GeometryChange, NativePointerDispatch, TerminalTab,
 };
 #[cfg(test)]
 use self::terminal_tab::{
-    attach_test_terminal, feed_text_until, GeometryBatchFailure, GeometryChange,
+    attach_test_terminal, feed_text_until, laid_out_host_terminal, GeometryBatchFailure,
     LocalPointerGesture, NativePointerOutcome, TerminalGeometry,
 };
 
@@ -158,13 +163,13 @@ fn tab_pill_id(tab: TabKey) -> Id {
 
 #[derive(Debug, Default)]
 struct StatusBanner {
-    message: Option<String>,
+    message: Option<(String, Severity)>,
     expires_at: Option<Instant>,
 }
 
 impl StatusBanner {
-    fn set_at(&mut self, message: impl Into<String>, now: Instant) {
-        self.message = Some(message.into());
+    fn set_at(&mut self, message: impl Into<String>, severity: Severity, now: Instant) {
+        self.message = Some((message.into(), severity));
         self.expires_at = Some(now + STATUS_BANNER_DURATION);
     }
 
@@ -179,8 +184,10 @@ impl StatusBanner {
         }
     }
 
-    fn message(&self) -> Option<&str> {
-        self.message.as_deref()
+    fn message(&self) -> Option<(&str, Severity)> {
+        self.message
+            .as_ref()
+            .map(|(message, severity)| (message.as_str(), *severity))
     }
 
     fn is_active(&self) -> bool {
@@ -213,15 +220,38 @@ pub(crate) enum DurabilitySource {
 fn bottom_line<'a>(
     status: &'a StatusBanner,
     durability: &'a BTreeMap<DurabilitySource, String>,
-) -> Option<Cow<'a, str>> {
-    if let Some(status) = status.message() {
-        return Some(Cow::Borrowed(status));
+) -> Option<BottomLine<'a>> {
+    if let Some((text, severity)) = status.message() {
+        return Some(BottomLine {
+            text: Cow::Borrowed(text),
+            severity,
+            source: BottomLineSource::Status,
+        });
     }
     let (source, error) = durability.iter().next()?;
-    Some(Cow::Owned(match source {
-        DurabilitySource::Local => format!("Roost couldn't save your workspace: {error}"),
-        DurabilitySource::Host(host) => format!("on {host}: last save failed: {error}"),
-    }))
+    Some(BottomLine {
+        text: Cow::Owned(match source {
+            DurabilitySource::Local => format!("Roost couldn't save your workspace: {error}"),
+            DurabilitySource::Host(host) => format!("on {host}: last save failed: {error}"),
+        }),
+        severity: Severity::Error,
+        source: BottomLineSource::Durability,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BottomLine<'a> {
+    text: Cow<'a, str>,
+    severity: Severity,
+    source: BottomLineSource,
+}
+
+fn bottom_line_color(severity: Severity) -> Color {
+    match severity {
+        Severity::Info => chrome::TEXT,
+        Severity::Warning => chrome::HOST_BANNER_TEXT,
+        Severity::Error => chrome::ERROR_TEXT,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -659,54 +689,65 @@ fn agent_hooks_row<'a>(
     .into()
 }
 
-/// A host tab's last frame, kept on screen under a scrim and a banner:
-/// the session ended and nothing will update these pixels again.
+/// The terminal area with its notice drawn in.
 ///
 /// Not a modal: the rest of the window stays live, because the user's
-/// local tabs and every other host are unaffected — only *this* frame
-/// stopped being true. The scrim is a layer rather than a recolor
-/// because the terminal draws from an owned snapshot; the banner sits
-/// above it so its own text is not dimmed with the frame it describes.
-fn frozen_frame<'a>(
-    content: Element<'a, Message>,
-    saved_id: &str,
-    frame: host_notice::FrozenFrame,
-    banner: host_notice::HostBanner,
-) -> Element<'a, Message> {
-    // The frame travels with the press: the button's promise is this
-    // frame's, and honoring it against a host that has since moved on
-    // would mean aborting a connect already running.
-    let press = Message::HostFrameReconnect {
-        saved_id: saved_id.to_string(),
-        frame,
+/// local tabs and every other host are unaffected. Over a frame, the
+/// scrim is a layer rather than a recolor because the terminal draws
+/// from an owned snapshot, and the strip sits above it so its own text
+/// is not dimmed with the frame it describes.
+fn with_notice<'a>(content: Element<'a, Message>, notice: Notice) -> Element<'a, Message> {
+    let placement = notice.placement;
+    let strip = notice_strip(notice);
+    let layers = match placement {
+        notice::Placement::OverFrame => {
+            let scrim = container(iced::widget::Space::new().width(Fill).height(Fill))
+                .style(chrome::host_frame_scrim);
+            stack![content, scrim, strip]
+        }
+        notice::Placement::EmptyArea => stack![content, strip],
     };
-    let scrim = container(iced::widget::Space::new().width(Fill).height(Fill))
-        .style(chrome::host_frame_scrim);
-    stack![content, scrim, host_strip(banner, press)]
-        .width(Fill)
-        .height(Fill)
-        .into()
+    layers.width(Fill).height(Fill).into()
 }
 
-/// The strip itself: a sentence, a button, and the hairline under it.
-fn host_strip<'a>(banner: host_notice::HostBanner, press: Message) -> Column<'a, Message> {
-    let strip = container(
-        row![
-            text(banner.message)
-                .size(chrome::HOST_BANNER_TEXT_SIZE)
-                .color(chrome::HOST_BANNER_TEXT),
-            iced::widget::Space::new().width(Fill),
-            button(text(banner.action).size(chrome::HOST_BANNER_ACTION_SIZE))
+/// The strip itself: a sentence, its buttons, an optional second line,
+/// and the hairline under it. Each button carries the notice it was drawn
+/// on, for [`notice::click_still_lands`].
+fn notice_strip<'a>(notice: Notice) -> Column<'a, Message> {
+    let mut line = row![
+        text(notice.message)
+            .size(chrome::HOST_BANNER_TEXT_SIZE)
+            .color(chrome::HOST_BANNER_TEXT),
+        iced::widget::Space::new().width(Fill),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    for action in &notice.actions {
+        line = line.push(
+            button(text(action.label).size(chrome::HOST_BANNER_ACTION_SIZE))
                 .padding([2, 9])
                 .style(chrome::host_banner_button)
-                .on_press(press),
+                .on_press(Message::NoticeAction {
+                    key: notice.key.clone(),
+                    action: action.id,
+                }),
+        );
+    }
+    let body: Element<'a, Message> = match notice.detail {
+        None => line.into(),
+        Some(detail) => column![
+            line,
+            text(detail)
+                .size(chrome::HOST_BANNER_ACTION_SIZE)
+                .color(chrome::HOST_BANNER_TEXT),
         ]
-        .spacing(10)
-        .align_y(Alignment::Center),
-    )
-    .width(Fill)
-    .padding([6, 12])
-    .style(chrome::host_banner);
+        .spacing(2)
+        .into(),
+    };
+    let strip = container(body)
+        .width(Fill)
+        .padding([6, 12])
+        .style(chrome::host_banner);
     let edge = container(iced::widget::Space::new().width(Fill).height(1.0))
         .style(chrome::host_banner_edge);
     column![strip, edge]
@@ -992,6 +1033,12 @@ pub enum EngineOpResult {
         focus_generation: u64,
         answer: Box<Result<serde_json::Value, roost_engine::ipc::HostOpFailure>>,
     },
+    /// A background resize wave on the local session, answered (plan 072
+    /// D5). `connection` is the incarnation it went to.
+    BackgroundResized {
+        connection: HostId,
+        outcomes: Vec<background_resize::Outcome>,
+    },
 }
 
 /// Build the future behind [`UiTask::EngineOp`]: the op runs on the
@@ -1072,12 +1119,14 @@ fn engine_op_status(result: EngineOpResult) -> Option<String> {
         // so `host_restart_completed` puts that on the status bar itself.
         // And a forward has already answered the client it belongs to:
         // there is no second surface that owes anything.
+        // And a background resize is nothing the user asked for.
         EngineOpResult::Renamed { .. }
         | EngineOpResult::TabsReordered { .. }
         | EngineOpResult::ProjectsReordered { .. }
         | EngineOpResult::HostVerified { .. }
         | EngineOpResult::HostRestarted { .. }
-        | EngineOpResult::LocalForward { .. } => None,
+        | EngineOpResult::LocalForward { .. }
+        | EngineOpResult::BackgroundResized { .. } => None,
         EngineOpResult::TabOpened {
             project, result, ..
         } => match result {
@@ -1104,6 +1153,18 @@ fn engine_op_status(result: EngineOpResult) -> Option<String> {
 }
 
 impl EngineOpResult {
+    /// A creation's op id and the tab it made, or why it made none.
+    fn creation(&self) -> Option<(u64, Result<TabKey, String>)> {
+        match self {
+            Self::TabOpened { op, result, .. } => Some((*op, result.clone())),
+            Self::ProjectCreated { op, result, .. } => Some((
+                *op,
+                result.as_ref().map(|(_, tab)| *tab).map_err(String::clone),
+            )),
+            _ => None,
+        }
+    }
+
     /// The dispatch id this completion carries, where it has one.
     ///
     /// Wider than [`Self::palette_op`] on purpose: this is what retires
@@ -1122,7 +1183,9 @@ impl EngineOpResult {
             | Self::LocalForward { op, .. } => Some(*op),
             // Not workspace mutations: a verify dials a target that may
             // not even be saved, and a restart is keyed by saved id.
-            Self::HostVerified { .. } | Self::HostRestarted { .. } => None,
+            Self::HostVerified { .. }
+            | Self::HostRestarted { .. }
+            | Self::BackgroundResized { .. } => None,
         }
     }
 
@@ -1150,7 +1213,8 @@ impl EngineOpResult {
             // opens, so the `palette.activate` that opened it was
             // answered then.
             | Self::HostVerified { .. }
-            | Self::HostRestarted { .. } => None,
+            | Self::HostRestarted { .. }
+            | Self::BackgroundResized { .. } => None,
         }
     }
 
@@ -1170,6 +1234,21 @@ impl EngineOpResult {
         let reply = answer.as_ref().as_ref().ok()?;
         let tab = forwarded_open::opened_tab(forwarded, reply)?;
         Some((TabKey::new(*host, tab), *selects))
+    }
+
+    /// The tab an open this window dispatched or forwarded made.
+    fn opened_tab(&self) -> Option<TabKey> {
+        match self {
+            Self::TabOpened {
+                result: Ok(tab), ..
+            }
+            | Self::ProjectCreated {
+                result: Ok((_, tab)),
+                ..
+            } => Some(*tab),
+            Self::LocalForward { .. } => self.forwarded_open().map(|(tab, _)| tab),
+            _ => None,
+        }
     }
 }
 
@@ -1207,8 +1286,9 @@ async fn host_call<T: serde::de::DeserializeOwned>(
     ops: &crate::host_conn::HostOps,
     op: &'static str,
     params: serde_json::Value,
+    on_slot: bool,
 ) -> Result<T, String> {
-    host_reply(op, ops.call(op, params).await)
+    host_reply(op, ops.call(op, params).await, on_slot)
 }
 
 /// [`host_call`]'s reading of a reply, for a caller that has to look at
@@ -1216,8 +1296,9 @@ async fn host_call<T: serde::de::DeserializeOwned>(
 fn host_reply<T: serde::de::DeserializeOwned>(
     op: &str,
     reply: Result<serde_json::Value, crate::host_conn::HostOpError>,
+    on_slot: bool,
 ) -> Result<T, String> {
-    let value = reply.map_err(|error| format!("{op}: {error}"))?;
+    let value = reply.map_err(|error| format!("{op}: {}", host_op_error_text(&error, on_slot)))?;
     serde_json::from_value(value).map_err(|error| format!("{op} answered unexpectedly: {error}"))
 }
 
@@ -1271,12 +1352,14 @@ fn host_op_error_text(error: &crate::host_conn::HostOpError, on_slot: bool) -> S
 async fn create_host_project_flow(
     ops: crate::host_conn::HostOps,
     grid: (u16, u16),
+    on_slot: bool,
 ) -> Result<(i64, i64), String> {
     use roost_ipc::messages::{ops as wire, ProjectCreateResult, TabOpenResult};
     let created: ProjectCreateResult = host_call(
         &ops,
         wire::PROJECT_CREATE,
         serde_json::json!({ "name": "", "cwd": "" }),
+        on_slot,
     )
     .await?;
     let project = created.project;
@@ -1284,12 +1367,15 @@ async fn create_host_project_flow(
         &ops,
         wire::TAB_OPEN,
         host_tab_open_params(project.id, &project.cwd, "", &[], None, grid),
+        on_slot,
     )
     .await;
     match opened {
         Ok(opened) => Ok((project.id, opened.tab.id)),
         Err(error) => {
-            if let Err(rollback_error) = roll_back_empty_host_project(&ops, project.id).await {
+            if let Err(rollback_error) =
+                roll_back_empty_host_project(&ops, project.id, on_slot).await
+            {
                 tracing::warn!(
                     project_id = project.id,
                     %rollback_error,
@@ -1307,9 +1393,11 @@ async fn create_host_project_flow(
 async fn roll_back_empty_host_project(
     ops: &crate::host_conn::HostOps,
     project_id: i64,
+    on_slot: bool,
 ) -> Result<(), String> {
     use roost_ipc::messages::{ops as wire, TabListResult};
-    let listed: TabListResult = host_call(ops, wire::TAB_LIST, serde_json::json!({})).await?;
+    let listed: TabListResult =
+        host_call(ops, wire::TAB_LIST, serde_json::json!({}), on_slot).await?;
     match listed.projects.iter().find(|p| p.id == project_id) {
         None => Ok(()),
         Some(project) if !project.tabs.is_empty() => {
@@ -1324,6 +1412,7 @@ async fn roll_back_empty_host_project(
             ops,
             wire::PROJECT_DELETE,
             serde_json::json!({ "project_id": project_id.to_string() }),
+            on_slot,
         )
         .await
         .map(|_| ()),
@@ -1344,6 +1433,7 @@ async fn host_remove_call<T>(
     params: serde_json::Value,
     removed: T,
     already_gone: T,
+    on_slot: bool,
 ) -> Result<T, String> {
     match ops.call(op, params).await {
         Ok(_) => Ok(removed),
@@ -1351,7 +1441,7 @@ async fn host_remove_call<T>(
             code: roost_ipc::client::ServerCode::NotFound,
             ..
         }) => Ok(already_gone),
-        Err(error) => Err(format!("{op}: {error}")),
+        Err(error) => Err(format!("{op}: {}", host_op_error_text(&error, on_slot))),
     }
 }
 
@@ -1361,6 +1451,7 @@ async fn host_remove_call<T>(
 async fn close_host_tab_flow(
     ops: crate::host_conn::HostOps,
     tab_id: i64,
+    on_slot: bool,
 ) -> Result<CloseTabOutcome, String> {
     host_remove_call(
         &ops,
@@ -1368,6 +1459,7 @@ async fn close_host_tab_flow(
         serde_json::json!({ "tab_id": tab_id.to_string() }),
         CloseTabOutcome::Closed,
         CloseTabOutcome::AlreadyGone,
+        on_slot,
     )
     .await
 }
@@ -1376,6 +1468,7 @@ async fn close_host_tab_flow(
 async fn delete_host_project_flow(
     ops: crate::host_conn::HostOps,
     project_id: i64,
+    on_slot: bool,
 ) -> Result<DeleteProjectOutcome, String> {
     host_remove_call(
         &ops,
@@ -1383,6 +1476,7 @@ async fn delete_host_project_flow(
         serde_json::json!({ "project_id": project_id.to_string() }),
         DeleteProjectOutcome::Deleted,
         DeleteProjectOutcome::AlreadyGone,
+        on_slot,
     )
     .await
 }
@@ -1434,6 +1528,7 @@ async fn open_host_tab_flow(
     title: String,
     argv: Vec<String>,
     grid: (u16, u16),
+    on_slot: bool,
 ) -> Result<i64, String> {
     use crate::host_conn::HostOpError;
     use roost_ipc::client::ServerCode;
@@ -1466,7 +1561,7 @@ async fn open_host_tab_flow(
         }
         reply => reply,
     };
-    let opened: TabOpenResult = host_reply(wire::TAB_OPEN, reply)?;
+    let opened: TabOpenResult = host_reply(wire::TAB_OPEN, reply, on_slot)?;
     Ok(opened.tab.id)
 }
 
@@ -1590,6 +1685,67 @@ fn effective_sidebar_width(collapsed: bool, width: f32) -> f32 {
         0.0
     } else {
         width
+    }
+}
+
+/// [`App::resize`]'s re-grid of every kept terminal: window resizes,
+/// sidebar width drags and collapse all land here.
+fn regrid_window(
+    tabs: &mut HashMap<TabKey, TerminalTab>,
+    host_resume: &mut HashMap<TabKey, host_tab::ResumePoint>,
+    (cols, rows): (u16, u16),
+    metrics: TerminalMetrics,
+    metric_generation: u64,
+) {
+    for (key, tab) in tabs {
+        match tab.apply_geometry(cols, rows, metrics, metric_generation) {
+            Ok(Some(change)) => {
+                host_tab::forget_resume_on_regrid(
+                    host_resume,
+                    *key,
+                    change.previous_grid,
+                    change.grid(),
+                );
+                tab.commit_geometry(change);
+                // A re-grid rewrites the viewport and drops hover, so the
+                // snapshot the widget draws describes the old dimensions
+                // until it is rebuilt.
+                refresh_or_warn(key.tab, tab, "window re-grid");
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    tab_id = key.tab,
+                    cols,
+                    rows,
+                    "terminal resize failed"
+                )
+            }
+        }
+    }
+}
+
+/// A background resize wave's half of D4: the session writes for the
+/// wave's grid from here on, so a resume point for another would replay
+/// at the wrong one. Only a point the wave moves off its grid goes. A
+/// detached tab keeps one only while its kept terminal is at the grid the
+/// session last heard from this window (`HostAttach::detach`, and the
+/// re-grid sites forget it after), and the wave every detach arms sends
+/// that very grid: forgetting the point there would make every refocus a
+/// snapshot.
+fn forget_resumes_moved_by_wave(
+    tabs: &HashMap<TabKey, TerminalTab>,
+    host_resume: &mut HashMap<TabKey, host_tab::ResumePoint>,
+    targets: &[(TabKey, (u16, u16))],
+) {
+    for &(key, grid) in targets {
+        match tabs.get(&key) {
+            Some(tab) => host_tab::forget_resume_on_regrid(host_resume, key, tab.grid(), grid),
+            None => {
+                host_resume.remove(&key);
+            }
+        }
     }
 }
 
@@ -1760,6 +1916,10 @@ fn ring_sections_from(
         .collect()
 }
 
+const SIDEBAR_BAND_PADDING_X: f32 = 12.0;
+const SIDEBAR_BAND_LABEL_SIZE: f32 = 11.0;
+const FIDELITY_PILL_PADDING_X: f32 = 6.0;
+
 /// The sidebar's band strip. The "PROJECTS" header and every host band
 /// are the same chrome, so the height and insets live in one place —
 /// that parity is the whole reason a host section reads as a band and
@@ -1768,18 +1928,53 @@ fn sidebar_band<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Mes
     container(content)
         .center_y(chrome::BAND_HEIGHT)
         .width(Fill)
-        .padding([0, 12])
+        .padding([0.0, SIDEBAR_BAND_PADDING_X])
         .style(chrome::band)
         .into()
+}
+
+fn sidebar_band_label_font() -> Font {
+    chrome::chrome_font(font::Weight::Semibold)
 }
 
 /// A band's label, in the one weight and size every band uses.
 fn sidebar_band_label(label: &str) -> Element<'_, Message> {
     text(label)
-        .size(11)
+        .size(SIDEBAR_BAND_LABEL_SIZE)
         .color(chrome::MUTED_TEXT)
-        .font(chrome::chrome_font(font::Weight::Semibold))
+        .font(sidebar_band_label_font())
         .into()
+}
+
+/// How wide a host band's rollup may draw and keep the band one line:
+/// the sidebar, less everything else [`App::host_band`] lays out beside
+/// it. `fidelity` is the band's `reduced fidelity` pill, if it draws one,
+/// and whether it is a button.
+///
+/// A row does not shrink its text to fit, so a rollup wider than this
+/// wraps down over "PROJECTS" and the rows under it; it is elided to this
+/// instead (#520).
+fn host_rollup_budget(sidebar_width: f32, label: &str, fidelity: Option<bool>) -> f32 {
+    let label = chrome::text_width(label, sidebar_band_label_font(), SIDEBAR_BAND_LABEL_SIZE);
+    let pill = fidelity.map_or(0.0, |pressable| {
+        chrome::HOST_BAND_SPACING
+            + chrome::text_width(
+                host_notice::FIDELITY_PILL,
+                chrome::chrome_font(font::Weight::Normal),
+                chrome::HOST_ROLLUP_SIZE,
+            )
+            + if pressable {
+                2.0 * FIDELITY_PILL_PADDING_X
+            } else {
+                0.0
+            }
+    });
+    // Dot, label, spacer and rollup: three gaps.
+    let fixed = chrome::DIVIDER_WIDTH
+        + 2.0 * SIDEBAR_BAND_PADDING_X
+        + chrome::HOST_DOT_SIZE
+        + 3.0 * chrome::HOST_BAND_SPACING;
+    (sidebar_width - fixed - label - pill).max(0.0)
 }
 
 /// One column of an agents-palette row, in the treatment its role
@@ -1883,6 +2078,9 @@ enum KeyboardRoute {
     HostDialog,
     Editor,
     Palette,
+    /// A new tab is opening, and the keys typed meanwhile are kept for
+    /// it (plan 072 §D2).
+    Pending,
     /// The terminal that owns the keyboard, host-qualified so a
     /// composition or a keystroke can never be delivered to another
     /// instance's tab of the same number.
@@ -1899,7 +2097,8 @@ fn ime_preedit_target(route: KeyboardRoute) -> Option<TabKey> {
         | KeyboardRoute::Confirm
         | KeyboardRoute::HostDialog
         | KeyboardRoute::Editor
-        | KeyboardRoute::Palette => None,
+        | KeyboardRoute::Palette
+        | KeyboardRoute::Pending => None,
     }
 }
 
@@ -1983,14 +2182,24 @@ fn set_preedit_in(
     }
 }
 
+/// Where [`commit_ime_in`] left a commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImeCommit {
+    /// Delivered, or dropped with nowhere to go.
+    Settled,
+    /// No tab holds a composition and a new tab is opening: the commit
+    /// is the new tab's, to keep with the keys typed for it.
+    ForPendingTab,
+}
+
 fn commit_ime_in(
     tabs: &mut HashMap<TabKey, TerminalTab>,
     discard: &mut ImeDiscard,
     route: KeyboardRoute,
     text: &str,
-) {
+) -> ImeCommit {
     if discard.claims_commit() {
-        return;
+        return ImeCommit::Settled;
     }
     // The holder's WHOLE key travels to the lookup: reducing it to a
     // number here and re-qualifying it below would hand the commit to
@@ -2000,14 +2209,19 @@ fn commit_ime_in(
         .find(|(_, tab)| tab.preedit.is_some())
         .map(|(key, _)| *key);
     let Some(key) = ime_commit_target(holder, route) else {
-        return;
+        return if route == KeyboardRoute::Pending {
+            ImeCommit::ForPendingTab
+        } else {
+            ImeCommit::Settled
+        };
     };
     let Some(tab) = tabs.get_mut(&key) else {
-        return;
+        return ImeCommit::Settled;
     };
     if let Err(error) = tab.commit_ime(text) {
         tracing::warn!(?error, tab_id = key.tab, "terminal IME commit failed");
     }
+    ImeCommit::Settled
 }
 
 /// Whether the terminal for `active_tab` should ask the platform for an
@@ -2023,6 +2237,50 @@ fn terminal_ime_active(route: KeyboardRoute, active_tab: TabKey, window_focused:
 /// focused` IPC op (`test_focus.py`), which stays unchanged.
 fn terminal_cursor_focused(route: KeyboardRoute, window_focused: bool) -> bool {
     window_focused && matches!(route, KeyboardRoute::Terminal(_))
+}
+
+/// One key press into the terminal it is typed at, encoded with that
+/// tab's own encoder and modes. `tracked` is the window's modifier state,
+/// which disqualifies a bare page key just as the event's own bits do.
+fn type_into(
+    tab: &mut TerminalTab,
+    tab_id: i64,
+    event: keyboard::Event,
+    tracked: keyboard::Modifiers,
+    composing: bool,
+) {
+    // A bare page key scrolls this tab's own scrollback whenever the shared
+    // policy keeps it local — no snap, no encode, nothing on the PTY. The
+    // bypass is the policy's decision, never the key's: `Forward` (mouse
+    // tracking, alternate screen) falls through to the normal encode below.
+    let page_direction = if composing {
+        None
+    } else {
+        input::bare_page_direction(&event, tracked)
+    };
+    if let Some(direction) = page_direction {
+        match tab.handle_page(direction) {
+            Ok(PageRoute::LocalViewport { .. }) => return,
+            Ok(PageRoute::Forward) => {}
+            Err(error) => {
+                // Only the repaint after a completed local move can fail,
+                // so the key is still consumed; the next refresh recovers.
+                tracing::warn!(?error, active_tab = tab_id, "terminal page scroll failed");
+                return;
+            }
+        }
+    }
+    if input::non_modifier_press(&event) {
+        if let Err(error) = tab.snap_to_bottom_for_input() {
+            tracing::warn!(
+                ?error,
+                active_tab = tab_id,
+                "terminal snap-to-bottom failed"
+            );
+        }
+    }
+    let bytes = input::encode_press(&mut tab.encoder, &tab.terminal, event, composing);
+    tab.session.send_input(bytes);
 }
 
 /// Whether the terminal the window is drawing can take a keystroke: it
@@ -2046,6 +2304,7 @@ fn resolve_keyboard_route(
     host_dialog_open: bool,
     editor_open: bool,
     palette_open: bool,
+    pending_tab: bool,
     active_tab: TabKey,
     active_terminal_live: bool,
 ) -> KeyboardRoute {
@@ -2057,6 +2316,8 @@ fn resolve_keyboard_route(
         KeyboardRoute::Editor
     } else if palette_open {
         KeyboardRoute::Palette
+    } else if pending_tab {
+        KeyboardRoute::Pending
     } else if active_terminal_live {
         KeyboardRoute::Terminal(active_tab)
     } else {
@@ -2160,6 +2421,9 @@ pub enum UiTask {
     /// One-shot: wake once the file-drop gesture's debounce window has
     /// elapsed. Scheduled where the deadline is set, never polled.
     FileDropDeadline(Duration),
+    /// One-shot: wake when the local session's background resize wave
+    /// may be due — [`App::take_background_resize_task`].
+    BackgroundResizeDeadline(Duration),
     PaletteVisibility {
         scroll_id: Id,
         row_id: Id,
@@ -2375,6 +2639,10 @@ impl Drop for RestoreDefaultQuitSignalsOnDrop {
 struct EngineDispatch {
     task: UiTask,
     op: Option<u64>,
+    /// Where a creation — a tab, or a project and its tab — went: the
+    /// incarnation, or the local backend's host. What a gesture binds the
+    /// keys typed after it to (plan 072 §D2).
+    created_on: Option<HostId>,
 }
 
 impl UiTask {
@@ -2636,6 +2904,11 @@ pub struct App {
     /// another's. `BTreeMap` so the first entry is the one
     /// [`bottom_line`] names.
     durability: BTreeMap<DurabilitySource, String>,
+    /// Which showing of the terminal notice is on screen — what
+    /// `app.notice_dump` reports and `app.notice_answer` must name.
+    notice_generation: notice::NoticeGeneration,
+    /// This profile's UI log, as a notice names it.
+    log_path: String,
     /// The one startup agent-hooks ensure has been started (plan 046
     /// §3.7). `window_opened` also runs on every focus change, so this
     /// is what keeps a startup act from becoming a focus act.
@@ -2690,6 +2963,7 @@ pub struct App {
     confirm_delete: Option<ConfirmDeleteProject>,
     pending_attachments: servicing::PendingAttachments,
     file_drops: FileDropQueue,
+    background_resize: background_resize::BackgroundResize,
     /// Per-host upload gestures (plan 047 §3.3). Holds the reply
     /// oneshots C6's `tab.send_file` waits on, so it must be dropped
     /// while those callers can still hear the answer — its `Drop`
@@ -2888,11 +3162,14 @@ pub struct App {
     /// click made while the request is in flight, or while its row is
     /// awaited, is never overridden by the creation (plan 071 §D13).
     focus_generation: u64,
+    /// The keys typed while a new tab opens, for it (plan 072 §D2).
+    pending_keyboard: PendingKeyboard,
     awaiting_listing: forwarded_open::AwaitingListing,
-    /// Whether the launch still owes the slot's tab a select + attach
-    /// (plan 063 §D5). Armed at bootstrap under `session` and cleared by
-    /// the first reconcile that can answer — either by selecting, or by
-    /// finding a selection already held.
+    /// Whether the window still owes the slot's tab a select + attach
+    /// (plan 063 §D5). Armed at bootstrap under `session`, and again when
+    /// the slot connects with nothing live selected (plan 072 §D8);
+    /// cleared by the first reconcile that can answer — either by
+    /// selecting, or by finding a selection already held.
     pending_initial_local_selection: bool,
     /// Why each connect this client started was started (plan 063
     /// §D12), keyed by saved host and drained on the edge where it
@@ -3174,6 +3451,8 @@ impl App {
             modifiers: keyboard::Modifiers::default(),
             test_mode,
             status: StatusBanner::default(),
+            notice_generation: notice::NoticeGeneration::default(),
+            log_path: profile.log_path().display().to_string(),
             durability: BTreeMap::new(),
             agent_hooks_started: false,
             agent_hooks_card_raised: false,
@@ -3195,6 +3474,7 @@ impl App {
             confirm_delete: None,
             pending_attachments: servicing::PendingAttachments::default(),
             file_drops: FileDropQueue::default(),
+            background_resize: background_resize::BackgroundResize::default(),
             gestures: file_transfer::Gestures::default(),
             config,
             local_backend: backend_mode,
@@ -3269,6 +3549,7 @@ impl App {
             add_host_focus_requested: false,
             pending_host_selection: None,
             focus_generation: 0,
+            pending_keyboard: PendingKeyboard::default(),
             awaiting_listing: forwarded_open::AwaitingListing::default(),
             pending_initial_local_selection: backend_mode == LocalBackendMode::Session,
             connect_purposes: HashMap::new(),
@@ -4124,8 +4405,9 @@ impl App {
     /// `mark_noticed` make the announcement permanent — the order
     /// `agent_hooks`'s own header pins.
     ///
-    /// The log lines are deliberate: no IPC op carries the status banner,
-    /// so they are the only thing the E2E can read the toast text out of.
+    /// The log lines are deliberate: `app.notice_dump` reads the toast
+    /// only while it is up, and the log is where an E2E reads it back
+    /// after it expired.
     fn show_hooks_toast(&mut self, toast: agent_hooks::AgentHooksToast) {
         if let Some(announcement) = &toast.announcement {
             tracing::info!(toast = announcement.as_str(), "agent hooks toast shown");
@@ -4266,6 +4548,9 @@ impl App {
         if let Some((tab, _)) = result.forwarded_open() {
             self.awaiting_listing.track(tab, Instant::now());
         }
+        if let Some(tab) = result.opened_tab() {
+            self.background_resize.opened(tab, Instant::now());
+        }
         // Strictly before the retirement below: a forwarded op's caller
         // is handed its answer, and only then does the op stop holding
         // §D6's auto-remove off (plan 063 §D10). One main-thread step,
@@ -4289,6 +4574,7 @@ impl App {
         if let Some(op) = result.op_id() {
             self.host_ops.finish(op);
         }
+        let creation = result.creation();
         match result {
             simple @ (EngineOpResult::TabClosed { .. }
             | EngineOpResult::ProjectDeleted { .. }
@@ -4334,7 +4620,17 @@ impl App {
             // `reconcile()`, which is how a forwarded mutation's effect
             // on the slot reaches the auto-remove and the exit rule.
             EngineOpResult::LocalForward { .. } => {}
+            EngineOpResult::BackgroundResized {
+                connection,
+                outcomes,
+            } => self
+                .background_resize
+                .settle(connection, outcomes, Instant::now()),
         }
+        // After the match put a failed creation's error on the status
+        // line: a buffer that held keys replaces it with a line that names
+        // them as well.
+        self.pending_keyboard_answered(creation);
         self.reconcile();
         if let Some((op, error)) = deferred_activation {
             settle_palette_activation(&mut self.palette_activate_replies, op, error);
@@ -4375,6 +4671,72 @@ impl App {
         }
     }
 
+    /// The background resize wave's drain, run after every message (plan
+    /// 072 D5). After, because an attach an edge starts takes its place
+    /// in the local session's queue as it starts, and the wave must not
+    /// hold it up.
+    pub fn take_background_resize_task(&mut self) -> UiTask {
+        match self.background_resize.poll(Instant::now()) {
+            background_resize::Poll::Idle => UiTask::None,
+            background_resize::Poll::Arm(delay) => UiTask::BackgroundResizeDeadline(delay),
+            background_resize::Poll::Wave => self.background_resize_wave(),
+        }
+    }
+
+    pub fn background_resize_deadline(&mut self) {
+        self.background_resize.fired();
+    }
+
+    fn local_session_listing(&self) -> Option<(HostId, Vec<TabKey>)> {
+        let view = self.connected_slot_view()?;
+        let listed = view
+            .projects
+            .iter()
+            .flat_map(|project| project.tabs.iter())
+            .map(|tab| TabKey::new(view.host, tab.id))
+            .collect();
+        Some((view.host, listed))
+    }
+
+    /// Reconcile's half: which connection the local session is on, and
+    /// whether it now lists a tab this window opened.
+    fn reconcile_background_resize(&mut self) {
+        let now = Instant::now();
+        self.background_resize
+            .connected(self.connected_slot_host(), now);
+        if !self.background_resize.awaits_listing() {
+            return;
+        }
+        if let Some((_, listed)) = self.local_session_listing() {
+            self.background_resize.listed(&listed, now);
+        }
+    }
+
+    fn background_resize_wave(&mut self) -> UiTask {
+        let Some((connection, listed)) = self.local_session_listing() else {
+            return UiTask::None;
+        };
+        let Some(queue) = self.hosts.ops_for(connection) else {
+            return UiTask::None;
+        };
+        let attached: HashSet<TabKey> = self.host_attach.keys().copied().collect();
+        let targets =
+            self.background_resize
+                .wave(connection, &listed, &attached, self.current_grid());
+        if targets.is_empty() {
+            return UiTask::None;
+        }
+        let sent = background_resize::send_wave(queue, &targets);
+        forget_resumes_moved_by_wave(&self.tabs, &mut self.host_resume, &targets);
+        self.engine_op(
+            async move { Ok::<_, String>(sent.await) },
+            move |outcomes| EngineOpResult::BackgroundResized {
+                connection,
+                outcomes: outcomes.unwrap_or_default(),
+            },
+        )
+    }
+
     /// The status banner is up, so its expiry is due — `Message::StatusTick`.
     pub fn expire_status(&mut self) {
         self.status.expire_at(Instant::now());
@@ -4384,7 +4746,7 @@ impl App {
         self.status.is_active()
     }
 
-    fn bottom_line(&self) -> Option<Cow<'_, str>> {
+    fn bottom_line(&self) -> Option<BottomLine<'_>> {
         bottom_line(&self.status, &self.durability)
     }
 
@@ -4456,14 +4818,17 @@ impl App {
         self.pending_attachments.has_retryable()
     }
 
-    /// A creation or a parked `tab.focus` is waiting on a mirror, so its
-    /// deadline needs a clock (plan 071 §D13).
+    /// A creation or a parked `tab.focus` is waiting on a mirror, or keys
+    /// wait for a new tab, so its deadline needs a clock (plan 071 §D13,
+    /// plan 072 §D2).
     pub fn pending_selection_waiting(&self) -> bool {
-        self.pending_host_selection.is_some() || !self.awaiting_listing.is_empty()
+        self.pending_host_selection.is_some()
+            || !self.awaiting_listing.is_empty()
+            || self.pending_keyboard.armed()
     }
 
     /// The wait's own tick — [`Self::pending_selection_waiting`] armed
-    /// it. A whole reconcile, because that is where both waits resolve,
+    /// it. A whole reconcile, because that is where the waits resolve,
     /// ordered against the selection check and the route publish.
     pub fn pending_selection_tick(&mut self) {
         self.reconcile();
@@ -4490,10 +4855,19 @@ impl App {
     }
 
     fn set_status(&mut self, message: impl Into<String>) {
+        self.set_status_as(message, Severity::Error);
+    }
+
+    /// A receipt: the toast in the normal text colour.
+    fn set_status_info(&mut self, message: impl Into<String>) {
+        self.set_status_as(message, Severity::Info);
+    }
+
+    fn set_status_as(&mut self, message: impl Into<String>, severity: Severity) {
         // A toast restructures the root widget tree, which drops the grip's
         // widget state — a live drag would never publish its end.
         self.commit_sidebar_drag();
-        self.status.set_at(message, Instant::now());
+        self.status.set_at(message, severity, Instant::now());
     }
 
     fn live_sidebar_width(&self) -> f32 {
@@ -4527,36 +4901,16 @@ impl App {
     pub fn resize(&mut self, size: Size) {
         let changed = self.window_size != size;
         self.window_size = size;
-        let (cols, rows) = self.current_grid();
-        // The attached host tab's server must follow the grid too — the
-        // machine decides when (immediately while live; withheld during
-        // hydration, where a mid-snapshot resize forfeits history).
-        let host_geometry = self.host_geometry(cols, rows);
-        for attach in self.host_attach.values_mut() {
-            attach.note_resize(host_geometry);
-        }
-        for (key, tab) in &mut self.tabs {
-            match tab.apply_geometry(cols, rows, self.terminal_metrics, self.metric_generation) {
-                Ok(Some(change)) => {
-                    tab.commit_geometry(change);
-                    // A re-grid rewrites the viewport and drops hover, so
-                    // the snapshot the widget draws describes the old
-                    // dimensions until it is rebuilt. Window resizes,
-                    // sidebar width drags and collapse all land here.
-                    refresh_or_warn(key.tab, tab, "window re-grid");
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        ?error,
-                        tab_id = key.tab,
-                        cols,
-                        rows,
-                        "terminal resize failed"
-                    )
-                }
-            }
-        }
+        let grid = self.current_grid();
+        self.note_host_grid(grid);
+        regrid_window(
+            &mut self.tabs,
+            &mut self.host_resume,
+            grid,
+            self.terminal_metrics,
+            self.metric_generation,
+        );
+        self.background_resize.resized(Instant::now());
         if changed && self.palette.is_some() {
             self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
         }
@@ -4756,41 +5110,18 @@ impl App {
             }
         }
 
-        let KeyboardRoute::Terminal(active_key) = self.keyboard_route() else {
-            return UiTask::None;
+        let active_key = match self.keyboard_route() {
+            KeyboardRoute::Terminal(active_key) => active_key,
+            KeyboardRoute::Pending => {
+                self.buffer_pending_input(PendingInput::Key(event));
+                return UiTask::None;
+            }
+            _ => return UiTask::None,
         };
-        let active_tab = active_key.tab;
         let Some(tab) = self.tabs.get_mut(&active_key) else {
             return UiTask::None;
         };
-        // A bare page key scrolls this tab's own scrollback whenever the shared
-        // policy keeps it local — no snap, no encode, nothing on the PTY. The
-        // bypass is the policy's decision, never the key's: `Forward` (mouse
-        // tracking, alternate screen) falls through to the normal encode below.
-        let page_direction = if composing {
-            None
-        } else {
-            input::bare_page_direction(&event, self.modifiers)
-        };
-        if let Some(direction) = page_direction {
-            match tab.handle_page(direction) {
-                Ok(PageRoute::LocalViewport { .. }) => return UiTask::None,
-                Ok(PageRoute::Forward) => {}
-                Err(error) => {
-                    // Only the repaint after a completed local move can fail,
-                    // so the key is still consumed; the next refresh recovers.
-                    tracing::warn!(?error, active_tab, "terminal page scroll failed");
-                    return UiTask::None;
-                }
-            }
-        }
-        if input::non_modifier_press(&event) {
-            if let Err(error) = tab.snap_to_bottom_for_input() {
-                tracing::warn!(?error, active_tab, "terminal snap-to-bottom failed");
-            }
-        }
-        let bytes = input::encode_press(&mut tab.encoder, &tab.terminal, event, composing);
-        tab.session.send_input(bytes);
+        type_into(tab, active_key.tab, event, self.modifiers, composing);
         UiTask::None
     }
 
@@ -4820,7 +5151,11 @@ impl App {
 
     pub fn ime_commit(&mut self, text: &str) {
         let route = self.keyboard_route();
-        commit_ime_in(&mut self.tabs, &mut self.ime_discard, route, text);
+        if commit_ime_in(&mut self.tabs, &mut self.ime_discard, route, text)
+            == ImeCommit::ForPendingTab
+        {
+            self.buffer_pending_input(PendingInput::Text(text.to_string()));
+        }
     }
 
     /// Handle the one captured text-input key that belongs to application
@@ -4845,7 +5180,9 @@ impl App {
                 self.cancel_confirm_delete();
                 UiTask::None
             }
-            KeyboardRoute::None | KeyboardRoute::Terminal(_) => UiTask::None,
+            KeyboardRoute::None | KeyboardRoute::Pending | KeyboardRoute::Terminal(_) => {
+                UiTask::None
+            }
         }
     }
 
@@ -4894,9 +5231,10 @@ impl App {
             }
             // The Window menu's rows take the same paths the sidebar and
             // tab strip take (`Message::ProjectSelected`/`TabSelected`) —
-            // including their lack of Swift's `ensureSidebarVisible`,
-            // which no iced selection route performs, including opening
-            // a tab on a host (`resolve_pending_host_selection`).
+            // never revealing the sidebar, matching Swift's ⌘1-9 (plan
+            // 072 D10): opening a tab never expands the sidebar (071's
+            // ruling), including opening a tab on a host
+            // (`resolve_pending_host_selection`).
             MenuEvent::SelectProject(project_id) => {
                 if !command_enabled(self.menu_gating(), false) {
                     return UiTask::None;
@@ -4970,7 +5308,11 @@ impl App {
             self.refuse_during_switch()?;
         }
         match action {
-            KeybindAction::NewTab => Ok(self.new_tab_dispatch().task),
+            KeybindAction::NewTab => {
+                let dispatch = self.new_tab_dispatch();
+                self.arm_pending_keyboard(&dispatch);
+                Ok(dispatch.task)
+            }
             KeybindAction::CloseTab => {
                 // The selection, not the local workspace's: with a host
                 // row showing, the tab under the keybind is that host's,
@@ -4984,7 +5326,11 @@ impl App {
                 }
                 Ok(self.close_tab_dispatch(tab).task)
             }
-            KeybindAction::NewProject => Ok(self.new_project_dispatch().task),
+            KeybindAction::NewProject => {
+                let dispatch = self.new_project_dispatch();
+                self.arm_pending_keyboard(&dispatch);
+                Ok(dispatch.task)
+            }
             KeybindAction::RenameProject => {
                 self.begin_rename_target(RenameTarget::Project(self.active_project_key()))?;
                 Ok(self.take_rename_focus_task())
@@ -5113,6 +5459,7 @@ impl App {
             self.host_dialog.is_some(),
             self.rename_editor.is_some(),
             self.palette.is_some(),
+            self.pending_keyboard.armed(),
             active_tab,
             active_terminal_live(
                 self.tabs.contains_key(&active_tab),
@@ -5573,10 +5920,22 @@ impl App {
             band = band.push(self.host_fidelity_pill(saved_id, &section.label, action));
         }
         if let Some(rollup) = &section.rollup {
+            let font = chrome::chrome_font(font::Weight::Normal);
+            let pill = section
+                .fidelity
+                .filter(|_| section.saved_id.is_some())
+                .map(|action| host_notice::fidelity_chrome(action, &section.label).pressable);
+            let budget = host_rollup_budget(self.live_sidebar_width(), &section.label, pill);
+            let (rollup, _) =
+                chrome::elide_to_width(rollup, font, chrome::HOST_ROLLUP_SIZE, budget);
             band = band.push(
-                text(rollup.as_str())
+                text(rollup)
                     .size(chrome::HOST_ROLLUP_SIZE)
-                    .color(chrome::HOST_ROLLUP_TEXT),
+                    .color(chrome::HOST_ROLLUP_TEXT)
+                    .font(font)
+                    // Measured with Advanced shaping, as the pill titles are.
+                    .shaping(iced::widget::text::Shaping::Advanced)
+                    .wrapping(iced::widget::text::Wrapping::None),
             );
         }
         sidebar_band(band)
@@ -5603,7 +5962,7 @@ impl App {
             return pill.into();
         }
         button(pill)
-            .padding([chrome::BAND_PILL_PADDING_Y, 6.0])
+            .padding([chrome::BAND_PILL_PADDING_Y, FIDELITY_PILL_PADDING_X])
             .style(chrome::transparent_button)
             .on_press(Message::HostFidelityAction(saved_id.to_string()))
             .into()
@@ -6092,11 +6451,8 @@ impl App {
                     .into()
             }
         };
-        // A frozen host frame keeps its pixels and says why (plan 037
-        // §3.1). With no host selection this is `None` and the terminal
-        // element goes through untouched.
-        let terminal = match self.host_frame_banner() {
-            Some((saved_id, frame, banner)) => frozen_frame(terminal, saved_id, frame, banner),
+        let terminal = match self.terminal_notice() {
+            Some(notice) => with_notice(terminal, notice),
             None => terminal,
         };
         let main = column![tab_bar, terminal].width(Fill).height(Fill);
@@ -6109,11 +6465,12 @@ impl App {
             )
             .into()
         };
-        let content: Element<'_, Message> = if let Some(status) = self.bottom_line() {
-            let toast = container(text(status).size(12).color(chrome::ERROR_TEXT))
+        let content: Element<'_, Message> = if let Some(line) = self.bottom_line() {
+            let color = bottom_line_color(line.severity);
+            let toast = container(text(line.text).size(12).color(color))
                 .max_width(520)
                 .padding([8, 12])
-                .style(chrome::status_toast);
+                .style(chrome::status_toast(color));
             let overlay = container(toast)
                 .width(Fill)
                 .height(Fill)
@@ -6393,7 +6750,9 @@ impl App {
     pub fn new_tab(&mut self) -> UiTask {
         self.cancel_drags();
         self.cancel_editor_for_interaction();
-        self.new_tab_dispatch().task
+        let dispatch = self.new_tab_dispatch();
+        self.arm_pending_keyboard(&dispatch);
+        dispatch.task
     }
 
     /// The new-tab route every surface shares. Nothing follows the
@@ -6468,9 +6827,12 @@ impl App {
         let grid = self.current_grid();
         let op = self.take_host_op_id(project.host, local_backend::HostOpKind::Other);
         let focus_generation = self.focus_generation;
+        let on_slot = self.is_local_slot(project.host);
         EngineDispatch {
             task: self.engine_op(
-                async move { open_host_tab_flow(ops, project, origin, title, argv, grid).await },
+                async move {
+                    open_host_tab_flow(ops, project, origin, title, argv, grid, on_slot).await
+                },
                 move |result| EngineOpResult::TabOpened {
                     op,
                     project,
@@ -6479,6 +6841,7 @@ impl App {
                 },
             ),
             op: Some(op),
+            created_on: Some(project.host),
         }
     }
 
@@ -6492,9 +6855,10 @@ impl App {
         let grid = self.current_grid();
         let op = self.take_host_op_id(host, local_backend::HostOpKind::Create);
         let focus_generation = self.focus_generation;
+        let on_slot = self.is_local_slot(host);
         EngineDispatch {
             task: self.engine_op(
-                async move { create_host_project_flow(ops, grid).await },
+                async move { create_host_project_flow(ops, grid, on_slot).await },
                 move |result| EngineOpResult::ProjectCreated {
                     op,
                     focus_generation,
@@ -6504,6 +6868,7 @@ impl App {
                 },
             ),
             op: Some(op),
+            created_on: Some(host),
         }
     }
 
@@ -6531,13 +6896,16 @@ impl App {
                 },
             ),
             op: Some(op),
+            created_on: Some(host),
         }
     }
 
     pub fn new_project(&mut self) -> UiTask {
         self.cancel_drags();
         self.cancel_editor_for_interaction();
-        self.new_project_dispatch().task
+        let dispatch = self.new_project_dispatch();
+        self.arm_pending_keyboard(&dispatch);
+        dispatch.task
     }
 
     /// The sidebar is expanded here, at the dispatch, rather than when
@@ -6562,7 +6930,11 @@ impl App {
                         UiTask::None
                     }
                 };
-                EngineDispatch { task, op: None }
+                EngineDispatch {
+                    task,
+                    op: None,
+                    created_on: None,
+                }
             }
         }
     }
@@ -6603,6 +6975,7 @@ impl App {
                 },
             ),
             op: Some(op),
+            created_on: Some(host),
         }
     }
 
@@ -6710,8 +7083,9 @@ impl App {
             };
             let host_project_id = project.project;
             let op = self.take_host_op_id(project.host, local_backend::HostOpKind::Other);
+            let on_slot = self.is_local_slot(project.host);
             return self.engine_op(
-                async move { delete_host_project_flow(ops, host_project_id).await },
+                async move { delete_host_project_flow(ops, host_project_id, on_slot).await },
                 move |result| EngineOpResult::ProjectDeleted {
                     op,
                     project,
@@ -6749,6 +7123,7 @@ impl App {
                 move |result| EngineOpResult::TabClosed { op, tab, result },
             ),
             op: Some(op),
+            created_on: None,
         }
     }
 
@@ -6771,12 +7146,14 @@ impl App {
         };
         let op = self.take_host_op_id(tab.host, local_backend::HostOpKind::Other);
         let tab_id = tab.tab;
+        let on_slot = self.is_local_slot(tab.host);
         EngineDispatch {
             task: self.engine_op(
-                async move { close_host_tab_flow(ops, tab_id).await },
+                async move { close_host_tab_flow(ops, tab_id, on_slot).await },
                 move |result| EngineOpResult::TabClosed { op, tab, result },
             ),
             op: Some(op),
+            created_on: None,
         }
     }
 
@@ -6917,7 +7294,8 @@ impl App {
         // A local focus ends any host selection: the two are one
         // selection, and the local workspace is the one that persists it.
         self.set_host_selection(None);
-        focus_tab_in_core(&self.workspace, tab)?;
+        let landed = focus_tab_in_core(&self.workspace, tab);
+        self.pending_keyboard_user_focus(landed)?;
         self.note_user_focus();
         if reveal_sidebar {
             self.set_sidebar_collapsed(false);
@@ -6944,9 +7322,10 @@ impl App {
         tab: TabKey,
         reveal_sidebar: bool,
     ) -> Result<(), String> {
-        let Some(project) = self.host_project_of(tab) else {
-            return Err(format!("tab {tab} is not listed by a connected host"));
-        };
+        let landed = self
+            .host_project_of(tab)
+            .ok_or_else(|| format!("tab {tab} is not listed by a connected host"));
+        let project = self.pending_keyboard_user_focus(landed)?;
         self.note_user_focus();
         self.set_host_selection(Some(HostSelection {
             project,
@@ -7038,11 +7417,19 @@ impl App {
     /// of the two terminal states — so with no host selection, and on
     /// every ordinary connected frame, this costs one `Option` check.
     fn frozen_host_frame(&self) -> Option<(&HostView, host_notice::FrozenFrame)> {
-        let selection = self.host_selection?;
-        let view = self.host_view(selection.tab.host)?;
-        let section = self.hosts.section(&view.saved_id)?;
+        let (view, section) = self.host_section(self.host_selection?.tab.host)?;
         let frozen = host_notice::frozen_frame(section.state)?;
         Some((view, frozen))
+    }
+
+    /// The cached view of the host serving an incarnation, and its
+    /// section, whatever state the section is in.
+    fn host_section(
+        &self,
+        host: HostId,
+    ) -> Option<(&HostView, crate::host_conn::HostSectionView<'_>)> {
+        let view = self.host_view(host)?;
+        Some((view, self.hosts.section(&view.saved_id)?))
     }
 
     /// [`Self::frozen_host_frame`]'s twin for a specific tab rather than
@@ -7056,50 +7443,156 @@ impl App {
         if tab.is_local() {
             return None;
         }
-        let view = self.host_view(tab.host)?;
-        let section = self.hosts.section(&view.saved_id)?;
+        let (_, section) = self.host_section(tab.host)?;
         host_notice::frozen_frame(section.state)
     }
 
-    /// The banner the window owes the frame it is showing, the host its
-    /// button reconnects, and the frame that button is a promise about.
-    /// The wording is composed here, at the draw, so the reconcile can
-    /// ask the same question without it.
-    fn host_frame_banner(
-        &self,
-    ) -> Option<(&str, host_notice::FrozenFrame, host_notice::HostBanner)> {
-        let selection = self.host_selection?;
-        let view = self.host_view(selection.tab.host)?;
-        let section = self.hosts.section(&view.saved_id)?;
-        let frozen = host_notice::frozen_frame(section.state)?;
-        let banner = frozen.banner(&view.label);
-        Some((view.saved_id.as_str(), frozen, banner))
+    /// Everything the terminal area's notice is decided from, read off
+    /// the live connection state the way the band reads it.
+    fn notice_input(&self) -> notice::NoticeInput<'_> {
+        let shown = self
+            .host_selection
+            .and_then(|selection| self.host_section(selection.tab.host))
+            .map(|(view, section)| {
+                host_notice::shown_host(&view.saved_id, &view.label, section.state)
+            });
+        let slot = self.local_slot_view().map(|view| notice::SlotFacts {
+            saved_id: &view.saved_id,
+            state: view.state,
+            reason: view.reason.as_deref(),
+            detail: self.hosts.section_detail(&view.saved_id),
+            retry_armed: self.hosts.retry_schedule(&view.saved_id).is_some(),
+        });
+        notice::NoticeInput {
+            mode: self.local_backend,
+            shown,
+            slot,
+            area_empty: self.active_tab_key().tab == 0,
+            switching: self.switch_in_flight(),
+            log_path: &self.log_path,
+        }
     }
 
-    /// The frozen-frame banner's button (plan 037 §3.1).
+    /// What the terminal area is saying — [`notice::terminal_notice`]
+    /// over [`Self::notice_input`], and nothing of its own.
+    fn terminal_notice(&self) -> Option<Notice> {
+        notice::terminal_notice(&self.notice_input())
+    }
+
+    /// Record which notice is on screen now, so the next dump or answer
+    /// names the showing it read. Every update turn passes through here.
+    pub fn observe_notice(&mut self) -> (u64, Option<Notice>) {
+        let current = self.terminal_notice();
+        let generation = self
+            .notice_generation
+            .observe(current.as_ref().map(|notice| &notice.key));
+        (generation, current)
+    }
+
+    /// A button on the terminal notice.
     ///
-    /// Re-checked against the host's state **now**, not against the
-    /// frame that was drawn: see [`host_notice::click_still_lands`] for
-    /// the two ways a stale click does damage.
-    pub fn host_frame_reconnect_requested(
+    /// Re-checked against the notice on screen **now**, not the one
+    /// that was drawn: see [`notice::click_still_lands`].
+    pub fn notice_action_requested(
         &mut self,
-        saved_id: &str,
-        frame: host_notice::FrozenFrame,
+        key: &notice::NoticeKey,
+        action: notice::NoticeActionId,
     ) {
-        let current = self
-            .hosts
-            .section(saved_id)
-            .and_then(|section| host_notice::frozen_frame(section.state));
-        if !host_notice::click_still_lands(frame, current) {
+        let current = self.terminal_notice();
+        if !notice::click_still_lands(key, action, current.as_ref()) {
             tracing::debug!(
-                host = %saved_id,
-                ?frame,
-                ?current,
-                "banner click ignored: the host is no longer showing that frame"
+                ?key,
+                ?action,
+                current = ?current.as_ref().map(|notice| &notice.key),
+                "notice click ignored: the window is no longer showing that notice"
             );
             return;
         }
-        self.host_connect_requested(saved_id, crate::host_conn::RequestOrigin::User);
+        self.run_notice_action(key, action);
+    }
+
+    fn run_notice_action(&mut self, key: &notice::NoticeKey, action: notice::NoticeActionId) {
+        match action {
+            notice::NoticeActionId::Start | notice::NoticeActionId::Reconnect => {
+                self.host_connect_requested(&key.subject, crate::host_conn::RequestOrigin::User)
+            }
+            notice::NoticeActionId::UseInProcess => {
+                if let Err(error) =
+                    self.open_local_switch_dialog(local_backend::SwitchDirection::ToInProcess)
+                {
+                    self.set_status(error);
+                }
+            }
+        }
+    }
+
+    /// What the window is telling the user, as the widgets draw it.
+    pub(crate) fn notice_dump(&mut self) -> roost_ipc::messages::AppNoticeDumpResult {
+        use roost_ipc::messages::{
+            AppNoticeAction, AppNoticeBottomLine, AppNoticeDumpResult, AppNoticeTerminal,
+        };
+        let (generation, current) = self.observe_notice();
+        let terminal = current.map(|notice| AppNoticeTerminal {
+            kind: notice.key.kind.as_str().to_string(),
+            subject: notice.key.subject,
+            severity: notice.severity.as_str().to_string(),
+            placement: notice.placement.as_str().to_string(),
+            message: notice.message,
+            detail: notice.detail,
+            actions: notice
+                .actions
+                .into_iter()
+                .map(|action| AppNoticeAction {
+                    id: action.id.as_str().to_string(),
+                    label: action.label.to_string(),
+                    primary: action.primary,
+                })
+                .collect(),
+        });
+        let bottom_line = self.bottom_line().map(|line| AppNoticeBottomLine {
+            text: line.text.into_owned(),
+            severity: line.severity.as_str().to_string(),
+            source: line.source.as_str().to_string(),
+        });
+        AppNoticeDumpResult {
+            generation,
+            terminal,
+            bottom_line,
+        }
+    }
+
+    /// Press an action of the notice a dump returned, through the same
+    /// route its button takes — but only while that very showing is on
+    /// screen and still offers the action.
+    pub(crate) fn notice_answer(
+        &mut self,
+        kind: &str,
+        subject: &str,
+        generation: u64,
+        action: &str,
+    ) -> Result<(), String> {
+        let current = self.terminal_notice();
+        let pressed = notice::NoticeKind::from_wire(kind)
+            .zip(notice::NoticeActionId::from_wire(action))
+            .map(|(kind, action)| {
+                let key = notice::NoticeKey {
+                    kind,
+                    subject: subject.to_string(),
+                };
+                (key, action)
+            })
+            .filter(|(key, action)| {
+                self.notice_generation
+                    .answer_lands(key, generation, *action, current.as_ref())
+            });
+        let Some((key, action)) = pressed else {
+            return Err(format!(
+                "{kind} on {subject:?} at generation {generation} offering {action:?} \
+                 is not the notice on screen"
+            ));
+        };
+        self.run_notice_action(&key, action);
+        Ok(())
     }
 
     /// The project a host *lists* a tab under, whatever state its
@@ -7188,7 +7681,7 @@ impl App {
             // A stop leaves a frame nothing will ever update again — and
             // that frame is the last true thing this window knows about
             // that session, so it stays (plan 037 §3.1's "keeps its last
-            // frame dimmed") with the banner over it. The row must still
+            // frame dimmed") with the notice over it. The row must still
             // be listed: a tab the mirror dropped before the connection
             // died has nothing left to show.
             frozen_and_listed: self.frozen_host_frame().is_some()
@@ -7310,8 +7803,8 @@ impl App {
         host_focus_claim(self.window_focused, self.host_selection)
     }
 
-    /// The gated Connect: the sidebar's ↻ row, the stopped banner's
-    /// button, and the `Connect Host` palette verb — which
+    /// The gated Connect: the sidebar's ↻ row, the ended session's
+    /// notice, and the `Connect Host` palette verb — which
     /// `palette.activate` also reaches over the IPC socket, hence the
     /// `origin`.
     ///
@@ -8756,8 +9249,9 @@ impl App {
         }
     }
 
-    /// The launch's own selection under `session` (plan 063 §D5): once
-    /// the slot's mirror lists a tab, select it and attach.
+    /// The launch's own selection under `session` (plan 063 §D5), owed
+    /// again whenever the slot reconnects (plan 072 §D8): once the
+    /// slot's mirror lists a tab, select it and attach.
     ///
     /// Same shape and the same reason as
     /// [`Self::resolve_pending_host_selection`] below, including why it
@@ -8788,7 +9282,8 @@ impl App {
         });
         match local_backend::initial_selection(
             self.local_backend,
-            self.host_selection.is_some(),
+            self.switch_in_flight(),
+            self.live_selection_held(),
             slot,
         ) {
             local_backend::InitialSelection::Wait => {}
@@ -8805,9 +9300,29 @@ impl App {
                     local_active: self.workspace.active().1,
                 }));
                 self.host_focus_tab(tab);
-                tracing::info!(%tab, "attached the local session's tab at launch");
+                tracing::info!(%tab, "attached the local session's tab");
             }
         }
+    }
+
+    /// Owe the window the launch's selection again when the slot
+    /// connects with nothing live selected (plan 072 §D8), by
+    /// [`local_backend::rearms_initial_selection`].
+    fn rearm_initial_local_selection(&mut self, saved_id: &str) {
+        let rearm = local_backend::rearms_initial_selection(local_backend::RearmGate {
+            slot: self.local_slot_saved_id().as_deref() == Some(saved_id),
+            mode: self.local_backend,
+            switch_in_flight: self.switch_in_flight(),
+            selection_held: self.live_selection_held(),
+        });
+        if rearm && !self.pending_initial_local_selection {
+            tracing::info!(host = %saved_id, "the slot connected with nothing selected; selecting its tab");
+            self.pending_initial_local_selection = true;
+        }
+    }
+
+    fn live_selection_held(&self) -> bool {
+        local_backend::live_selection_held(self.host_selection, |host| self.hosts.owns(host))
     }
 
     /// Resolve a pending host creation, by [`pending_selection::pending_step`].
@@ -9628,96 +10143,20 @@ fn hydrate_workspace(
     runtime.block_on(hydrate_local_workspace(client, grid))
 }
 
-/// Bring the in-process workspace up: seed it if it is empty, open the
-/// saved tabs of every project that has none, and restore the selection.
-///
-/// **Two callers, one spelling** — the launch under `in-process`, and
-/// the reverse switch (plan 063 §D8), which is a launch of this
-/// workspace in every respect that matters. Coming back from `session`
-/// over a `state.json` the session-mode launch loaded but deliberately
-/// did **not** hydrate leaves project rows carrying no live tabs, and a
-/// reverse that only counted projects would hand the user a band of
-/// empty rows — then a forward switch would snapshot those empty tab
-/// lists and delete the originals for good.
-///
-/// The `tabs.is_empty()` guard is what makes it safe to run twice. At
-/// bootstrap it is true of every project, so this is byte-for-byte the
-/// launch behaviour it replaced; on a reverse it is true of exactly the
-/// rows that need shells, and `take_restore_layout` being a one-shot
-/// means a second pass finds nothing to restore and adds nothing.
-async fn hydrate_local_workspace(client: &LocalClient, (cols, rows): (u16, u16)) -> Result<()> {
-    let mut projects = client.list_projects().await?;
-    if projects.is_empty() {
-        let cwd = roost_engine::home_dir();
-        projects.push(client.create_project("", &cwd).await?);
-    }
-    let restore = client.workspace.take_restore_layout();
-    for project in &projects {
-        if !project.tabs.is_empty() {
-            continue;
-        }
-        let saved = restore
-            .as_ref()
-            .and_then(|layout| {
-                layout
-                    .projects
-                    .iter()
-                    .find(|item| item.project_id == project.id)
-            })
-            .map(|item| item.tabs.as_slice())
-            .unwrap_or(&[]);
-        let fallback;
-        let specs = if saved.is_empty() {
-            fallback = vec![RestoreTab {
-                cwd: project.cwd.clone(),
-                title: String::new(),
-                user_titled: false,
-            }];
-            fallback.as_slice()
-        } else {
-            saved
-        };
-        for spec in specs {
-            match client
-                .open_tab(
-                    project.id,
-                    &spec.cwd,
-                    &spec.title,
-                    &[],
-                    u32::from(cols),
-                    u32::from(rows),
-                )
-                .await
-            {
-                Ok(tab) if spec.user_titled && !spec.title.is_empty() => {
-                    client.workspace.set_tab_title(tab.id, &spec.title)?;
-                }
-                Ok(_) => {}
-                Err(error) => tracing::warn!(project_id = project.id, ?error, "restore tab failed"),
-            }
-        }
-    }
-
-    let snapshot = client.workspace.snapshot();
-    let active_project = restore
-        .as_ref()
-        .map(|layout| layout.active_project_id)
-        .filter(|id| snapshot.iter().any(|project| project.id == *id))
-        .or_else(|| snapshot.first().map(|project| project.id));
-    if let Some(project_id) = active_project {
-        let position = restore
-            .as_ref()
-            .map_or(0, |layout| layout.active_tab_position.max(0) as usize);
-        if let Some(tab_id) = snapshot
-            .iter()
-            .find(|project| project.id == project_id)
-            .and_then(|project| project.tabs.get(position).or_else(|| project.tabs.first()))
-            .map(|tab| tab.id)
-        {
-            client.workspace.focus_tab(tab_id)?;
-        }
-    }
-    Ok(())
+/// Bring the in-process workspace up ([`roost_engine::hydrate`]) at the
+/// window's grid. **Two callers, one spelling** — the launch under
+/// `in-process`, and the reverse switch (plan 063 §D8), which is a
+/// launch of this workspace in every respect that matters.
+async fn hydrate_local_workspace(client: &LocalClient, grid: (u16, u16)) -> Result<()> {
+    roost_engine::hydrate(
+        client,
+        Hydration {
+            first_project: roost_ipc::session_launch::FirstProject::Seed,
+            grid,
+            on_error: OnRestoreError::Warn,
+        },
+    )
+    .await
 }
 
 impl Message {
@@ -9735,9 +10174,7 @@ impl Message {
                 // A widget press, so a person by construction.
                 app.host_connect_requested(&saved_id, crate::host_conn::RequestOrigin::User)
             }
-            Self::HostFrameReconnect { saved_id, frame } => {
-                app.host_frame_reconnect_requested(&saved_id, frame)
-            }
+            Self::NoticeAction { key, action } => app.notice_action_requested(&key, action),
             Self::HostFidelityAction(saved_id) => app.host_fidelity_action_requested(&saved_id),
             Self::AddHostNameChanged(value) => app.add_host_name_changed(value),
             Self::AddHostSocketChanged(value) => app.add_host_socket_changed(value),
@@ -9926,6 +10363,76 @@ mod tests {
         );
     }
 
+    /// #555: `host_call`/`host_reply` format a refusal through
+    /// [`host_op_error_text`] rather than the `HostOpError`'s own
+    /// `Display`, so the slot's wording matches every other banner. A
+    /// real host's text is byte-identical to before.
+    #[test]
+    fn host_reply_localizes_only_on_the_slot() {
+        use crate::host_conn::HostOpError;
+
+        let real: Result<serde_json::Value, String> =
+            host_reply("tab.open", Err(HostOpError::Disconnected), false);
+        assert_eq!(
+            real.unwrap_err(),
+            "tab.open: the host disconnected before this ran"
+        );
+        let slot: Result<serde_json::Value, String> =
+            host_reply("tab.open", Err(HostOpError::Disconnected), true);
+        assert_eq!(
+            slot.unwrap_err(),
+            "tab.open: the local session disconnected before this ran"
+        );
+    }
+
+    /// #555's `host_remove_call` twin: its own `Err` arm formatted the
+    /// `HostOpError`'s `Display` directly, so the slot's close/delete
+    /// refusals still said "the host". A real host's text is
+    /// byte-identical.
+    #[tokio::test]
+    async fn host_remove_call_localizes_only_on_the_slot() {
+        use crate::host_conn::HostOpError;
+
+        let (ops, mut rx) = crate::host_conn::HostOps::channel();
+        let worker = tokio::spawn(async move {
+            let call = rx.recv().await.expect("op sent");
+            call.answer(Err(HostOpError::Disconnected));
+        });
+        let error = host_remove_call(
+            &ops,
+            "tab.close",
+            serde_json::json!({}),
+            "removed",
+            "gone",
+            true,
+        )
+        .await
+        .expect_err("the host refused");
+        assert_eq!(
+            error,
+            "tab.close: the local session disconnected before this ran"
+        );
+        worker.await.expect("the mock host task must not panic");
+
+        let (ops, mut rx) = crate::host_conn::HostOps::channel();
+        let worker = tokio::spawn(async move {
+            let call = rx.recv().await.expect("op sent");
+            call.answer(Err(HostOpError::Disconnected));
+        });
+        let error = host_remove_call(
+            &ops,
+            "tab.close",
+            serde_json::json!({}),
+            "removed",
+            "gone",
+            false,
+        )
+        .await
+        .expect_err("the host refused");
+        assert_eq!(error, "tab.close: the host disconnected before this ran");
+        worker.await.expect("the mock host task must not panic");
+    }
+
     #[test]
     fn terminal_geometry_never_produces_zero_grid() {
         let size = Size::new(1.0, 1.0);
@@ -10105,6 +10612,65 @@ mod tests {
         assert_eq!(wide_rows, default_rows, "sidebar width must not touch rows");
     }
 
+    /// #564 (plan 072 D4a): a window re-grid that moves a detached host
+    /// tab's terminal takes its resume point with it, so the next focus
+    /// attaches from a snapshot. One that moves no cell — the same grid,
+    /// or only the cell pixels — leaves it.
+    #[test]
+    fn a_window_regrid_forgets_a_detached_host_tabs_resume_point() {
+        let metrics = TerminalMetrics::measure(13.0).expect("test metrics");
+        let key = TabKey::new(HostId::new(3), 7);
+        let mut tabs = HashMap::from([(key, laid_out_host_terminal(80, 24, metrics))]);
+        let point = host_tab::ResumePoint {
+            server_epoch: 11,
+            tab_generation: 2,
+            next_seq: 42,
+        };
+        let mut resumes = HashMap::from([(key, point)]);
+
+        let other_pixels = TerminalMetrics::measure(14.0).expect("other test metrics");
+        regrid_window(&mut tabs, &mut resumes, (80, 24), other_pixels, 2);
+        assert!(
+            resumes.contains_key(&key),
+            "a re-grid that moves no cell keeps the resume point"
+        );
+
+        regrid_window(&mut tabs, &mut resumes, (120, 24), other_pixels, 2);
+        assert_eq!(tabs[&key].grid(), (120, 24));
+        assert!(
+            !resumes.contains_key(&key),
+            "the terminal left the grid the session wrote for, so the next attach is a snapshot"
+        );
+    }
+
+    #[test]
+    fn a_background_wave_forgets_only_a_resume_point_it_moves_off_its_grid() {
+        let metrics = TerminalMetrics::measure(13.0).expect("test metrics");
+        let point = host_tab::ResumePoint {
+            server_epoch: 11,
+            tab_generation: 2,
+            next_seq: 42,
+        };
+        let (same, moved, gone) = (
+            TabKey::new(HostId::new(3), 7),
+            TabKey::new(HostId::new(3), 8),
+            TabKey::new(HostId::new(3), 9),
+        );
+        let tabs = HashMap::from([
+            (same, laid_out_host_terminal(80, 24, metrics)),
+            (moved, laid_out_host_terminal(120, 24, metrics)),
+        ]);
+        let mut resumes = HashMap::from([(same, point), (moved, point), (gone, point)]);
+
+        let grid = (80, 24);
+        forget_resumes_moved_by_wave(
+            &tabs,
+            &mut resumes,
+            &[(same, grid), (moved, grid), (gone, grid)],
+        );
+        assert_eq!(resumes.keys().collect::<Vec<_>>(), vec![&same]);
+    }
+
     #[test]
     fn restored_tabs_spawn_at_the_first_windows_grid_beside_the_persisted_sidebar() {
         let metrics = TerminalMetrics::measure(13.0).expect("test metrics");
@@ -10131,11 +10697,11 @@ mod tests {
             !status.is_active(),
             "an app with no banner arms no expiry timer"
         );
-        status.set_at("first", now);
-        assert_eq!(status.message(), Some("first"));
+        status.set_at("first", Severity::Error, now);
+        assert_eq!(status.message(), Some(("first", Severity::Error)));
         assert!(status.is_active());
-        status.set_at("replacement", now + Duration::from_secs(1));
-        assert_eq!(status.message(), Some("replacement"));
+        status.set_at("replacement", Severity::Info, now + Duration::from_secs(1));
+        assert_eq!(status.message(), Some(("replacement", Severity::Info)));
         status.expire_at(now + Duration::from_secs(1));
         assert!(
             status.is_active(),
@@ -10145,7 +10711,7 @@ mod tests {
         assert_eq!(status.message(), None);
         assert!(!status.is_active(), "expiry disarms the timer");
 
-        status.set_at("clear me", now);
+        status.set_at("clear me", Severity::Error, now);
         status.clear();
         assert_eq!(status.message(), None);
         assert!(!status.is_active());
@@ -10158,6 +10724,13 @@ mod tests {
             .collect()
     }
 
+    fn bottom_text<'a>(
+        status: &'a StatusBanner,
+        durability: &'a BTreeMap<DurabilitySource, String>,
+    ) -> Option<Cow<'a, str>> {
+        bottom_line(status, durability).map(|line| line.text)
+    }
+
     #[test]
     fn a_host_recovering_leaves_the_other_hosts_failure_on_the_line() {
         let quiet = StatusBanner::default();
@@ -10166,13 +10739,13 @@ mod tests {
             (DurabilitySource::Host("beta".into()), "read-only"),
         ]);
         assert_eq!(
-            bottom_line(&quiet, &failing).as_deref(),
+            bottom_text(&quiet, &failing).as_deref(),
             Some("on alpha: last save failed: disk full")
         );
 
         failing.remove(&DurabilitySource::Host("alpha".into()));
         assert_eq!(
-            bottom_line(&quiet, &failing).as_deref(),
+            bottom_text(&quiet, &failing).as_deref(),
             Some("on beta: last save failed: read-only")
         );
 
@@ -10191,13 +10764,13 @@ mod tests {
             (DurabilitySource::Local, "read-only"),
         ]);
         assert_eq!(
-            bottom_line(&quiet, &failing).as_deref(),
+            bottom_text(&quiet, &failing).as_deref(),
             Some("Roost couldn't save your workspace: read-only")
         );
 
         failing.remove(&DurabilitySource::Local);
         assert_eq!(
-            bottom_line(&quiet, &failing).as_deref(),
+            bottom_text(&quiet, &failing).as_deref(),
             Some("on alpha: last save failed: disk full"),
             "the host's failure was never overwritten, only covered"
         );
@@ -10208,17 +10781,87 @@ mod tests {
         let now = Instant::now();
         let failing = durability(&[(DurabilitySource::Local, "read-only")]);
         let mut status = StatusBanner::default();
-        status.set_at("agent hooks wired", now);
+        status.set_at("agent hooks wired", Severity::Info, now);
 
         assert_eq!(
-            bottom_line(&status, &failing).as_deref(),
+            bottom_text(&status, &failing).as_deref(),
             Some("agent hooks wired")
         );
 
         status.expire_at(now + STATUS_BANNER_DURATION);
         assert_eq!(
-            bottom_line(&status, &failing).as_deref(),
+            bottom_text(&status, &failing).as_deref(),
             Some("Roost couldn't save your workspace: read-only")
+        );
+    }
+
+    /// `app.notice_dump` names which of the two the line is showing, and
+    /// in what tone — the toast's own, and a failure to save always as
+    /// an error.
+    #[test]
+    fn the_bottom_line_says_whose_it_is_and_how_serious() {
+        let now = Instant::now();
+        let failing = durability(&[(DurabilitySource::Local, "read-only")]);
+        let mut status = StatusBanner::default();
+        status.set_at("local tabs run in Roost again", Severity::Info, now);
+        let line = bottom_line(&status, &failing).expect("the toast is up");
+        assert_eq!(
+            (line.severity, line.source),
+            (Severity::Info, BottomLineSource::Status)
+        );
+
+        status.clear();
+        let line = bottom_line(&status, &failing).expect("the failure stands");
+        assert_eq!(
+            (line.severity, line.source),
+            (Severity::Error, BottomLineSource::Durability)
+        );
+    }
+
+    /// The #520 overrun: a slot that cannot start names why in its band,
+    /// and in the narrowest sidebar and the default one the reason is cut
+    /// to the room left beside the label, one line, rather than wrapping
+    /// over "PROJECTS".
+    #[test]
+    fn a_band_reason_is_elided_to_one_line_beside_its_label() {
+        let rollup = "disconnected — roost-session exited early (status 1)";
+        let label = "PROJECTS";
+        let rollup_font = chrome::chrome_font(font::Weight::Normal);
+        for sidebar in [
+            roost_engine::SIDEBAR_MIN_WIDTH,
+            roost_engine::SIDEBAR_DEFAULT_WIDTH,
+        ] {
+            let sidebar = sidebar as f32;
+            let (drawn, width) = chrome::elide_to_width(
+                rollup,
+                rollup_font,
+                chrome::HOST_ROLLUP_SIZE,
+                host_rollup_budget(sidebar, label, None),
+            );
+            assert!(drawn.ends_with(chrome::ELLIPSIS), "{sidebar}: {drawn}");
+            let row = chrome::DIVIDER_WIDTH
+                + 2.0 * SIDEBAR_BAND_PADDING_X
+                + chrome::HOST_DOT_SIZE
+                + chrome::text_width(label, sidebar_band_label_font(), SIDEBAR_BAND_LABEL_SIZE)
+                + 3.0 * chrome::HOST_BAND_SPACING
+                + width;
+            assert!(row <= sidebar, "{sidebar}: the band needs {row}");
+        }
+        let wide = roost_engine::SIDEBAR_MAX_WIDTH as f32;
+        assert_eq!(
+            chrome::elide_to_width(
+                rollup,
+                rollup_font,
+                chrome::HOST_ROLLUP_SIZE,
+                host_rollup_budget(wide, label, None),
+            )
+            .0,
+            rollup,
+            "a reason with room is drawn whole"
+        );
+        assert!(
+            host_rollup_budget(wide, label, Some(true)) < host_rollup_budget(wide, label, None),
+            "a fidelity pill takes its share of the band"
         );
     }
 
@@ -11264,7 +11907,7 @@ mod tests {
             );
         });
 
-        let error = create_host_project_flow(ops, SPAWN_GRID)
+        let error = create_host_project_flow(ops, SPAWN_GRID, false)
             .await
             .expect_err("the tab.open failed");
         assert!(error.contains("no such directory"), "{error}");
@@ -11291,7 +11934,7 @@ mod tests {
         use roost_ipc::messages::{ops as wire, ProjectCreateResult, Tab, TabListResult, TabState};
 
         let (ops, mut rx) = crate::host_conn::HostOps::channel();
-        let flow = tokio::spawn(create_host_project_flow(ops, SPAWN_GRID));
+        let flow = tokio::spawn(create_host_project_flow(ops, SPAWN_GRID, false));
 
         let create = rx.recv().await.expect("project.create sent");
         create.answer(Ok(serde_json::to_value(ProjectCreateResult {
@@ -11369,7 +12012,7 @@ mod tests {
         // worker that already exited would silently swallow a stray
         // call rather than exposing it.
         let (ops, mut rx) = crate::host_conn::HostOps::channel();
-        let flow = tokio::spawn(create_host_project_flow(ops, SPAWN_GRID));
+        let flow = tokio::spawn(create_host_project_flow(ops, SPAWN_GRID, false));
 
         let create = rx.recv().await.expect("project.create sent");
         assert_eq!(create.op, wire::PROJECT_CREATE);
@@ -11576,7 +12219,8 @@ mod tests {
             sent
         });
         let argv = argv.iter().map(|arg| arg.to_string()).collect();
-        let result = open_host_tab_flow(ops, project, origin, title.into(), argv, SPAWN_GRID).await;
+        let result =
+            open_host_tab_flow(ops, project, origin, title.into(), argv, SPAWN_GRID, false).await;
         (
             result,
             session.await.expect("the stand-in session must not panic"),
@@ -12035,37 +12679,115 @@ mod tests {
     #[test]
     fn keyboard_route_requires_a_live_terminal_and_gives_editor_precedence() {
         assert_eq!(
-            resolve_keyboard_route(false, false, false, false, TabKey::local(7), false),
+            resolve_keyboard_route(false, false, false, false, false, TabKey::local(7), false),
             KeyboardRoute::None
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, false, false, TabKey::local(7), true),
+            resolve_keyboard_route(false, false, false, false, false, TabKey::local(7), true),
             KeyboardRoute::Terminal(TabKey::local(7))
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, false, true, TabKey::local(7), true),
+            resolve_keyboard_route(false, false, false, true, false, TabKey::local(7), true),
             KeyboardRoute::Palette
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, true, true, TabKey::local(7), true),
+            resolve_keyboard_route(false, false, true, true, false, TabKey::local(7), true),
             KeyboardRoute::Editor
         );
         // A host dialog owns the keyboard over the editor and the
         // palette, both of which it dismisses on the way up (plan 037
         // §3.1) — and yields only to the delete confirmation.
         assert_eq!(
-            resolve_keyboard_route(false, true, true, true, TabKey::local(7), true),
+            resolve_keyboard_route(false, true, true, true, false, TabKey::local(7), true),
             KeyboardRoute::HostDialog
         );
         // An open confirm outranks every other surface, so no keystroke can
         // reach an accelerator or the active PTY while it is up.
         assert_eq!(
-            resolve_keyboard_route(true, true, true, true, TabKey::local(7), true),
+            resolve_keyboard_route(true, true, true, true, false, TabKey::local(7), true),
             KeyboardRoute::Confirm
         );
         assert_eq!(
-            resolve_keyboard_route(true, false, false, false, TabKey::local(7), true),
+            resolve_keyboard_route(true, false, false, false, false, TabKey::local(7), true),
             KeyboardRoute::Confirm
+        );
+    }
+
+    /// A new tab that is opening takes the keys over the live terminal
+    /// (plan 072 §D2) — including the dimmed one's `None` — and yields to
+    /// every modal surface.
+    #[test]
+    fn a_pending_tab_outranks_the_terminal_but_no_modal() {
+        let tab = TabKey::local(7);
+        assert_eq!(
+            resolve_keyboard_route(false, false, false, false, true, tab, true),
+            KeyboardRoute::Pending
+        );
+        assert_eq!(
+            resolve_keyboard_route(false, false, false, false, true, tab, false),
+            KeyboardRoute::Pending
+        );
+        for (confirm, dialog, editor, palette, route) in [
+            (true, false, false, false, KeyboardRoute::Confirm),
+            (false, true, false, false, KeyboardRoute::HostDialog),
+            (false, false, true, false, KeyboardRoute::Editor),
+            (false, false, false, true, KeyboardRoute::Palette),
+        ] {
+            assert_eq!(
+                resolve_keyboard_route(confirm, dialog, editor, palette, true, tab, true),
+                route
+            );
+        }
+        assert_eq!(ime_preedit_target(KeyboardRoute::Pending), None);
+        assert!(
+            !terminal_ime_active(KeyboardRoute::Pending, tab, true),
+            "no composition starts while the keys go to a tab that isn't there yet"
+        );
+        assert!(
+            !terminal_cursor_focused(KeyboardRoute::Pending, true),
+            "and the old tab's cursor goes hollow"
+        );
+    }
+
+    /// A commit while a new tab opens is that tab's — unless a tab still
+    /// holds the composition it ends, which keeps it (plan 072 §D2).
+    #[test]
+    fn a_commit_while_a_tab_opens_is_kept_unless_the_old_tab_composed_it() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let old = TabKey::new(HostId::new(3), 7);
+        let (tab, capture) = terminal_tab::attach_test_host_terminal(80, 24, tx);
+        let mut tabs = HashMap::from([(old, tab)]);
+        let mut discard = ImeDiscard::default();
+        let captured = |capture: &InputCapture| capture.lock().expect("capture").clone();
+
+        assert_eq!(
+            commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Pending, "新"),
+            ImeCommit::ForPendingTab
+        );
+        assert!(captured(&capture).is_empty(), "nothing reached the old tab");
+
+        tabs.get_mut(&old)
+            .expect("the old tab")
+            .set_preedit("こ".into(), None)
+            .expect("preedit");
+        assert_eq!(
+            commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Pending, "こ"),
+            ImeCommit::Settled
+        );
+        assert_eq!(
+            captured(&capture),
+            "こ".as_bytes(),
+            "the composition's tab keeps its commit"
+        );
+
+        assert_eq!(
+            commit_ime_in(&mut tabs, &mut discard, KeyboardRoute::Terminal(old), "x"),
+            ImeCommit::Settled
+        );
+        assert_eq!(
+            captured(&capture),
+            "こx".as_bytes(),
+            "and a live terminal takes one"
         );
     }
 
@@ -12095,6 +12817,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 host,
                 active_terminal_live(true, false)
             ),
@@ -12105,6 +12828,7 @@ mod tests {
             resolve_keyboard_route(
                 false,
                 true,
+                false,
                 false,
                 false,
                 host,
@@ -12700,8 +13424,8 @@ mod tests {
                     );
                     Ok(Some(GeometryChange {
                         previous,
+                        previous_grid: (0, 0),
                         current: states[&tab],
-                        grid_changed: true,
                         metrics_changed: true,
                         deferred_replies: Vec::new(),
                     }))

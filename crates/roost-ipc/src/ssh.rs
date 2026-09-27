@@ -1425,7 +1425,9 @@ pub(crate) async fn exit_master(ssh_bin: &Path, config_path: &Path, ctl_path: &P
     }
     let argv = teardown_argv(config_path, ctl_path, target);
     match spawn_ssh_command(ssh_bin, &argv, Stdio::null(), Stdio::null(), Stdio::null()) {
-        Ok(mut child) => reap_by(&mut child, Instant::now() + scaled(TEARDOWN_BUDGET)).await,
+        Ok(mut child) => {
+            reap_by(&mut child, Instant::now() + scaled(TEARDOWN_BUDGET)).await;
+        }
         Err(error) => tracing::debug!(host = %target, %error, "ssh tunnel: -O exit"),
     }
 }

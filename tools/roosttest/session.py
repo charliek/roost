@@ -88,6 +88,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # pid-reuse fence in `_terminate_pid`.
 BIN_NAME = "roost-session"
 
+# MIRRORS `roost_ipc::paths::SESSION_DIR_NAMES_ENV`: `release` points a
+# debug build at the shipped session directories, `dev` at its own.
+SESSION_DIR_NAMES_ENV = "ROOST_TEST_SESSION_DIR_NAMES"
+
 # Env this harness owns outright: either it selects a profile / state
 # location (a leaked value would send the daemon at the developer's real
 # session) or it is something Roost injects per tab (a leaked value rides
@@ -114,6 +118,10 @@ _SANITIZE = (
     "ROOST_TAB_ID",
     "ROOST_SESSION_BIN",
     "ROOST_SESSION_LAUNCH_CWD",
+    # Which directory names a debug build resolves (plan 072 D13). A
+    # stray value would move every debug daemon here into the shipped
+    # names; the one lane that wants that passes `dir_names=`.
+    SESSION_DIR_NAMES_ENV,
     # The test-mode build-string override (plan 037 §3.7). A stray value
     # in a developer's shell would make every session here report a
     # libghostty build no client can match, so the cases that want it
@@ -185,10 +193,10 @@ def _is_debug_build(binary: Path) -> bool:
     return binary.parent.name != "release"
 
 
-def _dir_names(debug: bool) -> tuple[str, str]:
+def _dir_names(debug: bool, requested: str | None = None) -> tuple[str, str]:
     """`(mac_label, linux_namespace)` — mirrors `paths.rs`'s
-    `session_dir_names`."""
-    if debug:
+    `session_dir_names`, whose `requested` is `SESSION_DIR_NAMES_ENV`."""
+    if debug and requested != "release":
         return "RoostSessionDev", "roost-session-dev"
     return "RoostSession", "roost-session"
 
@@ -758,6 +766,8 @@ def make_env(
     launch_cwd_name: str = "launch",
     root: Path | None = None,
     state_dir: Path | None = None,
+    binary: Path | None = None,
+    dir_names: str | None = None,
 ) -> SessionEnv:
     """Build an isolated session profile, in a fresh temp root or in one
     the caller lends.
@@ -775,9 +785,14 @@ def make_env(
     the same `ROOST_STATE_DIR` seam `spawn_session` hands a UI-spawned
     child: aim both at one directory and a UI-driven restart hydrates the
     layout this env's daemon wrote.
+
+    `binary` runs another `roost-session` than this tree's — a released
+    one, for the old-session lane. `dir_names` is `SESSION_DIR_NAMES_ENV`'s
+    value, set on everything this env launches (a debug `roostctl`
+    included), so a debug build resolves the directories it names.
     """
-    binary = session_binary()
-    label, namespace = _dir_names(_is_debug_build(binary))
+    binary = binary or session_binary()
+    label, namespace = _dir_names(_is_debug_build(binary), dir_names)
     owns_root = root is None
     if owns_root:
         # `/tmp`, not `$TMPDIR`: a Unix socket path is capped at ~104
@@ -801,6 +816,8 @@ def make_env(
     env["SHELL"] = "/bin/sh"
     env["ROOST_SHELL_FEATURES"] = ""
     env["ROOST_SESSION_BIN"] = str(binary)
+    if dir_names is not None:
+        env[SESSION_DIR_NAMES_ENV] = dir_names
     env.setdefault("RUST_LOG", "info")
 
     if platform.system() == "Darwin":

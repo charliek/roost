@@ -16,8 +16,9 @@
 //   * Write to master fd: from the main actor (no concurrent
 //     writes possible per tab; ordering preserved).
 //   * Resize: `ioctl(TIOCSWINSZ)` — fires `SIGWINCH` to child.
-//   * Exit: `SIGCHLD` + `waitpid(WNOHANG)`. On exit, close
-//     master, fire `tabExited` on the supervisor's event sink.
+//   * Exit: `SIGCHLD` + `waitpid(WNOHANG)`. On exit, cancel the
+//     read source (its cancel handler closes the master), fire
+//     `tabExited` on the supervisor's event sink.
 //   * Quit-time reap: iterate all sessions, `SIGHUP` →
 //     `waitpid` with timeout → `SIGKILL` fallback. No zombies.
 //   * Env: `ROOST_TAB_ID` + `ROOST_SOCKET` + `TERM` +
@@ -56,6 +57,9 @@ final class PtySupervisor {
     }
 
     private struct Session {
+        /// Open while the session is in `sessions`: the only close is
+        /// `source`'s cancel handler, and the source is cancelled only
+        /// once the session has left the map.
         let masterFD: Int32
         let childPID: pid_t
         let source: DispatchSourceRead
@@ -380,25 +384,55 @@ final class PtySupervisor {
         sessions[tabID] != nil
     }
 
-    /// Best-effort native read of the tab's shell cwd — the new-tab
-    /// fallback for shells that don't emit OSC 7. Reads the direct
-    /// child (the shell) process's current directory, which tracks the
-    /// shell's `cd`s; a new tab spawns a LOCAL shell, so the local path
-    /// is what it should inherit. Returns nil if the tab has no live
-    /// PTY or the read fails.
+    /// Best-effort native read of the cwd of the tab's foreground job:
+    /// the first of `nativeCwds`. Nil if the tab has no live PTY or
+    /// every read fails.
     func foregroundCwd(tabID: Int64) -> String? {
-        guard let session = sessions[tabID] else { return nil }
-        return processCwd(pid: session.childPID)
+        nativeCwds(tabID: tabID).first
+    }
+
+    /// Best-effort native reads of the tab's cwd, best first — what a
+    /// new tab opened from it inherits, since a new tab spawns a LOCAL
+    /// shell. Rust's `PtySupervisor::native_cwds`: first the cwd of the
+    /// foreground process group's leader, the job the shell is running
+    /// (a nested shell, a command); then the direct child's, the shell
+    /// Roost started, which is also the leader while the shell sits at
+    /// its prompt. Empty if the tab has no live PTY or every read fails.
+    ///
+    /// A leader that changes directory moves the answer with it — `git`
+    /// under its pager reads as the repository root. Intended: that is
+    /// where the job is.
+    ///
+    /// Where Rust holds the child's reap latch, the main actor does the
+    /// same here: a child is reaped only after its session has left
+    /// `sessions`, so while it is in the map its pid names this child and
+    /// its master fd is open.
+    func nativeCwds(tabID: Int64) -> [String] {
+        guard let session = sessions[tabID] else { return [] }
+        return [
+            leaderCwd(masterFD: session.masterFD, child: session.childPID),
+            processCwd(pid: session.childPID),
+        ].compactMap { $0 }
+    }
+
+    /// The tab's read source, for the #557 seam test only.
+    func readSourceForTesting(tabID: Int64) -> DispatchSourceRead? {
+        sessions[tabID]?.source
     }
 
     // MARK: Read-source helpers
 
-    /// Install the DispatchSourceRead's event handler. Declared
-    /// `nonisolated static` so the closure literal inside doesn't
-    /// inherit `@MainActor` isolation from the enclosing call site
-    /// — see the doc comment in `spawn(...)` for the
+    /// Install the DispatchSourceRead's event and cancel handlers.
+    /// Declared `nonisolated static` so the closure literals inside
+    /// don't inherit `@MainActor` isolation from the enclosing call
+    /// site — see the doc comment in `spawn(...)` for the
     /// `dispatch_assert_queue(main)` crash that motivated this
     /// extraction.
+    ///
+    /// The cancel handler is the one place the master fd is closed.
+    /// Dispatch runs it only after any event handler in flight has
+    /// returned, and never runs the event handler again, so no read
+    /// can reach a later descriptor given the same number (#557).
     nonisolated private static func installReadHandler(
         source: DispatchSourceRead,
         masterFD: Int32,
@@ -409,6 +443,9 @@ final class PtySupervisor {
                 masterFD: masterFD,
                 signalCont: signalCont
             )
+        }
+        source.setCancelHandler {
+            Darwin.close(masterFD)
         }
     }
 
@@ -457,8 +494,9 @@ final class PtySupervisor {
             return false
         }
         sessions.removeValue(forKey: tabID)
+        // Before the reap: a source at EOF fires until it is cancelled.
+        session.source.cancel()
         let status = reapChild(pid: expectedPID)
-        Darwin.close(session.masterFD)
         emit(.tabExited(tabID: tabID, status: status))
         return true
     }
@@ -479,7 +517,6 @@ final class PtySupervisor {
         // when a `@MainActor` reference is captured into a
         // non-isolated dispatch closure.
         session.source.cancel()
-        let masterFD = session.masterFD
         let childPID = session.childPID
         let signalCont = session.signalContinuation
         let drainTask = session.drainTask
@@ -503,7 +540,6 @@ final class PtySupervisor {
                 kill(childPID, SIGKILL)
                 waitpid(childPID, &status, 0)
             }
-            Darwin.close(masterFD)
             // Signal the drain task to emit .tabExited with the
             // real status before letting the stream end.
             signalCont.yield(.forcedExit(exitStatus(status)))
@@ -732,9 +768,72 @@ func bashBootstrapEnv(
     return out
 }
 
+/// Who a process is, as far as the foreground-leader read needs it —
+/// Rust's `ProcStamp` in `crates/roost-engine/src/pty.rs`.
+struct ProcStamp {
+    var pid: pid_t
+    var pgid: pid_t
+    var session: pid_t
+    var tty: UInt32
+    var startSec: UInt64
+    var startUsec: UInt64
+}
+
+/// Whether the stamps taken before and after a leader's cwd read are one
+/// process, leading its own group, in the child's session and on the
+/// child's terminal — Rust's `same_leader`. The start time is what tells
+/// a reused pid apart.
+func sameLeader(_ before: ProcStamp, _ after: ProcStamp, childSID: pid_t, childTTY: UInt32) -> Bool {
+    [before, after].allSatisfy { stamp in
+        stamp.pgid == stamp.pid && stamp.session == childSID && stamp.tty == childTTY
+    } && before.pid == after.pid
+        && (before.startSec, before.startUsec) == (after.startSec, after.startUsec)
+}
+
+/// `pid`'s stamp via `proc_pidinfo` (`PROC_PIDTBSDINFO`), or nil.
+private func procStamp(pid: pid_t) -> ProcStamp? {
+    var info = proc_bsdinfo()
+    let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+    guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+    // `proc_bsdinfo` carries no session id.
+    let session = getsid(pid)
+    guard session >= 0 else { return nil }
+    return ProcStamp(
+        pid: pid_t(bitPattern: info.pbi_pid),
+        pgid: pid_t(bitPattern: info.pbi_pgid),
+        session: session,
+        tty: info.e_tdev,
+        startSec: info.pbi_start_tvsec,
+        startUsec: info.pbi_start_tvusec
+    )
+}
+
+/// The cwd of the leader of the terminal's foreground process group,
+/// when that is not `child` itself: a job the shell is running, or a
+/// nested shell — Rust's `leader_cwd`.
+///
+/// `forkpty` makes the child a session leader with the pty as its
+/// controlling terminal, so the master's foreground group is the job's.
+/// The leader is not our child, though, and nothing holds its pid, so its
+/// cwd is read between two `ProcStamp`s and kept only when `sameLeader`
+/// matches them. Asking the terminal for its foreground group again
+/// would not do: a dead job's group stays the foreground one until the
+/// shell calls `tcsetpgrp`, and its pid can be reused meanwhile. A leader
+/// this user can't read (`sudo -s`) is nil, like any failed read.
+private func leaderCwd(masterFD: Int32, child: pid_t) -> String? {
+    let leader = tcgetpgrp(masterFD)
+    guard leader > 0, leader != child,
+        let own = procStamp(pid: child),
+        let before = procStamp(pid: leader),
+        let cwd = processCwd(pid: leader),
+        let after = procStamp(pid: leader),
+        sameLeader(before, after, childSID: child, childTTY: own.tty)
+    else { return nil }
+    return cwd
+}
+
 /// The current working directory of `pid` via `proc_pidinfo`
-/// (`PROC_PIDVNODEPATHINFO`). Returns nil on any failure. Backs the
-/// new-tab cwd fallback when no OSC 7 cwd is tracked.
+/// (`PROC_PIDVNODEPATHINFO`). Returns nil on any failure.
 private func processCwd(pid: pid_t) -> String? {
     var info = proc_vnodepathinfo()
     let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)

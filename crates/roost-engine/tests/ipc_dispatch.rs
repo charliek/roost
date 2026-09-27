@@ -744,6 +744,80 @@ async fn app_dialog_answer_rejects_an_action_that_names_nothing() {
     }
 }
 
+/// `app.notice_answer` refuses a request that names no notice or no
+/// action at the dispatcher, before the hop — `invalid-param` with no UI
+/// attached is the proof, as for `app.dialog_answer` above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_notice_answer_rejects_a_request_that_names_nothing() {
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("roost.sock");
+
+    let handler = IpcHandler::new(
+        Arc::new(Workspace::new()),
+        Arc::new(PtySupervisor::new()),
+        socket_path.clone(),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    );
+    let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
+    let server_socket = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    let mut client = connect_with_retry(&server_socket).await;
+    let named = serde_json::json!({
+        "kind": "session_ended", "subject": "hs-1", "generation": 1, "action": "start",
+    });
+    for field in ["kind", "subject", "action"] {
+        let mut params = named.clone();
+        params[field] = serde_json::json!("");
+        let err = client
+            .call_raw(ops::APP_NOTICE_ANSWER, params)
+            .await
+            .unwrap_err();
+        assert_eq!(code(&err), "invalid-param", "empty {field}");
+    }
+}
+
+/// `app.key_event` refuses an empty key or a modifier it has no name
+/// for at the dispatcher, before the hop — `invalid-param` with no UI
+/// attached is the proof, as for `app.dialog_answer` above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_key_event_rejects_an_empty_key_and_an_unknown_modifier() {
+    let dir = tempdir().unwrap();
+    let socket_path = dir.path().join("roost.sock");
+
+    let handler = IpcHandler::new(
+        Arc::new(Workspace::new()),
+        Arc::new(PtySupervisor::new()),
+        socket_path.clone(),
+        "Roost-test",
+        "ai.stridelabs.Roost.test",
+    );
+    let server = IpcServer::bind(&socket_path, handler).await.expect("bind");
+    let server_socket = server.socket_path().to_path_buf();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    let mut client = connect_with_retry(&server_socket).await;
+    for params in [
+        serde_json::json!({"key": ""}),
+        serde_json::json!({"key": "t", "modifiers": ["meta"]}),
+        serde_json::json!({"key": "t", "modifiers": ["Alt"]}),
+    ] {
+        let err = client
+            .call_raw(ops::APP_KEY_EVENT, params.clone())
+            .await
+            .unwrap_err();
+        match err {
+            roost_ipc::ClientError::Server { code, .. } => {
+                assert_eq!(code, "invalid-param", "{params}")
+            }
+            other => panic!("expected Server error for {params}, got {other:?}"),
+        }
+    }
+}
+
 // ============================================================================
 // `session.put_file` — plan 047 §3.1 / W1
 // ============================================================================

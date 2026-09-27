@@ -2361,7 +2361,8 @@ pub(super) fn native_file_drop_origin(
             | KeyboardRoute::Confirm
             | KeyboardRoute::HostDialog
             | KeyboardRoute::Editor
-            | KeyboardRoute::Palette => None,
+            | KeyboardRoute::Palette
+            | KeyboardRoute::Pending => None,
         })
 }
 
@@ -2802,6 +2803,9 @@ impl App {
     }
 
     pub(super) fn paste_into_active(&mut self, target: ClipboardOp) -> Result<UiTask, String> {
+        if self.pending_keyboard.armed() {
+            return Err(super::pending_input::NOT_READY.to_string());
+        }
         let tab = self.active_tab_key();
         if !self.tabs.contains_key(&tab) {
             return Ok(UiTask::None);

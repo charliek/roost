@@ -214,6 +214,9 @@ fn accel_order(left: &Accel, right: &Accel) -> std::cmp::Ordering {
     (left.modifiers.bits(), &left.key).cmp(&(right.modifiers.bits(), &right.key))
 }
 
+// One over clippy's bar: the last five are `host_verbs::verbs`' own
+// inputs, passed through, and bundling them here would only rename them.
+#[allow(clippy::too_many_arguments)]
 fn command_palette_frame(
     notification_count: usize,
     providers: &[provider::Provider],
@@ -222,6 +225,7 @@ fn command_palette_frame(
     recents: &[host_verbs::RecentRow<'_>],
     local: host_sidebar::LocalSlot<'_>,
     switching: bool,
+    slot: host_verbs::SlotHistory,
 ) -> palette::PaletteFrame {
     let mut bindings = keybindings.iter().collect::<Vec<_>>();
     bindings.sort_by(|(left, _), (right, _)| accel_order(left, right));
@@ -266,6 +270,7 @@ fn command_palette_frame(
         recents,
         local,
         switching,
+        slot,
         picker_shortcut.as_deref(),
     ));
     palette::PaletteFrame::new(COMMANDS_FRAME_ID, "Execute a command…", items)
@@ -281,6 +286,7 @@ fn host_verb_items(
     recents: &[host_verbs::RecentRow<'_>],
     local: host_sidebar::LocalSlot<'_>,
     switching: bool,
+    slot: host_verbs::SlotHistory,
     new_project_on_shortcut: Option<&str>,
 ) -> Vec<palette::PaletteItem> {
     host_verbs::verbs(
@@ -289,6 +295,7 @@ fn host_verb_items(
         local,
         host_verbs::VerbPolicy::current(),
         switching,
+        slot,
     )
     .into_iter()
     .map(|verb| {
@@ -654,7 +661,7 @@ fn report_palette_query_result(
     now: Instant,
 ) {
     if let Err(error) = result {
-        status.set_at(error, now);
+        status.set_at(error, Severity::Error, now);
     }
 }
 
@@ -679,6 +686,28 @@ fn font_size_candidate(
     }
     let metrics = TerminalMetrics::measure_with_font(candidate.current_size_pt(), font)?;
     Ok(Some((candidate, metrics)))
+}
+
+/// The commit half of a font or typography change's re-grid, once every
+/// tab has taken the new geometry.
+fn commit_typography_regrid(
+    tabs: &mut HashMap<TabKey, TerminalTab>,
+    host_resume: &mut HashMap<TabKey, host_tab::ResumePoint>,
+    applied: Vec<(TabKey, GeometryChange)>,
+    operation: &str,
+) {
+    for (key, change) in applied {
+        if let Some(tab) = tabs.get_mut(&key) {
+            host_tab::forget_resume_on_regrid(
+                host_resume,
+                key,
+                change.previous_grid,
+                change.grid(),
+            );
+            tab.commit_geometry(change);
+            refresh_or_warn(key.tab, tab, operation);
+        }
+    }
 }
 
 impl App {
@@ -816,12 +845,9 @@ impl App {
                 tab.commit_pointer_cancel(release);
             }
         }
-        for (key, change) in applied {
-            if let Some(tab) = self.tabs.get_mut(&key) {
-                tab.commit_geometry(change);
-                refresh_or_warn(key.tab, tab, operation);
-            }
-        }
+        commit_typography_regrid(&mut self.tabs, &mut self.host_resume, applied, operation);
+        self.note_host_grid((cols, rows));
+        self.background_resize.trigger(Instant::now());
         Ok(())
     }
 
@@ -929,6 +955,7 @@ impl App {
                 &self.host_recent_rows(),
                 self.local_slot_input(),
                 self.switch_in_flight(),
+                self.local_slot_history(),
             ),
             "launcher" => launcher_palette_frame(&self.config),
             "agents" => self.agent_frame_now(),
@@ -1289,8 +1316,9 @@ impl App {
     /// the op id whose completion owes that answer.
     ///
     /// `origin` is who is asking — see [`Self::CLICK_ACTIVATION_ORIGIN`].
-    /// Only the host rows read it, and only to refuse to raise a modal
-    /// at a machine.
+    /// The host rows read it to refuse to raise a modal at a machine, and
+    /// `new_tab` so that only a person's press keeps the keys typed after
+    /// it for the new tab (plan 072 §D2).
     pub(super) fn activate_palette(
         &mut self,
         id: &str,
@@ -1422,6 +1450,9 @@ impl App {
                 "new_tab" => {
                     self.clear_palette_state();
                     dispatch = self.new_tab_dispatch();
+                    if origin == Self::CLICK_ACTIVATION_ORIGIN {
+                        self.arm_pending_keyboard(&dispatch);
+                    }
                 }
                 "new_project" => {
                     self.clear_palette_state();
@@ -1890,8 +1921,14 @@ impl App {
             .find(|frame| frame.id == COMMANDS_FRAME_ID)
             .and_then(|frame| {
                 let shortcut = self.shortcut_for(KeybindAction::NewProjectOnHost);
-                let verbs =
-                    host_verb_items(&hosts, &recents, local, switching, shortcut.as_deref());
+                let verbs = host_verb_items(
+                    &hosts,
+                    &recents,
+                    local,
+                    switching,
+                    self.local_slot_history(),
+                    shortcut.as_deref(),
+                );
                 // The family is one contiguous tail (`command_palette_frame`
                 // appends it last), so the splice is everything before the
                 // first host row followed by the new block — and the
@@ -2138,7 +2175,7 @@ impl App {
                 .map(|view| agent_palette::AgentSource {
                     projects: &view.projects,
                     host: view.host,
-                    label: Some(view.label.as_str()),
+                    label: agent_source_label(&view.label, self.is_local_slot(view.host)),
                 }),
         );
         sources
@@ -2370,6 +2407,14 @@ impl App {
     }
 }
 
+/// [`App::agent_sources`]'s label for one host view (#567): the session
+/// slot reads as local everywhere else (plan 071 D8), so its agent rows
+/// carry no host label either. A real host the user named "localhost"
+/// under in-process mode keeps its own.
+fn agent_source_label(label: &str, on_slot: bool) -> Option<&str> {
+    (!on_slot).then_some(label)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2381,6 +2426,15 @@ mod tests {
         mode: roost_ipc::LocalBackendMode::InProcess,
         slot_saved_id: None,
     };
+
+    /// #567: the slot's agent rows carry no host label, and a real host
+    /// the user actually named "localhost" (under in-process mode) keeps
+    /// its own.
+    #[test]
+    fn agent_source_label_drops_only_for_the_slot() {
+        assert_eq!(agent_source_label("localhost", true), None);
+        assert_eq!(agent_source_label("localhost", false), Some("localhost"));
+    }
 
     /// Every row that dispatches an engine op dismisses the palette
     /// first, so a synchronous version of it would have read this exact
@@ -2453,7 +2507,11 @@ mod tests {
     fn typed_palette_query_errors_are_visible_without_hiding_prior_state() {
         let now = Instant::now();
         let mut status = StatusBanner::default();
-        status.set_at("prior status", now - Duration::from_secs(1));
+        status.set_at(
+            "prior status",
+            Severity::Error,
+            now - Duration::from_secs(1),
+        );
         report_palette_query_result(
             &mut status,
             Err("font preview rollback: injected failure".to_string()),
@@ -2461,7 +2519,7 @@ mod tests {
         );
         assert_eq!(
             status.message(),
-            Some("font preview rollback: injected failure")
+            Some(("font preview rollback: injected failure", Severity::Error))
         );
         assert_eq!(status.expires_at, Some(now + STATUS_BANNER_DURATION));
     }
@@ -3083,6 +3141,7 @@ mod tests {
             &[],
             IN_PROCESS,
             false,
+            host_verbs::SlotHistory::Connected,
         ));
         let ids: Vec<String> = state
             .matches()
@@ -3142,6 +3201,7 @@ mod tests {
             &[],
             IN_PROCESS,
             false,
+            host_verbs::SlotHistory::Connected,
         );
         let ids: Vec<&str> = frame.items.iter().map(|item| item.id.as_str()).collect();
         let first_host = ids
@@ -3165,8 +3225,16 @@ mod tests {
         // the block is Add Host, the seed where the platform has a
         // session to reach, and the picker over LOCAL + localhost
         // (plan 063 §D3).
-        let bare =
-            command_palette_frame(0, &config.providers, &bindings, &[], &[], IN_PROCESS, false);
+        let bare = command_palette_frame(
+            0,
+            &config.providers,
+            &bindings,
+            &[],
+            &[],
+            IN_PROCESS,
+            false,
+            host_verbs::SlotHistory::Connected,
+        );
         let bare_ids: Vec<&str> = bare.items.iter().map(|item| item.id.as_str()).collect();
         assert!(bare_ids.contains(&host_verbs::ADD_ID));
         assert!(bare_ids.contains(&host_verbs::CONNECT_SEED_ID));
@@ -3209,7 +3277,14 @@ mod tests {
             transport: host_sidebar::HostTransportKind::Ssh,
             fidelity: None,
         }];
-        let items = host_verb_items(&hosts, &[], IN_PROCESS, false, Some("Alt+Shift+N"));
+        let items = host_verb_items(
+            &hosts,
+            &[],
+            IN_PROCESS,
+            false,
+            host_verbs::SlotHistory::Connected,
+            Some("Alt+Shift+N"),
+        );
         for item in &items {
             let expected = (item.id == host_verbs::NEW_PROJECT_ON_ID).then_some("Alt+Shift+N");
             assert_eq!(item.trailing_text.as_deref(), expected, "{}", item.id);
@@ -3295,6 +3370,50 @@ mod tests {
                 .expect("changed candidate");
         assert_eq!(candidate.0.current_size_pt(), 71.0);
         assert_eq!(current, before);
+    }
+
+    /// #564 (plan 072 D4a) through the font path, which re-grids every
+    /// kept terminal the way a window resize does: a detached host tab
+    /// whose terminal moves loses its resume point, and one whose grid
+    /// the new font happens to keep does not.
+    #[test]
+    fn a_font_regrid_forgets_a_detached_host_tabs_resume_point() {
+        let metrics = TerminalMetrics::measure(13.0).expect("test metrics");
+        let bigger = TerminalMetrics::measure(18.0).expect("bigger test metrics");
+        let moved = TabKey::new(HostId::new(3), 7);
+        let kept = TabKey::new(HostId::new(3), 8);
+        let mut tabs = HashMap::from([
+            (moved, laid_out_host_terminal(80, 24, metrics)),
+            (kept, laid_out_host_terminal(80, 24, metrics)),
+        ]);
+        let point = host_tab::ResumePoint {
+            server_epoch: 11,
+            tab_generation: 2,
+            next_seq: 42,
+        };
+        let mut resumes = HashMap::from([(moved, point), (kept, point)]);
+
+        let applied = [(moved, (58, 17)), (kept, (80, 24))]
+            .map(|(key, (cols, rows))| {
+                let change = tabs
+                    .get_mut(&key)
+                    .expect("tab")
+                    .apply_geometry(cols, rows, bigger, 2)
+                    .expect("apply the new font")
+                    .expect("new metrics are a change");
+                (key, change)
+            })
+            .to_vec();
+        commit_typography_regrid(&mut tabs, &mut resumes, applied, "font size");
+
+        assert!(
+            !resumes.contains_key(&moved),
+            "the font moved this terminal off the grid the session wrote for"
+        );
+        assert!(
+            resumes.contains_key(&kept),
+            "a font change that keeps the grid moves no cell"
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! What a host's connection state says to the user (plan 037 §3.1,
-//! §3.7): the banner over its last frame, and the prompt its Connect
+//! §3.7): whether its last frame stays on screen, and the prompt its Connect
 //! verb raises when the session is one this client cannot talk to at
 //! all — a protocol it does not speak, no payload kind it can decode,
 //! or a build skew against a session too old to serve `vt`. A skew a
@@ -7,41 +7,31 @@
 //! asked about from the band rather than from this gate —
 //! [`restart_prompt_for_skew`] is that question.
 //!
-//! Pure, and deliberately kept away from the widgets: "which banner,
+//! Pure, and deliberately kept away from the widgets: "which frame,
 //! which buttons, and is there a restart button at all" is the part that
 //! must be right for **every** connection state, and a table test is the
 //! only way to say that once. The adapter next door paints whatever
-//! these answer and adds nothing of its own.
+//! these answer and adds nothing of its own. The strip over a frozen
+//! frame is `roost_ui_model::notice`'s, with every other terminal notice.
 //!
 //! The two live together because they are the same question asked at two
 //! moments — a state that took the window away from the user gets a
-//! banner, and a state that needs a decision gets a dialog — and reading
+//! notice, and a state that needs a decision gets a dialog — and reading
 //! them side by side is how the copy stays consistent.
 
 use crate::host_conn::state::{
     BuildMismatch, HostConnState, MismatchKind, RestartAction, Skew, CLIENT_PAYLOAD_KINDS,
 };
 use roost_ui_model::host_sidebar::FidelityAction;
-
-/// A line the window owes a host tab, over the pixels it is drawing: a
-/// sentence and one button, the button being a Connect underneath.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct HostBanner {
-    pub(super) message: String,
-    pub(super) action: &'static str,
-}
+use roost_ui_model::notice;
 
 /// A frame nothing will ever update again, and why.
 ///
-/// One variant, and still an enum, because the click check below is a
-/// question about *which* frame was drawn and a second one may yet
+/// One variant, and still an enum, because the paste refusal is a
+/// question about *which* frame it lands on and a second one may yet
 /// exist.
-///
-/// `pub(crate)` because the banner's button carries it: the click has to
-/// name the frame it was drawn on, so the app can refuse one that landed
-/// after the host moved on (see [`click_still_lands`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FrozenFrame {
+pub(super) enum FrozenFrame {
     /// The session ended; its shells are gone with it.
     Stopped,
 }
@@ -49,16 +39,15 @@ pub(crate) enum FrozenFrame {
 /// Whether a host's state leaves its last frame frozen on screen.
 ///
 /// `None` for every state that is still driving the tab or that the
-/// sidebar already explains: a connected host needs no banner, and a
+/// sidebar already explains: a connected host needs no notice, and a
 /// disconnected or reconnecting one is saying so in its section band
 /// with a ↻ beside it.
 ///
-/// The kind is separate from its wording because two very different
-/// readers ask: the terminal area wants the sentence, and the selection
-/// reconcile wants only whether there is a frame worth keeping — which
-/// is a question about the state, not about the copy over it. One table
-/// answers both, so a state added later cannot mean "frozen" to one and
-/// not the other.
+/// The selection reconcile asks whether there is a frame worth keeping,
+/// and a paste whether there is a frame to refuse — questions about the
+/// state, not about the copy over it, which the terminal area's notice
+/// answers from the same state's [`HostConnState::section_state`]. A
+/// test holds the two to the same states.
 pub(super) fn frozen_frame(state: &HostConnState) -> Option<FrozenFrame> {
     match state {
         HostConnState::Stopped => Some(FrozenFrame::Stopped),
@@ -69,37 +58,22 @@ pub(super) fn frozen_frame(state: &HostConnState) -> Option<FrozenFrame> {
     }
 }
 
-/// Whether a banner click still names the frame it was drawn on.
-///
-/// The banner is a picture of a past frame, and a click carries the
-/// latency of a human hand: a second press, or a press on pixels the
-/// compositor has not repainted yet, can arrive after the host has
-/// already advanced to `Connecting`/`Connected` — where honoring it
-/// would abort the very attempt the first press started. "Start a new
-/// session" is a promise about a session that has ended, and honoring it
-/// against a host that has since come back would start a second one.
-///
-/// `current` is what [`frozen_frame`] says about the host **now**.
-pub(super) fn click_still_lands(rendered: FrozenFrame, current: Option<FrozenFrame>) -> bool {
-    current == Some(rendered)
+/// The host a tab on screen belongs to, as the terminal notice reads it.
+pub(super) fn shown_host<'a>(
+    saved_id: &'a str,
+    label: &'a str,
+    state: &HostConnState,
+) -> notice::ShownHost<'a> {
+    notice::ShownHost {
+        saved_id,
+        label,
+        state: state.section_state(),
+    }
 }
 
 impl FrozenFrame {
-    /// What this frame says to the user, over the pixels it froze.
-    pub(super) fn banner(self, label: &str) -> HostBanner {
-        match self {
-            Self::Stopped => HostBanner {
-                // Deliberately not "reconnect": the shells are gone, and
-                // the button starts a fresh session rather than finding
-                // this one.
-                message: format!("The session on {label} ended."),
-                action: "Start a new session",
-            },
-        }
-    }
-
     /// Why a paste into this frame is refused (issue #376), paired with
-    /// the remedy the banner beside it offers.
+    /// the remedy the notice beside it offers.
     pub(super) fn paste_refusal(self) -> &'static str {
         match self {
             Self::Stopped => "this session ended — start a new session to paste",
@@ -396,10 +370,17 @@ mod tests {
         }
     }
 
-    /// The two production halves composed exactly as the terminal area
-    /// composes them.
-    fn banner(label: &str, state: &HostConnState) -> Option<HostBanner> {
-        Some(frozen_frame(state)?.banner(label))
+    /// The terminal area's notice for a tab on a host in `state`,
+    /// composed exactly as the app composes it.
+    fn notice_over(label: &str, state: &HostConnState) -> Option<notice::Notice> {
+        notice::terminal_notice(&notice::NoticeInput {
+            mode: roost_ipc::LocalBackendMode::Session,
+            shown: Some(shown_host("hs-1", label, state)),
+            slot: None,
+            area_empty: false,
+            switching: false,
+            log_path: "/home/u/.local/state/roost/roost.log",
+        })
     }
 
     fn every_state() -> Vec<HostConnState> {
@@ -416,55 +397,64 @@ mod tests {
         ]
     }
 
-    /// The whole banner decision, state by state — the point of the
+    /// The whole decision over a frame, state by state — the point of the
     /// table being that a state added later fails this test rather than
     /// silently rendering nothing over a frozen frame.
     #[test]
-    fn only_a_session_that_ended_puts_a_banner_over_the_frame() {
-        let banners: Vec<Option<HostBanner>> = every_state()
+    fn only_a_session_that_ended_puts_a_notice_over_the_frame() {
+        let notices: Vec<Option<notice::Notice>> = every_state()
             .iter()
-            .map(|state| banner("pop-os", state))
+            .map(|state| notice_over("pop-os", state))
             .collect();
-        assert_eq!(banners[0], None, "disconnected explains itself in the band");
-        assert_eq!(banners[1], None, "connecting is not a failure yet");
-        assert_eq!(banners[2], None, "a connected host says nothing");
+        assert_eq!(notices[0], None, "disconnected explains itself in the band");
+        assert_eq!(notices[1], None, "connecting is not a failure yet");
+        assert_eq!(notices[2], None, "a connected host says nothing");
+        let ended = notices[3].as_ref().expect("a stopped session says so");
+        assert_eq!(ended.message, "The session on pop-os ended.");
         assert_eq!(
-            banners[3],
-            Some(HostBanner {
-                message: "The session on pop-os ended.".into(),
-                action: "Start a new session",
-            })
+            ended
+                .actions
+                .iter()
+                .map(|action| action.label)
+                .collect::<Vec<_>>(),
+            ["Start a new session"]
         );
+        assert_eq!(ended.placement, notice::Placement::OverFrame);
         assert_eq!(
-            banners[4], None,
-            "a build mismatch is answered by its dialog, not a banner"
+            notices[4], None,
+            "a build mismatch is answered by its dialog, not a notice"
         );
     }
 
-    /// A banner click is a promise about the frame it was drawn on, and
-    /// a click carries the latency of a human hand: a second press, or
-    /// one on pixels the compositor has not repainted, can arrive after
-    /// the host advanced to `Connecting`/`Connected` — where honoring it
-    /// would abort the very attempt the first press started. Only the
-    /// frame still on screen is acted on.
+    /// The notice over a frame and the frame the reconcile keeps are two
+    /// readings of one state, and they agree on every one of them.
     #[test]
-    fn a_banner_click_lands_only_on_the_frame_it_was_drawn_on() {
+    fn a_frame_has_a_notice_over_it_exactly_when_it_is_frozen() {
         for state in every_state() {
-            let current = frozen_frame(&state);
             assert_eq!(
-                click_still_lands(FrozenFrame::Stopped, current),
-                current == Some(FrozenFrame::Stopped),
+                notice_over("pop-os", &state).is_some(),
+                frozen_frame(&state).is_some(),
+                "{state:?}"
+            );
+        }
+    }
+
+    /// [`notice::click_still_lands`] over every state: only a frame still
+    /// frozen takes a press.
+    #[test]
+    fn a_press_lands_only_on_a_frame_still_frozen() {
+        let key = notice::NoticeKey {
+            kind: notice::NoticeKind::SessionEnded,
+            subject: "hs-1".into(),
+        };
+        for state in every_state() {
+            let current = notice_over("pop-os", &state);
+            assert_eq!(
+                notice::click_still_lands(&key, notice::NoticeActionId::Start, current.as_ref()),
+                frozen_frame(&state).is_some(),
                 "against {state:?}"
             );
         }
-        assert!(click_still_lands(
-            FrozenFrame::Stopped,
-            Some(FrozenFrame::Stopped)
-        ));
-        assert!(
-            !click_still_lands(FrozenFrame::Stopped, None),
-            "a connect is already under way; a second press must not abort it"
-        );
     }
 
     /// The paste-refusal copy (issue #376) names the state and the

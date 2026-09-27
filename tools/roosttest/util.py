@@ -18,6 +18,7 @@ a file" any more.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
@@ -489,6 +490,14 @@ def wait_shell_ready(
     )
 
 
+def foreground_job(directory) -> str:
+    """A command whose subshell `cd`s to `directory`, prints `JOB_READY`,
+    and stays there as the shell's foreground job — so the job's cwd is
+    not the shell's, and nothing emits OSC 7. The echoed command line
+    shows `JOB_%s`, so only the job's own output matches `JOB_READY`."""
+    return f"(cd '{directory}' && printf 'JOB_%s\\n' READY && exec sleep 300)"
+
+
 def run_printf_probe(
     roost,
     tab_id: int,
@@ -549,6 +558,26 @@ def press_new_tab(roost) -> None:
         roost.palette_activate("new_tab")
     finally:
         roost.palette_dismiss()
+
+
+def palette_command(roost, row: str) -> None:
+    """Activate one row of the command palette, as a user picking it."""
+    roost.palette_open("commands")
+    try:
+        roost.palette_activate(row)
+    finally:
+        with contextlib.suppress(RoostError):
+            roost.palette_dismiss()
+
+
+def widen_by_font(roost, tab, cols: int) -> None:
+    """Shrink the font a step at a time, at most eight, until `tab`'s
+    terminal has more than `cols` columns. The font path re-grids every
+    kept terminal, shown or not, the way a window resize does."""
+    for _ in range(8):
+        if roost.tab_dump_resolved(tab)["cols"] > cols:
+            return
+        palette_command(roost, "font_decrease")
 
 
 def set_sidebar_collapsed(roost, collapsed: bool) -> None:

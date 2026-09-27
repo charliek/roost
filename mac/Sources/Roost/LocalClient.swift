@@ -120,6 +120,39 @@ final class LocalClient {
         [requested, projectCwd].first(where: isDirectory) ?? home
     }
 
+    /// Where a restored tab starts: its saved cwd if a shell can enter
+    /// it, else the project's cwd if one can, else `$HOME` — Rust's
+    /// `application::restorable_cwd` (#559).
+    ///
+    /// Restore-only. `spawnCwd` keeps a directory the shell cannot enter,
+    /// so an interactive open there fails as it should; a restore that
+    /// failed would close the project's only tab, and closing a project's
+    /// last tab deletes the project.
+    nonisolated static func restoreCwd(saved: String, projectCwd: String) -> String {
+        restoreCwd(
+            saved: saved,
+            projectCwd: projectCwd,
+            home: homeDirectory(),
+            isEnterable: Self.isEnterable
+        )
+    }
+
+    /// `restoreCwd(saved:projectCwd:)` with `$HOME` and the predicate stated.
+    nonisolated static func restoreCwd(
+        saved: String,
+        projectCwd: String,
+        home: String,
+        isEnterable: (String) -> Bool
+    ) -> String {
+        [saved, projectCwd].first(where: isEnterable) ?? home
+    }
+
+    /// A directory this user may search, which is what `chdir` needs:
+    /// `access(2)`'s `X_OK` on a directory is search permission.
+    nonisolated static func isEnterable(_ path: String) -> Bool {
+        isDirectory(path) && access(path, X_OK) == 0
+    }
+
     /// `tab.open`'s `project_id: 0`. A new project records the requested
     /// cwd only if it is a directory, and otherwise none, as Rust's does;
     /// its tabs then take the `$HOME` fallback when they spawn.
@@ -132,12 +165,14 @@ final class LocalClient {
     }
 
     /// Where a tab opened from `tabID` starts — `tab.open`'s
-    /// `cwd_from_tab`, mirroring Rust's `application::inherited_cwd`.
+    /// `cwd_from_tab`, mirroring Rust's `application::inherited_cwd`: the
+    /// supervisor's native candidates (the foreground job's leader, then
+    /// the shell), then the tracked cwd, the first that is a directory. So
+    /// a job whose directory was removed falls to the shell's rather than
+    /// past it to the tracked one.
     func inheritedCwd(tabID: Int64) -> String? {
         guard let row = workspace.tab(tabID) else { return nil }
-        return [supervisor.foregroundCwd(tabID: tabID), row.cwd]
-            .compactMap { $0 }
-            .first(where: isDirectory)
+        return (supervisor.nativeCwds(tabID: tabID) + [row.cwd]).first(where: isDirectory)
     }
 
     func closeTab(_ tabID: Int64) throws {

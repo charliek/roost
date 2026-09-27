@@ -20,7 +20,10 @@
 # accept LANG LC_*; users may need to extend `AcceptEnv` server-side
 # for the env to take effect).
 #
-# KEEP IN SYNC with crates/roost-engine/resources/shell-integration/roost.zsh (shared by iced)
+# KEEP IN SYNC (shared functions only — __roost_osc7, __roost_title,
+# __roost_mark_c, __roost_mark_d) with
+# crates/roost-engine/resources/shell-integration/roost.zsh (shared by iced).
+# tools/roosttest_unit/test_osc7_emitters.py compares the shared bodies.
 
 [[ -o interactive ]] || return 0
 [[ -n "${ROOST_TAB_ID:-}" ]] || return 0
@@ -57,6 +60,11 @@ if _roost_feature ssh-env; then
   }
 fi
 
+# Each function is skipped when the user already defined one under this
+# name (e.g. in their rc, sourced before Roost) — their definition then
+# takes over the feature, since the hook registration below still names
+# it unconditionally.
+if (( ! $+functions[__roost_osc7] )); then
 __roost_osc7() {
   _roost_feature cwd || return 0
   # The reader percent-decodes, so a literal `%` goes out as %25, and a
@@ -77,16 +85,38 @@ __roost_osc7() {
   fi
   printf '\033]7;file://%s%s\033\\' "${HOST}" "$p"
 }
+fi
 
+if (( ! $+functions[__roost_title] )); then
 __roost_title() {
   _roost_feature title || return 0
-  printf '\033]0;%s\033\\' "${PWD/#$HOME/~}"
+  # A title needs no round trip, so a control byte is just dropped in
+  # favor of a placeholder — no %-encoding as in __roost_osc7.
+  local p c o i q=
+  p=${PWD/#$HOME/~}
+  if [[ $p == *[[:cntrl:]]* ]]; then
+    for (( i = 0; i < ${#p}; i++ )); do
+      c=${p:$i:1}
+      printf -v o '%d' "'$c"
+      if (( o > 0 && o < 32 || o == 127 )); then
+        c='?'
+      fi
+      q+=$c
+    done
+    p=$q
+  fi
+  printf '\033]0;%s\033\\' "$p"
 }
+fi
 
 # OSC 133 command marks: C before a command runs (preexec), D when it
 # ends / at the next prompt (precmd). Roost maps C -> running, D -> cleared.
+if (( ! $+functions[__roost_mark_c] )); then
 __roost_mark_c() { _roost_feature marks && printf '\033]133;C\033\\'; }
+fi
+if (( ! $+functions[__roost_mark_d] )); then
 __roost_mark_d() { _roost_feature marks && printf '\033]133;D\033\\'; }
+fi
 
 autoload -Uz add-zsh-hook
 add-zsh-hook precmd __roost_osc7

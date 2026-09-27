@@ -10,13 +10,16 @@
 //! `roost_ipc::messages` types (which have the same fields as the
 //! retired proto types they replace).
 
+use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use roost_ipc::messages::{Project, Tab, TabOpenParams};
+use roost_ipc::session_launch::FirstProject;
 
-use crate::{AttentionSource, PtyError, PtySupervisor, Workspace, WorkspaceError};
+use crate::{AttentionSource, PtyError, PtySupervisor, RestoreTab, Workspace, WorkspaceError};
 
 /// The one `tab.close` sequence, shared by the served handler, the
 /// in-process client and the facade.
@@ -41,11 +44,14 @@ pub fn close_tab(
 /// Where a tab opened from `tab_id` starts — `tab.open`'s
 /// `cwd_from_tab`, answered once for every surface that honours it.
 ///
-/// Native first, because the direct PTY child's own cwd follows a `cd`
-/// in a shell that emits no OSC 7, and is a path on this machine — an
-/// OSC 7 cwd reported across an `ssh` hop is the remote's. Either
-/// candidate counts only if it is a directory here, as in
-/// [`usable_cwd`], and Linux reports a removed cwd as `… (deleted)`.
+/// Native first, because the tab's own processes follow a `cd` in a
+/// shell that emits no OSC 7, and their cwds are paths on this machine —
+/// an OSC 7 cwd reported across an `ssh` hop is the remote's. The native
+/// candidates are [`PtySupervisor::native_cwds`], the foreground job's
+/// leader and then the shell, so a job whose directory was removed falls
+/// to the shell's rather than past it to the tracked one. Each candidate
+/// counts only if it is a directory here, as in [`usable_cwd`], and
+/// Linux reports a removed cwd as `… (deleted)`.
 /// No row means `None`, even while the supervisor still holds the tab's
 /// session — a closing tab leaves the workspace first ([`close_tab`]).
 pub fn inherited_cwd(
@@ -54,9 +60,10 @@ pub fn inherited_cwd(
     tab_id: i64,
 ) -> Option<String> {
     let tracked = workspace.tab(tab_id).ok()?.cwd;
-    [supervisor.foreground_cwd(tab_id), Some(tracked)]
+    supervisor
+        .native_cwds(tab_id)
         .into_iter()
-        .flatten()
+        .chain([tracked])
         .find(|cwd| Path::new(cwd).is_dir())
 }
 
@@ -80,6 +87,33 @@ pub fn usable_cwd_or(requested: &str, project_cwd: &str, home: &str) -> String {
         .find(|cwd| Path::new(cwd).is_dir())
         .unwrap_or(home)
         .to_string()
+}
+
+/// Where a restored tab starts: its saved cwd if a shell can enter it,
+/// else the project's cwd if one can, else `$HOME` (#559).
+///
+/// Restore-only. [`usable_cwd`] keeps a directory the shell cannot
+/// enter, so an interactive `tab.open` there fails as it should; a
+/// restore that failed would close the project's only tab, and closing a
+/// project's last tab deletes the project. Every saved tab opening also
+/// keeps the saved positions lined up for the tab each project remembers.
+fn restorable_cwd(saved: &str, project_cwd: &str) -> String {
+    restorable_cwd_or(saved, project_cwd, &crate::home_dir())
+}
+
+/// [`restorable_cwd`] with `$HOME` stated.
+fn restorable_cwd_or(saved: &str, project_cwd: &str, home: &str) -> String {
+    [saved, project_cwd]
+        .into_iter()
+        .find(|cwd| is_enterable(Path::new(cwd)))
+        .unwrap_or(home)
+        .to_string()
+}
+
+/// A directory this user may search, which is what `chdir` needs:
+/// `access(2)`'s `X_OK` on a directory is search permission.
+fn is_enterable(path: &Path) -> bool {
+    path.is_dir() && crate::process::is_executable_by_current_user(path)
 }
 
 /// Where a `tab.open` lands, settled in `params` itself, shared by the
@@ -292,6 +326,174 @@ impl LocalClient {
     pub fn apply_osc(&self, tab_id: i64, command: u32, payload: &str) {
         apply_osc(&self.workspace, tab_id, command, payload);
     }
+}
+
+/// Where the two hydrations differ: a UI's in-process launch (and its
+/// reverse switch, plan 063 §D8), and a `roost-session` coming up.
+#[derive(Clone, Copy, Debug)]
+pub struct Hydration {
+    /// What an empty workspace starts with.
+    pub first_project: FirstProject,
+    /// The grid every re-opened shell starts at.
+    pub grid: (u16, u16),
+    /// What a restored title lock or selection that fails does. An open
+    /// that fails is always only logged: one tab whose directory is gone
+    /// must not cost the rest of the layout.
+    pub on_error: OnRestoreError,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnRestoreError {
+    Propagate,
+    Warn,
+}
+
+impl OnRestoreError {
+    fn settle<T>(self, tab_id: i64, result: Result<T, WorkspaceError>, what: &str) -> Result<()> {
+        match (result, self) {
+            (Ok(_), _) => Ok(()),
+            (Err(error), Self::Propagate) => Err(error.into()),
+            (Err(error), Self::Warn) => {
+                tracing::warn!(tab_id, %error, "{what}");
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Re-open the saved layout as live shells, or seed a first project at
+/// `$HOME` — the one restore the UI's launch and a session's start share
+/// (plan 072 §D6).
+///
+/// Every saved tab comes back as a **fresh shell in its directory**, or
+/// where `restorable_cwd` falls back to when a shell can no longer enter
+/// it; no process or scrollback survives. In order:
+///
+/// 1. Each project with no live tabs re-opens its saved tabs (one tab at
+///    the project's cwd if it saved none), recording which saved position
+///    became which tab. A position whose open failed maps to nothing, so
+///    nothing below can land on the tab after it instead.
+/// 2. Each project remembers its saved tab when that position opened, and
+///    otherwise keeps the one the opens left it on.
+/// 3. The saved active pair is re-selected through the same mapping, else
+///    the active project's preferred tab.
+/// 4. One write covers all of it. Step 2 writes nothing, and `focus_tab`
+///    writes nothing when the pair is already selected, which it is when
+///    the last tab opened was the active one.
+///
+/// A project that already has tabs is skipped. That is what lets the
+/// reverse switch run this over a workspace the launch may already have
+/// hydrated: at a launch every project is tab-less, on a reverse exactly
+/// the rows that need shells are, and `take_restore_layout` is a one-shot,
+/// so a second run adds nothing.
+pub async fn hydrate(client: &LocalClient, how: Hydration) -> Result<()> {
+    let (cols, rows) = (u32::from(how.grid.0), u32::from(how.grid.1));
+    hydrate_with(&client.workspace, how, move |project_id, spec| async move {
+        client
+            .open_tab(project_id, &spec.cwd, &spec.title, &[], cols, rows)
+            .await
+    })
+    .await
+}
+
+/// [`hydrate`] with the open stated, so a test can fail one.
+async fn hydrate_with<F, Fut>(workspace: &Workspace, how: Hydration, mut open: F) -> Result<()>
+where
+    F: FnMut(i64, RestoreTab) -> Fut,
+    Fut: Future<Output = Result<Tab>>,
+{
+    let mut projects = workspace.snapshot();
+    if projects.is_empty() {
+        match how.first_project {
+            FirstProject::Seed => {
+                projects.push(workspace.create_project("", &crate::home_dir())?);
+            }
+            FirstProject::Withheld => tracing::warn!(
+                "starting with no seeded project; the client that started this session fills it"
+            ),
+        }
+    }
+
+    let restore = workspace.take_restore_layout();
+    let mut opened: BTreeMap<(i64, usize), i64> = BTreeMap::new();
+    for project in projects.iter().filter(|project| project.tabs.is_empty()) {
+        let specs = match restore
+            .as_ref()
+            .and_then(|layout| layout.project(project.id))
+        {
+            Some(saved) if !saved.tabs.is_empty() => saved.tabs.clone(),
+            _ => vec![RestoreTab {
+                cwd: project.cwd.clone(),
+                title: String::new(),
+                user_titled: false,
+            }],
+        };
+        for (position, spec) in specs.into_iter().enumerate() {
+            let title_lock =
+                (spec.user_titled && !spec.title.is_empty()).then(|| spec.title.clone());
+            let cwd = restorable_cwd(&spec.cwd, &project.cwd);
+            let spec = RestoreTab {
+                cwd: cwd.clone(),
+                ..spec
+            };
+            match open(project.id, spec).await {
+                Ok(tab) => {
+                    if let Some(title) = title_lock {
+                        how.on_error.settle(
+                            tab.id,
+                            workspace.set_tab_title(tab.id, &title),
+                            "restoring the tab's title lock failed",
+                        )?;
+                    }
+                    opened.insert((project.id, position), tab.id);
+                }
+                Err(error) => {
+                    tracing::warn!(project_id = project.id, %cwd, ?error, "restore tab failed");
+                }
+            }
+        }
+    }
+
+    let opened_at = |project_id: i64, position: i32| {
+        let position = usize::try_from(position).ok()?;
+        opened.get(&(project_id, position)).copied()
+    };
+    for saved in restore.iter().flat_map(|layout| &layout.projects) {
+        let Some(tab_id) = saved
+            .last_tab_position
+            .and_then(|position| opened_at(saved.project_id, position))
+        else {
+            continue;
+        };
+        if let Err(error) = workspace.restore_preferred_tab(tab_id) {
+            tracing::debug!(tab_id, %error, "a restored tab closed before its project remembered it");
+        }
+    }
+
+    // A tab can open and exit again while the rest restore.
+    let active = restore
+        .as_ref()
+        .and_then(|layout| opened_at(layout.active_project_id, layout.active_tab_position))
+        .filter(|tab_id| workspace.tab(*tab_id).is_ok())
+        .or_else(|| {
+            let snapshot = workspace.snapshot();
+            let project_id = restore
+                .as_ref()
+                .map(|layout| layout.active_project_id)
+                .filter(|id| snapshot.iter().any(|project| project.id == *id))
+                .or_else(|| snapshot.first().map(|project| project.id))?;
+            workspace.preferred_tab(project_id)
+        });
+    if let Some(tab_id) = active {
+        how.on_error.settle(
+            tab_id,
+            workspace.focus_tab(tab_id),
+            "restoring the active selection failed",
+        )?;
+    }
+
+    workspace.write_through();
+    Ok(())
 }
 
 /// The workspace half of [`LocalClient::apply_osc`], free-standing so a
@@ -581,6 +783,33 @@ mod tests {
         assert_eq!(inherited_cwd(&workspace, &supervisor, tab), Some(tracked));
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inherited_cwd_falls_from_a_removed_job_directory_to_the_shells() {
+        let [shell, job, tracked] = [(); 3].map(|()| tempfile::tempdir().unwrap());
+        let (workspace, tab) = workspace_with_tab(&string(tracked.path()));
+        let supervisor = Arc::new(PtySupervisor::new());
+        let Some(_guard) =
+            crate::pty::spawn_foreground_job(&supervisor, tab, shell.path(), job.path()).await
+        else {
+            return;
+        };
+        let shell_cwd = string(&std::fs::canonicalize(shell.path()).unwrap());
+
+        job.close().expect("remove the job's cwd");
+        let native = supervisor.native_cwds(tab);
+        assert!(
+            native.len() == 2 && !Path::new(&native[0]).is_dir() && native[1] == shell_cwd,
+            "the precondition: a leader cwd that is no longer a directory, then the shell's: {native:?}"
+        );
+        assert_eq!(
+            inherited_cwd(&workspace, &supervisor, tab),
+            Some(shell_cwd),
+            "the shell's cwd, not the row's {}",
+            tracked.path().display()
+        );
+    }
+
     #[test]
     fn inherited_cwd_is_none_when_the_tracked_cwd_is_not_a_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -645,6 +874,57 @@ mod tests {
             );
         }
         assert_eq!(usable_cwd(&gone, &gone), crate::home_dir());
+    }
+
+    /// #559: a restored tab starts only where a shell can enter. A
+    /// directory of mode 000 is still a directory, which is all
+    /// [`usable_cwd`] asks.
+    #[test]
+    fn restorable_cwd_is_the_saved_directory_a_shell_can_enter_else_the_projects_else_home() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // SAFETY: a read of the caller's own effective uid.
+        if unsafe { libc::geteuid() } == 0 {
+            // root enters a directory whatever its mode, so there is no
+            // directory here it could not restore into.
+            return;
+        }
+
+        /// Gives a locked directory its mode back, so the temp dir can
+        /// remove it, however the test ends.
+        struct Unlock(PathBuf);
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let [saved, project, locked] = ["saved", "project", "locked"].map(|name| {
+            let path = dir.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            path
+        });
+        let _unlock = Unlock(locked.clone());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let [saved, project, locked] = [saved, project, locked].map(|path| string(&path));
+        let gone = string(&dir.path().join("gone"));
+        let home = "/home-as-given";
+
+        assert_eq!(restorable_cwd_or(&saved, &project, home), saved);
+        assert_eq!(
+            restorable_cwd_or(&locked, &project, home),
+            project,
+            "a saved directory no shell can enter restores into the project's"
+        );
+        for unenterable in [locked.as_str(), gone.as_str(), ""] {
+            assert_eq!(
+                restorable_cwd_or(&locked, unenterable, home),
+                home,
+                "{unenterable:?}"
+            );
+        }
+        assert_eq!(restorable_cwd(&locked, &locked), crate::home_dir());
     }
 
     /// The request half of #541: a `cwd` that is not a directory is
@@ -734,6 +1014,246 @@ mod tests {
         assert_eq!(
             parse_notification_payload(9, "Hello"),
             ("Hello".into(), String::new())
+        );
+    }
+
+    /// `LocalClient::open_tab` without the PTY: the row opens selected,
+    /// and one whose cwd ends in a name in `failing` closes again, as a
+    /// failed spawn leaves it.
+    fn open_rows<'a>(
+        workspace: &'a Workspace,
+        failing: &'a [&'a str],
+    ) -> impl FnMut(i64, RestoreTab) -> std::future::Ready<Result<Tab>> + 'a {
+        move |project_id, spec| {
+            let opened = workspace
+                .open_tab(project_id, &spec.cwd, &spec.title, true)
+                .map_err(anyhow::Error::from)
+                .and_then(|tab| {
+                    if failing.iter().any(|name| spec.cwd.ends_with(name)) {
+                        let _ = workspace.close_tab(tab.id);
+                        anyhow::bail!("the spawn at {} failed", spec.cwd);
+                    }
+                    Ok(tab)
+                });
+            std::future::ready(opened)
+        }
+    }
+
+    async fn hydrate_rows(workspace: &Workspace, failing: &[&str]) {
+        let launch = Hydration {
+            first_project: FirstProject::Seed,
+            grid: (80, 24),
+            on_error: OnRestoreError::Propagate,
+        };
+        hydrate_with(workspace, launch, open_rows(workspace, failing))
+            .await
+            .unwrap();
+    }
+
+    /// Saved to `path`: `P1 [tabs…]` showing `viewed` when the user left
+    /// it, then `P2 [/x]`, which is active and was opened last. Each tab
+    /// is a directory made beside `path`, so a restore can enter it, and
+    /// is named by the directory's last component.
+    fn save_two_projects(path: &Path, tabs: &[&str], viewed: &str) -> (i64, i64) {
+        let dir = |name: &str| {
+            let dir = path.with_file_name(name.trim_start_matches('/'));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir.to_string_lossy().into_owned()
+        };
+        let ws = Workspace::open(path.to_path_buf());
+        let p1 = ws.create_project("p1", "/p1").unwrap().id;
+        for name in tabs {
+            ws.open_tab(p1, &dir(name), "", true).unwrap();
+        }
+        ws.focus_tab(tab_at(&ws, p1, viewed)).unwrap();
+        let p2 = ws.create_project("p2", "/p2").unwrap().id;
+        ws.open_tab(p2, &dir("/x"), "", true).unwrap();
+        (p1, p2)
+    }
+
+    fn tab_at(workspace: &Workspace, project_id: i64, name: &str) -> i64 {
+        workspace
+            .snapshot()
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .and_then(|project| project.tabs.into_iter().find(|tab| tab.cwd.ends_with(name)))
+            .unwrap_or_else(|| panic!("no tab at {name} in project {project_id}"))
+            .id
+    }
+
+    fn tab_ids(workspace: &Workspace) -> Vec<(i64, Vec<i64>)> {
+        workspace
+            .snapshot()
+            .into_iter()
+            .map(|project| (project.id, project.tabs.iter().map(|tab| tab.id).collect()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_restored_project_lands_on_the_tab_it_last_showed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let (p1, p2) = save_two_projects(&path, &["/a", "/b", "/c"], "/b");
+
+        let ws = Workspace::open(path);
+        hydrate_rows(&ws, &[]).await;
+
+        assert_eq!(ws.active().0, p2, "the saved active project is re-selected");
+        assert_eq!(
+            ws.preferred_tab(p1),
+            Some(tab_at(&ws, p1, "/b")),
+            "P1 must land on /b, the tab it showed, not /c, the last one reopened"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_restored_memory_is_written_through_without_a_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let (p1, p2) = save_two_projects(&path, &["/a", "/b", "/c"], "/b");
+
+        let ws = Workspace::open(path.clone());
+        hydrate_rows(&ws, &[]).await;
+
+        let on_disk = crate::persistence::read_state(&path).unwrap().unwrap();
+        assert_eq!(
+            (on_disk.active_project_id, on_disk.active_tab_position),
+            (p2, 0),
+            "the precondition: the saved active tab is the last one reopened, \
+             so re-selecting it writes nothing"
+        );
+        let saved = on_disk.projects.iter().find(|p| p.id == p1).unwrap();
+        assert_eq!(
+            saved.last_tab_position,
+            Some(1),
+            "the file must remember /b (1), not /c (2), the tab the last open left P1 on"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remembered_tab_that_fails_to_reopen_is_not_shifted_onto_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let (p1, _) = save_two_projects(&path, &["/a", "/b", "/c", "/d"], "/b");
+
+        let ws = Workspace::open(path);
+        hydrate_rows(&ws, &["/b"]).await;
+
+        let (c, d) = (tab_at(&ws, p1, "/c"), tab_at(&ws, p1, "/d"));
+        assert_eq!(
+            ws.preferred_tab(p1),
+            Some(d),
+            "with /b gone P1 keeps the tab the reopening left it on (/d = {d}), \
+             never /c = {c}, which took /b's index"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_active_tab_that_exits_while_the_rest_restore_falls_back_to_a_live_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let dir = |name: &str| {
+            let dir = path.with_file_name(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir.to_string_lossy().into_owned()
+        };
+        let p1 = {
+            let ws = Workspace::open(path.clone());
+            let p1 = ws.create_project("p1", "/p1").unwrap().id;
+            ws.open_tab(p1, &dir("a"), "", true).unwrap();
+            ws.open_tab(p1, &dir("b"), "", true).unwrap();
+            let p2 = ws.create_project("p2", "/p2").unwrap().id;
+            ws.open_tab(p2, &dir("x"), "", true).unwrap();
+            ws.focus_tab(tab_at(&ws, p1, "/a")).unwrap();
+            p1
+        };
+
+        let ws = Workspace::open(path.clone());
+        let mut rows = open_rows(&ws, &[]);
+        let exits_early = |project_id: i64, spec: RestoreTab| {
+            if spec.cwd.ends_with("/x") {
+                let _ = ws.close_tab(tab_at(&ws, p1, "/a"));
+            }
+            rows(project_id, spec)
+        };
+        let launch = Hydration {
+            first_project: FirstProject::Seed,
+            grid: (80, 24),
+            on_error: OnRestoreError::Propagate,
+        };
+        hydrate_with(&ws, launch, exits_early)
+            .await
+            .expect("a saved active tab that already exited is not an error");
+        assert_eq!(ws.active(), (p1, tab_at(&ws, p1, "/b")));
+    }
+
+    /// The UI's policy: the title lock of a tab whose shell exits right
+    /// after it reopens fails, and that must not cost the rest of the
+    /// layout — the saved layout was already taken, so an abort here
+    /// would leave the next write holding only what restored first.
+    #[tokio::test]
+    async fn a_title_lock_on_a_tab_that_already_exited_warns_and_the_restore_goes_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let folder = |name: &str| {
+            let folder = path.with_file_name(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            folder.to_string_lossy().into_owned()
+        };
+        let p1 = {
+            let ws = Workspace::open(path.clone());
+            let p1 = ws.create_project("p1", "/p1").unwrap().id;
+            ws.open_tab(p1, &folder("b"), "", true).unwrap();
+            let pinned = ws.open_tab(p1, &folder("a"), "", true).unwrap().id;
+            ws.set_tab_title(pinned, "Pinned").unwrap();
+            ws.open_tab(p1, &folder("c"), "", true).unwrap();
+            p1
+        };
+
+        let ws = Workspace::open(path.clone());
+        let mut rows = open_rows(&ws, &[]);
+        let exits_at_once = |project_id: i64, spec: RestoreTab| {
+            let title = spec.title.clone();
+            let opened = rows(project_id, spec);
+            std::future::ready(opened.into_inner().inspect(|tab| {
+                if title == "Pinned" {
+                    let _ = ws.close_tab(tab.id);
+                }
+            }))
+        };
+        let launch = Hydration {
+            first_project: FirstProject::Seed,
+            grid: (80, 24),
+            on_error: OnRestoreError::Warn,
+        };
+        hydrate_with(&ws, launch, exits_at_once)
+            .await
+            .expect("a title lock that fails only warns");
+        tab_at(&ws, p1, "/c");
+        let on_disk = crate::persistence::read_state(&path).unwrap().unwrap();
+        let saved = on_disk.projects.iter().find(|p| p.id == p1).unwrap();
+        assert!(
+            saved.tabs.iter().any(|tab| tab.cwd.ends_with("/c")),
+            "the tab after the failed lock restored and was written: {:?}",
+            saved.tabs
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_hydration_adds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        save_two_projects(&path, &["/a", "/b", "/c"], "/b");
+
+        let ws = Workspace::open(path);
+        hydrate_rows(&ws, &[]).await;
+        let hydrated = tab_ids(&ws);
+
+        hydrate_rows(&ws, &[]).await;
+        assert_eq!(
+            tab_ids(&ws),
+            hydrated,
+            "the reverse switch runs the same restore over a hydrated workspace"
         );
     }
 }

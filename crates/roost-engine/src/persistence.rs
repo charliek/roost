@@ -169,6 +169,12 @@ pub struct ProjectSnapshot {
     /// tabs" → the UI seeds a single tab on restore.
     #[serde(default)]
     pub tabs: Vec<TabSnapshot>,
+    /// The tab this project last showed, as its dense index in `tabs`
+    /// (plan 072 §D6) — what a project click, ⌘1–9 and the close
+    /// fallback land on after a relaunch. Omitted while `None`, so a
+    /// project nobody has viewed a tab in writes what older builds wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tab_position: Option<i32>,
 }
 
 /// A persisted tab's layout: enough to re-open a fresh shell in the
@@ -395,6 +401,7 @@ mod tests {
                         user_titled: true,
                     },
                 ],
+                last_tab_position: Some(1),
             }],
         };
         persist_state(&p, &snap, true).unwrap();
@@ -426,7 +433,15 @@ mod tests {
         );
         assert_eq!(back.projects.len(), 1);
         assert!(back.projects[0].tabs.is_empty());
+        assert_eq!(back.projects[0].last_tab_position, None);
         assert!(back.hosts.is_empty(), "absent hosts key defaults to none");
+
+        persist_state(&p, &back, false).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            !raw.contains("last_tab_position"),
+            "a project with no remembered tab must not grow the file: {raw}"
+        );
     }
 
     #[test]

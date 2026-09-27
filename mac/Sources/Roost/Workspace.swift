@@ -8,9 +8,10 @@
 // Mirrors `crates/roost-engine/src/workspace.rs` semantically:
 // in-memory `BTreeMap`-style storage, atomic write via tmp +
 // rename, corrupt state.json → start empty. Persists each project's
-// tab layout (title + cwd + position) + the active selection, loaded
-// at init into a one-shot `restoreLayout` the app bootstrap drains to
-// re-open the prior tabs as fresh shells (no live process/scrollback).
+// tab layout (title + cwd + position) and the tab it last showed, plus
+// the active selection, loaded at init into a one-shot `restoreLayout`
+// the app bootstrap drains to re-open the prior tabs as fresh shells
+// (no live process/scrollback).
 //
 // Threading: the workspace is `@MainActor`. PTY callbacks that
 // need to mutate state hop here via `Task { @MainActor in ... }`.
@@ -121,6 +122,12 @@ final class Workspace {
     private var nextID: Int64 = 1
     private(set) var activeProjectID: Int64 = 0
     private(set) var activeTabID: Int64 = 0
+    /// Each project's last selected tab — the Rust
+    /// `active_tabs_by_project` (plan 072 §D6), and the one memory of it:
+    /// the UI reads `preferredTab` rather than keeping its own. Written
+    /// wherever the selection lands on a tab, repaired when that tab
+    /// closes, and persisted per project as `lastTabPosition`.
+    private var activeTabsByProject: [Int64: Int64] = [:]
     private let statePath: String?
     private var observers: [UUID: @Sendable (Event) -> Void] = [:]
     /// One-shot tab layout loaded from `state.json` at init, drained
@@ -231,7 +238,8 @@ final class Workspace {
                                     title: $0.element.title,
                                     userTitled: $0.element.userTitled
                                 )
-                            }
+                            },
+                        lastTabPosition: p.lastTabPosition
                     )
                 },
                 activeProjectID: snapshot.activeProjectID,
@@ -338,11 +346,12 @@ final class Workspace {
             tabs.removeValue(forKey: tid)
         }
         projects.removeValue(forKey: projectID)
+        activeTabsByProject.removeValue(forKey: projectID)
 
         var activeChanged = false
         if activeProjectID == projectID || cascaded.contains(activeTabID) {
             let fallbackProject = neighbourProject(around: projectAnchor) ?? 0
-            let fallbackTab = tabs(in: fallbackProject).first.map { $0.id } ?? 0
+            let fallbackTab = preferredTab(fallbackProject) ?? 0
             activeProjectID = fallbackProject
             activeTabID = fallbackTab
             activeChanged = true
@@ -460,6 +469,7 @@ final class Workspace {
         if activate {
             activeProjectID = projectID
             activeTabID = id
+            activeTabsByProject[projectID] = id
             events.append(.activeChanged(projectID: projectID, tabID: id))
         }
         commit(events, persist: true)
@@ -490,6 +500,9 @@ final class Workspace {
             && !tabs.values.contains { $0.projectId == projectID }
         if projectEmptied {
             projects.removeValue(forKey: projectID)
+            activeTabsByProject.removeValue(forKey: projectID)
+        } else if activeTabsByProject[projectID] == tabID {
+            activeTabsByProject[projectID] = neighbourTab(in: projectID, around: tabAnchor)
         }
 
         // Reassign the active selection if it pointed at the closed
@@ -497,10 +510,11 @@ final class Workspace {
         var activeChanged = false
         if activeTabID == tabID || (projectEmptied && activeProjectID == projectID) {
             if projectEmptied {
-                // Project gone: fall back to another project's tab.
+                // Project gone: fall back to another project, on the tab
+                // it remembers.
                 let fallbackProject = projectAnchor
                     .flatMap { neighbourProject(around: $0) } ?? 0
-                let fallbackTab = tabs(in: fallbackProject).first.map { $0.id } ?? 0
+                let fallbackTab = preferredTab(fallbackProject) ?? 0
                 activeProjectID = fallbackProject
                 activeTabID = fallbackTab
             } else {
@@ -511,6 +525,9 @@ final class Workspace {
                     ?? tabs.values.sorted { ($0.position, $0.id) < ($1.position, $1.id) }.first
                 activeProjectID = next?.projectId ?? projectID
                 activeTabID = next?.id ?? 0
+            }
+            if activeTabID != 0 {
+                activeTabsByProject[activeProjectID] = activeTabID
             }
             activeChanged = true
         }
@@ -803,6 +820,7 @@ final class Workspace {
         let prev = (activeProjectID, activeTabID)
         activeProjectID = row.projectId
         activeTabID = row.id
+        activeTabsByProject[row.projectId] = row.id
         var events: [Event] = [.activeChanged(projectID: row.projectId, tabID: row.id)]
         // Focusing a tab acknowledges its notification. Conditional
         // because `.tabNotification` is an edge — emitting it on every
@@ -820,6 +838,28 @@ final class Workspace {
         let changed = prev != (row.projectId, row.id)
         commit(events, persist: changed)
         return prev
+    }
+
+    /// The tab `projectID` last showed, else its first in display order
+    /// — what a project click, ⌘1–9 and the close fallback land on. The
+    /// Rust `preferred_tab`.
+    func preferredTab(_ projectID: Int64) -> Int64? {
+        if let remembered = activeTabsByProject[projectID],
+           tabs[remembered]?.projectId == projectID
+        {
+            return remembered
+        }
+        return tabs(in: projectID).first?.id
+    }
+
+    /// Make `tabID` the tab its project remembers, without selecting it.
+    ///
+    /// A restore's setter, and silent on purpose: no event, because no
+    /// selection moved, and no write, because a restore sets one per
+    /// project and then writes once (`writeThrough`).
+    func restorePreferredTab(_ tabID: Int64) throws {
+        guard let row = tabs[tabID] else { throw WorkspaceError.tabNotFound(tabID) }
+        activeTabsByProject[row.projectId] = tabID
     }
 
     /// Ensure a default project exists; return its id. Used by
@@ -1047,6 +1087,13 @@ final class Workspace {
         shuttingDown = true
     }
 
+    /// Write the current layout through, as a commit would, with no
+    /// event: for a caller whose changes are silent ones, such as
+    /// `restorePreferredTab`.
+    func writeThrough() {
+        persist()
+    }
+
     /// Centralize the mutate → emit → persist tail shared by every
     /// mutator. No lock to manage (`@MainActor`, single-threaded), so
     /// this is simply "persist (per policy), then emit". `persist:
@@ -1067,31 +1114,29 @@ final class Workspace {
         // field, which goes sparse after a mid-project close and
         // wouldn't match the re-opened tabs' contiguous 0..n indices
         // on restore (the UI selects the nth tab). #95 review.
-        let activeTabPosition: Int32 = {
-            guard let active = tabs[activeTabID] else { return 0 }
-            let siblings = tabs(in: active.projectId)
-            return Int32(siblings.firstIndex { $0.id == active.id } ?? 0)
-        }()
+        let activeTabPosition: Int32 = tabs[activeTabID]
+            .flatMap { Self.denseIndex(of: $0.id, in: tabs(in: $0.projectId)) } ?? 0
         let snapshot = SnapshotFile(
             nextID: nextID,
             projects: snapshot()
                 .map { p in
-                    let projectTabs = tabs(in: p.id)
-                        .map {
-                            SnapshotFile.TabSnapshot(
-                                title: $0.title,
-                                cwd: $0.cwd,
-                                position: $0.position,
-                                userTitled: $0.userTitled
-                            )
-                        }
+                    let rows = tabs(in: p.id)
                     return SnapshotFile.ProjectSnapshot(
                         id: p.id,
                         name: p.name,
                         cwd: p.cwd,
                         position: p.position,
                         createdAt: p.createdAt,
-                        tabs: projectTabs
+                        tabs: rows.map {
+                            SnapshotFile.TabSnapshot(
+                                title: $0.title,
+                                cwd: $0.cwd,
+                                position: $0.position,
+                                userTitled: $0.userTitled
+                            )
+                        },
+                        lastTabPosition: activeTabsByProject[p.id]
+                            .flatMap { Self.denseIndex(of: $0, in: rows) }
                     )
                 },
             activeProjectID: activeProjectID,
@@ -1107,6 +1152,13 @@ final class Workspace {
             RoostLogger.shared.error("workspace: failed to persist state.json: \(message)")
             persistError = message
         }
+    }
+
+    /// Where `tabID` sits in `rows` (a project's tabs in display order),
+    /// counting from 0 — the index a restore re-opens it at, whatever
+    /// sparse `position` it holds now. The Rust `dense_index`.
+    private static func denseIndex(of tabID: Int64, in rows: [Tab]) -> Int32? {
+        rows.firstIndex { $0.id == tabID }.map { Int32($0) }
     }
 
     private static func readSnapshot(at path: String) -> SnapshotFile? {
@@ -1228,6 +1280,10 @@ final class Workspace {
             /// This project's tab layout, in display order. Defaulted
             /// so a file from an older build (no `tabs` key) loads.
             let tabs: [TabSnapshot]
+            /// The tab this project last showed, as its dense index in
+            /// `tabs` (plan 072 §D6). `nil` — and then left out of the
+            /// file, as Rust leaves it — when the project remembers none.
+            let lastTabPosition: Int32?
 
             init(
                 id: Int64,
@@ -1235,7 +1291,8 @@ final class Workspace {
                 cwd: String,
                 position: Int32,
                 createdAt: Int64,
-                tabs: [TabSnapshot] = []
+                tabs: [TabSnapshot] = [],
+                lastTabPosition: Int32? = nil
             ) {
                 self.id = id
                 self.name = name
@@ -1243,16 +1300,19 @@ final class Workspace {
                 self.position = position
                 self.createdAt = createdAt
                 self.tabs = tabs
+                self.lastTabPosition = lastTabPosition
             }
 
             enum CodingKeys: String, CodingKey {
                 case id, name, cwd, position, tabs
                 case createdAt = "created_at"
+                case lastTabPosition = "last_tab_position"
             }
 
-            // Custom decode so a missing `tabs` key (legacy file or
-            // the other UI predating tab persistence) defaults to []
-            // rather than throwing — matches Rust's `#[serde(default)]`.
+            // Custom decode so a missing `tabs` or `last_tab_position`
+            // key (a legacy file, or the other UI predating either)
+            // defaults rather than throwing — matches Rust's
+            // `#[serde(default)]`.
             init(from decoder: Decoder) throws {
                 let c = try decoder.container(keyedBy: CodingKeys.self)
                 id = try c.decode(Int64.self, forKey: .id)
@@ -1261,6 +1321,7 @@ final class Workspace {
                 position = try c.decode(Int32.self, forKey: .position)
                 createdAt = try c.decode(Int64.self, forKey: .createdAt)
                 tabs = try c.decodeIfPresent([TabSnapshot].self, forKey: .tabs) ?? []
+                lastTabPosition = try c.decodeIfPresent(Int32.self, forKey: .lastTabPosition)
             }
         }
 
@@ -1424,6 +1485,9 @@ final class Workspace {
         let projectID: Int64
         /// Tabs in display (position) order.
         let tabs: [RestoreTab]
+        /// Index into `tabs` of the tab the project last showed, if it
+        /// remembered one.
+        let lastTabPosition: Int32?
     }
 
     struct RestoreLayout: Sendable, Equatable {

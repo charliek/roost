@@ -64,7 +64,7 @@ fn resolve_home(raw: Option<&str>) -> String {
     }
 }
 
-pub use application::LocalClient;
+pub use application::{hydrate, Hydration, LocalClient, OnRestoreError};
 #[cfg(feature = "facade")]
 pub use facade::{
     CommandResult, Engine, EngineCommand, EngineError, EngineEvent, EngineEventStream,

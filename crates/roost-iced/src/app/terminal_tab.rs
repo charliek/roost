@@ -68,10 +68,22 @@ pub(super) struct TerminalGeometry {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct GeometryChange {
     pub(super) previous: Option<TerminalGeometry>,
+    /// The grid before the change — known even where `previous` is not,
+    /// for a tab that never had metrics installed.
+    pub(super) previous_grid: (u16, u16),
     pub(super) current: TerminalGeometry,
-    pub(super) grid_changed: bool,
     pub(super) metrics_changed: bool,
     pub(super) deferred_replies: Vec<u8>,
+}
+
+impl GeometryChange {
+    pub(super) fn grid(&self) -> (u16, u16) {
+        (self.current.cols, self.current.rows)
+    }
+
+    pub(super) fn grid_changed(&self) -> bool {
+        self.previous_grid != self.grid()
+    }
 }
 
 /// One step of a geometry batch, addressed by the SAME key the caller's
@@ -205,6 +217,24 @@ pub(super) fn attach_test_host_terminal(
     )
     .expect("host tab terminal");
     (tab, capture)
+}
+
+/// A host tab laid out at `cols`×`rows` with `metrics` installed, the
+/// shape `host_focus_tab` leaves behind — one a re-grid can move.
+#[cfg(test)]
+pub(super) fn laid_out_host_terminal(
+    cols: u16,
+    rows: u16,
+    metrics: TerminalMetrics,
+) -> TerminalTab {
+    let (input, _input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (mut tab, _capture) = attach_test_host_terminal(cols, rows, input);
+    let installed = tab
+        .apply_geometry(cols, rows, metrics, 1)
+        .expect("install host terminal metrics")
+        .expect("a new host terminal takes its first metrics");
+    tab.commit_geometry(installed);
+    tab
 }
 
 /// Accumulate one tab's PTY bytes off `rx` until `needle` shows up or
@@ -531,6 +561,10 @@ impl TerminalTab {
             .unwrap_or_default()
     }
 
+    pub(super) fn grid(&self) -> (u16, u16) {
+        (self.cols, self.rows)
+    }
+
     pub(super) fn apply_geometry(
         &mut self,
         cols: u16,
@@ -538,9 +572,9 @@ impl TerminalTab {
         metrics: TerminalMetrics,
         metric_generation: u64,
     ) -> Result<Option<GeometryChange>> {
-        let grid_changed = self.cols != cols || self.rows != rows;
+        let previous_grid = self.grid();
         let metrics_changed = self.applied_metrics != Some(metrics);
-        if !grid_changed && !metrics_changed {
+        if previous_grid == (cols, rows) && !metrics_changed {
             return Ok(None);
         }
         let previous = self.applied_metrics.map(|metrics| TerminalGeometry {
@@ -570,13 +604,13 @@ impl TerminalTab {
         });
         Ok(Some(GeometryChange {
             previous,
+            previous_grid,
             current: TerminalGeometry {
                 cols,
                 rows,
                 metrics,
                 metric_generation,
             },
-            grid_changed,
             metrics_changed,
             deferred_replies,
         }))
@@ -609,8 +643,9 @@ impl TerminalTab {
     }
 
     pub(super) fn commit_geometry(&self, change: GeometryChange) {
+        let grid_changed = change.grid_changed();
         self.session.send_replies(change.deferred_replies);
-        if change.grid_changed {
+        if grid_changed {
             self.session
                 .send_resize(change.current.cols, change.current.rows);
         }

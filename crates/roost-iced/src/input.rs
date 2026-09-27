@@ -1,4 +1,5 @@
-use iced::keyboard::{self, key::Named, Key};
+use iced::keyboard::key::{Code, Named, NativeCode, Physical};
+use iced::keyboard::{self, Key};
 use roost_ui_model::keybind::{Accel, AccelMods};
 use roost_vt::ffi as ghostty;
 use roost_vt::{
@@ -569,6 +570,148 @@ fn character_key_char(value: char) -> GhosttyKey {
         // Dropping them here would make the terminal ASCII-only.
         _ => GhosttyKey_GHOSTTY_KEY_UNIDENTIFIED,
     }
+}
+
+/// The press `app.key_event` delivers: `key` is one character or a named
+/// key, and `modifiers` spell `shift`/`ctrl`/`alt`/`super`. The fields a
+/// platform fills in and this module reads — `modified_key`,
+/// `physical_key` and `text` — are synthesized the way winit reports a
+/// US layout, so [`accelerator`] and [`encode_press`] see the event a
+/// keyboard would have sent. `text` overrides the synthesized one.
+pub(crate) fn synthetic_press(
+    key: &str,
+    text: Option<&str>,
+    modifiers: &[String],
+) -> Result<keyboard::Event, String> {
+    let mut held = keyboard::Modifiers::empty();
+    for name in modifiers {
+        held |= match name.as_str() {
+            "shift" => keyboard::Modifiers::SHIFT,
+            "ctrl" => keyboard::Modifiers::CTRL,
+            "alt" => keyboard::Modifiers::ALT,
+            "super" => keyboard::Modifiers::LOGO,
+            other => return Err(format!("unknown key name {other:?} in modifiers")),
+        };
+    }
+    let (logical, physical, typed) = if let Some((named, code, typed)) = named_key(key) {
+        (Key::Named(named), Physical::Code(code), typed)
+    } else {
+        let value = sole_char(key).ok_or_else(|| format!("unknown key name {key:?}"))?;
+        let typed = if held.logo() {
+            None
+        } else if held.control() {
+            control_transform(value)
+        } else {
+            Some(value)
+        };
+        let physical = character_code(value).map_or(
+            Physical::Unidentified(NativeCode::Unidentified),
+            Physical::Code,
+        );
+        (Key::Character(key.into()), physical, typed)
+    };
+    let text = match text {
+        Some(text) => Some(text.into()),
+        None => typed.map(|value| value.to_string().into()),
+    };
+    Ok(keyboard::Event::KeyPressed {
+        key: logical.clone(),
+        modified_key: logical,
+        physical_key: physical,
+        location: keyboard::Location::Standard,
+        modifiers: held,
+        text,
+        repeat: false,
+    })
+}
+
+/// The US-layout key that types `value`, shifted or not.
+fn character_code(value: char) -> Option<Code> {
+    Some(match value.to_ascii_lowercase() {
+        'a' => Code::KeyA,
+        'b' => Code::KeyB,
+        'c' => Code::KeyC,
+        'd' => Code::KeyD,
+        'e' => Code::KeyE,
+        'f' => Code::KeyF,
+        'g' => Code::KeyG,
+        'h' => Code::KeyH,
+        'i' => Code::KeyI,
+        'j' => Code::KeyJ,
+        'k' => Code::KeyK,
+        'l' => Code::KeyL,
+        'm' => Code::KeyM,
+        'n' => Code::KeyN,
+        'o' => Code::KeyO,
+        'p' => Code::KeyP,
+        'q' => Code::KeyQ,
+        'r' => Code::KeyR,
+        's' => Code::KeyS,
+        't' => Code::KeyT,
+        'u' => Code::KeyU,
+        'v' => Code::KeyV,
+        'w' => Code::KeyW,
+        'x' => Code::KeyX,
+        'y' => Code::KeyY,
+        'z' => Code::KeyZ,
+        '1' | '!' => Code::Digit1,
+        '2' | '@' => Code::Digit2,
+        '3' | '#' => Code::Digit3,
+        '4' | '$' => Code::Digit4,
+        '5' | '%' => Code::Digit5,
+        '6' | '^' => Code::Digit6,
+        '7' | '&' => Code::Digit7,
+        '8' | '*' => Code::Digit8,
+        '9' | '(' => Code::Digit9,
+        '0' | ')' => Code::Digit0,
+        '`' | '~' => Code::Backquote,
+        '-' | '_' => Code::Minus,
+        '=' | '+' => Code::Equal,
+        '[' | '{' => Code::BracketLeft,
+        ']' | '}' => Code::BracketRight,
+        '\\' | '|' => Code::Backslash,
+        ';' | ':' => Code::Semicolon,
+        '\'' | '"' => Code::Quote,
+        ',' | '<' => Code::Comma,
+        '.' | '>' => Code::Period,
+        '/' | '?' => Code::Slash,
+        _ => return None,
+    })
+}
+
+/// A named key by iced's own spelling, with its key code and the text
+/// winit reports for it.
+fn named_key(name: &str) -> Option<(Named, Code, Option<char>)> {
+    Some(match name {
+        "Enter" => (Named::Enter, Code::Enter, Some('\r')),
+        "Tab" => (Named::Tab, Code::Tab, Some('\t')),
+        " " | "Space" => (Named::Space, Code::Space, Some(' ')),
+        "Backspace" => (Named::Backspace, Code::Backspace, Some('\u{8}')),
+        "Escape" => (Named::Escape, Code::Escape, Some('\u{1b}')),
+        "Delete" => (Named::Delete, Code::Delete, Some('\u{7f}')),
+        "Insert" => (Named::Insert, Code::Insert, None),
+        "Home" => (Named::Home, Code::Home, None),
+        "End" => (Named::End, Code::End, None),
+        "PageUp" => (Named::PageUp, Code::PageUp, None),
+        "PageDown" => (Named::PageDown, Code::PageDown, None),
+        "ArrowUp" => (Named::ArrowUp, Code::ArrowUp, None),
+        "ArrowDown" => (Named::ArrowDown, Code::ArrowDown, None),
+        "ArrowLeft" => (Named::ArrowLeft, Code::ArrowLeft, None),
+        "ArrowRight" => (Named::ArrowRight, Code::ArrowRight, None),
+        "F1" => (Named::F1, Code::F1, None),
+        "F2" => (Named::F2, Code::F2, None),
+        "F3" => (Named::F3, Code::F3, None),
+        "F4" => (Named::F4, Code::F4, None),
+        "F5" => (Named::F5, Code::F5, None),
+        "F6" => (Named::F6, Code::F6, None),
+        "F7" => (Named::F7, Code::F7, None),
+        "F8" => (Named::F8, Code::F8, None),
+        "F9" => (Named::F9, Code::F9, None),
+        "F10" => (Named::F10, Code::F10, None),
+        "F11" => (Named::F11, Code::F11, None),
+        "F12" => (Named::F12, Code::F12, None),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -1432,5 +1575,65 @@ mod tests {
                 key: "i".into(),
             })
         );
+    }
+
+    fn synthetic(key: &str, modifiers: &[&str]) -> keyboard::Event {
+        let modifiers: Vec<String> = modifiers.iter().map(|name| name.to_string()).collect();
+        synthetic_press(key, None, &modifiers).expect("a key this op names")
+    }
+
+    fn typed(event: keyboard::Event) -> Vec<u8> {
+        let (mut encoder, terminal) = encoder_pair();
+        encode_press(&mut encoder, &terminal, event, false)
+    }
+
+    /// `app.key_event`'s press is the one a keyboard sends: Alt+T is the
+    /// accelerator a real one is, and printable keys, shifted
+    /// punctuation and Enter encode to what they type.
+    #[test]
+    fn a_synthetic_press_reaches_the_accelerator_and_the_encoder_as_a_real_one() {
+        assert_eq!(
+            synthetic("t", &["alt"]),
+            press(
+                character("t"),
+                character("t"),
+                Physical::Code(Code::KeyT),
+                keyboard::Modifiers::ALT,
+                Some("t"),
+            ),
+        );
+        assert_eq!(
+            accelerator(&synthetic("t", &["alt"])),
+            Some(Accel {
+                modifiers: AccelMods::ALT,
+                key: "t".into(),
+            })
+        );
+        for (key, bytes) in [
+            ("e", b"e".as_slice()),
+            ("M", b"M"),
+            ("$", b"$"),
+            ("(", b"("),
+            ("*", b"*"),
+            ("_", b"_"),
+            (" ", b" "),
+            ("Enter", b"\r"),
+        ] {
+            assert_eq!(typed(synthetic(key, &[])), bytes, "{key:?}");
+        }
+        assert_eq!(typed(synthetic("c", &["ctrl"])), b"\x03");
+        let keyboard::Event::KeyPressed { physical_key, .. } = synthetic("$", &[]) else {
+            unreachable!("a press");
+        };
+        assert_eq!(physical_key, Physical::Code(Code::Digit4));
+    }
+
+    #[test]
+    fn a_synthetic_press_refuses_a_name_it_does_not_know() {
+        let refused = synthetic_press("Hyperspace", None, &[]).expect_err("no such key");
+        assert!(refused.contains("unknown key name"), "{refused}");
+        let refused =
+            synthetic_press("t", None, &["meta".to_string()]).expect_err("no such modifier");
+        assert!(refused.contains("unknown key name"), "{refused}");
     }
 }

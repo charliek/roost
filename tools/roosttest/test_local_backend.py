@@ -119,6 +119,32 @@ NOT_RUNNING_EXIT = 3
 #: workspace to hold still. It is the same lever `test_a_destination_
 #: that_cannot_start_changes_nothing` pulls on the verb.
 NO_SESSION = {"ROOST_SESSION_BIN": str(_ROOT / "no-such-session")}
+#: `host_verbs::unanswered_switch_copy` for a slot no session ever
+#: answered — the palette row's subtitle and the confirm card's body.
+#: User-facing wording, restated so a change has to be made twice.
+NEVER_RAN_COPY = "Local tabs will run inside Roost."
+#: `spawn_failure`'s row for a launcher that exited with no verdict
+#: (`task.rs`), for the exit-1 stub `crashing_session` writes.
+EXITED_EARLY = "roost-session exited early (status 1)"
+#: `notice::local_session_cannot_start`'s words and buttons. User-facing
+#: wording, restated so a change has to be made twice.
+CANNOT_START = "local_session_cannot_start"
+CANNOT_START_MESSAGE = "Roost couldn't start its local session."
+CANNOT_START_ACTIONS = [
+    {"id": "reconnect", "label": "Try again", "primary": False},
+    {"id": "use_in_process", "label": "Use in-process tabs", "primary": True},
+]
+#: The reverse switch's receipt (`local_backend.rs`).
+BACK_IN_ROOST = "local tabs run in Roost again"
+
+
+def crashing_session() -> dict[str, str]:
+    """A `roost-session` that dies before it can print a verdict — the
+    likeliest way a fresh install's session fails."""
+    stub = _ROOT / "crashing-session"
+    stub.write_text("#!/bin/sh\necho 'boom: died on start' >&2\nexit 1\n")
+    stub.chmod(0o755)
+    return {"ROOST_SESSION_BIN": str(stub)}
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +671,51 @@ def test_the_reverse_switch_flips_the_key_and_copies_nothing_back(lane: Lane):
     assert running_session_id() is not None
     sections = roost.sidebar_sections()
     assert [s["role"] for s in sections] == ["local", "host"], sections
+    # Plan 072 D7a: a reverse that finished takes its journal with it,
+    # rather than leaving `committing` for the next launch to warn about.
+    assert lane.journal() is None, lane.journal()
+
+
+def test_leaving_a_session_that_never_ran_forgets_its_slot(lane: Lane):
+    """Plan 072 D7a (#520): the way out of a session that never started.
+
+    Both surfaces stop claiming a session "keeps running" when none ever
+    has, and the switch un-saves the slot rather than leaving a dead
+    `localhost` row behind it. Nothing is lost by that: no session ever
+    held a project there.
+    """
+    roost = lane.start("session", extra_env=NO_SESSION)
+    slot = wait_until(
+        lambda: next(
+            (
+                h
+                for h in roost.host_status()["hosts"]
+                if h["target"] == "localhost"
+                and h["state"] == "disconnected"
+                and "retry" not in h
+            ),
+            None,
+        ),
+        60.0,
+        "the slot's launch to settle",
+    )
+    assert "last_connected" not in slot, slot
+
+    roost.palette_open("commands")
+    try:
+        row = next(i for i in roost.palette_state()["items"] if i["id"] == USE_IN_PROCESS)
+    finally:
+        roost.palette_dismiss()
+    assert row["subtitle"] == NEVER_RAN_COPY, row
+    card = raise_switch(roost, USE_IN_PROCESS)
+    assert card["body"] == NEVER_RAN_COPY, card
+
+    roost.call("app.dialog_answer", {"action": "confirm"})
+    wait_until(lambda: settled(roost) == "in-process", 120.0, "the flip back")
+
+    hosts = roost.call("host.list", {})["hosts"]
+    assert slot["id"] not in [h["id"] for h in hosts], hosts
+    assert lane.journal() is None, lane.journal()
 
 
 def test_reverse_over_a_retained_layout_hydrates_it_rather_than_counting_it(lane: Lane):
@@ -736,6 +807,47 @@ def test_two_round_trips_move_the_work_once_and_the_seed_once(lane: Lane):
 # ---------------------------------------------------------------------------
 # 3. Failures, cancel, and quiescence
 # ---------------------------------------------------------------------------
+
+
+def test_a_session_that_dies_on_start_is_named_and_not_dialled_again(lane: Lane):
+    """Plan 072 D7a (#520): the likeliest way a fresh install's session
+    fails — a binary that dies before it can print a verdict.
+
+    Before D7a it read as "no session is running at …" with nothing
+    else, and a retry was armed every few seconds forever. Now the band
+    names the exit, `detail` carries what the launcher said on stderr,
+    and nothing dials again — held over a window, because "no retry"
+    has no edge to wait on. The settle waits out the one confirm a dead
+    launcher gets, for a daemon it may have left binding.
+    """
+    roost = lane.start("session", extra_env=crashing_session())
+
+    last: dict | None = None
+
+    def the_slot() -> dict | None:
+        nonlocal last
+        last = next((h for h in roost.host_status()["hosts"] if h["target"] == "localhost"), None)
+        return last
+
+    def named() -> dict | None:
+        row = the_slot()
+        if row is None or row["state"] != "disconnected":
+            return None
+        return row if row.get("reason") == EXITED_EARLY else None
+
+    try:
+        row = wait_until(named, 60.0, "the slot to name the exit")
+    except TimeoutError as timed_out:
+        raise AssertionError(f"the slot never named the exit; last row: {last}") from timed_out
+    assert "retry" not in row, row
+    assert row["detail"] == (
+        "roost-session exited before it was ready (exit status 1): boom: died on start"
+    ), row
+
+    deadline = time.monotonic() + scaled_timeout(5.0)
+    while time.monotonic() < deadline:
+        assert the_slot() == row, "the slot moved after it settled"
+        time.sleep(0.1)
 
 
 def test_a_destination_that_cannot_start_changes_nothing(lane: Lane):
@@ -1408,6 +1520,56 @@ def test_a_relaunch_under_session_reattaches_the_same_tabs(lane: Lane):
     )
 
 
+def test_an_in_process_relaunch_keeps_the_tab_each_project_last_showed(lane: Lane):
+    """Plan 072 §D6 (#565): an in-process project remembers its tab.
+
+    `P1 [a b c]` is left on `b`. A relaunch re-opens every tab, and each
+    open selects the tab it opens, so without the saved memory `P1` comes
+    back on `c`. Closing `P2`'s only tab while it is shown removes `P2`,
+    and the selection falls back onto `P1`'s remembered tab.
+
+    `P1` is kept off the first row: the harness's readiness probe opens
+    and closes a tab in the first project at every launch, which moves
+    that project's memory and the selection with it. The Swift half
+    (plan 072 C15) is not reachable from this lane, which is iced-only.
+    """
+    dirs = {name: _ROOT / "d6" / name for name in ("a", "b", "c", "x")}
+    for path in dirs.values():
+        path.mkdir(parents=True, exist_ok=True)
+    roost = lane.start("in-process")
+    p1 = roost.create_project(name="p1", cwd=str(dirs["a"]))
+    opened = {name: roost.open_tab(p1, cwd=str(dirs[name])) for name in ("a", "b", "c")}
+    roost.focus(opened["b"])
+    p2 = roost.create_project(name="p2", cwd=str(dirs["x"]))
+    roost.open_tab(p2, cwd=str(dirs["x"]))
+    assert int(roost.list()[0]["id"]) not in (p1, p2), roost.list()
+
+    ui.quit(lane.target)
+    roost = lane.restart()
+    assert roost.identify()["local_backend"] == "in-process"
+
+    def restored(project_id: int) -> list[dict]:
+        project = roost.project(project_id)
+        assert project is not None, roost.list()
+        return project["tabs"]
+
+    wait_until(
+        lambda: [t["cwd"] for t in restored(p1)] == [str(dirs[n]) for n in ("a", "b", "c")]
+        and len(restored(p2)) == 1,
+        30.0,
+        "both projects' tabs to reopen in order",
+    )
+    b, c = (int(t["id"]) for t in restored(p1)[1:])
+    x = int(restored(p2)[0]["id"])
+
+    roost.focus(x)
+    roost.close_tab(x)
+    active = roost.identify()
+    assert (active["active_project_id"], active["active_tab_id"]) == (p1, b), (
+        f"P1 must come back on b ({b}), the tab it last showed, not c ({c})"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 6. §D10: what `roostctl` and a hook reach on the UI socket under `session`
 # ---------------------------------------------------------------------------
@@ -1898,6 +2060,51 @@ def test_a_focus_right_after_an_unactivated_open_on_the_ui_socket_lands(lane: La
 
     assert selected(roost) == (project, quiet)
     assert roost.app_selected_tab_id() == quiet
+
+
+def roostctl_in_session_tab(
+    roost: Roost, *args: str, tab: int, timeout: float = 60.0
+) -> subprocess.CompletedProcess:
+    """`roostctl` as a shell inside session tab `tab` runs it: `ROOST_SOCKET`
+    is the session's own socket — the path the window names as
+    `local_session_socket` — and nothing on the command line names a
+    target."""
+    env = _without_roost_env()
+    env["ROOST_SOCKET"] = roost.identify()["local_session_socket"]
+    env["ROOST_TAB_ID"] = str(tab)
+    return subprocess.run(
+        [util.roostctl_path(), *args],
+        capture_output=True,
+        text=True,
+        timeout=scaled_timeout(timeout),
+        env=env,
+    )
+
+
+def test_roostctl_in_a_session_tab_talks_to_its_window(lane: Lane):
+    """#561 (plan 072 D3): inside a session tab `ROOST_SOCKET` names the
+    session, which has no palette and no window to move. `roostctl` there
+    now reaches the window that owns the session, as it does from a plain
+    terminal: `palette state` answers, `tab open` selects the new tab in
+    the window, and a bare `tab focus` brings the window back to the tab
+    it ran in."""
+    roost = session_ui(lane)
+    project, home = selected(roost)
+
+    palette = roostctl_in_session_tab(roost, "palette", "state", "--json", tab=home)
+    assert palette.returncode == 0, palette
+    assert json.loads(palette.stdout)["open"] is False, palette.stdout
+
+    opened = roostctl_in_session_tab(
+        roost, "tab", "open", "--project-id", str(project), "--cwd", "/tmp", tab=home
+    )
+    assert opened.returncode == 0, opened
+    new = int(opened.stdout.strip())
+    lands_on(roost, project, new, "the window to select the tab a session tab's `tab open` opened")
+
+    focused = roostctl_in_session_tab(roost, "tab", "focus", tab=home)
+    assert focused.returncode == 0, focused
+    lands_on(roost, project, home, "the window to move to the session tab `tab focus` ran in")
 
 
 def test_a_forwarded_delete_of_the_last_project_is_answered_before_the_exit(lane: Lane):
@@ -2803,6 +3010,27 @@ def test_closing_a_background_tab_leaves_the_window_where_it_is(lane: Lane):
 # ---------------------------------------------------------------------------
 
 
+def assert_new_tab_opens_in(
+    lane: Lane, roost: Roost, project: int, source: int, directory: Path
+) -> None:
+    """Show `source`, press ⌘T, and assert the tab it opens on the
+    session starts in `directory`."""
+    wait_until(
+        lambda: slot_key(roost, source),
+        30.0,
+        "the window to list the tab",
+    )
+    roost.focus(source)
+    lands_on(roost, project, source, "the window to show the tab")
+
+    with lane.session() as c:
+        before = set(session_tab_ids(lane))
+        util.press_new_tab(roost)
+        tab = util.spawned_tab_id(c, before, "the new tab to open on the session", timeout=30.0)
+
+        util.assert_opened_in(c, tab, directory)
+
+
 def test_a_new_tab_opens_in_the_shown_tabs_own_cwd_without_osc7(lane: Lane):
     """Plan 070 AC1 on the fresh-install default: ⌘T opens in the shown
     tab's direct-child cwd, read natively. The child `cd`s and emits no
@@ -2826,20 +3054,35 @@ def test_a_new_tab_opens_in_the_shown_tabs_own_cwd_without_osc7(lane: Lane):
             "the tab's child to cd",
         )
         assert c.tab(source)["cwd"] == str(opened_in), c.tab(source)
-    wait_until(
-        lambda: slot_key(roost, source),
-        30.0,
-        "the window to list the tab",
+    assert_new_tab_opens_in(lane, roost, project, source, moved_to)
+
+
+def test_a_new_tab_opens_in_the_shown_tabs_foreground_job_cwd(lane: Lane):
+    """#534 on the fresh-install default: ⌘T opens where the shown tab's
+    foreground job is. The tab's shell stays in the directory it was
+    opened in, which is also its tracked cwd, while the job it runs
+    `cd`s elsewhere and emits no OSC 7; the session reads the job's
+    group leader."""
+    roost = session_ui(lane)
+    opened_in, moved_to = (
+        Path(tempfile.mkdtemp(prefix=prefix, dir=lane.env.launch_cwd))
+        for prefix in ("opened-", "moved-")
     )
-    roost.focus(source)
-    lands_on(roost, project, source, "the window to show the tab")
-
     with lane.session() as c:
-        before = set(session_tab_ids(lane))
-        util.press_new_tab(roost)
-        tab = util.spawned_tab_id(c, before, "the new tab to open on the session", timeout=30.0)
-
-        util.assert_opened_in(c, tab, moved_to)
+        project = int(c.list()[0]["id"])
+        source = c.open_tab(
+            project,
+            cwd=str(opened_in),
+            argv=["bash", "--norc", "--noprofile", "-i"],
+        )
+        c.run(source, util.foreground_job(moved_to), ready_timeout=30.0)
+        wait_until(
+            lambda: "JOB_READY" in c.dump_text(source),
+            30.0,
+            "the tab's job to cd",
+        )
+        assert c.tab(source)["cwd"] == str(opened_in), c.tab(source)
+    assert_new_tab_opens_in(lane, roost, project, source, moved_to)
 
 
 # ---------------------------------------------------------------------------
@@ -3011,6 +3254,56 @@ def test_closing_the_last_tab_below_lands_on_the_tab_last_viewed_above(lane: Lan
     lands_on(roost, project, viewed, "the fallback to open P on the tab last viewed there")
 
 
+def start_the_stopped_session(lane: Lane) -> None:
+    """[`Lane.start_daemon`], retried until the stopped daemon lets go.
+
+    `roostctl session stop` returns once the socket is gone, which is
+    before that daemon releases its state lock, and a start inside that
+    window refuses rather than write `state.json` from two processes.
+    """
+    verdicts: list[str] = []
+
+    def started() -> bool:
+        launch = lane.env.start_daemonized()
+        verdicts.append(launch.verdict.raw.strip())
+        if launch.verdict.kind != "ready":
+            return False
+        lane.pid = launch.verdict.pid
+        return True
+
+    try:
+        wait_until(started, scaled_timeout(30.0), "the stopped session to start again")
+    except TimeoutError:
+        raise AssertionError(
+            f"the stopped session never started again; last verdicts: {verdicts[-3:]}"
+        ) from None
+
+
+def test_a_restarted_session_reconnects_onto_the_tab_last_viewed(lane: Lane):
+    """Plan 072 §D8 (#525): stop the slot's session, start it again and
+    reconnect, and the window selects and attaches the tab it was
+    showing — found by its position, since the restarted session has
+    renumbered every tab — rather than selecting nothing, `(0, 0)`."""
+    roost = session_ui(lane)
+    project, viewed = viewed_while_the_session_is_elsewhere(lane, roost)
+    position = roost.project_tab_ids(project).index(viewed)
+
+    lane.stop_daemon()
+    wait_until(
+        lambda: local_band(roost)["state"] != "connected",
+        scaled_timeout(60.0),
+        "the slot's band to leave connected",
+    )
+    start_the_stopped_session(lane)
+    roost.call("host.connect", {"id": local_band(roost)["saved_id"]})
+
+    restarted = next(p for p in lane.session_projects() if int(p["id"]) == project)
+    remembered = int(restarted["tabs"][position]["id"])
+    assert remembered != viewed, "the restarted session reused the old tab ids"
+    lands_on(roost, project, remembered, "the reconnected window to land on the tab last viewed")
+    attached(roost, remembered)
+
+
 # ---------------------------------------------------------------------------
 # 14. Plan 071 §D14 (#533): providers see the slot's active tab
 # ---------------------------------------------------------------------------
@@ -3053,3 +3346,276 @@ def test_provider_context_reads_the_slots_active_tab(lane: Lane):
         "the provider actually spawned in the active tab's cwd, not just "
         f"saw it in an env var: {probed}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 15. Plan 072 §D7b: what the window is telling the user, read off the wire
+# ---------------------------------------------------------------------------
+
+
+def shown_notice(roost: Roost, what: str, after: int | None = None) -> dict:
+    """The dump once the terminal area says something — under a newer
+    generation than `after`, when given."""
+
+    def dumped() -> dict | None:
+        reply = roost.notice_dump()
+        if reply["terminal"] is None:
+            return None
+        if after is not None and reply["generation"] <= after:
+            return None
+        return reply
+
+    return wait_until(dumped, 60.0, what)
+
+
+def test_a_session_that_ends_under_the_shown_tab_says_so_and_only_that_showing_answers(
+    lane: Lane,
+):
+    """The frame the window keeps when its session stops carries the
+    words it always has, and its button starts a new session — pressed
+    through `app.notice_answer`, which reaches the same handler the
+    button does.
+
+    An answer names the showing it read. The same notice gone and back
+    is a newer generation, so an answer read off the first is refused
+    `not-found` and presses nothing; so is one naming another host."""
+    roost = session_ui(lane)
+    slot = local_band(roost)["saved_id"]
+    assert roost.notice_dump()["terminal"] is None, "a live tab says nothing"
+
+    lane.stop_daemon()
+    first = shown_notice(roost, "the ended session's notice")
+    label = roost.host_status(slot)["hosts"][0]["label"]
+    assert first["terminal"] == {
+        "kind": "session_ended",
+        "subject": slot,
+        "severity": "warning",
+        "placement": "over_frame",
+        "message": f"The session on {label} ended.",
+        "detail": None,
+        "actions": [{"id": "start", "label": "Start a new session", "primary": True}],
+    }
+
+    roost.notice_answer("session_ended", slot, first["generation"], "start")
+    wait_until(
+        lambda: local_band(roost)["state"] == "connected",
+        120.0,
+        "Start a new session to bring the slot back",
+    )
+    wait_until(
+        lambda: roost.notice_dump()["terminal"] is None,
+        30.0,
+        "the notice to go once the session is back",
+    )
+    # Shown again by hand, so what follows needs nothing from whether the
+    # window re-selects on its own after a restart.
+    tab = wait_until(
+        lambda: next(
+            (t for t in session_tab_ids(lane) if slot_key(roost, t) is not None), None
+        ),
+        60.0,
+        "the restarted session's tab to reach the window",
+    )
+    show(lane, roost, tab)
+
+    lane.stop_daemon()
+    again = shown_notice(roost, "the same notice, shown again", after=first["generation"])
+    assert again["terminal"]["subject"] == slot
+
+    for subject, generation, why in [
+        (slot, first["generation"], "an earlier showing"),
+        ("hs-nonesuch", again["generation"], "another host"),
+    ]:
+        with pytest.raises(RoostError) as refused:
+            roost.notice_answer("session_ended", subject, generation, "start")
+        assert refused.value.code == "not-found", (why, refused.value)
+    assert local_band(roost)["state"] == "stopped", "a refused answer pressed nothing"
+    assert roost.notice_dump()["generation"] == again["generation"]
+
+
+def test_a_refusal_with_the_local_session_down_is_on_the_bottom_line(lane: Lane):
+    """The toast is five seconds long, so it is read right after the
+    press that raised it. The palette's own reply and the toast are one
+    verdict, so the line says exactly what the refusal said."""
+    roost = session_ui(lane)
+    lane.stop_daemon()
+    shown_notice(roost, "the slot's session to end under the shown tab")
+
+    with pytest.raises(RoostError) as refused:
+        util.press_new_tab(roost)
+    dumped = roost.notice_dump()
+    assert dumped["bottom_line"] == {
+        "text": refused.value.message,
+        "severity": "error",
+        "source": "status",
+    }, dumped
+    assert dumped["terminal"]["kind"] == "session_ended", (
+        "the toast and the terminal notice are two surfaces, both on screen"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 16. Plan 072 §D7c (#520): the local session that cannot start
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "launch, reason",
+    [("missing", "cannot find roost-session"), ("crash", EXITED_EARLY)],
+)
+def test_a_local_session_that_cannot_start_says_so_and_offers_the_way_out(
+    lane: Lane, launch: str, reason: str
+):
+    """A window under `session` whose session cannot start is no longer
+    an empty grey area: the terminal area says so, names why and where
+    the rest is written, and offers the two ways out.
+
+    Both are pressed here. "Try again" runs the launch once more, which
+    settles where it was — the same notice, a newer showing. "Use
+    in-process tabs" raises the confirm card the palette's row does, in
+    the words for a session that never ran, and nothing moves until it
+    is confirmed. Confirming lands in-process with a tab to show, the
+    key written, no journal left, and the dead slot forgotten.
+    """
+    env = NO_SESSION if launch == "missing" else crashing_session()
+    roost = lane.start("session", extra_env=env)
+    first = shown_notice(roost, "the notice in the empty window")
+    slot = local_band(roost)["saved_id"]
+    notice = first["terminal"]
+    pointer = re.fullmatch(
+        rf"{re.escape(reason)}\. Details are in (/.+)\.", notice["detail"] or ""
+    )
+    assert pointer, notice
+    log = Path(pointer[1])
+    assert log.is_file() and log.is_relative_to(_ROOT / "state"), log
+    assert notice == {
+        "kind": CANNOT_START,
+        "subject": slot,
+        "severity": "error",
+        "placement": "empty_area",
+        "message": CANNOT_START_MESSAGE,
+        "detail": notice["detail"],
+        "actions": CANNOT_START_ACTIONS,
+    }
+
+    roost.notice_answer(CANNOT_START, slot, first["generation"], "reconnect")
+    again = shown_notice(roost, "the notice back after trying again", after=first["generation"])
+    assert again["terminal"] == notice, again
+
+    roost.notice_answer(CANNOT_START, slot, again["generation"], "use_in_process")
+    card = roost.call("app.dialog_dump", {})
+    assert card["dialog"] == "confirm_switch" and card["body"] == NEVER_RAN_COPY, card
+    assert settled(roost) == "session", "raising the card switches nothing"
+
+    roost.call("app.dialog_answer", {"action": "confirm"})
+    wait_until(lambda: settled(roost) == "in-process", 120.0, "the switch to in-process")
+    # At once: the receipt is a five-second toast.
+    landed = roost.notice_dump()
+    assert landed["bottom_line"] == {
+        "text": BACK_IN_ROOST,
+        "severity": "info",
+        "source": "status",
+    }, landed
+    wait_until(lambda: int(roost.identify()["active_tab_id"]) != 0, 60.0, "a tab to show")
+    assert roost.notice_dump()["terminal"] is None
+    config = lane.config.read_text()
+    assert "local-backend = in-process" in config, config
+    assert "local-backend = session" not in config, config
+    assert lane.journal() is None, lane.journal()
+    hosts = roost.call("host.list", {})["hosts"]
+    assert slot not in [h["id"] for h in hosts], hosts
+
+
+# ---------------------------------------------------------------------------
+# 17. Plan 072 §D5 (#563): the session's tabs follow the window's grid
+# ---------------------------------------------------------------------------
+
+
+def window_grid(roost: Roost, tab: int) -> str:
+    """The grid the window draws a slot tab at, as `stty size` prints it.
+    Only the window's own terminal answers `tab.dump_resolved`."""
+    dumped = roost.tab_dump_resolved(tab)
+    return f"{dumped['rows']} {dumped['cols']}"
+
+
+def shell_grid(lane: Lane, tab: int, expected: str) -> str:
+    """What the tab's own shell reads as its size, asked until it reads
+    `expected` or the wait runs out: the last answer either way.
+
+    Asked on the session's socket, which needs no attach, and marked per
+    attempt so an earlier attempt's answer can never pass for this one's."""
+    deadline = time.monotonic() + scaled_timeout(30.0)
+    with lane.session() as c:
+        while True:
+            mark = uuid.uuid4().hex[:8]
+            printed = re.compile(rf"SIZE-{mark}=(\d+ \d+)")
+            c.run(tab, f"echo SIZE-{mark}=$(stty size)", ready_timeout=30.0)
+            answer = wait_until(
+                lambda: printed.search(c.dump_text(tab)),
+                30.0,
+                f"tab {tab} to print its size",
+            ).group(1)
+            if answer == expected or time.monotonic() >= deadline:
+                return answer
+
+
+def test_a_session_tab_the_window_is_not_showing_follows_its_grid(lane: Lane):
+    """#563: a slot tab opened from `roostctl` without being shown runs at
+    the window's grid, not the 80x24 the CLI spawns it at — and follows
+    the window when it resizes, still unshown."""
+    roost = session_ui(lane)
+    shown = roost.identify()["active_tab_id"]
+    project = int(roost.list()[0]["id"])
+
+    opened = roostctl(
+        "tab", "open", "--project-id", str(project), "--cwd", "/tmp", "--no-activate"
+    )
+    assert opened.returncode == 0, opened
+    quiet = int(opened.stdout.strip())
+    assert roost.identify()["active_tab_id"] == shown
+
+    grid = window_grid(roost, shown)
+    assert shell_grid(lane, quiet, grid) == grid
+
+    roost.window_resize(820, 520)
+    wait_until(
+        lambda: window_grid(roost, shown) != grid,
+        30.0,
+        "the window to draw at its new grid",
+    )
+    resized = window_grid(roost, shown)
+    assert shell_grid(lane, quiet, resized) == resized
+    assert roost.identify()["active_tab_id"] == shown, "the window never showed it"
+
+
+def test_a_font_change_reaches_every_session_tabs_shell(lane: Lane):
+    """#563: three font-size steps re-grid the window, and the shell of
+    the tab it shows follows (its attach carries the new grid), as does
+    the shell of a tab it does not."""
+    roost = session_ui(lane)
+    shown = roost.identify()["active_tab_id"]
+    project = int(roost.list()[0]["id"])
+    quiet = roost.open_tab(project, cwd="/tmp", title="quiet", activate=False)
+    grid = window_grid(roost, shown)
+    assert shell_grid(lane, shown, grid) == grid
+
+    try:
+        for _ in range(3):
+            util.palette_command(roost, "font_increase")
+        enlarged = window_grid(roost, shown)
+        assert enlarged != grid, "three font steps re-grid the window"
+
+        assert shell_grid(lane, shown, enlarged) == enlarged
+        assert shell_grid(lane, quiet, enlarged) == enlarged
+    finally:
+        # The steps were written to the config every later case launches
+        # with.
+        ui.quit(lane.target)
+        lines = lane.config.read_text().splitlines()
+        lane.config.write_text(
+            "".join(
+                f"{line}\n"
+                for line in lines
+                if not line.strip().startswith("font-size")
+            )
+        )

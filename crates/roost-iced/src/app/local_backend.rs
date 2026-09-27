@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use roost_ipc::messages::Project;
 use roost_ipc::{LocalBackendMode, LocalRoute};
 use roost_ui_model::config::RoostConfig;
+use roost_ui_model::host_verbs::SlotHistory;
 use roost_ui_model::keybind::KeybindAction;
 use roost_ui_model::keys::{HostId, ProjectKey, TabKey};
 
@@ -538,8 +539,9 @@ pub(crate) enum InitialSelection {
     /// Nothing left to do: the mode is not `session`, or a selection is
     /// already held and an unrelated one is preserved.
     Settled,
-    /// The slot has published no rows to select yet. A fresh session
-    /// seeds one; a session started empty gets one when it is seeded.
+    /// The slot has published no rows to select yet, or a switch is in
+    /// flight. A fresh session seeds one; a session started empty gets
+    /// one when it is seeded.
     Wait,
     /// Select this project/tab pair and attach to the tab.
     Select { project: i64, tab: i64 },
@@ -563,13 +565,25 @@ pub(crate) struct SlotRows<'a> {
 /// which is why this resolves to a tab rather than to a project.
 ///
 /// It also waits for the session id, without which the memory cannot be
-/// read ([`super::tab_memory::recall`]).
+/// read ([`super::tab_memory::recall`]), and for a switch to finish: a
+/// switch in flight owns the selection — the forward fence makes its own,
+/// the reverse clears it at the commit — and one made under it would
+/// fight it (plan 072 §D8).
+///
+/// `selection_held` is [`live_selection_held`]'s reading.
 pub(crate) fn initial_selection(
     mode: LocalBackendMode,
+    switch_in_flight: bool,
     selection_held: bool,
     slot: Option<SlotRows<'_>>,
 ) -> InitialSelection {
-    if mode != LocalBackendMode::Session || selection_held {
+    if mode != LocalBackendMode::Session {
+        return InitialSelection::Settled;
+    }
+    if switch_in_flight {
+        return InitialSelection::Wait;
+    }
+    if selection_held {
         return InitialSelection::Settled;
     }
     let Some(SlotRows {
@@ -603,6 +617,45 @@ pub(crate) fn initial_selection(
         },
         None => InitialSelection::Wait,
     }
+}
+
+/// Whether the window holds a selection the initial selection must leave
+/// alone: one whose `TabKey.host` is still a live incarnation (`live`).
+///
+/// A selection on a replaced incarnation counts as none (#525). The drain
+/// applies a batched `Connecting` + `Connected` before the reconcile that
+/// drops such a selection, so the `Connected` edge still sees it, and so
+/// does the initial selection, which resolves ahead of that drop in the
+/// same reconcile. Counting it would settle the latch just before the
+/// window is left with nothing selected.
+pub(super) fn live_selection_held(
+    selection: Option<super::HostSelection>,
+    live: impl Fn(HostId) -> bool,
+) -> bool {
+    selection.is_some_and(|selection| live(selection.tab.host))
+}
+
+/// What the slot's `Connected` edge reads to re-arm the initial
+/// selection (plan 072 §D8).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RearmGate {
+    /// The host that connected is the slot.
+    pub(crate) slot: bool,
+    pub(crate) mode: LocalBackendMode,
+    pub(crate) switch_in_flight: bool,
+    /// [`live_selection_held`].
+    pub(crate) selection_held: bool,
+}
+
+/// Whether the slot connecting owes the window the launch's selection
+/// again: a restarted or reconnected session comes back under a new
+/// incarnation with its tabs renumbered, and the launch-only latch would
+/// leave the window blank (#525).
+pub(crate) fn rearms_initial_selection(gate: RearmGate) -> bool {
+    gate.slot
+        && gate.mode == LocalBackendMode::Session
+        && !gate.switch_in_flight
+        && !gate.selection_held
 }
 
 /// What the UI knows about the slot, as one reading (plan 063
@@ -1085,12 +1138,7 @@ pub(crate) fn retained_migration(
     }
     let retained = |project_id: i64| {
         layout
-            .and_then(|layout| {
-                layout
-                    .projects
-                    .iter()
-                    .find(|row| row.project_id == project_id)
-            })
+            .and_then(|layout| layout.project(project_id))
             .map(|row| row.tabs.as_slice())
             .unwrap_or(&[])
     };
@@ -1397,6 +1445,20 @@ fn retire_failed_journal(path: &Path, journal: &SwitchJournal) -> Vec<(i64, Opti
     adopted
 }
 
+/// [`retire_failed_journal`]'s twin, for a reverse that finished (plan
+/// 072 D7a): a committed journal the next launch would otherwise find,
+/// warn about and resolve.
+///
+/// Kept, like its twin, while it names an adopted copy: a reverse copies
+/// nothing and so never clears one, and the launch's
+/// [`JournalRecovery::Finish`] arm is what deletes it. Kept too before the
+/// commit point, where the launch has to roll the key back.
+fn retire_committed_journal(path: &Path, journal: &SwitchJournal) {
+    if journal.phase.committed() && journal.inherited_dest.is_empty() {
+        clear_journal(path);
+    }
+}
+
 /// The reverse's commit point as the two writes it is: the key, then the
 /// journal that says the key may be trusted.
 ///
@@ -1614,13 +1676,17 @@ pub(crate) fn forward_confirm_body(projects: usize, tabs: usize) -> String {
 }
 
 /// What the reverse confirm card says — No-Replay stated plainly, since
-/// the surprising part is what does *not* happen (§D8's "Reverse").
-pub(crate) fn reverse_confirm_body(label: &str) -> String {
-    format!(
-        "Local tabs go back to running inside Roost and start fresh — \
-         nothing is copied back. The session keeps running and its \
-         projects stay one click away under {label}."
-    )
+/// the surprising part is what does *not* happen (§D8's "Reverse") — and
+/// a running session claimed only while one answers (plan 072 D7a).
+pub(crate) fn reverse_confirm_body(label: &str, slot: SlotHistory) -> String {
+    match roost_ui_model::host_verbs::unanswered_switch_copy(slot) {
+        Some(copy) => copy.to_string(),
+        None => format!(
+            "Local tabs go back to running inside Roost and start fresh — \
+             nothing is copied back. The session keeps running and its \
+             projects stay one click away under {label}."
+        ),
+    }
 }
 
 pub(super) fn plural(count: usize, noun: &str) -> String {
@@ -1825,7 +1891,7 @@ impl super::App {
                     .unwrap_or_else(|| roost_ui_model::host_verbs::SEED_LABEL.to_string());
                 (
                     "Use in-process local tabs?".to_string(),
-                    reverse_confirm_body(&label),
+                    reverse_confirm_body(&label, self.local_slot_history()),
                     "Use in-process tabs",
                 )
             }
@@ -2332,16 +2398,15 @@ impl super::App {
         }) {
             return false;
         }
-        let kept = self.switch.as_ref().map_or(0, |run| run.kept);
-        self.finish_switch(&match kept {
-            0 => "local tabs now run in a session on this machine".to_string(),
-            n => format!(
+        match self.switch.as_ref().map_or(0, |run| run.kept) {
+            0 => self.finish_switch_with_receipt("local tabs now run in a session on this machine"),
+            n => self.finish_switch(&format!(
                 "local tabs now run in a session on this machine — {} did not copy \
                  completely and {} left where they were",
                 plural(n, "project"),
                 if n == 1 { "was" } else { "were" },
-            ),
-        });
+            )),
+        }
         false
     }
 
@@ -2649,7 +2714,7 @@ impl super::App {
                     self.finish_switch_quietly();
                     return;
                 }
-                self.finish_switch("local tabs run in Roost again");
+                self.finish_switch_with_receipt("local tabs run in Roost again");
             }
         }
         self.reconcile();
@@ -2707,9 +2772,39 @@ impl super::App {
         self.finish_switch_quietly();
     }
 
+    /// [`Self::finish_switch`] for a switch that did all it was asked to.
+    fn finish_switch_with_receipt(&mut self, receipt: &str) {
+        self.set_status_info(receipt);
+        self.finish_switch_quietly();
+    }
+
     fn finish_switch_quietly(&mut self) {
         tracing::info!(mode = %self.local_backend, "local-backend switch finished");
+        let reversed = self
+            .switch
+            .as_ref()
+            .filter(|run| {
+                run.direction == SwitchDirection::ToInProcess && run.journal.phase.committed()
+            })
+            .map(|run| run.journal.clone());
+        if let Some(journal) = &reversed {
+            retire_committed_journal(&self.journal_path(), journal);
+        }
+        // A slot no session has ever answered holds nothing of the
+        // user's, and left saved it is a dead `localhost` row.
+        let forget = reversed
+            .filter(|_| self.local_slot_history() == SlotHistory::NeverConnected)
+            .and_then(|_| self.local_slot_saved_id());
         self.end_switch();
+        if let Some(saved_id) = forget {
+            if let Err(error) = self.host_remove_requested(&saved_id) {
+                tracing::warn!(
+                    %error,
+                    host = %saved_id,
+                    "could not un-save a slot that never connected"
+                );
+            }
+        }
     }
 
     /// Drop the run and republish, which is what re-arms the exit rule,
@@ -2773,6 +2868,7 @@ async fn replay_onto_slot(
             // the *destination's* count, which would rename an
             // `Untitled 2` that moved onto an empty session (§D4).
             serde_json::json!({ "name": project.name, "cwd": project.cwd }),
+            true,
         )
         .await;
         let made = match made {
@@ -2816,6 +2912,7 @@ async fn replay_onto_slot(
                 ops,
                 wire::TAB_OPEN,
                 super::host_tab_open_params(made.id, &cwd, &tab.title, &[], None, grid),
+                true,
             )
             .await;
             let opened = match opened {
@@ -2840,6 +2937,7 @@ async fn replay_onto_slot(
                     ops,
                     wire::TAB_SET_TITLE,
                     serde_json::json!({ "tab_id": opened.id.to_string(), "title": tab.title }),
+                    true,
                 )
                 .await
                 {
@@ -2929,7 +3027,7 @@ async fn delete_dest_projects(
     // somebody else's work, and deleting on the strength of a remembered
     // id is exactly what `rollback_is_still_ours` exists to stop.
     let listed: Result<TabListResult, String> =
-        super::host_call(ops, wire::TAB_LIST, serde_json::json!({})).await;
+        super::host_call(ops, wire::TAB_LIST, serde_json::json!({}), true).await;
     let found = match listed {
         Ok(listed) => tab_counts(&listed.projects),
         Err(error) => {
@@ -2959,6 +3057,7 @@ async fn delete_dest_projects(
             ops,
             wire::PROJECT_DELETE,
             serde_json::json!({ "project_id": id.to_string() }),
+            true,
         )
         .await
         {
@@ -3722,7 +3821,7 @@ mod tests {
 
         // The session's active tab, wherever it lives.
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, slot(&rows, 21)),
+            initial_selection(LocalBackendMode::Session, false, false, slot(&rows, 21)),
             InitialSelection::Select {
                 project: 2,
                 tab: 21
@@ -3731,7 +3830,7 @@ mod tests {
         // No active tab of its own (or one that closed): the first row
         // with something in it.
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, slot(&rows, 0)),
+            initial_selection(LocalBackendMode::Session, false, false, slot(&rows, 0)),
             InitialSelection::Select {
                 project: 1,
                 tab: 10
@@ -3740,7 +3839,7 @@ mod tests {
         // A project with no tabs is not somewhere to land.
         let empty = [project(1, &[]), project(2, &[20])];
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, slot(&empty, 0)),
+            initial_selection(LocalBackendMode::Session, false, false, slot(&empty, 0)),
             InitialSelection::Select {
                 project: 2,
                 tab: 20
@@ -3755,22 +3854,22 @@ mod tests {
     fn the_launch_selection_waits_for_the_slot_and_yields_to_a_held_one() {
         let rows = [project(1, &[10])];
         assert_eq!(
-            initial_selection(LocalBackendMode::InProcess, false, slot(&rows, 10)),
+            initial_selection(LocalBackendMode::InProcess, false, false, slot(&rows, 10)),
             InitialSelection::Settled,
             "in-process never had a slot to select from"
         );
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, true, slot(&rows, 10)),
+            initial_selection(LocalBackendMode::Session, false, true, slot(&rows, 10)),
             InitialSelection::Settled,
             "an unrelated remote-host selection is preserved"
         );
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, None),
+            initial_selection(LocalBackendMode::Session, false, false, None),
             InitialSelection::Wait,
             "the slot is not connected yet"
         );
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, slot(&[], 0)),
+            initial_selection(LocalBackendMode::Session, false, false, slot(&[], 0)),
             InitialSelection::Wait,
             "connected but empty: the seed has not landed yet"
         );
@@ -3808,6 +3907,7 @@ mod tests {
         let remembered = |session_id, projects| {
             initial_selection(
                 LocalBackendMode::Session,
+                false,
                 false,
                 Some(SlotRows {
                     projects,
@@ -3859,7 +3959,7 @@ mod tests {
         };
 
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, Some(arrived(None))),
+            initial_selection(LocalBackendMode::Session, false, false, Some(arrived(None))),
             InitialSelection::Wait,
             "connected, facts not yet"
         );
@@ -3870,12 +3970,141 @@ mod tests {
         );
 
         assert_eq!(
-            initial_selection(LocalBackendMode::Session, false, Some(arrived(Some("s-1")))),
+            initial_selection(
+                LocalBackendMode::Session,
+                false,
+                false,
+                Some(arrived(Some("s-1")))
+            ),
             InitialSelection::Select {
                 project: 2,
                 tab: 21
             },
             "the facts landed: the memory decides"
+        );
+    }
+
+    #[test]
+    fn the_initial_selection_waits_out_a_switch_in_flight() {
+        let rows = [project(1, &[10])];
+        assert_eq!(
+            initial_selection(LocalBackendMode::Session, true, false, slot(&rows, 10)),
+            InitialSelection::Wait,
+            "nothing selected mid-switch: the switch owns the selection"
+        );
+        assert_eq!(
+            initial_selection(LocalBackendMode::Session, true, true, slot(&rows, 10)),
+            InitialSelection::Wait,
+            "a selection the switch may still clear does not settle the latch"
+        );
+        assert_eq!(
+            initial_selection(LocalBackendMode::Session, false, false, slot(&rows, 10)),
+            InitialSelection::Select {
+                project: 1,
+                tab: 10
+            },
+            "the same slot once the switch is over"
+        );
+    }
+
+    #[test]
+    fn a_selection_on_a_dead_incarnation_is_not_held() {
+        let (dead, live) = (HostId::new(3), HostId::new(4));
+        let owns = |host: HostId| host == live;
+        assert!(
+            !live_selection_held(Some(showing(dead, 1, 10)), owns),
+            "the replaced incarnation's tab is no selection"
+        );
+        assert!(live_selection_held(Some(showing(live, 1, 10)), owns));
+        assert!(!live_selection_held(None, owns));
+    }
+
+    #[test]
+    fn only_the_slot_connecting_under_session_with_nothing_live_selected_rearms() {
+        let owed = RearmGate {
+            slot: true,
+            mode: LocalBackendMode::Session,
+            switch_in_flight: false,
+            selection_held: false,
+        };
+        assert!(rearms_initial_selection(owed));
+        assert!(
+            !rearms_initial_selection(RearmGate {
+                slot: false,
+                ..owed
+            }),
+            "another saved host connecting"
+        );
+        assert!(
+            !rearms_initial_selection(RearmGate {
+                mode: LocalBackendMode::InProcess,
+                ..owed
+            }),
+            "under in-process the slot is an ordinary host"
+        );
+        assert!(
+            !rearms_initial_selection(RearmGate {
+                switch_in_flight: true,
+                ..owed
+            }),
+            "a switch owns the selection"
+        );
+        assert!(
+            !rearms_initial_selection(RearmGate {
+                selection_held: true,
+                ..owed
+            }),
+            "a live selection is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batched_reconnect_under_a_new_incarnation_rearms() {
+        use crate::app::bootstrap::BootstrapsInFlight;
+        use crate::app::host_lifecycle::settle_host_state;
+        use crate::host_conn::fixtures::{a_connected_socket_host, a_set, next_incarnation};
+        use crate::host_conn::{HostConnState, HostTransport};
+
+        let (mut set, _feed) = a_set();
+        let mut bootstraps = BootstrapsInFlight::default();
+        let old = a_connected_socket_host(
+            &mut set,
+            "slot",
+            "/nonexistent/roost-rearm.sock",
+            HostTransport::LocalSession,
+        );
+        let window = Some(showing(old, 1, 10));
+        assert!(live_selection_held(window, |host| set.owns(host)));
+
+        let new = next_incarnation(&set, "slot");
+        let replacing = settle_host_state(
+            &mut set,
+            &mut bootstraps,
+            new,
+            HostConnState::Connecting {
+                previous: Some(old),
+            },
+        )
+        .expect("the retry is the slot's");
+        assert_eq!(replacing.previous, Some(old));
+        let landed = settle_host_state(&mut set, &mut bootstraps, new, HostConnState::Connected)
+            .expect("the landing is the slot's");
+        assert!(landed.connected);
+
+        let held = live_selection_held(window, |host| set.owns(host));
+        assert!(
+            !held,
+            "the window's tab is on the incarnation just replaced"
+        );
+        assert!(rearms_initial_selection(RearmGate {
+            slot: landed.host == "slot",
+            mode: LocalBackendMode::Session,
+            switch_in_flight: false,
+            selection_held: held,
+        }));
+        assert!(
+            live_selection_held(Some(showing(new, 1, 10)), |host| set.owns(host)),
+            "a tab on the incarnation that landed is held"
         );
     }
 
@@ -4463,6 +4692,42 @@ mod switch_tests {
         );
     }
 
+    /// Plan 072 D7a: a finished reverse takes its journal with it — unless
+    /// the journal names an adopted copy, which only a launch's `Finish`
+    /// arm deletes, or the run never reached the commit point.
+    #[test]
+    fn a_finished_reverse_retires_its_journal_unless_it_names_an_adopted_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = journal_path(dir.path());
+        let mut journal = SwitchJournal::new(SwitchDirection::ToInProcess, Vec::new());
+        journal.phase = SwitchState::Committing;
+
+        write_journal(&path, &journal).unwrap();
+        retire_committed_journal(&path, &journal);
+        assert!(read_journal(&path).is_none(), "nothing adopted: it goes");
+
+        journal.inherited_dest = vec![InheritedDest {
+            project: 7,
+            tabs: Some(2),
+        }];
+        write_journal(&path, &journal).unwrap();
+        retire_committed_journal(&path, &journal);
+        assert_eq!(
+            read_journal(&path).map(|kept| kept.inherited_dest),
+            Some(journal.inherited_dest.clone()),
+            "an adopted copy keeps it for the launch that deletes the copy"
+        );
+
+        journal.inherited_dest.clear();
+        journal.phase = SwitchState::Preparing;
+        write_journal(&path, &journal).unwrap();
+        retire_committed_journal(&path, &journal);
+        assert!(
+            read_journal(&path).is_some(),
+            "before the commit point the launch still has a key to roll back"
+        );
+    }
+
     /// What the `local-backend` line in a config file says, if any.
     fn backend_key(path: &Path) -> Option<String> {
         std::fs::read_to_string(path)
@@ -4914,9 +5179,30 @@ mod switch_tests {
         assert!(forward_confirm_body(0, 0).contains("0 projects and 0 tabs"));
 
         // Reverse says the thing that surprises: nothing comes back.
-        let back = reverse_confirm_body("localhost");
+        let back = reverse_confirm_body("localhost", SlotHistory::Connected);
         assert!(back.contains("nothing is copied back"), "{back}");
         assert!(back.contains("localhost"), "{back}");
+    }
+
+    /// Plan 072 D7a: the card claims a running session only while one
+    /// answers — the palette row's three states, on the card.
+    #[test]
+    fn the_reverse_card_claims_a_running_session_only_while_one_answers() {
+        assert_eq!(
+            reverse_confirm_body("localhost", SlotHistory::Connected),
+            "Local tabs go back to running inside Roost and start fresh — nothing is copied \
+             back. The session keeps running and its projects stay one click away under \
+             localhost."
+        );
+        assert_eq!(
+            reverse_confirm_body("localhost", SlotHistory::ConnectedBefore),
+            "Local tabs will run inside Roost. The local session isn't running; its projects \
+             stay under LOCALHOST for when it starts."
+        );
+        assert_eq!(
+            reverse_confirm_body("localhost", SlotHistory::NeverConnected),
+            "Local tabs will run inside Roost."
+        );
     }
 
     /// A stand-in session on the far end of a `HostOps` queue.
@@ -5301,6 +5587,7 @@ mod migration_tests {
                             user_titled: *user_titled,
                         })
                         .collect(),
+                    last_tab_position: None,
                 })
                 .collect(),
             active_project_id: active.0,

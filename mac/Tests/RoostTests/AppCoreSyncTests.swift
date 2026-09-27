@@ -1,9 +1,10 @@
-// The two seams where the Mac UI has to stay in step with the core's
-// agent model (plan 002): the active-tab sync a UI-initiated selection
-// performs, and the `.resync` reconcile's refresh of a session the UI
-// already holds. Both are `RoostApp` decisions extracted as pure
-// helpers so they can be exercised without an AppKit window — same
-// pattern as `RoostApp.activeTabIndex` in `TabPillStateTests`.
+// The seams where the Mac UI has to stay in step with the core: the tab
+// a project selection lands on (plan 072 §D6), and for the agent model
+// (plan 002) the active-tab sync a UI-initiated selection performs and
+// the `.resync` reconcile's refresh of a session the UI already holds.
+// All are `RoostApp` decisions extracted as pure helpers so they can be
+// exercised without an AppKit window — same pattern as
+// `RoostApp.activeTabIndex` in `TabPillStateTests`.
 
 import Foundation
 import Testing
@@ -13,6 +14,28 @@ import Testing
 @MainActor
 @Suite("UI ↔ core sync")
 struct AppCoreSyncTests {
+    // MARK: Project selection
+
+    /// The window still shows `a` (index 0) while the workspace has moved
+    /// the project to `b`, as a `tab focus` whose `.active` is in flight
+    /// leaves it.
+    @Test func selectingAProjectLandsOnTheWorkspacesTabOverTheShownOne() {
+        #expect(RoostApp.rememberedTabIndex(tabIDs: [1, 2, 3], preferred: 2, shown: 0) == 1)
+    }
+
+    @Test func theShownTabAnswersOnlyWhereTheWorkspaceCannot() {
+        #expect(
+            RoostApp.rememberedTabIndex(tabIDs: [1, nil], preferred: 1, shown: 1) == 1,
+            "its open has not named it yet"
+        )
+        #expect(
+            RoostApp.rememberedTabIndex(tabIDs: [1, 2], preferred: 9, shown: 1) == 1,
+            "the remembered tab has no session here"
+        )
+        #expect(RoostApp.rememberedTabIndex(tabIDs: [1, 2], preferred: 2, shown: nil) == 1)
+        #expect(RoostApp.rememberedTabIndex(tabIDs: [1, 2], preferred: nil, shown: nil) == 0)
+    }
+
     // MARK: Active-tab sync
 
     @Test func uiInitiatedSelectionPushesToTheCore() {

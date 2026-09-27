@@ -12,6 +12,7 @@ pub mod host_sidebar;
 pub mod host_verbs;
 pub mod keybind;
 pub mod keys;
+pub mod notice;
 pub mod notification_inbox;
 pub mod palette;
 pub mod provider;

@@ -404,9 +404,11 @@ instead of answering `not-found`, and answers `not-found` only if the
 tab closes first, the slot's connection drops, or 10 seconds pass. So
 `roostctl tab open --focus` and `roostctl open --focus` land on the new
 tab. This is the UI socket's behavior only: a client on the session's
-own socket — `roostctl` run inside a session tab, whose `ROOST_SOCKET`
-names the session — changes the session's active tab (the reply's
-`is_active`) and never the window's.
+own socket changes the session's active tab (the reply's `is_active`)
+and never the window's. `roostctl` run inside a session tab, whose
+`ROOST_SOCKET` names the session, dials the window that owns the
+session instead unless told otherwise, so it gets the UI socket's
+behavior ([`cli.md`](cli.md#inside-a-session-tab)).
 
 A forwarded request that cannot reach the slot — nothing is connected
 yet, or the connection dropped mid-op — answers `host-unavailable` with
@@ -477,9 +479,11 @@ active tab ([cwd tracking](../guides/cwd-tracking.md)). It is a
 string-wrapped id like every other (`"cwd_from_tab": "5"`); `null`
 means unset, and an unset field is not sent, so a request without it
 is the bytes it always was. The server resolves the tab's cwd
-**natively first** — read from the tab's *direct* PTY child, the
-process the tab spawned, so a `cd` inside a nested shell or tmux is not
-seen — and falls back to the tab's tracked (OSC 7) `cwd`. A candidate
+**natively first** — read from the leader of the tab's foreground
+process group, so a `cd` inside a nested interactive shell is seen
+(inside tmux it is not: the job is the tmux client, which stays where
+it started); then from the tab's *direct* PTY child, the process the
+tab spawned — and falls back to the tab's tracked (OSC 7) `cwd`. A candidate
 counts only if it is an existing directory on the server's own
 machine, so a directory since removed, or an OSC 7 path from across an
 `ssh` hop that does not exist here, falls through. A resolved cwd **replaces** `cwd`,
@@ -493,7 +497,11 @@ Served by sessions, Roost-Iced's UI socket and the Swift Mac app's
 socket. A server that predates the field — `Roost.app` through v0.0.20
 among them — answers `unknown-field`; see
 [the compatibility matrix](ipc-compatibility.md#the-compatibility-matrix).
-No CLI flag yet.
+From the CLI: `--cwd-from-tab <id>` on `tab open` (plan 072, #536), or
+`--here` for `$ROOST_TAB_ID` — accepted only with no explicit
+`--socket`/`--target` naming another target, since `$ROOST_TAB_ID` is
+otherwise not necessarily this call's own id space; see
+[cli.md](cli.md#tab-open-close-send-resize-reorder-dump).
 
 Response: `{"tab": <Tab>}`.
 
@@ -1203,7 +1211,10 @@ a bare `tab_id` on a UI socket is rewritten to the slot's `h<n>.<id>`
 and answered the same way. A tab a forwarded `tab.open` just opened may
 not be listed by the window yet; a focus on it waits for the listing,
 and answers `not-found` only if the tab closes first, the slot's
-connection drops, or 10 seconds pass.
+connection drops, or 10 seconds pass. A `tab.focus` on a session's own
+socket moves only the session's active tab; `roostctl tab focus` run
+inside a session tab reaches the window instead
+([`cli.md`](cli.md#inside-a-session-tab)).
 
 ### `tab.set_title`
 
@@ -1592,6 +1603,121 @@ classic single sticky `PROJECTS` header instead of a strip:
 the same absent-tolerant contract `hosts` uses, for the same reason.
 
 Ungated, read-only — always available, matching `app.window_metrics`.
+
+### `app.notice_dump`
+
+What the window is telling the user right now: the notice in the
+terminal area, and the bottom-right line. Like
+[`app.dialog_dump`](#host-bootstrap-test-ops-appdialog_dump-appdialog_answer-appkeybind_dispatch-test-only-gated),
+these are the **rendered** strings — the dump reads what the widgets
+read, so a test asserting "the user is told the right thing" does not
+re-derive the copy rule a second time. Which surface carries which kind
+of message is [User messaging](../development/user-messaging.md).
+
+Request: `{"params": {}}`. Response:
+
+```json
+{ "generation": 3,
+  "terminal": { "kind": "session_ended", "subject": "hs-2f1c", "severity": "warning",
+                "placement": "over_frame", "message": "The session on workbench ended.",
+                "detail": null,
+                "actions": [ { "id": "start", "label": "Start a new session",
+                               "primary": true } ] },
+  "bottom_line": { "text": "the local session is not connected", "severity": "error",
+                   "source": "status" } }
+```
+
+- `terminal` — the notice drawn in the terminal area, or `null`.
+    - `kind` says what it is about. Read it as an open set — a newer
+      build may add kinds.
+        - `"session_ended"`: a host whose session ended under the frame
+          the window is still showing (`placement: "over_frame"`).
+        - `"local_session_cannot_start"`: under `local-backend = session`,
+          the local session's launch settled without a session and nothing
+          is retrying it, and the terminal area has nothing selected to
+          show (`placement: "empty_area"`, `severity: "error"`). `detail`
+          is the band's reason and the path of the UI's log. Not shown
+          while a local-backend switch is in flight.
+    - `subject` is the saved host's **id**, the value `host.*` takes —
+      not its label, which `message` interpolates.
+    - `severity` is `"info"`, `"warning"` or `"error"`.
+    - `placement` is `"over_frame"` (over a kept frame, under a scrim) or
+      `"empty_area"` (at the top of a terminal area with nothing in it).
+    - `detail` is the second line, or `null` when the notice draws none.
+    - `actions` is every button in render order; its `id` is what
+      [`app.notice_answer`](#appnotice_answer-test-only-gated) presses.
+- `bottom_line` — the bottom-right line, or `null`. `source` is
+  `"status"` for the toast that follows something you just did, or
+  `"durability"` for a standing failure to save the workspace, which a
+  toast covers while it is up. `severity` is its tone. **The toast is
+  gone after five seconds**, so read it right after the action that
+  raised it.
+- `generation` — which showing of `terminal` this is. It is bumped every
+  time the notice on screen changes, including when it goes away and when
+  the same notice comes back, so two dumps with the same `kind` and
+  `subject` under different generations are two different showings.
+
+Ungated and read-only. The Swift Mac app answers `unknown-op`.
+
+### `app.notice_answer` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Presses one action of the
+terminal notice [`app.notice_dump`](#appnotice_dump) returned, through
+the same handler its button's click reaches. A test seam, not a
+surface: `roostctl` has no verb for it.
+
+Request:
+`{"params": {"kind": "session_ended", "subject": "hs-2f1c", "generation": 3, "action": "start"}}`.
+Response: `{}`.
+
+`kind`, `subject` and `generation` are the ones the dump returned, and
+`action` one of its `actions[].id`. If the notice on screen is not that
+showing — another notice, none at all, or the same notice gone and back
+under a newer generation — or it no longer offers that action, the
+answer is `not-found` and nothing is pressed. An empty `kind`,
+`subject` or `action` is rejected `invalid-param` before anything else
+runs.
+
+| `kind` | `action` | What it does |
+|---|---|---|
+| `session_ended` | `start` | Starts a new session on `subject`, the Connect the sidebar's ↻ runs. |
+| `local_session_cannot_start` | `reconnect` | Tries the local session again, the Connect the sidebar's ↻ runs. |
+| `local_session_cannot_start` | `use_in_process` | Raises the **Use in-process local tabs?** confirm card, as the palette's row does. Nothing switches until the card is confirmed. |
+
+The Swift Mac app answers `unknown-op`.
+
+### `app.key_event` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Delivers one key press to
+the window through the same handler a real one reaches: a configured
+shortcut runs first (Alt+T opens a tab on Linux, as ⌘T does on macOS),
+and otherwise the key goes to whatever owns the keyboard — the terminal
+on screen, the tab a new-tab shortcut is still opening, or a dialog or
+the palette, which answer Enter, Escape and the arrows here but take
+their text fields' typing from the toolkit, not from this handler. A
+test seam, not a surface: `roostctl` has no verb for it.
+
+Request: `{"params": {"key": "t", "modifiers": ["alt"]}}`. Response:
+`{}`.
+
+- `key` is one character (`"t"`, `"M"`, `"$"`, `" "`) or a named key:
+  `Enter`, `Tab`, `Space`, `Backspace`, `Escape`, `Delete`, `Insert`,
+  `Home`, `End`, `PageUp`, `PageDown`, `ArrowUp`, `ArrowDown`,
+  `ArrowLeft`, `ArrowRight`, `F1`–`F12`.
+- `modifiers` is any of `"shift"`, `"ctrl"`, `"alt"` and `"super"`;
+  omitted, none are held.
+- `text` is what the press types. Omitted, the UI derives it as a US
+  keyboard would: the character itself, its control byte under `ctrl`,
+  nothing under `super`.
+
+An empty `key` or an unknown modifier is rejected `invalid-param`
+before anything else runs, and so is a named key the UI doesn't know.
+Only the press is delivered, never a release. The press cannot drive an
+input method's composition; that path is `tab.feed_ime`'s.
+
+The Swift Mac app answers `unknown-op`.
 
 ### `app.set_window_focus` *(test-only — gated)*
 
@@ -2384,7 +2510,7 @@ A **live** host additionally carries `connect` and `tabs`:
 - `generation` — which connection attempt this host is on. Bumped once per attempt **started** — an explicit `host.connect`, a launch auto-reconnect, or one rung of the ssh retry ladder — `0` before the first, and **kept across a disconnect**. This is the monotonic edge to wait on: two consecutive attempts can fail with byte-identical reasons, so "state is `disconnected` and `reason` is set" cannot tell attempt N from N−1, but reading `generation` before a connect and waiting for it to advance can. It counts attempts rather than connections on purpose: an ssh host whose handshake never succeeds reaches no connection at all, and a ten-rung ladder that left the number flat would be no edge.
 - `state` — the same spellings `host.connect` answers with, from the same classifier the band's dot reads. A host that has never connected is `disconnected`.
 - `reason` — the connection's own one-line reason, **untruncated**: the band's *input*. Absent when there is none.
-- `detail` — the long form behind `reason`, when there is one the band has no room for. One thing fills it: a **localhost session that could not be started**, where `reason` is the ≤45-character band line (`"cannot find roost-session"`, `"roost-session failed to start"`) and `detail` is what actually happened — the launch ladder's three rungs verbatim, the exec error, or the daemon's own start verdict. Such a host carries no `retry`: no retry could find a binary, so it settles once and waits for ↻ Reconnect.
+- `detail` — the long form behind `reason`, when there is one the band has no room for. One thing fills it: a **localhost session that could not be started**, where `reason` is the ≤45-character band line (`"cannot find roost-session"`, `"roost-session failed to start"`, `"roost-session exited early (status N)"` or `"(signal N)"`) and `detail` is what actually happened — the launch ladder's three rungs verbatim, the exec error, the daemon's own start verdict, or the exit status of a `roost-session` that exited before it was ready and the last 4 KiB it wrote to stderr. Such a host carries no `retry`: no retry could find a binary, so it settles once and waits for ↻ Reconnect.
 - `rollup` — the band's *output*, verbatim from the sidebar's reducer, capped at 60 characters with an ellipsis. For a **connected** host this is the agent count (`"3 agents"`), not state text; absent when the band shows no rollup at all. It is what the next frame draws — nothing here asserts a frame was painted.
 - `retry` — a `RetrySchedule`, absent unless an auto-reconnect is armed. `delay_ms` is the delay the timer was armed with (not what is left) and `armed_at` is when, so a caller can compute the remainder. `attempt` (1-based, the `3` in the band's `(3/10)`) and `budget` come with the **ssh** ladder only: a localhost retry is the connection task's own backoff whose counter never leaves the task, so it reports `delay_ms` alone.
 - `payload_kind` — what the last attach this client accepted on this host is being **decoded as**, one of [`payload_kinds`](#sessionidentify)' spellings. `"vt"` is the fallback a libghostty build skew lands on; such a host connects normally, the dot deliberately stays green, at that payload's [documented fidelity](#payload-kinds). Absent until a tab has actually attached over the *live* connection — it reports what is being decoded, never what could be — and it goes when that connection does, so a reconnect to a matching daemon cannot keep claiming a fallback it is no longer on.
@@ -3354,9 +3480,10 @@ because raw input is open and any other client may resize the tab
 between this connection's own resize and the encode. A `vt` client
 builds its terminal at that size before replaying, then resizes it to
 its own; a resuming client replays the ring into the terminal it kept,
-and the geometry it was away for may not be the one it left. An
-accepted reply that states no geometry is a truncated reply, and a
-client refuses it.
+and an unfocused one may not be at the tab's grid (a served resume
+never straddles a grid change — see [Resume](#resume)). An accepted
+reply that states no geometry is a truncated reply, and a client
+refuses it.
 
 #### Preamble and frames
 
@@ -3561,10 +3688,23 @@ Resume is honored only when **all** of these hold:
 * `ring_front <= resume_from_seq <= last_assigned + 1`. The upper bound
   is inclusive: `last_assigned + 1` is a valid **empty-slice** resume —
   the client missed nothing and simply carries on.
+* The tab's grid has not changed since `resume_from_seq` (#564) —
+  whoever changed it, this attach's own `focus: true` resize included.
+  The ring holds records written for the grid the tab had, and replayed
+  into a terminal the client kept at another width they land in the
+  wrong cells. The rule is conservative: a resize with no output after
+  it refuses every resume point before it, since the seqs cannot say
+  whether the client saw it.
 
 Every miss — `resume_from_seq` of `0`, a seq past the end, an evicted
-range, an identity mismatch, a tab task that went away — falls back to
-`mode: "snapshot"` and a full attach **in the same reply**. A resume
+range, an identity mismatch, a grid change inside the range, a tab task
+that went away — falls back to `mode: "snapshot"` and a full attach
+**in the same reply**. A session older than the grid rule can still
+answer `resume` across a grid change, which is why Roost's own client
+also stops asking: it forgets a detached tab's resume point when it
+re-grids that tab's terminal, gives up the point of an attach that sent
+a resize while live, and discards a `resume` answered for a grid its
+terminal has left while the handshake was in flight. A resume
 failure is never an error, and a client never has to handle one: it
 reads `mode` and does what it says.
 

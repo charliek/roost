@@ -1491,30 +1491,26 @@ async fn a_resume_replays_the_ring_and_sends_no_snapshot() {
 /// A resume names the tab's geometry too, read at the handoff (review
 /// F1).
 ///
-/// A resuming client replays the ring into the terminal it *kept*, and
-/// the shared grid can have moved while it was away — every client that
-/// types sizes the tab, and this one was not there to see it. Without
-/// the answer it lays those records out at the width it left, wrapping
-/// every line and misplacing every absolute cursor move until something
-/// resizes it locally.
-///
-/// The dial is unfocused on purpose: that is the shape where the tab's
-/// grid at the handoff is somebody else's and not this client's own. A
-/// focused resume states its geometry, so the handoff would find the
-/// tab already at it and the assertion would say nothing.
+/// The other client's resize lands while this one is still attached and
+/// is followed by output it read, so the slice it resumes from starts
+/// after the change. The dial is unfocused on purpose: a focused resume
+/// states its geometry, so the handoff would find the tab already at it
+/// and the assertion would say nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resume_reports_the_geometry_the_ring_was_written_at() {
     let h = harness().await;
-    let (mut client, tab_id, applied, identity) = h.caught_up().await;
+    let (mut client, tab_id) = h.live_tab().await;
+    let (identity, mut data) = dial(&h.socket, h.handshake(tab_id))
+        .await
+        .expect("accepted");
+    let (_snapshot, pty) = data.read_snapshot().await;
+    let after = pty.last().map_or(identity.seq, |(seq, _)| *seq);
 
-    // Somebody else keeps typing at their own size while this client is
-    // still dialing back in.
     let mut other = h.control().await;
     resize(&mut other, tab_id, 60, 20).await;
-    wait_for_dump(&mut client, tab_id, "the other client's resize", |d| {
-        (d.cols, d.rows) == (60, 20)
-    })
-    .await;
+    feed(&mut client, tab_id, b"ROOST_AT_SIXTY\r\n".to_vec()).await;
+    let (applied, _) = data.read_pty_until(after, b"ROOST_AT_SIXTY").await;
+    drop(data);
 
     let mut watching = h.resume_handshake(
         tab_id,
@@ -1533,6 +1529,120 @@ async fn a_resume_reports_the_geometry_the_ring_was_written_at() {
         (60, 20),
         "a resume names the grid its records were written at, not the one asked for"
     );
+}
+
+/// A resume must not straddle a grid change (#564). Here the change is
+/// another client's resize with **no output after it**, and the resume
+/// asks for the grid the tab is already at — so this attach's own
+/// focused resize changes nothing, and only the marker the resize left
+/// can refuse it. The case a marker at `last_byte_seq` would miss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resize_with_no_output_after_it_refuses_the_resume() {
+    let h = harness().await;
+    let (mut client, tab_id, applied, identity) = h.caught_up().await;
+
+    let mut other = h.control().await;
+    resize(&mut other, tab_id, 100, 30).await;
+    wait_for_dump(&mut client, tab_id, "the other client's resize", |d| {
+        (d.cols, d.rows) == (100, 30)
+    })
+    .await;
+
+    let mut at_the_tabs_grid = h.resume_handshake(
+        tab_id,
+        applied + 1,
+        identity.server_epoch,
+        identity.tab_generation,
+    );
+    at_the_tabs_grid["cols"] = serde_json::json!(100);
+    at_the_tabs_grid["rows"] = serde_json::json!(30);
+    falls_back(
+        &h.socket,
+        at_the_tabs_grid,
+        "a resume across a resize with no output after it",
+    )
+    .await;
+}
+
+/// The resuming attach's own focused resize is a grid change like any
+/// other: the records the client missed were written at the grid it
+/// left, not the one it comes back at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_focused_resume_at_another_grid_refuses_the_resume() {
+    let h = harness().await;
+    let (_client, tab_id, applied, identity) = h.caught_up().await;
+
+    let mut wider = h.resume_handshake(
+        tab_id,
+        applied + 1,
+        identity.server_epoch,
+        identity.tab_generation,
+    );
+    wider["cols"] = serde_json::json!(100);
+    wider["rows"] = serde_json::json!(30);
+    falls_back(&h.socket, wider, "a focused resume at a new grid").await;
+}
+
+/// Away and back (A→B→A): the grid the client resumes at is the one it
+/// left, but the slice holds records written at B.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resize_away_and_back_refuses_the_resume() {
+    let h = harness().await;
+    let (mut client, tab_id, applied, identity) = h.caught_up().await;
+
+    let mut other = h.control().await;
+    resize(&mut other, tab_id, 100, 30).await;
+    feed(&mut client, tab_id, b"ROOST_AT_B\r\n".to_vec()).await;
+    resize(&mut other, tab_id, 80, 24).await;
+    wait_for_dump(&mut client, tab_id, "the resize back", |d| {
+        (d.cols, d.rows) == (80, 24) && d.rows_text.iter().any(|row| row.contains("ROOST_AT_B"))
+    })
+    .await;
+
+    falls_back(
+        &h.socket,
+        h.resume_handshake(
+            tab_id,
+            applied + 1,
+            identity.server_epoch,
+            identity.tab_generation,
+        ),
+        "a resume across a resize away and back",
+    )
+    .await;
+}
+
+/// The positive half: a resize to the grid the tab already has is no
+/// change, and the records after it resume as usual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resize_to_the_same_grid_still_resumes() {
+    let h = harness().await;
+    let (mut client, tab_id, applied, identity) = h.caught_up().await;
+
+    let mut other = h.control().await;
+    resize(&mut other, tab_id, 80, 24).await;
+    feed(&mut client, tab_id, b"ROOST_SAME_GRID\r\n".to_vec()).await;
+    wait_for_dump(&mut client, tab_id, "the output after the resize", |d| {
+        d.rows_text
+            .iter()
+            .any(|row| row.contains("ROOST_SAME_GRID"))
+    })
+    .await;
+
+    let (accepted, mut data) = dial(
+        &h.socket,
+        h.resume_handshake(
+            tab_id,
+            applied + 1,
+            identity.server_epoch,
+            identity.tab_generation,
+        ),
+    )
+    .await
+    .expect("accepted");
+    assert_eq!(accepted.mode, AttachMode::Resume);
+    let (_, replayed) = data.read_pty_until(applied, b"ROOST_SAME_GRID").await;
+    assert_eq!(replayed, b"ROOST_SAME_GRID\r\n");
 }
 
 /// `last_assigned + 1` is a hit, not a miss: the client missed nothing,

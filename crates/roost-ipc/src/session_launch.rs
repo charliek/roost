@@ -58,8 +58,9 @@
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -531,9 +532,11 @@ pub const DEFAULT_VERDICT_BUDGET: Duration = Duration::from_secs(45);
 
 /// How long to poll `session.identify` before declaring that the
 /// verdict lied. The winner of the socket-lock race has already bound
-/// by the time it writes `ready`, so this only ever covers the
-/// `already-running` loser overtaking the winner — microseconds in
-/// practice.
+/// by the time it writes `ready`, so after a verdict this only ever
+/// covers the `already-running` loser overtaking the winner —
+/// microseconds in practice. The UI also spends it once on a
+/// [`LauncherExited`], whose daemon may have been forked and still be
+/// binding.
 pub const DEFAULT_CONFIRM_BUDGET: Duration = Duration::from_secs(10);
 
 /// What came back on the launcher's stdout.
@@ -623,6 +626,91 @@ pub async fn spawn_and_read_verdict(
     first_project: FirstProject,
     budget: Duration,
 ) -> Result<Verdict> {
+    // Inherited: the session tees its startup log there, and a failed
+    // start is far easier to read with it in front of you.
+    launch(
+        bin,
+        cwd,
+        seam,
+        first_project,
+        budget,
+        LauncherStderr::Inherit,
+    )
+    .await
+}
+
+/// [`spawn_and_read_verdict`] for a caller with no terminal to inherit
+/// into — the UI's connect ladder.
+///
+/// Two differences, both about a launcher that dies. Its stderr is kept
+/// as a 4 KiB tail rather than inherited, and a launcher that closes
+/// stdout with no verdict **and exits on its own** within the budget is
+/// reported as a [`LauncherExited`], carrying its status and that tail.
+/// A launcher still alive after its EOF is killed at the deadline and
+/// reported exactly as [`spawn_and_read_verdict`] reports it. Every
+/// verdict and every other failure is the same.
+///
+/// The tail is read concurrently with the verdict, never after it: an
+/// unread stderr pipe fills, and a launcher blocked writing to it never
+/// gets as far as its verdict. It reaches EOF when the launcher exits,
+/// because the daemon a real launcher forks points all of its stdio at
+/// `/dev/null` before it reports.
+pub async fn spawn_and_read_verdict_capturing_stderr(
+    bin: &Path,
+    cwd: &Path,
+    seam: Option<&OsStr>,
+    first_project: FirstProject,
+    budget: Duration,
+) -> Result<Verdict> {
+    launch(bin, cwd, seam, first_project, budget, LauncherStderr::Tail).await
+}
+
+/// A launcher that closed its stdout without a verdict and then exited
+/// on its own: [`spawn_and_read_verdict_capturing_stderr`]'s account of
+/// a session that died on start.
+///
+/// No `io::Error` underneath: the exec succeeded, and a caller that
+/// tells a failed exec from everything else by the presence of one
+/// keeps working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LauncherExited {
+    pub status: ExitStatus,
+    /// The last 4 KiB the launcher wrote to stderr, verbatim.
+    pub stderr: String,
+}
+
+impl std::fmt::Display for LauncherExited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{BIN_NAME} exited before it was ready (")?;
+        match (self.status.code(), self.status.signal()) {
+            (Some(code), _) => write!(f, "exit status {code}")?,
+            (None, Some(signal)) => write!(f, "signal {signal}")?,
+            (None, None) => write!(f, "{}", self.status)?,
+        }
+        write!(f, ")")?;
+        match self.stderr.trim() {
+            "" => Ok(()),
+            tail => write!(f, ": {tail}"),
+        }
+    }
+}
+
+impl std::error::Error for LauncherExited {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LauncherStderr {
+    Inherit,
+    Tail,
+}
+
+async fn launch(
+    bin: &Path,
+    cwd: &Path,
+    seam: Option<&OsStr>,
+    first_project: FirstProject,
+    budget: Duration,
+    stderr: LauncherStderr,
+) -> Result<Verdict> {
     let deadline = Instant::now() + budget;
     let mut command = Command::new(bin);
     command
@@ -630,9 +718,10 @@ pub async fn spawn_and_read_verdict(
         .env(LAUNCH_CWD_ENV, cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        // Inherited: the session tees its startup log there, and a
-        // failed start is far easier to read with it in front of you.
-        .stderr(Stdio::inherit());
+        .stderr(match stderr {
+            LauncherStderr::Inherit => Stdio::inherit(),
+            LauncherStderr::Tail => Stdio::piped(),
+        });
     if let Some(derived) = derived_session_state_dir(seam) {
         // On the app path this line is the only trace of the
         // derivation; `roostctl session start` also says it on stderr.
@@ -665,9 +754,11 @@ pub async fn spawn_and_read_verdict(
         .stdout
         .take()
         .ok_or_else(|| anyhow!("no stdout pipe on the spawned {BIN_NAME}"))?;
+    let tail = (stderr == LauncherStderr::Tail).then(|| crate::ssh::spawn_stderr_tail(&mut child));
 
     let read =
         tokio::time::timeout_at(deadline, read_verdict_line(stdout, MAX_VERDICT_BYTES)).await;
+    let no_verdict = matches!(read, Ok(VerdictRead::Eof));
 
     // One reap for every path, bounded by what is left of the same
     // budget. A launcher still alive at the deadline is killed —
@@ -688,25 +779,41 @@ pub async fn spawn_and_read_verdict(
             budget.as_secs().max(1)
         )),
     };
-    reap_by(&mut child, deadline).await;
-    result
+    let exited = reap_by(&mut child, deadline).await;
+    let Some(tail) = tail else {
+        return result;
+    };
+    match exited {
+        Some(status) if no_verdict => Err(anyhow::Error::new(LauncherExited {
+            status,
+            stderr: drain_tail(tail, deadline).await.text,
+        })),
+        _ => {
+            tail.abort();
+            result
+        }
+    }
 }
 
 /// Wait for the launcher to exit, but no later than `deadline`; kill and
 /// reap it if it outlives that. Never returns a zombie and never
 /// outlives the budget.
 ///
+/// The status comes back only for a child that exited on its own: one
+/// this had to kill says nothing about why it would not stop.
+///
 /// `pub(crate)` for [`crate::ssh`]'s tunnel runtime, which reaps its
 /// `ssh` children under exactly this discipline — the shape of "bounded
 /// wait, then SIGKILL" is not worth having two of.
-pub(crate) async fn reap_by(child: &mut Child, deadline: Instant) {
-    if tokio::time::timeout_at(deadline, child.wait())
-        .await
-        .is_err()
-    {
-        // `kill` is SIGKILL + reap, so the wait behind it is the one
-        // the kernel is about to satisfy.
-        let _ = child.kill().await;
+pub(crate) async fn reap_by(child: &mut Child, deadline: Instant) -> Option<ExitStatus> {
+    match tokio::time::timeout_at(deadline, child.wait()).await {
+        Ok(waited) => waited.ok(),
+        Err(_elapsed) => {
+            // `kill` is SIGKILL + reap, so the wait behind it is the one
+            // the kernel is about to satisfy.
+            let _ = child.kill().await;
+            None
+        }
     }
 }
 
@@ -1304,6 +1411,155 @@ mod tests {
         await_stopped(&socket, "sess-1", DEFAULT_STOP_GONE_BUDGET)
             .await
             .expect("an absent socket is already gone");
+    }
+
+    /// A private directory under `/tmp`: short enough for a socket on
+    /// macOS, whose `temp_dir()` is not.
+    fn short_dir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("r-sl")
+            .tempdir_in("/tmp")
+            .expect("a temp dir under /tmp")
+    }
+
+    /// A launcher that runs `body`, through the committed fixture rather
+    /// than a script written here — see the fixture's header for the
+    /// ETXTBSY race a written script would run.
+    fn fake_launcher(dir: &Path, body: &str) -> PathBuf {
+        let path = dir.join(BIN_NAME);
+        std::fs::write(path.with_extension("conf"), format!("{body}\n")).expect("write the body");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/roosttest/fixtures/fake-roost-session.sh")
+            .canonicalize()
+            .expect("the fake-roost-session fixture must exist");
+        std::os::unix::fs::symlink(fixture, &path).expect("link the fixture");
+        path
+    }
+
+    async fn capture(body: &str, budget: Duration) -> Result<Verdict> {
+        let dir = short_dir();
+        let bin = fake_launcher(dir.path(), body);
+        spawn_and_read_verdict_capturing_stderr(&bin, dir.path(), None, FirstProject::Seed, budget)
+            .await
+    }
+
+    /// Only a child that ended by itself says how; one the budget had to
+    /// kill reports nothing.
+    #[tokio::test]
+    async fn a_reap_reports_the_status_of_a_child_that_ended_on_its_own() {
+        let far = Instant::now() + Duration::from_secs(10);
+        let sh = |script: &str| {
+            Command::new("/bin/sh")
+                .args(["-c", script])
+                .spawn()
+                .expect("spawn /bin/sh")
+        };
+
+        let status = reap_by(&mut sh("exit 3"), far).await.expect("it exited");
+        assert_eq!(status.code(), Some(3));
+
+        let status = reap_by(&mut sh("kill -TERM $$"), far)
+            .await
+            .expect("it was signalled, not killed by the reap");
+        assert_eq!((status.code(), status.signal()), (None, Some(15)));
+
+        let mut hung = sh("exec sleep 30");
+        let status = reap_by(&mut hung, Instant::now() + Duration::from_millis(100)).await;
+        assert_eq!(
+            status, None,
+            "a child the reap killed has no status of its own"
+        );
+        assert!(
+            hung.try_wait().expect("try_wait").is_some(),
+            "and it is reaped"
+        );
+    }
+
+    /// What the UI's band detail is written from.
+    #[test]
+    fn a_launcher_that_exited_says_how_and_what_it_said_last() {
+        let exited = |raw, stderr: &str| LauncherExited {
+            status: ExitStatus::from_raw(raw),
+            stderr: stderr.into(),
+        };
+        assert_eq!(
+            exited(1 << 8, "boom\n").to_string(),
+            "roost-session exited before it was ready (exit status 1): boom"
+        );
+        assert_eq!(
+            exited(11, "").to_string(),
+            "roost-session exited before it was ready (signal 11)"
+        );
+        assert_eq!(
+            exited(0, " \n").to_string(),
+            "roost-session exited before it was ready (exit status 0)"
+        );
+    }
+
+    /// Twice a pipe's 64 KiB of stderr ahead of the verdict. Read after
+    /// the verdict rather than beside it, the launcher blocks on its
+    /// second write and the verdict never comes.
+    #[tokio::test]
+    async fn a_launcher_that_floods_stderr_before_its_verdict_still_gets_read() {
+        let verdict = capture(
+            "head -c 131072 /dev/zero | tr '\\0' x >&2\necho 'ready pid=42'",
+            Duration::from_secs(20),
+        )
+        .await
+        .expect("the verdict is read past the flood");
+        assert_eq!(verdict, Verdict::Ready(42));
+    }
+
+    /// A launcher that dies with no verdict is named by its status, with
+    /// the last 4 KiB it wrote — never an `io::Error`, which is what a
+    /// caller reads as a failed exec.
+    #[tokio::test]
+    async fn a_launcher_that_exits_with_no_verdict_is_reported_with_its_status_and_tail() {
+        let error = capture(
+            "head -c 131072 /dev/zero | tr '\\0' x >&2\necho 'last words' >&2\nexit 7",
+            Duration::from_secs(20),
+        )
+        .await
+        .expect_err("no verdict");
+        let exited = error
+            .downcast_ref::<LauncherExited>()
+            .unwrap_or_else(|| panic!("expected LauncherExited, got {error:#}"));
+        assert_eq!(exited.status.code(), Some(7));
+        assert_eq!(exited.stderr.len(), 4 * 1024, "the tail is capped");
+        assert!(
+            exited.stderr.ends_with("xxlast words\n"),
+            "{:?}",
+            &exited.stderr[4000..]
+        );
+        assert!(!error.chain().any(|cause| cause.is::<std::io::Error>()));
+    }
+
+    /// `roostctl session start`'s path is untouched: stderr inherited,
+    /// and a launcher that exits with no verdict is the same no-verdict
+    /// error it always was.
+    #[tokio::test]
+    async fn the_inheriting_launch_reports_a_missing_verdict_as_it_always_did() {
+        let dir = short_dir();
+        let bin = fake_launcher(dir.path(), "exit 1");
+        let error = spawn_and_read_verdict(
+            &bin,
+            dir.path(),
+            None,
+            FirstProject::Seed,
+            Duration::from_secs(20),
+        )
+        .await
+        .expect_err("no verdict");
+        assert!(
+            error.downcast_ref::<LauncherExited>().is_none(),
+            "{error:#}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("closed its output without a complete readiness line"),
+            "{error:#}"
+        );
     }
 
     /// A listener that never answers `session.identify` is the

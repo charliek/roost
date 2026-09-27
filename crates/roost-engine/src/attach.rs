@@ -61,9 +61,10 @@
 //! between reading one and taking the other.
 //!
 //! Resume is an optimization, never a demand: a stale epoch, a respawned
-//! tab, a seq the ring no longer covers, or a tab task that went away all
-//! fall back to a full snapshot **in the same reply**. A client is told
-//! which it got by `mode`, and never has to handle a resume failure.
+//! tab, a seq the ring no longer covers, a grid change since that seq, or
+//! a tab task that went away all fall back to a full snapshot **in the
+//! same reply**. A client is told which it got by `mode`, and never has
+//! to handle a resume failure.
 
 use std::time::{Duration, Instant};
 
@@ -468,9 +469,10 @@ fn generation_holds(h: &IpcHandler, tab_id: i64, served: u64, admitted: u64) -> 
 
 /// The resume handoff (D6), or `None` for every reason it cannot be
 /// honored — a stale epoch, a respawned tab, a seq outside the ring, a
-/// tab task that is gone. Never an error: the caller serves a full
-/// snapshot instead, in the same reply, and a client that has been away
-/// too long simply pays for a snapshot rather than being told off.
+/// grid change inside the slice, a tab task that is gone. Never an
+/// error: the caller serves a full snapshot instead, in the same reply,
+/// and a client that has been away too long simply pays for a snapshot
+/// rather than being told off.
 ///
 /// Nothing here subscribes to the tee. The whole point is that the ring
 /// slice and the subscription come back from one turn of the tab task
@@ -545,12 +547,9 @@ async fn resume_tab(
         tab_generation: resumed.tab_generation,
         snapshot: Vec::new(),
         // The tab's size at the handoff, cut from the same turn of the
-        // task as the ring slice: a client that was away can have had
-        // the shared geometry changed under it by whoever kept typing,
-        // and replaying those records into the terminal it kept at the
-        // old width wraps every line and misplaces every absolute cursor
-        // move. Read here rather than after the await — a resize landing
-        // in between would describe records this reply does not carry.
+        // task as the ring slice. Read here rather than after the await —
+        // a resize landing in between would describe records this reply
+        // does not carry.
         reported_size: (resumed.cols, resumed.rows),
         ready_end: 0,
         terminator: false,

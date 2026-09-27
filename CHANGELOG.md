@@ -15,13 +15,15 @@ release workflow asserts they agree).
 
 - **`tab.open` takes `cwd_from_tab`, to open a tab where another one is
   (plan 070)** — the server starts the new tab in the named tab's
-  working directory: its direct PTY child's cwd first, then its OSC
-  7-tracked cwd, each only if it is a directory on the server's own
-  machine. A resolved cwd replaces `cwd`; nothing resolving is not an
-  error, and `cwd` is used as sent. Unset, the request is the bytes it
-  always was. Served by sessions, Roost-Iced's UI socket and the Swift
-  Mac app; servers that predate the field answer `unknown-field`. No
-  CLI flag yet. See [`ipc.md#tabopen`](docs/reference/ipc.md#tabopen).
+  working directory: its foreground job's cwd (#534, below), then its
+  direct PTY child's, then its OSC 7-tracked cwd, each only if it is a
+  directory on the server's own machine. A resolved cwd replaces `cwd`;
+  nothing resolving is not an error, and `cwd` is used as sent. Unset,
+  the request is the bytes it always was. Served by sessions,
+  Roost-Iced's UI socket and the Swift Mac app; servers that predate
+  the field answer `unknown-field`. `roostctl tab open --cwd-from-tab`
+  and `--here` spell it (#536, below). See
+  [`ipc.md#tabopen`](docs/reference/ipc.md#tabopen).
 - **A session-backed project remembers the tab you last viewed in it
   (#547)** — on the local session a fresh Roost-Iced install runs its tabs
   on, and on every saved host: a project click, ⌘1–9, the fallback when
@@ -39,9 +41,126 @@ release workflow asserts they agree).
   plan 070 entry above describes. Both decode as the Rust endpoints do,
   so `tab open --no-activate` works against `Roost.app` instead of
   answering `unknown-field`.
+- **`app.notice_dump` reads what the window is telling you (plan 072)** —
+  a new read-only op on Roost-Iced's UI socket that returns the notice
+  drawn in the terminal area (today, "The session on … ended." over a
+  frame whose session stopped, with its button) and the bottom-right
+  line (the five-second toast, or a standing failure to save), as the
+  strings on screen. Nothing on screen changes. The Swift Mac app answers
+  `unknown-op`. See [`ipc.md#appnotice_dump`](docs/reference/ipc.md#appnotice_dump).
+- **The window says when its local session can't start, and offers the
+  way out (#520)** — under `local-backend = session` (a fresh
+  Roost-Iced install's default), a session that cannot be started no
+  longer leaves an empty window with only a band line to explain it. The
+  terminal area says "Roost couldn't start its local session.", names
+  the reason and the log that has the rest, and offers **Try again** and
+  **Use in-process tabs**, which raises the usual confirm card. Nothing
+  switches on its own. The band's reason is cut to one line with an
+  ellipsis instead of wrapping over the sidebar, and a local-backend
+  switch that succeeds reports it in the normal text colour rather than
+  the error red. `app.notice_dump` reports the notice as
+  `local_session_cannot_start`.
+- **Keys typed while a new tab opens land in it (#562)** — in Roost-Iced,
+  what you type right after Alt+T (⌘T on macOS), the tab strip's "+", the
+  palette's New Tab, ⌘N or "+ New Project" is kept until the new tab can
+  take it, then typed there, instead of the first few keys going to the
+  tab you left — which on a session-backed or remote project split a
+  command between the two. If the tab doesn't open, or you move to
+  another tab first, the bottom line says how many keys weren't sent.
+  A paste in that moment is refused with "the new tab isn't ready yet".
+  A test-mode `app.key_event` op presses a key in the window
+  ([`ipc.md#appkey_event`](docs/reference/ipc.md#appkey_event-test-only-gated));
+  the Swift Mac app, which already kept these keys, answers it
+  `unknown-op`.
+- **`roostctl` inside a local session tab talks to its window (#561)** —
+  a tab on the local session a fresh Roost-Iced install runs its tabs on
+  gets the session's socket as `ROOST_SOCKET`, so until now `roostctl`
+  there reached the session: `palette`, `screenshot`, `host`, `agent set`
+  and `tab send-file` failed, and `tab focus`, `tab open` and
+  `open --focus` exited 0 without moving the window. It now sends the
+  command to the window that owns the session, as from a plain terminal —
+  `rpc`, `identify` and `doctor` included. The hooks, `events`, `wait` and
+  `tab prompt` stay on the session, so they work with the window closed.
+  `--socket` or `--target` keeps a command on the socket it names; with
+  no window running, or on an in-process or remote tab, nothing changes;
+  two windows on one session exit 2 `usage`. Finding the window costs one
+  `identify` per running window, at most 500 ms each, and only in a local
+  session tab. See
+  [`cli.md#inside-a-session-tab`](docs/reference/cli.md#inside-a-session-tab).
+- **`roostctl tab open` gets a spelling for `cwd_from_tab` (#536)** —
+  `--cwd-from-tab <id>` starts the new tab where that tab's working
+  directory is; `--here` does the same for `$ROOST_TAB_ID`, accepted only
+  with no explicit `--socket`/`--target` naming another target (inside a
+  local session tab too, which still reaches the window that owns it).
+  Omitted, the wire field stays absent, not `null`; a host tab
+  (`h<host>.<id>`) is refused, and a server that predates the field
+  answers `unknown-field`, same as `--no-activate`. See
+  [`cli.md#tab-open-close-send-resize-reorder-dump`](docs/reference/cli.md#tab-open-close-send-resize-reorder-dump).
 
 ### Fixed
 
+- **A local session that dies on start is named, and no longer retried
+  forever (#520)** — when `roost-session` exits before it is ready, the
+  local band now reads "roost-session exited early (status N)", or
+  "(signal N)" for a crash, instead of "no session is running", and
+  `roostctl host status` shows the exit and the last 4 KiB it wrote to
+  stderr; Roost logs it once and stops dialling until ↻ Reconnect. The
+  **Use in-process local tabs** row and its confirm card no longer claim
+  the session "keeps running" when it isn't, and switching away from a
+  session that never started forgets its dead `localhost` host. A switch
+  back to in-process no longer leaves its journal behind for the next
+  launch to warn about. `roost-session start`'s own output is unchanged.
+- **The window was blank after the local session came back (#525)** —
+  under `local-backend = session`, when the session a fresh Roost-Iced
+  install runs its tabs on was stopped or killed and then reconnected,
+  the window selected nothing until a row was clicked. It now lands on
+  the tab you were last viewing, found by its position in the project,
+  as a relaunch does.
+- **A new tab opened from a nested shell started in the outer shell's
+  directory (#534)** — ⌘T / Alt+T, the launcher, and `tab.open`'s
+  `cwd_from_tab` read the directory of the tab's foreground job instead
+  of the shell Roost started, so after `bash`, `nix develop` or another
+  interactive shell `cd`s, the new tab opens there. A foreground program
+  that changes its own directory moves it too (`git` under its pager
+  reads as the repository root). A tmux pane is still not seen: the job
+  is the tmux client, which stays where it started. A job that can't be
+  read (`sudo -s`) or whose directory is gone falls back to the shell's
+  directory, then to the OSC 7-tracked one, as before. Roost-Iced
+  in-process, the Swift Mac app, and every `roost-session`; a session
+  already running picks this up when it restarts. See
+  [cwd tracking](docs/guides/cwd-tracking.md).
+- **Mac: a tab whose shell exited at once could leave its output reader
+  on a reused descriptor (#557)** — the Swift Mac app closed a tab's PTY
+  while its reader could still run, so, rarely, the next tab or socket
+  given the same descriptor number could lose bytes to it. The PTY now
+  closes only once its reader has stopped.
+- **A directory name with a control byte cut the tab title short and
+  leaked live escape sequences to the terminal, and a hand-rolled
+  `__roost_title`/`__roost_osc7`/`__roost_marks` in `~/.bashrc` or
+  `~/.zshrc` was silently overwritten by the Mac app's shell integration
+  (#554, #193)** — `__roost_title` now replaces each control byte in the
+  title with `?`, in all four shipped shell-integration copies (Rust
+  bash/zsh, Mac bash/zsh); a title needs no `%`-encoding, unlike OSC 7's
+  cwd payload. The Mac copies now also skip redefining a function the
+  user already defined under the same name, matching the Rust copies —
+  closing #193 on macOS too.
+- **A failed open, close or upload on the local session's slot could say
+  "the host" instead of "the local session" (#555)** — a `tab.open`,
+  `project.create`, `tab.close`, `project.delete` refusal, or a failed
+  paste upload, on the slot a fresh Roost-Iced install runs its local
+  tabs on, now reads as local, matching the title and the other banners
+  plan 071 already localized. A real, saved host's wording is unchanged.
+- **The agents palette tagged the local session's rows "localhost"
+  (#567)** — its rows now carry no host label, like the in-process
+  source. A real host the user actually named "localhost" under
+  in-process mode keeps its own label.
+- **A write that raced a clean exit's final flush could still land on
+  disk afterward (#553)** — `Workspace::flush` now holds its write and
+  the freeze that follows it under the same lock, so a write already
+  past the freeze check and waiting on that lock sees the freeze the
+  instant it gets in, instead of a window where it could land right
+  after "the last write". The settle-in-`Drop` parts of #553 are
+  unchanged and stay open.
 - **A new tab on a session-backed project could take the window away
   from a tab you clicked while it opened, and one that never appeared
   was dropped silently (#549)** — on the local session and on saved
@@ -186,6 +305,68 @@ release workflow asserts they agree).
   says where the shell started, as on Roost-Iced. A directory that exists
   but can't be entered now fails the shell's start and the tab closes, as
   on Linux, instead of the shell running on in the launch directory.
+- **Mac: ⌘T and `cwd_from_tab` could pick different directories (#556)**
+  — ⌘T, the launcher and providers now resolve the new-tab cwd through
+  the same `LocalClient.inheritedCwd(tabID:)` rule `tab.open`'s
+  `cwd_from_tab` uses, instead of a second rule with no directory
+  check. A stale project cwd with no live directory to inherit now
+  falls through to `$HOME`, as intended, instead of landing in a
+  directory that no longer exists. ⌘1–9 and the Window menu no longer
+  reveal a hidden sidebar when switching projects, matching Roost-Iced
+  and 071's ruling that opening a tab never expands it.
+- **Coming back to a session tab after a window resize or a font-size
+  change could replay what it missed at the old width (#564)** — on the
+  local session and on saved hosts, a tab you leave keeps its screen, and
+  coming back replays only the output written while you were away. That
+  output was written for the width the tab had when you left, so after
+  the window, the sidebar or the font changed the width, cursor-placed
+  text and right-aligned prompts landed in the wrong columns, on the
+  primary screen and in scrollback, until something redrew them. A tab
+  whose grid changed while you were on it, while you were away, or while
+  it was still reconnecting, now comes back from a fresh copy of the
+  session's screen. The window's half of the fix works against every
+  `roost-session`. The session's half — it also refuses to replay across
+  a resize another window made — reaches a `roost-session` that was
+  already running only after it restarts.
+- **Session tabs the window wasn't showing kept the size they started at,
+  and a font-size change never reached the shown one's shell (#563)** —
+  on the local session, a tab you weren't looking at ran at 80×24 when
+  `roostctl tab open` made it, or 120×40 when the session did, until you
+  showed it, so programs in it drew for a terminal that wasn't there and
+  `roostctl tab dump` read them at that width. After a font-size change
+  the window drew the shown tab at its new size while the shell in it
+  kept the old one, on the local session and on saved hosts alike. Every
+  local-session tab now follows the window's grid, shown or not: when a
+  window or sidebar resize settles, on a font-size change, when the
+  window connects to the session, and when a tab it opened or `roostctl`
+  opened through it appears. Background programs there now get a resize
+  signal at those moments, as in-process tabs always have. A font-size
+  change now reaches the shown tab's shell on every host. The background
+  tabs of a remote host still keep their size until shown (#568).
+- **An in-process project forgot the tab you last viewed in it across a
+  relaunch (#565)** — under `local-backend = in-process`, Roost-Iced
+  reopened every project on its last tab, and the Mac app kept the memory
+  only while it ran, so after a relaunch a project click, ⌘1–9 and the
+  fallback when the shown project's last tab closes landed on some other
+  tab than the one you were last looking at. On both apps, each project's
+  last-viewed tab is now saved in `state.json` by its position and
+  restored with the layout; if that tab fails to reopen, the project
+  stays on the tab the restore ended on rather than the one after it. On
+  the Mac, that fallback also landed on the neighbouring project's first
+  tab even without a relaunch; it now lands on the one it remembers, as
+  on Roost-Iced. A `roost-session` restores its own projects' memory the
+  same way; one started by an older Roost, still running after an
+  upgrade, does so only after it restarts.
+- **Restoring a tab whose directory can't be entered deleted its project
+  (#559)** — on both apps, a saved tab whose directory still exists but
+  that the shell can no longer enter (mode 000, or a permission change
+  since the last run) failed to start at a relaunch and closed, and when
+  it was its project's only tab the project was deleted with it, for
+  good and without a word. A restored tab now starts in its project's
+  directory instead, else in `$HOME`. Opening a tab in such a directory
+  still fails, as before. A `roost-session` restores its own layout the
+  same way; one started by an older Roost, still running after an
+  upgrade, does so only after it restarts.
 
 ## v0.0.20 — 2026-09-20
 

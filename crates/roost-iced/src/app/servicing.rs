@@ -392,7 +392,8 @@ pub(crate) const ATTACH_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 /// counter with the timer, so a burst of workspace events could otherwise
 /// spend forty attempts in milliseconds and give up inside the very race
 /// this waits out. Giving up needs both halves.
-const ATTACH_RETRY_WINDOW: Duration = ATTACH_RETRY_INTERVAL.saturating_mul(ATTACH_RETRY_LIMIT);
+pub(super) const ATTACH_RETRY_WINDOW: Duration =
+    ATTACH_RETRY_INTERVAL.saturating_mul(ATTACH_RETRY_LIMIT);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AttachRetryVerdict {
@@ -1215,6 +1216,7 @@ impl App {
         self.resolve_pending_host_selection();
         let focused = self.resolve_awaited_listings();
         self.reconcile_host_selection();
+        self.reconcile_background_resize();
         // After selection resolution, not before it (plan 071 D15): the
         // active checkmark reads `active_project_key`/`active_tab_key`,
         // and syncing on the pre-resolution reads left a relaunch or an
@@ -1285,6 +1287,8 @@ impl App {
             }
             self.attach_tab_tracked(*key, now);
         }
+        // After the selection and the attaches: its rules read both.
+        self.settle_pending_keyboard();
         // Last, so the frame the next close walks is the one this
         // reconcile settled on, with whatever the clauses above did to
         // the rows and to the selection already in it.
@@ -1609,6 +1613,7 @@ impl App {
             }
         }
         self.host_attach.insert(key, attach);
+        self.background_resize.attached(key);
         self.host_begin_attach(key);
     }
 
@@ -1623,12 +1628,24 @@ impl App {
         }
     }
 
+    /// The attached host tabs' sessions follow the window's grid too —
+    /// the machine decides when (immediately while live; withheld during
+    /// hydration, where a mid-snapshot resize forfeits history).
+    pub(super) fn note_host_grid(&mut self, (cols, rows): (u16, u16)) {
+        let geometry = self.host_geometry(cols, rows);
+        for attach in self.host_attach.values_mut() {
+            attach.note_resize(geometry);
+        }
+    }
+
     /// Detach a host tab (focus moved away, or its stream told us to let
     /// go). The rendering state survives in `tabs` — disconnect is not
     /// stop, and refocus resumes from the point saved here.
     pub(super) fn host_detach_tab(&mut self, key: TabKey) {
         if let Some(attach) = self.host_attach.remove(&key) {
-            if let Some(resume) = attach.detach() {
+            self.background_resize.detached(key, Instant::now());
+            let kept = self.tabs.get(&key).map(TerminalTab::grid);
+            if let Some(resume) = attach.detach(kept) {
                 self.host_resume.insert(key, resume);
             }
         }
@@ -1666,6 +1683,7 @@ impl App {
         {
             self.pending_host_selection = None;
         }
+        self.pending_keyboard_host_gone(incarnation);
         self.awaiting_listing.purge(incarnation);
     }
 
@@ -1761,6 +1779,9 @@ impl App {
                 self.host_drop_tab(key);
             }
         }
+        if self.pending_keyboard.target() == Some(key) {
+            self.settle_pending_keyboard();
+        }
     }
 
     /// Route one host batch's per-commit envelopes to the surfaces that
@@ -1805,6 +1826,7 @@ impl App {
                     self.notification_inbox.remove(tab);
                     self.desktop_notifications.retire(tab);
                     self.awaiting_listing.closed(tab);
+                    self.background_resize.closed(tab);
                     if self
                         .pending_host_selection
                         .is_some_and(|pending| pending.tab == tab)
@@ -2038,6 +2060,7 @@ impl App {
                 // emits its first bytes.
                 refresh_or_warn(tab_id, &mut tab, "newly attached tab");
                 self.tabs.insert(key, tab);
+                self.settle_pending_keyboard();
                 true
             }
             Ok(None) => {
@@ -2240,6 +2263,7 @@ impl App {
                             // 063 §D12). Drained on the edge, so it is
                             // spent exactly once per connect.
                             task = task.then(self.settle_connect_purpose(host));
+                            self.rearm_initial_local_selection(host);
                         } else {
                             // #481. Kept while the ladder is still
                             // climbing — see `retire_host_durability`.
@@ -2963,6 +2987,29 @@ impl App {
         }
     }
 
+    /// What the switch to in-process may say about the session it leaves
+    /// behind (plan 072 D7a): the palette row, the confirm card and the
+    /// un-save of a slot that never connected all read this one answer.
+    ///
+    /// A build mismatch counts as answering: a session is running there,
+    /// only not one this build can attach to.
+    pub(super) fn local_slot_history(&self) -> roost_ui_model::host_verbs::SlotHistory {
+        use roost_ui_model::host_verbs::SlotHistory;
+        let Some(view) = self.local_slot_view() else {
+            return SlotHistory::NeverConnected;
+        };
+        if matches!(
+            view.state,
+            host_sidebar::SectionState::Connected | host_sidebar::SectionState::NeedsRestart
+        ) {
+            return SlotHistory::Connected;
+        }
+        match self.saved_host(&view.saved_id) {
+            Ok(host) if host.last_connected.is_some() => SlotHistory::ConnectedBefore,
+            _ => SlotHistory::NeverConnected,
+        }
+    }
+
     /// **The only seam that resolves "the local target"** (plan 063
     /// §D3): the in-process workspace under `in-process`, the slot's
     /// live incarnation under `session`, and `None` when the slot is not
@@ -2984,9 +3031,12 @@ impl App {
     /// the mode-aware seam there would answer `HostId::LOCAL` — the
     /// workspace it is migrating *away* from.
     pub(super) fn connected_slot_host(&self) -> Option<HostId> {
+        self.connected_slot_view().map(|view| view.host)
+    }
+
+    pub(super) fn connected_slot_view(&self) -> Option<&super::HostView> {
         self.local_slot_view()
             .filter(|view| view.state.interactive())
-            .map(|view| view.host)
     }
 
     /// Whether `host` is the session slot — the fact [`title_host`] and
@@ -3308,7 +3358,8 @@ impl App {
                         | KeyboardRoute::Confirm
                         | KeyboardRoute::HostDialog
                         | KeyboardRoute::Editor
-                        | KeyboardRoute::Palette => Err(format!(
+                        | KeyboardRoute::Palette
+                        | KeyboardRoute::Pending => Err(format!(
                             "tab {tab_id} is not the active terminal \
                                  (keyboard route is not a terminal)"
                         )),
@@ -3476,6 +3527,46 @@ impl App {
                 let _ = reply.send(match result {
                     Ok(button) => {
                         task = task.then(button);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                });
+            }
+            UiRequest::AppNoticeDump { reply } => {
+                let _ = reply.send(Ok(self.notice_dump()));
+            }
+            UiRequest::AppNoticeAnswer {
+                kind,
+                subject,
+                generation,
+                action,
+                reply,
+            } => {
+                let result = if self.test_mode {
+                    self.notice_answer(&kind, &subject, generation, &action)
+                        .map_err(|message| HostOpFailure::new(codes::NOT_FOUND, message))
+                } else {
+                    Err(HostOpFailure::new(
+                        codes::NOT_ENABLED,
+                        "ROOST_TEST_MODE=1 is required",
+                    ))
+                };
+                let _ = reply.send(result);
+            }
+            UiRequest::AppKeyEvent {
+                key,
+                text,
+                modifiers,
+                reply,
+            } => {
+                let result = if !self.test_mode {
+                    Err("ROOST_TEST_MODE=1 is required".into())
+                } else {
+                    crate::input::synthetic_press(&key, text.as_deref(), &modifiers)
+                };
+                let _ = reply.send(match result {
+                    Ok(event) => {
+                        task = task.then(self.keyboard(event));
                         Ok(())
                     }
                     Err(error) => Err(error),
@@ -6399,7 +6490,7 @@ mod tests {
             .expect("apply a width-only geometry change")
             .expect("cols moved, so this is a real geometry change");
         assert!(
-            change.grid_changed,
+            change.grid_changed(),
             "cols moved, so the grid-changed flag must fire even though rows did not"
         );
         tab.commit_geometry(change);

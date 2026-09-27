@@ -368,7 +368,8 @@ mod tests {
             panic!("{argv:?} is not a tab prompt")
         };
         let selector = fake.selector();
-        let mut ui = UiSocket::new(&selector);
+        let environment = crate::window::Environment::default();
+        let mut ui = UiSocket::new(&selector, &environment, false);
         bounded(submit(&mut ui, args, TAB)).await
     }
 
@@ -376,7 +377,7 @@ mod tests {
     /// policy, the argument refusals, and the exit code.
     async fn exit(fake: &Fake, argv: &[&str], tab_env: Option<&str>) -> Result<i32, CliError> {
         let args = parse(&fake.socket(), argv);
-        bounded(crate::run(args, tab_env, None)).await
+        bounded(crate::run(args, tab_env, None, &Default::default())).await
     }
 
     fn refused(error: &CliError) -> (i32, &str) {

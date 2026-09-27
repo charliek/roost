@@ -52,12 +52,44 @@ directly and ignore `--target` / `--socket` / `ROOST_BUNDLE_PROFILE` entirely (s
 [`session` subcommands](#session-subcommands)). Any other op reaches a running session only
 explicitly — `--target session` or `--socket <path>` (#475) — never by `ROOST_BUNDLE_PROFILE`
 (`session` is refused there like any other unrecognized value) or auto-detect (a session is
-never a candidate). An op the session does not serve fails with the server's own error for
+never a candidate); from inside a session tab, only the verbs that
+[stay on it](#inside-a-session-tab) do. An op the session does not serve fails with the server's own error for
 that op — `unknown-op` for `host.*` and `agent.set_hooks`, `internal: no UI attached` for
 `app.*` window/UI ops (`app.activate` alone answers `{}` and does nothing) — not a session-specific one; see
 [`ipc.md`](ipc.md#session-sockets) for the wire-level contract and
 [`identify`](ipc.md#identify) / [`session.identify`](ipc.md#sessionidentify) for what each
 socket serves.
+
+### Inside a session tab
+
+Under `local-backend = session`, a fresh install's default, a local tab's shell runs on the
+`roost-session`, so its `ROOST_SOCKET` names that session rather than the window. When
+`ROOST_SOCKET` picked the socket and neither `--socket` nor `--target` was given, `roostctl`
+asks each running window which local session it owns and sends the verb to the window that
+owns this one. It asks with one `identify` per window, each allowed 500 ms; a window that
+hasn't answered by then owns nothing. So `palette`, `screenshot`, `host`, `agent set`,
+`tab send-file`, `tab focus`, `tab open` and `open` (which select the new tab in the window),
+`rpc`, `identify` and [`doctor`](#doctor) behave there exactly as they do from a plain
+terminal outside Roost. Tab ids need no translating: a bare id on the window's socket
+already means the session's.
+
+Five verbs stay on the session:
+
+- `agent-hook` and `claude-hook`, which have to report with the window closed;
+- `events`, `wait` and `tab prompt`, which read the session's own event stream.
+
+`session start|stop|status` never read `ROOST_SOCKET` at all (see
+[`session` subcommands](#session-subcommands)). Everything else is unchanged:
+
+- **`--socket` or `--target` given:** the socket named is the socket dialled, so
+  `--socket "$ROOST_SOCKET"` reaches the session itself.
+- **No running window owns the session** (it is closed, or runs its tabs in-process): the
+  verb reaches the session, as before.
+- **A tab of an in-process window, or of a remote host:** its `ROOST_SOCKET` is not this
+  machine's local session, so no window is asked anything. Reaching a remote tab's window is
+  #560.
+- **Two windows own the session** (a development setup): `roostctl` exits 2 `usage`, naming
+  both sockets. Pass `--socket`.
 
 ### JSON output
 
@@ -366,6 +398,8 @@ roostctl tab open --project-id 1 -- htop                       # run a command i
 roostctl tab open --project-id 1 --hold -- make test           # keep the tab open after it exits
 roostctl tab open --project-id 1 --after-tab 5 --focus -- vim   # next to tab 5, then focus it
 roostctl tab open --project-id 1 --no-activate -- make test     # open it without selecting it
+roostctl tab open --project-id 1 --cwd-from-tab 5 -- vim         # start where tab 5's cwd is
+roostctl tab open --project-id 1 --here -- vim                   # start where $ROOST_TAB_ID's cwd is
 roostctl tab close --tab 5
 roostctl tab send --tab 5 --bytes 'ls -la\n'
 roostctl tab resize --tab 5 --cols 120 --rows 40
@@ -382,8 +416,10 @@ roostctl tab dump --tab 5 --scrollback 200   # 200 rows of history, then the vie
 | `-- <cmd…>` | Run this command in the tab. The tab **closes when the command exits** (hold=false) — standard terminal behavior. |
 | `--hold` | Keep the tab open after the command exits, dropping to an interactive shell (mirrors `command = … hold=true`). Only meaningful with a command. |
 | `--after-tab <id>` | Place the new tab immediately after that tab (same project) instead of at the end. Best-effort: if that tab is gone by the time the reorder lands, the new tab stays at the end. |
-| `--focus` | Focus (activate) the new tab after opening. Under `local-backend = session` the focus waits, on the UI socket, for the window to list the new tab rather than answering `not-found`. |
+| `--focus` | Focus (activate) the new tab after opening. Under `local-backend = session` the focus waits, on the UI socket, for the window to list the new tab rather than answering `not-found` — from inside a session tab too, which [dials the window](#inside-a-session-tab). |
 | `--no-activate` | Open the tab without selecting it: the active project and tab stay where they were (`tab.open`'s `activate: false`). Without it, opening a tab selects it. Refused beside `--focus` (exit 2 `usage`). A server that predates the field — `Roost.app` through v0.0.20 among them — answers `unknown-field`, which is reported verbatim; nothing retries without the flag. |
+| `--cwd-from-tab <id>` | Start the new tab where that tab's working directory is, when the server can resolve one (`tab.open`'s `cwd_from_tab`; see [ipc.md](ipc.md)). Omitted ⇒ the field is absent on the wire, not sent as `null`. A host tab (`h<host>.<id>`) is refused: `cwd_from_tab` never crosses a host. A server that predates the field answers `unknown-field`, same as `--no-activate`. Refused beside `--here`. |
+| `--here` | `--cwd-from-tab $ROOST_TAB_ID`: start where the calling tab already is. Only accepted with no explicit `--socket`/`--target` naming another target — `$ROOST_TAB_ID` is otherwise not necessarily this call's own id space — including from inside a session tab, which still [dials the window](#inside-a-session-tab) that owns it. Anything else is exit 2 `usage`. Refused beside `--cwd-from-tab`. |
 
 These compose: `--after-tab X --focus -- <cmd>` is the "open a command in a tab right here and switch to it" primitive that providers and other scripts use. (`--after-tab`/`--focus` are CLI orchestration over `tab.reorder` / `tab.focus`; `-- <cmd>` fills the `tab.open` op's `argv` — see [ipc.md](ipc.md).)
 
@@ -916,9 +952,10 @@ echo '{"tab_id":"4","data":"bHM="}' | roostctl rpc tab.write -   # params from s
 
 See [ipc.md](ipc.md#operations) for op names and their params, and
 `roostctl identify --json`'s `ops` field for exactly which ops the Roost
-this socket reaches serves right now. `rpc` never re-routes: under
-`local-backend = session` a raw op goes to the socket you dialled, not to
-the session that [`tab dump`](#tab-open-close-send-resize-reorder-dump),
+this socket reaches serves right now. `rpc` never re-routes an op: under
+`local-backend = session` a raw op goes to the socket `roostctl` dialled —
+from inside a session tab, [the window that owns it](#inside-a-session-tab)
+— not to the session that [`tab dump`](#tab-open-close-send-resize-reorder-dump),
 [`wait`](#wait) and [`events`](#events) read from.
 
 `rpc` is always JSON, with or without `--json` on the command line: the
@@ -994,6 +1031,10 @@ roostctl doctor --color=always
 | `--json` | flag | `false` | Machine-readable report (the global flag; see [JSON output](#json-output)) |
 | `-v` / `--verbose` | flag | `false` | Print the full per-check report — all 39 entries with details and doc links — instead of the one-line-per-section summary. Ignored by `--json`, which always carries everything |
 | `--color` | `auto` \| `always` \| `never` | `auto` | Colorize the text output. `auto` enables color only when stdout is a TTY, `NO_COLOR` is unset **or empty**, and `TERM` is not `dumb`; `always` bypasses all three checks; `never` always disables. Per <https://no-color.org/>, `NO_COLOR=` (present but empty) does **not** disable — only a non-empty value does. Ignored by `--json` |
+
+Doctor diagnoses the Roost any other verb would dial: from inside a local
+session tab, that is the window that owns the session, and `ui.target` names
+both ([Inside a session tab](#inside-a-session-tab)).
 
 The report is six sections. Each declares one of three scopes: **process**
 (the shell/process that invoked doctor), **ui** (the Roost instance doctor
@@ -1147,7 +1188,7 @@ flag.
 
 | Variable | Effect |
 |---|---|
-| `ROOST_SOCKET` | Override the UI socket the CLI dials |
+| `ROOST_SOCKET` | Override the UI socket the CLI dials. In a local session tab it names the session, and a verb goes to the window that owns it instead ([Inside a session tab](#inside-a-session-tab)) |
 | `ROOST_TAB_ID` | Default tab id when `--tab` is not given. A command that changes a tab refuses without one of the two ([why](#which-tab-a-command-acts-on)) |
 | `ROOST_ROOSTCTL` | Set by the UI for provider scripts: absolute path to its own `roostctl`. Best-effort — may be absent if the UI can't resolve its bundled/sibling CLI, so scripts keep the `"${ROOST_ROOSTCTL:-roostctl}"` fallback (see [Where `roostctl` lives](#where-roostctl-lives)) |
 | `ROOST_AGENT_HOOK` | Set by the UI (or `roost-session`) on every tab: absolute path of the `roostctl` (or `roost-session`) that understands `agent-hook <agent>`. Every hook entry Roost installs into an agent's config reads this indirectly through a shell fallback rather than calling `roostctl` directly, which is what keeps the installed command host-independent — see [Agent Hooks](../guides/agents.md#inert-outside-roost). Resolved the same sibling → bundled-`Resources/bin` → `PATH` ladder as `ROOST_ROOSTCTL`; omitted, like that variable, when nothing resolves |

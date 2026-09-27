@@ -1,7 +1,9 @@
 #!/bin/sh
 # A stand-in `roost-session` for the launcher tests — the seven lifecycle
-# cases in `crates/roost-cli/src/session.rs` and the state-dir seam in
-# `crates/roost-ipc/tests/session_launch_state_dir_test.rs`.
+# cases in `crates/roost-cli/src/session.rs`, the state-dir seam in
+# `crates/roost-ipc/tests/session_launch_state_dir_test.rs`, the stderr
+# tail in `crates/roost-ipc/src/session_launch.rs`, and the launchers that
+# die on start in `crates/roost-iced/src/host_conn/task.rs`.
 #
 # It has no behaviour of its own. A test symlinks this file to
 # `<dir>/roost-session` and writes what the launcher should do — print a

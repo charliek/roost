@@ -293,6 +293,11 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ("app.dialog_dump", OpClass::UiOwned),
     ("app.dialog_answer", OpClass::UiOwned),
     ("app.keybind_dispatch", OpClass::UiOwned),
+    // What this window is saying, and a press on it.
+    ("app.notice_dump", OpClass::UiOwned),
+    ("app.notice_answer", OpClass::UiOwned),
+    // A key press into this window — whatever owns its keyboard.
+    ("app.key_event", OpClass::UiOwned),
     // Sets *this* machine's own `agent-hooks` key and raises every
     // connected host to match — a property of this UI's config and its
     // host registry, neither of which the slot has any view of.
@@ -659,6 +664,9 @@ mod tests {
             "app.render_stats",
             "window.resize",
             "app.sidebar_dump",
+            "app.notice_dump",
+            "app.notice_answer",
+            "app.key_event",
         ] {
             assert_eq!(classify(op), Some(OpClass::UiOwned), "{op}");
         }

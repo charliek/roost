@@ -1,153 +1,39 @@
 //! Turn the saved layout in `state.json` back into live tabs.
 //!
-//! This is the same bootstrap contract every Roost front end honours,
-//! stated once more without a toolkit: the persisted layout is
-//! `{title, cwd, position, user_titled}` per tab and nothing else, so a
-//! restore re-opens each saved tab **as a fresh shell in its directory**.
-//! No process survives a restart, no scrollback does, and the session
-//! never pretends otherwise.
+//! The restore itself is the engine's, shared with the UI's own launch
+//! ([`roost_engine::hydrate`]). Every open passes an explicit directory,
+//! so the daemon's own cwd (`/`, after `daemonize` moves it there) never
+//! reaches a PTY.
 //!
-//! Three things it must get right, all of which a UI also gets right:
+//! What is the session's own is how it asks:
 //!
-//! * The layout is a one-shot. `take_restore_layout` drains it, and the
-//!   live tab map is built from the shells this function opens — the
-//!   descriptors are never inserted as rows themselves.
-//! * A manual rename outlives the restart. `user_titled` re-asserts the
-//!   title lock, so a post-relaunch `cd` does not silently re-derive the
-//!   name from the new cwd.
-//! * The active selection is restored by *position*, not by id: the ids
-//!   in the file belong to the previous run's tabs, which no longer
-//!   exist.
-//!
-//! A first-ever start seeds its project the same way every UI does: an
-//! empty name (the engine names it `Untitled 1`) at `$HOME`. The daemon's
-//! own cwd (`/`, after `daemonize` moves it there) must never reach a
-//! PTY, which is why every open below passes an explicit directory.
-//!
-//! The one exception is [`FirstProject::Withheld`] — the spawn a
-//! local-backend switch performs for its destination (plan 063 §D8
-//! phase 1). That session is about to be handed a whole layout, and a
-//! project it seeded first would sit beside the migrated one as a stray
-//! the user never asked for. It arrives as a hint from the *starter*,
-//! decided before the fork: nothing after hydrate can tell a pristine
-//! seed from a project somebody made, so a guess here would have to be
-//! a heuristic and this is not one.
+//! * At the grid a session opens every tab of its own at
+//!   ([`DEFAULT_TAB_COLS`] × [`DEFAULT_TAB_ROWS`]); no window has told it
+//!   one yet.
+//! * A failed title lock or selection only warns. `take_restore_layout`
+//!   is a one-shot and the opens so far are already written through, so
+//!   bailing would drop every *later* saved tab permanently, and a session
+//!   whose shells are all open but whose selection is off is a working
+//!   session with a cosmetic flaw.
+//! * [`FirstProject::Withheld`] leaves the workspace empty, and that is a
+//!   legitimate state: nothing in a session exits on empty, and the next
+//!   *ordinary* connect seeds it anyway (plan 063 §D6), so a caller that
+//!   withheld the seed and then failed leaves a session that heals itself.
 
 use anyhow::Result;
-use roost_engine::{LocalClient, RestoreLayout, RestoreTab};
-use tracing::warn;
+use roost_engine::{Hydration, LocalClient, OnRestoreError};
 
 use crate::consts::{FirstProject, DEFAULT_TAB_COLS, DEFAULT_TAB_ROWS};
 
 /// Re-open the saved layout, or seed a first project at `$HOME`.
 pub async fn hydrate(client: &LocalClient, first_project: FirstProject) -> Result<()> {
-    let mut projects = client.list_projects().await?;
-    if projects.is_empty() {
-        match first_project {
-            FirstProject::Seed => {
-                let cwd = roost_engine::home_dir();
-                projects.push(client.create_project("", &cwd).await?);
-            }
-            // An empty workspace is a legitimate state: nothing in a
-            // session exits on empty, and the next *ordinary* connect
-            // seeds it anyway (plan 063 §D6's "empty at connect is
-            // seeded, not forgotten"), so a caller that withheld the
-            // seed and then failed leaves a session that heals itself.
-            FirstProject::Withheld => warn!(
-                "starting with no seeded project; the client that started this session fills it"
-            ),
-        }
-    }
-
-    let restore = client.workspace.take_restore_layout();
-    for project in &projects {
-        let saved = restore
-            .as_ref()
-            .and_then(|layout| {
-                layout
-                    .projects
-                    .iter()
-                    .find(|item| item.project_id == project.id)
-            })
-            .map(|item| item.tabs.as_slice())
-            .unwrap_or_default();
-
-        // A project with no saved tabs still opens one, so a session is
-        // never restored into a state with nothing to attach to.
-        let fallback = [RestoreTab {
-            cwd: project.cwd.clone(),
-            title: String::new(),
-            user_titled: false,
-        }];
-        let specs = if saved.is_empty() {
-            fallback.as_slice()
-        } else {
-            saved
-        };
-
-        for spec in specs {
-            let opened = client
-                .open_tab(
-                    project.id,
-                    &spec.cwd,
-                    &spec.title,
-                    &[],
-                    u32::from(DEFAULT_TAB_COLS),
-                    u32::from(DEFAULT_TAB_ROWS),
-                )
-                .await;
-            match opened {
-                Ok(tab) if spec.user_titled && !spec.title.is_empty() => {
-                    // Warn rather than `?` for the same reason the open
-                    // does: `take_restore_layout` is a one-shot and the
-                    // opens so far have already been written through, so
-                    // bailing here would drop every *later* saved tab
-                    // permanently. Losing a title lock is a small,
-                    // recoverable loss; losing the rest of the layout is
-                    // not.
-                    if let Err(error) = client.workspace.set_tab_title(tab.id, &spec.title) {
-                        warn!(tab_id = tab.id, %error, "restoring the tab's title lock failed");
-                    }
-                }
-                Ok(_) => {}
-                // One tab whose directory no longer exists must not cost
-                // the user the rest of the session.
-                Err(error) => {
-                    warn!(project_id = project.id, cwd = %spec.cwd, ?error, "restore tab failed");
-                }
-            }
-        }
-    }
-
-    restore_selection(client, restore.as_ref());
-    Ok(())
-}
-
-/// Re-select the project and tab that were active, matching the tab by
-/// its saved *position* — the ids in the file are the previous run's.
-///
-/// Infallible by choice: a session whose tabs are all open and drained
-/// but whose *selection* could not be restored is a working session with
-/// a cosmetic flaw, and failing the start over it would throw away the
-/// layout that was just rebuilt.
-fn restore_selection(client: &LocalClient, restore: Option<&RestoreLayout>) {
-    let snapshot = client.workspace.snapshot();
-    let Some(project_id) = restore
-        .map(|layout| layout.active_project_id)
-        .filter(|id| snapshot.iter().any(|project| project.id == *id))
-        .or_else(|| snapshot.first().map(|project| project.id))
-    else {
-        return;
-    };
-    let position = restore.map_or(0, |layout| layout.active_tab_position.max(0) as usize);
-    if let Some(tab_id) = snapshot
-        .iter()
-        .find(|project| project.id == project_id)
-        .and_then(|project| project.tabs.get(position).or_else(|| project.tabs.first()))
-        .map(|tab| tab.id)
-    {
-        if let Err(error) = client.workspace.focus_tab(tab_id) {
-            warn!(tab_id, %error, "restoring the active selection failed");
-        }
-    }
+    roost_engine::hydrate(
+        client,
+        Hydration {
+            first_project,
+            grid: (DEFAULT_TAB_COLS, DEFAULT_TAB_ROWS),
+            on_error: OnRestoreError::Warn,
+        },
+    )
+    .await
 }

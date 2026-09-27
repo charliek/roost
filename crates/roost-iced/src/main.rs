@@ -78,6 +78,8 @@ enum Message {
     PendingSelectionTick,
     /// A file-drop debounce window elapsed — a one-shot, not a timer.
     FileDropDeadline,
+    /// The background resize wave may be due — a one-shot, not a timer.
+    BackgroundResizeDeadline,
     WindowOpened(window::Id),
     WindowResized(window::Id, Size),
     WindowFocus(window::Id, bool),
@@ -144,13 +146,12 @@ enum Message {
     /// verb lands on the same app entry — the one that raises the
     /// upgrade prompt for a mismatched build rather than re-dialing it.
     HostReconnect(String),
-    /// The banner over a frozen host frame (plan 037 §3.1). Separate
-    /// from [`Self::HostReconnect`] because it carries the frame it was
-    /// drawn on: a click that lands after the host moved on is dropped
-    /// rather than aborting the reconnect already under way.
-    HostFrameReconnect {
-        saved_id: String,
-        frame: app::host_notice::FrozenFrame,
+    /// A button on the terminal area's notice (plan 072 §D7b). Separate
+    /// from [`Self::HostReconnect`] because it carries the notice it was
+    /// drawn on, for [`roost_ui_model::notice::click_still_lands`].
+    NoticeAction {
+        key: roost_ui_model::notice::NoticeKey,
+        action: roost_ui_model::notice::NoticeActionId,
     },
     /// The band's `reduced fidelity` pill and the inline row under it,
     /// carrying the saved host's stable id (plan 056 §3.4). The palette's
@@ -485,14 +486,18 @@ fn window_settings(profile: &BundleProfile) -> window::Settings {
 /// long-lived engine future, and neither drain must wait behind it. The
 /// macOS menu-bar gate rides here for the same reason: every route
 /// transition passes through some message, and only one of them is the
-/// one that moved it.
+/// one that moved it. So does the terminal notice's generation, which
+/// must see a notice that went away before it comes back, and the local
+/// session's background resize wave, whose triggers are as scattered.
 fn update(app: &mut App, message: Message) -> Task<Message> {
     let dispatched = dispatch(app, message);
     app.sync_menu_gating();
+    app.observe_notice();
     Task::batch([
         dispatched,
         app.take_tab_reveal_task().map_task(),
         app.take_exit_task().map_task(),
+        app.take_background_resize_task().map_task(),
     ])
 }
 
@@ -521,6 +526,10 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::FileDropDeadline => app.file_drop_deadline().map_task(),
+        Message::BackgroundResizeDeadline => {
+            app.background_resize_deadline();
+            Task::none()
+        }
         Message::WindowOpened(id) => app.window_opened(id).map_task(),
         Message::WindowResized(id, size) => app.window_resized(id, size).map_task(),
         Message::WindowFocus(id, focused) => {
@@ -652,7 +661,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         | Message::NewTab
         | Message::NewProject
         | Message::HostReconnect(_)
-        | Message::HostFrameReconnect { .. }
+        | Message::NoticeAction { .. }
         | Message::HostFidelityAction(_)
         | Message::AddHostNameChanged(_)
         | Message::AddHostSocketChanged(_)
@@ -1013,6 +1022,11 @@ impl UiTask for app::UiTask {
             }),
             app::UiTask::FileDropDeadline(delay) => {
                 Task::perform(tokio::time::sleep(delay), |()| Message::FileDropDeadline)
+            }
+            app::UiTask::BackgroundResizeDeadline(delay) => {
+                Task::perform(tokio::time::sleep(delay), |()| {
+                    Message::BackgroundResizeDeadline
+                })
             }
             app::UiTask::PaletteVisibility {
                 scroll_id,

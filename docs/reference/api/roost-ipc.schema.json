@@ -368,6 +368,32 @@
       ],
       "type": "object"
     },
+    "AppKeyEventParams": {
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "modifiers": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "text": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
     "AppKeybindDispatchParams": {
       "additionalProperties": false,
       "properties": {
@@ -410,6 +436,150 @@
       },
       "required": [
         "menus"
+      ],
+      "type": "object"
+    },
+    "AppNoticeAction": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "primary": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "primary"
+      ],
+      "type": "object"
+    },
+    "AppNoticeAnswerParams": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "generation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "subject",
+        "generation",
+        "action"
+      ],
+      "type": "object"
+    },
+    "AppNoticeBottomLine": {
+      "properties": {
+        "severity": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "severity",
+        "source"
+      ],
+      "type": "object"
+    },
+    "AppNoticeDumpParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AppNoticeDumpResult": {
+      "properties": {
+        "bottom_line": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AppNoticeBottomLine"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "generation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "terminal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AppNoticeTerminal"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "generation"
+      ],
+      "type": "object"
+    },
+    "AppNoticeTerminal": {
+      "properties": {
+        "actions": {
+          "items": {
+            "$ref": "#/$defs/AppNoticeAction"
+          },
+          "type": "array"
+        },
+        "detail": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "placement": {
+          "type": "string"
+        },
+        "severity": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "subject",
+        "severity",
+        "placement",
+        "message",
+        "actions"
       ],
       "type": "object"
     },
@@ -3867,6 +4037,14 @@
         "$ref": "#/$defs/AppDockBadgeResult"
       }
     },
+    "app.key_event": {
+      "params": {
+        "$ref": "#/$defs/AppKeyEventParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
     "app.keybind_dispatch": {
       "params": {
         "$ref": "#/$defs/AppKeybindDispatchParams"
@@ -3889,6 +4067,22 @@
       },
       "result": {
         "$ref": "#/$defs/AppMenuDumpResult"
+      }
+    },
+    "app.notice_answer": {
+      "params": {
+        "$ref": "#/$defs/AppNoticeAnswerParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "app.notice_dump": {
+      "params": {
+        "$ref": "#/$defs/AppNoticeDumpParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AppNoticeDumpResult"
       }
     },
     "app.notification_status": {

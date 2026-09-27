@@ -3058,6 +3058,12 @@ pub(crate) mod fixtures {
         incarnation
     }
 
+    /// The incarnation a host's own task mints for its next attempt, as a
+    /// retry inside its loop does.
+    pub(crate) fn next_incarnation(set: &HostConnSet, host: &str) -> HostId {
+        set.mint_for(host)
+    }
+
     pub(crate) fn band_reason(set: &HostConnSet, host: &str) -> String {
         set.section_reason(host)
             .expect("a disconnected host has a reason")
