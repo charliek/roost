@@ -11,6 +11,18 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+## v0.0.21 — 2026-09-27
+
+_The session-parity release: a tab on a `roost-session` behaves more like an
+in-process one from your seat. A new tab starts in the foreground job's
+directory, keys typed while it opens land in it, the local session's unshown
+tabs follow the window's size, a returning tab never replays at an older
+width, and `roostctl` in a local session tab reaches its window. Both apps
+remember each project's last-viewed tab across relaunch, and the window says
+when its local session can't start and offers a way out. There is no
+session-protocol bump: a running `roost-session` picks up its side of these
+fixes when it restarts._
+
 ### Added
 
 - **`tab.open` takes `cwd_from_tab`, to open a tab where another one is
