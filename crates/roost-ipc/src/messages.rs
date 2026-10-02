@@ -751,6 +751,20 @@ pub struct ClipboardWriteParams {
     pub image_png: Option<Vec<u8>>,
 }
 
+/// `clipboard.write_files` request (plan 073 D2): put `paths` on the
+/// system clipboard the way a file manager's copy leaves them, so a test
+/// can paste copied files. Gated on `ROOST_TEST_MODE=1`, and its own op
+/// rather than a field on [`ClipboardWriteParams`] so no existing type
+/// changes shape.
+///
+/// Every path must be **absolute** (relative → `invalid-param`). An
+/// empty list writes nothing and leaves the clipboard as it was.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClipboardWriteFilesParams {
+    pub paths: Vec<String>,
+}
+
 // ============================================================================
 // Test-only ops (ROOST_TEST_MODE=1)
 // ============================================================================
@@ -3573,6 +3587,10 @@ pub mod ops {
     pub const SELECTION_DUMP: &str = "selection.dump";
     pub const CLIPBOARD_DUMP: &str = "clipboard.dump";
     pub const CLIPBOARD_WRITE: &str = "clipboard.write";
+    /// Test-only: copied files onto the system clipboard, for the paste
+    /// tests (plan 073 D2). Gated by `ROOST_TEST_MODE=1`; the iced UI
+    /// only.
+    pub const CLIPBOARD_WRITE_FILES: &str = "clipboard.write_files";
 
     /// Test-only PTY drain ops — drive bytes through the OSC scanner,
     /// libghostty, and the input-reply path. Gated behind

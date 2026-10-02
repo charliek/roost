@@ -11,6 +11,11 @@ known-different baseline value, then verify the OSC 52 payload
 actually replaced it — a prior matching clipboard value would
 otherwise produce a false pass.
 
+The selection target is PRIMARY on Linux and, on macOS, the private
+`ai.stridelabs.Roost.selection` pasteboard both apps share (plan 073 D1)
+— so the selection cases run on every clipboard lane, including the
+macOS iced cell. The middle-click case is iced-only.
+
 Run against either UI:
 
     pytest -q tools/roosttest/test_osc52.py --roost-target mac
@@ -20,10 +25,15 @@ Run against either UI:
 from __future__ import annotations
 
 import base64
-import sys
+import os
+import re
 import uuid
 
 import pytest
+
+from util import drain, drain_until_match, wait_tab_attached
+
+TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
 
 def _emit_osc52_command(target: str, text: str) -> str:
@@ -88,22 +98,7 @@ def test_osc52_writes_system_clipboard(roost, project):
     assert roost.clipboard_dump("system") != baseline
 
 
-def test_osc52_writes_selection_clipboard(roost, project, target):
-    # The iced selection clipboard maps to the X11/Wayland PRIMARY
-    # selection, which is `#[cfg(target_os = "linux")]`-gated to no-op
-    # off Linux. A macOS iced dev build therefore has no PRIMARY
-    # backing: write is a no-op, dump returns None, and the test fails
-    # before the OSC 52 path even runs. Skip on that profile only; on
-    # real Linux CI and on `--roost-target mac` (named NSPasteboard)
-    # the test runs and exercises the real PRIMARY path.
-    if target == "iced" and sys.platform == "darwin":
-        pytest.skip(
-            f"{target} selection clipboard (X11/Wayland PRIMARY) is Linux-only; "
-            f"macOS {target} dev build has no PRIMARY. System clipboard covered "
-            "by test_osc52_writes_system_clipboard. Iced runs this in both "
-            "renderer lanes on X11 in CI; the Iced plan records the headless "
-            "Wayland protocol gap."
-        )
+def test_osc52_writes_selection_clipboard(roost, project):
     tab = roost.open_tab(project, cwd="/tmp", title="osc52-sel")
     baseline = _seed_baseline(roost, "selection")
     payload = f"osc52-sel-{uuid.uuid4().hex[:8]}"
@@ -124,3 +119,41 @@ def test_osc52_read_request_does_not_clobber_clipboard(roost, project):
     # forces a main-loop tick.
     roost.dump(tab)
     assert roost.clipboard_dump("system") == baseline
+
+
+def test_middle_click_pastes_selection(roost, project, target):
+    """A middle press on a tab that is not tracking the mouse pastes the
+    selection clipboard into it, bracketed like any paste (plan 073 D1,
+    #575 — on macOS it used to be compiled out).
+
+    Driven through `tab.dispatch_mouse_event`, which takes the iced UI's
+    production pointer route. iced only: the Swift app's op drives its
+    mouse-tracking encoder alone, never the `otherMouseDown` that pastes
+    there, so under `--roost-target mac` it cannot reach this gesture.
+    """
+    if target != "iced":
+        pytest.skip(
+            "Roost.app's tab.dispatch_mouse_event bypasses its middle-click paste"
+        )
+    if not TEST_MODE:
+        pytest.skip("tab.dispatch_mouse_event requires ROOST_TEST_MODE=1")
+    tab = roost.open_tab(
+        project,
+        cwd="/tmp",
+        title="osc52-middle",
+        argv=["/bin/sh", "-c", "exec sleep 300"],
+    )
+    wait_tab_attached(roost, tab)
+    roost.tab_feed_pty_bytes(tab, b"\x1b[?2004h")
+    payload = f"middle-{uuid.uuid4().hex[:8]}"
+    roost.clipboard_write("selection", payload)
+    assert roost.clipboard_dump("selection") == payload, \
+        "the selection write didn't take — the paste below would be vacuous"
+    drain(roost, tab)
+
+    roost.tab_dispatch_mouse_event(tab, kind="press", button="middle", cell_x=2, cell_y=2)
+    roost.tab_dispatch_mouse_event(tab, kind="release", button="middle", cell_x=2, cell_y=2)
+
+    expected = b"\x1b[200~" + payload.encode() + b"\x1b[201~"
+    captured = drain_until_match(roost, tab, re.escape(expected))
+    assert captured == expected

@@ -1084,6 +1084,21 @@
       ],
       "type": "string"
     },
+    "ClipboardWriteFilesParams": {
+      "additionalProperties": false,
+      "properties": {
+        "paths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "paths"
+      ],
+      "type": "object"
+    },
     "ClipboardWriteParams": {
       "additionalProperties": false,
       "properties": {
@@ -4168,6 +4183,14 @@
     "clipboard.write": {
       "params": {
         "$ref": "#/$defs/ClipboardWriteParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "clipboard.write_files": {
+      "params": {
+        "$ref": "#/$defs/ClipboardWriteFilesParams"
       },
       "result": {
         "$ref": "#/$defs/EmptyResult"

@@ -12,10 +12,15 @@
 //! touch this machine's disk (plan 047 §3.2). [`probe`] picks the half
 //! its caller's sink asked for.
 //!
-//! [`read_clipboard_png`] BLOCKS: `arboard` talks to the display server
-//! (or NSPasteboard) synchronously, and a large paste also spends real
-//! time in the PNG encoder. Callers run it on the blocking pool — see
-//! `UiTask::PasteImageProbe` — never on the UI thread.
+//! Copied *files* are read here too (plan 073 D2), and a paste that finds
+//! some does what dropping them on the tab does. Where that read sits in
+//! a paste differs by OS — see [`FILES_BEFORE_TEXT`].
+//!
+//! [`read_clipboard_png`] and [`read_file_list`] BLOCK: `arboard` talks to
+//! the display server (or NSPasteboard) synchronously, and a large paste
+//! also spends real time in the PNG encoder. Callers run them on the
+//! blocking pool — see `UiTask::PasteImageProbe` and
+//! `UiTask::ClipboardReadFiles` — never on the UI thread.
 //!
 //! Failures are strings, like `screenshot.rs` — roost-iced carries no
 //! `thiserror` — wrapped in [`ProbeError`] only far enough to separate
@@ -49,14 +54,48 @@ pub(crate) enum ProbeError {
     /// There was an image and it did not become a PNG: over the caps,
     /// a clipboard held by someone else, an encode that failed.
     Failed(String),
+    /// The read was abandoned at its [`read_budget`] — see [`bounded`].
+    TimedOut(String),
 }
 
 impl std::fmt::Display for ProbeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProbeError::Empty => f.write_str("the clipboard holds no image"),
-            ProbeError::Failed(message) => f.write_str(message),
+            ProbeError::Failed(message) | ProbeError::TimedOut(message) => f.write_str(message),
         }
+    }
+}
+
+/// How long a paste's blocking clipboard read — the probe, or macOS's
+/// file step — may run. It holds the clipboard queue meanwhile, and an
+/// owner that accepts a transfer but never finishes it would otherwise
+/// hold it forever; ten seconds covers a large image's encode in a debug
+/// build.
+const READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+pub(crate) fn read_budget() -> std::time::Duration {
+    READ_BUDGET.mul_f64(crate::host_conn::task::scale())
+}
+
+/// A blocking read's join, given up after `budget` as
+/// [`ProbeError::TimedOut`] so the paste it holds the queue for can end.
+///
+/// An abandoned read never delivers: a blocking-pool worker cannot be
+/// cancelled, but its result reaches nothing except the `JoinHandle` this
+/// drops, so it finishes into nothing — at worst leaving behind the temp
+/// PNG it was writing.
+pub(crate) async fn bounded<T>(
+    what: &'static str,
+    budget: std::time::Duration,
+    read: impl std::future::Future<Output = Result<Result<T, ProbeError>, tokio::task::JoinError>>,
+) -> Result<T, ProbeError> {
+    match tokio::time::timeout(budget, read).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(ProbeError::Failed(format!("{what}: did not join: {error}"))),
+        Err(_) => Err(ProbeError::TimedOut(format!(
+            "{what}: the clipboard did not answer within {budget:?}"
+        ))),
     }
 }
 
@@ -68,16 +107,56 @@ pub(crate) enum Materialized {
     /// A host tab's bytes, to be uploaded under `name`. They never reach
     /// this machine's disk.
     Png { name: String, png: Vec<u8> },
+    /// Copied files, never empty, for the drop route — whichever sink was
+    /// asked for, since that route decides per tab itself.
+    Paths(Vec<PathBuf>),
 }
 
-/// The whole blocking half of a clipboard-image paste, by the sink its
-/// target asked for.
+/// Whether a system paste reads copied files *before* its text (plan 073
+/// D2).
+///
+/// macOS does: Finder's string flavor is only the file's *name*, so a
+/// text-first read pastes that. The read is the first step of the paste's
+/// clipboard effect, at the front of the queue.
+///
+/// Linux reads them only behind an empty text read, as the first step of
+/// [`probe`], so a text paste never pays a blocking hop first. A file
+/// manager that also offers its paths as `text/plain` keeps pasting
+/// through the text read there — a deliberate asymmetry.
+pub(crate) const FILES_BEFORE_TEXT: bool = cfg!(target_os = "macos");
+
+/// The whole blocking half of a paste that found no text, by the sink its
+/// target asked for: copied files first (where [`FILES_BEFORE_TEXT`] has
+/// not already looked), then an image.
 ///
 /// The host name is minted here rather than on the UI thread:
 /// [`temp_png_name`] reads `/dev/urandom`, which has no business
 /// blocking a frame.
 pub(crate) fn probe(sink: crate::app::ProbeSink) -> Result<Materialized, ProbeError> {
-    let png = read_clipboard_png()?;
+    let files = || {
+        if FILES_BEFORE_TEXT {
+            Err(ProbeError::Empty)
+        } else {
+            read_file_list()
+        }
+    };
+    probe_with(sink, files, read_clipboard_png)
+}
+
+/// [`probe`]'s order with its two clipboard reads handed in. Files win;
+/// only their *absence* falls through to the image, and a failed file
+/// read is the probe's failure like a failed image read is.
+fn probe_with(
+    sink: crate::app::ProbeSink,
+    read_files: impl FnOnce() -> Result<Vec<PathBuf>, ProbeError>,
+    read_png: impl FnOnce() -> Result<Vec<u8>, ProbeError>,
+) -> Result<Materialized, ProbeError> {
+    match read_files() {
+        Ok(paths) if !paths.is_empty() => return Ok(Materialized::Paths(paths)),
+        Ok(_) | Err(ProbeError::Empty) => {}
+        Err(failed) => return Err(failed),
+    }
+    let png = read_png()?;
     match sink {
         crate::app::ProbeSink::TempFile => write_temp_png(&png)
             .map(|path| Materialized::Path(path.to_string_lossy().into_owned()))
@@ -97,6 +176,33 @@ pub(crate) fn write_png(png: &[u8]) -> Result<(), HostOpFailure> {
         .map_err(|message| HostOpFailure::new(codes::INVALID_PARAM, message))?;
     write_clipboard_image(width, height, rgba)
         .map_err(|error| write_failure(&error, std::env::var_os("WAYLAND_DISPLAY").is_some()))
+}
+
+/// The whole blocking half of `clipboard.write_files` (plan 073 D2):
+/// `paths` onto the system clipboard as a file manager's copy leaves
+/// them. An empty list writes nothing and leaves the clipboard as it is.
+pub(crate) fn write_files(paths: &[PathBuf]) -> Result<(), HostOpFailure> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    write_clipboard_files(paths)
+        .map_err(|error| write_failure(&error, std::env::var_os("WAYLAND_DISPLAY").is_some()))
+}
+
+#[cfg(target_os = "macos")]
+fn write_clipboard_files(paths: &[PathBuf]) -> Result<(), String> {
+    crate::macos::pasteboard::write_file_list(paths)
+}
+
+/// arboard's `text/uri-list`, which canonicalizes each path and drops
+/// one that does not exist.
+#[cfg(not(target_os = "macos"))]
+fn write_clipboard_files(paths: &[PathBuf]) -> Result<(), String> {
+    write_held(
+        "clipboard files",
+        |clipboard| clipboard.set().file_list(paths),
+        |fresh| fresh.get().file_list().map(drop),
+    )
 }
 
 /// What a failed platform write is worth telling the caller.
@@ -127,8 +233,76 @@ fn write_failure(error: &str, wayland_display: bool) -> HostOpFailure {
 pub(crate) fn read_clipboard_png() -> Result<Vec<u8>, ProbeError> {
     let mut clipboard = arboard::Clipboard::new()
         .map_err(|error| ProbeError::Failed(format!("clipboard image: open: {error}")))?;
-    let image = clipboard.get_image().map_err(read_failure)?;
+    let image = clipboard
+        .get_image()
+        .map_err(|error| read_failure("clipboard image", error))?;
     encode_rgba(image.width, image.height, &image.bytes).map_err(ProbeError::Failed)
+}
+
+/// The system clipboard's copied files on this machine, in the
+/// clipboard's order: file URLs on macOS, `text/uri-list` on Linux. Never
+/// an empty list — no such files is [`ProbeError::Empty`], as no image
+/// is, so the probe goes on to the image.
+///
+/// Blocking — see the module docs.
+pub(crate) fn read_file_list() -> Result<Vec<PathBuf>, ProbeError> {
+    let mut clipboard = arboard::Clipboard::new()
+        .map_err(|error| ProbeError::Failed(format!("clipboard files: open: {error}")))?;
+    let paths = clipboard
+        .get()
+        .file_list()
+        .map_err(|error| read_failure("clipboard files", error))?;
+    files_on_this_machine(paths)
+}
+
+/// [`local_paths`], with nothing left reported as [`ProbeError::Empty`].
+fn files_on_this_machine(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, ProbeError> {
+    let paths = local_paths(paths);
+    if paths.is_empty() {
+        return Err(ProbeError::Empty);
+    }
+    Ok(paths)
+}
+
+/// Finish arboard's `text/uri-list` parse, which splits on LF alone and
+/// strips `file://` without reading the authority.
+///
+/// - A CRLF list — the spec's delimiter, and what COSMIC Files writes —
+///   leaves a `\r` on every path, which the drop route refuses; one
+///   trailing `\r` is dropped.
+/// - `file://localhost/tmp/a` arrives as `localhost/tmp/a`, which names
+///   this machine's `/tmp/a`.
+/// - Any other authority (`file://server/share/a`) arrives as a relative
+///   path that names nothing here — a host tab would upload whatever
+///   matched it under Roost's working directory — so every path still not
+///   absolute is dropped.
+///
+/// macOS's paths come from `NSURL` and are already absolute and whole, so
+/// they pass unchanged.
+fn local_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let path = match path.to_str() {
+                Some(text) => {
+                    let text = text.strip_suffix('\r').unwrap_or(text);
+                    match text.get(..10) {
+                        Some(host) if host.eq_ignore_ascii_case("localhost/") => {
+                            PathBuf::from(format!("/{}", &text[10..]))
+                        }
+                        _ => PathBuf::from(text),
+                    }
+                }
+                None => path,
+            };
+            if path.is_absolute() {
+                Some(path)
+            } else {
+                tracing::debug!(path = %path.display(), "dropped a copied file that is not on this machine");
+                None
+            }
+        })
+        .collect()
 }
 
 /// [`MAX_PIXELS`], applied wherever dimensions are known and before
@@ -197,7 +371,7 @@ pub(crate) fn decode_png_rgba(png: &[u8]) -> Result<(usize, usize, Vec<u8>), Str
     Ok((frame.width as usize, frame.height as usize, buffer))
 }
 
-/// The `arboard::Clipboard` an image write leaves alive.
+/// The `arboard::Clipboard` the test seam's writes leave alive.
 ///
 /// X11 has no clipboard *content*, only an owning window that answers
 /// requests — and arboard's `Drop` tears its owning window down as soon
@@ -208,17 +382,18 @@ pub(crate) fn decode_png_rgba(png: &[u8]) -> Result<(usize, usize, Vec<u8>), Str
 /// handle for the life of the process is arboard's own advice, and is
 /// what makes a paste issued right after the write find the image.
 ///
-/// The read side does not touch it — [`read_clipboard_png`] opens its
-/// own handle, exactly as an ordinary paste does — so what this static
-/// buys is only that the image outlives the call that wrote it.
+/// The read side does not touch it — [`read_clipboard_png`] and
+/// [`read_file_list`] open their own handles, exactly as an ordinary
+/// paste does — so what this static buys is only that the data outlives
+/// the call that wrote it.
 ///
-/// Only ever populated by [`write_clipboard_image`], which
+/// Only ever populated by [`write_held`], whose callers
 /// `ROOST_TEST_MODE=1` gates — an ordinary run never opens it.
-static IMAGE_CLIPBOARD: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
+static HELD_CLIPBOARD: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
 
-/// How long [`write_clipboard_image`] waits for what it wrote to become
-/// readable. Generous for a local display server, and bounded because
-/// the op's caller is blocked on it.
+/// How long [`write_held`] waits for what it wrote to become readable.
+/// Generous for a local display server, and bounded because the op's
+/// caller is blocked on it.
 const OWNERSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Hand decoded pixels to the platform clipboard, blocking until a
@@ -233,49 +408,56 @@ pub(crate) fn write_clipboard_image(
     height: usize,
     rgba: Vec<u8>,
 ) -> Result<(), String> {
-    let mut held = IMAGE_CLIPBOARD
-        .lock()
-        .map_err(|_| "clipboard image: the held clipboard is poisoned".to_string())?;
-    let clipboard = match held.as_mut() {
-        Some(clipboard) => clipboard,
-        None => held.insert(
-            arboard::Clipboard::new().map_err(|error| format!("clipboard image: open: {error}"))?,
-        ),
-    };
-    clipboard
-        .set_image(arboard::ImageData {
-            width,
-            height,
-            bytes: std::borrow::Cow::Owned(rgba),
-        })
-        .map_err(|error| format!("clipboard image: write: {error}"))?;
-    confirm_readable()
+    write_held(
+        "clipboard image",
+        |clipboard| {
+            clipboard.set_image(arboard::ImageData {
+                width,
+                height,
+                bytes: std::borrow::Cow::Owned(rgba),
+            })
+        },
+        |fresh| fresh.get_image().map(drop),
+    )
 }
 
-/// Wait until the image just written can actually be read back.
+/// `write` through [`HELD_CLIPBOARD`], then wait until `read_back` on a
+/// fresh handle succeeds.
 ///
-/// `set_image` returns once the write is on its way, not once the
-/// display server has acted on it: the X11 backend flushes a
+/// The wait is the point. A write returns once it is on its way, not once
+/// the display server has acted on it: the X11 backend flushes a
 /// `SetSelectionOwner` without a round trip, and the Wayland one hands
 /// the data to a helper that serves it. Answering the op on that alone
 /// lets the paste issued in the next breath read the *previous*
 /// clipboard — an intermittent failure of the exact lane this seam
 /// exists for.
 ///
-/// The check is a fresh handle plus `get_image`, which is
-/// [`read_clipboard_png`]'s own call path (an ownership round trip
-/// included) rather than a question the writing handle could answer out
-/// of the data it just cached. Dropping the handle taken here is safe:
-/// arboard hands the selection away only when its *last* handle goes,
-/// and [`IMAGE_CLIPBOARD`] is still holding one.
-fn confirm_readable() -> Result<(), String> {
+/// `read_back` runs on a fresh handle, which is the paste's own call path
+/// (an ownership round trip included) rather than a question the writing
+/// handle could answer out of the data it just cached. Dropping that
+/// handle is safe: arboard hands the selection away only when its *last*
+/// handle goes, and [`HELD_CLIPBOARD`] is still holding one.
+fn write_held(
+    what: &str,
+    write: impl FnOnce(&mut arboard::Clipboard) -> Result<(), arboard::Error>,
+    read_back: impl Fn(&mut arboard::Clipboard) -> Result<(), arboard::Error>,
+) -> Result<(), String> {
+    let mut held = HELD_CLIPBOARD
+        .lock()
+        .map_err(|_| format!("{what}: the held clipboard is poisoned"))?;
+    let clipboard = match held.as_mut() {
+        Some(clipboard) => clipboard,
+        None => held
+            .insert(arboard::Clipboard::new().map_err(|error| format!("{what}: open: {error}"))?),
+    };
+    write(clipboard).map_err(|error| format!("{what}: write: {error}"))?;
     let deadline = std::time::Instant::now() + OWNERSHIP_TIMEOUT;
     loop {
-        match arboard::Clipboard::new().and_then(|mut fresh| fresh.get_image()) {
-            Ok(_) => return Ok(()),
+        match arboard::Clipboard::new().and_then(|mut fresh| read_back(&mut fresh)) {
+            Ok(()) => return Ok(()),
             Err(error) if std::time::Instant::now() >= deadline => {
                 return Err(format!(
-                    "clipboard image: nothing readable {OWNERSHIP_TIMEOUT:?} after the write: {error}"
+                    "{what}: nothing readable {OWNERSHIP_TIMEOUT:?} after the write: {error}"
                 ));
             }
             Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
@@ -283,13 +465,14 @@ fn confirm_readable() -> Result<(), String> {
     }
 }
 
-/// arboard reports an empty clipboard and one carrying only text with
-/// the same variant, which is exactly the distinction we want: neither
-/// is an image, and neither is worth telling the user about.
-fn read_failure(error: arboard::Error) -> ProbeError {
+/// arboard reports an empty clipboard and one carrying only something
+/// else with the same variant, which is exactly the distinction we want:
+/// neither holds what was asked for, and neither is worth telling the
+/// user about.
+fn read_failure(what: &str, error: arboard::Error) -> ProbeError {
     match error {
         arboard::Error::ContentNotAvailable => ProbeError::Empty,
-        other => ProbeError::Failed(format!("clipboard image: read: {other}")),
+        other => ProbeError::Failed(format!("{what}: read: {other}")),
     }
 }
 
@@ -381,6 +564,7 @@ pub(crate) fn temp_png_name() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::ProbeSink;
 
     fn rgba(width: usize, height: usize) -> Vec<u8> {
         (0..width * height)
@@ -603,17 +787,176 @@ mod tests {
         assert!(refused.contains("8 bits per sample"), "{refused}");
     }
 
+    fn no_image() -> Result<Vec<u8>, ProbeError> {
+        Err(ProbeError::Empty)
+    }
+
+    /// Plan 073 D2's Linux half: behind an empty text read, copied files
+    /// win, and the image is never read when there are some.
+    #[test]
+    fn a_probe_that_finds_files_never_reads_the_image() {
+        let files = vec![PathBuf::from("/tmp/a b.txt"), PathBuf::from("/tmp/c.pdf")];
+        for sink in [ProbeSink::TempFile, ProbeSink::Bytes] {
+            assert_eq!(
+                probe_with(
+                    sink,
+                    || Ok(files.clone()),
+                    || panic!("the image was read although files were copied"),
+                ),
+                Ok(Materialized::Paths(files.clone())),
+                "{sink:?}"
+            );
+        }
+    }
+
+    /// Only the *absence* of files reaches the image read — an empty list
+    /// is absence too — and a failed file read is the probe's failure,
+    /// toasted like a failed image read, not hidden behind the image.
+    #[test]
+    fn a_probe_falls_through_to_the_image_only_when_no_files_were_copied() {
+        let png = encode_rgba(2, 2, &rgba(2, 2)).expect("encode");
+        for no_files in [Err(ProbeError::Empty), Ok(Vec::new())] {
+            let mut image_read = false;
+            let found = probe_with(
+                ProbeSink::Bytes,
+                || no_files,
+                || {
+                    image_read = true;
+                    Ok(png.clone())
+                },
+            );
+            assert!(image_read);
+            assert!(
+                matches!(found, Ok(Materialized::Png { png: ref bytes, .. }) if *bytes == png),
+                "{found:?}"
+            );
+        }
+
+        assert_eq!(
+            probe_with(ProbeSink::TempFile, || Err(ProbeError::Empty), no_image),
+            Err(ProbeError::Empty),
+            "neither files nor an image is the quiet end of a paste"
+        );
+
+        let failed = ProbeError::Failed("clipboard files: read: occupied".into());
+        assert_eq!(
+            probe_with(
+                ProbeSink::TempFile,
+                || Err(failed.clone()),
+                || panic!("the image was read behind a failed file read"),
+            ),
+            Err(failed)
+        );
+    }
+
+    fn paths(list: &[&str]) -> Vec<PathBuf> {
+        list.iter().map(PathBuf::from).collect()
+    }
+
+    /// What arboard hands back for a CRLF `text/uri-list` — the spec's
+    /// delimiter, COSMIC Files' too — once its LF-only split is done.
+    #[test]
+    fn a_crlf_uri_list_keeps_its_files() {
+        assert_eq!(
+            files_on_this_machine(paths(&["/tmp/a.txt\r", "/tmp/b c.txt\r"])),
+            Ok(paths(&["/tmp/a.txt", "/tmp/b c.txt"]))
+        );
+        assert_eq!(
+            files_on_this_machine(paths(&["/tmp/a.txt\r", "/tmp/last.txt"])),
+            Ok(paths(&["/tmp/a.txt", "/tmp/last.txt"])),
+            "a list without a final CRLF"
+        );
+    }
+
+    /// arboard strips `file://` and keeps the authority: `localhost` is
+    /// this machine, any other host is not, and what it leaves behind is a
+    /// relative path that must never be read as one.
+    #[test]
+    fn a_file_uri_authority_is_this_machine_only_when_it_is_localhost() {
+        assert_eq!(
+            files_on_this_machine(paths(&[
+                "localhost/tmp/a.txt",
+                "LOCALHOST/tmp/b.txt\r",
+                "server/share/c.txt",
+                "/tmp/d.txt",
+            ])),
+            Ok(paths(&["/tmp/a.txt", "/tmp/b.txt", "/tmp/d.txt"]))
+        );
+    }
+
+    /// Nothing on this machine is no files at all, so the probe goes on to
+    /// the image, as it does for an empty list.
+    #[test]
+    fn a_list_with_no_file_on_this_machine_falls_through_to_the_image() {
+        assert_eq!(
+            files_on_this_machine(paths(&["server/share/a.txt", "relative.txt"])),
+            Err(ProbeError::Empty)
+        );
+        let png = encode_rgba(2, 2, &rgba(2, 2)).expect("encode");
+        let found = probe_with(
+            ProbeSink::Bytes,
+            || files_on_this_machine(paths(&["server/share/a.txt"])),
+            || Ok(png.clone()),
+        );
+        assert!(
+            matches!(found, Ok(Materialized::Png { png: ref bytes, .. }) if *bytes == png),
+            "{found:?}"
+        );
+    }
+
+    type Joined<T> = Result<Result<T, ProbeError>, tokio::task::JoinError>;
+
+    /// An owner that accepts a transfer and never finishes it ends the
+    /// read at the budget, as `TimedOut`, instead of holding the paste —
+    /// and the clipboard queue behind it — forever. The outer timeout is
+    /// the test's own, so a missing bound fails here rather than hanging.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_the_clipboard_never_answers_is_abandoned_at_its_budget() {
+        let budget = std::time::Duration::from_secs(10);
+        let never = std::future::pending::<Joined<Vec<u8>>>();
+        let settled =
+            tokio::time::timeout(budget * 2, bounded("clipboard image", budget, never)).await;
+        assert!(
+            matches!(settled, Ok(Err(ProbeError::TimedOut(ref message))) if message.contains("did not answer")),
+            "{settled:?}"
+        );
+    }
+
+    /// A read that answers in time is the read's own answer, and a worker
+    /// that never joined is an ordinary failure rather than a timeout.
+    #[tokio::test]
+    async fn a_read_that_settles_in_time_is_its_own_answer() {
+        let budget = std::time::Duration::from_secs(10);
+        let answered: Joined<u8> = Ok(Ok(7));
+        assert_eq!(
+            bounded("clipboard image", budget, async { answered }).await,
+            Ok(7)
+        );
+        let empty: Joined<u8> = Ok(Err(ProbeError::Empty));
+        assert_eq!(
+            bounded("clipboard image", budget, async { empty }).await,
+            Err(ProbeError::Empty)
+        );
+
+        let worker = tokio::spawn(std::future::pending::<Result<u8, ProbeError>>());
+        worker.abort();
+        assert!(matches!(
+            bounded("clipboard image", budget, worker).await,
+            Err(ProbeError::Failed(ref message)) if message.contains("did not join")
+        ));
+    }
+
     /// An empty clipboard is not a failure and must not become one: the
     /// probe's `Err` arm toasts, and "you pasted with nothing on the
     /// clipboard" is not news.
     #[test]
     fn only_a_missing_image_is_silent() {
         assert_eq!(
-            read_failure(arboard::Error::ContentNotAvailable),
+            read_failure("clipboard image", arboard::Error::ContentNotAvailable),
             ProbeError::Empty
         );
         assert!(matches!(
-            read_failure(arboard::Error::ClipboardOccupied),
+            read_failure("clipboard image", arboard::Error::ClipboardOccupied),
             ProbeError::Failed(_)
         ));
     }

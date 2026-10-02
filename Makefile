@@ -91,7 +91,7 @@ ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walkin
 # pasteboard, so `test_selection.py` belongs in the list above and runs
 # under headless Wayland too. Only files that read/write the real
 # clipboard go here.
-ICED_CLIPBOARD_TESTS := tools/roosttest/test_osc52.py
+ICED_CLIPBOARD_TESTS := tools/roosttest/test_osc52.py tools/roosttest/test_paste_files.py
 # Its OWN invocation, never a member of ICED_E2E_TESTS: this module deletes
 # the last project, which now ends the app (plan 026 D8) — inside the shared
 # session it would strand every module that runs after it. Always fresh: it

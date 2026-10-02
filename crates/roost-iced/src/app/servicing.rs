@@ -3718,6 +3718,17 @@ impl App {
                     task = task.then(self.clipboard.start_next());
                 }
             }
+            UiRequest::ClipboardWriteFiles { paths, reply } => {
+                if self.test_mode {
+                    self.clipboard.enqueue_write_files(paths, reply);
+                    task = task.then(self.clipboard.start_next());
+                } else {
+                    let _ = reply.send(Err(HostOpFailure::new(
+                        codes::NOT_ENABLED,
+                        "clipboard.write_files requires ROOST_TEST_MODE=1 at UI launch",
+                    )));
+                }
+            }
             UiRequest::TabExpandSelectionAt {
                 tab_id,
                 col,

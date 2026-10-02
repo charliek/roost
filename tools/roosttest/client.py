@@ -579,6 +579,24 @@ class Roost:
             "image_png": base64.b64encode(png).decode("ascii"),
         })
 
+    def clipboard_write_files(self, paths) -> None:
+        """Put copied files on the SYSTEM clipboard, the way a file
+        manager's copy leaves them (plan 073 D2): on macOS one item per
+        file with its URL and, as text, only its name, as Finder does; on
+        Linux `text/uri-list`. A paste then finds the files.
+
+        Every path must be **absolute**. Linux canonicalizes each path and
+        drops one that does not exist, so pass real files and compare
+        against their canonical paths. An empty list writes nothing and
+        leaves the clipboard as it was. Returns once a paste could read
+        the files.
+
+        Refusals, all `RoostError`: `not-enabled` without ROOST_TEST_MODE=1
+        at UI launch; `not-supported` when a Wayland session refused the
+        write; `invalid-param` for a relative path. iced only — the Swift
+        app answers `unknown-op`."""
+        self.call("clipboard.write_files", {"paths": [str(path) for path in paths]})
+
     # -- files into a tab (plan 047 §3.4) ---------------------------------
     def tab_send_file(self, tab: str | int, paths) -> dict:
         """Send local files to a tab — the drop route, as an op.

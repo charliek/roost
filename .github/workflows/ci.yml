@@ -791,6 +791,7 @@ jobs:
           tools/roosttest/test_boot_failure.py
           tools/roosttest/test_quit_with_foreground_job.py
           tools/roosttest/test_osc52.py
+          tools/roosttest/test_paste_files.py
           --roost-target iced --roost-fresh -v
 
       # Its own invocation, after the shared-session lane above: this
@@ -1015,7 +1016,8 @@ jobs:
         # Wayland renderer suite; the POC plan records the real-seat evidence
         # and remaining programmatic-write limitation. `test_selection.py` is
         # in this list because `selection.*` reads UI state over IPC and never
-        # touches the pasteboard — only `test_osc52.py` is X11-only.
+        # touches the pasteboard — only `test_osc52.py` and
+        # `test_paste_files.py` are X11-only.
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1265,6 +1267,7 @@ jobs:
           tools/roosttest/test_sparkle.py
           tools/roosttest/test_view_perf.py
           tools/roosttest/test_osc52.py
+          tools/roosttest/test_paste_files.py
           -m 'not host_client'
           --roost-target iced --roost-fresh -v
 

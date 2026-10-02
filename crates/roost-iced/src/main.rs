@@ -89,14 +89,21 @@ enum Message {
         value: Option<String>,
     },
     ClipboardWriteCompleted(u64),
+    /// A paste's file-list read finished (`UiTask::ClipboardReadFiles`).
+    ClipboardFilesRead {
+        request_id: u64,
+        result: Result<Vec<std::path::PathBuf>, paste_image::ProbeError>,
+    },
     /// A clipboard image probe finished — a temp PNG's path for a local
     /// tab, the encoded bytes for a host one, or why neither happened.
     ///
     /// `tab` is the tab whose paste asked for it, host-qualified: the
     /// probe blocks, so this is a delayed callback and its target must
     /// not be reinterpreted against whatever id-space is live when it
-    /// lands.
+    /// lands. `request_id` is the paste's, whose hold on the clipboard
+    /// queue this ends.
     PasteImageMaterialized {
+        request_id: u64,
         tab: TabKey,
         result: Result<paste_image::Materialized, paste_image::ProbeError>,
     },
@@ -544,9 +551,16 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         Message::ClipboardWriteCompleted(request_id) => {
             app.clipboard_write_completed(request_id).map_task()
         }
-        Message::PasteImageMaterialized { tab, result } => {
-            app.paste_image_materialized(tab, result).map_task()
+        Message::ClipboardFilesRead { request_id, result } => {
+            app.clipboard_files_read(request_id, result).map_task()
         }
+        Message::PasteImageMaterialized {
+            request_id,
+            tab,
+            result,
+        } => app
+            .paste_image_materialized(request_id, tab, result)
+            .map_task(),
         Message::FilesInspected { id, result } => app.files_inspected(id, result).map_task(),
         Message::UploadSettled {
             host,
@@ -933,6 +947,19 @@ impl UiTask for app::UiTask {
                 let message = move |value| Message::ClipboardReadCompleted { request_id, value };
                 match target {
                     roost_engine::ipc::ClipboardOp::System => iced::clipboard::read().map(message),
+                    // iced's primary-selection calls are no-ops on macOS;
+                    // the selection is the named pasteboard (plan 073 D1).
+                    #[cfg(target_os = "macos")]
+                    roost_engine::ipc::ClipboardOp::Selection => Task::perform(
+                        tokio::task::spawn_blocking(macos::pasteboard::selection_read),
+                        move |joined| {
+                            message(joined.unwrap_or_else(|error| {
+                                tracing::warn!(%error, "selection pasteboard read did not join");
+                                None
+                            }))
+                        },
+                    ),
+                    #[cfg(not(target_os = "macos"))]
                     roost_engine::ipc::ClipboardOp::Selection => {
                         iced::clipboard::read_primary().map(message)
                     }
@@ -943,14 +970,50 @@ impl UiTask for app::UiTask {
                 target,
                 text,
             } => {
-                let write = match target {
-                    roost_engine::ipc::ClipboardOp::System => iced::clipboard::write(text),
-                    roost_engine::ipc::ClipboardOp::Selection => {
-                        iced::clipboard::write_primary(text)
+                let done = Task::done(Message::ClipboardWriteCompleted(request_id));
+                match target {
+                    roost_engine::ipc::ClipboardOp::System => {
+                        iced::clipboard::write(text).chain(done)
                     }
-                };
-                write.chain(Task::done(Message::ClipboardWriteCompleted(request_id)))
+                    #[cfg(target_os = "macos")]
+                    roost_engine::ipc::ClipboardOp::Selection => Task::perform(
+                        tokio::task::spawn_blocking(move || {
+                            macos::pasteboard::selection_write(&text)
+                        }),
+                        move |joined| {
+                            let written = joined.map_err(|error| error.to_string());
+                            if let Err(error) = written.and_then(|written| written) {
+                                tracing::warn!(%error, "selection pasteboard write failed");
+                            }
+                            Message::ClipboardWriteCompleted(request_id)
+                        },
+                    ),
+                    #[cfg(not(target_os = "macos"))]
+                    roost_engine::ipc::ClipboardOp::Selection => {
+                        iced::clipboard::write_primary(text).chain(done)
+                    }
+                }
             }
+            app::UiTask::ClipboardReadFiles { request_id } => Task::perform(
+                paste_image::bounded(
+                    "clipboard files",
+                    paste_image::read_budget(),
+                    tokio::task::spawn_blocking(paste_image::read_file_list),
+                ),
+                move |result| Message::ClipboardFilesRead { request_id, result },
+            ),
+            // Answered from the blocking closure, as `ClipboardWriteImage`
+            // is below and for the same reason.
+            app::UiTask::ClipboardWriteFiles {
+                request_id,
+                paths,
+                reply,
+            } => Task::perform(
+                tokio::task::spawn_blocking(move || {
+                    let _ = reply.send(paste_image::write_files(&paths));
+                }),
+                move |_joined| Message::ClipboardWriteCompleted(request_id),
+            ),
             // The reply is answered from inside the blocking closure
             // rather than from the completion arm: `Task::perform`'s
             // mapper is an `Fn`, so it cannot consume a oneshot sender,
@@ -975,15 +1038,20 @@ impl UiTask for app::UiTask {
             // `update` in `Executor::enter`, i.e. this runs inside the
             // application's tokio runtime. The blocking pool is what keeps
             // the clipboard round-trip and the PNG encode off the UI thread.
-            app::UiTask::PasteImageProbe { tab, sink } => Task::perform(
-                tokio::task::spawn_blocking(move || paste_image::probe(sink)),
-                move |joined| {
-                    let result = joined.unwrap_or_else(|error| {
-                        Err(paste_image::ProbeError::Failed(format!(
-                            "clipboard image: probe did not join: {error}"
-                        )))
-                    });
-                    Message::PasteImageMaterialized { tab, result }
+            app::UiTask::PasteImageProbe {
+                request_id,
+                tab,
+                sink,
+            } => Task::perform(
+                paste_image::bounded(
+                    "clipboard image",
+                    paste_image::read_budget(),
+                    tokio::task::spawn_blocking(move || paste_image::probe(sink)),
+                ),
+                move |result| Message::PasteImageMaterialized {
+                    request_id,
+                    tab,
+                    result,
                 },
             ),
             // Bounded: a `metadata` on a hung mount would otherwise hold

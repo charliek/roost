@@ -11,6 +11,32 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+### Added
+
+- **Pasting copied files (plan 073, #576)** — in Roost-Iced, ⌘V /
+  Ctrl+Shift+V with files on the clipboard (copied in Finder or a file
+  manager) does what dropping those files on the tab does: a local tab
+  gets their shell-escaped paths, and a host tab uploads them and gets
+  the host paths. Any file type, not only images. On macOS the files are
+  read before the text, because Finder's text for a copied file is only
+  its name. On Linux the text still comes first, so a file manager that
+  also copies its paths as text keeps pasting that text; a clipboard
+  that carries only `text/uri-list` now pastes the files. A test-mode
+  `clipboard.write_files` op seeds such a clipboard (see
+  [`ipc.md`](docs/reference/ipc.md#selection-clipboard-test-ops-selection-clipboard)).
+
+### Fixed
+
+- **Select-to-copy and middle-click paste did nothing in Roost-Iced on
+  macOS (plan 073, #575)** — the selection clipboard had no macOS
+  backing, so under the default `copy-on-select = true` a drag-selection
+  was written nowhere, OSC 52's selection target was dropped, and the
+  middle-click paste was compiled out. The selection now lives on the
+  same private pasteboard the Swift app uses
+  (`ai.stridelabs.Roost.selection`), so a selection made in either app
+  middle-click-pastes in the other, and ⌘V still pastes the system
+  clipboard.
+
 ## v0.0.21 — 2026-09-27
 
 _The session-parity release: a tab on a `roost-session` behaves more like an

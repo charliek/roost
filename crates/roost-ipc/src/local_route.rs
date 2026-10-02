@@ -276,6 +276,7 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ("palette.present", OpClass::UiOwned),
     ("clipboard.dump", OpClass::UiOwned),
     ("clipboard.write", OpClass::UiOwned),
+    ("clipboard.write_files", OpClass::UiOwned),
     ("window.resize", OpClass::UiOwned),
     // The sidebar's own width, which belongs to this window and not to
     // whatever backend its tabs run on.

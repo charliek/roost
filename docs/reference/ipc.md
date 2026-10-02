@@ -2428,6 +2428,7 @@ collapsed); the empty-state row (`"agents:empty"`) is not actionable.
 | `selection.dump` | `{"tab_id": "1"}` | Read back the selection. Response: `{"text"?: "...", "anchor_visible": bool, "cursor_visible": bool}`. `text` carries the **whole** selection, including rows scrolled out of the viewport (#249). It is omitted when no selection is active, and also when an active selection currently resolves to nothing — its rows were evicted from scrollback, or it belongs to the screen (primary/alternate) that is not on display. Those cases are reported as an *absent* `text`, never as another row's text (#334); an alt-screen one starts reporting text again once its screen is active. `anchor_visible` / `cursor_visible` stay viewport-truthful on purpose — they answer "is this endpoint on screen right now", which is a different question from what `text` contains, and the pixel-level tests rely on it; a discarded or inactive-screen endpoint reads `false`. |
 | `clipboard.dump` | `{"target": "system" \| "selection"}` | Read the host pasteboard. Response: `{"text"?: "..."}`. `system` is the ⌘V / Ctrl+V target; `selection` is the named per-app pasteboard on Mac / X11 PRIMARY on Linux. Unknown targets → `invalid-param`. |
 | `clipboard.write` | `{"target": "...", "text": "..."}` or `{"target": "system", "image_png": "<base64>"}` | Test-only pasteboard seeding (lets a roosttest case set a known value before asserting paste behavior). The text form is not gated: any process on the host can already write the OS clipboard. The image form is — see below. |
+| `clipboard.write_files` | `{"paths": ["/abs/a.txt", "/abs/b c.pdf"]}` | *(Test-only — gated.)* Put copied files on the system clipboard, the way a file manager's copy leaves them — see below. |
 
 **`clipboard.write` takes exactly one of `text` / `image_png`.** `text`
 was required until the image form existed and is optional now; both at
@@ -2459,6 +2460,23 @@ lane's cue to skip rather than to report a paste bug.
 and nothing else, so an `image_png` key is `unknown-field` there, and a
 request carrying neither field is `invalid-param` (a decode failure, not
 `missing-param`).
+
+**`clipboard.write_files`** exists so the end-to-end lanes can paste
+copied files: a paste that finds files on the system clipboard does what
+dropping them on the tab does (the escaped paths in a local tab, an
+upload in a host tab). It is its own op rather than a field on
+`clipboard.write`, is **gated on `ROOST_TEST_MODE=1`** at UI launch
+(`not-enabled` otherwise), and is served by the iced UI only —
+`Roost.app` answers `unknown-op`. Every path must be absolute
+(`invalid-param` otherwise). On macOS each file becomes one pasteboard
+item carrying its file URL and, as the string flavor, only its name —
+what a Finder copy leaves, and why a paste there reads files before
+text. On Linux the iced UI writes `text/uri-list` through `arboard`,
+which canonicalizes each path and drops one that does not exist, and
+holds the clipboard the way the image form does; under Wayland a
+refused write is `not-supported`, as it is there. An empty `paths` writes
+nothing and leaves the clipboard as it was. The reply comes once a paste
+could read the files.
 
 `roostctl` does not surface these yet — they exist for end-to-end test
 coverage (`tools/roosttest/`) and as a stable surface a future scriptable

@@ -2389,17 +2389,33 @@ pub enum UiTask {
         png: Vec<u8>,
         reply: roost_engine::ipc::HostOpReply<()>,
     },
+    /// A system paste's first step where copied files come before the text
+    /// (plan 073 D2): a blocking file-list read, answered as
+    /// `Message::ClipboardFilesRead` with the read still holding the queue.
+    ClipboardReadFiles {
+        request_id: u64,
+    },
+    /// `clipboard.write_files`' half of the queue (plan 073 D2), answered
+    /// from the blocking pool like [`UiTask::ClipboardWriteImage`].
+    ClipboardWriteFiles {
+        request_id: u64,
+        paths: Vec<PathBuf>,
+        reply: roost_engine::ipc::HostOpReply<()>,
+    },
     OpenUrl {
         url: String,
     },
-    /// A paste found no text on the system clipboard — go look for an
-    /// image. The read + PNG encode block, so this runs off the UI
-    /// thread and reports back as `Message::PasteImageMaterialized`.
+    /// A paste found no text on the system clipboard — go look for copied
+    /// files, then an image. The reads + PNG encode block, so this runs
+    /// off the UI thread and reports back as
+    /// `Message::PasteImageMaterialized`, holding the clipboard queue under
+    /// its paste's `request_id` until then.
     ///
     /// `sink` is chosen from the target tab when the probe is spawned: a
     /// host tab's image must never touch this machine's disk (plan 047
     /// §3.2), so it stops at the bytes.
     PasteImageProbe {
+        request_id: u64,
         tab: TabKey,
         sink: ProbeSink,
     },

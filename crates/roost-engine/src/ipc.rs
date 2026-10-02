@@ -34,27 +34,27 @@ use roost_ipc::messages::{
     AppNotificationStatusResult, AppRenderStatsParams, AppRenderStatsResult,
     AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams, AppUpdateCheckParams,
     AppUpdateStatusParams, AppUpdateStatusResult, AttachPayloadKind, ClipboardDumpParams,
-    ClipboardDumpResult, ClipboardWriteParams, EventsSubscribeParams, EventsSubscribeResult, Host,
-    HostAddParams, HostAddResult, HostConnectParams, HostConnectionResult, HostDisconnectParams,
-    HostListParams, HostListResult, HostRemoveParams, HostStatusParams, HostStatusResult,
-    IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
-    PaletteDismissParams, PaletteOpenParams, PalettePresentParams, PalettePresentResult,
-    PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
-    ProjectCreateResult, ProjectDeleteParams, ProjectEnsureParams, ProjectEnsureResult,
-    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
-    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
-    SessionIdentify, SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult,
-    SessionSetAgentHooksParams, SessionSetThemeParams, SessionStopParams, SessionStopResult,
-    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
-    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams,
-    TabClearNotificationResult, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
-    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
-    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
-    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams, TabSendFileResult,
-    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
-    WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef, WireTabRef,
-    MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
+    ClipboardDumpResult, ClipboardWriteFilesParams, ClipboardWriteParams, EventsSubscribeParams,
+    EventsSubscribeResult, Host, HostAddParams, HostAddResult, HostConnectParams,
+    HostConnectionResult, HostDisconnectParams, HostListParams, HostListResult, HostRemoveParams,
+    HostStatusParams, HostStatusResult, IdentifyParams, IdentifyResult, NotificationCreateParams,
+    PaletteActivateParams, PaletteDismissParams, PaletteOpenParams, PalettePresentParams,
+    PalettePresentResult, PaletteQueryParams, PaletteStateParams, PaletteStateResult,
+    ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectEnsureParams,
+    ProjectEnsureResult, ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams,
+    ScreenshotResult, SelectionClearParams, SelectionDumpParams, SelectionDumpResult,
+    SelectionSetParams, SessionIdentify, SessionIdentifyParams, SessionPutFileParams,
+    SessionPutFileResult, SessionSetAgentHooksParams, SessionSetThemeParams, SessionStopParams,
+    SessionStopResult, SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams,
+    TabAgentReportResult, TabCapturePtyInputParams, TabCapturePtyInputResult,
+    TabClearNotificationParams, TabClearNotificationResult, TabCloseParams,
+    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
+    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
+    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
+    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams,
+    TabSendFileResult, TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams,
+    TabWriteParams, WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef,
+    WireTabRef, MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{AttachHandshake, SessionSetThemeResult};
@@ -350,6 +350,14 @@ pub enum UiRequest {
     /// that a paste issued right afterwards reads what this put there.
     ClipboardWriteImage {
         png: Vec<u8>,
+        reply: HostOpReply<()>,
+    },
+    /// `clipboard.write_files` — test-only: files onto the system
+    /// clipboard as a file manager's copy leaves them (plan 073 D2).
+    /// Answered like [`UiRequest::ClipboardWriteImage`], once a paste
+    /// could read them.
+    ClipboardWriteFiles {
+        paths: Vec<PathBuf>,
         reply: HostOpReply<()>,
     },
     /// `tab.feed_pty_bytes` — inject bytes into a tab's PTY-output
@@ -3800,6 +3808,19 @@ async fn dispatch(
             }
             Ok(serde_json::json!({}))
         }
+        ops::CLIPBOARD_WRITE_FILES => {
+            let p: ClipboardWriteFilesParams = decode(params)?;
+            let paths: Vec<PathBuf> = p.paths.into_iter().map(PathBuf::from).collect();
+            if let Some(relative) = paths.iter().find(|path| !path.is_absolute()) {
+                return Err(HandlerError::invalid_param(format!(
+                    "clipboard.write_files takes absolute paths (got {})",
+                    relative.display()
+                )));
+            }
+            h.ui_call(|reply| UiRequest::ClipboardWriteFiles { paths, reply })
+                .await??;
+            Ok(serde_json::json!({}))
+        }
         ops::TAB_FEED_PTY_BYTES => {
             let p: TabFeedPtyBytesParams = decode(params)?;
             match served::feed_pty_bytes(h, p.tab_id, p.data.clone()).await {
@@ -4361,6 +4382,7 @@ const DISPATCHED_OPS: &[(&str, &[Withheld])] = {
         (ops::SELECTION_DUMP, &[NeedsUi]),
         (ops::CLIPBOARD_DUMP, &[NeedsUi]),
         (ops::CLIPBOARD_WRITE, &[NeedsUi]),
+        (ops::CLIPBOARD_WRITE_FILES, &[NeedsUi, TestMode]),
         (ops::TAB_FEED_PTY_BYTES, &[NeedsATerminal, TestMode]),
         (ops::TAB_CAPTURE_PTY_INPUT, &[NeedsATerminal, TestMode]),
         (ops::TAB_EXPAND_SELECTION_AT, &[NeedsUi, TestMode]),
@@ -5632,6 +5654,7 @@ mod tests {
         "app.keybind_dispatch",
         "app.notice_answer",
         "app.set_window_focus",
+        "clipboard.write_files",
         "sidebar.set_width",
         "tab.capture_pty_input",
         "tab.dispatch_mouse_event",

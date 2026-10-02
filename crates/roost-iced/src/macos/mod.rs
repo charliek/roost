@@ -31,12 +31,17 @@
 //! still happens on the main thread, under a marker, and the second rule
 //! holds there unchanged.
 //!
+//! [`pasteboard`] is the other exception to the first rule; its module
+//! docs say why.
+//!
 //! First consumer: [`dock_badge`], the parity port of `App.swift`'s
 //! `refreshDockBadge()`. Second: [`menu`], the native menu bar. Third:
 //! [`sparkle`], the runtime-loaded updater. Fourth: [`notifications`],
-//! the `UNUserNotificationCenter` backend.
+//! the `UNUserNotificationCenter` backend. Fifth: [`pasteboard`], the
+//! selection pasteboard.
 
 pub(crate) mod dock_badge;
 pub(crate) mod menu;
 pub(crate) mod notifications;
+pub(crate) mod pasteboard;
 pub(crate) mod sparkle;
