@@ -26,7 +26,7 @@ the launcher with deterministic commands.
 | Key | Type | Default | Effect |
 |---|---|---|---|
 | `theme` | string | bundled `roost-dark` | Theme name (see [`themes.md`](themes.md)). |
-| `font-family` | string | system monospace (Mac) / `JetBrains Mono, Monospace` (Linux) | Monospaced font family. Quoted values supported (`"JetBrains Mono"`). See [Fonts](fonts.md). |
+| `font-family` | string | system monospace (Swift Mac app) / `JetBrains Mono, Monospace` (iced UI, which bundles JetBrains Mono) | Monospaced font family. Quoted values supported (`"JetBrains Mono"`). See [Fonts](fonts.md). |
 | `word-break-chars` | string | `` `_-.+~/:@%` `` | Extra characters treated as word characters for double-click word selection (keeps paths + URLs whole). Despite the `-break-` name (kept for Ghostty compatibility), the value is the extra word-char set. |
 | `show-sidebar-agents` | bool | `true` | Whether the sidebar renders one row per agent-owned tab under its project. Also toggled at runtime (keybind / palette / Mac View menu). |
 | `font-size` | number | `13` (Linux), `14` (Mac) | Point size for the terminal font. Must be `> 0`. |

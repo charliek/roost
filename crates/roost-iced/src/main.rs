@@ -4,6 +4,7 @@ mod config_writer;
 mod engine_feed;
 mod focus_probe;
 mod font_registry;
+mod fonts;
 /// Host sessions, client side (plan 037): one connection owner per
 /// connected `roost-session`, publishing onto the engine feed.
 mod host_conn;

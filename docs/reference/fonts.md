@@ -19,7 +19,7 @@ misspelled key is silently ignored.
 
 | Key           | Default                 | Effect                                                                                 |
 |---------------|-------------------------|----------------------------------------------------------------------------------------|
-| `font-family` | macOS: the system monospaced font. Linux: `JetBrains Mono, Monospace` (JetBrains Mono when installed, else the system `Monospace` alias) | Terminal cell font. Quote values containing spaces (`"JetBrains Mono"`). |
+| `font-family` | Swift `Roost.app`: the system monospaced font. iced UI (Linux, and `Roost-Iced.app` on macOS): `JetBrains Mono, Monospace`, which is always [JetBrains Mono](#the-bundled-terminal-font) | Terminal cell font. Quote values containing spaces (`"JetBrains Mono"`). |
 | `font-size`   | `13` (Linux) / `14` (macOS) | Point size for the terminal font. Must be `> 0`. Adjustable per tab at runtime via `Cmd-+` / `Cmd--` (`Alt-+` / `Alt--` on Linux). |
 
 ### How `font-family` resolves
@@ -31,22 +31,41 @@ work on both should name a single installed family:
   case-insensitively against the installed families left-to-right; the
   first installed one wins. `monospace` anywhere in the chain (and an
   unmatched chain) resolves to the `Monospace` generic
-  (`resolve_family_name` in `crates/roost-ui-model/src/typography.rs`).
+  (`resolve_family_name` in `crates/roost-ui-model/src/typography.rs`),
+  which the iced UI maps to its bundled JetBrains Mono. The same rules
+  apply to `Roost-Iced.app` on macOS.
 - **macOS (Swift).** The value is a single family name handed to
   `NSFont(name:size:)`. An unknown or empty name falls back to
   `NSFont.monospacedSystemFont` — a comma-separated *list* is not parsed,
   so it will not match a family and you get the system monospace instead.
 
-Either way an unresolvable family degrades to the system monospace rather
-than failing to launch.
+Either way an unresolvable family never stops Roost from launching: the
+iced UI falls back to its bundled JetBrains Mono, and the Swift app to the
+system monospace.
+
+## The bundled terminal font
+
+The iced UI carries [JetBrains Mono](https://www.jetbrains.com/lp/mono/)
+v2.304 (Regular, Bold, Italic, Bold Italic) inside its binary
+(`third_party/jetbrains-mono`, loaded by `crates/roost-iced/src/fonts.rs`).
+So the default `font-family` renders the same font on every machine,
+whether or not JetBrains Mono is installed, and the picker always lists
+it. A family you name that is installed resolves as before, and a
+system-wide JetBrains Mono install coexists with the bundled copy.
+
+Before the font was bundled, an unset `font-family` on a machine without
+JetBrains Mono fell back to whatever monospace font the system offered.
+Those machines now show JetBrains Mono; set `font-family` to keep the
+font you had.
 
 ## Picking a font from the UI
 
 Both UIs expose **Select a font…** in the command palette
 (`Cmd-Shift-P` / `Alt-Shift-P`). It lists the monospaced families the
-system reports, previews the highlighted one live, and writes the choice
-back to `config.conf` as a `font-family =` line when you confirm — so the
-picker and the config file are the same setting, not two.
+system reports (plus the bundled JetBrains Mono in the iced UI),
+previews the highlighted one live, and writes the choice back to
+`config.conf` as a `font-family =` line when you confirm — so the picker
+and the config file are the same setting, not two.
 
 ## Chrome vs. terminal cells
 

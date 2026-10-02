@@ -70,6 +70,19 @@ def _activate_command(palette, command: str) -> None:
     assert state["open"] is False
 
 
+def test_rust_default_family_is_the_bundled_jetbrains_mono(owned_rust_config, roost):
+    """CI runners have no system JetBrains Mono, so only the copy bootstrap
+    loads can make the unset default resolve to it; without that load the
+    UI reports the `Monospace` generic."""
+    family_lines = [
+        line
+        for line in owned_rust_config.read_text().splitlines()
+        if line.split("=", 1)[0].strip() == "font-family"
+    ]
+    assert family_lines == [], "the seed config leaves font-family unset"
+    assert roost.window_metrics()["terminal_font_family"] == "JetBrains Mono"
+
+
 def test_rust_shared_font_size_reflows_all_tabs_and_persists(
     owned_rust_config, roost, rust_project, rust_palette
 ):

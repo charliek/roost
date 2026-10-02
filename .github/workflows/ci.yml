@@ -65,6 +65,9 @@ jobs:
               - 'crates/**'
               - 'third_party/ghostty/**'
               - 'third_party/swash/**'
+              # `include_bytes!`'d into roost-iced: the chrome and terminal fonts.
+              - 'third_party/inter/**'
+              - 'third_party/jetbrains-mono/**'
             rust:
               - *rustcore
             mac:

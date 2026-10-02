@@ -65,6 +65,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::chrome::{self, ChromePalette};
 use crate::engine_feed::{self, EngineBatch, EngineFeed, EngineFeedReceiver, EngineFeedSender};
 use crate::font_registry::{system_font_registry, FontRegistry};
+use crate::fonts;
 use crate::input;
 use crate::notifications::DesktopNotifications;
 use crate::palette_scroll::Visibility;
@@ -3432,6 +3433,7 @@ struct StartedEngine {
 
 impl App {
     pub fn bootstrap(profile: &BundleProfile, locks: InstanceLocks) -> Result<Self> {
+        fonts::install_bundled_terminal_fonts();
         let config = RoostConfig::load_default();
         let font_registry = system_font_registry();
         let configured_typography =

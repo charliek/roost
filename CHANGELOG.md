@@ -52,6 +52,18 @@ release workflow asserts they agree).
   #rrggbb` key pins a color instead; on Linux `system` keeps Roost's blue
   (#578).
 
+### Changed
+
+- **JetBrains Mono is bundled as the iced UI's terminal font (#580)** —
+  the default `font-family` (`JetBrains Mono, Monospace`) now renders
+  JetBrains Mono on every machine, installed or not, and a family that
+  does not resolve falls back to it too, instead of to whatever monospace
+  font the system has. If you never set `font-family` and JetBrains Mono
+  was not installed, the terminal font changes after this update; set
+  `font-family` to keep the font you had. A font you configure that is
+  installed resolves as before. See
+  [`fonts.md`](docs/reference/fonts.md#the-bundled-terminal-font).
+
 ### Fixed
 
 - **Select-to-copy and middle-click paste did nothing in Roost-Iced on
