@@ -41,6 +41,7 @@ the launcher with deterministic commands.
 | `macos-option-as-alt` | `false \| true \| left \| right` | `false` | Which Option keys send Alt (Meta) on macOS, so ⌥B sends `ESC b` instead of typing `∫`. Read by the iced UI on macOS only. See [the dedicated section below](#macos-option-as-alt). |
 | `agent-hooks` | agent list \| `off` \| absent | absent (unanswered) | Which supported coding agents (Claude Code, Codex, grok/gx, cursor-agent, OpenCode) Roost wires its hook entries into, at startup. Absent means nobody has answered the consent dialog yet — Roost writes nothing until they do. See [the dedicated section below](#agent-hooks) and the [Agent Hooks](../guides/agents.md) guide. |
 | `local-backend` | `in-process \| session` | `in-process` for an existing setup; `session` on a genuinely fresh install | Where the tabs you start in the Roost window run. See [the dedicated section below](#local-backend). |
+| `chrome-accent` | `system \| #rrggbb` | `system` | The accent color of the window chrome: the active tab and project, notification dots, focus rings. iced-only. See [the dedicated section below](#chrome-accent). |
 
 ## `copy-on-select`
 
@@ -373,6 +374,29 @@ later launch.
 
 Read by the iced UI. The Swift Mac app (`Roost.app`) is always
 in-process and never reads this key.
+
+## `chrome-accent`
+
+The accent color of the window chrome around the terminal: the active
+tab pill and project row, the notification dots, the outline of a
+dragged tab, the focus ring, the confirm button and the command
+palette's match highlight.
+
+| Value | Accent |
+|---|---|
+| `system` *(default)* | **macOS:** the system accent color (System Settings → Appearance), followed live when you change it. **Linux:** Roost's blue, `#007aff` — the desktop's accent is not followed. |
+| `#rrggbb` | That color, on both platforms. Hex digits in either case. |
+
+Under Roost's blue the chrome keeps its hand-picked fills. Any other
+accent derives them the way macOS's own controls do: the active tab is
+the accent at 18% over the tab band, and the selected project row is the
+accent mixed half and half with a dark grey.
+
+Anything else (a color name, a short hex) logs a warning and reads as
+`system`.
+
+Read by the iced UI. The Swift Mac app (`Roost.app`) ignores this key
+and always follows the system accent.
 
 ## Example
 

@@ -2187,6 +2187,10 @@ impl App {
                     task = task.then(self.menu_event(event));
                     batch.mark_dirty();
                 }
+                #[cfg(target_os = "macos")]
+                EngineFeed::AccentChanged(accent) => {
+                    self.chrome = chrome_palette_for(self.config.chrome_accent, accent);
+                }
                 // Host mirrors + lifecycle land in the connection set.
                 // C6/C7 render off it; C4 only keeps it current, so with
                 // zero hosts these arms never run.
@@ -2716,6 +2720,30 @@ impl App {
                 return;
             };
             crate::macos::notifications::init(mtm);
+        }
+    }
+
+    /// Read the system accent into the chrome and start following it
+    /// (plan 073 D4). A no-op on every other host, where `system` is
+    /// already [`chrome::DEFAULT_ACCENT`] from bootstrap.
+    ///
+    /// From `window_opened`, not bootstrap: AppKit before winit has built
+    /// the event loop is unsupported. The read repeats on every focus
+    /// change, which is cheap and squares the chrome with the OS if a
+    /// change was ever missed.
+    pub(super) fn follow_system_accent(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.window_id.is_none() {
+                return;
+            }
+            let Some(mtm) = seam_on_main("accent observe") else {
+                return;
+            };
+            crate::macos::accent::observe(mtm, self.feed_tx.clone());
+            if let Some(accent) = crate::macos::accent::current(mtm) {
+                self.chrome = chrome_palette_for(self.config.chrome_accent, accent);
+            }
         }
     }
 

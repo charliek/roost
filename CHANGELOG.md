@@ -44,6 +44,14 @@ release workflow asserts they agree).
   Linux ignores the key. See
   [`config.md#macos-option-as-alt`](docs/reference/config.md#macos-option-as-alt).
 
+- **The iced chrome follows the macOS accent color (plan 073)** — the active
+  tab and project fills, the notification dots, the drag outline, the focus
+  ring, the confirm button and the palette's match highlight take the system
+  accent, resolved for the dark chrome as the Swift app does, and follow a
+  change in System Settings while Roost runs. A new `chrome-accent = system |
+  #rrggbb` key pins a color instead; on Linux `system` keeps Roost's blue
+  (#578).
+
 ### Fixed
 
 - **Select-to-copy and middle-click paste did nothing in Roost-Iced on

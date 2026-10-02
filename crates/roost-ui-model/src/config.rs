@@ -95,6 +95,11 @@ pub struct RoostConfig {
     /// written, so a typo must not read as "never configured" and
     /// silently move a user's tabs to a session.
     pub local_backend_key_present: bool,
+
+    /// `chrome-accent` — the iced chrome's accent color (plan 073 D4).
+    /// Defaults to [`ChromeAccent::System`], which an unparseable value
+    /// also resolves to.
+    pub chrome_accent: ChromeAccent,
 }
 
 impl Default for RoostConfig {
@@ -115,7 +120,38 @@ impl Default for RoostConfig {
             agent_hooks: AgentHooks::default(),
             local_backend: LocalBackend::default(),
             local_backend_key_present: false,
+            chrome_accent: ChromeAccent::default(),
         }
+    }
+}
+
+/// The `chrome-accent` value (plan 073 D4).
+///
+/// * `System` (default) — the OS accent color where the UI follows one
+///   (macOS), Roost's own blue elsewhere.
+/// * `Rgb` — an explicit `#rrggbb`, used as written on every OS.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ChromeAccent {
+    #[default]
+    System,
+    Rgb([u8; 3]),
+}
+
+impl ChromeAccent {
+    /// Parse a config value: `system`, or `#` and six hex digits in either
+    /// case. Any other value returns `None` so the caller can warn and
+    /// keep the default.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("system") {
+            return Some(Self::System);
+        }
+        let hex = s.strip_prefix('#')?;
+        if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let channel = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).ok();
+        Some(Self::Rgb([channel(0)?, channel(2)?, channel(4)?]))
     }
 }
 
@@ -591,6 +627,19 @@ impl RoostConfig {
                                  falling back to default `in-process`"
                             );
                             LocalBackend::default()
+                        }
+                    };
+                }
+                "chrome-accent" => {
+                    cfg.chrome_accent = match ChromeAccent::parse(value) {
+                        Some(v) => v,
+                        None => {
+                            tracing::warn!(
+                                value,
+                                "unknown chrome-accent value; expected system|#rrggbb, \
+                                 falling back to default `system`"
+                            );
+                            ChromeAccent::default()
                         }
                     };
                 }
@@ -1362,6 +1411,31 @@ mod tests {
             RoostConfig::parse("copy-on-select = both").copy_on_select,
             CopyOnSelect::Clipboard
         );
+    }
+
+    #[test]
+    fn chrome_accent_is_system_or_a_hex_and_anything_else_falls_back() {
+        assert_eq!(RoostConfig::default().chrome_accent, ChromeAccent::System);
+        assert_eq!(
+            RoostConfig::parse("chrome-accent = system").chrome_accent,
+            ChromeAccent::System
+        );
+        assert_eq!(
+            RoostConfig::parse("chrome-accent = #a1b2c3").chrome_accent,
+            ChromeAccent::Rgb([0xa1, 0xb2, 0xc3])
+        );
+        assert_eq!(
+            RoostConfig::parse("chrome-accent = #A1B2C3").chrome_accent,
+            ChromeAccent::Rgb([0xa1, 0xb2, 0xc3])
+        );
+        for bad in ["blue", "#12345"] {
+            assert_eq!(
+                RoostConfig::parse(&format!("chrome-accent = #a1b2c3\nchrome-accent = {bad}"))
+                    .chrome_accent,
+                ChromeAccent::System,
+                "{bad} falls back to system, not to the line before it"
+            );
+        }
     }
 
     #[test]

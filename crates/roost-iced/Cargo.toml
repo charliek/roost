@@ -121,6 +121,10 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSArray",
     # `localizedDescription` on the errors the UN completion blocks hand back.
     "NSError",
+    # The system-accent observer: a block on the main operation queue.
+    "NSNotification",
+    "NSOperation",
+    "block2",
     "NSObject",
     "NSSet",
     "NSString",
@@ -134,6 +138,13 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 ] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
+    # The system accent, resolved under darkAqua (`performAsCurrentDrawingAppearance:`
+    # takes a block) and read back as sRGB components (`CGFloat`).
+    "NSAppearance",
+    "NSColor",
+    "NSColorSpace",
+    "block2",
+    "objc2-core-foundation",
     "NSApplication",
     # `NSControlStateValue` — the Window menu's active-row checkmark.
     "NSCell",
