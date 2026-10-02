@@ -397,12 +397,12 @@ class Roost:
 
     # -- the keyboard (test mode) ------------------------------------------
     def key_event(self, key: str, modifiers=(), text: str | None = None) -> None:
-        """Test-mode only — press `key` in the window, through the handler
-        a real press reaches: shortcuts first, then whatever owns the
-        keyboard. `key` is one character or a named key (`"Enter"`,
-        `"Escape"`, `"ArrowUp"`, …); `modifiers` any of `shift`, `ctrl`,
-        `alt`, `super`. The press only — no release. Iced-only; the
-        Swift app answers `unknown-op`."""
+        """Test-mode only — press and release `key` in the window, through
+        the handler a real keystroke reaches: shortcuts first, then
+        whatever owns the keyboard. `key` is one character or a named key
+        (`"Enter"`, `"Escape"`, `"ArrowUp"`, …); `modifiers` any of
+        `shift`, `ctrl`, `alt`, `super`. Iced-only; the Swift app answers
+        `unknown-op`."""
         params: dict = {"key": key, "modifiers": list(modifiers)}
         if text is not None:
             params["text"] = text
@@ -412,6 +412,27 @@ class Roost:
         """[`key_event`] once per character of `text`, unmodified."""
         for char in text:
             self.key_event(char)
+
+    # -- a row's right-click menu (test mode) ------------------------------
+    def context_menu_dump(self, target: dict) -> list[dict]:
+        """Test-mode only — the menu `target` would show now:
+        `[{action, label, enabled} | {separator: True}]`. `target` is
+        `{"tab_id": ref}`, `{"project_id": ref}` or `{"host": saved_id}`;
+        a ref is a bare id or the `h<host>.<id>` spelling. Iced-only."""
+        return self.call("app.context_menu_dump", {"target": target})["entries"]
+
+    def context_menu_activate(self, target: dict, action: str) -> None:
+        """Test-mode only — run one item of that menu through the
+        dispatcher a click reaches. Returns once it is dispatched, so wait
+        on its effect. A gone row, a stale connection, an item not on the
+        menu or disabled, and an open modal are `RoostError('invalid-param')`."""
+        self.call("app.context_menu_activate", {"target": target, "action": action})
+
+    def context_menu_open(self, target: dict) -> None:
+        """Test-mode only — show that menu on screen, where it owns the
+        keyboard until `Enter` runs an item or `Escape` closes it. On
+        macOS, whose menu is the native popup, `RoostError('not-supported')`."""
+        self.call("app.context_menu_open", {"target": target})
 
     # -- host sessions ----------------------------------------------------
     def host_status(self, id: str | None = None) -> dict:
@@ -578,6 +599,24 @@ class Roost:
             "target": "system",
             "image_png": base64.b64encode(png).decode("ascii"),
         })
+
+    def clipboard_write_files(self, paths) -> None:
+        """Put copied files on the SYSTEM clipboard, the way a file
+        manager's copy leaves them (plan 073 D2): on macOS one item per
+        file with its URL and, as text, only its name, as Finder does; on
+        Linux `text/uri-list`. A paste then finds the files.
+
+        Every path must be **absolute**. Linux canonicalizes each path and
+        drops one that does not exist, so pass real files and compare
+        against their canonical paths. An empty list writes nothing and
+        leaves the clipboard as it was. Returns once a paste could read
+        the files.
+
+        Refusals, all `RoostError`: `not-enabled` without ROOST_TEST_MODE=1
+        at UI launch; `not-supported` when a Wayland session refused the
+        write; `invalid-param` for a relative path. iced only — the Swift
+        app answers `unknown-op`."""
+        self.call("clipboard.write_files", {"paths": [str(path) for path in paths]})
 
     # -- files into a tab (plan 047 §3.4) ---------------------------------
     def tab_send_file(self, tab: str | int, paths) -> dict:

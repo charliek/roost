@@ -11,6 +11,114 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+### Added
+
+- **Pasting copied files (plan 073, #576)** — in Roost-Iced, ⌘V /
+  Ctrl+Shift+V with files on the clipboard (copied in Finder or a file
+  manager) does what dropping those files on the tab does: a local tab
+  gets their shell-escaped paths, and a host tab uploads them and gets
+  the host paths. Any file type, not only images. On macOS the files are
+  read before the text, because Finder's text for a copied file is only
+  its name. On Linux the text still comes first, so a file manager that
+  also copies its paths as text keeps pasting that text; a clipboard
+  that carries only `text/uri-list` now pastes the files. A test-mode
+  `clipboard.write_files` op seeds such a clipboard (see
+  [`ipc.md`](docs/reference/ipc.md#selection-clipboard-test-ops-selection-clipboard)).
+
+- **iced: Settings…, Help, Full Screen and Agent Hooks… in the macOS menu bar,
+  and three new actions (#577)** — `open_config` (⌘, on macOS) opens
+  `config.conf` in your default text editor, creating it first if it is
+  missing; `open_docs` opens the documentation site; `toggle_fullscreen`
+  (⌃⌘F on macOS) flips full screen, and the View item reads "Enter Full
+  Screen" or "Exit Full Screen" to match the window. The macOS menu gains
+  Settings… (Roost menu), Agent Hooks… (View) and a Help menu. On Linux the
+  three actions are unbound and reachable from the command palette ("Open
+  Settings File", "Open Documentation", "Toggle Full Screen").
+
+- **`macos-option-as-alt` sends Option as Meta in Roost-Iced on macOS
+  (#341)** — `false | true | left | right`, Ghostty's key and values,
+  default `false` (today's behavior). With it set, ⌥B sends `ESC b`
+  instead of typing `∫`, so readline's ⌥B and ⌥F word jumps work, and
+  `left` or `right` keeps the other Option for typing characters. The
+  dead-key chords (⌥E, ⌥U, ⌥N, ⌥I, ⌥\`) still start accents (#582).
+  Linux ignores the key. See
+  [`config.md#macos-option-as-alt`](docs/reference/config.md#macos-option-as-alt).
+
+- **The iced chrome follows the macOS accent color (plan 073)** — the active
+  tab and project fills, the notification dots, the drag outline, the focus
+  ring, the confirm button and the palette's match highlight take the system
+  accent, resolved for the dark chrome as the Swift app does, and follow a
+  change in System Settings while Roost runs. A new `chrome-accent = system |
+  #rrggbb` key pins a color instead; on Linux `system` keeps Roost's blue
+  (#578).
+
+- **Right-click menus in Roost-Iced (plan 073, #338)** — right-click (or
+  Control-click on macOS, where the menu is the native one) a tab, a
+  project or a host's band in the sidebar. A tab offers Rename…, New Tab
+  Here (a new tab in that tab's directory), Copy Path and Close Tab. A
+  project offers New Tab, Rename…, Copy Path, Open in Finder / Open in
+  File Manager when its folder is on this machine, and Close Project…,
+  which still asks first. A host's band offers that host's own
+  command-palette entries — Connect, Disconnect, Stop Session (which asks
+  first), and Update or Restart when its session is out of date — and a
+  project on a host lists them below its own; Remove Host stays in the
+  palette. Test-mode
+  `app.context_menu_*` ops list and run a row's menu (see
+  [`ipc.md`](docs/reference/ipc.md#context-menu-test-ops-appcontext_menu_dump-appcontext_menu_activate-appcontext_menu_open-test-only-gated)).
+
+### Changed
+
+- **JetBrains Mono is bundled as the iced UI's terminal font (#580)** —
+  the default `font-family` (`JetBrains Mono, Monospace`) now renders
+  JetBrains Mono on every machine, installed or not, and a family that
+  does not resolve falls back to it too, instead of to whatever monospace
+  font the system has. If you never set `font-family` and JetBrains Mono
+  was not installed, the terminal font changes after this update; set
+  `font-family` to keep the font you had. A font you configure that is
+  installed resolves as before. See
+  [`fonts.md`](docs/reference/fonts.md#the-bundled-terminal-font).
+
+- **Roost-Iced on macOS sizes text like a Mac (#581)** — a point is now
+  one pixel, as in the Swift app and other macOS terminals, so the text
+  shrinks: a `font-size = 13` setting goes from 17.3 px to 13 px. Cells
+  are sized as the Swift app sizes them (8×18 for JetBrains Mono at
+  13 px), so the same `font-size` gives both apps the same cell. The
+  macOS default `font-size` becomes 14, the Swift app's. Linux is
+  unchanged: 96 dpi (13pt ≈ 17.3 px), the same cells, and a default of
+  13. See [`fonts.md`](docs/reference/fonts.md#font-size).
+
+- **Glyphs look like macOS text, and blending matches AppKit and Ghostty
+  (#581)** — on macOS, glyphs are unhinted, closer to native macOS text.
+  On both OSes, text antialiasing and translucent fills (a dragged tab,
+  the host scrim, dimmed host sections) blend in display space, as AppKit
+  and Ghostty do, so the wgpu and software renderers agree. Solid colors,
+  including the now-opaque selection and block cursor, are unchanged.
+
+### Fixed
+
+- **Select-to-copy and middle-click paste did nothing in Roost-Iced on
+  macOS (plan 073, #575)** — the selection clipboard had no macOS
+  backing, so under the default `copy-on-select = true` a drag-selection
+  was written nowhere, OSC 52's selection target was dropped, and the
+  middle-click paste was compiled out. The selection now lives on the
+  same private pasteboard the Swift app uses
+  (`ai.stridelabs.Roost.selection`), so a selection made in either app
+  middle-click-pastes in the other, and ⌘V still pastes the system
+  clipboard.
+
+- **The block cursor hid the character under it; selections and bold
+  text ignored the theme (#579)** — in Roost-Iced, a focused block
+  cursor was a translucent tint under an unchanged character. It is now
+  a solid block in the cursor color with the character drawn in the
+  background color, as in the Swift app and Ghostty, and it covers both
+  columns of a wide character. A selection is a solid
+  `selection-background` with its text in the theme's
+  `selection-foreground`, as Ghostty draws it, instead of a translucent
+  tint. Bold text with no color of its own takes the theme's
+  `bold-color`, as the Swift app does. The bundled themes' bold color
+  matches their foreground, so that shows only with a theme of your own
+  or after a script recolors the default foreground (OSC 10).
+
 ## v0.0.21 — 2026-09-27
 
 _The session-parity release: a tab on a `roost-session` behaves more like an

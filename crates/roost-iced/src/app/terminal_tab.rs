@@ -320,11 +320,11 @@ pub(super) struct TerminalTab {
     cached_grid_size: Option<(u16, u16)>,
     cached_defaults: Option<(ColorRgb, ColorRgb)>,
     cached_theme_generation: Option<u64>,
-    /// Bumped whenever a theme lands on this tab. Nothing theme-derived
-    /// besides the default fg/bg pair enters `RenderedRow::build` today
-    /// (the now-removed GTK UI's twin resolver already pulled the
-    /// theme's `bold_color`), so this fails the cache safe toward
-    /// over-rebuilding if that override ever lands here.
+    /// Bumped whenever a theme lands on this tab. It is the cache key
+    /// for the theme's `bold_color`, the one theme input
+    /// `RenderedRow::build` reads besides the default fg/bg pair:
+    /// `bold_color` comes only from the theme, so every change to it
+    /// moves this.
     theme_generation: u64,
     cols: u16,
     rows: u16,
@@ -1176,10 +1176,11 @@ impl TerminalTab {
     /// **Caching invariant.** A cached `RenderedRow` is valid exactly
     /// while (a) libghostty reports its row undirty and (b) the inputs
     /// `RenderedRow::build` reads besides the row's own vt cells — the
-    /// default fg/bg pair and the grid width — are unchanged. Everything
+    /// default fg/bg pair, the theme's bold color (keyed by
+    /// `theme_generation`) and the grid width — are unchanged. Everything
     /// that alters what a row should render must therefore either mark
     /// that row dirty inside libghostty or move one of the cache keys
-    /// guarded below. Anyone adding a third input to `RenderedRow::build`
+    /// guarded below. Anyone adding another input to `RenderedRow::build`
     /// must add a guard for it here.
     ///
     /// The default-color guard is not belt-and-braces: `OSC 10`/`OSC 11`
@@ -1220,6 +1221,7 @@ impl TerminalTab {
         }
 
         let cols = self.cols;
+        let bold = self.theme.bold_color;
         let grid = &mut self.grid;
         let mut rows_rebuilt: u64 = 0;
         let mut cells_walked: u64 = 0;
@@ -1232,7 +1234,7 @@ impl TerminalTab {
             if row as usize >= grid.len() {
                 return;
             }
-            grid[row as usize] = Arc::new(RenderedRow::build(cells, defaults, cols));
+            grid[row as usize] = Arc::new(RenderedRow::build(cells, defaults, bold, cols));
             rows_rebuilt += 1;
         })?;
 
@@ -1245,6 +1247,7 @@ impl TerminalTab {
             cursor_color: self.theme.cursor,
             grid: self.grid.clone(),
             selection_background: self.theme.selection_background,
+            selection_foreground: self.theme.selection_foreground,
             selection_spans: self
                 .selection
                 .visible_spans(&self.terminal, self.cols, self.rows),
@@ -1345,5 +1348,33 @@ mod tests {
             tab.theme.selection_background
         );
         assert!(tab.snapshot.cursor.is_none());
+    }
+
+    /// The UI's row build reads the theme's bold color, and a theme that
+    /// changes only `bold_color` recolors a bold row built before it.
+    /// Applying a theme re-seeds libghostty's colors, which already
+    /// dirties every row, so this does not isolate the `theme_generation`
+    /// guard.
+    #[test]
+    fn a_theme_bold_color_recolors_a_row_built_before_it() {
+        let (input_tx, _input_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut tab, _capture) = attach_test_host_terminal(80, 24, input_tx);
+        tab.write_vt(b"\x1b[1mB\x1b[0m");
+        tab.refresh_snapshot().expect("build the bold row");
+        tab.refresh_snapshot().expect("refresh over the clean row");
+        let bold_ink = |tab: &TerminalTab| tab.snapshot.grid[0].cells[0].foreground;
+        assert_eq!(bold_ink(&tab), tab.theme.foreground);
+
+        let bold_color = ColorRgb {
+            r: 0x12,
+            g: 0x34,
+            b: 0x56,
+        };
+        let theme = Theme {
+            bold_color: Some(bold_color),
+            ..tab.theme.clone()
+        };
+        tab.set_theme(&theme).expect("apply the bold color");
+        assert_eq!(bold_ink(&tab), bold_color);
     }
 }

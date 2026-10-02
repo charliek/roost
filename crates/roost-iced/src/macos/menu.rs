@@ -33,7 +33,7 @@ use objc2_app_kit::{
     NSApplication, NSControlStateValueOff, NSControlStateValueOn, NSEventModifierFlags, NSMenu,
     NSMenuItem,
 };
-use objc2_foundation::NSString;
+use objc2_foundation::{NSDictionary, NSNumber, NSString, NSUserDefaults};
 use roost_ipc::messages::{AppMenuDumpResult, MenuDump, MenuItemDump, Project};
 use roost_ui_model::keybind::{menu_accel_for_action, Accel, AccelMods, KeybindAction};
 use roost_ui_model::keys::{HostId, ProjectKey, TabKey};
@@ -336,6 +336,9 @@ define_class!(
     }
 );
 
+const ENTER_FULL_SCREEN: &str = "Enter Full Screen";
+const EXIT_FULL_SCREEN: &str = "Exit Full Screen";
+
 /// One menu item the gate can mutate.
 struct GatedItem {
     item: Retained<NSMenuItem>,
@@ -358,6 +361,12 @@ struct MainMenu {
     /// Sparkle updater rather than the keyboard route — the one item
     /// [`sync_gating`] must never touch.
     updates: Retained<NSMenuItem>,
+    /// The Help menu, registered with `NSApplication.setHelpMenu`.
+    help: Retained<NSMenu>,
+    /// The View menu, kept for [`drop_appkit_full_screen_rows`].
+    view: Retained<NSMenu>,
+    /// The View menu's full-screen item, kept for [`sync_fullscreen_title`].
+    fullscreen: Option<Retained<NSMenuItem>>,
     /// Indexed by the item's tag.
     events: Vec<MenuEvent>,
     /// Tags below this belong to the static menus and never move. A
@@ -427,11 +436,73 @@ pub(crate) fn install(
     if MENU.with(|cell| cell.borrow().is_some()) {
         return false;
     }
+    suppress_appkit_full_screen_item();
     let menu = build(mtm, app_name, keybindings, feed);
-    NSApplication::sharedApplication(mtm).setMainMenu(Some(&menu.root));
+    let app = NSApplication::sharedApplication(mtm);
+    app.setMainMenu(Some(&menu.root));
+    app.setHelpMenu(Some(&menu.help));
+    drop_appkit_full_screen_rows(&menu.view);
     MENU.with(|cell| *cell.borrow_mut() = Some(menu));
     tracing::info!(app_name, "installed the native menu bar");
     true
+}
+
+/// Our own "Enter Full Screen" item owns the chord, the title and the
+/// action, so AppKit must not inject a second one into View. The
+/// registration domain is read-only fallback state, never written to disk.
+/// AppKit reads the key while a bundled app finishes launching, before the
+/// first window exists, so `main` calls this before the event loop starts
+/// (Foundation only — no AppKit); the menu install calls it again.
+pub(crate) fn suppress_appkit_full_screen_item() {
+    let key = NSString::from_str("NSFullScreenMenuItemEverywhere");
+    let off: Retained<AnyObject> = {
+        let number = NSNumber::new_bool(false);
+        // SAFETY: an `NSNumber` is an `NSObject`, which is an `AnyObject`.
+        unsafe { Retained::cast_unchecked(number) }
+    };
+    let defaults = NSDictionary::from_retained_objects(&[&*key], &[off]);
+    // SAFETY: the dictionary maps `NSString` keys to `NSNumber` values,
+    // which is what `registerDefaults:` documents.
+    unsafe { NSUserDefaults::standardUserDefaults().registerDefaults(&defaults) };
+}
+
+/// The backstop when AppKit injects its own row anyway: ours dispatches
+/// through the menu target, so any `toggleFullScreen:` row in View is
+/// AppKit's.
+fn drop_appkit_full_screen_rows(view: &NSMenu) {
+    let appkit_rows: Vec<_> = view
+        .itemArray()
+        .iter()
+        .filter(|item| item.action() == Some(sel!(toggleFullScreen:)))
+        .collect();
+    for item in appkit_rows {
+        view.removeItem(&item);
+    }
+}
+
+/// Retitle the full-screen item to match the window: "Exit Full Screen"
+/// while it is full screen, "Enter Full Screen" otherwise.
+/// `autoenablesItems` is off, so AppKit never does this itself; the App
+/// re-queries the window after every toggle, resize and focus change.
+pub(crate) fn sync_fullscreen_title(_mtm: MainThreadMarker, is_full: bool) {
+    MENU.with(|cell| {
+        let slot = cell.borrow();
+        let Some(menu) = slot.as_ref() else {
+            return;
+        };
+        drop_appkit_full_screen_rows(&menu.view);
+        let Some(item) = menu.fullscreen.as_ref() else {
+            return;
+        };
+        let title = if is_full {
+            EXIT_FULL_SCREEN
+        } else {
+            ENTER_FULL_SCREEN
+        };
+        if item.title().to_string() != title {
+            item.setTitle(&NSString::from_str(title));
+        }
+    });
 }
 
 /// Push the app's keyboard route onto the live menu.
@@ -508,6 +579,9 @@ fn build(
         root: submenu(mtm, ""),
         window: submenu(mtm, "Window"),
         updates: plain_item(mtm, "Check for Updates\u{2026}"),
+        help: submenu(mtm, "Help"),
+        view: submenu(mtm, "View"),
+        fullscreen: None,
         events: Vec::new(),
         static_events: 0,
         gated: Vec::new(),
@@ -534,6 +608,14 @@ fn build(
     updates.setEnabled(false);
     bind_event(&mut menu, &updates, MenuEvent::CheckForUpdates);
     app_menu.addItem(&updates);
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add_action_item(
+        mtm,
+        &mut menu,
+        &app_menu,
+        Some(("Settings\u{2026}", KeybindAction::OpenConfig)),
+        keybindings,
+    );
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     app_menu.addItem(&standard_item(
         mtm,
@@ -577,7 +659,8 @@ fn build(
     }
     attach(mtm, &menu.root, &file_menu);
 
-    let view_menu = submenu(mtm, "View");
+    let view_menu = menu.view.clone();
+    let mut fullscreen = None;
     for spec in [
         Some(("Command Palette\u{2026}", KeybindAction::CommandPalette)),
         Some(("Command Launcher\u{2026}", KeybindAction::CommandLauncher)),
@@ -590,11 +673,18 @@ fn build(
         None,
         Some(("Toggle Sidebar", KeybindAction::ToggleSidebar)),
         Some(("Toggle Sidebar Agents", KeybindAction::ToggleSidebarAgents)),
+        Some(("Agent Hooks\u{2026}", KeybindAction::AgentHooks)),
         None,
         Some(("Jump to Unread", KeybindAction::JumpToUnread)),
+        None,
+        Some((ENTER_FULL_SCREEN, KeybindAction::ToggleFullScreen)),
     ] {
-        add_action_item(mtm, &mut menu, &view_menu, spec, keybindings);
+        let added = add_action_item(mtm, &mut menu, &view_menu, spec, keybindings);
+        if spec.is_some_and(|(_, action)| action == KeybindAction::ToggleFullScreen) {
+            fullscreen = added;
+        }
     }
+    menu.fullscreen = fullscreen;
     attach(mtm, &menu.root, &view_menu);
 
     // Cut and Select All exist for menu-shape parity only: neither the
@@ -614,6 +704,16 @@ fn build(
     attach(mtm, &menu.root, &edit_menu);
 
     attach(mtm, &menu.root, &menu.window);
+
+    let help = menu.help.clone();
+    add_action_item(
+        mtm,
+        &mut menu,
+        &help,
+        Some(("Roost Help", KeybindAction::OpenDocs)),
+        keybindings,
+    );
+    attach(mtm, &menu.root, &help);
     menu.static_events = menu.events.len();
     // The rows come from the workspace, which no menu install may read:
     // `reconcile()` owns that and fills them in on the turn after this.
@@ -755,17 +855,18 @@ fn add_window_row<K>(
     });
 }
 
-/// `None` adds a separator; `Some` adds a keybind-table-bound item.
+/// `None` adds a separator; `Some` adds a keybind-table-bound item and
+/// returns it.
 fn add_action_item(
     mtm: MainThreadMarker,
     menu: &mut MainMenu,
     parent: &NSMenu,
     spec: Option<(&str, KeybindAction)>,
     keybindings: &HashMap<Accel, KeybindAction>,
-) {
+) -> Option<Retained<NSMenuItem>> {
     let Some((title, action)) = spec else {
         parent.addItem(&NSMenuItem::separatorItem(mtm));
-        return;
+        return None;
     };
     let item = plain_item(mtm, title);
     bind_event(menu, &item, MenuEvent::Action(action));
@@ -778,10 +879,11 @@ fn add_action_item(
     let clipboard_equivalent = matches!(action, KeybindAction::Copy | KeybindAction::Paste)
         .then(|| accel.unwrap_or_default());
     menu.gated.push(GatedItem {
-        item,
+        item: item.clone(),
         palette_toggle: is_palette_toggle(action),
         clipboard_equivalent,
     });
+    Some(item)
 }
 
 /// A submenu with `autoenablesItems` off — every enabled-state in here is

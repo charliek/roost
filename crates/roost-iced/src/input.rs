@@ -1,9 +1,11 @@
+use std::sync::Once;
+
 use iced::keyboard::key::{Code, Named, NativeCode, Physical};
-use iced::keyboard::{self, Key};
+use iced::keyboard::{self, Key, Location};
 use roost_ui_model::keybind::{Accel, AccelMods};
 use roost_vt::ffi as ghostty;
 use roost_vt::{
-    key_action, mods, Key as GhosttyKey, KeyEncoder, KeyEvent, PageDirection, Terminal,
+    key_action, mods, Key as GhosttyKey, KeyEncoder, KeyEvent, OptionAsAlt, PageDirection, Terminal,
 };
 
 /// Translate an Iced key press into the toolkit-neutral accelerator grammar.
@@ -282,11 +284,142 @@ fn new_key_event() -> Option<KeyEvent> {
         .ok()
 }
 
+/// Which physical Option keys are down. iced's `Modifiers` has one ALT
+/// bit, so the side comes from the Alt key's own located press and
+/// release.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct OptionSides {
+    pub(crate) left: bool,
+    pub(crate) right: bool,
+}
+
+impl OptionSides {
+    /// The events [`Self::observe`] reads — what the window's keyboard
+    /// listener still forwards when a widget captured them.
+    pub(crate) fn observes(event: &keyboard::Event) -> bool {
+        matches!(
+            event,
+            keyboard::Event::KeyPressed {
+                key: Key::Named(Named::Alt),
+                ..
+            } | keyboard::Event::KeyReleased {
+                key: Key::Named(Named::Alt),
+                ..
+            } | keyboard::Event::ModifiersChanged(_)
+        )
+    }
+
+    pub(crate) fn observe(&mut self, event: &keyboard::Event) {
+        match event {
+            keyboard::Event::KeyPressed {
+                key: Key::Named(Named::Alt),
+                location,
+                ..
+            } => self.set(*location, true),
+            keyboard::Event::KeyReleased {
+                key: Key::Named(Named::Alt),
+                location,
+                ..
+            } => self.set(*location, false),
+            // The modifier state, not the key's own event, is the one
+            // that never misses a release: winit sends the Alt key's
+            // event before the `ModifiersChanged` it causes, so a key
+            // event's own `modifiers` would be stale here.
+            keyboard::Event::ModifiersChanged(modifiers) if !modifiers.alt() => {
+                *self = Self::default();
+            }
+            _ => {}
+        }
+    }
+
+    /// A release while the window is unfocused never reaches it.
+    pub(crate) fn window_focus(&mut self, focused: bool) {
+        if !focused {
+            *self = Self::default();
+        }
+    }
+
+    fn set(&mut self, location: Location, down: bool) {
+        match location {
+            Location::Left => self.left = down,
+            Location::Right => self.right = down,
+            Location::Standard | Location::Numpad => {}
+        }
+    }
+}
+
+/// What a press needs to know about Option: the `macos-option-as-alt`
+/// setting and which Option keys are down.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct OptionKey {
+    pub(crate) as_alt: OptionAsAlt,
+    pub(crate) sides: OptionSides,
+}
+
+/// What [`encode_press`] changes in a press for Option.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct OptionPress {
+    /// The unmodified key, one ASCII byte, in place of the glyph Option
+    /// typed: libghostty's legacy ESC prefix needs a single-byte `utf8`,
+    /// so ALT is no longer consumed. `None` keeps the press's own text.
+    text: Option<String>,
+    /// [`mods::ALT_SIDE`] when the right Option is the held one, which
+    /// libghostty checks for `left` and `right` itself.
+    side: u16,
+    /// Neither Option's own event was seen while ALT is held, so the
+    /// press is taken to be on the configured side.
+    assumed: bool,
+}
+
+/// Logs once that Option's side is being assumed (plan 073 R7): `left`
+/// and `right` need winit's located Alt key events.
+static ASSUMED_OPTION_SIDE: Once = Once::new();
+
+fn option_press(option: OptionKey, key: &Key<&str>, modifiers: keyboard::Modifiers) -> OptionPress {
+    if !modifiers.alt() {
+        return OptionPress::default();
+    }
+    let OptionSides { left, right } = option.sides;
+    let untracked = !left && !right;
+    // (Option is Alt for this press, the side libghostty is told)
+    let (as_alt, right_side) = match option.as_alt {
+        OptionAsAlt::False => return OptionPress::default(),
+        OptionAsAlt::True => (true, right && !left),
+        OptionAsAlt::Left if left || untracked => (true, false),
+        OptionAsAlt::Left => (false, true),
+        OptionAsAlt::Right if right || untracked => (true, true),
+        OptionAsAlt::Right => (false, false),
+    };
+    let unmodified = match key {
+        Key::Character(value) => sole_char(value),
+        Key::Named(Named::Space) => Some(' '),
+        _ => None,
+    };
+    // Control owns its own chord recovery and a Command chord types no
+    // text. The ESC prefix carries one byte, so a non-ASCII key (`é`)
+    // keeps the glyph Option typed: libghostty would otherwise truncate
+    // its codepoint into a byte that is not UTF-8. So does a shifted
+    // non-letter, whose shifted glyph is the layout's to know.
+    let text = unmodified
+        .filter(|value| as_alt && value.is_ascii() && !modifiers.control() && !modifiers.logo())
+        .and_then(|value| match modifiers.shift() {
+            false => Some(value.to_string()),
+            true if value.is_ascii_alphabetic() => Some(value.to_ascii_uppercase().to_string()),
+            true => None,
+        });
+    OptionPress {
+        text,
+        side: if right_side { mods::ALT_SIDE } else { 0 },
+        assumed: untracked && matches!(option.as_alt, OptionAsAlt::Left | OptionAsAlt::Right),
+    }
+}
+
 pub fn encode_press(
     encoder: &mut KeyEncoder,
     terminal: &Terminal,
     event: keyboard::Event,
     composing: bool,
+    option: OptionKey,
 ) -> Vec<u8> {
     let keyboard::Event::KeyPressed {
         key,
@@ -338,8 +471,24 @@ pub fn encode_press(
     // The control transform goes back to the character it came from — the
     // byte libghostty's control-sequence table is keyed on.
     let mut control_buf = [0u8; 4];
+    // Linux's Alt already sends the ESC prefix: the setting is macOS's.
+    let option = if cfg!(target_os = "macos") {
+        option
+    } else {
+        OptionKey::default()
+    };
+    let option_press = option_press(option, &key, modifiers);
+    if option_press.assumed {
+        ASSUMED_OPTION_SIDE.call_once(|| {
+            tracing::info!(
+                as_alt = ?option.as_alt,
+                "no left/right Option key event seen; treating either Option as the configured side"
+            );
+        });
+    }
     let utf8 = chord
         .map(|chord| &*chord.text.encode_utf8(&mut control_buf))
+        .or(option_press.text.as_deref())
         .or(text.as_deref())
         .unwrap_or("");
     let unshifted = match recovered_key {
@@ -381,11 +530,14 @@ pub fn encode_press(
             .chars()
             .all(|value| !value.is_control() && (value as u32) < 0xE000);
     let mod_bits = ghostty_modifiers(modifiers);
-    let consumed = if printable && !modifiers.control() && unshifted_text != Some(utf8) {
+    let mut consumed = if printable && !modifiers.control() && unshifted_text != Some(utf8) {
         mod_bits & translation_mods
     } else {
         0
     };
+    if option_press.text.is_some() {
+        consumed &= !mods::ALT;
+    }
     event
         .set_action(if repeat {
             key_action::REPEAT
@@ -393,12 +545,13 @@ pub fn encode_press(
             key_action::PRESS
         })
         .set_key(keycode)
-        .set_mods(mod_bits)
+        .set_mods(mod_bits | option_press.side)
         .set_consumed_mods(consumed)
         .set_composing(composing)
         .set_unshifted_codepoint(unshifted)
         .set_utf8(utf8.as_bytes());
     encoder.sync_from_terminal(terminal);
+    encoder.set_macos_option_as_alt(option.as_alt);
     encoder.encode(&event).unwrap_or_else(|error| {
         tracing::warn!(?error, "libghostty key encoding failed");
         Vec::new()
@@ -622,6 +775,29 @@ pub(crate) fn synthetic_press(
         modifiers: held,
         text,
         repeat: false,
+    })
+}
+
+/// The release that ends `press`'s keystroke; `None` for anything but a
+/// press.
+pub(crate) fn release_of(press: &keyboard::Event) -> Option<keyboard::Event> {
+    let keyboard::Event::KeyPressed {
+        key,
+        modified_key,
+        physical_key,
+        location,
+        modifiers,
+        ..
+    } = press
+    else {
+        return None;
+    };
+    Some(keyboard::Event::KeyReleased {
+        key: key.clone(),
+        modified_key: modified_key.clone(),
+        physical_key: *physical_key,
+        location: *location,
+        modifiers: *modifiers,
     })
 }
 
@@ -1053,7 +1229,7 @@ mod tests {
             repeat: false,
         };
         assert_eq!(
-            encode_press(&mut encoder, &terminal, letter, false),
+            encode_press(&mut encoder, &terminal, letter, false, OptionKey::default()),
             b"a".to_vec()
         );
         assert_eq!(
@@ -1066,6 +1242,7 @@ mod tests {
                     keyboard::Modifiers::empty(),
                 ),
                 false,
+                OptionKey::default(),
             ),
             b"\r".to_vec()
         );
@@ -1079,6 +1256,7 @@ mod tests {
                     keyboard::Modifiers::CTRL,
                 ),
                 false,
+                OptionKey::default(),
             ),
             b"\x03".to_vec()
         );
@@ -1101,7 +1279,7 @@ mod tests {
         ] {
             let event = key_press(key.0.clone(), key.1, keyboard::Modifiers::empty());
             assert!(
-                encode_press(&mut encoder, &terminal, event, true).is_empty(),
+                encode_press(&mut encoder, &terminal, event, true, OptionKey::default()).is_empty(),
                 "{:?} must not reach the PTY while composing",
                 key.0
             );
@@ -1145,7 +1323,7 @@ mod tests {
         ] {
             let event = chord(key, modified, physical, modifiers, text);
             assert_eq!(
-                encode_press(&mut encoder, &terminal, event, false),
+                encode_press(&mut encoder, &terminal, event, false, OptionKey::default()),
                 expected.to_vec(),
                 "ctrl chord on {key:?}"
             );
@@ -1165,7 +1343,7 @@ mod tests {
             keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT;
         let event = chord("-", "_", Code::Minus, mods, "\u{1f}");
         assert_eq!(
-            encode_press(&mut encoder, &terminal, event, false),
+            encode_press(&mut encoder, &terminal, event, false, OptionKey::default()),
             b"\x1b\x1f".to_vec()
         );
     }
@@ -1185,7 +1363,7 @@ mod tests {
         let ctrl = keyboard::Modifiers::CTRL;
         let event = chord("[", "[", Code::BracketLeft, ctrl, "\u{1b}");
         assert_eq!(
-            encode_press(&mut encoder, &terminal, event, false),
+            encode_press(&mut encoder, &terminal, event, false, OptionKey::default()),
             b"\x1b[91;5u".to_vec()
         );
     }
@@ -1210,7 +1388,7 @@ mod tests {
         ] {
             let event = chord(c0, modified, physical, modifiers, c0);
             assert_eq!(
-                encode_press(&mut encoder, &terminal, event, false),
+                encode_press(&mut encoder, &terminal, event, false, OptionKey::default()),
                 expected.to_vec(),
                 "control-transformed logical key {c0:?}"
             );
@@ -1225,7 +1403,7 @@ mod tests {
         let (mut encoder, terminal) = encoder_pair();
         let event = chord("ф", "ф", Code::KeyA, keyboard::Modifiers::CTRL, "\u{1}");
         assert_eq!(
-            encode_press(&mut encoder, &terminal, event, false),
+            encode_press(&mut encoder, &terminal, event, false, OptionKey::default()),
             b"\x01".to_vec()
         );
     }
@@ -1263,7 +1441,7 @@ mod tests {
         ] {
             let event = chord(key, modified, physical, modifiers, text);
             assert_eq!(
-                encode_press(&mut encoder, &terminal, event, false),
+                encode_press(&mut encoder, &terminal, event, false, OptionKey::default()),
                 expected.to_vec(),
                 "{key:?} + {modifiers:?}"
             );
@@ -1277,7 +1455,7 @@ mod tests {
             let key = Key::Named(named);
             let event = press(key.clone(), key, Physical::Code(physical), ctrl, Some(text));
             assert_eq!(
-                encode_press(&mut encoder, &terminal, event, false),
+                encode_press(&mut encoder, &terminal, event, false, OptionKey::default()),
                 expected.to_vec(),
                 "{named:?}"
             );
@@ -1299,7 +1477,7 @@ mod tests {
         let (mut encoder, terminal) = kitty_encoder_pair();
         let event = chord("a", "a", Code::KeyA, keyboard::Modifiers::CTRL, "\u{1}");
         assert_eq!(
-            encode_press(&mut encoder, &terminal, event, false),
+            encode_press(&mut encoder, &terminal, event, false, OptionKey::default()),
             b"\x1b[97;5u".to_vec()
         );
     }
@@ -1321,12 +1499,14 @@ mod tests {
                 &terminal,
                 chord(mac, modified, physical, ctrl_shift, transformed),
                 false,
+                OptionKey::default(),
             );
             let from_transformed = encode_press(
                 &mut encoder,
                 &terminal,
                 chord(transformed, modified, physical, ctrl_shift, transformed),
                 false,
+                OptionKey::default(),
             );
             assert_eq!(from_mac, expected.to_vec(), "ctrl+shift chord on {mac:?}");
             assert_eq!(
@@ -1350,7 +1530,7 @@ mod tests {
         {
             let event = chord(key, modified, physical, shift, expected);
             assert_eq!(
-                encode_press(&mut encoder, &terminal, event, false),
+                encode_press(&mut encoder, &terminal, event, false, OptionKey::default()),
                 expected.as_bytes().to_vec(),
                 "shift+{key:?} under kitty"
             );
@@ -1377,7 +1557,7 @@ mod tests {
                 Some(text),
             );
             assert_eq!(
-                encode_press(&mut encoder, &terminal, event, false),
+                encode_press(&mut encoder, &terminal, event, false, OptionKey::default()),
                 expected.to_vec(),
                 "shift+{named:?} under kitty"
             );
@@ -1406,6 +1586,7 @@ mod tests {
                 &terminal,
                 chord("b", "∫", Code::KeyB, alt, "∫"),
                 false,
+                OptionKey::default(),
             ),
             option_transformed.to_vec(),
             "mac-shaped alt+b under kitty"
@@ -1417,6 +1598,7 @@ mod tests {
                 &terminal,
                 chord("b", "b", Code::KeyB, alt, "b"),
                 false,
+                OptionKey::default(),
             ),
             b"\x1b[98;3u".to_vec(),
             "linux-shaped alt+b under kitty"
@@ -1524,12 +1706,24 @@ mod tests {
         let event = || chord("i", "i", Code::KeyI, ctrl_logo, "\t");
 
         let (mut encoder, terminal) = encoder_pair();
-        let legacy = encode_press(&mut encoder, &terminal, event(), false);
+        let legacy = encode_press(
+            &mut encoder,
+            &terminal,
+            event(),
+            false,
+            OptionKey::default(),
+        );
         assert_eq!(legacy, b"\x1b[9;5u".to_vec(), "legacy ctrl+super+i");
         assert_ne!(legacy, b"\x1b[105;5u".to_vec(), "must not be plain ctrl+i");
 
         let (mut encoder, terminal) = kitty_encoder_pair();
-        let kitty = encode_press(&mut encoder, &terminal, event(), false);
+        let kitty = encode_press(
+            &mut encoder,
+            &terminal,
+            event(),
+            false,
+            OptionKey::default(),
+        );
         assert_eq!(kitty, b"\x1b[105;13u".to_vec(), "kitty ctrl+super+i");
         assert_ne!(kitty, b"\x1b[105;5u".to_vec(), "must not be plain ctrl+i");
     }
@@ -1543,6 +1737,7 @@ mod tests {
             &terminal,
             chord("i", "i", Code::KeyI, ctrl, "\t"),
             false,
+            OptionKey::default(),
         );
         assert_eq!(ctrl_i, b"\x1b[105;5u".to_vec(), "ctrl+i alone");
 
@@ -1553,6 +1748,7 @@ mod tests {
             &terminal,
             key_press(character("i"), Physical::Code(Code::KeyI), logo),
             false,
+            OptionKey::default(),
         );
         assert!(
             logo_i.is_empty(),
@@ -1584,7 +1780,7 @@ mod tests {
 
     fn typed(event: keyboard::Event) -> Vec<u8> {
         let (mut encoder, terminal) = encoder_pair();
-        encode_press(&mut encoder, &terminal, event, false)
+        encode_press(&mut encoder, &terminal, event, false, OptionKey::default())
     }
 
     /// `app.key_event`'s press is the one a keyboard sends: Alt+T is the
@@ -1635,5 +1831,359 @@ mod tests {
         let refused =
             synthetic_press("t", None, &["meta".to_string()]).expect_err("no such modifier");
         assert!(refused.contains("unknown key name"), "{refused}");
+    }
+
+    fn alt_key(pressed: bool, location: Location) -> keyboard::Event {
+        let key = Key::Named(Named::Alt);
+        let physical_key = Physical::Code(match location {
+            Location::Right => Code::AltRight,
+            _ => Code::AltLeft,
+        });
+        if pressed {
+            keyboard::Event::KeyPressed {
+                modified_key: key.clone(),
+                key,
+                physical_key,
+                location,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            }
+        } else {
+            keyboard::Event::KeyReleased {
+                modified_key: key.clone(),
+                key,
+                physical_key,
+                location,
+                modifiers: keyboard::Modifiers::ALT,
+            }
+        }
+    }
+
+    fn sides(left: bool, right: bool) -> OptionSides {
+        OptionSides { left, right }
+    }
+
+    #[test]
+    fn option_sides_follow_each_options_own_press_and_release() {
+        let mut held = OptionSides::default();
+        for (event, expected) in [
+            (alt_key(true, Location::Left), sides(true, false)),
+            (alt_key(true, Location::Right), sides(true, true)),
+            (alt_key(false, Location::Left), sides(false, true)),
+            (alt_key(true, Location::Left), sides(true, true)),
+            (alt_key(false, Location::Right), sides(true, false)),
+            // An Alt with no side names neither Option.
+            (alt_key(true, Location::Standard), sides(true, false)),
+            (alt_key(false, Location::Left), sides(false, false)),
+        ] {
+            held.observe(&event);
+            assert_eq!(held, expected, "after {event:?}");
+        }
+    }
+
+    #[test]
+    fn option_sides_clear_when_the_window_loses_focus() {
+        let mut held = OptionSides::default();
+        held.observe(&alt_key(true, Location::Left));
+        held.observe(&alt_key(true, Location::Right));
+        held.window_focus(true);
+        assert_eq!(held, sides(true, true), "gaining focus keeps what is held");
+        held.window_focus(false);
+        assert_eq!(held, OptionSides::default());
+    }
+
+    #[test]
+    fn option_sides_reconcile_to_empty_once_alt_is_no_longer_held() {
+        let mut held = OptionSides::default();
+        held.observe(&alt_key(true, Location::Right));
+        held.observe(&keyboard::Event::ModifiersChanged(keyboard::Modifiers::ALT));
+        assert_eq!(held, sides(false, true), "ALT still held keeps the side");
+        held.observe(&keyboard::Event::ModifiersChanged(
+            keyboard::Modifiers::SHIFT,
+        ));
+        assert_eq!(held, OptionSides::default());
+    }
+
+    #[test]
+    fn only_alt_keys_and_modifier_changes_move_option_sides() {
+        assert!(OptionSides::observes(&alt_key(true, Location::Left)));
+        assert!(OptionSides::observes(&alt_key(false, Location::Right)));
+        assert!(OptionSides::observes(&keyboard::Event::ModifiersChanged(
+            keyboard::Modifiers::empty()
+        )));
+        let letter = chord("b", "∫", Code::KeyB, keyboard::Modifiers::ALT, "∫");
+        assert!(!OptionSides::observes(&letter));
+        let mut held = sides(true, false);
+        held.observe(&letter);
+        assert_eq!(held, sides(true, false));
+    }
+
+    fn option_decision(
+        as_alt: OptionAsAlt,
+        held: OptionSides,
+        key: &str,
+        modifiers: keyboard::Modifiers,
+    ) -> (Option<String>, u16) {
+        let decision = option_press(
+            OptionKey {
+                as_alt,
+                sides: held,
+            },
+            &character(key).as_ref(),
+            modifiers,
+        );
+        (decision.text, decision.side)
+    }
+
+    /// The per-press decision for every mode and every held side: the
+    /// unmodified key replaces Option's glyph exactly when Option is Alt,
+    /// and the side bit names the right Option.
+    #[test]
+    fn option_as_alt_decides_the_text_and_side_of_each_press() {
+        let alt = keyboard::Modifiers::ALT;
+        let b = || Some("b".to_string());
+        let right = mods::ALT_SIDE;
+        for (as_alt, held, expected) in [
+            (OptionAsAlt::False, sides(true, false), (None, 0)),
+            (OptionAsAlt::False, sides(false, true), (None, 0)),
+            (OptionAsAlt::True, sides(true, false), (b(), 0)),
+            (OptionAsAlt::True, sides(false, true), (b(), right)),
+            (OptionAsAlt::True, sides(true, true), (b(), 0)),
+            (OptionAsAlt::Left, sides(true, false), (b(), 0)),
+            (OptionAsAlt::Left, sides(false, true), (None, right)),
+            (OptionAsAlt::Left, sides(true, true), (b(), 0)),
+            (OptionAsAlt::Right, sides(true, false), (None, 0)),
+            (OptionAsAlt::Right, sides(false, true), (b(), right)),
+            (OptionAsAlt::Right, sides(true, true), (b(), right)),
+        ] {
+            assert_eq!(
+                option_decision(as_alt, held, "b", alt),
+                expected,
+                "{as_alt:?} with {held:?}"
+            );
+        }
+
+        // No Alt held: nothing to decide.
+        assert_eq!(
+            option_decision(
+                OptionAsAlt::True,
+                sides(true, false),
+                "b",
+                keyboard::Modifiers::empty()
+            ),
+            (None, 0)
+        );
+        // Shift uppercases a letter; a shifted non-letter keeps Option's
+        // glyph (its shifted character is the layout's to know).
+        let shift_alt = alt | keyboard::Modifiers::SHIFT;
+        assert_eq!(
+            option_decision(OptionAsAlt::True, sides(true, false), "b", shift_alt),
+            (Some("B".to_string()), 0)
+        );
+        assert_eq!(
+            option_decision(OptionAsAlt::True, sides(true, false), "1", shift_alt),
+            (None, 0)
+        );
+        assert_eq!(
+            option_decision(OptionAsAlt::True, sides(true, false), ".", alt),
+            (Some(".".to_string()), 0)
+        );
+        // A non-ASCII key keeps Option's glyph, shifted or not: the ESC
+        // prefix carries one byte.
+        for key in ["é", "ф"] {
+            for held in [alt, shift_alt] {
+                assert_eq!(
+                    option_decision(OptionAsAlt::True, sides(false, true), key, held),
+                    (None, right),
+                    "{key} with {held:?}"
+                );
+            }
+        }
+        // Control has its own chord recovery; Command types no text.
+        for chord in [keyboard::Modifiers::CTRL, keyboard::Modifiers::LOGO] {
+            assert_eq!(
+                option_decision(OptionAsAlt::True, sides(false, true), "b", alt | chord),
+                (None, right),
+                "{chord:?}"
+            );
+        }
+        let space = option_press(
+            OptionKey {
+                as_alt: OptionAsAlt::True,
+                sides: sides(true, false),
+            },
+            &Key::Named(Named::Space).as_ref(),
+            alt,
+        );
+        assert_eq!(space.text.as_deref(), Some(" "));
+    }
+
+    /// With no located Alt key event seen while ALT is held, `left` and
+    /// `right` treat either Option as their own side (plan 073 R7).
+    #[test]
+    fn an_untracked_option_counts_as_the_configured_side() {
+        let alt = keyboard::Modifiers::ALT;
+        for (as_alt, side, assumed) in [
+            (OptionAsAlt::Left, 0, true),
+            (OptionAsAlt::Right, mods::ALT_SIDE, true),
+            (OptionAsAlt::True, 0, false),
+        ] {
+            let decision = option_press(
+                OptionKey {
+                    as_alt,
+                    sides: OptionSides::default(),
+                },
+                &character("b").as_ref(),
+                alt,
+            );
+            assert_eq!(
+                decision,
+                OptionPress {
+                    text: Some("b".to_string()),
+                    side,
+                    assumed,
+                },
+                "{as_alt:?}"
+            );
+        }
+    }
+
+    fn every_option_key() -> Vec<OptionKey> {
+        let mut all = Vec::new();
+        for as_alt in [
+            OptionAsAlt::False,
+            OptionAsAlt::True,
+            OptionAsAlt::Left,
+            OptionAsAlt::Right,
+        ] {
+            for (left, right) in [(false, false), (true, false), (false, true), (true, true)] {
+                all.push(OptionKey {
+                    as_alt,
+                    sides: sides(left, right),
+                });
+            }
+        }
+        all
+    }
+
+    /// Preservation (plan 073 D5): the default `false` keeps today's
+    /// Option bytes whichever Option is held.
+    #[test]
+    fn option_as_alt_false_keeps_todays_option_bytes() {
+        let (mut encoder, terminal) = encoder_pair();
+        #[cfg(target_os = "macos")]
+        let today = "∫".as_bytes();
+        #[cfg(not(target_os = "macos"))]
+        let today = b"\x1bb".as_slice();
+        for (left, right) in [(false, false), (true, false), (false, true), (true, true)] {
+            let option = OptionKey {
+                as_alt: OptionAsAlt::False,
+                sides: sides(left, right),
+            };
+            let event = chord("b", "∫", Code::KeyB, keyboard::Modifiers::ALT, "∫");
+            assert_eq!(
+                encode_press(&mut encoder, &terminal, event, false, option),
+                today.to_vec(),
+                "{option:?}"
+            );
+        }
+    }
+
+    /// Preservation (plan 073 D5): a ctrl+alt chord keeps its legacy
+    /// bytes under every mode, since control owns its own recovery.
+    #[test]
+    fn ctrl_alt_chords_keep_their_bytes_under_every_option_mode() {
+        let (mut encoder, terminal) = encoder_pair();
+        let held =
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT;
+        for option in every_option_key() {
+            let event = chord("-", "_", Code::Minus, held, "\u{1f}");
+            assert_eq!(
+                encode_press(&mut encoder, &terminal, event, false, option),
+                b"\x1b\x1f".to_vec(),
+                "{option:?}"
+            );
+        }
+    }
+
+    /// Preservation (plan 073 D5): Linux parses `macos-option-as-alt` and
+    /// ignores it — Alt stays an ESC prefix, and Kitty's alt is never
+    /// consumed.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn linux_ignores_option_as_alt() {
+        let alt = keyboard::Modifiers::ALT;
+        let (mut encoder, terminal) = encoder_pair();
+        let (mut kitty, kitty_terminal) = kitty_encoder_pair();
+        for option in every_option_key() {
+            let mac_shaped = || chord("b", "∫", Code::KeyB, alt, "∫");
+            assert_eq!(
+                encode_press(&mut encoder, &terminal, mac_shaped(), false, option),
+                b"\x1bb".to_vec(),
+                "legacy {option:?}"
+            );
+            for event in [mac_shaped(), chord("b", "b", Code::KeyB, alt, "b")] {
+                assert_eq!(
+                    encode_press(&mut kitty, &kitty_terminal, event, false, option),
+                    b"\x1b[98;3u".to_vec(),
+                    "kitty {option:?}"
+                );
+            }
+        }
+    }
+
+    /// macOS's Option presses through the whole press path: the setter
+    /// after each sync, the unmodified key and the side bit together send
+    /// Meta.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn option_as_alt_sends_mac_option_presses_as_meta() {
+        let (mut encoder, terminal) = encoder_pair();
+        let alt = keyboard::Modifiers::ALT;
+        let option = |as_alt, left, right| OptionKey {
+            as_alt,
+            sides: sides(left, right),
+        };
+        let option_b = || chord("b", "∫", Code::KeyB, alt, "∫");
+        for (option, event, expected) in [
+            (
+                option(OptionAsAlt::True, true, false),
+                option_b(),
+                b"\x1bb".as_slice(),
+            ),
+            (
+                option(OptionAsAlt::True, false, true),
+                chord("f", "ƒ", Code::KeyF, alt, "ƒ"),
+                b"\x1bf",
+            ),
+            (
+                option(OptionAsAlt::True, true, false),
+                chord("b", "ı", Code::KeyB, alt | keyboard::Modifiers::SHIFT, "ı"),
+                b"\x1bB",
+            ),
+            (option(OptionAsAlt::Left, true, false), option_b(), b"\x1bb"),
+            (
+                option(OptionAsAlt::Left, false, true),
+                option_b(),
+                "∫".as_bytes(),
+            ),
+            (
+                option(OptionAsAlt::Right, false, true),
+                option_b(),
+                b"\x1bb",
+            ),
+            (
+                option(OptionAsAlt::Right, true, false),
+                option_b(),
+                "∫".as_bytes(),
+            ),
+        ] {
+            assert_eq!(
+                encode_press(&mut encoder, &terminal, event, false, option),
+                expected.to_vec(),
+                "{option:?}"
+            );
+        }
     }
 }

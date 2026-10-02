@@ -1,4 +1,30 @@
 use super::*;
+use crate::url_launcher;
+
+const CONFIG_SEED: &str = "# Roost settings — https://charliek.github.io/roost/reference/config/";
+/// Long enough for macOS's full-screen transition to finish and winit to
+/// drop its cached mode.
+const FULL_SCREEN_SETTLE: Duration = Duration::from_secs(1);
+const DOCS_URL: &str = "https://charliek.github.io/roost/";
+const SETTINGS_OPENED: &str = "Settings opened — changes apply when Roost restarts";
+
+/// A trailing debounce's generations: every arm supersedes the ones
+/// before it, so only the latest arm's deadline acts.
+#[derive(Debug, Default)]
+pub(super) struct TrailingDebounce {
+    latest: u64,
+}
+
+impl TrailingDebounce {
+    pub(super) fn arm(&mut self) -> u64 {
+        self.latest = self.latest.wrapping_add(1);
+        self.latest
+    }
+
+    pub(super) fn is_latest(&self, generation: u64) -> bool {
+        generation == self.latest
+    }
+}
 
 // ── rename ──
 
@@ -2203,7 +2229,6 @@ impl App {
             CopyKind::OnSelect(self.config.copy_on_select),
             selected_text,
         );
-        #[cfg(target_os = "linux")]
         if outcome.paste_selection {
             // Middle-click paste doesn't sit in the `Result`-returning
             // keybind dispatcher (`dispatch_keybind_action`), so a
@@ -2216,6 +2241,8 @@ impl App {
         }
         let clipboard = self.clipboard.start_next();
         match outcome.open_url {
+            // Not `open_external`: a terminal link launches even in test mode, because
+            // test_local_backend asserts the launcher runs here through a PATH-stubbed xdg-open.
             Some(url) => UiTask::OpenUrl { url }.then(clipboard),
             None => clipboard,
         }
@@ -2260,6 +2287,98 @@ impl App {
     pub(super) fn link_modifier_held(&self) -> bool {
         let effective = keybind::resolve_link_modifier(self.config.link_modifier);
         input::accelerator_modifiers(self.modifiers).intersects(effective)
+    }
+
+    /// The one door to the OS opener: under test mode it names the target
+    /// in the toast and launches nothing, so no test can open a browser or
+    /// an editor.
+    pub(super) fn open_external(&mut self, what: url_launcher::External) -> UiTask {
+        match url_launcher::plan(self.test_mode, what) {
+            url_launcher::ExternalPlan::WouldOpen(target) => {
+                self.set_status_info(format!("Would open {target}"));
+                UiTask::None
+            }
+            url_launcher::ExternalPlan::Launch(url_launcher::External::Url(url)) => {
+                UiTask::OpenUrl { url }
+            }
+            url_launcher::ExternalPlan::Launch(url_launcher::External::File { path, seed }) => {
+                UiTask::OpenFile { path, seed }
+            }
+        }
+    }
+
+    pub(super) fn open_config(&mut self) -> UiTask {
+        let Some(path) = roost_ui_model::config::config_path() else {
+            self.set_status("there is no config file to open");
+            return UiTask::None;
+        };
+        self.open_external(url_launcher::External::File {
+            path,
+            seed: Some(CONFIG_SEED),
+        })
+    }
+
+    pub(super) fn open_docs(&mut self) -> UiTask {
+        self.open_external(url_launcher::External::Url(DOCS_URL.to_string()))
+    }
+
+    pub(super) fn toggle_full_screen(&mut self) -> UiTask {
+        match self.window_id {
+            Some(id) => UiTask::ToggleFullScreen(id),
+            None => UiTask::None,
+        }
+    }
+
+    /// A re-query of the window's mode, so the menu's "Enter/Exit Full
+    /// Screen" title follows every way the window can change — the green
+    /// button included. Only macOS has that menu.
+    pub fn query_full_screen(&self) -> UiTask {
+        match self.window_id {
+            Some(id) if cfg!(target_os = "macos") => UiTask::QueryFullScreen(id),
+            _ => UiTask::None,
+        }
+    }
+
+    /// The one follow-up query a resize earns. winit clears its cached
+    /// full-screen mode in `windowDidExitFullScreen`, which emits nothing
+    /// Roost can listen to, so a query made mid-transition can read the
+    /// old mode and nothing later would correct it. A trailing debounce:
+    /// a resize storm queries once, a settle after its last resize.
+    pub(super) fn schedule_full_screen_settle(&mut self) -> UiTask {
+        if !cfg!(target_os = "macos") || self.window_id.is_none() {
+            return UiTask::None;
+        }
+        UiTask::FullScreenSettle {
+            delay: FULL_SCREEN_SETTLE,
+            generation: self.full_screen_settle.arm(),
+        }
+    }
+
+    pub fn full_screen_settled(&mut self, generation: u64) -> UiTask {
+        if self.full_screen_settle.is_latest(generation) {
+            self.query_full_screen()
+        } else {
+            UiTask::None
+        }
+    }
+
+    pub fn full_screen_mode(&mut self, mode: window::Mode) {
+        #[cfg(target_os = "macos")]
+        if let Some(mtm) = servicing::seam_on_main("full-screen menu title") {
+            crate::macos::menu::sync_fullscreen_title(mtm, mode == window::Mode::Fullscreen);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = mode;
+    }
+
+    pub fn file_open_completed(&mut self, result: std::result::Result<(), String>) {
+        match result {
+            Ok(()) => self.set_status_info(SETTINGS_OPENED),
+            Err(error) => {
+                tracing::warn!(%error, "file launcher failed");
+                self.set_status(error);
+            }
+        }
     }
 
     pub fn url_open_completed(&mut self, result: std::result::Result<(), String>) {
@@ -2361,6 +2480,7 @@ pub(super) fn native_file_drop_origin(
             | KeyboardRoute::Confirm
             | KeyboardRoute::HostDialog
             | KeyboardRoute::Editor
+            | KeyboardRoute::ContextMenu
             | KeyboardRoute::Palette
             | KeyboardRoute::Pending => None,
         })
@@ -2401,6 +2521,8 @@ enum ClipboardEffect {
     Read {
         request_id: u64,
         target: ClipboardOp,
+        /// Read copied files before the text — see [`paste_reads_files_first`].
+        files_first: bool,
     },
     Write {
         request_id: u64,
@@ -2413,6 +2535,12 @@ enum ClipboardEffect {
         png: Vec<u8>,
         reply: roost_engine::ipc::HostOpReply<()>,
     },
+    /// The test seam's file-list write (plan 073 D2).
+    WriteFiles {
+        request_id: u64,
+        paths: Vec<PathBuf>,
+        reply: roost_engine::ipc::HostOpReply<()>,
+    },
 }
 
 impl ClipboardEffect {
@@ -2420,13 +2548,23 @@ impl ClipboardEffect {
         match self {
             Self::Read { request_id, .. }
             | Self::Write { request_id, .. }
-            | Self::WriteImage { request_id, .. } => *request_id,
+            | Self::WriteImage { request_id, .. }
+            | Self::WriteFiles { request_id, .. } => *request_id,
         }
     }
 
     fn into_task(self) -> UiTask {
         match self {
-            Self::Read { request_id, target } => UiTask::ClipboardRead { request_id, target },
+            Self::Read {
+                request_id,
+                files_first: true,
+                ..
+            } => UiTask::ClipboardReadFiles { request_id },
+            Self::Read {
+                request_id,
+                target,
+                files_first: false,
+            } => UiTask::ClipboardRead { request_id, target },
             Self::Write {
                 request_id,
                 target,
@@ -2445,8 +2583,24 @@ impl ClipboardEffect {
                 png,
                 reply,
             },
+            Self::WriteFiles {
+                request_id,
+                paths,
+                reply,
+            } => UiTask::ClipboardWriteFiles {
+                request_id,
+                paths,
+                reply,
+            },
         }
     }
+}
+
+/// Whether a paste on `target` reads copied files before its text:
+/// [`crate::paste_image::FILES_BEFORE_TEXT`], on the system clipboard
+/// only. The selection is text.
+fn paste_reads_files_first(target: ClipboardOp) -> bool {
+    crate::paste_image::FILES_BEFORE_TEXT && target == ClipboardOp::System
 }
 
 #[derive(Default)]
@@ -2479,8 +2633,11 @@ impl ClipboardQueue {
         let request_id = self.allocate_request_id();
         self.pending_reads
             .insert(request_id, ClipboardReadDestination::Ipc(reply));
-        self.queued
-            .push_back(ClipboardEffect::Read { request_id, target });
+        self.queued.push_back(ClipboardEffect::Read {
+            request_id,
+            target,
+            files_first: false,
+        });
         request_id
     }
 
@@ -2488,12 +2645,15 @@ impl ClipboardQueue {
     // outside this queue's own tests must go through
     // `App::enqueue_tab_paste`, which checks `frozen_host_frame_for`
     // before a single byte of the clipboard is read (issue #376).
-    fn enqueue_paste_read(&mut self, target: ClipboardOp, tab: TabKey) -> u64 {
+    fn enqueue_paste_read(&mut self, target: ClipboardOp, tab: TabKey, files_first: bool) -> u64 {
         let request_id = self.allocate_request_id();
         self.pending_reads
             .insert(request_id, ClipboardReadDestination::Paste { tab, target });
-        self.queued
-            .push_back(ClipboardEffect::Read { request_id, target });
+        self.queued.push_back(ClipboardEffect::Read {
+            request_id,
+            target,
+            files_first,
+        });
         request_id
     }
 
@@ -2516,6 +2676,20 @@ impl ClipboardQueue {
         self.queued.push_back(ClipboardEffect::WriteImage {
             request_id,
             png,
+            reply,
+        });
+        request_id
+    }
+
+    pub(super) fn enqueue_write_files(
+        &mut self,
+        paths: Vec<PathBuf>,
+        reply: roost_engine::ipc::HostOpReply<()>,
+    ) -> u64 {
+        let request_id = self.allocate_request_id();
+        self.queued.push_back(ClipboardEffect::WriteFiles {
+            request_id,
+            paths,
             reply,
         });
         request_id
@@ -2557,6 +2731,86 @@ impl ClipboardQueue {
         self.active_request_id = None;
         true
     }
+
+    /// Hold the queue for a paste's probe, in the slot its read has just
+    /// given up. The probe reads the clipboard too, so nothing queued
+    /// behind the paste may change the clipboard before it has (plan 073
+    /// correction 6). [`Self::complete_probe`] ends the hold; the probe
+    /// always reports, a join failure included, so the hold always ends.
+    fn hold_for_probe(&mut self, request_id: u64) {
+        self.active_request_id = Some(request_id);
+    }
+
+    /// A probe reported: its hold ends and the queue resumes.
+    fn complete_probe(&mut self, request_id: u64) -> UiTask {
+        if self.active_request_id != Some(request_id) {
+            tracing::warn!(
+                request_id,
+                "a clipboard probe reported without holding the queue"
+            );
+            return UiTask::None;
+        }
+        self.active_request_id = None;
+        self.start_next()
+    }
+
+    /// The tab a paste was asked for, while its read still holds the
+    /// queue.
+    fn active_paste(&self, request_id: u64) -> Option<(TabKey, ClipboardOp)> {
+        if self.active_request_id != Some(request_id) {
+            return None;
+        }
+        match self.pending_reads.get(&request_id)? {
+            ClipboardReadDestination::Paste { tab, target } => Some((*tab, *target)),
+            ClipboardReadDestination::Ipc(_) => None,
+        }
+    }
+
+    /// A paste's file read found nothing: the same read goes on to its
+    /// text, still holding the queue.
+    fn continue_paste_read(&mut self, request_id: u64) -> UiTask {
+        match self.active_paste(request_id) {
+            Some((_, target)) => UiTask::ClipboardRead { request_id, target },
+            None => UiTask::None,
+        }
+    }
+
+    /// A paste's file read found files: the read is over, and they belong
+    /// to the tab the paste was asked for.
+    fn complete_paste_files(&mut self, request_id: u64) -> Option<TabKey> {
+        let (tab, _) = self.active_paste(request_id)?;
+        self.pending_reads.remove(&request_id);
+        self.active_request_id = None;
+        Some(tab)
+    }
+}
+
+/// What a paste's file read owes the event loop (plan 073 D2's macOS
+/// step).
+///
+/// No files: the same read goes on to its text, still holding the queue.
+/// Files: the read is over, the queue resumes, and `send` — the drop
+/// route, `App::send_files` — gets the tab the paste was asked for, never
+/// whichever is active now. Its task is returned, not dropped: for a host
+/// tab it is the upload's `InspectFiles`.
+///
+/// Generic over the queue's owner only so `send` can borrow all of it.
+fn paste_files_followup<O>(
+    owner: &mut O,
+    queue: fn(&mut O) -> &mut ClipboardQueue,
+    send: impl FnOnce(&mut O, TabKey, Vec<PathBuf>) -> UiTask,
+    request_id: u64,
+    paths: Vec<PathBuf>,
+) -> UiTask {
+    if paths.is_empty() {
+        return queue(owner).continue_paste_read(request_id);
+    }
+    let Some(tab) = queue(owner).complete_paste_files(request_id) else {
+        tracing::warn!(request_id, "ignored stale clipboard file list");
+        return UiTask::None;
+    };
+    let sent = send(owner, tab, paths);
+    queue(owner).start_next().then(sent)
 }
 
 pub(super) fn enqueue_osc_clipboard_write(
@@ -2604,46 +2858,46 @@ fn enqueue_selection_copy(
     targets.len()
 }
 
-/// Whether a settled read would go looking for a clipboard image: the
-/// system clipboard only, and only when it carried no text. Selection
-/// pastes never probe — PRIMARY carries text, and the now-removed GTK
-/// UI's `paste_from_clipboard` had no image branch for it either.
+/// Whether a settled read would go looking for copied files or a
+/// clipboard image: the system clipboard only, and only when it carried
+/// no text. Selection pastes never probe — PRIMARY carries text, and the
+/// now-removed GTK UI's `paste_from_clipboard` had no image branch for it
+/// either.
 fn probe_wanted(target: ClipboardOp, text: Option<&str>) -> bool {
     matches!(target, ClipboardOp::System) && !text.is_some_and(|text| !text.is_empty())
 }
 
-/// What a settled paste read owes the event loop: resume the clipboard
-/// queue, and — when [`probe_wanted`] and the target can take one —
-/// probe for an image behind it.
-///
-/// The queue goes first so a clipboard effect already waiting behind this
-/// read doesn't stall for the length of a blocking image read.
+/// What a settled paste read owes the event loop: when [`probe_wanted`]
+/// and the target can take one, a probe for copied files or an image,
+/// which holds the queue until it reports ([`ClipboardQueue::hold_for_probe`]);
+/// otherwise the queue resumes.
 ///
 /// `probe_allowed` is the caller's answer to "can this tab still receive
 /// an image at all": a host that is not accepting operations refuses now
 /// rather than after a blocking read whose bytes have nowhere to go.
 fn paste_read_followup(
     clipboard: &mut ClipboardQueue,
+    request_id: u64,
     target: ClipboardOp,
     tab: TabKey,
     text: Option<&str>,
     probe_allowed: bool,
 ) -> UiTask {
-    let probe = if probe_allowed && probe_wanted(target, text) {
-        // The sink is chosen here, from the tab the paste started on —
-        // a host tab's image must never become a file on this machine.
-        UiTask::PasteImageProbe {
-            tab,
-            sink: if tab.is_local() {
-                ProbeSink::TempFile
-            } else {
-                ProbeSink::Bytes
-            },
-        }
-    } else {
-        UiTask::None
-    };
-    clipboard.start_next().then(probe)
+    if !(probe_allowed && probe_wanted(target, text)) {
+        return clipboard.start_next();
+    }
+    clipboard.hold_for_probe(request_id);
+    UiTask::PasteImageProbe {
+        request_id,
+        tab,
+        // The sink is chosen here, from the tab the paste started on — a
+        // host tab's image must never become a file on this machine.
+        sink: if tab.is_local() {
+            ProbeSink::TempFile
+        } else {
+            ProbeSink::Bytes
+        },
+    }
 }
 
 /// Paste text into the tab whose gesture asked for it — never the active
@@ -2725,6 +2979,7 @@ impl App {
                 }
                 paste_read_followup(
                     &mut self.clipboard,
+                    request_id,
                     target,
                     tab,
                     value.as_deref(),
@@ -2748,30 +3003,72 @@ impl App {
     /// A failed probe toasts too (plan 047 §3.2): an image that was over
     /// the cap or could not be read is a paste the user spent and got
     /// nothing for. An *absent* image is not a failure and stays silent.
+    ///
+    /// [`Materialized::Paths`] is the drop route's (plan 073 D2), and so
+    /// are its own checks on whether that tab can still take them.
+    ///
+    /// Whatever it found, the probe's hold on the clipboard queue ends
+    /// here.
     pub fn paste_image_materialized(
         &mut self,
+        request_id: u64,
         tab: TabKey,
         result: Result<Materialized, ProbeError>,
     ) -> UiTask {
-        let materialized = match result {
-            Ok(materialized) => materialized,
+        let delivered = match result {
             Err(ProbeError::Empty) => {
                 tracing::debug!(?tab, "clipboard image paste found nothing");
-                return UiTask::None;
+                UiTask::None
             }
             Err(ProbeError::Failed(error)) => {
                 tracing::info!(?tab, %error, "clipboard image paste failed");
                 self.set_status(error);
-                return UiTask::None;
+                UiTask::None
             }
-        };
-        match materialized {
-            Materialized::Path(path) => {
+            Err(ProbeError::TimedOut(error)) => {
+                tracing::warn!(?tab, %error, "clipboard paste probe abandoned");
+                self.set_status(error);
+                UiTask::None
+            }
+            Ok(Materialized::Path(path)) => {
                 deliver_paste_image(&self.tabs, tab, Some(&path));
                 UiTask::None
             }
-            Materialized::Png { name, png } => self.send_clipboard_png(tab, name, png),
-        }
+            Ok(Materialized::Png { name, png }) => self.send_clipboard_png(tab, name, png),
+            Ok(Materialized::Paths(paths)) => self.send_files(tab, paths, None),
+        };
+        self.clipboard.complete_probe(request_id).then(delivered)
+    }
+
+    /// A paste's file read came back (plan 073 D2) — see
+    /// [`paste_files_followup`].
+    ///
+    /// A failed read still goes on to the text: a paste that cannot see
+    /// files may yet carry text, and the text read says what it found.
+    pub fn clipboard_files_read(
+        &mut self,
+        request_id: u64,
+        result: Result<Vec<PathBuf>, ProbeError>,
+    ) -> UiTask {
+        let paths = match result {
+            Ok(paths) => paths,
+            Err(ProbeError::Empty) => Vec::new(),
+            Err(ProbeError::Failed(error)) => {
+                tracing::info!(request_id, %error, "clipboard file read failed; pasting text");
+                Vec::new()
+            }
+            Err(ProbeError::TimedOut(error)) => {
+                tracing::warn!(request_id, %error, "clipboard file read abandoned; pasting text");
+                Vec::new()
+            }
+        };
+        paste_files_followup(
+            self,
+            |app| &mut app.clipboard,
+            |app, tab, paths| app.send_files(tab, paths, None),
+            request_id,
+            paths,
+        )
     }
 
     pub fn clipboard_write_completed(&mut self, request_id: u64) -> UiTask {
@@ -2815,9 +3112,9 @@ impl App {
     }
 
     /// The one place a paste read gets enqueued for a specific tab —
-    /// `paste_into_active` (keybind/menu paste) and the Linux
-    /// primary-selection middle-click route both funnel through this,
-    /// so a future third caller can't forget the check.
+    /// `paste_into_active` (keybind/menu paste) and the selection's
+    /// middle-click route both funnel through this, so a future third
+    /// caller can't forget the check.
     ///
     /// Checked before the clipboard is touched at all: a host tab whose
     /// attach ended is still in `self.tabs` — that's deliberate, it's
@@ -2834,7 +3131,8 @@ impl App {
         if let Some(refusal) = self.paste_refusal_for(tab) {
             return Err(refusal.to_string());
         }
-        self.clipboard.enqueue_paste_read(target, tab);
+        self.clipboard
+            .enqueue_paste_read(target, tab, paste_reads_files_first(target));
         Ok(())
     }
 }
@@ -4620,6 +4918,19 @@ mod tests {
     }
 
     #[test]
+    fn a_trailing_debounce_acts_only_on_its_latest_arm() {
+        let mut settle = TrailingDebounce::default();
+        let entered = settle.arm();
+        let exited = settle.arm();
+        assert!(
+            !settle.is_latest(entered),
+            "an earlier arm's deadline acted"
+        );
+        assert!(settle.is_latest(exited));
+        assert!(!settle.is_latest(exited.wrapping_add(1)));
+    }
+
+    #[test]
     fn rename_completion_keys_are_consumed_through_release_only() {
         use iced::keyboard::key::{Code, Physical};
         use iced::keyboard::Location;
@@ -5064,7 +5375,7 @@ mod tests {
         assert_eq!(*request_id, write_id);
         assert_eq!(png.as_slice(), b"\x89PNG");
 
-        let read_id = queue.enqueue_paste_read(ClipboardOp::System, TabKey::local(7));
+        let read_id = queue.enqueue_paste_read(ClipboardOp::System, TabKey::local(7), false);
         assert!(matches!(queue.start_next(), UiTask::None));
         // The reply is the blocking pool's to send, so nothing has
         // answered it while the write is still the active item.
@@ -5168,8 +5479,8 @@ mod tests {
     #[test]
     fn paste_reads_keep_the_initiating_tab_and_reject_stale_results() {
         let mut queue = ClipboardQueue::default();
-        let first_id = queue.enqueue_paste_read(ClipboardOp::System, TabKey::local(41));
-        let second_id = queue.enqueue_paste_read(ClipboardOp::Selection, TabKey::local(42));
+        let first_id = queue.enqueue_paste_read(ClipboardOp::System, TabKey::local(41), false);
+        let second_id = queue.enqueue_paste_read(ClipboardOp::Selection, TabKey::local(42), false);
         assert!(matches!(
             queue.start_next(),
             UiTask::ClipboardRead { request_id, target: ClipboardOp::System }
@@ -5299,10 +5610,20 @@ mod tests {
         let accelerator = input::accelerator(&event).expect("native Command-V accelerator");
         assert_eq!(bindings.get(&accelerator), Some(&KeybindAction::Paste));
 
+        // macOS reads copied files first (plan 073 D2); with none on the
+        // clipboard the same read goes on to the text.
         let mut queue = ClipboardQueue::default();
-        let request_id = queue.enqueue_paste_read(ClipboardOp::System, TabKey::local(73));
+        let request_id = queue.enqueue_paste_read(
+            ClipboardOp::System,
+            TabKey::local(73),
+            paste_reads_files_first(ClipboardOp::System),
+        );
         assert!(matches!(
             queue.start_next(),
+            UiTask::ClipboardReadFiles { request_id: scheduled } if scheduled == request_id
+        ));
+        assert!(matches!(
+            queue.continue_paste_read(request_id),
             UiTask::ClipboardRead { request_id: scheduled, .. } if scheduled == request_id
         ));
         let completion = queue
@@ -5322,79 +5643,247 @@ mod tests {
         assert_eq!(paste_bytes(&terminal, value.as_deref()), b"mac paste");
     }
 
+    /// Plan 073 D2's macOS step, which the queue owns on every OS: the
+    /// file read is the paste's first effect, and with nothing found the
+    /// same read goes on to the text — still holding the queue, so an
+    /// effect behind it waits for the whole paste.
+    #[test]
+    fn a_files_first_paste_reads_files_then_its_text_in_one_queue_slot() {
+        let mut queue = ClipboardQueue::default();
+        let read_id = queue.enqueue_paste_read(ClipboardOp::System, TabKey::local(7), true);
+        let write_id = queue.enqueue_write(ClipboardOp::System, "behind".into());
+        assert!(matches!(
+            queue.start_next(),
+            UiTask::ClipboardReadFiles { request_id } if request_id == read_id
+        ));
+        assert!(matches!(queue.start_next(), UiTask::None));
+        assert!(matches!(
+            queue.continue_paste_read(read_id),
+            UiTask::ClipboardRead { request_id, target: ClipboardOp::System }
+                if request_id == read_id
+        ));
+        assert!(matches!(queue.start_next(), UiTask::None));
+        assert!(matches!(
+            queue.complete_read(read_id, Some("text".into())),
+            Some(ClipboardReadCompletion::Paste { tab, .. }) if tab == TabKey::local(7)
+        ));
+        assert!(matches!(
+            queue.start_next(),
+            UiTask::ClipboardWrite { request_id, .. } if request_id == write_id
+        ));
+
+        // The selection is text: no file step, whatever the platform.
+        assert!(!paste_reads_files_first(ClipboardOp::Selection));
+        assert_eq!(
+            paste_reads_files_first(ClipboardOp::System),
+            cfg!(target_os = "macos")
+        );
+    }
+
+    /// What `App` is to [`paste_files_followup`]: the queue, and a
+    /// stand-in for `send_files` that records its tab and answers with a
+    /// host upload's task.
+    #[derive(Default)]
+    struct PasteOwner {
+        clipboard: ClipboardQueue,
+        sent: Vec<(TabKey, Vec<PathBuf>)>,
+    }
+
+    fn upload_to(owner: &mut PasteOwner, tab: TabKey, paths: Vec<PathBuf>) -> UiTask {
+        owner.sent.push((tab, paths.clone()));
+        UiTask::InspectFiles { id: 99, paths }
+    }
+
+    /// Plan 073 correction 6: the files go through the drop route bound to
+    /// the tab the paste was asked for, and the route's task — a host
+    /// tab's upload — comes back to the runtime behind the queue's next
+    /// effect instead of being dropped.
+    #[test]
+    fn copied_files_hand_the_host_upload_task_back_for_the_tab_that_pasted() {
+        let host_tab = TabKey::new(HostId::new(3), 7);
+        let files = vec![PathBuf::from("/tmp/a b.txt"), PathBuf::from("/tmp/c.pdf")];
+        let mut owner = PasteOwner::default();
+        let read_id = owner
+            .clipboard
+            .enqueue_paste_read(ClipboardOp::System, host_tab, true);
+        let write_id = owner
+            .clipboard
+            .enqueue_write(ClipboardOp::System, "behind".into());
+        assert!(matches!(
+            owner.clipboard.start_next(),
+            UiTask::ClipboardReadFiles { .. }
+        ));
+
+        let task = paste_files_followup(
+            &mut owner,
+            |owner| &mut owner.clipboard,
+            upload_to,
+            read_id,
+            files.clone(),
+        );
+
+        assert_eq!(owner.sent, vec![(host_tab, files.clone())]);
+        let UiTask::Then(first, second) = task else {
+            panic!("the queue's next effect and the upload must both be returned")
+        };
+        assert!(matches!(
+            *first,
+            UiTask::ClipboardWrite { request_id, .. } if request_id == write_id
+        ));
+        assert!(matches!(
+            *second,
+            UiTask::InspectFiles { id: 99, ref paths } if *paths == files
+        ));
+
+        // The read is over: no text read follows it, and a second answer
+        // for it is stale.
+        assert!(owner.clipboard.complete_read(read_id, None).is_none());
+        assert!(matches!(
+            paste_files_followup(
+                &mut owner,
+                |owner| &mut owner.clipboard,
+                upload_to,
+                read_id,
+                files.clone(),
+            ),
+            UiTask::None
+        ));
+        assert_eq!(owner.sent.len(), 1, "a stale answer sent files");
+    }
+
+    /// No files sends nothing and goes on to the text, holding the queue.
+    #[test]
+    fn no_copied_files_continue_the_same_paste_to_its_text() {
+        let mut owner = PasteOwner::default();
+        let read_id =
+            owner
+                .clipboard
+                .enqueue_paste_read(ClipboardOp::System, TabKey::local(7), true);
+        assert!(matches!(
+            owner.clipboard.start_next(),
+            UiTask::ClipboardReadFiles { .. }
+        ));
+        assert!(matches!(
+            paste_files_followup(
+                &mut owner,
+                |owner| &mut owner.clipboard,
+                upload_to,
+                read_id,
+                Vec::new(),
+            ),
+            UiTask::ClipboardRead { request_id, target: ClipboardOp::System }
+                if request_id == read_id
+        ));
+        assert!(owner.sent.is_empty());
+        assert!(matches!(
+            owner.clipboard.complete_read(read_id, Some("plain".into())),
+            Some(ClipboardReadCompletion::Paste { .. })
+        ));
+    }
+
+    /// `paste_read_followup` on a fresh queue, as the read it follows has
+    /// just released its slot.
+    fn followup(
+        target: ClipboardOp,
+        tab: TabKey,
+        text: Option<&str>,
+        probe_allowed: bool,
+    ) -> UiTask {
+        paste_read_followup(
+            &mut ClipboardQueue::default(),
+            7,
+            target,
+            tab,
+            text,
+            probe_allowed,
+        )
+    }
+
     #[test]
     fn only_an_empty_system_paste_probes_for_a_clipboard_image() {
-        let mut queue = ClipboardQueue::default();
+        let tab = TabKey::local(7);
         assert!(matches!(
-            paste_read_followup(&mut queue, ClipboardOp::System, TabKey::local(7), None, true),
-            UiTask::PasteImageProbe { tab, sink: ProbeSink::TempFile } if tab == TabKey::local(7)
+            followup(ClipboardOp::System, tab, None, true),
+            UiTask::PasteImageProbe { request_id: 7, tab: probed, sink: ProbeSink::TempFile }
+                if probed == tab
         ));
         assert!(matches!(
-            paste_read_followup(
-                &mut queue,
-                ClipboardOp::System,
-                TabKey::local(7),
-                Some(""),
-                true
-            ),
-            UiTask::PasteImageProbe { tab, sink: ProbeSink::TempFile } if tab == TabKey::local(7)
+            followup(ClipboardOp::System, tab, Some(""), true),
+            UiTask::PasteImageProbe { tab: probed, sink: ProbeSink::TempFile, .. } if probed == tab
         ));
         assert!(matches!(
-            paste_read_followup(
-                &mut queue,
-                ClipboardOp::System,
-                TabKey::local(7),
-                Some("text"),
-                true
-            ),
+            followup(ClipboardOp::System, tab, Some("text"), true),
             UiTask::None
         ));
         // Matches the (now-removed) GTK UI: a PRIMARY paste has no image branch at all.
         assert!(matches!(
-            paste_read_followup(
-                &mut queue,
-                ClipboardOp::Selection,
-                TabKey::local(7),
-                None,
-                true
-            ),
+            followup(ClipboardOp::Selection, tab, None, true),
             UiTask::None
         ));
+    }
 
-        // An effect already waiting on the queue starts now, not after the
-        // blocking probe.
-        let queued = queue.enqueue_write(ClipboardOp::System, "queued".into());
-        let UiTask::Then(first, second) = paste_read_followup(
-            &mut queue,
-            ClipboardOp::System,
-            TabKey::local(7),
-            None,
-            true,
-        ) else {
-            panic!("the clipboard queue must resume alongside the probe")
-        };
+    /// Plan 073 correction 6: the probe reads the clipboard, so it keeps
+    /// the paste's place in the queue. A write queued behind the paste —
+    /// one that would replace the files the probe is about to read —
+    /// waits until the probe reports, and starts then. A paste with
+    /// nothing to probe lets it go at once.
+    #[test]
+    fn a_probe_holds_the_clipboard_queue_until_it_reports() {
+        let tab = TabKey::local(7);
+        let mut queue = ClipboardQueue::default();
+        let read_id = queue.enqueue_paste_read(ClipboardOp::System, tab, false);
+        let (reply, _result) = tokio::sync::oneshot::channel();
+        let write_id = queue.enqueue_write_files(vec![PathBuf::from("/tmp/b.txt")], reply);
+        assert!(matches!(queue.start_next(), UiTask::ClipboardRead { .. }));
+        assert!(queue.complete_read(read_id, None).is_some());
+
         assert!(matches!(
-            *first,
-            UiTask::ClipboardWrite { request_id, .. } if request_id == queued
+            paste_read_followup(&mut queue, read_id, ClipboardOp::System, tab, None, true),
+            UiTask::PasteImageProbe { request_id, .. } if request_id == read_id
         ));
         assert!(
-            matches!(*second, UiTask::PasteImageProbe { tab, sink: ProbeSink::TempFile } if tab == TabKey::local(7))
+            matches!(queue.start_next(), UiTask::None),
+            "a write ran while the probe was still reading the clipboard"
         );
+        assert!(matches!(
+            queue.complete_probe(read_id),
+            UiTask::ClipboardWriteFiles { request_id, .. } if request_id == write_id
+        ));
+
+        let mut nothing_to_probe = ClipboardQueue::default();
+        let read_id = nothing_to_probe.enqueue_paste_read(ClipboardOp::System, tab, false);
+        let write_id = nothing_to_probe.enqueue_write(ClipboardOp::System, "behind".into());
+        assert!(matches!(
+            nothing_to_probe.start_next(),
+            UiTask::ClipboardRead { .. }
+        ));
+        assert!(nothing_to_probe
+            .complete_read(read_id, Some("text".into()))
+            .is_some());
+        assert!(matches!(
+            paste_read_followup(
+                &mut nothing_to_probe,
+                read_id,
+                ClipboardOp::System,
+                tab,
+                Some("text"),
+                true
+            ),
+            UiTask::ClipboardWrite { request_id, .. } if request_id == write_id
+        ));
     }
 
     /// A host that is not accepting operations gets no probe: the read
     /// blocks and its bytes would have nowhere to go (plan 047 §3.2).
-    /// The clipboard queue still resumes either way.
     #[test]
     fn a_target_that_cannot_take_an_image_never_spawns_the_probe() {
-        let mut queue = ClipboardQueue::default();
         let host_tab = TabKey::new(HostId::new(3), 7);
         assert!(matches!(
-            paste_read_followup(&mut queue, ClipboardOp::System, host_tab, None, true),
-            UiTask::PasteImageProbe { tab, sink: ProbeSink::Bytes } if tab == host_tab
+            followup(ClipboardOp::System, host_tab, None, true),
+            UiTask::PasteImageProbe { tab, sink: ProbeSink::Bytes, .. } if tab == host_tab
         ));
         assert!(matches!(
-            paste_read_followup(&mut queue, ClipboardOp::System, host_tab, None, false),
+            followup(ClipboardOp::System, host_tab, None, false),
             UiTask::None
         ));
     }
@@ -5462,7 +5951,7 @@ mod tests {
         let tabs = HashMap::from([(TabKey::local(9_201), tab)]);
 
         let mut queue = ClipboardQueue::default();
-        let request_id = queue.enqueue_paste_read(ClipboardOp::System, stale);
+        let request_id = queue.enqueue_paste_read(ClipboardOp::System, stale, false);
         assert!(matches!(queue.start_next(), UiTask::ClipboardRead { .. }));
         let completion = queue
             .complete_read(request_id, None)
@@ -5478,8 +5967,8 @@ mod tests {
 
         // The empty system read hands the probe the same key.
         assert!(matches!(
-            paste_read_followup(&mut queue, target, tab, value.as_deref(), true),
-            UiTask::PasteImageProbe { tab, sink: ProbeSink::Bytes } if tab == stale
+            paste_read_followup(&mut queue, request_id, target, tab, value.as_deref(), true),
+            UiTask::PasteImageProbe { tab, sink: ProbeSink::Bytes, .. } if tab == stale
         ));
 
         // …and the materialized image finds nothing to paste into.
@@ -5859,6 +6348,7 @@ mod tests {
             &tab.terminal,
             page_press(named, modifiers),
             false,
+            input::OptionKey::default(),
         );
         tab.session.send_input(bytes);
     }
@@ -6439,6 +6929,7 @@ mod tests {
             &tab.terminal,
             named_press(Named::Enter),
             true,
+            input::OptionKey::default(),
         );
         assert!(swallowed.is_empty());
 

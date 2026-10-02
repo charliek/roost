@@ -100,6 +100,8 @@ STATIC_MENUS: dict[str, list[tuple | None]] = {
         # `test_sparkle.py` asserts it per lane.
         (UPDATES_ITEM, "", [], ANY, "check_for_updates"),
         None,
+        ("Settings…", ",", ["super"], True, "open_config"),
+        None,
         (f"Hide {APP}", "h", ["super"], True, "appkit:hide:"),
         ("Hide Others", "h", ["alt", "super"], True, "appkit:hideOtherApplications:"),
         ("Show All", "", [], True, "appkit:unhideAllApplications:"),
@@ -130,14 +132,20 @@ STATIC_MENUS: dict[str, list[tuple | None]] = {
         None,
         ("Toggle Sidebar", "b", ["super"], True, "toggle_sidebar"),
         ("Toggle Sidebar Agents", "a", ["shift", "super"], True, "toggle_sidebar_agents"),
+        ("Agent Hooks…", "", [], True, "agent_hooks"),
         None,
         ("Jump to Unread", "u", ["shift", "super"], True, "jump_to_unread"),
+        None,
+        ("Enter Full Screen", "f", ["ctrl", "super"], True, "toggle_fullscreen"),
     ],
     "Edit": [
         ("Cut", "", [], False, None),
         ("Copy", "c", ["super"], True, "copy"),
         ("Paste", "v", ["super"], True, "paste"),
         ("Select All", "", [], False, None),
+    ],
+    "Help": [
+        ("Roost Help", "", [], True, "open_docs"),
     ],
 }
 
@@ -180,13 +188,31 @@ def _row(item: dict) -> tuple | None:
 # IS parity; the tests just must not assert on their presence/absence.
 OS_INJECTED_ACTIONS = {"appkit:toggleFullScreen:"}
 
+# Both spellings of "a full-screen row": our own item, and the one AppKit
+# injects when `NSFullScreenMenuItemEverywhere` is not honored.
+FULL_SCREEN_ACTIONS = {"toggle_fullscreen", "appkit:toggleFullScreen:"}
 
-def _ours(item: dict) -> bool:
-    return item.get("action") not in OS_INJECTED_ACTIONS
+
+def _is_help_search(menu_title: str, item: dict) -> bool:
+    """macOS adds a view-backed search field to the registered Help menu.
+    It is an untitled, action-less, non-separator row — filtered only in
+    "Help", so the same shape anywhere else still fails the inventory."""
+    return (
+        menu_title == "Help"
+        and not item["separator"]
+        and item["title"] == ""
+        and item["action"] is None
+    )
+
+
+def _ours(item: dict, menu_title: str = "") -> bool:
+    return item.get("action") not in OS_INJECTED_ACTIONS and not _is_help_search(
+        menu_title, item
+    )
 
 
 def _rows(menu: dict) -> list[tuple | None]:
-    return [_row(item) for item in menu["items"] if _ours(item)]
+    return [_row(item) for item in menu["items"] if _ours(item, menu["title"])]
 
 
 def _items_by_title(menu: dict) -> dict[str, dict]:
@@ -224,7 +250,7 @@ class TestMenuShape:
 
     def test_menu_titles(self, roost):
         titles = [menu["title"] for menu in roost.app_menu_dump()]
-        assert titles == [APP, "File", "View", "Edit", "Window"]
+        assert titles == [APP, "File", "View", "Edit", "Window", "Help"]
 
     def test_static_items_match_the_pinned_inventory(self, roost):
         menus = _menus_by_title(roost.app_menu_dump())
@@ -236,14 +262,33 @@ class TestMenuShape:
         rows = _rows(menus["Window"])
         assert rows[-2:] == WINDOW_TAIL
 
-    def test_static_actionable_item_count_is_28_plus_minimize_zoom(self, roost):
+    def test_static_actionable_item_count_is_32_plus_minimize_zoom(self, roost):
         menus = _menus_by_title(roost.app_menu_dump())
         static_count = sum(
-            len([i for i in menus[t]["items"] if not i["separator"] and _ours(i)])
-            for t in (APP, "File", "View", "Edit")
+            len(
+                [
+                    i
+                    for i in menus[t]["items"]
+                    if not i["separator"] and _ours(i, t)
+                ]
+            )
+            for t in (APP, "File", "View", "Edit", "Help")
         )
-        assert static_count == 28
+        assert static_count == 32
         assert _rows(menus["Window"])[-2:] == WINDOW_TAIL
+
+    def test_exactly_one_full_screen_row_in_the_whole_menu_bar(self, roost):
+        """`NSFullScreenMenuItemEverywhere = NO` is what keeps AppKit from
+        adding its own beside ours (CI's macos-latest does without it). The
+        count is over the UNFILTERED dump, so an injected row fails here
+        even though the inventory comparison above ignores it."""
+        rows = [
+            (menu["title"], item["title"], item["action"])
+            for menu in roost.app_menu_dump()
+            for item in menu["items"]
+            if item["action"] in FULL_SCREEN_ACTIONS
+        ]
+        assert rows == [("View", "Enter Full Screen", "toggle_fullscreen")], rows
 
     def test_separator_counts_match_swift(self, roost):
         menus = _menus_by_title(roost.app_menu_dump())
@@ -251,7 +296,7 @@ class TestMenuShape:
             t: sum(1 for i in menus[t]["items"] if i["separator"])
             for t in (APP, "File", "View", "Edit")
         }
-        assert counts == {APP: 2, "File": 2, "View": 3, "Edit": 0}
+        assert counts == {APP: 3, "File": 2, "View": 4, "Edit": 0}
 
     def test_cut_and_select_all_are_disabled_with_no_key_equivalent(self, roost):
         edit = _items_by_title(_menus_by_title(roost.app_menu_dump())["Edit"])
@@ -266,6 +311,58 @@ class TestMenuShape:
         item, never inert."""
         app_menu = _items_by_title(_menus_by_title(roost.app_menu_dump())[APP])
         assert app_menu[UPDATES_ITEM]["action"] == "check_for_updates"
+
+
+def _bottom_line_text(roost) -> str | None:
+    line = roost.notice_dump()["bottom_line"]
+    return line["text"] if line else None
+
+
+class TestAdditions:
+    """Settings…, Agent Hooks…, Roost Help and Full Screen — each through
+    the real AppKit -> feed -> update-loop path. Test mode makes the two
+    openers toast `Would open …` instead of launching anything."""
+
+    def test_settings_names_the_config_file_it_would_open(self, roost):
+        roost.app_menu_activate([APP, "Settings…"])
+        seen: list[str] = []
+
+        def toasted() -> bool:
+            text = _bottom_line_text(roost)
+            if text and text.startswith("Would open "):
+                seen.append(text)
+                return True
+            return False
+
+        roost._wait(toasted, 5.0, "Settings… toasts the config path it would open")
+        assert seen[0].endswith(".conf"), seen
+
+    def test_roost_help_names_the_docs_it_would_open(self, roost):
+        roost.app_menu_activate(["Help", "Roost Help"])
+        roost._wait(
+            lambda: _bottom_line_text(roost)
+            == "Would open https://charliek.github.io/roost/",
+            5.0,
+            "Roost Help toasts the docs URL it would open",
+        )
+
+    def test_agent_hooks_opens_the_preferences_card(self, roost):
+        roost.app_menu_activate(["View", "Agent Hooks…"])
+        try:
+            roost._wait(
+                lambda: roost.call("app.dialog_dump", {}).get("dialog") == "agent_hooks",
+                10.0,
+                "View -> Agent Hooks… raises the agent-hooks card",
+            )
+            assert roost.call("app.dialog_dump", {})["mode"] == "preferences"
+        finally:
+            if roost.call("app.dialog_dump", {}).get("dialog") == "agent_hooks":
+                roost.call("app.dialog_answer", {"action": "cancel"})
+        roost._wait(
+            lambda: roost.call("app.dialog_dump", {}).get("dialog") is None,
+            5.0,
+            "cancel dismisses the agent-hooks card",
+        )
 
 
 class TestKeyEquivalents:

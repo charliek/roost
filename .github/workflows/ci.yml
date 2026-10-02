@@ -65,6 +65,9 @@ jobs:
               - 'crates/**'
               - 'third_party/ghostty/**'
               - 'third_party/swash/**'
+              # `include_bytes!`'d into roost-iced: the chrome and terminal fonts.
+              - 'third_party/inter/**'
+              - 'third_party/jetbrains-mono/**'
             rust:
               - *rustcore
             mac:
@@ -779,6 +782,7 @@ jobs:
           tools/roosttest/test_palette_256.py
           tools/roosttest/test_tab_dump_scrollback.py
           tools/roosttest/test_sprite_pixels.py
+          tools/roosttest/test_cursor_pixels.py
           tools/roosttest/test_ime.py
           tools/roosttest/test_selection.py
           tools/roosttest/test_mouse_tracking.py
@@ -790,7 +794,11 @@ jobs:
           tools/roosttest/test_newtab_cwd.py
           tools/roosttest/test_boot_failure.py
           tools/roosttest/test_quit_with_foreground_job.py
+          tools/roosttest/test_open_external.py
+          tools/roosttest/test_context_menu.py
           tools/roosttest/test_osc52.py
+          tools/roosttest/test_paste_files.py
+          tools/roosttest/test_context_menu_clipboard.py
           --roost-target iced --roost-fresh -v
 
       # Its own invocation, after the shared-session lane above: this
@@ -1015,7 +1023,9 @@ jobs:
         # Wayland renderer suite; the POC plan records the real-seat evidence
         # and remaining programmatic-write limitation. `test_selection.py` is
         # in this list because `selection.*` reads UI state over IPC and never
-        # touches the pasteboard — only `test_osc52.py` is X11-only.
+        # touches the pasteboard — only `test_osc52.py`,
+        # `test_paste_files.py` and `test_context_menu_clipboard.py` are
+        # X11-only.
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1046,6 +1056,7 @@ jobs:
           tools/roosttest/test_palette_256.py
           tools/roosttest/test_tab_dump_scrollback.py
           tools/roosttest/test_sprite_pixels.py
+          tools/roosttest/test_cursor_pixels.py
           tools/roosttest/test_ime.py
           tools/roosttest/test_selection.py
           tools/roosttest/test_mouse_tracking.py
@@ -1057,6 +1068,8 @@ jobs:
           tools/roosttest/test_newtab_cwd.py
           tools/roosttest/test_boot_failure.py
           tools/roosttest/test_quit_with_foreground_job.py
+          tools/roosttest/test_open_external.py
+          tools/roosttest/test_context_menu.py
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced exit-on-empty E2E (Linux Wayland)
@@ -1257,6 +1270,7 @@ jobs:
           tools/roosttest/test_palette_256.py
           tools/roosttest/test_tab_dump_scrollback.py
           tools/roosttest/test_sprite_pixels.py
+          tools/roosttest/test_cursor_pixels.py
           tools/roosttest/test_ime.py
           tools/roosttest/test_selection.py
           tools/roosttest/test_mouse_tracking.py
@@ -1264,7 +1278,11 @@ jobs:
           tools/roosttest/test_menu_bar.py
           tools/roosttest/test_sparkle.py
           tools/roosttest/test_view_perf.py
+          tools/roosttest/test_open_external.py
+          tools/roosttest/test_context_menu.py
           tools/roosttest/test_osc52.py
+          tools/roosttest/test_paste_files.py
+          tools/roosttest/test_context_menu_clipboard.py
           -m 'not host_client'
           --roost-target iced --roost-fresh -v
 

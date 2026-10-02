@@ -2138,7 +2138,7 @@ mod tests {
         keyboard.arm(Some((5, target.host)), 0, now);
         for key in ["e", "c", "h", "o", "ArrowUp"] {
             let press = crate::input::synthetic_press(key, None, &[]).expect("a key");
-            keyboard.push(PendingInput::Key(press));
+            keyboard.push(PendingInput::Key(press, crate::input::OptionKey::default()));
         }
         keyboard.answered(5, Ok(target), now);
         let step = |keyboard: &PendingKeyboard, attach: &HostAttach| {

@@ -9,12 +9,18 @@ discards the temporary copy.
 
 from __future__ import annotations
 
+import sys
 import time
 import uuid
 
 import pytest
 import ui
 from util import BARE_SHELL_ARGV, wait_for_config_line, wait_tab_attached
+
+
+# The iced UI's default `font-size`, which follows its host OS
+# (`typography::DEFAULT_FONT_SIZE_PT`); the UI under test runs on this host.
+DEFAULT_FONT_SIZE = 14 if sys.platform == "darwin" else 13
 
 
 def _grid(roost, tab_id: int) -> tuple[int, int]:
@@ -70,6 +76,19 @@ def _activate_command(palette, command: str) -> None:
     assert state["open"] is False
 
 
+def test_rust_default_family_is_the_bundled_jetbrains_mono(owned_rust_config, roost):
+    """CI runners have no system JetBrains Mono, so only the copy bootstrap
+    loads can make the unset default resolve to it; without that load the
+    UI reports the `Monospace` generic."""
+    family_lines = [
+        line
+        for line in owned_rust_config.read_text().splitlines()
+        if line.split("=", 1)[0].strip() == "font-family"
+    ]
+    assert family_lines == [], "the seed config leaves font-family unset"
+    assert roost.window_metrics()["terminal_font_family"] == "JetBrains Mono"
+
+
 def test_rust_shared_font_size_reflows_all_tabs_and_persists(
     owned_rust_config, roost, rust_project, rust_palette
 ):
@@ -102,7 +121,9 @@ def test_rust_shared_font_size_reflows_all_tabs_and_persists(
         5.0,
         "shared font-size transition reaches the hidden Rust UI tab",
     )
-    wait_for_config_line(config_path, "font-size", "font-size = 14")
+    wait_for_config_line(
+        config_path, "font-size", f"font-size = {DEFAULT_FONT_SIZE + 1}"
+    )
 
     third = roost.open_tab(rust_project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     wait_tab_attached(roost, third)
@@ -126,7 +147,7 @@ def test_rust_shared_font_size_reflows_all_tabs_and_persists(
             5.0,
             f"font reset restores the launch baseline on Rust UI tab {tab_id}",
         )
-    wait_for_config_line(config_path, "font-size", "font-size = 13")
+    wait_for_config_line(config_path, "font-size", f"font-size = {DEFAULT_FONT_SIZE}")
 
     before_second_reset = config_path.read_bytes()
     before_stat = config_path.stat()

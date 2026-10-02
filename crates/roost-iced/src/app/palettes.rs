@@ -1488,6 +1488,18 @@ impl App {
                     self.clear_palette_state();
                     self.open_agent_hooks_preferences();
                 }
+                "open_config" => {
+                    self.clear_palette_state();
+                    dispatch.task = self.open_config();
+                }
+                "open_docs" => {
+                    self.clear_palette_state();
+                    dispatch.task = self.open_docs();
+                }
+                "toggle_fullscreen" => {
+                    self.clear_palette_state();
+                    dispatch.task = self.toggle_full_screen();
+                }
                 "font_increase" => {
                     self.clear_palette_state();
                     self.apply_font_size_transition(FontSizeTransition::Adjust(1.0))?;
@@ -1647,7 +1659,7 @@ impl App {
     /// ordinary dial for most hosts, but on a mismatched one it raises
     /// the upgrade prompt — whose button now starts a remote install —
     /// and `palette.activate` is reachable from `roostctl`.
-    fn run_host_verb(
+    pub(super) fn run_host_verb(
         &mut self,
         verb: host_verbs::HostVerb,
         origin: crate::host_conn::RequestOrigin,
@@ -2321,7 +2333,7 @@ impl App {
                     .map(|tab| tab.title)
                     .unwrap_or_default();
                 let active_cwd = if project_id != 0 {
-                    self.launch_cwd()
+                    local_launch_cwd(&self.workspace, &self.client.supervisor, tab_id)
                 } else {
                     String::new()
                 };

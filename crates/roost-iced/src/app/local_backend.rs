@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use roost_ipc::messages::Project;
 use roost_ipc::{LocalBackendMode, LocalRoute};
 use roost_ui_model::config::RoostConfig;
+use roost_ui_model::context_menu::ContextAction;
 use roost_ui_model::host_verbs::SlotHistory;
 use roost_ui_model::keybind::KeybindAction;
 use roost_ui_model::keys::{HostId, ProjectKey, TabKey};
@@ -1657,6 +1658,19 @@ pub(crate) fn palette_row_mutates_local_backend(id: &str) -> bool {
     matches!(
         id,
         "new_tab" | "new_project" | "close_tab" | "close_project"
+    )
+}
+
+/// The same gate on a row's right-click menu (plan 073 D9), which offers
+/// three of the four, plus New Tab Here: New Tab from another tab's
+/// directory.
+pub(crate) fn context_action_mutates_local_backend(action: ContextAction) -> bool {
+    matches!(
+        action,
+        ContextAction::NewTab
+            | ContextAction::NewTabHere
+            | ContextAction::CloseTab
+            | ContextAction::CloseProject
     )
 }
 
@@ -5158,6 +5172,14 @@ mod switch_tests {
             roost_ui_model::host_verbs::USE_SESSION_ID,
         ] {
             assert!(!palette_row_mutates_local_backend(id), "{id}");
+        }
+        for action in ContextAction::ALL {
+            assert_eq!(
+                context_action_mutates_local_backend(action),
+                action == ContextAction::NewTabHere
+                    || palette_row_mutates_local_backend(action.as_str()),
+                "{action:?}"
+            );
         }
 
         assert_eq!(

@@ -51,12 +51,14 @@ iced = { version = "=0.14.0", default-features = false, features = [
     "tiny-skia",
     "tokio",
     "wayland",
+    "web-colors",
     "wgpu",
     "x11",
 ] }
 
 anyhow = { workspace = true }
-# Clipboard image reads only — Iced owns the text clipboard. `image-data`
+# Clipboard image and file-list reads only — Iced owns the text clipboard
+# (plan 073 D2's file lists need no feature). `image-data`
 # hands us raw RGBA (arboard's `image` dep does the decode; the PNG we
 # write is encoded with `png` below); `wayland-data-control` lets the
 # read work on a Wayland compositor with no window focused.
@@ -120,12 +122,30 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSArray",
     # `localizedDescription` on the errors the UN completion blocks hand back.
     "NSError",
+    # The system-accent observer: a block on the main operation queue.
+    "NSNotification",
+    "NSOperation",
+    "block2",
     "NSObject",
     "NSSet",
     "NSString",
+    # The file URLs `macos::pasteboard::write_file_list` puts on the clipboard.
+    "NSURL",
+    # `registerDefaults:` — `NSFullScreenMenuItemEverywhere = NO`, so AppKit
+    # does not add a second full-screen item beside ours.
+    "NSDictionary",
+    "NSUserDefaults",
+    "NSValue",
 ] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
+    # The system accent, resolved under darkAqua (`performAsCurrentDrawingAppearance:`
+    # takes a block) and read back as sRGB components (`CGFloat`).
+    "NSAppearance",
+    "NSColor",
+    "NSColorSpace",
+    "block2",
+    "objc2-core-foundation",
     "NSApplication",
     # `NSControlStateValue` — the Window menu's active-row checkmark.
     "NSCell",
@@ -134,8 +154,14 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSEvent",
     "NSMenu",
     "NSMenuItem",
+    # The selection pasteboard and the file-list write (`macos::pasteboard`).
+    "NSPasteboard",
+    "NSPasteboardItem",
     # `NSApplication`'s superclass; the class item does not exist without it.
     "NSResponder",
+    # `popUpMenuPositioningItem:atLocation:inView:` — the right-click menu
+    # (`macos::context_menu`) — is declared only with it.
+    "NSView",
 ] }
 
 # The UNUserNotificationCenter backend (`src/macos/notifications.rs`, plan

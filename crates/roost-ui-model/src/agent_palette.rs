@@ -379,7 +379,7 @@ fn token_role(token: &str) -> MetricsRole {
 /// The colour a role renders in — Mac-only today: `AgentPalette.swift`'s
 /// `metricsColor` uses these exact hexes. iced does not read this
 /// function; it paints the metrics + elapsed-time strings in a single
-/// flat `chrome::MUTED_TEXT` (`#a0a4b0`), with no per-role split. The
+/// flat chrome `muted_text` (`#a0a4b0`), with no per-role split. The
 /// now-removed GTK UI's `.palette-agent-time` CSS class happened to
 /// share `#7a7a7a` with Mac's muted shade, which is why this value is
 /// pinned rather than picked freely.

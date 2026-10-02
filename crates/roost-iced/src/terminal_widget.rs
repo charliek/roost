@@ -1,5 +1,6 @@
 //! Renderer-neutral Iced terminal widget.
 
+use iced::advanced::graphics::text::{font_system, Paragraph};
 use iced::advanced::text::{Paragraph as _, Renderer as _};
 use iced::advanced::widget::{self, Widget};
 use iced::advanced::{
@@ -15,7 +16,7 @@ use roost_engine::pointer::{PointerAction, PointerButton};
 use roost_ui_model::sprite::{sprite_geometry, tessellate, SpriteGeometry, SpritePrimitive};
 use roost_ui_model::theme::Theme as AppTheme;
 use roost_vt::{ColorRgb, CursorInfo, CursorVisualStyle, SelectionSpan};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -24,7 +25,13 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// the terminal flush under the tab band). Kept as a named seam so the cell
 /// math below stays symbolic.
 pub const TERMINAL_PADDING: f32 = 0.0;
-const POINT_TO_LOGICAL_PIXEL: f64 = 96.0 / 72.0;
+/// Each OS's own convention, so a `font-size` matches that OS's other
+/// terminals: AppKit's 1 pt = 1 px (the Swift app's), and 96 dpi on Linux.
+const POINT_TO_LOGICAL_PIXEL: f64 = if cfg!(target_os = "macos") {
+    1.0
+} else {
+    96.0 / 72.0
+};
 const TERMINAL_LINE_HEIGHT: f32 = 1.2;
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -35,6 +42,111 @@ pub struct TerminalMetrics {
     pub font_pixels: f32,
     pub cell_width: f32,
     pub cell_height: f32,
+    /// The line box a cell's glyph run is laid out in, in pixels.
+    glyph_line_height: f32,
+    /// How far below a cell's top that line box starts.
+    glyph_top: f32,
+}
+
+/// A face's vertical metrics in font units, as the shaper lays out with
+/// them (`descent` is negative).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FaceMetrics {
+    units_per_em: f32,
+    ascent: f32,
+    descent: f32,
+    leading: f32,
+}
+
+impl FaceMetrics {
+    fn is_valid(self) -> bool {
+        [self.units_per_em, self.ascent, self.descent, self.leading]
+            .iter()
+            .all(|value| value.is_finite())
+            && self.units_per_em > 0.0
+            && self.ascent - self.descent > 0.0
+            && self.ascent - self.descent + self.leading > 0.0
+    }
+}
+
+/// The cell and glyph placement one rule derives from a measured "M".
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CellGeometry {
+    cell_width: f32,
+    cell_height: f32,
+    glyph_line_height: f32,
+    glyph_top: f32,
+}
+
+/// How a font's measurements become the cell grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellRule {
+    /// The Swift app's (`TerminalView.swift`'s cell size): the ceilings of
+    /// the "M" advance and of the face height, with the baseline at the
+    /// cell's top plus the ascent and the leading below the descent.
+    FontDerived,
+    /// The floors of the "M" advance and of a 1.2 line, with glyphs one
+    /// pixel down. Linux's view, unchanged.
+    Legacy,
+}
+
+impl CellRule {
+    const PLATFORM: Self = if cfg!(target_os = "macos") {
+        Self::FontDerived
+    } else {
+        Self::Legacy
+    };
+
+    /// `FontDerived` falls back to `Legacy` when the face's metrics are
+    /// missing or unusable.
+    fn geometry(self, font_pixels: f32, advance: f32, face: Option<FaceMetrics>) -> CellGeometry {
+        match (self, face.filter(|face| face.is_valid())) {
+            (Self::FontDerived, Some(face)) => {
+                let to_pixels = |units: f32| units * font_pixels / face.units_per_em;
+                CellGeometry {
+                    cell_width: advance.ceil(),
+                    cell_height: to_pixels(face.ascent - face.descent + face.leading).ceil(),
+                    // Exactly ascent + descent, so the shaper's centering
+                    // leaves the baseline at the line box's top + ascent.
+                    glyph_line_height: to_pixels(face.ascent - face.descent),
+                    glyph_top: 0.0,
+                }
+            }
+            _ => {
+                let line = TERMINAL_LINE_HEIGHT * font_pixels;
+                CellGeometry {
+                    cell_width: advance.floor(),
+                    cell_height: line.floor(),
+                    glyph_line_height: line,
+                    glyph_top: 1.0,
+                }
+            }
+        }
+    }
+}
+
+/// The metrics of the face the shaper actually used for `paragraph`'s first
+/// glyph, which is a fallback face when the requested family is missing.
+fn shaped_face_metrics(paragraph: &Paragraph) -> Option<FaceMetrics> {
+    let (id, weight) = paragraph
+        .buffer()
+        .layout_runs()
+        .find_map(|run| run.glyphs.first())
+        .map(|glyph| (glyph.font_id, glyph.font_weight))?;
+    // Building a paragraph takes this lock too, so it is taken only once
+    // the paragraph exists.
+    let face = font_system()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .raw()
+        .get_font(id, weight)?;
+    let metrics = face.metrics();
+    Some(FaceMetrics {
+        units_per_em: f32::from(metrics.units_per_em),
+        ascent: metrics.ascent,
+        descent: metrics.descent,
+        leading: metrics.leading,
+    })
 }
 
 impl TerminalMetrics {
@@ -45,6 +157,10 @@ impl TerminalMetrics {
 
     /// Resolve a supplied renderer family at a Rust UI point size.
     pub fn measure_with_font(size_pt: f64, font: Font) -> Result<Self, String> {
+        Self::measure_by(CellRule::PLATFORM, size_pt, font)
+    }
+
+    fn measure_by(rule: CellRule, size_pt: f64, font: Font) -> Result<Self, String> {
         let pixels = size_pt * POINT_TO_LOGICAL_PIXEL;
         if !pixels.is_finite() || pixels <= 0.0 || pixels > f64::from(f32::MAX) {
             return Err(format!(
@@ -58,7 +174,6 @@ impl TerminalMetrics {
             ));
         }
 
-        type Paragraph = <Renderer as text::Renderer>::Paragraph;
         let paragraph = Paragraph::with_text(text::Text {
             content: "M",
             bounds: Size::INFINITE,
@@ -70,34 +185,47 @@ impl TerminalMetrics {
             shaping: text::Shaping::Auto,
             wrapping: text::Wrapping::None,
         });
-        let measured = paragraph.min_bounds();
-        let cell_width = measured.width.floor();
-        let cell_height = measured.height.floor();
-        if !cell_width.is_finite()
-            || !cell_height.is_finite()
-            || cell_width < 1.0
-            || cell_height < 1.0
+        let advance = paragraph.min_bounds().width;
+        let face = match rule {
+            CellRule::FontDerived => shaped_face_metrics(&paragraph),
+            CellRule::Legacy => None,
+        };
+        let geometry = rule.geometry(font_pixels, advance, face);
+        if !geometry.cell_width.is_finite()
+            || !geometry.cell_height.is_finite()
+            || geometry.cell_width < 1.0
+            || geometry.cell_height < 1.0
         {
             return Err(format!(
                 "font size {size_pt}pt measured an invalid Iced cell {}x{}",
-                measured.width, measured.height
+                geometry.cell_width, geometry.cell_height
             ));
         }
         Ok(Self {
             font,
             font_pixels,
-            cell_width,
-            cell_height,
+            cell_width: geometry.cell_width,
+            cell_height: geometry.cell_height,
+            glyph_line_height: geometry.glyph_line_height,
+            glyph_top: geometry.glyph_top,
         })
+    }
+
+    /// Where a glyph run for the cell whose top-left is `cell` is placed.
+    fn glyph_origin(self, cell: Point) -> Point {
+        Point::new(cell.x, cell.y + self.glyph_top)
     }
 
     #[cfg(test)]
     fn fixed(cell_width: f32, cell_height: f32) -> Self {
+        let font_pixels = 13.5;
         Self {
             font: Font::MONOSPACE,
-            font_pixels: 13.5,
+            font_pixels,
             cell_width,
             cell_height,
+            glyph_line_height: TERMINAL_LINE_HEIGHT * font_pixels,
+            glyph_top: 1.0,
         }
     }
 }
@@ -220,7 +348,7 @@ fn cell_text(content: String, font: Font, metrics: TerminalMetrics) -> text::Tex
         content,
         bounds: Size::new(f32::INFINITY, metrics.cell_height),
         size: Pixels(metrics.font_pixels),
-        line_height: text::LineHeight::Relative(TERMINAL_LINE_HEIGHT),
+        line_height: text::LineHeight::Absolute(Pixels(metrics.glyph_line_height)),
         font,
         align_x: text::Alignment::Default,
         align_y: alignment::Vertical::Top,
@@ -301,6 +429,8 @@ pub struct TerminalSnapshot {
     /// Indexed by viewport row; `grid.len() == rows`.
     pub grid: Vec<Arc<RenderedRow>>,
     pub selection_background: ColorRgb,
+    /// The theme's `selection-foreground`: the ink of selected text.
+    pub selection_foreground: ColorRgb,
     pub selection_spans: Vec<SelectionSpan>,
     pub link_hover: Option<SelectionSpan>,
     pub pointer_shape: String,
@@ -339,6 +469,11 @@ impl TerminalSnapshot {
                 g: 83,
                 b: 109,
             },
+            selection_foreground: ColorRgb {
+                r: 255,
+                g: 255,
+                b: 255,
+            },
             selection_spans: Vec::new(),
             link_hover: None,
             pointer_shape: "default".into(),
@@ -356,9 +491,218 @@ impl TerminalSnapshot {
             background: theme.background,
             cursor_color: theme.cursor,
             selection_background: theme.selection_background,
+            selection_foreground: theme.selection_foreground,
             ..Self::blank(cols, rows)
         }
     }
+
+    /// The solid block cursor, or `None` when the cursor is hidden or draws
+    /// as an outline: unfocused, or a hollow, bar or underline style.
+    ///
+    /// Decided from the cursor alone, never from whether its cell has a
+    /// `DrawCell` — a blank prompt cell has none. The cell is asked only
+    /// whether it holds a wide glyph. On a wide glyph's tail the block
+    /// moves back onto the head and covers both columns, as Ghostty does
+    /// (`renderer/generic.zig`'s cursor uniforms).
+    fn block_cursor(&self, focused: bool) -> Option<BlockCursor> {
+        let cursor = self.cursor.filter(|cursor| {
+            focused && cursor.visible && cursor.visual_style == CursorVisualStyle::Block
+        })?;
+        let col = cursor.col as u16;
+        let (col, cells) = if cursor.wide_tail {
+            (col.saturating_sub(1), 2)
+        } else if self.cell(cursor.row, col).is_some_and(|cell| cell.wide) {
+            (col, 2)
+        } else {
+            (col, 1)
+        };
+        Some(BlockCursor {
+            row: cursor.row,
+            col,
+            cells,
+            color: effective_cursor_color(&cursor, self),
+        })
+    }
+
+    fn cell(&self, row: u32, col: u16) -> Option<&DrawCell> {
+        let cells = &self.grid.get(row as usize)?.cells;
+        let index = cells.binary_search_by_key(&col, |cell| cell.col).ok()?;
+        cells.get(index)
+    }
+
+    /// The cell whose glyph covers (`row`, `col`): its own, or the head of
+    /// the wide glyph whose tail it is.
+    fn glyph_at(&self, row: u32, col: u16) -> Option<&DrawCell> {
+        self.cell(row, col).or_else(|| {
+            let head = self.cell(row, col.checked_sub(1)?)?;
+            head.wide.then_some(head)
+        })
+    }
+
+    /// `span` grown to cover every wide glyph it splits. Selection
+    /// endpoints are cells, not graphemes, and a glyph's ink follows its
+    /// head, so a span holding half a wide glyph would otherwise paint
+    /// selection ink over the plain background, or plain ink over the
+    /// selection.
+    fn whole_glyphs(&self, span: SelectionSpan) -> SelectionSpan {
+        if span.col1 <= span.col0 {
+            return span;
+        }
+        let row = u32::from(span.row);
+        let wide_head = |col: u16| self.cell(row, col).is_some_and(|cell| cell.wide);
+        let col0 = match span.col0.checked_sub(1) {
+            Some(head) if wide_head(head) => head,
+            _ => span.col0,
+        };
+        let col1 = if wide_head(span.col1 - 1) {
+            span.col1.saturating_add(1).min(self.cols)
+        } else {
+            span.col1
+        };
+        SelectionSpan { col0, col1, ..span }
+    }
+
+    /// The selection's background cells, row by row.
+    fn selection_backgrounds(&self) -> impl Iterator<Item = SelectionSpan> + '_ {
+        self.selection_spans
+            .iter()
+            .map(|span| self.whole_glyphs(*span))
+    }
+
+    /// The selection's cells on `row`, if any.
+    fn selection_on(&self, row: u32) -> Option<SelectionSpan> {
+        self.selection_spans
+            .iter()
+            .find(|span| u32::from(span.row) == row)
+            .map(|span| self.whole_glyphs(*span))
+    }
+}
+
+/// The cells a solid block cursor fills — `cells` columns from `col` —
+/// and its color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockCursor {
+    row: u32,
+    col: u16,
+    cells: u16,
+    color: ColorRgb,
+}
+
+impl BlockCursor {
+    fn covers(self, row: u32, col: u16) -> bool {
+        row == self.row && col >= self.col && col - self.col < self.cells
+    }
+
+    fn rect(self, origin: Point, metrics: TerminalMetrics) -> Rectangle {
+        cells_rect(origin, self.row, self.col, self.cells, metrics)
+    }
+}
+
+/// The ink at (`row`, `col`) by role, the first match winning: under the
+/// block cursor, the terminal background (the inverted glyph, as Swift's
+/// `drawCursorBlock` and Ghostty draw it); inside the row's selection
+/// (see [`TerminalSnapshot::selection_on`]), the theme's
+/// `selection-foreground`; otherwise `own`, the cell's resolved
+/// foreground.
+fn cell_ink(
+    row: u32,
+    col: u16,
+    own: ColorRgb,
+    cursor: Option<BlockCursor>,
+    selection: Option<SelectionSpan>,
+    snapshot: &TerminalSnapshot,
+) -> ColorRgb {
+    if cursor.is_some_and(|cursor| cursor.covers(row, col)) {
+        snapshot.background
+    } else if selection.is_some_and(|span| (span.col0..span.col1).contains(&col)) {
+        snapshot.selection_foreground
+    } else {
+        own
+    }
+}
+
+/// The hovered link's underline as runs of (first column, columns, color),
+/// every column in the ink of the glyph above it (see [`cell_ink`]), so
+/// the underline stays visible on a selection and under the block cursor.
+fn link_underline(
+    snapshot: &TerminalSnapshot,
+    link: SelectionSpan,
+    cursor: Option<BlockCursor>,
+) -> Vec<(u16, u16, ColorRgb)> {
+    let row = u32::from(link.row);
+    let selection = snapshot.selection_on(row);
+    let mut runs: Vec<(u16, u16, ColorRgb)> = Vec::new();
+    for col in link.col0..link.col1 {
+        let own = snapshot
+            .glyph_at(row, col)
+            .map_or(snapshot.foreground, |cell| cell.foreground);
+        let ink = cell_ink(row, col, own, cursor, selection, snapshot);
+        match runs.last_mut() {
+            Some((_, cells, color)) if *color == ink => *cells += 1,
+            _ => runs.push((col, 1, ink)),
+        }
+    }
+    runs
+}
+
+/// One cell of the foreground pass.
+struct InkedCell<'a> {
+    row: u32,
+    cell: &'a DrawCell,
+    ink: ColorRgb,
+    /// Set when the cell draws as quads instead of a glyph.
+    sprite: Option<SpriteGeometry>,
+}
+
+/// The foreground pass: every cell that draws ink, sprites and glyphs
+/// alike, in its role's ink (see [`cell_ink`]).
+fn inked_cells(
+    snapshot: &TerminalSnapshot,
+    cursor: Option<BlockCursor>,
+    metrics: TerminalMetrics,
+) -> impl Iterator<Item = InkedCell<'_>> {
+    snapshot
+        .grid
+        .iter()
+        .enumerate()
+        .flat_map(move |(row_idx, row)| {
+            // The row index comes from the grid position, never from
+            // the cell — see `DrawCell`.
+            let row_y = row_idx as u32;
+            let selection = snapshot.selection_on(row_y);
+            row.cells
+                .iter()
+                .filter(|cell| !cell.text.is_empty() && cell.text != " ")
+                .map(move |cell| InkedCell {
+                    row: row_y,
+                    cell,
+                    ink: cell_ink(
+                        row_y,
+                        cell.col,
+                        cell.foreground,
+                        cursor,
+                        selection,
+                        snapshot,
+                    ),
+                    sprite: cell_sprite(&cell.text, metrics),
+                })
+        })
+}
+
+/// Sprite-render single-codepoint cells whose codepoint falls in one of
+/// the geometric ranges (the now-removed GTK UI did the same in
+/// `terminal_view::paint`). Multi-codepoint graphemes skip this path
+/// because the sprite layer is by-codepoint, not by-grapheme.
+fn cell_sprite(text: &str, metrics: TerminalMetrics) -> Option<SpriteGeometry> {
+    let mut chars = text.chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else {
+        return None;
+    };
+    sprite_geometry(
+        c as u32,
+        f64::from(metrics.cell_width),
+        f64::from(metrics.cell_height),
+    )
 }
 
 /// The cursor color the renderer should paint: an OSC-12 override
@@ -376,6 +720,11 @@ pub struct TerminalWidget {
     pub snapshot: TerminalSnapshot,
     pub metrics: TerminalMetrics,
     pub metric_generation: u64,
+    /// Bumped each time the app cancels the terminals' pointer gestures.
+    /// A button pressed before the cancel no longer owns anything, and
+    /// its release may never come here (a context menu's backdrop
+    /// swallows it), so the widget's pointer state starts over.
+    pub pointer_cancel_epoch: u64,
     /// Whether this terminal owns keyboard input right now — the app
     /// computes it as "the keyboard route is this tab and the window is
     /// focused". Only then does the widget ask the platform for an IME.
@@ -430,6 +779,7 @@ fn wheel_history_rows(delta: mouse::ScrollDelta, cell_height: f32) -> f64 {
 pub(crate) struct TerminalWidgetState {
     tab_id: Option<i64>,
     metric_generation: u64,
+    pointer_cancel_epoch: u64,
     pressed: Option<PointerButton>,
     last_cell: Option<(u32, u32)>,
     was_inside: bool,
@@ -517,9 +867,13 @@ impl TerminalWidget {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<PointerOutcome> {
-        if state.tab_id != Some(self.tab_id) || state.metric_generation != self.metric_generation {
+        if state.tab_id != Some(self.tab_id)
+            || state.metric_generation != self.metric_generation
+            || state.pointer_cancel_epoch != self.pointer_cancel_epoch
+        {
             state.tab_id = Some(self.tab_id);
             state.metric_generation = self.metric_generation;
+            state.pointer_cancel_epoch = self.pointer_cancel_epoch;
             state.pressed = None;
             state.last_cell = None;
             state.was_inside = false;
@@ -750,7 +1104,7 @@ impl TerminalWidget {
                     draw_font(metrics.font, cluster, false, false),
                     metrics,
                 ),
-                Point::new(position.x, position.y + 1.0),
+                metrics.glyph_origin(position),
                 color(self.snapshot.foreground),
                 clip,
             );
@@ -895,95 +1249,88 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
         renderer.with_layer(clip, |renderer| {
             fill_quad(renderer, bounds, color(self.snapshot.background));
             let metrics = self.metrics;
+            let origin = bounds.position();
 
+            // iced paints a layer's quads in submission order and all of
+            // its text after every quad, so the order that matters is the
+            // quads': cell backgrounds, then the selection, then the block
+            // cursor, then sprites. Each glyph's color says which of them
+            // it sits on (`cell_ink`).
             for (row_idx, row) in self.snapshot.grid.iter().enumerate() {
-                // The row index comes from the grid position, never from
-                // the cell — see `DrawCell`.
                 let row_y = row_idx as u32;
-                for cell in &row.cells {
-                    let position = cell_position(bounds.position(), cell.col, row_y, metrics);
-                    if cell.explicit_background {
-                        fill_quad(
-                            renderer,
-                            // Preserve the Canvas path's overdraw policy. Adjacent
-                            // antialiased quads can otherwise expose hairlines of
-                            // the default background under tiny-skia.
-                            Rectangle::new(
-                                position,
-                                Size::new(metrics.cell_width, metrics.cell_height),
-                            ),
-                            color(cell.background),
-                        );
-                    }
-                    if !cell.text.is_empty() && cell.text != " " {
-                        // Sprite-render single-codepoint cells whose codepoint
-                        // falls in one of the geometric ranges (the now-removed
-                        // GTK UI did the same in `terminal_view::paint`). Multi-codepoint
-                        // graphemes skip this path because the sprite layer is
-                        // by-codepoint, not by-grapheme.
-                        let mut chars = cell.text.chars();
-                        if let (Some(c), None) = (chars.next(), chars.next()) {
-                            if let Some(geometry) = sprite_geometry(
-                                c as u32,
-                                f64::from(metrics.cell_width),
-                                f64::from(metrics.cell_height),
-                            ) {
-                                draw_sprite(renderer, position, &geometry, color(cell.foreground));
-                                // A sprite *replaces* a glyph draw, so it counts
-                                // as one — same semantics the now-removed GTK UI used.
-                                fill_text_calls += 1;
-                                continue;
-                            }
-                        }
-                        let font =
-                            draw_font(metrics.font, cell.text.as_str(), cell.bold, cell.italic);
-                        renderer.fill_text(
-                            cell_text(cell.text.clone(), font, metrics),
-                            Point::new(position.x, position.y + 1.0),
-                            color(cell.foreground),
-                            clip,
-                        );
-                        fill_text_calls += 1;
-                    }
+                for cell in row.cells.iter().filter(|cell| cell.explicit_background) {
+                    fill_quad(
+                        renderer,
+                        // Preserve the Canvas path's overdraw policy. Adjacent
+                        // antialiased quads can otherwise expose hairlines of
+                        // the default background under tiny-skia.
+                        cells_rect(origin, row_y, cell.col, 1, metrics),
+                        color(cell.background),
+                    );
                 }
             }
 
-            for span in &self.snapshot.selection_spans {
+            for span in self.snapshot.selection_backgrounds() {
                 fill_quad(
                     renderer,
-                    Rectangle::new(
-                        cell_position(bounds.position(), span.col0, u32::from(span.row), metrics),
-                        Size::new(
-                            f32::from(span.col1.saturating_sub(span.col0)) * metrics.cell_width,
-                            metrics.cell_height,
-                        ),
+                    cells_rect(
+                        origin,
+                        u32::from(span.row),
+                        span.col0,
+                        span.col1.saturating_sub(span.col0),
+                        metrics,
                     ),
-                    Color {
-                        a: 0.35,
-                        ..color(self.snapshot.selection_background)
-                    },
+                    color(self.snapshot.selection_background),
                 );
             }
 
-            if let Some(span) = self.snapshot.link_hover {
-                let point =
-                    cell_position(bounds.position(), span.col0, u32::from(span.row), metrics);
-                fill_quad(
-                    renderer,
-                    Rectangle::new(
-                        Point::new(point.x, point.y + metrics.cell_height - 1.0),
-                        Size::new(
-                            f32::from(span.col1.saturating_sub(span.col0)) * metrics.cell_width,
-                            1.0,
+            let block = self.snapshot.block_cursor(self.focused);
+            if let Some(block) = block {
+                fill_quad(renderer, block.rect(origin, metrics), color(block.color));
+            }
+
+            for inked in inked_cells(&self.snapshot, block, metrics) {
+                let position = cell_position(origin, inked.cell.col, inked.row, metrics);
+                let ink = color(inked.ink);
+                match &inked.sprite {
+                    Some(geometry) => draw_sprite(renderer, position, geometry, ink),
+                    None => renderer.fill_text(
+                        cell_text(
+                            inked.cell.text.clone(),
+                            draw_font(
+                                metrics.font,
+                                &inked.cell.text,
+                                inked.cell.bold,
+                                inked.cell.italic,
+                            ),
+                            metrics,
                         ),
+                        metrics.glyph_origin(position),
+                        ink,
+                        clip,
                     ),
-                    color(self.snapshot.foreground),
-                );
+                }
+                // A sprite *replaces* a glyph draw, so it counts as one —
+                // same semantics the now-removed GTK UI used.
+                fill_text_calls += 1;
+            }
+
+            if let Some(link) = self.snapshot.link_hover {
+                for (col, cells, ink) in link_underline(&self.snapshot, link, block) {
+                    let point = cell_position(origin, col, u32::from(link.row), metrics);
+                    fill_quad(
+                        renderer,
+                        Rectangle::new(
+                            Point::new(point.x, point.y + metrics.cell_height - 1.0),
+                            Size::new(f32::from(cells) * metrics.cell_width, 1.0),
+                        ),
+                        color(ink),
+                    );
+                }
             }
 
             if let Some(cursor) = self.snapshot.cursor.filter(|cursor| cursor.visible) {
-                let point =
-                    cell_position(bounds.position(), cursor.col as u16, cursor.row, metrics);
+                let point = cell_position(origin, cursor.col as u16, cursor.row, metrics);
                 let cursor_color = color(effective_cursor_color(&cursor, &self.snapshot));
                 let visual_style = if self.focused {
                     cursor.visual_style
@@ -991,14 +1338,8 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                     CursorVisualStyle::BlockHollow
                 };
                 match visual_style {
-                    CursorVisualStyle::Block => fill_quad(
-                        renderer,
-                        Rectangle::new(point, Size::new(metrics.cell_width, metrics.cell_height)),
-                        Color {
-                            a: 0.55,
-                            ..cursor_color
-                        },
-                    ),
+                    // Painted solid under the glyphs, which ink it by role.
+                    CursorVisualStyle::Block => {}
                     CursorVisualStyle::BlockHollow => renderer.fill_quad(
                         renderer::Quad {
                             bounds: Rectangle::new(
@@ -1141,6 +1482,20 @@ fn cell_position(origin: Point, col: u16, row: u32, metrics: TerminalMetrics) ->
     )
 }
 
+/// `cells` columns from (`col`, `row`), one row tall.
+fn cells_rect(
+    origin: Point,
+    row: u32,
+    col: u16,
+    cells: u16,
+    metrics: TerminalMetrics,
+) -> Rectangle {
+    Rectangle::new(
+        cell_position(origin, col, row, metrics),
+        Size::new(f32::from(cells) * metrics.cell_width, metrics.cell_height),
+    )
+}
+
 fn cell_at(point: Point, cols: u16, rows: u16, metrics: TerminalMetrics) -> Option<(u32, u32)> {
     if point.x < TERMINAL_PADDING || point.y < TERMINAL_PADDING {
         return None;
@@ -1218,6 +1573,7 @@ mod tests {
             snapshot,
             metrics: metrics(),
             metric_generation: 1,
+            pointer_cancel_epoch: 0,
             ime_active: false,
             focused: true,
         }
@@ -1271,6 +1627,283 @@ mod tests {
         assert_eq!(effective_cursor_color(&cursor, &snapshot), override_color);
     }
 
+    const CURSOR: ColorRgb = ColorRgb {
+        r: 255,
+        g: 136,
+        b: 0,
+    };
+    const OWN_INK: ColorRgb = ColorRgb {
+        r: 200,
+        g: 10,
+        b: 10,
+    };
+
+    fn draw_cell(col: u16, text: &str) -> DrawCell {
+        DrawCell {
+            col,
+            text: text.into(),
+            foreground: OWN_INK,
+            background: ColorRgb { r: 0, g: 0, b: 0 },
+            explicit_background: false,
+            bold: false,
+            italic: false,
+            inverse: false,
+            wide: false,
+        }
+    }
+
+    /// A snapshot whose `row` holds `cells`, with a focused-style block
+    /// cursor at (`col`, `row`).
+    fn cursor_snapshot(row: u32, col: u32, cells: Vec<DrawCell>) -> TerminalSnapshot {
+        let mut snapshot = TerminalSnapshot::blank(80, 24);
+        snapshot.grid[row as usize] = Arc::new(RenderedRow {
+            cells,
+            text: String::new(),
+        });
+        snapshot.cursor = Some(CursorInfo {
+            col,
+            row,
+            ..cursor_info(Some(CURSOR))
+        });
+        snapshot
+    }
+
+    fn ink_by_col(snapshot: &TerminalSnapshot, focused: bool) -> Vec<(u16, ColorRgb, bool)> {
+        inked_cells(snapshot, snapshot.block_cursor(focused), metrics())
+            .map(|inked| (inked.cell.col, inked.ink, inked.sprite.is_some()))
+            .collect()
+    }
+
+    #[test]
+    fn a_cursor_on_a_blank_cell_still_gets_a_block() {
+        let snapshot = cursor_snapshot(3, 5, Vec::new());
+        let block = snapshot.block_cursor(true).expect("a focused block cursor");
+        assert_eq!(
+            block,
+            BlockCursor {
+                row: 3,
+                col: 5,
+                cells: 1,
+                color: CURSOR
+            }
+        );
+        assert_eq!(
+            block.rect(Point::ORIGIN, metrics()),
+            Rectangle::new(
+                Point::new(5.0 * CELL_WIDTH, 3.0 * CELL_HEIGHT),
+                Size::new(CELL_WIDTH, CELL_HEIGHT)
+            )
+        );
+    }
+
+    #[test]
+    fn a_cursor_on_a_wide_glyph_covers_both_its_columns() {
+        let wide = DrawCell {
+            wide: true,
+            ..draw_cell(4, "界")
+        };
+        let head = cursor_snapshot(0, 4, vec![wide.clone()]);
+        let block = head.block_cursor(true).expect("head block");
+        assert_eq!((block.col, block.cells), (4, 2));
+
+        let mut tail = cursor_snapshot(0, 5, vec![wide]);
+        tail.cursor = tail.cursor.map(|cursor| CursorInfo {
+            wide_tail: true,
+            ..cursor
+        });
+        let block = tail.block_cursor(true).expect("tail block");
+        assert_eq!(
+            (block.col, block.cells),
+            (4, 2),
+            "the tail moves back onto the head"
+        );
+        assert_eq!(
+            block.rect(Point::ORIGIN, metrics()),
+            Rectangle::new(
+                Point::new(4.0 * CELL_WIDTH, 0.0),
+                Size::new(2.0 * CELL_WIDTH, CELL_HEIGHT)
+            )
+        );
+        assert_eq!(
+            ink_by_col(&tail, true),
+            vec![(4, TerminalSnapshot::blank(80, 24).background, false)],
+            "the wide glyph inverts from its tail too"
+        );
+    }
+
+    #[test]
+    fn a_hidden_unfocused_or_outline_cursor_has_no_block() {
+        let mut snapshot = cursor_snapshot(0, 1, vec![draw_cell(1, "A")]);
+        assert!(snapshot.block_cursor(true).is_some());
+        assert_eq!(snapshot.block_cursor(false), None, "unfocused draws hollow");
+        assert_eq!(
+            ink_by_col(&snapshot, false),
+            vec![(1, OWN_INK, false)],
+            "an outline cursor leaves the glyph its own ink"
+        );
+
+        snapshot.cursor = snapshot.cursor.map(|cursor| CursorInfo {
+            visual_style: CursorVisualStyle::Bar,
+            ..cursor
+        });
+        assert_eq!(snapshot.block_cursor(true), None);
+
+        snapshot.cursor = snapshot.cursor.map(|cursor| CursorInfo {
+            visible: false,
+            visual_style: CursorVisualStyle::Block,
+            ..cursor
+        });
+        assert_eq!(snapshot.block_cursor(true), None, "DECTCEM hidden");
+    }
+
+    #[test]
+    fn the_block_cursor_inks_over_the_selection() {
+        let mut snapshot = cursor_snapshot(
+            2,
+            1,
+            vec![
+                draw_cell(0, "X"),
+                draw_cell(1, "Y"),
+                draw_cell(2, "Z"),
+                draw_cell(3, "W"),
+            ],
+        );
+        snapshot.selection_foreground = ColorRgb { r: 1, g: 2, b: 3 };
+        snapshot.selection_spans = vec![SelectionSpan {
+            row: 2,
+            col0: 0,
+            col1: 3,
+        }];
+        assert_eq!(
+            ink_by_col(&snapshot, true),
+            vec![
+                (0, snapshot.selection_foreground, false),
+                (1, snapshot.background, false),
+                (2, snapshot.selection_foreground, false),
+                (3, OWN_INK, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sprite_inside_the_selection_takes_the_selection_ink() {
+        let mut snapshot = TerminalSnapshot::blank(80, 24);
+        snapshot.grid[0] = Arc::new(RenderedRow {
+            cells: vec![draw_cell(0, "█"), draw_cell(1, "█")],
+            text: String::new(),
+        });
+        snapshot.selection_foreground = ColorRgb { r: 1, g: 2, b: 3 };
+        snapshot.selection_spans = vec![SelectionSpan {
+            row: 0,
+            col0: 0,
+            col1: 1,
+        }];
+        assert_eq!(
+            ink_by_col(&snapshot, true),
+            vec![(0, snapshot.selection_foreground, true), (1, OWN_INK, true),]
+        );
+    }
+
+    /// Row 0: a wide `界` at columns 0-1, then `A`.
+    fn wide_glyph_snapshot(selected: (u16, u16)) -> TerminalSnapshot {
+        let mut snapshot = TerminalSnapshot::blank(80, 24);
+        snapshot.grid[0] = Arc::new(RenderedRow {
+            cells: vec![
+                DrawCell {
+                    wide: true,
+                    ..draw_cell(0, "界")
+                },
+                draw_cell(2, "A"),
+            ],
+            text: String::new(),
+        });
+        snapshot.selection_foreground = ColorRgb { r: 1, g: 2, b: 3 };
+        snapshot.selection_spans = vec![SelectionSpan {
+            row: 0,
+            col0: selected.0,
+            col1: selected.1,
+        }];
+        snapshot
+    }
+
+    #[test]
+    fn selecting_a_wide_glyphs_head_selects_the_whole_glyph() {
+        let snapshot = wide_glyph_snapshot((0, 1));
+        assert_eq!(
+            snapshot.selection_backgrounds().collect::<Vec<_>>(),
+            vec![SelectionSpan {
+                row: 0,
+                col0: 0,
+                col1: 2
+            }],
+            "the background covers both of the glyph's columns"
+        );
+        assert_eq!(
+            ink_by_col(&snapshot, false),
+            vec![
+                (0, snapshot.selection_foreground, false),
+                (2, OWN_INK, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn selecting_a_wide_glyphs_tail_selects_the_whole_glyph() {
+        let snapshot = wide_glyph_snapshot((1, 3));
+        assert_eq!(
+            snapshot.selection_backgrounds().collect::<Vec<_>>(),
+            vec![SelectionSpan {
+                row: 0,
+                col0: 0,
+                col1: 3
+            }]
+        );
+        assert_eq!(
+            ink_by_col(&snapshot, false),
+            vec![
+                (0, snapshot.selection_foreground, false),
+                (2, snapshot.selection_foreground, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_link_underline_takes_each_columns_ink() {
+        let link_ink = ColorRgb {
+            r: 9,
+            g: 99,
+            b: 199,
+        };
+        let cells = (0..6)
+            .map(|col| DrawCell {
+                foreground: link_ink,
+                ..draw_cell(col, "u")
+            })
+            .collect();
+        let mut snapshot = cursor_snapshot(0, 5, cells);
+        snapshot.selection_foreground = ColorRgb { r: 1, g: 2, b: 3 };
+        snapshot.selection_spans = vec![SelectionSpan {
+            row: 0,
+            col0: 2,
+            col1: 4,
+        }];
+        let link = SelectionSpan {
+            row: 0,
+            col0: 0,
+            col1: 7,
+        };
+        assert_eq!(
+            link_underline(&snapshot, link, snapshot.block_cursor(true)),
+            vec![
+                (0, 2, link_ink),
+                (2, 2, snapshot.selection_foreground),
+                (4, 1, link_ink),
+                (5, 1, snapshot.background),
+                (6, 1, snapshot.foreground),
+            ]
+        );
+    }
+
     #[test]
     fn measured_metrics_are_positive_and_scale_with_point_size() {
         let default = TerminalMetrics::measure(13.0).expect("default metrics");
@@ -1282,6 +1915,138 @@ mod tests {
         assert!(larger.font_pixels > default.font_pixels);
         assert!(larger.cell_width >= default.cell_width);
         assert!(larger.cell_height > default.cell_height);
+    }
+
+    /// JetBrains Mono's numbers: upm 1000, ascent 1020, descent −300, no
+    /// line gap, and a 600-unit advance.
+    const JETBRAINS_MONO: FaceMetrics = FaceMetrics {
+        units_per_em: 1000.0,
+        ascent: 1020.0,
+        descent: -300.0,
+        leading: 0.0,
+    };
+
+    fn jetbrains_mono_advance(font_pixels: f32) -> f32 {
+        600.0 * font_pixels / 1000.0
+    }
+
+    fn cell_size(geometry: CellGeometry) -> (f32, f32) {
+        (geometry.cell_width, geometry.cell_height)
+    }
+
+    #[test]
+    fn font_derived_cells_match_the_swift_app() {
+        for (font_pixels, want) in [(13.0, (8.0, 18.0)), (14.0, (9.0, 19.0))] {
+            let geometry = CellRule::FontDerived.geometry(
+                font_pixels,
+                jetbrains_mono_advance(font_pixels),
+                Some(JETBRAINS_MONO),
+            );
+            assert_eq!(cell_size(geometry), want, "at {font_pixels} px");
+            assert_eq!(geometry.glyph_line_height, 1320.0 * font_pixels / 1000.0);
+            assert_eq!(geometry.glyph_top, 0.0);
+        }
+    }
+
+    #[test]
+    fn legacy_cells_keep_the_linux_grid() {
+        let font_pixels = (13.0 * 96.0 / 72.0) as f32;
+        let geometry = CellRule::Legacy.geometry(
+            font_pixels,
+            jetbrains_mono_advance(font_pixels),
+            Some(JETBRAINS_MONO),
+        );
+        assert_eq!(cell_size(geometry), (10.0, 20.0));
+        assert_eq!(
+            geometry.glyph_line_height,
+            TERMINAL_LINE_HEIGHT * font_pixels
+        );
+        assert_eq!(geometry.glyph_top, 1.0);
+    }
+
+    #[test]
+    fn font_derived_falls_back_to_legacy_without_usable_face_metrics() {
+        let font_pixels = 13.0;
+        let advance = jetbrains_mono_advance(font_pixels);
+        let legacy = CellRule::Legacy.geometry(font_pixels, advance, None);
+        let unusable = [
+            None,
+            Some(FaceMetrics {
+                units_per_em: 0.0,
+                ..JETBRAINS_MONO
+            }),
+            Some(FaceMetrics {
+                ascent: f32::NAN,
+                ..JETBRAINS_MONO
+            }),
+            Some(FaceMetrics {
+                leading: f32::INFINITY,
+                ..JETBRAINS_MONO
+            }),
+            Some(FaceMetrics {
+                ascent: 0.0,
+                descent: 0.0,
+                ..JETBRAINS_MONO
+            }),
+            Some(FaceMetrics {
+                leading: -1320.0,
+                ..JETBRAINS_MONO
+            }),
+        ];
+        for face in unusable {
+            assert_eq!(
+                CellRule::FontDerived.geometry(font_pixels, advance, face),
+                legacy,
+                "{face:?}"
+            );
+        }
+    }
+
+    fn bundled_font_metrics(rule: CellRule, font_pixels: f32) -> TerminalMetrics {
+        crate::fonts::install_bundled_terminal_fonts();
+        let size_pt = f64::from(font_pixels) / POINT_TO_LOGICAL_PIXEL;
+        let metrics = TerminalMetrics::measure_by(rule, size_pt, Font::MONOSPACE)
+            .expect("the bundled font measures");
+        assert_eq!(metrics.font_pixels, font_pixels);
+        metrics
+    }
+
+    #[test]
+    fn the_bundled_font_measures_swift_cells_under_font_derived() {
+        for (font_pixels, want) in [(13.0, (8.0, 18.0)), (14.0, (9.0, 19.0))] {
+            let metrics = bundled_font_metrics(CellRule::FontDerived, font_pixels);
+            assert_eq!(
+                (metrics.cell_width, metrics.cell_height),
+                want,
+                "at {font_pixels} px"
+            );
+        }
+    }
+
+    #[test]
+    fn the_font_derived_baseline_sits_at_the_cell_top_plus_the_ascent() {
+        for font_pixels in [13.0_f32, 14.0] {
+            let metrics = bundled_font_metrics(CellRule::FontDerived, font_pixels);
+            let paragraph =
+                Paragraph::with_text(cell_text("M".into(), metrics.font, metrics).as_ref());
+            let line_y = paragraph
+                .buffer()
+                .layout_runs()
+                .next()
+                .expect("one laid-out line")
+                .line_y;
+            let ascent = 1020.0 * font_pixels / 1000.0;
+            let baseline = metrics.glyph_origin(Point::ORIGIN).y + line_y;
+            assert!(
+                (baseline - ascent).abs() < 1e-3,
+                "at {font_pixels} px the baseline is {baseline}, not the ascent {ascent}"
+            );
+            // Both renderers put a run's baseline at its rounded `line_y`.
+            assert_eq!(
+                metrics.glyph_origin(Point::ORIGIN).y + line_y.round(),
+                ascent.round()
+            );
+        }
     }
 
     #[test]
@@ -1404,8 +2169,12 @@ mod tests {
     fn inverse_swaps_resolved_defaults() {
         let fg = ColorRgb { r: 1, g: 2, b: 3 };
         let bg = ColorRgb { r: 4, g: 5, b: 6 };
+        let inverse = roost_vt::Style {
+            inverse: true,
+            ..roost_vt::Style::default()
+        };
         assert_eq!(
-            roost_vt::resolve_colors(None, None, (fg, bg), true),
+            roost_vt::resolve_colors(None, None, (fg, bg), inverse, None),
             (bg, fg)
         );
     }
@@ -1474,6 +2243,7 @@ mod tests {
         let mut state = TerminalWidgetState {
             tab_id: Some(21),
             metric_generation: 1,
+            pointer_cancel_epoch: 0,
             pressed: Some(PointerButton::Left),
             last_cell: Some((7, 4)),
             was_inside: true,
@@ -1739,6 +2509,82 @@ mod tests {
             )))
         ));
         assert_eq!(state.pressed, None);
+    }
+
+    /// Left held since a press the widget saw at `pointer_cancel_epoch`.
+    fn left_held(program: &TerminalWidget, pointer_cancel_epoch: u64) -> TerminalWidgetState {
+        TerminalWidgetState {
+            tab_id: Some(program.tab_id),
+            metric_generation: program.metric_generation,
+            pointer_cancel_epoch,
+            pressed: Some(PointerButton::Left),
+            last_cell: Some((7, 4)),
+            was_inside: true,
+            ..TerminalWidgetState::default()
+        }
+    }
+
+    fn press_in_cell_5_3(
+        program: &TerminalWidget,
+        state: &mut TerminalWidgetState,
+        button: mouse::Button,
+    ) -> (Option<crate::Message>, (), event::Status) {
+        let cursor = mouse::Cursor::Available(Point::new(
+            TERMINAL_PADDING + 5.5 * CELL_WIDTH,
+            TERMINAL_PADDING + 3.5 * CELL_HEIGHT,
+        ));
+        program
+            .update_pointer(
+                state,
+                &Event::Mouse(mouse::Event::ButtonPressed(button)),
+                Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0)),
+                cursor,
+            )
+            .expect("a press over the grid is handled")
+            .into_inner()
+    }
+
+    #[test]
+    fn a_pointer_cancel_lets_the_next_press_start_a_gesture() {
+        for (native, button) in [
+            (mouse::Button::Left, PointerButton::Left),
+            (mouse::Button::Middle, PointerButton::Middle),
+        ] {
+            let mut program = widget(42, TerminalSnapshot::blank(80, 24));
+            program.pointer_cancel_epoch = 1;
+            let mut state = left_held(&program, 0);
+
+            let press = press_in_cell_5_3(&program, &mut state, native);
+            assert!(
+                matches!(
+                    press.0,
+                    Some(crate::Message::TerminalPointer(TerminalPointer::Event(
+                        TerminalPointerEvent {
+                            action: PointerAction::Press,
+                            button: Some(pressed),
+                            col: 5,
+                            row: 3,
+                            click_count: 1,
+                            ..
+                        }
+                    ))) if pressed == button
+                ),
+                "{button:?}: {:?}",
+                press.0
+            );
+            assert_eq!(state.pressed, Some(button));
+        }
+    }
+
+    #[test]
+    fn a_second_press_of_the_held_button_without_a_cancel_stays_captured() {
+        let program = widget(42, TerminalSnapshot::blank(80, 24));
+        let mut state = left_held(&program, program.pointer_cancel_epoch);
+
+        let press = press_in_cell_5_3(&program, &mut state, mouse::Button::Left);
+        assert!(press.0.is_none(), "{:?}", press.0);
+        assert_eq!(press.2, event::Status::Captured);
+        assert_eq!(state.pressed, Some(PointerButton::Left));
     }
 
     #[test]

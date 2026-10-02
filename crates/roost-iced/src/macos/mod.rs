@@ -10,7 +10,7 @@
 //! that.
 //!
 //! Two rules hold for every AppKit surface under here — [`dock_badge`],
-//! [`menu`] and [`sparkle`]:
+//! [`menu`], [`sparkle`], [`accent`] and [`context_menu`]:
 //!
 //! * **Main thread only.** AppKit is main-thread-only (CLAUDE.md's
 //!   threading table), so every entry point either takes a
@@ -31,12 +31,20 @@
 //! still happens on the main thread, under a marker, and the second rule
 //! holds there unchanged.
 //!
+//! [`pasteboard`] is the other exception to the first rule; its module
+//! docs say why.
+//!
 //! First consumer: [`dock_badge`], the parity port of `App.swift`'s
 //! `refreshDockBadge()`. Second: [`menu`], the native menu bar. Third:
 //! [`sparkle`], the runtime-loaded updater. Fourth: [`notifications`],
-//! the `UNUserNotificationCenter` backend.
+//! the `UNUserNotificationCenter` backend. Fifth: [`pasteboard`], the
+//! selection pasteboard. Sixth: [`accent`], the system accent color the
+//! chrome follows. Seventh: [`context_menu`], a row's right-click menu.
 
+pub(crate) mod accent;
+pub(crate) mod context_menu;
 pub(crate) mod dock_badge;
 pub(crate) mod menu;
 pub(crate) mod notifications;
+pub(crate) mod pasteboard;
 pub(crate) mod sparkle;

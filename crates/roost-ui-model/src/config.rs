@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use roost_agent::{Agent, ALL_AGENTS};
 use roost_ipc::LocalBackendMode;
+use roost_vt::OptionAsAlt;
 
 use crate::custom_command::{self, CustomCommand};
 use crate::keybind::{self, AccelMods};
@@ -64,6 +65,12 @@ pub struct RoostConfig {
     /// Consumed by both Rust UIs; the Swift UI's modifier is fixed to Cmd.
     pub link_modifier: Option<AccelMods>,
 
+    /// `macos-option-as-alt` — which Option keys type as Alt (Meta)
+    /// instead of the macOS text modifier, in Ghostty's vocabulary.
+    /// Defaults to [`OptionAsAlt::False`]. Read by the iced UI on macOS
+    /// only; Linux's Alt is already Meta.
+    pub macos_option_as_alt: OptionAsAlt,
+
     /// `show-sidebar-agents` — whether the sidebar renders one row
     /// per agent-owned tab under its project (plan 007). Defaults to
     /// `true`. Toggled at runtime via the `toggle_sidebar_agents`
@@ -88,6 +95,11 @@ pub struct RoostConfig {
     /// written, so a typo must not read as "never configured" and
     /// silently move a user's tabs to a session.
     pub local_backend_key_present: bool,
+
+    /// `chrome-accent` — the iced chrome's accent color (plan 073 D4).
+    /// Defaults to [`ChromeAccent::System`], which an unparseable value
+    /// also resolves to.
+    pub chrome_accent: ChromeAccent,
 }
 
 impl Default for RoostConfig {
@@ -103,11 +115,43 @@ impl Default for RoostConfig {
             clipboard_write: ClipboardWrite::default(),
             word_break_chars: DEFAULT_EXTRA_WORD_CHARS.to_string(),
             link_modifier: None,
+            macos_option_as_alt: OptionAsAlt::default(),
             show_sidebar_agents: true,
             agent_hooks: AgentHooks::default(),
             local_backend: LocalBackend::default(),
             local_backend_key_present: false,
+            chrome_accent: ChromeAccent::default(),
         }
+    }
+}
+
+/// The `chrome-accent` value (plan 073 D4).
+///
+/// * `System` (default) — the OS accent color where the UI follows one
+///   (macOS), Roost's own blue elsewhere.
+/// * `Rgb` — an explicit `#rrggbb`, used as written on every OS.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ChromeAccent {
+    #[default]
+    System,
+    Rgb([u8; 3]),
+}
+
+impl ChromeAccent {
+    /// Parse a config value: `system`, or `#` and six hex digits in either
+    /// case. Any other value returns `None` so the caller can warn and
+    /// keep the default.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("system") {
+            return Some(Self::System);
+        }
+        let hex = s.strip_prefix('#')?;
+        if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let channel = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).ok();
+        Some(Self::Rgb([channel(0)?, channel(2)?, channel(4)?]))
     }
 }
 
@@ -420,6 +464,19 @@ impl CopyOnSelect {
     }
 }
 
+/// Parse a `macos-option-as-alt` value: Ghostty's `false | true | left |
+/// right`, case-insensitive; anything else is `None` so the caller can
+/// fall back to the default and log.
+fn parse_option_as_alt(s: &str) -> Option<OptionAsAlt> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "false" => Some(OptionAsAlt::False),
+        "true" => Some(OptionAsAlt::True),
+        "left" => Some(OptionAsAlt::Left),
+        "right" => Some(OptionAsAlt::Right),
+        _ => None,
+    }
+}
+
 /// Parse a plain boolean config value (`true | yes` / `false | no`).
 /// Mirrors `ClipboardWrite::parse` / `CopyOnSelect::parse`'s
 /// `Option`-returning shape so every boolean key in the parse loop
@@ -573,6 +630,19 @@ impl RoostConfig {
                         }
                     };
                 }
+                "chrome-accent" => {
+                    cfg.chrome_accent = match ChromeAccent::parse(value) {
+                        Some(v) => v,
+                        None => {
+                            tracing::warn!(
+                                value,
+                                "unknown chrome-accent value; expected system|#rrggbb, \
+                                 falling back to default `system`"
+                            );
+                            ChromeAccent::default()
+                        }
+                    };
+                }
                 "word-break-chars" => {
                     // Empty value is a deliberate user choice meaning
                     // "Unicode letters/digits only" — distinct from
@@ -589,6 +659,19 @@ impl RoostConfig {
                              keeping the platform default"
                         );
                     }
+                }
+                "macos-option-as-alt" => {
+                    cfg.macos_option_as_alt = match parse_option_as_alt(value) {
+                        Some(v) => v,
+                        None => {
+                            tracing::warn!(
+                                value,
+                                "unknown macos-option-as-alt value; expected false|true|left|right, \
+                                 falling back to default `false`"
+                            );
+                            OptionAsAlt::default()
+                        }
+                    };
                 }
                 "command" => {
                     // Launcher entry: `command = label="…" run="…" …`.
@@ -1331,9 +1414,76 @@ mod tests {
     }
 
     #[test]
+    fn chrome_accent_is_system_or_a_hex_and_anything_else_falls_back() {
+        assert_eq!(RoostConfig::default().chrome_accent, ChromeAccent::System);
+        assert_eq!(
+            RoostConfig::parse("chrome-accent = system").chrome_accent,
+            ChromeAccent::System
+        );
+        assert_eq!(
+            RoostConfig::parse("chrome-accent = #a1b2c3").chrome_accent,
+            ChromeAccent::Rgb([0xa1, 0xb2, 0xc3])
+        );
+        assert_eq!(
+            RoostConfig::parse("chrome-accent = #A1B2C3").chrome_accent,
+            ChromeAccent::Rgb([0xa1, 0xb2, 0xc3])
+        );
+        for bad in ["blue", "#12345"] {
+            assert_eq!(
+                RoostConfig::parse(&format!("chrome-accent = #a1b2c3\nchrome-accent = {bad}"))
+                    .chrome_accent,
+                ChromeAccent::System,
+                "{bad} falls back to system, not to the line before it"
+            );
+        }
+    }
+
+    #[test]
     fn copy_on_select_unknown_value_keeps_default() {
         let cfg = RoostConfig::parse("copy-on-select = pancakes");
         assert_eq!(cfg.copy_on_select, CopyOnSelect::True);
+    }
+
+    #[test]
+    fn macos_option_as_alt_takes_ghosttys_four_values_in_any_case() {
+        assert_eq!(
+            RoostConfig::default().macos_option_as_alt,
+            OptionAsAlt::False
+        );
+        for (value, expected) in [
+            ("false", OptionAsAlt::False),
+            ("true", OptionAsAlt::True),
+            ("left", OptionAsAlt::Left),
+            ("right", OptionAsAlt::Right),
+            ("Left", OptionAsAlt::Left),
+            ("RIGHT", OptionAsAlt::Right),
+            ("\"true\"", OptionAsAlt::True),
+        ] {
+            assert_eq!(
+                RoostConfig::parse(&format!("macos-option-as-alt = {value}")).macos_option_as_alt,
+                expected,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_option_as_alt_unknown_value_keeps_default() {
+        for value in ["both", "yes", "on", ""] {
+            assert_eq!(
+                RoostConfig::parse(&format!("macos-option-as-alt = {value}")).macos_option_as_alt,
+                OptionAsAlt::False,
+                "{value:?}"
+            );
+        }
+    }
+
+    /// Last line wins, and an unparseable last line is the default — not
+    /// whatever an earlier line set.
+    #[test]
+    fn macos_option_as_alt_unknown_value_after_a_valid_one_restores_default() {
+        let cfg = RoostConfig::parse("macos-option-as-alt = true\nmacos-option-as-alt = typo\n");
+        assert_eq!(cfg.macos_option_as_alt, OptionAsAlt::False);
     }
 
     #[test]

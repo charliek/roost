@@ -26,10 +26,10 @@ the launcher with deterministic commands.
 | Key | Type | Default | Effect |
 |---|---|---|---|
 | `theme` | string | bundled `roost-dark` | Theme name (see [`themes.md`](themes.md)). |
-| `font-family` | string | system monospace (Mac) / `JetBrains Mono, Monospace` (Linux) | Monospaced font family. Quoted values supported (`"JetBrains Mono"`). See [Fonts](fonts.md). |
+| `font-family` | string | system monospace (Swift Mac app) / `JetBrains Mono, Monospace` (iced UI, which bundles JetBrains Mono) | Monospaced font family. Quoted values supported (`"JetBrains Mono"`). See [Fonts](fonts.md). |
 | `word-break-chars` | string | `` `_-.+~/:@%` `` | Extra characters treated as word characters for double-click word selection (keeps paths + URLs whole). Despite the `-break-` name (kept for Ghostty compatibility), the value is the extra word-char set. |
 | `show-sidebar-agents` | bool | `true` | Whether the sidebar renders one row per agent-owned tab under its project. Also toggled at runtime (keybind / palette / Mac View menu). |
-| `font-size` | number | `13` (Linux), `14` (Mac) | Point size for the terminal font. Must be `> 0`. |
+| `font-size` | number | `13` (Linux), `14` (Mac) | Point size for the terminal font. Must be `> 0`. One point is one pixel on macOS; Linux renders at 96 dpi (`13` ≈ 17.3 px). See [Fonts](fonts.md#font-size). |
 | `tab-min-width` | number | `80` (Mac) | Minimum tab pill width in points. `0` disables the floor. Mac-only. |
 | `tab-max-width` | number | `220` (Mac) | Maximum tab pill width in points. `0` disables the cap (pills grow to fit). Mac-only. |
 | `keybind` | `<trigger> = <action>` | (see [Keybindings](../getting-started/keybindings.md)) | Append a custom keybinding. Repeatable; later entries override earlier ones. |
@@ -38,8 +38,10 @@ the launcher with deterministic commands.
 | `copy-on-select` | `off \| true \| clipboard` | `true` | What a mouse-drag selection writes to the clipboard on release. See [the dedicated section below](#copy-on-select). |
 | `clipboard-write` | `allow \| deny` | `allow` | Whether a program running in the terminal can write the host clipboard via OSC 52. See [the dedicated section below](#clipboard-write). |
 | `link-modifier` | `ctrl \| alt \| super` | Cmd (Mac) / Alt (Linux) | Which held modifier reveals + opens a URL on hover/click. iced-only; the Swift Mac app is fixed to Cmd. See [the dedicated section below](#link-modifier). |
+| `macos-option-as-alt` | `false \| true \| left \| right` | `false` | Which Option keys send Alt (Meta) on macOS, so ⌥B sends `ESC b` instead of typing `∫`. Read by the iced UI on macOS only. See [the dedicated section below](#macos-option-as-alt). |
 | `agent-hooks` | agent list \| `off` \| absent | absent (unanswered) | Which supported coding agents (Claude Code, Codex, grok/gx, cursor-agent, OpenCode) Roost wires its hook entries into, at startup. Absent means nobody has answered the consent dialog yet — Roost writes nothing until they do. See [the dedicated section below](#agent-hooks) and the [Agent Hooks](../guides/agents.md) guide. |
 | `local-backend` | `in-process \| session` | `in-process` for an existing setup; `session` on a genuinely fresh install | Where the tabs you start in the Roost window run. See [the dedicated section below](#local-backend). |
+| `chrome-accent` | `system \| #rrggbb` | `system` | The accent color of the window chrome: the active tab and project, notification dots, focus rings. iced-only. See [the dedicated section below](#chrome-accent). |
 
 ## `copy-on-select`
 
@@ -232,6 +234,49 @@ keybind = ctrl+w = close_tab
 See [Keybindings](../getting-started/keybindings.md) for the full action
 list and trigger syntax.
 
+## `macos-option-as-alt`
+
+On macOS, Option is a text modifier: ⌥B types `∫` and ⌥F types `ƒ`.
+Shells and editors that use Meta chords, such as readline's ⌥B and ⌥F
+word jumps, want those keys to send `ESC b` and `ESC f` instead. This
+setting makes Option act as Alt. The key and its values are Ghostty's.
+
+| Value | Which Option sends Alt |
+|---|---|
+| `false` (default) | neither; both type macOS characters |
+| `true` | both |
+| `left` | the left Option; the right one still types characters |
+| `right` | the right Option; the left one still types characters |
+
+Values are case-insensitive. An unrecognized value logs a warning and
+reads as `false`.
+
+```conf
+macos-option-as-alt = left
+```
+
+When Option acts as Alt, it sends the key without Option's character:
+⌥B sends `ESC b`, and ⇧⌥B sends `ESC B`. Two kinds of key still type
+the character macOS gives them:
+
+- a shifted key that is not a letter, such as ⇧⌥1, because its shifted
+  character depends on the keyboard layout;
+- a key whose own character is not ASCII, such as `é` on a French
+  layout, because the Meta prefix carries a single byte.
+
+**Limitations:**
+
+- The dead-key chords ⌥E, ⌥U, ⌥N, ⌥I and ⌥\` are taken by macOS's input
+  method before Roost sees them, so they still start an accent
+  ([#582](https://github.com/charliek/roost/issues/582)).
+- `left` and `right` tell the two Options apart by the Option key's own
+  press and release. If Roost has seen neither while Option is held, it
+  counts that Option as the configured side, and logs this once.
+
+> **Scope:** read by the iced UI on macOS (`Roost-Iced.app`). On Linux,
+> Alt already sends the ESC prefix, so the key is parsed and ignored.
+> The Swift Mac app ignores it too (unknown keys are always dropped).
+
 ## `agent-hooks`
 
 Which supported coding agents Roost wires its hook entries into, in
@@ -329,6 +374,29 @@ later launch.
 
 Read by the iced UI. The Swift Mac app (`Roost.app`) is always
 in-process and never reads this key.
+
+## `chrome-accent`
+
+The accent color of the window chrome around the terminal: the active
+tab pill and project row, the notification dots, the outline of a
+dragged tab, the focus ring, the confirm button and the command
+palette's match highlight.
+
+| Value | Accent |
+|---|---|
+| `system` *(default)* | **macOS:** the system accent color (System Settings → Appearance), followed live when you change it. **Linux:** Roost's blue, `#007aff` — the desktop's accent is not followed. |
+| `#rrggbb` | That color, on both platforms. Hex digits in either case. |
+
+Under Roost's blue the chrome keeps its hand-picked fills. Any other
+accent derives them the way macOS's own controls do: the active tab is
+the accent at 18% over the tab band, and the selected project row is the
+accent mixed half and half with a dark grey.
+
+Anything else (a color name, a short hex) logs a warning and reads as
+`system`.
+
+Read by the iced UI. The Swift Mac app (`Roost.app`) ignores this key
+and always follows the system accent.
 
 ## Example
 

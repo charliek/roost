@@ -398,7 +398,7 @@ impl<'a> ScalerBuilder<'a> {
 
     /// Specifies whether to apply hinting to outlines. The default value is `false`.
     pub fn hint(mut self, yes: bool) -> Self {
-        self.hint = yes;
+        self.hint = yes && !cfg!(target_os = "macos");
         self
     }
 

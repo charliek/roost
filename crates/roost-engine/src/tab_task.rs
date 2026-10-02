@@ -1405,7 +1405,7 @@ impl TabTask {
             .collect();
         vt.render.walk_dirty(&vt.terminal, |row, cells: &[Cell]| {
             if let Some(slot) = grid.get_mut(row as usize) {
-                *slot = RenderedRow::build(cells, defaults, cols);
+                *slot = RenderedRow::build(cells, defaults, None, cols);
             }
         })?;
         Ok((grid, colors, cursor))

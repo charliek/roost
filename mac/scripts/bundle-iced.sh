@@ -19,7 +19,10 @@
 #      version (or $ROOST_VERSION).
 #   4. Installs the app icon, reusing the same art as Roost.app
 #      (shared art is a recorded decision — plan 027 § W2; a distinct
-#      Roost-Iced icon is future work).
+#      Roost-Iced icon is future work), and the SIL OFL texts of the two
+#      fonts compiled into the binary (Inter, JetBrains Mono) under
+#      Contents/Resources/ — the OFL requires the license to travel with
+#      the fonts.
 #   5. Embeds `roostctl` under Contents/Resources/bin/ (same as
 #      bundle.sh) and the `roost-session` daemon under Contents/MacOS/,
 #      with a relative compatibility symlink beside roostctl — HS-4b
@@ -53,8 +56,8 @@
 #
 # What this script deliberately does NOT do (unlike bundle.sh):
 #   * No SwiftPM build, no SwiftPM resource-bundle copy — the iced
-#     chrome fonts are `include_bytes!`'d and the themes ship
-#     compiled into `roost-ui-model`; nothing is loaded from a
+#     chrome and terminal fonts are `include_bytes!`'d and the themes
+#     ship compiled into `roost-ui-model`; nothing is loaded from a
 #     resource bundle at runtime.
 #
 # Deferred the same way bundle.sh defers them (shared posture, not a
@@ -149,6 +152,10 @@ roost_insert_sparkle_feed "${APP_DIR}" \
 roost_write_pkginfo "${APP_DIR}"
 
 roost_install_app_icon "${ICON_COMPOSER_SRC}" "${ICON_SRC}" "${APP_DIR}"
+
+echo "==> Installing font licenses"
+cp "${REPO_ROOT}/third_party/inter/LICENSE.txt" "${APP_DIR}/Contents/Resources/Inter-OFL.txt"
+cp "${REPO_ROOT}/third_party/jetbrains-mono/OFL.txt" "${APP_DIR}/Contents/Resources/JetBrainsMono-OFL.txt"
 
 # M8-parity: embed roostctl under Contents/Resources/bin/ so `claude
 # install` invoked from inside Roost-Iced.app writes hook paths that
@@ -293,6 +300,16 @@ roost_iced_bundle_self_check() {
     echo "    FAIL: Contents/Resources/bin/roostctl missing or not executable" >&2
     failed=1
   fi
+
+  local license
+  for license in Inter-OFL.txt JetBrainsMono-OFL.txt; do
+    if [ -s "${app_dir}/Contents/Resources/${license}" ]; then
+      echo "    OK: Contents/Resources/${license} present"
+    else
+      echo "    FAIL: Contents/Resources/${license} missing or empty" >&2
+      failed=1
+    fi
+  done
 
   local session_link="${app_dir}/Contents/Resources/bin/roost-session"
   local want_target="../../MacOS/roost-session"

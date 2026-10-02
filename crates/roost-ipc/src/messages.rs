@@ -751,6 +751,20 @@ pub struct ClipboardWriteParams {
     pub image_png: Option<Vec<u8>>,
 }
 
+/// `clipboard.write_files` request (plan 073 D2): put `paths` on the
+/// system clipboard the way a file manager's copy leaves them, so a test
+/// can paste copied files. Gated on `ROOST_TEST_MODE=1`, and its own op
+/// rather than a field on [`ClipboardWriteParams`] so no existing type
+/// changes shape.
+///
+/// Every path must be **absolute** (relative → `invalid-param`). An
+/// empty list writes nothing and leaves the clipboard as it was.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClipboardWriteFilesParams {
+    pub paths: Vec<String>,
+}
+
 // ============================================================================
 // Test-only ops (ROOST_TEST_MODE=1)
 // ============================================================================
@@ -1048,6 +1062,69 @@ pub struct AppKeyEventParams {
     /// Any of `"shift"`, `"ctrl"`, `"alt"`, `"super"`.
     #[serde(default)]
     pub modifiers: Vec<String>,
+}
+
+/// The row a context-menu test op names (plan 073 D9):
+/// `{"tab_id": "<ref>"}`, `{"project_id": "<ref>"}` or
+/// `{"host": "<saved id>"}`. The refs take `tab.dump`'s and
+/// `project.*`'s spellings — bare for this window's local tabs, or
+/// `h<host>.<id>` for a host's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AppContextMenuTarget {
+    TabId(WireTabRef),
+    ProjectId(WireProjectRef),
+    /// A host band, by the saved host's id (`host.list`'s `id`).
+    Host(String),
+}
+
+/// `app.context_menu_dump` request. Gated on `ROOST_TEST_MODE=1`, and
+/// the same "test seam, not a surface" rule as `app.dialog_answer`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppContextMenuDumpParams {
+    pub target: AppContextMenuTarget,
+}
+
+/// What `app.context_menu_dump` answers: the menu that row would show
+/// now, in order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AppContextMenuDumpResult {
+    pub entries: Vec<AppContextMenuEntry>,
+}
+
+/// One menu row: an item, or `{"separator": true}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum AppContextMenuEntry {
+    Item {
+        /// What `app.context_menu_activate`'s `action` names.
+        action: String,
+        label: String,
+        enabled: bool,
+    },
+    Separator {
+        separator: bool,
+    },
+}
+
+/// `app.context_menu_activate` request: run one item of the menu
+/// `target` would show now, through the dispatcher a click reaches.
+/// Gated like `app.context_menu_dump`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppContextMenuActivateParams {
+    pub target: AppContextMenuTarget,
+    /// The item's `action`, as `app.context_menu_dump` lists it.
+    pub action: String,
+}
+
+/// `app.context_menu_open` request: show the menu for `target` on
+/// screen. Gated like `app.context_menu_dump`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppContextMenuOpenParams {
+    pub target: AppContextMenuTarget,
 }
 
 /// `tab.dump_resolved` request: walk a tab's render state through
@@ -3573,6 +3650,10 @@ pub mod ops {
     pub const SELECTION_DUMP: &str = "selection.dump";
     pub const CLIPBOARD_DUMP: &str = "clipboard.dump";
     pub const CLIPBOARD_WRITE: &str = "clipboard.write";
+    /// Test-only: copied files onto the system clipboard, for the paste
+    /// tests (plan 073 D2). Gated by `ROOST_TEST_MODE=1`; the iced UI
+    /// only.
+    pub const CLIPBOARD_WRITE_FILES: &str = "clipboard.write_files";
 
     /// Test-only PTY drain ops — drive bytes through the OSC scanner,
     /// libghostty, and the input-reply path. Gated behind
@@ -3697,6 +3778,14 @@ pub mod ops {
     /// real one reaches (plan 072 §D2). Same gate and the same "test
     /// seam, not a surface" rule as `app.dialog_answer`.
     pub const APP_KEY_EVENT: &str = "app.key_event";
+
+    /// Test-only reads and presses of a row's right-click menu (plan 073
+    /// D9): list it, run one item through the dispatcher a click
+    /// reaches, or show it on screen. Same gate and the same "test seam,
+    /// not a surface" rule as `app.dialog_answer`.
+    pub const APP_CONTEXT_MENU_DUMP: &str = "app.context_menu_dump";
+    pub const APP_CONTEXT_MENU_ACTIVATE: &str = "app.context_menu_activate";
+    pub const APP_CONTEXT_MENU_OPEN: &str = "app.context_menu_open";
 
     /// Set *this* machine's own `agent-hooks` key — the consent
     /// dialog's Apply and `roostctl agent set`'s wire path — and raise
@@ -4081,6 +4170,60 @@ mod tests {
         let json = serde_json::to_string(value).expect("serialize");
         let back: T = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(value, &back, "round-trip mismatch via {}", json);
+    }
+
+    /// The context-menu ops' documented spellings (plan 073 D9): a target
+    /// is a one-key object, and an entry is an item or a separator.
+    #[test]
+    fn context_menu_targets_and_entries_have_their_documented_shapes() {
+        let params: AppContextMenuActivateParams = serde_json::from_value(json!({
+            "target": {"tab_id": "h3.7"},
+            "action": "close_tab",
+        }))
+        .unwrap();
+        assert_eq!(
+            params.target,
+            AppContextMenuTarget::TabId(WireTabRef::Host { host: 3, tab: 7 })
+        );
+        for (wire, target) in [
+            (
+                json!({"project_id": "4"}),
+                AppContextMenuTarget::ProjectId(WireProjectRef::Local(4)),
+            ),
+            (
+                json!({"host": "3f9a"}),
+                AppContextMenuTarget::Host("3f9a".into()),
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<AppContextMenuTarget>(wire.clone()).unwrap(),
+                target
+            );
+            assert_eq!(serde_json::to_value(&target).unwrap(), wire);
+        }
+        assert!(serde_json::from_value::<AppContextMenuTarget>(
+            json!({"tab_id": "5", "host": "3f9a"})
+        )
+        .is_err());
+
+        let dump = AppContextMenuDumpResult {
+            entries: vec![
+                AppContextMenuEntry::Item {
+                    action: "close_tab".into(),
+                    label: "Close Tab".into(),
+                    enabled: true,
+                },
+                AppContextMenuEntry::Separator { separator: true },
+            ],
+        };
+        assert_eq!(
+            serde_json::to_value(&dump).unwrap(),
+            json!({"entries": [
+                {"action": "close_tab", "label": "Close Tab", "enabled": true},
+                {"separator": true},
+            ]})
+        );
+        round_trip(&dump);
     }
 
     /// The wire-form tab ref (plan 037 §3.4): bare stays byte-identical

@@ -45,7 +45,8 @@ use roost_ui_model::theme::Theme;
 use roost_ui_model::typography::{self, FamilyApply, TerminalTypography};
 use roost_ui_model::{
     agent_palette,
-    config::{self, RoostConfig},
+    config::{self, ChromeAccent, RoostConfig},
+    context_menu::ContextTarget,
     custom_command, host_sidebar, host_verbs,
     keybind::{self, Accel, AccelMods, KeybindAction},
     keys::{HostId, ProjectKey, TabKey},
@@ -62,8 +63,12 @@ use roost_vt::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::chrome::{self, ChromePalette};
+use crate::context_press::ContextPressArea;
 use crate::engine_feed::{self, EngineBatch, EngineFeed, EngineFeedReceiver, EngineFeedSender};
 use crate::font_registry::{system_font_registry, FontRegistry};
+use crate::fonts;
+use crate::input;
 use crate::notifications::DesktopNotifications;
 use crate::palette_scroll::Visibility;
 use crate::paste_image::{Materialized, ProbeError};
@@ -74,7 +79,6 @@ use crate::terminal_widget::{
     TerminalWheelEvent, TerminalWidget, TERMINAL_PADDING,
 };
 use crate::Message;
-use crate::{chrome, input};
 
 // `mod palette` would collide with the `roost_ui_model::palette` import in
 // this module's namespace, so the palette-overlay half of App lives in
@@ -83,6 +87,7 @@ pub(crate) mod agent_hooks;
 pub(crate) mod agent_hooks_dialog;
 pub(crate) mod background_resize;
 pub(crate) mod bootstrap;
+pub(crate) mod context_menu;
 pub(crate) mod file_transfer;
 mod forwarded_open;
 mod host_dialog;
@@ -112,6 +117,7 @@ use self::interactions::{
     consume_rename_completion_key, enqueue_osc_clipboard_write, host_section_is_reorderable,
     native_file_drop_origin, paste_bytes, visual_tab_ids, ClipboardQueue, FileDropQueue,
     ProjectDragPreview, RenameCompletionKey, RenameEditor, ScreenshotQueue, TabDragPreview,
+    TrailingDebounce,
 };
 pub(crate) use self::palettes::ProviderRunResult;
 pub(crate) use self::palettes::PALETTE_RETRY_INTERVAL;
@@ -246,12 +252,25 @@ struct BottomLine<'a> {
     source: BottomLineSource,
 }
 
-fn bottom_line_color(severity: Severity) -> Color {
+fn bottom_line_color(chrome: &ChromePalette, severity: Severity) -> Color {
     match severity {
-        Severity::Info => chrome::TEXT,
-        Severity::Warning => chrome::HOST_BANNER_TEXT,
-        Severity::Error => chrome::ERROR_TEXT,
+        Severity::Info => chrome.text,
+        Severity::Warning => chrome.host_banner_text,
+        Severity::Error => chrome.error_text,
     }
+}
+
+/// The chrome `chrome-accent` asks for: its hex as written, or under
+/// `system` the OS accent — [`chrome::DEFAULT_ACCENT`] wherever there is
+/// none to follow, or none read yet.
+///
+/// Bootstrap and an OS accent change (`EngineFeed::AccentChanged`) both
+/// build through here, which is what keeps an explicit hex deaf to the OS.
+fn chrome_palette_for(configured: ChromeAccent, system_accent: Color) -> ChromePalette {
+    ChromePalette::roost_dark(match configured {
+        ChromeAccent::System => system_accent,
+        ChromeAccent::Rgb([r, g, b]) => Color::from_rgb8(r, g, b),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -516,23 +535,23 @@ fn modal_over<'a>(content: Element<'a, Message>, modal: Modal<'a>) -> Element<'a
 }
 
 /// The panel every modal is drawn in.
-fn modal_card<'a>(body: Column<'a, Message>) -> Element<'a, Message> {
+fn modal_card<'a>(chrome: &ChromePalette, body: Column<'a, Message>) -> Element<'a, Message> {
     container(body.spacing(16))
         .width(Fill)
         .max_width(CONFIRM_PANEL_WIDTH)
         .height(Shrink)
         .padding(16)
-        .style(chrome::palette_panel)
+        .style(chrome::palette_panel(chrome))
         .into()
 }
 
 /// A modal's title + explanatory paragraph.
-fn modal_heading<'a>(title: String, body: &'a str) -> Column<'a, Message> {
+fn modal_heading<'a>(chrome: &ChromePalette, title: String, body: &'a str) -> Column<'a, Message> {
     column![
         text(title)
             .size(15)
             .font(chrome::chrome_font(font::Weight::Semibold)),
-        text(body).size(12).color(chrome::MUTED_TEXT),
+        text(body).size(12).color(chrome.muted_text),
     ]
     .spacing(6)
 }
@@ -547,8 +566,13 @@ struct ConfirmButton<'a> {
     /// the agent-hooks card counts the switches that are on, and the
     /// count changes under the pointer.
     label: std::borrow::Cow<'a, str>,
-    style: fn(&iced::Theme, iced::widget::button::Status) -> iced::widget::button::Style,
+    style: ConfirmStyle,
     press: Option<Message>,
+}
+
+enum ConfirmStyle {
+    Primary,
+    Danger,
 }
 
 /// A modal's trailing button row: the dismissing action, then the
@@ -565,6 +589,7 @@ struct ConfirmButton<'a> {
 /// ring wrapper reserves its space whether or not it is drawn, so a modal
 /// that can never show one must not carry the wrapper at all.
 fn modal_buttons<'a>(
+    chrome: &ChromePalette,
     cancel_label: &'a str,
     cancel: Message,
     confirm: Option<ConfirmButton<'a>>,
@@ -574,7 +599,7 @@ fn modal_buttons<'a>(
         match ring {
             Some(_) => container(element)
                 .padding(chrome::FOCUS_RING_PADDING)
-                .style(chrome::focus_ring(focused))
+                .style(chrome::focus_ring(chrome, focused))
                 .into(),
             None => element,
         }
@@ -584,16 +609,18 @@ fn modal_buttons<'a>(
         ringed(
             button(text(cancel_label).size(12))
                 .padding([4, 12])
-                .style(chrome::transparent_button)
+                .style(chrome::transparent_button(chrome))
                 .on_press(cancel)
                 .into(),
             ring.is_some_and(|ring| ring.cancel),
         ),
     ];
     if let Some(confirm) = confirm {
-        let mut primary = button(text(confirm.label).size(12))
-            .padding([4, 12])
-            .style(confirm.style);
+        let primary = button(text(confirm.label).size(12)).padding([4, 12]);
+        let mut primary = match confirm.style {
+            ConfirmStyle::Primary => primary.style(chrome::primary_button(chrome)),
+            ConfirmStyle::Danger => primary.style(chrome::danger_button(chrome)),
+        };
         if let Some(message) = confirm.press {
             primary = primary.on_press(message);
         }
@@ -611,25 +638,30 @@ fn modal_buttons<'a>(
 /// Every string it draws comes from [`agent_hooks_dialog`], which is
 /// also what `app.dialog_dump` reports — one source, so the card and the
 /// dump cannot say different things about the same card.
-fn agent_hooks_body(draft: &agent_hooks_dialog::AgentHooksDraft) -> Column<'_, Message> {
+fn agent_hooks_body<'a>(
+    chrome: &ChromePalette,
+    draft: &'a agent_hooks_dialog::AgentHooksDraft,
+) -> Column<'a, Message> {
     let mut body = column![modal_heading(
+        chrome,
         agent_hooks_dialog::TITLE.to_string(),
         agent_hooks_dialog::LEDE
     )];
     for (index, entry) in draft.rows().iter().enumerate() {
-        body = body.push(agent_hooks_row(draft, index, entry));
+        body = body.push(agent_hooks_row(chrome, draft, index, entry));
     }
     body = body.push(
         text(agent_hooks_dialog::FOOTER)
             .size(11)
-            .color(chrome::MUTED_TEXT),
+            .color(chrome.muted_text),
     );
     body.push(modal_buttons(
+        chrome,
         draft.dismiss_label(),
         Message::HostDialogCancel,
         Some(ConfirmButton {
             label: draft.confirm_label().into(),
-            style: chrome::primary_button,
+            style: ConfirmStyle::Primary,
             press: Some(Message::AgentHooksConfirm),
         }),
         Some(draft.button_ring()),
@@ -640,14 +672,15 @@ fn agent_hooks_body(draft: &agent_hooks_dialog::AgentHooksDraft) -> Column<'_, M
 /// install would touch, and — in preferences mode — where that agent
 /// stands right now.
 fn agent_hooks_row<'a>(
+    chrome: &ChromePalette,
     draft: &'a agent_hooks_dialog::AgentHooksDraft,
     index: usize,
     entry: &'a agent_hooks_dialog::AgentHooksRow,
 ) -> Element<'a, Message> {
     let chip = text(entry.chip()).size(10).color(if entry.found {
-        chrome::HOST_DOT_CONNECTED
+        chrome.host_dot_connected
     } else {
-        chrome::MUTED_TEXT
+        chrome.muted_text
     });
     let mut detail = column![row![
         text(agent_hooks_dialog::display_name(entry.agent))
@@ -658,13 +691,13 @@ fn agent_hooks_row<'a>(
     .spacing(8)
     .align_y(Alignment::Center)];
     for file in &entry.files {
-        detail = detail.push(text(file.as_str()).size(10).color(chrome::MUTED_TEXT));
+        detail = detail.push(text(file.as_str()).size(10).color(chrome.muted_text));
     }
     if let Some(status) = &entry.status {
-        detail = detail.push(text(status.as_str()).size(10).color(chrome::MUTED_TEXT));
+        detail = detail.push(text(status.as_str()).size(10).color(chrome.muted_text));
     }
     if let Some(note) = agent_hooks_dialog::note(entry.agent) {
-        detail = detail.push(text(note).size(10).color(chrome::MUTED_TEXT));
+        detail = detail.push(text(note).size(10).color(chrome.muted_text));
     }
     // The ring wrapper reserves its space whether or not it draws, so
     // stepping the ring never moves the switches under the pointer —
@@ -676,6 +709,7 @@ fn agent_hooks_row<'a>(
     )
     .padding(chrome::FOCUS_RING_PADDING)
     .style(chrome::focus_ring(
+        chrome,
         draft.focus() == agent_hooks_dialog::CardFocus::Switch(index),
     ));
     container(
@@ -685,7 +719,7 @@ fn agent_hooks_row<'a>(
     )
     .padding(6)
     .width(Fill)
-    .style(chrome::agent_hooks_row(entry.found))
+    .style(chrome::agent_hooks_row(chrome, entry.found))
     .into()
 }
 
@@ -696,13 +730,17 @@ fn agent_hooks_row<'a>(
 /// scrim is a layer rather than a recolor because the terminal draws
 /// from an owned snapshot, and the strip sits above it so its own text
 /// is not dimmed with the frame it describes.
-fn with_notice<'a>(content: Element<'a, Message>, notice: Notice) -> Element<'a, Message> {
+fn with_notice<'a>(
+    chrome: &ChromePalette,
+    content: Element<'a, Message>,
+    notice: Notice,
+) -> Element<'a, Message> {
     let placement = notice.placement;
-    let strip = notice_strip(notice);
+    let strip = notice_strip(chrome, notice);
     let layers = match placement {
         notice::Placement::OverFrame => {
             let scrim = container(iced::widget::Space::new().width(Fill).height(Fill))
-                .style(chrome::host_frame_scrim);
+                .style(chrome::host_frame_scrim(chrome));
             stack![content, scrim, strip]
         }
         notice::Placement::EmptyArea => stack![content, strip],
@@ -713,11 +751,11 @@ fn with_notice<'a>(content: Element<'a, Message>, notice: Notice) -> Element<'a,
 /// The strip itself: a sentence, its buttons, an optional second line,
 /// and the hairline under it. Each button carries the notice it was drawn
 /// on, for [`notice::click_still_lands`].
-fn notice_strip<'a>(notice: Notice) -> Column<'a, Message> {
+fn notice_strip<'a>(chrome: &ChromePalette, notice: Notice) -> Column<'a, Message> {
     let mut line = row![
         text(notice.message)
             .size(chrome::HOST_BANNER_TEXT_SIZE)
-            .color(chrome::HOST_BANNER_TEXT),
+            .color(chrome.host_banner_text),
         iced::widget::Space::new().width(Fill),
     ]
     .spacing(10)
@@ -726,7 +764,7 @@ fn notice_strip<'a>(notice: Notice) -> Column<'a, Message> {
         line = line.push(
             button(text(action.label).size(chrome::HOST_BANNER_ACTION_SIZE))
                 .padding([2, 9])
-                .style(chrome::host_banner_button)
+                .style(chrome::host_banner_button(chrome))
                 .on_press(Message::NoticeAction {
                     key: notice.key.clone(),
                     action: action.id,
@@ -739,7 +777,7 @@ fn notice_strip<'a>(notice: Notice) -> Column<'a, Message> {
             line,
             text(detail)
                 .size(chrome::HOST_BANNER_ACTION_SIZE)
-                .color(chrome::HOST_BANNER_TEXT),
+                .color(chrome.host_banner_text),
         ]
         .spacing(2)
         .into(),
@@ -747,9 +785,9 @@ fn notice_strip<'a>(notice: Notice) -> Column<'a, Message> {
     let strip = container(body)
         .width(Fill)
         .padding([6, 12])
-        .style(chrome::host_banner);
+        .style(chrome::host_banner(chrome));
     let edge = container(iced::widget::Space::new().width(Fill).height(1.0))
-        .style(chrome::host_banner_edge);
+        .style(chrome::host_banner_edge(chrome));
     column![strip, edge]
 }
 
@@ -773,6 +811,7 @@ fn stop_session_title(label: &str) -> String {
 /// One labelled text field in the Add Host dialog (the mock's
 /// `label` + `.field` pair).
 fn dialog_field<'a>(
+    chrome: &ChromePalette,
     label: &'a str,
     placeholder: &'a str,
     value: &str,
@@ -780,14 +819,14 @@ fn dialog_field<'a>(
     on_input: impl Fn(String) -> Message + 'a,
 ) -> Column<'a, Message> {
     column![
-        text(label).size(11).color(chrome::MUTED_TEXT),
+        text(label).size(11).color(chrome.muted_text),
         text_input(placeholder, value)
             .id(id)
             .on_input(on_input)
             .on_submit(Message::AddHostSubmit)
             .size(12)
             .padding([5, 8])
-            .style(chrome::palette_input),
+            .style(chrome::palette_input(chrome)),
     ]
     .spacing(3)
 }
@@ -805,6 +844,9 @@ struct FocusTeardown {
     /// tool stealing focus) read as the app having crashed. The Mac's
     /// `NSAlert` is application-modal and equally unaffected.
     confirm_delete: bool,
+    /// A menu answers one click; a click into another app dismisses it,
+    /// as a native menu's would.
+    context_menu: bool,
     ime_composition: bool,
     /// Refocus only: macOS discards marked text when the window loses
     /// focus, so a commit arriving after refocus is fresh input (emoji
@@ -823,6 +865,7 @@ fn focus_teardown(focused: bool) -> FocusTeardown {
             rename_completion_key: true,
             drags: true,
             confirm_delete: false,
+            context_menu: true,
             ime_composition: true,
             ime_discard: false,
         }
@@ -1489,17 +1532,24 @@ struct HostTabOrigin {
     cwd_from_tab: Option<i64>,
 }
 
-/// [`HostTabOrigin`] for a new tab on `project`, off the window's
-/// selection and the project's mirror row.
+/// [`HostTabOrigin`] for a new tab on `project`, off the tab it is
+/// opened from and the project's mirror row.
 ///
-/// Only a selection on the project's own connection is named: a tab on
+/// Only a source on the project's own connection is named: a tab on
 /// another host or on the local backend has an id from another id-space
-/// and a path that means nothing there, so it gets the project's cwd.
+/// and a path that means nothing there, so it gets the project's cwd —
+/// as does no source at all.
 ///
 /// The mirror cwd rides as `cwd` because it is where a session older
 /// than `cwd_from_tab` lands on [`open_host_tab_flow`]'s retry.
-fn host_tab_origin(project: ProjectKey, selected: TabKey, row: Option<&Project>) -> HostTabOrigin {
-    let cwd_from_tab = (selected.host == project.host).then_some(selected.tab);
+fn host_tab_origin(
+    project: ProjectKey,
+    source: Option<TabKey>,
+    row: Option<&Project>,
+) -> HostTabOrigin {
+    let cwd_from_tab = source
+        .filter(|source| source.host == project.host)
+        .map(|source| source.tab);
     let cwd = row.map_or("", |row| match cwd_from_tab {
         Some(tab) => listed_tab_cwd(row, tab),
         None => &row.cwd,
@@ -1924,12 +1974,15 @@ const FIDELITY_PILL_PADDING_X: f32 = 6.0;
 /// are the same chrome, so the height and insets live in one place —
 /// that parity is the whole reason a host section reads as a band and
 /// not as a second visual language.
-fn sidebar_band<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+fn sidebar_band<'a>(
+    chrome: &ChromePalette,
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
     container(content)
         .center_y(chrome::BAND_HEIGHT)
         .width(Fill)
         .padding([0.0, SIDEBAR_BAND_PADDING_X])
-        .style(chrome::band)
+        .style(chrome::band(chrome))
         .into()
 }
 
@@ -1938,10 +1991,10 @@ fn sidebar_band_label_font() -> Font {
 }
 
 /// A band's label, in the one weight and size every band uses.
-fn sidebar_band_label(label: &str) -> Element<'_, Message> {
+fn sidebar_band_label<'a>(chrome: &ChromePalette, label: &'a str) -> Element<'a, Message> {
     text(label)
         .size(SIDEBAR_BAND_LABEL_SIZE)
-        .color(chrome::MUTED_TEXT)
+        .color(chrome.muted_text)
         .font(sidebar_band_label_font())
         .into()
 }
@@ -2077,6 +2130,9 @@ enum KeyboardRoute {
     /// deletion, and Escape closes this dialog rather than that one.
     HostDialog,
     Editor,
+    /// The right-click menu (plan 073 D9). Every key is the menu's while
+    /// it is up.
+    ContextMenu,
     Palette,
     /// A new tab is opening, and the keys typed meanwhile are kept for
     /// it (plan 072 §D2).
@@ -2097,6 +2153,7 @@ fn ime_preedit_target(route: KeyboardRoute) -> Option<TabKey> {
         | KeyboardRoute::Confirm
         | KeyboardRoute::HostDialog
         | KeyboardRoute::Editor
+        | KeyboardRoute::ContextMenu
         | KeyboardRoute::Palette
         | KeyboardRoute::Pending => None,
     }
@@ -2248,6 +2305,7 @@ fn type_into(
     event: keyboard::Event,
     tracked: keyboard::Modifiers,
     composing: bool,
+    option: input::OptionKey,
 ) {
     // A bare page key scrolls this tab's own scrollback whenever the shared
     // policy keeps it local — no snap, no encode, nothing on the PTY. The
@@ -2279,7 +2337,7 @@ fn type_into(
             );
         }
     }
-    let bytes = input::encode_press(&mut tab.encoder, &tab.terminal, event, composing);
+    let bytes = input::encode_press(&mut tab.encoder, &tab.terminal, event, composing, option);
     tab.session.send_input(bytes);
 }
 
@@ -2299,10 +2357,12 @@ fn active_terminal_live(has_session: bool, attach_live: bool) -> bool {
     has_session && attach_live
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_keyboard_route(
     confirm_open: bool,
     host_dialog_open: bool,
     editor_open: bool,
+    context_menu_open: bool,
     palette_open: bool,
     pending_tab: bool,
     active_tab: TabKey,
@@ -2314,6 +2374,8 @@ fn resolve_keyboard_route(
         KeyboardRoute::HostDialog
     } else if editor_open {
         KeyboardRoute::Editor
+    } else if context_menu_open {
+        KeyboardRoute::ContextMenu
     } else if palette_open {
         KeyboardRoute::Palette
     } else if pending_tab {
@@ -2389,17 +2451,49 @@ pub enum UiTask {
         png: Vec<u8>,
         reply: roost_engine::ipc::HostOpReply<()>,
     },
+    /// A system paste's first step where copied files come before the text
+    /// (plan 073 D2): a blocking file-list read, answered as
+    /// `Message::ClipboardFilesRead` with the read still holding the queue.
+    ClipboardReadFiles {
+        request_id: u64,
+    },
+    /// `clipboard.write_files`' half of the queue (plan 073 D2), answered
+    /// from the blocking pool like [`UiTask::ClipboardWriteImage`].
+    ClipboardWriteFiles {
+        request_id: u64,
+        paths: Vec<PathBuf>,
+        reply: roost_engine::ipc::HostOpReply<()>,
+    },
     OpenUrl {
         url: String,
     },
-    /// A paste found no text on the system clipboard — go look for an
-    /// image. The read + PNG encode block, so this runs off the UI
-    /// thread and reports back as `Message::PasteImageMaterialized`.
+    /// Open a file in the default text editor, creating it with `seed`
+    /// first when it is missing. Completes as `Message::FileOpenCompleted`.
+    OpenFile {
+        path: PathBuf,
+        seed: Option<&'static str>,
+    },
+    /// Flip the window between windowed and full screen.
+    ToggleFullScreen(window::Id),
+    /// Ask the window whether it is full screen; the answer arrives as
+    /// `Message::FullScreenMode`.
+    QueryFullScreen(window::Id),
+    /// Wait, then `Message::FullScreenSettled(generation)`.
+    FullScreenSettle {
+        delay: Duration,
+        generation: u64,
+    },
+    /// A paste found no text on the system clipboard — go look for copied
+    /// files, then an image. The reads + PNG encode block, so this runs
+    /// off the UI thread and reports back as
+    /// `Message::PasteImageMaterialized`, holding the clipboard queue under
+    /// its paste's `request_id` until then.
     ///
     /// `sink` is chosen from the target tab when the probe is spawned: a
     /// host tab's image must never touch this machine's disk (plan 047
     /// §3.2), so it stops at the bytes.
     PasteImageProbe {
+        request_id: u64,
         tab: TabKey,
         sink: ProbeSink,
     },
@@ -2892,6 +2986,7 @@ pub struct App {
     title_fallback: &'static str,
     ime_discard: ImeDiscard,
     modifiers: keyboard::Modifiers,
+    option_sides: input::OptionSides,
     test_mode: bool,
     status: StatusBanner,
     /// Standing "this workspace is not reaching disk" failures, one per
@@ -2961,6 +3056,7 @@ pub struct App {
     project_drag_preview: Option<ProjectDragPreview>,
     project_strip_generation: u64,
     confirm_delete: Option<ConfirmDeleteProject>,
+    context_menu: Option<context_menu::OpenContextMenu>,
     pending_attachments: servicing::PendingAttachments,
     file_drops: FileDropQueue,
     background_resize: background_resize::BackgroundResize,
@@ -2970,6 +3066,9 @@ pub struct App {
     /// answers everything it still holds.
     gestures: file_transfer::Gestures,
     config: RoostConfig,
+    /// The chrome's colors (plan 073 D4), which every view draws from.
+    /// Built only by [`chrome_palette_for`].
+    chrome: ChromePalette,
     /// Where this UI's own tabs run (plan 063 §D1), read once from the
     /// `local-backend` key at bootstrap.
     local_backend: LocalBackendMode,
@@ -3013,6 +3112,8 @@ pub struct App {
     font_registry: &'static FontRegistry,
     terminal_metrics: TerminalMetrics,
     metric_generation: u64,
+    /// See `TerminalWidget::pointer_cancel_epoch`.
+    pointer_cancel_epoch: u64,
     keybindings: HashMap<Accel, KeybindAction>,
     active_theme_name: String,
     palette: Option<palette::PaletteState>,
@@ -3046,6 +3147,8 @@ pub struct App {
     /// moved no project or tab never touches AppKit.
     #[cfg(target_os = "macos")]
     menu_window_rows: crate::macos::menu::WindowRows,
+    /// See `schedule_full_screen_settle`.
+    full_screen_settle: TrailingDebounce,
     /// `SPUUpdater.canCheckForUpdates` as last pushed onto the "Check
     /// for Updates…" item. `None` before the first push, so boot writes
     /// the item's state even when it is already correct.
@@ -3359,6 +3462,7 @@ struct StartedEngine {
 
 impl App {
     pub fn bootstrap(profile: &BundleProfile, locks: InstanceLocks) -> Result<Self> {
+        fonts::install_bundled_terminal_fonts();
         let config = RoostConfig::load_default();
         let font_registry = system_font_registry();
         let configured_typography =
@@ -3449,6 +3553,7 @@ impl App {
             title_fallback: title_fallback(profile.kind),
             ime_discard: ImeDiscard::default(),
             modifiers: keyboard::Modifiers::default(),
+            option_sides: input::OptionSides::default(),
             test_mode,
             status: StatusBanner::default(),
             notice_generation: notice::NoticeGeneration::default(),
@@ -3472,10 +3577,12 @@ impl App {
             project_drag_preview: None,
             project_strip_generation: 1,
             confirm_delete: None,
+            context_menu: None,
             pending_attachments: servicing::PendingAttachments::default(),
             file_drops: FileDropQueue::default(),
             background_resize: background_resize::BackgroundResize::default(),
             gestures: file_transfer::Gestures::default(),
+            chrome: chrome_palette_for(config.chrome_accent, chrome::DEFAULT_ACCENT),
             config,
             local_backend: backend_mode,
             local_route,
@@ -3491,6 +3598,7 @@ impl App {
             font_registry,
             terminal_metrics,
             metric_generation: 1,
+            pointer_cancel_epoch: 0,
             keybindings,
             active_theme_name,
             palette: None,
@@ -3515,6 +3623,7 @@ impl App {
             menu_gating: crate::macos::menu::MenuGating::default(),
             #[cfg(target_os = "macos")]
             menu_window_rows: crate::macos::menu::WindowRows::default(),
+            full_screen_settle: TrailingDebounce::default(),
             #[cfg(target_os = "macos")]
             menu_can_check_updates: None,
             palette_visibility_retries: 0,
@@ -3893,6 +4002,7 @@ impl App {
         // disabled and shows nothing — by design, and vanishingly rare:
         // policy B only fires for an unfocused window.
         self.init_notifications();
+        self.follow_system_accent();
         // Last, and off this thread: the agent-hooks ensure reads and
         // writes the user's dotfiles under an advisory lock (plan 046
         // §3.7). The window is up by the time its toast can land, which
@@ -4461,7 +4571,8 @@ impl App {
         if self.palette.is_some() {
             self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
         }
-        opened.task
+        let settle = self.schedule_full_screen_settle();
+        opened.task.then(self.query_full_screen()).then(settle)
     }
 
     /// The wake this app's feed notifies on, for the subscription that
@@ -5073,6 +5184,9 @@ impl App {
             // terminal encoder can observe the same key.
             return UiTask::None;
         }
+        if matches!(self.keyboard_route(), KeyboardRoute::ContextMenu) {
+            return self.context_menu_key(&event);
+        }
         if let keyboard::Event::KeyPressed { key, .. } = &event {
             if matches!(self.keyboard_route(), KeyboardRoute::Palette) {
                 let mut task = UiTask::None;
@@ -5113,16 +5227,37 @@ impl App {
         let active_key = match self.keyboard_route() {
             KeyboardRoute::Terminal(active_key) => active_key,
             KeyboardRoute::Pending => {
-                self.buffer_pending_input(PendingInput::Key(event));
+                self.buffer_pending_input(PendingInput::Key(event, self.option_key()));
                 return UiTask::None;
             }
             _ => return UiTask::None,
         };
+        let option = self.option_key();
         let Some(tab) = self.tabs.get_mut(&active_key) else {
             return UiTask::None;
         };
-        type_into(tab, active_key.tab, event, self.modifiers, composing);
+        type_into(
+            tab,
+            active_key.tab,
+            event,
+            self.modifiers,
+            composing,
+            option,
+        );
         UiTask::None
+    }
+
+    /// Folds one raw keyboard event, captured or not, into the Option
+    /// sides — before any route can swallow it.
+    pub fn observe_option_key(&mut self, event: &keyboard::Event) {
+        self.option_sides.observe(event);
+    }
+
+    fn option_key(&self) -> input::OptionKey {
+        input::OptionKey {
+            as_alt: self.config.macos_option_as_alt,
+            sides: self.option_sides,
+        }
     }
 
     /// Whether the terminal that owns the keyboard is mid-composition.
@@ -5168,6 +5303,11 @@ impl App {
                 self.cancel_rename_editor();
                 UiTask::None
             }
+            KeyboardRoute::ContextMenu => {
+                self.rename_completion_key = Some(RenameCompletionKey::Escape);
+                self.close_context_menu();
+                UiTask::None
+            }
             KeyboardRoute::Palette => {
                 self.palette_back_or_dismiss();
                 self.take_palette_focus_task()
@@ -5199,10 +5339,7 @@ impl App {
     fn menu_gating(&self) -> crate::macos::menu::MenuGating {
         crate::macos::menu::MenuGating {
             palette_open: self.palette.is_some(),
-            text_capture: self.rename_editor.is_some()
-                || self.confirm_delete.is_some()
-                || self.host_dialog.is_some()
-                || self.terminal_composing(),
+            text_capture: self.text_capture() || self.context_menu.is_some(),
         }
     }
 
@@ -5377,6 +5514,9 @@ impl App {
                 self.open_agent_hooks_preferences();
                 Ok(UiTask::None)
             }
+            KeybindAction::OpenConfig => Ok(self.open_config()),
+            KeybindAction::OpenDocs => Ok(self.open_docs()),
+            KeybindAction::ToggleFullScreen => Ok(self.toggle_full_screen()),
             KeybindAction::FontIncrease => {
                 self.apply_font_size_transition(FontSizeTransition::Adjust(1.0))?;
                 Ok(UiTask::None)
@@ -5415,6 +5555,12 @@ impl App {
     /// gesture behind it.
     fn strip_gestures_enabled(&self) -> bool {
         self.rename_editor.is_none() && self.confirm_delete.is_none() && self.host_dialog.is_none()
+    }
+
+    /// Whether a rename editor, a confirm card, a host dialog or an IME
+    /// composition owns the keyboard.
+    fn text_capture(&self) -> bool {
+        !self.strip_gestures_enabled() || self.terminal_composing()
     }
 
     /// The active project, host-qualified. The workspace's active
@@ -5458,6 +5604,7 @@ impl App {
             self.confirm_delete.is_some(),
             self.host_dialog.is_some(),
             self.rename_editor.is_some(),
+            self.context_menu.is_some(),
             self.palette.is_some(),
             self.pending_keyboard.armed(),
             active_tab,
@@ -5498,12 +5645,16 @@ impl App {
         if teardown.confirm_delete {
             self.cancel_confirm_delete();
         }
+        if teardown.context_menu {
+            self.close_context_menu();
+        }
         if teardown.ime_composition {
             self.cancel_ime_composition();
         }
         if teardown.ime_discard {
             self.ime_discard.disarm();
         }
+        self.option_sides.window_focus(focused);
         self.window_focused = focused;
         self.workspace.set_window_focused(focused);
         if let Some(tab) = self.tabs.get(&self.active_tab_key()) {
@@ -5516,7 +5667,7 @@ impl App {
 
     pub fn view(&self) -> Element<'_, Message> {
         let started = Instant::now();
-        let content = self.view_body();
+        let content = self.with_context_menu(self.view_body());
         // At most one modal is ever up: each of the three cancels the
         // others where it opens, so this is a preference order and not a
         // stack.
@@ -5546,7 +5697,7 @@ impl App {
                 confirm.tab_count
             ))
             .size(12)
-            .color(chrome::MUTED_TEXT),
+            .color(self.chrome.muted_text),
         ]
         .spacing(6);
         let heading: Element<'_, Message> = match chrome::app_icon() {
@@ -5561,19 +5712,23 @@ impl App {
             .into(),
             None => message.into(),
         };
-        let card = modal_card(column![
-            heading,
-            modal_buttons(
-                "Cancel",
-                Message::ConfirmDeleteCancel,
-                Some(ConfirmButton {
-                    label: "Close Project".into(),
-                    style: chrome::danger_button,
-                    press: Some(Message::ConfirmDeleteConfirm),
-                }),
-                None,
-            )
-        ]);
+        let card = modal_card(
+            &self.chrome,
+            column![
+                heading,
+                modal_buttons(
+                    &self.chrome,
+                    "Cancel",
+                    Message::ConfirmDeleteCancel,
+                    Some(ConfirmButton {
+                        label: "Close Project".into(),
+                        style: ConfirmStyle::Danger,
+                        press: Some(Message::ConfirmDeleteConfirm),
+                    }),
+                    None,
+                )
+            ],
+        );
         Some(Modal {
             card,
             card_pressed: Message::ConfirmDeleteCardPressed,
@@ -5592,31 +5747,33 @@ impl App {
         let body = match self.host_dialog.as_ref()? {
             host_dialog::HostDialog::Add(draft) => self.add_host_body(draft),
             host_dialog::HostDialog::ConfirmStop { label, .. } => column![
-                modal_heading(stop_session_title(label), STOP_SESSION_BODY),
+                modal_heading(&self.chrome, stop_session_title(label), STOP_SESSION_BODY),
                 modal_buttons(
+                    &self.chrome,
                     "Cancel",
                     Message::HostDialogCancel,
                     Some(ConfirmButton {
                         label: STOP_SESSION_CONFIRM.into(),
-                        style: chrome::danger_button,
+                        style: ConfirmStyle::Danger,
                         press: Some(Message::HostStopConfirm),
                     }),
                     None,
                 )
             ],
             host_dialog::HostDialog::ConfirmRestart { prompt, .. } => column![
-                modal_heading(prompt.title.clone(), &prompt.body),
+                modal_heading(&self.chrome, prompt.title.clone(), &prompt.body),
                 // A host nothing can be offered for gets the state and
                 // the pointer, and no button that would fail (§3.1).
                 // The other two differ only in what the button promises;
                 // which flow it starts is `host_restart_dialog_confirmed`'s
                 // to decide, so Enter and a click cannot route differently.
                 modal_buttons(
+                    &self.chrome,
                     prompt.dismiss_label(),
                     Message::HostDialogCancel,
                     prompt.confirm.as_deref().map(|label| ConfirmButton {
                         label: label.into(),
-                        style: chrome::danger_button,
+                        style: ConfirmStyle::Danger,
                         press: Some(Message::HostRestartConfirm),
                     }),
                     None,
@@ -5632,13 +5789,14 @@ impl App {
                 confirm,
                 ..
             } => column![
-                modal_heading(title.clone(), body),
+                modal_heading(&self.chrome, title.clone(), body),
                 modal_buttons(
+                    &self.chrome,
                     "Cancel",
                     Message::HostDialogCancel,
                     Some(ConfirmButton {
                         label: (*confirm).into(),
-                        style: chrome::danger_button,
+                        style: ConfirmStyle::Danger,
                         press: Some(Message::LocalSwitchConfirm),
                     }),
                     None,
@@ -5648,22 +5806,23 @@ impl App {
             // is the offer: what, where, from where, and — for an update
             // over a live session — what it ends.
             host_dialog::HostDialog::Bootstrap(draft) => column![
-                modal_heading(draft.copy.title.clone(), &draft.copy.body),
+                modal_heading(&self.chrome, draft.copy.title.clone(), &draft.copy.body),
                 modal_buttons(
+                    &self.chrome,
                     "Cancel",
                     Message::HostDialogCancel,
                     Some(ConfirmButton {
                         label: draft.copy.confirm.into(),
-                        style: chrome::primary_button,
+                        style: ConfirmStyle::Primary,
                         press: Some(Message::HostBootstrapConfirm),
                     }),
                     None,
                 )
             ],
-            host_dialog::HostDialog::AgentHooks(draft) => agent_hooks_body(draft),
+            host_dialog::HostDialog::AgentHooks(draft) => agent_hooks_body(&self.chrome, draft),
         };
         Some(Modal {
-            card: modal_card(body),
+            card: modal_card(&self.chrome, body),
             card_pressed: Message::HostDialogCardPressed,
             dismiss: Message::HostDialogCancel,
         })
@@ -5673,8 +5832,9 @@ impl App {
     /// buttons — the approved mock, widget for widget.
     fn add_host_body(&self, draft: &host_dialog::AddHostDraft) -> Column<'_, Message> {
         let mut body = column![
-            modal_heading(ADD_HOST_TITLE.to_string(), ADD_HOST_BODY),
+            modal_heading(&self.chrome, ADD_HOST_TITLE.to_string(), ADD_HOST_BODY),
             dialog_field(
+                &self.chrome,
                 "Name",
                 "pop-os",
                 &draft.name,
@@ -5682,6 +5842,7 @@ impl App {
                 Message::AddHostNameChanged,
             ),
             dialog_field(
+                &self.chrome,
                 "Target",
                 "workbox, user@host, or /path/to.sock",
                 &draft.socket,
@@ -5690,7 +5851,7 @@ impl App {
             ),
         ];
         if let Some(error) = &draft.error {
-            body = body.push(text(error.clone()).size(11).color(chrome::ERROR_TEXT));
+            body = body.push(text(error.clone()).size(11).color(self.chrome.error_text));
         }
         // Inert while the dial is in flight rather than hidden: a button
         // that vanishes mid-press moves the card under the pointer.
@@ -5700,11 +5861,12 @@ impl App {
         // would draw it on "Add & Connect" while the caret sits in Name.
         let confirm = (!draft.is_verifying()).then_some(Message::AddHostConfirmPressed);
         body.push(modal_buttons(
+            &self.chrome,
             "Cancel",
             Message::HostDialogCancel,
             Some(ConfirmButton {
                 label: draft.confirm_label().into(),
-                style: chrome::primary_button,
+                style: ConfirmStyle::Primary,
                 press: confirm,
             }),
             Some(draft.button_ring()),
@@ -5770,7 +5932,7 @@ impl App {
                     // real-input harness counts exact border pixels).
                     .line_height(iced::widget::text::LineHeight::Absolute(18.0.into()))
                     .padding([1, 3])
-                    .style(chrome::inline_rename_input)
+                    .style(chrome::inline_rename_input(&self.chrome))
                     .into()
             }
             // Label leading, notification-dot slot trailing: the spacer
@@ -5782,9 +5944,9 @@ impl App {
             // field, and no dot renders beside the editor.
             _ => {
                 let label_color = if active {
-                    chrome::PROJECT_LABEL_ACTIVE
+                    self.chrome.project_label_active
                 } else {
-                    chrome::PROJECT_LABEL_INACTIVE
+                    self.chrome.project_label_inactive
                 }
                 .scale_alpha(alpha);
                 let mut label_row = row![
@@ -5799,7 +5961,7 @@ impl App {
                                 .width(chrome::NOTIFICATION_DOT_SIZE)
                                 .height(chrome::NOTIFICATION_DOT_SIZE),
                         )
-                        .style(chrome::badge),
+                        .style(chrome::badge(&self.chrome)),
                     );
                 }
                 label_row.width(Fill).into()
@@ -5815,6 +5977,7 @@ impl App {
                 left: chrome::PROJECT_LABEL_INSET,
             })
             .style(chrome::project_pill(
+                &self.chrome,
                 active,
                 dragged_project == Some(project.id),
             ));
@@ -5840,7 +6003,12 @@ impl App {
         // publishes nothing at all on press — so those rows are simply
         // press-less, which is the whole of "nothing here is actionable
         // until the connection is back".
-        let project_row: Element<'a, Message> = project_row.into();
+        let project_row: Element<'a, Message> = ContextPressArea::new(
+            project_row,
+            ContextTarget::Project(project_key),
+            self.modifiers,
+        )
+        .into();
         let mut project_group = column![project_row].spacing(2);
         if self.config.show_sidebar_agents && !hide_agent_rows {
             for agent in self.sidebar_agents.get(&project_key).into_iter().flatten() {
@@ -5858,7 +6026,7 @@ impl App {
                     text(name).size(11),
                     text(detail)
                         .size(9)
-                        .color(chrome::MUTED_TEXT.scale_alpha(alpha))
+                        .color(self.chrome.muted_text.scale_alpha(alpha))
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center);
@@ -5875,7 +6043,7 @@ impl App {
                         bottom: 3.0,
                         left: chrome::AGENT_DOT_INSET,
                     })
-                    .style(chrome::agent_button(agent.tab == active_key));
+                    .style(chrome::agent_button(&self.chrome, agent.tab == active_key));
                 if !dim {
                     agent_button = agent_button.on_press(Message::AgentSelected(agent.tab));
                 }
@@ -5888,13 +6056,13 @@ impl App {
     /// One host section's band: the dot, the uppercase label, and the
     /// right-aligned rollup. Same band as the "PROJECTS" header it
     /// replaces — `chrome::band`, [`chrome::BAND_HEIGHT`], the same 11pt
-    /// semibold [`chrome::MUTED_TEXT`] label — so the sidebar gains a
+    /// semibold muted-text label — so the sidebar gains a
     /// structure without gaining a second visual language.
     fn host_band<'a>(&'a self, section: &'a host_sidebar::Section) -> Element<'a, Message> {
         let dot_color = match section.state.dot() {
-            host_sidebar::HostDot::Connected => chrome::HOST_DOT_CONNECTED,
-            host_sidebar::HostDot::Pending => chrome::HOST_DOT_PENDING,
-            host_sidebar::HostDot::Offline => chrome::HOST_DOT_OFFLINE,
+            host_sidebar::HostDot::Connected => self.chrome.host_dot_connected,
+            host_sidebar::HostDot::Pending => self.chrome.host_dot_pending,
+            host_sidebar::HostDot::Offline => self.chrome.host_dot_offline,
         };
         let dot = container(
             iced::widget::Space::new()
@@ -5908,7 +6076,7 @@ impl App {
         });
         let mut band = row![
             dot,
-            sidebar_band_label(&section.label),
+            sidebar_band_label(&self.chrome, &section.label),
             iced::widget::Space::new().width(Fill)
         ]
         .spacing(chrome::HOST_BAND_SPACING)
@@ -5931,14 +6099,22 @@ impl App {
             band = band.push(
                 text(rollup)
                     .size(chrome::HOST_ROLLUP_SIZE)
-                    .color(chrome::HOST_ROLLUP_TEXT)
+                    .color(self.chrome.host_rollup_text)
                     .font(font)
                     // Measured with Advanced shaping, as the pill titles are.
                     .shaping(iced::widget::text::Shaping::Advanced)
                     .wrapping(iced::widget::text::Wrapping::None),
             );
         }
-        sidebar_band(band)
+        let band = sidebar_band(&self.chrome, band);
+        // The in-process band has no saved host, and so no host verbs.
+        match &section.saved_id {
+            Some(saved_id) => {
+                ContextPressArea::new(band, ContextTarget::Host(saved_id.clone()), self.modifiers)
+                    .into()
+            }
+            None => band,
+        }
     }
 
     /// The band's `reduced fidelity` pill (plan 056 §3.4).
@@ -5957,13 +6133,13 @@ impl App {
     ) -> Element<'_, Message> {
         let pill = text(host_notice::FIDELITY_PILL)
             .size(chrome::HOST_ROLLUP_SIZE)
-            .color(chrome::HOST_FIDELITY_TEXT);
+            .color(self.chrome.host_fidelity_text);
         if !host_notice::fidelity_chrome(action, label).pressable {
             return pill.into();
         }
         button(pill)
             .padding([chrome::BAND_PILL_PADDING_Y, FIDELITY_PILL_PADDING_X])
-            .style(chrome::transparent_button)
+            .style(chrome::transparent_button(&self.chrome))
             .on_press(Message::HostFidelityAction(saved_id.to_string()))
             .into()
     }
@@ -5981,14 +6157,16 @@ impl App {
         action: host_sidebar::FidelityAction,
     ) -> Element<'_, Message> {
         let offer = host_notice::fidelity_chrome(action, label);
-        let body = text(offer.row).size(12).color(chrome::HOST_FIDELITY_TEXT);
+        let body = text(offer.row)
+            .size(12)
+            .color(self.chrome.host_fidelity_text);
         if !offer.pressable {
             return container(body).width(Fill).padding([6, 12]).into();
         }
         button(body)
             .width(Fill)
             .padding([6, 12])
-            .style(chrome::transparent_button)
+            .style(chrome::transparent_button(&self.chrome))
             .on_press(Message::HostFidelityAction(saved_id.to_string()))
             .into()
     }
@@ -6000,11 +6178,11 @@ impl App {
         button(
             text("↻ Reconnect")
                 .size(12)
-                .color(chrome::HOST_RECONNECT_TEXT),
+                .color(self.chrome.host_reconnect_text),
         )
         .width(Fill)
         .padding([6, 12])
-        .style(chrome::transparent_button)
+        .style(chrome::transparent_button(&self.chrome))
         .on_press(Message::HostReconnect(saved_id.to_string()))
         .into()
     }
@@ -6045,12 +6223,13 @@ impl App {
                 false,
             ));
         }
-        let sidebar_header = || sidebar_band(sidebar_band_label("PROJECTS"));
+        let sidebar_header =
+            || sidebar_band(&self.chrome, sidebar_band_label(&self.chrome, "PROJECTS"));
         let sidebar_footer = container(
             button(text("+ New Project").size(13))
                 .height(chrome::PILL_HEIGHT)
                 .padding([3, 12])
-                .style(chrome::footer_chip_button)
+                .style(chrome::footer_chip_button(&self.chrome))
                 .on_press(Message::NewProject),
         )
         .height(chrome::FOOTER_BAND_HEIGHT)
@@ -6062,7 +6241,7 @@ impl App {
             bottom: chrome::FOOTER_PADDING_BOTTOM,
             left: 8.0,
         })
-        .style(chrome::band);
+        .style(chrome::band(&self.chrome));
         // The strip delegates layout to its content, so its layout node is the
         // column's: one child per project group, which is what the gesture's
         // hit-testing and target index walk.
@@ -6173,7 +6352,7 @@ impl App {
         let sidebar_list = container(sidebar_list)
             .width(Fill)
             .height(Fill)
-            .style(chrome::list);
+            .style(chrome::list(&self.chrome));
         let mut sidebar_column = column![];
         if let Some(header) = sidebar_header {
             sidebar_column = sidebar_column.push(header);
@@ -6186,7 +6365,7 @@ impl App {
             .width(self.live_sidebar_width())
             .height(Fill)
             .padding(iced::Padding::default().right(chrome::DIVIDER_WIDTH))
-            .style(chrome::divider);
+            .style(chrome::divider(&self.chrome));
 
         // The tab bar renders the selected project's tabs, whichever host
         // it lives on — the pills themselves are host-blind, so only the
@@ -6288,7 +6467,7 @@ impl App {
                             // rename editor above.
                             .line_height(iced::widget::text::LineHeight::Absolute(18.0.into(),))
                             .padding([1, 3])
-                            .style(chrome::inline_rename_input)
+                            .style(chrome::inline_rename_input(&self.chrome))
                     ]
                     .spacing(chrome::TAB_PILL_LABEL_SPACING)
                     .align_y(Alignment::Center),
@@ -6303,9 +6482,9 @@ impl App {
                         text(label)
                             .size(chrome::TAB_TITLE_SIZE)
                             .color(if active {
-                                chrome::TEXT
+                                self.chrome.text
                             } else {
-                                chrome::MUTED_TEXT
+                                self.chrome.muted_text
                             })
                             .font(title_font)
                             // Elision measured with Advanced shaping; the
@@ -6338,7 +6517,7 @@ impl App {
                             .width(chrome::NOTIFICATION_DOT_SIZE)
                             .height(chrome::NOTIFICATION_DOT_SIZE),
                     )
-                    .style(chrome::badge),
+                    .style(chrome::badge(&self.chrome)),
                 );
             }
             if active {
@@ -6347,7 +6526,7 @@ impl App {
                         .width(chrome::PILL_HEIGHT)
                         .height(chrome::PILL_HEIGHT)
                         .padding(2)
-                        .style(chrome::close_button)
+                        .style(chrome::close_button(&self.chrome))
                         .on_press(Message::CloseTab(tab_key)),
                 );
             }
@@ -6357,6 +6536,7 @@ impl App {
                 .height(chrome::PILL_HEIGHT)
                 .padding([0.0, chrome::TAB_PILL_PADDING_X])
                 .style(chrome::tab_pill(
+                    &self.chrome,
                     active,
                     self.tab_drag_preview
                         .as_ref()
@@ -6368,13 +6548,18 @@ impl App {
             // dimmed host — falls back to a plain press of its own; a
             // strip disabled because a modal is up leaves its pills
             // press-less exactly as the local strip always has.
-            tab_pills = tab_pills.push(if reorderable_project {
-                Element::from(pill_container)
+            let pill: Element<'_, Message> = if reorderable_project {
+                pill_container.into()
             } else {
                 mouse_area(pill_container)
                     .on_press(Message::TabSelected(tab_key))
                     .into()
-            });
+            };
+            tab_pills = tab_pills.push(ContextPressArea::new(
+                pill,
+                ContextTarget::Tab(tab_key),
+                self.modifiers,
+            ));
         }
         let tab_strip = ReorderStrip::tabs(
             tab_pills,
@@ -6384,11 +6569,11 @@ impl App {
             self.tab_strip_generation,
             self.strip_gestures_enabled() && reorderable_project,
         );
-        let add_tab_button = button(text("+").size(16).color(chrome::MUTED_TEXT))
+        let add_tab_button = button(text("+").size(16).color(self.chrome.muted_text))
             .width(chrome::PILL_HEIGHT)
             .height(chrome::PILL_HEIGHT)
             .padding(1)
-            .style(chrome::transparent_button)
+            .style(chrome::transparent_button(&self.chrome))
             .on_press(Message::NewTab);
         // The `+` is a sibling of the strip — never inside its content, since
         // the strip walks its own layout children for reorder hit-testing and
@@ -6414,7 +6599,7 @@ impl App {
             .height(chrome::BAND_HEIGHT)
             .width(Fill)
             .padding([chrome::BAND_PILL_PADDING_Y, 8.0])
-            .style(chrome::band);
+            .style(chrome::band(&self.chrome));
 
         let terminal: Element<'_, Message> = match self.tabs.get(&active_key) {
             Some(tab) if tab.applied_metrics.is_some() => TerminalWidget {
@@ -6422,6 +6607,7 @@ impl App {
                 snapshot: tab.snapshot.clone(),
                 metrics: tab.applied_metrics.unwrap_or(self.terminal_metrics),
                 metric_generation: tab.metric_generation,
+                pointer_cancel_epoch: self.pointer_cancel_epoch,
                 ime_active: terminal_ime_active(
                     self.keyboard_route(),
                     active_key,
@@ -6452,7 +6638,7 @@ impl App {
             }
         };
         let terminal = match self.terminal_notice() {
-            Some(notice) => with_notice(terminal, notice),
+            Some(notice) => with_notice(&self.chrome, terminal, notice),
             None => terminal,
         };
         let main = column![tab_bar, terminal].width(Fill).height(Fill);
@@ -6466,11 +6652,11 @@ impl App {
             .into()
         };
         let content: Element<'_, Message> = if let Some(line) = self.bottom_line() {
-            let color = bottom_line_color(line.severity);
+            let color = bottom_line_color(&self.chrome, line.severity);
             let toast = container(text(line.text).size(12).color(color))
                 .max_width(520)
                 .padding([8, 12])
-                .style(chrome::status_toast(color));
+                .style(chrome::status_toast(&self.chrome, color));
             let overlay = container(toast)
                 .width(Fill)
                 .height(Fill)
@@ -6498,22 +6684,22 @@ impl App {
             .on_submit(Message::PaletteConfirm)
             .padding([4, 8])
             .size(17)
-            .style(chrome::palette_input);
+            .style(chrome::palette_input(&self.chrome));
         let mut items = column![].spacing(0);
         for (index, matched) in palette.matches().into_iter().enumerate() {
             let selected = index == frame.selection;
             let item = matched.item;
             let actionable = item.actionable;
             let primary_color = if actionable {
-                chrome::TEXT
+                self.chrome.text
             } else {
-                chrome::PALETTE_PLACEHOLDER.scale_alpha(0.6)
+                self.chrome.palette_placeholder.scale_alpha(0.6)
             };
             let label: Element<'_, Message> = if let Some(agent) = item.agent {
                 let lifecycle_color = if actionable {
                     agent_color(agent.effective_lifecycle)
                 } else {
-                    chrome::PALETTE_PLACEHOLDER.scale_alpha(0.6)
+                    self.chrome.palette_placeholder.scale_alpha(0.6)
                 };
                 let dot =
                     container(iced::widget::Space::new().width(8).height(8)).style(move |_| {
@@ -6525,7 +6711,7 @@ impl App {
                 // row can't be activated — `primary_color` is already
                 // the dimmed shade in that case.
                 let muted_color = if actionable {
-                    chrome::MUTED_TEXT
+                    self.chrome.muted_text
                 } else {
                     primary_color
                 };
@@ -6544,13 +6730,13 @@ impl App {
                         text(metrics)
                             .size(12)
                             .font(Font::MONOSPACE)
-                            .color(chrome::MUTED_TEXT),
+                            .color(self.chrome.muted_text),
                     )
                     .push(
                         text(agent.time_text)
                             .size(12)
                             .font(Font::MONOSPACE)
-                            .color(chrome::MUTED_TEXT),
+                            .color(self.chrome.muted_text),
                     )
                     .into()
             } else {
@@ -6559,7 +6745,7 @@ impl App {
                     .map(|run| {
                         let mut span = iced::widget::span::<(), Font>(run.text).color(
                             if run.matched && actionable {
-                                chrome::PALETTE_MATCH
+                                self.chrome.palette_match
                             } else {
                                 primary_color
                             },
@@ -6579,7 +6765,7 @@ impl App {
                     leading = leading.push(
                         text(subtitle)
                             .size(12)
-                            .color(chrome::PALETTE_PLACEHOLDER)
+                            .color(self.chrome.palette_placeholder)
                             .wrapping(iced::widget::text::Wrapping::None),
                     );
                 }
@@ -6588,7 +6774,7 @@ impl App {
                     generic = generic.push(
                         text(trailing)
                             .size(12)
-                            .color(chrome::PALETTE_PLACEHOLDER)
+                            .color(self.chrome.palette_placeholder)
                             .wrapping(iced::widget::text::Wrapping::None),
                     );
                 }
@@ -6597,7 +6783,7 @@ impl App {
             let row = button(label)
                 .width(Fill)
                 .padding([6.0, chrome::PALETTE_ROW_PADDING_X])
-                .style(chrome::palette_row(selected, actionable));
+                .style(chrome::palette_row(&self.chrome, selected, actionable));
             let row = if actionable {
                 row.on_press(Message::PaletteActivate(item.id))
             } else {
@@ -6637,7 +6823,7 @@ impl App {
             .height(Shrink)
             .max_height(chrome::PALETTE_MAX_HEIGHT)
             .padding(chrome::PALETTE_PANEL_PADDING)
-            .style(chrome::palette_panel);
+            .style(chrome::palette_panel(&self.chrome));
         let overlay = container(mouse_area(panel).on_press(Message::PaletteCardPressed))
             .width(Fill)
             .height(Fill)
@@ -6748,9 +6934,15 @@ impl App {
     }
 
     pub fn new_tab(&mut self) -> UiTask {
+        self.new_tab_in(self.active_project_key(), Some(self.active_tab_key()))
+    }
+
+    /// ⌘T's gesture on `project`, opened from `source` (see
+    /// [`Self::open_tab_in`]).
+    pub(super) fn new_tab_in(&mut self, project: ProjectKey, source: Option<TabKey>) -> UiTask {
         self.cancel_drags();
         self.cancel_editor_for_interaction();
-        let dispatch = self.new_tab_dispatch();
+        let dispatch = self.open_tab_in(project, source, String::new(), Vec::new());
         self.arm_pending_keyboard(&dispatch);
         dispatch.task
     }
@@ -6776,21 +6968,43 @@ impl App {
     /// creation built from it fails `ProjectNotFound` while a slot tab
     /// is plainly selected.
     fn open_tab_here(&mut self, title: String, argv: Vec<String>) -> EngineDispatch {
-        let project = self.active_project_key();
+        let (project, source) = (self.active_project_key(), self.active_tab_key());
+        self.open_tab_in(project, Some(source), title, argv)
+    }
+
+    /// Open a tab in `project`, active or not, starting where `source`
+    /// is — the foreground job's directory, then the shell's, then OSC 7
+    /// — or in the project's cwd when no source is named.
+    ///
+    /// A creation like any other: the dispatch carries its op, so a
+    /// gesture can arm the pending keyboard on it, and the new tab takes
+    /// the selection when the engine (locally) or the mirror (on a host)
+    /// confirms it.
+    fn open_tab_in(
+        &mut self,
+        project: ProjectKey,
+        source: Option<TabKey>,
+        title: String,
+        argv: Vec<String>,
+    ) -> EngineDispatch {
         match creation_route(self.local_backend, project.host) {
-            CreationRoute::Host(_) => return self.open_host_tab_dispatch(project, title, argv),
+            CreationRoute::Host(_) => {
+                return self.open_host_tab_dispatch(project, source, title, argv)
+            }
             CreationRoute::NoLocalBackend => {
                 self.no_local_backend();
                 return EngineDispatch::default();
             }
             CreationRoute::Local => {}
         }
-        let (project_id, _) = self.workspace.active();
-        if project_id == 0 {
+        if project.project == 0 {
             return EngineDispatch::default();
         }
-        let cwd = self.launch_cwd();
-        self.open_tab_dispatch(project_id, cwd, title, argv)
+        let cwd = source
+            .and_then(TabKey::local_tab)
+            .map(|tab| local_launch_cwd(&self.workspace, &self.client.supervisor, tab))
+            .unwrap_or_default();
+        self.open_tab_dispatch(project.project, cwd, title, argv)
     }
 
     /// What a creation addressed at the local workspace answers under
@@ -6810,6 +7024,7 @@ impl App {
     fn open_host_tab_dispatch(
         &mut self,
         project: ProjectKey,
+        source: Option<TabKey>,
         title: String,
         argv: Vec<String>,
     ) -> EngineDispatch {
@@ -6821,7 +7036,7 @@ impl App {
         };
         let origin = host_tab_origin(
             project,
-            self.active_tab_key(),
+            source,
             self.host_project_row(project).map(|(_, row)| row),
         );
         let grid = self.current_grid();
@@ -7029,27 +7244,7 @@ impl App {
         self.cancel_drags();
         self.cancel_editor_for_interaction();
         self.dismiss_palette_with_focus_recovery();
-        // The modal drops pointer events, so a held terminal button would
-        // never see its release: settle every tab's pointer state (synthetic
-        // release into tracking PTYs) before the modal owns input.
-        for (key, tab) in &mut self.tabs {
-            match tab.prepare_pointer_cancel() {
-                Ok(release) => {
-                    tab.commit_pointer_cancel(release);
-                    // The cancel drops hover, so the link underline and
-                    // pointer shape the snapshot carries are decorations
-                    // for a gesture that no longer exists.
-                    refresh_or_warn(key.tab, tab, "pointer cancel before delete confirm");
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        ?error,
-                        tab_id = key.tab,
-                        "pointer cancel before delete confirm"
-                    )
-                }
-            }
-        }
+        self.cancel_terminal_pointers("pointer cancel before delete confirm");
         self.confirm_delete = Some(target);
         self.cancel_ime_composition();
         Ok(())
@@ -7057,6 +7252,35 @@ impl App {
 
     fn cancel_confirm_delete(&mut self) {
         self.confirm_delete = None;
+    }
+
+    /// Settle every tab's pointer state — a synthetic release into a
+    /// tracking PTY — before a surface that drops pointer events takes
+    /// input: a held terminal button would never see its own release.
+    fn cancel_terminal_pointers(&mut self, reason: &'static str) {
+        let active = self.active_tab_key();
+        let mut active_released = true;
+        for (key, tab) in &mut self.tabs {
+            match tab.prepare_pointer_cancel() {
+                Ok(release) => {
+                    tab.commit_pointer_cancel(release);
+                    // The cancel drops hover, so the link underline and
+                    // pointer shape the snapshot carries are decorations
+                    // for a gesture that no longer exists.
+                    refresh_or_warn(key.tab, tab, reason);
+                }
+                Err(error) => {
+                    active_released &= *key != active;
+                    tracing::warn!(?error, tab_id = key.tab, "{reason}");
+                }
+            }
+        }
+        // The rendered widget drops its held button only when the active
+        // tab's tracking owner really was released; otherwise its next
+        // press would reach the PTY with no release before it.
+        if active_released {
+            self.pointer_cancel_epoch = self.pointer_cancel_epoch.wrapping_add(1);
+        }
     }
 
     /// The overlay is dismissed here, at the confirm, exactly as it was
@@ -9424,7 +9648,7 @@ impl App {
     /// Mirrors the Mac's priority: the active tab's cwd — which OSC 7 keeps
     /// current through `Workspace::set_tab_cwd` — falling back to the
     /// project's static cwd before a tab has reported one. The native
-    /// foreground-process lookup `launch_cwd` uses is deliberately not
+    /// foreground-process lookup `local_launch_cwd` uses is deliberately not
     /// consulted here: this runs every batch, and the Mac subtitle tracks
     /// OSC 7 only.
     pub fn window_title(&self, home: &str) -> String {
@@ -9462,23 +9686,13 @@ impl App {
             .map(|row| (row.name.as_str(), listed_tab_cwd(row, tab.tab)));
         compose_window_title(self.title_fallback, named, host, home)
     }
-
-    /// The cwd a new in-process tab launches in: the active tab's, else
-    /// empty, which the open resolves to the project's.
-    ///
-    /// Local only: `open_tab_here` sends a creation on a host project,
-    /// ⌘T and launcher row alike, to `open_host_tab_dispatch` first.
-    fn launch_cwd(&self) -> String {
-        local_launch_cwd(&self.workspace, &self.client.supervisor)
-    }
 }
 
-/// [`App::launch_cwd`] without an `App` to build. It is `tab.open`'s
-/// `cwd_from_tab` resolver, so a new tab lands by one rule in-process
-/// and on a session.
-fn local_launch_cwd(workspace: &Workspace, supervisor: &PtySupervisor) -> String {
-    roost_engine::application::inherited_cwd(workspace, supervisor, workspace.active().1)
-        .unwrap_or_default()
+/// Where a new in-process tab opened from `tab` starts, without an `App`
+/// to build. It is `tab.open`'s `cwd_from_tab` resolver, so a new tab
+/// lands by one rule in-process and on a session.
+fn local_launch_cwd(workspace: &Workspace, supervisor: &PtySupervisor, tab: i64) -> String {
+    roost_engine::application::inherited_cwd(workspace, supervisor, tab).unwrap_or_default()
 }
 
 /// Which question a confirmed restart prompt was asking — the two
@@ -12106,7 +12320,7 @@ mod tests {
         };
 
         assert_eq!(
-            host_tab_origin(project, TabKey::new(host, 7), Some(&row)),
+            host_tab_origin(project, Some(TabKey::new(host, 7)), Some(&row)),
             HostTabOrigin {
                 cwd: "/srv/where-7-is".into(),
                 cwd_from_tab: Some(7),
@@ -12114,14 +12328,19 @@ mod tests {
             "the session resolves tab 7, and its mirror cwd is the fallback"
         );
         assert_eq!(
-            host_tab_origin(project, TabKey::new(HostId::new(4), 7), Some(&row)),
+            host_tab_origin(project, Some(TabKey::new(HostId::new(4), 7)), Some(&row)),
             project_only,
             "tab 7 of another host is not this host's tab 7"
         );
         assert_eq!(
-            host_tab_origin(project, TabKey::local(7), Some(&row)),
+            host_tab_origin(project, Some(TabKey::local(7)), Some(&row)),
             project_only,
             "an in-process tab's path means nothing on the host"
+        );
+        assert_eq!(
+            host_tab_origin(project, None, Some(&row)),
+            project_only,
+            "a project row's New Tab names no tab"
         );
     }
 
@@ -12135,14 +12354,14 @@ mod tests {
         row.tabs = vec![listed_tab(7, 42, "")];
 
         assert_eq!(
-            host_tab_origin(project, TabKey::new(host, 7), Some(&row)),
+            host_tab_origin(project, Some(TabKey::new(host, 7)), Some(&row)),
             HostTabOrigin {
                 cwd: row.cwd.clone(),
                 cwd_from_tab: Some(7),
             }
         );
         assert_eq!(
-            host_tab_origin(project, TabKey::new(host, 7), None),
+            host_tab_origin(project, Some(TabKey::new(host, 7)), None),
             HostTabOrigin {
                 cwd: String::new(),
                 cwd_from_tab: Some(7),
@@ -12425,7 +12644,7 @@ mod tests {
         let _child = child_in(&supervisor, tab, dir.path());
 
         assert_eq!(
-            local_launch_cwd(&workspace, &supervisor),
+            local_launch_cwd(&workspace, &supervisor, tab),
             canonical(dir.path())
         );
     }
@@ -12440,11 +12659,34 @@ mod tests {
         let _child = child_in(&supervisor, tab, native.path());
 
         assert_eq!(
-            local_launch_cwd(&workspace, &supervisor),
+            local_launch_cwd(&workspace, &supervisor, tab),
             canonical(native.path()),
             "the child's cwd must win over the row's {}",
             tracked.path().display()
         );
+    }
+
+    /// `open_tab_in`'s New Tab Here (plan 073 D9): a tab in a project
+    /// that is not on screen starts where *that* tab is, and asking does
+    /// not move the selection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_tab_from_an_inactive_projects_tab_starts_where_that_tab_is() {
+        let (shown_dir, source_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (workspace, shown) = workspace_tracking(shown_dir.path());
+        let other = workspace.create_project("q", "/").unwrap().id;
+        let source = workspace
+            .open_tab(other, &source_dir.path().to_string_lossy(), "", false)
+            .unwrap()
+            .id;
+        let supervisor = Arc::new(PtySupervisor::new());
+        let _shown = child_in(&supervisor, shown, shown_dir.path());
+        let _source = child_in(&supervisor, source, source_dir.path());
+
+        assert_eq!(
+            local_launch_cwd(&workspace, &supervisor, source),
+            canonical(source_dir.path())
+        );
+        assert_eq!(workspace.active().1, shown);
     }
 
     #[test]
@@ -12679,38 +12921,123 @@ mod tests {
     #[test]
     fn keyboard_route_requires_a_live_terminal_and_gives_editor_precedence() {
         assert_eq!(
-            resolve_keyboard_route(false, false, false, false, false, TabKey::local(7), false),
+            resolve_keyboard_route(
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                TabKey::local(7),
+                false
+            ),
             KeyboardRoute::None
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, false, false, false, TabKey::local(7), true),
+            resolve_keyboard_route(
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                TabKey::local(7),
+                true
+            ),
             KeyboardRoute::Terminal(TabKey::local(7))
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, false, true, false, TabKey::local(7), true),
+            resolve_keyboard_route(
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                TabKey::local(7),
+                true
+            ),
             KeyboardRoute::Palette
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, true, true, false, TabKey::local(7), true),
+            resolve_keyboard_route(
+                false,
+                false,
+                true,
+                false,
+                true,
+                false,
+                TabKey::local(7),
+                true
+            ),
             KeyboardRoute::Editor
         );
         // A host dialog owns the keyboard over the editor and the
         // palette, both of which it dismisses on the way up (plan 037
         // §3.1) — and yields only to the delete confirmation.
         assert_eq!(
-            resolve_keyboard_route(false, true, true, true, false, TabKey::local(7), true),
+            resolve_keyboard_route(
+                false,
+                true,
+                true,
+                false,
+                true,
+                false,
+                TabKey::local(7),
+                true
+            ),
             KeyboardRoute::HostDialog
         );
         // An open confirm outranks every other surface, so no keystroke can
         // reach an accelerator or the active PTY while it is up.
         assert_eq!(
-            resolve_keyboard_route(true, true, true, true, false, TabKey::local(7), true),
+            resolve_keyboard_route(true, true, true, false, true, false, TabKey::local(7), true),
             KeyboardRoute::Confirm
         );
         assert_eq!(
-            resolve_keyboard_route(true, false, false, false, false, TabKey::local(7), true),
+            resolve_keyboard_route(
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                TabKey::local(7),
+                true
+            ),
             KeyboardRoute::Confirm
         );
+    }
+
+    /// The right-click menu takes every key over the palette, the
+    /// pending tab and the terminal — and none from a surface that would
+    /// have closed it on the way up.
+    #[test]
+    fn an_open_context_menu_outranks_the_palette_and_the_terminal() {
+        let tab = TabKey::local(7);
+        for (palette, pending, live) in [
+            (false, false, true),
+            (true, false, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            assert_eq!(
+                resolve_keyboard_route(false, false, false, true, palette, pending, tab, live),
+                KeyboardRoute::ContextMenu
+            );
+        }
+        for (confirm, dialog, editor, route) in [
+            (true, false, false, KeyboardRoute::Confirm),
+            (false, true, false, KeyboardRoute::HostDialog),
+            (false, false, true, KeyboardRoute::Editor),
+        ] {
+            assert_eq!(
+                resolve_keyboard_route(confirm, dialog, editor, true, false, false, tab, true),
+                route
+            );
+        }
+        assert_eq!(ime_preedit_target(KeyboardRoute::ContextMenu), None);
+        assert!(!terminal_cursor_focused(KeyboardRoute::ContextMenu, true));
     }
 
     /// A new tab that is opening takes the keys over the live terminal
@@ -12720,11 +13047,11 @@ mod tests {
     fn a_pending_tab_outranks_the_terminal_but_no_modal() {
         let tab = TabKey::local(7);
         assert_eq!(
-            resolve_keyboard_route(false, false, false, false, true, tab, true),
+            resolve_keyboard_route(false, false, false, false, false, true, tab, true),
             KeyboardRoute::Pending
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, false, false, true, tab, false),
+            resolve_keyboard_route(false, false, false, false, false, true, tab, false),
             KeyboardRoute::Pending
         );
         for (confirm, dialog, editor, palette, route) in [
@@ -12734,7 +13061,7 @@ mod tests {
             (false, false, false, true, KeyboardRoute::Palette),
         ] {
             assert_eq!(
-                resolve_keyboard_route(confirm, dialog, editor, palette, true, tab, true),
+                resolve_keyboard_route(confirm, dialog, editor, false, palette, true, tab, true),
                 route
             );
         }
@@ -12818,6 +13145,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 host,
                 active_terminal_live(true, false)
             ),
@@ -12828,6 +13156,7 @@ mod tests {
             resolve_keyboard_route(
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -13098,6 +13427,10 @@ mod tests {
             "the delete confirmation outlives an unfocus — dropping it read as a crash"
         );
         assert!(unfocus.drags, "a drag cannot continue under another window");
+        assert!(
+            unfocus.context_menu,
+            "a click into another app dismisses the menu"
+        );
         assert!(unfocus.rename_completion_key);
         assert!(unfocus.ime_composition);
         assert!(!unfocus.ime_discard);
@@ -13351,6 +13684,31 @@ mod tests {
         assert_eq!(
             bindings.get(&keybind::parse_trigger("ctrl+alt+v").unwrap()),
             Some(&KeybindAction::Paste)
+        );
+    }
+
+    /// `EngineFeed::AccentChanged` is macOS-only, so its effect is pinned
+    /// through the function its drain arm and bootstrap share.
+    #[test]
+    fn an_os_accent_change_rebuilds_the_chrome_only_under_system() {
+        let purple = Color::from_rgb8(0xa5, 0x50, 0xa7);
+        assert_eq!(
+            chrome_palette_for(ChromeAccent::System, purple),
+            ChromePalette::roost_dark(purple),
+            "`system` follows the OS accent"
+        );
+
+        let pinned = ChromeAccent::Rgb([0xa1, 0xb2, 0xc3]);
+        let at_bootstrap = chrome_palette_for(pinned, chrome::DEFAULT_ACCENT);
+        assert_eq!(
+            chrome_palette_for(pinned, purple),
+            at_bootstrap,
+            "an explicit hex is deaf to the OS accent"
+        );
+        assert_eq!(
+            at_bootstrap,
+            ChromePalette::roost_dark(Color::from_rgb8(0xa1, 0xb2, 0xc3)),
+            "and draws its own color"
         );
     }
 

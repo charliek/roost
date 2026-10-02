@@ -54,6 +54,17 @@ pub enum KeybindAction {
     /// spending an accelerator on it would cost one the user could give
     /// to something they do every day.
     AgentHooks,
+    /// Open `config.conf` in the default text editor, creating it first
+    /// when missing. Default `super+comma` on macOS (the platform's
+    /// Settings chord), unbound on Linux, where there is no menu bar to
+    /// advertise it and the palette reaches it by name.
+    OpenConfig,
+    /// Open the documentation site in the default browser. Default
+    /// unbound: a palette-and-menu action, not a daily one.
+    OpenDocs,
+    /// Toggle the window's full-screen mode. Default `ctrl+super+f` on
+    /// macOS; unbound on Linux, where F11 stays with terminal programs.
+    ToggleFullScreen,
     /// Browser-style font sizing on the active tab's terminal.
     /// Defaults to `primary+plus`/`primary+equal` (both are bound
     /// because `Cmd-+` on US layouts is really `Cmd-Shift-=` and
@@ -63,7 +74,7 @@ pub enum KeybindAction {
     /// Default `primary+minus`.
     FontDecrease,
     /// Default `primary+0`. Resets to the config-file default
-    /// (or `cell_metrics::DEFAULT_FONT_SIZE_PT` if no config).
+    /// (or `typography::DEFAULT_FONT_SIZE_PT` if no config).
     FontReset,
     /// Open the command palette (VS Code / Zed–style `Cmd+Shift+P`
     /// overlay). Default `projectMod+shift+p` — Cmd+Shift+P on
@@ -121,6 +132,9 @@ impl KeybindAction {
             "toggle_sidebar" => Some(Self::ToggleSidebar),
             "toggle_sidebar_agents" => Some(Self::ToggleSidebarAgents),
             "agent_hooks" => Some(Self::AgentHooks),
+            "open_config" => Some(Self::OpenConfig),
+            "open_docs" => Some(Self::OpenDocs),
+            "toggle_fullscreen" => Some(Self::ToggleFullScreen),
             "font_increase" => Some(Self::FontIncrease),
             "font_decrease" => Some(Self::FontDecrease),
             "font_reset" => Some(Self::FontReset),
@@ -169,6 +183,9 @@ impl KeybindAction {
             Self::ToggleSidebar => "toggle_sidebar".into(),
             Self::ToggleSidebarAgents => "toggle_sidebar_agents".into(),
             Self::AgentHooks => "agent_hooks".into(),
+            Self::OpenConfig => "open_config".into(),
+            Self::OpenDocs => "open_docs".into(),
+            Self::ToggleFullScreen => "toggle_fullscreen".into(),
             Self::FontIncrease => "font_increase".into(),
             Self::FontDecrease => "font_decrease".into(),
             Self::FontReset => "font_reset".into(),
@@ -451,6 +468,14 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
         KeybindAction::NewProjectOnHost,
     );
 
+    // Settings (⌘,) and full screen (⌃⌘F) are the macOS conventions.
+    // Linux binds neither: there is no menu bar to advertise them, and F11
+    // belongs to terminal programs; the palette reaches both by name.
+    if cfg!(target_os = "macos") {
+        add(&mut out, "super+comma", KeybindAction::OpenConfig);
+        add(&mut out, "ctrl+super+f", KeybindAction::ToggleFullScreen);
+    }
+
     // Browser-style font sizing on the active terminal. `Cmd-+` on
     // US layouts is really `Cmd-Shift-=`, and many users hit `Cmd-=`
     // without shift; bind both for FontIncrease.
@@ -615,6 +640,9 @@ mod tests {
             KeybindAction::ToggleSidebar,
             KeybindAction::ToggleSidebarAgents,
             KeybindAction::AgentHooks,
+            KeybindAction::OpenConfig,
+            KeybindAction::OpenDocs,
+            KeybindAction::ToggleFullScreen,
             KeybindAction::FontIncrease,
             KeybindAction::FontDecrease,
             KeybindAction::FontReset,
@@ -1034,6 +1062,24 @@ mod tests {
             defaults.get(&trigger),
             Some(&KeybindAction::ToggleSidebarAgents)
         );
+    }
+
+    #[test]
+    fn open_config_docs_and_fullscreen_defaults_are_per_os() {
+        let defaults: HashMap<_, _> = default_bindings().into_iter().collect();
+        let bound = |trigger: &str| defaults.get(&parse_trigger(trigger).unwrap()).copied();
+        if cfg!(target_os = "macos") {
+            assert_eq!(bound("super+comma"), Some(KeybindAction::OpenConfig));
+            assert_eq!(bound("ctrl+super+f"), Some(KeybindAction::ToggleFullScreen));
+        } else {
+            assert!(!defaults.values().any(|action| matches!(
+                action,
+                KeybindAction::OpenConfig | KeybindAction::ToggleFullScreen
+            )));
+        }
+        assert!(!defaults
+            .values()
+            .any(|action| *action == KeybindAction::OpenDocs));
     }
 
     #[test]

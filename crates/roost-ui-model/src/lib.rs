@@ -5,6 +5,7 @@
 pub mod agent_palette;
 pub mod bracketed_paste;
 pub mod config;
+pub mod context_menu;
 pub mod custom_command;
 pub mod drop_content;
 pub mod file_transfer;

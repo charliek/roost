@@ -9,7 +9,7 @@
 use std::ptr;
 
 use crate::sys;
-use crate::{Error, Result, Terminal};
+use crate::{Error, OptionAsAlt, Result, Terminal};
 
 /// Re-export of the bindgen-generated key enum. Roughly 177 variants
 /// covering letters, digits, function keys, navigation, numpad,
@@ -35,6 +35,9 @@ pub mod mods {
     pub const SUPER: u16 = sys::GHOSTTY_MODS_SUPER as u16;
     pub const CAPS_LOCK: u16 = sys::GHOSTTY_MODS_CAPS_LOCK as u16;
     pub const NUM_LOCK: u16 = sys::GHOSTTY_MODS_NUM_LOCK as u16;
+    /// Set when the held Alt is the right one; meaningful only with
+    /// [`ALT`].
+    pub const ALT_SIDE: u16 = sys::GHOSTTY_MODS_ALT_SIDE as u16;
 }
 
 /// Key-action constants for [`KeyAction`].
@@ -160,6 +163,27 @@ impl KeyEncoder {
         unsafe { sys::ghostty_key_encoder_setopt_from_terminal(self.handle, terminal.handle()) };
     }
 
+    /// Set which Option keys libghostty's macOS build treats as Alt.
+    /// The terminal holds no such mode, so [`Self::sync_from_terminal`]
+    /// resets this to [`OptionAsAlt::False`]: set it after every sync.
+    pub fn set_macos_option_as_alt(&mut self, value: OptionAsAlt) {
+        let value: sys::GhosttyOptionAsAlt = match value {
+            OptionAsAlt::False => sys::GhosttyOptionAsAlt_GHOSTTY_OPTION_AS_ALT_FALSE,
+            OptionAsAlt::True => sys::GhosttyOptionAsAlt_GHOSTTY_OPTION_AS_ALT_TRUE,
+            OptionAsAlt::Left => sys::GhosttyOptionAsAlt_GHOSTTY_OPTION_AS_ALT_LEFT,
+            OptionAsAlt::Right => sys::GhosttyOptionAsAlt_GHOSTTY_OPTION_AS_ALT_RIGHT,
+        };
+        // SAFETY: handle non-null; libghostty reads one
+        // `GhosttyOptionAsAlt` through the pointer before returning.
+        unsafe {
+            sys::ghostty_key_encoder_setopt(
+                self.handle,
+                sys::GhosttyKeyEncoderOption_GHOSTTY_KEY_ENCODER_OPT_MACOS_OPTION_AS_ALT,
+                (&value as *const sys::GhosttyOptionAsAlt).cast(),
+            )
+        };
+    }
+
     /// Encode a key event to VT bytes. Returns an empty slice for
     /// no-output events (modifier-only press, IME dead key). The
     /// returned `Vec<u8>` is a fresh allocation; if you need to avoid
@@ -221,5 +245,70 @@ impl Drop for KeyEncoder {
     fn drop(&mut self) {
         // SAFETY: handle non-null per constructor.
         unsafe { sys::ghostty_key_encoder_free(self.handle) };
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use crate::TerminalOptions;
+
+    /// A legacy-mode terminal (DEC 1036, alt-sends-escape, on by default)
+    /// and an encoder synced to it, as production syncs before each press.
+    fn synced() -> (Terminal, KeyEncoder) {
+        let terminal = Terminal::new(TerminalOptions {
+            cols: 80,
+            rows: 24,
+            max_scrollback: 0,
+            ..Default::default()
+        })
+        .expect("terminal");
+        let mut encoder = KeyEncoder::new().expect("encoder");
+        encoder.sync_from_terminal(&terminal);
+        (terminal, encoder)
+    }
+
+    /// ⌥B the way the iced UI builds it once Option counts as Alt: the
+    /// unmodified `b`, with ALT left out of the consumed mods.
+    fn option_b(held: Mods) -> KeyEvent {
+        let mut event = KeyEvent::new().expect("event");
+        event
+            .set_action(key_action::PRESS)
+            .set_key(sys::GhosttyKey_GHOSTTY_KEY_B)
+            .set_mods(held)
+            .set_consumed_mods(mods::SHIFT)
+            .set_composing(false)
+            .set_unshifted_codepoint(u32::from('b'))
+            .set_utf8(b"b");
+        event
+    }
+
+    #[test]
+    fn option_as_alt_sends_option_b_as_meta() {
+        let (_terminal, mut encoder) = synced();
+        encoder.set_macos_option_as_alt(OptionAsAlt::True);
+        assert_eq!(encoder.encode(&option_b(mods::ALT)).unwrap(), b"\x1bb");
+    }
+
+    #[test]
+    fn left_option_as_alt_leaves_the_right_option_a_text_modifier() {
+        let (_terminal, mut encoder) = synced();
+        encoder.set_macos_option_as_alt(OptionAsAlt::Left);
+        assert_eq!(
+            encoder
+                .encode(&option_b(mods::ALT | mods::ALT_SIDE))
+                .unwrap(),
+            b"b"
+        );
+        assert_eq!(encoder.encode(&option_b(mods::ALT)).unwrap(), b"\x1bb");
+    }
+
+    /// Why the iced UI sets the option after every sync, not once.
+    #[test]
+    fn a_sync_resets_option_as_alt() {
+        let (terminal, mut encoder) = synced();
+        encoder.set_macos_option_as_alt(OptionAsAlt::True);
+        encoder.sync_from_terminal(&terminal);
+        assert_eq!(encoder.encode(&option_b(mods::ALT)).unwrap(), b"b");
     }
 }

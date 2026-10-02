@@ -1,9 +1,11 @@
 mod app;
 mod chrome;
 mod config_writer;
+mod context_press;
 mod engine_feed;
 mod focus_probe;
 mod font_registry;
+mod fonts;
 /// Host sessions, client side (plan 037): one connection owner per
 /// connected `roost-session`, publishing onto the engine feed.
 mod host_conn;
@@ -37,6 +39,7 @@ use roost_engine::single_instance;
 use roost_ipc::messages::ops;
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::IpcClient;
+use roost_ui_model::context_menu::{ContextAction, ContextTarget};
 use roost_ui_model::file_transfer::Candidate;
 use roost_ui_model::keys::{HostId, ProjectKey, TabKey};
 use tracing_subscriber::layer::SubscriberExt;
@@ -78,6 +81,7 @@ enum Message {
     PendingSelectionTick,
     /// A file-drop debounce window elapsed — a one-shot, not a timer.
     FileDropDeadline,
+    FullScreenSettled(u64),
     /// The background resize wave may be due — a one-shot, not a timer.
     BackgroundResizeDeadline,
     WindowOpened(window::Id),
@@ -89,14 +93,21 @@ enum Message {
         value: Option<String>,
     },
     ClipboardWriteCompleted(u64),
+    /// A paste's file-list read finished (`UiTask::ClipboardReadFiles`).
+    ClipboardFilesRead {
+        request_id: u64,
+        result: Result<Vec<std::path::PathBuf>, paste_image::ProbeError>,
+    },
     /// A clipboard image probe finished — a temp PNG's path for a local
     /// tab, the encoded bytes for a host one, or why neither happened.
     ///
     /// `tab` is the tab whose paste asked for it, host-qualified: the
     /// probe blocks, so this is a delayed callback and its target must
     /// not be reinterpreted against whatever id-space is live when it
-    /// lands.
+    /// lands. `request_id` is the paste's, whose hold on the clipboard
+    /// queue this ends.
     PasteImageMaterialized {
+        request_id: u64,
         tab: TabKey,
         result: Result<paste_image::Materialized, paste_image::ProbeError>,
     },
@@ -115,6 +126,8 @@ enum Message {
         result: host_conn::UploadResult,
     },
     UrlOpenCompleted(Result<(), String>),
+    FileOpenCompleted(Result<(), String>),
+    FullScreenMode(window::Mode),
     Keyboard(keyboard::Event),
     /// A platform input-method event the terminal widget claimed. The
     /// app-level `event::listen_with` below only forwards keyboard
@@ -122,6 +135,10 @@ enum Message {
     Ime(input_method::Event),
     CapturedEscape,
     CapturedEnterRelease,
+    /// A captured event that moves which Option keys are down: the
+    /// Option sides follow every Alt key event, not only the ones no
+    /// widget claimed.
+    CapturedOptionKey(keyboard::Event),
     TerminalPointer(terminal_widget::TerminalPointer),
     WindowFileDropped {
         window_id: window::Id,
@@ -222,6 +239,21 @@ enum Message {
     ConfirmDeleteCancel,
     ConfirmDeleteConfirm,
     ConfirmDeleteCardPressed,
+    /// A right-click on a row (`ContextPressArea`), in window
+    /// coordinates.
+    ContextMenuRequested {
+        target: ContextTarget,
+        at: iced::Point,
+    },
+    /// The pointer moved onto the open menu's row at this index, or
+    /// (`None`) off the menu.
+    ContextMenuHovered(Option<usize>),
+    ContextMenuChosen(ContextAction),
+    /// A press outside the open menu.
+    ContextMenuDismiss,
+    /// A press on the menu panel itself, between its rows. Swallowed, so
+    /// it does not reach the dismiss underneath.
+    ContextMenuPanelPressed,
     SidebarResizeDragged {
         width: f32,
     },
@@ -334,6 +366,8 @@ const PACKAGED_PLATFORM: bool = cfg!(target_os = "linux");
 const HOST_MACOS: bool = cfg!(target_os = "macos");
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    macos::menu::suppress_appkit_full_screen_item();
     let bundle_id = main_bundle_identifier();
     let profile = BundleProfile::resolve(host_default_kind(
         PACKAGED,
@@ -488,9 +522,12 @@ fn window_settings(profile: &BundleProfile) -> window::Settings {
 /// transition passes through some message, and only one of them is the
 /// one that moved it. So does the terminal notice's generation, which
 /// must see a notice that went away before it comes back, and the local
-/// session's background resize wave, whose triggers are as scattered.
+/// session's background resize wave, whose triggers are as scattered. And
+/// so does the context menu's close, which follows whatever took input
+/// from it or removed its row, by any path.
 fn update(app: &mut App, message: Message) -> Task<Message> {
     let dispatched = dispatch(app, message);
+    app.observe_context_menu();
     app.sync_menu_gating();
     app.observe_notice();
     Task::batch([
@@ -526,6 +563,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::FileDropDeadline => app.file_drop_deadline().map_task(),
+        Message::FullScreenSettled(generation) => app.full_screen_settled(generation).map_task(),
         Message::BackgroundResizeDeadline => {
             app.background_resize_deadline();
             Task::none()
@@ -535,7 +573,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         Message::WindowFocus(id, focused) => {
             let task = app.window_opened(id).map_task();
             app.set_window_focus(focused);
-            task
+            task.chain(app.query_full_screen().map_task())
         }
         Message::ScreenshotCaptured(capture) => app.screenshot_captured(&capture).map_task(),
         Message::ClipboardReadCompleted { request_id, value } => {
@@ -544,9 +582,16 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         Message::ClipboardWriteCompleted(request_id) => {
             app.clipboard_write_completed(request_id).map_task()
         }
-        Message::PasteImageMaterialized { tab, result } => {
-            app.paste_image_materialized(tab, result).map_task()
+        Message::ClipboardFilesRead { request_id, result } => {
+            app.clipboard_files_read(request_id, result).map_task()
         }
+        Message::PasteImageMaterialized {
+            request_id,
+            tab,
+            result,
+        } => app
+            .paste_image_materialized(request_id, tab, result)
+            .map_task(),
         Message::FilesInspected { id, result } => app.files_inspected(id, result).map_task(),
         Message::UploadSettled {
             host,
@@ -554,7 +599,10 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             index,
             result,
         } => app.upload_settled(host, gesture, index, result).map_task(),
-        Message::Keyboard(event) => app.keyboard(event).map_task(),
+        Message::Keyboard(event) => {
+            app.observe_option_key(&event);
+            app.keyboard(event).map_task()
+        }
         Message::Ime(event) => {
             match event {
                 // A session boundary cannot carry an older composition
@@ -566,6 +614,10 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
                 input_method::Event::Preedit(text, cursor) => app.ime_preedit(text, cursor),
                 input_method::Event::Commit(text) => app.ime_commit(&text),
             }
+            Task::none()
+        }
+        Message::CapturedOptionKey(event) => {
+            app.observe_option_key(&event);
             Task::none()
         }
         Message::CapturedEscape => app.captured_escape().map_task(),
@@ -583,6 +635,14 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::UrlOpenCompleted(result) => {
             app.url_open_completed(result);
+            Task::none()
+        }
+        Message::FileOpenCompleted(result) => {
+            app.file_open_completed(result);
+            Task::none()
+        }
+        Message::FullScreenMode(mode) => {
+            app.full_screen_mode(mode);
             Task::none()
         }
         Message::TerminalPointer(event) => match event {
@@ -627,7 +687,22 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         Message::PaletteActivate(id) => app.palette_activate(&id).map_task(),
         Message::PaletteConfirm => app.palette_confirm().map_task(),
         Message::PaletteDismiss => app.palette_pointer_dismiss().map_task(),
-        Message::PaletteCardPressed | Message::ConfirmDeleteCardPressed => Task::none(),
+        Message::PaletteCardPressed
+        | Message::ConfirmDeleteCardPressed
+        | Message::ContextMenuPanelPressed => Task::none(),
+        Message::ContextMenuRequested { target, at } => {
+            app.context_menu_requested(target, at);
+            Task::none()
+        }
+        Message::ContextMenuHovered(index) => {
+            app.context_menu_hovered(index);
+            Task::none()
+        }
+        Message::ContextMenuChosen(action) => app.context_menu_chosen(action).map_task(),
+        Message::ContextMenuDismiss => {
+            app.close_context_menu();
+            Task::none()
+        }
         Message::PaletteScrolled => {
             app.palette_scrolled();
             Task::none()
@@ -749,6 +824,9 @@ fn subscription_with(wake: Arc<tokio::sync::Notify>, armed: ArmedTimers) -> Subs
                 event::Status::Captured if is_escape_press(&event) => Some(Message::CapturedEscape),
                 event::Status::Captured if is_enter_release(&event) => {
                     Some(Message::CapturedEnterRelease)
+                }
+                event::Status::Captured if input::OptionSides::observes(&event) => {
+                    Some(Message::CapturedOptionKey(event))
                 }
                 event::Status::Captured => None,
             }
@@ -933,6 +1011,19 @@ impl UiTask for app::UiTask {
                 let message = move |value| Message::ClipboardReadCompleted { request_id, value };
                 match target {
                     roost_engine::ipc::ClipboardOp::System => iced::clipboard::read().map(message),
+                    // iced's primary-selection calls are no-ops on macOS;
+                    // the selection is the named pasteboard (plan 073 D1).
+                    #[cfg(target_os = "macos")]
+                    roost_engine::ipc::ClipboardOp::Selection => Task::perform(
+                        tokio::task::spawn_blocking(macos::pasteboard::selection_read),
+                        move |joined| {
+                            message(joined.unwrap_or_else(|error| {
+                                tracing::warn!(%error, "selection pasteboard read did not join");
+                                None
+                            }))
+                        },
+                    ),
+                    #[cfg(not(target_os = "macos"))]
                     roost_engine::ipc::ClipboardOp::Selection => {
                         iced::clipboard::read_primary().map(message)
                     }
@@ -943,14 +1034,50 @@ impl UiTask for app::UiTask {
                 target,
                 text,
             } => {
-                let write = match target {
-                    roost_engine::ipc::ClipboardOp::System => iced::clipboard::write(text),
-                    roost_engine::ipc::ClipboardOp::Selection => {
-                        iced::clipboard::write_primary(text)
+                let done = Task::done(Message::ClipboardWriteCompleted(request_id));
+                match target {
+                    roost_engine::ipc::ClipboardOp::System => {
+                        iced::clipboard::write(text).chain(done)
                     }
-                };
-                write.chain(Task::done(Message::ClipboardWriteCompleted(request_id)))
+                    #[cfg(target_os = "macos")]
+                    roost_engine::ipc::ClipboardOp::Selection => Task::perform(
+                        tokio::task::spawn_blocking(move || {
+                            macos::pasteboard::selection_write(&text)
+                        }),
+                        move |joined| {
+                            let written = joined.map_err(|error| error.to_string());
+                            if let Err(error) = written.and_then(|written| written) {
+                                tracing::warn!(%error, "selection pasteboard write failed");
+                            }
+                            Message::ClipboardWriteCompleted(request_id)
+                        },
+                    ),
+                    #[cfg(not(target_os = "macos"))]
+                    roost_engine::ipc::ClipboardOp::Selection => {
+                        iced::clipboard::write_primary(text).chain(done)
+                    }
+                }
             }
+            app::UiTask::ClipboardReadFiles { request_id } => Task::perform(
+                paste_image::bounded(
+                    "clipboard files",
+                    paste_image::read_budget(),
+                    tokio::task::spawn_blocking(paste_image::read_file_list),
+                ),
+                move |result| Message::ClipboardFilesRead { request_id, result },
+            ),
+            // Answered from the blocking closure, as `ClipboardWriteImage`
+            // is below and for the same reason.
+            app::UiTask::ClipboardWriteFiles {
+                request_id,
+                paths,
+                reply,
+            } => Task::perform(
+                tokio::task::spawn_blocking(move || {
+                    let _ = reply.send(paste_image::write_files(&paths));
+                }),
+                move |_joined| Message::ClipboardWriteCompleted(request_id),
+            ),
             // The reply is answered from inside the blocking closure
             // rather than from the completion arm: `Task::perform`'s
             // mapper is an `Fn`, so it cannot consume a oneshot sender,
@@ -971,19 +1098,41 @@ impl UiTask for app::UiTask {
             app::UiTask::OpenUrl { url } => {
                 Task::perform(url_launcher::open(url), Message::UrlOpenCompleted)
             }
+            app::UiTask::OpenFile { path, seed } => Task::perform(
+                url_launcher::open_file(path, seed),
+                Message::FileOpenCompleted,
+            ),
+            app::UiTask::ToggleFullScreen(id) => window::mode(id)
+                .then(move |mode| {
+                    window::set_mode::<Message>(
+                        id,
+                        if mode == window::Mode::Fullscreen {
+                            window::Mode::Windowed
+                        } else {
+                            window::Mode::Fullscreen
+                        },
+                    )
+                })
+                .chain(window::mode(id).map(Message::FullScreenMode)),
+            app::UiTask::QueryFullScreen(id) => window::mode(id).map(Message::FullScreenMode),
             // `spawn_blocking` is legal here because iced_winit wraps every
             // `update` in `Executor::enter`, i.e. this runs inside the
             // application's tokio runtime. The blocking pool is what keeps
             // the clipboard round-trip and the PNG encode off the UI thread.
-            app::UiTask::PasteImageProbe { tab, sink } => Task::perform(
-                tokio::task::spawn_blocking(move || paste_image::probe(sink)),
-                move |joined| {
-                    let result = joined.unwrap_or_else(|error| {
-                        Err(paste_image::ProbeError::Failed(format!(
-                            "clipboard image: probe did not join: {error}"
-                        )))
-                    });
-                    Message::PasteImageMaterialized { tab, result }
+            app::UiTask::PasteImageProbe {
+                request_id,
+                tab,
+                sink,
+            } => Task::perform(
+                paste_image::bounded(
+                    "clipboard image",
+                    paste_image::read_budget(),
+                    tokio::task::spawn_blocking(move || paste_image::probe(sink)),
+                ),
+                move |result| Message::PasteImageMaterialized {
+                    request_id,
+                    tab,
+                    result,
                 },
             ),
             // Bounded: a `metadata` on a hung mount would otherwise hold
@@ -1020,6 +1169,11 @@ impl UiTask for app::UiTask {
                 index,
                 result,
             }),
+            app::UiTask::FullScreenSettle { delay, generation } => {
+                Task::perform(tokio::time::sleep(delay), move |()| {
+                    Message::FullScreenSettled(generation)
+                })
+            }
             app::UiTask::FileDropDeadline(delay) => {
                 Task::perform(tokio::time::sleep(delay), |()| Message::FileDropDeadline)
             }

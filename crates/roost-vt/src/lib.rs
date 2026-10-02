@@ -54,6 +54,20 @@ use thiserror::Error;
 mod color;
 pub use color::ColorRgb;
 
+/// Which macOS Option keys the key encoder treats as Alt: libghostty's
+/// `GhosttyOptionAsAlt`, and the values of the `macos-option-as-alt`
+/// config key. Only libghostty's macOS build reads it. Outside the `ffi`
+/// gate so the config model can name it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum OptionAsAlt {
+    /// Option is the macOS text modifier (⌥B types `∫`).
+    #[default]
+    False,
+    True,
+    Left,
+    Right,
+}
+
 /// libghostty-vt's success return code, mirrored locally so wrapper
 /// callsites don't need to import bindgen names. Defined alongside
 /// `Error::from_result` so the conversion path is in one place.

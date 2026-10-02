@@ -810,9 +810,10 @@ other host stays `not-found`.
 Companion to `tab.dump` — a richer read of the same viewport, but each
 cell carries the post-resolver fg/bg the production paint path computes.
 Ungated; useful both for debugging "why is this row gray" and as the
-resolver-walk regression op for #142. (The only theme-derived input to
-the resolver is the default fg/bg pair; no `bold-color` accent is
-applied today, on either socket.) Viewport only — it takes no
+resolver-walk regression op for #142. (A UI socket resolves with its
+theme: bold text with no color of its own takes the theme's
+`bold-color`. A session socket has no theme, so its bold text keeps the
+default foreground.) Viewport only — it takes no
 `scrollback` param, and its params are strict, so passing one is
 `unknown-field`.
 
@@ -1690,14 +1691,15 @@ The Swift Mac app answers `unknown-op`.
 ### `app.key_event` *(test-only — gated)*
 
 **Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
-Without it the server returns `not-enabled`. Delivers one key press to
-the window through the same handler a real one reaches: a configured
-shortcut runs first (Alt+T opens a tab on Linux, as ⌘T does on macOS),
-and otherwise the key goes to whatever owns the keyboard — the terminal
-on screen, the tab a new-tab shortcut is still opening, or a dialog or
-the palette, which answer Enter, Escape and the arrows here but take
-their text fields' typing from the toolkit, not from this handler. A
-test seam, not a surface: `roostctl` has no verb for it.
+Without it the server returns `not-enabled`. Delivers one keystroke —
+the press, then its release — to the window through the same handler a
+real one reaches: a configured shortcut runs first (Alt+T opens a tab
+on Linux, as ⌘T does on macOS), and otherwise the key goes to whatever
+owns the keyboard — the terminal on screen, the tab a new-tab shortcut
+is still opening, or a dialog or the palette, which answer Enter,
+Escape and the arrows here but take their text fields' typing from the
+toolkit, not from this handler. A test seam, not a surface: `roostctl`
+has no verb for it.
 
 Request: `{"params": {"key": "t", "modifiers": ["alt"]}}`. Response:
 `{}`.
@@ -1714,8 +1716,9 @@ Request: `{"params": {"key": "t", "modifiers": ["alt"]}}`. Response:
 
 An empty `key` or an unknown modifier is rejected `invalid-param`
 before anything else runs, and so is a named key the UI doesn't know.
-Only the press is delivered, never a release. The press cannot drive an
-input method's composition; that path is `tab.feed_ime`'s.
+The release follows the press at once, so the key is never left held
+and never repeats. The keystroke cannot drive an input method's
+composition; that path is `tab.feed_ime`'s.
 
 The Swift Mac app answers `unknown-op`.
 
@@ -2279,6 +2282,90 @@ workspace state, or write the system clipboard. Like
 before anything else runs. Widening the allowlist happens one name at
 a time, alongside a concrete test need.
 
+### Context menu test ops (`app.context_menu_dump` / `app.context_menu_activate` / `app.context_menu_open`) *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it every op in this group returns `not-enabled`. They read and
+press the right-click menu on a tab, a project row or a host band — the
+same menu, built by the same code, that a right-click shows — and are a
+test seam with no `roostctl` verb, under the same rule as
+`app.dialog_answer`.
+
+Every op takes a `target`, one of:
+
+- `{"tab_id": "<ref>"}` — a tab, by `tab.dump`'s ref: a bare id for one
+  of this window's local tabs, or `h<host>.<id>` for a host's;
+- `{"project_id": "<ref>"}` — a project row, by the same two spellings;
+- `{"host": "<saved id>"}` — a host band, by the saved host's `id`
+  (`host.list`).
+
+A ref whose row is gone, or whose `h<host>` names a connection that has
+since reconnected (every connect mints a new one), is refused
+`invalid-param`.
+
+`app.context_menu_dump` lists the menu the row would show now, in order.
+Request: `{"params": {"target": {"tab_id": "7"}}}`. Response:
+
+```json
+{
+  "entries": [
+    {"action": "rename_tab", "label": "Rename…", "enabled": true},
+    {"action": "new_tab_here", "label": "New Tab Here", "enabled": true},
+    {"action": "copy_tab_path", "label": "Copy Path", "enabled": true},
+    {"separator": true},
+    {"action": "close_tab", "label": "Close Tab", "enabled": true}
+  ]
+}
+```
+
+A project row lists `new_tab`, `rename_project`, `copy_project_path`,
+`open_project_folder` (labelled "Open in Finder" on macOS and "Open in
+File Manager" on Linux, and only for a path on this machine), a
+separator and `close_project`. A project on a host adds a separator and the
+host's own items; a host band, and a dimmed or offline host's rows, list
+only those. The host items are the command palette's host rows for the
+same host, under the palette's titles: `host_connect`,
+`host_disconnect`, `host_update_session`, `host_restart_session` and
+`host_stop_session` ("Disconnect Host: workbox", "Stop Session:
+workbox", …). Remove Host is never on the menu.
+
+`app.context_menu_activate` runs one item through the dispatcher a
+click reaches. Request:
+`{"params": {"target": {"tab_id": "7"}, "action": "close_tab"}}`.
+Response: `{}`, as soon as the item has been dispatched — wait on its
+effect. An item that asks first raises its card, as a click does:
+`close_project` the project's close confirmation, `host_stop_session` the Stop
+Session card (`app.dialog_dump`'s `confirm_stop`), and the rename items
+the inline editor.
+
+The menu is rebuilt before the item runs, and each refusal is
+`invalid-param` with its own message:
+
+- the row is gone, or its connection was replaced;
+- `action` is not on that row's menu now (or is not an action at all);
+- the item is on the menu but disabled — Copy Path with no known path;
+- a modal, the palette, a rename editor or an input-method composition
+  owns input.
+
+New Tab, New Tab Here, Close Tab and Close Project answer `busy` while a
+local-backend switch is in flight, as their palette rows do.
+
+`app.context_menu_open` shows the row's menu on screen, as a
+right-click on the row does, with its corner 40 points right of and
+below the window content area's top-left. Request:
+`{"params": {"target": {"tab_id": "7"}}}`. Response: `{}`. While the
+menu is up it owns the keyboard: through `app.key_event`, `ArrowUp`,
+`ArrowDown`, `Home` and `End` move its highlight past separators and
+disabled items, `Enter` runs the highlighted item, `Escape` closes it,
+and every other key is swallowed — none reaches a shortcut or the
+terminal. A row that is gone, a row whose menu has no items, and a
+modal, the palette, a rename editor or an input-method composition
+owning input are each refused `invalid-param`. On macOS the menu is
+the native popup, which no test op opens, so the op answers
+`not-supported` there.
+
+The Swift Mac app answers `unknown-op` to all three.
+
 ### `agent.set_hooks`
 
 Set *this* machine's own `agent-hooks` key — the consent dialog's Apply
@@ -2428,6 +2515,7 @@ collapsed); the empty-state row (`"agents:empty"`) is not actionable.
 | `selection.dump` | `{"tab_id": "1"}` | Read back the selection. Response: `{"text"?: "...", "anchor_visible": bool, "cursor_visible": bool}`. `text` carries the **whole** selection, including rows scrolled out of the viewport (#249). It is omitted when no selection is active, and also when an active selection currently resolves to nothing — its rows were evicted from scrollback, or it belongs to the screen (primary/alternate) that is not on display. Those cases are reported as an *absent* `text`, never as another row's text (#334); an alt-screen one starts reporting text again once its screen is active. `anchor_visible` / `cursor_visible` stay viewport-truthful on purpose — they answer "is this endpoint on screen right now", which is a different question from what `text` contains, and the pixel-level tests rely on it; a discarded or inactive-screen endpoint reads `false`. |
 | `clipboard.dump` | `{"target": "system" \| "selection"}` | Read the host pasteboard. Response: `{"text"?: "..."}`. `system` is the ⌘V / Ctrl+V target; `selection` is the named per-app pasteboard on Mac / X11 PRIMARY on Linux. Unknown targets → `invalid-param`. |
 | `clipboard.write` | `{"target": "...", "text": "..."}` or `{"target": "system", "image_png": "<base64>"}` | Test-only pasteboard seeding (lets a roosttest case set a known value before asserting paste behavior). The text form is not gated: any process on the host can already write the OS clipboard. The image form is — see below. |
+| `clipboard.write_files` | `{"paths": ["/abs/a.txt", "/abs/b c.pdf"]}` | *(Test-only — gated.)* Put copied files on the system clipboard, the way a file manager's copy leaves them — see below. |
 
 **`clipboard.write` takes exactly one of `text` / `image_png`.** `text`
 was required until the image form existed and is optional now; both at
@@ -2459,6 +2547,23 @@ lane's cue to skip rather than to report a paste bug.
 and nothing else, so an `image_png` key is `unknown-field` there, and a
 request carrying neither field is `invalid-param` (a decode failure, not
 `missing-param`).
+
+**`clipboard.write_files`** exists so the end-to-end lanes can paste
+copied files: a paste that finds files on the system clipboard does what
+dropping them on the tab does (the escaped paths in a local tab, an
+upload in a host tab). It is its own op rather than a field on
+`clipboard.write`, is **gated on `ROOST_TEST_MODE=1`** at UI launch
+(`not-enabled` otherwise), and is served by the iced UI only —
+`Roost.app` answers `unknown-op`. Every path must be absolute
+(`invalid-param` otherwise). On macOS each file becomes one pasteboard
+item carrying its file URL and, as the string flavor, only its name —
+what a Finder copy leaves, and why a paste there reads files before
+text. On Linux the iced UI writes `text/uri-list` through `arboard`,
+which canonicalizes each path and drops one that does not exist, and
+holds the clipboard the way the image form does; under Wayland a
+refused write is `not-supported`, as it is there. An empty `paths` writes
+nothing and leaves the clipboard as it was. The reply comes once a paste
+could read the files.
 
 `roostctl` does not surface these yet — they exist for end-to-end test
 coverage (`tools/roosttest/`) and as a stable surface a future scriptable

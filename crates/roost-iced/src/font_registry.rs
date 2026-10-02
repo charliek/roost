@@ -66,6 +66,26 @@ impl FontRegistry {
         }
     }
 
+    /// One scan of the renderer's font database as it stands now.
+    pub fn scan() -> Self {
+        let facts = {
+            let mut system = font_system()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            system
+                .raw()
+                .db()
+                .faces()
+                .flat_map(|face| {
+                    face.families
+                        .iter()
+                        .map(move |(name, _)| (name.clone(), face.monospaced))
+                })
+                .collect::<Vec<_>>()
+        };
+        Self::from_facts(facts)
+    }
+
     /// System monospace rows in shared curated order.
     pub fn picker_names(&self) -> &[String] {
         &self.picker_names
@@ -97,24 +117,7 @@ impl FontRegistry {
 /// The renderer and picker share exactly one system-font scan and name arena.
 pub fn system_font_registry() -> &'static FontRegistry {
     static REGISTRY: OnceLock<FontRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(|| {
-        let facts = {
-            let mut system = font_system()
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            system
-                .raw()
-                .db()
-                .faces()
-                .flat_map(|face| {
-                    face.families
-                        .iter()
-                        .map(move |(name, _)| (name.clone(), face.monospaced))
-                })
-                .collect::<Vec<_>>()
-        };
-        FontRegistry::from_facts(facts)
-    })
+    REGISTRY.get_or_init(FontRegistry::scan)
 }
 
 #[cfg(test)]

@@ -2,12 +2,17 @@ use std::collections::BTreeMap;
 
 use roost_engine::ipc::{DumpError, HostOpFailure, HostOpReply};
 use roost_ipc::codes;
-use roost_ipc::messages::{SentFile, SkippedFile, TabSendFileResult};
+use roost_ipc::messages::{
+    AppContextMenuDumpResult, AppContextMenuTarget, SentFile, SkippedFile, TabSendFileResult,
+    WireProjectRef,
+};
+use roost_ui_model::context_menu::{ContextAction, ContextTarget};
 use roost_ui_model::file_transfer::{status, Refusal, Skipped, Target};
 use roost_ui_model::keys::HostId;
 
 use crate::host_conn::HostConnState;
 
+use super::context_menu::ContextError;
 use super::file_transfer::{GestureOutcome, SentSource};
 use super::interactions::{host_reorder_call, ReorderTarget};
 use super::*;
@@ -1975,6 +1980,32 @@ impl App {
         }
     }
 
+    /// A context-menu test op's target, resolved the way `tab.dump`
+    /// resolves its ref: a bare id is the local backend's, which under
+    /// `session` is the slot's.
+    fn context_test_target(
+        &self,
+        target: AppContextMenuTarget,
+    ) -> Result<ContextTarget, HostOpFailure> {
+        if !self.test_mode {
+            return Err(HostOpFailure::new(
+                codes::NOT_ENABLED,
+                "ROOST_TEST_MODE=1 is required",
+            ));
+        }
+        let resolved = match target {
+            AppContextMenuTarget::TabId(tab) => self.wire_tab_key(tab).map(ContextTarget::Tab),
+            AppContextMenuTarget::ProjectId(WireProjectRef::Local(project)) => self
+                .local_slot_host()
+                .map(|host| ContextTarget::Project(ProjectKey::new(host, project))),
+            AppContextMenuTarget::ProjectId(WireProjectRef::Host { host, project }) => Some(
+                ContextTarget::Project(ProjectKey::new(HostId::new(host), project)),
+            ),
+            AppContextMenuTarget::Host(saved_id) => Some(ContextTarget::Host(saved_id)),
+        };
+        resolved.ok_or_else(|| ContextError::Missing.failure())
+    }
+
     /// What a **bare** id off the IPC wire names (plan 063 §D10).
     ///
     /// The UI half of the bare-id rewrite. Most rewrite rows are
@@ -2186,6 +2217,21 @@ impl App {
                     }
                     task = task.then(self.menu_event(event));
                     batch.mark_dirty();
+                }
+                // The menu bar's arm above, for its reason: the item acts
+                // on `self.projects`.
+                #[cfg(target_os = "macos")]
+                EngineFeed::Context(target, action) => {
+                    if batch.workspace_dirty() {
+                        self.reconcile();
+                        batch.mark_reconciled();
+                    }
+                    task = task.then(self.context_item_chosen(&target, action));
+                    batch.mark_dirty();
+                }
+                #[cfg(target_os = "macos")]
+                EngineFeed::AccentChanged(accent) => {
+                    self.chrome = chrome_palette_for(self.config.chrome_accent, accent);
                 }
                 // Host mirrors + lifecycle land in the connection set.
                 // C6/C7 render off it; C4 only keeps it current, so with
@@ -2716,6 +2762,30 @@ impl App {
                 return;
             };
             crate::macos::notifications::init(mtm);
+        }
+    }
+
+    /// Read the system accent into the chrome and start following it
+    /// (plan 073 D4). A no-op on every other host, where `system` is
+    /// already [`chrome::DEFAULT_ACCENT`] from bootstrap.
+    ///
+    /// From `window_opened`, not bootstrap: AppKit before winit has built
+    /// the event loop is unsupported. The read repeats on every focus
+    /// change, which is cheap and squares the chrome with the OS if a
+    /// change was ever missed.
+    pub(super) fn follow_system_accent(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.window_id.is_none() {
+                return;
+            }
+            let Some(mtm) = seam_on_main("accent observe") else {
+                return;
+            };
+            crate::macos::accent::observe(mtm, self.feed_tx.clone());
+            if let Some(accent) = crate::macos::accent::current(mtm) {
+                self.chrome = chrome_palette_for(self.config.chrome_accent, accent);
+            }
         }
     }
 
@@ -3358,6 +3428,7 @@ impl App {
                         | KeyboardRoute::Confirm
                         | KeyboardRoute::HostDialog
                         | KeyboardRoute::Editor
+                        | KeyboardRoute::ContextMenu
                         | KeyboardRoute::Palette
                         | KeyboardRoute::Pending => Err(format!(
                             "tab {tab_id} is not the active terminal \
@@ -3565,12 +3636,68 @@ impl App {
                     crate::input::synthetic_press(&key, text.as_deref(), &modifiers)
                 };
                 let _ = reply.send(match result {
-                    Ok(event) => {
-                        task = task.then(self.keyboard(event));
+                    Ok(press) => {
+                        // A whole keystroke: the Enter or Escape latch a
+                        // menu or dialog arms on the press is let go only
+                        // by that key's release.
+                        let release = crate::input::release_of(&press);
+                        task = task.then(self.keyboard(press));
+                        if let Some(release) = release {
+                            task = task.then(self.keyboard(release));
+                        }
                         Ok(())
                     }
                     Err(error) => Err(error),
                 });
+            }
+            UiRequest::AppContextMenuDump { target, reply } => {
+                let result = self.context_test_target(target).and_then(|target| {
+                    let entries = self
+                        .context_entries(&target)
+                        .ok_or_else(|| ContextError::Missing.failure())?;
+                    Ok(AppContextMenuDumpResult {
+                        entries: entries
+                            .iter()
+                            .map(super::context_menu::wire_entry)
+                            .collect(),
+                    })
+                });
+                let _ = reply.send(result);
+            }
+            UiRequest::AppContextMenuActivate {
+                target,
+                action,
+                reply,
+            } => {
+                let result = self.context_test_target(target).and_then(|target| {
+                    ContextAction::from_wire(&action)
+                        .ok_or(ContextError::Unknown(action))
+                        .and_then(|action| self.context_activate(&target, action))
+                        .map_err(|error| error.failure())
+                });
+                let _ = reply.send(match result {
+                    Ok(next) => {
+                        task = task.then(next);
+                        Ok(())
+                    }
+                    Err(failure) => Err(failure),
+                });
+            }
+            UiRequest::AppContextMenuOpen { target, reply } => {
+                // macOS draws the native popup, whose tracking loop would
+                // block this drain until a person closed it.
+                let result = if self.test_mode && cfg!(target_os = "macos") {
+                    Err(HostOpFailure::new(
+                        codes::NOT_SUPPORTED,
+                        super::context_menu::OPEN_UNSUPPORTED,
+                    ))
+                } else {
+                    self.context_test_target(target).and_then(|target| {
+                        self.open_context_menu(target, super::context_menu::OPEN_ANCHOR)
+                            .map_err(|refusal| refusal.failure())
+                    })
+                };
+                let _ = reply.send(result);
             }
             UiRequest::AppKeybindDispatch { action, reply } => {
                 let result = if !self.test_mode {
@@ -3716,6 +3843,17 @@ impl App {
                 } else {
                     self.clipboard.enqueue_write_image(png, reply);
                     task = task.then(self.clipboard.start_next());
+                }
+            }
+            UiRequest::ClipboardWriteFiles { paths, reply } => {
+                if self.test_mode {
+                    self.clipboard.enqueue_write_files(paths, reply);
+                    task = task.then(self.clipboard.start_next());
+                } else {
+                    let _ = reply.send(Err(HostOpFailure::new(
+                        codes::NOT_ENABLED,
+                        "clipboard.write_files requires ROOST_TEST_MODE=1 at UI launch",
+                    )));
                 }
             }
             UiRequest::TabExpandSelectionAt {
@@ -6413,11 +6551,9 @@ mod tests {
 
     /// `set_theme` bumps `theme_generation`, and `refresh_snapshot`'s
     /// `cached_theme_generation` guard exists precisely to force a full
-    /// rebuild off that bump — today nothing but the default fg/bg pair
-    /// (already covered by the default-color guard) is theme-derived, but
-    /// the guard is there so a future theme-derived input (e.g. a
-    /// `bold_color` override, like the now-removed GTK UI's) fails safe
-    /// toward over-rebuilding rather than silently keeping stale rows.
+    /// rebuild off that bump — it keys the theme's `bold_color`, the
+    /// theme-derived input besides the default fg/bg pair (which has its
+    /// own guard), so a theme change never leaves a stale row behind.
     ///
     /// Measured while writing this test: `apply_theme_candidate`'s color
     /// FFI calls (`set_color_foreground`/`background`/`cursor`/`palette`)
