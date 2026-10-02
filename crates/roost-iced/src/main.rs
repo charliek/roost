@@ -366,6 +366,8 @@ const PACKAGED_PLATFORM: bool = cfg!(target_os = "linux");
 const HOST_MACOS: bool = cfg!(target_os = "macos");
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    macos::menu::suppress_appkit_full_screen_item();
     let bundle_id = main_bundle_identifier();
     let profile = BundleProfile::resolve(host_default_kind(
         PACKAGED,

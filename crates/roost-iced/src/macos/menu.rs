@@ -363,6 +363,8 @@ struct MainMenu {
     updates: Retained<NSMenuItem>,
     /// The Help menu, registered with `NSApplication.setHelpMenu`.
     help: Retained<NSMenu>,
+    /// The View menu, kept for [`drop_appkit_full_screen_rows`].
+    view: Retained<NSMenu>,
     /// The View menu's full-screen item, kept for [`sync_fullscreen_title`].
     fullscreen: Option<Retained<NSMenuItem>>,
     /// Indexed by the item's tag.
@@ -439,6 +441,7 @@ pub(crate) fn install(
     let app = NSApplication::sharedApplication(mtm);
     app.setMainMenu(Some(&menu.root));
     app.setHelpMenu(Some(&menu.help));
+    drop_appkit_full_screen_rows(&menu.view);
     MENU.with(|cell| *cell.borrow_mut() = Some(menu));
     tracing::info!(app_name, "installed the native menu bar");
     true
@@ -447,7 +450,10 @@ pub(crate) fn install(
 /// Our own "Enter Full Screen" item owns the chord, the title and the
 /// action, so AppKit must not inject a second one into View. The
 /// registration domain is read-only fallback state, never written to disk.
-fn suppress_appkit_full_screen_item() {
+/// AppKit reads the key while a bundled app finishes launching, before the
+/// first window exists, so `main` calls this before the event loop starts
+/// (Foundation only — no AppKit); the menu install calls it again.
+pub(crate) fn suppress_appkit_full_screen_item() {
     let key = NSString::from_str("NSFullScreenMenuItemEverywhere");
     let off: Retained<AnyObject> = {
         let number = NSNumber::new_bool(false);
@@ -460,6 +466,20 @@ fn suppress_appkit_full_screen_item() {
     unsafe { NSUserDefaults::standardUserDefaults().registerDefaults(&defaults) };
 }
 
+/// The backstop when AppKit injects its own row anyway: ours dispatches
+/// through the menu target, so any `toggleFullScreen:` row in View is
+/// AppKit's.
+fn drop_appkit_full_screen_rows(view: &NSMenu) {
+    let appkit_rows: Vec<_> = view
+        .itemArray()
+        .iter()
+        .filter(|item| item.action() == Some(sel!(toggleFullScreen:)))
+        .collect();
+    for item in appkit_rows {
+        view.removeItem(&item);
+    }
+}
+
 /// Retitle the full-screen item to match the window: "Exit Full Screen"
 /// while it is full screen, "Enter Full Screen" otherwise.
 /// `autoenablesItems` is off, so AppKit never does this itself; the App
@@ -467,7 +487,11 @@ fn suppress_appkit_full_screen_item() {
 pub(crate) fn sync_fullscreen_title(_mtm: MainThreadMarker, is_full: bool) {
     MENU.with(|cell| {
         let slot = cell.borrow();
-        let Some(item) = slot.as_ref().and_then(|menu| menu.fullscreen.as_ref()) else {
+        let Some(menu) = slot.as_ref() else {
+            return;
+        };
+        drop_appkit_full_screen_rows(&menu.view);
+        let Some(item) = menu.fullscreen.as_ref() else {
             return;
         };
         let title = if is_full {
@@ -556,6 +580,7 @@ fn build(
         window: submenu(mtm, "Window"),
         updates: plain_item(mtm, "Check for Updates\u{2026}"),
         help: submenu(mtm, "Help"),
+        view: submenu(mtm, "View"),
         fullscreen: None,
         events: Vec::new(),
         static_events: 0,
@@ -634,7 +659,7 @@ fn build(
     }
     attach(mtm, &menu.root, &file_menu);
 
-    let view_menu = submenu(mtm, "View");
+    let view_menu = menu.view.clone();
     let mut fullscreen = None;
     for spec in [
         Some(("Command Palette\u{2026}", KeybindAction::CommandPalette)),
