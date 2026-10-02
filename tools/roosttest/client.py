@@ -413,6 +413,25 @@ class Roost:
         for char in text:
             self.key_event(char)
 
+    # -- a row's right-click menu (test mode) ------------------------------
+    def context_menu_dump(self, target: dict) -> list[dict]:
+        """Test-mode only — the menu `target` would show now:
+        `[{action, label, enabled} | {separator: True}]`. `target` is
+        `{"tab_id": ref}`, `{"project_id": ref}` or `{"host": saved_id}`;
+        a ref is a bare id or the `h<host>.<id>` spelling. Iced-only."""
+        return self.call("app.context_menu_dump", {"target": target})["entries"]
+
+    def context_menu_activate(self, target: dict, action: str) -> None:
+        """Test-mode only — run one item of that menu through the
+        dispatcher a click reaches. Returns once it is dispatched, so wait
+        on its effect. A gone row, a stale connection, an item not on the
+        menu or disabled, and an open modal are `RoostError('invalid-param')`."""
+        self.call("app.context_menu_activate", {"target": target, "action": action})
+
+    def context_menu_open(self, target: dict) -> None:
+        """Test-mode only — show that menu on screen."""
+        self.call("app.context_menu_open", {"target": target})
+
     # -- host sessions ----------------------------------------------------
     def host_status(self, id: str | None = None) -> dict:
         """Every saved host's live connection state, or just `id`'s.

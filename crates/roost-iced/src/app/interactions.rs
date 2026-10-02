@@ -2274,7 +2274,7 @@ impl App {
     /// The one door to the OS opener: under test mode it names the target
     /// in the toast and launches nothing, so no test can open a browser or
     /// an editor.
-    fn open_external(&mut self, what: url_launcher::External) -> UiTask {
+    pub(super) fn open_external(&mut self, what: url_launcher::External) -> UiTask {
         match url_launcher::plan(self.test_mode, what) {
             url_launcher::ExternalPlan::WouldOpen(target) => {
                 self.set_status_info(format!("Would open {target}"));

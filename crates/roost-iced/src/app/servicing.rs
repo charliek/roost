@@ -2,12 +2,17 @@ use std::collections::BTreeMap;
 
 use roost_engine::ipc::{DumpError, HostOpFailure, HostOpReply};
 use roost_ipc::codes;
-use roost_ipc::messages::{SentFile, SkippedFile, TabSendFileResult};
+use roost_ipc::messages::{
+    AppContextMenuDumpResult, AppContextMenuTarget, SentFile, SkippedFile, TabSendFileResult,
+    WireProjectRef,
+};
+use roost_ui_model::context_menu::{ContextAction, ContextTarget};
 use roost_ui_model::file_transfer::{status, Refusal, Skipped, Target};
 use roost_ui_model::keys::HostId;
 
 use crate::host_conn::HostConnState;
 
+use super::context_menu::ContextError;
 use super::file_transfer::{GestureOutcome, SentSource};
 use super::interactions::{host_reorder_call, ReorderTarget};
 use super::*;
@@ -1975,6 +1980,32 @@ impl App {
         }
     }
 
+    /// A context-menu test op's target, resolved the way `tab.dump`
+    /// resolves its ref: a bare id is the local backend's, which under
+    /// `session` is the slot's.
+    fn context_test_target(
+        &self,
+        target: AppContextMenuTarget,
+    ) -> Result<ContextTarget, HostOpFailure> {
+        if !self.test_mode {
+            return Err(HostOpFailure::new(
+                codes::NOT_ENABLED,
+                "ROOST_TEST_MODE=1 is required",
+            ));
+        }
+        let resolved = match target {
+            AppContextMenuTarget::TabId(tab) => self.wire_tab_key(tab).map(ContextTarget::Tab),
+            AppContextMenuTarget::ProjectId(WireProjectRef::Local(project)) => self
+                .local_slot_host()
+                .map(|host| ContextTarget::Project(ProjectKey::new(host, project))),
+            AppContextMenuTarget::ProjectId(WireProjectRef::Host { host, project }) => Some(
+                ContextTarget::Project(ProjectKey::new(HostId::new(host), project)),
+            ),
+            AppContextMenuTarget::Host(saved_id) => Some(ContextTarget::Host(saved_id)),
+        };
+        resolved.ok_or_else(|| ContextError::Missing.failure())
+    }
+
     /// What a **bare** id off the IPC wire names (plan 063 §D10).
     ///
     /// The UI half of the bare-id rewrite. Most rewrite rows are
@@ -3599,6 +3630,47 @@ impl App {
                     }
                     Err(error) => Err(error),
                 });
+            }
+            UiRequest::AppContextMenuDump { target, reply } => {
+                let result = self.context_test_target(target).and_then(|target| {
+                    let entries = self
+                        .context_entries(&target)
+                        .ok_or_else(|| ContextError::Missing.failure())?;
+                    Ok(AppContextMenuDumpResult {
+                        entries: entries
+                            .iter()
+                            .map(super::context_menu::wire_entry)
+                            .collect(),
+                    })
+                });
+                let _ = reply.send(result);
+            }
+            UiRequest::AppContextMenuActivate {
+                target,
+                action,
+                reply,
+            } => {
+                let result = self.context_test_target(target).and_then(|target| {
+                    ContextAction::from_wire(&action)
+                        .ok_or(ContextError::Unknown(action))
+                        .and_then(|action| self.context_activate(&target, action))
+                        .map_err(|error| error.failure())
+                });
+                let _ = reply.send(match result {
+                    Ok(next) => {
+                        task = task.then(next);
+                        Ok(())
+                    }
+                    Err(failure) => Err(failure),
+                });
+            }
+            UiRequest::AppContextMenuOpen { target: _, reply } => {
+                let failure = if self.test_mode {
+                    HostOpFailure::new(codes::NOT_SUPPORTED, super::context_menu::OPEN_UNSUPPORTED)
+                } else {
+                    HostOpFailure::new(codes::NOT_ENABLED, "ROOST_TEST_MODE=1 is required")
+                };
+                let _ = reply.send(Err(failure));
             }
             UiRequest::AppKeybindDispatch { action, reply } => {
                 let result = if !self.test_mode {

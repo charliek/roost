@@ -299,6 +299,10 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ("app.notice_answer", OpClass::UiOwned),
     // A key press into this window — whatever owns its keyboard.
     ("app.key_event", OpClass::UiOwned),
+    // A row's right-click menu in this window.
+    ("app.context_menu_dump", OpClass::UiOwned),
+    ("app.context_menu_activate", OpClass::UiOwned),
+    ("app.context_menu_open", OpClass::UiOwned),
     // Sets *this* machine's own `agent-hooks` key and raises every
     // connected host to match — a property of this UI's config and its
     // host registry, neither of which the slot has any view of.

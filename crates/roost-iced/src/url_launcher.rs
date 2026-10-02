@@ -57,6 +57,23 @@ pub(crate) fn plan(test_mode: bool, what: External) -> ExternalPlan {
     })
 }
 
+/// `path` as a `file://` URL, every byte outside RFC 3986's unreserved
+/// set and `/` percent-encoded, so a space, `#` or `?` in a directory
+/// name cannot end the path early.
+pub(crate) fn file_url(path: &Path) -> String {
+    use std::fmt::Write as _;
+    use std::os::unix::ffi::OsStrExt;
+    let mut url = String::from("file://");
+    for &byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~') {
+            url.push(char::from(byte));
+        } else {
+            let _ = write!(url, "%{byte:02X}");
+        }
+    }
+    url
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct LauncherExit {
     success: bool,
@@ -194,6 +211,23 @@ pub(crate) async fn open_file(path: PathBuf, seed: Option<&'static str>) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_url_percent_encodes_everything_a_url_would_read_as_syntax() {
+        assert_eq!(
+            file_url(Path::new("/tmp/a-b_c.d~e")),
+            "file:///tmp/a-b_c.d~e"
+        );
+        assert_eq!(
+            file_url(Path::new("/Users/me/my dir/#1?x%")),
+            "file:///Users/me/my%20dir/%231%3Fx%25"
+        );
+        assert_eq!(file_url(Path::new("/srv/café")), "file:///srv/caf%C3%A9");
+        assert_eq!(
+            command_for(Platform::Linux, file_url(Path::new("/a b"))).map(|_| ()),
+            Ok(())
+        );
+    }
 
     #[test]
     fn builders_are_argument_safe_and_cross_platform() {

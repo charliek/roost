@@ -85,6 +85,7 @@ pub(crate) mod agent_hooks;
 pub(crate) mod agent_hooks_dialog;
 pub(crate) mod background_resize;
 pub(crate) mod bootstrap;
+pub(crate) mod context_menu;
 pub(crate) mod file_transfer;
 mod forwarded_open;
 mod host_dialog;
@@ -1524,17 +1525,24 @@ struct HostTabOrigin {
     cwd_from_tab: Option<i64>,
 }
 
-/// [`HostTabOrigin`] for a new tab on `project`, off the window's
-/// selection and the project's mirror row.
+/// [`HostTabOrigin`] for a new tab on `project`, off the tab it is
+/// opened from and the project's mirror row.
 ///
-/// Only a selection on the project's own connection is named: a tab on
+/// Only a source on the project's own connection is named: a tab on
 /// another host or on the local backend has an id from another id-space
-/// and a path that means nothing there, so it gets the project's cwd.
+/// and a path that means nothing there, so it gets the project's cwd —
+/// as does no source at all.
 ///
 /// The mirror cwd rides as `cwd` because it is where a session older
 /// than `cwd_from_tab` lands on [`open_host_tab_flow`]'s retry.
-fn host_tab_origin(project: ProjectKey, selected: TabKey, row: Option<&Project>) -> HostTabOrigin {
-    let cwd_from_tab = (selected.host == project.host).then_some(selected.tab);
+fn host_tab_origin(
+    project: ProjectKey,
+    source: Option<TabKey>,
+    row: Option<&Project>,
+) -> HostTabOrigin {
+    let cwd_from_tab = source
+        .filter(|source| source.host == project.host)
+        .map(|source| source.tab);
     let cwd = row.map_or("", |row| match cwd_from_tab {
         Some(tab) => listed_tab_cwd(row, tab),
         None => &row.cwd,
@@ -5300,10 +5308,7 @@ impl App {
     fn menu_gating(&self) -> crate::macos::menu::MenuGating {
         crate::macos::menu::MenuGating {
             palette_open: self.palette.is_some(),
-            text_capture: self.rename_editor.is_some()
-                || self.confirm_delete.is_some()
-                || self.host_dialog.is_some()
-                || self.terminal_composing(),
+            text_capture: self.text_capture(),
         }
     }
 
@@ -5519,6 +5524,12 @@ impl App {
     /// gesture behind it.
     fn strip_gestures_enabled(&self) -> bool {
         self.rename_editor.is_none() && self.confirm_delete.is_none() && self.host_dialog.is_none()
+    }
+
+    /// Whether a rename editor, a confirm card, a host dialog or an IME
+    /// composition owns the keyboard.
+    fn text_capture(&self) -> bool {
+        !self.strip_gestures_enabled() || self.terminal_composing()
     }
 
     /// The active project, host-qualified. The workspace's active
@@ -6869,9 +6880,15 @@ impl App {
     }
 
     pub fn new_tab(&mut self) -> UiTask {
+        self.new_tab_in(self.active_project_key(), Some(self.active_tab_key()))
+    }
+
+    /// ⌘T's gesture on `project`, opened from `source` (see
+    /// [`Self::open_tab_in`]).
+    pub(super) fn new_tab_in(&mut self, project: ProjectKey, source: Option<TabKey>) -> UiTask {
         self.cancel_drags();
         self.cancel_editor_for_interaction();
-        let dispatch = self.new_tab_dispatch();
+        let dispatch = self.open_tab_in(project, source, String::new(), Vec::new());
         self.arm_pending_keyboard(&dispatch);
         dispatch.task
     }
@@ -6897,21 +6914,43 @@ impl App {
     /// creation built from it fails `ProjectNotFound` while a slot tab
     /// is plainly selected.
     fn open_tab_here(&mut self, title: String, argv: Vec<String>) -> EngineDispatch {
-        let project = self.active_project_key();
+        let (project, source) = (self.active_project_key(), self.active_tab_key());
+        self.open_tab_in(project, Some(source), title, argv)
+    }
+
+    /// Open a tab in `project`, active or not, starting where `source`
+    /// is — the foreground job's directory, then the shell's, then OSC 7
+    /// — or in the project's cwd when no source is named.
+    ///
+    /// A creation like any other: the dispatch carries its op, so a
+    /// gesture can arm the pending keyboard on it, and the new tab takes
+    /// the selection when the engine (locally) or the mirror (on a host)
+    /// confirms it.
+    fn open_tab_in(
+        &mut self,
+        project: ProjectKey,
+        source: Option<TabKey>,
+        title: String,
+        argv: Vec<String>,
+    ) -> EngineDispatch {
         match creation_route(self.local_backend, project.host) {
-            CreationRoute::Host(_) => return self.open_host_tab_dispatch(project, title, argv),
+            CreationRoute::Host(_) => {
+                return self.open_host_tab_dispatch(project, source, title, argv)
+            }
             CreationRoute::NoLocalBackend => {
                 self.no_local_backend();
                 return EngineDispatch::default();
             }
             CreationRoute::Local => {}
         }
-        let (project_id, _) = self.workspace.active();
-        if project_id == 0 {
+        if project.project == 0 {
             return EngineDispatch::default();
         }
-        let cwd = self.launch_cwd();
-        self.open_tab_dispatch(project_id, cwd, title, argv)
+        let cwd = source
+            .and_then(TabKey::local_tab)
+            .map(|tab| local_launch_cwd(&self.workspace, &self.client.supervisor, tab))
+            .unwrap_or_default();
+        self.open_tab_dispatch(project.project, cwd, title, argv)
     }
 
     /// What a creation addressed at the local workspace answers under
@@ -6931,6 +6970,7 @@ impl App {
     fn open_host_tab_dispatch(
         &mut self,
         project: ProjectKey,
+        source: Option<TabKey>,
         title: String,
         argv: Vec<String>,
     ) -> EngineDispatch {
@@ -6942,7 +6982,7 @@ impl App {
         };
         let origin = host_tab_origin(
             project,
-            self.active_tab_key(),
+            source,
             self.host_project_row(project).map(|(_, row)| row),
         );
         let grid = self.current_grid();
@@ -9545,7 +9585,7 @@ impl App {
     /// Mirrors the Mac's priority: the active tab's cwd — which OSC 7 keeps
     /// current through `Workspace::set_tab_cwd` — falling back to the
     /// project's static cwd before a tab has reported one. The native
-    /// foreground-process lookup `launch_cwd` uses is deliberately not
+    /// foreground-process lookup `local_launch_cwd` uses is deliberately not
     /// consulted here: this runs every batch, and the Mac subtitle tracks
     /// OSC 7 only.
     pub fn window_title(&self, home: &str) -> String {
@@ -9583,23 +9623,13 @@ impl App {
             .map(|row| (row.name.as_str(), listed_tab_cwd(row, tab.tab)));
         compose_window_title(self.title_fallback, named, host, home)
     }
-
-    /// The cwd a new in-process tab launches in: the active tab's, else
-    /// empty, which the open resolves to the project's.
-    ///
-    /// Local only: `open_tab_here` sends a creation on a host project,
-    /// ⌘T and launcher row alike, to `open_host_tab_dispatch` first.
-    fn launch_cwd(&self) -> String {
-        local_launch_cwd(&self.workspace, &self.client.supervisor)
-    }
 }
 
-/// [`App::launch_cwd`] without an `App` to build. It is `tab.open`'s
-/// `cwd_from_tab` resolver, so a new tab lands by one rule in-process
-/// and on a session.
-fn local_launch_cwd(workspace: &Workspace, supervisor: &PtySupervisor) -> String {
-    roost_engine::application::inherited_cwd(workspace, supervisor, workspace.active().1)
-        .unwrap_or_default()
+/// Where a new in-process tab opened from `tab` starts, without an `App`
+/// to build. It is `tab.open`'s `cwd_from_tab` resolver, so a new tab
+/// lands by one rule in-process and on a session.
+fn local_launch_cwd(workspace: &Workspace, supervisor: &PtySupervisor, tab: i64) -> String {
+    roost_engine::application::inherited_cwd(workspace, supervisor, tab).unwrap_or_default()
 }
 
 /// Which question a confirmed restart prompt was asking — the two
@@ -12227,7 +12257,7 @@ mod tests {
         };
 
         assert_eq!(
-            host_tab_origin(project, TabKey::new(host, 7), Some(&row)),
+            host_tab_origin(project, Some(TabKey::new(host, 7)), Some(&row)),
             HostTabOrigin {
                 cwd: "/srv/where-7-is".into(),
                 cwd_from_tab: Some(7),
@@ -12235,14 +12265,19 @@ mod tests {
             "the session resolves tab 7, and its mirror cwd is the fallback"
         );
         assert_eq!(
-            host_tab_origin(project, TabKey::new(HostId::new(4), 7), Some(&row)),
+            host_tab_origin(project, Some(TabKey::new(HostId::new(4), 7)), Some(&row)),
             project_only,
             "tab 7 of another host is not this host's tab 7"
         );
         assert_eq!(
-            host_tab_origin(project, TabKey::local(7), Some(&row)),
+            host_tab_origin(project, Some(TabKey::local(7)), Some(&row)),
             project_only,
             "an in-process tab's path means nothing on the host"
+        );
+        assert_eq!(
+            host_tab_origin(project, None, Some(&row)),
+            project_only,
+            "a project row's New Tab names no tab"
         );
     }
 
@@ -12256,14 +12291,14 @@ mod tests {
         row.tabs = vec![listed_tab(7, 42, "")];
 
         assert_eq!(
-            host_tab_origin(project, TabKey::new(host, 7), Some(&row)),
+            host_tab_origin(project, Some(TabKey::new(host, 7)), Some(&row)),
             HostTabOrigin {
                 cwd: row.cwd.clone(),
                 cwd_from_tab: Some(7),
             }
         );
         assert_eq!(
-            host_tab_origin(project, TabKey::new(host, 7), None),
+            host_tab_origin(project, Some(TabKey::new(host, 7)), None),
             HostTabOrigin {
                 cwd: String::new(),
                 cwd_from_tab: Some(7),
@@ -12546,7 +12581,7 @@ mod tests {
         let _child = child_in(&supervisor, tab, dir.path());
 
         assert_eq!(
-            local_launch_cwd(&workspace, &supervisor),
+            local_launch_cwd(&workspace, &supervisor, tab),
             canonical(dir.path())
         );
     }
@@ -12561,11 +12596,34 @@ mod tests {
         let _child = child_in(&supervisor, tab, native.path());
 
         assert_eq!(
-            local_launch_cwd(&workspace, &supervisor),
+            local_launch_cwd(&workspace, &supervisor, tab),
             canonical(native.path()),
             "the child's cwd must win over the row's {}",
             tracked.path().display()
         );
+    }
+
+    /// `open_tab_in`'s New Tab Here (plan 073 D9): a tab in a project
+    /// that is not on screen starts where *that* tab is, and asking does
+    /// not move the selection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_tab_from_an_inactive_projects_tab_starts_where_that_tab_is() {
+        let (shown_dir, source_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (workspace, shown) = workspace_tracking(shown_dir.path());
+        let other = workspace.create_project("q", "/").unwrap().id;
+        let source = workspace
+            .open_tab(other, &source_dir.path().to_string_lossy(), "", false)
+            .unwrap()
+            .id;
+        let supervisor = Arc::new(PtySupervisor::new());
+        let _shown = child_in(&supervisor, shown, shown_dir.path());
+        let _source = child_in(&supervisor, source, source_dir.path());
+
+        assert_eq!(
+            local_launch_cwd(&workspace, &supervisor, source),
+            canonical(source_dir.path())
+        );
+        assert_eq!(workspace.active().1, shown);
     }
 
     #[test]

@@ -234,6 +234,134 @@
       ],
       "type": "object"
     },
+    "AppContextMenuActivateParams": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "target": {
+          "$ref": "#/$defs/AppContextMenuTarget"
+        }
+      },
+      "required": [
+        "target",
+        "action"
+      ],
+      "type": "object"
+    },
+    "AppContextMenuDumpParams": {
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/AppContextMenuTarget"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    },
+    "AppContextMenuDumpResult": {
+      "properties": {
+        "entries": {
+          "items": {
+            "$ref": "#/$defs/AppContextMenuEntry"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "entries"
+      ],
+      "type": "object"
+    },
+    "AppContextMenuEntry": {
+      "anyOf": [
+        {
+          "properties": {
+            "action": {
+              "type": "string"
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "label": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "action",
+            "label",
+            "enabled"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "separator": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "separator"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AppContextMenuOpenParams": {
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/AppContextMenuTarget"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    },
+    "AppContextMenuTarget": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "tab_id": {
+              "$ref": "#/$defs/WireTabRef"
+            }
+          },
+          "required": [
+            "tab_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "project_id": {
+              "$ref": "#/$defs/WireProjectRef"
+            }
+          },
+          "required": [
+            "project_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "host": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "host"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "AppCursorShapeParams": {
       "additionalProperties": false,
       "type": "object"
@@ -4018,6 +4146,30 @@
       },
       "result": {
         "$ref": "#/$defs/AppActiveTerminalFocusedResult"
+      }
+    },
+    "app.context_menu_activate": {
+      "params": {
+        "$ref": "#/$defs/AppContextMenuActivateParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    "app.context_menu_dump": {
+      "params": {
+        "$ref": "#/$defs/AppContextMenuDumpParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AppContextMenuDumpResult"
+      }
+    },
+    "app.context_menu_open": {
+      "params": {
+        "$ref": "#/$defs/AppContextMenuOpenParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
       }
     },
     "app.cursor_shape": {

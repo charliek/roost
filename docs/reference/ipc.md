@@ -2280,6 +2280,80 @@ workspace state, or write the system clipboard. Like
 before anything else runs. Widening the allowlist happens one name at
 a time, alongside a concrete test need.
 
+### Context menu test ops (`app.context_menu_dump` / `app.context_menu_activate` / `app.context_menu_open`) *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it every op in this group returns `not-enabled`. They read and
+press the right-click menu on a tab, a project row or a host band — the
+same menu, built by the same code, that a right-click shows — and are a
+test seam with no `roostctl` verb, under the same rule as
+`app.dialog_answer`.
+
+Every op takes a `target`, one of:
+
+- `{"tab_id": "<ref>"}` — a tab, by `tab.dump`'s ref: a bare id for one
+  of this window's local tabs, or `h<host>.<id>` for a host's;
+- `{"project_id": "<ref>"}` — a project row, by the same two spellings;
+- `{"host": "<saved id>"}` — a host band, by the saved host's `id`
+  (`host.list`).
+
+A ref whose row is gone, or whose `h<host>` names a connection that has
+since reconnected (every connect mints a new one), is refused
+`invalid-param`.
+
+`app.context_menu_dump` lists the menu the row would show now, in order.
+Request: `{"params": {"target": {"tab_id": "7"}}}`. Response:
+
+```json
+{
+  "entries": [
+    {"action": "rename_tab", "label": "Rename…", "enabled": true},
+    {"action": "new_tab_here", "label": "New Tab Here", "enabled": true},
+    {"action": "copy_tab_path", "label": "Copy Path", "enabled": true},
+    {"separator": true},
+    {"action": "close_tab", "label": "Close Tab", "enabled": true}
+  ]
+}
+```
+
+A project row lists `new_tab`, `rename_project`, `copy_project_path`,
+`open_project_folder` (labelled "Open in Finder" on macOS and "Open in
+File Manager" on Linux, and only for a path on this machine), a
+separator and `close_project`. A project on a host adds a separator and the
+host's own items; a host band, and a dimmed or offline host's rows, list
+only those. The host items are the command palette's host rows for the
+same host, under the palette's titles: `host_connect`,
+`host_disconnect`, `host_update_session`, `host_restart_session` and
+`host_stop_session` ("Disconnect Host: workbox", "Stop Session:
+workbox", …). Remove Host is never on the menu.
+
+`app.context_menu_activate` runs one item through the dispatcher a
+click reaches. Request:
+`{"params": {"target": {"tab_id": "7"}, "action": "close_tab"}}`.
+Response: `{}`, as soon as the item has been dispatched — wait on its
+effect. An item that asks first raises its card, as a click does:
+`close_project` the project's close confirmation, `host_stop_session` the Stop
+Session card (`app.dialog_dump`'s `confirm_stop`), and the rename items
+the inline editor.
+
+The menu is rebuilt before the item runs, and each refusal is
+`invalid-param` with its own message:
+
+- the row is gone, or its connection was replaced;
+- `action` is not on that row's menu now (or is not an action at all);
+- the item is on the menu but disabled — Copy Path with no known path;
+- a modal, the palette, a rename editor or an input-method composition
+  owns input.
+
+New Tab, New Tab Here, Close Tab and Close Project answer `busy` while a
+local-backend switch is in flight, as their palette rows do.
+
+`app.context_menu_open` would show the menu on screen. It answers
+`not-supported` on every platform for now: on macOS the menu is the
+native popup, which no test op opens.
+
+The Swift Mac app answers `unknown-op` to all three.
+
 ### `agent.set_hooks`
 
 Set *this* machine's own `agent-hooks` key — the consent dialog's Apply

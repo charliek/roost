@@ -3648,3 +3648,40 @@ def test_a_paste_while_a_new_host_tab_opens_is_refused(roost, session_env):
                 release.set()
             assert line.get("text") == "the new tab isn't ready yet", line
             assert roost.tab_capture_pty_input(key) == b"", "the paste reached the old tab"
+
+
+# ---------------------------------------------------------------------------
+# 20. Plan 073 D9 (#338): a host row's right-click menu is the palette's
+# ---------------------------------------------------------------------------
+
+
+def test_a_host_rows_menu_lists_the_palettes_host_rows_and_stop_asks_first(host, roost):
+    """The menu's host items are `host_verbs::verbs`' own rows for that
+    host, under the palette's titles, and Remove Host is never among them
+    (plan 073 decision g). Stop Session raises the same confirm card the
+    palette row does — it ends every shell over there, so it is never one
+    click — and cancelling it stops nothing."""
+    host.connect_and_wait()
+    section = wait_host_section(
+        roost,
+        host.saved_id,
+        lambda section: section["projects"],
+        "the host's projects to reach the sidebar",
+    )
+    target = {"project_id": section["projects"][0]["key"]}
+    host_rows = [f"Disconnect Host: {host.label}", f"Stop Session: {host.label}"]
+
+    labels = [entry.get("label") for entry in roost.context_menu_dump(target)]
+    assert labels[-3:] == [None, *host_rows], labels
+    band = roost.context_menu_dump({"host": host.saved_id})
+    assert [entry["label"] for entry in band] == host_rows, band
+
+    roost.context_menu_activate(target, "host_stop_session")
+    try:
+        dialog = roost.call("app.dialog_dump", {})
+        assert dialog.get("dialog") == "confirm_stop", dialog
+        assert dialog.get("host") == host.saved_id, dialog
+    finally:
+        roost.call("app.dialog_answer", {"action": "cancel"})
+    assert roost.call("app.dialog_dump", {}).get("dialog") is None
+    host.wait_connected()

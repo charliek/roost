@@ -52,6 +52,20 @@ release workflow asserts they agree).
   #rrggbb` key pins a color instead; on Linux `system` keeps Roost's blue
   (#578).
 
+- **Right-click menus in Roost-Iced (plan 073, #338)** — right-click (or
+  Control-click on macOS, where the menu is the native one) a tab, a
+  project or a host's band in the sidebar. A tab offers Rename…, New Tab
+  Here (a new tab in that tab's directory), Copy Path and Close Tab. A
+  project offers New Tab, Rename…, Copy Path, Open in Finder / Open in
+  File Manager when its folder is on this machine, and Close Project…,
+  which still asks first. A host's band offers that host's own
+  command-palette entries — Connect, Disconnect, Stop Session (which asks
+  first), and Update or Restart when its session is out of date — and a
+  project on a host lists them below its own; Remove Host stays in the
+  palette. Test-mode
+  `app.context_menu_*` ops list and run a row's menu (see
+  [`ipc.md`](docs/reference/ipc.md#context-menu-test-ops-appcontext_menu_dump-appcontext_menu_activate-appcontext_menu_open-test-only-gated)).
+
 ### Changed
 
 - **JetBrains Mono is bundled as the iced UI's terminal font (#580)** —

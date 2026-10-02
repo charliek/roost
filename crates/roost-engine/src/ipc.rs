@@ -27,34 +27,36 @@ use roost_ipc::agent::{self, TabAgentReportParams};
 use roost_ipc::messages::{
     ops, AgentHooksOutcome, AgentSetHooksAgents, AgentSetHooksParams, AgentSetHooksResult,
     AppActivateParams, AppActiveTerminalFocusedParams, AppActiveTerminalFocusedResult,
-    AppCursorShapeParams, AppCursorShapeResult, AppDialogAnswerParams, AppDialogDumpParams,
-    AppDialogDumpResult, AppDockBadgeParams, AppDockBadgeResult, AppKeyEventParams,
-    AppKeybindDispatchParams, AppMenuActivateParams, AppMenuDumpParams, AppMenuDumpResult,
-    AppNoticeAnswerParams, AppNoticeDumpParams, AppNoticeDumpResult, AppNotificationStatusParams,
-    AppNotificationStatusResult, AppRenderStatsParams, AppRenderStatsResult,
-    AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams, AppUpdateCheckParams,
-    AppUpdateStatusParams, AppUpdateStatusResult, AttachPayloadKind, ClipboardDumpParams,
-    ClipboardDumpResult, ClipboardWriteFilesParams, ClipboardWriteParams, EventsSubscribeParams,
-    EventsSubscribeResult, Host, HostAddParams, HostAddResult, HostConnectParams,
-    HostConnectionResult, HostDisconnectParams, HostListParams, HostListResult, HostRemoveParams,
-    HostStatusParams, HostStatusResult, IdentifyParams, IdentifyResult, NotificationCreateParams,
-    PaletteActivateParams, PaletteDismissParams, PaletteOpenParams, PalettePresentParams,
-    PalettePresentResult, PaletteQueryParams, PaletteStateParams, PaletteStateResult,
-    ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectEnsureParams,
-    ProjectEnsureResult, ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams,
-    ScreenshotResult, SelectionClearParams, SelectionDumpParams, SelectionDumpResult,
-    SelectionSetParams, SessionIdentify, SessionIdentifyParams, SessionPutFileParams,
-    SessionPutFileResult, SessionSetAgentHooksParams, SessionSetThemeParams, SessionStopParams,
-    SessionStopResult, SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams,
-    TabAgentReportResult, TabCapturePtyInputParams, TabCapturePtyInputResult,
-    TabClearNotificationParams, TabClearNotificationResult, TabCloseParams,
-    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
-    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
-    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
-    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams,
-    TabSendFileResult, TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams,
-    TabWriteParams, WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef,
-    WireTabRef, MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
+    AppContextMenuActivateParams, AppContextMenuDumpParams, AppContextMenuDumpResult,
+    AppContextMenuOpenParams, AppContextMenuTarget, AppCursorShapeParams, AppCursorShapeResult,
+    AppDialogAnswerParams, AppDialogDumpParams, AppDialogDumpResult, AppDockBadgeParams,
+    AppDockBadgeResult, AppKeyEventParams, AppKeybindDispatchParams, AppMenuActivateParams,
+    AppMenuDumpParams, AppMenuDumpResult, AppNoticeAnswerParams, AppNoticeDumpParams,
+    AppNoticeDumpResult, AppNotificationStatusParams, AppNotificationStatusResult,
+    AppRenderStatsParams, AppRenderStatsResult, AppSelectedTabIdParams, AppSelectedTabIdResult,
+    AppSetWindowFocusParams, AppUpdateCheckParams, AppUpdateStatusParams, AppUpdateStatusResult,
+    AttachPayloadKind, ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteFilesParams,
+    ClipboardWriteParams, EventsSubscribeParams, EventsSubscribeResult, Host, HostAddParams,
+    HostAddResult, HostConnectParams, HostConnectionResult, HostDisconnectParams, HostListParams,
+    HostListResult, HostRemoveParams, HostStatusParams, HostStatusResult, IdentifyParams,
+    IdentifyResult, NotificationCreateParams, PaletteActivateParams, PaletteDismissParams,
+    PaletteOpenParams, PalettePresentParams, PalettePresentResult, PaletteQueryParams,
+    PaletteStateParams, PaletteStateResult, ProjectCreateParams, ProjectCreateResult,
+    ProjectDeleteParams, ProjectEnsureParams, ProjectEnsureResult, ProjectRenameParams,
+    ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams,
+    SelectionDumpParams, SelectionDumpResult, SelectionSetParams, SessionIdentify,
+    SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams,
+    SessionSetThemeParams, SessionStopParams, SessionStopResult, SidebarDumpParams,
+    SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult, TabCapturePtyInputParams,
+    TabCapturePtyInputResult, TabClearNotificationParams, TabClearNotificationResult,
+    TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams,
+    TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams,
+    TabExpandSelectionAtResult, TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams,
+    TabFocusResult, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
+    TabSendFileParams, TabSendFileResult, TabSetHookActiveParams, TabSetStateParams,
+    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
+    WindowResizeParams, WireProjectRef, WireTabRef, MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES,
+    SESSION_PROTOCOL_VERSION,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{AttachHandshake, SessionSetThemeResult};
@@ -547,6 +549,26 @@ pub enum UiRequest {
         text: Option<String>,
         modifiers: Vec<String>,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// `app.context_menu_dump` — the right-click menu `target` would show
+    /// now (plan 073 D9). Gated like `AppDialogDump`.
+    AppContextMenuDump {
+        target: AppContextMenuTarget,
+        reply: HostOpReply<AppContextMenuDumpResult>,
+    },
+    /// `app.context_menu_activate` — run one item of that menu through
+    /// the dispatcher a click reaches. `action` is the item's wire name;
+    /// the UI owns the vocabulary. Gated like `AppDialogDump`.
+    AppContextMenuActivate {
+        target: AppContextMenuTarget,
+        action: String,
+        reply: HostOpReply<()>,
+    },
+    /// `app.context_menu_open` — show that menu on screen. Gated like
+    /// `AppDialogDump`.
+    AppContextMenuOpen {
+        target: AppContextMenuTarget,
+        reply: HostOpReply<()>,
     },
     /// `app.update_status` — read back the macOS iced UI's Sparkle
     /// updater state (framework loaded, updater started, last completed
@@ -4168,6 +4190,35 @@ async fn dispatch(
             .map_err(map_test_op_err)?;
             Ok(serde_json::json!({}))
         }
+        ops::APP_CONTEXT_MENU_DUMP => {
+            let p: AppContextMenuDumpParams = decode(params)?;
+            let result = h
+                .ui_call(|reply| UiRequest::AppContextMenuDump {
+                    target: p.target,
+                    reply,
+                })
+                .await??;
+            encode(&result)
+        }
+        ops::APP_CONTEXT_MENU_ACTIVATE => {
+            let p: AppContextMenuActivateParams = decode(params)?;
+            h.ui_call(|reply| UiRequest::AppContextMenuActivate {
+                target: p.target,
+                action: p.action,
+                reply,
+            })
+            .await??;
+            Ok(serde_json::json!({}))
+        }
+        ops::APP_CONTEXT_MENU_OPEN => {
+            let p: AppContextMenuOpenParams = decode(params)?;
+            h.ui_call(|reply| UiRequest::AppContextMenuOpen {
+                target: p.target,
+                reply,
+            })
+            .await??;
+            Ok(serde_json::json!({}))
+        }
         ops::APP_UPDATE_STATUS => {
             let _: AppUpdateStatusParams = decode(params)?;
             let result = h
@@ -4404,6 +4455,9 @@ const DISPATCHED_OPS: &[(&str, &[Withheld])] = {
         (ops::APP_NOTICE_DUMP, &[NeedsUi]),
         (ops::APP_NOTICE_ANSWER, &[NeedsUi, TestMode]),
         (ops::APP_KEY_EVENT, &[NeedsUi, TestMode]),
+        (ops::APP_CONTEXT_MENU_DUMP, &[NeedsUi, TestMode]),
+        (ops::APP_CONTEXT_MENU_ACTIVATE, &[NeedsUi, TestMode]),
+        (ops::APP_CONTEXT_MENU_OPEN, &[NeedsUi, TestMode]),
         (ops::APP_UPDATE_STATUS, &[NeedsUi, TestMode, MacosOnly]),
         (ops::APP_UPDATE_CHECK, &[NeedsUi, TestMode, MacosOnly]),
         (
@@ -5648,6 +5702,9 @@ mod tests {
 
     /// What `ROOST_TEST_MODE=1` adds to [`UI`].
     const UI_TEST_SEAMS: &[&str] = &[
+        "app.context_menu_activate",
+        "app.context_menu_dump",
+        "app.context_menu_open",
         "app.dialog_answer",
         "app.dialog_dump",
         "app.key_event",

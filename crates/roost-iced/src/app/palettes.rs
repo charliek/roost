@@ -1659,7 +1659,7 @@ impl App {
     /// ordinary dial for most hosts, but on a mismatched one it raises
     /// the upgrade prompt — whose button now starts a remote install —
     /// and `palette.activate` is reachable from `roostctl`.
-    fn run_host_verb(
+    pub(super) fn run_host_verb(
         &mut self,
         verb: host_verbs::HostVerb,
         origin: crate::host_conn::RequestOrigin,
@@ -2333,7 +2333,7 @@ impl App {
                     .map(|tab| tab.title)
                     .unwrap_or_default();
                 let active_cwd = if project_id != 0 {
-                    self.launch_cwd()
+                    local_launch_cwd(&self.workspace, &self.client.supervisor, tab_id)
                 } else {
                     String::new()
                 };
