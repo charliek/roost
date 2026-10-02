@@ -5,6 +5,12 @@ Written 2026-09-27. Companion to [`swift-retirement.md`](swift-retirement.md);
 neither blocks the other. File and line references are as of `main` @
 `474e6b5`.
 
+**Update 2026-10-02:** plan 073 (the first gap release, see
+[`swift-retirement.md`](swift-retirement.md)) shipped all of Tier 0 and the
+cursor, selection and cell-metrics items of Tier 1. They are marked ✅
+below, with [findings](#findings-from-plan-073). The "today" tables
+describe the code at `474e6b5`, before that work.
+
 iced's terminal text is good. The question here is which knobs exist to
 make it better, especially on macOS once the Core Text-based Swift app is
 gone, and what each costs.
@@ -258,21 +264,27 @@ state either (a known limitation in `docs/development/host-sessions.md`).
 
 ### Tier 0: small, try together
 
-| Option | Cost | Effect | Notes |
-|---|---|---|---|
-| 1 pt = 1 px on macOS | tiny | Matches Mac convention, the Swift app, Ghostty and Terminal.app | Existing Roost-Iced users on macOS see text shrink 25% unless they raise `font-size`. Linux keeps 96/72. |
-| Hinting off on macOS | one line | Smooth, unhinted shapes like Core Text | Cheapest route: force `hint(false)` under `cfg(target_os = "macos")` in the vendored swash (`third_party/swash/src/scale/mod.rs:400`). That unhints chrome text too, as native Mac text is. It bends the vendored copy's "malformed-font guards only" rule; the cleaner route is the raw path's `DISABLE_HINTING` flag (Tier 1). |
-| Enable iced's `web-colors` | one line plus a look at the chrome | Blending in display space, like AppKit and Ghostty's `native` | Solid colors stay the same; translucent chrome blends differently and needs a visual check. Also makes the wgpu and tiny-skia renderers agree. |
-| Bundle JetBrains Mono as the default | small | Same look on every machine; no silent fallback to an arbitrary monospace font | Ghostty embeds it too. OFL license, like the bundled Inter. Also map the generic monospace family to Menlo on macOS. |
-| Apply the theme's bold color | small | Matches the theme author's intent | iced ignores `bold_color` today. |
+| Status | Option | Cost | Effect | Notes |
+|---|---|---|---|---|
+| ✅ macOS | 1 pt = 1 px on macOS | tiny | Matches Mac convention, the Swift app, Ghostty and Terminal.app | Existing Roost-Iced users on macOS see text shrink 25% unless they raise `font-size`. Linux keeps 96/72. |
+| ✅ macOS | Hinting off on macOS | one line | Smooth, unhinted shapes like Core Text | Cheapest route: force `hint(false)` under `cfg(target_os = "macos")` in the vendored swash (`third_party/swash/src/scale/mod.rs:400`). That unhints chrome text too, as native Mac text is. It bends the vendored copy's "malformed-font guards only" rule; the cleaner route is the raw path's `DISABLE_HINTING` flag (Tier 1). |
+| ✅ both OSes | Enable iced's `web-colors` | one line plus a look at the chrome | Blending in display space, like AppKit and Ghostty's `native` | Solid colors stay the same; translucent chrome blends differently and needs a visual check. Also makes the wgpu and tiny-skia renderers agree. |
+| ✅ as the generic, not Menlo | Bundle JetBrains Mono as the default | small | Same look on every machine; no silent fallback to an arbitrary monospace font | Ghostty embeds it too. OFL license, like the bundled Inter. Also map the generic monospace family to Menlo on macOS. |
+| ✅ | Apply the theme's bold color | small | Matches the theme author's intent | iced ignores `bold_color` today. |
 
 ### Tier 1: medium, independent of each other
 
-- **Cursor and selection above the glyphs.** Draw them in a later layer
+- ✅ **Cursor and selection above the glyphs.** Draw them in a later layer
   and invert the character under a block cursor. A gap you see every day.
-- **Ghostty-style cell metrics:** round instead of floor, take line height
+  *Shipped:* an opaque block cursor that inverts its glyph, and Ghostty's
+  selection colors (an opaque `selection-background`, text in
+  `selection-foreground`).
+- ✅ (macOS only) **Ghostty-style cell metrics:** round instead of floor, take line height
   and baseline from the font's own metrics, and add `adjust-cell-width` and
   `adjust-cell-height` options.
+  *Shipped on macOS only, with Swift's rule rather than Ghostty's:* cells
+  come from the font's own metrics, rounded **up**. **Still open:** Linux
+  keeps floor and 1.2, and the `adjust-*` options don't exist.
 - **A macOS fallback list** with Menlo, Apple Symbols and SF Mono ahead of
   the system UI font, swapped in once at startup.
 - **More sprite ranges:** powerline, braille and Legacy Computing, with
@@ -282,6 +294,11 @@ state either (a known limitation in `docs/development/host-sessions.md`).
   without an italic face, font features and exact weights. It is also a
   step toward Tier 2's per-frame savings. It must keep per-column placement
   to avoid the E4 drift.
+
+**Known limitation (plan 073).** A glyph drawn in a fallback face
+(CJK, emoji) is centered by its own metrics, so its baseline isn't the
+primary font's. This is part of the fallback-glyph sizing above, which is
+still open (#585, with the rest of Tier 1).
 
 ### Tier 2: a terminal renderer of Roost's own
 
@@ -329,6 +346,54 @@ The size change fits naturally with the identity cutover in
 [`swift-retirement.md`](swift-retirement.md): users coming from the Swift
 app already expect 13pt to render at 13 px.
 
+Steps 1 and 2 shipped in plan 073, ahead of the cutover.
+
+---
+
+## Findings from plan 073
+
+Checked against the code at `5c01a9b`, 2026-10-02.
+
+- **Swift rounds cells up; Ghostty rounds to nearest.** Swift's cell width
+  is the ceiling of the advance of "M", and its height the ceiling of
+  ascent − descent + leading (`TerminalView.swift:462-466`). Ghostty rounds.
+  For JetBrains Mono (upm 1000, advance 600, ascent 1020, descent −300):
+
+  | Size | Swift (ceil) | Ghostty (round) | iced before 073 |
+  |---|---|---|---|
+  | 13 px | 8×18 | 8×17 | |
+  | 14 px | 9×19 | 8×18 | |
+  | 13pt at 17.33 px | | | 10×20 |
+
+  Side-by-side parity with Swift won the choice, so plan 073 uses ceil, on
+  macOS only. The baseline sits at cell top + ascent and the slack goes to
+  the bottom, as in Swift.
+- **Swift's default is 14pt and SF Mono.** Swift's unset `font-size` is 14
+  (`App.swift:346,493,502`), and with `font-family` unset it uses the system
+  monospace font (SF Mono). iced's default was 13pt and `"JetBrains Mono,
+  Monospace"`. After plan 073 the macOS default size is 14 and Linux stays
+  13, each following its own OS's convention. The generic monospace family
+  maps to the bundled JetBrains Mono on both OSes, not to Menlo as the Tier
+  0 row first proposed: that mapping assumed the font wasn't bundled. Users
+  who never set `font-family` now get JetBrains Mono instead of whatever was
+  installed, which is a release note, not a regression.
+- **The draw-order note, corrected.** The cursor and selection are drawn
+  *after* the text in the widget, but iced paints every quad in a layer
+  before any text, so they landed under the glyphs regardless. The fix is
+  not "draw later": rows are sparse, so a cursor on a blank cell gets no
+  quad, and sprites are quads too. The order is now pinned as cell
+  backgrounds, selection, cursor, then sprites and glyphs in role colors.
+- **The default theme hides the bold color.** `roost-dark` sets its
+  foreground, `bold-color` and `selection-foreground` all to `#ffffff`, so
+  no shipped theme shows a bold-color difference unless something recolors
+  the default foreground with OSC 10 (base16 and tinted-shell scripts do).
+  Headless dumps keep the plain foreground.
+- **Unhinting is a swash delta, and it reaches chrome text.** The vendored
+  swash turns hinting off on macOS, which also unhints the sidebar and tab
+  strip, as native Mac text is. It goes away only when terminal and chrome
+  text can both turn hinting off, or when iced or cosmic-text expose the
+  flag (Tier 1's raw path would do it).
+
 ---
 
 ## Constraints
@@ -349,15 +414,15 @@ app already expect 13pt to render at 13 px.
 
 ## Open questions
 
-- How to introduce the macOS size change for existing Roost-Iced users:
-  with the cutover release notes, or with a one-time notice.
-- What `web-colors` does to translucent chrome (overlays, hover states).
-  It may bring it closer to the Swift look, since AppKit blends the same
-  way; it needs checking.
+- ~~How to introduce the macOS size change for existing Roost-Iced users.~~
+  **Settled:** the CHANGELOG notice. No one-time in-app notice.
+- ~~What `web-colors` does to translucent chrome.~~ **Partly settled:** it
+  shipped on **both** OSes, and exact-color pixel probes still pass. Whether
+  translucent chrome looks right is Charlie's V2 verdict; if he rejects it, the fallback is `web-colors` on macOS
+  only, a small follow-up.
 - Whether to get Screen Recording permission for one capturing tool on the
   mini, for true on-screen comparisons.
-- Whether Linux should stay hinted. Probably yes: hinted text is the Linux
-  convention, so hinting becomes a per-platform default rather than a
-  global change.
+- ~~Whether Linux should stay hinted.~~ **Settled: yes.** Hinting is a
+  per-platform default, off only on macOS.
 - Whether to expose `font-thicken`-style and hinting options to users, or
   keep them as platform defaults.

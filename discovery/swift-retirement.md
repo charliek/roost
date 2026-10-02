@@ -5,6 +5,14 @@ Status: **decided direction, not an implementation plan.** Written
 about tuning iced's terminal text; that work does not block this one. File
 and line references are as of `main` @ `474e6b5`.
 
+Re-sequenced 2026-10-02: the gap work ships as releases **before** v0.1.0,
+with Swift frozen, so each gap is judged against the live Swift app. Plan 073
+is the first of those releases; the [Mac feature gaps](#mac-feature-gaps-to-close-before-v010)
+and [Phases](#phases) below record what it took and what is left. A
+verified removal inventory for the v0.1.0 cutover exists, kept with the
+plan-073 working notes outside the repo, for that plan's planning session
+to start from.
+
 Implementation plans, and the `docs/development/vision.md` decision-log
 entry that supersedes DL-1, DL-5, DL-16 and DL-28, land in the PRs that do
 the work, per this folder's [README](README.md).
@@ -23,7 +31,7 @@ Pinned by Charlie, 2026-09-27:
 |---|---|
 | Identity | The iced Mac build takes over the production identity: bundle id `ai.stridelabs.Roost`, the name `Roost.app`, the Swift update feed (`docs/appcast.xml`) and its Sparkle signing key. |
 | Roost-Iced.app | Sunset, along with its feed (`docs/appcast-iced.xml`). It has no real users. How to tell anyone who installed it is an open discussion; release notes may be enough. |
-| Releases | One more release that still ships the Swift app. The first Swift-less release is **v0.1.0**. |
+| Releases | Gap-closing releases ship **before** v0.1.0, with the Swift app frozen in them (plan 073 is the first). The first Swift-less release is **v0.1.0**. The legacy snapshot pin is the last release before v0.1.0. |
 | Code | The Swift app moves to a private `roost-legacy-swift` repo, modeled on `roost-legacy-go`. |
 | Issues | Swift-related issues are closed or rewritten only **after** the work that retires them merges, never before. |
 | Deferred | The `mac/` layout, the Mac-only e2e modules and the Swift-facing facade are decided at removal time (see [Deferred](#deferred-to-removal-time)). |
@@ -132,6 +140,10 @@ Already in iced on macOS: a native menu bar (`crates/roost-iced/src/macos/menu.r
 routed through the same action path as hotkeys), the Dock badge,
 notification banners with click-to-focus, Sparkle, and IME input.
 
+**Disposition after plan 073** (the first gap release; Swift frozen,
+2026-10-02). Each item below ends with what became of it. Plan 073's new
+issues are #575–#581; its PR also closes #338 and #341, and files #582.
+
 ### Must-have
 
 1. **Primary selection on macOS (bug).** `window_clipboard` 0.5.1's macOS
@@ -139,16 +151,32 @@ notification banners with click-to-focus, Sparkle, and IME input.
    `copy-on-select = true` writes only there. Select-to-copy and
    middle-click paste silently do nothing. The Swift app fakes a primary
    selection with a private named pasteboard. Small. New issue.
+   **Shipped in plan 073 (#575):** the same private pasteboard (Swift's
+   name, so the two apps share it), and middle-click paste enabled on macOS.
 2. **Right-click menus** on tab and project rows (#338) and in the terminal
    (#165). Medium.
+   **Rows shipped in plan 073 (#338 closed):** tab, project and host-band
+   menus, designed rather than ported, from one shared model: native
+   `NSMenu` on macOS (ctrl-click too), an iced overlay on Linux. **The
+   terminal menu (#165) is deferred**; Swift never had one either, so it is
+   new work, not a gap.
 3. **Drops and paste.** Dropping links or text onto the terminal (iced only
    accepts dropped files), and pasting files copied in Finder. Small to
    medium. New issue.
+   **Pasting files shipped in plan 073 (#576), on both OSes:** a paste of
+   copied files does what dropping them does, any file type. **Link and text
+   drops are deferred (#302).**
 4. **Menu completeness.** Add Agent Hooks…, Settings (⌘,), Help, Enter Full
    Screen and Services; make Cut and Select All work; rebuild key
    equivalents when keybinds change (today they are read once at startup).
    Small. New issue.
+   **Shipped in plan 073 (#577):** Agent Hooks…, Settings… (⌘,; opens
+   `config.conf` in the text editor), Help → Roost Help, and a full-screen
+   item of our own. **Deferred:** Services, and Cut and Select All (iced's
+   text inputs handle them). **Dropped:** rebuilding key equivalents on a
+   keybind change, because neither app reloads config while running.
 5. **The identity cutover** ([below](#identity-cutover)). Medium.
+   **Deferred to the v0.1.0 plan.**
 6. **Test coverage the Swift jobs provide today.**
    - The Swift-only `EntitlementsTests.swift` guards entitlements files the
      iced bundle keeps (`roostctl.entitlements`, `roost-session.entitlements`)
@@ -157,18 +185,39 @@ notification banners with click-to-focus, Sparkle, and IME input.
    - The Mac-only e2e modules and the four modules the macOS iced cell
      skips (see [Deferred](#deferred-to-removal-time)).
 
+   **Deferred to the v0.1.0 plan**, with the removal.
+
 ### Should-have
 
 - **The system accent color.** iced hard-codes `#007aff`. Small.
+  **Shipped in plan 073 (#578):** a chrome palette seam, and a
+  `chrome-accent = system | #rrggbb` key. On macOS `system` follows the
+  control accent live; on Linux it stays `#007aff`.
 - **Block cursor drawn over the glyph**, inverting the character under it.
   Today the cursor and selection are drawn under the text. See
   [`text-rendering.md`](text-rendering.md). Small to medium.
+  **Shipped in plan 073 (#579):** an opaque cursor that inverts its glyph,
+  Ghostty-style selection colors, and the theme's bold color. (The
+  cursor sat *under* the glyph because iced paints all quads before text
+  within a layer, not because of the order the widget submits them in.)
 - **Option-as-Meta (#341).** Most keys can be done inside Roost: iced's
   key event carries the key without modifiers (`key`) plus `modifiers.alt()`.
   The dead-key chords (⌥e, ⌥u, ⌥n, ⌥i, ⌥\`) still go through the macOS
   input method and need winit's option-as-alt setting, which iced 0.14
   doesn't expose. Small, plus a small iced patch for dead keys.
+  **Shipped in plan 073 (#341 closed):** `macos-option-as-alt = false | true |
+  left | right`, Ghostty's key and values, through libghostty's encoder with
+  no winit patch. **The dead-key chords are deferred (#582)** because they
+  need the patch. Swift has no Option-as-Meta at all, so this is new for
+  both apps, not a gap.
 - **Follow system light/dark mode (#164).** Small to medium.
+  **Deferred.** Not a Swift gap either: the Swift window forces darkAqua.
+
+Plan 073 also took on terminal text from
+[`text-rendering.md`](text-rendering.md), which this list never carried:
+macOS text sized like a Mac (#581: 1 pt = 1 px, Swift's cell rule, default
+`font-size` 14, hinting off), and JetBrains Mono bundled as the default
+terminal font (#580).
 
 ### Later
 
@@ -191,6 +240,24 @@ notification banners with click-to-focus, Sparkle, and IME input.
 ### Accepted
 
 - VoiceOver. iced exposes nothing to accessibility (DL-16).
+
+### Corrections found during plan 073 discovery
+
+Checked against the code, 2026-10-02. They amend the lists above.
+
+- **Swift has no terminal right-click menu.** #165 is new work, not a gap.
+- **Option-as-Meta and light/dark are not Swift gaps.** Neither app has
+  them; the Swift window forces darkAqua.
+- **Only Agent Hooks… is a real menu-bar parity gap.** "Rebuild key
+  equivalents when keybinds change" is moot: neither app reloads config
+  while running.
+- **The cursor sits under the glyph.** It is drawn after the text, but iced
+  paints all quads before all text within a layer. The "under the text"
+  reading above is right; an "over" reading is wrong.
+- **Removal-time corrections** (`SnapshotFile` defaults, the CI checks, the
+  release steps that read Swift files) live in the verified removal
+  inventory, kept with the plan-073 working notes outside the repo. It is
+  the starting point for the v0.1.0 planning session.
 
 ---
 
@@ -550,25 +617,31 @@ the entitlements checks; the e2e module evaluation.
 
 ## Phases
 
-0. **Stop Swift parity work.** Plan 072 has merged; new plans don't add
-   Swift twins.
-1. **Last Swift release.** It ships the Unreleased Swift fixes, and its
-   release notes say Roost.app is being replaced. Its tag is the legacy
-   snapshot pin.
-2. **Gap work in iced.** The must-haves, as independent PRs.
-3. **Cutover and removal.** One or two PRs, merged before v0.1.0:
+0. **Swift frozen.** Plan 072 has merged; no edits to `mac/` and no Swift
+   twins of new work. The Swift app still ships and still runs in CI.
+1. **Gap releases.** The must-haves and should-haves, as releases that ship
+   both apps side by side, so each gap is judged against the live Swift app.
+   Plan 073 is the first; more may follow. The Swift fixes already in
+   Unreleased ship in these. The tag of the last gap release, the last one
+   before v0.1.0, is the legacy snapshot pin.
+2. **Cutover and removal (v0.1.0).** One or two PRs, merged before the
+   release:
    - the identity change and a live-tested Sparkle handoff;
-   - extracting `roost-legacy-swift` at the last Swift release tag;
+   - extracting `roost-legacy-swift` at the pin;
    - deleting the Swift code, CI jobs, Makefile targets, tool branches and
      docs;
    - the test evaluation and the deferred decisions;
    - the vision.md decision entry.
-4. **v0.1.0,** the first Swift-less release.
-5. **Issue triage.**
 
-Tier 0 of [`text-rendering.md`](text-rendering.md) can land at any point.
-The macOS size change fits naturally with the cutover, since migrating
-Swift users already expect 13pt to render at 13 px.
+   v0.1.0 is the first Swift-less release; its notes say Roost-Iced.app is
+   sunset. The verified removal inventory for this plan is kept with the
+   plan-073 working notes, outside the repo.
+3. **Issue triage.**
+
+Tier 0 of [`text-rendering.md`](text-rendering.md) shipped in plan 073, the
+first gap release, ahead of the cutover. The macOS size change is a
+CHANGELOG note, since migrating Swift users already expect 13pt to render at
+13 px.
 
 ---
 
