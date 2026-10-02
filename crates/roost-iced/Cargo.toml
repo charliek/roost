@@ -159,6 +159,9 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSPasteboardItem",
     # `NSApplication`'s superclass; the class item does not exist without it.
     "NSResponder",
+    # `popUpMenuPositioningItem:atLocation:inView:` — the right-click menu
+    # (`macos::context_menu`) — is declared only with it.
+    "NSView",
 ] }
 
 # The UNUserNotificationCenter backend (`src/macos/notifications.rs`, plan

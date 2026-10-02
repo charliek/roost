@@ -5996,8 +5996,12 @@ impl App {
         // publishes nothing at all on press — so those rows are simply
         // press-less, which is the whole of "nothing here is actionable
         // until the connection is back".
-        let project_row: Element<'a, Message> =
-            ContextPressArea::new(project_row, ContextTarget::Project(project_key)).into();
+        let project_row: Element<'a, Message> = ContextPressArea::new(
+            project_row,
+            ContextTarget::Project(project_key),
+            self.modifiers,
+        )
+        .into();
         let mut project_group = column![project_row].spacing(2);
         if self.config.show_sidebar_agents && !hide_agent_rows {
             for agent in self.sidebar_agents.get(&project_key).into_iter().flatten() {
@@ -6099,7 +6103,8 @@ impl App {
         // The in-process band has no saved host, and so no host verbs.
         match &section.saved_id {
             Some(saved_id) => {
-                ContextPressArea::new(band, ContextTarget::Host(saved_id.clone())).into()
+                ContextPressArea::new(band, ContextTarget::Host(saved_id.clone()), self.modifiers)
+                    .into()
             }
             None => band,
         }
@@ -6543,7 +6548,11 @@ impl App {
                     .on_press(Message::TabSelected(tab_key))
                     .into()
             };
-            tab_pills = tab_pills.push(ContextPressArea::new(pill, ContextTarget::Tab(tab_key)));
+            tab_pills = tab_pills.push(ContextPressArea::new(
+                pill,
+                ContextTarget::Tab(tab_key),
+                self.modifiers,
+            ));
         }
         let tab_strip = ReorderStrip::tabs(
             tab_pills,

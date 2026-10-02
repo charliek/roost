@@ -199,6 +199,81 @@ pub(super) fn wire_entry(entry: &ContextEntry) -> AppContextMenuEntry {
     }
 }
 
+/// One row of the native macOS popup, as plain data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NativeRow<'a> {
+    /// `tag` indexes the actions [`native_rows`] returns beside the rows.
+    Item {
+        title: &'a str,
+        enabled: bool,
+        tag: isize,
+    },
+    Separator,
+}
+
+/// The native popup for `entries`: its rows, and the action each item's
+/// tag names.
+///
+/// Portable, though only macOS shows it, so its tests run on every CI
+/// cell.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn native_rows(entries: &[ContextEntry]) -> (Vec<NativeRow<'_>>, Vec<ContextAction>) {
+    let mut actions = Vec::new();
+    let rows = entries
+        .iter()
+        .map(|entry| match entry {
+            ContextEntry::Item {
+                action,
+                label,
+                enabled,
+            } => {
+                let tag = isize::try_from(actions.len()).unwrap_or(-1);
+                actions.push(*action);
+                NativeRow::Item {
+                    title: label,
+                    enabled: *enabled,
+                    tag,
+                }
+            }
+            ContextEntry::Separator => NativeRow::Separator,
+        })
+        .collect();
+    (rows, actions)
+}
+
+/// What one native popup's items name, as plain data. Portable for
+/// [`native_rows`]' reason.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct NativeTable {
+    /// Which popup this is. Its items' target carries the same number,
+    /// so an item of an older popup cannot be read against this table.
+    pub(crate) generation: u64,
+    pub(crate) target: ContextTarget,
+    /// Indexed by the item's tag.
+    pub(crate) actions: Vec<ContextAction>,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl NativeTable {
+    /// What the item tagged `tag` of popup `generation` chose, if this is
+    /// that popup's table.
+    pub(crate) fn chosen(
+        &self,
+        generation: u64,
+        tag: isize,
+    ) -> Result<(ContextTarget, ContextAction), &'static str> {
+        if generation != self.generation {
+            return Err("context menu item fired for a menu that has since been replaced");
+        }
+        let action = usize::try_from(tag)
+            .ok()
+            .and_then(|index| self.actions.get(index).copied())
+            .ok_or("context menu item fired with no bound action")?;
+        Ok((self.target.clone(), action))
+    }
+}
+
 impl App {
     /// The menu `target` shows now; `None` when its row is gone.
     pub(crate) fn context_entries(&self, target: &ContextTarget) -> Option<Vec<ContextEntry>> {
@@ -561,32 +636,63 @@ fn menu_row<'a>(
 }
 
 impl App {
-    /// A right-click on a row.
+    /// A right-click on a row: the native popup on macOS, the overlay
+    /// everywhere else.
     pub fn context_menu_requested(&mut self, target: ContextTarget, at: Point) {
-        if let Err(refusal) = self.open_context_menu(target, at) {
+        #[cfg(target_os = "macos")]
+        let shown = {
+            // The popup opens at the pointer, in screen coordinates.
+            let _ = at;
+            self.pop_up_context_menu(target)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let shown = self.open_context_menu(target, at);
+        if let Err(refusal) = shown {
             tracing::debug!(%refusal, "a right-click opened no menu");
         }
     }
 
-    /// Show `target`'s menu with its corner at `at`, in window
-    /// coordinates. Refused while something else owns input, as an
-    /// activation is.
-    pub(super) fn open_context_menu(
+    /// `target`'s menu, to show now. Refused while something else owns
+    /// input, as an activation is; otherwise any drag or held terminal
+    /// pointer is let go first.
+    fn context_menu_to_show(
         &mut self,
-        target: ContextTarget,
-        at: Point,
-    ) -> Result<(), ContextError> {
+        target: &ContextTarget,
+    ) -> Result<Vec<ContextEntry>, ContextError> {
         if self.context_blocked() {
             return Err(ContextError::Blocked);
         }
-        let entries = self.context_entries(&target).ok_or(ContextError::Missing)?;
+        let entries = self.context_entries(target).ok_or(ContextError::Missing)?;
         if entries.is_empty() {
             return Err(ContextError::Empty);
         }
         self.cancel_drags();
         self.cancel_terminal_pointers("pointer cancel before a context menu");
         self.cancel_ime_composition();
-        let (entries, size) = fitted(entries);
+        Ok(entries)
+    }
+
+    /// Track `target`'s native menu until it closes. An item chosen off
+    /// it comes back on the feed as `EngineFeed::Context`, and runs
+    /// through [`Self::context_activate`] as every other surface's does.
+    #[cfg(target_os = "macos")]
+    fn pop_up_context_menu(&mut self, target: ContextTarget) -> Result<(), ContextError> {
+        let Some(mtm) = servicing::seam_on_main("context menu") else {
+            return Ok(());
+        };
+        let entries = self.context_menu_to_show(&target)?;
+        crate::macos::context_menu::pop_up(mtm, target, &entries, self.feed_tx.clone());
+        Ok(())
+    }
+
+    /// Show `target`'s menu with its corner at `at`, in window
+    /// coordinates.
+    pub(super) fn open_context_menu(
+        &mut self,
+        target: ContextTarget,
+        at: Point,
+    ) -> Result<(), ContextError> {
+        let (entries, size) = fitted(self.context_menu_to_show(&target)?);
         self.context_menu = Some(OpenContextMenu {
             target,
             entries,
@@ -627,7 +733,17 @@ impl App {
         let Some(target) = self.context_menu.as_ref().map(|menu| menu.target.clone()) else {
             return UiTask::None;
         };
-        match self.context_activate(&target, action) {
+        self.context_item_chosen(&target, action)
+    }
+
+    /// An item a person picked off a menu on screen. A refusal goes to
+    /// the status line: nothing else would tell them it did not run.
+    pub(super) fn context_item_chosen(
+        &mut self,
+        target: &ContextTarget,
+        action: ContextAction,
+    ) -> UiTask {
+        match self.context_activate(target, action) {
             Ok(task) => task,
             Err(refusal) => {
                 self.set_status(refusal.to_string());
@@ -940,6 +1056,73 @@ mod tests {
             wire_entry(&ContextEntry::Separator),
             AppContextMenuEntry::Separator { separator: true }
         );
+    }
+
+    #[test]
+    fn the_native_popup_shows_each_entry_and_tags_it_with_its_action() {
+        let entries = context_menu::entries(
+            &ContextTarget::Tab(TabKey::local(2)),
+            &ContextFacts {
+                host: None,
+                interactive: true,
+                on_this_machine: true,
+                cwd_known: false,
+            },
+            &[],
+        );
+        let (rows, actions) = native_rows(&entries);
+        assert_eq!(
+            rows,
+            [
+                NativeRow::Item {
+                    title: "Rename…",
+                    enabled: true,
+                    tag: 0
+                },
+                NativeRow::Item {
+                    title: "New Tab Here",
+                    enabled: true,
+                    tag: 1
+                },
+                NativeRow::Item {
+                    title: "Copy Path",
+                    enabled: false,
+                    tag: 2
+                },
+                NativeRow::Separator,
+                NativeRow::Item {
+                    title: "Close Tab",
+                    enabled: true,
+                    tag: 3
+                },
+            ]
+        );
+        assert_eq!(
+            actions,
+            [
+                ContextAction::RenameTab,
+                ContextAction::NewTabHere,
+                ContextAction::CopyTabPath,
+                ContextAction::CloseTab,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_native_item_is_read_only_against_the_popup_it_was_shown_in() {
+        let tab = ContextTarget::Tab(TabKey::local(7));
+        let table = NativeTable {
+            generation: 2,
+            target: tab.clone(),
+            actions: vec![ContextAction::RenameTab, ContextAction::CloseTab],
+        };
+        assert_eq!(table.chosen(2, 1), Ok((tab, ContextAction::CloseTab)));
+        assert!(
+            table.chosen(1, 1).is_err(),
+            "an item of the popup this one replaced"
+        );
+        assert!(table.chosen(2, 2).is_err());
+        assert!(table.chosen(2, -1).is_err());
     }
 
     fn row(action: ContextAction, enabled: bool) -> ContextEntry {

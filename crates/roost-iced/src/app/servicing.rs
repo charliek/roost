@@ -2218,6 +2218,17 @@ impl App {
                     task = task.then(self.menu_event(event));
                     batch.mark_dirty();
                 }
+                // The menu bar's arm above, for its reason: the item acts
+                // on `self.projects`.
+                #[cfg(target_os = "macos")]
+                EngineFeed::Context(target, action) => {
+                    if batch.workspace_dirty() {
+                        self.reconcile();
+                        batch.mark_reconciled();
+                    }
+                    task = task.then(self.context_item_chosen(&target, action));
+                    batch.mark_dirty();
+                }
                 #[cfg(target_os = "macos")]
                 EngineFeed::AccentChanged(accent) => {
                     self.chrome = chrome_palette_for(self.config.chrome_accent, accent);

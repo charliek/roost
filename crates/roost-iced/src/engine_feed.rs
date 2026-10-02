@@ -99,6 +99,14 @@ pub(crate) enum EngineFeed {
     /// racing them on a channel of its own.
     #[cfg(target_os = "macos")]
     Menu(crate::macos::menu::MenuEvent),
+    /// The user picked an item off a row's native right-click menu (plan
+    /// 073 D9). On the feed for the menu bar's reason; the drain runs it
+    /// through `App::context_activate`, which re-reads the row first.
+    #[cfg(target_os = "macos")]
+    Context(
+        roost_ui_model::context_menu::ContextTarget,
+        roost_ui_model::context_menu::ContextAction,
+    ),
     /// The system accent color moved (plan 073 D4), already resolved the
     /// way the dark chrome shows it. On the feed because the observer's
     /// block cannot reach `App`; the drain can.

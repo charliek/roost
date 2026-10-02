@@ -6,25 +6,32 @@ use iced::advanced::overlay;
 use iced::advanced::renderer;
 use iced::advanced::widget::{tree, Operation, Tree};
 use iced::advanced::{mouse, Clipboard, Layout, Shell, Widget};
-use iced::{Element, Event, Length, Point, Rectangle, Size, Vector};
+use iced::{keyboard, Element, Event, Length, Point, Rectangle, Size, Vector};
 use roost_ui_model::context_menu::ContextTarget;
 
 use crate::Message;
 
 /// Wraps exactly one row, so a reorder strip around it still finds one
-/// layout child per id. The row sees every event first, and only a press
+/// layout child per id. The row sees a right press first, and only one
 /// nothing inside it claimed opens the menu — the strips own the left
 /// button alone, so reorder never sees a difference.
 pub(crate) struct ContextPressArea<'a> {
     content: Element<'a, Message>,
     target: ContextTarget,
+    /// The window's modifiers as the app last heard them.
+    modifiers: keyboard::Modifiers,
 }
 
 impl<'a> ContextPressArea<'a> {
-    pub(crate) fn new(content: impl Into<Element<'a, Message>>, target: ContextTarget) -> Self {
+    pub(crate) fn new(
+        content: impl Into<Element<'a, Message>>,
+        target: ContextTarget,
+        modifiers: keyboard::Modifiers,
+    ) -> Self {
         Self {
             content: content.into(),
             target,
+            modifiers,
         }
     }
 }
@@ -33,31 +40,78 @@ impl<'a> ContextPressArea<'a> {
 /// children the cursor in its content's coordinates, and iced passes the
 /// way back to the window only to `overlay` — so it is kept from there
 /// for the press, which the menu is drawn at over the whole window.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct State {
     translation: Vector,
+    /// A mouse press carries no modifiers, so they are kept here: the
+    /// window's, set at every view build — a row made while Control is
+    /// already down hears no `ModifiersChanged` until it moves — and then
+    /// the keyboard events since, which reach the row ahead of a press
+    /// later in the same batch.
+    modifiers: keyboard::Modifiers,
 }
 
-fn opens_menu(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right))
-    )
+/// A press that opens the row's menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuPress {
+    /// The right button.
+    Secondary,
+    /// macOS's control-click, which is its right-click and never a left
+    /// press: it is claimed before the row sees it, so neither a button
+    /// inside the row (a pill's ×, a host's Update) nor the strip around
+    /// it takes it for one.
+    ControlClick,
 }
 
-/// Where a menu press over `bounds` lands in the window.
+fn opens_menu(event: &Event, modifiers: keyboard::Modifiers) -> Option<MenuPress> {
+    match event {
+        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+            Some(MenuPress::Secondary)
+        }
+        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+            if cfg!(target_os = "macos") && modifiers.control() =>
+        {
+            Some(MenuPress::ControlClick)
+        }
+        _ => None,
+    }
+}
+
+/// A menu press over `bounds`, and where it lands in the window.
 fn menu_press(
     event: &Event,
+    modifiers: keyboard::Modifiers,
     cursor: mouse::Cursor,
     bounds: Rectangle,
     translation: Vector,
-) -> Option<Point> {
-    if !opens_menu(event) {
-        return None;
-    }
+) -> Option<(MenuPress, Point)> {
+    let press = opens_menu(event, modifiers)?;
     cursor
         .position_over(bounds)
-        .map(|position| position + translation)
+        .map(|position| (press, position + translation))
+}
+
+/// Publish `request` for `press`, on the right side of the row's own
+/// handling of the event (`update_row`).
+fn route_press<Message>(
+    press: Option<(MenuPress, Point)>,
+    shell: &mut Shell<'_, Message>,
+    request: impl FnOnce(Point) -> Message,
+    update_row: impl FnOnce(&mut Shell<'_, Message>),
+) {
+    if let Some((MenuPress::ControlClick, at)) = press {
+        shell.publish(request(at));
+        shell.capture_event();
+        return;
+    }
+    update_row(shell);
+    if shell.is_event_captured() {
+        return;
+    }
+    if let Some((MenuPress::Secondary, at)) = press {
+        shell.publish(request(at));
+        shell.capture_event();
+    }
 }
 
 impl Widget<Message, iced::Theme, iced::Renderer> for ContextPressArea<'_> {
@@ -66,7 +120,10 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ContextPressArea<'_> {
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(State::default())
+        tree::State::new(State {
+            translation: Vector::ZERO,
+            modifiers: self.modifiers,
+        })
     }
 
     fn children(&self) -> Vec<Tree> {
@@ -74,6 +131,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ContextPressArea<'_> {
     }
 
     fn diff(&self, tree: &mut Tree) {
+        tree.state.downcast_mut::<State>().modifiers = self.modifiers;
         tree.diff_children(std::slice::from_ref(&self.content));
     }
 
@@ -115,27 +173,39 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ContextPressArea<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        self.content.as_widget_mut().update(
-            &mut tree.children[0],
+        let state = tree.state.downcast_mut::<State>();
+        if let Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) = event {
+            state.modifiers = *modifiers;
+        }
+        let press = menu_press(
             event,
-            layout,
+            state.modifiers,
             cursor,
-            renderer,
-            clipboard,
-            shell,
-            viewport,
+            layout.bounds(),
+            state.translation,
         );
-        if shell.is_event_captured() {
-            return;
-        }
-        let translation = tree.state.downcast_ref::<State>().translation;
-        if let Some(at) = menu_press(event, cursor, layout.bounds(), translation) {
-            shell.publish(Message::ContextMenuRequested {
-                target: self.target.clone(),
+        let target = &self.target;
+        let content = &mut self.content;
+        route_press(
+            press,
+            shell,
+            |at| Message::ContextMenuRequested {
+                target: target.clone(),
                 at,
-            });
-            shell.capture_event();
-        }
+            },
+            |shell| {
+                content.as_widget_mut().update(
+                    &mut tree.children[0],
+                    event,
+                    layout,
+                    cursor,
+                    renderer,
+                    clipboard,
+                    shell,
+                    viewport,
+                );
+            },
+        );
     }
 
     fn mouse_interaction(
@@ -216,19 +286,135 @@ mod tests {
         // scrollable hands its children the cursor 250 lower.
         let scrolled = Vector::new(0.0, -250.0);
         let cursor = mouse::Cursor::Available(Point::new(40.0, 310.0));
+        let none = keyboard::Modifiers::empty();
         assert_eq!(
-            menu_press(&press(mouse::Button::Right), cursor, row, scrolled),
-            Some(Point::new(40.0, 60.0))
+            menu_press(&press(mouse::Button::Right), none, cursor, row, scrolled),
+            Some((MenuPress::Secondary, Point::new(40.0, 60.0)))
         );
         assert_eq!(
-            menu_press(&press(mouse::Button::Left), cursor, row, scrolled),
+            menu_press(&press(mouse::Button::Left), none, cursor, row, scrolled),
             None,
             "the left button stays the strip's"
         );
         let outside = mouse::Cursor::Available(Point::new(40.0, 20.0));
         assert_eq!(
-            menu_press(&press(mouse::Button::Right), outside, row, scrolled),
+            menu_press(&press(mouse::Button::Right), none, outside, row, scrolled),
             None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_control_click_opens_the_menu_on_macos() {
+        let left = press(mouse::Button::Left);
+        assert_eq!(
+            opens_menu(&left, keyboard::Modifiers::CTRL),
+            Some(MenuPress::ControlClick)
+        );
+        assert_eq!(opens_menu(&left, keyboard::Modifiers::empty()), None);
+        assert_eq!(
+            opens_menu(&left, keyboard::Modifiers::LOGO),
+            None,
+            "a command-click is not a right-click"
+        );
+        assert_eq!(
+            opens_menu(&press(mouse::Button::Right), keyboard::Modifiers::CTRL),
+            Some(MenuPress::Secondary)
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_control_click_stays_the_rows_off_macos() {
+        assert_eq!(
+            opens_menu(&press(mouse::Button::Left), keyboard::Modifiers::CTRL),
+            None
+        );
+    }
+
+    fn row(modifiers: keyboard::Modifiers) -> Element<'static, Message> {
+        ContextPressArea::new(
+            iced::widget::Space::new(),
+            ContextTarget::Tab(roost_ui_model::keys::TabKey::local(1)),
+            modifiers,
+        )
+        .into()
+    }
+
+    fn held(tree: &Tree) -> keyboard::Modifiers {
+        tree.state.downcast_ref::<State>().modifiers
+    }
+
+    #[test]
+    fn a_row_takes_the_windows_modifiers_at_every_view_build() {
+        // Control is already down when the row is made, so no
+        // `ModifiersChanged` is coming to tell it.
+        let mut tree = Tree::new(row(keyboard::Modifiers::CTRL));
+        assert_eq!(held(&tree), keyboard::Modifiers::CTRL);
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            opens_menu(&press(mouse::Button::Left), held(&tree)),
+            Some(MenuPress::ControlClick)
+        );
+        tree.diff(row(keyboard::Modifiers::empty()));
+        assert_eq!(
+            held(&tree),
+            keyboard::Modifiers::empty(),
+            "a later build carries the window's modifiers over the row's"
+        );
+    }
+
+    /// The messages and capture `press` leaves behind, around a row that
+    /// publishes `"row"` and, when `row_claims`, captures the event — as
+    /// a pill's × button and a dimmed host's pill capture a left press.
+    fn routed(
+        press: Option<(MenuPress, Point)>,
+        row_claims: bool,
+    ) -> (Vec<String>, iced::event::Status) {
+        let mut messages = Vec::new();
+        let status = {
+            let mut shell = Shell::new(&mut messages);
+            route_press(
+                press,
+                &mut shell,
+                |at| format!("menu at {},{}", at.x, at.y),
+                |shell| {
+                    shell.publish("row".to_string());
+                    if row_claims {
+                        shell.capture_event();
+                    }
+                },
+            );
+            shell.event_status()
+        };
+        (messages, status)
+    }
+
+    #[test]
+    fn a_control_click_is_claimed_before_the_row_and_a_right_press_after_it() {
+        use iced::event::Status;
+
+        let at = Point::new(4.0, 5.0);
+        assert_eq!(
+            routed(Some((MenuPress::ControlClick, at)), true),
+            (vec!["menu at 4,5".to_string()], Status::Captured),
+            "the row never sees a control-click"
+        );
+        assert_eq!(
+            routed(Some((MenuPress::Secondary, at)), true),
+            (vec!["row".to_string()], Status::Captured),
+            "a right press the row claims stays the row's"
+        );
+        assert_eq!(
+            routed(Some((MenuPress::Secondary, at)), false),
+            (
+                vec!["row".to_string(), "menu at 4,5".to_string()],
+                Status::Captured
+            )
+        );
+        assert_eq!(
+            routed(None, false),
+            (vec!["row".to_string()], Status::Ignored)
         );
     }
 }
