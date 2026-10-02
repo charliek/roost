@@ -20,7 +20,7 @@ misspelled key is silently ignored.
 | Key           | Default                 | Effect                                                                                 |
 |---------------|-------------------------|----------------------------------------------------------------------------------------|
 | `font-family` | Swift `Roost.app`: the system monospaced font. iced UI (Linux, and `Roost-Iced.app` on macOS): `JetBrains Mono, Monospace`, which is always [JetBrains Mono](#the-bundled-terminal-font) | Terminal cell font. Quote values containing spaces (`"JetBrains Mono"`). |
-| `font-size`   | `13` (Linux) / `14` (macOS) | Point size for the terminal font. Must be `> 0`. Adjustable per tab at runtime via `Cmd-+` / `Cmd--` (`Alt-+` / `Alt--` on Linux). |
+| `font-size`   | `13` (Linux) / `14` (macOS) | Point size for the terminal font (see [Font size](#font-size)). Must be `> 0`. Adjustable per tab at runtime via `Cmd-+` / `Cmd--` (`Alt-+` / `Alt--` on Linux). |
 
 ### How `font-family` resolves
 
@@ -42,6 +42,20 @@ work on both should name a single installed family:
 Either way an unresolvable family never stops Roost from launching: the
 iced UI falls back to its bundled JetBrains Mono, and the Swift app to the
 system monospace.
+
+## Font size
+
+`font-size` is in points, and each OS turns points into pixels its own
+way, so a size matches that OS's other terminals:
+
+- **macOS (both apps):** one point is one pixel, as in AppKit. The iced
+  UI sizes its cells as the Swift app does: the width is the "M"
+  advance and the height is the font's ascent + descent + line gap,
+  each rounded up. JetBrains Mono at 13 gives 8×18 cells in both apps.
+  The default is `14`.
+- **Linux (iced):** 96 dpi, so `13` draws at about 17.3 px. A cell is
+  the "M" advance wide and 1.2 lines tall, each rounded down. The
+  default is `13`.
 
 ## The bundled terminal font
 

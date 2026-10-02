@@ -9,12 +9,18 @@ discards the temporary copy.
 
 from __future__ import annotations
 
+import sys
 import time
 import uuid
 
 import pytest
 import ui
 from util import BARE_SHELL_ARGV, wait_for_config_line, wait_tab_attached
+
+
+# The iced UI's default `font-size`, which follows its host OS
+# (`typography::DEFAULT_FONT_SIZE_PT`); the UI under test runs on this host.
+DEFAULT_FONT_SIZE = 14 if sys.platform == "darwin" else 13
 
 
 def _grid(roost, tab_id: int) -> tuple[int, int]:
@@ -115,7 +121,9 @@ def test_rust_shared_font_size_reflows_all_tabs_and_persists(
         5.0,
         "shared font-size transition reaches the hidden Rust UI tab",
     )
-    wait_for_config_line(config_path, "font-size", "font-size = 14")
+    wait_for_config_line(
+        config_path, "font-size", f"font-size = {DEFAULT_FONT_SIZE + 1}"
+    )
 
     third = roost.open_tab(rust_project, cwd="/tmp", argv=BARE_SHELL_ARGV)
     wait_tab_attached(roost, third)
@@ -139,7 +147,7 @@ def test_rust_shared_font_size_reflows_all_tabs_and_persists(
             5.0,
             f"font reset restores the launch baseline on Rust UI tab {tab_id}",
         )
-    wait_for_config_line(config_path, "font-size", "font-size = 13")
+    wait_for_config_line(config_path, "font-size", f"font-size = {DEFAULT_FONT_SIZE}")
 
     before_second_reset = config_path.read_bytes()
     before_stat = config_path.stat()

@@ -74,7 +74,7 @@ pub enum KeybindAction {
     /// Default `primary+minus`.
     FontDecrease,
     /// Default `primary+0`. Resets to the config-file default
-    /// (or `cell_metrics::DEFAULT_FONT_SIZE_PT` if no config).
+    /// (or `typography::DEFAULT_FONT_SIZE_PT` if no config).
     FontReset,
     /// Open the command palette (VS Code / Zed–style `Cmd+Shift+P`
     /// overlay). Default `projectMod+shift+p` — Cmd+Shift+P on

@@ -29,7 +29,7 @@ the launcher with deterministic commands.
 | `font-family` | string | system monospace (Swift Mac app) / `JetBrains Mono, Monospace` (iced UI, which bundles JetBrains Mono) | Monospaced font family. Quoted values supported (`"JetBrains Mono"`). See [Fonts](fonts.md). |
 | `word-break-chars` | string | `` `_-.+~/:@%` `` | Extra characters treated as word characters for double-click word selection (keeps paths + URLs whole). Despite the `-break-` name (kept for Ghostty compatibility), the value is the extra word-char set. |
 | `show-sidebar-agents` | bool | `true` | Whether the sidebar renders one row per agent-owned tab under its project. Also toggled at runtime (keybind / palette / Mac View menu). |
-| `font-size` | number | `13` (Linux), `14` (Mac) | Point size for the terminal font. Must be `> 0`. |
+| `font-size` | number | `13` (Linux), `14` (Mac) | Point size for the terminal font. Must be `> 0`. One point is one pixel on macOS; Linux renders at 96 dpi (`13` ≈ 17.3 px). See [Fonts](fonts.md#font-size). |
 | `tab-min-width` | number | `80` (Mac) | Minimum tab pill width in points. `0` disables the floor. Mac-only. |
 | `tab-max-width` | number | `220` (Mac) | Maximum tab pill width in points. `0` disables the cap (pills grow to fit). Mac-only. |
 | `keybind` | `<trigger> = <action>` | (see [Keybindings](../getting-started/keybindings.md)) | Append a custom keybinding. Repeatable; later entries override earlier ones. |

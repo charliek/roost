@@ -1,5 +1,6 @@
 //! Renderer-neutral Iced terminal widget.
 
+use iced::advanced::graphics::text::{font_system, Paragraph};
 use iced::advanced::text::{Paragraph as _, Renderer as _};
 use iced::advanced::widget::{self, Widget};
 use iced::advanced::{
@@ -15,7 +16,7 @@ use roost_engine::pointer::{PointerAction, PointerButton};
 use roost_ui_model::sprite::{sprite_geometry, tessellate, SpriteGeometry, SpritePrimitive};
 use roost_ui_model::theme::Theme as AppTheme;
 use roost_vt::{ColorRgb, CursorInfo, CursorVisualStyle, SelectionSpan};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -24,7 +25,13 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// the terminal flush under the tab band). Kept as a named seam so the cell
 /// math below stays symbolic.
 pub const TERMINAL_PADDING: f32 = 0.0;
-const POINT_TO_LOGICAL_PIXEL: f64 = 96.0 / 72.0;
+/// Each OS's own convention, so a `font-size` matches that OS's other
+/// terminals: AppKit's 1 pt = 1 px (the Swift app's), and 96 dpi on Linux.
+const POINT_TO_LOGICAL_PIXEL: f64 = if cfg!(target_os = "macos") {
+    1.0
+} else {
+    96.0 / 72.0
+};
 const TERMINAL_LINE_HEIGHT: f32 = 1.2;
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -35,6 +42,111 @@ pub struct TerminalMetrics {
     pub font_pixels: f32,
     pub cell_width: f32,
     pub cell_height: f32,
+    /// The line box a cell's glyph run is laid out in, in pixels.
+    glyph_line_height: f32,
+    /// How far below a cell's top that line box starts.
+    glyph_top: f32,
+}
+
+/// A face's vertical metrics in font units, as the shaper lays out with
+/// them (`descent` is negative).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FaceMetrics {
+    units_per_em: f32,
+    ascent: f32,
+    descent: f32,
+    leading: f32,
+}
+
+impl FaceMetrics {
+    fn is_valid(self) -> bool {
+        [self.units_per_em, self.ascent, self.descent, self.leading]
+            .iter()
+            .all(|value| value.is_finite())
+            && self.units_per_em > 0.0
+            && self.ascent - self.descent > 0.0
+            && self.ascent - self.descent + self.leading > 0.0
+    }
+}
+
+/// The cell and glyph placement one rule derives from a measured "M".
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CellGeometry {
+    cell_width: f32,
+    cell_height: f32,
+    glyph_line_height: f32,
+    glyph_top: f32,
+}
+
+/// How a font's measurements become the cell grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellRule {
+    /// The Swift app's (`TerminalView.swift`'s cell size): the ceilings of
+    /// the "M" advance and of the face height, with the baseline at the
+    /// cell's top plus the ascent and the leading below the descent.
+    FontDerived,
+    /// The floors of the "M" advance and of a 1.2 line, with glyphs one
+    /// pixel down. Linux's view, unchanged.
+    Legacy,
+}
+
+impl CellRule {
+    const PLATFORM: Self = if cfg!(target_os = "macos") {
+        Self::FontDerived
+    } else {
+        Self::Legacy
+    };
+
+    /// `FontDerived` falls back to `Legacy` when the face's metrics are
+    /// missing or unusable.
+    fn geometry(self, font_pixels: f32, advance: f32, face: Option<FaceMetrics>) -> CellGeometry {
+        match (self, face.filter(|face| face.is_valid())) {
+            (Self::FontDerived, Some(face)) => {
+                let to_pixels = |units: f32| units * font_pixels / face.units_per_em;
+                CellGeometry {
+                    cell_width: advance.ceil(),
+                    cell_height: to_pixels(face.ascent - face.descent + face.leading).ceil(),
+                    // Exactly ascent + descent, so the shaper's centering
+                    // leaves the baseline at the line box's top + ascent.
+                    glyph_line_height: to_pixels(face.ascent - face.descent),
+                    glyph_top: 0.0,
+                }
+            }
+            _ => {
+                let line = TERMINAL_LINE_HEIGHT * font_pixels;
+                CellGeometry {
+                    cell_width: advance.floor(),
+                    cell_height: line.floor(),
+                    glyph_line_height: line,
+                    glyph_top: 1.0,
+                }
+            }
+        }
+    }
+}
+
+/// The metrics of the face the shaper actually used for `paragraph`'s first
+/// glyph, which is a fallback face when the requested family is missing.
+fn shaped_face_metrics(paragraph: &Paragraph) -> Option<FaceMetrics> {
+    let (id, weight) = paragraph
+        .buffer()
+        .layout_runs()
+        .find_map(|run| run.glyphs.first())
+        .map(|glyph| (glyph.font_id, glyph.font_weight))?;
+    // Building a paragraph takes this lock too, so it is taken only once
+    // the paragraph exists.
+    let face = font_system()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .raw()
+        .get_font(id, weight)?;
+    let metrics = face.metrics();
+    Some(FaceMetrics {
+        units_per_em: f32::from(metrics.units_per_em),
+        ascent: metrics.ascent,
+        descent: metrics.descent,
+        leading: metrics.leading,
+    })
 }
 
 impl TerminalMetrics {
@@ -45,6 +157,10 @@ impl TerminalMetrics {
 
     /// Resolve a supplied renderer family at a Rust UI point size.
     pub fn measure_with_font(size_pt: f64, font: Font) -> Result<Self, String> {
+        Self::measure_by(CellRule::PLATFORM, size_pt, font)
+    }
+
+    fn measure_by(rule: CellRule, size_pt: f64, font: Font) -> Result<Self, String> {
         let pixels = size_pt * POINT_TO_LOGICAL_PIXEL;
         if !pixels.is_finite() || pixels <= 0.0 || pixels > f64::from(f32::MAX) {
             return Err(format!(
@@ -58,7 +174,6 @@ impl TerminalMetrics {
             ));
         }
 
-        type Paragraph = <Renderer as text::Renderer>::Paragraph;
         let paragraph = Paragraph::with_text(text::Text {
             content: "M",
             bounds: Size::INFINITE,
@@ -70,34 +185,47 @@ impl TerminalMetrics {
             shaping: text::Shaping::Auto,
             wrapping: text::Wrapping::None,
         });
-        let measured = paragraph.min_bounds();
-        let cell_width = measured.width.floor();
-        let cell_height = measured.height.floor();
-        if !cell_width.is_finite()
-            || !cell_height.is_finite()
-            || cell_width < 1.0
-            || cell_height < 1.0
+        let advance = paragraph.min_bounds().width;
+        let face = match rule {
+            CellRule::FontDerived => shaped_face_metrics(&paragraph),
+            CellRule::Legacy => None,
+        };
+        let geometry = rule.geometry(font_pixels, advance, face);
+        if !geometry.cell_width.is_finite()
+            || !geometry.cell_height.is_finite()
+            || geometry.cell_width < 1.0
+            || geometry.cell_height < 1.0
         {
             return Err(format!(
                 "font size {size_pt}pt measured an invalid Iced cell {}x{}",
-                measured.width, measured.height
+                geometry.cell_width, geometry.cell_height
             ));
         }
         Ok(Self {
             font,
             font_pixels,
-            cell_width,
-            cell_height,
+            cell_width: geometry.cell_width,
+            cell_height: geometry.cell_height,
+            glyph_line_height: geometry.glyph_line_height,
+            glyph_top: geometry.glyph_top,
         })
+    }
+
+    /// Where a glyph run for the cell whose top-left is `cell` is placed.
+    fn glyph_origin(self, cell: Point) -> Point {
+        Point::new(cell.x, cell.y + self.glyph_top)
     }
 
     #[cfg(test)]
     fn fixed(cell_width: f32, cell_height: f32) -> Self {
+        let font_pixels = 13.5;
         Self {
             font: Font::MONOSPACE,
-            font_pixels: 13.5,
+            font_pixels,
             cell_width,
             cell_height,
+            glyph_line_height: TERMINAL_LINE_HEIGHT * font_pixels,
+            glyph_top: 1.0,
         }
     }
 }
@@ -220,7 +348,7 @@ fn cell_text(content: String, font: Font, metrics: TerminalMetrics) -> text::Tex
         content,
         bounds: Size::new(f32::INFINITY, metrics.cell_height),
         size: Pixels(metrics.font_pixels),
-        line_height: text::LineHeight::Relative(TERMINAL_LINE_HEIGHT),
+        line_height: text::LineHeight::Absolute(Pixels(metrics.glyph_line_height)),
         font,
         align_x: text::Alignment::Default,
         align_y: alignment::Vertical::Top,
@@ -966,7 +1094,7 @@ impl TerminalWidget {
                     draw_font(metrics.font, cluster, false, false),
                     metrics,
                 ),
-                Point::new(position.x, position.y + 1.0),
+                metrics.glyph_origin(position),
                 color(self.snapshot.foreground),
                 clip,
             );
@@ -1167,7 +1295,7 @@ impl Widget<crate::Message, Theme, Renderer> for TerminalWidget {
                             ),
                             metrics,
                         ),
-                        Point::new(position.x, position.y + 1.0),
+                        metrics.glyph_origin(position),
                         ink,
                         clip,
                     ),
@@ -1776,6 +1904,138 @@ mod tests {
         assert!(larger.font_pixels > default.font_pixels);
         assert!(larger.cell_width >= default.cell_width);
         assert!(larger.cell_height > default.cell_height);
+    }
+
+    /// JetBrains Mono's numbers: upm 1000, ascent 1020, descent −300, no
+    /// line gap, and a 600-unit advance.
+    const JETBRAINS_MONO: FaceMetrics = FaceMetrics {
+        units_per_em: 1000.0,
+        ascent: 1020.0,
+        descent: -300.0,
+        leading: 0.0,
+    };
+
+    fn jetbrains_mono_advance(font_pixels: f32) -> f32 {
+        600.0 * font_pixels / 1000.0
+    }
+
+    fn cell_size(geometry: CellGeometry) -> (f32, f32) {
+        (geometry.cell_width, geometry.cell_height)
+    }
+
+    #[test]
+    fn font_derived_cells_match_the_swift_app() {
+        for (font_pixels, want) in [(13.0, (8.0, 18.0)), (14.0, (9.0, 19.0))] {
+            let geometry = CellRule::FontDerived.geometry(
+                font_pixels,
+                jetbrains_mono_advance(font_pixels),
+                Some(JETBRAINS_MONO),
+            );
+            assert_eq!(cell_size(geometry), want, "at {font_pixels} px");
+            assert_eq!(geometry.glyph_line_height, 1320.0 * font_pixels / 1000.0);
+            assert_eq!(geometry.glyph_top, 0.0);
+        }
+    }
+
+    #[test]
+    fn legacy_cells_keep_the_linux_grid() {
+        let font_pixels = (13.0 * 96.0 / 72.0) as f32;
+        let geometry = CellRule::Legacy.geometry(
+            font_pixels,
+            jetbrains_mono_advance(font_pixels),
+            Some(JETBRAINS_MONO),
+        );
+        assert_eq!(cell_size(geometry), (10.0, 20.0));
+        assert_eq!(
+            geometry.glyph_line_height,
+            TERMINAL_LINE_HEIGHT * font_pixels
+        );
+        assert_eq!(geometry.glyph_top, 1.0);
+    }
+
+    #[test]
+    fn font_derived_falls_back_to_legacy_without_usable_face_metrics() {
+        let font_pixels = 13.0;
+        let advance = jetbrains_mono_advance(font_pixels);
+        let legacy = CellRule::Legacy.geometry(font_pixels, advance, None);
+        let unusable = [
+            None,
+            Some(FaceMetrics {
+                units_per_em: 0.0,
+                ..JETBRAINS_MONO
+            }),
+            Some(FaceMetrics {
+                ascent: f32::NAN,
+                ..JETBRAINS_MONO
+            }),
+            Some(FaceMetrics {
+                leading: f32::INFINITY,
+                ..JETBRAINS_MONO
+            }),
+            Some(FaceMetrics {
+                ascent: 0.0,
+                descent: 0.0,
+                ..JETBRAINS_MONO
+            }),
+            Some(FaceMetrics {
+                leading: -1320.0,
+                ..JETBRAINS_MONO
+            }),
+        ];
+        for face in unusable {
+            assert_eq!(
+                CellRule::FontDerived.geometry(font_pixels, advance, face),
+                legacy,
+                "{face:?}"
+            );
+        }
+    }
+
+    fn bundled_font_metrics(rule: CellRule, font_pixels: f32) -> TerminalMetrics {
+        crate::fonts::install_bundled_terminal_fonts();
+        let size_pt = f64::from(font_pixels) / POINT_TO_LOGICAL_PIXEL;
+        let metrics = TerminalMetrics::measure_by(rule, size_pt, Font::MONOSPACE)
+            .expect("the bundled font measures");
+        assert_eq!(metrics.font_pixels, font_pixels);
+        metrics
+    }
+
+    #[test]
+    fn the_bundled_font_measures_swift_cells_under_font_derived() {
+        for (font_pixels, want) in [(13.0, (8.0, 18.0)), (14.0, (9.0, 19.0))] {
+            let metrics = bundled_font_metrics(CellRule::FontDerived, font_pixels);
+            assert_eq!(
+                (metrics.cell_width, metrics.cell_height),
+                want,
+                "at {font_pixels} px"
+            );
+        }
+    }
+
+    #[test]
+    fn the_font_derived_baseline_sits_at_the_cell_top_plus_the_ascent() {
+        for font_pixels in [13.0_f32, 14.0] {
+            let metrics = bundled_font_metrics(CellRule::FontDerived, font_pixels);
+            let paragraph =
+                Paragraph::with_text(cell_text("M".into(), metrics.font, metrics).as_ref());
+            let line_y = paragraph
+                .buffer()
+                .layout_runs()
+                .next()
+                .expect("one laid-out line")
+                .line_y;
+            let ascent = 1020.0 * font_pixels / 1000.0;
+            let baseline = metrics.glyph_origin(Point::ORIGIN).y + line_y;
+            assert!(
+                (baseline - ascent).abs() < 1e-3,
+                "at {font_pixels} px the baseline is {baseline}, not the ascent {ascent}"
+            );
+            // Both renderers put a run's baseline at its rounded `line_y`.
+            assert_eq!(
+                metrics.glyph_origin(Point::ORIGIN).y + line_y.round(),
+                ascent.round()
+            );
+        }
     }
 
     #[test]

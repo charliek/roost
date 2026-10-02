@@ -64,6 +64,15 @@ release workflow asserts they agree).
   installed resolves as before. See
   [`fonts.md`](docs/reference/fonts.md#the-bundled-terminal-font).
 
+- **Roost-Iced on macOS sizes text like a Mac (#581)** — a point is now
+  one pixel, as in the Swift app and other macOS terminals, so the text
+  shrinks: a `font-size = 13` setting goes from 17.3 px to 13 px. Cells
+  are sized as the Swift app sizes them (8×18 for JetBrains Mono at
+  13 px), so the same `font-size` gives both apps the same cell. The
+  macOS default `font-size` becomes 14, the Swift app's. Linux is
+  unchanged: 96 dpi (13pt ≈ 17.3 px), the same cells, and a default of
+  13. See [`fonts.md`](docs/reference/fonts.md#font-size).
+
 ### Fixed
 
 - **Select-to-copy and middle-click paste did nothing in Roost-Iced on

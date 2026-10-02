@@ -7,8 +7,13 @@
 
 /// Preferred Rust UI terminal family chain when config does not override it.
 pub const DEFAULT_FONT_FAMILY: &str = "JetBrains Mono, Monospace";
-/// Default Rust UI terminal size in points.
-pub const DEFAULT_FONT_SIZE_PT: f64 = 13.0;
+/// Default Rust UI terminal size in points: the Swift app's 14 on macOS,
+/// 13 on Linux.
+pub const DEFAULT_FONT_SIZE_PT: f64 = if cfg!(target_os = "macos") {
+    14.0
+} else {
+    13.0
+};
 /// Smallest size reachable through a zoom command.
 pub const MIN_FONT_SIZE_PT: f64 = 6.0;
 /// Largest size reachable through a zoom command.
