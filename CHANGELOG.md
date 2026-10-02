@@ -73,6 +73,13 @@ release workflow asserts they agree).
   unchanged: 96 dpi (13pt ≈ 17.3 px), the same cells, and a default of
   13. See [`fonts.md`](docs/reference/fonts.md#font-size).
 
+- **Glyphs look like macOS text, and blending matches AppKit and Ghostty
+  (#581)** — on macOS, glyphs are unhinted, closer to native macOS text.
+  On both OSes, text antialiasing and translucent fills (a dragged tab,
+  the host scrim, dimmed host sections) blend in display space, as AppKit
+  and Ghostty do, so the wgpu and software renderers agree. Solid colors,
+  including the now-opaque selection and block cursor, are unchanged.
+
 ### Fixed
 
 - **Select-to-copy and middle-click paste did nothing in Roost-Iced on

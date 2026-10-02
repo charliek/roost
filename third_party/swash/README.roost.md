@@ -1,9 +1,11 @@
 # Vendored swash (roost)
 
 Pristine [swash](https://crates.io/crates/swash) 0.2.10 from crates.io, plus
-the deltas enumerated below. 0.2.10 is the latest published swash release as
+the deltas enumerated below — safety fixes, plus one rendering delta (macOS
+hinting off), marked as such. 0.2.10 is the latest published swash release as
 of 2026-08-06 (checked via the crates.io API), so none of these have an
-upstream version to move to.
+upstream version to move to (the hinting delta is not a fix and has no
+upstream equivalent).
 
 * `src/internal/xmtx.rs::advance` — a guard returning `0` when
   `long_metric_count == 0`. Without it, a font whose `hhea`/`vhea` declares
@@ -31,13 +33,23 @@ upstream version to move to.
   string length but falls back to an empty slice when that length overruns the
   table's storage area, so any font with such a record crashed on the first
   character. The iterator now ends there instead.
+* `src/scale/mod.rs::ScalerBuilder::hint` — `self.hint = yes &&
+  !cfg!(target_os = "macos")`, so glyphs are never hinted on macOS (plan 073
+  D8, #581). **This is not a safety fix**: it changes rendering, to match
+  native macOS text, which is unhinted. cosmic-text calls `.hint(!DISABLE_HINTING)`
+  and iced never sets the flag, so a patch is the only lever today. Linux
+  is unchanged. It covers chrome text as well as terminal text, so remove it
+  only when both draw through a path that can turn hinting off (terminal
+  text via text-rendering Tier 1's raw path, plus a matching route for the
+  chrome), or when iced or cosmic-text expose hinting.
 
 Wired in via `[patch.crates-io]` in the workspace root `Cargo.toml`.
 Authoritative rationale: `CLAUDE.md` § Library preferences.
 
 **Removal condition.** Delete `third_party/swash/` and the
 `[patch.crates-io]` entry once a published swash release ships equivalent
-guards for every delta listed above. Note cargo alone does NOT enforce this:
+guards for every safety delta listed above and the hinting delta's own
+removal condition is met. Note cargo alone does NOT enforce this:
 a `[patch.crates-io]` entry only shadows the version it matches, so a future
 dependency bump requiring a newer swash would resolve the unpatched registry
 release with just a warning. The enforcement is `make check-iced`'s
