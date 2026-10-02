@@ -25,6 +25,16 @@ release workflow asserts they agree).
   `clipboard.write_files` op seeds such a clipboard (see
   [`ipc.md`](docs/reference/ipc.md#selection-clipboard-test-ops-selection-clipboard)).
 
+- **iced: Settings…, Help, Full Screen and Agent Hooks… in the macOS menu bar,
+  and three new actions (#577)** — `open_config` (⌘, on macOS) opens
+  `config.conf` in your default text editor, creating it first if it is
+  missing; `open_docs` opens the documentation site; `toggle_fullscreen`
+  (⌃⌘F on macOS) flips full screen, and the View item reads "Enter Full
+  Screen" or "Exit Full Screen" to match the window. The macOS menu gains
+  Settings… (Roost menu), Agent Hooks… (View) and a Help menu. On Linux the
+  three actions are unbound and reachable from the command palette ("Open
+  Settings File", "Open Documentation", "Toggle Full Screen").
+
 ### Fixed
 
 - **Select-to-copy and middle-click paste did nothing in Roost-Iced on

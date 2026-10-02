@@ -122,6 +122,8 @@ enum Message {
         result: host_conn::UploadResult,
     },
     UrlOpenCompleted(Result<(), String>),
+    FileOpenCompleted(Result<(), String>),
+    FullScreenMode(window::Mode),
     Keyboard(keyboard::Event),
     /// A platform input-method event the terminal widget claimed. The
     /// app-level `event::listen_with` below only forwards keyboard
@@ -542,7 +544,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         Message::WindowFocus(id, focused) => {
             let task = app.window_opened(id).map_task();
             app.set_window_focus(focused);
-            task
+            task.chain(app.query_full_screen().map_task())
         }
         Message::ScreenshotCaptured(capture) => app.screenshot_captured(&capture).map_task(),
         Message::ClipboardReadCompleted { request_id, value } => {
@@ -597,6 +599,14 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::UrlOpenCompleted(result) => {
             app.url_open_completed(result);
+            Task::none()
+        }
+        Message::FileOpenCompleted(result) => {
+            app.file_open_completed(result);
+            Task::none()
+        }
+        Message::FullScreenMode(mode) => {
+            app.full_screen_mode(mode);
             Task::none()
         }
         Message::TerminalPointer(event) => match event {
@@ -1034,6 +1044,23 @@ impl UiTask for app::UiTask {
             app::UiTask::OpenUrl { url } => {
                 Task::perform(url_launcher::open(url), Message::UrlOpenCompleted)
             }
+            app::UiTask::OpenFile { path, seed } => Task::perform(
+                url_launcher::open_file(path, seed),
+                Message::FileOpenCompleted,
+            ),
+            app::UiTask::ToggleFullScreen(id) => window::mode(id)
+                .then(move |mode| {
+                    window::set_mode::<Message>(
+                        id,
+                        if mode == window::Mode::Fullscreen {
+                            window::Mode::Windowed
+                        } else {
+                            window::Mode::Fullscreen
+                        },
+                    )
+                })
+                .chain(window::mode(id).map(Message::FullScreenMode)),
+            app::UiTask::QueryFullScreen(id) => window::mode(id).map(Message::FullScreenMode),
             // `spawn_blocking` is legal here because iced_winit wraps every
             // `update` in `Executor::enter`, i.e. this runs inside the
             // application's tokio runtime. The blocking pool is what keeps

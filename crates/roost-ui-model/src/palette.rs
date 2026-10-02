@@ -238,6 +238,9 @@ impl PaletteCommands {
         // The one surface that changes `agent-hooks` after the first
         // launch, and the row the wiring toast points at by name.
         ("agent_hooks", "Agent Hooks\u{2026}"),
+        ("open_config", "Open Settings File"),
+        ("open_docs", "Open Documentation"),
+        ("toggle_fullscreen", "Toggle Full Screen"),
         ("new_tab", "New Tab"),
         ("close_tab", "Close Tab"),
         ("rename_tab", "Rename Tab"),

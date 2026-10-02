@@ -2405,6 +2405,17 @@ pub enum UiTask {
     OpenUrl {
         url: String,
     },
+    /// Open a file in the default text editor, creating it with `seed`
+    /// first when it is missing. Completes as `Message::FileOpenCompleted`.
+    OpenFile {
+        path: PathBuf,
+        seed: Option<&'static str>,
+    },
+    /// Flip the window between windowed and full screen.
+    ToggleFullScreen(window::Id),
+    /// Ask the window whether it is full screen; the answer arrives as
+    /// `Message::FullScreenMode`.
+    QueryFullScreen(window::Id),
     /// A paste found no text on the system clipboard — go look for copied
     /// files, then an image. The reads + PNG encode block, so this runs
     /// off the UI thread and reports back as
@@ -4477,7 +4488,7 @@ impl App {
         if self.palette.is_some() {
             self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
         }
-        opened.task
+        opened.task.then(self.query_full_screen())
     }
 
     /// The wake this app's feed notifies on, for the subscription that
@@ -5393,6 +5404,9 @@ impl App {
                 self.open_agent_hooks_preferences();
                 Ok(UiTask::None)
             }
+            KeybindAction::OpenConfig => Ok(self.open_config()),
+            KeybindAction::OpenDocs => Ok(self.open_docs()),
+            KeybindAction::ToggleFullScreen => Ok(self.toggle_full_screen()),
             KeybindAction::FontIncrease => {
                 self.apply_font_size_transition(FontSizeTransition::Adjust(1.0))?;
                 Ok(UiTask::None)

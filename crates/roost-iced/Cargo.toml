@@ -126,6 +126,11 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSString",
     # The file URLs `macos::pasteboard::write_file_list` puts on the clipboard.
     "NSURL",
+    # `registerDefaults:` — `NSFullScreenMenuItemEverywhere = NO`, so AppKit
+    # does not add a second full-screen item beside ours.
+    "NSDictionary",
+    "NSUserDefaults",
+    "NSValue",
 ] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",

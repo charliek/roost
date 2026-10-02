@@ -1488,6 +1488,18 @@ impl App {
                     self.clear_palette_state();
                     self.open_agent_hooks_preferences();
                 }
+                "open_config" => {
+                    self.clear_palette_state();
+                    dispatch.task = self.open_config();
+                }
+                "open_docs" => {
+                    self.clear_palette_state();
+                    dispatch.task = self.open_docs();
+                }
+                "toggle_fullscreen" => {
+                    self.clear_palette_state();
+                    dispatch.task = self.toggle_full_screen();
+                }
                 "font_increase" => {
                     self.clear_palette_state();
                     self.apply_font_size_transition(FontSizeTransition::Adjust(1.0))?;

@@ -1,4 +1,9 @@
 use super::*;
+use crate::url_launcher;
+
+const CONFIG_SEED: &str = "# Roost settings — https://charliek.github.io/roost/reference/config/";
+const DOCS_URL: &str = "https://charliek.github.io/roost/";
+const SETTINGS_OPENED: &str = "Settings opened — changes apply when Roost restarts";
 
 // ── rename ──
 
@@ -2259,6 +2264,75 @@ impl App {
     pub(super) fn link_modifier_held(&self) -> bool {
         let effective = keybind::resolve_link_modifier(self.config.link_modifier);
         input::accelerator_modifiers(self.modifiers).intersects(effective)
+    }
+
+    /// The one door to the OS opener: under test mode it names the target
+    /// in the toast and launches nothing, so no test can open a browser or
+    /// an editor.
+    fn open_external(&mut self, what: url_launcher::External) -> UiTask {
+        match url_launcher::plan(self.test_mode, what) {
+            url_launcher::ExternalPlan::WouldOpen(target) => {
+                self.set_status_info(format!("Would open {target}"));
+                UiTask::None
+            }
+            url_launcher::ExternalPlan::Launch(url_launcher::External::Url(url)) => {
+                UiTask::OpenUrl { url }
+            }
+            url_launcher::ExternalPlan::Launch(url_launcher::External::File { path, seed }) => {
+                UiTask::OpenFile { path, seed }
+            }
+        }
+    }
+
+    pub(super) fn open_config(&mut self) -> UiTask {
+        let Some(path) = roost_ui_model::config::config_path() else {
+            self.set_status("there is no config file to open");
+            return UiTask::None;
+        };
+        self.open_external(url_launcher::External::File {
+            path,
+            seed: Some(CONFIG_SEED),
+        })
+    }
+
+    pub(super) fn open_docs(&mut self) -> UiTask {
+        self.open_external(url_launcher::External::Url(DOCS_URL.to_string()))
+    }
+
+    pub(super) fn toggle_full_screen(&mut self) -> UiTask {
+        match self.window_id {
+            Some(id) => UiTask::ToggleFullScreen(id),
+            None => UiTask::None,
+        }
+    }
+
+    /// A re-query of the window's mode, so the menu's "Enter/Exit Full
+    /// Screen" title follows every way the window can change — the green
+    /// button included. Only macOS has that menu.
+    pub fn query_full_screen(&self) -> UiTask {
+        match self.window_id {
+            Some(id) if cfg!(target_os = "macos") => UiTask::QueryFullScreen(id),
+            _ => UiTask::None,
+        }
+    }
+
+    pub fn full_screen_mode(&mut self, mode: window::Mode) {
+        #[cfg(target_os = "macos")]
+        if let Some(mtm) = servicing::seam_on_main("full-screen menu title") {
+            crate::macos::menu::sync_fullscreen_title(mtm, mode == window::Mode::Fullscreen);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = mode;
+    }
+
+    pub fn file_open_completed(&mut self, result: std::result::Result<(), String>) {
+        match result {
+            Ok(()) => self.set_status_info(SETTINGS_OPENED),
+            Err(error) => {
+                tracing::warn!(%error, "file launcher failed");
+                self.set_status(error);
+            }
+        }
     }
 
     pub fn url_open_completed(&mut self, result: std::result::Result<(), String>) {

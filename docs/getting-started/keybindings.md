@@ -234,9 +234,14 @@ Use only leading-line `#` comments. A `#` after a `keybind` value is treated as 
 | `agent_palette`       | `super+shift+o` / `alt+shift+o`                        |
 | `switch_project_1..9` | `super+1..9` / `alt+1..9`                              |
 | `switch_tab_1..9`     | `ctrl+1..9` / `ctrl+1..9`                              |
+| `open_config`         | `super+comma` / unbound                                |
+| `open_docs`           | unbound / unbound                                      |
+| `toggle_fullscreen`   | `ctrl+super+f` / unbound                               |
 | `font_increase`       | `super+plus`, `super+equal` / `alt+plus`, `alt+equal`  |
 | `font_decrease`       | `super+minus` / `alt+minus`                            |
 | `font_reset`          | `super+0` / `alt+0`                                    |
+
+`open_config` opens `config.conf` in your default text editor, creating it first if it does not exist; edits apply when Roost restarts. `open_docs` opens this documentation site. `toggle_fullscreen` flips the window in and out of full screen. All three are also in the command palette ("Open Settings File", "Open Documentation", "Toggle Full Screen"), and on macOS in the menu bar (Roost → Settings…, Help → Roost Help, View → Enter Full Screen).
 
 Defaults with multiple triggers (`cycle_tab_*`, `paste`, `copy`) keep both triggers; an `unbind` line removes only the listed one.
 
