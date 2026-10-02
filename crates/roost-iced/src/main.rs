@@ -81,7 +81,7 @@ enum Message {
     PendingSelectionTick,
     /// A file-drop debounce window elapsed — a one-shot, not a timer.
     FileDropDeadline,
-    FullScreenSettled,
+    FullScreenSettled(u64),
     /// The background resize wave may be due — a one-shot, not a timer.
     BackgroundResizeDeadline,
     WindowOpened(window::Id),
@@ -561,7 +561,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::FileDropDeadline => app.file_drop_deadline().map_task(),
-        Message::FullScreenSettled => app.full_screen_settled().map_task(),
+        Message::FullScreenSettled(generation) => app.full_screen_settled(generation).map_task(),
         Message::BackgroundResizeDeadline => {
             app.background_resize_deadline();
             Task::none()
@@ -1167,8 +1167,10 @@ impl UiTask for app::UiTask {
                 index,
                 result,
             }),
-            app::UiTask::FullScreenSettle(delay) => {
-                Task::perform(tokio::time::sleep(delay), |()| Message::FullScreenSettled)
+            app::UiTask::FullScreenSettle { delay, generation } => {
+                Task::perform(tokio::time::sleep(delay), move |()| {
+                    Message::FullScreenSettled(generation)
+                })
             }
             app::UiTask::FileDropDeadline(delay) => {
                 Task::perform(tokio::time::sleep(delay), |()| Message::FileDropDeadline)

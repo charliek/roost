@@ -219,11 +219,6 @@ def _overlay_platform() -> None:
         pytest.skip("macOS draws the native popup, which no test op opens")
 
 
-# `app.key_event` sends a press and never its release, so the Enter or
-# Escape a menu or dialog consumes stays latched (`RenameCompletionKey`)
-# and eats the next press of that same key. The cases from here on take
-# turns: the Escape `test_rename_…` latched cannot eat this Enter, and
-# the Enter this one latches cannot eat the next case's Escape.
 def test_the_open_menu_walks_with_the_arrow_keys_and_runs_on_enter(roost, project):
     """Four `ArrowDown`s pass Rename…, New Tab Here and Copy Path, step
     over the separator to Close Tab, and `Enter` runs it."""
@@ -252,6 +247,18 @@ def test_the_open_menu_swallows_every_other_key_and_escape_closes_it(roost, proj
     roost.key_event("z")
     typed = drain_until_match(roost, tab, rb"z")
     assert b"q" not in typed, f"a key typed at the open menu reached the terminal: {typed!r}"
+
+
+def test_escape_closes_the_menu_each_time_it_opens(roost, project):
+    _overlay_platform()
+    tab = _listed_tab(roost, project)
+    _shown(roost, tab)
+    roost._wait(roost.app_active_terminal_focused, 5.0, "the terminal to own the keyboard")
+    for showing in ("first", "second"):
+        roost.context_menu_open(tab_target(tab))
+        assert not roost.app_active_terminal_focused(), f"the {showing} menu took no keyboard"
+        roost.key_event("Escape")
+        roost._wait(roost.app_active_terminal_focused, 5.0, f"Escape to close the {showing} menu")
 
 
 def test_open_is_not_supported_on_macos(roost, project):

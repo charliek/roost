@@ -117,6 +117,7 @@ use self::interactions::{
     consume_rename_completion_key, enqueue_osc_clipboard_write, host_section_is_reorderable,
     native_file_drop_origin, paste_bytes, visual_tab_ids, ClipboardQueue, FileDropQueue,
     ProjectDragPreview, RenameCompletionKey, RenameEditor, ScreenshotQueue, TabDragPreview,
+    TrailingDebounce,
 };
 pub(crate) use self::palettes::ProviderRunResult;
 pub(crate) use self::palettes::PALETTE_RETRY_INTERVAL;
@@ -2477,8 +2478,11 @@ pub enum UiTask {
     /// Ask the window whether it is full screen; the answer arrives as
     /// `Message::FullScreenMode`.
     QueryFullScreen(window::Id),
-    /// Wait, then `Message::FullScreenSettled`.
-    FullScreenSettle(Duration),
+    /// Wait, then `Message::FullScreenSettled(generation)`.
+    FullScreenSettle {
+        delay: Duration,
+        generation: u64,
+    },
     /// A paste found no text on the system clipboard — go look for copied
     /// files, then an image. The reads + PNG encode block, so this runs
     /// off the UI thread and reports back as
@@ -3108,6 +3112,8 @@ pub struct App {
     font_registry: &'static FontRegistry,
     terminal_metrics: TerminalMetrics,
     metric_generation: u64,
+    /// See `TerminalWidget::pointer_cancel_epoch`.
+    pointer_cancel_epoch: u64,
     keybindings: HashMap<Accel, KeybindAction>,
     active_theme_name: String,
     palette: Option<palette::PaletteState>,
@@ -3141,8 +3147,8 @@ pub struct App {
     /// moved no project or tab never touches AppKit.
     #[cfg(target_os = "macos")]
     menu_window_rows: crate::macos::menu::WindowRows,
-    /// A settle query is already scheduled; see `schedule_full_screen_settle`.
-    full_screen_settle_pending: bool,
+    /// See `schedule_full_screen_settle`.
+    full_screen_settle: TrailingDebounce,
     /// `SPUUpdater.canCheckForUpdates` as last pushed onto the "Check
     /// for Updates…" item. `None` before the first push, so boot writes
     /// the item's state even when it is already correct.
@@ -3592,6 +3598,7 @@ impl App {
             font_registry,
             terminal_metrics,
             metric_generation: 1,
+            pointer_cancel_epoch: 0,
             keybindings,
             active_theme_name,
             palette: None,
@@ -3616,7 +3623,7 @@ impl App {
             menu_gating: crate::macos::menu::MenuGating::default(),
             #[cfg(target_os = "macos")]
             menu_window_rows: crate::macos::menu::WindowRows::default(),
-            full_screen_settle_pending: false,
+            full_screen_settle: TrailingDebounce::default(),
             #[cfg(target_os = "macos")]
             menu_can_check_updates: None,
             palette_visibility_retries: 0,
@@ -6600,6 +6607,7 @@ impl App {
                 snapshot: tab.snapshot.clone(),
                 metrics: tab.applied_metrics.unwrap_or(self.terminal_metrics),
                 metric_generation: tab.metric_generation,
+                pointer_cancel_epoch: self.pointer_cancel_epoch,
                 ime_active: terminal_ime_active(
                     self.keyboard_route(),
                     active_key,
@@ -7250,6 +7258,8 @@ impl App {
     /// tracking PTY — before a surface that drops pointer events takes
     /// input: a held terminal button would never see its own release.
     fn cancel_terminal_pointers(&mut self, reason: &'static str) {
+        let active = self.active_tab_key();
+        let mut active_released = true;
         for (key, tab) in &mut self.tabs {
             match tab.prepare_pointer_cancel() {
                 Ok(release) => {
@@ -7259,8 +7269,17 @@ impl App {
                     // for a gesture that no longer exists.
                     refresh_or_warn(key.tab, tab, reason);
                 }
-                Err(error) => tracing::warn!(?error, tab_id = key.tab, "{reason}"),
+                Err(error) => {
+                    active_released &= *key != active;
+                    tracing::warn!(?error, tab_id = key.tab, "{reason}");
+                }
             }
+        }
+        // The rendered widget drops its held button only when the active
+        // tab's tracking owner really was released; otherwise its next
+        // press would reach the PTY with no release before it.
+        if active_released {
+            self.pointer_cancel_epoch = self.pointer_cancel_epoch.wrapping_add(1);
         }
     }
 

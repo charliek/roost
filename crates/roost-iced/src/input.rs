@@ -778,6 +778,29 @@ pub(crate) fn synthetic_press(
     })
 }
 
+/// The release that ends `press`'s keystroke; `None` for anything but a
+/// press.
+pub(crate) fn release_of(press: &keyboard::Event) -> Option<keyboard::Event> {
+    let keyboard::Event::KeyPressed {
+        key,
+        modified_key,
+        physical_key,
+        location,
+        modifiers,
+        ..
+    } = press
+    else {
+        return None;
+    };
+    Some(keyboard::Event::KeyReleased {
+        key: key.clone(),
+        modified_key: modified_key.clone(),
+        physical_key: *physical_key,
+        location: *location,
+        modifiers: *modifiers,
+    })
+}
+
 /// The US-layout key that types `value`, shifted or not.
 fn character_code(value: char) -> Option<Code> {
     Some(match value.to_ascii_lowercase() {

@@ -3636,8 +3636,15 @@ impl App {
                     crate::input::synthetic_press(&key, text.as_deref(), &modifiers)
                 };
                 let _ = reply.send(match result {
-                    Ok(event) => {
-                        task = task.then(self.keyboard(event));
+                    Ok(press) => {
+                        // A whole keystroke: the Enter or Escape latch a
+                        // menu or dialog arms on the press is let go only
+                        // by that key's release.
+                        let release = crate::input::release_of(&press);
+                        task = task.then(self.keyboard(press));
+                        if let Some(release) = release {
+                            task = task.then(self.keyboard(release));
+                        }
                         Ok(())
                     }
                     Err(error) => Err(error),

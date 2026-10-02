@@ -1691,14 +1691,15 @@ The Swift Mac app answers `unknown-op`.
 ### `app.key_event` *(test-only — gated)*
 
 **Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
-Without it the server returns `not-enabled`. Delivers one key press to
-the window through the same handler a real one reaches: a configured
-shortcut runs first (Alt+T opens a tab on Linux, as ⌘T does on macOS),
-and otherwise the key goes to whatever owns the keyboard — the terminal
-on screen, the tab a new-tab shortcut is still opening, or a dialog or
-the palette, which answer Enter, Escape and the arrows here but take
-their text fields' typing from the toolkit, not from this handler. A
-test seam, not a surface: `roostctl` has no verb for it.
+Without it the server returns `not-enabled`. Delivers one keystroke —
+the press, then its release — to the window through the same handler a
+real one reaches: a configured shortcut runs first (Alt+T opens a tab
+on Linux, as ⌘T does on macOS), and otherwise the key goes to whatever
+owns the keyboard — the terminal on screen, the tab a new-tab shortcut
+is still opening, or a dialog or the palette, which answer Enter,
+Escape and the arrows here but take their text fields' typing from the
+toolkit, not from this handler. A test seam, not a surface: `roostctl`
+has no verb for it.
 
 Request: `{"params": {"key": "t", "modifiers": ["alt"]}}`. Response:
 `{}`.
@@ -1715,8 +1716,9 @@ Request: `{"params": {"key": "t", "modifiers": ["alt"]}}`. Response:
 
 An empty `key` or an unknown modifier is rejected `invalid-param`
 before anything else runs, and so is a named key the UI doesn't know.
-Only the press is delivered, never a release. The press cannot drive an
-input method's composition; that path is `tab.feed_ime`'s.
+The release follows the press at once, so the key is never left held
+and never repeats. The keystroke cannot drive an input method's
+composition; that path is `tab.feed_ime`'s.
 
 The Swift Mac app answers `unknown-op`.
 

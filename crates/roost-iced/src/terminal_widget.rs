@@ -720,6 +720,11 @@ pub struct TerminalWidget {
     pub snapshot: TerminalSnapshot,
     pub metrics: TerminalMetrics,
     pub metric_generation: u64,
+    /// Bumped each time the app cancels the terminals' pointer gestures.
+    /// A button pressed before the cancel no longer owns anything, and
+    /// its release may never come here (a context menu's backdrop
+    /// swallows it), so the widget's pointer state starts over.
+    pub pointer_cancel_epoch: u64,
     /// Whether this terminal owns keyboard input right now — the app
     /// computes it as "the keyboard route is this tab and the window is
     /// focused". Only then does the widget ask the platform for an IME.
@@ -774,6 +779,7 @@ fn wheel_history_rows(delta: mouse::ScrollDelta, cell_height: f32) -> f64 {
 pub(crate) struct TerminalWidgetState {
     tab_id: Option<i64>,
     metric_generation: u64,
+    pointer_cancel_epoch: u64,
     pressed: Option<PointerButton>,
     last_cell: Option<(u32, u32)>,
     was_inside: bool,
@@ -861,9 +867,13 @@ impl TerminalWidget {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<PointerOutcome> {
-        if state.tab_id != Some(self.tab_id) || state.metric_generation != self.metric_generation {
+        if state.tab_id != Some(self.tab_id)
+            || state.metric_generation != self.metric_generation
+            || state.pointer_cancel_epoch != self.pointer_cancel_epoch
+        {
             state.tab_id = Some(self.tab_id);
             state.metric_generation = self.metric_generation;
+            state.pointer_cancel_epoch = self.pointer_cancel_epoch;
             state.pressed = None;
             state.last_cell = None;
             state.was_inside = false;
@@ -1563,6 +1573,7 @@ mod tests {
             snapshot,
             metrics: metrics(),
             metric_generation: 1,
+            pointer_cancel_epoch: 0,
             ime_active: false,
             focused: true,
         }
@@ -2232,6 +2243,7 @@ mod tests {
         let mut state = TerminalWidgetState {
             tab_id: Some(21),
             metric_generation: 1,
+            pointer_cancel_epoch: 0,
             pressed: Some(PointerButton::Left),
             last_cell: Some((7, 4)),
             was_inside: true,
@@ -2497,6 +2509,82 @@ mod tests {
             )))
         ));
         assert_eq!(state.pressed, None);
+    }
+
+    /// Left held since a press the widget saw at `pointer_cancel_epoch`.
+    fn left_held(program: &TerminalWidget, pointer_cancel_epoch: u64) -> TerminalWidgetState {
+        TerminalWidgetState {
+            tab_id: Some(program.tab_id),
+            metric_generation: program.metric_generation,
+            pointer_cancel_epoch,
+            pressed: Some(PointerButton::Left),
+            last_cell: Some((7, 4)),
+            was_inside: true,
+            ..TerminalWidgetState::default()
+        }
+    }
+
+    fn press_in_cell_5_3(
+        program: &TerminalWidget,
+        state: &mut TerminalWidgetState,
+        button: mouse::Button,
+    ) -> (Option<crate::Message>, (), event::Status) {
+        let cursor = mouse::Cursor::Available(Point::new(
+            TERMINAL_PADDING + 5.5 * CELL_WIDTH,
+            TERMINAL_PADDING + 3.5 * CELL_HEIGHT,
+        ));
+        program
+            .update_pointer(
+                state,
+                &Event::Mouse(mouse::Event::ButtonPressed(button)),
+                Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0)),
+                cursor,
+            )
+            .expect("a press over the grid is handled")
+            .into_inner()
+    }
+
+    #[test]
+    fn a_pointer_cancel_lets_the_next_press_start_a_gesture() {
+        for (native, button) in [
+            (mouse::Button::Left, PointerButton::Left),
+            (mouse::Button::Middle, PointerButton::Middle),
+        ] {
+            let mut program = widget(42, TerminalSnapshot::blank(80, 24));
+            program.pointer_cancel_epoch = 1;
+            let mut state = left_held(&program, 0);
+
+            let press = press_in_cell_5_3(&program, &mut state, native);
+            assert!(
+                matches!(
+                    press.0,
+                    Some(crate::Message::TerminalPointer(TerminalPointer::Event(
+                        TerminalPointerEvent {
+                            action: PointerAction::Press,
+                            button: Some(pressed),
+                            col: 5,
+                            row: 3,
+                            click_count: 1,
+                            ..
+                        }
+                    ))) if pressed == button
+                ),
+                "{button:?}: {:?}",
+                press.0
+            );
+            assert_eq!(state.pressed, Some(button));
+        }
+    }
+
+    #[test]
+    fn a_second_press_of_the_held_button_without_a_cancel_stays_captured() {
+        let program = widget(42, TerminalSnapshot::blank(80, 24));
+        let mut state = left_held(&program, program.pointer_cancel_epoch);
+
+        let press = press_in_cell_5_3(&program, &mut state, mouse::Button::Left);
+        assert!(press.0.is_none(), "{:?}", press.0);
+        assert_eq!(press.2, event::Status::Captured);
+        assert_eq!(state.pressed, Some(PointerButton::Left));
     }
 
     #[test]

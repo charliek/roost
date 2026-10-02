@@ -8,6 +8,24 @@ const FULL_SCREEN_SETTLE: Duration = Duration::from_secs(1);
 const DOCS_URL: &str = "https://charliek.github.io/roost/";
 const SETTINGS_OPENED: &str = "Settings opened — changes apply when Roost restarts";
 
+/// A trailing debounce's generations: every arm supersedes the ones
+/// before it, so only the latest arm's deadline acts.
+#[derive(Debug, Default)]
+pub(super) struct TrailingDebounce {
+    latest: u64,
+}
+
+impl TrailingDebounce {
+    pub(super) fn arm(&mut self) -> u64 {
+        self.latest = self.latest.wrapping_add(1);
+        self.latest
+    }
+
+    pub(super) fn is_latest(&self, generation: u64) -> bool {
+        generation == self.latest
+    }
+}
+
 // ── rename ──
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2324,20 +2342,24 @@ impl App {
     /// The one follow-up query a resize earns. winit clears its cached
     /// full-screen mode in `windowDidExitFullScreen`, which emits nothing
     /// Roost can listen to, so a query made mid-transition can read the
-    /// old mode and nothing later would correct it. Debounced: a resize
-    /// storm schedules one, not one per event.
+    /// old mode and nothing later would correct it. A trailing debounce:
+    /// a resize storm queries once, a settle after its last resize.
     pub(super) fn schedule_full_screen_settle(&mut self) -> UiTask {
-        if !cfg!(target_os = "macos") || self.window_id.is_none() || self.full_screen_settle_pending
-        {
+        if !cfg!(target_os = "macos") || self.window_id.is_none() {
             return UiTask::None;
         }
-        self.full_screen_settle_pending = true;
-        UiTask::FullScreenSettle(FULL_SCREEN_SETTLE)
+        UiTask::FullScreenSettle {
+            delay: FULL_SCREEN_SETTLE,
+            generation: self.full_screen_settle.arm(),
+        }
     }
 
-    pub fn full_screen_settled(&mut self) -> UiTask {
-        self.full_screen_settle_pending = false;
-        self.query_full_screen()
+    pub fn full_screen_settled(&mut self, generation: u64) -> UiTask {
+        if self.full_screen_settle.is_latest(generation) {
+            self.query_full_screen()
+        } else {
+            UiTask::None
+        }
     }
 
     pub fn full_screen_mode(&mut self, mode: window::Mode) {
@@ -4893,6 +4915,19 @@ mod tests {
         assert!(
             begin_rename_editor(&projects, RenameTarget::Tab(TabKey::local(i64::MAX))).is_err()
         );
+    }
+
+    #[test]
+    fn a_trailing_debounce_acts_only_on_its_latest_arm() {
+        let mut settle = TrailingDebounce::default();
+        let entered = settle.arm();
+        let exited = settle.arm();
+        assert!(
+            !settle.is_latest(entered),
+            "an earlier arm's deadline acted"
+        );
+        assert!(settle.is_latest(exited));
+        assert!(!settle.is_latest(exited.wrapping_add(1)));
     }
 
     #[test]
