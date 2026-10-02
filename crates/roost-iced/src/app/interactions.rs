@@ -2223,9 +2223,9 @@ impl App {
         }
         let clipboard = self.clipboard.start_next();
         match outcome.open_url {
-            Some(url) => self
-                .open_external(url_launcher::External::Url(url))
-                .then(clipboard),
+            // Not `open_external`: a terminal link launches even in test mode, because
+            // test_local_backend asserts the launcher runs here through a PATH-stubbed xdg-open.
+            Some(url) => UiTask::OpenUrl { url }.then(clipboard),
             None => clipboard,
         }
     }
