@@ -2248,6 +2248,7 @@ fn type_into(
     event: keyboard::Event,
     tracked: keyboard::Modifiers,
     composing: bool,
+    option: input::OptionKey,
 ) {
     // A bare page key scrolls this tab's own scrollback whenever the shared
     // policy keeps it local — no snap, no encode, nothing on the PTY. The
@@ -2279,7 +2280,7 @@ fn type_into(
             );
         }
     }
-    let bytes = input::encode_press(&mut tab.encoder, &tab.terminal, event, composing);
+    let bytes = input::encode_press(&mut tab.encoder, &tab.terminal, event, composing, option);
     tab.session.send_input(bytes);
 }
 
@@ -2416,6 +2417,8 @@ pub enum UiTask {
     /// Ask the window whether it is full screen; the answer arrives as
     /// `Message::FullScreenMode`.
     QueryFullScreen(window::Id),
+    /// Wait, then `Message::FullScreenSettled`.
+    FullScreenSettle(Duration),
     /// A paste found no text on the system clipboard — go look for copied
     /// files, then an image. The reads + PNG encode block, so this runs
     /// off the UI thread and reports back as
@@ -2919,6 +2922,7 @@ pub struct App {
     title_fallback: &'static str,
     ime_discard: ImeDiscard,
     modifiers: keyboard::Modifiers,
+    option_sides: input::OptionSides,
     test_mode: bool,
     status: StatusBanner,
     /// Standing "this workspace is not reaching disk" failures, one per
@@ -3073,6 +3077,8 @@ pub struct App {
     /// moved no project or tab never touches AppKit.
     #[cfg(target_os = "macos")]
     menu_window_rows: crate::macos::menu::WindowRows,
+    /// A settle query is already scheduled; see `schedule_full_screen_settle`.
+    full_screen_settle_pending: bool,
     /// `SPUUpdater.canCheckForUpdates` as last pushed onto the "Check
     /// for Updates…" item. `None` before the first push, so boot writes
     /// the item's state even when it is already correct.
@@ -3476,6 +3482,7 @@ impl App {
             title_fallback: title_fallback(profile.kind),
             ime_discard: ImeDiscard::default(),
             modifiers: keyboard::Modifiers::default(),
+            option_sides: input::OptionSides::default(),
             test_mode,
             status: StatusBanner::default(),
             notice_generation: notice::NoticeGeneration::default(),
@@ -3542,6 +3549,7 @@ impl App {
             menu_gating: crate::macos::menu::MenuGating::default(),
             #[cfg(target_os = "macos")]
             menu_window_rows: crate::macos::menu::WindowRows::default(),
+            full_screen_settle_pending: false,
             #[cfg(target_os = "macos")]
             menu_can_check_updates: None,
             palette_visibility_retries: 0,
@@ -4488,7 +4496,8 @@ impl App {
         if self.palette.is_some() {
             self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
         }
-        opened.task.then(self.query_full_screen())
+        let settle = self.schedule_full_screen_settle();
+        opened.task.then(self.query_full_screen()).then(settle)
     }
 
     /// The wake this app's feed notifies on, for the subscription that
@@ -5140,16 +5149,37 @@ impl App {
         let active_key = match self.keyboard_route() {
             KeyboardRoute::Terminal(active_key) => active_key,
             KeyboardRoute::Pending => {
-                self.buffer_pending_input(PendingInput::Key(event));
+                self.buffer_pending_input(PendingInput::Key(event, self.option_key()));
                 return UiTask::None;
             }
             _ => return UiTask::None,
         };
+        let option = self.option_key();
         let Some(tab) = self.tabs.get_mut(&active_key) else {
             return UiTask::None;
         };
-        type_into(tab, active_key.tab, event, self.modifiers, composing);
+        type_into(
+            tab,
+            active_key.tab,
+            event,
+            self.modifiers,
+            composing,
+            option,
+        );
         UiTask::None
+    }
+
+    /// Folds one raw keyboard event, captured or not, into the Option
+    /// sides — before any route can swallow it.
+    pub fn observe_option_key(&mut self, event: &keyboard::Event) {
+        self.option_sides.observe(event);
+    }
+
+    fn option_key(&self) -> input::OptionKey {
+        input::OptionKey {
+            as_alt: self.config.macos_option_as_alt,
+            sides: self.option_sides,
+        }
     }
 
     /// Whether the terminal that owns the keyboard is mid-composition.
@@ -5534,6 +5564,7 @@ impl App {
         if teardown.ime_discard {
             self.ime_discard.disarm();
         }
+        self.option_sides.window_focus(focused);
         self.window_focused = focused;
         self.workspace.set_window_focused(focused);
         if let Some(tab) = self.tabs.get(&self.active_tab_key()) {

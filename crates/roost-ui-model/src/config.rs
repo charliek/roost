@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use roost_agent::{Agent, ALL_AGENTS};
 use roost_ipc::LocalBackendMode;
+use roost_vt::OptionAsAlt;
 
 use crate::custom_command::{self, CustomCommand};
 use crate::keybind::{self, AccelMods};
@@ -64,6 +65,12 @@ pub struct RoostConfig {
     /// Consumed by both Rust UIs; the Swift UI's modifier is fixed to Cmd.
     pub link_modifier: Option<AccelMods>,
 
+    /// `macos-option-as-alt` — which Option keys type as Alt (Meta)
+    /// instead of the macOS text modifier, in Ghostty's vocabulary.
+    /// Defaults to [`OptionAsAlt::False`]. Read by the iced UI on macOS
+    /// only; Linux's Alt is already Meta.
+    pub macos_option_as_alt: OptionAsAlt,
+
     /// `show-sidebar-agents` — whether the sidebar renders one row
     /// per agent-owned tab under its project (plan 007). Defaults to
     /// `true`. Toggled at runtime via the `toggle_sidebar_agents`
@@ -103,6 +110,7 @@ impl Default for RoostConfig {
             clipboard_write: ClipboardWrite::default(),
             word_break_chars: DEFAULT_EXTRA_WORD_CHARS.to_string(),
             link_modifier: None,
+            macos_option_as_alt: OptionAsAlt::default(),
             show_sidebar_agents: true,
             agent_hooks: AgentHooks::default(),
             local_backend: LocalBackend::default(),
@@ -420,6 +428,19 @@ impl CopyOnSelect {
     }
 }
 
+/// Parse a `macos-option-as-alt` value: Ghostty's `false | true | left |
+/// right`, case-insensitive; anything else is `None` so the caller can
+/// fall back to the default and log.
+fn parse_option_as_alt(s: &str) -> Option<OptionAsAlt> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "false" => Some(OptionAsAlt::False),
+        "true" => Some(OptionAsAlt::True),
+        "left" => Some(OptionAsAlt::Left),
+        "right" => Some(OptionAsAlt::Right),
+        _ => None,
+    }
+}
+
 /// Parse a plain boolean config value (`true | yes` / `false | no`).
 /// Mirrors `ClipboardWrite::parse` / `CopyOnSelect::parse`'s
 /// `Option`-returning shape so every boolean key in the parse loop
@@ -589,6 +610,19 @@ impl RoostConfig {
                              keeping the platform default"
                         );
                     }
+                }
+                "macos-option-as-alt" => {
+                    cfg.macos_option_as_alt = match parse_option_as_alt(value) {
+                        Some(v) => v,
+                        None => {
+                            tracing::warn!(
+                                value,
+                                "unknown macos-option-as-alt value; expected false|true|left|right, \
+                                 falling back to default `false`"
+                            );
+                            OptionAsAlt::default()
+                        }
+                    };
                 }
                 "command" => {
                     // Launcher entry: `command = label="…" run="…" …`.
@@ -1334,6 +1368,48 @@ mod tests {
     fn copy_on_select_unknown_value_keeps_default() {
         let cfg = RoostConfig::parse("copy-on-select = pancakes");
         assert_eq!(cfg.copy_on_select, CopyOnSelect::True);
+    }
+
+    #[test]
+    fn macos_option_as_alt_takes_ghosttys_four_values_in_any_case() {
+        assert_eq!(
+            RoostConfig::default().macos_option_as_alt,
+            OptionAsAlt::False
+        );
+        for (value, expected) in [
+            ("false", OptionAsAlt::False),
+            ("true", OptionAsAlt::True),
+            ("left", OptionAsAlt::Left),
+            ("right", OptionAsAlt::Right),
+            ("Left", OptionAsAlt::Left),
+            ("RIGHT", OptionAsAlt::Right),
+            ("\"true\"", OptionAsAlt::True),
+        ] {
+            assert_eq!(
+                RoostConfig::parse(&format!("macos-option-as-alt = {value}")).macos_option_as_alt,
+                expected,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_option_as_alt_unknown_value_keeps_default() {
+        for value in ["both", "yes", "on", ""] {
+            assert_eq!(
+                RoostConfig::parse(&format!("macos-option-as-alt = {value}")).macos_option_as_alt,
+                OptionAsAlt::False,
+                "{value:?}"
+            );
+        }
+    }
+
+    /// Last line wins, and an unparseable last line is the default — not
+    /// whatever an earlier line set.
+    #[test]
+    fn macos_option_as_alt_unknown_value_after_a_valid_one_restores_default() {
+        let cfg = RoostConfig::parse("macos-option-as-alt = true\nmacos-option-as-alt = typo\n");
+        assert_eq!(cfg.macos_option_as_alt, OptionAsAlt::False);
     }
 
     #[test]

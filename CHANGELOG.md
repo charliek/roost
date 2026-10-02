@@ -35,6 +35,15 @@ release workflow asserts they agree).
   three actions are unbound and reachable from the command palette ("Open
   Settings File", "Open Documentation", "Toggle Full Screen").
 
+- **`macos-option-as-alt` sends Option as Meta in Roost-Iced on macOS
+  (#341)** — `false | true | left | right`, Ghostty's key and values,
+  default `false` (today's behavior). With it set, ⌥B sends `ESC b`
+  instead of typing `∫`, so readline's ⌥B and ⌥F word jumps work, and
+  `left` or `right` keeps the other Option for typing characters. The
+  dead-key chords (⌥E, ⌥U, ⌥N, ⌥I, ⌥\`) still start accents (#582).
+  Linux ignores the key. See
+  [`config.md#macos-option-as-alt`](docs/reference/config.md#macos-option-as-alt).
+
 ### Fixed
 
 - **Select-to-copy and middle-click paste did nothing in Roost-Iced on

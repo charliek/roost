@@ -2,6 +2,9 @@ use super::*;
 use crate::url_launcher;
 
 const CONFIG_SEED: &str = "# Roost settings — https://charliek.github.io/roost/reference/config/";
+/// Long enough for macOS's full-screen transition to finish and winit to
+/// drop its cached mode.
+const FULL_SCREEN_SETTLE: Duration = Duration::from_secs(1);
 const DOCS_URL: &str = "https://charliek.github.io/roost/";
 const SETTINGS_OPENED: &str = "Settings opened — changes apply when Roost restarts";
 
@@ -2220,7 +2223,9 @@ impl App {
         }
         let clipboard = self.clipboard.start_next();
         match outcome.open_url {
-            Some(url) => UiTask::OpenUrl { url }.then(clipboard),
+            Some(url) => self
+                .open_external(url_launcher::External::Url(url))
+                .then(clipboard),
             None => clipboard,
         }
     }
@@ -2314,6 +2319,25 @@ impl App {
             Some(id) if cfg!(target_os = "macos") => UiTask::QueryFullScreen(id),
             _ => UiTask::None,
         }
+    }
+
+    /// The one follow-up query a resize earns. winit clears its cached
+    /// full-screen mode in `windowDidExitFullScreen`, which emits nothing
+    /// Roost can listen to, so a query made mid-transition can read the
+    /// old mode and nothing later would correct it. Debounced: a resize
+    /// storm schedules one, not one per event.
+    pub(super) fn schedule_full_screen_settle(&mut self) -> UiTask {
+        if !cfg!(target_os = "macos") || self.window_id.is_none() || self.full_screen_settle_pending
+        {
+            return UiTask::None;
+        }
+        self.full_screen_settle_pending = true;
+        UiTask::FullScreenSettle(FULL_SCREEN_SETTLE)
+    }
+
+    pub fn full_screen_settled(&mut self) -> UiTask {
+        self.full_screen_settle_pending = false;
+        self.query_full_screen()
     }
 
     pub fn full_screen_mode(&mut self, mode: window::Mode) {
@@ -6288,6 +6312,7 @@ mod tests {
             &tab.terminal,
             page_press(named, modifiers),
             false,
+            input::OptionKey::default(),
         );
         tab.session.send_input(bytes);
     }
@@ -6868,6 +6893,7 @@ mod tests {
             &tab.terminal,
             named_press(Named::Enter),
             true,
+            input::OptionKey::default(),
         );
         assert!(swallowed.is_empty());
 

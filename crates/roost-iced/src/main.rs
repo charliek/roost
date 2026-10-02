@@ -78,6 +78,7 @@ enum Message {
     PendingSelectionTick,
     /// A file-drop debounce window elapsed — a one-shot, not a timer.
     FileDropDeadline,
+    FullScreenSettled,
     /// The background resize wave may be due — a one-shot, not a timer.
     BackgroundResizeDeadline,
     WindowOpened(window::Id),
@@ -131,6 +132,10 @@ enum Message {
     Ime(input_method::Event),
     CapturedEscape,
     CapturedEnterRelease,
+    /// A captured event that moves which Option keys are down: the
+    /// Option sides follow every Alt key event, not only the ones no
+    /// widget claimed.
+    CapturedOptionKey(keyboard::Event),
     TerminalPointer(terminal_widget::TerminalPointer),
     WindowFileDropped {
         window_id: window::Id,
@@ -535,6 +540,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::FileDropDeadline => app.file_drop_deadline().map_task(),
+        Message::FullScreenSettled => app.full_screen_settled().map_task(),
         Message::BackgroundResizeDeadline => {
             app.background_resize_deadline();
             Task::none()
@@ -570,7 +576,10 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             index,
             result,
         } => app.upload_settled(host, gesture, index, result).map_task(),
-        Message::Keyboard(event) => app.keyboard(event).map_task(),
+        Message::Keyboard(event) => {
+            app.observe_option_key(&event);
+            app.keyboard(event).map_task()
+        }
         Message::Ime(event) => {
             match event {
                 // A session boundary cannot carry an older composition
@@ -582,6 +591,10 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
                 input_method::Event::Preedit(text, cursor) => app.ime_preedit(text, cursor),
                 input_method::Event::Commit(text) => app.ime_commit(&text),
             }
+            Task::none()
+        }
+        Message::CapturedOptionKey(event) => {
+            app.observe_option_key(&event);
             Task::none()
         }
         Message::CapturedEscape => app.captured_escape().map_task(),
@@ -773,6 +786,9 @@ fn subscription_with(wake: Arc<tokio::sync::Notify>, armed: ArmedTimers) -> Subs
                 event::Status::Captured if is_escape_press(&event) => Some(Message::CapturedEscape),
                 event::Status::Captured if is_enter_release(&event) => {
                     Some(Message::CapturedEnterRelease)
+                }
+                event::Status::Captured if input::OptionSides::observes(&event) => {
+                    Some(Message::CapturedOptionKey(event))
                 }
                 event::Status::Captured => None,
             }
@@ -1115,6 +1131,9 @@ impl UiTask for app::UiTask {
                 index,
                 result,
             }),
+            app::UiTask::FullScreenSettle(delay) => {
+                Task::perform(tokio::time::sleep(delay), |()| Message::FullScreenSettled)
+            }
             app::UiTask::FileDropDeadline(delay) => {
                 Task::perform(tokio::time::sleep(delay), |()| Message::FileDropDeadline)
             }

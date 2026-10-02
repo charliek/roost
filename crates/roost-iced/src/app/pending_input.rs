@@ -27,7 +27,9 @@ pub(super) const NOT_READY: &str = "the new tab isn't ready yet";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PendingInput {
-    Key(keyboard::Event),
+    /// A key event, with Option's state as it was pressed: replay comes
+    /// after the Option keys may have been released.
+    Key(keyboard::Event, input::OptionKey),
     /// An input-method commit.
     Text(String),
 }
@@ -58,7 +60,7 @@ impl Pending {
         self.entries
             .iter()
             .filter(|entry| match entry {
-                PendingInput::Key(event) => input::non_modifier_press(event),
+                PendingInput::Key(event, _) => input::non_modifier_press(event),
                 PendingInput::Text(_) => true,
             })
             .count()
@@ -190,14 +192,14 @@ impl PendingKeyboard {
             return Push::Skipped;
         };
         match &input {
-            PendingInput::Key(keyboard::Event::ModifiersChanged(_)) => return Push::Skipped,
-            PendingInput::Key(keyboard::Event::KeyReleased { physical_key, .. }) => {
+            PendingInput::Key(keyboard::Event::ModifiersChanged(_), _) => return Push::Skipped,
+            PendingInput::Key(keyboard::Event::KeyReleased { physical_key, .. }, _) => {
                 let Some(at) = pending.pressed.iter().position(|key| key == physical_key) else {
                     return Push::Skipped;
                 };
                 pending.pressed.swap_remove(at);
             }
-            PendingInput::Key(keyboard::Event::KeyPressed { physical_key, .. }) => {
+            PendingInput::Key(keyboard::Event::KeyPressed { physical_key, .. }, _) => {
                 if !pending.pressed.contains(physical_key) {
                     pending.pressed.push(*physical_key);
                 }
@@ -303,9 +305,14 @@ impl PendingKeyboard {
 pub(super) fn deliver(tab: &mut TerminalTab, tab_id: i64, entries: Vec<PendingInput>) {
     for entry in entries {
         match entry {
-            PendingInput::Key(event) => {
-                type_into(tab, tab_id, event, keyboard::Modifiers::empty(), false)
-            }
+            PendingInput::Key(event, option) => type_into(
+                tab,
+                tab_id,
+                event,
+                keyboard::Modifiers::empty(),
+                false,
+                option,
+            ),
             PendingInput::Text(text) => {
                 if let Err(error) = tab.commit_ime(&text) {
                     tracing::warn!(?error, tab_id, "typed-ahead IME commit failed");
@@ -436,17 +443,23 @@ mod tests {
     const HOST: HostId = HostId::new(3);
 
     fn press(key: &str) -> PendingInput {
-        PendingInput::Key(input::synthetic_press(key, None, &[]).expect("a key"))
+        PendingInput::Key(
+            input::synthetic_press(key, None, &[]).expect("a key"),
+            input::OptionKey::default(),
+        )
     }
 
     fn release(key: Key, code: Code) -> PendingInput {
-        PendingInput::Key(keyboard::Event::KeyReleased {
-            modified_key: key.clone(),
-            key,
-            physical_key: Physical::Code(code),
-            location: Location::Standard,
-            modifiers: Modifiers::empty(),
-        })
+        PendingInput::Key(
+            keyboard::Event::KeyReleased {
+                modified_key: key.clone(),
+                key,
+                physical_key: Physical::Code(code),
+                location: Location::Standard,
+                modifiers: Modifiers::empty(),
+            },
+            input::OptionKey::default(),
+        )
     }
 
     fn typed(keyboard: &mut PendingKeyboard, text: &str) {
@@ -615,9 +628,10 @@ mod tests {
             "and the modifier's"
         );
         assert_eq!(
-            keyboard.push(PendingInput::Key(keyboard::Event::ModifiersChanged(
-                Modifiers::empty()
-            ))),
+            keyboard.push(PendingInput::Key(
+                keyboard::Event::ModifiersChanged(Modifiers::empty()),
+                input::OptionKey::default(),
+            )),
             Push::Skipped
         );
         assert_eq!(keyboard.push(press("e")), Push::Kept);
@@ -780,5 +794,42 @@ mod tests {
         );
         drop(tab);
         supervisor.close(93);
+    }
+
+    /// Typed-ahead keeps the Option side each press was typed with: under
+    /// `left`, a right-Option ⌥B buffered while the tab opens still types
+    /// `∫` when it is replayed after Option was released, and the
+    /// left-Option one is still Meta.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_buffered_option_press_replays_with_the_side_it_was_typed_with() {
+        let (input_tx, _input_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut tab, capture) =
+            crate::app::terminal_tab::attach_test_host_terminal(80, 24, input_tx);
+        let held = |left, right| input::OptionKey {
+            as_alt: roost_vt::OptionAsAlt::Left,
+            sides: input::OptionSides { left, right },
+        };
+        let option_b = || keyboard::Event::KeyPressed {
+            key: Key::Character("b".into()),
+            modified_key: Key::Character("∫".into()),
+            physical_key: Physical::Code(Code::KeyB),
+            location: Location::Standard,
+            modifiers: Modifiers::ALT,
+            text: Some("∫".into()),
+            repeat: false,
+        };
+        deliver(
+            &mut tab,
+            7,
+            vec![
+                PendingInput::Key(option_b(), held(false, true)),
+                PendingInput::Key(option_b(), held(true, false)),
+            ],
+        );
+        assert_eq!(
+            capture.lock().expect("capture").as_slice(),
+            "∫\x1bb".as_bytes()
+        );
     }
 }

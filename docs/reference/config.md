@@ -38,6 +38,7 @@ the launcher with deterministic commands.
 | `copy-on-select` | `off \| true \| clipboard` | `true` | What a mouse-drag selection writes to the clipboard on release. See [the dedicated section below](#copy-on-select). |
 | `clipboard-write` | `allow \| deny` | `allow` | Whether a program running in the terminal can write the host clipboard via OSC 52. See [the dedicated section below](#clipboard-write). |
 | `link-modifier` | `ctrl \| alt \| super` | Cmd (Mac) / Alt (Linux) | Which held modifier reveals + opens a URL on hover/click. iced-only; the Swift Mac app is fixed to Cmd. See [the dedicated section below](#link-modifier). |
+| `macos-option-as-alt` | `false \| true \| left \| right` | `false` | Which Option keys send Alt (Meta) on macOS, so ⌥B sends `ESC b` instead of typing `∫`. Read by the iced UI on macOS only. See [the dedicated section below](#macos-option-as-alt). |
 | `agent-hooks` | agent list \| `off` \| absent | absent (unanswered) | Which supported coding agents (Claude Code, Codex, grok/gx, cursor-agent, OpenCode) Roost wires its hook entries into, at startup. Absent means nobody has answered the consent dialog yet — Roost writes nothing until they do. See [the dedicated section below](#agent-hooks) and the [Agent Hooks](../guides/agents.md) guide. |
 | `local-backend` | `in-process \| session` | `in-process` for an existing setup; `session` on a genuinely fresh install | Where the tabs you start in the Roost window run. See [the dedicated section below](#local-backend). |
 
@@ -231,6 +232,49 @@ keybind = ctrl+w = close_tab
 
 See [Keybindings](../getting-started/keybindings.md) for the full action
 list and trigger syntax.
+
+## `macos-option-as-alt`
+
+On macOS, Option is a text modifier: ⌥B types `∫` and ⌥F types `ƒ`.
+Shells and editors that use Meta chords, such as readline's ⌥B and ⌥F
+word jumps, want those keys to send `ESC b` and `ESC f` instead. This
+setting makes Option act as Alt. The key and its values are Ghostty's.
+
+| Value | Which Option sends Alt |
+|---|---|
+| `false` (default) | neither; both type macOS characters |
+| `true` | both |
+| `left` | the left Option; the right one still types characters |
+| `right` | the right Option; the left one still types characters |
+
+Values are case-insensitive. An unrecognized value logs a warning and
+reads as `false`.
+
+```conf
+macos-option-as-alt = left
+```
+
+When Option acts as Alt, it sends the key without Option's character:
+⌥B sends `ESC b`, and ⇧⌥B sends `ESC B`. Two kinds of key still type
+the character macOS gives them:
+
+- a shifted key that is not a letter, such as ⇧⌥1, because its shifted
+  character depends on the keyboard layout;
+- a key whose own character is not ASCII, such as `é` on a French
+  layout, because the Meta prefix carries a single byte.
+
+**Limitations:**
+
+- The dead-key chords ⌥E, ⌥U, ⌥N, ⌥I and ⌥\` are taken by macOS's input
+  method before Roost sees them, so they still start an accent
+  ([#582](https://github.com/charliek/roost/issues/582)).
+- `left` and `right` tell the two Options apart by the Option key's own
+  press and release. If Roost has seen neither while Option is held, it
+  counts that Option as the configured side, and logs this once.
+
+> **Scope:** read by the iced UI on macOS (`Roost-Iced.app`). On Linux,
+> Alt already sends the ESC prefix, so the key is parsed and ignored.
+> The Swift Mac app ignores it too (unknown keys are always dropped).
 
 ## `agent-hooks`
 
