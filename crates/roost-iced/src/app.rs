@@ -46,6 +46,7 @@ use roost_ui_model::typography::{self, FamilyApply, TerminalTypography};
 use roost_ui_model::{
     agent_palette,
     config::{self, ChromeAccent, RoostConfig},
+    context_menu::ContextTarget,
     custom_command, host_sidebar, host_verbs,
     keybind::{self, Accel, AccelMods, KeybindAction},
     keys::{HostId, ProjectKey, TabKey},
@@ -63,6 +64,7 @@ use roost_vt::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::chrome::{self, ChromePalette};
+use crate::context_press::ContextPressArea;
 use crate::engine_feed::{self, EngineBatch, EngineFeed, EngineFeedReceiver, EngineFeedSender};
 use crate::font_registry::{system_font_registry, FontRegistry};
 use crate::fonts;
@@ -841,6 +843,9 @@ struct FocusTeardown {
     /// tool stealing focus) read as the app having crashed. The Mac's
     /// `NSAlert` is application-modal and equally unaffected.
     confirm_delete: bool,
+    /// A menu answers one click; a click into another app dismisses it,
+    /// as a native menu's would.
+    context_menu: bool,
     ime_composition: bool,
     /// Refocus only: macOS discards marked text when the window loses
     /// focus, so a commit arriving after refocus is fresh input (emoji
@@ -859,6 +864,7 @@ fn focus_teardown(focused: bool) -> FocusTeardown {
             rename_completion_key: true,
             drags: true,
             confirm_delete: false,
+            context_menu: true,
             ime_composition: true,
             ime_discard: false,
         }
@@ -2123,6 +2129,9 @@ enum KeyboardRoute {
     /// deletion, and Escape closes this dialog rather than that one.
     HostDialog,
     Editor,
+    /// The right-click menu (plan 073 D9). Every key is the menu's while
+    /// it is up.
+    ContextMenu,
     Palette,
     /// A new tab is opening, and the keys typed meanwhile are kept for
     /// it (plan 072 §D2).
@@ -2143,6 +2152,7 @@ fn ime_preedit_target(route: KeyboardRoute) -> Option<TabKey> {
         | KeyboardRoute::Confirm
         | KeyboardRoute::HostDialog
         | KeyboardRoute::Editor
+        | KeyboardRoute::ContextMenu
         | KeyboardRoute::Palette
         | KeyboardRoute::Pending => None,
     }
@@ -2346,10 +2356,12 @@ fn active_terminal_live(has_session: bool, attach_live: bool) -> bool {
     has_session && attach_live
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_keyboard_route(
     confirm_open: bool,
     host_dialog_open: bool,
     editor_open: bool,
+    context_menu_open: bool,
     palette_open: bool,
     pending_tab: bool,
     active_tab: TabKey,
@@ -2361,6 +2373,8 @@ fn resolve_keyboard_route(
         KeyboardRoute::HostDialog
     } else if editor_open {
         KeyboardRoute::Editor
+    } else if context_menu_open {
+        KeyboardRoute::ContextMenu
     } else if palette_open {
         KeyboardRoute::Palette
     } else if pending_tab {
@@ -3038,6 +3052,7 @@ pub struct App {
     project_drag_preview: Option<ProjectDragPreview>,
     project_strip_generation: u64,
     confirm_delete: Option<ConfirmDeleteProject>,
+    context_menu: Option<context_menu::OpenContextMenu>,
     pending_attachments: servicing::PendingAttachments,
     file_drops: FileDropQueue,
     background_resize: background_resize::BackgroundResize,
@@ -3556,6 +3571,7 @@ impl App {
             project_drag_preview: None,
             project_strip_generation: 1,
             confirm_delete: None,
+            context_menu: None,
             pending_attachments: servicing::PendingAttachments::default(),
             file_drops: FileDropQueue::default(),
             background_resize: background_resize::BackgroundResize::default(),
@@ -5161,6 +5177,9 @@ impl App {
             // terminal encoder can observe the same key.
             return UiTask::None;
         }
+        if matches!(self.keyboard_route(), KeyboardRoute::ContextMenu) {
+            return self.context_menu_key(&event);
+        }
         if let keyboard::Event::KeyPressed { key, .. } = &event {
             if matches!(self.keyboard_route(), KeyboardRoute::Palette) {
                 let mut task = UiTask::None;
@@ -5277,6 +5296,11 @@ impl App {
                 self.cancel_rename_editor();
                 UiTask::None
             }
+            KeyboardRoute::ContextMenu => {
+                self.rename_completion_key = Some(RenameCompletionKey::Escape);
+                self.close_context_menu();
+                UiTask::None
+            }
             KeyboardRoute::Palette => {
                 self.palette_back_or_dismiss();
                 self.take_palette_focus_task()
@@ -5308,7 +5332,7 @@ impl App {
     fn menu_gating(&self) -> crate::macos::menu::MenuGating {
         crate::macos::menu::MenuGating {
             palette_open: self.palette.is_some(),
-            text_capture: self.text_capture(),
+            text_capture: self.text_capture() || self.context_menu.is_some(),
         }
     }
 
@@ -5573,6 +5597,7 @@ impl App {
             self.confirm_delete.is_some(),
             self.host_dialog.is_some(),
             self.rename_editor.is_some(),
+            self.context_menu.is_some(),
             self.palette.is_some(),
             self.pending_keyboard.armed(),
             active_tab,
@@ -5613,6 +5638,9 @@ impl App {
         if teardown.confirm_delete {
             self.cancel_confirm_delete();
         }
+        if teardown.context_menu {
+            self.close_context_menu();
+        }
         if teardown.ime_composition {
             self.cancel_ime_composition();
         }
@@ -5632,7 +5660,7 @@ impl App {
 
     pub fn view(&self) -> Element<'_, Message> {
         let started = Instant::now();
-        let content = self.view_body();
+        let content = self.with_context_menu(self.view_body());
         // At most one modal is ever up: each of the three cancels the
         // others where it opens, so this is a preference order and not a
         // stack.
@@ -5968,7 +5996,8 @@ impl App {
         // publishes nothing at all on press — so those rows are simply
         // press-less, which is the whole of "nothing here is actionable
         // until the connection is back".
-        let project_row: Element<'a, Message> = project_row.into();
+        let project_row: Element<'a, Message> =
+            ContextPressArea::new(project_row, ContextTarget::Project(project_key)).into();
         let mut project_group = column![project_row].spacing(2);
         if self.config.show_sidebar_agents && !hide_agent_rows {
             for agent in self.sidebar_agents.get(&project_key).into_iter().flatten() {
@@ -6066,7 +6095,14 @@ impl App {
                     .wrapping(iced::widget::text::Wrapping::None),
             );
         }
-        sidebar_band(&self.chrome, band)
+        let band = sidebar_band(&self.chrome, band);
+        // The in-process band has no saved host, and so no host verbs.
+        match &section.saved_id {
+            Some(saved_id) => {
+                ContextPressArea::new(band, ContextTarget::Host(saved_id.clone())).into()
+            }
+            None => band,
+        }
     }
 
     /// The band's `reduced fidelity` pill (plan 056 §3.4).
@@ -6500,13 +6536,14 @@ impl App {
             // dimmed host — falls back to a plain press of its own; a
             // strip disabled because a modal is up leaves its pills
             // press-less exactly as the local strip always has.
-            tab_pills = tab_pills.push(if reorderable_project {
-                Element::from(pill_container)
+            let pill: Element<'_, Message> = if reorderable_project {
+                pill_container.into()
             } else {
                 mouse_area(pill_container)
                     .on_press(Message::TabSelected(tab_key))
                     .into()
-            });
+            };
+            tab_pills = tab_pills.push(ContextPressArea::new(pill, ContextTarget::Tab(tab_key)));
         }
         let tab_strip = ReorderStrip::tabs(
             tab_pills,
@@ -7190,27 +7227,7 @@ impl App {
         self.cancel_drags();
         self.cancel_editor_for_interaction();
         self.dismiss_palette_with_focus_recovery();
-        // The modal drops pointer events, so a held terminal button would
-        // never see its release: settle every tab's pointer state (synthetic
-        // release into tracking PTYs) before the modal owns input.
-        for (key, tab) in &mut self.tabs {
-            match tab.prepare_pointer_cancel() {
-                Ok(release) => {
-                    tab.commit_pointer_cancel(release);
-                    // The cancel drops hover, so the link underline and
-                    // pointer shape the snapshot carries are decorations
-                    // for a gesture that no longer exists.
-                    refresh_or_warn(key.tab, tab, "pointer cancel before delete confirm");
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        ?error,
-                        tab_id = key.tab,
-                        "pointer cancel before delete confirm"
-                    )
-                }
-            }
-        }
+        self.cancel_terminal_pointers("pointer cancel before delete confirm");
         self.confirm_delete = Some(target);
         self.cancel_ime_composition();
         Ok(())
@@ -7218,6 +7235,24 @@ impl App {
 
     fn cancel_confirm_delete(&mut self) {
         self.confirm_delete = None;
+    }
+
+    /// Settle every tab's pointer state — a synthetic release into a
+    /// tracking PTY — before a surface that drops pointer events takes
+    /// input: a held terminal button would never see its own release.
+    fn cancel_terminal_pointers(&mut self, reason: &'static str) {
+        for (key, tab) in &mut self.tabs {
+            match tab.prepare_pointer_cancel() {
+                Ok(release) => {
+                    tab.commit_pointer_cancel(release);
+                    // The cancel drops hover, so the link underline and
+                    // pointer shape the snapshot carries are decorations
+                    // for a gesture that no longer exists.
+                    refresh_or_warn(key.tab, tab, reason);
+                }
+                Err(error) => tracing::warn!(?error, tab_id = key.tab, "{reason}"),
+            }
+        }
     }
 
     /// The overlay is dismissed here, at the confirm, exactly as it was
@@ -12858,38 +12893,123 @@ mod tests {
     #[test]
     fn keyboard_route_requires_a_live_terminal_and_gives_editor_precedence() {
         assert_eq!(
-            resolve_keyboard_route(false, false, false, false, false, TabKey::local(7), false),
+            resolve_keyboard_route(
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                TabKey::local(7),
+                false
+            ),
             KeyboardRoute::None
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, false, false, false, TabKey::local(7), true),
+            resolve_keyboard_route(
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                TabKey::local(7),
+                true
+            ),
             KeyboardRoute::Terminal(TabKey::local(7))
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, false, true, false, TabKey::local(7), true),
+            resolve_keyboard_route(
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                TabKey::local(7),
+                true
+            ),
             KeyboardRoute::Palette
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, true, true, false, TabKey::local(7), true),
+            resolve_keyboard_route(
+                false,
+                false,
+                true,
+                false,
+                true,
+                false,
+                TabKey::local(7),
+                true
+            ),
             KeyboardRoute::Editor
         );
         // A host dialog owns the keyboard over the editor and the
         // palette, both of which it dismisses on the way up (plan 037
         // §3.1) — and yields only to the delete confirmation.
         assert_eq!(
-            resolve_keyboard_route(false, true, true, true, false, TabKey::local(7), true),
+            resolve_keyboard_route(
+                false,
+                true,
+                true,
+                false,
+                true,
+                false,
+                TabKey::local(7),
+                true
+            ),
             KeyboardRoute::HostDialog
         );
         // An open confirm outranks every other surface, so no keystroke can
         // reach an accelerator or the active PTY while it is up.
         assert_eq!(
-            resolve_keyboard_route(true, true, true, true, false, TabKey::local(7), true),
+            resolve_keyboard_route(true, true, true, false, true, false, TabKey::local(7), true),
             KeyboardRoute::Confirm
         );
         assert_eq!(
-            resolve_keyboard_route(true, false, false, false, false, TabKey::local(7), true),
+            resolve_keyboard_route(
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                TabKey::local(7),
+                true
+            ),
             KeyboardRoute::Confirm
         );
+    }
+
+    /// The right-click menu takes every key over the palette, the
+    /// pending tab and the terminal — and none from a surface that would
+    /// have closed it on the way up.
+    #[test]
+    fn an_open_context_menu_outranks_the_palette_and_the_terminal() {
+        let tab = TabKey::local(7);
+        for (palette, pending, live) in [
+            (false, false, true),
+            (true, false, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            assert_eq!(
+                resolve_keyboard_route(false, false, false, true, palette, pending, tab, live),
+                KeyboardRoute::ContextMenu
+            );
+        }
+        for (confirm, dialog, editor, route) in [
+            (true, false, false, KeyboardRoute::Confirm),
+            (false, true, false, KeyboardRoute::HostDialog),
+            (false, false, true, KeyboardRoute::Editor),
+        ] {
+            assert_eq!(
+                resolve_keyboard_route(confirm, dialog, editor, true, false, false, tab, true),
+                route
+            );
+        }
+        assert_eq!(ime_preedit_target(KeyboardRoute::ContextMenu), None);
+        assert!(!terminal_cursor_focused(KeyboardRoute::ContextMenu, true));
     }
 
     /// A new tab that is opening takes the keys over the live terminal
@@ -12899,11 +13019,11 @@ mod tests {
     fn a_pending_tab_outranks_the_terminal_but_no_modal() {
         let tab = TabKey::local(7);
         assert_eq!(
-            resolve_keyboard_route(false, false, false, false, true, tab, true),
+            resolve_keyboard_route(false, false, false, false, false, true, tab, true),
             KeyboardRoute::Pending
         );
         assert_eq!(
-            resolve_keyboard_route(false, false, false, false, true, tab, false),
+            resolve_keyboard_route(false, false, false, false, false, true, tab, false),
             KeyboardRoute::Pending
         );
         for (confirm, dialog, editor, palette, route) in [
@@ -12913,7 +13033,7 @@ mod tests {
             (false, false, false, true, KeyboardRoute::Palette),
         ] {
             assert_eq!(
-                resolve_keyboard_route(confirm, dialog, editor, palette, true, tab, true),
+                resolve_keyboard_route(confirm, dialog, editor, false, palette, true, tab, true),
                 route
             );
         }
@@ -12997,6 +13117,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 host,
                 active_terminal_live(true, false)
             ),
@@ -13007,6 +13128,7 @@ mod tests {
             resolve_keyboard_route(
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -13277,6 +13399,10 @@ mod tests {
             "the delete confirmation outlives an unfocus — dropping it read as a crash"
         );
         assert!(unfocus.drags, "a drag cannot continue under another window");
+        assert!(
+            unfocus.context_menu,
+            "a click into another app dismisses the menu"
+        );
         assert!(unfocus.rename_completion_key);
         assert!(unfocus.ime_composition);
         assert!(!unfocus.ime_discard);

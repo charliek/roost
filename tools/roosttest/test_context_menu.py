@@ -14,6 +14,10 @@ its menu.
 Copy Path reads the native clipboard, so it is in
 `test_context_menu_clipboard.py`, on the clipboard lanes.
 
+On Linux, `app.context_menu_open` shows the overlay a right-click shows,
+and the last cases drive it with `app.key_event`. macOS draws a native
+popup instead, which the op does not open.
+
 Skipped under `--roost-target mac`: the Swift app has no context-menu ops.
 """
 
@@ -61,6 +65,14 @@ def item(action: str, label: str) -> dict:
 
 SEPARATOR = {"separator": True}
 
+TAB_MENU = [
+    item("rename_tab", "Rename…"),
+    item("new_tab_here", "New Tab Here"),
+    item("copy_tab_path", "Copy Path"),
+    SEPARATOR,
+    item("close_tab", "Close Tab"),
+]
+
 
 def refused(call, *args) -> RoostError:
     with pytest.raises(RoostError) as raised:
@@ -92,13 +104,7 @@ def _wait_unlisted(roost, target: dict) -> None:
 
 def test_dump_lists_a_tabs_and_a_projects_items(roost, project):
     tab = _listed_tab(roost, project)
-    assert roost.context_menu_dump(tab_target(tab)) == [
-        item("rename_tab", "Rename…"),
-        item("new_tab_here", "New Tab Here"),
-        item("copy_tab_path", "Copy Path"),
-        SEPARATOR,
-        item("close_tab", "Close Tab"),
-    ]
+    assert roost.context_menu_dump(tab_target(tab)) == TAB_MENU
     assert roost.context_menu_dump(project_target(project)) == [
         item("new_tab", "New Tab"),
         item("rename_project", "Rename…"),
@@ -206,3 +212,51 @@ def test_an_item_not_on_the_rows_menu_is_refused(roost, project):
     assert unknown.code == "invalid-param", unknown
     assert "is not a context-menu action" in unknown.message, unknown
     assert roost.tab(tab) is not None
+
+
+def _overlay_platform() -> None:
+    if sys.platform == "darwin":
+        pytest.skip("macOS draws the native popup, which no test op opens")
+
+
+# `app.key_event` sends a press and never its release, so the Enter or
+# Escape a menu or dialog consumes stays latched (`RenameCompletionKey`)
+# and eats the next press of that same key. The cases from here on take
+# turns: the Escape `test_rename_…` latched cannot eat this Enter, and
+# the Enter this one latches cannot eat the next case's Escape.
+def test_the_open_menu_walks_with_the_arrow_keys_and_runs_on_enter(roost, project):
+    """Four `ArrowDown`s pass Rename…, New Tab Here and Copy Path, step
+    over the separator to Close Tab, and `Enter` runs it."""
+    _overlay_platform()
+    _listed_tab(roost, project)
+    tab = _listed_tab(roost, project)
+    assert roost.context_menu_dump(tab_target(tab)) == TAB_MENU
+    roost.context_menu_open(tab_target(tab))
+    for _ in range(4):
+        roost.key_event("ArrowDown")
+    roost.key_event("Enter")
+    roost.wait_gone(tab)
+
+
+def test_the_open_menu_swallows_every_other_key_and_escape_closes_it(roost, project):
+    _overlay_platform()
+    tab = _listed_tab(roost, project)
+    _shown(roost, tab)
+    roost._wait(roost.app_active_terminal_focused, 5.0, "the terminal to own the keyboard")
+    drain(roost, tab)
+
+    roost.context_menu_open(tab_target(tab))
+    roost.key_event("q")
+    roost.key_event("Escape")
+    roost._wait(roost.app_active_terminal_focused, 5.0, "Escape to close the menu")
+    roost.key_event("z")
+    typed = drain_until_match(roost, tab, rb"z")
+    assert b"q" not in typed, f"a key typed at the open menu reached the terminal: {typed!r}"
+
+
+def test_open_is_not_supported_on_macos(roost, project):
+    if sys.platform != "darwin":
+        pytest.skip("Linux draws the menu as an overlay the op opens")
+    tab = _listed_tab(roost, project)
+    error = refused(roost.context_menu_open, tab_target(tab))
+    assert error.code == "not-supported", error

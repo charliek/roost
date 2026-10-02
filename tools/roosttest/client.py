@@ -429,7 +429,9 @@ class Roost:
         self.call("app.context_menu_activate", {"target": target, "action": action})
 
     def context_menu_open(self, target: dict) -> None:
-        """Test-mode only — show that menu on screen."""
+        """Test-mode only — show that menu on screen, where it owns the
+        keyboard until `Enter` runs an item or `Escape` closes it. On
+        macOS, whose menu is the native popup, `RoostError('not-supported')`."""
         self.call("app.context_menu_open", {"target": target})
 
     # -- host sessions ----------------------------------------------------

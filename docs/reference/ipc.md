@@ -2348,9 +2348,19 @@ The menu is rebuilt before the item runs, and each refusal is
 New Tab, New Tab Here, Close Tab and Close Project answer `busy` while a
 local-backend switch is in flight, as their palette rows do.
 
-`app.context_menu_open` would show the menu on screen. It answers
-`not-supported` on every platform for now: on macOS the menu is the
-native popup, which no test op opens.
+`app.context_menu_open` shows the row's menu on screen, as a
+right-click on the row does, with its corner 40 points right of and
+below the window content area's top-left. Request:
+`{"params": {"target": {"tab_id": "7"}}}`. Response: `{}`. While the
+menu is up it owns the keyboard: through `app.key_event`, `ArrowUp`,
+`ArrowDown`, `Home` and `End` move its highlight past separators and
+disabled items, `Enter` runs the highlighted item, `Escape` closes it,
+and every other key is swallowed — none reaches a shortcut or the
+terminal. A row that is gone, a row whose menu has no items, and a
+modal, the palette, a rename editor or an input-method composition
+owning input are each refused `invalid-param`. On macOS the menu is
+the native popup, which no test op opens, so the op answers
+`not-supported` there.
 
 The Swift Mac app answers `unknown-op` to all three.
 

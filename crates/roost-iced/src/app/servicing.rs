@@ -3417,6 +3417,7 @@ impl App {
                         | KeyboardRoute::Confirm
                         | KeyboardRoute::HostDialog
                         | KeyboardRoute::Editor
+                        | KeyboardRoute::ContextMenu
                         | KeyboardRoute::Palette
                         | KeyboardRoute::Pending => Err(format!(
                             "tab {tab_id} is not the active terminal \
@@ -3664,13 +3665,21 @@ impl App {
                     Err(failure) => Err(failure),
                 });
             }
-            UiRequest::AppContextMenuOpen { target: _, reply } => {
-                let failure = if self.test_mode {
-                    HostOpFailure::new(codes::NOT_SUPPORTED, super::context_menu::OPEN_UNSUPPORTED)
+            UiRequest::AppContextMenuOpen { target, reply } => {
+                // macOS draws the native popup, whose tracking loop would
+                // block this drain until a person closed it.
+                let result = if self.test_mode && cfg!(target_os = "macos") {
+                    Err(HostOpFailure::new(
+                        codes::NOT_SUPPORTED,
+                        super::context_menu::OPEN_UNSUPPORTED,
+                    ))
                 } else {
-                    HostOpFailure::new(codes::NOT_ENABLED, "ROOST_TEST_MODE=1 is required")
+                    self.context_test_target(target).and_then(|target| {
+                        self.open_context_menu(target, super::context_menu::OPEN_ANCHOR)
+                            .map_err(|refusal| refusal.failure())
+                    })
                 };
-                let _ = reply.send(Err(failure));
+                let _ = reply.send(result);
             }
             UiRequest::AppKeybindDispatch { action, reply } => {
                 let result = if !self.test_mode {

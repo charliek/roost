@@ -667,6 +667,11 @@ pub fn host_frame_scrim(chrome: &ChromePalette) -> impl Fn(&Theme) -> container:
     fill(chrome.host_frame_scrim)
 }
 
+/// The rule between a context menu's groups.
+pub fn menu_separator(chrome: &ChromePalette) -> impl Fn(&Theme) -> container::Style {
+    fill(chrome.palette_selection)
+}
+
 pub fn palette_panel(chrome: &ChromePalette) -> impl Fn(&Theme) -> container::Style {
     fixed(container::Style {
         background: Some(Background::Color(chrome.palette_surface)),

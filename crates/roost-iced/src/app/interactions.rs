@@ -2458,6 +2458,7 @@ pub(super) fn native_file_drop_origin(
             | KeyboardRoute::Confirm
             | KeyboardRoute::HostDialog
             | KeyboardRoute::Editor
+            | KeyboardRoute::ContextMenu
             | KeyboardRoute::Palette
             | KeyboardRoute::Pending => None,
         })

@@ -1,6 +1,7 @@
 mod app;
 mod chrome;
 mod config_writer;
+mod context_press;
 mod engine_feed;
 mod focus_probe;
 mod font_registry;
@@ -38,6 +39,7 @@ use roost_engine::single_instance;
 use roost_ipc::messages::ops;
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::IpcClient;
+use roost_ui_model::context_menu::{ContextAction, ContextTarget};
 use roost_ui_model::file_transfer::Candidate;
 use roost_ui_model::keys::{HostId, ProjectKey, TabKey};
 use tracing_subscriber::layer::SubscriberExt;
@@ -237,6 +239,21 @@ enum Message {
     ConfirmDeleteCancel,
     ConfirmDeleteConfirm,
     ConfirmDeleteCardPressed,
+    /// A right-click on a row (`ContextPressArea`), in window
+    /// coordinates.
+    ContextMenuRequested {
+        target: ContextTarget,
+        at: iced::Point,
+    },
+    /// The pointer moved onto the open menu's row at this index, or
+    /// (`None`) off the menu.
+    ContextMenuHovered(Option<usize>),
+    ContextMenuChosen(ContextAction),
+    /// A press outside the open menu.
+    ContextMenuDismiss,
+    /// A press on the menu panel itself, between its rows. Swallowed, so
+    /// it does not reach the dismiss underneath.
+    ContextMenuPanelPressed,
     SidebarResizeDragged {
         width: f32,
     },
@@ -503,9 +520,12 @@ fn window_settings(profile: &BundleProfile) -> window::Settings {
 /// transition passes through some message, and only one of them is the
 /// one that moved it. So does the terminal notice's generation, which
 /// must see a notice that went away before it comes back, and the local
-/// session's background resize wave, whose triggers are as scattered.
+/// session's background resize wave, whose triggers are as scattered. And
+/// so does the context menu's close, which follows whatever took input
+/// from it or removed its row, by any path.
 fn update(app: &mut App, message: Message) -> Task<Message> {
     let dispatched = dispatch(app, message);
+    app.observe_context_menu();
     app.sync_menu_gating();
     app.observe_notice();
     Task::batch([
@@ -665,7 +685,22 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         Message::PaletteActivate(id) => app.palette_activate(&id).map_task(),
         Message::PaletteConfirm => app.palette_confirm().map_task(),
         Message::PaletteDismiss => app.palette_pointer_dismiss().map_task(),
-        Message::PaletteCardPressed | Message::ConfirmDeleteCardPressed => Task::none(),
+        Message::PaletteCardPressed
+        | Message::ConfirmDeleteCardPressed
+        | Message::ContextMenuPanelPressed => Task::none(),
+        Message::ContextMenuRequested { target, at } => {
+            app.context_menu_requested(target, at);
+            Task::none()
+        }
+        Message::ContextMenuHovered(index) => {
+            app.context_menu_hovered(index);
+            Task::none()
+        }
+        Message::ContextMenuChosen(action) => app.context_menu_chosen(action).map_task(),
+        Message::ContextMenuDismiss => {
+            app.close_context_menu();
+            Task::none()
+        }
         Message::PaletteScrolled => {
             app.palette_scrolled();
             Task::none()
