@@ -71,11 +71,8 @@ class TestOscPipeline:
         Note: The bundled `roost-dark` has `bold-color = foreground`,
         so the resolved fg is `#ffffff` in both arms — we can't
         differentiate bold-color vs default-fg by the color value
-        alone. That's covered separately by the Mac/Rust unit tests
-        in `ThemeBoldColorTests.swift` /
-        `terminal_view.rs::tests::bold_default_fg_through_libghostty_uses_theme_bold_color`.
-        Closing the call-site gap end-to-end via the bold bit is the
-        strongest signal we can get from the bundled-theme set.
+        alone. `test_bold_default_foreground_takes_the_theme_bold_color`
+        moves the default foreground with OSC 10 to tell them apart.
         """
         tab = roost.open_tab(project, cwd="/tmp")
         # Quiet, not just attached: `feed_pty_bytes` applies immediately
@@ -97,6 +94,31 @@ class TestOscPipeline:
         assert non_bold_cell["text"] == "N", non_bold_cell
         assert bold_cell["bold"] is True, bold_cell
         assert non_bold_cell["bold"] is False, non_bold_cell
+
+    def test_bold_default_foreground_takes_the_theme_bold_color(
+        self, roost, project, target
+    ):
+        """Bold text with no foreground of its own takes the theme's
+        `bold-color`; plain text keeps the default foreground (plan 073
+        D6). roost-dark's `bold-color` equals its foreground, so OSC 10
+        moves the default foreground first to tell the two apart.
+
+        Iced-only: Swift paints the same rule, but its `tab.dump_resolved`
+        resolves against `theme.foreground` rather than the terminal's
+        OSC 10 default, so its plain cell would read `#ffffff`.
+        """
+        if target != "iced":
+            pytest.skip("Swift's tab.dump_resolved ignores an OSC 10 default foreground")
+        tab = roost.open_tab(project, cwd="/tmp")
+        wait_tab_quiet(roost, tab)
+        roost.tab_feed_pty_bytes(
+            tab,
+            b"\x1b]10;#00ff00\x07\x1b[2J\x1b[10;1H\x1b[1mB\x1b[0mN",
+        )
+        bold_cell, plain_cell = _find_bn_cells(roost, tab)
+        assert plain_cell["fg"].lower() == "#00ff00", plain_cell
+        assert bold_cell["bold"] is True, bold_cell
+        assert bold_cell["fg"].lower() == "#ffffff", bold_cell
 
     def test_inverse_resolver_call_site_swaps_fg_bg(self, roost, project):
         """The resolver's `\\e[7m` (SGR inverse) branch swaps fg/bg
@@ -369,7 +391,7 @@ def _find_bn_cells(roost, tab_id: int, timeout: float = 5.0):
     """Poll `tab.dump_resolved` until both the bold 'B' cell at row
     9 col 0 AND the non-bold 'N' cell at row 9 col 1 are present.
     Returns the two cells (bold first). Raises AssertionError on
-    timeout. Used by `test_bold_resolver_call_site_walks_style_bits`.
+    timeout.
     """
     deadline = time.monotonic() + scaled_timeout(timeout)
     last = None

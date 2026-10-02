@@ -136,7 +136,7 @@ impl Vt {
             .walk_dirty(&self.terminal, |row, cells| {
                 // `walk_dirty` hands the row's complete cell slice, so
                 // its length is the grid width even after a DECCOLM.
-                let built = RenderedRow::build(cells, defaults, cells.len() as u16);
+                let built = RenderedRow::build(cells, defaults, None, cells.len() as u16);
                 while rows.len() <= row as usize {
                     rows.push(Row::default());
                 }

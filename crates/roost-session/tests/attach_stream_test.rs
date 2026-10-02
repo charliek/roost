@@ -629,7 +629,7 @@ fn walk_decoded(terminal: &Terminal, cols: u16) -> DecodedGrid {
     let mut rows: Vec<(u32, RenderedRow)> = Vec::new();
     render
         .walk_dirty(terminal, |row, cells: &[Cell]| {
-            rows.push((row, RenderedRow::build(cells, defaults, cols)));
+            rows.push((row, RenderedRow::build(cells, defaults, None, cols)));
         })
         .expect("walk_dirty");
     rows.sort_by_key(|(row, _)| *row);

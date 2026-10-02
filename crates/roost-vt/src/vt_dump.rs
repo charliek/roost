@@ -279,7 +279,7 @@ fn write_background_fills(
         if !cells.iter().all(|cell| cell.text.is_empty()) {
             return;
         }
-        let built = RenderedRow::build(cells, defaults, cols);
+        let built = RenderedRow::build(cells, defaults, None, cols);
         if !built.cells.is_empty() {
             rows.push((row, built));
         }

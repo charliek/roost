@@ -64,6 +64,19 @@ release workflow asserts they agree).
   middle-click-pastes in the other, and ⌘V still pastes the system
   clipboard.
 
+- **The block cursor hid the character under it; selections and bold
+  text ignored the theme (#579)** — in Roost-Iced, a focused block
+  cursor was a translucent tint under an unchanged character. It is now
+  a solid block in the cursor color with the character drawn in the
+  background color, as in the Swift app and Ghostty, and it covers both
+  columns of a wide character. A selection is a solid
+  `selection-background` with its text in the theme's
+  `selection-foreground`, as Ghostty draws it, instead of a translucent
+  tint. Bold text with no color of its own takes the theme's
+  `bold-color`, as the Swift app does. The bundled themes' bold color
+  matches their foreground, so that shows only with a theme of your own
+  or after a script recolors the default foreground (OSC 10).
+
 ## v0.0.21 — 2026-09-27
 
 _The session-parity release: a tab on a `roost-session` behaves more like an

@@ -6452,11 +6452,9 @@ mod tests {
 
     /// `set_theme` bumps `theme_generation`, and `refresh_snapshot`'s
     /// `cached_theme_generation` guard exists precisely to force a full
-    /// rebuild off that bump — today nothing but the default fg/bg pair
-    /// (already covered by the default-color guard) is theme-derived, but
-    /// the guard is there so a future theme-derived input (e.g. a
-    /// `bold_color` override, like the now-removed GTK UI's) fails safe
-    /// toward over-rebuilding rather than silently keeping stale rows.
+    /// rebuild off that bump — it keys the theme's `bold_color`, the
+    /// theme-derived input besides the default fg/bg pair (which has its
+    /// own guard), so a theme change never leaves a stale row behind.
     ///
     /// Measured while writing this test: `apply_theme_candidate`'s color
     /// FFI calls (`set_color_foreground`/`background`/`cursor`/`palette`)

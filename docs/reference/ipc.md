@@ -810,9 +810,10 @@ other host stays `not-found`.
 Companion to `tab.dump` — a richer read of the same viewport, but each
 cell carries the post-resolver fg/bg the production paint path computes.
 Ungated; useful both for debugging "why is this row gray" and as the
-resolver-walk regression op for #142. (The only theme-derived input to
-the resolver is the default fg/bg pair; no `bold-color` accent is
-applied today, on either socket.) Viewport only — it takes no
+resolver-walk regression op for #142. (A UI socket resolves with its
+theme: bold text with no color of its own takes the theme's
+`bold-color`. A session socket has no theme, so its bold text keeps the
+default foreground.) Viewport only — it takes no
 `scrollback` param, and its params are strict, so passing one is
 `unknown-field`.
 

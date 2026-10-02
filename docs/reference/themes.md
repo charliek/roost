@@ -51,10 +51,10 @@ Theme files are plain key=value text with `#` comments — the same syntax as `c
 | `background`           | Default background color.                                             |
 | `foreground`           | Default foreground color.                                             |
 | `palette = N=#RRGGBB`  | One of the 16 ANSI colors (`N` in `0..15`). Indices 16–255 are computed (xterm 6×6×6 cube + 24-step gray ramp). |
-| `cursor-color`         | Cursor block fill.                                                    |
+| `cursor-color`         | Cursor color. A focused block cursor is solid, with the character under it drawn in the background color. |
 | `bold-color`           | Color for bold text drawn with the *default* foreground. Bold-with-explicit-color (e.g. bold red) is unaffected. |
-| `selection-background` | Selection overlay color (rendered at 35% alpha).                     |
-| `selection-foreground` | Parsed but currently unused (see *Limitations*).                     |
+| `selection-background` | Selection fill, drawn solid behind the selected text.                 |
+| `selection-foreground` | Color of selected text.                                               |
 
 Any other key — including Ghostty's `cursor-text`, `link-color`, and `palette-generate` — is silently ignored. A theme file is typically ~22 lines.
 
@@ -78,7 +78,7 @@ selection-foreground = #545454
 
 - **No user override directory.** Only the bundled themes are loadable. To use a theme that isn't bundled, add the file to the bundled set and rebuild (see below) — themes are embedded into the binary at compile time.
 - **No hot-reload.** Theme is loaded once when each tab is created. To switch, edit `config.conf` and restart roost.
-- **`selection-foreground` is parsed but not yet rendered.** Roost's selection is currently a 35%-alpha overlay over the existing text; honoring `selection-foreground` requires switching to opaque selection + re-rendering glyphs, which is a render-order change tracked separately.
+- **The Swift Mac app draws selections its own way.** Its selection is a 60%-alpha `selection-background` overlay over the text, and it does not read `selection-foreground`.
 - **Indices 16–255 of the palette are not customizable** — they're filled by the standard xterm formula. Bundled themes only set indices 0–15, matching every Ghostty theme.
 
 ## Trying a Ghostty theme that isn't bundled

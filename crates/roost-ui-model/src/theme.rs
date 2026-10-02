@@ -19,7 +19,6 @@ use roost_vt::ColorRgb;
 /// 256-entry palette + chrome colors. Layout matches the bytes
 /// `Terminal::set_color_palette` expects.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // selection_foreground reserved for commit 11+ selection contrast tuning.
 pub struct Theme {
     pub background: ColorRgb,
     pub foreground: ColorRgb,
@@ -29,7 +28,7 @@ pub struct Theme {
     /// Ghostty `bold-color` accent: when `Some`, bold cells whose
     /// foreground is the default (no explicit SGR fg) render in this
     /// color. `None` leaves bold default-fg cells rendering in the
-    /// canvas default — `resolve_cell_colors` already handles both
+    /// canvas default — `roost_vt::resolve_colors` handles both
     /// branches, and keeping the field optional makes "theme didn't
     /// opt in" trivially visible in tests.
     pub bold_color: Option<ColorRgb>,
