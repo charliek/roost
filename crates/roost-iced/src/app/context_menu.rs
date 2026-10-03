@@ -335,7 +335,8 @@ impl App {
                 Ok(self.new_tab_in(project, Some(*tab)))
             }
             (ContextTarget::Project(project), ContextAction::NewTab) => {
-                Ok(self.new_tab_in(*project, None))
+                let source = self.preferred_tab_key(*project);
+                Ok(self.new_tab_in(*project, source))
             }
             (ContextTarget::Tab(tab), ContextAction::CloseTab) => Ok(self.close_tab(*tab)),
             (ContextTarget::Project(project), ContextAction::CloseProject) => {
