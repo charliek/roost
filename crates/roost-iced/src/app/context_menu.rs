@@ -669,6 +669,7 @@ impl App {
         }
         self.cancel_drags();
         self.cancel_terminal_pointers("pointer cancel before a context menu");
+        self.menu_press_floor = crate::terminal_widget::latest_press_seq();
         self.cancel_ime_composition();
         Ok(entries)
     }

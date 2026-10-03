@@ -131,8 +131,9 @@ use self::pending_selection::{Creation, PendingHostSelection, PendingStep};
 pub(crate) use self::servicing::{AgentMetricsResult, ATTACH_RETRY_INTERVAL};
 use self::tab_backend::{TabBackend, TabHandle};
 use self::terminal_tab::{
-    apply_geometry_batch, clear_preedit_or_warn, pointer_origin_tab, refresh_or_warn,
-    terminal_grid, GeometryBatchOperation, GeometryChange, NativePointerDispatch, TerminalTab,
+    apply_geometry_batch, cancel_tab_pointers, clear_preedit_or_warn, pointer_origin_tab,
+    refresh_or_warn, refuse_stale_press, release_host_pointer_before_detach, terminal_grid,
+    GeometryBatchOperation, GeometryChange, NativePointerDispatch, PressGate, TerminalTab,
 };
 #[cfg(test)]
 use self::terminal_tab::{
@@ -847,6 +848,10 @@ struct FocusTeardown {
     /// A menu answers one click; a click into another app dismisses it,
     /// as a native menu's would.
     context_menu: bool,
+    /// A button held as focus leaves is released somewhere Roost never
+    /// hears, which would leave the terminal latched on it (#587) — the
+    /// principle Ghostty applies to a held key on focus loss.
+    terminal_pointers: bool,
     ime_composition: bool,
     /// Refocus only: macOS discards marked text when the window loses
     /// focus, so a commit arriving after refocus is fresh input (emoji
@@ -866,6 +871,7 @@ fn focus_teardown(focused: bool) -> FocusTeardown {
             drags: true,
             confirm_delete: false,
             context_menu: true,
+            terminal_pointers: true,
             ime_composition: true,
             ime_discard: false,
         }
@@ -1848,18 +1854,6 @@ fn focus_tab_in_core(workspace: &Workspace, tab: TabKey) -> Result<(), String> {
         .focus_tab(tab_id)
         .map(|_| ())
         .map_err(|error| error.to_string())
-}
-
-/// See [`App::terminal_event_key`]. Split out so the "a host terminal is
-/// showing, so a bare id is that host's" rule can be checked without an
-/// `App` (which needs a bundle profile, the instance lock and the Iced
-/// runtime to build).
-fn terminal_event_key(active: TabKey, local_host: HostId, tab_id: i64) -> TabKey {
-    if active.tab == tab_id {
-        active
-    } else {
-        TabKey::new(local_host, tab_id)
-    }
 }
 
 /// The host tab whose attach a selection move releases, if any. See
@@ -3112,8 +3106,8 @@ pub struct App {
     font_registry: &'static FontRegistry,
     terminal_metrics: TerminalMetrics,
     metric_generation: u64,
-    /// See `TerminalWidget::pointer_cancel_epoch`.
-    pointer_cancel_epoch: u64,
+    /// See [`PressGate::menu_press_floor`].
+    menu_press_floor: u64,
     keybindings: HashMap<Accel, KeybindAction>,
     active_theme_name: String,
     palette: Option<palette::PaletteState>,
@@ -3598,7 +3592,7 @@ impl App {
             font_registry,
             terminal_metrics,
             metric_generation: 1,
-            pointer_cancel_epoch: 0,
+            menu_press_floor: 0,
             keybindings,
             active_theme_name,
             palette: None,
@@ -5583,21 +5577,6 @@ impl App {
         }
     }
 
-    /// The key an event off the terminal widget names. The widget renders
-    /// the selected tab and stamps its bare id onto every pointer, wheel
-    /// and hover event, so an id that still matches the selection belongs
-    /// to whatever host that selection is on — qualifying it at the local
-    /// backend would land the gesture on whichever LOCAL tab happens to
-    /// share the number while a host terminal is showing. An id that no
-    /// longer matches is a straggler from a previous frame and keeps
-    /// resolving exactly as it did before, at the local backend.
-    ///
-    /// With no host selection both branches are the same key, which is
-    /// what keeps the zero-host path byte-identical.
-    pub(super) fn terminal_event_key(&self, tab_id: i64) -> TabKey {
-        terminal_event_key(self.active_tab_key(), self.backend.host(), tab_id)
-    }
-
     fn keyboard_route(&self) -> KeyboardRoute {
         let active_tab = self.active_tab_key();
         resolve_keyboard_route(
@@ -5647,6 +5626,9 @@ impl App {
         }
         if teardown.context_menu {
             self.close_context_menu();
+        }
+        if teardown.terminal_pointers {
+            self.cancel_terminal_pointers("pointer cancel on focus loss");
         }
         if teardown.ime_composition {
             self.cancel_ime_composition();
@@ -6603,11 +6585,10 @@ impl App {
 
         let terminal: Element<'_, Message> = match self.tabs.get(&active_key) {
             Some(tab) if tab.applied_metrics.is_some() => TerminalWidget {
-                tab_id: active_key.tab,
+                tab: active_key,
                 snapshot: tab.snapshot.clone(),
                 metrics: tab.applied_metrics.unwrap_or(self.terminal_metrics),
-                metric_generation: tab.metric_generation,
-                pointer_cancel_epoch: self.pointer_cancel_epoch,
+                cancelled_through: tab.cancelled_through,
                 ime_active: terminal_ime_active(
                     self.keyboard_route(),
                     active_key,
@@ -7258,29 +7239,7 @@ impl App {
     /// tracking PTY — before a surface that drops pointer events takes
     /// input: a held terminal button would never see its own release.
     fn cancel_terminal_pointers(&mut self, reason: &'static str) {
-        let active = self.active_tab_key();
-        let mut active_released = true;
-        for (key, tab) in &mut self.tabs {
-            match tab.prepare_pointer_cancel() {
-                Ok(release) => {
-                    tab.commit_pointer_cancel(release);
-                    // The cancel drops hover, so the link underline and
-                    // pointer shape the snapshot carries are decorations
-                    // for a gesture that no longer exists.
-                    refresh_or_warn(key.tab, tab, reason);
-                }
-                Err(error) => {
-                    active_released &= *key != active;
-                    tracing::warn!(?error, tab_id = key.tab, "{reason}");
-                }
-            }
-        }
-        // The rendered widget drops its held button only when the active
-        // tab's tracking owner really was released; otherwise its next
-        // press would reach the PTY with no release before it.
-        if active_released {
-            self.pointer_cancel_epoch = self.pointer_cancel_epoch.wrapping_add(1);
-        }
+        cancel_tab_pointers(&mut self.tabs, None, reason);
     }
 
     /// The overlay is dismissed here, at the confirm, exactly as it was
@@ -8013,7 +7972,22 @@ impl App {
         // `--tab` acts on (plan 063 §D1/§D10).
         self.publish_local_route();
         if let Some(tab) = released {
+            self.release_host_pointer(tab);
             self.host_detach_tab(tab);
+        }
+    }
+
+    /// See [`release_host_pointer_before_detach`].
+    fn release_host_pointer(&mut self, key: TabKey) {
+        let ops = self.hosts.ops_for(key.host);
+        let Some(tab) = self.tabs.get_mut(&key) else {
+            return;
+        };
+        let reason = "pointer release before a host tab detaches";
+        match release_host_pointer_before_detach(tab, key, ops) {
+            Ok(true) => refresh_or_warn(key.tab, tab, reason),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(?error, %key, "{reason}"),
         }
     }
 
@@ -11107,40 +11081,6 @@ mod tests {
         assert_eq!(calls, 1);
     }
 
-    /// The terminal widget stamps a bare tab id on every pointer, wheel
-    /// and hover event. While a host row is showing, that id is the
-    /// host's — resolving it at the local backend would land the gesture
-    /// on whichever local tab happens to share the number.
-    #[test]
-    fn a_terminal_event_qualifies_at_the_host_whose_terminal_is_showing() {
-        let local = HostId::LOCAL;
-        let remote = HostId::new(4);
-
-        // No host selection: every id is the local backend's, exactly as
-        // before the override existed.
-        assert_eq!(
-            terminal_event_key(TabKey::new(local, 7), local, 7),
-            TabKey::new(local, 7)
-        );
-        assert_eq!(
-            terminal_event_key(TabKey::new(local, 7), local, 9),
-            TabKey::new(local, 9)
-        );
-
-        // A host terminal is showing: its own id is its own key…
-        assert_eq!(
-            terminal_event_key(TabKey::new(remote, 7), local, 7),
-            TabKey::new(remote, 7),
-            "the same number under the local backend is a different tab"
-        );
-        // …and a straggler from a previous frame keeps resolving where it
-        // always did.
-        assert_eq!(
-            terminal_event_key(TabKey::new(remote, 7), local, 9),
-            TabKey::new(local, 9)
-        );
-    }
-
     fn a_host_selection(host: HostId, project: i64, tab: i64) -> HostSelection {
         HostSelection {
             project: ProjectKey::new(host, project),
@@ -13430,6 +13370,10 @@ mod tests {
         assert!(
             unfocus.context_menu,
             "a click into another app dismisses the menu"
+        );
+        assert!(
+            unfocus.terminal_pointers,
+            "a button's release while unfocused never reaches the terminal"
         );
         assert!(unfocus.rename_completion_key);
         assert!(unfocus.ime_composition);

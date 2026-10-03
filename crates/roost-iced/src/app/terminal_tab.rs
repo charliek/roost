@@ -1,4 +1,5 @@
 use super::*;
+use crate::terminal_widget::next_press_seq;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct NativePointerOutcome {
@@ -17,6 +18,8 @@ pub(super) struct NativePointerDispatch {
     pub(super) click_count: u8,
     pub(super) inside: bool,
     pub(super) link_modifier_held: bool,
+    /// See `TerminalPointerEvent::press_seq`.
+    pub(super) press_seq: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,6 +31,106 @@ pub(super) enum LocalPointerGesture {
 
 pub(super) fn pointer_origin_tab<V>(tabs: &mut HashMap<TabKey, V>, tab: TabKey) -> Option<&mut V> {
     tabs.get_mut(&tab)
+}
+
+/// Let go of the pointer on every tab in `tabs` but `except`: a held
+/// tracking button gets its release, and the presses the tab has seen are
+/// settled, so the widget lets go of them and whatever they still have
+/// queued is dropped (#587). A tab whose release fails to encode keeps its
+/// gesture whole — its application never saw the button come up, so a
+/// press the widget forwarded next would reach it with no release before.
+pub(super) fn cancel_tab_pointers(
+    tabs: &mut HashMap<TabKey, TerminalTab>,
+    except: Option<TabKey>,
+    reason: &str,
+) {
+    for (key, tab) in tabs.iter_mut().filter(|(key, _)| Some(**key) != except) {
+        match tab.prepare_pointer_cancel() {
+            Ok(release) => {
+                // The cancel drops hover, so the link underline and
+                // pointer shape the snapshot carries are decorations for
+                // a gesture that no longer exists.
+                if tab.commit_pointer_cancel(release) {
+                    refresh_or_warn(key.tab, tab, reason);
+                }
+            }
+            Err(error) => tracing::warn!(?error, tab_id = key.tab, "{reason}"),
+        }
+    }
+}
+
+/// Let go of the pointer on a host tab whose attach is about to detach.
+/// The attach's data connection is what the tab's input rides, and the
+/// detach aborts its writer with whatever it has not written yet, so a
+/// held button's release goes over the host's control connection
+/// (`tab.write`) instead — the route `tab.resize` takes for a tab with no
+/// attach. With no connection to carry it, the gesture is kept whole, as
+/// for a release that fails to encode. Reports whether the tab held any
+/// pointer state to let go of.
+pub(super) fn release_host_pointer_before_detach(
+    tab: &mut TerminalTab,
+    key: TabKey,
+    ops: Option<&crate::host_conn::HostOps>,
+) -> Result<bool> {
+    let release = tab.prepare_pointer_cancel()?;
+    if !release.is_empty() {
+        let ops = ops.ok_or_else(|| anyhow::anyhow!("no connection to carry {key}'s release"))?;
+        let params = serde_json::to_value(roost_ipc::messages::TabWriteParams {
+            tab_id: key.tab,
+            data: release,
+        })?;
+        let intent = crate::host_conn::HostIntent::new(roost_ipc::messages::ops::TAB_WRITE, params)
+            .fenced_at(key.host);
+        ops.send(intent)
+            .map_err(|error| anyhow::anyhow!("queue {key}'s release: {error}"))?;
+    }
+    Ok(tab.commit_pointer_cancel(Vec::new()))
+}
+
+/// What decides whether a fresh terminal press may start a gesture.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PressGate {
+    /// The tab on screen, for a press the widget stamped. `None` for a
+    /// synthetic press, which names its tab on purpose — a background tab
+    /// included.
+    pub(super) on_screen: Option<TabKey>,
+    pub(super) context_menu_open: bool,
+    /// The latest press stamped when the last context menu opened.
+    pub(super) menu_press_floor: u64,
+}
+
+impl PressGate {
+    fn refuses(&self, event: &TerminalPointerEvent) -> bool {
+        event.action == PointerAction::Press
+            && (self.on_screen.is_some_and(|tab| tab != event.tab)
+                || self.context_menu_open
+                || event
+                    .press_seq
+                    .is_some_and(|seq| seq <= self.menu_press_floor))
+    }
+}
+
+/// Refuse a fresh press that may not start a gesture (#587), and report
+/// whether it was refused. The widget stamps a press when iced hands it
+/// the native event, and the model acts on it only when `update` drains
+/// the message, so what ran in between decides. Refused: a press for a
+/// tab no longer on screen — the switch already let that tab's pointer
+/// go, and the release will reach whichever tab shows now — and a press
+/// under a context menu opened in that gap, whose backdrop (or AppKit's
+/// menu tracking) takes the release. A cancel that leaves the release
+/// with the widget, such as a font-size change, refuses nothing.
+pub(super) fn refuse_stale_press(
+    tabs: &mut HashMap<TabKey, TerminalTab>,
+    event: &TerminalPointerEvent,
+    gate: PressGate,
+) -> bool {
+    if !gate.refuses(event) {
+        return false;
+    }
+    if let (Some(tab), Some(seq)) = (tabs.get_mut(&event.tab), event.press_seq) {
+        tab.refuse_press(seq);
+    }
+    true
 }
 
 /// Republish what a tab renders after something moved its terminal state.
@@ -295,6 +398,16 @@ pub(super) struct TerminalTab {
     drag_gate: DragCellGate,
     pub(super) tracking_pointer: Option<PointerButton>,
     pub(super) local_pointer_gesture: Option<LocalPointerGesture>,
+    /// The latest press (`TerminalPointerEvent::press_seq`) this tab has
+    /// acted on.
+    pub(super) last_press_seq: u64,
+    /// The latest press a pointer cancel has settled: its release went
+    /// out with the cancel. The view hands it to the widget.
+    pub(super) cancelled_through: u64,
+    /// Fails every pointer encode: libghostty's encoder has no input that
+    /// does, and a cancel's failure path is what the tests pin.
+    #[cfg(test)]
+    pub(super) fail_pointer_encode: bool,
     pub(super) last_pointer_cell: Option<(u16, u16)>,
     pub(super) link_modifier_held: bool,
     pub(super) hover_url: Option<HoverUrl>,
@@ -392,6 +505,10 @@ impl TerminalTab {
             drag_gate: DragCellGate::new(),
             tracking_pointer: None,
             local_pointer_gesture: None,
+            last_press_seq: 0,
+            cancelled_through: 0,
+            #[cfg(test)]
+            fail_pointer_encode: false,
             last_pointer_cell: None,
             link_modifier_held: false,
             hover_url: None,
@@ -666,13 +783,20 @@ impl TerminalTab {
         }
     }
 
-    pub(super) fn commit_pointer_cancel(&mut self, release: Vec<u8>) {
-        self.session.send_input(release);
+    /// Send the release [`Self::prepare_pointer_cancel`] staged and settle
+    /// every press seen so far. Reports whether the tab held any pointer
+    /// state to let go of.
+    pub(super) fn commit_pointer_cancel(&mut self, release: Vec<u8>) -> bool {
+        if !release.is_empty() {
+            self.session.send_input(release);
+        }
+        self.cancelled_through = self.cancelled_through.max(self.last_press_seq);
         self.drag_gate.reset();
-        self.tracking_pointer = None;
-        self.local_pointer_gesture = None;
-        self.last_pointer_cell = None;
-        self.hover_url = None;
+        let tracking = self.tracking_pointer.take();
+        let gesture = self.local_pointer_gesture.take();
+        let cell = self.last_pointer_cell.take();
+        let hover = self.hover_url.take();
+        tracking.is_some() || gesture.is_some() || cell.is_some() || hover.is_some()
     }
 
     pub(super) fn dispatch_pointer(
@@ -720,6 +844,10 @@ impl TerminalTab {
         row: u32,
         mods: u16,
     ) -> Result<Vec<u8>> {
+        #[cfg(test)]
+        if self.fail_pointer_encode {
+            anyhow::bail!("injected pointer encode failure");
+        }
         let Some(metrics) = self.applied_metrics else {
             return Ok(Vec::new());
         };
@@ -867,7 +995,17 @@ impl TerminalTab {
             click_count,
             inside,
             link_modifier_held,
+            press_seq,
         } = event;
+        if press_seq.is_some_and(|seq| seq <= self.cancelled_through) {
+            // Queued behind the cancel that settled its press, in the
+            // same batch: that press's release already went out, so the
+            // rest of it must not reach the application.
+            return Ok(NativePointerOutcome::default());
+        }
+        if let (PointerAction::Press, Some(seq)) = (action, press_seq) {
+            self.last_press_seq = self.last_press_seq.max(seq);
+        }
         let col = col.min(u32::from(self.cols.saturating_sub(1)));
         let row = row.min(u32::from(self.rows.saturating_sub(1)));
         let cell = (col as u16, row as u16);
@@ -931,6 +1069,29 @@ impl TerminalTab {
         }
     }
 
+    /// Settle a press refused before it reached the application (see
+    /// [`refuse_stale_press`]): no release is owed, the widget lets go of
+    /// it, and whatever of it is still queued is dropped.
+    pub(super) fn refuse_press(&mut self, seq: u64) {
+        self.cancelled_through = self.cancelled_through.max(seq);
+    }
+
+    /// The `press_seq` for an event no widget stamped: a fresh one on a
+    /// press, none on a hover, and otherwise this tab's latest press's —
+    /// so after a cancel, a button's motion or release is dropped as the
+    /// widget's would be.
+    pub(super) fn synthetic_press_seq(
+        &self,
+        action: PointerAction,
+        button: Option<PointerButton>,
+    ) -> Option<u64> {
+        match (action, button) {
+            (PointerAction::Press, _) => Some(next_press_seq()),
+            (PointerAction::Motion, None) => None,
+            _ => Some(self.last_press_seq),
+        }
+    }
+
     fn route_press_without_link(
         &mut self,
         button: Option<PointerButton>,
@@ -982,16 +1143,6 @@ impl TerminalTab {
     pub(super) fn pointer_leave(&mut self) {
         self.last_pointer_cell = None;
         self.hover_url = None;
-    }
-
-    pub(super) fn reset_pointer_state(&mut self) -> bool {
-        self.drag_gate.reset();
-        let gesture = self.local_pointer_gesture.take();
-        let tracking = self.tracking_pointer.take();
-        let cell = self.last_pointer_cell.take();
-        let hover = self.hover_url.take();
-        let modifier = std::mem::take(&mut self.link_modifier_held);
-        gesture.is_some() || tracking.is_some() || cell.is_some() || hover.is_some() || modifier
     }
 
     pub(super) fn effective_pointer_shape(&self) -> &str {

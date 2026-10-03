@@ -1261,25 +1261,27 @@ impl App {
         let active_key = self.active_tab_key();
         // **On the edge, not on every reconcile**, which is what the log
         // line below has always said this was. The pointer can only be
-        // over the tab on screen, so a tab losing that place drops its
-        // gesture and hover — but a tab that was already in the
-        // background has no stale state to drop, and clearing it every
-        // reconcile makes the *whole gesture* unrepresentable there: a
-        // synthetic press through `tab.dispatch_mouse_event` (which
-        // names a tab by id, not by what is showing) had its capture
-        // wiped before the release arrived, so the application on the
-        // far end saw a button go down and never come up.
+        // over the tab on screen, so a tab losing that place lets go of
+        // its gesture and hover — a held tracking button sends its
+        // release, as every pointer cancel does — but a tab that was
+        // already in the background has no stale state to drop, and
+        // clearing it every reconcile makes the *whole gesture*
+        // unrepresentable there: a synthetic press through
+        // `tab.dispatch_mouse_event` (which names a tab by id, not by
+        // what is showing) had its capture wiped before the release
+        // arrived, so the application on the far end saw a button go
+        // down and never come up.
         //
         // `revealed_tab` is the memo of the last observed active tab, so
         // the edge is read off it before `request_tab_reveal` moves it.
         let active_changed = self.revealed_tab != Some(active_key);
         self.request_tab_reveal(active_key);
         if active_changed {
-            for (key, tab) in &mut self.tabs {
-                if *key != active_key && tab.reset_pointer_state() {
-                    refresh_or_warn(key.tab, tab, "pointer reset after active tab changed");
-                }
-            }
+            cancel_tab_pointers(
+                &mut self.tabs,
+                Some(active_key),
+                "pointer cancel after active tab changed",
+            );
         }
         // Every focus change funnels through `focus_tab_and_clear`, which
         // reconciles — so this is the one place a tab switch cancels a
@@ -6711,6 +6713,7 @@ mod tests {
             click_count: 0,
             inside: true,
             link_modifier_held: false,
+            press_seq: None,
         })
         .expect("hover motion dispatch");
         tab.refresh_snapshot()

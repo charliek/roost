@@ -1018,6 +1018,13 @@ plain hover motion). `cell_x` / `cell_y` are 0-based terminal cell
 coordinates. `mods` defaults to `0` and matches the key encoder's
 `Mods` bit layout: shift(0), ctrl(1), alt(2), cmd/super(3).
 
+On iced, a press starts a new gesture and a button's motion or release
+belongs to the tab's latest press, as the terminal widget's do. Once a
+pointer cancel has sent that press's release (the window switching away
+from the tab or losing focus, a context menu or the delete confirmation
+opening, a font-size change), its later motion and release are dropped.
+A press while a context menu is open is dropped too.
+
 Response: `{}`. Errors: `invalid-param` for an unrecognized `kind` or
 `button`.
 

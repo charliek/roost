@@ -648,8 +648,8 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         Message::TerminalPointer(event) => match event {
             terminal_widget::TerminalPointer::Event(event) => app.pointer(event).map_task(),
             terminal_widget::TerminalPointer::Wheel(event) => app.wheel(event).map_task(),
-            terminal_widget::TerminalPointer::Leave { tab_id } => {
-                app.pointer_leave(tab_id);
+            terminal_widget::TerminalPointer::Leave { tab } => {
+                app.pointer_leave(tab);
                 Task::none()
             }
         },
