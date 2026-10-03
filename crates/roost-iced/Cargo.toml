@@ -136,6 +136,9 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "NSDictionary",
     "NSUserDefaults",
     "NSValue",
+    # The window frame's screen check (`macos::window_frame`) reads and sets
+    # `NSRect`s.
+    "NSGeometry",
 ] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
@@ -162,6 +165,10 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     # `popUpMenuPositioningItem:atLocation:inView:` — the right-click menu
     # (`macos::context_menu`) — is declared only with it.
     "NSView",
+    # The window frame's screen check (`macos::window_frame`): the visible
+    # screens, and the `NSWindow` behind the raw handle's `NSView`.
+    "NSScreen",
+    "NSWindow",
 ] }
 
 # The UNUserNotificationCenter backend (`src/macos/notifications.rs`, plan

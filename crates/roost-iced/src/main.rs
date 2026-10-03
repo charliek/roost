@@ -34,7 +34,7 @@ use anyhow::Context;
 use iced::advanced::input_method;
 use iced::keyboard::key::Named;
 use iced::keyboard::Key;
-use iced::{event, keyboard, mouse, time, window, Event, Size, Subscription, Task, Theme};
+use iced::{event, keyboard, mouse, time, window, Event, Point, Size, Subscription, Task, Theme};
 use roost_engine::single_instance;
 use roost_ipc::messages::ops;
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
@@ -89,6 +89,15 @@ enum Message {
     BackgroundResizeDeadline,
     WindowOpened(window::Id),
     WindowResized(window::Id, Size),
+    /// The window's outer top-left moved — macOS only, the one platform
+    /// that remembers the frame.
+    WindowMoved(Point),
+    WindowFrameChecked(Option<app::window_frame::CheckedFrame>),
+    WindowFrameDue {
+        generation: u64,
+        mode: window::Mode,
+        outer: Option<Point>,
+    },
     WindowFocus(window::Id, bool),
     ScreenshotCaptured(window::Screenshot),
     ClipboardReadCompleted {
@@ -433,7 +442,9 @@ fn run(profile: &BundleProfile, bundle_id: Option<&str>) -> anyhow::Result<()> {
         Err(error) => return Err(anyhow::anyhow!("single-instance lock failed: {error}")),
     };
 
-    let initial = Arc::new(Mutex::new(Some(App::bootstrap(profile, locks)?)));
+    let app = App::bootstrap(profile, locks)?;
+    let opening = app.window_opening();
+    let initial = Arc::new(Mutex::new(Some(app)));
     let boot = {
         let initial = Arc::clone(&initial);
         move || {
@@ -453,7 +464,7 @@ fn run(profile: &BundleProfile, bundle_id: Option<&str>) -> anyhow::Result<()> {
         .font(include_bytes!("../../../third_party/inter/Inter-Medium.ttf").as_slice())
         .font(include_bytes!("../../../third_party/inter/Inter-SemiBold.ttf").as_slice())
         .default_font(chrome::chrome_font(iced::font::Weight::Normal))
-        .window(window_settings(profile))
+        .window(window_settings(profile, opening))
         .run()
         .context("run Iced application")
 }
@@ -495,11 +506,22 @@ fn forced_test_panic() {
 /// installed desktop entry already declares as its `StartupWMClass`; it is
 /// the same id the notification adapter sends as its `desktop-entry` hint,
 /// so shells group both under one identity.
+///
+/// `opening` is the frame `state.json` remembered (plan 074 §D5b). On
+/// macOS iced applies a `Position::Specific` with `set_outer_position`
+/// right after creation, so the window never shows at a default spot
+/// first.
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-fn window_settings(profile: &BundleProfile) -> window::Settings {
+fn window_settings(
+    profile: &BundleProfile,
+    opening: app::window_frame::OpeningFrame,
+) -> window::Settings {
     window::Settings {
-        size: app::INITIAL_WINDOW_SIZE,
-        min_size: Some(Size::new(640.0, 360.0)),
+        size: opening.size,
+        position: opening
+            .position
+            .map_or(window::Position::Default, window::Position::Specific),
+        min_size: Some(app::MIN_WINDOW_SIZE),
         #[cfg(target_os = "macos")]
         platform_specific: window::settings::PlatformSpecific {
             titlebar_transparent: true,
@@ -579,6 +601,16 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::WindowOpened(id) => app.window_opened(id).map_task(),
         Message::WindowResized(id, size) => app.window_resized(id, size).map_task(),
+        Message::WindowMoved(outer) => app.window_moved(outer).map_task(),
+        Message::WindowFrameChecked(observed) => app.window_frame_checked(observed).map_task(),
+        Message::WindowFrameDue {
+            generation,
+            mode,
+            outer,
+        } => {
+            app.window_frame_due(generation, mode, outer);
+            Task::none()
+        }
         Message::WindowFocus(id, focused) => {
             let task = app.window_opened(id).map_task();
             app.set_window_focus(focused);
@@ -899,8 +931,23 @@ fn window_event_message(id: window::Id, event: window::Event) -> Option<Message>
             window_id: id,
             path,
         }),
+        window::Event::Moved(outer) if app::window_frame::REMEMBERS_WINDOW_FRAME => {
+            Some(Message::WindowMoved(outer))
+        }
         _ => None,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn check_window_frame(id: window::Id, fit: bool) -> Task<Message> {
+    window::run(id, move |window| macos::window_frame::check(window, fit))
+        .map(Message::WindowFrameChecked)
+}
+
+/// Nothing to check where nothing is remembered, and nothing asks.
+#[cfg(not(target_os = "macos"))]
+fn check_window_frame(_id: window::Id, _fit: bool) -> Task<Message> {
+    Task::done(Message::WindowFrameChecked(None))
 }
 
 /// Text inputs capture Escape before `keyboard::listen`, but Escape is an
@@ -1005,6 +1052,9 @@ impl UiTask for app::UiTask {
         match self {
             app::UiTask::None => Task::none(),
             app::UiTask::Then(first, second) => first.map_task().chain(second.map_task()),
+            app::UiTask::Alongside(first, second) => {
+                Task::batch([first.map_task(), second.map_task()])
+            }
             app::UiTask::EngineOp(future) => Task::future(future).map(Message::EngineOp),
             app::UiTask::Focus(id) => window::gain_focus(id),
             app::UiTask::FocusWidget(id) => iced::widget::operation::focus(id),
@@ -1192,6 +1242,24 @@ impl UiTask for app::UiTask {
                     Message::FullScreenSettled(generation)
                 })
             }
+            app::UiTask::CheckWindowFrame { id, fit } => check_window_frame(id, fit),
+            // The mode and the position are read at the deadline, not
+            // remembered from before it: a full-screen transition can start
+            // inside the 500 ms, and a `Moved` can be scaled wrong (see
+            // `WindowFrameMemory::save_due`).
+            app::UiTask::WindowFrameDeadline {
+                id,
+                delay,
+                generation,
+            } => Task::future(tokio::time::sleep(delay))
+                .then(move |()| window::mode(id))
+                .then(move |mode| {
+                    window::position(id).map(move |outer| Message::WindowFrameDue {
+                        generation,
+                        mode,
+                        outer,
+                    })
+                }),
             app::UiTask::FileDropDeadline(delay) => {
                 Task::perform(tokio::time::sleep(delay), |()| Message::FileDropDeadline)
             }

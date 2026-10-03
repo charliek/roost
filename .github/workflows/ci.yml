@@ -1270,6 +1270,7 @@ jobs:
           tools/roosttest/test_z_typography.py
           tools/roosttest/test_project_lifecycle.py
           tools/roosttest/test_sidebar_resize.py
+          tools/roosttest/test_window_geometry_persistence.py
           tools/roosttest/test_osc_pipeline.py
           tools/roosttest/test_palette_256.py
           tools/roosttest/test_tab_dump_scrollback.py

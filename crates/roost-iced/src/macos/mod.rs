@@ -10,7 +10,8 @@
 //! that.
 //!
 //! Two rules hold for every AppKit surface under here — [`dock_badge`],
-//! [`menu`], [`sparkle`], [`accent`] and [`context_menu`]:
+//! [`menu`], [`sparkle`], [`accent`], [`context_menu`] and
+//! [`window_frame`]:
 //!
 //! * **Main thread only.** AppKit is main-thread-only (CLAUDE.md's
 //!   threading table), so every entry point either takes a
@@ -40,6 +41,7 @@
 //! the `UNUserNotificationCenter` backend. Fifth: [`pasteboard`], the
 //! selection pasteboard. Sixth: [`accent`], the system accent color the
 //! chrome follows. Seventh: [`context_menu`], a row's right-click menu.
+//! Eighth: [`window_frame`], the remembered frame's screen check.
 
 pub(crate) mod accent;
 pub(crate) mod context_menu;
@@ -48,3 +50,4 @@ pub(crate) mod menu;
 pub(crate) mod notifications;
 pub(crate) mod pasteboard;
 pub(crate) mod sparkle;
+pub(crate) mod window_frame;

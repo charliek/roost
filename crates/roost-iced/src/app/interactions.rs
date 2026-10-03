@@ -2337,11 +2337,15 @@ impl App {
         self.open_external(url_launcher::External::Url(DOCS_URL.to_string()))
     }
 
+    /// Roost's own toggle — the menu row, the keybind and the palette. The
+    /// settle it arms is what ends the remembered frame's transition guard
+    /// (`WindowFrameMemory::full_screen_toggling`) when no resize follows.
     pub(super) fn toggle_full_screen(&mut self) -> UiTask {
-        match self.window_id {
-            Some(id) => UiTask::ToggleFullScreen(id),
-            None => UiTask::None,
-        }
+        let Some(id) = self.window_id else {
+            return UiTask::None;
+        };
+        self.window_frame.full_screen_toggling(&self.workspace);
+        UiTask::ToggleFullScreen(id).then(self.schedule_full_screen_settle())
     }
 
     /// A re-query of the window's mode, so the menu's "Enter/Exit Full
@@ -2371,6 +2375,7 @@ impl App {
 
     pub fn full_screen_settled(&mut self, generation: u64) -> UiTask {
         if self.full_screen_settle.is_latest(generation) {
+            self.window_frame.full_screen_settled();
             self.query_full_screen()
         } else {
             UiTask::None
@@ -2378,12 +2383,11 @@ impl App {
     }
 
     pub fn full_screen_mode(&mut self, mode: window::Mode) {
+        self.window_frame.observe_mode(mode);
         #[cfg(target_os = "macos")]
         if let Some(mtm) = servicing::seam_on_main("full-screen menu title") {
             crate::macos::menu::sync_fullscreen_title(mtm, mode == window::Mode::Fullscreen);
         }
-        #[cfg(not(target_os = "macos"))]
-        let _ = mode;
     }
 
     pub fn file_open_completed(&mut self, result: std::result::Result<(), String>) {

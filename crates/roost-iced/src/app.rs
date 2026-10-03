@@ -15,7 +15,7 @@ use iced::widget::{
     button, column, container, image, mouse_area, row, scrollable, stack, text, text_input,
     toggler, Column, Row, Space,
 };
-use iced::{font, window, Alignment, Color, Element, Fill, Font, Shrink, Size};
+use iced::{font, window, Alignment, Color, Element, Fill, Font, Point, Shrink, Size};
 use roost_engine::git_metrics;
 use roost_engine::ipc::{
     ClipboardOp, DumpData, ExpandSelectionData, HostOpFailure, HostOpReply, IpcHandler,
@@ -103,6 +103,7 @@ mod servicing;
 mod tab_backend;
 mod tab_memory;
 mod terminal_tab;
+pub(crate) mod window_frame;
 // The in-crate `#[ignore]`d perf harness — see `tools/perf/README.md` for
 // how to run it. Gated on `cfg(test)` like `terminal_tab`'s test-only
 // `attach_test_terminal` fixture it depends on; it carries no production
@@ -148,9 +149,10 @@ const DEFAULT_ROWS: u16 = 32;
 /// that ignored it cannot pass for one that used it.
 #[cfg(test)]
 const SPAWN_GRID: (u16, u16) = (137, 43);
-/// The size the window opens at, before the first resize reports the
-/// one the window manager actually gave it.
+/// The size the window opens at when no frame is remembered, before the
+/// first resize reports the one the window manager actually gave it.
 pub(crate) const INITIAL_WINDOW_SIZE: Size = Size::new(1100.0, 720.0);
+pub(crate) const MIN_WINDOW_SIZE: Size = Size::new(640.0, 360.0);
 const STATUS_BANNER_DURATION: Duration = Duration::from_secs(5);
 /// How often the banner's expiry is checked while one is up. Coarse
 /// against the five-second life it polices — the banner is allowed to
@@ -1843,15 +1845,16 @@ fn forget_resumes_moved_by_wave(
 }
 
 /// [`App::current_grid`] for the launch's restored tabs, which spawn
-/// before the window exists: the grid it opens at, beside the sidebar
-/// `state.json` restores.
+/// before the window exists: the grid of the size it opens at, beside the
+/// sidebar `state.json` restores.
 fn initial_grid(
+    window_size: Size,
     sidebar_collapsed: bool,
     sidebar_width: f32,
     metrics: TerminalMetrics,
 ) -> (u16, u16) {
     terminal_grid(
-        INITIAL_WINDOW_SIZE,
+        window_size,
         effective_sidebar_width(sidebar_collapsed, sidebar_width),
         metrics,
     )
@@ -2441,6 +2444,8 @@ pub enum UiTask {
     #[default]
     None,
     Then(Box<UiTask>, Box<UiTask>),
+    /// Both at once: neither waits for the other to finish.
+    Alongside(Box<UiTask>, Box<UiTask>),
     /// A mutation dispatched to the engine runtime. Its completion comes
     /// back as `Message::EngineOp`, never as a return value — the UI
     /// thread does not wait for the engine.
@@ -2511,6 +2516,19 @@ pub enum UiTask {
     QueryFullScreen(window::Id),
     /// Wait, then `Message::FullScreenSettled(generation)`.
     FullScreenSettle {
+        delay: Duration,
+        generation: u64,
+    },
+    /// The window frame's screen check, once the window exists (plan 074
+    /// §D5b), moving it onto a screen only when `fit`. Answers as
+    /// `Message::WindowFrameChecked`.
+    CheckWindowFrame {
+        id: window::Id,
+        fit: bool,
+    },
+    /// Wait, ask the window's mode, then `Message::WindowFrameDue`.
+    WindowFrameDeadline {
+        id: window::Id,
         delay: Duration,
         generation: u64,
     },
@@ -2778,6 +2796,22 @@ impl UiTask {
             (task, next) => Self::Then(Box::new(task), Box::new(next)),
         }
     }
+
+    fn alongside(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::None, other) => other,
+            (task, Self::None) => task,
+            (task, other) => Self::Alongside(Box::new(task), Box::new(other)),
+        }
+    }
+}
+
+/// What a native resize schedules: the window bookkeeping, the full-screen
+/// re-query and its settle in order — and beside them, never behind, the
+/// frame save, whose 500 ms would otherwise start only once the settle's
+/// second had run out.
+fn after_resize(opened: UiTask, query: UiTask, settle: UiTask, save: UiTask) -> UiTask {
+    opened.then(query).then(settle).alongside(save)
 }
 
 struct WindowOpenResult {
@@ -3007,6 +3041,7 @@ pub struct App {
     pending_window_resize: Option<Size>,
     screenshots: ScreenshotQueue,
     window_size: Size,
+    window_frame: window_frame::WindowFrameMemory,
     /// Set only while the seam is being dragged; the engine holds the
     /// committed width, and persisting per pointer-move would rewrite
     /// `state.json` on every frame.
@@ -3491,6 +3526,7 @@ struct StartedEngine {
     in_process_streams: Arc<roost_engine::ipc::InProcessStreams>,
     switch_gate: Arc<tokio::sync::RwLock<()>>,
     test_mode: bool,
+    opening: window_frame::OpeningFrame,
 }
 
 impl App {
@@ -3556,6 +3592,7 @@ impl App {
             in_process_streams,
             switch_gate,
             test_mode,
+            opening,
         } = match Self::start_engine(profile, &config, &runtime, &supervisor, terminal_metrics) {
             Ok(engine) => engine,
             Err(error) => {
@@ -3580,7 +3617,11 @@ impl App {
             window_id: None,
             pending_window_resize: None,
             screenshots: ScreenshotQueue::default(),
-            window_size: INITIAL_WINDOW_SIZE,
+            window_size: opening.size,
+            window_frame: window_frame::WindowFrameMemory::new(
+                window_frame::REMEMBERS_WINDOW_FRAME,
+                opening,
+            ),
             sidebar_drag_width: None,
             window_focused: true,
             title_fallback: title_fallback(profile.kind),
@@ -3761,7 +3802,12 @@ impl App {
         // a populated in-process workspace this is about to empty.
         finish_switch_source_deletion(runtime, &client, profile, &resumed);
 
+        let opening = window_frame::OpeningFrame::from_saved(
+            workspace.window_frame(),
+            window_frame::REMEMBERS_WINDOW_FRAME,
+        );
         let grid = initial_grid(
+            opening.size,
             workspace.sidebar_collapsed(),
             workspace.sidebar_width() as f32,
             terminal_metrics,
@@ -3830,6 +3876,7 @@ impl App {
             in_process_streams,
             switch_gate,
             test_mode,
+            opening,
         })
     }
 
@@ -4072,7 +4119,11 @@ impl App {
                 &self.feed_tx,
             );
         }
-        opened.task
+        let check = match self.window_frame.take_check() {
+            Some(fit) => UiTask::CheckWindowFrame { id, fit },
+            None => UiTask::None,
+        };
+        opened.task.then(check)
     }
 
     /// The startup ensure came back. The toast names the agents the
@@ -4606,7 +4657,47 @@ impl App {
             self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
         }
         let settle = self.schedule_full_screen_settle();
-        opened.task.then(self.query_full_screen()).then(settle)
+        let armed = self.window_frame.resized(size);
+        let save = self.arm_frame_save(armed);
+        after_resize(opened.task, self.query_full_screen(), settle, save)
+    }
+
+    /// The frame the window is created at — the one bootstrap already
+    /// spawned the restored tabs' grid from.
+    pub fn window_opening(&self) -> window_frame::OpeningFrame {
+        self.window_frame.opening()
+    }
+
+    /// A native move of the window's outer top-left. Subscribed only where
+    /// the frame is remembered (`window_frame::REMEMBERS_WINDOW_FRAME`).
+    pub fn window_moved(&mut self, outer: Point) -> UiTask {
+        let armed = self.window_frame.moved(outer);
+        self.arm_frame_save(armed)
+    }
+
+    /// The post-open screen check answered (plan 074 §D5b).
+    pub fn window_frame_checked(&mut self, observed: Option<window_frame::CheckedFrame>) -> UiTask {
+        let armed = self.window_frame.checked(observed);
+        self.arm_frame_save(armed)
+    }
+
+    /// A frame save's deadline, with the window's mode and outer position
+    /// read at it.
+    pub fn window_frame_due(&mut self, generation: u64, mode: window::Mode, outer: Option<Point>) {
+        self.full_screen_mode(mode);
+        self.window_frame
+            .save_due(&self.workspace, generation, outer);
+    }
+
+    fn arm_frame_save(&self, generation: Option<u64>) -> UiTask {
+        match (generation, self.window_id) {
+            (Some(generation), Some(id)) => UiTask::WindowFrameDeadline {
+                id,
+                delay: window_frame::SAVE_DELAY,
+                generation,
+            },
+            _ => UiTask::None,
+        }
     }
 
     /// The wake this app's feed notifies on, for the subscription that
@@ -10019,7 +10110,7 @@ impl Drop for App {
         // than the process being killed under it — the exit-on-empty path
         // depends on this running. There is no surface left to raise a
         // failure on, so the log is where it goes (#481).
-        match self.workspace.flush() {
+        match window_frame::flush_on_exit(&self.workspace, &mut self.window_frame) {
             Ok(()) => tracing::info!("workspace state flushed on shutdown"),
             Err(error) => {
                 tracing::error!(%error, "the workspace layout could not be written on shutdown")
@@ -10937,8 +11028,8 @@ mod tests {
     #[test]
     fn restored_tabs_spawn_at_the_first_windows_grid_beside_the_persisted_sidebar() {
         let metrics = TerminalMetrics::measure(13.0).expect("test metrics");
-        let expanded = initial_grid(false, 300.0, metrics);
-        let collapsed = initial_grid(true, 300.0, metrics);
+        let expanded = initial_grid(INITIAL_WINDOW_SIZE, false, 300.0, metrics);
+        let collapsed = initial_grid(INITIAL_WINDOW_SIZE, true, 300.0, metrics);
         assert_eq!(
             expanded,
             terminal_grid(INITIAL_WINDOW_SIZE, 300.0, metrics),
@@ -10950,6 +11041,13 @@ mod tests {
             "a collapsed sidebar takes nothing, whatever width it remembers"
         );
         assert!(collapsed.0 > expanded.0, "{collapsed:?} vs {expanded:?}");
+        let remembered = initial_grid(Size::new(900.0, 600.0), false, 300.0, metrics);
+        assert_eq!(
+            remembered,
+            terminal_grid(Size::new(900.0, 600.0), 300.0, metrics),
+            "a remembered window size is the one restored tabs spawn at"
+        );
+        assert_ne!(remembered, expanded);
     }
 
     #[test]
@@ -13624,6 +13722,60 @@ mod tests {
         };
         assert!(matches!(*first, UiTask::FocusWidget(_)));
         assert!(matches!(*second, UiTask::Resize(_, _)));
+    }
+
+    /// How long `task` runs before it starts a frame-save deadline — the
+    /// sleeps chained ahead of it — or `None` when it holds none.
+    fn delay_before_frame_save(task: &UiTask) -> Option<Duration> {
+        match task {
+            UiTask::WindowFrameDeadline { .. } => Some(Duration::ZERO),
+            UiTask::Then(first, second) => delay_before_frame_save(first)
+                .or_else(|| delay_before_frame_save(second).map(|delay| delay + run_time(first))),
+            UiTask::Alongside(first, second) => {
+                delay_before_frame_save(first).or_else(|| delay_before_frame_save(second))
+            }
+            _ => None,
+        }
+    }
+
+    /// How long `task` takes to finish, counting the sleeps it is made of.
+    fn run_time(task: &UiTask) -> Duration {
+        match task {
+            UiTask::FullScreenSettle { delay, .. } | UiTask::WindowFrameDeadline { delay, .. } => {
+                *delay
+            }
+            UiTask::Then(first, second) => run_time(first) + run_time(second),
+            UiTask::Alongside(first, second) => run_time(first).max(run_time(second)),
+            _ => Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn a_resize_starts_its_frame_save_without_waiting_out_the_full_screen_settle() {
+        let id = window::Id::unique();
+        let task = after_resize(
+            UiTask::Resize(id, Size::new(900.0, 600.0)),
+            UiTask::QueryFullScreen(id),
+            UiTask::FullScreenSettle {
+                delay: Duration::from_secs(1),
+                generation: 1,
+            },
+            UiTask::WindowFrameDeadline {
+                id,
+                delay: window_frame::SAVE_DELAY,
+                generation: 1,
+            },
+        );
+        assert_eq!(
+            delay_before_frame_save(&task),
+            Some(Duration::ZERO),
+            "the save's 500 ms must start with the resize, not after the settle"
+        );
+        assert_eq!(
+            run_time(&task),
+            Duration::from_secs(1),
+            "the settle still runs, after the re-query"
+        );
     }
 
     #[test]
