@@ -21,8 +21,9 @@ No keystroke-interleaving case: `roost.send`/`tab.write` bypasses
 `capture_pty_input` — ordering is proven compositionally in the roost-vt
 + Mac unit tests instead (plan §3.5).
 
-Both targets run these in CI (iced-build-e2e + e2e-mac) with
-`ROOST_TEST_MODE: "1"` set in the workflow env block.
+Both targets run these in CI with `ROOST_TEST_MODE: "1"` set in the workflow
+env block: iced through `ICED_E2E_TESTS` and the X11, Wayland and macOS
+iced lists, the Swift app through `e2e-mac`'s whole-directory sweep.
 """
 
 from __future__ import annotations

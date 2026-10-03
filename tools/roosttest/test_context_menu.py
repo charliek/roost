@@ -198,11 +198,15 @@ def _session_backend_ui(target: str):
     """The UI relaunched on `local-backend = session`, inside a private
     runtime dir so the session it spawns is not the developer's, then the
     in-process UI put back for whatever module runs next."""
+    if sys.platform == "darwin":
+        pytest.skip(
+            "the session is isolated through XDG_RUNTIME_DIR, which is Linux "
+            "only; the macOS variant is #390"
+        )
     state_dir = ui.session_state_dir()
     config = ui.owned_session_config_path()
     if state_dir is None or config is None:
         pytest.skip("the session backend needs a harness-owned UI")
-    ui.quit(target)
 
     root = Path(tempfile.mkdtemp(prefix="roost-cm-", dir="/tmp")).resolve()
     run = root / "run"
@@ -217,10 +221,11 @@ def _session_backend_ui(target: str):
     saved = {key: os.environ.get(key) for key in private}
     original_config = config.read_text()
     derived = state_dir / ui.DERIVED_SESSION_SUBDIR
+    stop = None
     try:
+        ui.quit(target)
         os.environ.update(private)
-        for leftover in ("state.json",):
-            (state_dir / leftover).unlink(missing_ok=True)
+        (state_dir / "state.json").unlink(missing_ok=True)
         shutil.rmtree(derived, ignore_errors=True)
         lines = [
             line
@@ -232,28 +237,38 @@ def _session_backend_ui(target: str):
         client = Roost(ui.socket_path(target))
         try:
             assert client.identify()["local_backend"] == "session"
+            sessionlib.wait_until(
+                lambda: (client.sidebar_local_band() or {}).get("state") == "connected",
+                scaled_timeout(60.0),
+                "the local session to connect",
+            )
             yield client
         finally:
             client.close()
     finally:
-        with contextlib.suppress(Exception):
-            ui.quit(target)
-        with contextlib.suppress(Exception):
-            subprocess.run(
+        try:
+            with contextlib.suppress(Exception):
+                ui.quit(target)
+            stop = subprocess.run(
                 [roostctl_path(), "session", "stop"],
                 capture_output=True,
+                text=True,
                 timeout=scaled_timeout(60.0),
             )
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-        config.write_text(original_config)
-        (state_dir / "state.json").unlink(missing_ok=True)
-        shutil.rmtree(derived, ignore_errors=True)
-        shutil.rmtree(root, ignore_errors=True)
-        ui.launch(target, state_dir=state_dir, force=True)
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            config.write_text(original_config)
+            (state_dir / "state.json").unlink(missing_ok=True)
+            # The derived session dir is left to the harness's sweep, which
+            # proves the daemon's state lock is free before it deletes it.
+            if stop is not None and stop.returncode == 0:
+                shutil.rmtree(root, ignore_errors=True)
+            ui.launch(target, state_dir=state_dir, force=True)
+    assert stop.returncode == 0, f"`roostctl session stop` failed: {stop.stdout}{stop.stderr}"
 
 
 def test_a_project_rows_new_tab_opens_where_the_gesture_would_on_the_session_backend(target):
