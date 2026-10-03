@@ -1018,6 +1018,24 @@ plain hover motion). `cell_x` / `cell_y` are 0-based terminal cell
 coordinates. `mods` defaults to `0` and matches the key encoder's
 `Mods` bit layout: shift(0), ctrl(1), alt(2), cmd/super(3).
 
+`overshoot` (iced only, optional) puts the pointer that many rows past
+the grid: negative above row 0, positive below the last row, with
+`cell_x` / `cell_y` the cell the pointer clamps to, as a real drag past
+the edge reports it. A left-button motion with a non-zero `overshoot`
+during a selection drag starts the selection auto-scroll: every 50 ms
+the viewport scrolls one to five rows toward that edge and the
+selection grows to the row it brought on screen. A release, a motion
+back over the grid, a resize, or anything that cancels the gesture
+stops it, and it never scrolls on the alternate screen or under mouse
+tracking. Omit the key rather than sending `0`: the params reject
+unknown keys, so a server that predates it refuses any request
+carrying it.
+
+```json
+{"params": {"tab_id": "3", "kind": "motion", "button": "left",
+            "cell_x": 0, "cell_y": 0, "mods": 0, "overshoot": -3}}
+```
+
 On iced, a press starts a new gesture and a button's motion or release
 belongs to the tab's latest press, as the terminal widget's do. Once a
 pointer cancel has sent that press's release (the window switching away

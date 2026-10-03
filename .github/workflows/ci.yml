@@ -797,6 +797,7 @@ jobs:
           tools/roosttest/test_open_external.py
           tools/roosttest/test_context_menu.py
           tools/roosttest/test_device_queries.py
+          tools/roosttest/test_selection_autoscroll.py
           tools/roosttest/test_osc52.py
           tools/roosttest/test_paste_files.py
           tools/roosttest/test_context_menu_clipboard.py
@@ -1072,6 +1073,7 @@ jobs:
           tools/roosttest/test_open_external.py
           tools/roosttest/test_context_menu.py
           tools/roosttest/test_device_queries.py
+          tools/roosttest/test_selection_autoscroll.py
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced exit-on-empty E2E (Linux Wayland)
@@ -1283,6 +1285,7 @@ jobs:
           tools/roosttest/test_open_external.py
           tools/roosttest/test_context_menu.py
           tools/roosttest/test_device_queries.py
+          tools/roosttest/test_selection_autoscroll.py
           tools/roosttest/test_osc52.py
           tools/roosttest/test_paste_files.py
           tools/roosttest/test_context_menu_clipboard.py

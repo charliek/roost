@@ -455,6 +455,7 @@ pub enum UiRequest {
         cell_x: u32,
         cell_y: u32,
         mods: u32,
+        overshoot: i16,
         reply: UnitReply,
     },
     /// `app.set_window_focus` — drive the focus-tracking emit path
@@ -4030,6 +4031,7 @@ async fn dispatch(
                 cell_x: p.cell_x,
                 cell_y: p.cell_y,
                 mods: p.mods,
+                overshoot: p.overshoot,
                 reply,
             })
             .await?

@@ -914,7 +914,6 @@ mod tests {
             (ops::CLIPBOARD_WRITE_FILES, TEST_SEAM),
             (ops::TAB_FEED_IME, TEST_SEAM),
             (ops::SIDEBAR_SET_WIDTH, TEST_SEAM),
-            (ops::TAB_DISPATCH_MOUSE_EVENT, TEST_SEAM),
             (ops::APP_SET_WINDOW_FOCUS, TEST_SEAM),
             (ops::APP_DIALOG_DUMP, TEST_SEAM),
             (ops::APP_DIALOG_ANSWER, TEST_SEAM),

@@ -424,8 +424,8 @@ pub struct TabDumpParams {
     pub scrollback: u32,
 }
 
-fn is_zero(value: &u32) -> bool {
-    *value == 0
+fn is_zero<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
 }
 
 /// The most history rows one [`TabDumpParams`] may ask for. A larger
@@ -1195,6 +1195,12 @@ pub struct TabDispatchMouseEventParams {
     /// alt(2), cmd/super(3). `0` for no modifiers.
     #[serde(default)]
     pub mods: u32,
+    /// Rows the pointer is past the grid: negative above row 0, positive
+    /// below the last row, `0` over it. A held selection drag past either
+    /// edge auto-scrolls (iced only). Omitted when `0`, for the reason
+    /// [`TabDumpParams::scrollback`] gives.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub overshoot: i16,
 }
 
 /// `app.set_window_focus` request: drive the focus-tracking emit
@@ -5151,18 +5157,21 @@ mod tests {
             cell_x: 6,
             cell_y: 3,
             mods: 0,
+            overshoot: 0,
         };
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains("\"tab_id\":\"11\""), "got: {json}");
         assert!(json.contains("\"kind\":\"press\""), "got: {json}");
         round_trip(&p);
 
-        // `mods` defaults to 0 when omitted (most tests don't carry mods).
+        // `mods` and `overshoot` default to 0 when omitted (most tests
+        // carry neither).
         let no_mods: TabDispatchMouseEventParams = serde_json::from_str(
             r#"{"tab_id":"3","kind":"motion","button":"none","cell_x":1,"cell_y":1}"#,
         )
         .unwrap();
         assert_eq!(no_mods.mods, 0);
+        assert_eq!(no_mods.overshoot, 0);
 
         let bad =
             r#"{"tab_id":"3","kind":"press","button":"left","cell_x":1,"cell_y":1,"extra":"x"}"#;

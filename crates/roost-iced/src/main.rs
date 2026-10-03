@@ -79,6 +79,9 @@ enum Message {
     /// A creation or a parked focus is waiting on a mirror. Armed only
     /// while one is.
     PendingSelectionTick,
+    /// A selection drag is held past the terminal's edge. Armed only
+    /// while one is.
+    SelectionAutoscrollTick,
     /// A file-drop debounce window elapsed — a one-shot, not a timer.
     FileDropDeadline,
     FullScreenSettled(u64),
@@ -524,12 +527,14 @@ fn window_settings(profile: &BundleProfile) -> window::Settings {
 /// must see a notice that went away before it comes back, and the local
 /// session's background resize wave, whose triggers are as scattered. And
 /// so does the context menu's close, which follows whatever took input
-/// from it or removed its row, by any path.
+/// from it or removed its row, by any path, and the terminals' pointer
+/// cancel when anything rewraps the terminal widget.
 fn update(app: &mut App, message: Message) -> Task<Message> {
     let dispatched = dispatch(app, message);
     app.observe_context_menu();
     app.sync_menu_gating();
-    app.observe_notice();
+    let (_, notice) = app.observe_notice();
+    app.observe_terminal_wrapping(notice.is_some());
     Task::batch([
         dispatched,
         app.take_tab_reveal_task().map_task(),
@@ -560,6 +565,10 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::PendingSelectionTick => {
             app.pending_selection_tick();
+            Task::none()
+        }
+        Message::SelectionAutoscrollTick => {
+            app.selection_autoscroll_tick();
             Task::none()
         }
         Message::FileDropDeadline => app.file_drop_deadline().map_task(),
@@ -775,6 +784,7 @@ struct ArmedTimers {
     reorder_hold: bool,
     add_host_pointer: bool,
     pending_selection: bool,
+    selection_autoscroll: bool,
 }
 
 impl ArmedTimers {
@@ -786,6 +796,7 @@ impl ArmedTimers {
             reorder_hold: app.reorder_hold_pending(),
             add_host_pointer: app.add_host_dialog_open(),
             pending_selection: app.pending_selection_waiting(),
+            selection_autoscroll: app.selection_autoscroll_pending(),
         }
     }
 
@@ -799,6 +810,7 @@ impl ArmedTimers {
             + usize::from(self.reorder_hold)
             + usize::from(self.add_host_pointer)
             + usize::from(self.pending_selection)
+            + usize::from(self.selection_autoscroll)
     }
 }
 
@@ -854,6 +866,12 @@ fn subscription_with(wake: Arc<tokio::sync::Notify>, armed: ArmedTimers) -> Subs
         members.push(
             time::every(app::PENDING_SELECTION_TICK_INTERVAL)
                 .map(|_| Message::PendingSelectionTick),
+        );
+    }
+    if armed.selection_autoscroll {
+        members.push(
+            time::every(app::SELECTION_AUTOSCROLL_INTERVAL)
+                .map(|_| Message::SelectionAutoscrollTick),
         );
     }
     if armed.add_host_pointer {
@@ -1279,6 +1297,7 @@ mod tests {
         reorder_hold: bool,
         add_host_pointer: bool,
         pending_selection: bool,
+        selection_autoscroll: bool,
     ) -> ArmedTimers {
         ArmedTimers {
             status,
@@ -1287,6 +1306,7 @@ mod tests {
             reorder_hold,
             add_host_pointer,
             pending_selection,
+            selection_autoscroll,
         }
     }
 
@@ -1315,7 +1335,7 @@ mod tests {
 
         // Every combination, so a member that forgot its own arming
         // condition (or shares a recipe id with another) is caught.
-        for bits in 0u8..64 {
+        for bits in 0u8..128 {
             let timers = armed(
                 bits & 1 != 0,
                 bits & 2 != 0,
@@ -1323,6 +1343,7 @@ mod tests {
                 bits & 8 != 0,
                 bits & 16 != 0,
                 bits & 32 != 0,
+                bits & 64 != 0,
             );
             let ids = recipe_ids(subscription_with(Arc::clone(&wake), timers));
             let unique: HashSet<u64> = ids.iter().copied().collect();

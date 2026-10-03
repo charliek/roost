@@ -20,6 +20,8 @@ pub(super) struct NativePointerDispatch {
     pub(super) link_modifier_held: bool,
     /// See `TerminalPointerEvent::press_seq`.
     pub(super) press_seq: Option<u64>,
+    /// See `TerminalPointerEvent::overshoot`.
+    pub(super) overshoot: i16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,6 +29,47 @@ pub(super) enum LocalPointerGesture {
     Selection,
     MultiClick,
     Url,
+}
+
+/// A selection drag whose last motion was past the grid's top or bottom
+/// edge (#342).
+#[derive(Clone, Copy)]
+struct SelectionAutoscroll {
+    /// The press the drag belongs to (`TerminalPointerEvent::press_seq`).
+    press_seq: u64,
+    /// `TerminalPointerEvent::overshoot`, never 0.
+    overshoot: i16,
+    /// The column the drag's last motion clamped to.
+    col: u16,
+}
+
+/// The history rows one auto-scroll tick moves for a pointer `overshoot`
+/// rows past the grid: toward older history above it — the sign flips
+/// here, where rows-below-positive meets history-positive — and at most
+/// five rows a tick however far out the pointer is.
+pub(super) fn autoscroll_history_rows(overshoot: i16) -> isize {
+    let rows = overshoot.unsigned_abs().clamp(1, 5) as isize;
+    -isize::from(overshoot.signum()) * rows
+}
+
+/// The auto-scroll tick over every tab (#342). Only the tab on screen, in
+/// a focused window, scrolls: anywhere else the pointer has left the drag
+/// behind, so it disarms.
+pub(super) fn autoscroll_selections(
+    tabs: &mut HashMap<TabKey, TerminalTab>,
+    active: TabKey,
+    window_focused: bool,
+) {
+    for (key, tab) in tabs.iter_mut() {
+        if *key != active || !window_focused {
+            tab.autoscroll = None;
+            continue;
+        }
+        if let Err(error) = tab.autoscroll_selection() {
+            tab.autoscroll = None;
+            tracing::warn!(?error, tab_id = key.tab, "selection auto-scroll failed");
+        }
+    }
 }
 
 pub(super) fn pointer_origin_tab<V>(tabs: &mut HashMap<TabKey, V>, tab: TabKey) -> Option<&mut V> {
@@ -95,8 +138,9 @@ pub(super) struct PressGate {
     /// included.
     pub(super) on_screen: Option<TabKey>,
     pub(super) context_menu_open: bool,
-    /// The latest press stamped when the last context menu opened.
-    pub(super) menu_press_floor: u64,
+    /// The latest press stamped when a context menu last opened or the
+    /// terminal widget was last rewrapped (`App::observe_terminal_wrapping`).
+    pub(super) press_floor: u64,
 }
 
 impl PressGate {
@@ -104,9 +148,7 @@ impl PressGate {
         event.action == PointerAction::Press
             && (self.on_screen.is_some_and(|tab| tab != event.tab)
                 || self.context_menu_open
-                || event
-                    .press_seq
-                    .is_some_and(|seq| seq <= self.menu_press_floor))
+                || event.press_seq.is_some_and(|seq| seq <= self.press_floor))
     }
 }
 
@@ -115,10 +157,12 @@ impl PressGate {
 /// the native event, and the model acts on it only when `update` drains
 /// the message, so what ran in between decides. Refused: a press for a
 /// tab no longer on screen — the switch already let that tab's pointer
-/// go, and the release will reach whichever tab shows now — and a press
+/// go, and the release will reach whichever tab shows now — a press
 /// under a context menu opened in that gap, whose backdrop (or AppKit's
-/// menu tracking) takes the release. A cancel that leaves the release
-/// with the widget, such as a font-size change, refuses nothing.
+/// menu tracking) takes the release, and a press stamped by a terminal
+/// widget a rewrap has since rebuilt, which drops that press's capture.
+/// A cancel that leaves the release with the widget, such as a
+/// font-size change, refuses nothing.
 pub(super) fn refuse_stale_press(
     tabs: &mut HashMap<TabKey, TerminalTab>,
     event: &TerminalPointerEvent,
@@ -408,6 +452,10 @@ pub(super) struct TerminalTab {
     /// does, and a cancel's failure path is what the tests pin.
     #[cfg(test)]
     pub(super) fail_pointer_encode: bool,
+    /// Live only while [`Self::armed_autoscroll`] says so. A resize clears
+    /// it, whether or not the cell grid changes: its overshoot was measured
+    /// against edges that have moved.
+    autoscroll: Option<SelectionAutoscroll>,
     pub(super) last_pointer_cell: Option<(u16, u16)>,
     pub(super) link_modifier_held: bool,
     pub(super) hover_url: Option<HoverUrl>,
@@ -509,6 +557,7 @@ impl TerminalTab {
             cancelled_through: 0,
             #[cfg(test)]
             fail_pointer_encode: false,
+            autoscroll: None,
             last_pointer_cell: None,
             link_modifier_held: false,
             hover_url: None,
@@ -609,6 +658,7 @@ impl TerminalTab {
         self.rows = rows;
         self.selection = TerminalSelection::new();
         self.scroll = TerminalScroll::new();
+        self.end_selection_drag();
         self.grid = Vec::new();
         self.cached_grid_size = None;
         self.cached_defaults = None;
@@ -631,16 +681,21 @@ impl TerminalTab {
         self.terminal
             .resize(cols, rows, cell_w.max(1), cell_h.max(1))?;
         let _ = self.take_terminal_replies();
+        self.adopt_grid(cols, rows);
+        Ok(())
+    }
+
+    fn adopt_grid(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
         self.hover_url = None;
+        self.autoscroll = None;
         self.last_pointer_cell = self.last_pointer_cell.map(|(col, row)| {
             (
                 col.min(cols.saturating_sub(1)),
                 row.min(rows.saturating_sub(1)),
             )
         });
-        Ok(())
     }
 
     /// Apply a chunk of terminal output that has ALREADY been scanned
@@ -708,17 +763,9 @@ impl TerminalTab {
         );
         let deferred_replies = self.take_terminal_replies();
         resize?;
-        self.cols = cols;
-        self.rows = rows;
+        self.adopt_grid(cols, rows);
         self.applied_metrics = Some(metrics);
         self.metric_generation = metric_generation;
-        self.hover_url = None;
-        self.last_pointer_cell = self.last_pointer_cell.map(|(col, row)| {
-            (
-                col.min(cols.saturating_sub(1)),
-                row.min(rows.saturating_sub(1)),
-            )
-        });
         Ok(Some(GeometryChange {
             previous,
             previous_grid,
@@ -745,17 +792,9 @@ impl TerminalTab {
         // Neither may escape a failed all-tab transaction.
         let _ = self.take_terminal_replies();
         resize?;
-        self.cols = previous.cols;
-        self.rows = previous.rows;
+        self.adopt_grid(previous.cols, previous.rows);
         self.applied_metrics = Some(previous.metrics);
         self.metric_generation = previous.metric_generation;
-        self.hover_url = None;
-        self.last_pointer_cell = self.last_pointer_cell.map(|(col, row)| {
-            (
-                col.min(previous.cols.saturating_sub(1)),
-                row.min(previous.rows.saturating_sub(1)),
-            )
-        });
         Ok(())
     }
 
@@ -996,6 +1035,7 @@ impl TerminalTab {
             inside,
             link_modifier_held,
             press_seq,
+            overshoot,
         } = event;
         if press_seq.is_some_and(|seq| seq <= self.cancelled_through) {
             // Queued behind the cancel that settled its press, in the
@@ -1039,7 +1079,21 @@ impl TerminalTab {
             }
             PointerAction::Motion => match self.local_pointer_gesture {
                 Some(LocalPointerGesture::Selection) => {
-                    self.selection.update(&self.terminal, cell.0, cell.1)?;
+                    let extended = self.selection.update(&self.terminal, cell.0, cell.1)?;
+                    self.autoscroll = match press_seq {
+                        Some(press_seq)
+                            if extended
+                                && overshoot != 0
+                                && TerminalScroll::scrolls_locally(&self.terminal) =>
+                        {
+                            Some(SelectionAutoscroll {
+                                press_seq,
+                                overshoot,
+                                col: cell.0,
+                            })
+                        }
+                        _ => None,
+                    };
                     Ok(NativePointerOutcome::default())
                 }
                 Some(LocalPointerGesture::MultiClick | LocalPointerGesture::Url) => {
@@ -1090,6 +1144,94 @@ impl TerminalTab {
             (PointerAction::Motion, None) => None,
             _ => Some(self.last_press_seq),
         }
+    }
+
+    /// The auto-scroll this tab's selection drag holds, while that drag
+    /// is still the one in progress: a selection gesture, and the latest
+    /// press this tab has seen.
+    fn armed_autoscroll(&self) -> Option<SelectionAutoscroll> {
+        self.autoscroll.filter(|armed| {
+            self.local_pointer_gesture == Some(LocalPointerGesture::Selection)
+                && armed.press_seq == self.last_press_seq
+        })
+    }
+
+    pub(super) fn autoscroll_armed(&self) -> bool {
+        self.armed_autoscroll().is_some()
+    }
+
+    /// Stop the auto-scroll but not the drag: its next motion past an edge
+    /// arms it again.
+    pub(super) fn disarm_autoscroll(&mut self) {
+        self.autoscroll = None;
+    }
+
+    /// The selection a drag was stretching is gone or replaced, so the
+    /// drag is over, and its press is settled as a cancel settles one:
+    /// the widget lets go of it, and its later motion and release are
+    /// dropped — even if the application turns mouse tracking on while
+    /// the button is still down. Its auto-scroll stops.
+    fn end_selection_drag(&mut self) {
+        if self.local_pointer_gesture == Some(LocalPointerGesture::Selection) {
+            self.local_pointer_gesture = None;
+            self.cancelled_through = self.cancelled_through.max(self.last_press_seq);
+        }
+        self.autoscroll = None;
+    }
+
+    /// `selection.set`: a selection made from outside the pointer ends
+    /// any drag that was stretching the one it replaces.
+    pub(super) fn set_selection(&mut self, anchor: (u16, u16), cursor: (u16, u16)) -> Result<bool> {
+        self.end_selection_drag();
+        Ok(self.selection.set(&self.terminal, anchor, cursor)?)
+    }
+
+    /// `selection.clear`, which ends any drag stretching the selection.
+    pub(super) fn clear_selection(&mut self) -> bool {
+        self.end_selection_drag();
+        self.selection.clear()
+    }
+
+    /// One auto-scroll step: scroll toward the edge the drag is held past
+    /// and stretch the selection to that edge's row. At an end of history
+    /// nothing scrolls, but the endpoint still follows the edge row, so a
+    /// drag held past the live bottom takes in output as it arrives; the
+    /// drag stays armed there. A drag that is over, a selection that is
+    /// gone, or a viewport the terminal no longer owns (alternate screen,
+    /// mouse tracking) disarms.
+    pub(super) fn autoscroll_selection(&mut self) -> Result<()> {
+        let Some(armed) = self.armed_autoscroll() else {
+            self.autoscroll = None;
+            return Ok(());
+        };
+        let history_rows = autoscroll_history_rows(armed.overshoot);
+        let Some(scrolled) = self.scroll.scroll_local(&mut self.terminal, history_rows) else {
+            self.autoscroll = None;
+            return Ok(());
+        };
+        let edge_row = if armed.overshoot < 0 {
+            0
+        } else {
+            self.rows.saturating_sub(1)
+        };
+        let unscrolled_spans = (!scrolled).then(|| {
+            self.selection
+                .visible_spans(&self.terminal, self.cols, self.rows)
+        });
+        let extended = self.selection.update(&self.terminal, armed.col, edge_row);
+        // A scrolled viewport is published even when the update failed.
+        if unscrolled_spans.is_none_or(|spans| {
+            spans
+                != self
+                    .selection
+                    .visible_spans(&self.terminal, self.cols, self.rows)
+        }) {
+            self.refresh_snapshot()?;
+        }
+        if !extended? {
+            self.end_selection_drag();
+        }
+        Ok(())
     }
 
     fn route_press_without_link(
@@ -1252,10 +1394,7 @@ impl TerminalTab {
         let Some(span) = span else {
             return Ok(None);
         };
-        if !self
-            .selection
-            .set(&self.terminal, (span.col0, row), (span.col1, row))?
-        {
+        if !self.set_selection((span.col0, row), (span.col1, row))? {
             return Ok(None);
         }
         let text = self.selection.selected_text(

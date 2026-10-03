@@ -3270,6 +3270,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "overshoot": {
+          "format": "int16",
+          "maximum": 32767,
+          "minimum": -32768,
+          "type": "integer"
+        },
         "tab_id": {
           "type": "string"
         }

@@ -3800,8 +3800,7 @@ impl App {
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| {
                         let anchored = tab
-                            .selection
-                            .set(&tab.terminal, anchor, cursor)
+                            .set_selection(anchor, cursor)
                             .map_err(|error| error.to_string())?;
                         if !anchored {
                             return Err(format!(
@@ -3818,7 +3817,7 @@ impl App {
                     .and_then(|key| self.tabs.get_mut(&key))
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| {
-                        tab.selection.clear();
+                        tab.clear_selection();
                         tab.refresh_snapshot().map_err(|error| error.to_string())
                     });
                 let _ = reply.send(result);
@@ -3930,6 +3929,7 @@ impl App {
                 cell_x,
                 cell_y,
                 mods,
+                overshoot,
                 reply,
             } => {
                 let result = if !self.test_mode {
@@ -3938,7 +3938,14 @@ impl App {
                     u16::try_from(mods)
                         .map_err(|_| format!("modifier mask {mods} exceeds u16"))
                         .and_then(|mods| {
-                            self.dispatch_test_pointer(tab_id, kind, button, cell_x, cell_y, mods)
+                            self.dispatch_test_pointer(
+                                tab_id,
+                                kind,
+                                button,
+                                (cell_x, cell_y),
+                                mods,
+                                overshoot,
+                            )
                         })
                 };
                 match result {
@@ -6714,6 +6721,7 @@ mod tests {
             inside: true,
             link_modifier_held: false,
             press_seq: None,
+            overshoot: 0,
         })
         .expect("hover motion dispatch");
         tab.refresh_snapshot()

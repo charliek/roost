@@ -731,6 +731,7 @@ class Roost:
         cell_x: int,
         cell_y: int,
         mods: int = 0,
+        overshoot: int = 0,
     ) -> None:
         """Drive a synthetic mouse event into the UI's mouse handler at
         cell-grid coordinates. Same `routeMouseEvent` path the real
@@ -742,19 +743,28 @@ class Roost:
         opens it through the UI's own launcher (plan 063 §D11). The Mac
         UI drives the encoder alone.
 
+        `overshoot` (iced only) puts the pointer that many rows past the
+        grid — negative above it, positive below — with `cell_x`/`cell_y`
+        the cell it clamps to; a selection drag held there auto-scrolls.
+        The key is sent only when non-zero: the params are strict, so an
+        older server refuses a request that names it.
+
         `kind` ∈ {"press","release","motion"}; `button` ∈
         {"left","right","middle","wheel_up","wheel_down","none"}
         (use "none" for motion-no-button events under mode 1003).
         Gated by ROOST_TEST_MODE=1; raises `RoostError('not-enabled')`
         when the gate is off, `not-found` for an unknown tab id."""
-        self.call("tab.dispatch_mouse_event", {
+        params: dict = {
             "tab_id": str(tab_id),
             "kind": kind,
             "button": button,
             "cell_x": cell_x,
             "cell_y": cell_y,
             "mods": mods,
-        })
+        }
+        if overshoot:
+            params["overshoot"] = overshoot
+        self.call("tab.dispatch_mouse_event", params)
 
     def app_set_window_focus(self, focus: bool) -> None:
         """Drive the focus-tracking emit path without taking real OS

@@ -131,9 +131,10 @@ use self::pending_selection::{Creation, PendingHostSelection, PendingStep};
 pub(crate) use self::servicing::{AgentMetricsResult, ATTACH_RETRY_INTERVAL};
 use self::tab_backend::{TabBackend, TabHandle};
 use self::terminal_tab::{
-    apply_geometry_batch, cancel_tab_pointers, clear_preedit_or_warn, pointer_origin_tab,
-    refresh_or_warn, refuse_stale_press, release_host_pointer_before_detach, terminal_grid,
-    GeometryBatchOperation, GeometryChange, NativePointerDispatch, PressGate, TerminalTab,
+    apply_geometry_batch, autoscroll_selections, cancel_tab_pointers, clear_preedit_or_warn,
+    pointer_origin_tab, refresh_or_warn, refuse_stale_press, release_host_pointer_before_detach,
+    terminal_grid, GeometryBatchOperation, GeometryChange, NativePointerDispatch, PressGate,
+    TerminalTab,
 };
 #[cfg(test)]
 use self::terminal_tab::{
@@ -408,6 +409,9 @@ const PENDING_HOST_SELECTION_DEADLINE: Duration = Duration::from_secs(10);
 /// parked focus waits on a mirror (plan 071 §D13). Nothing else drives
 /// the deadline above when no event arrives.
 pub(crate) const PENDING_SELECTION_TICK_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How often a selection drag held past the grid's edge scrolls (#342).
+pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Whether a wait for a host's mirror to list a row, started at
 /// `armed`, has run out.
@@ -830,6 +834,35 @@ fn dialog_field<'a>(
             .style(chrome::palette_input(chrome)),
     ]
     .spacing(3)
+}
+
+/// What `view` wraps around the terminal widget. iced keeps a widget's
+/// state only while every widget on the path to it keeps its shape, so a
+/// change here rebuilds the terminal widget holding no button: a press it
+/// held would never see its release, and its drag would never end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct TerminalWrapping {
+    sidebar_collapsed: bool,
+    notice: bool,
+    bottom_line: bool,
+    rename_editor: bool,
+    palette: bool,
+    modal: bool,
+}
+
+/// [`App::observe_terminal_wrapping`]'s step: record `now`, and when it
+/// differs from what was observed, let go of every terminal pointer and
+/// raise the press floor, as a context menu opening does (#342, #587).
+fn rewrap_lets_go(
+    observed: &mut TerminalWrapping,
+    now: TerminalWrapping,
+    tabs: &mut HashMap<TabKey, TerminalTab>,
+    press_floor: &mut u64,
+) {
+    if std::mem::replace(observed, now) != now {
+        cancel_tab_pointers(tabs, None, "pointer cancel: the terminal was rewrapped");
+        *press_floor = crate::terminal_widget::latest_press_seq();
+    }
 }
 
 /// What a window-focus transition tears down. A table rather than a
@@ -1754,6 +1787,10 @@ fn regrid_window(
     metric_generation: u64,
 ) {
     for (key, tab) in tabs {
+        // The grid's edges moved under a pointer that may be holding still,
+        // so a held drag's overshoot is stale even when the cell count is
+        // not (#342).
+        tab.disarm_autoscroll();
         match tab.apply_geometry(cols, rows, metrics, metric_generation) {
             Ok(Some(change)) => {
                 host_tab::forget_resume_on_regrid(
@@ -3024,6 +3061,8 @@ pub struct App {
     /// [`Self::show_agent_hooks_toast`].
     pending_agent_hooks_toast: Option<agent_hooks::AgentHooksToast>,
     rename_editor: Option<RenameEditor>,
+    /// See [`TerminalWrapping`].
+    terminal_wrapping: TerminalWrapping,
     rename_input_id: Id,
     rename_focus_requested: bool,
     rename_completion_key: Option<RenameCompletionKey>,
@@ -3106,8 +3145,8 @@ pub struct App {
     font_registry: &'static FontRegistry,
     terminal_metrics: TerminalMetrics,
     metric_generation: u64,
-    /// See [`PressGate::menu_press_floor`].
-    menu_press_floor: u64,
+    /// See [`PressGate::press_floor`].
+    press_floor: u64,
     keybindings: HashMap<Accel, KeybindAction>,
     active_theme_name: String,
     palette: Option<palette::PaletteState>,
@@ -3560,6 +3599,7 @@ impl App {
             agent_hooks_applies: 0,
             pending_agent_hooks_toast: None,
             rename_editor: None,
+            terminal_wrapping: TerminalWrapping::default(),
             rename_input_id: Id::unique(),
             rename_focus_requested: false,
             rename_completion_key: None,
@@ -3592,7 +3632,7 @@ impl App {
             font_registry,
             terminal_metrics,
             metric_generation: 1,
-            menu_press_floor: 0,
+            press_floor: 0,
             keybindings,
             active_theme_name,
             palette: None,
@@ -4957,6 +4997,20 @@ impl App {
     pub fn reorder_hold_tick(&mut self) {
         self.reconcile_tab_drag_preview();
         self.reconcile_project_drag_preview();
+    }
+
+    /// A selection drag is held past the terminal's edge, so its
+    /// auto-scroll needs a clock (#342): a pointer holding still makes no
+    /// events of its own.
+    pub fn selection_autoscroll_pending(&self) -> bool {
+        self.tabs.values().any(TerminalTab::autoscroll_armed)
+    }
+
+    /// The auto-scroll's own tick — [`Self::selection_autoscroll_pending`]
+    /// armed it.
+    pub fn selection_autoscroll_tick(&mut self) {
+        let active = self.active_tab_key();
+        autoscroll_selections(&mut self.tabs, active, self.window_focused);
     }
 
     fn set_status(&mut self, message: impl Into<String>) {
@@ -7660,6 +7714,27 @@ impl App {
     /// over [`Self::notice_input`], and nothing of its own.
     fn terminal_notice(&self) -> Option<Notice> {
         notice::terminal_notice(&self.notice_input())
+    }
+
+    /// Every update turn passes through here, after whatever opened or
+    /// closed something `view` wraps around the terminal: a palette, a
+    /// dialog, the rename editor, a notice, the bottom line, or a sidebar
+    /// collapse.
+    pub fn observe_terminal_wrapping(&mut self, notice_shown: bool) {
+        let now = TerminalWrapping {
+            sidebar_collapsed: self.workspace.sidebar_collapsed(),
+            notice: notice_shown,
+            bottom_line: self.bottom_line().is_some(),
+            rename_editor: self.rename_editor.is_some(),
+            palette: self.palette.is_some(),
+            modal: self.confirm_delete.is_some() || self.host_dialog.is_some(),
+        };
+        rewrap_lets_go(
+            &mut self.terminal_wrapping,
+            now,
+            &mut self.tabs,
+            &mut self.press_floor,
+        );
     }
 
     /// Record which notice is on screen now, so the next dump or answer

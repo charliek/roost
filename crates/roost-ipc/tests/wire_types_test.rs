@@ -781,6 +781,79 @@ fn tab_dump_params_omit_an_unset_scrollback() {
 }
 
 #[test]
+fn dispatch_mouse_event_vectors_decode_into_their_typed_shapes() {
+    use roost_ipc::messages::TabDispatchMouseEventParams;
+
+    for (name, params) in [
+        (
+            "tab.dispatch_mouse_event.request.json",
+            TabDispatchMouseEventParams {
+                tab_id: 5,
+                kind: "press".into(),
+                button: "left".into(),
+                cell_x: 10,
+                cell_y: 4,
+                mods: 0,
+                overshoot: 0,
+            },
+        ),
+        (
+            "tab.dispatch_mouse_event.overshoot.request.json",
+            TabDispatchMouseEventParams {
+                tab_id: 5,
+                kind: "motion".into(),
+                button: "left".into(),
+                cell_x: 0,
+                cell_y: 0,
+                mods: 0,
+                overshoot: -3,
+            },
+        ),
+    ] {
+        let request: roost_ipc::messages::RawRequest =
+            serde_json::from_str(&read_vector(name)).expect("decode request envelope");
+        assert_eq!(
+            request.op,
+            roost_ipc::messages::ops::TAB_DISPATCH_MOUSE_EVENT,
+            "{name}"
+        );
+        let decoded: TabDispatchMouseEventParams =
+            serde_json::from_value(request.params).expect("decode mouse event params");
+        assert_eq!(decoded, params, "{name}");
+        round_trip(&decoded);
+    }
+}
+
+/// `TabDispatchMouseEventParams` is `deny_unknown_fields`, so a request
+/// with no overshoot must not put the key on the wire, or a server that
+/// predates it rejects the whole request.
+#[test]
+fn dispatch_mouse_event_params_omit_a_zero_overshoot() {
+    use roost_ipc::messages::TabDispatchMouseEventParams;
+
+    let params = TabDispatchMouseEventParams {
+        tab_id: 5,
+        kind: "motion".into(),
+        button: "left".into(),
+        cell_x: 0,
+        cell_y: 0,
+        mods: 0,
+        overshoot: 0,
+    };
+    assert_eq!(
+        serde_json::to_string(&params).unwrap(),
+        r#"{"tab_id":"5","kind":"motion","button":"left","cell_x":0,"cell_y":0,"mods":0}"#
+    );
+    let past_the_bottom = TabDispatchMouseEventParams {
+        overshoot: 2,
+        ..params
+    };
+    assert!(serde_json::to_string(&past_the_bottom)
+        .unwrap()
+        .ends_with(r#""mods":0,"overshoot":2}"#));
+}
+
+#[test]
 fn session_stopping_vector_decodes_into_its_typed_shape() {
     let raw = read_vector("session.stopping.event.json");
     let envelope: EventEnvelope = serde_json::from_str(&raw).expect("decode event envelope");

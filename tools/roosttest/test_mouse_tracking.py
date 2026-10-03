@@ -342,6 +342,36 @@ def test_a_tab_switch_releases_the_button_held_on_the_tab_it_leaves(
     )
 
 
+def test_opening_the_palette_releases_the_held_button(roost, project, target):
+    """#342: the palette rebuilds the terminal widget with no button
+    held, so the button's physical release would never reach the
+    application. Opening it sends that release instead, and closing it
+    sends nothing more."""
+    if target != "iced":
+        pytest.skip("the rewrap-time release is iced's; the Swift app is frozen")
+    held = _enable_drag_reporting(roost, project)
+    _show(roost, held)
+    drain(roost, held)
+
+    roost.tab_dispatch_mouse_event(
+        held, kind="press", button="left", cell_x=5, cell_y=3
+    )
+    pressed = drain_until_match(roost, held, rb"\x1b\[<0;6;4M", timeout=2.0)
+    pressed += drain(roost, held)
+    assert pressed == b"\x1b[<0;6;4M", ("the button came up before the palette", pressed)
+
+    roost.palette_open()
+    try:
+        released = drain_until_match(roost, held, rb"\x1b\[<0;6;4m", timeout=2.0)
+    finally:
+        roost.palette_dismiss()
+    released += drain(roost, held)
+    assert released == b"\x1b[<0;6;4m", (
+        "the palette's tab must hear its button come up once, and nothing else",
+        released,
+    )
+
+
 def test_focus_event_emitted_when_mode_1004_enabled(roost, project, target):
     """Mode 1004 on → focus-out emits `\\x1b[O`; focus-in emits
     `\\x1b[I`. The bytes are the canonical xterm focus sequences and

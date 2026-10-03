@@ -763,6 +763,9 @@ pub(crate) struct TerminalPointerEvent {
     /// press, that press's on its motion and release, and `None` for an
     /// event no held press owns (a hover, a stray release).
     pub press_seq: Option<u64>,
+    /// Rows the pointer is past the grid's top (negative) or bottom
+    /// (positive) edge; see [`row_overshoot`].
+    pub overshoot: i16,
 }
 
 /// Process-wide rather than per widget: iced rebuilds a widget's state
@@ -812,6 +815,10 @@ struct HeldPress {
 pub(crate) struct TerminalWidgetState {
     tab: Option<TabKey>,
     pressed: Option<HeldPress>,
+    /// The cell of the last event this widget reported, clamped past the
+    /// edge or not. A held drag's release can come with no cursor at all —
+    /// X reports the pointer leaving the window before the release, and
+    /// iced forgets the position on the leave — so it lands here.
     last_cell: Option<(u32, u32)>,
     was_inside: bool,
     clicks: ClickTracker,
@@ -1000,11 +1007,14 @@ impl TerminalWidget {
             })
             .or(state.last_cell)?;
         let (col, row) = cell;
+        let overshoot = point.map_or(0, |point| {
+            row_overshoot(point, self.snapshot.rows, self.metrics)
+        });
         if !inside {
             state.clicks.reset();
         }
         state.was_inside = inside;
-        state.last_cell = inside.then_some(cell).or(state.last_cell);
+        state.last_cell = Some(cell);
         let pointer = match event {
             Event::Mouse(mouse::Event::ButtonPressed(button)) => {
                 let Some(button) = mouse_button(*button) else {
@@ -1030,6 +1040,7 @@ impl TerminalWidget {
                     click_count,
                     inside,
                     press_seq: Some(seq),
+                    overshoot,
                 })
             }
             Event::Mouse(mouse::Event::ButtonReleased(button)) => {
@@ -1048,6 +1059,7 @@ impl TerminalWidget {
                     click_count: 0,
                     inside,
                     press_seq: owner.map(|held| held.seq),
+                    overshoot,
                 })
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
@@ -1060,6 +1072,7 @@ impl TerminalWidget {
                     click_count: 0,
                     inside,
                     press_seq: state.pressed.map(|held| held.seq),
+                    overshoot,
                 })
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
@@ -1580,6 +1593,21 @@ fn cell_at_clamped(
         .floor()
         .clamp(0.0, f32::from(rows.saturating_sub(1))) as u32;
     Some((col, row))
+}
+
+/// How many rows `point` is beyond the grid's own rectangle — its cells,
+/// so the padding band around them counts as beyond — vertically:
+/// negative above row 0, positive below the last row, and `0` level with
+/// the grid whatever the column, or with no grid at all. The drag
+/// selection's auto-scroll runs on it (#342), and `cell_at_clamped`
+/// throws it away.
+fn row_overshoot(point: Point, rows: u16, metrics: TerminalMetrics) -> i16 {
+    if rows == 0 {
+        return 0;
+    }
+    let row = ((point.y - TERMINAL_PADDING) / metrics.cell_height).floor();
+    // `as` saturates at `i16::MIN` / `i16::MAX`.
+    (row - row.clamp(0.0, f32::from(rows - 1))) as i16
 }
 
 fn mouse_button(button: mouse::Button) -> Option<PointerButton> {
@@ -2406,6 +2434,7 @@ mod tests {
             click_count,
             inside,
             press_seq,
+            overshoot,
         })) = press
         else {
             panic!("unexpected press message")
@@ -2413,7 +2442,10 @@ mod tests {
         assert_eq!(action, PointerAction::Press);
         assert_eq!(tab, TabKey::local(42));
         assert_eq!(button, Some(PointerButton::Left));
-        assert_eq!((col, row, click_count, inside), (5, 3, 1, true));
+        assert_eq!(
+            (col, row, click_count, inside, overshoot),
+            (5, 3, 1, true, 0)
+        );
         let press_seq = press_seq.expect("a press is stamped");
 
         let motion = program
@@ -2494,6 +2526,132 @@ mod tests {
         assert_eq!((col, row, inside), (0, 23, false));
         assert_eq!(release_seq, Some(press_seq), "so does its release");
         assert_eq!(state.pressed, None);
+    }
+
+    /// #342: a held drag reports how many rows past the grid the pointer
+    /// is, measured off the raw point before the cell is clamped and
+    /// relative to the widget, not the window.
+    #[test]
+    fn a_held_drag_reports_the_rows_the_pointer_is_past_the_grid() {
+        let program = widget(42, TerminalSnapshot::blank(80, 24));
+        let mut state = TerminalWidgetState::default();
+        let origin = Point::new(100.0, 50.0);
+        let bounds = Rectangle::new(origin, Size::new(800.0, 600.0));
+        let at = |col: f32, row: f32| {
+            mouse::Cursor::Available(Point::new(
+                origin.x + TERMINAL_PADDING + col * CELL_WIDTH,
+                origin.y + TERMINAL_PADDING + row * CELL_HEIGHT,
+            ))
+        };
+        program
+            .update_pointer(
+                &mut state,
+                &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                bounds,
+                at(5.5, 3.5),
+            )
+            .expect("press");
+
+        for (cursor, expected, label) in [
+            (at(5.5, 3.5), 0, "over the grid"),
+            (at(5.5, -0.5), -1, "just above row 0"),
+            (at(5.5, -2.5), -3, "three rows up"),
+            (at(5.5, 23.5), 0, "on the last row"),
+            (
+                at(5.5, 24.0),
+                1,
+                "the widget's own space below the last row",
+            ),
+            (at(5.5, 26.2), 3, "three rows down"),
+            (at(-2.0, 3.5), 0, "left of the grid only"),
+            (at(90.0, 3.5), 0, "right of the grid only"),
+            (at(-2.0, -1.5), -2, "up and to the left"),
+            (at(5.5, -1.0e9), i16::MIN, "saturating above"),
+            (at(5.5, 1.0e9), i16::MAX, "saturating below"),
+        ] {
+            let message = program
+                .update_pointer(
+                    &mut state,
+                    &Event::Mouse(mouse::Event::CursorMoved {
+                        position: Point::ORIGIN,
+                    }),
+                    bounds,
+                    cursor,
+                )
+                .and_then(|outcome| outcome.message);
+            let Some(crate::Message::TerminalPointer(TerminalPointer::Event(event))) = message
+            else {
+                panic!("{label}: no drag event: {message:?}");
+            };
+            assert_eq!(event.overshoot, expected, "{label}");
+        }
+    }
+
+    /// A drag held below the window, then released after the pointer's
+    /// leave took iced's cursor away, ends on the cell the drag last
+    /// reported — not on the last cell the pointer was over inside.
+    #[test]
+    fn a_release_with_no_cursor_lands_where_the_drag_last_was() {
+        let program = widget(42, TerminalSnapshot::blank(80, 24));
+        let mut state = TerminalWidgetState::default();
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
+        let at = |col: f32, row: f32| {
+            mouse::Cursor::Available(Point::new(
+                TERMINAL_PADDING + col * CELL_WIDTH,
+                TERMINAL_PADDING + row * CELL_HEIGHT,
+            ))
+        };
+        program.update_pointer(
+            &mut state,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            bounds,
+            at(2.5, 3.5),
+        );
+        program.update_pointer(
+            &mut state,
+            &Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::ORIGIN,
+            }),
+            bounds,
+            at(9.5, 40.0),
+        );
+        program.update_pointer(
+            &mut state,
+            &Event::Mouse(mouse::Event::CursorLeft),
+            bounds,
+            mouse::Cursor::Unavailable,
+        );
+        let release = program
+            .update_pointer(
+                &mut state,
+                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                bounds,
+                mouse::Cursor::Unavailable,
+            )
+            .and_then(|outcome| outcome.message);
+        assert!(
+            matches!(
+                release,
+                Some(crate::Message::TerminalPointer(TerminalPointer::Event(
+                    TerminalPointerEvent {
+                        action: PointerAction::Release,
+                        col: 9,
+                        row: 23,
+                        inside: false,
+                        ..
+                    }
+                )))
+            ),
+            "{release:?}"
+        );
+        assert_eq!(state.last_cell, None);
+    }
+
+    #[test]
+    fn no_grid_has_no_edge_to_be_past() {
+        for y in [-100.0, 0.0, 100.0] {
+            assert_eq!(row_overshoot(Point::new(5.0, y), 0, metrics()), 0, "{y}");
+        }
     }
 
     #[test]

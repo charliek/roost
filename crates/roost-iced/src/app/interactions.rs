@@ -2123,16 +2123,18 @@ impl App {
     ///
     /// The inputs a synthetic event has no source for: the modifier state
     /// is the request's own `mods` mask rather than the keyboard's (nobody
-    /// is holding a key), the press is a single click inside the widget,
-    /// and its `press_seq` is [`TerminalTab::synthetic_press_seq`]'s.
+    /// is holding a key), the press is a single click, the pointer is
+    /// inside the widget unless the request puts it `overshoot` rows past
+    /// the grid, and its `press_seq` is
+    /// [`TerminalTab::synthetic_press_seq`]'s.
     pub(super) fn dispatch_test_pointer(
         &mut self,
         tab_id: i64,
         action: PointerAction,
         button: Option<PointerButton>,
-        col: u32,
-        row: u32,
+        (col, row): (u32, u32),
         mods: u16,
+        overshoot: i16,
     ) -> std::result::Result<UiTask, String> {
         // A bare id means the slot under `session` (plan 063 §D10).
         let Some((key, press_seq)) = self.local_tab_key(tab_id).and_then(|key| {
@@ -2152,8 +2154,9 @@ impl App {
                 col,
                 row,
                 click_count: 1,
-                inside: true,
+                inside: overshoot == 0,
                 press_seq,
+                overshoot,
             },
             mods,
             link_modifier_held,
@@ -2178,7 +2181,7 @@ impl App {
         let gate = PressGate {
             on_screen,
             context_menu_open: self.context_menu.is_some(),
-            menu_press_floor: self.menu_press_floor,
+            press_floor: self.press_floor,
         };
         if refuse_stale_press(&mut self.tabs, &event, gate) {
             tracing::debug!(tab = %event.tab, "refused a terminal press whose release cannot come");
@@ -2193,6 +2196,7 @@ impl App {
             click_count,
             inside,
             press_seq,
+            overshoot,
         } = event;
         if action == PointerAction::Press {
             self.cancel_editor_for_interaction();
@@ -2212,6 +2216,7 @@ impl App {
             inside,
             link_modifier_held,
             press_seq,
+            overshoot,
         }) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -3266,6 +3271,7 @@ mod tests {
             inside,
             link_modifier_held,
             press_seq,
+            overshoot: 0,
         })
         .expect("native pointer dispatch")
     }
@@ -6486,6 +6492,545 @@ mod tests {
         supervisor.close(195);
     }
 
+    // ── selection auto-scroll (#342) ──
+
+    use super::super::terminal_tab::{autoscroll_history_rows, autoscroll_selections};
+
+    /// A tab whose 200 history lines put `history-169` on row 0 and
+    /// `history-199` on row 30, above the empty cursor row.
+    fn history_tab(tab_id: i64) -> (TerminalTab, Arc<PtySupervisor>) {
+        let (mut tab, supervisor) = attached_test_terminal(tab_id);
+        for index in 0..200 {
+            tab.write_vt(format!("history-{index:03}\r\n").as_bytes());
+        }
+        tab.refresh_snapshot().expect("baseline snapshot");
+        assert_eq!(viewport_offset(&tab), 169);
+        (tab, supervisor)
+    }
+
+    /// `history-{first}` through `history-{last}`, as a selection copies them.
+    fn history_span(first: u64, last: u64) -> String {
+        (first..=last)
+            .map(|index| format!("history-{index:03}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The held left button's motion over `cell`, `overshoot` rows past
+    /// the grid, as the widget reports it.
+    fn drag(tab: &mut TerminalTab, cell: (u32, u32), overshoot: i16) {
+        let press_seq = tab.synthetic_press_seq(PointerAction::Motion, Some(PointerButton::Left));
+        tab.handle_native_pointer(NativePointerDispatch {
+            action: PointerAction::Motion,
+            button: Some(PointerButton::Left),
+            col: cell.0,
+            row: cell.1,
+            mods: 0,
+            click_count: 0,
+            inside: overshoot == 0,
+            link_modifier_held: false,
+            press_seq,
+            overshoot,
+        })
+        .expect("drag dispatch");
+    }
+
+    fn press_left(tab: &mut TerminalTab, cell: (u32, u32)) {
+        native_pointer(
+            tab,
+            PointerAction::Press,
+            Some(PointerButton::Left),
+            cell,
+            1,
+            true,
+            false,
+        );
+    }
+
+    fn tick(tab: &mut TerminalTab) {
+        tab.autoscroll_selection().expect("auto-scroll tick");
+    }
+
+    #[test]
+    fn an_auto_scroll_tick_scrolls_toward_the_edge_at_most_five_rows() {
+        for (overshoot, history_rows) in [
+            (-1, 1),
+            (-3, 3),
+            (-5, 5),
+            (-6, 5),
+            (i16::MIN, 5),
+            (1, -1),
+            (4, -4),
+            (9, -5),
+            (i16::MAX, -5),
+        ] {
+            assert_eq!(
+                autoscroll_history_rows(overshoot),
+                history_rows,
+                "{overshoot} rows past the grid: above it is older history"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drag_held_above_the_grid_grows_the_selection_into_history() {
+        let (mut tab, supervisor) = history_tab(421);
+        press_left(&mut tab, (10, 30));
+        drag(&mut tab, (0, 0), -2);
+        assert!(tab.autoscroll_armed());
+
+        for _ in 0..3 {
+            tick(&mut tab);
+        }
+        assert_eq!(viewport_offset(&tab), 163, "three ticks of two rows");
+        assert_eq!(
+            tab.snapshot.selection_spans.len(),
+            usize::from(DEFAULT_ROWS),
+            "the published snapshot shows the selection filling the scrolled viewport"
+        );
+        assert_eq!(
+            tab.selected_text().expect("selection text").as_deref(),
+            Some(history_span(163, 199).as_str()),
+            "the selection reaches the row each tick brought on screen"
+        );
+        supervisor.close(421);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drag_held_below_a_scrolled_up_grid_grows_the_selection_toward_the_bottom() {
+        let (mut tab, supervisor) = history_tab(422);
+        for _ in 0..3 {
+            tab.handle_page(PageDirection::Up).expect("local page up");
+        }
+        assert_eq!(viewport_offset(&tab), 73);
+        press_left(&mut tab, (0, 0));
+        drag(&mut tab, (10, u32::from(DEFAULT_ROWS) - 1), 3);
+
+        tick(&mut tab);
+        tick(&mut tab);
+        assert_eq!(viewport_offset(&tab), 79);
+        assert_eq!(
+            tab.selected_text().expect("selection text").as_deref(),
+            Some(history_span(73, 110).as_str())
+        );
+        supervisor.close(422);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_auto_scroll_tick_at_the_top_of_history_does_nothing() {
+        let (mut tab, supervisor) = history_tab(423);
+        for _ in 0..8 {
+            tab.handle_page(PageDirection::Up).expect("local page up");
+        }
+        assert_eq!(viewport_offset(&tab), 0);
+        press_left(&mut tab, (10, 5));
+        drag(&mut tab, (0, 0), -5);
+        let refreshes = tab.render_stats.refresh_calls;
+
+        tick(&mut tab);
+        assert_eq!(viewport_offset(&tab), 0);
+        assert_eq!(
+            tab.render_stats.refresh_calls, refreshes,
+            "nothing to repaint"
+        );
+        assert!(tab.autoscroll_armed(), "a held drag stays armed at the end");
+        assert_eq!(
+            tab.selected_text().expect("selection text").as_deref(),
+            Some(history_span(0, 5).as_str())
+        );
+        supervisor.close(423);
+    }
+
+    /// The arming table: only a selection drag past the top or bottom of
+    /// the grid arms, a geometry change disarms, and the speed clamp
+    /// holds at the far end of the range.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_selection_drag_past_the_top_or_bottom_edge_arms() {
+        let (mut tab, supervisor) = history_tab(424);
+        press_left(&mut tab, (10, 30));
+        drag(&mut tab, (0, 0), -2);
+        assert!(tab.autoscroll_armed(), "past the top");
+        drag(&mut tab, (4, 10), 0);
+        assert!(!tab.autoscroll_armed(), "back over the grid");
+        native_pointer(
+            &mut tab,
+            PointerAction::Motion,
+            Some(PointerButton::Left),
+            (0, 10),
+            0,
+            false,
+            false,
+        );
+        assert!(!tab.autoscroll_armed(), "past the side only");
+
+        drag(&mut tab, (0, 0), i16::MIN);
+        assert!(tab.autoscroll_armed(), "as far up as a pointer can be");
+        tick(&mut tab);
+        assert_eq!(viewport_offset(&tab), 164, "at most five rows a tick");
+
+        let metrics = tab.applied_metrics.expect("installed metrics");
+        tab.apply_geometry(DEFAULT_COLS, DEFAULT_ROWS - 4, metrics, 1)
+            .expect("resize")
+            .expect("the grid changed");
+        assert!(
+            !tab.autoscroll_armed(),
+            "a resize leaves an overshoot measured against a grid that is gone"
+        );
+        supervisor.close(424);
+    }
+
+    /// A tick already queued when the drag ended — by a release or a
+    /// cancel — finds the next press's selection, not its own drag, and
+    /// must not scroll it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tick_queued_behind_the_end_of_its_drag_does_nothing() {
+        for (tab_id, end) in [(425, "release"), (426, "cancel")] {
+            let (tab, supervisor) = history_tab(tab_id);
+            let key = TabKey::local(tab_id);
+            let mut tabs = HashMap::from([(key, tab)]);
+            let tab = tabs.get_mut(&key).unwrap();
+            press_left(tab, (10, 30));
+            drag(tab, (0, 0), -2);
+            assert!(tab.autoscroll_armed(), "{end}");
+            match end {
+                "release" => {
+                    native_pointer(
+                        tab,
+                        PointerAction::Release,
+                        Some(PointerButton::Left),
+                        (0, 0),
+                        0,
+                        false,
+                        false,
+                    );
+                }
+                _ => cancel_tab_pointers(&mut tabs, None, "test cancel"),
+            }
+            let tab = tabs.get_mut(&key).unwrap();
+            press_left(tab, (4, 10));
+            assert!(
+                !tab.autoscroll_armed(),
+                "{end}: the next press is not dragging"
+            );
+
+            tick(tab);
+            assert_eq!(viewport_offset(tab), 169, "{end}: the stale tick scrolled");
+            assert_eq!(
+                tab.selected_text().expect("selection text"),
+                None,
+                "{end}: the next press has selected nothing yet"
+            );
+            supervisor.close(tab_id);
+        }
+    }
+
+    /// The alternate screen has no history to scroll into, so a drag
+    /// there never arms.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drag_past_the_edge_of_the_alternate_screen_never_arms() {
+        let (mut tab, supervisor) = history_tab(427);
+        tab.write_vt(b"\x1b[?1049h");
+        press_left(&mut tab, (3, 10));
+        drag(&mut tab, (0, 0), -2);
+        assert!(!tab.autoscroll_armed());
+        supervisor.close(427);
+    }
+
+    /// The application taking the viewport mid-drag — the alternate
+    /// screen, or mouse tracking — stops the auto-scroll at its next
+    /// tick, and a drag after it does not re-arm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mode_change_mid_drag_disarms() {
+        for (tab_id, mode) in [(428, &b"\x1b[?1049h"[..]), (429, b"\x1b[?1000h\x1b[?1006h")] {
+            let (mut tab, supervisor) = history_tab(tab_id);
+            press_left(&mut tab, (10, 30));
+            drag(&mut tab, (0, 0), -2);
+            assert!(tab.autoscroll_armed(), "{mode:?}");
+            tab.write_vt(mode);
+            tick(&mut tab);
+            assert!(!tab.autoscroll_armed(), "{mode:?}: the tick disarms");
+
+            drag(&mut tab, (0, 0), -2);
+            assert!(!tab.autoscroll_armed(), "{mode:?}: a drag does not re-arm");
+            supervisor.close(tab_id);
+        }
+    }
+
+    /// Only the tab on screen, in a focused window, scrolls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_auto_scroll_tick_scrolls_only_the_shown_tab_of_a_focused_window() {
+        let mut tabs = HashMap::new();
+        let mut supervisors = Vec::new();
+        for tab_id in [430, 431] {
+            let (mut tab, supervisor) = history_tab(tab_id);
+            press_left(&mut tab, (10, 30));
+            drag(&mut tab, (0, 0), -2);
+            tabs.insert(TabKey::local(tab_id), tab);
+            supervisors.push((tab_id, supervisor));
+        }
+        let (shown, hidden) = (TabKey::local(430), TabKey::local(431));
+
+        autoscroll_selections(&mut tabs, shown, true);
+        assert_eq!(viewport_offset(&tabs[&shown]), 167);
+        assert_eq!(viewport_offset(&tabs[&hidden]), 169);
+        assert!(!tabs[&hidden].autoscroll_armed());
+
+        autoscroll_selections(&mut tabs, shown, false);
+        assert_eq!(viewport_offset(&tabs[&shown]), 167, "an unfocused window");
+        assert!(!tabs[&shown].autoscroll_armed());
+        for (tab_id, supervisor) in supervisors {
+            supervisor.close(tab_id);
+        }
+    }
+
+    /// A window resize stops the auto-scroll even when the cell grid
+    /// comes out the same, as a few pixels' resize does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resize_that_keeps_the_cell_grid_still_disarms() {
+        let (tab, supervisor) = history_tab(432);
+        let key = TabKey::local(432);
+        let mut tabs = HashMap::from([(key, tab)]);
+        let tab = tabs.get_mut(&key).unwrap();
+        press_left(tab, (10, 30));
+        drag(tab, (0, 0), -2);
+        let (grid, metrics, generation) = (
+            tab.grid(),
+            tab.applied_metrics.expect("installed metrics"),
+            tab.metric_generation,
+        );
+
+        super::super::regrid_window(&mut tabs, &mut HashMap::new(), grid, metrics, generation);
+
+        let tab = &tabs[&key];
+        assert_eq!(tab.grid(), grid, "the cell grid did not change");
+        assert!(!tab.autoscroll_armed());
+        assert_eq!(
+            tab.local_pointer_gesture,
+            Some(LocalPointerGesture::Selection),
+            "the drag itself goes on"
+        );
+        supervisor.close(432);
+    }
+
+    /// At the live bottom there is nothing to scroll, but output keeps
+    /// arriving: a drag held below the grid takes it in on the next tick,
+    /// and a tick with nothing new repaints nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drag_held_past_the_live_bottom_takes_in_new_output() {
+        let (mut tab, supervisor) = history_tab(433);
+        press_left(&mut tab, (0, 10));
+        drag(&mut tab, (10, 30), 2);
+        tab.write_vt(b"history-200\r\nhistory-201");
+        tab.refresh_snapshot().expect("the drain's repaint");
+        assert_eq!(
+            viewport_offset(&tab),
+            170,
+            "the viewport followed the output"
+        );
+
+        tick(&mut tab);
+        assert_eq!(
+            tab.selected_text().expect("selection text").as_deref(),
+            Some(history_span(179, 201).as_str()),
+            "the endpoint followed the bottom row onto the new output"
+        );
+        assert_eq!(
+            tab.snapshot.selection_spans.last().map(|span| span.row),
+            Some(DEFAULT_ROWS - 1),
+            "and was published"
+        );
+        assert!(tab.autoscroll_armed(), "the drag stays armed at the bottom");
+
+        let refreshes = tab.render_stats.refresh_calls;
+        tick(&mut tab);
+        assert_eq!(tab.render_stats.refresh_calls, refreshes, "nothing new");
+        supervisor.close(433);
+    }
+
+    /// Opening the palette rebuilds the terminal widget with no button
+    /// held, so a physical release would never reach the drags it owned:
+    /// they let go there instead. An unchanged wrapping lets go of nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rewrapped_terminal_lets_go_of_its_drags() {
+        let mut fixture = TrackingTabs::new(&[435]);
+        let (selecting, tracking) = (TabKey::local(434), TabKey::local(435));
+        let (mut tab, supervisor) = history_tab(434);
+        press_left(&mut tab, (10, 30));
+        drag(&mut tab, (0, 0), -2);
+        fixture.tabs.insert(selecting, tab);
+        let tracked = fixture.tabs.get_mut(&tracking).unwrap();
+        press_left(tracked, (2, 2));
+        clear_captured_input(tracked);
+
+        let unwrapped = super::super::TerminalWrapping::default();
+        let mut observed = unwrapped;
+        let mut press_floor = 0;
+        super::super::rewrap_lets_go(
+            &mut observed,
+            unwrapped,
+            &mut fixture.tabs,
+            &mut press_floor,
+        );
+        assert!(fixture.tabs[&selecting].autoscroll_armed());
+        assert!(captured_input(&fixture.tabs[&tracking]).is_empty());
+
+        let palette = super::super::TerminalWrapping {
+            palette: true,
+            ..unwrapped
+        };
+        super::super::rewrap_lets_go(&mut observed, palette, &mut fixture.tabs, &mut press_floor);
+        let dragged = &fixture.tabs[&selecting];
+        assert!(!dragged.autoscroll_armed(), "the auto-scroll stops");
+        assert_eq!(
+            dragged.local_pointer_gesture, None,
+            "the selection drag ends"
+        );
+        assert_eq!(
+            captured_input(&fixture.tabs[&tracking]),
+            b"\x1b[<0;3;3m".to_vec(),
+            "the tracking button gets its release"
+        );
+        supervisor.close(434);
+    }
+
+    /// A selection cleared or replaced from outside the pointer is no
+    /// longer the drag's to stretch: the drag and its auto-scroll end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clearing_or_replacing_the_selection_ends_its_drag() {
+        for (tab_id, change) in [(436, "clear"), (437, "set"), (438, "expand")] {
+            let (mut tab, supervisor) = history_tab(tab_id);
+            press_left(&mut tab, (10, 30));
+            drag(&mut tab, (0, 0), -2);
+            match change {
+                "clear" => assert!(tab.clear_selection()),
+                "set" => assert!(tab.set_selection((0, 5), (10, 5)).expect("set")),
+                _ => assert!(tab.expand_selection_at(2, 5, 2).expect("expand").is_some()),
+            }
+            let selected = tab.selected_text().expect("selection text");
+
+            tick(&mut tab);
+            assert!(!tab.autoscroll_armed(), "{change}");
+            assert_eq!(tab.local_pointer_gesture, None, "{change}");
+            assert_eq!(viewport_offset(&tab), 169, "{change}: the drag scrolled on");
+            drag(&mut tab, (0, 0), -2);
+            assert_eq!(
+                tab.selected_text().expect("selection text"),
+                selected,
+                "{change}: the drag stretched a selection it does not own"
+            );
+            supervisor.close(tab_id);
+        }
+    }
+
+    /// A selection that goes by any other path ends its drag at the next
+    /// tick, which finds nothing to stretch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drag_whose_selection_vanished_ends_at_the_next_tick() {
+        let (mut tab, supervisor) = history_tab(439);
+        press_left(&mut tab, (10, 30));
+        drag(&mut tab, (0, 0), -2);
+        tab.selection.clear();
+
+        tick(&mut tab);
+        assert!(!tab.autoscroll_armed());
+        assert_eq!(tab.local_pointer_gesture, None);
+        let scrolled = viewport_offset(&tab);
+        tick(&mut tab);
+        assert_eq!(viewport_offset(&tab), scrolled, "a second tick scrolled");
+        supervisor.close(439);
+    }
+
+    /// A press the old widget stamped before a rewrap but that reaches the
+    /// model after it is refused: the rebuild drops that widget's capture,
+    /// so the application would get a press with no release to follow. A
+    /// press the rebuilt widget stamps goes through.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_press_queued_behind_a_rewrap_is_refused() {
+        let mut fixture = TrackingTabs::new(&[440]);
+        let tabs = &mut fixture.tabs;
+        let key = TabKey::local(440);
+        let press = widget_pointer(
+            &shown_widget(key, &tabs[&key]),
+            &mut TerminalWidgetState::default(),
+            LEFT_DOWN,
+            (2, 2),
+        )
+        .expect("a press");
+
+        let unwrapped = super::super::TerminalWrapping::default();
+        let palette = super::super::TerminalWrapping {
+            palette: true,
+            ..unwrapped
+        };
+        let (mut observed, mut press_floor) = (unwrapped, 0);
+        super::super::rewrap_lets_go(&mut observed, palette, tabs, &mut press_floor);
+        let gate = PressGate {
+            press_floor,
+            ..on_screen(key)
+        };
+
+        assert!(
+            refuse_stale_press(tabs, &press, gate),
+            "the stale press is refused"
+        );
+        assert!(
+            captured_input(&tabs[&key]).is_empty(),
+            "nothing reached the application"
+        );
+        let fresh = widget_pointer(
+            &shown_widget(key, &tabs[&key]),
+            &mut TerminalWidgetState::default(),
+            LEFT_DOWN,
+            (4, 2),
+        )
+        .expect("a press on the rebuilt widget");
+        assert!(!refuse_stale_press(tabs, &fresh, gate));
+        deliver(tabs.get_mut(&key).unwrap(), fresh);
+        assert_eq!(captured_input(&tabs[&key]), b"\x1b[<0;5;3M".to_vec());
+    }
+
+    /// Replacing or clearing the selection settles its press: the widget
+    /// lets go of the button, and a drag already queued behind the change
+    /// is dropped — even once the application has turned tracking on, when
+    /// it would otherwise arrive as a drag of a button it never saw go down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replacing_the_selection_retires_its_press() {
+        for (tab_id, change) in [(441, "set"), (442, "clear")] {
+            let (mut tab, supervisor) = history_tab(tab_id);
+            let key = TabKey::local(tab_id);
+            let mut state = TerminalWidgetState::default();
+            let press = widget_pointer(&shown_widget(key, &tab), &mut state, LEFT_DOWN, (2, 2))
+                .expect("a press");
+            deliver(&mut tab, press);
+            let queued = widget_pointer(&shown_widget(key, &tab), &mut state, MOVED, (6, 2))
+                .expect("a drag");
+            match change {
+                "set" => assert!(tab.set_selection((0, 5), (10, 5)).expect("set")),
+                _ => assert!(tab.clear_selection()),
+            }
+            tab.write_vt(b"\x1b[?1002h\x1b[?1006h");
+            clear_captured_input(&tab);
+
+            deliver(&mut tab, queued);
+            let rebuilt = shown_widget(key, &tab);
+            let motion = widget_pointer(&rebuilt, &mut state, MOVED, (8, 2));
+            assert_eq!(
+                motion.and_then(|motion| motion.button),
+                None,
+                "{change}: the widget still holds the press"
+            );
+            if let Some(release) = widget_pointer(&rebuilt, &mut state, LEFT_UP, (8, 2)) {
+                deliver(&mut tab, release);
+            }
+            assert_eq!(
+                captured_input(&tab),
+                Vec::<u8>::new(),
+                "{change}: the application heard a button it never saw pressed"
+            );
+            supervisor.close(tab_id);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pages_forward_to_the_application_on_tracking_and_alternate_screen() {
         let (mut tracked, tracked_supervisor) = attached_test_terminal(196);
@@ -6962,6 +7507,7 @@ mod tests {
             inside: event.inside,
             link_modifier_held: false,
             press_seq: event.press_seq,
+            overshoot: event.overshoot,
         })
         .expect("native pointer dispatch")
     }
@@ -6972,7 +7518,7 @@ mod tests {
         PressGate {
             on_screen: Some(key),
             context_menu_open: false,
-            menu_press_floor: 0,
+            press_floor: 0,
         }
     }
 
@@ -7251,7 +7797,7 @@ mod tests {
         let open = PressGate {
             on_screen: Some(key),
             context_menu_open: true,
-            menu_press_floor: crate::terminal_widget::latest_press_seq(),
+            press_floor: crate::terminal_widget::latest_press_seq(),
         };
         let closed = PressGate {
             context_menu_open: false,
