@@ -82,6 +82,8 @@ first.
 | `make e2e-iced` | curated `ICED_E2E_TESTS` against an Iced UI | reuses a running Iced UI | `iced-build-e2e` (macOS cells) |
 | `make e2e-iced-ci` | the same list, `--roost-fresh` (CI parity) | yes (Iced) | `iced-build-e2e` |
 | `make e2e-iced-exit`, `e2e-iced-menu-quit` | exit-on-empty and menu-Quit, own invocation each | yes (Iced) | `iced-build-e2e` |
+| `make e2e-iced-sparkle` | Sparkle update flow against the bundle, `--roost-fresh`; rewrites the bundle with test update settings | yes (Iced) | `iced-build-e2e` |
+| `make e2e-iced-release-ci` | curated subset against a release binary (`ROOST_ICED_BIN`), `--roost-fresh` | yes (Iced) | `iced-release` (Linux only) |
 | `make e2e-iced-bundle` | `make bundle-iced`, then smoke + menu bar against the `.app` (`ROOST_ICED_APP`) | yes (Iced) | `iced-build-e2e` |
 | `make e2e-mac` / `e2e-mac-ci` | whole `tools/roosttest` against Roost.app (`-ci` adds `--roost-fresh`) | yes (Roost.app) | `e2e-mac` |
 | `make e2e-session` | headless `roost-session` daemons, no UI | no | `session-e2e` |

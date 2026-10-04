@@ -645,7 +645,10 @@ def readiness_report(report: dict, claimants: dict | None) -> tuple[list[str], s
             f"display {display['id']}:     {display['bounds']['width']:.0f}x{display['bounds']['height']:.0f}"
             f"{' main' if display.get('main') else ''}"
             f" safe_area_top={display.get('safe_area_top')} menu_bar_inset={display.get('menu_bar_inset')}"
+            + (f" insets={display['insets']}" if display.get("insets") else "")
         )
+        if display.get("insets") == "unavailable-translated":
+            lines.append("  the helper runs under Rosetta: build it natively (arm64) or test_full_screen fails")
     if claimants is not None:
         rows = claimants["claimants"]
         blocking = [row for row in rows if row["blocks"]]
