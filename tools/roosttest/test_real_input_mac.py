@@ -334,10 +334,29 @@ def require_no_secure_input(helper) -> int | None:
 # ---------------------------------------------------------------------------
 
 
+def report_displays(helper) -> None:
+    """Each display's bounds and top insets. CI's pytest runs without `-s`, so
+    a passing test's stdout never reaches the log; the job summary does."""
+    lines = [
+        f"display {d['id']} main={d['main']} bounds={d['bounds']} "
+        f"safe_area_top={d.get('safe_area_top')} menu_bar_inset={d.get('menu_bar_inset')}"
+        for d in helper.preflight()["displays"]
+    ]
+    print("\n".join(lines))
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        try:
+            with open(summary, "a", encoding="utf-8") as out:
+                out.write("\n".join(f"- {line}" for line in lines) + "\n")
+        except OSError as err:
+            print(f"GITHUB_STEP_SUMMARY not written: {err}")
+
+
 def test_preflight(helper, launch_ui):
     """Behind the `helper` fixture's readiness gate (the read-only grant
     checks, an unlocked console, a US input source), one real operation: a
     real key posted into Roost comes back out of `tab.capture_pty_input`."""
+    report_displays(helper)
     with real_input.unavailable_skips():
         roost = launch_ui()
         tab = roost.open_tab(["/bin/cat"])
@@ -479,7 +498,7 @@ def full_screen_rows(menus: list[dict]) -> list[tuple[str, str]]:
     ]
 
 
-def settle_in_full_screen(roost: RealInputUI, helper, screens: list[coords.Frame]) -> None:
+def settle_in_full_screen(roost: RealInputUI, helper, report: dict) -> None:
     """Wait until the window fills a display in full screen, the UI's content
     fills the window, and both have held still for `FULL_SCREEN_QUIET_S`.
 
@@ -489,13 +508,19 @@ def settle_in_full_screen(roost: RealInputUI, helper, screens: list[coords.Frame
     marks the animation's end, so the wait is for quiet: on the harness Mac 9
     of 10 exits sent as AXFullScreen turned were dropped, and 24 of 24 sent
     half a second or more later landed."""
+    translated = [d["id"] for d in report["displays"] if d.get("insets") == "unavailable-translated"]
+    assert not translated, (
+        f"displays {translated} have no inset readings because the helper runs under Rosetta: "
+        "build the helper natively (arm64)"
+    )
+    candidates = coords.full_screen_frames(report)
     quiet = scaled_timeout(FULL_SCREEN_QUIET_S)
     since: list = [None, 0.0]
 
     def read():
         window = helper.window(roost.pid)
         frame = coords.Frame.from_window(window)
-        if window["full_screen"] is not True or frame not in screens:
+        if window["full_screen"] is not True or frame not in candidates:
             return None
         return frame if roost.client.window_metrics()["window_height"] == frame.height else None
 
@@ -515,11 +540,11 @@ def test_full_screen(helper, launch_ui):
     roost = launch_ui()
     roost.bring_to_front(helper)
     before, _ = geometry(roost, helper)
-    screens = coords.displays(helper.preflight())
+    report = helper.preflight()
     assert full_screen_rows(helper.menu_bar(roost.pid)["menus"]) == [("View", "Enter Full Screen")]
 
     helper.press(roost.pid, ["window", "AXFullScreenButton"])
-    settle_in_full_screen(roost, helper, screens)
+    settle_in_full_screen(roost, helper, report)
     settle(
         lambda: full_screen_rows(roost.client.app_menu_dump()),
         lambda rows: rows == [("View", "Exit Full Screen")],
