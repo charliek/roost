@@ -217,6 +217,11 @@ wrapper small.
   (mounts the repo, provisions via `.shed/provision.yaml`, builds
   `roost-iced` + `roostctl` shed-local, runs the three iced real-input
   lanes — mirrors CI's `e2e-iced-wayland-drag`).
+- **Mac testing (local or a remote Mac over ssh)**: the **`mac-test`
+  skill** has the lane map (which `make` targets force-quit a running app),
+  the "don't break the human's session" checks, launching a dev build, the
+  real-input harness + `make mac-real-input-check`, and the remote-Mac
+  recipe.
 - **Linux testing natively (Pop!_OS COSMIC)**: on a Linux dev box you
   don't need a VM — build + run the suite directly. The **`popos-test`
   skill** covers the apt deps, `make e2e-iced` / `e2e-iced-ci` under the

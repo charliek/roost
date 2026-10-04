@@ -17,6 +17,9 @@ Wayland is the **primary** lane here — winit's Wayland backend is only
 exercised on a real compositor, never under Xvfb, so Wayland-specific bugs
 slip through an X11-only run.
 
+This skill is for a Mac host. On a native Linux box use `popos-test`; for the
+Mac products themselves (and real input on macOS) use `mac-test`.
+
 ## Prerequisites
 - `shed` CLI installed + a shed-server online (`shed server list` shows `online`).
   If shed isn't set up, see the ../shed macOS quickstart; stop and tell the user.
@@ -26,8 +29,9 @@ slip through an X11-only run.
 `tools/shed/shed-test.sh` provisions on first use, builds `roost-iced` +
 `roostctl` shed-local (via `tools/shed/build-in-shed.sh`, so your Mac
 `target/` + ghostty outputs are never clobbered), then runs the three iced
-real-input lanes. Run it from the repo root. The persistent `roost-dev` box
-IS the day-to-day cache (stop/start reuses its build cache); the
+real-input lanes. Run it from the repo root. The persistent dev box (`SHED=` at the top
+of the script; `roost-dev` by default, written `<shed>` below where a command
+takes it) IS the day-to-day cache (stop/start reuses its build cache); the
 **snapshot is opt-in** — a bare run does NOT auto-snapshot, so run
 `--snapshot-base` once if you want fast cold re-creates after a teardown:
 
@@ -67,7 +71,7 @@ read that override for the iced target — no bind-mount needed):
 
 ```bash
 tools/shed/shed-test.sh --build-only            # builds ~/rt/debug/{roost-iced,roostctl}
-shed exec roost-dev -- bash -lc '
+shed exec <shed> -- bash -lc '
   cd ~/roost
   mkdir -p /tmp/xdgrt-iced && chmod 700 /tmp/xdgrt-iced
   # Wayland (primary): headless weston, the Iced CI Wayland lane.
@@ -98,6 +102,52 @@ bundle profile it resolves — a plain `cargo build -p roost-iced` (no
 **dev** `roost-iced` profile (`$XDG_RUNTIME_DIR/roost-iced/roost.sock`), which
 is what the harness expects.
 
+### Harness rules for hand-run pytest
+
+- **Timeouts and mode.** CI sets `ROOST_TEST_TIMEOUT_SCALE=3` and
+  `ROOST_TEST_MODE=1`; a shed is a loaded VM, so set both.
+- **Which modules.** `ICED_E2E_TESTS` is the curated list, now including the
+  plan 073/074 modules (`test_context_menu`, `test_password_input`,
+  `test_secure_input`, `test_notification_raise`, `test_selection_autoscroll`,
+  `test_device_queries`). `ICED_CLIPBOARD_TESTS` (`test_osc52`,
+  `test_paste_files`, `test_context_menu_clipboard`) is appended only when
+  `WAYLAND_DISPLAY` is unset, since Wayland clipboard needs a focused seat. Run
+  them under Xvfb. `tools/roosttest_unit/test_e2e_lists.py` (`make
+  test-harness`) fails when a module and the lane lists drift.
+- **Daemon deselect.** A hand-run pytest over the iced list must add
+  `-m 'not session_daemon and not host_client'` (the Makefile's
+  `DAEMON_E2E_DESELECT`), or `test_password_input.py`'s daemon cases run in the
+  wrong lane.
+- **Own-invocation lanes.** `make e2e-iced-exit`, `e2e-iced-menu-quit` and
+  `e2e-iced-release-ci` (needs `ROOST_ICED_BIN` pointing at a real release
+  binary) each run in their own invocation; never fold them into the main list.
+- **Host lanes** (`e2e-host-client`, `e2e-host-ssh`, `e2e-host-bootstrap`,
+  `e2e-host-missing-daemon`, `e2e-host-local-spawn`, `e2e-host-localhost`,
+  `e2e-local-backend`, `e2e-old-session`) run **one at a time**. Two concurrent
+  runs bind their probes to each other's terminals, which looks like a product
+  bug.
+- **See which tests self-skip** with `pytest -rs`; do not trust a fixed count.
+  The pixel/render tests skip when `WAYLAND_DISPLAY` names a live desktop
+  compositor rather than the harness's own weston socket.
+- **Pointer rules.** Keep the real pointer off the Roost window during
+  IPC-driven drag tests (#606): a hover hijacks the synthetic drag. A test that
+  holds a gesture starts with no status toast up (`notice_dump`'s `bottom_line`
+  with source `"status"`), or its expiry rewraps the terminal and cancels the
+  gesture (#608). On a timeout, report state, not just "timed out". Once #605
+  lands, `app.window_metrics` carries `window_focused` / `native_focus_losses`:
+  retry only when focus losses rose between press and timeout, never blanket.
+
+### Isolating an agent-in-Roost run
+
+- Unset `HERDR_ENV` (and `TMUX`, etc.) before launching any harness: it leaks
+  through an isolated Roost into its tabs and confuses agent hooks.
+- An isolated lane needs a private `XDG_RUNTIME_DIR`, `XDG_DATA_HOME`,
+  `XDG_STATE_HOME`, `XDG_CACHE_HOME` and `XDG_CONFIG_HOME`, plus `ROOST_CONFIG`.
+- **Never run `/usr/bin/roost --version`** to probe an install: there is no such
+  flag and it launches the real UI. Use `dpkg -s roost` instead.
+- Real X input under Xvfb comes from `xdotool`. A Wayland lane with real keys is
+  weston's x11 backend with kiosk-shell, nested in Xvfb.
+
 ### Visual screenshot on real Linux
 Launch the shed binary directly under Xvfb or weston (skip the harness),
 seed via `roostctl`, `screenshot` to a mount path, read it on the Mac
@@ -114,8 +164,8 @@ A separate loop from the three lanes above — for exercising the
 host-sessions bootstrap (Add Host → install → connect) against a real
 Linux remote, not for the iced real-input tests. `tools/session/dev-session.sh`
 builds `roost-session` in a shed of the target's own architecture
-(`roost-dev` for aarch64; a shed on a remote shed server such as `mini3`
-for amd64 — no cross-compile), fetches it back proving the version pin
+(`roost-dev`, `shed-test.sh`'s default shed name, for aarch64; a shed on a
+remote shed server `<server>` for amd64 — no cross-compile), fetches it back proving the version pin
 matches this checkout, and can point a local `Roost-Iced.app` at it via
 `ROOST_SESSION_INSTALL_BIN` so the product's own bootstrap does the
 install. See `tools/session/README.md` and
@@ -128,7 +178,7 @@ Another separate loop — `tools/session/live/` (plan 042, #384) drives a
 **real** `sshd` through a real severance and reads every claim back
 through `roostctl host status --json`, the only way any of this
 proves the fake-`ssh` unit tests aren't lying. Run inside a shed
-(`roost-dev`), never on the Mac:
+(`<shed>`), never on the Mac:
 
 ```bash
 tools/session/live/mutate.sh selftest   # all five traps must trip
@@ -152,9 +202,9 @@ not inline in the shell you're typing the command in.
   mise) and a `startup` hook (every boot: start seatd + `chmod 0666
   /dev/uinput /run/seatd.sock` so the drag test can inject — these reset to
   root-only each boot).
-- **Box model:** a long-lived `roost-dev` shed + a `roost-base` snapshot cache.
+- **Box model:** a long-lived dev shed (`roost-dev` by default) + a `roost-base` snapshot cache.
   Treat both as a *cache* — assume a shed upgrade invalidates them; just
-  `--reprovision` (or `shed delete roost-dev -f; shed snapshot delete roost-base -f`)
+  `--reprovision` (or `shed delete <shed> -f; shed snapshot delete roost-base -f`)
   and re-run. The snapshot makes a fresh box boot in seconds instead of
   re-running the full install hook.
 - **`tools/shed/build-in-shed.sh`** — bind-mounts shed-local dirs over the

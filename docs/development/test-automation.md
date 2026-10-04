@@ -273,9 +273,21 @@ also what surfaced [#409](https://github.com/charliek/roost/issues/409).
 - **Rendering** — a Layer 2 check via `tools/screenshot/` and
   `pngtool.py`. `tab.dump` is text-only, so anything about color or
   layout needs pixels.
-- **Real key/pointer/clipboard behavior** — Layer 3, local, Linux for
-  now. A Mac CGEvent sibling is
-  [#285](https://github.com/charliek/roost/issues/285).
+- **Real key/pointer/clipboard behavior** — Layer 3. Linux:
+  `tools/input/linux/` (uinput/xdotool). Mac: `tools/input/mac/` (real
+  CGEvents + Accessibility through the never-rebuilt runner app; see
+  [the Mac real-input harness](#the-mac-real-input-harness)).
+
+## Agent verification
+
+An agent should be able to verify a change on the machine it has, without a
+human present. Three skills under `.claude/skills/` carry the recipes:
+`mac-test` (a local Mac, or a remote Mac over ssh, including the real-input
+harness), `linux-test` (Linux from a Mac, in a shed VM) and `popos-test` (a
+native Linux dev box). On a Mac, `make mac-real-input-check` answers "can this
+Mac take real input right now?" (grants, lock, Secure Input, input layout)
+before a real-input run. Skills use placeholders (`$MAC_HOST`, `$MAC_REPO`,
+`TEST_SHA`, `<shed>`) rather than machine names.
 
 The guiding rule: an agent should be able to go from "I changed X" to
 "here is the exact command that proves X still works" without guessing.
