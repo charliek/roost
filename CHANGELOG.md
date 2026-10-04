@@ -11,6 +11,19 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+## v0.0.22 — 2026-10-04
+
+_The Mac-gap release before v0.1.0 (plans 073 and 074): Roost-Iced gains
+what a Swift-app user would miss, and the Swift app is unchanged. It brings
+the macOS selection pasteboard and middle-click paste, pasting copied files,
+Settings, Help and Full Screen in the menu bar, right-click menus, the system
+accent, Option as Meta, Mac-sized text and glyphs with a bundled JetBrains
+Mono, Secure Keyboard Entry, selection auto-scroll, a remembered window frame
+on macOS, and the Wayland raise on a notification click. If you never set
+`font-family`, the terminal font may change (see Changed). There is no
+session-protocol bump: a running `roost-session` picks up its side
+(password-prompt detection) when it restarts._
+
 ### Added
 
 - **Pasting copied files (plan 073, #576)** — in Roost-Iced, ⌘V /
@@ -108,9 +121,10 @@ release workflow asserts they agree).
   focusing the tab. X11 and macOS are unchanged. New test-mode ops
   `app.notification_activate` and `app.last_activation`.
 
-- **`app.window_metrics` reports cell geometry (plan 074)** —
-  `terminal_left`, `terminal_padding`, `cell_width` and `cell_height`,
-  additive.
+- **`app.window_metrics` reports cell geometry and window focus (plan 074,
+  #605)** — `terminal_left`, `terminal_padding`, `cell_width` and
+  `cell_height`, plus `window_focused` and `native_focus_losses` (the OS's
+  focus losses only, never `app.set_window_focus`'s), all additive.
 
 - **A Mac real-input test harness (plan 074, #189)** — real CGEvent and
   Accessibility input against Roost-Iced, through a TCC anchor app
@@ -188,6 +202,13 @@ release workflow asserts they agree).
 
 - **A setting toggled just before quitting is no longer lost (plan 074)**
   — a clean exit drains queued `config.conf` writes, bounded at 2 s.
+
+- **A hover no longer moves a held selection drag (#606)** — a pointer
+  motion with no button held reached an in-progress drag in Roost-Iced,
+  moving its end to the hovered cell and stopping its auto-scroll. A
+  real drag's motions always carry their button, so this showed up in
+  drags driven through `tab.dispatch_mouse_event`, where a stray hover
+  could break them.
 
 - **`test_device_queries.py` runs in the iced lanes (plan 074, #596)** —
   it ran only in the Swift `e2e-mac` sweep, although its docstring said
