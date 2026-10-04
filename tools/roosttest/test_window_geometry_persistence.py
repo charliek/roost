@@ -97,6 +97,20 @@ def _resize_and_wait_saved(
     )
 
 
+def _restore_and_wait_saved(roost: Roost, state_dir: Path, size: tuple[float, float]) -> None:
+    """Put the window back and wait for `state.json` to hold the size it
+    settles at. That can be smaller than `size`: the session's first window
+    is never fitted, but a resize that lands before the relaunch's screen
+    check is, and on a screen too small for it (the 1024×768 mini and CI
+    runners) the fit shrinks it, as it should."""
+    roost.window_resize(*size)
+    Roost._wait(
+        lambda: _saved_size(state_dir) == _size(roost),
+        timeout=5.0,
+        what="state.json to remember the size the restored window settled at",
+    )
+
+
 def test_window_size_survives_three_relaunches(roost, target):
     # Ownership gate, before anything is mutated: quit + relaunch against
     # a developer's own UI would close their session.
@@ -125,6 +139,6 @@ def test_window_size_survives_three_relaunches(roost, target):
         # A later relaunch in this session would otherwise inherit the
         # last round's size (plan 074 §9 R7).
         if client is not None:
-            _resize_and_wait_saved(client, state_dir, original)
+            _restore_and_wait_saved(client, state_dir, original)
             if client is not roost:
                 client.close()

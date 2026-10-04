@@ -14,12 +14,13 @@ use objc2::MainThreadMarker;
 use objc2_app_kit::{NSScreen, NSView, NSWindow};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 
-use crate::app::window_frame::{fit_on_screens, iced_frame, CheckedFrame, ScreenRect};
+use crate::app::window_frame::{iced_frame, CheckedFrame, FrameCheck, ScreenRect};
 
-/// Report the window's frame as it stands — after moving it onto a screen,
-/// when `fit` and it is on none or only partly on one. `None` when there
-/// is no `NSWindow` or no screen to measure against.
-pub(crate) fn check(window: &dyn Window, fit: bool) -> Option<CheckedFrame> {
+/// Report the window's frame as it stands — after moving it onto a screen
+/// as `brief` says ([`FrameCheck::fit`]) when it is on none or only partly
+/// on one. `None` when there is no `NSWindow` or no screen to measure
+/// against.
+pub(crate) fn check(window: &dyn Window, brief: FrameCheck) -> Option<CheckedFrame> {
     let Some(mtm) = MainThreadMarker::new() else {
         tracing::error!("window frame check ran off the main thread; skipping");
         return None;
@@ -33,27 +34,32 @@ pub(crate) fn check(window: &dyn Window, fit: bool) -> Option<CheckedFrame> {
         return None;
     };
     let primary_height = primary.frame().size.height;
-    let fitted = if fit {
-        let visible: Vec<ScreenRect> = screens
-            .iter()
-            .map(|screen| screen_rect(screen.visibleFrame()))
-            .collect();
-        let main = NSScreen::mainScreen(mtm)
-            .map_or(visible[0], |screen| screen_rect(screen.visibleFrame()));
-        let opened = screen_rect(ns_window.frame());
-        let fitted = fit_on_screens(opened, &visible, main);
-        if let Some(target) = fitted {
-            tracing::info!(
-                ?opened,
-                ?target,
-                "the remembered window frame is off its screens; moving it onto one"
-            );
-            ns_window.setFrame_display(ns_rect(target), true);
-        }
-        fitted
-    } else {
-        None
-    };
+    let visible: Vec<ScreenRect> = screens
+        .iter()
+        .map(|screen| screen_rect(screen.visibleFrame()))
+        .collect();
+    let opened = screen_rect(ns_window.frame());
+    let opened_content = ns_window.contentRectForFrameRect(ns_window.frame()).size;
+    tracing::debug!(
+        ?brief,
+        ?opened,
+        content_width = opened_content.width,
+        content_height = opened_content.height,
+        ?visible,
+        primary_height,
+        "window frame check: measured"
+    );
+    let main =
+        NSScreen::mainScreen(mtm).map_or(visible[0], |screen| screen_rect(screen.visibleFrame()));
+    let fitted = brief.fit(opened, &visible, main);
+    if let Some(target) = fitted {
+        tracing::info!(
+            ?opened,
+            ?target,
+            "the remembered window frame is off its screens; moving it onto one"
+        );
+        ns_window.setFrame_display(ns_rect(target), true);
+    }
     let frame = ns_window.frame();
     let content = ns_window.contentRectForFrameRect(frame);
     Some(CheckedFrame {

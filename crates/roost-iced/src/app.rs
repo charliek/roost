@@ -2523,11 +2523,11 @@ pub enum UiTask {
         generation: u64,
     },
     /// The window frame's screen check, once the window exists (plan 074
-    /// §D5b), moving it onto a screen only when `fit`. Answers as
+    /// §D5b), moving it onto a screen only as `check` allows. Answers as
     /// `Message::WindowFrameChecked`.
     CheckWindowFrame {
         id: window::Id,
-        fit: bool,
+        check: window_frame::FrameCheck,
     },
     /// Wait, ask the window's mode, then `Message::WindowFrameDue`.
     WindowFrameDeadline {
@@ -4145,7 +4145,7 @@ impl App {
             );
         }
         let check = match self.window_frame.take_check() {
-            Some(fit) => UiTask::CheckWindowFrame { id, fit },
+            Some(check) => UiTask::CheckWindowFrame { id, check },
             None => UiTask::None,
         };
         opened.task.then(check)
@@ -4706,12 +4706,18 @@ impl App {
         self.arm_frame_save(armed)
     }
 
-    /// A frame save's deadline, with the window's mode and outer position
-    /// read at it.
-    pub fn window_frame_due(&mut self, generation: u64, mode: window::Mode, outer: Option<Point>) {
+    /// A frame save's deadline, with the window's mode, outer position and
+    /// content size read at it.
+    pub fn window_frame_due(
+        &mut self,
+        generation: u64,
+        mode: window::Mode,
+        outer: Option<Point>,
+        content: Size,
+    ) {
         self.full_screen_mode(mode);
         self.window_frame
-            .save_due(&self.workspace, generation, outer);
+            .save_due(&self.workspace, generation, outer, Some(content));
     }
 
     fn arm_frame_save(&self, generation: Option<u64>) -> UiTask {
@@ -4721,7 +4727,14 @@ impl App {
                 delay: window_frame::SAVE_DELAY,
                 generation,
             },
-            _ => UiTask::None,
+            (Some(generation), None) => {
+                tracing::debug!(
+                    generation,
+                    "window frame: no window to schedule the save on"
+                );
+                UiTask::None
+            }
+            (None, _) => UiTask::None,
         }
     }
 

@@ -101,6 +101,7 @@ enum Message {
         generation: u64,
         mode: window::Mode,
         outer: Option<Point>,
+        content: Size,
     },
     WindowFocus(window::Id, bool),
     ScreenshotCaptured(window::Screenshot),
@@ -614,8 +615,9 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             generation,
             mode,
             outer,
+            content,
         } => {
-            app.window_frame_due(generation, mode, outer);
+            app.window_frame_due(generation, mode, outer, content);
             Task::none()
         }
         Message::WindowFocus(id, focused) => {
@@ -946,14 +948,14 @@ fn window_event_message(id: window::Id, event: window::Event) -> Option<Message>
 }
 
 #[cfg(target_os = "macos")]
-fn check_window_frame(id: window::Id, fit: bool) -> Task<Message> {
-    window::run(id, move |window| macos::window_frame::check(window, fit))
+fn check_window_frame(id: window::Id, check: app::window_frame::FrameCheck) -> Task<Message> {
+    window::run(id, move |window| macos::window_frame::check(window, check))
         .map(Message::WindowFrameChecked)
 }
 
 /// Nothing to check where nothing is remembered, and nothing asks.
 #[cfg(not(target_os = "macos"))]
-fn check_window_frame(_id: window::Id, _fit: bool) -> Task<Message> {
+fn check_window_frame(_id: window::Id, _check: app::window_frame::FrameCheck) -> Task<Message> {
     Task::done(Message::WindowFrameChecked(None))
 }
 
@@ -1249,10 +1251,10 @@ impl UiTask for app::UiTask {
                     Message::FullScreenSettled(generation)
                 })
             }
-            app::UiTask::CheckWindowFrame { id, fit } => check_window_frame(id, fit),
-            // The mode and the position are read at the deadline, not
+            app::UiTask::CheckWindowFrame { id, check } => check_window_frame(id, check),
+            // The mode, position and size are read at the deadline, not
             // remembered from before it: a full-screen transition can start
-            // inside the 500 ms, and a `Moved` can be scaled wrong (see
+            // inside the 500 ms, and the events can be wrong or missing (see
             // `WindowFrameMemory::save_due`).
             app::UiTask::WindowFrameDeadline {
                 id,
@@ -1260,11 +1262,13 @@ impl UiTask for app::UiTask {
                 generation,
             } => Task::future(tokio::time::sleep(delay))
                 .then(move |()| window::mode(id))
-                .then(move |mode| {
-                    window::position(id).map(move |outer| Message::WindowFrameDue {
+                .then(move |mode| window::position(id).map(move |outer| (mode, outer)))
+                .then(move |(mode, outer)| {
+                    window::size(id).map(move |content| Message::WindowFrameDue {
                         generation,
                         mode,
                         outer,
+                        content,
                     })
                 }),
             app::UiTask::FileDropDeadline(delay) => {
