@@ -151,7 +151,11 @@ extern "C" {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     pub static kCGWindowOwnerPID: CFStringRef;
+    pub static kCGWindowLayer: CFStringRef;
+    pub static kCGWindowBounds: CFStringRef;
     pub fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> CFArrayRef;
+    pub fn CGRectMakeWithDictionaryRepresentation(dict: CFDictionaryRef, rect: *mut CGRect)
+        -> bool;
 
     pub fn CGEventSourceCreate(state: i32) -> CGEventSourceRef;
     pub fn CGEventSourceButtonState(state: i32, button: u32) -> bool;

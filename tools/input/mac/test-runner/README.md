@@ -87,19 +87,48 @@ capabilities to the job's own processes, so CI runs the helper directly
 The helper refuses whatever it can tell would go astray. These are the cases
 it cannot tell, accepted as they stand:
 
-- **A foreign key panel in an app that does not answer Accessibility.** A key
-  goes to whichever window is key, and a non-activating panel can take the
-  keyboard while Roost stays the front process. Before each key the helper asks
-  every app with a window on screen whether its focused window is key, and
-  refuses if any app but Roost says yes. An app with no Accessibility, an AX
-  error, or no answer in time counts as saying no, so its panel is missed and
-  the key reaches it. The answers are not one snapshot either: an app already
-  asked can take the keyboard while later ones are asked. The 0.25 s
-  `FOREIGN_TIMEOUT` is set on each app's application element only; the
-  `AXFocused` read goes to that app's window element, which waits for the
-  process-wide timeout instead (the system default, or 2 s once an earlier read
-  in the same command has set it), so one app that stops answering delays the
-  key by that much.
+- **A foreign key window, judged by where it is.** A key goes to whichever
+  window is key, and a non-activating panel can take the keyboard while Roost
+  stays the front process. Before each key the helper takes one window list
+  (`CGWindowListCopyWindowInfo`, front to back) and asks every other app with a
+  window on screen whether its focused window is key. A claim refuses the key
+  only when the window it names is *ahead* of Roost's first normal (layer 0)
+  window in that list. The claimed window is found among its app's windows by
+  its frame, every edge within a point of what Accessibility reports; one that
+  matches none or more than one, or an app with a window whose layer or bounds
+  the list does not give, is taken as ahead and refuses. A list entry with no
+  owner pid refuses every key (`unreadable window list entry`); macOS has not
+  been seen to list one. An app's other windows never count, so its status item
+  (a higher layer, never its focused window) cannot make a background claim
+  look ahead. A GPUI or winit app (Zed, a second Roost-Iced) that claims key
+  while inactive, from a window behind Roost's, no longer refuses keys (#604).
+  What this cannot catch:
+  - **An app that does not answer Accessibility.** An AX error or no answer
+    in time counts as not claiming, so its panel is missed and the key reaches
+    it. A stock AppKit non-activating panel in an inactive app is one: it is
+    genuinely key, but its app does not report it as its focused window
+    (measured on macOS 26; the suite's fixture panel answers on purpose). The
+    0.25 s `FOREIGN_TIMEOUT` is set on each app's application element only;
+    the `AXFocused` read goes to that app's window element, which waits for
+    the process-wide timeout instead (the system default, or 2 s once an
+    earlier read in the same command has set it), so one app that stops
+    answering delays the key by that much.
+  - **An ordering race.** The window list and the answers are not one
+    snapshot: a panel ordered front after the list is taken, or an app that
+    takes the keyboard after it was asked, is missed for that event.
+  - **Accessibility and the window list disagreeing by more than a point.**
+    The claimed window then misses its own entry, and a same-app window
+    behind Roost within a point of the reported frame is taken for it. The
+    two agree exactly on the desktops measured.
+  - **A genuinely key window behind Roost.** AppKit does not produce one, but
+    a misbehaving app could take the keyboard from a window behind Roost's,
+    and that claim is passed as harmless.
+- **No window on screen refuses.** A key for an app with no normal window in
+  the window list is refused (`pid N has no window on screen`), even when that
+  app is the front process: there is no window for the key to reach and
+  nothing to judge a claim against. A key posted during a Space transition, or
+  with Roost on another Space, can be refused this way; the suite keys only
+  after its full-screen transitions settle.
 - **Secure Input is observed, not resolved.** Secure Input hides keystrokes from
   event taps; it never redirects them. The helper refuses to post while it is
   on unless the caller passes `allow_secure_input`, and that flag cannot tell

@@ -19,7 +19,8 @@ lists — the helper's own presses, never anything else held down.
 Results map onto three exceptions: :class:`RealInputUnavailable` (a missing
 grant or runner, a locked console — a skip, or a failure under
 ``ROOST_REQUIRE_REAL_INPUT=1``), :class:`RealInputRefused` (the target was not
-frontmost, or not topmost at the point — always a failure) and
+frontmost, had no window on screen, another app claimed the keyboard in front
+of it, or it was not topmost at the point — always a failure) and
 :class:`RealInputError` (anything else). This module is importable without
 pytest, so the lifecycle is unit-tested on any OS.
 """
@@ -62,7 +63,11 @@ class RealInputUnavailable(Exception):
 
 
 class RealInputRefused(AssertionError):
-    """The helper would not post: the target was not frontmost or not topmost."""
+    """The helper would not post: the target was not frontmost, had no window
+    on screen, another app claimed a key window in front of the target's, or
+    the target was not topmost at the point."""
+
+    released: list | None = None
 
 
 class RealInputError(RuntimeError):
@@ -163,7 +168,9 @@ def _classify(command: str, status: int | None, stdout: str, stderr: str) -> dic
     if kind == "unavailable":
         raise RealInputUnavailable(message)
     if kind == "refused":
-        raise RealInputRefused(message)
+        refused = RealInputRefused(message)
+        refused.released = result.get("released")
+        raise refused
     raise RealInputError(f"{message} (kind={kind}, status={status})")
 
 
@@ -419,7 +426,9 @@ class Helper:
             if not release:
                 raise
             if isinstance(error, HELPER_ERRORS):
-                raise type(error)(f"{error}; tracked release: {self._recover(outdir)}") from error
+                wrapped = type(error)(f"{error}; tracked release: {self._recover(outdir)}")
+                wrapped.released = getattr(error, "released", None)
+                raise wrapped from error
             # The outcome could not be read, so the helper may still be
             # running: stop it, as a timeout does, before releasing.
             try:
@@ -520,6 +529,12 @@ class Helper:
         if (reason := readiness(report)) is not None:
             raise RealInputUnavailable(reason)
         return report
+
+    def claimants(self, pid: int) -> dict:
+        """Read only: every other app with a window on screen, whether it
+        claims the keyboard, and whether that is ahead of `pid`'s window —
+        what a `key` for `pid` would be refused over now."""
+        return self.run("claimants", "--pid", str(pid))
 
     def window(self, pid: int) -> dict:
         return self.run("window", "--pid", str(pid))
