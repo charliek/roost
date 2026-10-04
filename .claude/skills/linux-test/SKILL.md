@@ -133,8 +133,8 @@ is what the harness expects.
   IPC-driven drag tests (#606): a hover hijacks the synthetic drag. A test that
   holds a gesture starts with no status toast up (`notice_dump`'s `bottom_line`
   with source `"status"`), or its expiry rewraps the terminal and cancels the
-  gesture (#608). On a timeout, report state, not just "timed out". Once #605
-  lands, `app.window_metrics` carries `window_focused` / `native_focus_losses`:
+  gesture (#608). On a timeout, report state, not just "timed out". `app.window_metrics`
+  carries `window_focused` / `native_focus_losses`:
   retry only when focus losses rose between press and timeout, never blanket.
 
 ### Isolating an agent-in-Roost run

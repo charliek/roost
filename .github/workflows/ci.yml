@@ -1672,8 +1672,9 @@ jobs:
             --junitxml="$ROOST_E2E_ARTIFACT_DIR/junit.xml"
 
       # Proves the suite above ran every scenario and passed each one: a green
-      # pytest exit does not say a scenario was collected, and a skip or a
-      # teardown error recorded beside a pass would not turn the step red.
+      # pytest exit does not say a scenario was collected, and a skip is not a
+      # failure to pytest. (A teardown error does fail the pytest step; the
+      # guard rejects it too, so the two agree.)
       # It restates the JUnit path (env is not inherited across steps) and
       # skips only when the suite step itself did not run.
       - name: Check the Mac real-input JUnit covers every scenario (macOS)

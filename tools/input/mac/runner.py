@@ -84,15 +84,15 @@ def readiness(report: dict) -> str | None:
     locked console, Secure Input already on (someone else's: it blinds the
     event tap and Roost's own toggle can't be told apart from it), or an input
     source other than US, which the key scenarios' expected bytes assume."""
+    session, console = report.get("session") or {}, report.get("console") or {}
+    if not session.get("available"):
+        return "the helper is outside the GUI login session"
     missing = sorted(name for name, granted in report["capabilities"].items() if not granted)
     if missing:
         return f"not granted to the helper: {', '.join(missing)}"
-    session, console = report["session"], report["console"]
-    if not session["available"]:
-        return "the helper is outside the GUI login session"
     if session.get("on_console") is False or console.get("on_console") is False:
         return "the login session is not on the console"
-    if session["locked"] or console.get("locked"):
+    if session.get("locked") or console.get("locked"):
         return "the console is locked"
     if (holder := report.get("secure_input_pid")) is not None:
         return f"Secure Input is already on (ioreg names pid {holder}, the frontmost app)"
@@ -628,16 +628,16 @@ def readiness_report(report: dict, claimants: dict | None) -> tuple[list[str], s
     Only `readiness`'s reasons block. Claimants are information: who would be
     refused for the *current* frontmost app, which says nothing certain about
     the window a test will later target."""
-    capabilities = report["capabilities"]
+    capabilities = report.get("capabilities") or {}
     granted = ", ".join(f"{name}={'yes' if ok else 'NO'}" for name, ok in sorted(capabilities.items()))
-    console, session = report["console"], report["session"]
+    console, session = report.get("console") or {}, report.get("session") or {}
     front = report.get("frontmost") or {}
     lines = [
         f"grants:        {granted}",
-        f"session:       available={session['available']} on_console={session.get('on_console')} "
-        f"locked={session['locked'] or console.get('locked')}",
+        f"session:       available={session.get('available')} on_console={session.get('on_console')} "
+        f"locked={session.get('locked') or console.get('locked')}",
         f"secure input:  {report.get('secure_input_pid') or 'off'}",
-        f"input source:  {report['input_source']}",
+        f"input source:  {report.get('input_source')}",
         f"frontmost:     pid {front.get('pid')} ({front.get('bundle_id')})",
     ]
     for display in report.get("displays", []):

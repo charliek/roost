@@ -71,8 +71,8 @@ class ProblemsTests(unittest.TestCase):
         self.check(suite(case("test_a", '<failure message="boom"/>'), case("test_b"), case("test_c")), "failure")
 
     def test_a_setup_error_beside_a_pass_fails(self) -> None:
-        # pytest writes a passed call and a setup/teardown error as two
-        # <testcase> entries with the same name.
+        # pytest writes a failed call followed by a setup/teardown error as
+        # two <testcase> entries with the same name.
         error = '<error message="failed on setup with fixture"/>'
         xml = suite(case("test_a"), case("test_b"), case("test_c"), case("test_b", error))
         self.check(xml, "<error>", "duplicate")

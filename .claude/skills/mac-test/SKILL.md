@@ -37,7 +37,11 @@ state are all per GUI session.
   section).
 - `cargo build -p roost-cli` before any e2e or hand-driven probe: the harness
   reuses an existing `target/debug/roostctl` and does not rebuild a stale one.
-  `make e2e-iced*` do it for you; a bare `pytest` does not.
+  Only `make e2e-iced`, `e2e-iced-ci`, `e2e-session` and the `e2e-host-*` /
+  `e2e-local-backend` / `e2e-old-session` lanes build it. `e2e-iced-exit`,
+  `e2e-iced-menu-quit`, `e2e-iced-clipboard`, `e2e-iced-release-ci`,
+  `e2e-iced-bundle`, `e2e-iced-sparkle`, `e2e-mac*`, `e2e-iced-real-input-mac`
+  and a bare `pytest` do not: build `roost-cli` first for those.
 
 ## Don't break the human's session
 
@@ -115,12 +119,20 @@ nohup sh -c 'cargo build -p roost-cli && make bundle-iced' > /tmp/roost-build.lo
 # poll until `tail /tmp/roost-build.log` shows the bundle finished and the job is gone
 ```
 
+Every hand-driven `roostctl` command here goes through `rc`, because an
+inherited `ROOST_SOCKET` outranks `--target` and would address the Roost app
+hosting your own shell, not the one you launched:
+
+```bash
+rc() { env -u ROOST_SOCKET -u ROOST_TAB_ID target/debug/roostctl "$@"; }
+```
+
 Iced app, with its dev session. `open` returns at once, so wait for the socket:
 
 ```bash
 open -n mac/build/Roost-Iced.app
 for i in $(seq 1 30); do
-  target/debug/roostctl --target iced identify --json >/tmp/identify.json 2>/dev/null && break
+  rc --target iced identify --json >/tmp/identify.json 2>/dev/null && break
   sleep 2
 done
 cat /tmp/identify.json   # bounded: 60 s. Check local_session_socket contains RoostSessionDev
@@ -129,17 +141,26 @@ cat /tmp/identify.json   # bounded: 60 s. Check local_session_socket contains Ro
 Plain `identify` (no `--json`) omits `local_session_socket`. Note the `pid` field.
 
 Quit the dev app by that pid, never by name or bundle id (the installed app
-shares both): `kill <pid>` (SIGTERM). The dev `roost-session` it started
-**outlives the app**; stop it with `target/debug/roostctl --target iced session
-stop` (a debug `roostctl` stops only the `RoostSessionDev` one). The installed
-app's session is untouched.
+shares both). An answering socket does not prove the pid is yours, so first
+check its executable is inside the bundle you launched:
+
+```bash
+ps -p <pid> -o command=   # must start with <repo>/mac/build/Roost-Iced.app/Contents/MacOS/
+kill <pid>                # SIGTERM, only if it did
+```
+
+The dev `roost-session` it started **outlives the app**; stop it with
+`rc --target iced session stop`. A debug `roostctl` stops only the
+`RoostSessionDev` one, unless `ROOST_TEST_SESSION_DIR_NAMES` is set (it
+overrides the debug separation, so leave it unset here). The installed app's
+session is untouched.
 
 Swift app: `make bundle`, quit the running `Roost.app`, `open mac/build/Roost.app`,
-then `target/debug/roostctl --target mac identify`.
+then `rc --target mac identify`.
 
 ## See the app
 
-- `roostctl --target iced screenshot --out /tmp/shot.png`: rendered in-process,
+- `rc --target iced screenshot --out /tmp/shot.png`: rendered in-process,
   no OS permission, works unfocused or occluded. It captures the main window
   only. Under the GL fallback renderer it can return geometry without text
   (#496): check the `Selected: AdapterInfo` line in
@@ -197,9 +218,8 @@ Check `notice_dump`'s `bottom_line` source is not `"status"`, or the toast's
 expiry rewraps the terminal and cancels the gesture.
 
 On a timeout, report state, not just "timed out": the viewport, selection and
-what the helper last saw. Once #605 lands, `app.window_metrics` will carry
-`window_focused` and `native_focus_losses`, which tell OS focus churn from a real
-failure; retry only when focus losses rose between press and timeout, never as a
+what the helper last saw. `app.window_metrics` carries `window_focused` and
+`native_focus_losses`, which tell OS focus churn from a real failure; retry only when focus losses rose between press and timeout, never as a
 blanket retry, and `_hold_state` in `test_selection_autoscroll.py` is the
 pattern to copy.
 
@@ -219,21 +239,27 @@ which is why the runner works remotely. Leave `ROOST_REAL_INPUT_MODE` unset.
 **Shell.** Run everything through the user's login shell and prepend
 `~/.cargo/bin` on every call (it is missing under bash too, and state does not
 persist). Define one local helper and use it for every remote command. The
-command is a single-quoted argument to `rr`; `$HOME` and `$PATH` expand on the
-Mac, while `$MAC_REPO` is expanded locally, because the helper splices it in:
+string passes through two parsers on the Mac (the ssh login shell, then the
+inner `"$SHELL" -lc`), so the helper quotes with `printf '%q'` once per layer.
+`$MAC_REPO` may hold spaces, `'`, `$` or backticks, and the command passed to
+`rr` may contain single quotes; it is run as written, so `$HOME` and `$PATH`
+inside it expand on the Mac:
 
 ```bash
 rr() {  # usage: rr '<command run in $MAC_REPO>'
-  ssh "$MAC_HOST" "exec \"\$SHELL\" -lc 'export PATH=\"\$HOME/.cargo/bin:\$PATH\"; cd \"$MAC_REPO\" && $1'"
+  local inner
+  inner='export PATH="$HOME/.cargo/bin:$PATH"; cd '"$(printf '%q' "$MAC_REPO")"' && '"$1"
+  ssh "$MAC_HOST" 'exec "$SHELL" -lc '"$(printf '%q' "$inner")"
 }
 rr 'command -v cargo uv zig && git rev-parse HEAD'    # compare with TEST_SHA
 ```
 
-Commands passed to `rr` must not contain single quotes; for those, write a small
-script file on the Mac and run it. Start long work with `rr 'nohup make ... >
+The helper works under a local bash or zsh. The Mac's login shell may be zsh or
+bash: the helper emits only backslash escapes (and `$'...'` for control
+characters), which both accept. Start long work with `rr 'nohup make ... >
 /tmp/run.log 2>&1 &'` so `nohup` runs inside the login shell (from the bare ssh
-shell `uv` is missing). `MAC_REPO` must be an absolute path on the Mac (a leading `~` is not
-expanded inside the quotes).
+shell `uv` is missing). `MAC_REPO` must be an absolute path on the Mac (a leading
+`~` is not expanded).
 
 **Sync.** Never modify the Mac's working branch; check out the commit detached.
 First check the tree is clean, and stop and report if it is not:
@@ -261,7 +287,7 @@ paste the value); replace `<branch>` with the real branch name.
 nothing over ssh fixes it.
 
 **One lock owner.** The real-input lane takes `/tmp/roost-real-input.lock`
-itself (`flock`, non-blocking), so **never wrap it**; wrapping deadlocks it.
+itself (`flock`, non-blocking), so **never wrap it**; wrapping it makes the run refuse to start.
 Every other UI lane on a Mac that also runs real input goes under the same lock.
 Stock macOS has no `flock(1)`, so use Python:
 

@@ -71,32 +71,52 @@ MACOS_STEP = "Run Iced functional E2E (macOS)"
 REAL_INPUT_TARGET = "e2e-iced-real-input-mac"
 
 
-def makefile_lists() -> dict[str, list[str]]:
+def logical_lines(text: str) -> list[str]:
+    """Make's view of a file: backslash continuations joined, `#` comments dropped."""
+    joined: list[str] = []
+    pending = ""
+    for line in text.splitlines():
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        joined.append(pending + line)
+        pending = ""
+    if pending:
+        joined.append(pending)
+    return [line.split("#", 1)[0].rstrip() if "#" in line else line for line in joined]
+
+
+ASSIGNMENT = re.compile(r"(?:(override|export)\s+)?([A-Z][A-Z0-9_]*_TESTS)\s*(\S*?)=\s*(.*)$")
+DEFINE = re.compile(r"(?:override\s+)?define\s+[A-Z][A-Z0-9_]*_TESTS\b")
+REFERENCE = re.compile(r"\$[({][A-Z][A-Z0-9_]*_TESTS[)}]")
+
+
+def parse_makefile_lists(text: str) -> dict[str, list[str]]:
+    """Every `*_TESTS` variable's modules. `=`, `:=`, `::=` replace and `+=`
+    appends; a form this parser cannot honour (`?=`, `!=`, `define`, a prefix,
+    a reference to another list) raises rather than guessing."""
     lists: dict[str, list[str]] = {}
-    for line in MAKEFILE.read_text().splitlines():
-        match = re.match(r"([A-Z][A-Z0-9_]*_TESTS)\s*:?=\s*(.*)$", line)
-        if match:
-            lists[match.group(1)] = MODULE.findall(match.group(2))
+    for line in logical_lines(text):
+        if DEFINE.match(line):
+            raise AssertionError(f"unsupported Makefile `define` of a list: {line!r}")
+        match = ASSIGNMENT.match(line)
+        if not match:
+            continue
+        prefix, name, operator, value = match.groups()
+        if prefix or operator not in ("", ":", "::", "+"):
+            raise AssertionError(f"unsupported assignment to {name}: {line!r}")
+        if REFERENCE.search(value):
+            raise AssertionError(f"{name} references another list, which this parser does not expand")
+        modules = MODULE.findall(value)
+        if operator == "+":
+            lists.setdefault(name, []).extend(modules)
+        else:
+            lists[name] = modules
     return lists
 
 
-def ci_step_modules(name: str) -> list[str]:
-    lines = CI.read_text().splitlines()
-    start = next((i for i, line in enumerate(lines) if line.strip() == f"- name: {name}"), None)
-    if start is None:
-        raise AssertionError(f"ci.yml has no step named {name!r}")
-    modules: list[str] = []
-    for line in lines[start + 1 :]:
-        if line.startswith("      - name:"):
-            break
-        if line.lstrip().startswith("#"):
-            continue
-        modules += MODULE.findall(line)
-    return modules
-
-
-def makefile_recipe_modules(target: str) -> list[str]:
-    lines = MAKEFILE.read_text().splitlines()
+def parse_recipe_modules(text: str, target: str) -> list[str]:
+    lines = logical_lines(text)
     start = next((i for i, line in enumerate(lines) if line.startswith(f"{target}:")), None)
     if start is None:
         raise AssertionError(f"Makefile has no target {target!r}")
@@ -108,8 +128,99 @@ def makefile_recipe_modules(target: str) -> list[str]:
     return modules
 
 
+def makefile_lists() -> dict[str, list[str]]:
+    return parse_makefile_lists(MAKEFILE.read_text())
+
+
+def ci_step_modules(name: str) -> list[str]:
+    return parse_ci_step_modules(CI.read_text(), name)
+
+
+def parse_ci_step_modules(text: str, name: str) -> list[str]:
+    lines = text.splitlines()
+    start = next((i for i, line in enumerate(lines) if line.strip() == f"- name: {name}"), None)
+    if start is None:
+        raise AssertionError(f"ci.yml has no step named {name!r}")
+    modules: list[str] = []
+    for line in lines[start + 1 :]:
+        if line.startswith("      - name:"):
+            break
+        if line.lstrip().startswith("#"):
+            continue
+        modules += MODULE.findall(re.split(r"\s#", line, maxsplit=1)[0])
+    return modules
+
+
+def makefile_recipe_modules(target: str) -> list[str]:
+    return parse_recipe_modules(MAKEFILE.read_text(), target)
+
+
 def on_disk() -> set[str]:
     return {f"tools/roosttest/{path.name}" for path in ROOSTTEST.glob("test_*.py")}
+
+
+LANE = "tools/roosttest/test_a.py"
+OTHER = "tools/roosttest/test_b.py"
+
+
+class MakefileParserTests(unittest.TestCase):
+    def test_a_commented_out_value_is_empty(self) -> None:
+        text = f"LOCAL_BACKEND_E2E_TESTS := # {LANE}\n"
+        self.assertEqual(parse_makefile_lists(text), {"LOCAL_BACKEND_E2E_TESTS": []})
+
+    def test_a_trailing_comment_is_dropped(self) -> None:
+        text = f"X_TESTS := {LANE} # {OTHER}\n"
+        self.assertEqual(parse_makefile_lists(text)["X_TESTS"], [LANE])
+
+    def test_an_append_extends_the_variable(self) -> None:
+        text = f"ICED_E2E_TESTS := {LANE}\nICED_E2E_TESTS += {OTHER}\n"
+        self.assertEqual(parse_makefile_lists(text)["ICED_E2E_TESTS"], [LANE, OTHER])
+
+    def test_an_append_with_no_prior_definition_starts_the_list(self) -> None:
+        self.assertEqual(parse_makefile_lists(f"X_TESTS += {LANE}\n")["X_TESTS"], [LANE])
+
+    def test_a_plain_reassignment_replaces(self) -> None:
+        text = f"X_TESTS = {LANE}\nX_TESTS := {OTHER}\n"
+        self.assertEqual(parse_makefile_lists(text)["X_TESTS"], [OTHER])
+
+    def test_a_continuation_line_joins_the_value(self) -> None:
+        text = f"LOCAL_BACKEND_E2E_TESTS := {LANE} \\\n    {OTHER}\n"
+        self.assertEqual(parse_makefile_lists(text)["LOCAL_BACKEND_E2E_TESTS"], [LANE, OTHER])
+
+    def test_a_continuation_after_a_comment_is_still_a_comment(self) -> None:
+        text = f"X_TESTS := {LANE} # note \\\n {OTHER}\nY_TESTS := {OTHER}\n"
+        self.assertEqual(parse_makefile_lists(text), {"X_TESTS": [LANE], "Y_TESTS": [OTHER]})
+
+    def test_unsupported_forms_fail(self) -> None:
+        for text in (
+            f"X_TESTS ?= {LANE}\n",
+            f"X_TESTS != echo {LANE}\n",
+            f"define X_TESTS\n{LANE}\nendef\n",
+            f"override X_TESTS := {LANE}\n",
+            f"export X_TESTS := {LANE}\n",
+            f"X_TESTS := {LANE}\nY_TESTS := $(X_TESTS) {OTHER}\n",
+        ):
+            with self.subTest(text=text), self.assertRaises(AssertionError):
+                parse_makefile_lists(text)
+
+    def test_recipe_comments_do_not_count(self) -> None:
+        text = f"t:\n\tpytest {LANE}\n\t# pytest {OTHER}\n\tpytest x # {OTHER}\nnext:\n"
+        self.assertEqual(parse_recipe_modules(text, "t"), [LANE])
+
+    def test_recipe_continuations_join(self) -> None:
+        text = f"t:\n\tpytest {LANE} \\\n\t  {OTHER}\n"
+        self.assertEqual(parse_recipe_modules(text, "t"), [LANE, OTHER])
+
+    def test_ci_step_comments_do_not_count(self) -> None:
+        text = (
+            "      - name: Lane\n"
+            "        run: >\n"
+            f"          pytest {LANE}\n"
+            f"          # {OTHER}\n"
+            f"          {LANE.replace('test_a', 'test_c')} # {OTHER}\n"
+            "      - name: Next\n"
+        )
+        self.assertEqual(parse_ci_step_modules(text, "Lane"), [LANE, "tools/roosttest/test_c.py"])
 
 
 class ListTests(unittest.TestCase):

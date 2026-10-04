@@ -52,8 +52,12 @@ sudo apt-get install -y \
 
 ```bash
 make e2e-iced       # the curated ICED_E2E_TESTS lane against a dev build
-make e2e-iced-ci    # same lane, fresh + isolated state (CI parity — sets ROOST_TEST_MODE)
+make e2e-iced-ci    # same lane, fresh harness UI (CI parity — sets ROOST_TEST_MODE)
 ```
+
+Neither bare command isolates your user's XDG dirs: the dev `roost-iced` profile
+still reads your real state and runtime dir. Use the isolated form below when
+that matters.
 
 On a live COSMIC session `$WAYLAND_DISPLAY` is already set, so these targets
 will run against it directly with no weston needed, but **prefer
@@ -88,16 +92,21 @@ More lanes and rules (shared with `linux-test`, which has the full text):
   (#606), and start a gesture test with no status toast up (#608).
 - For Mac work (including real input on macOS) use the `mac-test` skill.
 
-Or reach for the pieces directly, isolated so a run never touches your real
-workspace:
+Or run the curated lane isolated, so a run never touches your real workspace:
 
 ```bash
 RUN=$(mktemp -d)
-XDG_RUNTIME_DIR="$RUN/rt" XDG_DATA_HOME="$RUN/data" XDG_STATE_HOME="$RUN/state" \
-  ROOST_TEST_MODE=1 ROOST_TEST_TIMEOUT_SCALE=3 \
-  tools/wayland/weston-run.sh \
-  uv run --group test pytest tools/roosttest --roost-target iced --roost-fresh -q
+env -u HERDR_ENV -u TMUX -u ROOST_SOCKET -u ROOST_TAB_ID \
+  XDG_RUNTIME_DIR="$RUN/rt" XDG_DATA_HOME="$RUN/data" XDG_STATE_HOME="$RUN/state" \
+  XDG_CACHE_HOME="$RUN/cache" XDG_CONFIG_HOME="$RUN/config" \
+  ROOST_TEST_TIMEOUT_SCALE=3 \
+  tools/wayland/weston-run.sh make e2e-iced-ci
 ```
+
+For a hand-picked module set, replace the last line with
+`uv run --group test pytest <modules> -m 'not session_daemon and not host_client' --roost-target iced --roost-fresh -q`
+(the Makefile's `DAEMON_E2E_DESELECT`); never the whole `tools/roosttest`
+directory, which includes dedicated-lane and host modules.
 
 - **Isolate `XDG_RUNTIME_DIR`, `XDG_DATA_HOME`, `XDG_STATE_HOME`,
   `XDG_CACHE_HOME` and `XDG_CONFIG_HOME`** to a scratch dir (plus `ROOST_CONFIG`
@@ -129,6 +138,8 @@ untouched:
 # socket from the same XDG vars, so a prefix on only the UI line would
 # leave every roostctl below dialing the normal namespace instead.
 export XDG_RUNTIME_DIR="$RUN/rt" XDG_DATA_HOME="$RUN/data" XDG_STATE_HOME="$RUN/state"
+# An inherited ROOST_SOCKET outranks --target, so clear it (and the tab id) too.
+unset ROOST_SOCKET ROOST_TAB_ID
 ROOST_TEST_MODE=1 ./target/debug/roost-iced > "$RUN/roost.log" 2>&1 &
 rc=./target/debug/roostctl                # the repo build; bare `roostctl` needs a PATH install
 $rc --target iced identify                # wait for the socket

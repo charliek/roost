@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import io
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "input" / "mac"))
@@ -60,6 +63,37 @@ class ReadinessReportTests(unittest.TestCase):
         for name, report in cases.items():
             with self.subTest(name):
                 self.assertIsNotNone(runner.readiness_report(report, None)[1])
+
+    def test_an_unavailable_session_reports_the_gui_session_blocker(self) -> None:
+        report = variant(session={"available": False})
+        lines, blocker = runner.readiness_report(report, None)
+        self.assertEqual(blocker, "the helper is outside the GUI login session")
+        self.assertTrue(any("available=False" in line for line in lines))
+
+    def test_check_exits_nonzero_without_a_traceback_when_unavailable(self) -> None:
+        report = variant(session={"available": False})
+
+        class FakeHelper:
+            def __init__(self, _artifacts) -> None:
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc) -> None:
+                return None
+
+            def preflight(self):
+                return report
+
+            def claimants(self, _pid):
+                return {"claimants": []}
+
+        out = io.StringIO()
+        with mock.patch.object(runner, "Helper", FakeHelper), contextlib.redirect_stdout(out):
+            code = runner.check(Path("."))
+        self.assertEqual(code, 1)
+        self.assertIn("outside the GUI login session", out.getvalue())
 
 
 if __name__ == "__main__":
