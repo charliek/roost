@@ -428,6 +428,9 @@ pub struct TerminalSnapshot {
     /// set, cleared by OSC 112) is `None`. Mac parity: both fall back
     /// to `theme.cursor`, not `foreground`.
     pub cursor_color: ColorRgb,
+    /// The theme's `cursor-text`: the ink of the glyph under a block
+    /// cursor, when it differs from the cursor's fill (see [`cell_ink`]).
+    pub cursor_text: Option<ColorRgb>,
     /// Indexed by viewport row; `grid.len() == rows`.
     pub grid: Vec<Arc<RenderedRow>>,
     pub selection_background: ColorRgb,
@@ -465,6 +468,7 @@ impl TerminalSnapshot {
                 g: 218,
                 b: 224,
             },
+            cursor_text: None,
             grid: vec![blank_row; usize::from(rows)],
             selection_background: ColorRgb {
                 r: 72,
@@ -492,6 +496,7 @@ impl TerminalSnapshot {
             foreground: theme.foreground,
             background: theme.background,
             cursor_color: theme.cursor,
+            cursor_text: theme.cursor_text,
             selection_background: theme.selection_background,
             selection_foreground: theme.selection_foreground,
             ..Self::blank(cols, rows)
@@ -601,8 +606,10 @@ impl BlockCursor {
 }
 
 /// The ink at (`row`, `col`) by role, the first match winning: under the
-/// block cursor, the terminal background (the inverted glyph, as Swift's
-/// `drawCursorBlock` and Ghostty draw it); inside the row's selection
+/// block cursor, the theme's `cursor-text`, or the terminal background (the
+/// inverted glyph, as Swift's `drawCursorBlock` and Ghostty draw it) when
+/// that is absent or equals the cursor's fill, which would hide the glyph;
+/// inside the row's selection
 /// (see [`TerminalSnapshot::selection_on`]), the theme's
 /// `selection-foreground`; otherwise `own`, the cell's resolved
 /// foreground.
@@ -614,8 +621,11 @@ fn cell_ink(
     selection: Option<SelectionSpan>,
     snapshot: &TerminalSnapshot,
 ) -> ColorRgb {
-    if cursor.is_some_and(|cursor| cursor.covers(row, col)) {
-        snapshot.background
+    if let Some(cursor) = cursor.filter(|cursor| cursor.covers(row, col)) {
+        snapshot
+            .cursor_text
+            .filter(|text| *text != cursor.color)
+            .unwrap_or(snapshot.background)
     } else if selection.is_some_and(|span| (span.col0..span.col1).contains(&col)) {
         snapshot.selection_foreground
     } else {
@@ -1840,6 +1850,53 @@ mod tests {
             ..cursor
         });
         assert_eq!(snapshot.block_cursor(true), None, "DECTCEM hidden");
+    }
+
+    #[test]
+    fn a_themes_cursor_text_inks_the_glyph_under_the_block_cursor() {
+        let mut snapshot = cursor_snapshot(2, 1, vec![draw_cell(0, "X"), draw_cell(1, "Y")]);
+        let text = ColorRgb { r: 9, g: 8, b: 7 };
+        snapshot.cursor_text = Some(text);
+        assert_eq!(
+            ink_by_col(&snapshot, true),
+            vec![(0, OWN_INK, false), (1, text, false)]
+        );
+    }
+
+    #[test]
+    fn without_a_cursor_text_the_glyph_takes_the_background() {
+        let mut snapshot = cursor_snapshot(2, 1, vec![draw_cell(0, "X"), draw_cell(1, "Y")]);
+        snapshot.cursor_text = None;
+        assert_eq!(
+            ink_by_col(&snapshot, true),
+            vec![(0, OWN_INK, false), (1, snapshot.background, false)]
+        );
+    }
+
+    #[test]
+    fn a_cursor_text_equal_to_the_cursor_fill_falls_back_to_the_background() {
+        let mut snapshot = cursor_snapshot(2, 1, vec![draw_cell(1, "Y")]);
+        snapshot.cursor_text = Some(CURSOR);
+        assert_eq!(
+            ink_by_col(&snapshot, true),
+            vec![(1, snapshot.background, false)]
+        );
+    }
+
+    #[test]
+    fn the_osc12_fill_decides_whether_cursor_text_is_hidden() {
+        let theme_cursor = ColorRgb { r: 1, g: 1, b: 1 };
+        let mut snapshot = cursor_snapshot(2, 1, vec![draw_cell(1, "Y")]);
+        snapshot.cursor_color = theme_cursor;
+        snapshot.cursor_text = Some(theme_cursor);
+        // OSC 12 moved the fill off the theme cursor: the text is visible.
+        assert_eq!(ink_by_col(&snapshot, true), vec![(1, theme_cursor, false)]);
+        // OSC 12 moved the fill onto the text color: it would vanish.
+        snapshot.cursor_text = Some(CURSOR);
+        assert_eq!(
+            ink_by_col(&snapshot, true),
+            vec![(1, snapshot.background, false)]
+        );
     }
 
     #[test]
