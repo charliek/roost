@@ -89,6 +89,12 @@ def _assert_one_run(rows: list[int], first: int, last: int) -> None:
 
 
 def _drag(roost, tab: int, kind: str, cell: tuple[int, int], overshoot: int = 0) -> None:
+    if kind == "press":
+        # A focus loss cancels the drag and the tick scrolls only a focused
+        # window. On a CI runner the app's own activation churn (an earlier
+        # module activating it) can unfocus the window after the fixture
+        # focused it, so focus it again right before the gesture starts.
+        roost.app_set_window_focus(focus=True)
     roost.tab_dispatch_mouse_event(
         tab, kind=kind, button="left", cell_x=cell[0], cell_y=cell[1], overshoot=overshoot
     )
