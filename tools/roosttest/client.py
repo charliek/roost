@@ -50,7 +50,8 @@ class Roost:
                  deadline: float | None = None):
         """`timeout` bounds each socket operation; `deadline`, when given,
         bounds each `call` as a whole — a reply trickling in under `timeout`
-        a chunk at a time cannot outlast it."""
+        a chunk at a time cannot outlast it. A call past its deadline raises
+        `Timeout` and closes the client."""
         self.path = str(socket_path)
         self._next_id = 0
         self._buf = b""
@@ -93,19 +94,32 @@ class Roost:
 
     def _readline(self, ends: float | None = None) -> str:
         while b"\n" not in self._buf:
+            by_deadline = False
             if ends is not None:
                 remaining = ends - time.monotonic()
                 if remaining <= 0:
-                    raise Timeout(f"no complete reply from {self.path} within {self._deadline}s")
-                self._sock.settimeout(
-                    remaining if self._timeout is None else min(remaining, self._timeout)
-                )
-            chunk = self._sock.recv(1 << 16)
+                    raise self._past_deadline()
+                by_deadline = self._timeout is None or remaining <= self._timeout
+                self._sock.settimeout(remaining if by_deadline else self._timeout)
+            try:
+                chunk = self._sock.recv(1 << 16)
+            except socket.timeout:
+                if by_deadline:
+                    raise self._past_deadline() from None
+                raise
             if not chunk:
                 raise RoostError("disconnected", "socket closed mid-response")
             self._buf += chunk
         line, self._buf = self._buf.split(b"\n", 1)
         return line.decode()
+
+    def _past_deadline(self) -> Timeout:
+        """The reply may still arrive, and nothing matches a reply to its
+        request's id, so the connection goes with the call: a late reply
+        must not read as the next call's."""
+        self._buf = b""
+        self.close()
+        return Timeout(f"no complete reply from {self.path} within {self._deadline}s")
 
     # -- ops --------------------------------------------------------------
     def identify(self) -> dict:

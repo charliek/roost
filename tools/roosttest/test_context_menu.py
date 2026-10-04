@@ -277,7 +277,14 @@ def test_a_project_rows_new_tab_opens_where_the_gesture_would_on_the_session_bac
     with _session_backend_ui(target) as roost:
         project = roost.create_project(name=f"pytest-{uuid.uuid4().hex[:8]}", cwd="/tmp")
         other = roost.create_project(name=f"pytest-{uuid.uuid4().hex[:8]}", cwd="/tmp")
-        _opens_where_new_tab_does(roost, project, other)
+        try:
+            _opens_where_new_tab_does(roost, project, other)
+        finally:
+            # Best-effort: a UI or session that died mid-test must not mask
+            # the failure that killed it.
+            for doomed in (other, project):
+                with contextlib.suppress(OSError, RoostError):
+                    roost.delete_project(doomed)
 
 
 def test_close_tab_closes_it(roost, project):

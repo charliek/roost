@@ -611,34 +611,31 @@ impl RoostConfig {
                     }
                 }
                 "macos-auto-secure-input" => {
-                    if let Some(v) = parse_bool_like(value) {
-                        cfg.macos_auto_secure_input = v;
-                    } else {
+                    cfg.macos_auto_secure_input = parse_bool_like(value).unwrap_or_else(|| {
                         tracing::warn!(
                             value,
                             "unknown macos-auto-secure-input value; falling back to default `true`"
                         );
-                    }
+                        true
+                    });
                 }
                 "macos-secure-input-indication" => {
-                    if let Some(v) = parse_bool_like(value) {
-                        cfg.macos_secure_input_indication = v;
-                    } else {
+                    cfg.macos_secure_input_indication = parse_bool_like(value).unwrap_or_else(|| {
                         tracing::warn!(
                             value,
                             "unknown macos-secure-input-indication value; falling back to default `true`"
                         );
-                    }
+                        true
+                    });
                 }
                 "macos-secure-keyboard-entry" => {
-                    if let Some(v) = parse_bool_like(value) {
-                        cfg.macos_secure_keyboard_entry = v;
-                    } else {
+                    cfg.macos_secure_keyboard_entry = parse_bool_like(value).unwrap_or_else(|| {
                         tracing::warn!(
                             value,
                             "unknown macos-secure-keyboard-entry value; falling back to default `false`"
                         );
-                    }
+                        false
+                    });
                 }
                 "agent-hooks" => {
                     // Empty (`Some(Ask)`) is silent — a fresh install
@@ -1629,6 +1626,26 @@ mod tests {
         assert!(cfg.macos_auto_secure_input);
         assert!(cfg.macos_secure_input_indication);
         assert!(!cfg.macos_secure_keyboard_entry);
+    }
+
+    /// Last line wins, and an unparseable last line is the default — not
+    /// whatever an earlier line set.
+    #[test]
+    fn an_unknown_secure_input_value_after_a_valid_one_restores_default() {
+        let cfg = RoostConfig::parse(
+            "macos-auto-secure-input = false\nmacos-auto-secure-input = pancakes\n\
+             macos-secure-input-indication = false\nmacos-secure-input-indication = on\n\
+             macos-secure-keyboard-entry = true\nmacos-secure-keyboard-entry = 1\n",
+        );
+        assert!(cfg.macos_auto_secure_input, "macos-auto-secure-input");
+        assert!(
+            cfg.macos_secure_input_indication,
+            "macos-secure-input-indication"
+        );
+        assert!(
+            !cfg.macos_secure_keyboard_entry,
+            "macos-secure-keyboard-entry"
+        );
     }
 
     // ----- agent-hooks (plan 064 §3.1; supersedes plan 046 §3.6) -----

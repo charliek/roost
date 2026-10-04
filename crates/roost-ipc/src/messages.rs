@@ -1448,7 +1448,7 @@ pub struct AppSecureInputParams {}
 /// Secure Keyboard Entry as the UI's owner holds it: the inputs it last
 /// applied, what they asked for, and what it got.
 ///
-/// `desired == app_active && (manual || (auto && password_input))`;
+/// `desired == (app_active && (manual || (auto && password_input)))`;
 /// `owned` is whether Roost holds an `EnableSecureEventInput` that
 /// succeeded; `indicator` is whether the tab band draws the lock, which
 /// is `owned` under `macos-secure-input-indication = true`.

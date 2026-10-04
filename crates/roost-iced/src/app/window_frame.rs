@@ -247,7 +247,7 @@ impl WindowFrameMemory {
     /// size it read back. The read-back mode and size are adopted only for
     /// the latest arm with no resize or mode change delivered since it
     /// (`changes`); the frame is saved by [`Self::save_due`]'s rules
-    /// either way.
+    /// either way, at the size the events left when the read-back is older.
     pub(super) fn deadline_answered(
         &mut self,
         workspace: &Workspace,
@@ -268,10 +268,10 @@ impl WindowFrameMemory {
                 "window frame: deadline read back before a newer resize or mode"
             );
         }
-        let won = self.save_due(workspace, generation, outer, Some(content));
+        let won = self.save_due(workspace, generation, outer, current.then_some(content));
         DeadlineAnswer {
             mode: current.then_some(mode),
-            regrid: missed_resize(won.filter(|_| current), gridded),
+            regrid: missed_resize(won, gridded),
         }
     }
 
@@ -903,6 +903,12 @@ mod tests {
             created,
         );
         assert_eq!(answer.regrid, None, "the resize came after the read-back");
+        assert_eq!(
+            workspace.window_frame(),
+            Some(FRAME),
+            "the read-back size is older than the resize back to the created size"
+        );
+        assert_eq!(memory.content, created);
     }
 
     #[test]

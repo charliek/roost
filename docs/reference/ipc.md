@@ -2166,7 +2166,7 @@ Request: `{"params": {}}`. Response:
 - `app_active` is `NSApp.isActive` as read the last time the owner
   applied. A bare binary on a CI runner may never be active, so assert
   the formula against the reported inputs rather than an outcome:
-  `desired == app_active && (manual || (auto && password_input))`.
+  `desired == (app_active && (manual || (auto && password_input)))`.
 - `owned` is whether Roost holds an `EnableSecureEventInput` that
   succeeded: `desired`, unless the call failed.
 - `indicator` is `owned` while `macos-secure-input-indication` is on,
