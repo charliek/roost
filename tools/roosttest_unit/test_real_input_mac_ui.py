@@ -30,6 +30,7 @@ sys.path.insert(0, str(REPO / "tools" / "roosttest"))
 
 import real_input_ui  # noqa: E402
 import ui  # noqa: E402
+from test_real_input_mac_scenarios import scenarios_and_tests  # noqa: E402
 
 APP = Path("/Volumes/x/roost/mac/build/Roost-Iced.app")
 EXE = f"{APP}/Contents/MacOS/Roost-Iced"
@@ -365,7 +366,8 @@ class RequiredModeTests(unittest.TestCase):
     def test_an_ordinary_run_skips(self) -> None:
         result = self.run_module(required=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("1 skipped", result.stdout)
+        scenarios, _ = scenarios_and_tests()
+        self.assertIn(f"{len(scenarios)} skipped", result.stdout)
 
     def test_a_required_run_fails(self) -> None:
         result = self.run_module(required=True)

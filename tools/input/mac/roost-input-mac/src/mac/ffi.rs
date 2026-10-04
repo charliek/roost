@@ -189,6 +189,10 @@ extern "C" {
 
     pub fn CGSessionCopyCurrentDictionary() -> CFDictionaryRef;
 
+    pub fn CGMainDisplayID() -> u32;
+    pub fn CGGetActiveDisplayList(max_displays: u32, displays: *mut u32, count: *mut u32) -> i32;
+    pub fn CGDisplayBounds(display: u32) -> CGRect;
+
     pub fn CGPreflightPostEventAccess() -> bool;
     pub fn CGPreflightListenEventAccess() -> bool;
     pub fn CGPreflightScreenCaptureAccess() -> bool;

@@ -1,8 +1,9 @@
 //! What the desktop looks like to this process: its grants (read-only checks;
 //! nothing here may ask for one, because the request APIs raise a dialog), the
-//! console session, the frontmost app, who holds Secure Input, and the input
-//! source.
+//! console session, the frontmost app, who holds Secure Input, the input
+//! source and the displays.
 
+use super::ax::rect_json;
 use super::cf::{self, Cf};
 use super::ffi::*;
 use crate::Outcome;
@@ -153,6 +154,28 @@ pub fn posting_session() -> crate::input::Session {
     }
 }
 
+/// The active displays' bounds, in the global top-left points AX frames
+/// and CGEvent use, so a window's frame can be checked against them.
+fn displays() -> Value {
+    const MAX: usize = 16;
+    let mut ids = [0u32; MAX];
+    let mut count = 0u32;
+    // SAFETY: writes at most MAX ids into `ids` and their number into `count`.
+    if unsafe { CGGetActiveDisplayList(MAX as u32, ids.as_mut_ptr(), &mut count) } != 0 {
+        return Value::Null;
+    }
+    // SAFETY: plain display queries.
+    let main = unsafe { CGMainDisplayID() };
+    ids[..(count as usize).min(MAX)]
+        .iter()
+        .map(|&id| {
+            // SAFETY: a plain display query.
+            let bounds = unsafe { CGDisplayBounds(id) };
+            json!({"id": id, "main": id == main, "bounds": rect_json(bounds)})
+        })
+        .collect()
+}
+
 pub fn alive(pid: i32) -> bool {
     // SAFETY: signal 0 only checks for existence.
     unsafe { kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1) }
@@ -187,6 +210,7 @@ pub fn preflight(pid: Option<i32>) -> Outcome {
         "frontmost": front.as_ref().map(|app| json!({"pid": app.pid, "bundle_id": app.bundle_id})),
         "secure_input_pid": secure_input_pid,
         "input_source": input_source(),
+        "displays": displays(),
     });
     if let Some(pid) = pid {
         report["target"] = json!({

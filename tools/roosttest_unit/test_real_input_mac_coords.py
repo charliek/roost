@@ -126,5 +126,43 @@ class SanityTests(unittest.TestCase):
             coords.Metrics.from_window_metrics(absent)
 
 
+class DisplayTests(unittest.TestCase):
+    """A window "on a screen" for the window-frame scenario: all of it on one
+    active display, which may sit at negative global coordinates."""
+
+    MAIN = coords.Frame(0.0, 0.0, 1920.0, 1080.0)
+    LEFT = coords.Frame(-1440.0, -300.0, 1440.0, 900.0)
+
+    def test_a_window_inside_one_display_is_on_it(self) -> None:
+        self.assertTrue(coords.on_one_display(coords.Frame(100.0, 50.0, 900.0, 600.0), [self.MAIN]))
+        self.assertTrue(
+            coords.on_one_display(coords.Frame(-1300.0, -200.0, 900.0, 600.0), [self.MAIN, self.LEFT])
+        )
+        self.assertTrue(coords.on_one_display(self.MAIN, [self.MAIN]), "edges are inclusive")
+
+    def test_a_window_off_every_display_or_split_across_two_is_not(self) -> None:
+        for frame in (
+            coords.Frame(5000.0, 100.0, 900.0, 600.0),
+            coords.Frame(1500.0, 100.0, 900.0, 600.0),
+            coords.Frame(-200.0, 100.0, 900.0, 600.0),
+            coords.Frame(100.0, 1000.0, 900.0, 600.0),
+        ):
+            with self.subTest(frame=frame):
+                self.assertFalse(coords.on_one_display(frame, [self.MAIN, self.LEFT]))
+
+    def test_displays_come_from_a_preflight_report(self) -> None:
+        report = {
+            "displays": [
+                {"id": 2, "main": False, "bounds": {"x": -1440, "y": -300, "width": 1440, "height": 900}},
+                {"id": 1, "main": True, "bounds": {"x": 0, "y": 0, "width": 1920, "height": 1080}},
+            ]
+        }
+        self.assertEqual(coords.displays(report), [self.MAIN, self.LEFT], "the main display first")
+        for empty in ({}, {"displays": None}, {"displays": []}):
+            with self.subTest(report=empty):
+                with self.assertRaisesRegex(AssertionError, "no displays"):
+                    coords.displays(empty)
+
+
 if __name__ == "__main__":
     unittest.main()

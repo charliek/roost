@@ -42,13 +42,26 @@ class Frame:
     height: float
 
     @classmethod
+    def from_rect(cls, rect: dict) -> "Frame":
+        """From the helper's `{x, y, width, height}`."""
+        return cls(float(rect["x"]), float(rect["y"]), float(rect["width"]), float(rect["height"]))
+
+    @classmethod
     def from_window(cls, window: dict) -> "Frame":
         """From `roost-input-mac window`'s result."""
-        frame = window["frame"]
-        return cls(float(frame["x"]), float(frame["y"]), float(frame["width"]), float(frame["height"]))
+        return cls.from_rect(window["frame"])
 
     def contains(self, x: float, y: float) -> bool:
         return self.x <= x < self.x + self.width and self.y <= y < self.y + self.height
+
+    def within(self, other: "Frame") -> bool:
+        """Whether all of this frame lies inside `other`."""
+        return (
+            other.x <= self.x
+            and other.y <= self.y
+            and self.x + self.width <= other.x + other.width
+            and self.y + self.height <= other.y + other.height
+        )
 
 
 @dataclass(frozen=True)
@@ -139,3 +152,19 @@ def cell_center(frame: Frame, metrics: Metrics, col: int, row: int) -> tuple[flo
     if not frame.contains(*center):
         raise AssertionError(f"cell ({col}, {row})'s centre {center} is outside the window frame {frame}")
     return center
+
+
+def displays(preflight: dict) -> list[Frame]:
+    """The active displays' bounds from a `roost-input-mac preflight`
+    report, the main display first."""
+    found = preflight.get("displays")
+    if not found:
+        raise AssertionError(f"the preflight report names no displays: {found!r}")
+    ordered = sorted(found, key=lambda display: not display.get("main"))
+    return [Frame.from_rect(display["bounds"]) for display in ordered]
+
+
+def on_one_display(frame: Frame, screens: list[Frame]) -> bool:
+    """Whether the whole window lies on a single display: a frame split
+    across two, or partly off every one, is not."""
+    return any(frame.within(screen) for screen in screens)
