@@ -93,6 +93,10 @@ jobs:
               - 'tools/roosttest/**'
               - 'tools/roosttest_unit/**'
               - 'tools/input/linux/**'
+              # The Mac real-input harness: its helper's checks and its suite
+              # run in iced-build-e2e's macOS/wgpu cell, its unit tests in
+              # harness-unit.
+              - 'tools/input/mac/**'
               - 'tools/wayland/**'
               # e2e-iced-wayland-drag's check imports pngtool from here (and
               # the screenshot harness shares helpers with tools/input), so a
@@ -1618,6 +1622,68 @@ jobs:
           -m 'not host_client'
           --roost-target iced --roost-fresh -v
 
+      # The Mac real-input harness (plan 074 §D7). The helper is an ordinary
+      # crate outside the workspace, so its own fmt/clippy/test/--locked gate
+      # is a normal, blocking step. Only the wgpu cell runs any of it: real
+      # input does not depend on the renderer, and one run per push is enough.
+      # It builds into the root `target`, which the cargo cache above keeps.
+      - name: Check the Mac real-input helper (macOS)
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
+        working-directory: tools/input/mac/roost-input-mac
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          cargo build --locked
+
+      # The real-input suite itself, preflight first, against the keyless bundle
+      # assembled above (before the Sparkle step re-assembles it). The hosted
+      # runner's own responsible process already holds every grant the helper
+      # needs (plan 074 §2.12), so there is no TCC grant step: `direct` mode
+      # runs the helper as this step's child, and preflight fails loudly if a
+      # future image drops those grants. Non-blocking until it qualifies under
+      # §D7's promotion rule, which reads this step's `outcome` (the
+      # `conclusion` is masked by continue-on-error) and the JUnit report.
+      - name: Run Mac real-input suite (macOS, experimental)
+        id: real-input-mac
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          ROOST_ICED_APP: mac/build/Roost-Iced.app
+          ICED_BACKEND: wgpu
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_REAL_INPUT_MODE: direct
+          ROOST_REQUIRE_REAL_INPUT: "1"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-real-input-artifacts
+        run: |
+          echo "ImageOS=${ImageOS:-unset} ImageVersion=${ImageVersion:-unset}"
+          sw_vers
+          csrutil status || true
+          uv run --group test pytest tools/roosttest/test_real_input_mac.py \
+            --roost-target iced -v \
+            --junitxml="$ROOST_E2E_ARTIFACT_DIR/junit.xml"
+
+      # The promotion rule needs the step's `outcome`, which continue-on-error
+      # masks in its conclusion, so it is written where a reader can find it:
+      # the job summary, and outcome.txt beside the JUnit report.
+      - name: Record Mac real-input outcome (macOS)
+        if: always() && runner.os == 'macOS' && matrix.renderer == 'wgpu'
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.real-input-mac.outcome }}
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-real-input-artifacts
+        run: |
+          echo "real-input-mac outcome: ${OUTCOME}" | tee -a "$GITHUB_STEP_SUMMARY"
+          mkdir -p "$ROOST_E2E_ARTIFACT_DIR"
+          echo "${OUTCOME}" > "$ROOST_E2E_ARTIFACT_DIR/outcome.txt"
+
       # Deliberately AFTER the keyless assemble + its assertion block:
       # this step re-assembles mac/build/Roost-Iced.app in place, with
       # the fixture's TEST-ONLY SUPublicEDKey and a dead placeholder
@@ -1765,6 +1831,18 @@ jobs:
             # `Roost-Iced` (CFBundleExecutable), not `roost-iced`, so its
             # crash reports need their own glob.
             cp "$HOME"/Library/Logs/DiagnosticReports/Roost-Iced*.ips diagnostics/ 2>/dev/null || true
+            # The real-input suite's artifacts dir holds every helper
+            # invocation's JSON (helper/<n>-<command>/), the JUnit XML, any
+            # captures and the Roost-linux logs the module copied before its
+            # cleanup; the live Roost-linux log dir is copied too, for a run
+            # that died before that copy.
+            real_input="${RUNNER_TEMP}/roost-iced-e2e-mac-real-input-artifacts"
+            if [ -d "${real_input}" ]; then
+              cp -R "${real_input}" diagnostics/real-input-mac
+            fi
+            if [ -d "$HOME/Library/Logs/Roost-linux" ]; then
+              cp -R "$HOME/Library/Logs/Roost-linux" diagnostics/real-input-mac-Roost-linux-logs
+            fi
           fi
           ls -la diagnostics || true
 

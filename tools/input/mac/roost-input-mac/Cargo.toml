@@ -1,0 +1,23 @@
+# The Mac real-input harness's helper (plan 074 §D7): real CGEvents, the
+# Accessibility API and a listen-only event tap, driven by
+# tools/input/mac/runner.py as a child of the never-rebuilt TCC anchor in
+# tools/input/mac/test-runner/. A test tool, not product code: it stays out of
+# the root workspace (the empty [workspace] table below, plus the root's
+# `exclude`) with its own lockfile and its own fmt/clippy/test/--locked gate.
+
+[package]
+name = "roost-input-mac"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+# Every command prints one JSON object, and its strings are whatever the
+# Accessibility API hands back (menu titles with quotes, ellipses, any
+# script), so the escaping has to be right rather than hand-rolled.
+serde_json = "1"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"

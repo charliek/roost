@@ -1,0 +1,16 @@
+{
+  "id": "20",
+  "ok": true,
+  "result": {
+    "window_width": 1100.0,
+    "window_height": 720.0,
+    "sidebar_width": 220.0,
+    "sidebar_collapsed": false,
+    "terminal_top": 32.0,
+    "terminal_font_family": "JetBrains Mono",
+    "terminal_left": 220.0,
+    "terminal_padding": 0.0,
+    "cell_width": 8.0,
+    "cell_height": 16.0
+  }
+}

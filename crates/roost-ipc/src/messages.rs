@@ -1884,6 +1884,20 @@ pub struct WindowMetricsResult {
     /// report the installed family actually used by the live terminal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_font_family: Option<String>,
+    /// Left edge of the terminal viewport in the window content (logical
+    /// points), so a driver that clicks a cell computes its origin rather
+    /// than inferring it from the sidebar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_left: Option<f64>,
+    /// Inset of the cell grid inside the terminal viewport, on every side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_padding: Option<f64>,
+    /// The live grid's cell size (logical points): the active tab's applied
+    /// metrics, else the UI's current ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_width: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_height: Option<f64>,
 }
 
 /// `app.sidebar_dump` request — nullary envelope (`{}`), matching
@@ -5003,6 +5017,10 @@ mod tests {
             sidebar_collapsed: false,
             terminal_top: Some(34.0),
             terminal_font_family: Some("JetBrains Mono".to_string()),
+            terminal_left: Some(220.0),
+            terminal_padding: Some(0.0),
+            cell_width: Some(7.8),
+            cell_height: Some(15.6),
         });
         let native = WindowMetricsResult {
             window_width: 1800.0,
@@ -5011,12 +5029,24 @@ mod tests {
             sidebar_collapsed: true,
             terminal_top: None,
             terminal_font_family: None,
+            terminal_left: None,
+            terminal_padding: None,
+            cell_width: None,
+            cell_height: None,
         };
         let json = serde_json::to_string(&native).unwrap();
-        assert!(
-            !json.contains("terminal_top"),
-            "None changed the old wire shape"
-        );
+        for absent in [
+            "terminal_top",
+            "terminal_left",
+            "terminal_padding",
+            "cell_width",
+            "cell_height",
+        ] {
+            assert!(
+                !json.contains(absent),
+                "None changed the old wire shape: {json}"
+            );
+        }
         round_trip(&native);
 
         let old: WindowMetricsResult = serde_json::from_str(
@@ -5025,6 +5055,15 @@ mod tests {
         .unwrap();
         assert_eq!(old.terminal_top, None);
         assert_eq!(old.terminal_font_family, None);
+        assert_eq!(
+            (
+                old.terminal_left,
+                old.terminal_padding,
+                old.cell_width,
+                old.cell_height
+            ),
+            (None, None, None, None)
+        );
     }
 
     #[test]

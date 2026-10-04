@@ -3631,13 +3631,25 @@ impl App {
                     .resolve(self.typography.effective_family())
                     .name
                     .to_string();
+                // The metrics the view hands the active tab's widget.
+                let metrics = self
+                    .tabs
+                    .get(&self.active_tab_key())
+                    .and_then(|tab| tab.applied_metrics)
+                    .unwrap_or(self.terminal_metrics);
+                let sidebar_width = self.effective_sidebar_width();
+                let viewport = terminal_viewport(self.window_size, sidebar_width);
                 let _ = reply.send(Ok(WindowMetricsResult {
                     window_width: f64::from(self.window_size.width),
                     window_height: f64::from(self.window_size.height),
-                    sidebar_width: f64::from(self.effective_sidebar_width()),
+                    sidebar_width: f64::from(sidebar_width),
                     sidebar_collapsed: collapsed,
-                    terminal_top: Some(f64::from(chrome::BAND_HEIGHT)),
+                    terminal_top: Some(f64::from(viewport.y)),
                     terminal_font_family: Some(resolved_family),
+                    terminal_left: Some(f64::from(viewport.x)),
+                    terminal_padding: Some(f64::from(TERMINAL_PADDING)),
+                    cell_width: Some(f64::from(metrics.cell_width)),
+                    cell_height: Some(f64::from(metrics.cell_height)),
                 }));
             }
             UiRequest::WindowResize {

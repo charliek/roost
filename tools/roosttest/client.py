@@ -43,10 +43,19 @@ class Timeout(RoostError):
 
 
 class Roost:
-    def __init__(self, socket_path: str, timeout: float | None = None):
+    _timeout: float | None = None
+    _deadline: float | None = None
+
+    def __init__(self, socket_path: str, timeout: float | None = None,
+                 deadline: float | None = None):
+        """`timeout` bounds each socket operation; `deadline`, when given,
+        bounds each `call` as a whole — a reply trickling in under `timeout`
+        a chunk at a time cannot outlast it."""
         self.path = str(socket_path)
         self._next_id = 0
         self._buf = b""
+        self._timeout = timeout
+        self._deadline = deadline
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.settimeout(timeout)
         self._sock.connect(self.path)
@@ -69,15 +78,28 @@ class Roost:
         """Send one request, return its `result` dict, raise on error."""
         self._next_id += 1
         req = {"id": str(self._next_id), "op": op, "params": params or {}}
+        ends = None
+        if self._deadline is not None:
+            ends = time.monotonic() + self._deadline
+            self._sock.settimeout(
+                self._deadline if self._timeout is None else min(self._deadline, self._timeout)
+            )
         self._sock.sendall((json.dumps(req) + "\n").encode())
-        resp = json.loads(self._readline())
+        resp = json.loads(self._readline(ends))
         if not resp.get("ok"):
             err = resp.get("error") or {}
             raise RoostError(err.get("code", "unknown"), err.get("message", ""))
         return resp.get("result") or {}
 
-    def _readline(self) -> str:
+    def _readline(self, ends: float | None = None) -> str:
         while b"\n" not in self._buf:
+            if ends is not None:
+                remaining = ends - time.monotonic()
+                if remaining <= 0:
+                    raise Timeout(f"no complete reply from {self.path} within {self._deadline}s")
+                self._sock.settimeout(
+                    remaining if self._timeout is None else min(remaining, self._timeout)
+                )
             chunk = self._sock.recv(1 << 16)
             if not chunk:
                 raise RoostError("disconnected", "socket closed mid-response")

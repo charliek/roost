@@ -134,8 +134,8 @@ use self::tab_backend::{TabBackend, TabHandle};
 use self::terminal_tab::{
     apply_geometry_batch, autoscroll_selections, cancel_tab_pointers, clear_preedit_or_warn,
     pointer_origin_tab, refresh_or_warn, refuse_stale_press, release_host_pointer_before_detach,
-    terminal_grid, GeometryBatchOperation, GeometryChange, NativePointerDispatch, PressGate,
-    TerminalTab,
+    terminal_grid, terminal_viewport, GeometryBatchOperation, GeometryChange,
+    NativePointerDispatch, PressGate, TerminalTab,
 };
 #[cfg(test)]
 use self::terminal_tab::{

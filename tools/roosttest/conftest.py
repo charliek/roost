@@ -64,16 +64,20 @@ def pytest_collection_modifyitems(config, items):
     `session_daemon`) spawns its own `roost-session` daemons against
     throwaway profiles and never dials a UI socket. Launching a UI for it
     would be pure cost — and destructive under `--roost-fresh`, which
-    force-quits the developer's running instance. So the autouse fixture
-    below stands down when *every* collected test is a session-daemon
-    test; a mixed run still gets its UI.
+    force-quits the developer's running instance. An `owns_ui` module (the
+    Mac real-input suite) launches, verifies and quits its own UI, so the
+    shared one would only be a second window in its way — and an inherited
+    `ROOST_TEST_FRESH=1` would quit whatever answers the target's socket. So
+    the autouse fixture below stands down when *every* collected test is a
+    session-daemon test or one of those; a mixed run still gets its UI for
+    the rest.
 
     `trylast`, so it reads what `-m` left selected: a module with cases in
     both lanes (`test_password_input.py`) is run headless as
     `-m session_daemon`, and its deselected UI cases must not launch one.
     """
-    config.stash[_needs_ui] = any(
-        item.get_closest_marker("session_daemon") is None for item in items
+    config.stash[_needs_ui] = ui.needs_shared_ui(
+        [marker.name for marker in item.iter_markers()] for item in items
     )
 
 
@@ -125,6 +129,31 @@ def palette(roost):
     roost.palette_dismiss()
 
 
+def _report_owned_ui(terminalreporter) -> None:
+    """Print the executed/skipped count of the `owns_ui` tests in this run.
+
+    A real-input run in which any scenario skipped does not satisfy plan 074's
+    acceptance, so this count is the line its reader checks first.
+    """
+    executed, skipped, errored = set(), set(), set()
+    for outcome in ("passed", "failed", "skipped", "error"):
+        for rep in terminalreporter.stats.get(outcome, []):
+            if "owns_ui" not in getattr(rep, "keywords", {}):
+                continue
+            if rep.skipped:
+                skipped.add(rep.nodeid)
+            elif rep.when == "call":
+                executed.add(rep.nodeid)
+            elif rep.failed:
+                errored.add(rep.nodeid)
+    if executed or skipped or errored:
+        terminalreporter.write_sep(
+            "-",
+            f"owns_ui: {len(executed)} executed, {len(skipped)} skipped, "
+            f"{len(errored - executed)} errored outside the test body",
+        )
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     """Make skips loud: print every skipped test + reason at session end.
 
@@ -133,6 +162,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     + reasons means a run that quietly skipped half the suite can't read as
     "all green" — the reviewer sees `SKIPS: N` and what was dropped.
     """
+    _report_owned_ui(terminalreporter)
     skipped = terminalreporter.stats.get("skipped", [])
     if not skipped:
         return

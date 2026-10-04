@@ -416,14 +416,26 @@ pub(super) async fn feed_text_until(
     }
 }
 
+/// The terminal viewport in the window content: right of the sidebar, under
+/// the tab band. The grid a tab is sized to and the origin `app.window_metrics`
+/// reports both come from it.
+pub(super) fn terminal_viewport(size: Size, sidebar_width: f32) -> iced::Rectangle {
+    iced::Rectangle {
+        x: sidebar_width,
+        y: chrome::BAND_HEIGHT,
+        width: size.width - sidebar_width,
+        height: size.height - chrome::BAND_HEIGHT,
+    }
+}
+
 pub(super) fn terminal_grid(
     size: Size,
     sidebar_width: f32,
     metrics: TerminalMetrics,
 ) -> (u16, u16) {
-    let width = (size.width - sidebar_width - 2.0 * TERMINAL_PADDING).max(metrics.cell_width * 2.0);
-    let height =
-        (size.height - chrome::BAND_HEIGHT - 2.0 * TERMINAL_PADDING).max(metrics.cell_height * 2.0);
+    let viewport = terminal_viewport(size, sidebar_width);
+    let width = (viewport.width - 2.0 * TERMINAL_PADDING).max(metrics.cell_width * 2.0);
+    let height = (viewport.height - 2.0 * TERMINAL_PADDING).max(metrics.cell_height * 2.0);
     (
         ((width / metrics.cell_width).floor() as u16).max(2),
         ((height / metrics.cell_height).floor() as u16).max(2),

@@ -4078,6 +4078,20 @@
     },
     "WindowMetricsResult": {
       "properties": {
+        "cell_height": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "cell_width": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "sidebar_collapsed": {
           "type": "boolean"
         },
@@ -4088,6 +4102,20 @@
         "terminal_font_family": {
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "terminal_left": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "terminal_padding": {
+          "format": "double",
+          "type": [
+            "number",
             "null"
           ]
         },

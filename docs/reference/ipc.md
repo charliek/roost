@@ -1517,7 +1517,8 @@ Request: `{"params": {}}`.
 
 ```json
 {"window_width":1100.0,"window_height":700.0,"sidebar_width":220.0,
- "sidebar_collapsed":false,"terminal_top":34.0,"terminal_font_family":"Berkeley Mono"}
+ "sidebar_collapsed":false,"terminal_top":34.0,"terminal_font_family":"Berkeley Mono",
+ "terminal_left":220.0,"terminal_padding":0.0,"cell_width":8.0,"cell_height":16.0}
 ```
 
 `terminal_top` and `terminal_font_family` are optional for wire compatibility
@@ -1532,6 +1533,19 @@ the resolved family the live terminal is actually rendering with
 adapters once a terminal is live — the Mac adapter omits both until a terminal
 view is mounted (fresh launch, no tabs). This operation is ungated and
 read-only.
+
+`terminal_left`, `terminal_padding`, `cell_width` and `cell_height` are the
+cell grid's exact geometry, in the same logical points and equally optional
+(omitted when an adapter does not report them; the iced UI always does, the Mac
+UI does not). `terminal_left` is the terminal viewport's left edge in the
+content, `terminal_padding` the grid's inset inside the viewport on every side,
+and the cell size is the live grid's: the active tab's applied metrics, or the
+UI's current ones before a tab has any. A cell's top-left in the content is
+`(terminal_left + terminal_padding + col × cell_width, terminal_top +
+terminal_padding + row × cell_height)`. The Mac real-input harness
+(`tools/input/mac/coords.py`) turns that into a screen point with the window's
+Accessibility frame, so a real click lands on a known cell without measuring
+pixels.
 
 ### `app.sidebar_dump`
 
