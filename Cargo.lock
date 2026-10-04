@@ -2984,7 +2984,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "roost-agent"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "roost-ipc",
  "serde_json",
@@ -2993,7 +2993,7 @@ dependencies = [
 
 [[package]]
 name = "roost-agent-install"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "roost-agent",
  "roost-ui-model",
@@ -3007,7 +3007,7 @@ dependencies = [
 
 [[package]]
 name = "roost-cli"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "anyhow",
  "base64",
@@ -3026,7 +3026,7 @@ dependencies = [
 
 [[package]]
 name = "roost-engine"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "anyhow",
  "futures",
@@ -3047,7 +3047,7 @@ dependencies = [
 
 [[package]]
 name = "roost-iced"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3083,7 +3083,7 @@ dependencies = [
 
 [[package]]
 name = "roost-ipc"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "anyhow",
  "base64",
@@ -3101,14 +3101,14 @@ dependencies = [
 
 [[package]]
 name = "roost-osc"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "base64",
 ]
 
 [[package]]
 name = "roost-session"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "anyhow",
  "clap",
@@ -3128,7 +3128,7 @@ dependencies = [
 
 [[package]]
 name = "roost-ui-model"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "bitflags 2.11.1",
  "roost-agent",
@@ -3143,14 +3143,14 @@ dependencies = [
 
 [[package]]
 name = "roost-url"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "regex",
 ]
 
 [[package]]
 name = "roost-vt"
-version = "0.0.21"
+version = "0.0.22"
 dependencies = [
  "bindgen",
  "thiserror 1.0.69",
