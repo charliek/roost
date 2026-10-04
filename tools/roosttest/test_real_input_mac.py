@@ -115,7 +115,7 @@ SCENARIOS = (
     "test_preflight",
     "test_option_as_meta_left",
     "test_option_as_meta_right",
-    "test_shift_enter",
+    "test_shift_enter_SCRATCH_RENAMED",
     "test_native_context_popup",
     "test_full_screen",
     "test_secure_keyboard_entry_manual",
