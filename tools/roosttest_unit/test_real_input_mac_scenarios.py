@@ -4,34 +4,25 @@ The CI promotion rule counts the real-input suite as qualified only when the
 JUnit report lists every expected scenario as passed, so the expected list
 must not drift from the tests themselves: a test added without an entry would
 never be required, and an entry without a test would never pass. Read with
-`ast`, since the module imports pytest and this suite's interpreter may not.
+`ast` (`junit_guard.scenarios_and_tests`, shared with the CI guard), since the
+module imports pytest and this suite's interpreter may not.
 """
 
 from __future__ import annotations
 
-import ast
+import sys
 import unittest
 from pathlib import Path
 
-MODULE = Path(__file__).resolve().parents[1] / "roosttest" / "test_real_input_mac.py"
+ROOSTTEST_DIR = Path(__file__).resolve().parents[1] / "roosttest"
+MODULE = ROOSTTEST_DIR / "test_real_input_mac.py"
+sys.path.insert(0, str(ROOSTTEST_DIR))
+
+import junit_guard  # noqa: E402
 
 
 def scenarios_and_tests() -> tuple[list[str], list[str]]:
-    tree = ast.parse(MODULE.read_text())
-    listed: list[str] = []
-    tests: list[str] = []
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == "SCENARIOS" for target in node.targets
-        ):
-            listed = list(ast.literal_eval(node.value))
-        elif isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
-            if node.decorator_list:
-                raise AssertionError(
-                    f"{node.name} is decorated: a parametrized test's ids are not its name"
-                )
-            tests.append(node.name)
-    return listed, tests
+    return junit_guard.scenarios_and_tests(MODULE)
 
 
 class ScenarioListTests(unittest.TestCase):
