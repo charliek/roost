@@ -10,6 +10,9 @@ mod fonts;
 /// connected `roost-session`, publishing onto the engine feed.
 mod host_conn;
 mod input;
+/// The Linux native seam, `cfg`'d whole for the reason [`macos`] is.
+#[cfg(target_os = "linux")]
+mod linux;
 /// The AppKit seam. `cfg`'d whole rather than stubbed per-function: every
 /// call site pairs with a `not(macos)` no-op of its own, so nothing outside
 /// macOS ever names an AppKit type.
@@ -21,6 +24,10 @@ mod paste_image;
 mod perf;
 mod png_encode;
 mod screenshot;
+/// Secure Keyboard Entry's state machine. Compiled where it is used —
+/// macOS — and wherever the tests run, which is every host.
+#[cfg(any(target_os = "macos", test))]
+mod secure_input;
 mod sidebar_resize;
 mod strip_reorder;
 mod terminal_widget;
@@ -34,7 +41,7 @@ use anyhow::Context;
 use iced::advanced::input_method;
 use iced::keyboard::key::Named;
 use iced::keyboard::Key;
-use iced::{event, keyboard, mouse, time, window, Event, Size, Subscription, Task, Theme};
+use iced::{event, keyboard, mouse, time, window, Event, Point, Size, Subscription, Task, Theme};
 use roost_engine::single_instance;
 use roost_ipc::messages::ops;
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
@@ -79,6 +86,9 @@ enum Message {
     /// A creation or a parked focus is waiting on a mirror. Armed only
     /// while one is.
     PendingSelectionTick,
+    /// A selection drag is held past the terminal's edge. Armed only
+    /// while one is.
+    SelectionAutoscrollTick,
     /// A file-drop debounce window elapsed — a one-shot, not a timer.
     FileDropDeadline,
     FullScreenSettled(u64),
@@ -86,7 +96,23 @@ enum Message {
     BackgroundResizeDeadline,
     WindowOpened(window::Id),
     WindowResized(window::Id, Size),
+    /// The window's outer top-left moved — macOS only, the one platform
+    /// that remembers the frame.
+    WindowMoved(Point),
+    WindowFrameChecked(Option<app::window_frame::CheckedFrame>),
+    WindowFrameDue {
+        generation: u64,
+        mode: window::Mode,
+        outer: Option<Point>,
+        content: Size,
+    },
     WindowFocus(window::Id, bool),
+    /// A banner click's activation token was spent on the window (#351).
+    #[cfg(target_os = "linux")]
+    NotificationRaised {
+        token: String,
+        attempt: linux::wayland::Attempt,
+    },
     ScreenshotCaptured(window::Screenshot),
     ClipboardReadCompleted {
         request_id: u64,
@@ -430,7 +456,9 @@ fn run(profile: &BundleProfile, bundle_id: Option<&str>) -> anyhow::Result<()> {
         Err(error) => return Err(anyhow::anyhow!("single-instance lock failed: {error}")),
     };
 
-    let initial = Arc::new(Mutex::new(Some(App::bootstrap(profile, locks)?)));
+    let app = App::bootstrap(profile, locks)?;
+    let opening = app.window_opening();
+    let initial = Arc::new(Mutex::new(Some(app)));
     let boot = {
         let initial = Arc::clone(&initial);
         move || {
@@ -450,7 +478,7 @@ fn run(profile: &BundleProfile, bundle_id: Option<&str>) -> anyhow::Result<()> {
         .font(include_bytes!("../../../third_party/inter/Inter-Medium.ttf").as_slice())
         .font(include_bytes!("../../../third_party/inter/Inter-SemiBold.ttf").as_slice())
         .default_font(chrome::chrome_font(iced::font::Weight::Normal))
-        .window(window_settings(profile))
+        .window(window_settings(profile, opening))
         .run()
         .context("run Iced application")
 }
@@ -492,11 +520,22 @@ fn forced_test_panic() {
 /// installed desktop entry already declares as its `StartupWMClass`; it is
 /// the same id the notification adapter sends as its `desktop-entry` hint,
 /// so shells group both under one identity.
+///
+/// `opening` is the frame `state.json` remembered (plan 074 §D5b). On
+/// macOS iced applies a `Position::Specific` with `set_outer_position`
+/// right after creation, so the window never shows at a default spot
+/// first.
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-fn window_settings(profile: &BundleProfile) -> window::Settings {
+fn window_settings(
+    profile: &BundleProfile,
+    opening: app::window_frame::OpeningFrame,
+) -> window::Settings {
     window::Settings {
-        size: app::INITIAL_WINDOW_SIZE,
-        min_size: Some(Size::new(640.0, 360.0)),
+        size: opening.size,
+        position: opening
+            .position
+            .map_or(window::Position::Default, window::Position::Specific),
+        min_size: Some(app::MIN_WINDOW_SIZE),
         #[cfg(target_os = "macos")]
         platform_specific: window::settings::PlatformSpecific {
             titlebar_transparent: true,
@@ -524,12 +563,17 @@ fn window_settings(profile: &BundleProfile) -> window::Settings {
 /// must see a notice that went away before it comes back, and the local
 /// session's background resize wave, whose triggers are as scattered. And
 /// so does the context menu's close, which follows whatever took input
-/// from it or removed its row, by any path.
+/// from it or removed its row, by any path, and the terminals' pointer
+/// cancel when anything rewraps the terminal widget. So does Secure
+/// Keyboard Entry, whose inputs — the active tab, its prompt, the toggle —
+/// move on as many paths.
 fn update(app: &mut App, message: Message) -> Task<Message> {
     let dispatched = dispatch(app, message);
     app.observe_context_menu();
     app.sync_menu_gating();
-    app.observe_notice();
+    app.sync_secure_input();
+    let (_, notice) = app.observe_notice();
+    app.observe_terminal_wrapping(notice.is_some());
     Task::batch([
         dispatched,
         app.take_tab_reveal_task().map_task(),
@@ -562,6 +606,10 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             app.pending_selection_tick();
             Task::none()
         }
+        Message::SelectionAutoscrollTick => {
+            app.selection_autoscroll_tick();
+            Task::none()
+        }
         Message::FileDropDeadline => app.file_drop_deadline().map_task(),
         Message::FullScreenSettled(generation) => app.full_screen_settled(generation).map_task(),
         Message::BackgroundResizeDeadline => {
@@ -570,10 +618,26 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::WindowOpened(id) => app.window_opened(id).map_task(),
         Message::WindowResized(id, size) => app.window_resized(id, size).map_task(),
+        Message::WindowMoved(outer) => app.window_moved(outer).map_task(),
+        Message::WindowFrameChecked(observed) => app.window_frame_checked(observed).map_task(),
+        Message::WindowFrameDue {
+            generation,
+            mode,
+            outer,
+            content,
+        } => {
+            app.window_frame_due(generation, mode, outer, content);
+            Task::none()
+        }
         Message::WindowFocus(id, focused) => {
             let task = app.window_opened(id).map_task();
             app.set_window_focus(focused);
             task.chain(app.query_full_screen().map_task())
+        }
+        #[cfg(target_os = "linux")]
+        Message::NotificationRaised { token, attempt } => {
+            app.notification_raised(token, attempt);
+            Task::none()
         }
         Message::ScreenshotCaptured(capture) => app.screenshot_captured(&capture).map_task(),
         Message::ClipboardReadCompleted { request_id, value } => {
@@ -648,8 +712,8 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         Message::TerminalPointer(event) => match event {
             terminal_widget::TerminalPointer::Event(event) => app.pointer(event).map_task(),
             terminal_widget::TerminalPointer::Wheel(event) => app.wheel(event).map_task(),
-            terminal_widget::TerminalPointer::Leave { tab_id } => {
-                app.pointer_leave(tab_id);
+            terminal_widget::TerminalPointer::Leave { tab } => {
+                app.pointer_leave(tab);
                 Task::none()
             }
         },
@@ -775,6 +839,7 @@ struct ArmedTimers {
     reorder_hold: bool,
     add_host_pointer: bool,
     pending_selection: bool,
+    selection_autoscroll: bool,
 }
 
 impl ArmedTimers {
@@ -786,6 +851,7 @@ impl ArmedTimers {
             reorder_hold: app.reorder_hold_pending(),
             add_host_pointer: app.add_host_dialog_open(),
             pending_selection: app.pending_selection_waiting(),
+            selection_autoscroll: app.selection_autoscroll_pending(),
         }
     }
 
@@ -799,6 +865,7 @@ impl ArmedTimers {
             + usize::from(self.reorder_hold)
             + usize::from(self.add_host_pointer)
             + usize::from(self.pending_selection)
+            + usize::from(self.selection_autoscroll)
     }
 }
 
@@ -856,6 +923,12 @@ fn subscription_with(wake: Arc<tokio::sync::Notify>, armed: ArmedTimers) -> Subs
                 .map(|_| Message::PendingSelectionTick),
         );
     }
+    if armed.selection_autoscroll {
+        members.push(
+            time::every(app::SELECTION_AUTOSCROLL_INTERVAL)
+                .map(|_| Message::SelectionAutoscrollTick),
+        );
+    }
     if armed.add_host_pointer {
         // Deliberately status-blind, unlike the keyboard member above: a
         // press into a `text_input` IS captured, and that is precisely the
@@ -881,8 +954,23 @@ fn window_event_message(id: window::Id, event: window::Event) -> Option<Message>
             window_id: id,
             path,
         }),
+        window::Event::Moved(outer) if app::window_frame::REMEMBERS_WINDOW_FRAME => {
+            Some(Message::WindowMoved(outer))
+        }
         _ => None,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn check_window_frame(id: window::Id, check: app::window_frame::FrameCheck) -> Task<Message> {
+    window::run(id, move |window| macos::window_frame::check(window, check))
+        .map(Message::WindowFrameChecked)
+}
+
+/// Nothing to check where nothing is remembered, and nothing asks.
+#[cfg(not(target_os = "macos"))]
+fn check_window_frame(_id: window::Id, _check: app::window_frame::FrameCheck) -> Task<Message> {
+    Task::done(Message::WindowFrameChecked(None))
 }
 
 /// Text inputs capture Escape before `keyboard::listen`, but Escape is an
@@ -978,6 +1066,27 @@ fn inspect_budget() -> Duration {
     INSPECT_BUDGET.mul_f64(crate::host_conn::task::scale())
 }
 
+/// Bring the window to the front. A click's activation token is spent
+/// first, through [`linux::wayland`] (which says why `gain_focus` alone does
+/// not reach a Wayland compositor); `gain_focus` still follows, and is what
+/// raises an X11 window.
+#[cfg(target_os = "linux")]
+fn raise(id: window::Id, token: Option<String>) -> Task<Message> {
+    let Some(token) = token else {
+        return window::gain_focus(id);
+    };
+    window::run(id, move |window| {
+        let attempt = linux::wayland::activate(window, &token);
+        Message::NotificationRaised { token, attempt }
+    })
+    .chain(window::gain_focus(id))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn raise(id: window::Id, _token: Option<String>) -> Task<Message> {
+    window::gain_focus(id)
+}
+
 trait UiTask {
     fn map_task(self) -> Task<Message>;
 }
@@ -987,8 +1096,11 @@ impl UiTask for app::UiTask {
         match self {
             app::UiTask::None => Task::none(),
             app::UiTask::Then(first, second) => first.map_task().chain(second.map_task()),
+            app::UiTask::Alongside(first, second) => {
+                Task::batch([first.map_task(), second.map_task()])
+            }
             app::UiTask::EngineOp(future) => Task::future(future).map(Message::EngineOp),
-            app::UiTask::Focus(id) => window::gain_focus(id),
+            app::UiTask::Raise { id, token } => raise(id, token),
             app::UiTask::FocusWidget(id) => iced::widget::operation::focus(id),
             app::UiTask::SelectAllWidget(id) => iced::widget::operation::select_all(id),
             // `iced::widget::operation` has a Task-returning `focus` but no
@@ -1174,6 +1286,26 @@ impl UiTask for app::UiTask {
                     Message::FullScreenSettled(generation)
                 })
             }
+            app::UiTask::CheckWindowFrame { id, check } => check_window_frame(id, check),
+            // The mode, position and size are read at the deadline, not
+            // remembered from before it: a full-screen transition can start
+            // inside the 500 ms, and the events can be wrong or missing (see
+            // `WindowFrameMemory::save_due`).
+            app::UiTask::WindowFrameDeadline {
+                id,
+                delay,
+                generation,
+            } => Task::future(tokio::time::sleep(delay))
+                .then(move |()| window::mode(id))
+                .then(move |mode| window::position(id).map(move |outer| (mode, outer)))
+                .then(move |(mode, outer)| {
+                    window::size(id).map(move |content| Message::WindowFrameDue {
+                        generation,
+                        mode,
+                        outer,
+                        content,
+                    })
+                }),
             app::UiTask::FileDropDeadline(delay) => {
                 Task::perform(tokio::time::sleep(delay), |()| Message::FileDropDeadline)
             }
@@ -1279,6 +1411,7 @@ mod tests {
         reorder_hold: bool,
         add_host_pointer: bool,
         pending_selection: bool,
+        selection_autoscroll: bool,
     ) -> ArmedTimers {
         ArmedTimers {
             status,
@@ -1287,6 +1420,7 @@ mod tests {
             reorder_hold,
             add_host_pointer,
             pending_selection,
+            selection_autoscroll,
         }
     }
 
@@ -1315,7 +1449,7 @@ mod tests {
 
         // Every combination, so a member that forgot its own arming
         // condition (or shares a recipe id with another) is caught.
-        for bits in 0u8..64 {
+        for bits in 0u8..128 {
             let timers = armed(
                 bits & 1 != 0,
                 bits & 2 != 0,
@@ -1323,6 +1457,7 @@ mod tests {
                 bits & 8 != 0,
                 bits & 16 != 0,
                 bits & 32 != 0,
+                bits & 64 != 0,
             );
             let ids = recipe_ids(subscription_with(Arc::clone(&wake), timers));
             let unique: HashSet<u64> = ids.iter().copied().collect();

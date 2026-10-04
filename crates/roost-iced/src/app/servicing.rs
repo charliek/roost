@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use roost_engine::ipc::{DumpError, HostOpFailure, HostOpReply};
 use roost_ipc::codes;
 use roost_ipc::messages::{
-    AppContextMenuDumpResult, AppContextMenuTarget, SentFile, SkippedFile, TabSendFileResult,
-    WireProjectRef,
+    ActivationOutcome, AppContextMenuDumpResult, AppContextMenuTarget, AppSecureInputResult,
+    SentFile, SkippedFile, TabSendFileResult, WireProjectRef,
 };
 use roost_ui_model::context_menu::{ContextAction, ContextTarget};
 use roost_ui_model::file_transfer::{status, Refusal, Skipped, Target};
@@ -122,7 +122,7 @@ fn forwarded_failure(error: &crate::host_conn::HostOpError) -> HostOpFailure {
 
 /// A forwarded op that could not be put to the slot because it is not
 /// connected (plan 063 §D10).
-fn slot_unavailable() -> Result<serde_json::Value, HostOpFailure> {
+fn slot_unavailable<T>() -> Result<T, HostOpFailure> {
     Err(HostOpFailure::new(
         roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
         roost_ipc::local_route::SLOT_UNAVAILABLE,
@@ -562,20 +562,10 @@ pub(super) fn collect_tab_output(
 
 /// A click on the OS notification banner, decided off the core alone so it
 /// is testable without an `App`: focus the tab the banner named and clear
-/// its pending notification, then say what raise the click earned. `None`
-/// is a tab that closed between the banner and the click — the
-/// (now-removed) GTK UI's `focus_tab_by_id` bailed on the same
-/// `focus_tab` error.
-///
-/// The raise is best-effort: a window that has not opened yet has no id,
-/// and the tab focus still landed in the core either way. On Wayland,
-/// iced `window::gain_focus` is a no-op (no way to spend the spec
-/// `ActivationToken`); see [#351](https://github.com/charliek/roost/issues/351).
-fn notification_activation(
-    workspace: &Workspace,
-    window_id: Option<window::Id>,
-    key: TabKey,
-) -> Option<UiTask> {
+/// its pending notification. `false` is a tab that closed between the
+/// banner and the click — the (now-removed) GTK UI's `focus_tab_by_id`
+/// bailed on the same `focus_tab` error — and earns no raise.
+fn notification_activation(workspace: &Workspace, key: TabKey) -> bool {
     // The local workspace owns only the local id-space: a banner minted
     // by a connection epoch that has since died carries that instance, and
     // focusing its numeric id here would jump to whatever local tab
@@ -583,9 +573,9 @@ fn notification_activation(
     // is the same guard every other engine sink now applies.
     if let Err(error) = focus_tab_in_core(workspace, key) {
         tracing::debug!(?key, %error, "notification click named a tab that is gone");
-        return None;
+        return false;
     }
-    Some(window_id.map_or(UiTask::None, UiTask::Focus))
+    true
 }
 
 /// What one envelope from a connected host's event batch asks this
@@ -1261,25 +1251,27 @@ impl App {
         let active_key = self.active_tab_key();
         // **On the edge, not on every reconcile**, which is what the log
         // line below has always said this was. The pointer can only be
-        // over the tab on screen, so a tab losing that place drops its
-        // gesture and hover — but a tab that was already in the
-        // background has no stale state to drop, and clearing it every
-        // reconcile makes the *whole gesture* unrepresentable there: a
-        // synthetic press through `tab.dispatch_mouse_event` (which
-        // names a tab by id, not by what is showing) had its capture
-        // wiped before the release arrived, so the application on the
-        // far end saw a button go down and never come up.
+        // over the tab on screen, so a tab losing that place lets go of
+        // its gesture and hover — a held tracking button sends its
+        // release, as every pointer cancel does — but a tab that was
+        // already in the background has no stale state to drop, and
+        // clearing it every reconcile makes the *whole gesture*
+        // unrepresentable there: a synthetic press through
+        // `tab.dispatch_mouse_event` (which names a tab by id, not by
+        // what is showing) had its capture wiped before the release
+        // arrived, so the application on the far end saw a button go
+        // down and never come up.
         //
         // `revealed_tab` is the memo of the last observed active tab, so
         // the edge is read off it before `request_tab_reveal` moves it.
         let active_changed = self.revealed_tab != Some(active_key);
         self.request_tab_reveal(active_key);
         if active_changed {
-            for (key, tab) in &mut self.tabs {
-                if *key != active_key && tab.reset_pointer_state() {
-                    refresh_or_warn(key.tab, tab, "pointer reset after active tab changed");
-                }
-            }
+            cancel_tab_pointers(
+                &mut self.tabs,
+                Some(active_key),
+                "pointer cancel after active tab changed",
+            );
         }
         // Every focus change funnels through `focus_tab_and_clear`, which
         // reconciles — so this is the one place a tab switch cancels a
@@ -1980,6 +1972,51 @@ impl App {
         }
     }
 
+    /// The raise a banner click earned (#351) — best-effort: a window that
+    /// has not opened yet has nothing to raise. What it comes to is recorded
+    /// here when the window need not be asked (macOS is never Wayland, and a
+    /// click without a token has nothing to spend), and by
+    /// [`Self::notification_raised`] when it must.
+    fn notification_raise(&mut self, token: Option<String>) -> UiTask {
+        let Some(id) = self.window_id else {
+            return UiTask::None;
+        };
+        let settled = if cfg!(not(target_os = "linux")) {
+            Some(ActivationOutcome::NotWayland)
+        } else if token.is_none() {
+            Some(ActivationOutcome::NoToken)
+        } else {
+            None
+        };
+        if let Some(outcome) = settled {
+            self.last_activation = AppLastActivationResult {
+                outcome: Some(outcome),
+                token: token.clone(),
+                activation_global: None,
+            };
+        }
+        UiTask::Raise { id, token }
+    }
+
+    /// What spending a click's token on the window came to.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn notification_raised(
+        &mut self,
+        token: String,
+        attempt: crate::linux::wayland::Attempt,
+    ) {
+        tracing::info!(
+            outcome = ?attempt.outcome,
+            activation_global = ?attempt.activation_global,
+            "notification raise settled"
+        );
+        self.last_activation = AppLastActivationResult {
+            outcome: Some(attempt.outcome),
+            token: Some(token),
+            activation_global: attempt.activation_global,
+        };
+    }
+
     /// A context-menu test op's target, resolved the way `tab.dump`
     /// resolves its ref: a bare id is the local backend's, which under
     /// `session` is the slot's.
@@ -2233,6 +2270,12 @@ impl App {
                 EngineFeed::AccentChanged(accent) => {
                     self.chrome = chrome_palette_for(self.config.chrome_accent, accent);
                 }
+                // The observer already applied; arriving here is what
+                // redraws the lock.
+                #[cfg(target_os = "macos")]
+                EngineFeed::AppActive(active) => {
+                    tracing::debug!(active, "app activation changed");
+                }
                 // Host mirrors + lifecycle land in the connection set.
                 // C6/C7 render off it; C4 only keeps it current, so with
                 // zero hosts these arms never run.
@@ -2394,7 +2437,7 @@ impl App {
                 }
                 EngineFeed::AgentMetrics(result) => self.apply_agent_metrics(result),
                 EngineFeed::Provider(result) => self.apply_provider_result(*result),
-                EngineFeed::NotificationActivated { tab } => {
+                EngineFeed::NotificationActivated { tab, token } => {
                     if !tab.is_local() {
                         // A host tab's jump: select it and attach, the
                         // same pair its sidebar row does. A tab whose
@@ -2403,9 +2446,7 @@ impl App {
                         match self.focus_host_tab_and_clear(tab, true) {
                             Ok(()) => {
                                 batch.mark_reconciled();
-                                if let Some(window) = self.window_id {
-                                    task = task.then(UiTask::Focus(window));
-                                }
+                                task = task.then(self.notification_raise(token));
                             }
                             Err(error) => tracing::debug!(
                                 %tab,
@@ -2413,9 +2454,7 @@ impl App {
                                 "notification click named a host tab that is gone"
                             ),
                         }
-                    } else if let Some(raise) =
-                        notification_activation(&self.workspace, self.window_id, tab)
-                    {
+                    } else if notification_activation(&self.workspace, tab) {
                         // The rest of a notification jump, exactly as the
                         // palette's rows do it: reveal the sidebar so the
                         // user sees which project they landed in, and fold
@@ -2424,7 +2463,7 @@ impl App {
                         self.set_sidebar_collapsed(false);
                         self.reconcile();
                         batch.mark_reconciled();
-                        task = task.then(raise);
+                        task = task.then(self.notification_raise(token));
                     }
                 }
             }
@@ -2718,6 +2757,8 @@ impl App {
                 self.menu_gating = crate::macos::menu::MenuGating::default();
                 // Ditto for the Window rows: the menu was built with none.
                 self.menu_window_rows = crate::macos::menu::WindowRows::default();
+                // And Secure Keyboard Entry's row was built unchecked.
+                self.menu_secure_input = None;
             }
         }
     }
@@ -2786,6 +2827,124 @@ impl App {
             if let Some(accent) = crate::macos::accent::current(mtm) {
                 self.chrome = chrome_palette_for(self.config.chrome_accent, accent);
             }
+        }
+    }
+
+    /// Start acting on the app becoming and resigning active (plan 074
+    /// §D3). A no-op on every other host. From `window_opened` for the
+    /// accent's reason; the seam installs once.
+    pub(super) fn follow_app_activation(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.window_id.is_none() {
+                return;
+            }
+            let Some(mtm) = seam_on_main("app activation observe") else {
+                return;
+            };
+            crate::macos::secure_input::observe(mtm, &self.feed_tx);
+        }
+    }
+
+    /// Push Secure Keyboard Entry's inputs into its owner and apply, and
+    /// the toggle onto its menu row, each only when it moved.
+    ///
+    /// The one call site is `update()`'s post-dispatch funnel, so every
+    /// way an input moves — the active tab, a close, a host mirror's
+    /// resync or disconnect, the toggle, the config at boot — is covered
+    /// without a call site per change. App activation is the observers'.
+    pub fn sync_secure_input(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.window_id.is_none() {
+                return;
+            }
+            let inputs = self.secure_inputs();
+            let inputs_moved = self.secure_inputs_pushed != Some(inputs);
+            let menu_moved = self.menu_secure_input != Some(inputs.manual);
+            if !inputs_moved && !menu_moved {
+                return;
+            }
+            let Some(mtm) = seam_on_main("secure input sync") else {
+                return;
+            };
+            if inputs_moved {
+                crate::macos::secure_input::set_inputs(mtm, inputs);
+                crate::macos::secure_input::apply(mtm);
+                self.secure_inputs_pushed = Some(inputs);
+            }
+            if menu_moved {
+                crate::macos::menu::sync_secure_input_state(mtm, inputs.manual);
+                self.menu_secure_input = Some(inputs.manual);
+            }
+        }
+    }
+
+    /// Give back Secure Keyboard Entry and latch it off: the quit path and
+    /// `Drop`.
+    pub(super) fn release_secure_input(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(mtm) = seam_on_main("secure input release") {
+                crate::macos::secure_input::release(mtm);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn secure_inputs(&self) -> crate::secure_input::Inputs {
+        crate::secure_input::Inputs {
+            manual: self.config.macos_secure_keyboard_entry,
+            auto: self.config.macos_auto_secure_input,
+            password_input: crate::secure_input::listed_password_input(
+                self.active_project_row(),
+                self.active_tab_key().tab,
+            ),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn secure_input_status(&self) -> crate::secure_input::Status {
+        objc2::MainThreadMarker::new()
+            .map(crate::macos::secure_input::status)
+            .unwrap_or_default()
+    }
+
+    /// Whether the tab band draws the lock. Never off macOS, where there
+    /// is no Secure Keyboard Entry to show.
+    pub(super) fn secure_input_indicator(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            crate::secure_input::indicator(
+                self.secure_input_status().owned,
+                self.config.macos_secure_input_indication,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// `app.secure_input`'s answer: the owner as it stands, never synced
+    /// first, so a change `update` failed to push reads as stale here.
+    fn secure_input_result(&self) -> AppSecureInputResult {
+        #[cfg(target_os = "macos")]
+        {
+            let status = self.secure_input_status();
+            AppSecureInputResult {
+                desired: status.desired,
+                owned: status.owned,
+                indicator: self.secure_input_indicator(),
+                manual: status.inputs.manual,
+                auto: status.inputs.auto,
+                app_active: status.app_active,
+                password_input: status.inputs.password_input,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            AppSecureInputResult::default()
         }
     }
 
@@ -3305,7 +3464,7 @@ impl App {
         match request {
             UiRequest::Activate => {
                 if let Some(id) = self.window_id {
-                    task = task.then(UiTask::Focus(id));
+                    task = task.then(UiTask::Raise { id, token: None });
                 }
             }
             UiRequest::Dump {
@@ -3472,13 +3631,25 @@ impl App {
                     .resolve(self.typography.effective_family())
                     .name
                     .to_string();
+                // The metrics the view hands the active tab's widget.
+                let metrics = self
+                    .tabs
+                    .get(&self.active_tab_key())
+                    .and_then(|tab| tab.applied_metrics)
+                    .unwrap_or(self.terminal_metrics);
+                let sidebar_width = self.effective_sidebar_width();
+                let viewport = terminal_viewport(self.window_size, sidebar_width);
                 let _ = reply.send(Ok(WindowMetricsResult {
                     window_width: f64::from(self.window_size.width),
                     window_height: f64::from(self.window_size.height),
-                    sidebar_width: f64::from(self.effective_sidebar_width()),
+                    sidebar_width: f64::from(sidebar_width),
                     sidebar_collapsed: collapsed,
-                    terminal_top: Some(f64::from(chrome::BAND_HEIGHT)),
+                    terminal_top: Some(f64::from(viewport.y)),
                     terminal_font_family: Some(resolved_family),
+                    terminal_left: Some(f64::from(viewport.x)),
+                    terminal_padding: Some(f64::from(TERMINAL_PADDING)),
+                    cell_width: Some(f64::from(metrics.cell_width)),
+                    cell_height: Some(f64::from(metrics.cell_height)),
                 }));
             }
             UiRequest::WindowResize {
@@ -3577,6 +3748,40 @@ impl App {
                 let result = macos_test_gated(self.test_mode, || activate_menu(&path));
                 let _ = reply.send(result);
             }
+            UiRequest::AppNotificationActivate { tab, token, reply } => {
+                let result = if !self.test_mode {
+                    Err(HostOpFailure::new(
+                        codes::NOT_ENABLED,
+                        "ROOST_TEST_MODE=1 is required",
+                    ))
+                } else if let Some(tab) = self.wire_tab_key(tab) {
+                    if self
+                        .feed_tx
+                        .send(EngineFeed::NotificationActivated { tab, token })
+                    {
+                        Ok(())
+                    } else {
+                        Err(HostOpFailure::new(
+                            codes::INTERNAL,
+                            "the engine feed is closed",
+                        ))
+                    }
+                } else {
+                    slot_unavailable()
+                };
+                let _ = reply.send(result);
+            }
+            UiRequest::AppLastActivation { reply } => {
+                let result = if self.test_mode {
+                    Ok(self.last_activation.clone())
+                } else {
+                    Err(HostOpFailure::new(
+                        codes::NOT_ENABLED,
+                        "ROOST_TEST_MODE=1 is required",
+                    ))
+                };
+                let _ = reply.send(result);
+            }
             UiRequest::AppDialogDump { reply } => {
                 let result = if self.test_mode {
                     Ok(self.dialog_dump())
@@ -3649,6 +3854,14 @@ impl App {
                     }
                     Err(error) => Err(error),
                 });
+            }
+            UiRequest::AppSecureInput { reply } => {
+                let result = if self.test_mode {
+                    Ok(self.secure_input_result())
+                } else {
+                    Err("ROOST_TEST_MODE=1 is required".into())
+                };
+                let _ = reply.send(result);
             }
             UiRequest::AppContextMenuDump { target, reply } => {
                 let result = self.context_test_target(target).and_then(|target| {
@@ -3798,8 +4011,7 @@ impl App {
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| {
                         let anchored = tab
-                            .selection
-                            .set(&tab.terminal, anchor, cursor)
+                            .set_selection(anchor, cursor)
                             .map_err(|error| error.to_string())?;
                         if !anchored {
                             return Err(format!(
@@ -3816,7 +4028,7 @@ impl App {
                     .and_then(|key| self.tabs.get_mut(&key))
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
                     .and_then(|tab| {
-                        tab.selection.clear();
+                        tab.clear_selection();
                         tab.refresh_snapshot().map_err(|error| error.to_string())
                     });
                 let _ = reply.send(result);
@@ -3928,6 +4140,7 @@ impl App {
                 cell_x,
                 cell_y,
                 mods,
+                overshoot,
                 reply,
             } => {
                 let result = if !self.test_mode {
@@ -3936,7 +4149,14 @@ impl App {
                     u16::try_from(mods)
                         .map_err(|_| format!("modifier mask {mods} exceeds u16"))
                         .and_then(|mods| {
-                            self.dispatch_test_pointer(tab_id, kind, button, cell_x, cell_y, mods)
+                            self.dispatch_test_pointer(
+                                tab_id,
+                                kind,
+                                button,
+                                (cell_x, cell_y),
+                                mods,
+                                overshoot,
+                            )
                         })
                 };
                 match result {
@@ -4494,7 +4714,7 @@ mod tests {
     /// in flight is `busy`.
     #[test]
     fn a_refused_forward_says_which_of_the_two_reasons_it_was() {
-        let down = slot_unavailable().unwrap_err();
+        let down = slot_unavailable::<()>().unwrap_err();
         let busy = switch_busy().unwrap_err();
         assert_eq!(down.code, "host-unavailable");
         assert_eq!(down.message, "local session is not connected");
@@ -4514,7 +4734,10 @@ mod tests {
         assert_eq!(forward_slot(now, Some(3)), now);
         assert_eq!(forward_slot(now, None), now, "an unaddressed forward");
         assert_eq!(forward_slot(None, None), None);
-        assert_eq!(slot_unavailable().unwrap_err().code, "host-unavailable");
+        assert_eq!(
+            slot_unavailable::<()>().unwrap_err().code,
+            "host-unavailable"
+        );
     }
 
     /// `app.sidebar_dump`'s band strip, one row per plan 063 §D2
@@ -5433,6 +5656,7 @@ mod tests {
             shell_state: roost_ipc::agent::ShellState::default(),
             agent_lifecycle: roost_ipc::agent::AgentLifecycle::default(),
             ownership: None,
+            password_input: false,
         }
     }
 
@@ -6050,7 +6274,10 @@ mod tests {
                 reason: "shell exited".into(),
             }
         )));
-        assert!(tx.send(EngineFeed::NotificationActivated { tab: stale }));
+        assert!(tx.send(EngineFeed::NotificationActivated {
+            tab: stale,
+            token: None,
+        }));
 
         // `service_engine`'s drain loop and batch tail, verbatim in shape.
         let mut batch = EngineBatch::default();
@@ -6061,10 +6288,8 @@ mod tests {
                 EngineFeed::Tab(key, output) => {
                     collect_tab_output(&mut tabs, &mut pty, key, output);
                 }
-                EngineFeed::NotificationActivated { tab } => {
-                    if notification_activation(&workspace, Some(window::Id::unique()), tab)
-                        .is_some()
-                    {
+                EngineFeed::NotificationActivated { tab, .. } => {
+                    if notification_activation(&workspace, tab) {
                         raised += 1;
                     }
                 }
@@ -6236,10 +6461,10 @@ mod tests {
                 .map(|tab| tab.has_notification)
         };
 
-        let window = window::Id::unique();
-        let raise = notification_activation(&workspace, Some(window), TabKey::local(clicked.id))
-            .expect("the tab the banner named is still there");
-        assert!(matches!(raise, UiTask::Focus(id) if id == window));
+        assert!(
+            notification_activation(&workspace, TabKey::local(clicked.id)),
+            "the tab the banner named is still there"
+        );
         assert_eq!(workspace.active().1, clicked.id);
         assert_eq!(
             pending(clicked.id),
@@ -6247,17 +6472,12 @@ mod tests {
             "the jump clears the badge"
         );
 
-        // No window id yet (or a headless run): the focus still landed in
-        // the core, and only the raise is skipped.
-        assert!(matches!(
-            notification_activation(&workspace, None, TabKey::local(other.id)),
-            Some(UiTask::None)
-        ));
+        assert!(notification_activation(&workspace, TabKey::local(other.id)));
         assert_eq!(workspace.active().1, other.id);
 
         workspace.close_tab(clicked.id).expect("close the tab");
         assert!(
-            notification_activation(&workspace, Some(window), TabKey::local(clicked.id)).is_none(),
+            !notification_activation(&workspace, TabKey::local(clicked.id)),
             "a banner outliving its tab is a no-op"
         );
         assert_eq!(workspace.active().1, other.id, "and moves nothing");
@@ -6282,12 +6502,7 @@ mod tests {
         workspace.focus_tab(two.id).expect("focus elsewhere");
 
         assert!(
-            notification_activation(
-                &workspace,
-                Some(window::Id::unique()),
-                TabKey::new(HostId::new(9), one.id),
-            )
-            .is_none(),
+            !notification_activation(&workspace, TabKey::new(HostId::new(9), one.id)),
             "another instance's banner earns no raise"
         );
         assert_eq!(
@@ -6711,6 +6926,8 @@ mod tests {
             click_count: 0,
             inside: true,
             link_modifier_held: false,
+            press_seq: None,
+            overshoot: 0,
         })
         .expect("hover motion dispatch");
         tab.refresh_snapshot()

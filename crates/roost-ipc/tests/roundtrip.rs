@@ -16,6 +16,16 @@ fn round_trip_to_value<T: serde::Serialize + serde::de::DeserializeOwned + std::
     json
 }
 
+/// A recorded wire vector from `tests/ipc-vectors/`.
+fn vector(name: &str) -> serde_json::Value {
+    let path = format!(
+        "{}/../../tests/ipc-vectors/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {path}: {e}"))
+}
+
 #[test]
 fn identify_request_envelope() {
     let raw = RawRequest {
@@ -128,6 +138,7 @@ fn event_envelope_round_trip() {
                 shell_state: Default::default(),
                 agent_lifecycle: Default::default(),
                 ownership: None,
+                password_input: false,
             },
         })
         .unwrap(),
@@ -247,15 +258,6 @@ fn agents_vector_file_decodes_as_typed_palette_state() {
 /// struct has no name for fails here rather than at a user's socket.
 #[test]
 fn host_connection_vectors_decode_as_typed_params_and_results() {
-    fn vector(name: &str) -> serde_json::Value {
-        let path = format!(
-            "{}/../../tests/ipc-vectors/{name}",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {path}: {e}"))
-    }
-
     /// A recorded `host.status` result, plus the always-serialized keys
     /// [`HostStatus`] has grown since it was recorded.
     ///
@@ -415,15 +417,6 @@ fn reorder_tab_ids_serialize_as_string_array() {
 /// fails here rather than at a session's socket.
 #[test]
 fn file_transfer_vectors_decode_as_typed_params_and_results() {
-    fn vector(name: &str) -> serde_json::Value {
-        let path = format!(
-            "{}/../../tests/ipc-vectors/{name}",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {path}: {e}"))
-    }
-
     let request = vector("session.put_file.request.json");
     assert_eq!(request["op"], ops::SESSION_PUT_FILE);
     let params: SessionPutFileParams =
@@ -476,15 +469,6 @@ fn file_transfer_vectors_decode_as_typed_params_and_results() {
 /// those two fields exists to satisfy.
 #[test]
 fn both_identify_vectors_decode_as_the_current_typed_result() {
-    fn vector(name: &str) -> serde_json::Value {
-        let path = format!(
-            "{}/../../tests/ipc-vectors/{name}",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {path}: {e}"))
-    }
-
     let pre_063 = vector("identify.response.json");
     let result: IdentifyResult =
         serde_json::from_value(pre_063["result"].clone()).expect("pre-063 identify decodes");
@@ -521,15 +505,6 @@ fn both_identify_vectors_decode_as_the_current_typed_result() {
 /// session` — a leading band that is itself a saved host.
 #[test]
 fn both_sidebar_dump_vectors_decode_as_the_current_typed_result() {
-    fn vector(name: &str) -> serde_json::Value {
-        let path = format!(
-            "{}/../../tests/ipc-vectors/{name}",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {path}: {e}"))
-    }
-
     let pre_063 = vector("app.sidebar_dump.response.json");
     let result: SidebarDumpResult =
         serde_json::from_value(pre_063["result"].clone()).expect("pre-063 sidebar dump decodes");
@@ -569,6 +544,46 @@ fn both_sidebar_dump_vectors_decode_as_the_current_typed_result() {
     assert_eq!(
         serde_json::to_value(&result).unwrap(),
         session["result"],
+        "typed re-encode must match the vector"
+    );
+}
+
+/// `app.window_metrics` before and after the real-input harness's cell
+/// geometry (plan 074 §D7): the recorded response carries none of the
+/// optional fields and re-encodes exactly, and the iced shape carries all of
+/// them and re-encodes exactly.
+#[test]
+fn both_window_metrics_vectors_decode_as_the_current_typed_result() {
+    let recorded = vector("app.window_metrics.response.json");
+    let result: WindowMetricsResult =
+        serde_json::from_value(recorded["result"].clone()).expect("recorded metrics decode");
+    assert_eq!(
+        (
+            result.terminal_left,
+            result.terminal_padding,
+            result.cell_width,
+            result.cell_height
+        ),
+        (None, None, None, None)
+    );
+    assert_eq!(
+        serde_json::to_value(&result).unwrap(),
+        recorded["result"],
+        "absent geometry is omitted, so the recorded shape re-encodes exactly"
+    );
+
+    let geometry = vector("app.window_metrics.cell-geometry.response.json");
+    let result: WindowMetricsResult =
+        serde_json::from_value(geometry["result"].clone()).expect("cell geometry decodes");
+    assert_eq!(result.terminal_left, Some(220.0));
+    assert_eq!(result.terminal_padding, Some(0.0));
+    assert_eq!(
+        (result.cell_width, result.cell_height),
+        (Some(8.0), Some(16.0))
+    );
+    assert_eq!(
+        serde_json::to_value(&result).unwrap(),
+        geometry["result"],
         "typed re-encode must match the vector"
     );
 }

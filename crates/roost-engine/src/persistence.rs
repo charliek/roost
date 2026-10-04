@@ -71,6 +71,13 @@ pub struct SnapshotFile {
     /// [`SIDEBAR_MAX_WIDTH`]: crate::SIDEBAR_MAX_WIDTH
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f64,
+    /// The UI window's frame at save time, so a relaunch reopens it
+    /// where it was (plan 074 §D5b). Only the macOS iced UI writes it —
+    /// Ghostty remembers the frame on macOS alone — so it is omitted
+    /// while `None`: the daemon's file and every Linux one stay what
+    /// older builds wrote, and an older build reading this one ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<WindowFrame>,
     /// Saved host sessions, in the order the UI lists them. This is
     /// **client-side** state: the laptop remembers which hosts it can
     /// dial, while a host's own project/tab layout lives in that
@@ -109,9 +116,46 @@ impl Default for SnapshotFile {
             active_tab_position: 0,
             sidebar_collapsed: false,
             sidebar_width: default_sidebar_width(),
+            window: None,
             hosts: Vec::new(),
             recent_hosts: Vec::new(),
         }
+    }
+}
+
+/// A window frame in the UI toolkit's logical points: the content size
+/// the window opens at, and the outer (titlebar-inclusive) top-left on
+/// the desktop. The UI converts to and from the platform's own screen
+/// coordinates; this is what crosses a relaunch.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowFrame {
+    pub content_width: f64,
+    pub content_height: f64,
+    pub outer_x: f64,
+    pub outer_y: f64,
+}
+
+impl WindowFrame {
+    /// The largest content side a frame may restore, in logical points.
+    /// The window's GPU surface is created at the saved size before
+    /// anything can fit it to a screen, and wgpu panics on a texture past
+    /// its limit — 16384 pixels on Apple GPUs, so 8192 points at 2x. No
+    /// screen is that big, so nothing real is lost.
+    pub const MAX_CONTENT_SIDE: f64 = 8192.0;
+
+    /// Whether this frame can be opened at all: every value finite and
+    /// both sizes positive and at most [`Self::MAX_CONTENT_SIDE`]. A
+    /// position may be negative — a screen left of or above the primary
+    /// one has negative coordinates. The one place the rule lives, shared
+    /// by the workspace's setter and its `state.json` restore so they
+    /// can't diverge.
+    pub fn is_valid(&self) -> bool {
+        let side = |value: f64| value > 0.0 && value <= Self::MAX_CONTENT_SIDE;
+        [self.outer_x, self.outer_y]
+            .iter()
+            .all(|value| value.is_finite())
+            && side(self.content_width)
+            && side(self.content_height)
     }
 }
 
@@ -330,6 +374,12 @@ mod tests {
             active_tab_position: 1,
             sidebar_collapsed: true,
             sidebar_width: 300.0,
+            window: Some(WindowFrame {
+                content_width: 1280.0,
+                content_height: 800.0,
+                outer_x: -1440.0,
+                outer_y: 25.5,
+            }),
             hosts: vec![
                 HostSnapshot {
                     id: "h1".into(),
@@ -435,6 +485,7 @@ mod tests {
         assert!(back.projects[0].tabs.is_empty());
         assert_eq!(back.projects[0].last_tab_position, None);
         assert!(back.hosts.is_empty(), "absent hosts key defaults to none");
+        assert_eq!(back.window, None, "absent window key defaults to none");
 
         persist_state(&p, &back, false).unwrap();
         let raw = std::fs::read_to_string(&p).unwrap();
@@ -442,6 +493,73 @@ mod tests {
             !raw.contains("last_tab_position"),
             "a project with no remembered tab must not grow the file: {raw}"
         );
+    }
+
+    #[test]
+    fn an_unset_window_frame_writes_no_key() {
+        // The daemon's state.json and every Linux one never carry a
+        // frame; they must stay byte-for-byte what older builds wrote.
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("state.json");
+        persist_state(&p, &SnapshotFile::default(), false).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            !raw.contains("\"window\""),
+            "an unset frame must not grow the file: {raw}"
+        );
+    }
+
+    #[test]
+    fn a_window_frame_is_valid_only_when_finite_with_positive_sizes() {
+        let frame = WindowFrame {
+            content_width: 900.0,
+            content_height: 600.0,
+            outer_x: -1920.0,
+            outer_y: -40.0,
+        };
+        assert!(frame.is_valid(), "a negative position is a real screen");
+        assert!(
+            WindowFrame {
+                content_width: WindowFrame::MAX_CONTENT_SIDE,
+                ..frame
+            }
+            .is_valid(),
+            "the cap itself is allowed"
+        );
+        for broken in [
+            WindowFrame {
+                content_width: 0.0,
+                ..frame
+            },
+            WindowFrame {
+                content_height: -600.0,
+                ..frame
+            },
+            WindowFrame {
+                content_width: f64::NAN,
+                ..frame
+            },
+            WindowFrame {
+                outer_x: f64::INFINITY,
+                ..frame
+            },
+            WindowFrame {
+                outer_y: f64::NEG_INFINITY,
+                ..frame
+            },
+            // Finite, and enough to panic wgpu before any screen fit runs.
+            WindowFrame {
+                content_width: 100_000.0,
+                content_height: 100_000.0,
+                ..frame
+            },
+            WindowFrame {
+                content_height: WindowFrame::MAX_CONTENT_SIDE + 0.5,
+                ..frame
+            },
+        ] {
+            assert!(!broken.is_valid(), "{broken:?} must be invalid");
+        }
     }
 
     #[test]

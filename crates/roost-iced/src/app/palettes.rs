@@ -250,6 +250,14 @@ fn command_palette_frame(
         ];
     dynamic.extend(notification_inbox::command_items(notification_count));
     items.splice(index..index, dynamic);
+    if cfg!(target_os = "macos") {
+        splice_secure_input_row(
+            &mut items,
+            reverse
+                .get(&KeybindAction::ToggleSecureInput)
+                .and_then(|accel| accel_label(accel)),
+        );
+    }
     if !providers.is_empty() {
         items.push(
             palette::PaletteItem::new("custom_commands", "Custom Commands…").with_trailing(
@@ -274,6 +282,26 @@ fn command_palette_frame(
         picker_shortcut.as_deref(),
     ));
     palette::PaletteFrame::new(COMMANDS_FRAME_ID, "Execute a command…", items)
+}
+
+/// The Secure Keyboard Entry row's id (plan 074 §D3): the action's own
+/// wire name rather than a palette sentinel, because the row runs exactly
+/// the action. macOS-only, so it is spliced in rather than in the `SPECS`
+/// both UIs share.
+const SECURE_INPUT_ROW_ID: &str = "toggle_secure_input";
+
+/// Put the Secure Keyboard Entry row right after "Open Settings File",
+/// where the menu bar puts its item after "Settings…".
+fn splice_secure_input_row(items: &mut Vec<palette::PaletteItem>, shortcut: Option<String>) {
+    let at = items
+        .iter()
+        .position(|item| item.id == "open_config")
+        .map_or(items.len(), |index| index + 1);
+    items.insert(
+        at,
+        palette::PaletteItem::new(SECURE_INPUT_ROW_ID, "Toggle Secure Keyboard Entry")
+            .with_trailing(shortcut),
+    );
 }
 
 /// The host verb rows, as palette items.
@@ -1483,6 +1511,10 @@ impl App {
                 "toggle_sidebar_agents" => {
                     self.clear_palette_state();
                     self.toggle_sidebar_agents();
+                }
+                SECURE_INPUT_ROW_ID => {
+                    self.clear_palette_state();
+                    self.toggle_secure_input();
                 }
                 "agent_hooks" => {
                     self.clear_palette_state();
@@ -3185,6 +3217,49 @@ mod tests {
         assert_eq!(
             state.selected_item().map(|item| item.id),
             Some(palette::PaletteCommands::SELECT_THEME_ID.to_string())
+        );
+    }
+
+    /// The row is the action itself, after "Open Settings File", and it
+    /// advertises whatever chord the user bound to it.
+    #[test]
+    fn the_secure_input_row_is_the_action_after_open_settings() {
+        assert_eq!(
+            KeybindAction::from_name(SECURE_INPUT_ROW_ID),
+            Some(KeybindAction::ToggleSecureInput)
+        );
+        let mut items = palette::command_items(|_| None);
+        splice_secure_input_row(&mut items, Some("Ctrl+Alt+Shift+K".into()));
+        let settings = items
+            .iter()
+            .position(|item| item.id == "open_config")
+            .expect("Open Settings File");
+        let row = &items[settings + 1];
+        assert_eq!(row.id, SECURE_INPUT_ROW_ID);
+        assert_eq!(row.title, "Toggle Secure Keyboard Entry");
+        assert_eq!(row.trailing_text.as_deref(), Some("Ctrl+Alt+Shift+K"));
+    }
+
+    /// macOS has Secure Keyboard Entry; every other host has nothing to
+    /// toggle, so it offers no row.
+    #[test]
+    fn the_command_frame_offers_secure_input_only_on_macos() {
+        let frame = command_palette_frame(
+            0,
+            &[],
+            &keybind::default_bindings().into_iter().collect(),
+            &[],
+            &[],
+            IN_PROCESS,
+            false,
+            host_verbs::SlotHistory::Connected,
+        );
+        assert_eq!(
+            frame
+                .items
+                .iter()
+                .any(|item| item.id == SECURE_INPUT_ROW_ID),
+            cfg!(target_os = "macos")
         );
     }
 

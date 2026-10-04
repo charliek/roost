@@ -1,0 +1,13 @@
+{
+  "id": "42",
+  "op": "tab.dispatch_mouse_event",
+  "params": {
+    "tab_id": "5",
+    "kind": "motion",
+    "button": "left",
+    "cell_x": 0,
+    "cell_y": 0,
+    "mods": 0,
+    "overshoot": -3
+  }
+}

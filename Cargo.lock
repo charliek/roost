@@ -3076,6 +3076,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-width",
+ "wayland-client",
+ "wayland-protocols",
  "zbus",
 ]
 

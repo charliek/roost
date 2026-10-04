@@ -76,6 +76,15 @@ pub struct Tab {
     pub agent_lifecycle: AgentLifecycle,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ownership: Option<Ownership>,
+    /// Whether the tab's PTY is at a password prompt right now: line mode
+    /// with echo off (`ICANON && !ECHO`), sampled off the PTY master. Live
+    /// state, never persisted.
+    ///
+    /// Omitted while `false`, so every tab a server sends without it — an
+    /// older session's included — reads as not at a prompt, and a vector
+    /// recorded before the field existed still round-trips byte for byte.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub password_input: bool,
 }
 
 impl Tab {
@@ -424,8 +433,8 @@ pub struct TabDumpParams {
     pub scrollback: u32,
 }
 
-fn is_zero(value: &u32) -> bool {
-    *value == 0
+fn is_zero<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
 }
 
 /// The most history rows one [`TabDumpParams`] may ask for. A larger
@@ -1195,6 +1204,12 @@ pub struct TabDispatchMouseEventParams {
     /// alt(2), cmd/super(3). `0` for no modifiers.
     #[serde(default)]
     pub mods: u32,
+    /// Rows the pointer is past the grid: negative above row 0, positive
+    /// below the last row, `0` over it. A held selection drag past either
+    /// edge auto-scrolls (iced only). Omitted when `0`, for the reason
+    /// [`TabDumpParams::scrollback`] gives.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub overshoot: i16,
 }
 
 /// `app.set_window_focus` request: drive the focus-tracking emit
@@ -1420,6 +1435,84 @@ pub struct AppNotificationStatusResult {
     /// while unavailable. CI's TCC authorization state is unknowable,
     /// so nothing in the automated suite asserts this `true`.
     pub authorized: bool,
+}
+
+/// `app.secure_input` request: read Secure Keyboard Entry's state (plan
+/// 074 §D3). Gated on `ROOST_TEST_MODE=1`; the iced UI answers on every
+/// OS, with every field `false` off macOS, where the feature does not
+/// exist.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppSecureInputParams {}
+
+/// Secure Keyboard Entry as the UI's owner holds it: the inputs it last
+/// applied, what they asked for, and what it got.
+///
+/// `desired == (app_active && (manual || (auto && password_input)))`;
+/// `owned` is whether Roost holds an `EnableSecureEventInput` that
+/// succeeded; `indicator` is whether the tab band draws the lock, which
+/// is `owned` under `macos-secure-input-indication = true`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AppSecureInputResult {
+    pub desired: bool,
+    pub owned: bool,
+    pub indicator: bool,
+    /// `macos-secure-keyboard-entry`, the remembered toggle.
+    pub manual: bool,
+    /// `macos-auto-secure-input`.
+    pub auto: bool,
+    /// `NSApp.isActive` when the owner last applied.
+    pub app_active: bool,
+    /// The active tab's `password_input` when the owner last applied.
+    pub password_input: bool,
+}
+
+/// `app.notification_activate` request: a click on the desktop banner for
+/// `tab_id`, put where a real click lands, carrying `token` as the
+/// notification server's spec 1.2 `ActivationToken` would. Gated on
+/// `ROOST_TEST_MODE=1`; a test seam, not a surface.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppNotificationActivateParams {
+    pub tab_id: WireTabRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+/// `app.last_activation` request — nullary envelope (`{}`). Gated like
+/// `app.notification_activate`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppLastActivationParams {}
+
+/// What the window raise a banner click asked for came to (#351).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ActivationOutcome {
+    /// `xdg_activation_v1.activate(token, surface)` was sent.
+    Activated,
+    /// A Wayland window, and a compositor that offers no
+    /// `xdg_activation_v1`.
+    NoGlobal,
+    /// Not a Wayland window: X11, or macOS.
+    NotWayland,
+    /// The click carried no activation token to spend.
+    NoToken,
+    /// The compositor could not be asked: the registry did not answer in
+    /// time, or the connection failed.
+    Failed,
+}
+
+/// What `app.last_activation` answers: the last banner click whose raise
+/// has settled. Every field is `null` until one has.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AppLastActivationResult {
+    pub outcome: Option<ActivationOutcome>,
+    /// The token the click carried.
+    pub token: Option<String>,
+    /// Whether the compositor's registry lists `xdg_activation_v1`, or
+    /// `null` when it was not asked or did not answer.
+    pub activation_global: Option<bool>,
 }
 
 /// `tab.expand_selection_at` response: the committed selection's
@@ -1791,6 +1884,20 @@ pub struct WindowMetricsResult {
     /// report the installed family actually used by the live terminal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_font_family: Option<String>,
+    /// Left edge of the terminal viewport in the window content (logical
+    /// points), so a driver that clicks a cell computes its origin rather
+    /// than inferring it from the sidebar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_left: Option<f64>,
+    /// Inset of the cell grid inside the terminal viewport, on every side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_padding: Option<f64>,
+    /// The live grid's cell size (logical points): the active tab's applied
+    /// metrics, else the UI's current ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_width: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_height: Option<f64>,
 }
 
 /// `app.sidebar_dump` request — nullary envelope (`{}`), matching
@@ -2118,6 +2225,17 @@ pub struct HookActiveChangedEvent {
     #[schemars(with = "String")]
     pub tab_id: i64,
     pub active: bool,
+}
+
+/// `tab.password_input` — [`Tab::password_input`] changed. Workspace
+/// state like any other tab field, so it is replayed into a resume, and a
+/// client that reconnects reads the standing value off `tab.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TabPasswordInputEvent {
+    #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
+    pub tab_id: i64,
+    pub password_input: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -3746,6 +3864,13 @@ pub mod ops {
     /// `app.menu_dump`.
     pub const APP_NOTIFICATION_STATUS: &str = "app.notification_status";
 
+    /// Test-only click on a tab's desktop banner, with or without the
+    /// server's activation token, and the read of what the window raise
+    /// it asked for came to (#351). Same gate as `tab.feed_pty_bytes`,
+    /// on every platform.
+    pub const APP_NOTIFICATION_ACTIVATE: &str = "app.notification_activate";
+    pub const APP_LAST_ACTIVATION: &str = "app.last_activation";
+
     /// Test-only read of the host modal on screen — which one, what it
     /// says, and what its buttons are labelled. Same gate as
     /// `tab.feed_pty_bytes`. It exists so the IPC-only pytest harness
@@ -3779,6 +3904,12 @@ pub mod ops {
     /// seam, not a surface" rule as `app.dialog_answer`.
     pub const APP_KEY_EVENT: &str = "app.key_event";
 
+    /// Test-only read of Secure Keyboard Entry's state (plan 074 §D3):
+    /// the owner's inputs, what they ask for, what it holds and whether
+    /// the lock is drawn. Same gate as `app.dialog_answer`; the iced UI
+    /// answers on every OS, all `false` off macOS.
+    pub const APP_SECURE_INPUT: &str = "app.secure_input";
+
     /// Test-only reads and presses of a row's right-click menu (plan 073
     /// D9): list it, run one item through the dispatcher a click
     /// reaches, or show it on screen. Same gate and the same "test seam,
@@ -3808,6 +3939,10 @@ pub mod ops {
     pub const EVENT_PROJECT_DELETED: &str = "project.deleted";
     pub const EVENT_ACTIVE_CHANGED: &str = "active.changed";
     pub const EVENT_HOOK_ACTIVE_CHANGED: &str = "hook_active.changed";
+    /// A tab's PTY entered or left a password prompt
+    /// ([`crate::messages::Tab::password_input`]). A new name inside the
+    /// existing batch, so no protocol bump: an older client skips it.
+    pub const EVENT_TAB_PASSWORD_INPUT: &str = "tab.password_input";
     pub const EVENT_NOTIFICATION_FIRED: &str = "notification.fired";
     pub const EVENT_AGENT_REPORT_CHANGED: &str = "agent_report.changed";
     /// Plural subjects: the event names the *set* that was reordered,
@@ -4312,6 +4447,7 @@ mod tests {
             shell_state: ShellState::ForegroundProcess,
             agent_lifecycle: AgentLifecycle::Inactive,
             ownership: None,
+            password_input: false,
         };
         round_trip(&t);
         let json = serde_json::to_string(&t).unwrap();
@@ -4364,6 +4500,7 @@ mod tests {
             shell_state: ShellState::default(),
             agent_lifecycle: AgentLifecycle::default(),
             ownership: None,
+            password_input: false,
         };
         let value = serde_json::to_value(&tab).unwrap();
         for key in ["shell_state", "agent_lifecycle"] {
@@ -4880,6 +5017,10 @@ mod tests {
             sidebar_collapsed: false,
             terminal_top: Some(34.0),
             terminal_font_family: Some("JetBrains Mono".to_string()),
+            terminal_left: Some(220.0),
+            terminal_padding: Some(0.0),
+            cell_width: Some(7.8),
+            cell_height: Some(15.6),
         });
         let native = WindowMetricsResult {
             window_width: 1800.0,
@@ -4888,12 +5029,24 @@ mod tests {
             sidebar_collapsed: true,
             terminal_top: None,
             terminal_font_family: None,
+            terminal_left: None,
+            terminal_padding: None,
+            cell_width: None,
+            cell_height: None,
         };
         let json = serde_json::to_string(&native).unwrap();
-        assert!(
-            !json.contains("terminal_top"),
-            "None changed the old wire shape"
-        );
+        for absent in [
+            "terminal_top",
+            "terminal_left",
+            "terminal_padding",
+            "cell_width",
+            "cell_height",
+        ] {
+            assert!(
+                !json.contains(absent),
+                "None changed the old wire shape: {json}"
+            );
+        }
         round_trip(&native);
 
         let old: WindowMetricsResult = serde_json::from_str(
@@ -4902,6 +5055,15 @@ mod tests {
         .unwrap();
         assert_eq!(old.terminal_top, None);
         assert_eq!(old.terminal_font_family, None);
+        assert_eq!(
+            (
+                old.terminal_left,
+                old.terminal_padding,
+                old.cell_width,
+                old.cell_height
+            ),
+            (None, None, None, None)
+        );
     }
 
     #[test]
@@ -5151,18 +5313,21 @@ mod tests {
             cell_x: 6,
             cell_y: 3,
             mods: 0,
+            overshoot: 0,
         };
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains("\"tab_id\":\"11\""), "got: {json}");
         assert!(json.contains("\"kind\":\"press\""), "got: {json}");
         round_trip(&p);
 
-        // `mods` defaults to 0 when omitted (most tests don't carry mods).
+        // `mods` and `overshoot` default to 0 when omitted (most tests
+        // carry neither).
         let no_mods: TabDispatchMouseEventParams = serde_json::from_str(
             r#"{"tab_id":"3","kind":"motion","button":"none","cell_x":1,"cell_y":1}"#,
         )
         .unwrap();
         assert_eq!(no_mods.mods, 0);
+        assert_eq!(no_mods.overshoot, 0);
 
         let bad =
             r#"{"tab_id":"3","kind":"press","button":"left","cell_x":1,"cell_y":1,"extra":"x"}"#;
@@ -5212,6 +5377,60 @@ mod tests {
         assert_eq!(cleared, r#"{"label":null}"#);
         let bad = r#"{"extra":"x"}"#;
         assert!(serde_json::from_str::<AppDockBadgeParams>(bad).is_err());
+    }
+
+    #[test]
+    fn app_secure_input_round_trips() {
+        round_trip(&AppSecureInputParams {});
+        round_trip(&AppSecureInputResult {
+            desired: true,
+            owned: true,
+            indicator: true,
+            manual: false,
+            auto: true,
+            app_active: true,
+            password_input: true,
+        });
+        round_trip(&AppSecureInputResult::default());
+        let bad = r#"{"extra":"x"}"#;
+        assert!(serde_json::from_str::<AppSecureInputParams>(bad).is_err());
+    }
+
+    #[test]
+    fn the_notification_raise_ops_round_trip_in_their_documented_spellings() {
+        let with_token: AppNotificationActivateParams =
+            serde_json::from_value(json!({"tab_id": "h3.7", "token": "t-1"})).unwrap();
+        assert_eq!(with_token.tab_id, WireTabRef::Host { host: 3, tab: 7 });
+        assert_eq!(with_token.token.as_deref(), Some("t-1"));
+        let bare: AppNotificationActivateParams =
+            serde_json::from_value(json!({"tab_id": "7"})).unwrap();
+        assert_eq!(bare.token, None, "a click without a token omits it");
+        assert_eq!(serde_json::to_value(&bare).unwrap(), json!({"tab_id": "7"}));
+        assert!(serde_json::from_value::<AppNotificationActivateParams>(
+            json!({"tab_id": "7", "extra": 1})
+        )
+        .is_err());
+
+        assert_eq!(
+            serde_json::to_value(AppLastActivationResult::default()).unwrap(),
+            json!({"outcome": null, "token": null, "activation_global": null}),
+            "nothing settled yet reads as nulls, never as missing keys"
+        );
+        for (outcome, spelling) in [
+            (ActivationOutcome::Activated, "activated"),
+            (ActivationOutcome::NoGlobal, "no-global"),
+            (ActivationOutcome::NotWayland, "not-wayland"),
+            (ActivationOutcome::NoToken, "no-token"),
+            (ActivationOutcome::Failed, "failed"),
+        ] {
+            assert_eq!(serde_json::to_value(outcome).unwrap(), json!(spelling));
+            round_trip(&AppLastActivationResult {
+                outcome: Some(outcome),
+                token: Some("t-1".into()),
+                activation_global: Some(false),
+            });
+        }
+        round_trip(&AppLastActivationParams {});
     }
 
     #[test]

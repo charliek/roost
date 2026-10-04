@@ -39,4 +39,6 @@ markers = [
     # lane can be selected on its own (`make e2e-host-client`) and deselected
     # where no session binary is built (see DAEMON_E2E_DESELECT).
     "host_client: HS-2 host-client E2E; needs a UI *and* a roost-session daemon",
+    # The real-input module (plan 074 §D7); conftest says why it matters.
+    "owns_ui: the module launches its own UI; the session launcher stands down for it",
 ]

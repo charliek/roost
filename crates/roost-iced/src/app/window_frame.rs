@@ -1,0 +1,1369 @@
+//! Remembering the window frame across launches — macOS only, after
+//! Ghostty's `LastWindowPosition` (plan 074 §D5b).
+//!
+//! The frame is kept in iced's own logical points: the content size
+//! `window::Settings::size` means, and the outer top-left that
+//! `window::Event::Moved` reports and `Position::Specific` places on
+//! macOS. So the window opens where it was, with no jump. AppKit's
+//! coordinates appear only in [`fit_on_screens`] and [`iced_frame`],
+//! which `macos::window_frame` calls once the window exists, to bring a
+//! frame saved on a since-disconnected display back onto a screen.
+
+use std::time::Duration;
+
+use iced::{window, Point, Size};
+use roost_engine::persistence::WindowFrame;
+use roost_engine::Workspace;
+
+use super::{TrailingDebounce, INITIAL_WINDOW_SIZE, MIN_WINDOW_SIZE};
+
+/// Ghostty's GTK build doesn't remember the frame, and Wayland can
+/// neither read nor set a window's position, so Linux never reads or
+/// writes it.
+pub(crate) const REMEMBERS_WINDOW_FRAME: bool = cfg!(target_os = "macos");
+
+/// How long after the last resize or move the frame is written.
+pub(super) const SAVE_DELAY: Duration = Duration::from_millis(500);
+
+/// What the window is created at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct OpeningFrame {
+    pub(crate) size: Size,
+    /// `None` leaves the placement to the platform.
+    pub(crate) position: Option<Point>,
+}
+
+impl OpeningFrame {
+    /// The saved frame, if this build remembers one, it is
+    /// [`WindowFrame::is_valid`], and its position survives the trip into
+    /// iced's `f32`s; otherwise the defaults. The size is clamped up only
+    /// to the window's minimum — whether it fits a screen is the post-open
+    /// check's question, which needs `NSScreen`.
+    pub(crate) fn from_saved(saved: Option<WindowFrame>, remembers: bool) -> Self {
+        let defaults = Self {
+            size: INITIAL_WINDOW_SIZE,
+            position: None,
+        };
+        let Some(frame) = saved.filter(|frame| remembers && frame.is_valid()) else {
+            return defaults;
+        };
+        let size = Size::new(frame.content_width as f32, frame.content_height as f32);
+        let position = Point::new(frame.outer_x as f32, frame.outer_y as f32);
+        if !(position.x.is_finite() && position.y.is_finite()) {
+            return defaults;
+        }
+        Self {
+            size: Size::new(
+                size.width.max(MIN_WINDOW_SIZE.width),
+                size.height.max(MIN_WINDOW_SIZE.height),
+            ),
+            position: Some(position),
+        }
+    }
+}
+
+/// What the post-open screen check reports: the window's frame as it now
+/// stands, and whether the check had to move it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CheckedFrame {
+    pub(crate) frame: WindowFrame,
+    pub(crate) adjusted: bool,
+}
+
+/// The post-open screen check's brief: the size a saved frame opened the
+/// window at, or `None` when the platform placed it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FrameCheck {
+    opened_at: Option<Size>,
+}
+
+impl FrameCheck {
+    /// Where the check moves a window whose frame is now `frame`: wholly
+    /// onto a visible screen whenever a saved frame placed it, whatever size
+    /// it has by now. AppKit may already have cut a frame from a monitor
+    /// that is gone down to this screen's height, keeping its width and
+    /// position, and a resize that got there first still has to land on a
+    /// screen. [`fit_on_screens`] shrinks only what cannot fit at all.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn fit(
+        self,
+        frame: ScreenRect,
+        visible: &[ScreenRect],
+        main: ScreenRect,
+    ) -> Option<ScreenRect> {
+        self.opened_at?;
+        fit_on_screens(frame, visible, main)
+    }
+}
+
+/// The running window's frame, and whether `state.json` is owed it.
+#[derive(Debug)]
+pub(super) struct WindowFrameMemory {
+    remembers: bool,
+    opening: OpeningFrame,
+    check_requested: bool,
+    /// Whether the post-open screen check has answered. Until it has, a
+    /// `Moved` is the window being placed, not the user moving it.
+    checked: bool,
+    /// The content size the latest native resize reported. Those events,
+    /// not the screen check's look, are what the size follows: a resize
+    /// can be applied after the check looked and still reach `update`
+    /// before its answer does.
+    content: Size,
+    outer: Option<Point>,
+    /// The window's mode as of its latest query: `Windowed` is visible
+    /// and not full screen.
+    mode: window::Mode,
+    /// A resize or move `state.json` doesn't have yet. A full-screen
+    /// answer clears it: a resize can land before the query that says it
+    /// was a full-screen transition's.
+    owed: bool,
+    /// Roost's own full-screen toggle ran and its transition has not
+    /// settled: what a resize records now may be transition geometry the
+    /// mode queries have not caught up with.
+    toggling: bool,
+    debounce: TrailingDebounce,
+    /// Every delivered resize and mode change, counted. A deadline reads
+    /// the window back some time after its arm, so once one of these has
+    /// reached `update` since, its answer can be older than what the App
+    /// applied — and a resize while full screen, or the creation's own,
+    /// arms nothing that would supersede it.
+    changes: u64,
+    /// `changes` at the latest arm.
+    changes_at_arm: u64,
+}
+
+/// What a save deadline's answer leaves the App to do.
+#[derive(Debug, PartialEq)]
+pub(super) struct DeadlineAnswer {
+    /// The mode it read back, when that was adopted: the menu's full-screen
+    /// title follows it.
+    pub(super) mode: Option<window::Mode>,
+    /// The size to re-grid the window at ([`missed_resize`]).
+    pub(super) regrid: Option<Size>,
+}
+
+impl WindowFrameMemory {
+    pub(super) fn new(remembers: bool, opening: OpeningFrame) -> Self {
+        Self {
+            remembers,
+            opening,
+            check_requested: false,
+            checked: false,
+            content: opening.size,
+            outer: opening.position,
+            mode: window::Mode::Windowed,
+            owed: false,
+            toggling: false,
+            debounce: TrailingDebounce::default(),
+            changes: 0,
+            changes_at_arm: 0,
+        }
+    }
+
+    pub(super) fn opening(&self) -> OpeningFrame {
+        self.opening
+    }
+
+    /// `Some` exactly once, for the first window open, when this build
+    /// remembers the frame. Only a frame `state.json` placed is fitted onto
+    /// a screen — the platform's own placement of a fresh window is left as
+    /// it always was.
+    pub(super) fn take_check(&mut self) -> Option<FrameCheck> {
+        let take = self.remembers && !self.check_requested;
+        self.check_requested = true;
+        take.then_some(FrameCheck {
+            opened_at: self.opening.position.map(|_| self.opening.size),
+        })
+    }
+
+    /// The screen check answered. `None` means it could not read the
+    /// window, which still ends the placement: later moves are the user's.
+    /// A frame the check had to move is owed to `state.json`, so it arms
+    /// a save; the returned generation is that arm. Its size is never
+    /// taken from here: a size the check changed comes back as a resize.
+    pub(super) fn checked(&mut self, observed: Option<CheckedFrame>) -> Option<u64> {
+        self.checked = true;
+        let Some(observed) = observed else {
+            tracing::debug!("window frame: the screen check could not read the window");
+            return None;
+        };
+        tracing::debug!(
+            frame = ?observed.frame,
+            adjusted = observed.adjusted,
+            "window frame: screen check reported"
+        );
+        self.outer = Some(Point::new(
+            observed.frame.outer_x as f32,
+            observed.frame.outer_y as f32,
+        ));
+        if observed.adjusted {
+            self.record("the screen check moved it")
+        } else {
+            None
+        }
+    }
+
+    /// A native resize, in logical points. Returns the save to arm. Before
+    /// the screen check answers, only a resize to the size the window was
+    /// created at is the creation's own; any other is a real one, and the
+    /// check's answer arriving after it is no reason to lose it.
+    pub(super) fn resized(&mut self, size: Size) -> Option<u64> {
+        self.changes = self.changes.wrapping_add(1);
+        self.content = size;
+        if !self.checked && size == self.opening.size {
+            tracing::trace!(?size, "window frame: resize is the window's creation");
+            return None;
+        }
+        self.record("resize")
+    }
+
+    /// A native move of the outer top-left. Returns the save to arm.
+    pub(super) fn moved(&mut self, outer: Point) -> Option<u64> {
+        if !self.checked {
+            tracing::trace!(?outer, "window frame: move is the window being placed");
+            return None;
+        }
+        self.outer = Some(outer);
+        self.record("move")
+    }
+
+    pub(super) fn observe_mode(&mut self, mode: window::Mode) {
+        if mode != self.mode {
+            self.changes = self.changes.wrapping_add(1);
+            if self.remembers {
+                tracing::debug!(?mode, "window frame: mode changed");
+            }
+        }
+        self.mode = mode;
+        if mode == window::Mode::Fullscreen && self.owed {
+            tracing::debug!("window frame: full screen drops the unsaved frame");
+            self.owed = false;
+        }
+    }
+
+    /// A save deadline answered with the mode, outer top-left and content
+    /// size it read back. The read-back mode and size are adopted only for
+    /// the latest arm with no resize or mode change delivered since it
+    /// (`changes`); the frame is saved by [`Self::save_due`]'s rules
+    /// either way, at the size the events left when the read-back is older.
+    pub(super) fn deadline_answered(
+        &mut self,
+        workspace: &Workspace,
+        generation: u64,
+        mode: window::Mode,
+        outer: Option<Point>,
+        content: Size,
+        gridded: Size,
+    ) -> DeadlineAnswer {
+        let current = self.debounce.is_latest(generation) && self.changes == self.changes_at_arm;
+        if current {
+            self.observe_mode(mode);
+        } else {
+            tracing::debug!(
+                generation,
+                ?mode,
+                ?content,
+                "window frame: deadline read back before a newer resize or mode"
+            );
+        }
+        let won = self.save_due(workspace, generation, outer, current.then_some(content));
+        DeadlineAnswer {
+            mode: current.then_some(mode),
+            regrid: missed_resize(won, gridded),
+        }
+    }
+
+    /// A save's deadline. Only the latest arm acts, and only while the
+    /// window is visible and not full screen — as of the latest mode
+    /// `update` knows, which is the deadline's own when it was adopted.
+    ///
+    /// `outer` and `content` are what the deadline read back from the
+    /// window, and they win over what the events left. winit converts a
+    /// move with the window's new backing scale while iced still holds the
+    /// old one, so a move onto a screen of another scale can arrive scaled
+    /// wrong; and iced's subscriptions drop events when their channel is
+    /// full, so the resize from the screen check's shrink can go missing
+    /// while iced's own record of the size stays right.
+    ///
+    /// Returns the read-back `content` when it won — the latest deadline,
+    /// windowed — since the terminals are owed that size too
+    /// ([`missed_resize`]).
+    fn save_due(
+        &mut self,
+        workspace: &Workspace,
+        generation: u64,
+        outer: Option<Point>,
+        content: Option<Size>,
+    ) -> Option<Size> {
+        if !self.debounce.is_latest(generation) {
+            tracing::trace!(generation, "window frame: deadline superseded");
+            return None;
+        }
+        tracing::debug!(
+            generation,
+            mode = ?self.mode,
+            ?outer,
+            ?content,
+            "window frame: save deadline"
+        );
+        if self.mode != window::Mode::Windowed {
+            return None;
+        }
+        if outer.is_some() {
+            self.outer = outer;
+        }
+        if let Some(content) = content {
+            self.content = content;
+        }
+        self.write_owed(workspace, "deadline");
+        content
+    }
+
+    /// Roost's own full-screen toggle is about to run. Entering full screen
+    /// clears what is owed (see `owed`), so a windowed frame is written now,
+    /// before it can be. The AppKit green button gives no such warning:
+    /// there the last frame written is the one that stays.
+    pub(super) fn full_screen_toggling(&mut self, workspace: &Workspace) {
+        if !self.remembers {
+            return;
+        }
+        tracing::debug!(mode = ?self.mode, "window frame: Roost's full-screen toggle");
+        self.toggling = true;
+        if self.mode == window::Mode::Windowed {
+            self.write_owed(workspace, "full-screen toggle");
+        }
+    }
+
+    /// The full-screen settle after the last resize came due: a transition
+    /// Roost started is over.
+    pub(super) fn full_screen_settled(&mut self) {
+        if self.toggling {
+            tracing::debug!("window frame: the full-screen toggle settled");
+        }
+        self.toggling = false;
+    }
+
+    /// A quit inside the debounce would otherwise lose the last move.
+    /// No visibility check: a hidden or minimized window keeps the frame
+    /// it had, and the window may be gone by now anyway. Nothing during a
+    /// transition Roost started — its windowed frame was written when the
+    /// toggle ran.
+    pub(super) fn save_on_exit(&mut self, workspace: &Workspace) {
+        if !self.remembers {
+            return;
+        }
+        if self.toggling || self.mode == window::Mode::Fullscreen {
+            tracing::debug!(
+                toggling = self.toggling,
+                mode = ?self.mode,
+                "window frame: not saved on quit, full screen or entering it"
+            );
+            return;
+        }
+        self.write_owed(workspace, "quit");
+    }
+
+    fn record(&mut self, cause: &'static str) -> Option<u64> {
+        if !self.remembers {
+            return None;
+        }
+        if self.mode == window::Mode::Fullscreen {
+            tracing::trace!(cause, "window frame: not recorded, full screen");
+            return None;
+        }
+        self.owed = true;
+        let generation = self.debounce.arm();
+        self.changes_at_arm = self.changes;
+        tracing::trace!(
+            cause,
+            generation,
+            content = ?self.content,
+            outer = ?self.outer,
+            "window frame: save scheduled"
+        );
+        Some(generation)
+    }
+
+    /// Write what is owed, once the position is known: a first launch's
+    /// window has none until the screen check or a deadline reads one.
+    fn write_owed(&mut self, workspace: &Workspace, when: &'static str) {
+        if !self.owed {
+            tracing::debug!(when, "window frame: nothing owed");
+            return;
+        }
+        let Some(outer) = self.outer else {
+            tracing::debug!(when, "window frame: not saved yet, no position known");
+            return;
+        };
+        self.owed = false;
+        let frame = WindowFrame {
+            content_width: f64::from(self.content.width),
+            content_height: f64::from(self.content.height),
+            outer_x: f64::from(outer.x),
+            outer_y: f64::from(outer.y),
+        };
+        tracing::debug!(when, ?frame, "window frame: saved");
+        workspace.set_window_frame(frame);
+    }
+}
+
+/// The size the window re-grids at for a resize whose event never reached
+/// `update`: the size a deadline read back and won with
+/// ([`WindowFrameMemory::save_due`]), when the terminals are gridded for
+/// another. An equal size is no resize — a re-grid would still disarm a
+/// held drag's auto-scroll.
+fn missed_resize(won: Option<Size>, gridded: Size) -> Option<Size> {
+    won.filter(|size| *size != gridded)
+}
+
+/// `App::drop`'s persistence, in its required order: the frame a quit
+/// inside the debounce still owes, then the flush that freezes
+/// persistence for good.
+pub(super) fn flush_on_exit(
+    workspace: &Workspace,
+    frames: &mut WindowFrameMemory,
+) -> Result<(), String> {
+    frames.save_on_exit(workspace);
+    workspace.flush()
+}
+
+/// A rectangle in AppKit's global screen space: points, with the origin at
+/// the primary screen's bottom-left and y growing up.
+///
+/// This and the geometry below are portable, though only macOS calls
+/// them, so their tests run on every CI cell.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ScreenRect {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) width: f64,
+    pub(crate) height: f64,
+}
+
+/// Slack for AppKit's rounding: a frame flush with a screen's edge is on
+/// that screen.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const EDGE_SLACK: f64 = 0.5;
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl ScreenRect {
+    fn max_x(self) -> f64 {
+        self.x + self.width
+    }
+
+    fn max_y(self) -> f64 {
+        self.y + self.height
+    }
+
+    fn contains(self, other: Self) -> bool {
+        other.x >= self.x - EDGE_SLACK
+            && other.y >= self.y - EDGE_SLACK
+            && other.max_x() <= self.max_x() + EDGE_SLACK
+            && other.max_y() <= self.max_y() + EDGE_SLACK
+    }
+
+    fn overlap_area(self, other: Self) -> f64 {
+        let width = self.max_x().min(other.max_x()) - self.x.max(other.x);
+        let height = self.max_y().min(other.max_y()) - self.y.max(other.y);
+        width.max(0.0) * height.max(0.0)
+    }
+}
+
+/// Where `frame` has to go to lie wholly on one screen's visible area, or
+/// `None` when it already does. It goes to the screen it overlaps most,
+/// or to `main` when it is on none, and shrinks only when it no longer
+/// fits there.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn fit_on_screens(
+    frame: ScreenRect,
+    visible: &[ScreenRect],
+    main: ScreenRect,
+) -> Option<ScreenRect> {
+    if visible.iter().any(|screen| screen.contains(frame)) {
+        return None;
+    }
+    let target = visible
+        .iter()
+        .copied()
+        .map(|screen| (screen.overlap_area(frame), screen))
+        .filter(|(area, _)| *area > 0.0)
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .map_or(main, |(_, screen)| screen);
+    let width = frame.width.min(target.width);
+    let height = frame.height.min(target.height);
+    Some(ScreenRect {
+        x: frame.x.clamp(target.x, target.max_x() - width),
+        y: frame.y.clamp(target.y, target.max_y() - height),
+        width,
+        height,
+    })
+}
+
+/// An AppKit window frame as iced means it: the content size, and the
+/// outer top-left measured down from the top of the primary screen —
+/// the flip winit applies with that screen's height.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn iced_frame(
+    frame: ScreenRect,
+    content_width: f64,
+    content_height: f64,
+    primary_height: f64,
+) -> WindowFrame {
+    WindowFrame {
+        content_width,
+        content_height,
+        outer_x: frame.x,
+        outer_y: primary_height - frame.max_y(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FRAME: WindowFrame = WindowFrame {
+        content_width: 900.0,
+        content_height: 600.0,
+        outer_x: 120.0,
+        outer_y: 80.0,
+    };
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> ScreenRect {
+        ScreenRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// A memory past its screen check, at `FRAME`, the way a launch that
+    /// restored it stands once the window is up.
+    fn checked_memory(remembers: bool) -> WindowFrameMemory {
+        let mut memory =
+            WindowFrameMemory::new(remembers, OpeningFrame::from_saved(Some(FRAME), remembers));
+        assert_eq!(memory.take_check().is_some(), remembers);
+        memory.checked(Some(CheckedFrame {
+            frame: FRAME,
+            adjusted: false,
+        }));
+        memory
+    }
+
+    fn state(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        dir.path().join("state.json")
+    }
+
+    #[test]
+    fn a_saved_frame_opens_at_its_size_and_position() {
+        let opening = OpeningFrame::from_saved(Some(FRAME), true);
+        assert_eq!(opening.size, Size::new(900.0, 600.0));
+        assert_eq!(opening.position, Some(Point::new(120.0, 80.0)));
+    }
+
+    #[test]
+    fn no_saved_frame_opens_at_the_defaults() {
+        let defaults = OpeningFrame {
+            size: INITIAL_WINDOW_SIZE,
+            position: None,
+        };
+        assert_eq!(OpeningFrame::from_saved(None, true), defaults);
+        assert_eq!(
+            OpeningFrame::from_saved(Some(FRAME), false),
+            defaults,
+            "a build that does not remember the frame never reads it"
+        );
+    }
+
+    #[test]
+    fn a_saved_size_is_clamped_only_to_the_minimum() {
+        let small = WindowFrame {
+            content_width: 200.0,
+            content_height: 5000.0,
+            ..FRAME
+        };
+        let opening = OpeningFrame::from_saved(Some(small), true);
+        assert_eq!(opening.size, Size::new(MIN_WINDOW_SIZE.width, 5000.0));
+    }
+
+    #[test]
+    fn an_invalid_saved_frame_opens_at_the_defaults() {
+        for broken in [
+            WindowFrame {
+                content_width: 0.0,
+                ..FRAME
+            },
+            WindowFrame {
+                content_height: -600.0,
+                ..FRAME
+            },
+            WindowFrame {
+                outer_x: f64::NAN,
+                ..FRAME
+            },
+            // Finite as an `f64`, not as the `f32` iced places it with.
+            WindowFrame {
+                outer_y: 1e300,
+                ..FRAME
+            },
+            // Finite everywhere, and a GPU surface wgpu panics on.
+            WindowFrame {
+                content_width: 100_000.0,
+                content_height: 100_000.0,
+                ..FRAME
+            },
+        ] {
+            assert_eq!(
+                OpeningFrame::from_saved(Some(broken), true),
+                OpeningFrame {
+                    size: INITIAL_WINDOW_SIZE,
+                    position: None,
+                },
+                "{broken:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_screen_check_is_asked_for_once() {
+        let mut memory = WindowFrameMemory::new(true, OpeningFrame::from_saved(None, true));
+        assert!(memory.take_check().is_some());
+        assert_eq!(
+            memory.take_check(),
+            None,
+            "a later focus re-runs window_opened"
+        );
+    }
+
+    #[test]
+    fn only_a_saved_frame_is_fitted_onto_a_screen() {
+        let off_screen = rect(3000.0, 300.0, 900.0, 628.0);
+        let mut fresh = WindowFrameMemory::new(true, OpeningFrame::from_saved(None, true));
+        let fresh = fresh.take_check().expect("a check is asked for");
+        assert_eq!(
+            fresh.fit(off_screen, &[BUILT_IN], BUILT_IN),
+            None,
+            "a default placement is the platform's, whatever the screen"
+        );
+        let mut restored =
+            WindowFrameMemory::new(true, OpeningFrame::from_saved(Some(FRAME), true));
+        let restored = restored.take_check().expect("a check is asked for");
+        assert_eq!(
+            restored.fit(off_screen, &[BUILT_IN], BUILT_IN),
+            Some(rect(612.0, 300.0, 900.0, 628.0))
+        );
+    }
+
+    #[test]
+    fn a_saved_frame_lands_on_a_screen_whatever_size_it_has_by_the_check() {
+        // Saved on a large external display that is gone now: AppKit cut
+        // the frame to this screen's height at creation, keeping its width
+        // and its x out past the built-in's right edge.
+        let external = WindowFrame {
+            content_width: 1800.0,
+            content_height: 1100.0,
+            outer_x: 1600.0,
+            outer_y: 100.0,
+        };
+        let mut memory =
+            WindowFrameMemory::new(true, OpeningFrame::from_saved(Some(external), true));
+        let check = memory.take_check().expect("a check is asked for");
+        let cut = rect(1600.0, 70.0, 1800.0, 882.0);
+        assert_eq!(
+            check.fit(cut, &[BUILT_IN], BUILT_IN),
+            Some(BUILT_IN),
+            "it must open wholly on the screen that is left"
+        );
+        // A window a resize got to first lands on the screen too, and keeps
+        // that size because it fits.
+        let resized_first = rect(1200.0, 200.0, 1100.0, 748.0);
+        assert_eq!(
+            check.fit(resized_first, &[BUILT_IN], BUILT_IN),
+            Some(rect(412.0, 200.0, 1100.0, 748.0))
+        );
+    }
+
+    #[test]
+    fn the_deadline_saves_the_size_it_reads_back_when_a_resize_went_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let wide = WindowFrame {
+            content_width: 1800.0,
+            content_height: 600.0,
+            outer_x: 1600.0,
+            outer_y: 80.0,
+        };
+        let mut memory = WindowFrameMemory::new(true, OpeningFrame::from_saved(Some(wide), true));
+        assert!(memory.take_check().is_some());
+        // The check shrank the window onto the screen, and the resize that
+        // reports it was dropped on its way to `update`.
+        let shrunk = WindowFrame {
+            content_width: 1512.0,
+            outer_x: 0.0,
+            ..wide
+        };
+        let armed = memory
+            .checked(Some(CheckedFrame {
+                frame: shrunk,
+                adjusted: true,
+            }))
+            .expect("an adjusted frame arms a save");
+        memory.observe_mode(window::Mode::Windowed);
+        memory.save_due(
+            &workspace,
+            armed,
+            Some(Point::new(0.0, 80.0)),
+            Some(Size::new(1512.0, 600.0)),
+        );
+        assert_eq!(workspace.window_frame(), Some(shrunk));
+    }
+
+    /// The screen check shrank a restored window onto the screen and the
+    /// resize that reports it was dropped, so the terminals are still
+    /// gridded for the size the window opened at. The memory and its arm.
+    fn shrunk_at_launch() -> (WindowFrameMemory, u64) {
+        let wide = WindowFrame {
+            content_width: 1800.0,
+            content_height: 600.0,
+            outer_x: 1600.0,
+            outer_y: 80.0,
+        };
+        let mut memory = WindowFrameMemory::new(true, OpeningFrame::from_saved(Some(wide), true));
+        assert!(memory.take_check().is_some());
+        let armed = memory
+            .checked(Some(CheckedFrame {
+                frame: WindowFrame {
+                    content_width: 1512.0,
+                    outer_x: 0.0,
+                    ..wide
+                },
+                adjusted: true,
+            }))
+            .expect("an adjusted frame arms a save");
+        (memory, armed)
+    }
+
+    /// The same missing resize, from the terminals' side.
+    #[test]
+    fn the_deadline_re_grids_the_window_at_a_size_the_resize_events_missed() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let (opened, shrunk) = (Size::new(1800.0, 600.0), Size::new(1512.0, 600.0));
+        let outer = Some(Point::new(0.0, 80.0));
+        let (mut memory, armed) = shrunk_at_launch();
+        // A mode query that finds nothing new changes nothing.
+        memory.observe_mode(window::Mode::Windowed);
+        assert_eq!(
+            memory.deadline_answered(
+                &workspace,
+                armed,
+                window::Mode::Windowed,
+                outer,
+                shrunk,
+                opened
+            ),
+            DeadlineAnswer {
+                mode: Some(window::Mode::Windowed),
+                regrid: Some(shrunk),
+            }
+        );
+
+        let (mut memory, armed) = shrunk_at_launch();
+        assert_eq!(
+            memory
+                .deadline_answered(
+                    &workspace,
+                    armed,
+                    window::Mode::Windowed,
+                    outer,
+                    shrunk,
+                    shrunk
+                )
+                .regrid,
+            None,
+            "a window already gridded at the size re-grids nothing"
+        );
+    }
+
+    #[test]
+    fn a_superseded_or_full_screen_deadline_re_grids_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let mut memory = checked_memory(true);
+        let (first, gridded) = (Size::new(1000.0, 700.0), Size::new(1100.0, 720.0));
+        let superseded = memory.resized(first).expect("armed");
+        let latest = memory.resized(gridded).expect("armed");
+        assert_eq!(
+            memory.deadline_answered(
+                &workspace,
+                superseded,
+                window::Mode::Windowed,
+                None,
+                first,
+                gridded
+            ),
+            DeadlineAnswer {
+                mode: None,
+                regrid: None,
+            },
+            "a superseded deadline read the window back before the resize that superseded it"
+        );
+        assert_eq!(
+            memory.deadline_answered(
+                &workspace,
+                latest,
+                window::Mode::Fullscreen,
+                None,
+                Size::new(1512.0, 982.0),
+                gridded
+            ),
+            DeadlineAnswer {
+                mode: Some(window::Mode::Fullscreen),
+                regrid: None,
+            }
+        );
+    }
+
+    /// Branch review (plan 074): the deadline read the window back while
+    /// it was windowed, and before its answer reached `update`, entering
+    /// full screen did — the mode, then a resize that gridded the
+    /// terminals for full screen and armed nothing.
+    #[test]
+    fn a_deadline_read_back_before_full_screen_neither_re_grids_nor_restores_windowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let mut memory = checked_memory(true);
+        let (windowed, full) = (Size::new(1100.0, 720.0), Size::new(1512.0, 982.0));
+        let armed = memory.resized(windowed).expect("armed");
+        memory.observe_mode(window::Mode::Fullscreen);
+        assert_eq!(
+            memory.resized(full),
+            None,
+            "a full-screen resize arms nothing"
+        );
+
+        let answer = memory.deadline_answered(
+            &workspace,
+            armed,
+            window::Mode::Windowed,
+            Some(Point::new(120.0, 80.0)),
+            windowed,
+            full,
+        );
+        assert_eq!(
+            answer,
+            DeadlineAnswer {
+                mode: None,
+                regrid: None,
+            }
+        );
+        assert_eq!(memory.mode, window::Mode::Fullscreen);
+    }
+
+    /// Either one alone is newer than a pending read-back: a mode change
+    /// with no resize, or a resize that arms nothing.
+    #[test]
+    fn a_mode_change_or_an_unarmed_resize_alone_outdates_a_pending_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let windowed = Size::new(1100.0, 720.0);
+        let mut memory = checked_memory(true);
+        let armed = memory.resized(windowed).expect("armed");
+        memory.observe_mode(window::Mode::Fullscreen);
+        let answer = memory.deadline_answered(
+            &workspace,
+            armed,
+            window::Mode::Windowed,
+            None,
+            windowed,
+            windowed,
+        );
+        assert_eq!(
+            answer.mode, None,
+            "the mode change came after the read-back"
+        );
+        assert_eq!(memory.mode, window::Mode::Fullscreen);
+
+        // Before the screen check, a resize to the size the window was
+        // created at is the creation's own and arms nothing.
+        let mut memory = WindowFrameMemory::new(true, OpeningFrame::from_saved(Some(FRAME), true));
+        assert!(memory.take_check().is_some());
+        let armed = memory.resized(windowed).expect("armed");
+        let created = Size::new(900.0, 600.0);
+        assert_eq!(memory.resized(created), None);
+        let answer = memory.deadline_answered(
+            &workspace,
+            armed,
+            window::Mode::Windowed,
+            None,
+            windowed,
+            created,
+        );
+        assert_eq!(answer.regrid, None, "the resize came after the read-back");
+        assert_eq!(
+            workspace.window_frame(),
+            Some(FRAME),
+            "the read-back size is older than the resize back to the created size"
+        );
+        assert_eq!(memory.content, created);
+    }
+
+    #[test]
+    fn a_move_before_the_screen_check_is_the_placement_not_the_user() {
+        let mut memory = WindowFrameMemory::new(true, OpeningFrame::from_saved(Some(FRAME), true));
+        assert_eq!(memory.moved(Point::new(0.0, 0.0)), None);
+        assert_eq!(
+            memory.resized(Size::new(900.0, 600.0)),
+            None,
+            "a resize to the size it opened at is the creation's own"
+        );
+        assert!(!memory.owed);
+    }
+
+    /// Every save `arms` asks for, at its deadline, with `outer` read back.
+    fn run_deadlines(
+        memory: &mut WindowFrameMemory,
+        workspace: &Workspace,
+        arms: impl IntoIterator<Item = Option<u64>>,
+        outer: Point,
+    ) {
+        memory.observe_mode(window::Mode::Windowed);
+        for generation in arms.into_iter().flatten() {
+            memory.save_due(workspace, generation, Some(outer), None);
+        }
+    }
+
+    #[test]
+    fn a_resize_that_beats_the_screen_checks_answer_is_still_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let mut memory = WindowFrameMemory::new(true, OpeningFrame::from_saved(Some(FRAME), true));
+        assert!(memory.take_check().is_some());
+        // A resize asked for right after launch reaches `update` before the
+        // check's answer — which looked at the window before the resize was
+        // applied, and so reports the frame it opened at.
+        let early = memory.resized(Size::new(1100.0, 720.0));
+        let late = memory.checked(Some(CheckedFrame {
+            frame: FRAME,
+            adjusted: false,
+        }));
+        run_deadlines(
+            &mut memory,
+            &workspace,
+            [early, late],
+            Point::new(120.0, 80.0),
+        );
+        assert_eq!(
+            workspace.window_frame(),
+            Some(WindowFrame {
+                content_width: 1100.0,
+                content_height: 720.0,
+                ..FRAME
+            }),
+            "the resize must reach state.json while the window is open"
+        );
+    }
+
+    #[test]
+    fn a_screen_check_that_moved_the_window_keeps_the_size_a_resize_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let mut memory = WindowFrameMemory::new(true, OpeningFrame::from_saved(Some(FRAME), true));
+        assert!(memory.take_check().is_some());
+        // The check fitted the window it measured at the saved size; a
+        // resize applied after that look reached `update` first.
+        let early = memory.resized(Size::new(1100.0, 720.0));
+        let late = memory.checked(Some(CheckedFrame {
+            frame: WindowFrame {
+                outer_x: 0.0,
+                ..FRAME
+            },
+            adjusted: true,
+        }));
+        run_deadlines(
+            &mut memory,
+            &workspace,
+            [early, late],
+            Point::new(0.0, 80.0),
+        );
+        assert_eq!(
+            workspace.window_frame(),
+            Some(WindowFrame {
+                content_width: 1100.0,
+                content_height: 720.0,
+                outer_x: 0.0,
+                outer_y: 80.0,
+            }),
+            "the check's own look at the size is older than the resize"
+        );
+    }
+
+    #[test]
+    fn a_first_launch_resize_before_any_position_is_known_is_still_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let mut memory = WindowFrameMemory::new(true, OpeningFrame::from_saved(None, true));
+        assert!(memory.take_check().is_some());
+        let early = memory.resized(Size::new(800.0, 500.0));
+        let late = memory.checked(None);
+        run_deadlines(
+            &mut memory,
+            &workspace,
+            [early, late],
+            Point::new(64.0, 48.0),
+        );
+        assert_eq!(
+            workspace.window_frame(),
+            Some(WindowFrame {
+                content_width: 800.0,
+                content_height: 500.0,
+                outer_x: 64.0,
+                outer_y: 48.0,
+            })
+        );
+    }
+
+    #[test]
+    fn the_debounce_writes_the_frame_while_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let mut memory = checked_memory(true);
+
+        let first = memory.moved(Point::new(300.0, 40.0)).expect("a move arms");
+        let latest = memory
+            .resized(Size::new(1000.0, 700.0))
+            .expect("a resize re-arms");
+        memory.observe_mode(window::Mode::Windowed);
+        memory.save_due(&workspace, first, None, None);
+        assert_eq!(
+            workspace.window_frame(),
+            None,
+            "a superseded deadline writes nothing"
+        );
+
+        memory.observe_mode(window::Mode::Windowed);
+        memory.save_due(&workspace, latest, None, None);
+        drop(workspace);
+        assert_eq!(
+            Workspace::open(state(&dir)).window_frame(),
+            Some(WindowFrame {
+                content_width: 1000.0,
+                content_height: 700.0,
+                outer_x: 300.0,
+                outer_y: 40.0,
+            }),
+            "the deadline wrote the frame with the window still open"
+        );
+    }
+
+    #[test]
+    fn a_quit_inside_the_debounce_writes_the_final_frame_before_the_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let mut memory = checked_memory(true);
+        memory
+            .moved(Point::new(-1500.0, 60.0))
+            .expect("a move arms");
+
+        // No deadline: the quit lands inside the 500 ms.
+        flush_on_exit(&workspace, &mut memory).unwrap();
+        drop(workspace);
+        assert_eq!(
+            Workspace::open(state(&dir)).window_frame(),
+            Some(WindowFrame {
+                outer_x: -1500.0,
+                outer_y: 60.0,
+                ..FRAME
+            })
+        );
+    }
+
+    #[test]
+    fn nothing_is_written_while_full_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let mut memory = checked_memory(true);
+        memory.observe_mode(window::Mode::Fullscreen);
+        assert_eq!(memory.resized(Size::new(1512.0, 982.0)), None);
+        assert_eq!(memory.moved(Point::new(0.0, 0.0)), None);
+        flush_on_exit(&workspace, &mut memory).unwrap();
+        assert_eq!(workspace.window_frame(), None);
+    }
+
+    #[test]
+    fn a_full_screen_enter_and_exit_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let mut memory = checked_memory(true);
+
+        // Entering: the first resize lands before the query that says it
+        // was the transition's, so it is recorded — and then dropped.
+        let entering = memory
+            .resized(Size::new(1512.0, 982.0))
+            .expect("the mode is not known to be full screen yet");
+        memory.observe_mode(window::Mode::Fullscreen);
+        memory.save_due(&workspace, entering, None, None);
+
+        // Leaving: winit reports full screen until the transition ends, so
+        // the resize back is never recorded, and the settle's query that
+        // finally reads windowed finds nothing owed.
+        memory.observe_mode(window::Mode::Fullscreen);
+        assert_eq!(memory.resized(Size::new(900.0, 600.0)), None);
+        memory.observe_mode(window::Mode::Windowed);
+        memory.save_due(&workspace, entering, None, None);
+        flush_on_exit(&workspace, &mut memory).unwrap();
+        assert_eq!(workspace.window_frame(), None);
+    }
+
+    fn saved_origin(workspace: &Workspace) -> Option<(f64, f64)> {
+        workspace
+            .window_frame()
+            .map(|frame| (frame.outer_x, frame.outer_y))
+    }
+
+    #[test]
+    fn the_deadline_saves_the_position_it_reads_back_not_the_last_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let mut memory = checked_memory(true);
+        // The last move onto a 1x screen, converted with the 2x scale iced
+        // still held: half the real x.
+        let armed = memory.moved(Point::new(800.0, 40.0)).expect("a move arms");
+        memory.observe_mode(window::Mode::Windowed);
+        memory.save_due(&workspace, armed, Some(Point::new(1600.0, 40.0)), None);
+        assert_eq!(saved_origin(&workspace), Some((1600.0, 40.0)));
+
+        // A resize after it composes with the position read back, not the
+        // one the move left.
+        let armed = memory
+            .resized(Size::new(1000.0, 700.0))
+            .expect("a resize arms");
+        memory.save_due(&workspace, armed, None, None);
+        assert_eq!(saved_origin(&workspace), Some((1600.0, 40.0)));
+    }
+
+    #[test]
+    fn roosts_own_full_screen_toggle_writes_the_pending_windowed_frame_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let mut memory = checked_memory(true);
+        memory.moved(Point::new(300.0, 40.0)).expect("a move arms");
+
+        // Entering inside the debounce: the deadline never gets to write it.
+        memory.full_screen_toggling(&workspace);
+        assert_eq!(
+            saved_origin(&workspace),
+            Some((300.0, 40.0)),
+            "written before full screen can drop it"
+        );
+        memory.observe_mode(window::Mode::Fullscreen);
+        flush_on_exit(&workspace, &mut memory).unwrap();
+        assert_eq!(saved_origin(&workspace), Some((300.0, 40.0)));
+    }
+
+    #[test]
+    fn a_quit_during_roosts_own_full_screen_entry_writes_no_transition_geometry() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let mut memory = checked_memory(true);
+        memory.full_screen_toggling(&workspace);
+        // The transition's first resize, before any query says full screen.
+        memory
+            .resized(Size::new(1512.0, 982.0))
+            .expect("the mode is not known to be full screen yet");
+        flush_on_exit(&workspace, &mut memory).unwrap();
+        assert_eq!(
+            workspace.window_frame(),
+            None,
+            "full-screen transition geometry must never be the saved frame"
+        );
+    }
+
+    #[test]
+    fn the_settle_ends_a_toggle_so_a_quit_saves_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let mut memory = checked_memory(true);
+        memory.full_screen_toggling(&workspace);
+        memory.observe_mode(window::Mode::Windowed);
+        memory.full_screen_settled();
+        memory.moved(Point::new(5.0, 6.0)).expect("a move arms");
+        flush_on_exit(&workspace, &mut memory).unwrap();
+        assert_eq!(saved_origin(&workspace), Some((5.0, 6.0)));
+    }
+
+    #[test]
+    fn a_deadline_on_a_hidden_window_writes_nothing_but_the_quit_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let mut memory = checked_memory(true);
+        let armed = memory.moved(Point::new(10.0, 30.0)).expect("a move arms");
+        memory.observe_mode(window::Mode::Hidden);
+        memory.save_due(&workspace, armed, None, None);
+        assert_eq!(workspace.window_frame(), None, "not while hidden");
+
+        flush_on_exit(&workspace, &mut memory).unwrap();
+        assert_eq!(
+            workspace
+                .window_frame()
+                .map(|frame| (frame.outer_x, frame.outer_y)),
+            Some((10.0, 30.0)),
+            "a minimized window keeps its frame"
+        );
+    }
+
+    #[test]
+    fn a_frame_the_screen_check_moved_is_owed_to_state_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let mut memory = WindowFrameMemory::new(true, OpeningFrame::from_saved(Some(FRAME), true));
+        assert!(memory.take_check().is_some());
+        let moved_on = WindowFrame {
+            outer_x: 0.0,
+            ..FRAME
+        };
+        let armed = memory
+            .checked(Some(CheckedFrame {
+                frame: moved_on,
+                adjusted: true,
+            }))
+            .expect("an adjusted frame arms a save");
+        memory.save_due(&workspace, armed, None, None);
+        assert_eq!(workspace.window_frame(), Some(moved_on));
+    }
+
+    #[test]
+    fn a_build_that_does_not_remember_never_writes_a_window_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let mut memory = checked_memory(false);
+        assert_eq!(memory.moved(Point::new(300.0, 40.0)), None);
+        assert_eq!(memory.resized(Size::new(1000.0, 700.0)), None);
+        assert_eq!(
+            memory.checked(Some(CheckedFrame {
+                frame: FRAME,
+                adjusted: true,
+            })),
+            None
+        );
+        workspace.set_sidebar_width(300.0);
+        flush_on_exit(&workspace, &mut memory).unwrap();
+        let raw = std::fs::read_to_string(state(&dir)).unwrap();
+        assert!(!raw.contains("\"window\""), "{raw}");
+    }
+
+    // ── the screen check's geometry ──
+
+    /// A 14" MacBook's built-in Retina panel (points) as the primary, with
+    /// the menu bar and a bottom Dock taken out of its visible frame.
+    const BUILT_IN: ScreenRect = ScreenRect {
+        x: 0.0,
+        y: 70.0,
+        width: 1512.0,
+        height: 882.0,
+    };
+
+    #[test]
+    fn a_frame_wholly_on_a_screen_stays_put() {
+        let frame = rect(100.0, 200.0, 900.0, 628.0);
+        assert_eq!(fit_on_screens(frame, &[BUILT_IN], BUILT_IN), None);
+        let flush = rect(0.0, 70.0, 1512.0, 882.0);
+        assert_eq!(
+            fit_on_screens(flush, &[BUILT_IN], BUILT_IN),
+            None,
+            "a frame filling the visible area is on it"
+        );
+    }
+
+    #[test]
+    fn a_partly_off_screen_frame_moves_back_without_shrinking() {
+        let off_right = rect(1200.0, 200.0, 900.0, 628.0);
+        assert_eq!(
+            fit_on_screens(off_right, &[BUILT_IN], BUILT_IN),
+            Some(rect(612.0, 200.0, 900.0, 628.0))
+        );
+        let into_the_dock = rect(100.0, 20.0, 900.0, 628.0);
+        assert_eq!(
+            fit_on_screens(into_the_dock, &[BUILT_IN], BUILT_IN),
+            Some(rect(100.0, 70.0, 900.0, 628.0))
+        );
+    }
+
+    #[test]
+    fn a_frame_on_no_screen_goes_to_the_main_one() {
+        // Saved on an external display that is no longer connected.
+        let gone = rect(3000.0, 300.0, 900.0, 628.0);
+        assert_eq!(
+            fit_on_screens(gone, &[BUILT_IN], BUILT_IN),
+            Some(rect(612.0, 300.0, 900.0, 628.0))
+        );
+    }
+
+    #[test]
+    fn a_frame_too_big_for_its_screen_shrinks_to_it() {
+        let huge = rect(-50.0, 0.0, 2560.0, 1440.0);
+        assert_eq!(fit_on_screens(huge, &[BUILT_IN], BUILT_IN), Some(BUILT_IN));
+    }
+
+    #[test]
+    fn negative_origin_screens_are_real_screens() {
+        // An external display left of the primary, and one above it: both
+        // have origins AppKit gives negative or beyond-the-primary values.
+        let left = rect(-1920.0, 0.0, 1920.0, 1055.0);
+        let above = rect(0.0, 982.0, 2560.0, 1415.0);
+        let screens = [BUILT_IN, left, above];
+        let on_left = rect(-1800.0, 100.0, 900.0, 628.0);
+        assert_eq!(fit_on_screens(on_left, &screens, BUILT_IN), None);
+        let past_left_edge = rect(-2000.0, 100.0, 900.0, 628.0);
+        assert_eq!(
+            fit_on_screens(past_left_edge, &screens, BUILT_IN),
+            Some(rect(-1920.0, 100.0, 900.0, 628.0))
+        );
+        let over_the_top = rect(100.0, 1900.0, 900.0, 628.0);
+        assert_eq!(
+            fit_on_screens(over_the_top, &screens, BUILT_IN),
+            Some(rect(100.0, 1769.0, 900.0, 628.0))
+        );
+    }
+
+    #[test]
+    fn a_frame_across_mixed_scale_screens_goes_to_the_one_it_overlaps_most() {
+        // A 1x 2560×1440 display right of the 2x built-in: AppKit's global
+        // space is points on both, so the geometry needs no scale.
+        let external = rect(1512.0, -200.0, 2560.0, 1415.0);
+        let screens = [BUILT_IN, external];
+        let mostly_external = rect(1400.0, 300.0, 900.0, 628.0);
+        assert_eq!(
+            fit_on_screens(mostly_external, &screens, BUILT_IN),
+            Some(rect(1512.0, 300.0, 900.0, 628.0))
+        );
+        let mostly_built_in = rect(1000.0, 300.0, 900.0, 628.0);
+        assert_eq!(
+            fit_on_screens(mostly_built_in, &screens, BUILT_IN),
+            Some(rect(612.0, 300.0, 900.0, 628.0))
+        );
+    }
+
+    #[test]
+    fn the_appkit_frame_reads_back_as_iceds_top_left() {
+        // Primary 982 points tall: a frame whose top edge is 182 points
+        // below the primary's top.
+        let frame = rect(100.0, 200.0, 900.0, 600.0);
+        assert_eq!(
+            iced_frame(frame, 900.0, 572.0, 982.0),
+            WindowFrame {
+                content_width: 900.0,
+                content_height: 572.0,
+                outer_x: 100.0,
+                outer_y: 182.0,
+            }
+        );
+        // On a display above the primary, the top-left is above iced's
+        // origin: negative, and still a real place.
+        let above = rect(-300.0, 1200.0, 900.0, 600.0);
+        assert_eq!(iced_frame(above, 900.0, 572.0, 982.0).outer_y, -818.0);
+    }
+}

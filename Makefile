@@ -67,9 +67,9 @@ run-mac: bundle  ## Launch the bundled Mac app
 
 # ---- test -------------------------------------------------------------
 
-.PHONY: test test-rust which-runner test-iced test-mac test-harness test-linux-scripts e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-session e2e-host-client e2e-host-client-ci e2e-host-ssh e2e-host-ssh-ci e2e-host-missing-daemon e2e-host-missing-daemon-ci e2e-host-local-spawn e2e-host-local-spawn-ci e2e-host-localhost e2e-host-localhost-ci e2e-local-backend e2e-local-backend-ci e2e-old-session e2e-host-bootstrap e2e-host-bootstrap-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle smoke-iced smoke-mac visual-parity smoke-mac-launch test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
+.PHONY: test test-rust which-runner test-iced test-mac test-harness test-linux-scripts e2e e2e-iced e2e-iced-exit e2e-iced-menu-quit e2e-iced-clipboard e2e-mac e2e-session e2e-host-client e2e-host-client-ci e2e-host-ssh e2e-host-ssh-ci e2e-host-missing-daemon e2e-host-missing-daemon-ci e2e-host-local-spawn e2e-host-local-spawn-ci e2e-host-localhost e2e-host-localhost-ci e2e-local-backend e2e-local-backend-ci e2e-old-session e2e-host-bootstrap e2e-host-bootstrap-ci e2e-iced-ci e2e-iced-release-ci e2e-mac-ci e2e-iced-bundle e2e-iced-sparkle e2e-iced-real-input-mac smoke-iced smoke-mac visual-parity smoke-mac-launch test-iced-real-input test-iced-wayland-input check-iced perf-refresh perf-render-stats
 
-ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_agent_lifecycle.py tools/roosttest/test_agent_hooks.py tools/roosttest/test_agent_hooks_dialog.py tools/roosttest/test_agent_palette.py tools/roosttest/test_doctor.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_palette_256.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_cursor_pixels.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py tools/roosttest/test_tab_dump_scrollback.py tools/roosttest/test_dock_badge.py tools/roosttest/test_menu_bar.py tools/roosttest/test_sparkle.py tools/roosttest/test_view_perf.py tools/roosttest/test_shell_integration.py tools/roosttest/test_newtab_cwd.py tools/roosttest/test_boot_failure.py tools/roosttest/test_quit_with_foreground_job.py tools/roosttest/test_open_external.py tools/roosttest/test_context_menu.py
+ICED_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_iced_walking_skeleton.py tools/roosttest/test_notifications.py tools/roosttest/test_notification_raise.py tools/roosttest/test_agent_lifecycle.py tools/roosttest/test_agent_hooks.py tools/roosttest/test_agent_hooks_dialog.py tools/roosttest/test_agent_palette.py tools/roosttest/test_doctor.py tools/roosttest/test_provider.py tools/roosttest/test_sidebar_pixels.py tools/roosttest/test_tab_strip_pixels.py tools/roosttest/test_focus.py tools/roosttest/test_palette.py tools/roosttest/test_z_typography.py tools/roosttest/test_project_lifecycle.py tools/roosttest/test_sidebar_resize.py tools/roosttest/test_osc_pipeline.py tools/roosttest/test_palette_256.py tools/roosttest/test_sprite_pixels.py tools/roosttest/test_cursor_pixels.py tools/roosttest/test_ime.py tools/roosttest/test_selection.py tools/roosttest/test_mouse_tracking.py tools/roosttest/test_tab_dump_scrollback.py tools/roosttest/test_dock_badge.py tools/roosttest/test_menu_bar.py tools/roosttest/test_sparkle.py tools/roosttest/test_view_perf.py tools/roosttest/test_shell_integration.py tools/roosttest/test_newtab_cwd.py tools/roosttest/test_boot_failure.py tools/roosttest/test_quit_with_foreground_job.py tools/roosttest/test_open_external.py tools/roosttest/test_context_menu.py tools/roosttest/test_password_input.py tools/roosttest/test_secure_input.py tools/roosttest/test_device_queries.py tools/roosttest/test_selection_autoscroll.py
 # `test_tab_dump_scrollback.py` needs no lane entry for Mac: `e2e-mac`
 # collects the whole `tools/roosttest` directory (minus the two daemon
 # markers), so a new UI-socket module runs on both required gates the
@@ -117,7 +117,13 @@ ICED_RELEASE_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_ice
 # `test_ssh_transport.py` is a member for the same reasons: it drives a
 # daemon plus the far side of the SSH transport (`roost-session
 # client-bridge`, spawned by the test itself), and no UI at all.
-SESSION_E2E_TESTS := tools/roosttest/test_session.py tools/roosttest/test_session_attach.py tools/roosttest/test_session_effects.py tools/roosttest/test_ssh_transport.py
+#
+# `test_password_input.py` is a member of BOTH this list and ICED_E2E_TESTS:
+# its `session_daemon` cases spawn a daemon and its unmarked ones drive the
+# harness UI. The marker splits it — `e2e-session` selects
+# `-m session_daemon`, and the iced lanes deselect the daemon markers
+# (DAEMON_E2E_DESELECT).
+SESSION_E2E_TESTS := tools/roosttest/test_session.py tools/roosttest/test_session_attach.py tools/roosttest/test_session_effects.py tools/roosttest/test_ssh_transport.py tools/roosttest/test_password_input.py
 # The HS-2 host-client lane (plan 037 C9). It drives BOTH a `roost-session`
 # daemon and the harness UI, so it is neither a member of SESSION_E2E_TESTS
 # (which runs headless and would stand the UI down) nor of ICED_E2E_TESTS
@@ -203,10 +209,15 @@ BOOTSTRAP_E2E_TESTS := tools/roosttest/test_host_bootstrap.py
 # invocation need a UI" decision off, plus `host_client`. A second module in
 # either lane needs no edit here or in the workflows.
 #
+# The curated iced lists (`e2e-iced`, `e2e-iced-ci`) carry it too, for the
+# one module with cases in both lanes (`test_password_input.py`).
+#
 # MIRRORS (keep the expression identical, move together):
-#   * .github/workflows/ci.yml       — the `e2e-mac` job's pytest step, and
-#                                      the macOS iced e2e / bundle / sparkle
-#                                      cells (which deselect `host_client`)
+#   * .github/workflows/ci.yml       — the `e2e-mac` job's pytest step, the
+#                                      three iced functional cells (X11,
+#                                      Wayland, macOS), and the macOS bundle
+#                                      / sparkle cells (which deselect only
+#                                      `host_client`)
 #   * .github/workflows/release.yml  — "E2E against the release bundle"
 # Neither can reference a Makefile variable, so they restate the flag —
 # the same hand-mirrored-constant arrangement `smoke-deb`'s `expect_exec`
@@ -297,7 +308,7 @@ e2e-iced:  ## Required functional E2E against Iced
 	@tests='$(ICED_E2E_TESTS)'; \
 	if [ -z "$${WAYLAND_DISPLAY:-}" ]; then tests="$$tests $(ICED_CLIPBOARD_TESTS)"; \
 	else echo "Iced/Wayland clipboard requires a focused seat/serial; running the documented non-clipboard renderer gate"; fi; \
-	ROOST_TEST_MODE=1 uv run --group test pytest $$tests --roost-target iced
+	ROOST_TEST_MODE=1 uv run --group test pytest $$tests $(DAEMON_E2E_DESELECT) --roost-target iced
 
 e2e-iced-exit:  ## Iced exit-on-empty E2E in its own lane (DESTRUCTIVE: force-quits a running Iced UI, and the UI it launches exits)
 	ROOST_TEST_MODE=1 uv run --group test pytest $(ICED_EXIT_E2E_TESTS) --roost-target iced --roost-fresh
@@ -321,7 +332,7 @@ e2e-mac:  ## E2E against the Mac app
 e2e-session:  ## Headless host-session E2E (spawns roost-session daemons; no UI)
 	./third_party/ghostty/build.sh
 	cargo build -p roost-session -p roost-cli
-	uv run --group test pytest $(SESSION_E2E_TESTS)
+	uv run --group test pytest -m session_daemon $(SESSION_E2E_TESTS)
 
 # Both processes, and the wire between them. Needs everything `e2e-session`
 # needs (the daemon + the archive it links) AND a UI, so it builds all three
@@ -425,7 +436,7 @@ e2e-iced-ci:  ## Required Iced functional E2E at CI parity (fresh + isolated sta
 	@tests='$(ICED_E2E_TESTS)'; \
 	if [ -z "$${WAYLAND_DISPLAY:-}" ]; then tests="$$tests $(ICED_CLIPBOARD_TESTS)"; \
 	else echo "Iced/Wayland clipboard requires a focused seat/serial; running the documented non-clipboard renderer gate"; fi; \
-	ROOST_TEST_MODE=1 uv run --group test pytest $$tests --roost-target iced --roost-fresh
+	ROOST_TEST_MODE=1 uv run --group test pytest $$tests $(DAEMON_E2E_DESELECT) --roost-target iced --roost-fresh
 
 e2e-iced-release-ci:  ## Release-profile Iced E2E gate: curated subset against a real release binary (ROOST_ICED_BIN required)
 	@test -n "$$ROOST_ICED_BIN" || \
@@ -451,6 +462,18 @@ e2e-iced-sparkle:  ## macOS-only: assemble a TEST-KEYED Roost-Iced.app + run the
 		$(MAKE) bundle-iced
 	ROOST_ICED_APP=mac/build/Roost-Iced.app ROOST_TEST_MODE=1 \
 		uv run --group test pytest tools/roosttest/test_sparkle.py --roost-target iced --roost-fresh
+
+# The Mac real-input harness (plan 074 §D7): real CGEvents and Accessibility
+# through tools/input/mac/roost-input-mac, against the branch's own
+# Roost-Iced.app in the Roost-linux namespace. Never in ICED_E2E_TESTS: the
+# module launches and quits its own UI (`owns_ui`). ROOST_REAL_INPUT_MODE unset
+# means runner mode, through ~/Applications/Roost Test Runner.app and its grants
+# (tools/input/mac/test-runner/README.md); CI runs the module in `direct` mode.
+e2e-iced-real-input-mac:  ## macOS-only: real CGEvent/AX input against the branch Roost-Iced.app (ROOST_REQUIRE_REAL_INPUT=1)
+	@[ "$$(uname -s)" = "Darwin" ] || { echo "e2e-iced-real-input-mac is macOS-only: it posts real CGEvents into a macOS app"; exit 1; }
+	cargo build --manifest-path tools/input/mac/roost-input-mac/Cargo.toml --locked
+	$(MAKE) bundle-iced
+	ROOST_REQUIRE_REAL_INPUT=1 ROOST_TEST_MODE=1 uv run --group test pytest tools/roosttest/test_real_input_mac.py --roost-target iced -v
 
 smoke-iced:  ## Screenshot-driven UI smoke against a running Iced UI
 	tools/screenshot/smoke.sh iced

@@ -12,7 +12,9 @@ copy-on-select from making the explicit-Copy assertion pass accidentally:
   CLIPBOARD + PRIMARY, ordinary Paste reads CLIPBOARD, and middle-click reads
   PRIMARY;
 * native double/triple clicks expand a word/line, and Alt-hover composes the
-  link pointer over an OSC 22 cursor without launching a browser.
+  link pointer over an OSC 22 cursor without launching a browser;
+* a drag held past the grid's top (the tab band) or bottom (below the window)
+  auto-scrolls, and its PRIMARY copy spans more than one screen;
 * physical wheel input reaches local history, snaps on the next terminal key,
   emits terminal mouse reports, and becomes arrows on an untracked alt screen;
 * physical Page Up/Down walks local history a viewport at a time without
@@ -2318,6 +2320,164 @@ def _drag_copy_and_middle_paste(launch: Launch) -> None:
     )
 
 
+AUTOSCROLL_PREFIX = "autoscroll-"
+
+
+def _autoscroll_rows(text: str | None) -> list[int] | None:
+    """The seeded index of every row of `text`, top to bottom, or `None`
+    when it is not a run of the auto-scroll history."""
+    if not text:
+        return None
+    rows = text.split("\n")
+    if not all(row.startswith(AUTOSCROLL_PREFIX) for row in rows):
+        return None
+    return [int(row[len(AUTOSCROLL_PREFIX) :]) for row in rows]
+
+
+def _seed_autoscroll_history(client, tab: int, total: int) -> str:
+    """Feed `total` numbered rows and wait for the last at the live
+    bottom; returns that row."""
+    history = "".join(f"{AUTOSCROLL_PREFIX}{index:03}\r\n" for index in range(total))
+    client.tab_feed_pty_bytes(
+        tab, b"\x1b[?1000l\x1b[?1006l\x1b[?1049l\x1b[2J\x1b[H" + history.encode()
+    )
+    last = f"{AUTOSCROLL_PREFIX}{total - 1:03}"
+    _wait_until(
+        lambda: last in client.dump(tab).get("rows_text", []),
+        "auto-scroll history fixture at live bottom",
+    )
+    return last
+
+
+def _viewport_top(launch: Launch) -> int | None:
+    rows = _autoscroll_rows(launch.client.dump(launch.tab)["rows_text"][0])
+    return rows[0] if rows else None
+
+
+def _held_autoscroll_drag(
+    launch: Launch,
+    start: tuple[int, int],
+    held_at: tuple[int, int],
+    spans: Callable[[list[int]], bool],
+    description: str,
+) -> list[int]:
+    """Press at `start`, move to `held_at` past the grid and keep still
+    until the selection `spans`, then release. Returns the rows the
+    release copied to PRIMARY. A pointer holding still makes no events,
+    so only the UI's own auto-scroll tick can grow the selection."""
+    launch.terminal_pointer(
+        ["mousemove", "--window", launch.window, str(start[0]), str(start[1])]
+    )
+    selected: list[int] | None = None
+
+    def grown() -> bool:
+        nonlocal selected
+        selected = _autoscroll_rows(launch.client.selection_dump(launch.tab).get("text"))
+        return selected is not None and spans(selected)
+
+    # Done once the release's copy is in PRIMARY. A tick can still grow
+    # the selection between the mouseup and the UI handling it, so the
+    # expected text is never read ahead: it is the selection read in the
+    # same poll that finds PRIMARY holding it.
+    seen: dict[str, str | None] = {}
+
+    def released() -> bool:
+        seen["selection"] = launch.client.selection_dump(launch.tab).get("text")
+        seen["primary"] = launch.client.clipboard_dump("selection")
+        return (
+            _autoscroll_rows(seen["selection"]) is not None
+            and seen["primary"] == seen["selection"]
+        )
+
+    try:
+        launch.terminal_pointer(["mousedown", "1"])
+        launch.terminal_pointer(
+            ["mousemove", "--window", launch.window, str(held_at[0]), str(held_at[1])]
+        )
+        try:
+            _wait_until(grown, description, timeout=15)
+        except AssertionError as error:
+            shown = selected if selected is None else (selected[:3], selected[-3:])
+            raise AssertionError(f"{error}; selected rows {shown}") from error
+        # Copy-on-select waits for the release, so the fence below cannot
+        # hold while the button is still down.
+        assert not released(), f"PRIMARY took the selection before the release ({description})"
+    finally:
+        launch.terminal_pointer(["mouseup", "1"])
+
+    try:
+        _wait_until(released, f"PRIMARY holds the released selection ({description})")
+    except AssertionError as error:
+        shown = {name: (text or "")[-60:] for name, text in seen.items()}
+        raise AssertionError(f"{error}; last read (tails) {shown!r}") from error
+    copied = _autoscroll_rows(seen["selection"])
+    assert copied is not None
+    return copied
+
+
+def _drag_autoscroll_past_the_edges(launch: Launch) -> None:
+    """#342 with a real pointer: a drag held past the grid scrolls, and
+    the copy spans more than one screen. Xvfb has no window manager and
+    the window sits at (0, 0), so past the top is the tab band above the
+    grid, and past the bottom is below the window itself, where the
+    implicit grab keeps reporting the held pointer. Runs last in its
+    launch: it leaves the viewport scrolled back."""
+    total = 400
+    last = _seed_autoscroll_history(launch.client, launch.tab, total)
+    dump = launch.client.dump(launch.tab)
+    rows = int(dump["rows"])
+    anchor_row = dump["rows_text"].index(last)
+    top = _viewport_top(launch)
+    assert top is not None, dump["rows_text"][:2]
+    # The auto-scroll runs only in a focused window, and with no window
+    # manager to give it focus, winit never reports this one focused.
+    launch.client.app_set_window_focus(focus=True)
+    metrics = launch.client.window_metrics()
+    terminal_top = round(launch.client.terminal_top(metrics))
+    sidebar = round(float(metrics["sidebar_width"]))
+    below_window = round(float(metrics["window_height"])) + 3 * launch.cell_height
+
+    def x(col: int) -> int:
+        return sidebar + TERMINAL_PADDING + int((col + 0.5) * launch.cell_width)
+
+    def y(row: int) -> int:
+        return terminal_top + TERMINAL_PADDING + int((row + 0.5) * launch.cell_height)
+
+    last_col = len(last) - 1
+    copied = _held_autoscroll_drag(
+        launch,
+        (x(last_col), y(anchor_row)),
+        (x(0), terminal_top // 2),
+        lambda selected: selected[0] <= top - rows,
+        f"a drag held over the tab band to select a screen above {AUTOSCROLL_PREFIX}{top:03}",
+    )
+    assert copied == list(range(copied[0], total)), (copied[:3], copied[-3:])
+    assert len(copied) > rows, f"the upward copy spans {len(copied)} rows; a screen is {rows}"
+
+    # Room below for a screen of downward scroll that stops short of the
+    # live bottom's empty cursor row.
+    scrolled_top = _viewport_top(launch)
+    assert scrolled_top is not None
+    for _ in range(2):
+        launch.key("Prior")
+    paged_top = scrolled_top - 2 * rows
+    _wait_until(
+        lambda: _viewport_top(launch) == paged_top,
+        f"Page Up twice to {AUTOSCROLL_PREFIX}{paged_top:03} before the downward drag",
+    )
+    paged_bottom = paged_top + rows - 1
+    copied = _held_autoscroll_drag(
+        launch,
+        (x(0), y(0)),
+        (x(last_col), below_window),
+        lambda selected: selected[-1] >= paged_bottom + rows,
+        f"a drag held below the window to select a screen below "
+        f"{AUTOSCROLL_PREFIX}{paged_bottom:03}",
+    )
+    assert copied == list(range(paged_top, copied[-1] + 1)), (copied[:3], copied[-3:])
+    assert len(copied) > rows, f"the downward copy spans {len(copied)} rows; a screen is {rows}"
+
+
 def _multi_click_and_link_hover(launch: Launch) -> None:
     row = "alpha/beta tail"
     _set_row(launch, row)
@@ -2469,6 +2629,7 @@ def main() -> int:
         launches.append(clipboard)
         _drag_copy_and_middle_paste(clipboard)
         _multi_click_and_link_hover(clipboard)
+        _drag_autoscroll_past_the_edges(clipboard)
     except Exception:
         _preserve_failure(launches)
         for launch in launches:
@@ -2490,6 +2651,7 @@ def main() -> int:
     print(
         "PASS: configured explicit Copy, plain/bracketed Paste, real-drag "
         "copy-on-select, middle-click PRIMARY Paste, native multi-click, "
+        "drag auto-scroll past both grid edges copying more than a screen, "
         "local/tracked/alternate terminal wheel routing and key snap, "
         "local page-key scrollback with alt-screen page-key forwarding, "
         "exhaustive shortcut dispatch/repeat suppression, "

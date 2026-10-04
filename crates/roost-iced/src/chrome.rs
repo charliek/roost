@@ -466,6 +466,27 @@ pub fn badge(chrome: &ChromePalette) -> impl Fn(&Theme) -> container::Style {
     )
 }
 
+/// The Secure Keyboard Entry lock (plan 074 §D3) is two containers, an
+/// outlined shackle over a solid body, rather than a glyph: Inter has no
+/// lock, and a fallback emoji would draw in its own colors.
+pub const LOCK_SHACKLE_SIZE: Size = Size::new(6.0, 5.0);
+pub const LOCK_BODY_SIZE: Size = Size::new(10.0, 7.0);
+
+pub fn lock_shackle(chrome: &ChromePalette) -> impl Fn(&Theme) -> container::Style {
+    fixed(container::Style {
+        border: Border {
+            color: chrome.muted_text,
+            width: 1.5,
+            radius: iced::border::top(3.0),
+        },
+        ..container::Style::default()
+    })
+}
+
+pub fn lock_body(chrome: &ChromePalette) -> impl Fn(&Theme) -> container::Style {
+    fixed(container::background(chrome.muted_text).border(Border::default().rounded(1.5)))
+}
+
 pub fn project_pill(
     chrome: &ChromePalette,
     active: bool,

@@ -534,6 +534,51 @@ class QuitDispatchTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "survived SIGKILL"):
                 ui._quit_iced_bundle()
 
+    def test_a_pid_reused_by_the_swift_roost_during_the_grace_period_is_never_killed(
+        self,
+    ) -> None:
+        """The bundle exits during the SIGTERM grace period and the Swift
+        Roost.app gets its pid: ownership is proven again before SIGKILL, so
+        the escalation never reaches it."""
+        with (
+            patch("ui._ICED_BUNDLE_PID", 4242),
+            patch("ui._pid_alive", return_value=True),
+            patch(
+                "ui._process_command",
+                side_effect=[
+                    "/Applications/Roost-Iced.app/Contents/MacOS/Roost-Iced",
+                    "/Applications/Roost.app/Contents/MacOS/Roost",
+                ],
+            ),
+            # The SIGTERM window ends with the pid alive (the Swift app's now);
+            # a SIGKILL, were one sent, would "work".
+            patch("ui._wait_pid_gone", side_effect=[False, True]),
+            patch("ui.subprocess.run") as run,
+        ):
+            ui._quit_iced_bundle()
+            self.assertIsNone(ui._ICED_BUNDLE_PID)
+        self.assertEqual([call.args[0] for call in run.call_args_list], [["kill", "4242"]])
+
+    def test_an_identity_ps_cannot_tell_is_neither_signalled_nor_forgotten(self) -> None:
+        with (
+            patch("ui._ICED_BUNDLE_PID", 4242),
+            patch("ui._pid_alive", return_value=True),
+            patch("ui._process_command", return_value=None),
+            patch("ui.subprocess.run") as run,
+        ):
+            with self.assertRaisesRegex(ui.OwnershipUnknown, "cannot tell whether pid 4242"):
+                ui._quit_iced_bundle()
+            self.assertEqual(ui._ICED_BUNDLE_PID, 4242)
+        run.assert_not_called()
+
+    def test_a_hung_ps_reads_as_no_answer(self) -> None:
+        def hangs(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+        with patch("ui.subprocess.run", side_effect=hangs) as run:
+            self.assertIsNone(ui._process_command(4242))
+        self.assertEqual(run.call_args.kwargs.get("timeout"), ui._PS_TIMEOUT_S)
+
     def test_process_name_kill_is_never_used_for_bundle_teardown(self) -> None:
         """Regression guard: teardown must stay pid-based. A `pkill -x
         Roost-Iced` (or `-x Roost`) would be a process-name kill banned by

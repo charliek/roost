@@ -19,9 +19,10 @@ All tests use the `tab.feed_pty_bytes` (to enable a mode) +
 
 Cross-platform behavioral-parity gate: every case runs against
 `--roost-target mac` and `--roost-target iced`. A regression on
-either side fails the matching job in CI. The same-cell drag-gate
-cases are the one exception — the gate is wired from iced only
-(plan 026 D11), so they skip on mac.
+either side fails the matching job in CI. Two exceptions skip on mac:
+the same-cell drag-gate cases — the gate is wired from iced only
+(plan 026 D11) — and the tab switch's release of a held button (#587),
+which landed after the Swift app was frozen.
 """
 
 from __future__ import annotations
@@ -169,6 +170,15 @@ def test_motion_throttle_dedups_same_cell(roost, project, target):
     assert reports == 1, f"expected 1 throttled report, got {reports}: {captured!r}"
 
 
+def _show(roost, tab: int) -> None:
+    """Focus `tab` and wait until the window is showing it."""
+    roost.focus(tab)
+    deadline = time.monotonic() + scaled_timeout(10.0)
+    while roost.identify()["active_tab_id"] != tab:
+        assert time.monotonic() < deadline, f"the window never moved to tab {tab}"
+        time.sleep(0.05)
+
+
 def test_a_press_and_release_on_a_background_tab_both_reach_it(roost, project, target):
     """`tab.dispatch_mouse_event` names a tab by **id**, so which tab the
     window happens to be showing may not change what the op does.
@@ -187,11 +197,7 @@ def test_a_press_and_release_on_a_background_tab_both_reach_it(roost, project, t
 
     front = roost.open_tab(project, cwd="/tmp")
     wait_tab_attached(roost, front)
-    roost.focus(front)
-    deadline = time.monotonic() + scaled_timeout(10.0)
-    while roost.identify()["active_tab_id"] != front:
-        assert time.monotonic() < deadline, "the window never moved off the tab under test"
-        time.sleep(0.05)
+    _show(roost, front)
 
     roost.tab_dispatch_mouse_event(
         background, kind="press", button="left", cell_x=5, cell_y=3
@@ -301,6 +307,69 @@ def test_return_to_origin_reports_every_crossing(roost, project, target):
     assert captured == (
         b"\x1b[<0;6;4M\x1b[<32;8;4M\x1b[<32;6;4M\x1b[<0;6;4m"
     ), captured
+
+
+def test_a_tab_switch_releases_the_button_held_on_the_tab_it_leaves(
+    roost, project, target
+):
+    """#587: the pointer can only be over the tab on screen, so a button
+    held on the tab the window switches away from would never see its
+    release, and the application on the far end would be left holding
+    it down. The switch sends that release itself."""
+    if target != "iced":
+        pytest.skip("the switch-time release is iced's (#587); the Swift app is frozen")
+    held = _enable_drag_reporting(roost, project)
+    other = roost.open_tab(project, cwd="/tmp")
+    wait_tab_attached(roost, other)
+    _show(roost, held)
+    drain(roost, held)
+
+    roost.tab_dispatch_mouse_event(
+        held, kind="press", button="left", cell_x=5, cell_y=3
+    )
+    pressed = drain_until_match(roost, held, rb"\x1b\[<0;6;4M", timeout=2.0)
+    pressed += drain(roost, held)
+    # Nothing may release the button before the switch: a release from
+    # anything else (a window focus loss) would pass for the switch's.
+    assert pressed == b"\x1b[<0;6;4M", ("the button came up before the switch", pressed)
+
+    _show(roost, other)
+    released = drain_until_match(roost, held, rb"\x1b\[<0;6;4m", timeout=2.0)
+    released += drain(roost, held)
+    assert released == b"\x1b[<0;6;4m", (
+        "the tab left behind must hear its button come up once, and nothing else",
+        released,
+    )
+
+
+def test_opening_the_palette_releases_the_held_button(roost, project, target):
+    """#342: the palette rebuilds the terminal widget with no button
+    held, so the button's physical release would never reach the
+    application. Opening it sends that release instead, and closing it
+    sends nothing more."""
+    if target != "iced":
+        pytest.skip("the rewrap-time release is iced's; the Swift app is frozen")
+    held = _enable_drag_reporting(roost, project)
+    _show(roost, held)
+    drain(roost, held)
+
+    roost.tab_dispatch_mouse_event(
+        held, kind="press", button="left", cell_x=5, cell_y=3
+    )
+    pressed = drain_until_match(roost, held, rb"\x1b\[<0;6;4M", timeout=2.0)
+    pressed += drain(roost, held)
+    assert pressed == b"\x1b[<0;6;4M", ("the button came up before the palette", pressed)
+
+    roost.palette_open()
+    try:
+        released = drain_until_match(roost, held, rb"\x1b\[<0;6;4m", timeout=2.0)
+    finally:
+        roost.palette_dismiss()
+    released += drain(roost, held)
+    assert released == b"\x1b[<0;6;4m", (
+        "the palette's tab must hear its button come up once, and nothing else",
+        released,
+    )
 
 
 def test_focus_event_emitted_when_mode_1004_enabled(roost, project, target):

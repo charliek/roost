@@ -93,6 +93,10 @@ jobs:
               - 'tools/roosttest/**'
               - 'tools/roosttest_unit/**'
               - 'tools/input/linux/**'
+              # The Mac real-input harness: its helper's checks and its suite
+              # run in iced-build-e2e's macOS/wgpu cell, its unit tests in
+              # harness-unit.
+              - 'tools/input/mac/**'
               - 'tools/wayland/**'
               # e2e-iced-wayland-drag's check imports pngtool from here (and
               # the screenshot harness shares helpers with tools/input), so a
@@ -765,6 +769,7 @@ jobs:
           tools/roosttest/test_smoke.py
           tools/roosttest/test_iced_walking_skeleton.py
           tools/roosttest/test_notifications.py
+          tools/roosttest/test_notification_raise.py
           tools/roosttest/test_agent_lifecycle.py
           tools/roosttest/test_agent_hooks.py
           tools/roosttest/test_agent_hooks_dialog.py
@@ -796,9 +801,14 @@ jobs:
           tools/roosttest/test_quit_with_foreground_job.py
           tools/roosttest/test_open_external.py
           tools/roosttest/test_context_menu.py
+          tools/roosttest/test_device_queries.py
+          tools/roosttest/test_selection_autoscroll.py
+          tools/roosttest/test_password_input.py
+          tools/roosttest/test_secure_input.py
           tools/roosttest/test_osc52.py
           tools/roosttest/test_paste_files.py
           tools/roosttest/test_context_menu_clipboard.py
+          -m 'not session_daemon and not host_client'
           --roost-target iced --roost-fresh -v
 
       # Its own invocation, after the shared-session lane above: this
@@ -1039,6 +1049,7 @@ jobs:
           tools/roosttest/test_smoke.py
           tools/roosttest/test_iced_walking_skeleton.py
           tools/roosttest/test_notifications.py
+          tools/roosttest/test_notification_raise.py
           tools/roosttest/test_agent_lifecycle.py
           tools/roosttest/test_agent_hooks.py
           tools/roosttest/test_agent_hooks_dialog.py
@@ -1070,6 +1081,11 @@ jobs:
           tools/roosttest/test_quit_with_foreground_job.py
           tools/roosttest/test_open_external.py
           tools/roosttest/test_context_menu.py
+          tools/roosttest/test_device_queries.py
+          tools/roosttest/test_selection_autoscroll.py
+          tools/roosttest/test_password_input.py
+          tools/roosttest/test_secure_input.py
+          -m 'not session_daemon and not host_client'
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced exit-on-empty E2E (Linux Wayland)
@@ -1232,13 +1248,15 @@ jobs:
           --roost-target iced --roost-fresh -v
 
       # The three macOS iced cells (this one, the bundle smoke and the
-      # Sparkle lane below) all carry `-m 'not host_client'`. Nothing
-      # ships a macOS `roost-session`, so HS-2's host lane is a Linux
-      # gate — and the deselect is a *fence*, not a filter: these are
-      # enumerated file lists, so its job is to keep the lane out of the
-      # macOS cells the day someone adds the module to all three lists at
-      # once (the enumerated-lists gotcha). Mirrors the Makefile's
-      # DAEMON_E2E_DESELECT.
+      # Sparkle lane below) all deselect `host_client`. Nothing ships a
+      # macOS `roost-session`, so HS-2's host lane is a Linux gate — and
+      # the deselect is a *fence*, not a filter: these are enumerated file
+      # lists, so its job is to keep the lane out of the macOS cells the
+      # day someone adds the module to all three lists at once (the
+      # enumerated-lists gotcha). This cell, like the X11 and Wayland
+      # functional cells, also deselects `session_daemon`:
+      # `test_password_input.py` has cases in both its lanes. Mirrors the
+      # Makefile's DAEMON_E2E_DESELECT.
       - name: Run Iced functional E2E (macOS)
         if: runner.os == 'macOS'
         env:
@@ -1253,6 +1271,7 @@ jobs:
           tools/roosttest/test_smoke.py
           tools/roosttest/test_iced_walking_skeleton.py
           tools/roosttest/test_notifications.py
+          tools/roosttest/test_notification_raise.py
           tools/roosttest/test_agent_lifecycle.py
           tools/roosttest/test_agent_hooks.py
           tools/roosttest/test_agent_hooks_dialog.py
@@ -1266,6 +1285,7 @@ jobs:
           tools/roosttest/test_z_typography.py
           tools/roosttest/test_project_lifecycle.py
           tools/roosttest/test_sidebar_resize.py
+          tools/roosttest/test_window_geometry_persistence.py
           tools/roosttest/test_osc_pipeline.py
           tools/roosttest/test_palette_256.py
           tools/roosttest/test_tab_dump_scrollback.py
@@ -1280,10 +1300,14 @@ jobs:
           tools/roosttest/test_view_perf.py
           tools/roosttest/test_open_external.py
           tools/roosttest/test_context_menu.py
+          tools/roosttest/test_device_queries.py
+          tools/roosttest/test_selection_autoscroll.py
+          tools/roosttest/test_password_input.py
+          tools/roosttest/test_secure_input.py
           tools/roosttest/test_osc52.py
           tools/roosttest/test_paste_files.py
           tools/roosttest/test_context_menu_clipboard.py
-          -m 'not host_client'
+          -m 'not session_daemon and not host_client'
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced exit-on-empty E2E (macOS)
@@ -1598,6 +1622,67 @@ jobs:
           -m 'not host_client'
           --roost-target iced --roost-fresh -v
 
+      # The Mac real-input harness (plan 074 §D7). The helper is an ordinary
+      # crate outside the workspace, so its own fmt/clippy/test/--locked gate
+      # is a normal, blocking step. Only the wgpu cell runs any of it: real
+      # input does not depend on the renderer, and one run per push is enough.
+      # It builds into the root `target`, which the cargo cache above keeps.
+      - name: Check the Mac real-input helper (macOS)
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
+        working-directory: tools/input/mac/roost-input-mac
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          cargo build --locked
+
+      # The real-input suite itself, preflight first, against the keyless bundle
+      # assembled above (before the Sparkle step re-assembles it). The hosted
+      # runner's own responsible process already holds every grant the helper
+      # needs (plan 074 §2.12), so there is no TCC grant step: `direct` mode
+      # runs the helper as this step's child, and preflight fails loudly if a
+      # future image drops those grants. Blocking since it qualified under
+      # §D7's promotion rule (three consecutive attempts of one commit with
+      # every scenario passing, plan 074); `outcome` is still recorded below.
+      - name: Run Mac real-input suite (macOS)
+        id: real-input-mac
+        if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
+        timeout-minutes: 10
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          ROOST_ICED_APP: mac/build/Roost-Iced.app
+          ICED_BACKEND: wgpu
+          RUST_LOG: warn
+          ROOST_TEST_MODE: "1"
+          ROOST_TEST_TIMEOUT_SCALE: "3"
+          ROOST_REAL_INPUT_MODE: direct
+          ROOST_REQUIRE_REAL_INPUT: "1"
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-real-input-artifacts
+        run: |
+          echo "ImageOS=${ImageOS:-unset} ImageVersion=${ImageVersion:-unset}"
+          sw_vers
+          csrutil status || true
+          uv run --group test pytest tools/roosttest/test_real_input_mac.py \
+            --roost-target iced -v \
+            --junitxml="$ROOST_E2E_ARTIFACT_DIR/junit.xml"
+
+      # The step's `outcome`, written where a reader can find it: the job
+      # summary, and outcome.txt beside the JUnit report (the promotion rule
+      # read it while the step was still continue-on-error).
+      - name: Record Mac real-input outcome (macOS)
+        if: always() && runner.os == 'macOS' && matrix.renderer == 'wgpu'
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.real-input-mac.outcome }}
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-real-input-artifacts
+        run: |
+          echo "real-input-mac outcome: ${OUTCOME}" | tee -a "$GITHUB_STEP_SUMMARY"
+          mkdir -p "$ROOST_E2E_ARTIFACT_DIR"
+          echo "${OUTCOME}" > "$ROOST_E2E_ARTIFACT_DIR/outcome.txt"
+
       # Deliberately AFTER the keyless assemble + its assertion block:
       # this step re-assembles mac/build/Roost-Iced.app in place, with
       # the fixture's TEST-ONLY SUPublicEDKey and a dead placeholder
@@ -1745,6 +1830,18 @@ jobs:
             # `Roost-Iced` (CFBundleExecutable), not `roost-iced`, so its
             # crash reports need their own glob.
             cp "$HOME"/Library/Logs/DiagnosticReports/Roost-Iced*.ips diagnostics/ 2>/dev/null || true
+            # The real-input suite's artifacts dir holds every helper
+            # invocation's JSON (helper/<n>-<command>/), the JUnit XML, any
+            # captures and the Roost-linux logs the module copied before its
+            # cleanup; the live Roost-linux log dir is copied too, for a run
+            # that died before that copy.
+            real_input="${RUNNER_TEMP}/roost-iced-e2e-mac-real-input-artifacts"
+            if [ -d "${real_input}" ]; then
+              cp -R "${real_input}" diagnostics/real-input-mac
+            fi
+            if [ -d "$HOME/Library/Logs/Roost-linux" ]; then
+              cp -R "$HOME/Library/Logs/Roost-linux" diagnostics/real-input-mac-Roost-linux-logs
+            fi
           fi
           ls -la diagnostics || true
 

@@ -1,0 +1,12 @@
+{
+  "id": "41",
+  "op": "tab.dispatch_mouse_event",
+  "params": {
+    "tab_id": "5",
+    "kind": "press",
+    "button": "left",
+    "cell_x": 10,
+    "cell_y": 4,
+    "mods": 0
+  }
+}

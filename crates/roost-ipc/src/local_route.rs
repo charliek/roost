@@ -291,6 +291,11 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ("app.update_status", OpClass::UiOwned),
     ("app.update_check", OpClass::UiOwned),
     ("app.notification_status", OpClass::UiOwned),
+    // A banner click into this window, and what its raise came to. The
+    // click's bare tab id is resolved against the slot by the UI, as the
+    // context-menu ops' are.
+    ("app.notification_activate", OpClass::UiOwned),
+    ("app.last_activation", OpClass::UiOwned),
     ("app.dialog_dump", OpClass::UiOwned),
     ("app.dialog_answer", OpClass::UiOwned),
     ("app.keybind_dispatch", OpClass::UiOwned),
@@ -299,6 +304,8 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ("app.notice_answer", OpClass::UiOwned),
     // A key press into this window — whatever owns its keyboard.
     ("app.key_event", OpClass::UiOwned),
+    // This window's Secure Keyboard Entry.
+    ("app.secure_input", OpClass::UiOwned),
     // A row's right-click menu in this window.
     ("app.context_menu_dump", OpClass::UiOwned),
     ("app.context_menu_activate", OpClass::UiOwned),
@@ -338,6 +345,7 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ("project.deleted", OpClass::Event),
     ("active.changed", OpClass::Event),
     ("hook_active.changed", OpClass::Event),
+    ("tab.password_input", OpClass::Event),
     ("notification.fired", OpClass::Event),
     ("agent_report.changed", OpClass::Event),
     ("tabs.reordered", OpClass::Event),

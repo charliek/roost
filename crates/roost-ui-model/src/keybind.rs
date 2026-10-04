@@ -65,6 +65,11 @@ pub enum KeybindAction {
     /// Toggle the window's full-screen mode. Default `ctrl+super+f` on
     /// macOS; unbound on Linux, where F11 stays with terminal programs.
     ToggleFullScreen,
+    /// Flip the remembered Secure Keyboard Entry toggle
+    /// (`macos-secure-keyboard-entry`, plan 074 §D3). Ghostty's name.
+    /// Default unbound on both platforms; off macOS it is recognised and
+    /// does nothing, so one config file stays valid everywhere.
+    ToggleSecureInput,
     /// Browser-style font sizing on the active tab's terminal.
     /// Defaults to `primary+plus`/`primary+equal` (both are bound
     /// because `Cmd-+` on US layouts is really `Cmd-Shift-=` and
@@ -135,6 +140,7 @@ impl KeybindAction {
             "open_config" => Some(Self::OpenConfig),
             "open_docs" => Some(Self::OpenDocs),
             "toggle_fullscreen" => Some(Self::ToggleFullScreen),
+            "toggle_secure_input" => Some(Self::ToggleSecureInput),
             "font_increase" => Some(Self::FontIncrease),
             "font_decrease" => Some(Self::FontDecrease),
             "font_reset" => Some(Self::FontReset),
@@ -186,6 +192,7 @@ impl KeybindAction {
             Self::OpenConfig => "open_config".into(),
             Self::OpenDocs => "open_docs".into(),
             Self::ToggleFullScreen => "toggle_fullscreen".into(),
+            Self::ToggleSecureInput => "toggle_secure_input".into(),
             Self::FontIncrease => "font_increase".into(),
             Self::FontDecrease => "font_decrease".into(),
             Self::FontReset => "font_reset".into(),
@@ -643,6 +650,7 @@ mod tests {
             KeybindAction::OpenConfig,
             KeybindAction::OpenDocs,
             KeybindAction::ToggleFullScreen,
+            KeybindAction::ToggleSecureInput,
             KeybindAction::FontIncrease,
             KeybindAction::FontDecrease,
             KeybindAction::FontReset,
@@ -1080,6 +1088,19 @@ mod tests {
         assert!(!defaults
             .values()
             .any(|action| *action == KeybindAction::OpenDocs));
+    }
+
+    /// Ghostty binds nothing to it either: a chord that flips a security
+    /// setting by accident is worse than one the user has to choose.
+    #[test]
+    fn toggle_secure_input_is_named_like_ghostty_and_unbound() {
+        assert_eq!(
+            KeybindAction::from_name("toggle_secure_input"),
+            Some(KeybindAction::ToggleSecureInput)
+        );
+        assert!(!default_bindings()
+            .iter()
+            .any(|(_, action)| *action == KeybindAction::ToggleSecureInput));
     }
 
     #[test]

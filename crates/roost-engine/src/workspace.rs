@@ -40,6 +40,7 @@ use tracing::warn;
 
 use crate::persistence::{
     persist_state, read_state, HostSnapshot, HostTabMemory, ProjectSnapshot, SnapshotFile,
+    WindowFrame,
 };
 
 /// How many events the broadcast channel buffers per subscriber.
@@ -116,6 +117,11 @@ struct TabRow {
     /// about is not one anybody can acknowledge. Not persisted, like
     /// `has_notification`.
     notification_generation: u64,
+    /// Whether the tab's PTY is at a password prompt, as its owner's
+    /// password poller last reported ([`Workspace::set_tab_password_input`]).
+    /// Not persisted, like `has_notification`: a relaunch reopens fresh
+    /// shells, and none of them starts at a prompt.
+    password_input: bool,
     user_titled: bool,
     position: i32,
     created_at: i64,
@@ -146,6 +152,10 @@ struct Inner {
     /// (Rust UI adapter (Iced) parity with the Mac UI's
     /// `RoostSidebarWidth`).
     sidebar_width: f64,
+    /// The UI window's last frame (plan 074 §D5b). UI-set via
+    /// `set_window_frame`; persisted so a relaunch reopens the window
+    /// where it was. Only the macOS UI ever sets it.
+    window_frame: Option<WindowFrame>,
     /// Saved hosts, carried opaquely from `state.json` back into every
     /// rewrite. The workspace neither reads nor mutates them — HS-2
     /// owns the mutation API and the `HostSnapshot.id` ↔ `HostId`
@@ -208,6 +218,7 @@ impl Default for Inner {
             active_tab_id: 0,
             sidebar_collapsed: false,
             sidebar_width: SIDEBAR_DEFAULT_WIDTH,
+            window_frame: None,
             hosts: Vec::new(),
             recent_hosts: Vec::new(),
             // The safe default for a workspace nobody reports focus to:
@@ -379,6 +390,13 @@ pub enum WorkspaceEvent {
         #[serde(with = "roost_ipc::messages::string_int64")]
         tab_id: i64,
         active: bool,
+    },
+    /// The tab entered or left a password prompt. State, not a moment,
+    /// so it is replayed like every other tab field.
+    TabPasswordInput {
+        #[serde(with = "roost_ipc::messages::string_int64")]
+        tab_id: i64,
+        password_input: bool,
     },
     /// The full agent record after an accepted report or shell mark;
     /// see [`roost_ipc::messages::AgentReportChangedEvent`].
@@ -873,6 +891,7 @@ impl Workspace {
             sidebar_collapsed: snapshot.sidebar_collapsed,
             sidebar_width: normalize_sidebar_width(snapshot.sidebar_width)
                 .unwrap_or(SIDEBAR_DEFAULT_WIDTH),
+            window_frame: snapshot.window.filter(WindowFrame::is_valid),
             hosts: std::mem::take(&mut snapshot.hosts),
             recent_hosts: std::mem::take(&mut snapshot.recent_hosts),
             window_focused: false,
@@ -1009,6 +1028,30 @@ impl Workspace {
             return;
         }
         inner.sidebar_width = width;
+        self.commit(inner, Vec::new(), Persist::Write);
+    }
+
+    /// The window frame `state.json` restored, if a valid one was saved.
+    /// The macOS UI opens its window at it (plan 074 §D5b).
+    pub fn window_frame(&self) -> Option<WindowFrame> {
+        self.inner.lock().unwrap().window_frame
+    }
+
+    /// Record the window's frame and persist it. Emits no event — the
+    /// window already is where it is; this only writes the frame through
+    /// so a relaunch reopens it there. A no-op (no write) when unchanged,
+    /// and an invalid frame ([`WindowFrame::is_valid`]) is ignored
+    /// outright, so `state.json` can never carry one a relaunch would
+    /// have to reject.
+    pub fn set_window_frame(&self, frame: WindowFrame) {
+        if !frame.is_valid() {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if inner.window_frame == Some(frame) {
+            return;
+        }
+        inner.window_frame = Some(frame);
         self.commit(inner, Vec::new(), Persist::Write);
     }
 
@@ -1544,6 +1587,7 @@ impl Workspace {
             agent: AgentTabState::default(),
             has_notification: false,
             notification_generation: 0,
+            password_input: false,
             // Always start with user_titled=false. The caller-
             // supplied `title` is a placeholder (e.g. UI's
             // "roost-mac N" / CLI's "roostctl" default) that
@@ -2002,6 +2046,32 @@ impl Workspace {
         // Run state isn't in the persisted snapshot — emit only.
         self.commit(inner, events, Persist::Skip);
         Ok((accepted, tab))
+    }
+
+    /// Record whether a tab's PTY is at a password prompt.
+    ///
+    /// A tab that is gone is not an error: the report comes from a
+    /// poller sampling the PTY, which can land a beat after the row
+    /// closed, and there is nothing left to tell anyone about. An
+    /// unchanged value commits nothing, so a client sees one event per
+    /// transition however often the poller repeats itself.
+    pub fn set_tab_password_input(&self, tab_id: i64, password_input: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(row) = inner.tabs.get_mut(&tab_id) else {
+            return;
+        };
+        if row.password_input == password_input {
+            return;
+        }
+        row.password_input = password_input;
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::TabPasswordInput {
+                tab_id,
+                password_input,
+            }],
+            Persist::Skip,
+        );
     }
 
     pub fn set_tab_has_notification(
@@ -2787,6 +2857,7 @@ impl Inner {
             active_tab_position,
             sidebar_collapsed: self.sidebar_collapsed,
             sidebar_width: self.sidebar_width,
+            window: self.window_frame,
             hosts: self.hosts.clone(),
             recent_hosts: self.recent_hosts.clone(),
             projects: self
@@ -2874,6 +2945,7 @@ fn wire_tab(row: &TabRow, is_active: bool) -> Tab {
         shell_state: row.agent.shell,
         agent_lifecycle: row.agent.lifecycle,
         ownership: row.agent.ownership.clone(),
+        password_input: row.password_input,
     }
 }
 
@@ -5294,6 +5366,79 @@ mod tests {
     }
 
     #[test]
+    fn window_frame_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let frame = WindowFrame {
+            content_width: 1280.0,
+            content_height: 800.0,
+            outer_x: -1440.0,
+            outer_y: 25.5,
+        };
+        {
+            let ws = Workspace::open(path.clone());
+            assert_eq!(ws.window_frame(), None, "nothing saved yet");
+            // A commit that is not a frame must not invent one: this is
+            // the daemon's and every Linux workspace's whole life.
+            ws.set_sidebar_width(300.0);
+            let raw = std::fs::read_to_string(&path).unwrap();
+            assert!(!raw.contains("\"window\""), "{raw}");
+            ws.set_window_frame(frame);
+        }
+        let ws2 = Workspace::open(path.clone());
+        assert_eq!(ws2.window_frame(), Some(frame), "frame must survive reopen");
+        let moved = WindowFrame {
+            outer_x: 40.0,
+            ..frame
+        };
+        ws2.set_window_frame(moved);
+        drop(ws2);
+        assert_eq!(Workspace::open(path).window_frame(), Some(moved));
+    }
+
+    #[test]
+    fn an_invalid_window_frame_is_neither_restored_nor_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, window) in [
+            (
+                "zero",
+                r#"{"content_width":0,"content_height":600,"outer_x":0,"outer_y":0}"#,
+            ),
+            (
+                "negative",
+                r#"{"content_width":900,"content_height":-1,"outer_x":0,"outer_y":0}"#,
+            ),
+        ] {
+            let path = dir.path().join(format!("state-{name}.json"));
+            std::fs::write(
+                &path,
+                format!(r#"{{"next_id":1,"projects":[],"window":{window}}}"#),
+            )
+            .unwrap();
+            assert_eq!(
+                Workspace::open(path).window_frame(),
+                None,
+                "a {name} size must open at the defaults"
+            );
+        }
+
+        let path = dir.path().join("state.json");
+        let ws = Workspace::open(path.clone());
+        ws.set_window_frame(WindowFrame {
+            content_width: f64::NAN,
+            content_height: 600.0,
+            outer_x: 0.0,
+            outer_y: 0.0,
+        });
+        assert_eq!(
+            ws.window_frame(),
+            None,
+            "the setter refuses what open would"
+        );
+        assert!(!path.exists(), "a refused frame must not write state.json");
+    }
+
+    #[test]
     fn sidebar_width_clamps_on_open() {
         let dir = tempfile::tempdir().unwrap();
         for (stored, expected) in [(90.0, SIDEBAR_MIN_WIDTH), (1000.0, SIDEBAR_MAX_WIDTH)] {
@@ -6436,6 +6581,62 @@ mod tests {
             "a writable directory is not a write"
         );
         assert!(durability_events(&mut events).is_empty());
+    }
+
+    /// `password_input` (plan 074 §D2) is live tab state: it reaches
+    /// `tab.list` and one event per change, and a commit that never
+    /// touches disk.
+    #[test]
+    fn password_input_is_live_state_with_one_event_per_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::open(dir.path().join("state.json"));
+        let pid = ws.create_project("p", "/").unwrap().id;
+        let tid = ws.open_tab(pid, "/", "a", true).unwrap().id;
+        let written = ws.inner.lock().unwrap().persist_seq;
+        let mut events = ws.subscribe();
+
+        ws.set_tab_password_input(tid, true);
+        assert!(ws.tab(tid).unwrap().password_input);
+        ws.set_tab_password_input(tid, true);
+        ws.set_tab_password_input(tid, false);
+        ws.set_tab_password_input(tid + 1000, true);
+
+        let seen: Vec<WorkspaceEvent> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert_eq!(
+            seen,
+            [true, false].map(|password_input| WorkspaceEvent::TabPasswordInput {
+                tab_id: tid,
+                password_input
+            }),
+            "an unchanged value and a tab that is gone commit nothing"
+        );
+        assert_eq!(
+            ws.inner.lock().unwrap().persist_seq,
+            written,
+            "password_input must never write state.json"
+        );
+    }
+
+    /// State, not a moment: a resume replays it like any other tab field,
+    /// so a client that missed the change while away still learns it.
+    #[test]
+    fn a_password_input_change_is_replayed_into_a_resume() {
+        let ws = replaying(16, REPLAY_BUDGET_BYTES);
+        let pid = ws.create_project("p", "/").unwrap().id;
+        let tid = ws.open_tab(pid, "/", "a", true).unwrap().id;
+        let fence = ws.revision();
+        ws.set_tab_password_input(tid, true);
+
+        let cut = ws.subscribe_from(fence).expect("young enough");
+        let replayed: Vec<&WorkspaceEvent> =
+            cut.replay.iter().flat_map(|batch| &batch.events).collect();
+        assert_eq!(
+            replayed,
+            [&WorkspaceEvent::TabPasswordInput {
+                tab_id: tid,
+                password_input: true
+            }]
+        );
     }
 
     #[test]

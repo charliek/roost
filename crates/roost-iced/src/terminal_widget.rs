@@ -13,9 +13,11 @@ use iced::{
     Renderer, Size, Theme,
 };
 use roost_engine::pointer::{PointerAction, PointerButton};
+use roost_ui_model::keys::TabKey;
 use roost_ui_model::sprite::{sprite_geometry, tessellate, SpriteGeometry, SpritePrimitive};
 use roost_ui_model::theme::Theme as AppTheme;
 use roost_vt::{ColorRgb, CursorInfo, CursorVisualStyle, SelectionSpan};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -426,6 +428,9 @@ pub struct TerminalSnapshot {
     /// set, cleared by OSC 112) is `None`. Mac parity: both fall back
     /// to `theme.cursor`, not `foreground`.
     pub cursor_color: ColorRgb,
+    /// The theme's `cursor-text`: the ink of the glyph under a block
+    /// cursor, when it differs from the cursor's fill (see [`cell_ink`]).
+    pub cursor_text: Option<ColorRgb>,
     /// Indexed by viewport row; `grid.len() == rows`.
     pub grid: Vec<Arc<RenderedRow>>,
     pub selection_background: ColorRgb,
@@ -463,6 +468,7 @@ impl TerminalSnapshot {
                 g: 218,
                 b: 224,
             },
+            cursor_text: None,
             grid: vec![blank_row; usize::from(rows)],
             selection_background: ColorRgb {
                 r: 72,
@@ -490,6 +496,7 @@ impl TerminalSnapshot {
             foreground: theme.foreground,
             background: theme.background,
             cursor_color: theme.cursor,
+            cursor_text: theme.cursor_text,
             selection_background: theme.selection_background,
             selection_foreground: theme.selection_foreground,
             ..Self::blank(cols, rows)
@@ -599,8 +606,10 @@ impl BlockCursor {
 }
 
 /// The ink at (`row`, `col`) by role, the first match winning: under the
-/// block cursor, the terminal background (the inverted glyph, as Swift's
-/// `drawCursorBlock` and Ghostty draw it); inside the row's selection
+/// block cursor, the theme's `cursor-text`, or the terminal background (the
+/// inverted glyph, as Swift's `drawCursorBlock` and Ghostty draw it) when
+/// that is absent or equals the cursor's fill, which would hide the glyph;
+/// inside the row's selection
 /// (see [`TerminalSnapshot::selection_on`]), the theme's
 /// `selection-foreground`; otherwise `own`, the cell's resolved
 /// foreground.
@@ -612,8 +621,11 @@ fn cell_ink(
     selection: Option<SelectionSpan>,
     snapshot: &TerminalSnapshot,
 ) -> ColorRgb {
-    if cursor.is_some_and(|cursor| cursor.covers(row, col)) {
-        snapshot.background
+    if let Some(cursor) = cursor.filter(|cursor| cursor.covers(row, col)) {
+        snapshot
+            .cursor_text
+            .filter(|text| *text != cursor.color)
+            .unwrap_or(snapshot.background)
     } else if selection.is_some_and(|span| (span.col0..span.col1).contains(&col)) {
         snapshot.selection_foreground
     } else {
@@ -716,15 +728,19 @@ fn effective_cursor_color(cursor: &CursorInfo, snapshot: &TerminalSnapshot) -> C
 
 #[derive(Debug, Clone)]
 pub struct TerminalWidget {
-    pub tab_id: i64,
+    /// The tab on screen, qualified by its instance: a local tab and a
+    /// host's can share a number, and a press held on one must not pass
+    /// to the other (#587).
+    pub tab: TabKey,
     pub snapshot: TerminalSnapshot,
     pub metrics: TerminalMetrics,
-    pub metric_generation: u64,
-    /// Bumped each time the app cancels the terminals' pointer gestures.
-    /// A button pressed before the cancel no longer owns anything, and
-    /// its release may never come here (a context menu's backdrop
-    /// swallows it), so the widget's pointer state starts over.
-    pub pointer_cancel_epoch: u64,
+    /// The latest press (`TerminalPointerEvent::press_seq`) a pointer
+    /// cancel has settled for this tab. A button held since such a press
+    /// no longer owns anything, and its release may never come here (a
+    /// context menu's backdrop swallows it), so the widget lets it go. A
+    /// later press is kept: the model accepted it after the cancel, even
+    /// when both landed in one event batch (#587).
+    pub cancelled_through: u64,
     /// Whether this terminal owns keyboard input right now — the app
     /// computes it as "the keyboard route is this tab and the window is
     /// focused". Only then does the widget ask the platform for an IME.
@@ -741,23 +757,47 @@ pub struct TerminalWidget {
 pub(crate) enum TerminalPointer {
     Event(TerminalPointerEvent),
     Wheel(TerminalWheelEvent),
-    Leave { tab_id: i64 },
+    Leave { tab: TabKey },
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TerminalPointerEvent {
-    pub tab_id: i64,
+    pub tab: TabKey,
     pub action: PointerAction,
     pub button: Option<PointerButton>,
     pub col: u32,
     pub row: u32,
     pub click_count: u8,
     pub inside: bool,
+    /// The press this event belongs to: a fresh [`next_press_seq`] on a
+    /// press, that press's on its motion and release, and `None` for an
+    /// event no held press owns (a hover, a stray release).
+    pub press_seq: Option<u64>,
+    /// Rows the pointer is past the grid's top (negative) or bottom
+    /// (positive) edge; see [`row_overshoot`].
+    pub overshoot: i16,
+}
+
+/// Process-wide rather than per widget: iced rebuilds a widget's state
+/// whenever the tree around it changes shape (a modal opening), and a
+/// counter that restarted there would mint presses a past cancel already
+/// covers.
+static NEXT_PRESS_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// A press sequence number no earlier press has had. Never 0, so a
+/// model that has seen no press yet has settled none.
+pub(crate) fn next_press_seq() -> u64 {
+    NEXT_PRESS_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The last press sequence number handed out; 0 before the first.
+pub(crate) fn latest_press_seq() -> u64 {
+    NEXT_PRESS_SEQ.load(Ordering::Relaxed) - 1
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TerminalWheelEvent {
-    pub tab_id: i64,
+    pub tab: TabKey,
     /// Positive moves toward older history; negative toward the live bottom.
     pub history_rows: f64,
     pub col: u32,
@@ -775,12 +815,20 @@ fn wheel_history_rows(delta: mouse::ScrollDelta, cell_height: f32) -> f64 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeldPress {
+    button: PointerButton,
+    seq: u64,
+}
+
 #[derive(Default)]
 pub(crate) struct TerminalWidgetState {
-    tab_id: Option<i64>,
-    metric_generation: u64,
-    pointer_cancel_epoch: u64,
-    pressed: Option<PointerButton>,
+    tab: Option<TabKey>,
+    pressed: Option<HeldPress>,
+    /// The cell of the last event this widget reported, clamped past the
+    /// edge or not. A held drag's release can come with no cursor at all —
+    /// X reports the pointer leaving the window before the release, and
+    /// iced forgets the position on the leave — so it lands here.
     last_cell: Option<(u32, u32)>,
     was_inside: bool,
     clicks: ClickTracker,
@@ -789,7 +837,9 @@ pub(crate) struct TerminalWidgetState {
 
 #[derive(Debug, Clone, Copy)]
 struct ClickSequence {
-    tab_id: i64,
+    tab: TabKey,
+    /// The press that made the last click. See `TerminalWidget::update_pointer`.
+    seq: u64,
     cell: (u32, u32),
     at: Instant,
     count: u8,
@@ -801,17 +851,18 @@ struct ClickTracker {
 }
 
 impl ClickTracker {
-    fn primary_press(&mut self, tab_id: i64, cell: (u32, u32), now: Instant) -> u8 {
+    fn primary_press(&mut self, tab: TabKey, seq: u64, cell: (u32, u32), now: Instant) -> u8 {
         let count = self
             .sequence
             .filter(|sequence| {
-                sequence.tab_id == tab_id
+                sequence.tab == tab
                     && sequence.cell == cell
                     && now.saturating_duration_since(sequence.at) <= MULTI_CLICK_INTERVAL
             })
             .map_or(1, |sequence| sequence.count.saturating_add(1));
         self.sequence = Some(ClickSequence {
-            tab_id,
+            tab,
+            seq,
             cell,
             at: now,
             count,
@@ -860,6 +911,23 @@ impl PointerOutcome {
 }
 
 impl TerminalWidget {
+    /// The pointer half of `Widget::update` without a renderer: the
+    /// pointer event one native event makes, if any, for the app's tests
+    /// to hand to the model.
+    #[cfg(test)]
+    pub(crate) fn pointer_event(
+        &self,
+        state: &mut TerminalWidgetState,
+        event: &Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<TerminalPointerEvent> {
+        match self.update_pointer(state, event, bounds, cursor)?.message? {
+            crate::Message::TerminalPointer(TerminalPointer::Event(event)) => Some(event),
+            _ => None,
+        }
+    }
+
     fn update_pointer(
         &self,
         state: &mut TerminalWidgetState,
@@ -867,16 +935,25 @@ impl TerminalWidget {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<PointerOutcome> {
-        if state.tab_id != Some(self.tab_id)
-            || state.metric_generation != self.metric_generation
-            || state.pointer_cancel_epoch != self.pointer_cancel_epoch
+        if state.tab != Some(self.tab)
+            || state
+                .pressed
+                .is_some_and(|held| held.seq <= self.cancelled_through)
         {
-            state.tab_id = Some(self.tab_id);
-            state.metric_generation = self.metric_generation;
-            state.pointer_cancel_epoch = self.pointer_cancel_epoch;
+            state.tab = Some(self.tab);
             state.pressed = None;
             state.last_cell = None;
             state.was_inside = false;
+            state.clicks.reset();
+        }
+        // The click count follows the held press's rule: a click a cancel
+        // has settled is over, so a font-size change between two clicks on
+        // one cell leaves two single clicks, not a double.
+        if state
+            .clicks
+            .sequence
+            .is_some_and(|click| click.seq <= self.cancelled_through)
+        {
             state.clicks.reset();
         }
         if matches!(event, Event::Mouse(mouse::Event::CursorLeft)) {
@@ -887,9 +964,7 @@ impl TerminalWidget {
                 }
                 state.clicks.reset();
                 return Some(PointerOutcome::publish(crate::Message::TerminalPointer(
-                    TerminalPointer::Leave {
-                        tab_id: self.tab_id,
-                    },
+                    TerminalPointer::Leave { tab: self.tab },
                 )));
             }
             return None;
@@ -906,7 +981,7 @@ impl TerminalWidget {
         }
         if let Event::Mouse(mouse::Event::ButtonReleased(native_button)) = event {
             if let Some(owner) = state.pressed {
-                if mouse_button(*native_button) != Some(owner) {
+                if mouse_button(*native_button) != Some(owner.button) {
                     return Some(PointerOutcome::capture());
                 }
             }
@@ -926,9 +1001,7 @@ impl TerminalWidget {
                 state.last_cell = None;
                 state.clicks.reset();
                 return Some(PointerOutcome::publish(crate::Message::TerminalPointer(
-                    TerminalPointer::Leave {
-                        tab_id: self.tab_id,
-                    },
+                    TerminalPointer::Leave { tab: self.tab },
                 )));
             }
             if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_))) {
@@ -944,63 +1017,72 @@ impl TerminalWidget {
             })
             .or(state.last_cell)?;
         let (col, row) = cell;
+        let overshoot = point.map_or(0, |point| {
+            row_overshoot(point, self.snapshot.rows, self.metrics)
+        });
         if !inside {
             state.clicks.reset();
         }
         state.was_inside = inside;
-        state.last_cell = inside.then_some(cell).or(state.last_cell);
+        state.last_cell = Some(cell);
         let pointer = match event {
             Event::Mouse(mouse::Event::ButtonPressed(button)) => {
                 let Some(button) = mouse_button(*button) else {
                     state.clicks.reset();
                     return None;
                 };
-                state.pressed = Some(button);
+                let seq = next_press_seq();
+                state.pressed = Some(HeldPress { button, seq });
                 let click_count = if button == PointerButton::Left {
                     state
                         .clicks
-                        .primary_press(self.tab_id, cell, Instant::now())
+                        .primary_press(self.tab, seq, cell, Instant::now())
                 } else {
                     state.clicks.reset();
                     1
                 };
                 TerminalPointer::Event(TerminalPointerEvent {
-                    tab_id: self.tab_id,
+                    tab: self.tab,
                     action: PointerAction::Press,
                     button: Some(button),
                     col,
                     row,
                     click_count,
                     inside,
+                    press_seq: Some(seq),
+                    overshoot,
                 })
             }
             Event::Mouse(mouse::Event::ButtonReleased(button)) => {
                 let button = mouse_button(*button)?;
-                if state.pressed == Some(button) {
-                    state.pressed = None;
-                }
+                // A held press of any other button returned above.
+                let owner = state.pressed.take();
                 if !inside {
                     state.last_cell = None;
                 }
                 TerminalPointer::Event(TerminalPointerEvent {
-                    tab_id: self.tab_id,
+                    tab: self.tab,
                     action: PointerAction::Release,
                     button: Some(button),
                     col,
                     row,
                     click_count: 0,
                     inside,
+                    press_seq: owner.map(|held| held.seq),
+                    overshoot,
                 })
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 TerminalPointer::Event(TerminalPointerEvent {
-                    tab_id: self.tab_id,
+                    tab: self.tab,
                     action: PointerAction::Motion,
-                    button: state.pressed,
+                    button: state.pressed.map(|held| held.button),
                     col,
                     row,
                     click_count: 0,
                     inside,
+                    press_seq: state.pressed.map(|held| held.seq),
+                    overshoot,
                 })
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
@@ -1010,7 +1092,7 @@ impl TerminalWidget {
                     return None;
                 }
                 TerminalPointer::Wheel(TerminalWheelEvent {
-                    tab_id: self.tab_id,
+                    tab: self.tab,
                     history_rows,
                     col,
                     row,
@@ -1523,6 +1605,21 @@ fn cell_at_clamped(
     Some((col, row))
 }
 
+/// How many rows `point` is beyond the grid's own rectangle — its cells,
+/// so the padding band around them counts as beyond — vertically:
+/// negative above row 0, positive below the last row, and `0` level with
+/// the grid whatever the column, or with no grid at all. The drag
+/// selection's auto-scroll runs on it (#342), and `cell_at_clamped`
+/// throws it away.
+fn row_overshoot(point: Point, rows: u16, metrics: TerminalMetrics) -> i16 {
+    if rows == 0 {
+        return 0;
+    }
+    let row = ((point.y - TERMINAL_PADDING) / metrics.cell_height).floor();
+    // `as` saturates at `i16::MIN` / `i16::MAX`.
+    (row - row.clamp(0.0, f32::from(rows - 1))) as i16
+}
+
 fn mouse_button(button: mouse::Button) -> Option<PointerButton> {
     match button {
         mouse::Button::Left => Some(PointerButton::Left),
@@ -1569,11 +1666,10 @@ mod tests {
 
     fn widget(tab_id: i64, snapshot: TerminalSnapshot) -> TerminalWidget {
         TerminalWidget {
-            tab_id,
+            tab: TabKey::local(tab_id),
             snapshot,
             metrics: metrics(),
-            metric_generation: 1,
-            pointer_cancel_epoch: 0,
+            cancelled_through: 0,
             ime_active: false,
             focused: true,
         }
@@ -1754,6 +1850,53 @@ mod tests {
             ..cursor
         });
         assert_eq!(snapshot.block_cursor(true), None, "DECTCEM hidden");
+    }
+
+    #[test]
+    fn a_themes_cursor_text_inks_the_glyph_under_the_block_cursor() {
+        let mut snapshot = cursor_snapshot(2, 1, vec![draw_cell(0, "X"), draw_cell(1, "Y")]);
+        let text = ColorRgb { r: 9, g: 8, b: 7 };
+        snapshot.cursor_text = Some(text);
+        assert_eq!(
+            ink_by_col(&snapshot, true),
+            vec![(0, OWN_INK, false), (1, text, false)]
+        );
+    }
+
+    #[test]
+    fn without_a_cursor_text_the_glyph_takes_the_background() {
+        let mut snapshot = cursor_snapshot(2, 1, vec![draw_cell(0, "X"), draw_cell(1, "Y")]);
+        snapshot.cursor_text = None;
+        assert_eq!(
+            ink_by_col(&snapshot, true),
+            vec![(0, OWN_INK, false), (1, snapshot.background, false)]
+        );
+    }
+
+    #[test]
+    fn a_cursor_text_equal_to_the_cursor_fill_falls_back_to_the_background() {
+        let mut snapshot = cursor_snapshot(2, 1, vec![draw_cell(1, "Y")]);
+        snapshot.cursor_text = Some(CURSOR);
+        assert_eq!(
+            ink_by_col(&snapshot, true),
+            vec![(1, snapshot.background, false)]
+        );
+    }
+
+    #[test]
+    fn the_osc12_fill_decides_whether_cursor_text_is_hidden() {
+        let theme_cursor = ColorRgb { r: 1, g: 1, b: 1 };
+        let mut snapshot = cursor_snapshot(2, 1, vec![draw_cell(1, "Y")]);
+        snapshot.cursor_color = theme_cursor;
+        snapshot.cursor_text = Some(theme_cursor);
+        // OSC 12 moved the fill off the theme cursor: the text is visible.
+        assert_eq!(ink_by_col(&snapshot, true), vec![(1, theme_cursor, false)]);
+        // OSC 12 moved the fill onto the text color: it would vanish.
+        snapshot.cursor_text = Some(CURSOR);
+        assert_eq!(
+            ink_by_col(&snapshot, true),
+            vec![(1, snapshot.background, false)]
+        );
     }
 
     #[test]
@@ -2241,15 +2384,17 @@ mod tests {
     fn non_pointer_events_are_ignored_and_a_new_tab_resets_gesture_state() {
         let widget = widget(22, TerminalSnapshot::blank(80, 24));
         let mut state = TerminalWidgetState {
-            tab_id: Some(21),
-            metric_generation: 1,
-            pointer_cancel_epoch: 0,
-            pressed: Some(PointerButton::Left),
+            tab: Some(TabKey::local(21)),
+            pressed: Some(HeldPress {
+                button: PointerButton::Left,
+                seq: next_press_seq(),
+            }),
             last_cell: Some((7, 4)),
             was_inside: true,
             clicks: ClickTracker {
                 sequence: Some(ClickSequence {
-                    tab_id: 21,
+                    tab: TabKey::local(21),
+                    seq: 1,
                     cell: (7, 4),
                     at: Instant::now(),
                     count: 2,
@@ -2269,7 +2414,7 @@ mod tests {
         );
 
         assert!(outcome.is_none(), "keyboard input must remain uncaptured");
-        assert_eq!(state.tab_id, Some(22));
+        assert_eq!(state.tab, Some(TabKey::local(22)));
         assert_eq!(state.pressed, None);
         assert_eq!(state.last_cell, None);
         assert!(!state.was_inside);
@@ -2277,33 +2422,44 @@ mod tests {
     }
 
     #[test]
-    fn metric_generation_change_resets_a_captured_pointer_gesture() {
-        let mut widget = widget(22, TerminalSnapshot::blank(80, 24));
-        widget.metric_generation = 8;
-        let mut state = TerminalWidgetState {
-            tab_id: Some(22),
-            metric_generation: 7,
-            pressed: Some(PointerButton::Left),
-            last_cell: Some((7, 4)),
-            was_inside: true,
-            ..TerminalWidgetState::default()
-        };
+    fn a_cancel_through_the_held_press_resets_a_captured_pointer_gesture() {
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
+        let modifiers = Event::Keyboard(iced::keyboard::Event::ModifiersChanged(
+            iced::keyboard::Modifiers::SHIFT,
+        ));
+        let held = next_press_seq();
+        let later = next_press_seq();
+        let mut widget = widget(22, TerminalSnapshot::blank(80, 24));
+        widget.cancelled_through = held;
 
+        let mut cancelled = left_held(&widget, held);
         assert!(widget
             .update_pointer(
-                &mut state,
-                &Event::Keyboard(iced::keyboard::Event::ModifiersChanged(
-                    iced::keyboard::Modifiers::SHIFT,
-                )),
+                &mut cancelled,
+                &modifiers,
                 bounds,
-                mouse::Cursor::Unavailable,
+                mouse::Cursor::Unavailable
             )
             .is_none());
-        assert_eq!(state.metric_generation, 8);
-        assert_eq!(state.pressed, None);
-        assert_eq!(state.last_cell, None);
-        assert!(!state.was_inside);
+        assert_eq!(cancelled.pressed, None);
+        assert_eq!(cancelled.last_cell, None);
+        assert!(!cancelled.was_inside);
+
+        let mut accepted = left_held(&widget, later);
+        let _ = widget.update_pointer(
+            &mut accepted,
+            &modifiers,
+            bounds,
+            mouse::Cursor::Unavailable,
+        );
+        assert_eq!(
+            accepted.pressed,
+            Some(HeldPress {
+                button: PointerButton::Left,
+                seq: later
+            }),
+            "a press the cancel did not cover still owns its gesture"
+        );
     }
 
     #[test]
@@ -2327,21 +2483,27 @@ mod tests {
             .0
             .expect("press message");
         let crate::Message::TerminalPointer(TerminalPointer::Event(TerminalPointerEvent {
-            tab_id,
+            tab,
             action,
             button,
             col,
             row,
             click_count,
             inside,
+            press_seq,
+            overshoot,
         })) = press
         else {
             panic!("unexpected press message")
         };
         assert_eq!(action, PointerAction::Press);
-        assert_eq!(tab_id, 42);
+        assert_eq!(tab, TabKey::local(42));
         assert_eq!(button, Some(PointerButton::Left));
-        assert_eq!((col, row, click_count, inside), (5, 3, 1, true));
+        assert_eq!(
+            (col, row, click_count, inside, overshoot),
+            (5, 3, 1, true, 0)
+        );
+        let press_seq = press_seq.expect("a press is stamped");
 
         let motion = program
             .update_pointer(
@@ -2360,6 +2522,7 @@ mod tests {
             action,
             button,
             inside,
+            press_seq: motion_seq,
             ..
         })) = motion
         else {
@@ -2368,6 +2531,7 @@ mod tests {
         assert_eq!(action, PointerAction::Motion);
         assert_eq!(button, Some(PointerButton::Left));
         assert!(inside);
+        assert_eq!(motion_seq, Some(press_seq), "motion belongs to its press");
 
         let outside = mouse::Cursor::Available(Point::new(-20.0, 900.0));
         let outside_motion = program
@@ -2409,6 +2573,7 @@ mod tests {
             col,
             row,
             inside,
+            press_seq: release_seq,
             ..
         })) = release
         else {
@@ -2416,7 +2581,134 @@ mod tests {
         };
         assert_eq!(action, PointerAction::Release);
         assert_eq!((col, row, inside), (0, 23, false));
+        assert_eq!(release_seq, Some(press_seq), "so does its release");
         assert_eq!(state.pressed, None);
+    }
+
+    /// #342: a held drag reports how many rows past the grid the pointer
+    /// is, measured off the raw point before the cell is clamped and
+    /// relative to the widget, not the window.
+    #[test]
+    fn a_held_drag_reports_the_rows_the_pointer_is_past_the_grid() {
+        let program = widget(42, TerminalSnapshot::blank(80, 24));
+        let mut state = TerminalWidgetState::default();
+        let origin = Point::new(100.0, 50.0);
+        let bounds = Rectangle::new(origin, Size::new(800.0, 600.0));
+        let at = |col: f32, row: f32| {
+            mouse::Cursor::Available(Point::new(
+                origin.x + TERMINAL_PADDING + col * CELL_WIDTH,
+                origin.y + TERMINAL_PADDING + row * CELL_HEIGHT,
+            ))
+        };
+        program
+            .update_pointer(
+                &mut state,
+                &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                bounds,
+                at(5.5, 3.5),
+            )
+            .expect("press");
+
+        for (cursor, expected, label) in [
+            (at(5.5, 3.5), 0, "over the grid"),
+            (at(5.5, -0.5), -1, "just above row 0"),
+            (at(5.5, -2.5), -3, "three rows up"),
+            (at(5.5, 23.5), 0, "on the last row"),
+            (
+                at(5.5, 24.0),
+                1,
+                "the widget's own space below the last row",
+            ),
+            (at(5.5, 26.2), 3, "three rows down"),
+            (at(-2.0, 3.5), 0, "left of the grid only"),
+            (at(90.0, 3.5), 0, "right of the grid only"),
+            (at(-2.0, -1.5), -2, "up and to the left"),
+            (at(5.5, -1.0e9), i16::MIN, "saturating above"),
+            (at(5.5, 1.0e9), i16::MAX, "saturating below"),
+        ] {
+            let message = program
+                .update_pointer(
+                    &mut state,
+                    &Event::Mouse(mouse::Event::CursorMoved {
+                        position: Point::ORIGIN,
+                    }),
+                    bounds,
+                    cursor,
+                )
+                .and_then(|outcome| outcome.message);
+            let Some(crate::Message::TerminalPointer(TerminalPointer::Event(event))) = message
+            else {
+                panic!("{label}: no drag event: {message:?}");
+            };
+            assert_eq!(event.overshoot, expected, "{label}");
+        }
+    }
+
+    /// A drag held below the window, then released after the pointer's
+    /// leave took iced's cursor away, ends on the cell the drag last
+    /// reported — not on the last cell the pointer was over inside.
+    #[test]
+    fn a_release_with_no_cursor_lands_where_the_drag_last_was() {
+        let program = widget(42, TerminalSnapshot::blank(80, 24));
+        let mut state = TerminalWidgetState::default();
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
+        let at = |col: f32, row: f32| {
+            mouse::Cursor::Available(Point::new(
+                TERMINAL_PADDING + col * CELL_WIDTH,
+                TERMINAL_PADDING + row * CELL_HEIGHT,
+            ))
+        };
+        program.update_pointer(
+            &mut state,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            bounds,
+            at(2.5, 3.5),
+        );
+        program.update_pointer(
+            &mut state,
+            &Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::ORIGIN,
+            }),
+            bounds,
+            at(9.5, 40.0),
+        );
+        program.update_pointer(
+            &mut state,
+            &Event::Mouse(mouse::Event::CursorLeft),
+            bounds,
+            mouse::Cursor::Unavailable,
+        );
+        let release = program
+            .update_pointer(
+                &mut state,
+                &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                bounds,
+                mouse::Cursor::Unavailable,
+            )
+            .and_then(|outcome| outcome.message);
+        assert!(
+            matches!(
+                release,
+                Some(crate::Message::TerminalPointer(TerminalPointer::Event(
+                    TerminalPointerEvent {
+                        action: PointerAction::Release,
+                        col: 9,
+                        row: 23,
+                        inside: false,
+                        ..
+                    }
+                )))
+            ),
+            "{release:?}"
+        );
+        assert_eq!(state.last_cell, None);
+    }
+
+    #[test]
+    fn no_grid_has_no_edge_to_be_past() {
+        for y in [-100.0, 0.0, 100.0] {
+            assert_eq!(row_overshoot(Point::new(5.0, y), 0, metrics()), 0, "{y}");
+        }
     }
 
     #[test]
@@ -2438,7 +2730,7 @@ mod tests {
             .expect("left press action")
             .into_inner();
         assert!(left_press.0.is_some());
-        assert_eq!(state.pressed, Some(PointerButton::Left));
+        assert_eq!(held_button(&state), Some(PointerButton::Left));
 
         let right_press = program
             .update_pointer(
@@ -2451,7 +2743,7 @@ mod tests {
             .into_inner();
         assert!(right_press.0.is_none());
         assert_eq!(right_press.2, event::Status::Captured);
-        assert_eq!(state.pressed, Some(PointerButton::Left));
+        assert_eq!(held_button(&state), Some(PointerButton::Left));
 
         let right_release = program
             .update_pointer(
@@ -2463,7 +2755,7 @@ mod tests {
             .expect("chorded release is captured")
             .into_inner();
         assert!(right_release.0.is_none());
-        assert_eq!(state.pressed, Some(PointerButton::Left));
+        assert_eq!(held_button(&state), Some(PointerButton::Left));
 
         let motion = program
             .update_pointer(
@@ -2511,17 +2803,22 @@ mod tests {
         assert_eq!(state.pressed, None);
     }
 
-    /// Left held since a press the widget saw at `pointer_cancel_epoch`.
-    fn left_held(program: &TerminalWidget, pointer_cancel_epoch: u64) -> TerminalWidgetState {
+    /// Left held since press `seq`, over cell (7, 4).
+    fn left_held(program: &TerminalWidget, seq: u64) -> TerminalWidgetState {
         TerminalWidgetState {
-            tab_id: Some(program.tab_id),
-            metric_generation: program.metric_generation,
-            pointer_cancel_epoch,
-            pressed: Some(PointerButton::Left),
+            tab: Some(program.tab),
+            pressed: Some(HeldPress {
+                button: PointerButton::Left,
+                seq,
+            }),
             last_cell: Some((7, 4)),
             was_inside: true,
             ..TerminalWidgetState::default()
         }
+    }
+
+    fn held_button(state: &TerminalWidgetState) -> Option<PointerButton> {
+        state.pressed.map(|held| held.button)
     }
 
     fn press_in_cell_5_3(
@@ -2550,9 +2847,10 @@ mod tests {
             (mouse::Button::Left, PointerButton::Left),
             (mouse::Button::Middle, PointerButton::Middle),
         ] {
+            let held = next_press_seq();
             let mut program = widget(42, TerminalSnapshot::blank(80, 24));
-            program.pointer_cancel_epoch = 1;
-            let mut state = left_held(&program, 0);
+            program.cancelled_through = held;
+            let mut state = left_held(&program, held);
 
             let press = press_in_cell_5_3(&program, &mut state, native);
             assert!(
@@ -2565,66 +2863,203 @@ mod tests {
                             col: 5,
                             row: 3,
                             click_count: 1,
+                            press_seq: Some(seq),
                             ..
                         }
-                    ))) if pressed == button
+                    ))) if pressed == button && seq > held
                 ),
                 "{button:?}: {:?}",
                 press.0
             );
-            assert_eq!(state.pressed, Some(button));
+            assert_eq!(held_button(&state), Some(button));
         }
     }
 
+    /// The same batch at the widget: the rebuilt widget sees a cancel
+    /// that covered an earlier press, never the one it holds.
     #[test]
-    fn a_second_press_of_the_held_button_without_a_cancel_stays_captured() {
-        let program = widget(42, TerminalSnapshot::blank(80, 24));
-        let mut state = left_held(&program, program.pointer_cancel_epoch);
+    fn a_second_press_of_a_held_button_no_cancel_covers_stays_captured() {
+        let mut program = widget(42, TerminalSnapshot::blank(80, 24));
+        program.cancelled_through = next_press_seq();
+        let mut state = left_held(&program, next_press_seq());
 
         let press = press_in_cell_5_3(&program, &mut state, mouse::Button::Left);
         assert!(press.0.is_none(), "{:?}", press.0);
         assert_eq!(press.2, event::Status::Captured);
-        assert_eq!(state.pressed, Some(PointerButton::Left));
+        assert_eq!(held_button(&state), Some(PointerButton::Left));
+    }
+
+    /// #587: a local tab and a host's tab can share a number. A press
+    /// held on one is let go when the other takes the screen, and every
+    /// event names the whole key, so none of it can land on the other.
+    #[test]
+    fn a_press_held_on_one_instances_tab_never_passes_to_anothers_of_the_same_number() {
+        let local = widget(7, TerminalSnapshot::blank(80, 24));
+        let host = TerminalWidget {
+            tab: TabKey::new(roost_ui_model::keys::HostId::new(4), 7),
+            ..local.clone()
+        };
+        let mut state = TerminalWidgetState::default();
+        let press = press_in_cell_5_3(&local, &mut state, mouse::Button::Left);
+        assert!(
+            matches!(
+                press.0,
+                Some(crate::Message::TerminalPointer(TerminalPointer::Event(
+                    TerminalPointerEvent { tab, .. }
+                ))) if tab == local.tab
+            ),
+            "{:?}",
+            press.0
+        );
+
+        let cursor = mouse::Cursor::Available(Point::new(
+            TERMINAL_PADDING + 8.5 * CELL_WIDTH,
+            TERMINAL_PADDING + 3.5 * CELL_HEIGHT,
+        ));
+        let motion = host
+            .update_pointer(
+                &mut state,
+                &Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::ORIGIN,
+                }),
+                Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0)),
+                cursor,
+            )
+            .expect("motion over the host's terminal")
+            .into_inner()
+            .0;
+        assert!(
+            matches!(
+                motion,
+                Some(crate::Message::TerminalPointer(TerminalPointer::Event(
+                    TerminalPointerEvent {
+                        tab,
+                        button: None,
+                        press_seq: None,
+                        ..
+                    }
+                ))) if tab == host.tab
+            ),
+            "the local tab's press does not drag on the host's: {motion:?}"
+        );
+    }
+
+    /// #587: a cancel through the last click — a font-size change, say —
+    /// ends its multi-click count, while a click made after the cancel
+    /// counts as usual.
+    #[test]
+    fn a_click_a_cancel_settled_starts_no_double_click() {
+        let mut program = widget(42, TerminalSnapshot::blank(80, 24));
+        let mut state = TerminalWidgetState::default();
+        let click = |program: &TerminalWidget, state: &mut TerminalWidgetState| {
+            let press = press_in_cell_5_3(program, state, mouse::Button::Left).0;
+            let Some(crate::Message::TerminalPointer(TerminalPointer::Event(
+                TerminalPointerEvent {
+                    click_count,
+                    press_seq: Some(seq),
+                    ..
+                },
+            ))) = press
+            else {
+                panic!("a press over the grid: {press:?}")
+            };
+            program
+                .update_pointer(
+                    state,
+                    &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                    Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0)),
+                    mouse::Cursor::Available(Point::new(
+                        TERMINAL_PADDING + 5.5 * CELL_WIDTH,
+                        TERMINAL_PADDING + 3.5 * CELL_HEIGHT,
+                    )),
+                )
+                .expect("its release");
+            (click_count, seq)
+        };
+
+        let (count, first) = click(&program, &mut state);
+        assert_eq!(count, 1);
+        program.cancelled_through = first;
+        let (count, _) = click(&program, &mut state);
+        assert_eq!(count, 1, "the cancel ended the first click's count");
+        let (count, _) = click(&program, &mut state);
+        assert_eq!(count, 2, "a click after the cancel chains as usual");
     }
 
     #[test]
     fn click_tracker_counts_matching_sequence_and_resets() {
         let mut tracker = ClickTracker::default();
         let start = Instant::now();
-        assert_eq!(tracker.primary_press(1, (4, 2), start), 1);
+        assert_eq!(tracker.primary_press(TabKey::local(1), 1, (4, 2), start), 1);
         assert_eq!(
-            tracker.primary_press(1, (4, 2), start + Duration::from_millis(100)),
+            tracker.primary_press(
+                TabKey::local(1),
+                1,
+                (4, 2),
+                start + Duration::from_millis(100)
+            ),
             2
         );
         assert_eq!(
-            tracker.primary_press(1, (4, 2), start + Duration::from_millis(200)),
+            tracker.primary_press(
+                TabKey::local(1),
+                1,
+                (4, 2),
+                start + Duration::from_millis(200)
+            ),
             3
         );
         assert_eq!(
-            tracker.primary_press(1, (5, 2), start + Duration::from_millis(250)),
+            tracker.primary_press(
+                TabKey::local(1),
+                1,
+                (5, 2),
+                start + Duration::from_millis(250)
+            ),
             1
         );
         assert_eq!(
-            tracker.primary_press(2, (5, 2), start + Duration::from_millis(300)),
+            tracker.primary_press(
+                TabKey::local(2),
+                1,
+                (5, 2),
+                start + Duration::from_millis(300)
+            ),
             1
         );
         assert_eq!(
-            tracker.primary_press(2, (5, 2), start + Duration::from_millis(900)),
+            tracker.primary_press(
+                TabKey::local(2),
+                1,
+                (5, 2),
+                start + Duration::from_millis(900)
+            ),
             1
         );
         tracker.reset();
         assert_eq!(
-            tracker.primary_press(2, (5, 2), start + Duration::from_millis(950)),
+            tracker.primary_press(
+                TabKey::local(2),
+                1,
+                (5, 2),
+                start + Duration::from_millis(950)
+            ),
             1
         );
         tracker.sequence = Some(ClickSequence {
-            tab_id: 2,
+            tab: TabKey::local(2),
+            seq: 1,
             cell: (5, 2),
             at: start + Duration::from_millis(960),
             count: u8::MAX,
         });
         assert_eq!(
-            tracker.primary_press(2, (5, 2), start + Duration::from_millis(970)),
+            tracker.primary_press(
+                TabKey::local(2),
+                1,
+                (5, 2),
+                start + Duration::from_millis(970)
+            ),
             u8::MAX
         );
     }
@@ -2633,8 +3068,7 @@ mod tests {
     fn passive_move_out_publishes_one_leave() {
         let program = widget(9, TerminalSnapshot::blank(80, 24));
         let mut state = TerminalWidgetState {
-            tab_id: Some(9),
-            metric_generation: 1,
+            tab: Some(TabKey::local(9)),
             was_inside: true,
             last_cell: Some((3, 2)),
             ..TerminalWidgetState::default()
@@ -2655,9 +3089,7 @@ mod tests {
             .0;
         assert!(matches!(
             action,
-            Some(crate::Message::TerminalPointer(TerminalPointer::Leave {
-                tab_id: 9
-            }))
+            Some(crate::Message::TerminalPointer(TerminalPointer::Leave { tab })) if tab == TabKey::local(9)
         ));
         assert!(program
             .update_pointer(
@@ -2677,8 +3109,7 @@ mod tests {
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 600.0));
         let padding = mouse::Cursor::Available(Point::new(790.0, 590.0));
         let mut passive = TerminalWidgetState {
-            tab_id: Some(10),
-            metric_generation: 1,
+            tab: Some(TabKey::local(10)),
             was_inside: true,
             last_cell: Some((5, 3)),
             ..TerminalWidgetState::default()
@@ -2697,16 +3128,16 @@ mod tests {
             .0;
         assert!(matches!(
             leave,
-            Some(crate::Message::TerminalPointer(TerminalPointer::Leave {
-                tab_id: 10
-            }))
+            Some(crate::Message::TerminalPointer(TerminalPointer::Leave { tab })) if tab == TabKey::local(10)
         ));
         assert_eq!(passive.last_cell, None);
 
         let mut captured = TerminalWidgetState {
-            tab_id: Some(10),
-            metric_generation: 1,
-            pressed: Some(PointerButton::Left),
+            tab: Some(TabKey::local(10)),
+            pressed: Some(HeldPress {
+                button: PointerButton::Left,
+                seq: next_press_seq(),
+            }),
             was_inside: true,
             last_cell: Some((5, 3)),
             ..TerminalWidgetState::default()
@@ -2742,11 +3173,11 @@ mod tests {
         let program = widget(11, TerminalSnapshot::blank(80, 24));
         let start = Instant::now();
         let mut state = TerminalWidgetState {
-            tab_id: Some(11),
-            metric_generation: 1,
+            tab: Some(TabKey::local(11)),
             clicks: ClickTracker {
                 sequence: Some(ClickSequence {
-                    tab_id: 11,
+                    tab: TabKey::local(11),
+                    seq: 1,
                     cell: (4, 2),
                     at: start,
                     count: 1,

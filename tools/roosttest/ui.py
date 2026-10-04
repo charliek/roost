@@ -176,6 +176,13 @@ def _clear_mac_test_defaults() -> None:
     )
 
 
+def needs_shared_ui(marker_sets) -> bool:
+    """Whether a run needs the session's shared UI: some collected test is
+    neither headless (`session_daemon`) nor the owner of its own UI
+    (`owns_ui`). `marker_sets` holds each collected test's marker names."""
+    return any(not ({"session_daemon", "owns_ui"} & set(names)) for names in marker_sets)
+
+
 def socket_path(target: str) -> Path:
     try:
         spec = TARGET_SPECS[target]
@@ -849,8 +856,15 @@ def _remove_session_state(target: str, state_dir: Path) -> None:
 
 
 def _answering_pid(target: str) -> int | None:
+    return _answering_pid_at(socket_path(target))
+
+
+def _answering_pid_at(socket: Path, timeout: float | None = None) -> int | None:
+    """The pid of the UI answering `identify` on `socket`, or None — also when
+    it does not answer within `timeout`: the connect, and the whole reply (a
+    server dripping bytes without ever finishing the line included)."""
     try:
-        client = Roost(socket_path(target))
+        client = Roost(socket, timeout=timeout, deadline=timeout)
         try:
             return int(client.identify()["pid"])
         finally:
@@ -1377,13 +1391,19 @@ def _process_command(pid: int) -> str | None:
     isn't running / isn't visible to us. Used to verify `identify`'s
     reported pid actually belongs to the bundle's own process before the
     harness adopts it for teardown."""
-    result = subprocess.run(
-        ["ps", "-p", str(pid), "-o", "comm="],
-        capture_output=True, text=True, check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "comm="],
+            capture_output=True, text=True, check=False, timeout=_PS_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return None
     if result.returncode != 0:
         return None
     return result.stdout.strip() or None
+
+
+_PS_TIMEOUT_S = 5.0
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1501,30 +1521,52 @@ def _quit_iced_bundle(graceful: float = 10.0) -> None:
     pid = _ICED_BUNDLE_PID
     if pid is None:
         return
-    if not _pid_alive(pid):
-        _ICED_BUNDLE_PID = None
-        return
-    # macOS recycles pids; a Roost-Iced pid can go dead and be reassigned to
-    # an unrelated process between launch and teardown. Confirm the pid
-    # still names a Roost-Iced process before signalling it — if not, treat
-    # it as already dead rather than risk killing whatever's there now.
-    command = _process_command(pid)
-    name = Path(command).name if command else None
-    if name != ICED_BUNDLE_EXECUTABLE_NAME:
-        _ICED_BUNDLE_PID = None
-        return
-    subprocess.run(["kill", str(pid)], check=False)  # SIGTERM
-    if _wait_pid_gone(pid, graceful):
-        _ICED_BUNDLE_PID = None
-        return
-    subprocess.run(["kill", "-9", str(pid)], check=False)  # SIGKILL
-    if not _wait_pid_gone(pid, 5.0):
-        raise RuntimeError(
-            f"Roost-Iced (pid {pid}) survived SIGKILL — refusing to unlink its "
-            "locks or delete its state dir (would risk a second instance "
-            "against fresh lock inodes)"
-        )
+
+    def is_bundle(pid: int) -> bool | None:
+        command = _process_command(pid)
+        if command is None:
+            return None if _pid_alive(pid) else False
+        return Path(command).name == ICED_BUNDLE_EXECUTABLE_NAME
+
+    _terminate_owned_pid(pid, owned=is_bundle, graceful=graceful)
     _ICED_BUNDLE_PID = None
+
+
+class OwnershipUnknown(RuntimeError):
+    """A live pid that cannot be shown to be — or not to be — the caller's."""
+
+
+def _terminate_owned_pid(pid: int, *, owned, graceful: float) -> None:
+    """SIGTERM `pid`, SIGKILL it if it outlives `graceful`, and return only once
+    it is gone — never by process name, and never while it might still hold
+    the state lock its caller is about to delete.
+
+    macOS recycles pids, so the number can belong to an unrelated process —
+    the Swift `Roost` included — by teardown time, or by the end of the
+    SIGTERM grace period. So `owned(pid)` is asked again immediately before
+    *each* signal: False (provably not the caller's process) means the one
+    launched is already gone, and None (it cannot tell) raises
+    `OwnershipUnknown` without signalling, rather than be taken for dead.
+    """
+    for argv, grace in ((["kill", str(pid)], graceful), (["kill", "-9", str(pid)], 5.0)):
+        if not _pid_alive(pid):
+            return
+        verdict = owned(pid)
+        if verdict is None:
+            raise OwnershipUnknown(
+                f"cannot tell whether pid {pid} is still the process launched — not "
+                "signalled, and its locks and state dir must be kept"
+            )
+        if not verdict:
+            return
+        subprocess.run(argv, check=False)
+        if _wait_pid_gone(pid, grace):
+            return
+    raise RuntimeError(
+        f"pid {pid} survived SIGKILL — refusing to unlink its locks or "
+        "delete its state dir (would risk a second instance against fresh "
+        "lock inodes)"
+    )
 
 
 def quit(target: str) -> None:

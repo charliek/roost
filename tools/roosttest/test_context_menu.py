@@ -23,14 +23,27 @@ Skipped under `--roost-target mac`: the Swift app has no context-menu ops.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import uuid
+from pathlib import Path
 
+import agent_jail
 import pytest
-from client import RoostError
-from test_newtab_cwd import LIVE_CWD, _active_tab_in_live_cwd, _assert_shell_in
-from util import drain, drain_until_match, spawned_tab_id, wait_tab_attached
+import session as sessionlib
+import ui
+from client import Roost, RoostError, scaled_timeout
+from test_newtab_cwd import (
+    LIVE_CWD,
+    _active_tab_in_live_cwd,
+    _assert_shell_in,
+    _press_new_tab,
+)
+from util import drain, drain_until_match, roostctl_path, spawned_tab_id, wait_tab_attached
 
 TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
 
@@ -145,6 +158,133 @@ def test_new_tab_here_opens_where_an_unshown_tab_is_and_takes_the_keys(roost, pr
         _assert_shell_in(roost, opened, LIVE_CWD)
     finally:
         roost.delete_project(other)
+
+
+def _opens_where_new_tab_does(roost, project: int, shown_project: int) -> None:
+    """The project row's New Tab lands where the ⌘T gesture does, in the
+    remembered tab's directory (#589). `shown_project` is on screen, so the
+    row's own project is not the active one."""
+    source = _active_tab_in_live_cwd(roost, project)
+    shown = _listed_tab(roost, shown_project)
+
+    _shown(roost, source)
+    typed = _press_new_tab(roost, roost)
+    expected = roost.tab(typed)["cwd"]
+    assert expected == LIVE_CWD, "the precondition: the gesture opens in the live cwd"
+    _assert_shell_in(roost, typed, LIVE_CWD)
+
+    _shown(roost, shown)
+    before = {int(row["id"]) for row in roost.tabs()}
+    roost.context_menu_activate(project_target(project), "new_tab")
+    opened = spawned_tab_id(roost, before, "the project row's New Tab opened a tab")
+    assert int(roost.tab(opened)["project_id"]) == project
+    assert roost.tab(opened)["cwd"] == expected
+    _assert_shell_in(roost, opened, LIVE_CWD)
+
+
+def test_a_project_rows_new_tab_opens_where_the_new_tab_gesture_would(roost, project):
+    """The palette's `new_tab` row runs the same dispatch as ⌘T: both reach
+    `new_tab_dispatch`, which opens from `active_tab_key()`.
+    `app.keybind_dispatch` is paste-only, so it cannot press the gesture."""
+    other = roost.create_project(name=f"pytest-{uuid.uuid4().hex[:8]}", cwd="/tmp")
+    try:
+        _opens_where_new_tab_does(roost, project, other)
+    finally:
+        roost.delete_project(other)
+
+
+@contextlib.contextmanager
+def _session_backend_ui(target: str):
+    """The UI relaunched on `local-backend = session`, inside a private
+    runtime dir so the session it spawns is not the developer's, then the
+    in-process UI put back for whatever module runs next."""
+    if sys.platform == "darwin":
+        pytest.skip(
+            "the session is isolated through XDG_RUNTIME_DIR, which is Linux "
+            "only; the macOS variant is #390"
+        )
+    state_dir = ui.session_state_dir()
+    config = ui.owned_session_config_path()
+    if state_dir is None or config is None:
+        pytest.skip("the session backend needs a harness-owned UI")
+
+    root = Path(tempfile.mkdtemp(prefix="roost-cm-", dir="/tmp")).resolve()
+    run = root / "run"
+    agent_jail.make_private_runtime_dir(run)
+    private = {
+        "XDG_RUNTIME_DIR": str(run),
+        "XDG_DATA_HOME": str(root / "data"),
+        "XDG_STATE_HOME": str(root / "state"),
+        "XDG_CACHE_HOME": str(root / "cache"),
+        "ROOST_SESSION_BIN": str(sessionlib.session_binary()),
+    }
+    saved = {key: os.environ.get(key) for key in private}
+    original_config = config.read_text()
+    derived = state_dir / ui.DERIVED_SESSION_SUBDIR
+    stop = None
+    try:
+        ui.quit(target)
+        os.environ.update(private)
+        (state_dir / "state.json").unlink(missing_ok=True)
+        shutil.rmtree(derived, ignore_errors=True)
+        lines = [
+            line
+            for line in original_config.splitlines()
+            if not line.strip().startswith("local-backend")
+        ]
+        config.write_text("\n".join([*lines, "local-backend = session"]) + "\n")
+        ui.launch(target, state_dir=state_dir, force=True)
+        client = Roost(ui.socket_path(target))
+        try:
+            assert client.identify()["local_backend"] == "session"
+            sessionlib.wait_until(
+                lambda: (client.sidebar_local_band() or {}).get("state") == "connected",
+                scaled_timeout(60.0),
+                "the local session to connect",
+            )
+            yield client
+        finally:
+            client.close()
+    finally:
+        try:
+            with contextlib.suppress(Exception):
+                ui.quit(target)
+            stop = subprocess.run(
+                [roostctl_path(), "session", "stop"],
+                capture_output=True,
+                text=True,
+                timeout=scaled_timeout(60.0),
+            )
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            config.write_text(original_config)
+            (state_dir / "state.json").unlink(missing_ok=True)
+            # The derived session dir is left to the harness's sweep, which
+            # proves the daemon's state lock is free before it deletes it.
+            if stop is not None and stop.returncode == 0:
+                shutil.rmtree(root, ignore_errors=True)
+            ui.launch(target, state_dir=state_dir, force=True)
+    assert stop.returncode == 0, f"`roostctl session stop` failed: {stop.stdout}{stop.stderr}"
+
+
+def test_a_project_rows_new_tab_opens_where_the_gesture_would_on_the_session_backend(target):
+    """The same case where the tabs live in a `roost-session`, which is
+    what a fresh install runs."""
+    with _session_backend_ui(target) as roost:
+        project = roost.create_project(name=f"pytest-{uuid.uuid4().hex[:8]}", cwd="/tmp")
+        other = roost.create_project(name=f"pytest-{uuid.uuid4().hex[:8]}", cwd="/tmp")
+        try:
+            _opens_where_new_tab_does(roost, project, other)
+        finally:
+            # Best-effort: a UI or session that died mid-test must not mask
+            # the failure that killed it.
+            for doomed in (other, project):
+                with contextlib.suppress(OSError, RoostError):
+                    roost.delete_project(doomed)
 
 
 def test_close_tab_closes_it(roost, project):

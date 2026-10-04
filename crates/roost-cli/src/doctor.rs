@@ -3860,6 +3860,7 @@ mod tests {
             shell_state: ShellState::AtPrompt,
             agent_lifecycle: AgentLifecycle::Inactive,
             ownership: None,
+            password_input: false,
         }
     }
 

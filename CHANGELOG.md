@@ -66,6 +66,61 @@ release workflow asserts they agree).
   `app.context_menu_*` ops list and run a row's menu (see
   [`ipc.md`](docs/reference/ipc.md#context-menu-test-ops-appcontext_menu_dump-appcontext_menu_activate-appcontext_menu_open-test-only-gated)).
 
+- **Secure Keyboard Entry on macOS (plan 074, #593)** — Roost-Iced turns
+  on macOS Secure Keyboard Entry, as Terminal.app, iTerm2 and Ghostty do.
+  It is automatic at password prompts (`macos-auto-secure-input`, default
+  on), including a `sudo` prompt in a host-session tab. A remembered
+  toggle lives in Roost › Secure Keyboard Entry, the command palette and
+  the new `toggle_secure_input` action (`macos-secure-keyboard-entry`),
+  and a lock at the right end of the tab band shows while it is on
+  (`macos-secure-input-indication`). It is off whenever Roost is not the
+  active app. On Linux the action does nothing.
+
+- **Tabs report a password prompt (plan 074, #594)** — a tab is at a
+  password prompt when its PTY is in line mode with echo off. Whichever
+  process owns the PTY samples it every 200 ms (the UI, or
+  `roost-session` for host tabs), and it appears as a `password_input`
+  field on `tab.list` and a `tab.password_input` event. No session
+  protocol bump.
+
+- **Selection auto-scroll (plan 074, #342)** — in Roost-Iced, holding a
+  selection drag past the top or bottom of the terminal scrolls history
+  and keeps extending the selection, so a copy can span more than one
+  screen. A drag released outside the window keeps the end it reached.
+  The test-mode `tab.dispatch_mouse_event` gains an optional `overshoot`.
+
+- **Roost-Iced remembers its window frame on macOS (plan 074, #595)** —
+  it reopens at the size and position it was closed at, moved back onto
+  a visible screen if that display is gone, as Ghostty does. Linux is
+  unchanged.
+
+- **The theme's `cursor-text` color (plan 074)** — the glyph under a
+  block cursor takes the theme's `cursor-text` color, as in Ghostty. On
+  the 14 bundled themes whose `cursor-text` differs from their
+  background, that glyph changes color; the other 11 that define it look
+  as before. When `cursor-text` equals the cursor color the glyph keeps
+  the background. A malformed theme color is now ignored instead of
+  risking a panic.
+
+- **Clicking a notification raises the window on Wayland (plan 074,
+  #351)** — Roost-Iced spends the notification server's activation token
+  through `xdg_activation_v1`, so the click raises the window as well as
+  focusing the tab. X11 and macOS are unchanged. New test-mode ops
+  `app.notification_activate` and `app.last_activation`.
+
+- **`app.window_metrics` reports cell geometry (plan 074)** —
+  `terminal_left`, `terminal_padding`, `cell_width` and `cell_height`,
+  additive.
+
+- **A Mac real-input test harness (plan 074, #189)** — real CGEvent and
+  Accessibility input against Roost-Iced, through a TCC anchor app
+  (`make e2e-iced-real-input-mac`). It covers Option as Meta by side,
+  Shift+Enter, the native context popup, full screen, Secure Keyboard
+  Entry, selection auto-scroll, the remembered window frame and SGR mouse
+  clicks, and runs as a blocking step on GitHub's hosted macOS runner.
+  See
+  [`test-automation.md`](docs/development/test-automation.md#the-mac-real-input-harness).
+
 ### Changed
 
 - **JetBrains Mono is bundled as the iced UI's terminal font (#580)** —
@@ -118,6 +173,25 @@ release workflow asserts they agree).
   `bold-color`, as the Swift app does. The bundled themes' bold color
   matches their foreground, so that shows only with a theme of your own
   or after a script recolors the default foreground (OSC 10).
+
+- **Right-click New Tab on a project opens where ⌘T would (plan 074,
+  #589)** — in Roost-Iced it opens in the directory of the project's
+  remembered tab instead of the project's saved cwd. A project with no
+  tabs keeps the saved cwd.
+
+- **A mouse button could stay held in a mouse-tracking app (plan 074,
+  #587)** — in vim, htop and the like, switching tabs (host tabs
+  included) or losing window focus now releases the button. A click right
+  after a font-size change keeps its drag and release, and a click caught
+  behind a tab switch, a context menu or an opening overlay no longer
+  leaves the button stuck down.
+
+- **A setting toggled just before quitting is no longer lost (plan 074)**
+  — a clean exit drains queued `config.conf` writes, bounded at 2 s.
+
+- **`test_device_queries.py` runs in the iced lanes (plan 074, #596)** —
+  it ran only in the Swift `e2e-mac` sweep, although its docstring said
+  iced ran it too. It is now in the X11, Wayland and macOS iced lists.
 
 ## v0.0.21 — 2026-09-27
 

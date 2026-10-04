@@ -1,5 +1,29 @@
 {
   "$defs": {
+    "ActivationOutcome": {
+      "oneOf": [
+        {
+          "const": "activated",
+          "type": "string"
+        },
+        {
+          "const": "no-global",
+          "type": "string"
+        },
+        {
+          "const": "not-wayland",
+          "type": "string"
+        },
+        {
+          "const": "no-token",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "type": "string"
+        }
+      ]
+    },
     "ActiveChangedEvent": {
       "properties": {
         "project_id": {
@@ -534,6 +558,42 @@
       ],
       "type": "object"
     },
+    "AppLastActivationParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AppLastActivationResult": {
+      "properties": {
+        "activation_global": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActivationOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "token": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "outcome",
+        "token",
+        "activation_global"
+      ],
+      "type": "object"
+    },
     "AppMenuActivateParams": {
       "additionalProperties": false,
       "properties": {
@@ -711,6 +771,24 @@
       ],
       "type": "object"
     },
+    "AppNotificationActivateParams": {
+      "additionalProperties": false,
+      "properties": {
+        "tab_id": {
+          "$ref": "#/$defs/WireTabRef"
+        },
+        "token": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "tab_id"
+      ],
+      "type": "object"
+    },
     "AppNotificationStatusParams": {
       "additionalProperties": false,
       "type": "object"
@@ -795,6 +873,45 @@
         "draw_calls",
         "draw_nanos",
         "fill_text_calls"
+      ],
+      "type": "object"
+    },
+    "AppSecureInputParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AppSecureInputResult": {
+      "properties": {
+        "app_active": {
+          "type": "boolean"
+        },
+        "auto": {
+          "type": "boolean"
+        },
+        "desired": {
+          "type": "boolean"
+        },
+        "indicator": {
+          "type": "boolean"
+        },
+        "manual": {
+          "type": "boolean"
+        },
+        "owned": {
+          "type": "boolean"
+        },
+        "password_input": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "desired",
+        "owned",
+        "indicator",
+        "manual",
+        "auto",
+        "app_active",
+        "password_input"
       ],
       "type": "object"
     },
@@ -3027,6 +3144,9 @@
             }
           ]
         },
+        "password_input": {
+          "type": "boolean"
+        },
         "position": {
           "format": "int32",
           "type": "integer"
@@ -3268,6 +3388,12 @@
           "default": 0,
           "format": "uint32",
           "minimum": 0,
+          "type": "integer"
+        },
+        "overshoot": {
+          "format": "int16",
+          "maximum": 32767,
+          "minimum": -32768,
           "type": "integer"
         },
         "tab_id": {
@@ -3698,6 +3824,21 @@
       ],
       "type": "object"
     },
+    "TabPasswordInputEvent": {
+      "properties": {
+        "password_input": {
+          "type": "boolean"
+        },
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "password_input"
+      ],
+      "type": "object"
+    },
     "TabReorderParams": {
       "additionalProperties": false,
       "properties": {
@@ -3937,6 +4078,20 @@
     },
     "WindowMetricsResult": {
       "properties": {
+        "cell_height": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "cell_width": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "sidebar_collapsed": {
           "type": "boolean"
         },
@@ -3947,6 +4102,20 @@
         "terminal_font_family": {
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "terminal_left": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "terminal_padding": {
+          "format": "double",
+          "type": [
+            "number",
             "null"
           ]
         },
@@ -4110,6 +4279,9 @@
     "tab.opened": {
       "$ref": "#/$defs/TabOpenedEvent"
     },
+    "tab.password_input": {
+      "$ref": "#/$defs/TabPasswordInputEvent"
+    },
     "tab.state_changed": {
       "$ref": "#/$defs/TabStateChangedEvent"
     },
@@ -4220,6 +4392,14 @@
         "$ref": "#/$defs/EmptyResult"
       }
     },
+    "app.last_activation": {
+      "params": {
+        "$ref": "#/$defs/AppLastActivationParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AppLastActivationResult"
+      }
+    },
     "app.menu_activate": {
       "params": {
         "$ref": "#/$defs/AppMenuActivateParams"
@@ -4252,6 +4432,14 @@
         "$ref": "#/$defs/AppNoticeDumpResult"
       }
     },
+    "app.notification_activate": {
+      "params": {
+        "$ref": "#/$defs/AppNotificationActivateParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
     "app.notification_status": {
       "params": {
         "$ref": "#/$defs/AppNotificationStatusParams"
@@ -4274,6 +4462,14 @@
       },
       "result": {
         "$ref": "#/$defs/ScreenshotResult"
+      }
+    },
+    "app.secure_input": {
+      "params": {
+        "$ref": "#/$defs/AppSecureInputParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AppSecureInputResult"
       }
     },
     "app.selected_tab_id": {

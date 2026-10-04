@@ -16,14 +16,14 @@
 //! notification, so a high-churn host cannot pile full-workspace clones
 //! onto an unbounded channel.
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use roost_ipc::messages::{
     ops, ActiveChangedEvent, AgentReportChangedEvent, EventBatch, EventEnvelope,
     HookActiveChangedEvent, Project, ProjectCreatedEvent, ProjectDeletedEvent, ProjectRenamedEvent,
     ProjectsReorderedEvent, Tab, TabClosedEvent, TabCwdChangedEvent, TabListResult,
-    TabNotificationEvent, TabOpenedEvent, TabStateChangedEvent, TabTitleChangedEvent,
-    TabsReorderedEvent,
+    TabNotificationEvent, TabOpenedEvent, TabPasswordInputEvent, TabStateChangedEvent,
+    TabTitleChangedEvent, TabsReorderedEvent,
 };
 
 /// A host's projects and tabs, plus which of them the session considers
@@ -41,6 +41,9 @@ pub(crate) struct HostMirror {
     /// The last commit folded in. The fence at build time, then every
     /// applied batch's revision.
     pub(crate) revision: u64,
+    /// The tabs whose `password_input` [`Self::suspend_password_input`]
+    /// took down, for [`Self::resume_password_input`] to put back.
+    suspended_password_input: Vec<i64>,
 }
 
 impl HostMirror {
@@ -57,6 +60,34 @@ impl HostMirror {
             active_project_id: active.0,
             active_tab_id: active.1,
             revision,
+            suspended_password_input: Vec::new(),
+        }
+    }
+
+    /// Take every tab's `password_input` down, because the connection
+    /// that reported it is gone: a prompt nobody can type into is not
+    /// one to guard. Remembered, not forgotten — see
+    /// [`Self::resume_password_input`].
+    pub(crate) fn suspend_password_input(&mut self) {
+        for tab in self
+            .projects
+            .iter_mut()
+            .flat_map(|project| &mut project.tabs)
+        {
+            if std::mem::take(&mut tab.password_input) {
+                self.suspended_password_input.push(tab.id);
+            }
+        }
+    }
+
+    /// Put back what [`Self::suspend_password_input`] took down, for a
+    /// connection that resumed this mirror's stream. A resume replays only
+    /// the commits after the fence and no `tab.list`, so the values the
+    /// fence describes are the snapshot it reconnects with; a fresh
+    /// subscription rebuilds the mirror from `tab.list` instead.
+    pub(crate) fn resume_password_input(&mut self) {
+        for tab_id in std::mem::take(&mut self.suspended_password_input) {
+            self.with_tab(tab_id, |tab| tab.password_input = true);
         }
     }
 
@@ -134,6 +165,10 @@ impl HostMirror {
             ops::EVENT_HOOK_ACTIVE_CHANGED => {
                 let data = decode!(HookActiveChangedEvent);
                 self.with_tab(data.tab_id, |tab| tab.hook_active = data.active);
+            }
+            ops::EVENT_TAB_PASSWORD_INPUT => {
+                let data = decode!(TabPasswordInputEvent);
+                self.with_tab(data.tab_id, |tab| tab.password_input = data.password_input);
             }
             ops::EVENT_AGENT_REPORT_CHANGED => {
                 let data = decode!(AgentReportChangedEvent);
@@ -300,9 +335,12 @@ impl SharedMirror {
     }
 
     /// A copy of the contents, detached from this handle — the workspace
-    /// as of now, with no writer behind it.
-    pub(crate) fn snapshot(&self) -> HostMirror {
-        self.read().clone()
+    /// as of now, with no writer behind it. No connection is serving the
+    /// copy, so its prompts are suspended until one resumes it.
+    pub(crate) fn detached(&self) -> Arc<SharedMirror> {
+        let mut copy = self.read().clone();
+        copy.suspend_password_input();
+        Arc::new(SharedMirror::new(copy))
     }
 
     /// Replace the whole mirror: a fresh snapshot after a connect or a
@@ -368,6 +406,7 @@ mod tests {
             shell_state: ShellState::default(),
             agent_lifecycle: AgentLifecycle::default(),
             ownership: None,
+            password_input: false,
         }
     }
 
@@ -697,6 +736,51 @@ mod tests {
         ));
         assert_eq!(mirror.active_tab_id, 0);
         assert_eq!(mirror.active_project_id, 1);
+    }
+
+    fn password_input(tab_id: &str, password_input: bool) -> EventEnvelope {
+        event(
+            ops::EVENT_TAB_PASSWORD_INPUT,
+            serde_json::json!({"tab_id": tab_id, "password_input": password_input}),
+        )
+    }
+
+    #[test]
+    fn a_password_prompt_lands_on_its_tab_and_leaves_with_it() {
+        let mut mirror = mirror();
+        mirror.apply_event(&password_input("11", true));
+        assert!(mirror.tab(11).unwrap().password_input);
+        assert!(!mirror.tab(10).unwrap().password_input);
+        mirror.apply_event(&password_input("11", false));
+        assert!(!mirror.tab(11).unwrap().password_input);
+    }
+
+    /// A dropped connection takes every prompt down — nobody can type
+    /// into a host this client cannot reach — and a resume puts back the
+    /// values the mirror's fence describes, since it replays only what
+    /// changed after it.
+    #[test]
+    fn a_disconnect_takes_the_prompt_down_and_a_resume_puts_it_back() {
+        let mut mirror = mirror();
+        mirror.apply_event(&password_input("11", true));
+
+        mirror.suspend_password_input();
+        assert!(mirror.tabs().all(|tab| !tab.password_input));
+        mirror.suspend_password_input();
+
+        let mut resumed = mirror.clone();
+        resumed.resume_password_input();
+        assert!(
+            resumed.tab(11).unwrap().password_input,
+            "a resume lost the prompt"
+        );
+        assert!(!resumed.tab(10).unwrap().password_input);
+        resumed.suspend_password_input();
+        resumed.resume_password_input();
+        assert!(
+            resumed.tab(11).unwrap().password_input,
+            "a second drop lost it"
+        );
     }
 
     /// Additive server-side events must not break a mirror that predates

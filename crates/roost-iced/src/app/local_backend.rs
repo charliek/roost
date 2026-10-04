@@ -4140,6 +4140,7 @@ mod tests {
             shell_state: Default::default(),
             agent_lifecycle: Default::default(),
             ownership: None,
+            password_input: false,
         }
     }
 
@@ -4782,6 +4783,7 @@ mod switch_tests {
             shell_state: Default::default(),
             agent_lifecycle: Default::default(),
             ownership: None,
+            password_input: false,
         }
     }
 
@@ -5155,6 +5157,7 @@ mod switch_tests {
             Copy,
             Paste,
             ToggleSidebar,
+            ToggleSecureInput,
             CommandPalette,
             NewProjectOnHost,
         ] {
@@ -5166,6 +5169,7 @@ mod switch_tests {
         for id in [
             "rename_tab",
             "toggle_sidebar",
+            "toggle_secure_input",
             "jump_to_unread",
             "cycle_tab_next",
             roost_ui_model::host_verbs::ADD_ID,
@@ -5587,6 +5591,7 @@ mod migration_tests {
                     shell_state: Default::default(),
                     agent_lifecycle: Default::default(),
                     ownership: None,
+                    password_input: false,
                 })
                 .collect(),
         }

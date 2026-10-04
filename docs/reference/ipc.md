@@ -171,7 +171,8 @@ terminal from. It shares the socket path but not the framing; see
     "hook_active": "<bool>",
     "shell_state": "<ShellState>",
     "agent_lifecycle": "<AgentLifecycle>",
-    "ownership": "<Ownership, omitted when unowned>"
+    "ownership": "<Ownership, omitted when unowned>",
+    "password_input": "<bool, omitted while false>"
   },
   "Project": {
     "id": "<string-int64>",
@@ -207,6 +208,19 @@ the `(source, session_id)` identity pair, `last_event_at` (the
 server's receipt time of the most recently accepted report — never
 caller-supplied), a free-form `detail`, and an open `metadata` string
 map for forward-compatible extension (see `tab.agent_report`).
+
+`Tab.password_input` is `true` while the tab's PTY is at a password
+prompt: its line discipline is in canonical (line) mode with echo off
+(`ICANON && !ECHO`), Ghostty's heuristic. The process that owns the
+PTY samples it off the master every 200 ms — the UI for an in-process
+tab, the session for a host-session tab, so a `sudo` prompt on a remote
+host is seen too — and [`tab.password_input`](#events) reports each
+change. It is live state, never persisted, and it clears when the tab's
+process exits. A program that turns echo off at an interactive bash or
+zsh prompt does not set it: their line editors run the terminal raw,
+outside canonical mode. The key is omitted while `false`, so a server
+that predates the field, and a tab that is not at a prompt, look the
+same — both read as `false`, with no protocol bump.
 
 ### `tab.state` / `hook_active` — derived, and the compatibility contract
 
@@ -1018,6 +1032,31 @@ plain hover motion). `cell_x` / `cell_y` are 0-based terminal cell
 coordinates. `mods` defaults to `0` and matches the key encoder's
 `Mods` bit layout: shift(0), ctrl(1), alt(2), cmd/super(3).
 
+`overshoot` (iced only, optional) puts the pointer that many rows past
+the grid: negative above row 0, positive below the last row, with
+`cell_x` / `cell_y` the cell the pointer clamps to, as a real drag past
+the edge reports it. A left-button motion with a non-zero `overshoot`
+during a selection drag starts the selection auto-scroll: every 50 ms
+the viewport scrolls one to five rows toward that edge and the
+selection grows to the row it brought on screen. A release, a motion
+back over the grid, a resize, or anything that cancels the gesture
+stops it, and it never scrolls on the alternate screen or under mouse
+tracking. Omit the key rather than sending `0`: the params reject
+unknown keys, so a server that predates it refuses any request
+carrying it.
+
+```json
+{"params": {"tab_id": "3", "kind": "motion", "button": "left",
+            "cell_x": 0, "cell_y": 0, "mods": 0, "overshoot": -3}}
+```
+
+On iced, a press starts a new gesture and a button's motion or release
+belongs to the tab's latest press, as the terminal widget's do. Once a
+pointer cancel has sent that press's release (the window switching away
+from the tab or losing focus, a context menu or the delete confirmation
+opening, a font-size change), its later motion and release are dropped.
+A press while a context menu is open is dropped too.
+
 Response: `{}`. Errors: `invalid-param` for an unrecognized `kind` or
 `button`.
 
@@ -1478,7 +1517,8 @@ Request: `{"params": {}}`.
 
 ```json
 {"window_width":1100.0,"window_height":700.0,"sidebar_width":220.0,
- "sidebar_collapsed":false,"terminal_top":34.0,"terminal_font_family":"Berkeley Mono"}
+ "sidebar_collapsed":false,"terminal_top":34.0,"terminal_font_family":"Berkeley Mono",
+ "terminal_left":220.0,"terminal_padding":0.0,"cell_width":8.0,"cell_height":16.0}
 ```
 
 `terminal_top` and `terminal_font_family` are optional for wire compatibility
@@ -1493,6 +1533,19 @@ the resolved family the live terminal is actually rendering with
 adapters once a terminal is live — the Mac adapter omits both until a terminal
 view is mounted (fresh launch, no tabs). This operation is ungated and
 read-only.
+
+`terminal_left`, `terminal_padding`, `cell_width` and `cell_height` are the
+cell grid's exact geometry, in the same logical points and equally optional
+(omitted when an adapter does not report them; the iced UI always does, the Mac
+UI does not). `terminal_left` is the terminal viewport's left edge in the
+content, `terminal_padding` the grid's inset inside the viewport on every side,
+and the cell size is the live grid's: the active tab's applied metrics, or the
+UI's current ones before a tab has any. A cell's top-left in the content is
+`(terminal_left + terminal_padding + col × cell_width, terminal_top +
+terminal_padding + row × cell_height)`. The Mac real-input harness
+(`tools/input/mac/coords.py`) turns that into a screen point with the window's
+Accessibility frame, so a real click lands on a known cell without measuring
+pixels.
 
 ### `app.sidebar_dump`
 
@@ -2081,6 +2134,103 @@ this `true`; the real prompt/click is the morning checklist (#285).
 Implemented by both UIs, macOS only — unlike `app.menu_dump` above and
 the other macOS-gated ops around it, which are iced only and have no
 Swift counterpart.
+
+### `app.secure_input` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Reads Secure Keyboard
+Entry as the iced UI's owner holds it (see
+[`macos-secure-keyboard-entry`](config.md#secure-keyboard-entry)): the
+inputs it last applied, what they ask for, what it holds, and whether
+the tab band draws the lock. A test seam, not a surface: `roostctl` has
+no verb for it.
+
+Request: `{"params": {}}`. Response:
+
+```json
+{
+  "desired": true,
+  "owned": true,
+  "indicator": true,
+  "manual": false,
+  "auto": true,
+  "app_active": true,
+  "password_input": true
+}
+```
+
+- `manual` is `macos-secure-keyboard-entry`, `auto` is
+  `macos-auto-secure-input`, and `password_input` is the active tab's
+  [`password_input`](#shared-types) — whatever owns the keyboard, so a
+  palette or rename editor in front of a prompt does not count it out.
+- `app_active` is `NSApp.isActive` as read the last time the owner
+  applied. A bare binary on a CI runner may never be active, so assert
+  the formula against the reported inputs rather than an outcome:
+  `desired == (app_active && (manual || (auto && password_input)))`.
+- `owned` is whether Roost holds an `EnableSecureEventInput` that
+  succeeded: `desired`, unless the call failed.
+- `indicator` is `owned` while `macos-secure-input-indication` is on,
+  and `false` otherwise.
+
+The values are the owner's as they stand — the handler never pushes
+inputs or applies first, so an input change the UI failed to apply
+reads as stale here.
+
+Answered by the iced UI on every OS. Off macOS every field is `false`:
+Secure Keyboard Entry does not exist there, and the
+`toggle_secure_input` action does nothing. The Swift Mac app answers
+`unknown-op`.
+
+### Notification raise test ops (`app.notification_activate` / `app.last_activation`) *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it both ops return `not-enabled`. A click on a desktop banner
+focuses its tab and raises the window. On Wayland the raise spends the
+`xdg-activation` token the notification server sends with the click
+(the spec 1.2 `ActivationToken` signal) as
+`xdg_activation_v1.activate`, because a plain focus request never
+reaches the compositor there. These two ops click a banner and read back
+what the raise came to. They are a test seam with no `roostctl` verb.
+
+`app.notification_activate` clicks `tab_id`'s banner, carrying `token`
+as the server's `ActivationToken` would. Omit `token` for a server that
+sends none. `tab_id` takes `tab.dump`'s ref: a bare id for one of this
+window's local tabs, or `h<host>.<id>` for a host's. Request:
+`{"params": {"tab_id": "7", "token": "t-1"}}`. Response: `{}`, as soon
+as the click is queued where a real one lands, so wait on its effect. A
+tab that is gone is a click on a stale banner: nothing moves. A bare id
+while the local session is not connected is `host-unavailable`.
+
+`app.last_activation` reads the last click whose raise has settled.
+Request: `{"params": {}}`. Response:
+
+```json
+{"outcome": "no-global", "token": "t-1", "activation_global": false}
+```
+
+Every field is `null` until a click has settled. `outcome` is one of:
+
+- `activated`: `xdg_activation_v1.activate(token, surface)` was sent.
+  Whether the compositor then raises the window is its decision.
+- `no-global`: a Wayland window, on a compositor that offers no
+  `xdg_activation_v1`.
+- `not-wayland`: an X11 window, or macOS, which has no tokens.
+- `no-token`: a click on Linux that carried no token.
+- `failed`: the compositor could not be asked. Either its registry did
+  not answer within 250 ms (the next click resumes the wait), or the
+  connection failed.
+
+`token` is the click's token. `activation_global` says whether the
+compositor's registry lists `xdg_activation_v1`. It is read off the
+registry rather than off `outcome`, so a test can work out which outcome
+it should have seen, and it is `null` when the raise never asked a
+Wayland compositor (`not-wayland`, `no-token`) or the registry never
+answered.
+
+The focus request still follows in every case, and is what raises an
+X11 or macOS window.
+
+Implemented by the iced UI only; the Swift app answers `unknown-op`.
 
 ### `window.resize` *(test-only — gated)*
 
@@ -3911,6 +4061,13 @@ discipline, the last frame before the stream closes. See
 * `tabs.reordered`    — `{"project_id": "<id>", "tab_ids": ["<id>", ...]}`. The full post-reorder display order for that project, not a diff.
 * `projects.reordered` — `{"project_ids": ["<id>", ...]}`. The full post-reorder sidebar order.
 * `hook_active.changed` — `{"tab_id": "<id>", "active": <bool>}`.
+* `tab.password_input` — `{"tab_id": "<id>", "password_input": <bool>}`.
+  The tab's PTY entered or left a password prompt
+  ([`Tab.password_input`](#shared-types)); fires once per change, never
+  per sample. Workspace state like any other tab field, so it is
+  replayed into a resume, and a client that reconnects reads the
+  standing value off [`tab.list`](#tablist). An older client that does
+  not know the name skips it.
 * `notification.fired` — `{"tab_id": "<id>", "title": "<string>", "body": "<string>", "generation": <int>}`. Mirrors the legacy proto's `NotificationEvent`; useful for tools that mirror notifications elsewhere. `generation` numbers the raises on that tab, counting from one; a client acknowledging this raise sends it back on [`tab.clear_notification`](#tabclear_notification) — see [Notifications fan out](#notifications-fan-out). Live-only on a session's event stream: never replayed into a resume.
 * `agent_report.changed` — `{"tab_id": "<id>", "shell_state": "<ShellState>", "agent_lifecycle": "<AgentLifecycle>", "ownership": "<Ownership, omitted when unowned>", "state": "<TabState>", "hook_active": <bool>}`.
   Fires whenever an accepted `tab.agent_report` or an OSC 133 shell

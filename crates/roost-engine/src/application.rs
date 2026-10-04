@@ -13,13 +13,18 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::{Context, Result};
 use roost_ipc::messages::{Project, Tab, TabOpenParams};
 use roost_ipc::session_launch::FirstProject;
+use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::RecvError;
 
-use crate::{AttentionSource, PtyError, PtySupervisor, RestoreTab, Workspace, WorkspaceError};
+use crate::{
+    AttentionSource, PtyError, PtySupervisor, RestoreTab, SupervisorEvent, Workspace,
+    WorkspaceError,
+};
 
 /// The one `tab.close` sequence, shared by the served handler, the
 /// in-process client and the facade.
@@ -326,6 +331,123 @@ impl LocalClient {
     pub fn apply_osc(&self, tab_id: i64, command: u32, payload: &str) {
         apply_osc(&self.workspace, tab_id, command, payload);
     }
+
+    /// Start the supervisor's password poller and keep this workspace's
+    /// `password_input` in step with it (plan 074 §D2) — the owner's half
+    /// of a supervisor that only observes and broadcasts.
+    ///
+    /// Call from inside a Tokio runtime; a call that did not start the
+    /// poller starts nothing. The applier holds the supervisor weakly, so
+    /// it never keeps it alive.
+    pub fn watch_password_input(&self) {
+        let reports = self.supervisor.subscribe_lifecycle();
+        if self.supervisor.start_password_poller().is_none() {
+            return;
+        }
+        tokio::spawn(apply_password_reports(
+            Arc::clone(&self.workspace),
+            Arc::downgrade(&self.supervisor),
+            reports,
+        ));
+    }
+}
+
+/// [`LocalClient::watch_password_input`]'s applier: every report, in
+/// order, until the supervisor is gone.
+async fn apply_password_reports(
+    workspace: Arc<Workspace>,
+    supervisor: Weak<PtySupervisor>,
+    mut reports: broadcast::Receiver<SupervisorEvent>,
+) {
+    loop {
+        let report = reports.recv().await;
+        let Some(supervisor) = supervisor.upgrade() else {
+            return;
+        };
+        match report {
+            Ok(report) => apply_password_report(&workspace, &supervisor, &report),
+            Err(RecvError::Lagged(missed)) => {
+                tracing::debug!(
+                    missed,
+                    "password reports lagged; asking the poller to republish"
+                );
+                recover_from_lag(&workspace, &supervisor);
+            }
+            Err(RecvError::Closed) => return,
+        }
+    }
+}
+
+/// What one supervisor event does to `password_input`. An exit clears the
+/// flag unless the tab already has a newer PTY — the exit was the old
+/// one's.
+///
+/// The incarnation check and the write are not one critical section, so
+/// a report can still land on a spawn that took the tab id in between.
+/// That spawn's first sample, which the poller always reports, follows it
+/// on the channel and corrects it within a tick.
+pub(crate) fn apply_password_report(
+    workspace: &Workspace,
+    supervisor: &PtySupervisor,
+    event: &SupervisorEvent,
+) {
+    match event {
+        SupervisorEvent::PasswordInput {
+            tab_id,
+            incarnation,
+            password,
+        } => apply_sample(workspace, supervisor, *tab_id, *incarnation, *password),
+        SupervisorEvent::PasswordSnapshot { entries } => {
+            for &(tab_id, incarnation, password) in entries {
+                apply_sample(workspace, supervisor, tab_id, incarnation, password);
+            }
+            clear_rows_without_a_pty(workspace, supervisor);
+        }
+        SupervisorEvent::TabExited { tab_id, .. } => {
+            if supervisor.incarnation(*tab_id).is_none() {
+                workspace.set_tab_password_input(*tab_id, false);
+            }
+        }
+    }
+}
+
+fn apply_sample(
+    workspace: &Workspace,
+    supervisor: &PtySupervisor,
+    tab_id: i64,
+    incarnation: u64,
+    password: bool,
+) {
+    if supervisor.incarnation(tab_id) == Some(incarnation) {
+        workspace.set_tab_password_input(tab_id, password);
+    } else {
+        tracing::debug!(tab_id, incarnation, "dropping a stale password report");
+    }
+}
+
+/// Clear every raised row with no PTY behind it: its exit may be one of
+/// the reports a lag lost.
+fn clear_rows_without_a_pty(workspace: &Workspace, supervisor: &PtySupervisor) {
+    for tab in workspace
+        .snapshot()
+        .iter()
+        .flat_map(|project| &project.tabs)
+        .filter(|tab| tab.password_input)
+    {
+        if supervisor.incarnation(tab.id).is_none() {
+            workspace.set_tab_password_input(tab.id, false);
+        }
+    }
+}
+
+/// Resync after lost reports through the poller, never beside it: a
+/// sample taken here would bypass the poller's record of what it said,
+/// and a raise written from one could never be cleared by a poller that
+/// believes it never reported it. Rows with no PTY clear now, and the
+/// poller's next tick sends every live tab in one snapshot.
+fn recover_from_lag(workspace: &Workspace, supervisor: &PtySupervisor) {
+    clear_rows_without_a_pty(workspace, supervisor);
+    supervisor.republish_password_input();
 }
 
 /// Where the two hydrations differ: a UI's in-process launch (and its
@@ -596,11 +718,186 @@ impl Drop for HangUp {
     }
 }
 
+/// `script` under `/bin/sh -c` as `tab_id`, its cwd `dir`, hung up on drop.
+#[cfg(test)]
+pub(crate) fn spawn_in(
+    supervisor: &Arc<PtySupervisor>,
+    tab_id: i64,
+    dir: &Path,
+    script: &str,
+) -> HangUp {
+    let guard = HangUp(Arc::clone(supervisor), vec![tab_id]);
+    let argv = ["/bin/sh", "-c", script].map(String::from);
+    let socket = Path::new("/tmp/roost-test.sock");
+    let _rx = supervisor
+        .spawn(tab_id, &dir.to_string_lossy(), &argv, 80, 24, socket)
+        .expect("spawn");
+    guard
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use roost_ipc::agent::{AgentLifecycle, OwnershipAction, TabAgentReportParams};
     use roost_ipc::messages::TabState;
+
+    // ---- password_input's owner half (plan 074 §D2) -----------------
+
+    const PROMPT: &str = "stty -echo icanon; read line; stty echo; exec sleep 60";
+
+    /// A workspace row and a live PTY under the same id, as an owner has.
+    fn row_with_a_pty() -> (Workspace, Arc<PtySupervisor>, i64, HangUp) {
+        let (workspace, tab_id) = workspace_with_tab("/tmp");
+        let supervisor = Arc::new(PtySupervisor::new());
+        let pty = spawn_in(&supervisor, tab_id, Path::new("/tmp"), "exec sleep 60");
+        (workspace, supervisor, tab_id, pty)
+    }
+
+    fn report(tab_id: i64, incarnation: u64, password: bool) -> SupervisorEvent {
+        SupervisorEvent::PasswordInput {
+            tab_id,
+            incarnation,
+            password,
+        }
+    }
+
+    fn password_input(workspace: &Workspace, tab_id: i64) -> bool {
+        workspace.tab(tab_id).unwrap().password_input
+    }
+
+    async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+        let poll = async {
+            while !done() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), poll)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    /// A close and a respawn of the same tab id between a sample and its
+    /// delivery: the report names the closed spawn, so it must not land
+    /// on the replacement — nor may the closed spawn's exit clear it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_report_lands_only_on_the_spawn_it_was_sampled_from() {
+        let (workspace, supervisor, tab_id, _first_pty) = row_with_a_pty();
+        let first = supervisor.incarnation(tab_id).expect("live");
+        supervisor.close(tab_id);
+        let _second_pty = spawn_in(&supervisor, tab_id, Path::new("/tmp"), "exec sleep 60");
+        let second = supervisor.incarnation(tab_id).expect("respawned");
+        assert_ne!(first, second);
+
+        apply_password_report(&workspace, &supervisor, &report(tab_id, first, true));
+        assert!(
+            !password_input(&workspace, tab_id),
+            "the closed spawn's prompt landed on its replacement"
+        );
+
+        apply_password_report(&workspace, &supervisor, &report(tab_id, second, true));
+        assert!(password_input(&workspace, tab_id));
+        apply_password_report(
+            &workspace,
+            &supervisor,
+            &SupervisorEvent::TabExited { tab_id, status: 0 },
+        );
+        assert!(
+            password_input(&workspace, tab_id),
+            "the closed spawn's exit cleared its replacement's prompt"
+        );
+    }
+
+    /// A child that exits at a prompt: the exit clears the flag, and a
+    /// sample taken before the exit but delivered after it is dropped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_exit_clears_the_flag_and_a_late_report_stays_dropped() {
+        let (workspace, supervisor, tab_id, _pty) = row_with_a_pty();
+        let incarnation = supervisor.incarnation(tab_id).expect("live");
+        apply_password_report(&workspace, &supervisor, &report(tab_id, incarnation, true));
+        assert!(password_input(&workspace, tab_id));
+
+        supervisor.close(tab_id);
+        apply_password_report(
+            &workspace,
+            &supervisor,
+            &SupervisorEvent::TabExited { tab_id, status: 0 },
+        );
+        assert!(
+            !password_input(&workspace, tab_id),
+            "the exit left the flag up"
+        );
+        apply_password_report(&workspace, &supervisor, &report(tab_id, incarnation, true));
+        assert!(
+            !password_input(&workspace, tab_id),
+            "a report about a child that is gone raised the flag again"
+        );
+    }
+
+    /// A lag resyncs through the poller. A short prompt comes and goes,
+    /// so the poller's last word on the tab is "out of a prompt" and it
+    /// will not say so again unprompted; the row is then raised behind
+    /// its back — what a sample taken beside the poller during that prompt
+    /// would have left. The republish clears it; a row with no PTY clears
+    /// at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lag_has_the_poller_republish_every_live_tab() {
+        let (workspace, tab) = workspace_with_tab("/tmp");
+        let project = workspace.tab(tab).unwrap().project_id;
+        let orphaned = workspace.open_tab(project, "/tmp", "", true).unwrap().id;
+        let workspace = Arc::new(workspace);
+        let supervisor = Arc::new(PtySupervisor::new());
+        LocalClient::new(
+            Arc::clone(&workspace),
+            Arc::clone(&supervisor),
+            PathBuf::from("/tmp/roost-test.sock"),
+        )
+        .watch_password_input();
+        let _pty = spawn_in(&supervisor, tab, Path::new("/tmp"), PROMPT);
+        wait_for("the prompt", || password_input(&workspace, tab)).await;
+        supervisor
+            .write(tab, b"secret\n".to_vec())
+            .await
+            .expect("answer the prompt");
+        wait_for("the prompt to end", || !password_input(&workspace, tab)).await;
+
+        workspace.set_tab_password_input(tab, true);
+        workspace.set_tab_password_input(orphaned, true);
+        recover_from_lag(&workspace, &supervisor);
+        assert!(!password_input(&workspace, orphaned));
+        wait_for("the poller to republish the tab", || {
+            !password_input(&workspace, tab)
+        })
+        .await;
+    }
+
+    /// The whole owner loop over a real child: the poller samples, the
+    /// applier lands it on the row, and answering the prompt clears it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watch_password_input_keeps_the_row_in_step_with_the_pty() {
+        let (workspace, tab_id) = workspace_with_tab("/tmp");
+        let workspace = Arc::new(workspace);
+        let supervisor = Arc::new(PtySupervisor::new());
+        let client = LocalClient::new(
+            Arc::clone(&workspace),
+            Arc::clone(&supervisor),
+            PathBuf::from("/tmp/roost-test.sock"),
+        );
+        client.watch_password_input();
+        let _pty = spawn_in(&supervisor, tab_id, Path::new("/tmp"), PROMPT);
+
+        wait_for("the prompt to reach the row", || {
+            password_input(&workspace, tab_id)
+        })
+        .await;
+        supervisor
+            .write(tab_id, b"secret\n".to_vec())
+            .await
+            .expect("answer the prompt");
+        wait_for("the answered prompt to leave the row", || {
+            !password_input(&workspace, tab_id)
+        })
+        .await;
+    }
 
     /// A client over an empty in-memory workspace, plus one open tab.
     /// No PTY is ever spawned — `apply_osc` only touches the workspace.
@@ -719,17 +1016,6 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
-    /// A child for `tab_id` whose own cwd is `dir`, hung up on drop.
-    fn spawn_in(supervisor: &Arc<PtySupervisor>, tab_id: i64, dir: &Path) -> HangUp {
-        let guard = HangUp(supervisor.clone(), vec![tab_id]);
-        let argv = ["/bin/sh", "-c", "exec sleep 30"].map(String::from);
-        let socket = Path::new("/tmp/roost-inherited-cwd-test.sock");
-        let _rx = supervisor
-            .spawn(tab_id, &string(dir), &argv, 80, 24, socket)
-            .expect("spawn");
-        guard
-    }
-
     /// A workspace holding one tab whose tracked cwd is `tracked`.
     fn workspace_with_tab(tracked: &str) -> (Workspace, i64) {
         let workspace = Workspace::new();
@@ -743,7 +1029,7 @@ mod tests {
         let (native, tracked) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let (workspace, tab) = workspace_with_tab(&string(tracked.path()));
         let supervisor = Arc::new(PtySupervisor::new());
-        let _guard = spawn_in(&supervisor, tab, native.path());
+        let _guard = spawn_in(&supervisor, tab, native.path(), "exec sleep 30");
 
         let want = string(&std::fs::canonicalize(native.path()).unwrap());
         assert_eq!(
@@ -772,7 +1058,7 @@ mod tests {
         let tracked = string(dir.path());
         let (workspace, tab) = workspace_with_tab(&tracked);
         let supervisor = Arc::new(PtySupervisor::new());
-        let _guard = spawn_in(&supervisor, tab, native.path());
+        let _guard = spawn_in(&supervisor, tab, native.path(), "exec sleep 30");
 
         native.close().expect("remove the child's cwd");
         let native = supervisor.foreground_cwd(tab).expect("a native read");
@@ -841,7 +1127,7 @@ mod tests {
         let workspace = Workspace::new();
         let supervisor = Arc::new(PtySupervisor::new());
         let orphan = 99;
-        let _guard = spawn_in(&supervisor, orphan, native.path());
+        let _guard = spawn_in(&supervisor, orphan, native.path(), "exec sleep 30");
 
         assert_eq!(inherited_cwd(&workspace, &supervisor, orphan), None);
     }

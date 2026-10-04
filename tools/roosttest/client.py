@@ -43,10 +43,20 @@ class Timeout(RoostError):
 
 
 class Roost:
-    def __init__(self, socket_path: str, timeout: float | None = None):
+    _timeout: float | None = None
+    _deadline: float | None = None
+
+    def __init__(self, socket_path: str, timeout: float | None = None,
+                 deadline: float | None = None):
+        """`timeout` bounds each socket operation; `deadline`, when given,
+        bounds each `call` as a whole — a reply trickling in under `timeout`
+        a chunk at a time cannot outlast it. A call past its deadline raises
+        `Timeout` and closes the client."""
         self.path = str(socket_path)
         self._next_id = 0
         self._buf = b""
+        self._timeout = timeout
+        self._deadline = deadline
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.settimeout(timeout)
         self._sock.connect(self.path)
@@ -69,21 +79,47 @@ class Roost:
         """Send one request, return its `result` dict, raise on error."""
         self._next_id += 1
         req = {"id": str(self._next_id), "op": op, "params": params or {}}
+        ends = None
+        if self._deadline is not None:
+            ends = time.monotonic() + self._deadline
+            self._sock.settimeout(
+                self._deadline if self._timeout is None else min(self._deadline, self._timeout)
+            )
         self._sock.sendall((json.dumps(req) + "\n").encode())
-        resp = json.loads(self._readline())
+        resp = json.loads(self._readline(ends))
         if not resp.get("ok"):
             err = resp.get("error") or {}
             raise RoostError(err.get("code", "unknown"), err.get("message", ""))
         return resp.get("result") or {}
 
-    def _readline(self) -> str:
+    def _readline(self, ends: float | None = None) -> str:
         while b"\n" not in self._buf:
-            chunk = self._sock.recv(1 << 16)
+            by_deadline = False
+            if ends is not None:
+                remaining = ends - time.monotonic()
+                if remaining <= 0:
+                    raise self._past_deadline()
+                by_deadline = self._timeout is None or remaining <= self._timeout
+                self._sock.settimeout(remaining if by_deadline else self._timeout)
+            try:
+                chunk = self._sock.recv(1 << 16)
+            except socket.timeout:
+                if by_deadline:
+                    raise self._past_deadline() from None
+                raise
             if not chunk:
                 raise RoostError("disconnected", "socket closed mid-response")
             self._buf += chunk
         line, self._buf = self._buf.split(b"\n", 1)
         return line.decode()
+
+    def _past_deadline(self) -> Timeout:
+        """The reply may still arrive, and nothing matches a reply to its
+        request's id, so the connection goes with the call: a late reply
+        must not read as the next call's."""
+        self._buf = b""
+        self.close()
+        return Timeout(f"no complete reply from {self.path} within {self._deadline}s")
 
     # -- ops --------------------------------------------------------------
     def identify(self) -> dict:
@@ -213,6 +249,11 @@ class Roost:
 
     def has_notification(self, tab_id: int) -> bool:
         return bool((self.tab(tab_id) or {}).get("has_notification"))
+
+    def password_input(self, tab_id: int) -> bool:
+        """Omitted while false, so a missing key — a pre-074 session's
+        tabs included — reads as not at a prompt."""
+        return bool((self.tab(tab_id) or {}).get("password_input"))
 
     def set_title(self, tab_id: int, title: str) -> None:
         self.call("tab.set_title", {"tab_id": str(tab_id), "title": title})
@@ -433,6 +474,20 @@ class Roost:
         keyboard until `Enter` runs an item or `Escape` closes it. On
         macOS, whose menu is the native popup, `RoostError('not-supported')`."""
         self.call("app.context_menu_open", {"target": target})
+
+    # -- a banner click's window raise (test mode) -------------------------
+    def notification_activate(self, tab: int | str, token: str | None = None) -> None:
+        """Test-mode only — click `tab`'s desktop banner, carrying `token`
+        as the notification server's activation token would (omit it for a
+        server that sends none). Returns once the click is queued, so wait
+        on its effect. Iced-only."""
+        self.call("app.notification_activate", {"tab_id": str(tab), "token": token})
+
+    def last_activation(self) -> dict:
+        """Test-mode only — what the last banner click's raise came to:
+        `{outcome, token, activation_global}`, every field `None` until one
+        has settled. Iced-only."""
+        return self.call("app.last_activation")
 
     # -- host sessions ----------------------------------------------------
     def host_status(self, id: str | None = None) -> dict:
@@ -731,6 +786,7 @@ class Roost:
         cell_x: int,
         cell_y: int,
         mods: int = 0,
+        overshoot: int = 0,
     ) -> None:
         """Drive a synthetic mouse event into the UI's mouse handler at
         cell-grid coordinates. Same `routeMouseEvent` path the real
@@ -742,19 +798,28 @@ class Roost:
         opens it through the UI's own launcher (plan 063 §D11). The Mac
         UI drives the encoder alone.
 
+        `overshoot` (iced only) puts the pointer that many rows past the
+        grid — negative above it, positive below — with `cell_x`/`cell_y`
+        the cell it clamps to; a selection drag held there auto-scrolls.
+        The key is sent only when non-zero: the params are strict, so an
+        older server refuses a request that names it.
+
         `kind` ∈ {"press","release","motion"}; `button` ∈
         {"left","right","middle","wheel_up","wheel_down","none"}
         (use "none" for motion-no-button events under mode 1003).
         Gated by ROOST_TEST_MODE=1; raises `RoostError('not-enabled')`
         when the gate is off, `not-found` for an unknown tab id."""
-        self.call("tab.dispatch_mouse_event", {
+        params: dict = {
             "tab_id": str(tab_id),
             "kind": kind,
             "button": button,
             "cell_x": cell_x,
             "cell_y": cell_y,
             "mods": mods,
-        })
+        }
+        if overshoot:
+            params["overshoot"] = overshoot
+        self.call("tab.dispatch_mouse_event", params)
 
     def app_set_window_focus(self, focus: bool) -> None:
         """Drive the focus-tracking emit path without taking real OS
@@ -872,6 +937,18 @@ class Roost:
         `app_dock_badge`."""
         return self.call("app.notification_status", {})
 
+    def app_secure_input(self) -> dict:
+        """Read Secure Keyboard Entry as the UI's owner holds it:
+        `{"desired", "owned", "indicator", "manual", "auto",
+        "app_active", "password_input"}`, all bools.
+
+        `desired` is `app_active and (manual or (auto and
+        password_input))`; assert that formula against the reported
+        inputs rather than an outcome, since a bare binary may never be
+        the active app. Gated by ROOST_TEST_MODE=1; the iced UI answers on
+        every OS (all `False` off macOS), the Swift app `unknown-op`."""
+        return self.call("app.secure_input", {})
+
     def tab_expand_selection_at(
         self,
         tab_id: int,
@@ -915,6 +992,10 @@ class Roost:
     def wait_notification(self, tab_id: int, pending: bool, timeout: float = 5.0) -> None:
         self._wait(lambda: self.has_notification(tab_id) is pending,
                    timeout, f"tab {tab_id} has_notification == {pending}")
+
+    def wait_password_input(self, tab_id: int, at_prompt: bool, timeout: float = 5.0) -> None:
+        self._wait(lambda: self.password_input(tab_id) is at_prompt,
+                   timeout, f"tab {tab_id} password_input == {at_prompt}")
 
     def wait_text(self, tab_id: int, needle: str, timeout: float = 5.0) -> None:
         self._wait(lambda: needle in self._safe_dump_text(tab_id),

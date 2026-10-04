@@ -122,10 +122,7 @@ impl TerminalScroll {
         direction: PageDirection,
         viewport_rows: usize,
     ) -> PageRoute {
-        if terminal.mouse_tracking() {
-            return PageRoute::Forward;
-        }
-        if terminal.active_screen() == ActiveScreen::Alternate {
+        if !Self::scrolls_locally(terminal) {
             return PageRoute::Forward;
         }
 
@@ -139,6 +136,37 @@ impl TerminalScroll {
         PageRoute::LocalViewport {
             scrolled_back: self.move_local_viewport(terminal, history_rows),
         }
+    }
+
+    /// Move the local viewport for a selection drag held past the grid's
+    /// edge (#342), by whole rows, positive toward older history.
+    ///
+    /// `None` when the viewport is not the terminal's to move — the
+    /// precedence [`TerminalScroll::route_page`] applies — so the drag
+    /// stops scrolling. Otherwise whether the viewport moved, `false` at
+    /// either end of history. Like a page, it discards any accumulated
+    /// wheel fraction.
+    pub fn scroll_local(&mut self, terminal: &mut Terminal, history_rows: isize) -> Option<bool> {
+        if !Self::scrolls_locally(terminal) {
+            return None;
+        }
+        self.fractional_history_rows = 0.0;
+        self.last_direction = 0;
+        if history_rows == 0 {
+            return Some(false);
+        }
+        let before = terminal.scrollbar().map(|scrollbar| scrollbar.offset);
+        self.move_local_viewport(terminal, history_rows);
+        let after = terminal.scrollbar().map(|scrollbar| scrollbar.offset);
+        // An unreadable scrollbar cannot prove the viewport stayed put.
+        Some(!matches!((before, after), (Ok(before), Ok(after)) if before == after))
+    }
+
+    /// Whether the terminal's own viewport answers a scroll: mouse
+    /// tracking hands it to the application, and so does the alternate
+    /// screen, which has no history.
+    pub fn scrolls_locally(terminal: &Terminal) -> bool {
+        !terminal.mouse_tracking() && terminal.active_screen() != ActiveScreen::Alternate
     }
 
     /// Move the local viewport by whole rows (positive = toward older history)
@@ -412,6 +440,70 @@ mod tests {
             scroll.route(&mut terminal, 0.5),
             None,
             "the page must discard the fraction accumulated before it"
+        );
+    }
+
+    #[test]
+    fn local_scroll_walks_history_and_reports_both_ends() {
+        let mut terminal = terminal_with_paged_history();
+        let mut scroll = TerminalScroll::new();
+        let bottom = viewport_offset(&terminal);
+        assert_eq!(scroll.scroll_local(&mut terminal, 3), Some(true));
+        assert_eq!(bottom - viewport_offset(&terminal), 3, "positive is older");
+        assert!(scroll.is_scrolled_back());
+
+        assert_eq!(scroll.scroll_local(&mut terminal, 1_000), Some(true));
+        assert_eq!(viewport_offset(&terminal), 0);
+        assert_eq!(
+            scroll.scroll_local(&mut terminal, 2),
+            Some(false),
+            "nothing older than the top of history"
+        );
+
+        assert_eq!(scroll.scroll_local(&mut terminal, -2), Some(true));
+        assert_eq!(viewport_offset(&terminal), 2);
+        assert_eq!(scroll.scroll_local(&mut terminal, -1_000), Some(true));
+        assert_eq!(viewport_offset(&terminal), bottom);
+        assert!(!scroll.is_scrolled_back());
+        assert_eq!(
+            scroll.scroll_local(&mut terminal, -1),
+            Some(false),
+            "nothing newer than the live bottom"
+        );
+        assert_eq!(scroll.scroll_local(&mut terminal, 0), Some(false));
+    }
+
+    #[test]
+    fn local_scroll_leaves_tracking_and_the_alternate_screen_alone() {
+        for modes in [
+            &b"\x1b[?1000h"[..],
+            b"\x1b[?1049h",
+            b"\x1b[?1049h\x1b[?1000h",
+        ] {
+            let mut terminal = terminal_with_paged_history();
+            terminal.vt_write(modes);
+            let mut scroll = TerminalScroll::new();
+            let before = viewport_offset(&terminal);
+            assert!(!TerminalScroll::scrolls_locally(&terminal), "{modes:?}");
+            assert_eq!(scroll.scroll_local(&mut terminal, 2), None, "{modes:?}");
+            assert_eq!(viewport_offset(&terminal), before, "{modes:?}");
+            assert!(!scroll.is_scrolled_back(), "{modes:?}");
+        }
+        assert!(TerminalScroll::scrolls_locally(
+            &terminal_with_paged_history()
+        ));
+    }
+
+    #[test]
+    fn local_scroll_discards_stale_wheel_momentum() {
+        let mut terminal = terminal_with_paged_history();
+        let mut scroll = TerminalScroll::new();
+        assert_eq!(scroll.route(&mut terminal, 0.5), None);
+        assert_eq!(scroll.scroll_local(&mut terminal, 1), Some(true));
+        assert_eq!(
+            scroll.route(&mut terminal, 0.5),
+            None,
+            "the auto-scroll must discard the fraction accumulated before it"
         );
     }
 

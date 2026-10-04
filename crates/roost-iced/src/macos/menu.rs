@@ -367,6 +367,9 @@ struct MainMenu {
     view: Retained<NSMenu>,
     /// The View menu's full-screen item, kept for [`sync_fullscreen_title`].
     fullscreen: Option<Retained<NSMenuItem>>,
+    /// The App menu's "Secure Keyboard Entry", kept for
+    /// [`sync_secure_input_state`].
+    secure_input: Option<Retained<NSMenuItem>>,
     /// Indexed by the item's tag.
     events: Vec<MenuEvent>,
     /// Tags below this belong to the static menus and never move. A
@@ -505,6 +508,23 @@ pub(crate) fn sync_fullscreen_title(_mtm: MainThreadMarker, is_full: bool) {
     });
 }
 
+/// Check "Secure Keyboard Entry" while the remembered toggle is on — the
+/// toggle, not whether secure input is on right now, as Ghostty's item
+/// does. The App calls this only when the toggle moved.
+pub(crate) fn sync_secure_input_state(_mtm: MainThreadMarker, manual: bool) {
+    MENU.with(|cell| {
+        let slot = cell.borrow();
+        let Some(item) = slot.as_ref().and_then(|menu| menu.secure_input.as_ref()) else {
+            return;
+        };
+        item.setState(if manual {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+    });
+}
+
 /// Push the app's keyboard route onto the live menu.
 ///
 /// Two different mechanisms, because they answer two different questions:
@@ -582,6 +602,7 @@ fn build(
         help: submenu(mtm, "Help"),
         view: submenu(mtm, "View"),
         fullscreen: None,
+        secure_input: None,
         events: Vec::new(),
         static_events: 0,
         gated: Vec::new(),
@@ -614,6 +635,13 @@ fn build(
         &mut menu,
         &app_menu,
         Some(("Settings\u{2026}", KeybindAction::OpenConfig)),
+        keybindings,
+    );
+    menu.secure_input = add_action_item(
+        mtm,
+        &mut menu,
+        &app_menu,
+        Some(("Secure Keyboard Entry", KeybindAction::ToggleSecureInput)),
         keybindings,
     );
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -1198,6 +1226,7 @@ mod tests {
             shell_state: Default::default(),
             agent_lifecycle: Default::default(),
             ownership: None,
+            password_input: false,
         }
     }
 

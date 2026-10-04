@@ -19,7 +19,8 @@
 //! listener task per shown notification, and the click it observes lands on
 //! the engine feed as [`EngineFeed::NotificationActivated`] — the same
 //! channel every other engine → UI item travels, so the drain applies it in
-//! arrival order with everything else.
+//! arrival order with everything else, with the server's activation token
+//! for the click when it sent one.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -71,10 +72,19 @@ impl TabSlot {
     }
 }
 
+/// A click on a shown banner's body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Activated {
+    /// The `xdg-activation` token a spec 1.2 server sends just before the
+    /// click (`ActivationToken`). `None` from a server that sends none, and
+    /// always on macOS, whose banners have no such thing.
+    pub(crate) token: Option<String>,
+}
+
 /// The future that resolves once the user acts on a shown notification:
-/// `true` for a click on the banner body, `false` for anything else (a
+/// `Some` for a click on the banner body, `None` for anything else (a
 /// dismiss, or a server that closed it).
-pub(crate) type Activation = Pin<Box<dyn Future<Output = bool> + Send>>;
+pub(crate) type Activation = Pin<Box<dyn Future<Output = Option<Activated>> + Send>>;
 
 /// What one show produced. The `activation` is `None` on backends that
 /// cannot report a click at all, which is why the worker — not the
@@ -219,13 +229,17 @@ fn spawn_listener(
 ) -> tokio::task::JoinHandle<()> {
     let feed = feed.clone();
     tokio::spawn(async move {
-        if activation.await {
-            tracing::info!(tab_id = tab.tab, "desktop notification clicked");
+        if let Some(Activated { token }) = activation.await {
+            tracing::info!(
+                tab_id = tab.tab,
+                token = token.is_some(),
+                "desktop notification clicked"
+            );
             // The key the fire was raised under, carried verbatim: a
             // banner outlives the connection epoch that raised it, and
             // re-minting a local key here is exactly how a dead epoch's
             // click would land on a live tab of the same number.
-            feed.send(EngineFeed::NotificationActivated { tab });
+            feed.send(EngineFeed::NotificationActivated { tab, token });
         }
     })
 }
@@ -279,7 +293,7 @@ mod backend {
     use zbus::zvariant::Value;
     use zbus::{MatchRule, MessageStream};
 
-    use super::{Payload, Shown};
+    use super::{Activated, Payload, Shown};
 
     /// The freedesktop key a server invokes for a click on the banner body
     /// rather than on a button. Declaring it is what makes the banner
@@ -308,27 +322,30 @@ mod backend {
             .map_err(|error| error.to_string())?;
         // Subscribe before Notify so a fast click cannot land in the gap
         // between show and the listener task starting. Same connection as
-        // Notify, so a server that unicasts ActionInvoked at the sender
-        // still delivers it here.
-        let mut stream = action_invoked_stream(&connection).await?;
+        // Notify, so a server that unicasts its signals at the sender
+        // still delivers them here.
+        let mut stream = notification_signals(&connection).await?;
         let id = send_notify(&connection, &app_id, &payload).await?;
         tracing::info!(id, "desktop notification shown");
         Ok(Shown {
             server_id: Some(id),
             activation: Some(Box::pin(async move {
-                let clicked = drain_action_invoked(id, &mut stream).await;
+                let activated = drain_activation(id, &mut stream).await;
+                // Nothing reads it again, and the close below makes the
+                // server emit a signal its rule matches.
+                drop(stream);
                 // `resident` + expire 0: the server will not withdraw the
                 // banner for us after the action. Close it ourselves so a
                 // click (or a later tab close via `Retire`) cannot leave a
                 // permanent inert popup.
-                if clicked
+                if activated.is_some()
                     && tokio::time::timeout(super::SHOW_TIMEOUT, close_on(&connection, id))
                         .await
                         .is_err()
                 {
                     tracing::warn!(id, "CloseNotification timed out after click");
                 }
-                clicked
+                activated
             })),
         })
     }
@@ -391,48 +408,83 @@ mod backend {
         }
     }
 
-    async fn action_invoked_stream(connection: &zbus::Connection) -> Result<MessageStream, String> {
+    /// Both signals a click produces, on one stream. A `MatchRule` names
+    /// at most one member, so the rule stops at the interface and its
+    /// object, and [`decode`] tells the members apart.
+    async fn notification_signals(connection: &zbus::Connection) -> Result<MessageStream, String> {
         let rule = MatchRule::builder()
             .msg_type(MessageType::Signal)
             .interface(NOTIFICATIONS_INTERFACE)
             .expect("static Notifications interface")
-            .member("ActionInvoked")
-            .expect("static ActionInvoked member")
+            .path(NOTIFICATIONS_PATH)
+            .expect("static Notifications path")
             .build();
         MessageStream::for_match_rule(rule, connection, Some(16))
             .await
             .map_err(|error| error.to_string())
     }
 
-    /// Wait for a body-click on this banner.
+    /// Wait for a body-click on this banner, and the token that came with
+    /// it.
     ///
-    /// Spec 1.2 servers (GNOME, KDE, COSMIC, …) may emit `ActivationToken`
-    /// immediately before `ActionInvoked`. We subscribe to `ActionInvoked`
-    /// only, on one stream, on the same connection that sent `Notify`, so
-    /// that extra signal cannot steal the click. The `xdg-activation`
-    /// token is how Wayland compositors authorize a raise; iced 0.14 has
-    /// no API to consume it on an existing window, so `window::gain_focus`
-    /// is a no-op there — [#351](https://github.com/charliek/roost/issues/351).
+    /// Spec 1.2 servers (GNOME, KDE, COSMIC, …) emit `ActivationToken`
+    /// immediately before `ActionInvoked`, both on this stream.
     ///
     /// We only register the spec `default` action. Any `ActionInvoked` for
     /// this id is a click — some servers send the label instead of the
     /// key. Dismiss/timeout leave this future pending until the worker
     /// aborts it.
-    async fn drain_action_invoked(id: u32, stream: &mut MessageStream) -> bool {
+    async fn drain_activation(id: u32, stream: &mut MessageStream) -> Option<Activated> {
+        let mut token = None;
         while let Some(msg) = stream.next().await {
             let Ok(msg) = msg else {
                 continue;
             };
-            let Ok((nid, action)) = msg.body().deserialize::<(u32, String)>() else {
-                continue;
-            };
-            if !action_invoked_is_ours(id, nid) {
-                continue;
+            if let Some(activated) = pair(&mut token, decode(id, &msg)) {
+                return Some(activated);
             }
-            tracing::info!(id, %action, "desktop notification ActionInvoked");
-            return true;
         }
-        false
+        None
+    }
+
+    /// What one Notifications signal says about banner `our_id`.
+    enum Signal {
+        Token(String),
+        Click,
+        Other,
+    }
+
+    /// `ActionInvoked` and `ActivationToken` both carry a `(u32, String)`
+    /// body, so only the member tells a click from its token: it is read
+    /// before the body, always.
+    fn decode(our_id: u32, msg: &zbus::Message) -> Signal {
+        let header = msg.header();
+        let click = match header.member().map(|member| member.as_str()) {
+            Some("ActionInvoked") => true,
+            Some("ActivationToken") => false,
+            _ => return Signal::Other,
+        };
+        match msg.body().deserialize::<(u32, String)>() {
+            Ok((nid, _)) if nid != our_id => Signal::Other,
+            Ok(_) if click => Signal::Click,
+            Ok((_, token)) => Signal::Token(token),
+            Err(_) => Signal::Other,
+        }
+    }
+
+    /// Fold one signal into the click being assembled: our banner's latest
+    /// token waits for the click it was minted for.
+    fn pair(token: &mut Option<String>, signal: Signal) -> Option<Activated> {
+        match signal {
+            Signal::Token(minted) => {
+                *token = Some(minted);
+                None
+            }
+            Signal::Click => Some(Activated {
+                token: token.take(),
+            }),
+            Signal::Other => None,
+        }
     }
 
     /// Spec `actions` is `as` (array of STRING): even keys, odd labels.
@@ -441,17 +493,14 @@ mod backend {
         vec![DEFAULT_ACTION, DEFAULT_ACTION_LABEL]
     }
 
-    fn action_invoked_is_ours(our_id: u32, nid: u32) -> bool {
-        nid == our_id
-    }
-
     #[cfg(test)]
     mod linux_tests {
+        use serde::Serialize;
         use zbus::zvariant::DynamicType;
 
         use super::{
-            action_invoked_is_ours, notify_actions, DEFAULT_ACTION, DEFAULT_ACTION_LABEL,
-            EXPIRE_NEVER,
+            decode, notify_actions, pair, Activated, DEFAULT_ACTION, DEFAULT_ACTION_LABEL,
+            EXPIRE_NEVER, NOTIFICATIONS_INTERFACE, NOTIFICATIONS_PATH,
         };
 
         #[test]
@@ -477,10 +526,97 @@ mod backend {
             );
         }
 
+        fn signal<B: Serialize + DynamicType>(member: &str, body: &B) -> zbus::Message {
+            zbus::Message::signal(NOTIFICATIONS_PATH, NOTIFICATIONS_INTERFACE, member)
+                .expect("a well-formed signal header")
+                .build(body)
+                .expect("a serializable body")
+        }
+
+        fn token(id: u32, token: &str) -> zbus::Message {
+            signal("ActivationToken", &(id, token))
+        }
+
+        fn click(id: u32) -> zbus::Message {
+            signal("ActionInvoked", &(id, DEFAULT_ACTION))
+        }
+
+        /// What banner 7's listener makes of `signals`, in order.
+        fn listen(signals: &[zbus::Message]) -> Option<Activated> {
+            let mut token = None;
+            signals
+                .iter()
+                .find_map(|msg| pair(&mut token, decode(7, msg)))
+        }
+
+        fn clicked_with(token: Option<&str>) -> Option<Activated> {
+            Some(Activated {
+                token: token.map(str::to_owned),
+            })
+        }
+
+        /// A token has a click's body shape; read as one, it would raise
+        /// the window before anyone clicked.
         #[test]
-        fn any_action_invoked_for_our_id_is_a_click() {
-            assert!(action_invoked_is_ours(7, 7));
-            assert!(!action_invoked_is_ours(7, 8));
+        fn a_token_alone_is_not_a_click() {
+            assert_eq!(listen(&[token(7, "t-1")]), None);
+        }
+
+        #[test]
+        fn a_click_carries_the_token_minted_just_before_it() {
+            assert_eq!(
+                listen(&[token(7, "t-1"), click(7)]),
+                clicked_with(Some("t-1"))
+            );
+        }
+
+        #[test]
+        fn a_click_with_no_token_is_still_a_click() {
+            assert_eq!(listen(&[click(7)]), clicked_with(None));
+            assert_eq!(
+                listen(&[signal("ActionInvoked", &(7u32, DEFAULT_ACTION_LABEL))]),
+                clicked_with(None),
+                "a server that sends the label instead of the key"
+            );
+        }
+
+        #[test]
+        fn another_banners_token_and_click_are_not_ours() {
+            assert_eq!(listen(&[token(8, "t-8"), click(8)]), None);
+            assert_eq!(
+                listen(&[token(8, "t-8"), click(7)]),
+                clicked_with(None),
+                "banner 8's token is not spent on banner 7's click"
+            );
+        }
+
+        #[test]
+        fn a_malformed_body_or_another_member_is_ignored() {
+            assert_eq!(
+                listen(&[
+                    signal("ActionInvoked", &(7u32,)),
+                    signal("ActivationToken", &(7u32, 3u32)),
+                    signal("NotificationClosed", &(7u32, 2u32)),
+                    signal("ActionInvoked", &("7", DEFAULT_ACTION)),
+                ]),
+                None
+            );
+            assert_eq!(
+                listen(&[
+                    signal("ActivationToken", &("t-0", 7u32)),
+                    token(7, "t-1"),
+                    click(7)
+                ]),
+                clicked_with(Some("t-1"))
+            );
+        }
+
+        #[test]
+        fn a_second_token_replaces_the_first() {
+            assert_eq!(
+                listen(&[token(7, "t-1"), token(7, "t-2"), click(7)]),
+                clicked_with(Some("t-2"))
+            );
         }
     }
 }
@@ -584,7 +720,7 @@ mod tests {
         let activation: Activation = Box::pin(async move {
             let _signal = signal;
             std::future::pending::<()>().await;
-            false
+            None
         });
         (activation, rx)
     }
@@ -742,13 +878,20 @@ mod tests {
             .expect("a closed tab leaves no listener behind");
     }
 
+    fn clicked(token: Option<&str>) -> Activation {
+        Box::pin(std::future::ready(Some(Activated {
+            token: token.map(str::to_owned),
+        })))
+    }
+
     /// The click's whole path through this adapter: the listener resolves,
-    /// and the tab it was fired for lands on the engine feed.
+    /// and the tab it was fired for lands on the engine feed with the
+    /// server's activation token.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_clicked_banner_reaches_the_feed_as_an_activation() {
         let (show, mut shown) = recording_backend(vec![Ok(Shown {
             server_id: Some(11),
-            activation: Some(Box::pin(std::future::ready(true))),
+            activation: Some(clicked(Some("t-1"))),
         })]);
         let (feed, mut feed_rx) = engine_feed::channel();
         let wake = feed_rx.wake_handle();
@@ -761,19 +904,20 @@ mod tests {
         let mut batch = engine_feed::EngineBatch::default();
         assert!(matches!(
             feed_rx.try_next(&mut batch),
-            Some(EngineFeed::NotificationActivated { tab }) if tab == TabKey::local(7)
+            Some(EngineFeed::NotificationActivated { tab, token })
+                if tab == TabKey::local(7) && token.as_deref() == Some("t-1")
         ));
     }
 
     /// The listener's own verdict, awaited rather than raced: a dismiss (or
-    /// a server closing the banner) resolves the same future with `false`
+    /// a server closing the banner) resolves the same future with `None`
     /// and must put nothing on the feed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn only_a_click_on_the_banner_body_is_an_activation() {
         let (feed, mut feed_rx) = engine_feed::channel();
         let mut batch = engine_feed::EngineBatch::default();
 
-        spawn_listener(&feed, TabKey::local(7), Box::pin(std::future::ready(false)))
+        spawn_listener(&feed, TabKey::local(7), Box::pin(std::future::ready(None)))
             .await
             .expect("the listener ended");
         assert!(
@@ -781,12 +925,12 @@ mod tests {
             "a dismissed banner is not a jump"
         );
 
-        spawn_listener(&feed, TabKey::local(7), Box::pin(std::future::ready(true)))
+        spawn_listener(&feed, TabKey::local(7), clicked(None))
             .await
             .expect("the listener ended");
         assert!(matches!(
             feed_rx.try_next(&mut batch),
-            Some(EngineFeed::NotificationActivated { tab }) if tab == TabKey::local(7)
+            Some(EngineFeed::NotificationActivated { tab, token: None }) if tab == TabKey::local(7)
         ));
     }
 
@@ -800,18 +944,18 @@ mod tests {
         let (feed, mut feed_rx) = engine_feed::channel();
         let mut batch = engine_feed::EngineBatch::default();
 
-        spawn_listener(&feed, stale, Box::pin(std::future::ready(true)))
+        spawn_listener(&feed, stale, clicked(None))
             .await
             .expect("the listener ended");
         let activated = feed_rx.try_next(&mut batch);
         assert!(matches!(
             activated,
-            Some(EngineFeed::NotificationActivated { tab }) if tab == stale
+            Some(EngineFeed::NotificationActivated { tab, .. }) if tab == stale
         ));
         assert!(
             !matches!(
                 activated,
-                Some(EngineFeed::NotificationActivated { tab }) if tab == TabKey::local(7)
+                Some(EngineFeed::NotificationActivated { tab, .. }) if tab == TabKey::local(7)
             ),
             "the local tab 7 is a different tab and must not be named"
         );

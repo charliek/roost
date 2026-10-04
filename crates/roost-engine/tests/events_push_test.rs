@@ -815,6 +815,7 @@ fn every_workspace_event_has_a_wire_name() {
         shell_state: ShellState::ForegroundProcess,
         agent_lifecycle: AgentLifecycle::Inactive,
         ownership: None,
+        password_input: false,
     };
     let project = Project {
         id: 1,
@@ -912,6 +913,14 @@ fn every_workspace_event_has_a_wire_name() {
             },
             ops::EVENT_HOOK_ACTIVE_CHANGED,
             vec!["active", "tab_id"],
+        ),
+        (
+            WorkspaceEvent::TabPasswordInput {
+                tab_id: 5,
+                password_input: true,
+            },
+            ops::EVENT_TAB_PASSWORD_INPUT,
+            vec!["password_input", "tab_id"],
         ),
         (
             WorkspaceEvent::AgentChanged {

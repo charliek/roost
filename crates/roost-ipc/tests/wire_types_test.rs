@@ -27,9 +27,9 @@ use roost_ipc::messages::{
     SessionSetThemeParams, SessionSetThemeResult, SessionStopParams, SessionStopResult,
     SessionStoppingEvent, SkippedFile, StreamEndedEvent, TabClearNotificationParams,
     TabClearNotificationResult, TabDumpCursor, TabDumpParams, TabDumpResult, TabEffect,
-    TabEffectEvent, TabReorderParams, TabSendFileParams, TabSendFileResult, TabWriteParams,
-    WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
-    SESSION_STOPPING_EVENT, STREAM_ENDED_EVENT,
+    TabEffectEvent, TabListResult, TabPasswordInputEvent, TabReorderParams, TabSendFileParams,
+    TabSendFileResult, TabWriteParams, WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES,
+    SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT, STREAM_ENDED_EVENT,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -778,6 +778,79 @@ fn tab_dump_params_omit_an_unset_scrollback() {
 
     let decoded: TabDumpParams = serde_json::from_str(r#"{"tab_id":"5"}"#).unwrap();
     assert_eq!(decoded.scrollback, 0);
+}
+
+#[test]
+fn dispatch_mouse_event_vectors_decode_into_their_typed_shapes() {
+    use roost_ipc::messages::TabDispatchMouseEventParams;
+
+    for (name, params) in [
+        (
+            "tab.dispatch_mouse_event.request.json",
+            TabDispatchMouseEventParams {
+                tab_id: 5,
+                kind: "press".into(),
+                button: "left".into(),
+                cell_x: 10,
+                cell_y: 4,
+                mods: 0,
+                overshoot: 0,
+            },
+        ),
+        (
+            "tab.dispatch_mouse_event.overshoot.request.json",
+            TabDispatchMouseEventParams {
+                tab_id: 5,
+                kind: "motion".into(),
+                button: "left".into(),
+                cell_x: 0,
+                cell_y: 0,
+                mods: 0,
+                overshoot: -3,
+            },
+        ),
+    ] {
+        let request: roost_ipc::messages::RawRequest =
+            serde_json::from_str(&read_vector(name)).expect("decode request envelope");
+        assert_eq!(
+            request.op,
+            roost_ipc::messages::ops::TAB_DISPATCH_MOUSE_EVENT,
+            "{name}"
+        );
+        let decoded: TabDispatchMouseEventParams =
+            serde_json::from_value(request.params).expect("decode mouse event params");
+        assert_eq!(decoded, params, "{name}");
+        round_trip(&decoded);
+    }
+}
+
+/// `TabDispatchMouseEventParams` is `deny_unknown_fields`, so a request
+/// with no overshoot must not put the key on the wire, or a server that
+/// predates it rejects the whole request.
+#[test]
+fn dispatch_mouse_event_params_omit_a_zero_overshoot() {
+    use roost_ipc::messages::TabDispatchMouseEventParams;
+
+    let params = TabDispatchMouseEventParams {
+        tab_id: 5,
+        kind: "motion".into(),
+        button: "left".into(),
+        cell_x: 0,
+        cell_y: 0,
+        mods: 0,
+        overshoot: 0,
+    };
+    assert_eq!(
+        serde_json::to_string(&params).unwrap(),
+        r#"{"tab_id":"5","kind":"motion","button":"left","cell_x":0,"cell_y":0,"mods":0}"#
+    );
+    let past_the_bottom = TabDispatchMouseEventParams {
+        overshoot: 2,
+        ..params
+    };
+    assert!(serde_json::to_string(&past_the_bottom)
+        .unwrap()
+        .ends_with(r#""mods":0,"overshoot":2}"#));
 }
 
 #[test]
@@ -2010,4 +2083,55 @@ fn project_ensure_vectors_decode_into_their_typed_shapes() {
     let made = result("project.ensure.created.response.json");
     assert!(made.created);
     assert_eq!(made.project.name, params.name);
+}
+
+// ---------------------------------------------------------------------------
+// password_input (plan 074 §D2): an additive tab field and event, no bump
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tab_password_input_vector_decodes_into_its_typed_shape() {
+    let envelope: EventEnvelope =
+        serde_json::from_str(&read_vector("tab.password_input.event.json"))
+            .expect("decode event envelope");
+    assert_eq!(envelope.event, ops::EVENT_TAB_PASSWORD_INPUT);
+    let data: TabPasswordInputEvent =
+        serde_json::from_value(envelope.data).expect("decode tab.password_input data");
+    assert_eq!(data.tab_id, 5);
+    assert!(data.password_input);
+    round_trip(&data);
+}
+
+/// The `tab.list` an older session answers has no `password_input` key
+/// at all. A client built after the field must read every such tab as
+/// not at a prompt rather than refuse the snapshot, and put nothing back
+/// on the wire for it either.
+#[test]
+fn a_tab_list_from_before_password_input_reads_every_tab_as_false() {
+    for name in ["tab.list.response.json", "tab.list.session.response.json"] {
+        let resp: roost_ipc::messages::Response =
+            serde_json::from_str(&read_vector(name)).expect("decode response envelope");
+        let decoded: TabListResult = serde_json::from_value(resp.result.expect("result body"))
+            .unwrap_or_else(|error| {
+                panic!("{name}: a tab without password_input must decode: {error}")
+            });
+        let tabs: Vec<_> = decoded
+            .projects
+            .into_iter()
+            .flat_map(|project| project.tabs)
+            .collect();
+        assert!(!tabs.is_empty(), "{name} lists no tab to check");
+        for tab in tabs {
+            assert!(
+                !tab.password_input,
+                "{name}: tab {} read as at a prompt",
+                tab.id
+            );
+            let encoded = serde_json::to_value(&tab).unwrap();
+            assert!(
+                encoded.get("password_input").is_none(),
+                "{name}: an unset flag must stay off the wire: {encoded}"
+            );
+        }
+    }
 }

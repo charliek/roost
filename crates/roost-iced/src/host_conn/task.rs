@@ -158,8 +158,20 @@ impl Resume {
     pub(crate) fn freeze(&self) -> Resume {
         Resume {
             session_id: self.session_id.clone(),
-            mirror: Arc::new(SharedMirror::new(self.mirror.snapshot())),
+            mirror: self.mirror.detached(),
         }
+    }
+}
+
+/// Takes the mirror's `password_input` down on every exit from
+/// `Connected` (plan 074 §D2): a `Drop`, for the same reason the upload
+/// lane is — the loop's future can be dropped by [`run`]'s grace timer,
+/// and that runs no code after the `await`.
+struct SuspendsPasswordInput(Arc<SharedMirror>);
+
+impl Drop for SuspendsPasswordInput {
+    fn drop(&mut self) {
+        self.0.read().suspend_password_input();
     }
 }
 
@@ -572,6 +584,7 @@ async fn connect_loop(
             None => ConnEnd::Shutdown,
             Some(Err(error)) => error.into(),
             Some(Ok(live)) => {
+                let _password_input = SuspendsPasswordInput(Arc::clone(&live.mirror));
                 // Taken before the connection is served rather than
                 // after: both halves of a checkpoint are known the
                 // moment the prologue ends, and the fence is read off
@@ -810,6 +823,14 @@ async fn attempt(
     //    the subscribe is fenced on, so the recovery is a second read
     //    rather than a reordering (#481).
     facts.persist_error = session_identify(&mut control).await?.persist_error;
+
+    // Only once nothing in the attempt can fail: a resume that dies after
+    // restoring leaves its checkpoint raised while disconnected, where
+    // nothing will suspend it again. The caller's first act with the
+    // connection is a `SuspendsPasswordInput`, with no await before it, so
+    // every exit from here on suspends it. A fresh mirror has nothing
+    // suspended to restore.
+    mirror.read().resume_password_input();
 
     let live = Live {
         control,
@@ -3191,6 +3212,80 @@ mod tests {
             resumed(&states),
             Some(ResumeFacts { from_revision: 7 }),
             "and `host.status` reports the ack's fence, not the request's"
+        );
+    }
+
+    /// Plan 074 §D2's reattach, through the production prologue. A
+    /// checkpoint handed to a connection that does not exist yet carries
+    /// a tab's password prompt down; resuming the stream puts it back,
+    /// because a resume takes no `tab.list` to reseed it from; and the
+    /// connection ending takes it down again.
+    #[tokio::test]
+    async fn a_resume_reseeds_the_password_prompt_its_checkpoint_held() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("resume-prompt.sock");
+        let fake = Fake::new(PutFile::Land);
+        fake.serve(&socket);
+
+        let mut rows = crate::host_conn::fixtures::a_mirror(&[1]);
+        rows.projects[0].tabs[0].password_input = true;
+        let checkpoint = Resume {
+            session_id: SESSION_ID.into(),
+            mirror: Arc::new(SharedMirror::new(rows)),
+        }
+        .freeze();
+        let mirror = Arc::clone(&checkpoint.mirror);
+        let at_prompt = || mirror.read().tab(1).expect("the tab").password_input;
+        assert!(
+            !at_prompt(),
+            "a checkpoint for a later connection is a dropped one"
+        );
+
+        let mut host = Connected::resuming(socket, HostTransport::UnixSocket, checkpoint);
+        host.states.until_connected(&mut host.feed, 1).await;
+        assert_eq!(fake.snapshots(), 0, "a resume, not a fresh snapshot");
+        assert!(at_prompt(), "the resumed connection lost the prompt");
+
+        host.stop().await;
+        assert!(!at_prompt(), "the ended connection left the prompt up");
+    }
+
+    /// A resume that fails after its stream resumed — here the second
+    /// `session.identify` is refused — leaves the checkpoint it adopted
+    /// suspended: nothing serves that mirror, and nothing would suspend
+    /// it again.
+    #[tokio::test]
+    async fn a_resume_that_fails_late_leaves_the_prompt_suspended() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("resume-fails.sock");
+        let fake = Fake::new(PutFile::Land).refusing_after(ops::SESSION_IDENTIFY, "internal", 1);
+        fake.serve(&socket);
+
+        let mut rows = crate::host_conn::fixtures::a_mirror(&[1]);
+        rows.projects[0].tabs[0].password_input = true;
+        let checkpoint = Resume {
+            session_id: SESSION_ID.into(),
+            mirror: Arc::new(SharedMirror::new(rows)),
+        }
+        .freeze();
+        let mirror = Arc::clone(&checkpoint.mirror);
+
+        let mut host = Connected::resuming(socket, HostTransport::UnixSocket, checkpoint);
+        until_state(&mut host, "the attempt to fail", |state| {
+            matches!(state, HostConnState::Disconnected(_))
+        })
+        .await;
+        assert_eq!(
+            fake.subscribes()
+                .iter()
+                .map(|params| params.from_revision)
+                .collect::<Vec<_>>(),
+            vec![Some(1)],
+            "the stream resumed before the identify failed"
+        );
+        assert!(
+            !mirror.read().tab(1).expect("the tab").password_input,
+            "a failed resume left the disconnected mirror raised"
         );
     }
 

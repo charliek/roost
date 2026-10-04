@@ -12,5 +12,6 @@ no equivalent of MkDocs `exclude_docs`.
 | [agent-watching.md](agent-watching.md) | Expanding agent coverage (hooks + screen/process fallback) without blocking host sessions. |
 | [swift-retirement.md](swift-retirement.md) | Retiring the Swift `Roost.app`: iced takes over the Mac identity, the Mac feature gaps to close (with what plan 073, the first gap release, shipped or deferred), the removal inventory, the `roost-legacy-swift` extraction, issue triage, and phases: Swift frozen, gap releases, then the v0.1.0 cutover. |
 | [text-rendering.md](text-rendering.md) | Tuning iced's terminal text, especially on macOS: how it renders today, a side-by-side with the Swift app, lessons from Ghostty and cosmic-term, and tiered options. Marks what plan 073 shipped (all of Tier 0, plus cursor, selection and macOS cell metrics) and its findings. |
+| [chrome-themes.md](chrome-themes.md) | Chrome themes, user color overrides, per-region translucency, and following system light/dark: what plan 073's `ChromePalette` seam allows, what iced 0.14 and winit already support on each OS, and the open questions for a post-v0.1.0 planning session (#584, #164). |
 
 Update the notes when a later pass changes a recommendation. Implementation plans and `docs/development/vision.md` decision-log edits belong in the PR that actually builds the feature.

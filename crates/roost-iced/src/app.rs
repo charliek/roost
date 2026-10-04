@@ -13,9 +13,9 @@ use iced::keyboard::{self, key::Named, Key};
 use iced::widget::Id;
 use iced::widget::{
     button, column, container, image, mouse_area, row, scrollable, stack, text, text_input,
-    toggler, Column, Row, Space,
+    toggler, tooltip, Column, Row, Space,
 };
-use iced::{font, window, Alignment, Color, Element, Fill, Font, Shrink, Size};
+use iced::{font, window, Alignment, Color, Element, Fill, Font, Point, Shrink, Size};
 use roost_engine::git_metrics;
 use roost_engine::ipc::{
     ClipboardOp, DumpData, ExpandSelectionData, HostOpFailure, HostOpReply, IpcHandler,
@@ -33,11 +33,11 @@ use roost_engine::{
 use roost_ipc::agent;
 use roost_ipc::messages::{
     AgentHooksOutcome, AgentHooksSkipped, AgentSetHooksAgents, AgentSetHooksResult,
-    AppMenuDumpResult, AppNotificationStatusResult, AppRenderStatsResult, AppUpdateStatusResult,
-    HostConnectStatus, HostConnectionResult, HostStatus, HostStatusResult, PaletteItemView,
-    PalettePresentResult, PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpHost,
-    SidebarDumpHostProject, SidebarDumpHostTab, SidebarDumpProject, SidebarDumpResult,
-    SidebarDumpSection, WindowMetricsResult,
+    AppLastActivationResult, AppMenuDumpResult, AppNotificationStatusResult, AppRenderStatsResult,
+    AppUpdateStatusResult, HostConnectStatus, HostConnectionResult, HostStatus, HostStatusResult,
+    PaletteItemView, PalettePresentResult, PaletteStateResult, Project, SidebarDumpAgentRow,
+    SidebarDumpHost, SidebarDumpHostProject, SidebarDumpHostTab, SidebarDumpProject,
+    SidebarDumpResult, SidebarDumpSection, WindowMetricsResult,
 };
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::{codes, IpcServer, LocalBackendCell, LocalBackendMode};
@@ -103,6 +103,7 @@ mod servicing;
 mod tab_backend;
 mod tab_memory;
 mod terminal_tab;
+pub(crate) mod window_frame;
 // The in-crate `#[ignore]`d perf harness — see `tools/perf/README.md` for
 // how to run it. Gated on `cfg(test)` like `terminal_tab`'s test-only
 // `attach_test_terminal` fixture it depends on; it carries no production
@@ -131,8 +132,10 @@ use self::pending_selection::{Creation, PendingHostSelection, PendingStep};
 pub(crate) use self::servicing::{AgentMetricsResult, ATTACH_RETRY_INTERVAL};
 use self::tab_backend::{TabBackend, TabHandle};
 use self::terminal_tab::{
-    apply_geometry_batch, clear_preedit_or_warn, pointer_origin_tab, refresh_or_warn,
-    terminal_grid, GeometryBatchOperation, GeometryChange, NativePointerDispatch, TerminalTab,
+    apply_geometry_batch, autoscroll_selections, cancel_tab_pointers, clear_preedit_or_warn,
+    pointer_origin_tab, refresh_or_warn, refuse_stale_press, release_host_pointer_before_detach,
+    terminal_grid, terminal_viewport, GeometryBatchOperation, GeometryChange,
+    NativePointerDispatch, PressGate, TerminalTab,
 };
 #[cfg(test)]
 use self::terminal_tab::{
@@ -146,9 +149,10 @@ const DEFAULT_ROWS: u16 = 32;
 /// that ignored it cannot pass for one that used it.
 #[cfg(test)]
 const SPAWN_GRID: (u16, u16) = (137, 43);
-/// The size the window opens at, before the first resize reports the
-/// one the window manager actually gave it.
+/// The size the window opens at when no frame is remembered, before the
+/// first resize reports the one the window manager actually gave it.
 pub(crate) const INITIAL_WINDOW_SIZE: Size = Size::new(1100.0, 720.0);
+pub(crate) const MIN_WINDOW_SIZE: Size = Size::new(640.0, 360.0);
 const STATUS_BANNER_DURATION: Duration = Duration::from_secs(5);
 /// How often the banner's expiry is checked while one is up. Coarse
 /// against the five-second life it polices — the banner is allowed to
@@ -159,6 +163,9 @@ const CONFIRM_PANEL_WIDTH: f32 = 420.0;
 /// title width while a pill is being renamed, so an editing pill sizes by
 /// the same rule as every other one.
 const RENAME_FIELD_WIDTH: f32 = 140.0;
+const SECURE_INPUT_TOOLTIP: &str = "Secure Keyboard Entry is on: other apps can't read your \
+     keystrokes. It turns on automatically at password prompts, or always if Roost \u{203a} \
+     Secure Keyboard Entry is checked.";
 
 /// The tab pill the strip reveal scrolls to. Keyed by the tab alone: the
 /// pill for a tab is one container wherever the strip reorders it to, and
@@ -407,6 +414,9 @@ const PENDING_HOST_SELECTION_DEADLINE: Duration = Duration::from_secs(10);
 /// parked focus waits on a mirror (plan 071 §D13). Nothing else drives
 /// the deadline above when no event arrives.
 pub(crate) const PENDING_SELECTION_TICK_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How often a selection drag held past the grid's edge scrolls (#342).
+pub(crate) const SELECTION_AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Whether a wait for a host's mirror to list a row, started at
 /// `armed`, has run out.
@@ -723,6 +733,49 @@ fn agent_hooks_row<'a>(
     .into()
 }
 
+/// The tab band: the strip and its `+` in a scroller, and the secure-input
+/// lock beside it while it shows.
+///
+/// One `Row` with the lock or without. Iced keys widget state by tree
+/// position, so a band that was the bare scroller without the lock would
+/// rebuild the strip whenever the lock came or went — and the press that
+/// selects a tab sitting at a password prompt does exactly that, in the
+/// update that armed `ReorderStrip`'s drag.
+fn tab_band<'a>(
+    tab_strip: ReorderStrip<'a>,
+    add_tab_button: Element<'a, Message>,
+    scroll_id: Id,
+    lock: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    // The `+` is a sibling of the strip — never inside its content, since
+    // the strip walks its own layout children for reorder hit-testing and
+    // an extra child there would corrupt the drag target index. As a
+    // sibling row inside the scrollable it hugs the last pill and scrolls
+    // with overflow (Mac parity: the Mac's trailing ＋ scrolls with the
+    // strip too; under overflow it scrolls offscreen — accepted, #281).
+    let tab_strip_row = row![tab_strip, add_tab_button]
+        .spacing(6)
+        .align_y(Alignment::Center);
+    // A zero-width scrollbar: any visible indicator overlays the 24px
+    // pills themselves and reads as a band across the tab row (#281) —
+    // the stock 10px filled rail, and even a 2px hover sliver, both did.
+    // Wheel/trackpad scrolling is independent of the scrollbar's size.
+    let tab_scroller = scrollable(tab_strip_row)
+        .id(scroll_id)
+        .direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::hidden(),
+        ))
+        .width(Fill)
+        .height(chrome::PILL_HEIGHT);
+    // The lock sits outside the scrollable, so it never scrolls away,
+    // and outside `ReorderStrip`, which hit-tests its own children.
+    row![tab_scroller]
+        .extend(lock)
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into()
+}
+
 /// The terminal area with its notice drawn in.
 ///
 /// Not a modal: the rest of the window stays live, because the user's
@@ -831,6 +884,35 @@ fn dialog_field<'a>(
     .spacing(3)
 }
 
+/// What `view` wraps around the terminal widget. iced keeps a widget's
+/// state only while every widget on the path to it keeps its shape, so a
+/// change here rebuilds the terminal widget holding no button: a press it
+/// held would never see its release, and its drag would never end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct TerminalWrapping {
+    sidebar_collapsed: bool,
+    notice: bool,
+    bottom_line: bool,
+    rename_editor: bool,
+    palette: bool,
+    modal: bool,
+}
+
+/// [`App::observe_terminal_wrapping`]'s step: record `now`, and when it
+/// differs from what was observed, let go of every terminal pointer and
+/// raise the press floor, as a context menu opening does (#342, #587).
+fn rewrap_lets_go(
+    observed: &mut TerminalWrapping,
+    now: TerminalWrapping,
+    tabs: &mut HashMap<TabKey, TerminalTab>,
+    press_floor: &mut u64,
+) {
+    if std::mem::replace(observed, now) != now {
+        cancel_tab_pointers(tabs, None, "pointer cancel: the terminal was rewrapped");
+        *press_floor = crate::terminal_widget::latest_press_seq();
+    }
+}
+
 /// What a window-focus transition tears down. A table rather than a
 /// straight-line body because the interesting part of the policy is what it
 /// leaves ALONE, and `App` needs a bound IPC socket plus a real `state.json`
@@ -847,6 +929,10 @@ struct FocusTeardown {
     /// A menu answers one click; a click into another app dismisses it,
     /// as a native menu's would.
     context_menu: bool,
+    /// A button held as focus leaves is released somewhere Roost never
+    /// hears, which would leave the terminal latched on it (#587) — the
+    /// principle Ghostty applies to a held key on focus loss.
+    terminal_pointers: bool,
     ime_composition: bool,
     /// Refocus only: macOS discards marked text when the window loses
     /// focus, so a commit arriving after refocus is fresh input (emoji
@@ -866,6 +952,7 @@ fn focus_teardown(focused: bool) -> FocusTeardown {
             drags: true,
             confirm_delete: false,
             context_menu: true,
+            terminal_pointers: true,
             ime_composition: true,
             ime_discard: false,
         }
@@ -1748,6 +1835,10 @@ fn regrid_window(
     metric_generation: u64,
 ) {
     for (key, tab) in tabs {
+        // The grid's edges moved under a pointer that may be holding still,
+        // so a held drag's overshoot is stale even when the cell count is
+        // not (#342).
+        tab.disarm_autoscroll();
         match tab.apply_geometry(cols, rows, metrics, metric_generation) {
             Ok(Some(change)) => {
                 host_tab::forget_resume_on_regrid(
@@ -1800,15 +1891,16 @@ fn forget_resumes_moved_by_wave(
 }
 
 /// [`App::current_grid`] for the launch's restored tabs, which spawn
-/// before the window exists: the grid it opens at, beside the sidebar
-/// `state.json` restores.
+/// before the window exists: the grid of the size it opens at, beside the
+/// sidebar `state.json` restores.
 fn initial_grid(
+    window_size: Size,
     sidebar_collapsed: bool,
     sidebar_width: f32,
     metrics: TerminalMetrics,
 ) -> (u16, u16) {
     terminal_grid(
-        INITIAL_WINDOW_SIZE,
+        window_size,
         effective_sidebar_width(sidebar_collapsed, sidebar_width),
         metrics,
     )
@@ -1848,18 +1940,6 @@ fn focus_tab_in_core(workspace: &Workspace, tab: TabKey) -> Result<(), String> {
         .focus_tab(tab_id)
         .map(|_| ())
         .map_err(|error| error.to_string())
-}
-
-/// See [`App::terminal_event_key`]. Split out so the "a host terminal is
-/// showing, so a bare id is that host's" rule can be checked without an
-/// `App` (which needs a bundle profile, the instance lock and the Iced
-/// runtime to build).
-fn terminal_event_key(active: TabKey, local_host: HostId, tab_id: i64) -> TabKey {
-    if active.tab == tab_id {
-        active
-    } else {
-        TabKey::new(local_host, tab_id)
-    }
 }
 
 /// The host tab whose attach a selection move releases, if any. See
@@ -2410,11 +2490,19 @@ pub enum UiTask {
     #[default]
     None,
     Then(Box<UiTask>, Box<UiTask>),
+    /// Both at once: neither waits for the other to finish.
+    Alongside(Box<UiTask>, Box<UiTask>),
     /// A mutation dispatched to the engine runtime. Its completion comes
     /// back as `Message::EngineOp`, never as a return value — the UI
     /// thread does not wait for the engine.
     EngineOp(EngineOpFuture),
-    Focus(window::Id),
+    /// Bring the window to the front, spending `token` — a notification
+    /// server's activation token for the click that asked — where the
+    /// platform needs one (#351).
+    Raise {
+        id: window::Id,
+        token: Option<String>,
+    },
     FocusWidget(Id),
     SelectAllWidget(Id),
     /// Take keyboard focus away from every focusable widget — how the Add
@@ -2480,6 +2568,19 @@ pub enum UiTask {
     QueryFullScreen(window::Id),
     /// Wait, then `Message::FullScreenSettled(generation)`.
     FullScreenSettle {
+        delay: Duration,
+        generation: u64,
+    },
+    /// The window frame's screen check, once the window exists (plan 074
+    /// §D5b), moving it onto a screen only as `check` allows. Answers as
+    /// `Message::WindowFrameChecked`.
+    CheckWindowFrame {
+        id: window::Id,
+        check: window_frame::FrameCheck,
+    },
+    /// Wait, ask the window's mode, then `Message::WindowFrameDue`.
+    WindowFrameDeadline {
+        id: window::Id,
         delay: Duration,
         generation: u64,
     },
@@ -2747,6 +2848,22 @@ impl UiTask {
             (task, next) => Self::Then(Box::new(task), Box::new(next)),
         }
     }
+
+    fn alongside(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::None, other) => other,
+            (task, Self::None) => task,
+            (task, other) => Self::Alongside(Box::new(task), Box::new(other)),
+        }
+    }
+}
+
+/// What a native resize schedules: the window bookkeeping, the full-screen
+/// re-query and its settle in order — and beside them, never behind, the
+/// frame save, whose 500 ms would otherwise start only once the settle's
+/// second had run out.
+fn after_resize(opened: UiTask, query: UiTask, settle: UiTask, save: UiTask) -> UiTask {
+    opened.then(query).then(settle).alongside(save)
 }
 
 struct WindowOpenResult {
@@ -2972,10 +3089,12 @@ pub struct App {
     projects: Vec<Project>,
     sidebar_agents: HashMap<ProjectKey, Vec<agent_palette::SidebarAgentRow>>,
     notification_inbox: notification_inbox::NotificationInbox,
+    last_activation: AppLastActivationResult,
     window_id: Option<window::Id>,
     pending_window_resize: Option<Size>,
     screenshots: ScreenshotQueue,
     window_size: Size,
+    window_frame: window_frame::WindowFrameMemory,
     /// Set only while the seam is being dragged; the engine holds the
     /// committed width, and persisting per pointer-move would rewrite
     /// `state.json` on every frame.
@@ -3030,6 +3149,8 @@ pub struct App {
     /// [`Self::show_agent_hooks_toast`].
     pending_agent_hooks_toast: Option<agent_hooks::AgentHooksToast>,
     rename_editor: Option<RenameEditor>,
+    /// See [`TerminalWrapping`].
+    terminal_wrapping: TerminalWrapping,
     rename_input_id: Id,
     rename_focus_requested: bool,
     rename_completion_key: Option<RenameCompletionKey>,
@@ -3112,8 +3233,8 @@ pub struct App {
     font_registry: &'static FontRegistry,
     terminal_metrics: TerminalMetrics,
     metric_generation: u64,
-    /// See `TerminalWidget::pointer_cancel_epoch`.
-    pointer_cancel_epoch: u64,
+    /// See [`PressGate::press_floor`].
+    press_floor: u64,
     keybindings: HashMap<Accel, KeybindAction>,
     active_theme_name: String,
     palette: Option<palette::PaletteState>,
@@ -3154,6 +3275,15 @@ pub struct App {
     /// the item's state even when it is already correct.
     #[cfg(target_os = "macos")]
     menu_can_check_updates: Option<bool>,
+    /// Secure Keyboard Entry's inputs as last pushed into its owner, so a
+    /// turn that moved none of them makes no Carbon call. `None` before
+    /// the window opens.
+    #[cfg(target_os = "macos")]
+    secure_inputs_pushed: Option<crate::secure_input::Inputs>,
+    /// The toggle as last checked on the menu row. `None` until the first
+    /// push, and again whenever the menu is rebuilt.
+    #[cfg(target_os = "macos")]
+    menu_secure_input: Option<bool>,
     git_probe: Arc<git_metrics::GitProbe>,
     metrics_cache: git_metrics::MetricsCache,
     provider_request: u64,
@@ -3418,6 +3548,10 @@ struct HostSelection {
 
 const BOOT_ABORT_DEADLINE: Duration = Duration::from_secs(2);
 const QUIT_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
+/// How long a clean exit waits for queued `config.conf` writes — normally
+/// none, or one that lands in milliseconds; the bound is for a write stuck
+/// behind another holder of `config.lock`.
+const CONFIG_DRAIN_DEADLINE: Duration = Duration::from_secs(2);
 const QUIT_RUNTIME_GRACE: Duration = Duration::from_secs(1);
 
 /// The engine runtime, whose drop gives up on blocking tasks after
@@ -3458,6 +3592,7 @@ struct StartedEngine {
     in_process_streams: Arc<roost_engine::ipc::InProcessStreams>,
     switch_gate: Arc<tokio::sync::RwLock<()>>,
     test_mode: bool,
+    opening: window_frame::OpeningFrame,
 }
 
 impl App {
@@ -3523,6 +3658,7 @@ impl App {
             in_process_streams,
             switch_gate,
             test_mode,
+            opening,
         } = match Self::start_engine(profile, &config, &runtime, &supervisor, terminal_metrics) {
             Ok(engine) => engine,
             Err(error) => {
@@ -3544,10 +3680,15 @@ impl App {
             projects: Vec::new(),
             sidebar_agents: HashMap::new(),
             notification_inbox: notification_inbox::NotificationInbox::new(),
+            last_activation: AppLastActivationResult::default(),
             window_id: None,
             pending_window_resize: None,
             screenshots: ScreenshotQueue::default(),
-            window_size: INITIAL_WINDOW_SIZE,
+            window_size: opening.size,
+            window_frame: window_frame::WindowFrameMemory::new(
+                window_frame::REMEMBERS_WINDOW_FRAME,
+                opening,
+            ),
             sidebar_drag_width: None,
             window_focused: true,
             title_fallback: title_fallback(profile.kind),
@@ -3566,6 +3707,7 @@ impl App {
             agent_hooks_applies: 0,
             pending_agent_hooks_toast: None,
             rename_editor: None,
+            terminal_wrapping: TerminalWrapping::default(),
             rename_input_id: Id::unique(),
             rename_focus_requested: false,
             rename_completion_key: None,
@@ -3598,7 +3740,7 @@ impl App {
             font_registry,
             terminal_metrics,
             metric_generation: 1,
-            pointer_cancel_epoch: 0,
+            press_floor: 0,
             keybindings,
             active_theme_name,
             palette: None,
@@ -3626,6 +3768,10 @@ impl App {
             full_screen_settle: TrailingDebounce::default(),
             #[cfg(target_os = "macos")]
             menu_can_check_updates: None,
+            #[cfg(target_os = "macos")]
+            secure_inputs_pushed: None,
+            #[cfg(target_os = "macos")]
+            menu_secure_input: None,
             palette_visibility_retries: 0,
             git_probe: Arc::new(git_metrics::GitProbe::new()),
             metrics_cache: git_metrics::MetricsCache::default(),
@@ -3721,13 +3867,22 @@ impl App {
             Arc::clone(supervisor),
             profile.socket_path.clone(),
         );
+        {
+            let _runtime = runtime.enter();
+            client.watch_password_input();
+        }
 
         // After `Workspace::open` (there is nothing to delete before
         // it) and before the hydrate, which would otherwise warn about
         // a populated in-process workspace this is about to empty.
         finish_switch_source_deletion(runtime, &client, profile, &resumed);
 
+        let opening = window_frame::OpeningFrame::from_saved(
+            workspace.window_frame(),
+            window_frame::REMEMBERS_WINDOW_FRAME,
+        );
         let grid = initial_grid(
+            opening.size,
             workspace.sidebar_collapsed(),
             workspace.sidebar_width() as f32,
             terminal_metrics,
@@ -3796,6 +3951,7 @@ impl App {
             in_process_streams,
             switch_gate,
             test_mode,
+            opening,
         })
     }
 
@@ -4003,6 +4159,7 @@ impl App {
         // policy B only fires for an unfocused window.
         self.init_notifications();
         self.follow_system_accent();
+        self.follow_app_activation();
         // Last, and off this thread: the agent-hooks ensure reads and
         // writes the user's dotfiles under an advisory lock (plan 046
         // §3.7). The window is up by the time its toast can land, which
@@ -4038,7 +4195,11 @@ impl App {
                 &self.feed_tx,
             );
         }
-        opened.task
+        let check = match self.window_frame.take_check() {
+            Some(check) => UiTask::CheckWindowFrame { id, check },
+            None => UiTask::None,
+        };
+        opened.task.then(check)
     }
 
     /// The startup ensure came back. The toast names the agents the
@@ -4572,7 +4733,77 @@ impl App {
             self.invalidate_palette_geometry(PaletteVisibilityRequest::Reveal);
         }
         let settle = self.schedule_full_screen_settle();
-        opened.task.then(self.query_full_screen()).then(settle)
+        let armed = self.window_frame.resized(size);
+        let save = self.arm_frame_save(armed);
+        after_resize(opened.task, self.query_full_screen(), settle, save)
+    }
+
+    /// The frame the window is created at — the one bootstrap already
+    /// spawned the restored tabs' grid from.
+    pub fn window_opening(&self) -> window_frame::OpeningFrame {
+        self.window_frame.opening()
+    }
+
+    /// A native move of the window's outer top-left. Subscribed only where
+    /// the frame is remembered (`window_frame::REMEMBERS_WINDOW_FRAME`).
+    pub fn window_moved(&mut self, outer: Point) -> UiTask {
+        let armed = self.window_frame.moved(outer);
+        self.arm_frame_save(armed)
+    }
+
+    /// The post-open screen check answered (plan 074 §D5b).
+    pub fn window_frame_checked(&mut self, observed: Option<window_frame::CheckedFrame>) -> UiTask {
+        let armed = self.window_frame.checked(observed);
+        self.arm_frame_save(armed)
+    }
+
+    /// A frame save's deadline, with the window's mode, outer position and
+    /// content size read at it. A size the resize events missed takes the
+    /// delivered resize's own path, so the PTYs get its grid.
+    pub fn window_frame_due(
+        &mut self,
+        generation: u64,
+        mode: window::Mode,
+        outer: Option<Point>,
+        content: Size,
+    ) {
+        let answer = self.window_frame.deadline_answered(
+            &self.workspace,
+            generation,
+            mode,
+            outer,
+            content,
+            self.window_size,
+        );
+        if let Some(mode) = answer.mode {
+            self.sync_full_screen_title(mode);
+        }
+        if let Some(size) = answer.regrid {
+            tracing::debug!(
+                ?size,
+                gridded = ?self.window_size,
+                "window frame: re-grid for a resize the events missed"
+            );
+            self.resize(size);
+        }
+    }
+
+    fn arm_frame_save(&self, generation: Option<u64>) -> UiTask {
+        match (generation, self.window_id) {
+            (Some(generation), Some(id)) => UiTask::WindowFrameDeadline {
+                id,
+                delay: window_frame::SAVE_DELAY,
+                generation,
+            },
+            (Some(generation), None) => {
+                tracing::debug!(
+                    generation,
+                    "window frame: no window to schedule the save on"
+                );
+                UiTask::None
+            }
+            (None, _) => UiTask::None,
+        }
     }
 
     /// The wake this app's feed notifies on, for the subscription that
@@ -4918,6 +5149,7 @@ impl App {
         }
         if self.exit_state.take() {
             self.hosts.abandon_reconnects();
+            self.release_secure_input();
             UiTask::Exit
         } else {
             UiTask::None
@@ -4963,6 +5195,20 @@ impl App {
     pub fn reorder_hold_tick(&mut self) {
         self.reconcile_tab_drag_preview();
         self.reconcile_project_drag_preview();
+    }
+
+    /// A selection drag is held past the terminal's edge, so its
+    /// auto-scroll needs a clock (#342): a pointer holding still makes no
+    /// events of its own.
+    pub fn selection_autoscroll_pending(&self) -> bool {
+        self.tabs.values().any(TerminalTab::autoscroll_armed)
+    }
+
+    /// The auto-scroll's own tick — [`Self::selection_autoscroll_pending`]
+    /// armed it.
+    pub fn selection_autoscroll_tick(&mut self) {
+        let active = self.active_tab_key();
+        autoscroll_selections(&mut self.tabs, active, self.window_focused);
     }
 
     fn set_status(&mut self, message: impl Into<String>) {
@@ -5510,6 +5756,10 @@ impl App {
                 self.toggle_sidebar_agents();
                 Ok(UiTask::None)
             }
+            KeybindAction::ToggleSecureInput => {
+                self.toggle_secure_input();
+                Ok(UiTask::None)
+            }
             KeybindAction::AgentHooks => {
                 self.open_agent_hooks_preferences();
                 Ok(UiTask::None)
@@ -5583,19 +5833,19 @@ impl App {
         }
     }
 
-    /// The key an event off the terminal widget names. The widget renders
-    /// the selected tab and stamps its bare id onto every pointer, wheel
-    /// and hover event, so an id that still matches the selection belongs
-    /// to whatever host that selection is on — qualifying it at the local
-    /// backend would land the gesture on whichever LOCAL tab happens to
-    /// share the number while a host terminal is showing. An id that no
-    /// longer matches is a straggler from a previous frame and keeps
-    /// resolving exactly as it did before, at the local backend.
-    ///
-    /// With no host selection both branches are the same key, which is
-    /// what keeps the zero-host path byte-identical.
-    pub(super) fn terminal_event_key(&self, tab_id: i64) -> TabKey {
-        terminal_event_key(self.active_tab_key(), self.backend.host(), tab_id)
+    /// The selected project's row, whichever host it lives on — what the
+    /// tab band draws its pills from.
+    fn active_project_row(&self) -> Option<&Project> {
+        let key = self.active_project_key();
+        let projects = if key.is_local() {
+            self.projects.as_slice()
+        } else {
+            self.host_views
+                .iter()
+                .find(|view| view.host == key.host)
+                .map_or(&[][..], |view| view.projects.as_slice())
+        };
+        projects.iter().find(|project| project.id == key.project)
     }
 
     fn keyboard_route(&self) -> KeyboardRoute {
@@ -5647,6 +5897,9 @@ impl App {
         }
         if teardown.context_menu {
             self.close_context_menu();
+        }
+        if teardown.terminal_pointers {
+            self.cancel_terminal_pointers("pointer cancel on focus loss");
         }
         if teardown.ime_composition {
             self.cancel_ime_composition();
@@ -6187,6 +6440,32 @@ impl App {
         .into()
     }
 
+    /// The tab band's lock (plan 074 §D3): no click action, and a tooltip
+    /// that says what it means.
+    fn secure_input_lock(&self) -> Element<'_, Message> {
+        let glyph = column![
+            container(Space::new())
+                .width(chrome::LOCK_SHACKLE_SIZE.width)
+                .height(chrome::LOCK_SHACKLE_SIZE.height)
+                .style(chrome::lock_shackle(&self.chrome)),
+            container(Space::new())
+                .width(chrome::LOCK_BODY_SIZE.width)
+                .height(chrome::LOCK_BODY_SIZE.height)
+                .style(chrome::lock_body(&self.chrome)),
+        ]
+        .align_x(Alignment::Center);
+        let explanation = container(text(SECURE_INPUT_TOOLTIP).size(12).color(self.chrome.text))
+            .padding([6, 10])
+            .max_width(300)
+            .style(chrome::status_toast(&self.chrome, self.chrome.muted_text));
+        tooltip(
+            container(glyph).center(chrome::PILL_HEIGHT),
+            explanation,
+            tooltip::Position::Bottom,
+        )
+        .into()
+    }
+
     fn view_body(&self) -> Element<'_, Message> {
         // `self.projects` is this backend's snapshot, so every id read out
         // of it below qualifies at this backend's instance.
@@ -6367,23 +6646,7 @@ impl App {
             .padding(iced::Padding::default().right(chrome::DIVIDER_WIDTH))
             .style(chrome::divider(&self.chrome));
 
-        // The tab bar renders the selected project's tabs, whichever host
-        // it lives on — the pills themselves are host-blind, so only the
-        // list they come from changes.
-        let active_project_model = if active_project_key.is_local() {
-            self.projects
-                .iter()
-                .find(|project| project.id == active_project)
-        } else {
-            self.host_views
-                .iter()
-                .find(|view| view.host == active_project_key.host)
-                .and_then(|view| {
-                    view.projects
-                        .iter()
-                        .find(|project| project.id == active_project)
-                })
-        };
+        let active_project_model = self.active_project_row();
         let authoritative_tab_ids = active_project_model
             .map(|project| project.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>())
             .unwrap_or_default();
@@ -6575,39 +6838,26 @@ impl App {
             .padding(1)
             .style(chrome::transparent_button(&self.chrome))
             .on_press(Message::NewTab);
-        // The `+` is a sibling of the strip — never inside its content, since
-        // the strip walks its own layout children for reorder hit-testing and
-        // an extra child there would corrupt the drag target index. As a
-        // sibling row inside the scrollable it hugs the last pill and scrolls
-        // with overflow (Mac parity: the Mac's trailing ＋ scrolls with the
-        // strip too; under overflow it scrolls offscreen — accepted, #281).
-        let tab_strip_row = row![tab_strip, add_tab_button]
-            .spacing(6)
-            .align_y(Alignment::Center);
-        // A zero-width scrollbar: any visible indicator overlays the 24px
-        // pills themselves and reads as a band across the tab row (#281) —
-        // the stock 10px filled rail, and even a 2px hover sliver, both did.
-        // Wheel/trackpad scrolling is independent of the scrollbar's size.
-        let tab_scroller = scrollable(tab_strip_row)
-            .id(self.tab_strip_scroll_id.clone())
-            .direction(scrollable::Direction::Horizontal(
-                scrollable::Scrollbar::hidden(),
-            ))
-            .width(Fill)
-            .height(chrome::PILL_HEIGHT);
-        let tab_bar = container(tab_scroller)
-            .height(chrome::BAND_HEIGHT)
-            .width(Fill)
-            .padding([chrome::BAND_PILL_PADDING_Y, 8.0])
-            .style(chrome::band(&self.chrome));
+        let lock = self
+            .secure_input_indicator()
+            .then(|| self.secure_input_lock());
+        let tab_bar = container(tab_band(
+            tab_strip,
+            add_tab_button.into(),
+            self.tab_strip_scroll_id.clone(),
+            lock,
+        ))
+        .height(chrome::BAND_HEIGHT)
+        .width(Fill)
+        .padding([chrome::BAND_PILL_PADDING_Y, 8.0])
+        .style(chrome::band(&self.chrome));
 
         let terminal: Element<'_, Message> = match self.tabs.get(&active_key) {
             Some(tab) if tab.applied_metrics.is_some() => TerminalWidget {
-                tab_id: active_key.tab,
+                tab: active_key,
                 snapshot: tab.snapshot.clone(),
                 metrics: tab.applied_metrics.unwrap_or(self.terminal_metrics),
-                metric_generation: tab.metric_generation,
-                pointer_cancel_epoch: self.pointer_cancel_epoch,
+                cancelled_through: tab.cancelled_through,
                 ime_active: terminal_ime_active(
                     self.keyboard_route(),
                     active_key,
@@ -6931,6 +7181,25 @@ impl App {
             "false"
         };
         self.config_writer.set("show-sidebar-agents", value);
+    }
+
+    /// Flip the remembered Secure Keyboard Entry toggle (plan 074 §D3).
+    /// `update`'s funnel pushes it into the owner and onto the menu row.
+    /// Off macOS the feature does not exist, so the action is a logged
+    /// no-op that writes nothing.
+    fn toggle_secure_input(&mut self) {
+        if !cfg!(target_os = "macos") {
+            tracing::info!(
+                "toggle_secure_input: Secure Keyboard Entry is macOS-only; nothing to do"
+            );
+            return;
+        }
+        let manual = !self.config.macos_secure_keyboard_entry;
+        self.config.macos_secure_keyboard_entry = manual;
+        self.config_writer.set(
+            "macos-secure-keyboard-entry",
+            if manual { "true" } else { "false" },
+        );
     }
 
     pub fn new_tab(&mut self) -> UiTask {
@@ -7258,29 +7527,7 @@ impl App {
     /// tracking PTY — before a surface that drops pointer events takes
     /// input: a held terminal button would never see its own release.
     fn cancel_terminal_pointers(&mut self, reason: &'static str) {
-        let active = self.active_tab_key();
-        let mut active_released = true;
-        for (key, tab) in &mut self.tabs {
-            match tab.prepare_pointer_cancel() {
-                Ok(release) => {
-                    tab.commit_pointer_cancel(release);
-                    // The cancel drops hover, so the link underline and
-                    // pointer shape the snapshot carries are decorations
-                    // for a gesture that no longer exists.
-                    refresh_or_warn(key.tab, tab, reason);
-                }
-                Err(error) => {
-                    active_released &= *key != active;
-                    tracing::warn!(?error, tab_id = key.tab, "{reason}");
-                }
-            }
-        }
-        // The rendered widget drops its held button only when the active
-        // tab's tracking owner really was released; otherwise its next
-        // press would reach the PTY with no release before it.
-        if active_released {
-            self.pointer_cancel_epoch = self.pointer_cancel_epoch.wrapping_add(1);
-        }
+        cancel_tab_pointers(&mut self.tabs, None, reason);
     }
 
     /// The overlay is dismissed here, at the confirm, exactly as it was
@@ -7703,6 +7950,27 @@ impl App {
         notice::terminal_notice(&self.notice_input())
     }
 
+    /// Every update turn passes through here, after whatever opened or
+    /// closed something `view` wraps around the terminal: a palette, a
+    /// dialog, the rename editor, a notice, the bottom line, or a sidebar
+    /// collapse.
+    pub fn observe_terminal_wrapping(&mut self, notice_shown: bool) {
+        let now = TerminalWrapping {
+            sidebar_collapsed: self.workspace.sidebar_collapsed(),
+            notice: notice_shown,
+            bottom_line: self.bottom_line().is_some(),
+            rename_editor: self.rename_editor.is_some(),
+            palette: self.palette.is_some(),
+            modal: self.confirm_delete.is_some() || self.host_dialog.is_some(),
+        };
+        rewrap_lets_go(
+            &mut self.terminal_wrapping,
+            now,
+            &mut self.tabs,
+            &mut self.press_floor,
+        );
+    }
+
     /// Record which notice is on screen now, so the next dump or answer
     /// names the showing it read. Every update turn passes through here.
     pub fn observe_notice(&mut self) -> (u64, Option<Notice>) {
@@ -8013,7 +8281,22 @@ impl App {
         // `--tab` acts on (plan 063 §D1/§D10).
         self.publish_local_route();
         if let Some(tab) = released {
+            self.release_host_pointer(tab);
             self.host_detach_tab(tab);
+        }
+    }
+
+    /// See [`release_host_pointer_before_detach`].
+    fn release_host_pointer(&mut self, key: TabKey) {
+        let ops = self.hosts.ops_for(key.host);
+        let Some(tab) = self.tabs.get_mut(&key) else {
+            return;
+        };
+        let reason = "pointer release before a host tab detaches";
+        match release_host_pointer_before_detach(tab, key, ops) {
+            Ok(true) => refresh_or_warn(key.tab, tab, reason),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(?error, %key, "{reason}"),
         }
     }
 
@@ -9963,6 +10246,9 @@ fn pointer_button(button: PointerButton) -> roost_vt::MouseButton {
 
 impl Drop for App {
     fn drop(&mut self) {
+        // Again, for a teardown that did not come through Quit; it is
+        // latched, so a second call gives nothing back twice.
+        self.release_secure_input();
         // Freeze and fsync the authoritative layout before PTY-exit tasks can
         // observe teardown and attempt a later persistence write.
         //
@@ -9970,12 +10256,14 @@ impl Drop for App {
         // than the process being killed under it — the exit-on-empty path
         // depends on this running. There is no surface left to raise a
         // failure on, so the log is where it goes (#481).
-        match self.workspace.flush() {
+        match window_frame::flush_on_exit(&self.workspace, &mut self.window_frame) {
             Ok(()) => tracing::info!("workspace state flushed on shutdown"),
             Err(error) => {
                 tracing::error!(%error, "the workspace layout could not be written on shutdown")
             }
         }
+        self.config_writer
+            .drain_before_exit(&self.runtime, CONFIG_DRAIN_DEADLINE);
         // Hang the in-process shells up so their PTY readers finish before
         // the runtime drops. A session's tabs belong to its daemon, never
         // to this supervisor, so they are untouched.
@@ -10765,6 +11053,37 @@ mod tests {
     }
 
     #[test]
+    fn the_tab_strips_drag_survives_the_lock_coming_and_going() {
+        use iced::advanced::widget::Tree;
+
+        let band = |lock: bool| {
+            let pill = || Space::new().width(80).height(chrome::PILL_HEIGHT);
+            let strip =
+                ReorderStrip::tabs(row![pill(), pill()], HostId::LOCAL, 1, vec![7, 8], 0, true);
+            let add = Space::new()
+                .width(chrome::PILL_HEIGHT)
+                .height(chrome::PILL_HEIGHT);
+            let lock = lock.then(|| Space::new().width(16).height(chrome::PILL_HEIGHT).into());
+            tab_band(strip, add.into(), Id::new("tab-strip"), lock)
+        };
+        let mut tree = Tree::new(band(false));
+        crate::strip_reorder::press_strip_under(&mut tree, 8);
+
+        tree.diff(band(true));
+        assert_eq!(
+            crate::strip_reorder::strip_gesture_under(&mut tree),
+            Some(8),
+            "the press turned the lock on"
+        );
+        tree.diff(band(false));
+        assert_eq!(
+            crate::strip_reorder::strip_gesture_under(&mut tree),
+            Some(8),
+            "the press turned the lock off"
+        );
+    }
+
+    #[test]
     fn collapsed_sidebar_has_no_layout_width() {
         assert_eq!(effective_sidebar_width(false, 220.0), 220.0);
         assert_eq!(effective_sidebar_width(false, 340.0), 340.0);
@@ -10888,8 +11207,8 @@ mod tests {
     #[test]
     fn restored_tabs_spawn_at_the_first_windows_grid_beside_the_persisted_sidebar() {
         let metrics = TerminalMetrics::measure(13.0).expect("test metrics");
-        let expanded = initial_grid(false, 300.0, metrics);
-        let collapsed = initial_grid(true, 300.0, metrics);
+        let expanded = initial_grid(INITIAL_WINDOW_SIZE, false, 300.0, metrics);
+        let collapsed = initial_grid(INITIAL_WINDOW_SIZE, true, 300.0, metrics);
         assert_eq!(
             expanded,
             terminal_grid(INITIAL_WINDOW_SIZE, 300.0, metrics),
@@ -10901,6 +11220,13 @@ mod tests {
             "a collapsed sidebar takes nothing, whatever width it remembers"
         );
         assert!(collapsed.0 > expanded.0, "{collapsed:?} vs {expanded:?}");
+        let remembered = initial_grid(Size::new(900.0, 600.0), false, 300.0, metrics);
+        assert_eq!(
+            remembered,
+            terminal_grid(Size::new(900.0, 600.0), 300.0, metrics),
+            "a remembered window size is the one restored tabs spawn at"
+        );
+        assert_ne!(remembered, expanded);
     }
 
     #[test]
@@ -11105,40 +11431,6 @@ mod tests {
         });
         assert_eq!(pressed, Some(KeybindAction::CloseProject));
         assert_eq!(calls, 1);
-    }
-
-    /// The terminal widget stamps a bare tab id on every pointer, wheel
-    /// and hover event. While a host row is showing, that id is the
-    /// host's — resolving it at the local backend would land the gesture
-    /// on whichever local tab happens to share the number.
-    #[test]
-    fn a_terminal_event_qualifies_at_the_host_whose_terminal_is_showing() {
-        let local = HostId::LOCAL;
-        let remote = HostId::new(4);
-
-        // No host selection: every id is the local backend's, exactly as
-        // before the override existed.
-        assert_eq!(
-            terminal_event_key(TabKey::new(local, 7), local, 7),
-            TabKey::new(local, 7)
-        );
-        assert_eq!(
-            terminal_event_key(TabKey::new(local, 7), local, 9),
-            TabKey::new(local, 9)
-        );
-
-        // A host terminal is showing: its own id is its own key…
-        assert_eq!(
-            terminal_event_key(TabKey::new(remote, 7), local, 7),
-            TabKey::new(remote, 7),
-            "the same number under the local backend is a different tab"
-        );
-        // …and a straggler from a previous frame keeps resolving where it
-        // always did.
-        assert_eq!(
-            terminal_event_key(TabKey::new(remote, 7), local, 9),
-            TabKey::new(local, 9)
-        );
     }
 
     fn a_host_selection(host: HostId, project: i64, tab: i64) -> HostSelection {
@@ -12182,6 +12474,7 @@ mod tests {
             shell_state: ShellState::default(),
             agent_lifecycle: AgentLifecycle::default(),
             ownership: None,
+            password_input: false,
         }];
         listed.answer(Ok(serde_json::to_value(TabListResult {
             projects: vec![project],
@@ -12267,6 +12560,7 @@ mod tests {
             shell_state: Default::default(),
             agent_lifecycle: Default::default(),
             ownership: None,
+            password_input: false,
         };
         open.answer(Ok(serde_json::to_value(TabOpenResult { tab }).unwrap()));
 
@@ -12304,6 +12598,7 @@ mod tests {
             shell_state: Default::default(),
             agent_lifecycle: Default::default(),
             ownership: None,
+            password_input: false,
         }
     }
 
@@ -13431,6 +13726,10 @@ mod tests {
             unfocus.context_menu,
             "a click into another app dismisses the menu"
         );
+        assert!(
+            unfocus.terminal_pointers,
+            "a button's release while unfocused never reaches the terminal"
+        );
         assert!(unfocus.rename_completion_key);
         assert!(unfocus.ime_composition);
         assert!(!unfocus.ime_discard);
@@ -13605,6 +13904,60 @@ mod tests {
         };
         assert!(matches!(*first, UiTask::FocusWidget(_)));
         assert!(matches!(*second, UiTask::Resize(_, _)));
+    }
+
+    /// How long `task` runs before it starts a frame-save deadline — the
+    /// sleeps chained ahead of it — or `None` when it holds none.
+    fn delay_before_frame_save(task: &UiTask) -> Option<Duration> {
+        match task {
+            UiTask::WindowFrameDeadline { .. } => Some(Duration::ZERO),
+            UiTask::Then(first, second) => delay_before_frame_save(first)
+                .or_else(|| delay_before_frame_save(second).map(|delay| delay + run_time(first))),
+            UiTask::Alongside(first, second) => {
+                delay_before_frame_save(first).or_else(|| delay_before_frame_save(second))
+            }
+            _ => None,
+        }
+    }
+
+    /// How long `task` takes to finish, counting the sleeps it is made of.
+    fn run_time(task: &UiTask) -> Duration {
+        match task {
+            UiTask::FullScreenSettle { delay, .. } | UiTask::WindowFrameDeadline { delay, .. } => {
+                *delay
+            }
+            UiTask::Then(first, second) => run_time(first) + run_time(second),
+            UiTask::Alongside(first, second) => run_time(first).max(run_time(second)),
+            _ => Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn a_resize_starts_its_frame_save_without_waiting_out_the_full_screen_settle() {
+        let id = window::Id::unique();
+        let task = after_resize(
+            UiTask::Resize(id, Size::new(900.0, 600.0)),
+            UiTask::QueryFullScreen(id),
+            UiTask::FullScreenSettle {
+                delay: Duration::from_secs(1),
+                generation: 1,
+            },
+            UiTask::WindowFrameDeadline {
+                id,
+                delay: window_frame::SAVE_DELAY,
+                generation: 1,
+            },
+        );
+        assert_eq!(
+            delay_before_frame_save(&task),
+            Some(Duration::ZERO),
+            "the save's 500 ms must start with the resize, not after the settle"
+        );
+        assert_eq!(
+            run_time(&task),
+            Duration::from_secs(1),
+            "the settle still runs, after the re-query"
+        );
     }
 
     #[test]

@@ -24,6 +24,7 @@ precedent), so the module skips under `--roost-target mac`.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -61,6 +62,15 @@ CURSOR = (0xFF, 0x88, 0x00)
 SELECTION_THEME = "Synthwave"
 SELECTION_BACKGROUND = (0x19, 0xCD, 0xE6)
 SELECTION_FOREGROUND = (0x00, 0x00, 0x00)
+
+# Synthwave's `cursor-color` and `cursor-text`: the glyph under its block
+# cursor is the latter, not the terminal background (#000000).
+SYNTHWAVE_CURSOR = (0x19, 0xCD, 0xE6)
+SYNTHWAVE_CURSOR_TEXT = (0xFF, 0xFF, 0xED)
+# Synthwave's normal foreground, 38 away from its cursor-text: the tolerance
+# below must stay under that so the unchanged foreground can't pass.
+SYNTHWAVE_FOREGROUND = (0xDA, 0xD9, 0xC7)
+CURSOR_TEXT_TOL = 12
 
 # Ghostty-style ink: the glyph must carry no pixel this close to the cell's
 # normal foreground.
@@ -192,6 +202,36 @@ def _artifact(tmp_path: Path, name: str) -> Path:
     return artifact_dir / f"{name}-{renderer}.png"
 
 
+@contextmanager
+def _theme(roost, palette, tab, name: str):
+    """Select `name` through the palette for the body, then restore the
+    original theme."""
+    config_path = ui.owned_session_config_path()
+    if config_path is None:
+        pytest.skip("switching the theme requires a harness-owned config copy")
+    palette.palette_open()
+    themes = palette.palette_activate("select_theme")
+    original = themes["items"][themes["selection"]]
+    assert original["id"] != name, original
+    palette.palette_dismiss()
+    try:
+        palette.palette_open()
+        palette.palette_activate("select_theme")
+        assert palette.palette_activate(name)["open"] is False
+        Roost._wait(
+            lambda: _resolved_text_cell(roost, tab)["bg"].lower() == "#000000",
+            5.0,
+            f"{name} reaches the tab",
+        )
+        yield
+    finally:
+        palette.palette_dismiss()
+        palette.palette_open()
+        palette.palette_activate("select_theme")
+        assert palette.palette_activate(original["id"])["open"] is False
+        wait_for_config_line(config_path, "theme", f"theme = {original['id']}")
+
+
 @pytest.mark.skipif(
     not TEST_MODE,
     reason="scene injection and window focus require ROOST_TEST_MODE=1 in the UI's launch env",
@@ -236,24 +276,8 @@ class TestCellPaint:
     def test_a_selection_paints_the_theme_selection_colors(
         self, roost, project, palette, tmp_path
     ):
-        config_path = ui.owned_session_config_path()
-        if config_path is None:
-            pytest.skip("switching the theme requires a harness-owned config copy")
         tab = _scene_tab(roost, project)
-        palette.palette_open()
-        themes = palette.palette_activate("select_theme")
-        original = themes["items"][themes["selection"]]
-        assert original["id"] != SELECTION_THEME, original
-        palette.palette_dismiss()
-        try:
-            palette.palette_open()
-            palette.palette_activate("select_theme")
-            assert palette.palette_activate(SELECTION_THEME)["open"] is False
-            Roost._wait(
-                lambda: _resolved_text_cell(roost, tab)["bg"].lower() == "#000000",
-                5.0,
-                f"{SELECTION_THEME} reaches the tab",
-            )
+        with _theme(roost, palette, tab, SELECTION_THEME):
             _seed(roost, tab, b"\x1b[?25l" + SCENE_BYTES)
             foreground = _hex_rgb(_resolved_text_cell(roost, tab)["fg"])
             assert _dist(foreground, SELECTION_BACKGROUND) > 64
@@ -276,9 +300,27 @@ class TestCellPaint:
                     f"{foreground_ink[:4]}"
                 )
                 assert grid.corner(col, SCENE_ROW) == SELECTION_BACKGROUND, glyph
-        finally:
-            palette.palette_dismiss()
-            palette.palette_open()
-            palette.palette_activate("select_theme")
-            assert palette.palette_activate(original["id"])["open"] is False
-            wait_for_config_line(config_path, "theme", f"theme = {original['id']}")
+
+    def test_the_theme_cursor_text_inks_the_glyph_under_the_block_cursor(
+        self, roost, project, palette, tmp_path
+    ):
+        tab = _scene_tab(roost, project)
+        with _theme(roost, palette, tab, SELECTION_THEME):
+            # No OSC 12: the fill is the theme's cursor color.
+            _seed(roost, tab, b"\x1b[?25h\x1b[2 q" + SCENE_BYTES + b"\x1b[D")
+            cursor = roost.dump(tab)["cursor"]
+            assert (cursor["row"], cursor["col"]) == (SCENE_ROW, 2), cursor
+            assert roost.app_active_terminal_focused()
+
+            roost.app_set_window_focus(focus=True)
+            grid = _capture_grid(roost, tab, _artifact(tmp_path, "cursor-text"))
+            assert grid.corner(2, SCENE_ROW) == SYNTHWAVE_CURSOR
+            cell = grid.pixels(2, SCENE_ROW)
+            ink = max(cell, key=lambda px: _dist(px, SYNTHWAVE_CURSOR))
+            assert _dist(ink, SYNTHWAVE_FOREGROUND) > CURSOR_TEXT_TOL, (
+                f"the glyph under the block cursor kept the foreground {ink}"
+            )
+            assert _dist(ink, SYNTHWAVE_CURSOR_TEXT) <= CURSOR_TEXT_TOL, (
+                f"the strongest ink {ink} is not the theme's cursor-text "
+                f"{SYNTHWAVE_CURSOR_TEXT}"
+            )

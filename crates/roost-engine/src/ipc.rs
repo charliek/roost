@@ -30,24 +30,25 @@ use roost_ipc::messages::{
     AppContextMenuActivateParams, AppContextMenuDumpParams, AppContextMenuDumpResult,
     AppContextMenuOpenParams, AppContextMenuTarget, AppCursorShapeParams, AppCursorShapeResult,
     AppDialogAnswerParams, AppDialogDumpParams, AppDialogDumpResult, AppDockBadgeParams,
-    AppDockBadgeResult, AppKeyEventParams, AppKeybindDispatchParams, AppMenuActivateParams,
-    AppMenuDumpParams, AppMenuDumpResult, AppNoticeAnswerParams, AppNoticeDumpParams,
-    AppNoticeDumpResult, AppNotificationStatusParams, AppNotificationStatusResult,
-    AppRenderStatsParams, AppRenderStatsResult, AppSelectedTabIdParams, AppSelectedTabIdResult,
-    AppSetWindowFocusParams, AppUpdateCheckParams, AppUpdateStatusParams, AppUpdateStatusResult,
-    AttachPayloadKind, ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteFilesParams,
-    ClipboardWriteParams, EventsSubscribeParams, EventsSubscribeResult, Host, HostAddParams,
-    HostAddResult, HostConnectParams, HostConnectionResult, HostDisconnectParams, HostListParams,
-    HostListResult, HostRemoveParams, HostStatusParams, HostStatusResult, IdentifyParams,
-    IdentifyResult, NotificationCreateParams, PaletteActivateParams, PaletteDismissParams,
-    PaletteOpenParams, PalettePresentParams, PalettePresentResult, PaletteQueryParams,
-    PaletteStateParams, PaletteStateResult, ProjectCreateParams, ProjectCreateResult,
-    ProjectDeleteParams, ProjectEnsureParams, ProjectEnsureResult, ProjectRenameParams,
-    ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams,
-    SelectionDumpParams, SelectionDumpResult, SelectionSetParams, SessionIdentify,
-    SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams,
-    SessionSetThemeParams, SessionStopParams, SessionStopResult, SidebarDumpParams,
-    SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult, TabCapturePtyInputParams,
+    AppDockBadgeResult, AppKeyEventParams, AppKeybindDispatchParams, AppLastActivationParams,
+    AppLastActivationResult, AppMenuActivateParams, AppMenuDumpParams, AppMenuDumpResult,
+    AppNoticeAnswerParams, AppNoticeDumpParams, AppNoticeDumpResult, AppNotificationActivateParams,
+    AppNotificationStatusParams, AppNotificationStatusResult, AppRenderStatsParams,
+    AppRenderStatsResult, AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams,
+    AppUpdateCheckParams, AppUpdateStatusParams, AppUpdateStatusResult, AttachPayloadKind,
+    ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteFilesParams, ClipboardWriteParams,
+    EventsSubscribeParams, EventsSubscribeResult, Host, HostAddParams, HostAddResult,
+    HostConnectParams, HostConnectionResult, HostDisconnectParams, HostListParams, HostListResult,
+    HostRemoveParams, HostStatusParams, HostStatusResult, IdentifyParams, IdentifyResult,
+    NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
+    PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
+    PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
+    ProjectEnsureParams, ProjectEnsureResult, ProjectRenameParams, ProjectReorderParams,
+    ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
+    SelectionDumpResult, SelectionSetParams, SessionIdentify, SessionIdentifyParams,
+    SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams, SessionSetThemeParams,
+    SessionStopParams, SessionStopResult, SidebarDumpParams, SidebarDumpResult,
+    SidebarSetWidthParams, TabAgentReportResult, TabCapturePtyInputParams,
     TabCapturePtyInputResult, TabClearNotificationParams, TabClearNotificationResult,
     TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams,
     TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams,
@@ -455,6 +456,7 @@ pub enum UiRequest {
         cell_x: u32,
         cell_y: u32,
         mods: u32,
+        overshoot: i16,
         reply: UnitReply,
     },
     /// `app.set_window_focus` — drive the focus-tracking emit path
@@ -550,6 +552,12 @@ pub enum UiRequest {
         modifiers: Vec<String>,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// `app.secure_input` — Secure Keyboard Entry's state (plan 074
+    /// §D3). Gated like `AppDialogDump`; answered on every OS.
+    AppSecureInput {
+        reply:
+            tokio::sync::oneshot::Sender<Result<roost_ipc::messages::AppSecureInputResult, String>>,
+    },
     /// `app.context_menu_dump` — the right-click menu `target` would show
     /// now (plan 073 D9). Gated like `AppDialogDump`.
     AppContextMenuDump {
@@ -589,6 +597,20 @@ pub enum UiRequest {
     /// macOS-iced-only like `AppDockBadge`.
     AppNotificationStatus {
         reply: tokio::sync::oneshot::Sender<Result<AppNotificationStatusResult, String>>,
+    },
+    /// `app.notification_activate` — a click on `tab`'s desktop banner,
+    /// carrying `token` as the server's `ActivationToken` would, put on
+    /// the engine feed where a real click lands. Gated like
+    /// `AppDialogDump`.
+    AppNotificationActivate {
+        tab: WireTabRef,
+        token: Option<String>,
+        reply: HostOpReply<()>,
+    },
+    /// `app.last_activation` — what the last banner click's window raise
+    /// came to (#351). Gated like `AppDialogDump`.
+    AppLastActivation {
+        reply: HostOpReply<AppLastActivationResult>,
     },
     /// `agent.set_hooks` — set *this* machine's own `agent-hooks` key
     /// and raise every connected non-localhost host to at least the
@@ -4030,6 +4052,7 @@ async fn dispatch(
                 cell_x: p.cell_x,
                 cell_y: p.cell_y,
                 mods: p.mods,
+                overshoot: p.overshoot,
                 reply,
             })
             .await?
@@ -4190,6 +4213,14 @@ async fn dispatch(
             .map_err(map_test_op_err)?;
             Ok(serde_json::json!({}))
         }
+        ops::APP_SECURE_INPUT => {
+            let _: roost_ipc::messages::AppSecureInputParams = decode(params)?;
+            let result = h
+                .ui_call(|reply| UiRequest::AppSecureInput { reply })
+                .await?
+                .map_err(map_test_op_err)?;
+            encode(&result)
+        }
         ops::APP_CONTEXT_MENU_DUMP => {
             let p: AppContextMenuDumpParams = decode(params)?;
             let result = h
@@ -4240,6 +4271,23 @@ async fn dispatch(
                 .ui_call(|reply| UiRequest::AppNotificationStatus { reply })
                 .await?
                 .map_err(map_test_op_err)?;
+            encode(&result)
+        }
+        ops::APP_NOTIFICATION_ACTIVATE => {
+            let p: AppNotificationActivateParams = decode(params)?;
+            h.ui_call(|reply| UiRequest::AppNotificationActivate {
+                tab: p.tab_id,
+                token: p.token,
+                reply,
+            })
+            .await??;
+            Ok(serde_json::json!({}))
+        }
+        ops::APP_LAST_ACTIVATION => {
+            let _: AppLastActivationParams = decode(params)?;
+            let result = h
+                .ui_call(|reply| UiRequest::AppLastActivation { reply })
+                .await??;
             encode(&result)
         }
         // Answered by the app alone, with no headless fallback: the
@@ -4455,6 +4503,7 @@ const DISPATCHED_OPS: &[(&str, &[Withheld])] = {
         (ops::APP_NOTICE_DUMP, &[NeedsUi]),
         (ops::APP_NOTICE_ANSWER, &[NeedsUi, TestMode]),
         (ops::APP_KEY_EVENT, &[NeedsUi, TestMode]),
+        (ops::APP_SECURE_INPUT, &[NeedsUi, TestMode]),
         (ops::APP_CONTEXT_MENU_DUMP, &[NeedsUi, TestMode]),
         (ops::APP_CONTEXT_MENU_ACTIVATE, &[NeedsUi, TestMode]),
         (ops::APP_CONTEXT_MENU_OPEN, &[NeedsUi, TestMode]),
@@ -4464,6 +4513,8 @@ const DISPATCHED_OPS: &[(&str, &[Withheld])] = {
             ops::APP_NOTIFICATION_STATUS,
             &[NeedsUi, TestMode, MacosOnly],
         ),
+        (ops::APP_NOTIFICATION_ACTIVATE, &[NeedsUi, TestMode]),
+        (ops::APP_LAST_ACTIVATION, &[NeedsUi, TestMode]),
         (ops::EVENTS_SUBSCRIBE, &[]),
         (ops::AGENT_SET_HOOKS, &[UiSocketOnly, NeedsUi]),
         (ops::HOST_ADD, &[UiSocketOnly]),
@@ -5709,7 +5760,10 @@ mod tests {
         "app.dialog_dump",
         "app.key_event",
         "app.keybind_dispatch",
+        "app.last_activation",
         "app.notice_answer",
+        "app.secure_input",
+        "app.notification_activate",
         "app.set_window_focus",
         "clipboard.write_files",
         "sidebar.set_width",

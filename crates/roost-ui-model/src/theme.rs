@@ -32,6 +32,11 @@ pub struct Theme {
     /// branches, and keeping the field optional makes "theme didn't
     /// opt in" trivially visible in tests.
     pub bold_color: Option<ColorRgb>,
+    /// Ghostty `cursor-text`: the ink of the glyph under a block
+    /// cursor. `None` (absent, or Ghostty's `cell-foreground` /
+    /// `cell-background` keywords, which aren't supported) keeps the
+    /// cell background as that ink.
+    pub cursor_text: Option<ColorRgb>,
     pub palette: [ColorRgb; 256],
 }
 
@@ -62,6 +67,7 @@ impl Theme {
             selection_background: ColorRgb::new(0x44, 0x4f, 0x69),
             selection_foreground: ColorRgb::new(0xff, 0xff, 0xff),
             bold_color: None,
+            cursor_text: None,
             palette,
         }
     }
@@ -250,6 +256,13 @@ fn parse_theme(content: &str) -> Option<Theme> {
                     got_anything = true;
                 }
             }
+            "cursor-text" => match parse_hex(value) {
+                Some(rgb) => {
+                    t.cursor_text = Some(rgb);
+                    got_anything = true;
+                }
+                None => tracing::debug!(value, "theme cursor-text ignored: not #rgb or #rrggbb"),
+            },
             _ => {}
         }
     }
@@ -262,6 +275,9 @@ fn parse_theme(content: &str) -> Option<Theme> {
 
 fn parse_hex(s: &str) -> Option<ColorRgb> {
     let s = s.trim().strip_prefix('#')?;
+    if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     if s.len() == 6 {
         let r = u8::from_str_radix(&s[0..2], 16).ok()?;
         let g = u8::from_str_radix(&s[2..4], 16).ok()?;
@@ -299,6 +315,26 @@ mod tests {
     fn hex_short_form_expands() {
         let rgb = parse_hex("#fff").unwrap();
         assert_eq!(rgb, ColorRgb::new(0xff, 0xff, 0xff));
+    }
+
+    #[test]
+    fn malformed_hex_is_none_and_never_panics() {
+        for bad in [
+            "#1é",
+            "#é1",
+            "#ééé",
+            "#ab\u{e9}d",
+            "#+1+2+3",
+            "#12345g",
+            "#ggg",
+            "#",
+            "#12",
+            "fff",
+        ] {
+            assert_eq!(parse_hex(bad), None, "{bad}");
+        }
+        let parsed = parse_theme("background = #1e1e1e\ncursor-text = #1é\n").expect("parses");
+        assert!(parsed.cursor_text.is_none());
     }
 
     #[test]
@@ -369,6 +405,33 @@ mod tests {
         let snippet = "foreground = #ffffff\nbold-color = #aabbcc\n";
         let parsed = parse_theme(snippet).expect("snippet has parseable lines");
         assert_eq!(parsed.bold_color, Some(ColorRgb::new(0xaa, 0xbb, 0xcc)));
+    }
+
+    #[test]
+    fn parser_reads_cursor_text_in_both_hex_forms() {
+        let long = parse_theme("cursor-text = #ffffed\n").expect("parses");
+        assert_eq!(long.cursor_text, Some(ColorRgb::new(0xff, 0xff, 0xed)));
+        let short = parse_theme("cursor-text = #abc\n").expect("parses");
+        assert_eq!(short.cursor_text, Some(ColorRgb::new(0xaa, 0xbb, 0xcc)));
+    }
+
+    #[test]
+    fn a_theme_without_cursor_text_has_none() {
+        let parsed = parse_theme("background = #1e1e1e\n").expect("parses");
+        assert!(parsed.cursor_text.is_none());
+    }
+
+    #[test]
+    fn ghostty_cursor_text_keywords_are_ignored() {
+        let parsed =
+            parse_theme("background = #1e1e1e\ncursor-text = cell-background\n").expect("parses");
+        assert!(parsed.cursor_text.is_none());
+    }
+
+    #[test]
+    fn bundled_synthwave_sets_cursor_text() {
+        let theme = Theme::load_bundled("synthwave");
+        assert_eq!(theme.cursor_text, Some(ColorRgb::new(0xff, 0xff, 0xed)));
     }
 
     #[test]

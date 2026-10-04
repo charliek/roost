@@ -34,7 +34,7 @@ use roost_ipc::messages::{
     EventBatch, EventEnvelope, HookActiveChangedEvent, NotificationFiredEvent, ProjectCreatedEvent,
     ProjectDeletedEvent, ProjectRenamedEvent, ProjectsReorderedEvent, TabClosedEvent,
     TabCwdChangedEvent, TabEffect, TabEffectEvent, TabNotificationEvent, TabOpenedEvent,
-    TabStateChangedEvent, TabTitleChangedEvent, TabsReorderedEvent,
+    TabPasswordInputEvent, TabStateChangedEvent, TabTitleChangedEvent, TabsReorderedEvent,
 };
 use roost_ipc::PushSource;
 use tokio::sync::broadcast::error::RecvError;
@@ -176,6 +176,16 @@ pub fn envelope(event: &WorkspaceEvent) -> Option<EventEnvelope> {
             to_value(HookActiveChangedEvent {
                 tab_id: *tab_id,
                 active: *active,
+            }),
+        ),
+        WorkspaceEvent::TabPasswordInput {
+            tab_id,
+            password_input,
+        } => (
+            ops::EVENT_TAB_PASSWORD_INPUT,
+            to_value(TabPasswordInputEvent {
+                tab_id: *tab_id,
+                password_input: *password_input,
             }),
         ),
         // The one event whose wire shape is not its in-process shape:

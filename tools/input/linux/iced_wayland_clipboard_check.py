@@ -9,7 +9,9 @@ avoid programmatic Wayland clipboard seeding (which lacks an input serial):
   require the copied bytes on the initiating PTY;
 * perform a real pointer drag with copy-on-select=clipboard, inject Paste, and
   require the dragged bytes on the PTY;
-* drive native double/triple clicks and a combined Alt+pointer URL hover.
+* drive native double/triple clicks and a combined Alt+pointer URL hover;
+* hold a drag over the tab band above the grid, and require the auto-scrolled
+  selection, and the Paste of its copy, to span more than one screen.
 
 Those prove ordinary system clipboard ownership/read under real keyboard and
 pointer serials. PRIMARY/middle-click remains compositor-protocol-dependent and
@@ -35,7 +37,12 @@ sys.path.insert(0, str(REPO / "tools" / "roosttest"))
 sys.path.insert(0, str(REPO / "tools" / "screenshot"))
 
 import pngtool  # noqa: E402
-from iced_clipboard_check import TERMINAL_PADDING  # noqa: E402
+from iced_clipboard_check import (  # noqa: E402
+    AUTOSCROLL_PREFIX,
+    TERMINAL_PADDING,
+    _autoscroll_rows,
+    _seed_autoscroll_history,
+)
 
 ICED_BIN = Path(
     os.environ.get("ROOST_ICED_BIN") or REPO / "target" / "debug" / "roost-iced"
@@ -305,6 +312,82 @@ def _wait_for_selection(client, tab: int, expected: str, description: str) -> No
         ) from error
 
 
+def _wayland_drag_autoscroll(
+    client,
+    tab: int,
+    output: tuple[int, int],
+    sidebar: int,
+    cell: tuple[int, int],
+) -> None:
+    """#342 on a real seat: a drag held over the tab band, above the grid,
+    auto-scrolls, and the copy spans more than one screen. Cage fills the
+    output with the window, so nothing lies below it to drag into; the
+    downward half is the X11 check's."""
+    total = 600
+    last = _seed_autoscroll_history(client, tab, total)
+    dump = client.dump(tab)
+    rows = int(dump["rows"])
+    top = _autoscroll_rows(dump["rows_text"][0])[0]
+    anchor_row = dump["rows_text"].index(last)
+    # The auto-scroll runs only in a focused window; this lane proves the
+    # pointer path, not the compositor's focus.
+    client.app_set_window_focus(focus=True)
+    cell_width, cell_height = cell
+    terminal_top = round(client.terminal_top())
+    x0 = sidebar + TERMINAL_PADDING + int((len(last) - 0.5) * cell_width)
+    y0 = terminal_top + TERMINAL_PADDING + int((anchor_row + 0.5) * cell_height)
+    band_x = sidebar + TERMINAL_PADDING + cell_width // 2
+
+    def selected() -> list[int] | None:
+        return _autoscroll_rows(client.selection_dump(tab).get("text"))
+
+    # One device session holds the button down over the band for a fixed
+    # stretch; the IPC poll below is the fence that the scroll happened
+    # inside it.
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(INJECT_POINTER),
+            str(output[0]),
+            str(output[1]),
+            f"move {x0} {y0}",
+            "sleep 300",
+            "down LEFT",
+            "sleep 300",
+            f"move {band_x} 2",
+            f"sleep {int(4000 * SCALE)}",
+            "up LEFT",
+        ],
+    )
+    try:
+        _wait_until(
+            lambda: (selected() or [top])[0] <= top - rows,
+            f"real-seat Wayland drag held over the tab band selects a screen above "
+            f"{AUTOSCROLL_PREFIX}{top:03}",
+            timeout=15,
+        )
+    finally:
+        assert process.wait(timeout=15 * SCALE) == 0, "Wayland auto-scroll injector failed"
+
+    copied = selected()
+    assert copied, client.selection_dump(tab)
+    assert copied == list(range(copied[0], total)), (copied[:3], copied[-3:])
+    assert len(copied) > rows, f"the copy spans {len(copied)} rows; a screen is {rows}"
+    # Bracketed, so the pasted rows reach the PTY as one block whatever
+    # the shell makes of them.
+    client.tab_feed_pty_bytes(tab, b"\x1b[?2004h")
+    client.tab_capture_pty_input(tab, drain=True)
+    _inject_key("ALT", "V")
+    first, final = f"{AUTOSCROLL_PREFIX}{copied[0]:03}".encode(), last.encode()
+    _wait_until(
+        lambda: all(
+            needle in client.tab_capture_pty_input(tab, drain=False)
+            for needle in (first, final)
+        ),
+        "real-seat Wayland auto-scrolled copy-on-select to system Paste round trip",
+    )
+
+
 def main() -> int:
     if not ICED_BIN.is_file():
         _skip(f"Iced binary not found: {ICED_BIN}")
@@ -454,6 +537,10 @@ def main() -> int:
             lambda: client.app_cursor_shape() == "crosshair",
             "real-seat Wayland link hover restores OSC cursor",
         )
+
+        _wayland_drag_autoscroll(
+            client, tab, (width, height), sidebar, (cell_width, cell_height)
+        )
         assert process.poll() is None, "cage/Iced exited during clipboard checks"
     except Exception:
         for log_path in (cage_log, app_log):
@@ -479,7 +566,7 @@ def main() -> int:
     print(
         "PASS: Iced real-seat Wayland — stable-ID tab drag in both directions, "
         "explicit Copy/Paste, drag copy-on-select/Paste, native multi-click, "
-        "and link hover"
+        "link hover, and a drag auto-scrolled past the grid's top"
     )
     print("ACCEPTED LIMITATION: cage does not advertise PRIMARY; middle-click is X11-gated")
     return 0
