@@ -1097,6 +1097,12 @@ impl TerminalTab {
                 Ok(NativePointerOutcome::default())
             }
             PointerAction::Motion => match self.local_pointer_gesture {
+                // A motion that belongs to no press is the pointer hovering:
+                // it is not the held button's drag, so it neither moves the
+                // selection nor stops its auto-scroll (#606).
+                Some(LocalPointerGesture::Selection) if press_seq.is_none() => {
+                    Ok(NativePointerOutcome::default())
+                }
                 Some(LocalPointerGesture::Selection) => {
                     let extended = self.selection.update(&self.terminal, cell.0, cell.1)?;
                     self.autoscroll = match press_seq {
