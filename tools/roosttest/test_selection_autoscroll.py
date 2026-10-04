@@ -115,6 +115,7 @@ def _hold(
     between the press and the timeout raises `_NativeFocusLost`. Any other
     timeout fails the case and names the focus state."""
     _, before = _native_focus(roost)
+    top_at_press = roost.dump(tab)["rows_text"][0]
     _drag(roost, tab, "press", press)
     try:
         _drag(roost, tab, "motion", held, overshoot=overshoot)
@@ -122,15 +123,30 @@ def _hold(
             roost._wait(reached, 10.0, what)
         except Timeout as timeout:
             focused, after = _native_focus(roost)
+            state = _hold_state(roost, tab, top_at_press)
             if after > before:
                 raise _NativeFocusLost(
                     f"{timeout}: the OS took focus from the window {after - before}x during the hold"
+                    f" ({state})"
                 ) from timeout
             raise AssertionError(
-                f"{timeout} (window_focused={focused}, no native focus loss during the hold)"
+                f"{timeout} (window_focused={focused}, no native focus loss during the hold; {state})"
             ) from timeout
     finally:
         _drag(roost, tab, "release", held, overshoot=overshoot)
+
+
+def _hold_state(roost, tab: int, top_at_press: str) -> str:
+    """Where a stalled hold got to, read raw so a partial row shows as is:
+    whether the view scrolled, and the selection's ends, if it has any.
+    Best effort: a failed read is reported, never raised over the timeout."""
+    try:
+        top = roost.dump(tab)["rows_text"][0]
+        rows = (roost.selection_dump(tab).get("text") or "").split("\n")
+    except Exception as error:
+        return f"the hold's state could not be read: {error!r}"
+    selection = f"selection {rows[0]!r}..{rows[-1]!r}" if rows != [""] else "no selection"
+    return f"view top {top!r}, {top_at_press!r} at the press; {selection}"
 
 
 def _selected_rows(roost, tab: int) -> list[int]:
