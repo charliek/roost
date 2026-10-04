@@ -1643,13 +1643,12 @@ jobs:
       # runner's own responsible process already holds every grant the helper
       # needs (plan 074 §2.12), so there is no TCC grant step: `direct` mode
       # runs the helper as this step's child, and preflight fails loudly if a
-      # future image drops those grants. Non-blocking until it qualifies under
-      # §D7's promotion rule, which reads this step's `outcome` (the
-      # `conclusion` is masked by continue-on-error) and the JUnit report.
-      - name: Run Mac real-input suite (macOS, experimental)
+      # future image drops those grants. Blocking since it qualified under
+      # §D7's promotion rule (three consecutive attempts of one commit with
+      # every scenario passing, plan 074); `outcome` is still recorded below.
+      - name: Run Mac real-input suite (macOS)
         id: real-input-mac
         if: runner.os == 'macOS' && matrix.renderer == 'wgpu'
-        continue-on-error: true
         timeout-minutes: 10
         shell: bash
         env:
@@ -1670,9 +1669,9 @@ jobs:
             --roost-target iced -v \
             --junitxml="$ROOST_E2E_ARTIFACT_DIR/junit.xml"
 
-      # The promotion rule needs the step's `outcome`, which continue-on-error
-      # masks in its conclusion, so it is written where a reader can find it:
-      # the job summary, and outcome.txt beside the JUnit report.
+      # The step's `outcome`, written where a reader can find it: the job
+      # summary, and outcome.txt beside the JUnit report (the promotion rule
+      # read it while the step was still continue-on-error).
       - name: Record Mac real-input outcome (macOS)
         if: always() && runner.os == 'macOS' && matrix.renderer == 'wgpu'
         shell: bash

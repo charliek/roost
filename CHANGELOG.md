@@ -117,8 +117,8 @@ release workflow asserts they agree).
   (`make e2e-iced-real-input-mac`). It covers Option as Meta by side,
   Shift+Enter, the native context popup, full screen, Secure Keyboard
   Entry, selection auto-scroll, the remembered window frame and SGR mouse
-  clicks, and runs as an experimental step on GitHub's hosted macOS
-  runner. See
+  clicks, and runs as a blocking step on GitHub's hosted macOS runner.
+  See
   [`test-automation.md`](docs/development/test-automation.md#the-mac-real-input-harness).
 
 ### Changed

@@ -153,8 +153,9 @@ auto-scroll, the remembered window frame and SGR mouse clicks.
   Screen Recording once, and never rebuilt (a rebuild changes the ad-hoc
   signature and voids the grants). On GitHub's hosted macOS runner it runs in
   *direct mode* (`ROOST_REAL_INPUT_MODE=direct`): the job's own processes
-  already hold those grants, so there is no grant step. CI runs it as an
-  experimental step.
+  already hold those grants, so there is no grant step. CI runs the whole
+  suite as a blocking step of the macOS/wgpu `iced-build-e2e` cell (promoted
+  after three consecutive qualifying attempts, plan 074).
 - **Running it.** `make e2e-iced-real-input-mac` builds the helper and the
   bundle and runs `tools/roosttest/test_real_input_mac.py` with
   `ROOST_REQUIRE_REAL_INPUT=1`, which turns every "cannot run here" skip (a
