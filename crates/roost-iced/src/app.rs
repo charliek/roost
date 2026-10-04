@@ -907,8 +907,10 @@ fn rewrap_lets_go(
     tabs: &mut HashMap<TabKey, TerminalTab>,
     press_floor: &mut u64,
 ) {
-    if std::mem::replace(observed, now) != now {
-        cancel_tab_pointers(tabs, None, "pointer cancel: the terminal was rewrapped");
+    let before = std::mem::replace(observed, now);
+    if before != now {
+        let reason = format!("pointer cancel: the terminal was rewrapped ({before:?} -> {now:?})");
+        cancel_tab_pointers(tabs, None, &reason);
         *press_floor = crate::terminal_widget::latest_press_seq();
     }
 }
@@ -7981,6 +7983,17 @@ impl App {
     /// dialog, the rename editor, a notice, the bottom line, or a sidebar
     /// collapse.
     pub fn observe_terminal_wrapping(&mut self, notice_shown: bool) {
+        if self.tabs.values().any(TerminalTab::autoscroll_armed) {
+            let bottom = self.bottom_line().map(|line| line.text.into_owned());
+            if (bottom.is_some(), notice_shown)
+                != (
+                    self.terminal_wrapping.bottom_line,
+                    self.terminal_wrapping.notice,
+                )
+            {
+                tracing::info!(?bottom, notice = ?self.terminal_notice().map(|it| it.key), "the terminal's notice or bottom line changed under a held selection auto-scroll");
+            }
+        }
         let now = TerminalWrapping {
             sidebar_collapsed: self.workspace.sidebar_collapsed(),
             notice: notice_shown,
