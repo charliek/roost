@@ -112,6 +112,12 @@ pub(crate) enum EngineFeed {
     /// block cannot reach `App`; the drain can.
     #[cfg(target_os = "macos")]
     AccentChanged(iced::Color),
+    /// The app became (`true`) or resigned (`false`) active (plan 074
+    /// §D3). The observer has already applied Secure Keyboard Entry by
+    /// the time this lands; it is on the feed so the window redraws the
+    /// lock the change may have taken down.
+    #[cfg(target_os = "macos")]
+    AppActive(bool),
     /// The user clicked the OS notification banner for this tab. It travels
     /// the feed like every other engine → UI item so the jump it triggers is
     /// ordered against the events that may have closed the tab meanwhile.

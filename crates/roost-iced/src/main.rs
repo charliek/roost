@@ -21,6 +21,10 @@ mod paste_image;
 mod perf;
 mod png_encode;
 mod screenshot;
+/// Secure Keyboard Entry's state machine. Compiled where it is used —
+/// macOS — and wherever the tests run, which is every host.
+#[cfg(any(target_os = "macos", test))]
+mod secure_input;
 mod sidebar_resize;
 mod strip_reorder;
 mod terminal_widget;
@@ -550,11 +554,14 @@ fn window_settings(
 /// session's background resize wave, whose triggers are as scattered. And
 /// so does the context menu's close, which follows whatever took input
 /// from it or removed its row, by any path, and the terminals' pointer
-/// cancel when anything rewraps the terminal widget.
+/// cancel when anything rewraps the terminal widget. So does Secure
+/// Keyboard Entry, whose inputs — the active tab, its prompt, the toggle —
+/// move on as many paths.
 fn update(app: &mut App, message: Message) -> Task<Message> {
     let dispatched = dispatch(app, message);
     app.observe_context_menu();
     app.sync_menu_gating();
+    app.sync_secure_input();
     let (_, notice) = app.observe_notice();
     app.observe_terminal_wrapping(notice.is_some());
     Task::batch([

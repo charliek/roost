@@ -799,6 +799,7 @@ jobs:
           tools/roosttest/test_device_queries.py
           tools/roosttest/test_selection_autoscroll.py
           tools/roosttest/test_password_input.py
+          tools/roosttest/test_secure_input.py
           tools/roosttest/test_osc52.py
           tools/roosttest/test_paste_files.py
           tools/roosttest/test_context_menu_clipboard.py
@@ -1077,6 +1078,7 @@ jobs:
           tools/roosttest/test_device_queries.py
           tools/roosttest/test_selection_autoscroll.py
           tools/roosttest/test_password_input.py
+          tools/roosttest/test_secure_input.py
           -m 'not session_daemon and not host_client'
           --roost-target iced --roost-fresh -v
 
@@ -1294,6 +1296,7 @@ jobs:
           tools/roosttest/test_device_queries.py
           tools/roosttest/test_selection_autoscroll.py
           tools/roosttest/test_password_input.py
+          tools/roosttest/test_secure_input.py
           tools/roosttest/test_osc52.py
           tools/roosttest/test_paste_files.py
           tools/roosttest/test_context_menu_clipboard.py

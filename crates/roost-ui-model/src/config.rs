@@ -100,6 +100,22 @@ pub struct RoostConfig {
     /// Defaults to [`ChromeAccent::System`], which an unparseable value
     /// also resolves to.
     pub chrome_accent: ChromeAccent,
+
+    /// `macos-auto-secure-input` — turn Secure Keyboard Entry on while
+    /// the active tab is at a password prompt (plan 074 §D3, Ghostty's
+    /// key). Defaults to `true`. Parsed everywhere, read by the iced UI
+    /// on macOS only.
+    pub macos_auto_secure_input: bool,
+
+    /// `macos-secure-input-indication` — show the lock while Roost holds
+    /// Secure Keyboard Entry (Ghostty's key). Defaults to `true`; macOS
+    /// only, like the key above.
+    pub macos_secure_input_indication: bool,
+
+    /// `macos-secure-keyboard-entry` — the remembered always-on toggle.
+    /// Defaults to `false`. The `toggle_secure_input` action flips it and
+    /// writes it back through `set_key`; macOS only, like the keys above.
+    pub macos_secure_keyboard_entry: bool,
 }
 
 impl Default for RoostConfig {
@@ -121,6 +137,9 @@ impl Default for RoostConfig {
             local_backend: LocalBackend::default(),
             local_backend_key_present: false,
             chrome_accent: ChromeAccent::default(),
+            macos_auto_secure_input: true,
+            macos_secure_input_indication: true,
+            macos_secure_keyboard_entry: false,
         }
     }
 }
@@ -588,6 +607,36 @@ impl RoostConfig {
                         tracing::warn!(
                             value,
                             "unknown show-sidebar-agents value; falling back to default `true`"
+                        );
+                    }
+                }
+                "macos-auto-secure-input" => {
+                    if let Some(v) = parse_bool_like(value) {
+                        cfg.macos_auto_secure_input = v;
+                    } else {
+                        tracing::warn!(
+                            value,
+                            "unknown macos-auto-secure-input value; falling back to default `true`"
+                        );
+                    }
+                }
+                "macos-secure-input-indication" => {
+                    if let Some(v) = parse_bool_like(value) {
+                        cfg.macos_secure_input_indication = v;
+                    } else {
+                        tracing::warn!(
+                            value,
+                            "unknown macos-secure-input-indication value; falling back to default `true`"
+                        );
+                    }
+                }
+                "macos-secure-keyboard-entry" => {
+                    if let Some(v) = parse_bool_like(value) {
+                        cfg.macos_secure_keyboard_entry = v;
+                    } else {
+                        tracing::warn!(
+                            value,
+                            "unknown macos-secure-keyboard-entry value; falling back to default `false`"
                         );
                     }
                 }
@@ -1548,6 +1597,38 @@ mod tests {
     fn show_sidebar_agents_unknown_value_keeps_default() {
         let cfg = RoostConfig::parse("show-sidebar-agents = pancakes");
         assert!(cfg.show_sidebar_agents);
+    }
+
+    #[test]
+    fn the_secure_input_keys_default_like_ghostty() {
+        let cfg = RoostConfig::parse("");
+        assert!(cfg.macos_auto_secure_input);
+        assert!(cfg.macos_secure_input_indication);
+        assert!(!cfg.macos_secure_keyboard_entry);
+    }
+
+    #[test]
+    fn the_secure_input_keys_parse_as_bools() {
+        let cfg = RoostConfig::parse(
+            "macos-auto-secure-input = false\n\
+             macos-secure-input-indication = no\n\
+             macos-secure-keyboard-entry = \"true\"\n",
+        );
+        assert!(!cfg.macos_auto_secure_input);
+        assert!(!cfg.macos_secure_input_indication);
+        assert!(cfg.macos_secure_keyboard_entry);
+    }
+
+    #[test]
+    fn an_unknown_secure_input_value_keeps_its_default() {
+        let cfg = RoostConfig::parse(
+            "macos-auto-secure-input = pancakes\n\
+             macos-secure-input-indication = on\n\
+             macos-secure-keyboard-entry = 1\n",
+        );
+        assert!(cfg.macos_auto_secure_input);
+        assert!(cfg.macos_secure_input_indication);
+        assert!(!cfg.macos_secure_keyboard_entry);
     }
 
     // ----- agent-hooks (plan 064 §3.1; supersedes plan 046 §3.6) -----

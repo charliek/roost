@@ -13,7 +13,7 @@ use iced::keyboard::{self, key::Named, Key};
 use iced::widget::Id;
 use iced::widget::{
     button, column, container, image, mouse_area, row, scrollable, stack, text, text_input,
-    toggler, Column, Row, Space,
+    toggler, tooltip, Column, Row, Space,
 };
 use iced::{font, window, Alignment, Color, Element, Fill, Font, Point, Shrink, Size};
 use roost_engine::git_metrics;
@@ -163,6 +163,9 @@ const CONFIRM_PANEL_WIDTH: f32 = 420.0;
 /// title width while a pill is being renamed, so an editing pill sizes by
 /// the same rule as every other one.
 const RENAME_FIELD_WIDTH: f32 = 140.0;
+const SECURE_INPUT_TOOLTIP: &str = "Secure Keyboard Entry is on: other apps can't read your \
+     keystrokes. It turns on automatically at password prompts, or always if Roost \u{203a} \
+     Secure Keyboard Entry is checked.";
 
 /// The tab pill the strip reveal scrolls to. Keyed by the tab alone: the
 /// pill for a tab is one container wherever the strip reorders it to, and
@@ -3222,6 +3225,15 @@ pub struct App {
     /// the item's state even when it is already correct.
     #[cfg(target_os = "macos")]
     menu_can_check_updates: Option<bool>,
+    /// Secure Keyboard Entry's inputs as last pushed into its owner, so a
+    /// turn that moved none of them makes no Carbon call. `None` before
+    /// the window opens.
+    #[cfg(target_os = "macos")]
+    secure_inputs_pushed: Option<crate::secure_input::Inputs>,
+    /// The toggle as last checked on the menu row. `None` until the first
+    /// push, and again whenever the menu is rebuilt.
+    #[cfg(target_os = "macos")]
+    menu_secure_input: Option<bool>,
     git_probe: Arc<git_metrics::GitProbe>,
     metrics_cache: git_metrics::MetricsCache,
     provider_request: u64,
@@ -3486,6 +3498,10 @@ struct HostSelection {
 
 const BOOT_ABORT_DEADLINE: Duration = Duration::from_secs(2);
 const QUIT_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
+/// How long a clean exit waits for queued `config.conf` writes — normally
+/// none, or one that lands in milliseconds; the bound is for a write stuck
+/// behind another holder of `config.lock`.
+const CONFIG_DRAIN_DEADLINE: Duration = Duration::from_secs(2);
 const QUIT_RUNTIME_GRACE: Duration = Duration::from_secs(1);
 
 /// The engine runtime, whose drop gives up on blocking tasks after
@@ -3701,6 +3717,10 @@ impl App {
             full_screen_settle: TrailingDebounce::default(),
             #[cfg(target_os = "macos")]
             menu_can_check_updates: None,
+            #[cfg(target_os = "macos")]
+            secure_inputs_pushed: None,
+            #[cfg(target_os = "macos")]
+            menu_secure_input: None,
             palette_visibility_retries: 0,
             git_probe: Arc::new(git_metrics::GitProbe::new()),
             metrics_cache: git_metrics::MetricsCache::default(),
@@ -4088,6 +4108,7 @@ impl App {
         // policy B only fires for an unfocused window.
         self.init_notifications();
         self.follow_system_accent();
+        self.follow_app_activation();
         // Last, and off this thread: the agent-hooks ensure reads and
         // writes the user's dotfiles under an advisory lock (plan 046
         // §3.7). The window is up by the time its toast can land, which
@@ -5047,6 +5068,7 @@ impl App {
         }
         if self.exit_state.take() {
             self.hosts.abandon_reconnects();
+            self.release_secure_input();
             UiTask::Exit
         } else {
             UiTask::None
@@ -5653,6 +5675,10 @@ impl App {
                 self.toggle_sidebar_agents();
                 Ok(UiTask::None)
             }
+            KeybindAction::ToggleSecureInput => {
+                self.toggle_secure_input();
+                Ok(UiTask::None)
+            }
             KeybindAction::AgentHooks => {
                 self.open_agent_hooks_preferences();
                 Ok(UiTask::None)
@@ -5724,6 +5750,21 @@ impl App {
             Some(selection) => selection.tab,
             None => self.backend.tab_key(self.workspace.active().1),
         }
+    }
+
+    /// The selected project's row, whichever host it lives on — what the
+    /// tab band draws its pills from.
+    fn active_project_row(&self) -> Option<&Project> {
+        let key = self.active_project_key();
+        let projects = if key.is_local() {
+            self.projects.as_slice()
+        } else {
+            self.host_views
+                .iter()
+                .find(|view| view.host == key.host)
+                .map_or(&[][..], |view| view.projects.as_slice())
+        };
+        projects.iter().find(|project| project.id == key.project)
     }
 
     fn keyboard_route(&self) -> KeyboardRoute {
@@ -6318,6 +6359,32 @@ impl App {
         .into()
     }
 
+    /// The tab band's lock (plan 074 §D3): no click action, and a tooltip
+    /// that says what it means.
+    fn secure_input_lock(&self) -> Element<'_, Message> {
+        let glyph = column![
+            container(Space::new())
+                .width(chrome::LOCK_SHACKLE_SIZE.width)
+                .height(chrome::LOCK_SHACKLE_SIZE.height)
+                .style(chrome::lock_shackle(&self.chrome)),
+            container(Space::new())
+                .width(chrome::LOCK_BODY_SIZE.width)
+                .height(chrome::LOCK_BODY_SIZE.height)
+                .style(chrome::lock_body(&self.chrome)),
+        ]
+        .align_x(Alignment::Center);
+        let explanation = container(text(SECURE_INPUT_TOOLTIP).size(12).color(self.chrome.text))
+            .padding([6, 10])
+            .max_width(300)
+            .style(chrome::status_toast(&self.chrome, self.chrome.muted_text));
+        tooltip(
+            container(glyph).center(chrome::PILL_HEIGHT),
+            explanation,
+            tooltip::Position::Bottom,
+        )
+        .into()
+    }
+
     fn view_body(&self) -> Element<'_, Message> {
         // `self.projects` is this backend's snapshot, so every id read out
         // of it below qualifies at this backend's instance.
@@ -6498,23 +6565,7 @@ impl App {
             .padding(iced::Padding::default().right(chrome::DIVIDER_WIDTH))
             .style(chrome::divider(&self.chrome));
 
-        // The tab bar renders the selected project's tabs, whichever host
-        // it lives on — the pills themselves are host-blind, so only the
-        // list they come from changes.
-        let active_project_model = if active_project_key.is_local() {
-            self.projects
-                .iter()
-                .find(|project| project.id == active_project)
-        } else {
-            self.host_views
-                .iter()
-                .find(|view| view.host == active_project_key.host)
-                .and_then(|view| {
-                    view.projects
-                        .iter()
-                        .find(|project| project.id == active_project)
-                })
-        };
+        let active_project_model = self.active_project_row();
         let authoritative_tab_ids = active_project_model
             .map(|project| project.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>())
             .unwrap_or_default();
@@ -6726,7 +6777,17 @@ impl App {
             ))
             .width(Fill)
             .height(chrome::PILL_HEIGHT);
-        let tab_bar = container(tab_scroller)
+        // The lock sits outside the scrollable, so it never scrolls away,
+        // and outside `ReorderStrip`, which hit-tests its own children.
+        let tab_band: Element<'_, Message> = if self.secure_input_indicator() {
+            row![tab_scroller, self.secure_input_lock()]
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .into()
+        } else {
+            tab_scroller.into()
+        };
+        let tab_bar = container(tab_band)
             .height(chrome::BAND_HEIGHT)
             .width(Fill)
             .padding([chrome::BAND_PILL_PADDING_Y, 8.0])
@@ -7061,6 +7122,25 @@ impl App {
             "false"
         };
         self.config_writer.set("show-sidebar-agents", value);
+    }
+
+    /// Flip the remembered Secure Keyboard Entry toggle (plan 074 §D3).
+    /// `update`'s funnel pushes it into the owner and onto the menu row.
+    /// Off macOS the feature does not exist, so the action is a logged
+    /// no-op that writes nothing.
+    fn toggle_secure_input(&mut self) {
+        if !cfg!(target_os = "macos") {
+            tracing::info!(
+                "toggle_secure_input: Secure Keyboard Entry is macOS-only; nothing to do"
+            );
+            return;
+        }
+        let manual = !self.config.macos_secure_keyboard_entry;
+        self.config.macos_secure_keyboard_entry = manual;
+        self.config_writer.set(
+            "macos-secure-keyboard-entry",
+            if manual { "true" } else { "false" },
+        );
     }
 
     pub fn new_tab(&mut self) -> UiTask {
@@ -10107,6 +10187,9 @@ fn pointer_button(button: PointerButton) -> roost_vt::MouseButton {
 
 impl Drop for App {
     fn drop(&mut self) {
+        // Again, for a teardown that did not come through Quit; it is
+        // latched, so a second call gives nothing back twice.
+        self.release_secure_input();
         // Freeze and fsync the authoritative layout before PTY-exit tasks can
         // observe teardown and attempt a later persistence write.
         //
@@ -10120,6 +10203,8 @@ impl Drop for App {
                 tracing::error!(%error, "the workspace layout could not be written on shutdown")
             }
         }
+        self.config_writer
+            .drain_before_exit(&self.runtime, CONFIG_DRAIN_DEADLINE);
         // Hang the in-process shells up so their PTY readers finish before
         // the runtime drops. A session's tabs belong to its daemon, never
         // to this supervisor, so they are untouched.

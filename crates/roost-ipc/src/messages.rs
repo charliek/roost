@@ -1437,6 +1437,36 @@ pub struct AppNotificationStatusResult {
     pub authorized: bool,
 }
 
+/// `app.secure_input` request: read Secure Keyboard Entry's state (plan
+/// 074 §D3). Gated on `ROOST_TEST_MODE=1`; the iced UI answers on every
+/// OS, with every field `false` off macOS, where the feature does not
+/// exist.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppSecureInputParams {}
+
+/// Secure Keyboard Entry as the UI's owner holds it: the inputs it last
+/// applied, what they asked for, and what it got.
+///
+/// `desired == app_active && (manual || (auto && password_input))`;
+/// `owned` is whether Roost holds an `EnableSecureEventInput` that
+/// succeeded; `indicator` is whether the tab band draws the lock, which
+/// is `owned` under `macos-secure-input-indication = true`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AppSecureInputResult {
+    pub desired: bool,
+    pub owned: bool,
+    pub indicator: bool,
+    /// `macos-secure-keyboard-entry`, the remembered toggle.
+    pub manual: bool,
+    /// `macos-auto-secure-input`.
+    pub auto: bool,
+    /// `NSApp.isActive` when the owner last applied.
+    pub app_active: bool,
+    /// The active tab's `password_input` when the owner last applied.
+    pub password_input: bool,
+}
+
 /// `tab.expand_selection_at` response: the committed selection's
 /// bounds, mirroring `WordSpan`. `text` is the extracted selection
 /// content (same path `selection.dump` uses), or `None` when the
@@ -3805,6 +3835,12 @@ pub mod ops {
     /// seam, not a surface" rule as `app.dialog_answer`.
     pub const APP_KEY_EVENT: &str = "app.key_event";
 
+    /// Test-only read of Secure Keyboard Entry's state (plan 074 §D3):
+    /// the owner's inputs, what they ask for, what it holds and whether
+    /// the lock is drawn. Same gate as `app.dialog_answer`; the iced UI
+    /// answers on every OS, all `false` off macOS.
+    pub const APP_SECURE_INPUT: &str = "app.secure_input";
+
     /// Test-only reads and presses of a row's right-click menu (plan 073
     /// D9): list it, run one item through the dispatcher a click
     /// reaches, or show it on screen. Same gate and the same "test seam,
@@ -5247,6 +5283,23 @@ mod tests {
         assert_eq!(cleared, r#"{"label":null}"#);
         let bad = r#"{"extra":"x"}"#;
         assert!(serde_json::from_str::<AppDockBadgeParams>(bad).is_err());
+    }
+
+    #[test]
+    fn app_secure_input_round_trips() {
+        round_trip(&AppSecureInputParams {});
+        round_trip(&AppSecureInputResult {
+            desired: true,
+            owned: true,
+            indicator: true,
+            manual: false,
+            auto: true,
+            app_active: true,
+            password_input: true,
+        });
+        round_trip(&AppSecureInputResult::default());
+        let bad = r#"{"extra":"x"}"#;
+        assert!(serde_json::from_str::<AppSecureInputParams>(bad).is_err());
     }
 
     #[test]

@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use roost_engine::ipc::{DumpError, HostOpFailure, HostOpReply};
 use roost_ipc::codes;
 use roost_ipc::messages::{
-    AppContextMenuDumpResult, AppContextMenuTarget, SentFile, SkippedFile, TabSendFileResult,
-    WireProjectRef,
+    AppContextMenuDumpResult, AppContextMenuTarget, AppSecureInputResult, SentFile, SkippedFile,
+    TabSendFileResult, WireProjectRef,
 };
 use roost_ui_model::context_menu::{ContextAction, ContextTarget};
 use roost_ui_model::file_transfer::{status, Refusal, Skipped, Target};
@@ -2235,6 +2235,12 @@ impl App {
                 EngineFeed::AccentChanged(accent) => {
                     self.chrome = chrome_palette_for(self.config.chrome_accent, accent);
                 }
+                // The observer already applied; arriving here is what
+                // redraws the lock.
+                #[cfg(target_os = "macos")]
+                EngineFeed::AppActive(active) => {
+                    tracing::debug!(active, "app activation changed");
+                }
                 // Host mirrors + lifecycle land in the connection set.
                 // C6/C7 render off it; C4 only keeps it current, so with
                 // zero hosts these arms never run.
@@ -2720,6 +2726,8 @@ impl App {
                 self.menu_gating = crate::macos::menu::MenuGating::default();
                 // Ditto for the Window rows: the menu was built with none.
                 self.menu_window_rows = crate::macos::menu::WindowRows::default();
+                // And Secure Keyboard Entry's row was built unchecked.
+                self.menu_secure_input = None;
             }
         }
     }
@@ -2788,6 +2796,124 @@ impl App {
             if let Some(accent) = crate::macos::accent::current(mtm) {
                 self.chrome = chrome_palette_for(self.config.chrome_accent, accent);
             }
+        }
+    }
+
+    /// Start acting on the app becoming and resigning active (plan 074
+    /// §D3). A no-op on every other host. From `window_opened` for the
+    /// accent's reason; the seam installs once.
+    pub(super) fn follow_app_activation(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.window_id.is_none() {
+                return;
+            }
+            let Some(mtm) = seam_on_main("app activation observe") else {
+                return;
+            };
+            crate::macos::secure_input::observe(mtm, &self.feed_tx);
+        }
+    }
+
+    /// Push Secure Keyboard Entry's inputs into its owner and apply, and
+    /// the toggle onto its menu row, each only when it moved.
+    ///
+    /// The one call site is `update()`'s post-dispatch funnel, so every
+    /// way an input moves — the active tab, a close, a host mirror's
+    /// resync or disconnect, the toggle, the config at boot — is covered
+    /// without a call site per change. App activation is the observers'.
+    pub fn sync_secure_input(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.window_id.is_none() {
+                return;
+            }
+            let inputs = self.secure_inputs();
+            let inputs_moved = self.secure_inputs_pushed != Some(inputs);
+            let menu_moved = self.menu_secure_input != Some(inputs.manual);
+            if !inputs_moved && !menu_moved {
+                return;
+            }
+            let Some(mtm) = seam_on_main("secure input sync") else {
+                return;
+            };
+            if inputs_moved {
+                crate::macos::secure_input::set_inputs(mtm, inputs);
+                crate::macos::secure_input::apply(mtm);
+                self.secure_inputs_pushed = Some(inputs);
+            }
+            if menu_moved {
+                crate::macos::menu::sync_secure_input_state(mtm, inputs.manual);
+                self.menu_secure_input = Some(inputs.manual);
+            }
+        }
+    }
+
+    /// Give back Secure Keyboard Entry and latch it off: the quit path and
+    /// `Drop`.
+    pub(super) fn release_secure_input(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(mtm) = seam_on_main("secure input release") {
+                crate::macos::secure_input::release(mtm);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn secure_inputs(&self) -> crate::secure_input::Inputs {
+        crate::secure_input::Inputs {
+            manual: self.config.macos_secure_keyboard_entry,
+            auto: self.config.macos_auto_secure_input,
+            password_input: crate::secure_input::listed_password_input(
+                self.active_project_row(),
+                self.active_tab_key().tab,
+            ),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn secure_input_status(&self) -> crate::secure_input::Status {
+        objc2::MainThreadMarker::new()
+            .map(crate::macos::secure_input::status)
+            .unwrap_or_default()
+    }
+
+    /// Whether the tab band draws the lock. Never off macOS, where there
+    /// is no Secure Keyboard Entry to show.
+    pub(super) fn secure_input_indicator(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            crate::secure_input::indicator(
+                self.secure_input_status().owned,
+                self.config.macos_secure_input_indication,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    /// `app.secure_input`'s answer: the owner as it stands, never synced
+    /// first, so a change `update` failed to push reads as stale here.
+    fn secure_input_result(&self) -> AppSecureInputResult {
+        #[cfg(target_os = "macos")]
+        {
+            let status = self.secure_input_status();
+            AppSecureInputResult {
+                desired: status.desired,
+                owned: status.owned,
+                indicator: self.secure_input_indicator(),
+                manual: status.inputs.manual,
+                auto: status.inputs.auto,
+                app_active: status.app_active,
+                password_input: status.inputs.password_input,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            AppSecureInputResult::default()
         }
     }
 
@@ -3651,6 +3777,14 @@ impl App {
                     }
                     Err(error) => Err(error),
                 });
+            }
+            UiRequest::AppSecureInput { reply } => {
+                let result = if self.test_mode {
+                    Ok(self.secure_input_result())
+                } else {
+                    Err("ROOST_TEST_MODE=1 is required".into())
+                };
+                let _ = reply.send(result);
             }
             UiRequest::AppContextMenuDump { target, reply } => {
                 let result = self.context_test_target(target).and_then(|target| {

@@ -798,6 +798,45 @@
       ],
       "type": "object"
     },
+    "AppSecureInputParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AppSecureInputResult": {
+      "properties": {
+        "app_active": {
+          "type": "boolean"
+        },
+        "auto": {
+          "type": "boolean"
+        },
+        "desired": {
+          "type": "boolean"
+        },
+        "indicator": {
+          "type": "boolean"
+        },
+        "manual": {
+          "type": "boolean"
+        },
+        "owned": {
+          "type": "boolean"
+        },
+        "password_input": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "desired",
+        "owned",
+        "indicator",
+        "manual",
+        "auto",
+        "app_active",
+        "password_input"
+      ],
+      "type": "object"
+    },
     "AppSelectedTabIdParams": {
       "additionalProperties": false,
       "type": "object"
@@ -4301,6 +4340,14 @@
       },
       "result": {
         "$ref": "#/$defs/ScreenshotResult"
+      }
+    },
+    "app.secure_input": {
+      "params": {
+        "$ref": "#/$defs/AppSecureInputParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AppSecureInputResult"
       }
     },
     "app.selected_tab_id": {

@@ -237,11 +237,14 @@ Use only leading-line `#` comments. A `#` after a `keybind` value is treated as 
 | `open_config`         | `super+comma` / unbound                                |
 | `open_docs`           | unbound / unbound                                      |
 | `toggle_fullscreen`   | `ctrl+super+f` / unbound                               |
+| `toggle_secure_input` | unbound / unbound                                      |
 | `font_increase`       | `super+plus`, `super+equal` / `alt+plus`, `alt+equal`  |
 | `font_decrease`       | `super+minus` / `alt+minus`                            |
 | `font_reset`          | `super+0` / `alt+0`                                    |
 
 `open_config` opens `config.conf` in your default text editor, creating it first if it does not exist; edits apply when Roost restarts. `open_docs` opens this documentation site. `toggle_fullscreen` flips the window in and out of full screen. All three are also in the command palette ("Open Settings File", "Open Documentation", "Toggle Full Screen"), and on macOS in the menu bar (Roost → Settings…, Help → Roost Help, View → Enter Full Screen).
+
+`toggle_secure_input` flips the always-on Secure Keyboard Entry setting on macOS (`macos-secure-keyboard-entry`), the same as Roost → Secure Keyboard Entry in the menu bar and "Toggle Secure Keyboard Entry" in the command palette; Roost writes the choice to `config.conf`. It has no default shortcut. On Linux the action is accepted and does nothing. See [Secure Keyboard Entry](../reference/config.md#secure-keyboard-entry).
 
 Defaults with multiple triggers (`cycle_tab_*`, `paste`, `copy`) keep both triggers; an `unbind` line removes only the listed one.
 

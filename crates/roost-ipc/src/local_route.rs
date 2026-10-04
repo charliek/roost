@@ -299,6 +299,8 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ("app.notice_answer", OpClass::UiOwned),
     // A key press into this window — whatever owns its keyboard.
     ("app.key_event", OpClass::UiOwned),
+    // This window's Secure Keyboard Entry.
+    ("app.secure_input", OpClass::UiOwned),
     // A row's right-click menu in this window.
     ("app.context_menu_dump", OpClass::UiOwned),
     ("app.context_menu_activate", OpClass::UiOwned),

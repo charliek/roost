@@ -101,6 +101,9 @@ STATIC_MENUS: dict[str, list[tuple | None]] = {
         (UPDATES_ITEM, "", [], ANY, "check_for_updates"),
         None,
         ("Settings…", ",", ["super"], True, "open_config"),
+        # No default chord; `fixtures/launcher.conf` binds Ctrl+Shift+K
+        # for `test_secure_input.py`.
+        ("Secure Keyboard Entry", "k", ["shift", "ctrl"], True, "toggle_secure_input"),
         None,
         (f"Hide {APP}", "h", ["super"], True, "appkit:hide:"),
         ("Hide Others", "h", ["alt", "super"], True, "appkit:hideOtherApplications:"),
@@ -262,7 +265,9 @@ class TestMenuShape:
         rows = _rows(menus["Window"])
         assert rows[-2:] == WINDOW_TAIL
 
-    def test_static_actionable_item_count_is_32_plus_minimize_zoom(self, roost):
+    def test_static_actionable_item_count_matches_the_inventory_plus_minimize_zoom(
+        self, roost
+    ):
         menus = _menus_by_title(roost.app_menu_dump())
         static_count = sum(
             len(
@@ -272,9 +277,10 @@ class TestMenuShape:
                     if not i["separator"] and _ours(i, t)
                 ]
             )
-            for t in (APP, "File", "View", "Edit", "Help")
+            for t in STATIC_MENUS
         )
-        assert static_count == 32
+        pinned = sum(row is not None for rows in STATIC_MENUS.values() for row in rows)
+        assert static_count == pinned
         assert _rows(menus["Window"])[-2:] == WINDOW_TAIL
 
     def test_exactly_one_full_screen_row_in_the_whole_menu_bar(self, roost):

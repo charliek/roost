@@ -551,6 +551,12 @@ pub enum UiRequest {
         modifiers: Vec<String>,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// `app.secure_input` — Secure Keyboard Entry's state (plan 074
+    /// §D3). Gated like `AppDialogDump`; answered on every OS.
+    AppSecureInput {
+        reply:
+            tokio::sync::oneshot::Sender<Result<roost_ipc::messages::AppSecureInputResult, String>>,
+    },
     /// `app.context_menu_dump` — the right-click menu `target` would show
     /// now (plan 073 D9). Gated like `AppDialogDump`.
     AppContextMenuDump {
@@ -4192,6 +4198,14 @@ async fn dispatch(
             .map_err(map_test_op_err)?;
             Ok(serde_json::json!({}))
         }
+        ops::APP_SECURE_INPUT => {
+            let _: roost_ipc::messages::AppSecureInputParams = decode(params)?;
+            let result = h
+                .ui_call(|reply| UiRequest::AppSecureInput { reply })
+                .await?
+                .map_err(map_test_op_err)?;
+            encode(&result)
+        }
         ops::APP_CONTEXT_MENU_DUMP => {
             let p: AppContextMenuDumpParams = decode(params)?;
             let result = h
@@ -4457,6 +4471,7 @@ const DISPATCHED_OPS: &[(&str, &[Withheld])] = {
         (ops::APP_NOTICE_DUMP, &[NeedsUi]),
         (ops::APP_NOTICE_ANSWER, &[NeedsUi, TestMode]),
         (ops::APP_KEY_EVENT, &[NeedsUi, TestMode]),
+        (ops::APP_SECURE_INPUT, &[NeedsUi, TestMode]),
         (ops::APP_CONTEXT_MENU_DUMP, &[NeedsUi, TestMode]),
         (ops::APP_CONTEXT_MENU_ACTIVATE, &[NeedsUi, TestMode]),
         (ops::APP_CONTEXT_MENU_OPEN, &[NeedsUi, TestMode]),
@@ -5712,6 +5727,7 @@ mod tests {
         "app.key_event",
         "app.keybind_dispatch",
         "app.notice_answer",
+        "app.secure_input",
         "app.set_window_focus",
         "clipboard.write_files",
         "sidebar.set_width",

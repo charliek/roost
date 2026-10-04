@@ -39,6 +39,9 @@ the launcher with deterministic commands.
 | `clipboard-write` | `allow \| deny` | `allow` | Whether a program running in the terminal can write the host clipboard via OSC 52. See [the dedicated section below](#clipboard-write). |
 | `link-modifier` | `ctrl \| alt \| super` | Cmd (Mac) / Alt (Linux) | Which held modifier reveals + opens a URL on hover/click. iced-only; the Swift Mac app is fixed to Cmd. See [the dedicated section below](#link-modifier). |
 | `macos-option-as-alt` | `false \| true \| left \| right` | `false` | Which Option keys send Alt (Meta) on macOS, so ⌥B sends `ESC b` instead of typing `∫`. Read by the iced UI on macOS only. See [the dedicated section below](#macos-option-as-alt). |
+| `macos-auto-secure-input` | bool | `true` | Turn Secure Keyboard Entry on while the active tab is at a password prompt. Read by the iced UI on macOS only. See [Secure Keyboard Entry](#secure-keyboard-entry). |
+| `macos-secure-input-indication` | bool | `true` | Show a lock at the right end of the tab band while Secure Keyboard Entry is on. Read by the iced UI on macOS only. See [Secure Keyboard Entry](#secure-keyboard-entry). |
+| `macos-secure-keyboard-entry` | bool | `false` | Keep Secure Keyboard Entry on whenever Roost is the active app. Written by the menu's **Secure Keyboard Entry** row, the palette's **Toggle Secure Keyboard Entry** and the `toggle_secure_input` action. Read by the iced UI on macOS only. See [Secure Keyboard Entry](#secure-keyboard-entry). |
 | `agent-hooks` | agent list \| `off` \| absent | absent (unanswered) | Which supported coding agents (Claude Code, Codex, grok/gx, cursor-agent, OpenCode) Roost wires its hook entries into, at startup. Absent means nobody has answered the consent dialog yet — Roost writes nothing until they do. See [the dedicated section below](#agent-hooks) and the [Agent Hooks](../guides/agents.md) guide. |
 | `local-backend` | `in-process \| session` | `in-process` for an existing setup; `session` on a genuinely fresh install | Where the tabs you start in the Roost window run. See [the dedicated section below](#local-backend). |
 | `chrome-accent` | `system \| #rrggbb` | `system` | The accent color of the window chrome: the active tab and project, notification dots, focus rings. iced-only. See [the dedicated section below](#chrome-accent). |
@@ -276,6 +279,64 @@ the character macOS gives them:
 > **Scope:** read by the iced UI on macOS (`Roost-Iced.app`). On Linux,
 > Alt already sends the ESC prefix, so the key is parsed and ignored.
 > The Swift Mac app ignores it too (unknown keys are always dropped).
+
+## Secure Keyboard Entry
+
+While Secure Keyboard Entry is on, macOS stops other processes — event
+taps, keyloggers, some accessibility tools — from reading what you
+type. Terminal.app, iTerm2 and Ghostty all offer it. Roost follows
+Ghostty's model, and uses Ghostty's key names:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `macos-auto-secure-input` | `true` | Turn it on while the active tab is at a password prompt. |
+| `macos-secure-input-indication` | `true` | Show the lock while it is on. |
+| `macos-secure-keyboard-entry` | `false` | Keep it on whenever Roost is the active app. |
+
+```conf
+macos-auto-secure-input = true
+macos-secure-keyboard-entry = false
+```
+
+Secure Keyboard Entry is on while Roost is the active app and either
+`macos-secure-keyboard-entry` is on, or `macos-auto-secure-input` is on
+and the active tab is at a password prompt. Switching to another app
+turns it off at once, including while one of Roost's menus is open, and
+coming back turns it back on. Quitting Roost always gives it back.
+
+**The toggle.** The app menu's **Secure Keyboard Entry** row, just
+below **Settings…**, shows a checkmark while `macos-secure-keyboard-entry`
+is on and flips it. The command palette's **Toggle Secure Keyboard
+Entry** row and the `toggle_secure_input` action do the same; the
+action has no default shortcut (see
+[Keybindings](../getting-started/keybindings.md#available-actions)).
+The choice is written back to `config.conf`, so it survives a restart.
+
+**The lock.** While it is on, a small lock sits at the right end of the
+tab band; hover it for an explanation. `macos-secure-input-indication =
+false` hides it.
+
+**How a password prompt is recognised.** A tab is at a password prompt
+while its terminal is in line mode with echo off — what `sudo`, `ssh`'s
+own password prompt, `passwd` and `read -s` set. Roost checks every
+200 ms. Only the active tab counts: a prompt in a background tab turns
+nothing on until you switch to it. Any program that turns echo off in
+line mode is treated as a prompt; set `macos-auto-secure-input = false`
+if that gets in the way, for example of accessibility software.
+
+**Remote prompts.** A host-session tab, whose shell runs in a
+`roost-session` on another machine, does catch a remote `sudo`: the
+session watches its own terminals and reports a prompt to Roost. That
+needs a `roost-session` new enough to report it; an older one never
+does, and its tabs never turn Secure Keyboard Entry on by themselves. A
+plain `ssh` run in a local tab is different: `ssh` puts the local
+terminal in raw mode, so a password prompt on the far side is never
+seen. Turn on `macos-secure-keyboard-entry` for those.
+
+> **Scope:** the iced UI on macOS (`Roost-Iced.app`). On Linux the
+> three keys are parsed and ignored, `toggle_secure_input` does
+> nothing, and there is no menu row, palette row or lock. The Swift Mac
+> app ignores the keys too (unknown keys are always dropped).
 
 ## `agent-hooks`
 

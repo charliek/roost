@@ -2121,6 +2121,52 @@ Implemented by both UIs, macOS only — unlike `app.menu_dump` above and
 the other macOS-gated ops around it, which are iced only and have no
 Swift counterpart.
 
+### `app.secure_input` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Reads Secure Keyboard
+Entry as the iced UI's owner holds it (see
+[`macos-secure-keyboard-entry`](config.md#secure-keyboard-entry)): the
+inputs it last applied, what they ask for, what it holds, and whether
+the tab band draws the lock. A test seam, not a surface: `roostctl` has
+no verb for it.
+
+Request: `{"params": {}}`. Response:
+
+```json
+{
+  "desired": true,
+  "owned": true,
+  "indicator": true,
+  "manual": false,
+  "auto": true,
+  "app_active": true,
+  "password_input": true
+}
+```
+
+- `manual` is `macos-secure-keyboard-entry`, `auto` is
+  `macos-auto-secure-input`, and `password_input` is the active tab's
+  [`password_input`](#shared-types) — whatever owns the keyboard, so a
+  palette or rename editor in front of a prompt does not count it out.
+- `app_active` is `NSApp.isActive` as read the last time the owner
+  applied. A bare binary on a CI runner may never be active, so assert
+  the formula against the reported inputs rather than an outcome:
+  `desired == app_active && (manual || (auto && password_input))`.
+- `owned` is whether Roost holds an `EnableSecureEventInput` that
+  succeeded: `desired`, unless the call failed.
+- `indicator` is `owned` while `macos-secure-input-indication` is on,
+  and `false` otherwise.
+
+The values are the owner's as they stand — the handler never pushes
+inputs or applies first, so an input change the UI failed to apply
+reads as stale here.
+
+Answered by the iced UI on every OS. Off macOS every field is `false`:
+Secure Keyboard Entry does not exist there, and the
+`toggle_secure_input` action does nothing. The Swift Mac app answers
+`unknown-op`.
+
 ### `window.resize` *(test-only — gated)*
 
 **Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**

@@ -18,6 +18,12 @@
 //! the user passed through rather than the one they stopped on. One
 //! `mpsc` drained by one task means the file lands in the order the UI
 //! asked, and the last write is the last thing the user did.
+//!
+//! # Why a clean exit waits for it
+//!
+//! The writes the user made last are the ones most likely still queued
+//! when they quit — a toggle and then ⌘Q — and the runtime's teardown
+//! would drop them. [`ConfigWriter::drained`] is what the exit waits on.
 
 use std::path::PathBuf;
 
@@ -34,10 +40,17 @@ struct ConfigWrite {
     reply: Option<oneshot::Sender<Result<(), String>>>,
 }
 
+/// One item on the writer's queue.
+enum Queued {
+    Write(ConfigWrite),
+    /// Answered once every write queued ahead of it has landed or failed.
+    Drained(oneshot::Sender<()>),
+}
+
 /// The UI-side handle. Cloneable, cheap, and never blocks.
 #[derive(Debug, Clone)]
 pub(crate) struct ConfigWriter {
-    tx: mpsc::UnboundedSender<ConfigWrite>,
+    tx: mpsc::UnboundedSender<Queued>,
 }
 
 /// There is nowhere to write: `$HOME` is unset and `$ROOST_CONFIG` is
@@ -62,9 +75,16 @@ impl ConfigWriter {
         path: Option<PathBuf>,
         feed: EngineFeedSender,
     ) -> ConfigWriter {
-        let (tx, mut rx) = mpsc::unbounded_channel::<ConfigWrite>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Queued>();
         runtime.spawn(async move {
-            while let Some(write) = rx.recv().await {
+            while let Some(queued) = rx.recv().await {
+                let write = match queued {
+                    Queued::Write(write) => write,
+                    Queued::Drained(done) => {
+                        let _ = done.send(());
+                        continue;
+                    }
+                };
                 let outcome = match path.clone() {
                     None => {
                         if write.reply.is_none() {
@@ -133,13 +153,57 @@ impl ConfigWriter {
         }
     }
 
+    /// Resolves once every write queued before this call has landed or
+    /// failed. The caller bounds the wait: a write can sit on
+    /// `config.lock` for as long as another holder keeps it.
+    pub(crate) fn drained(
+        &self,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send + 'static {
+        let (done, answer) = oneshot::channel();
+        // A failed send drops `done`, which the await below reports.
+        let _ = self.tx.send(Queued::Drained(done));
+        async move {
+            answer
+                .await
+                .map_err(|_| "the config writer went away".to_string())
+        }
+    }
+
+    /// A clean exit's wait for the queue: at most `deadline`, answering
+    /// whether everything landed. What it could not wait for is logged —
+    /// there is no window left to toast it on.
+    pub(crate) fn drain_before_exit(
+        &self,
+        runtime: &tokio::runtime::Runtime,
+        deadline: std::time::Duration,
+    ) -> bool {
+        let drained = self.drained();
+        // Inside the runtime: a timer built outside it has no clock to run on.
+        match runtime.block_on(async move { tokio::time::timeout(deadline, drained).await }) {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "config.conf writes could not be drained before exit");
+                false
+            }
+            Err(_) => {
+                tracing::warn!(
+                    ?deadline,
+                    "config.conf writes were still queued at exit; quitting without them"
+                );
+                false
+            }
+        }
+    }
+
     fn enqueue(&self, key: &str, value: &str, reply: Option<oneshot::Sender<Result<(), String>>>) {
         let write = ConfigWrite {
             key: key.to_string(),
             value: value.to_string(),
             reply,
         };
-        if let Err(mpsc::error::SendError(write)) = self.tx.send(write) {
+        if let Err(mpsc::error::SendError(Queued::Write(write))) =
+            self.tx.send(Queued::Write(write))
+        {
             // Only reachable once the runtime is gone, which is to say
             // during shutdown — but a write nobody is waiting for must
             // still leave a trace rather than disappearing.
@@ -148,5 +212,42 @@ impl ConfigWriter {
                 let _ = reply.send(Err("the config writer went away".to_string()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use roost_ui_model::config::{ConfigLock, RoostConfig};
+
+    use super::*;
+
+    /// A toggle made just before a clean exit is on disk when the exit's
+    /// wait returns — including one held up behind another holder of
+    /// `config.lock`, where the wait must not return early.
+    #[test]
+    fn the_exit_drain_waits_for_a_write_queued_just_before_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("config.conf");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (feed, _receiver) = crate::engine_feed::channel();
+        let writer = ConfigWriter::spawn(runtime.handle(), Some(path.clone()), feed);
+
+        let held = ConfigLock::acquire(&path).expect("the test holds config.lock");
+        writer.set("macos-secure-keyboard-entry", "true");
+        assert!(
+            !writer.drain_before_exit(&runtime, Duration::from_millis(200)),
+            "the drain returned while the write was still waiting on the lock"
+        );
+
+        drop(held);
+        assert!(writer.drain_before_exit(&runtime, Duration::from_secs(10)));
+        let written = std::fs::read_to_string(&path).expect("the write landed");
+        assert!(RoostConfig::parse(&written).macos_secure_keyboard_entry);
     }
 }

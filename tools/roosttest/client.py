@@ -887,6 +887,18 @@ class Roost:
         `app_dock_badge`."""
         return self.call("app.notification_status", {})
 
+    def app_secure_input(self) -> dict:
+        """Read Secure Keyboard Entry as the UI's owner holds it:
+        `{"desired", "owned", "indicator", "manual", "auto",
+        "app_active", "password_input"}`, all bools.
+
+        `desired` is `app_active and (manual or (auto and
+        password_input))`; assert that formula against the reported
+        inputs rather than an outcome, since a bare binary may never be
+        the active app. Gated by ROOST_TEST_MODE=1; the iced UI answers on
+        every OS (all `False` off macOS), the Swift app `unknown-op`."""
+        return self.call("app.secure_input", {})
+
     def tab_expand_selection_at(
         self,
         tab_id: int,
