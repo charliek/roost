@@ -114,6 +114,14 @@ def _hold(
     until `reached`, then release there. A timeout with a native focus loss
     between the press and the timeout raises `_NativeFocusLost`. Any other
     timeout fails the case and names the focus state."""
+    # A status toast an earlier test raised expires five seconds later, and
+    # its line leaving rewraps the terminal, which lets go of a held drag
+    # (#608). Start the gesture with none up.
+    roost._wait(
+        lambda: (roost.notice_dump()["bottom_line"] or {}).get("source") != "status",
+        10.0,
+        "an earlier status toast to expire",
+    )
     # A focus loss cancels the drag and the tick scrolls only a focused
     # window. On a CI runner the app's own activation churn (an earlier
     # module activating it) can unfocus the window after the seeding
