@@ -56,6 +56,7 @@ def target(pytestconfig) -> str:
 _needs_ui = pytest.StashKey[bool]()
 
 
+@pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(config, items):
     """Record whether this invocation needs a UI at all.
 
@@ -66,6 +67,10 @@ def pytest_collection_modifyitems(config, items):
     force-quits the developer's running instance. So the autouse fixture
     below stands down when *every* collected test is a session-daemon
     test; a mixed run still gets its UI.
+
+    `trylast`, so it reads what `-m` left selected: a module with cases in
+    both lanes (`test_password_input.py`) is run headless as
+    `-m session_daemon`, and its deselected UI cases must not launch one.
     """
     config.stash[_needs_ui] = any(
         item.get_closest_marker("session_daemon") is None for item in items

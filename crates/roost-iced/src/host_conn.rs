@@ -1047,7 +1047,7 @@ impl HostConnSet {
                 // the same reason [`task::Resume::freeze`] is, and it
                 // leaves one invariant: what a connection carries is
                 // never something another writer can move.
-                None => Arc::new(SharedMirror::new(rows.mirror.snapshot())),
+                None => rows.mirror.detached(),
             },
         });
         // An ssh attempt started at [`Self::open_ssh`] and was numbered
@@ -2965,6 +2965,7 @@ pub(crate) mod fixtures {
                             shell_state: Default::default(),
                             agent_lifecycle: Default::default(),
                             ownership: None,
+                            password_input: false,
                         }
                     })
                     .collect(),

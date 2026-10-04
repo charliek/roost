@@ -798,9 +798,11 @@ jobs:
           tools/roosttest/test_context_menu.py
           tools/roosttest/test_device_queries.py
           tools/roosttest/test_selection_autoscroll.py
+          tools/roosttest/test_password_input.py
           tools/roosttest/test_osc52.py
           tools/roosttest/test_paste_files.py
           tools/roosttest/test_context_menu_clipboard.py
+          -m 'not session_daemon and not host_client'
           --roost-target iced --roost-fresh -v
 
       # Its own invocation, after the shared-session lane above: this
@@ -1074,6 +1076,8 @@ jobs:
           tools/roosttest/test_context_menu.py
           tools/roosttest/test_device_queries.py
           tools/roosttest/test_selection_autoscroll.py
+          tools/roosttest/test_password_input.py
+          -m 'not session_daemon and not host_client'
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced exit-on-empty E2E (Linux Wayland)
@@ -1236,13 +1240,15 @@ jobs:
           --roost-target iced --roost-fresh -v
 
       # The three macOS iced cells (this one, the bundle smoke and the
-      # Sparkle lane below) all carry `-m 'not host_client'`. Nothing
-      # ships a macOS `roost-session`, so HS-2's host lane is a Linux
-      # gate — and the deselect is a *fence*, not a filter: these are
-      # enumerated file lists, so its job is to keep the lane out of the
-      # macOS cells the day someone adds the module to all three lists at
-      # once (the enumerated-lists gotcha). Mirrors the Makefile's
-      # DAEMON_E2E_DESELECT.
+      # Sparkle lane below) all deselect `host_client`. Nothing ships a
+      # macOS `roost-session`, so HS-2's host lane is a Linux gate — and
+      # the deselect is a *fence*, not a filter: these are enumerated file
+      # lists, so its job is to keep the lane out of the macOS cells the
+      # day someone adds the module to all three lists at once (the
+      # enumerated-lists gotcha). This cell, like the X11 and Wayland
+      # functional cells, also deselects `session_daemon`:
+      # `test_password_input.py` has cases in both its lanes. Mirrors the
+      # Makefile's DAEMON_E2E_DESELECT.
       - name: Run Iced functional E2E (macOS)
         if: runner.os == 'macOS'
         env:
@@ -1287,10 +1293,11 @@ jobs:
           tools/roosttest/test_context_menu.py
           tools/roosttest/test_device_queries.py
           tools/roosttest/test_selection_autoscroll.py
+          tools/roosttest/test_password_input.py
           tools/roosttest/test_osc52.py
           tools/roosttest/test_paste_files.py
           tools/roosttest/test_context_menu_clipboard.py
-          -m 'not host_client'
+          -m 'not session_daemon and not host_client'
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced exit-on-empty E2E (macOS)

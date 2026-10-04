@@ -117,6 +117,11 @@ struct TabRow {
     /// about is not one anybody can acknowledge. Not persisted, like
     /// `has_notification`.
     notification_generation: u64,
+    /// Whether the tab's PTY is at a password prompt, as its owner's
+    /// password poller last reported ([`Workspace::set_tab_password_input`]).
+    /// Not persisted, like `has_notification`: a relaunch reopens fresh
+    /// shells, and none of them starts at a prompt.
+    password_input: bool,
     user_titled: bool,
     position: i32,
     created_at: i64,
@@ -385,6 +390,13 @@ pub enum WorkspaceEvent {
         #[serde(with = "roost_ipc::messages::string_int64")]
         tab_id: i64,
         active: bool,
+    },
+    /// The tab entered or left a password prompt. State, not a moment,
+    /// so it is replayed like every other tab field.
+    TabPasswordInput {
+        #[serde(with = "roost_ipc::messages::string_int64")]
+        tab_id: i64,
+        password_input: bool,
     },
     /// The full agent record after an accepted report or shell mark;
     /// see [`roost_ipc::messages::AgentReportChangedEvent`].
@@ -1575,6 +1587,7 @@ impl Workspace {
             agent: AgentTabState::default(),
             has_notification: false,
             notification_generation: 0,
+            password_input: false,
             // Always start with user_titled=false. The caller-
             // supplied `title` is a placeholder (e.g. UI's
             // "roost-mac N" / CLI's "roostctl" default) that
@@ -2033,6 +2046,32 @@ impl Workspace {
         // Run state isn't in the persisted snapshot — emit only.
         self.commit(inner, events, Persist::Skip);
         Ok((accepted, tab))
+    }
+
+    /// Record whether a tab's PTY is at a password prompt.
+    ///
+    /// A tab that is gone is not an error: the report comes from a
+    /// poller sampling the PTY, which can land a beat after the row
+    /// closed, and there is nothing left to tell anyone about. An
+    /// unchanged value commits nothing, so a client sees one event per
+    /// transition however often the poller repeats itself.
+    pub fn set_tab_password_input(&self, tab_id: i64, password_input: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(row) = inner.tabs.get_mut(&tab_id) else {
+            return;
+        };
+        if row.password_input == password_input {
+            return;
+        }
+        row.password_input = password_input;
+        self.commit(
+            inner,
+            vec![WorkspaceEvent::TabPasswordInput {
+                tab_id,
+                password_input,
+            }],
+            Persist::Skip,
+        );
     }
 
     pub fn set_tab_has_notification(
@@ -2906,6 +2945,7 @@ fn wire_tab(row: &TabRow, is_active: bool) -> Tab {
         shell_state: row.agent.shell,
         agent_lifecycle: row.agent.lifecycle,
         ownership: row.agent.ownership.clone(),
+        password_input: row.password_input,
     }
 }
 
@@ -6541,6 +6581,62 @@ mod tests {
             "a writable directory is not a write"
         );
         assert!(durability_events(&mut events).is_empty());
+    }
+
+    /// `password_input` (plan 074 §D2) is live tab state: it reaches
+    /// `tab.list` and one event per change, and a commit that never
+    /// touches disk.
+    #[test]
+    fn password_input_is_live_state_with_one_event_per_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::open(dir.path().join("state.json"));
+        let pid = ws.create_project("p", "/").unwrap().id;
+        let tid = ws.open_tab(pid, "/", "a", true).unwrap().id;
+        let written = ws.inner.lock().unwrap().persist_seq;
+        let mut events = ws.subscribe();
+
+        ws.set_tab_password_input(tid, true);
+        assert!(ws.tab(tid).unwrap().password_input);
+        ws.set_tab_password_input(tid, true);
+        ws.set_tab_password_input(tid, false);
+        ws.set_tab_password_input(tid + 1000, true);
+
+        let seen: Vec<WorkspaceEvent> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert_eq!(
+            seen,
+            [true, false].map(|password_input| WorkspaceEvent::TabPasswordInput {
+                tab_id: tid,
+                password_input
+            }),
+            "an unchanged value and a tab that is gone commit nothing"
+        );
+        assert_eq!(
+            ws.inner.lock().unwrap().persist_seq,
+            written,
+            "password_input must never write state.json"
+        );
+    }
+
+    /// State, not a moment: a resume replays it like any other tab field,
+    /// so a client that missed the change while away still learns it.
+    #[test]
+    fn a_password_input_change_is_replayed_into_a_resume() {
+        let ws = replaying(16, REPLAY_BUDGET_BYTES);
+        let pid = ws.create_project("p", "/").unwrap().id;
+        let tid = ws.open_tab(pid, "/", "a", true).unwrap().id;
+        let fence = ws.revision();
+        ws.set_tab_password_input(tid, true);
+
+        let cut = ws.subscribe_from(fence).expect("young enough");
+        let replayed: Vec<&WorkspaceEvent> =
+            cut.replay.iter().flat_map(|batch| &batch.events).collect();
+        assert_eq!(
+            replayed,
+            [&WorkspaceEvent::TabPasswordInput {
+                tab_id: tid,
+                password_input: true
+            }]
+        );
     }
 
     #[test]

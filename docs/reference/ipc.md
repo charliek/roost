@@ -171,7 +171,8 @@ terminal from. It shares the socket path but not the framing; see
     "hook_active": "<bool>",
     "shell_state": "<ShellState>",
     "agent_lifecycle": "<AgentLifecycle>",
-    "ownership": "<Ownership, omitted when unowned>"
+    "ownership": "<Ownership, omitted when unowned>",
+    "password_input": "<bool, omitted while false>"
   },
   "Project": {
     "id": "<string-int64>",
@@ -207,6 +208,19 @@ the `(source, session_id)` identity pair, `last_event_at` (the
 server's receipt time of the most recently accepted report — never
 caller-supplied), a free-form `detail`, and an open `metadata` string
 map for forward-compatible extension (see `tab.agent_report`).
+
+`Tab.password_input` is `true` while the tab's PTY is at a password
+prompt: its line discipline is in canonical (line) mode with echo off
+(`ICANON && !ECHO`), Ghostty's heuristic. The process that owns the
+PTY samples it off the master every 200 ms — the UI for an in-process
+tab, the session for a host-session tab, so a `sudo` prompt on a remote
+host is seen too — and [`tab.password_input`](#events) reports each
+change. It is live state, never persisted, and it clears when the tab's
+process exits. A program that turns echo off at an interactive bash or
+zsh prompt does not set it: their line editors run the terminal raw,
+outside canonical mode. The key is omitted while `false`, so a server
+that predates the field, and a tab that is not at a prompt, look the
+same — both read as `false`, with no protocol bump.
 
 ### `tab.state` / `hook_active` — derived, and the compatibility contract
 
@@ -3936,6 +3950,13 @@ discipline, the last frame before the stream closes. See
 * `tabs.reordered`    — `{"project_id": "<id>", "tab_ids": ["<id>", ...]}`. The full post-reorder display order for that project, not a diff.
 * `projects.reordered` — `{"project_ids": ["<id>", ...]}`. The full post-reorder sidebar order.
 * `hook_active.changed` — `{"tab_id": "<id>", "active": <bool>}`.
+* `tab.password_input` — `{"tab_id": "<id>", "password_input": <bool>}`.
+  The tab's PTY entered or left a password prompt
+  ([`Tab.password_input`](#shared-types)); fires once per change, never
+  per sample. Workspace state like any other tab field, so it is
+  replayed into a resume, and a client that reconnects reads the
+  standing value off [`tab.list`](#tablist). An older client that does
+  not know the name skips it.
 * `notification.fired` — `{"tab_id": "<id>", "title": "<string>", "body": "<string>", "generation": <int>}`. Mirrors the legacy proto's `NotificationEvent`; useful for tools that mirror notifications elsewhere. `generation` numbers the raises on that tab, counting from one; a client acknowledging this raise sends it back on [`tab.clear_notification`](#tabclear_notification) — see [Notifications fan out](#notifications-fan-out). Live-only on a session's event stream: never replayed into a resume.
 * `agent_report.changed` — `{"tab_id": "<id>", "shell_state": "<ShellState>", "agent_lifecycle": "<AgentLifecycle>", "ownership": "<Ownership, omitted when unowned>", "state": "<TabState>", "hook_active": <bool>}`.
   Fires whenever an accepted `tab.agent_report` or an OSC 133 shell

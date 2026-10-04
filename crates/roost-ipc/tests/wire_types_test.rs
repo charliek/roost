@@ -27,9 +27,9 @@ use roost_ipc::messages::{
     SessionSetThemeParams, SessionSetThemeResult, SessionStopParams, SessionStopResult,
     SessionStoppingEvent, SkippedFile, StreamEndedEvent, TabClearNotificationParams,
     TabClearNotificationResult, TabDumpCursor, TabDumpParams, TabDumpResult, TabEffect,
-    TabEffectEvent, TabReorderParams, TabSendFileParams, TabSendFileResult, TabWriteParams,
-    WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES, SESSION_PROTOCOL_VERSION,
-    SESSION_STOPPING_EVENT, STREAM_ENDED_EVENT,
+    TabEffectEvent, TabListResult, TabPasswordInputEvent, TabReorderParams, TabSendFileParams,
+    TabSendFileResult, TabWriteParams, WireProjectRef, WireTabRef, MAX_PUT_FILE_BYTES,
+    SESSION_PROTOCOL_VERSION, SESSION_STOPPING_EVENT, STREAM_ENDED_EVENT,
 };
 
 fn vectors_dir() -> PathBuf {
@@ -2083,4 +2083,55 @@ fn project_ensure_vectors_decode_into_their_typed_shapes() {
     let made = result("project.ensure.created.response.json");
     assert!(made.created);
     assert_eq!(made.project.name, params.name);
+}
+
+// ---------------------------------------------------------------------------
+// password_input (plan 074 §D2): an additive tab field and event, no bump
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tab_password_input_vector_decodes_into_its_typed_shape() {
+    let envelope: EventEnvelope =
+        serde_json::from_str(&read_vector("tab.password_input.event.json"))
+            .expect("decode event envelope");
+    assert_eq!(envelope.event, ops::EVENT_TAB_PASSWORD_INPUT);
+    let data: TabPasswordInputEvent =
+        serde_json::from_value(envelope.data).expect("decode tab.password_input data");
+    assert_eq!(data.tab_id, 5);
+    assert!(data.password_input);
+    round_trip(&data);
+}
+
+/// The `tab.list` an older session answers has no `password_input` key
+/// at all. A client built after the field must read every such tab as
+/// not at a prompt rather than refuse the snapshot, and put nothing back
+/// on the wire for it either.
+#[test]
+fn a_tab_list_from_before_password_input_reads_every_tab_as_false() {
+    for name in ["tab.list.response.json", "tab.list.session.response.json"] {
+        let resp: roost_ipc::messages::Response =
+            serde_json::from_str(&read_vector(name)).expect("decode response envelope");
+        let decoded: TabListResult = serde_json::from_value(resp.result.expect("result body"))
+            .unwrap_or_else(|error| {
+                panic!("{name}: a tab without password_input must decode: {error}")
+            });
+        let tabs: Vec<_> = decoded
+            .projects
+            .into_iter()
+            .flat_map(|project| project.tabs)
+            .collect();
+        assert!(!tabs.is_empty(), "{name} lists no tab to check");
+        for tab in tabs {
+            assert!(
+                !tab.password_input,
+                "{name}: tab {} read as at a prompt",
+                tab.id
+            );
+            let encoded = serde_json::to_value(&tab).unwrap();
+            assert!(
+                encoded.get("password_input").is_none(),
+                "{name}: an unset flag must stay off the wire: {encoded}"
+            );
+        }
+    }
 }

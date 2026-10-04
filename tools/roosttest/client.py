@@ -214,6 +214,11 @@ class Roost:
     def has_notification(self, tab_id: int) -> bool:
         return bool((self.tab(tab_id) or {}).get("has_notification"))
 
+    def password_input(self, tab_id: int) -> bool:
+        """Omitted while false, so a missing key — a pre-074 session's
+        tabs included — reads as not at a prompt."""
+        return bool((self.tab(tab_id) or {}).get("password_input"))
+
     def set_title(self, tab_id: int, title: str) -> None:
         self.call("tab.set_title", {"tab_id": str(tab_id), "title": title})
 
@@ -925,6 +930,10 @@ class Roost:
     def wait_notification(self, tab_id: int, pending: bool, timeout: float = 5.0) -> None:
         self._wait(lambda: self.has_notification(tab_id) is pending,
                    timeout, f"tab {tab_id} has_notification == {pending}")
+
+    def wait_password_input(self, tab_id: int, at_prompt: bool, timeout: float = 5.0) -> None:
+        self._wait(lambda: self.password_input(tab_id) is at_prompt,
+                   timeout, f"tab {tab_id} password_input == {at_prompt}")
 
     def wait_text(self, tab_id: int, needle: str, timeout: float = 5.0) -> None:
         self._wait(lambda: needle in self._safe_dump_text(tab_id),

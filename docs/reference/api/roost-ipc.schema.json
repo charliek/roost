@@ -3027,6 +3027,9 @@
             }
           ]
         },
+        "password_input": {
+          "type": "boolean"
+        },
         "position": {
           "format": "int32",
           "type": "integer"
@@ -3704,6 +3707,21 @@
       ],
       "type": "object"
     },
+    "TabPasswordInputEvent": {
+      "properties": {
+        "password_input": {
+          "type": "boolean"
+        },
+        "tab_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tab_id",
+        "password_input"
+      ],
+      "type": "object"
+    },
     "TabReorderParams": {
       "additionalProperties": false,
       "properties": {
@@ -4115,6 +4133,9 @@
     },
     "tab.opened": {
       "$ref": "#/$defs/TabOpenedEvent"
+    },
+    "tab.password_input": {
+      "$ref": "#/$defs/TabPasswordInputEvent"
     },
     "tab.state_changed": {
       "$ref": "#/$defs/TabStateChangedEvent"

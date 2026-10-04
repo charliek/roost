@@ -4140,6 +4140,7 @@ mod tests {
             shell_state: Default::default(),
             agent_lifecycle: Default::default(),
             ownership: None,
+            password_input: false,
         }
     }
 
@@ -4782,6 +4783,7 @@ mod switch_tests {
             shell_state: Default::default(),
             agent_lifecycle: Default::default(),
             ownership: None,
+            password_input: false,
         }
     }
 
@@ -5587,6 +5589,7 @@ mod migration_tests {
                     shell_state: Default::default(),
                     agent_lifecycle: Default::default(),
                     ownership: None,
+                    password_input: false,
                 })
                 .collect(),
         }

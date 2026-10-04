@@ -98,6 +98,13 @@ from eventstream import ENDED_EVENT, EventStream  # noqa: E402
 from relay import Relay  # noqa: E402
 from session import wait_until  # noqa: E402
 from test_host_local_spawn import roostctl_session, running_session_id  # noqa: E402
+from test_password_input import (  # noqa: E402
+    READY,
+    answer_and_clear,
+    assert_no_transition_through_a_marker,
+    prompt_argv,
+    raised_on,
+)
 
 pytestmark = pytest.mark.host_client
 
@@ -1518,6 +1525,41 @@ def test_a_relaunch_under_session_reattaches_the_same_tabs(lane: Lane):
     assert token in history, (
         "the shell that printed it is still the shell behind the tab"
     )
+
+
+def test_a_password_prompt_on_the_slot_survives_a_ui_restart(lane: Lane):
+    """Plan 074 §D2's reattach under `local-backend = session`: a slot tab
+    at a password prompt still reads as one after the UI restarts, off the
+    UI socket's `tab.list`, with no new transition — the session sampling
+    the PTY never saw the UI leave.
+
+    The event stream is the session's own, so it spans the restart. The
+    prompt is awaited on it rather than on `tab.list`, so the restarted
+    UI's read is the first snapshot to see the flag; the marker commit
+    after the reattach is what bounds "no transition".
+    """
+    roost = session_ui(lane)
+    project = int(lane.session_projects()[0]["id"])
+    with EventStream(lane.env.socket) as stream:
+        stream.subscribe()
+        tab = roost.open_tab(project, cwd="/tmp", argv=prompt_argv())
+        with lane.session() as c:
+            c.wait_text(tab, READY, timeout=30.0)
+        fence = int(raised_on(stream, tab)[-1]["revision"])
+
+        ui.quit(lane.target)
+        roost = lane.restart()
+        wait_until(
+            lambda: roost.identify()["active_tab_id"] != 0,
+            60.0,
+            "the restarted UI to reattach the slot",
+        )
+        assert roost.password_input(tab), "the restarted UI read the prompt as down"
+        with lane.session() as c:
+            assert_no_transition_through_a_marker(stream, c, tab, fence)
+
+    answer_and_clear(roost, tab)
+    roost.close_tab(tab)
 
 
 def test_an_in_process_relaunch_keeps_the_tab_each_project_last_showed(lane: Lane):

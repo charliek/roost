@@ -3796,6 +3796,10 @@ impl App {
             Arc::clone(supervisor),
             profile.socket_path.clone(),
         );
+        {
+            let _runtime = runtime.enter();
+            client.watch_password_input();
+        }
 
         // After `Workspace::open` (there is nothing to delete before
         // it) and before the hydrate, which would otherwise warn about
@@ -12295,6 +12299,7 @@ mod tests {
             shell_state: ShellState::default(),
             agent_lifecycle: AgentLifecycle::default(),
             ownership: None,
+            password_input: false,
         }];
         listed.answer(Ok(serde_json::to_value(TabListResult {
             projects: vec![project],
@@ -12380,6 +12385,7 @@ mod tests {
             shell_state: Default::default(),
             agent_lifecycle: Default::default(),
             ownership: None,
+            password_input: false,
         };
         open.answer(Ok(serde_json::to_value(TabOpenResult { tab }).unwrap()));
 
@@ -12417,6 +12423,7 @@ mod tests {
             shell_state: Default::default(),
             agent_lifecycle: Default::default(),
             ownership: None,
+            password_input: false,
         }
     }
 

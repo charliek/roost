@@ -21,6 +21,7 @@ fn tab(id: i64, project_id: i64, position: i32, is_active: bool) -> Tab {
         shell_state: Default::default(),
         agent_lifecycle: Default::default(),
         ownership: None,
+        password_input: false,
     }
 }
 

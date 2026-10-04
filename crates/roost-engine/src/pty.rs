@@ -19,16 +19,16 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, PtySize};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 use tracing::{debug, error, info, warn};
 
 /// Depth of a tab's output fan-out. A consumer that falls this far
@@ -70,6 +70,12 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// run; anything still there afterwards is reported as abandoned rather
 /// than waited on indefinitely.
 const SHUTDOWN_KILL_TAIL: Duration = Duration::from_millis(500);
+/// How often the password poller samples every PTY's line discipline —
+/// Ghostty's interval for the same heuristic.
+const PASSWORD_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Depth of the supervisor's lifecycle channel. A subscriber this far
+/// behind gets `Lagged`.
+const LIFECYCLE_CAPACITY: usize = 64;
 
 /// What a subscriber gets back from `PtySupervisor::subscribe`.
 ///
@@ -174,11 +180,32 @@ impl OutputPublisher {
     }
 }
 
-/// Supervisor-level lifecycle events, fan-out to higher-level
-/// state (e.g. `Workspace` listens for `Exit` and closes the tab).
+/// Supervisor-level lifecycle events. The supervisor knows nothing of
+/// the workspace; whoever owns both applies these to it.
 #[derive(Debug, Clone)]
 pub enum SupervisorEvent {
-    TabExited { tab_id: i64, status: i32 },
+    TabExited {
+        tab_id: i64,
+        status: i32,
+    },
+    /// Where a tab's PTY stands on a password prompt: a spawn's first
+    /// sample, or a change ([`PtySupervisor::start_password_poller`]).
+    /// `incarnation` names the spawn the sample was taken from, which an
+    /// owner compares with [`PtySupervisor::incarnation`] before applying
+    /// it — the sample is read with no lock held, so the tab id may name a
+    /// later spawn by the time it arrives.
+    PasswordInput {
+        tab_id: i64,
+        incarnation: u64,
+        password: bool,
+    },
+    /// Every live tab's sample at once, `(tab_id, incarnation, password)`
+    /// — the poller's answer to [`PtySupervisor::republish_password_input`].
+    /// One message whatever the tab count, so an owner resyncing after a
+    /// lag cannot overflow the channel again with the resync itself.
+    PasswordSnapshot {
+        entries: Vec<(i64, u64, bool)>,
+    },
 }
 
 /// What [`PtySupervisor::shutdown_all`] did with every tab that was live
@@ -478,9 +505,15 @@ pub struct PtySupervisor {
     /// waits and then runs against what the winner left, which is
     /// normally nothing.
     shutdown_gate: tokio::sync::Mutex<()>,
-    /// One broadcast channel for supervisor-level events. The
-    /// `Workspace` subscribes once at startup.
+    /// One broadcast channel for supervisor-level events: the exits
+    /// `shutdown_all` wakes on, and the password poller's reports, which
+    /// the owner applies to its workspace.
     lifecycle: broadcast::Sender<SupervisorEvent>,
+    /// Numbers every spawn, so a report about one PTY can never be
+    /// mistaken for a later spawn that reuses its tab id.
+    next_incarnation: AtomicU64,
+    /// What the password poller reaches this supervisor through.
+    password_watch: Arc<PasswordWatch>,
     /// Set by [`PtySupervisor::enable_server_vt`] before the first
     /// spawn. `None` — the default, and what every UI build sees even
     /// when feature unification compiles the code in — means the reader
@@ -527,6 +560,209 @@ struct Session {
     /// this session before anyone can observe the exit.
     #[cfg(feature = "server-vt")]
     tab_task: Option<(mpsc::Sender<crate::tab_task::TabCmd>, u64)>,
+    /// This spawn's number, unique for the supervisor's life.
+    incarnation: u64,
+    /// The password poller's CLOEXEC dup of the master, held weakly. The
+    /// writer task owns it beside the PTY's other master handles, so it
+    /// closes exactly when they do. A session can outlive them: a reap
+    /// still waiting on the child holds the map, and a dup held here
+    /// would keep the master open, so a child that only ends on the
+    /// hang-up the last master close sends would never end — and the
+    /// reap would wait on it forever. A tick upgrades it for one
+    /// `tcgetattr` at a time, so a recycled fd number can never redirect
+    /// a read.
+    password_fd: Weak<OwnedFd>,
+}
+
+/// The password poller's handle on its supervisor (plan 074 §D2).
+///
+/// The supervisor holds the only strong reference, so a poller that can
+/// no longer upgrade its `Weak` knows the supervisor is gone — and the
+/// drop wakes an idle poller so it finds out.
+struct PasswordWatch {
+    sessions: Arc<Mutex<HashMap<i64, Session>>>,
+    lifecycle: broadcast::Sender<SupervisorEvent>,
+    /// Woken by a spawn (an idle poller has something to sample), by
+    /// `shutdown_all`, and by this watch's drop. Held by the poller
+    /// directly, because waiting on it through the `Weak` would keep the
+    /// watch alive for as long as the poller sleeps.
+    wake: Arc<Notify>,
+    started: AtomicBool,
+    /// Latched by `shutdown_all`: the poller has nothing left to do.
+    stopped: AtomicBool,
+    /// Set by [`PtySupervisor::republish_password_input`]: the poller's
+    /// next tick sends a [`SupervisorEvent::PasswordSnapshot`].
+    republish: AtomicBool,
+    /// How many times the poller has gone to sleep with nothing to
+    /// sample, so a test can know it is asleep before it spawns.
+    #[cfg(test)]
+    idle_waits: AtomicU64,
+}
+
+impl PasswordWatch {
+    /// Every promoted session's sampling handle. A spawn still in
+    /// `pending` has no session yet, so it is skipped by construction.
+    fn probes(&self) -> Vec<PasswordProbe> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(tab_id, session)| PasswordProbe {
+                tab_id: *tab_id,
+                incarnation: session.incarnation,
+                fd: Weak::clone(&session.password_fd),
+            })
+            .collect()
+    }
+}
+
+impl Drop for PasswordWatch {
+    fn drop(&mut self) {
+        self.wake.notify_one();
+    }
+}
+
+/// One session, as the password poller samples it.
+struct PasswordProbe {
+    tab_id: i64,
+    incarnation: u64,
+    fd: Weak<OwnedFd>,
+}
+
+/// Whether the PTY behind `fd` is at a password prompt: canonical (line)
+/// mode with echo off, Ghostty's heuristic. A master reports the slave's
+/// line discipline on both Linux and macOS.
+fn at_password_prompt(fd: BorrowedFd<'_>) -> std::io::Result<bool> {
+    // SAFETY: `tcgetattr` only writes the `termios` it is handed, and
+    // `fd` is borrowed from an open descriptor for the length of the call.
+    let termios = unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd.as_raw_fd(), &mut termios) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        termios
+    };
+    Ok(termios.c_lflag & libc::ICANON != 0 && termios.c_lflag & libc::ECHO == 0)
+}
+
+/// The password poller's change detection, apart from its timer so a
+/// test can drive it one tick at a time.
+#[derive(Default)]
+struct PasswordSampler {
+    /// Each live tab's last reported spawn and value. A spawn's first
+    /// sample is always reported, `false` included: it is what clears a
+    /// flag its predecessor under the same tab id left raised, whose own
+    /// clear an owner drops as stale once the replacement exists.
+    reported: HashMap<i64, (u64, bool)>,
+    /// Incarnations whose failing `tcgetattr` has already been logged.
+    failures_logged: HashSet<u64>,
+}
+
+impl PasswordSampler {
+    /// Sample every probe and answer what changed. A tab no probe names
+    /// any more is forgotten without a report: its exit is the owner's
+    /// to clear, through [`SupervisorEvent::TabExited`].
+    fn tick(&mut self, probes: &[PasswordProbe]) -> Vec<SupervisorEvent> {
+        let reported = std::mem::take(&mut self.reported);
+        let mut changes = Vec::new();
+        for probe in probes {
+            let Some(password) = self.sample(probe) else {
+                continue;
+            };
+            let sample = (probe.incarnation, password);
+            if reported.get(&probe.tab_id) != Some(&sample) {
+                changes.push(SupervisorEvent::PasswordInput {
+                    tab_id: probe.tab_id,
+                    incarnation: probe.incarnation,
+                    password: sample.1,
+                });
+            }
+            self.reported.insert(probe.tab_id, sample);
+        }
+        self.forget_failures_of_the_gone(probes);
+        changes
+    }
+
+    /// Sample every probe and answer all of it as one
+    /// [`SupervisorEvent::PasswordSnapshot`], recording each sample as
+    /// reported.
+    fn snapshot(&mut self, probes: &[PasswordProbe]) -> Vec<SupervisorEvent> {
+        self.reported.clear();
+        let mut entries = Vec::with_capacity(probes.len());
+        for probe in probes {
+            let Some(password) = self.sample(probe) else {
+                continue;
+            };
+            self.reported
+                .insert(probe.tab_id, (probe.incarnation, password));
+            entries.push((probe.tab_id, probe.incarnation, password));
+        }
+        self.forget_failures_of_the_gone(probes);
+        vec![SupervisorEvent::PasswordSnapshot { entries }]
+    }
+
+    /// `None` once the PTY's master handles are gone: there is nothing
+    /// left to sample, and the session is on its way out of the map.
+    fn sample(&mut self, probe: &PasswordProbe) -> Option<bool> {
+        let fd = probe.fd.upgrade()?;
+        Some(match at_password_prompt(fd.as_fd()) {
+            Ok(password) => password,
+            // A child that has exited leaves a master `tcgetattr` can fail
+            // on (EIO). Nobody types a password into that.
+            Err(error) => {
+                if self.failures_logged.insert(probe.incarnation) {
+                    debug!(
+                        tab_id = probe.tab_id,
+                        incarnation = probe.incarnation,
+                        %error,
+                        "tcgetattr on the pty master failed; reading it as no password prompt"
+                    );
+                }
+                false
+            }
+        })
+    }
+
+    fn forget_failures_of_the_gone(&mut self, probes: &[PasswordProbe]) {
+        self.failures_logged
+            .retain(|incarnation| probes.iter().any(|probe| probe.incarnation == *incarnation));
+    }
+}
+
+/// The password poller's body: one tick every [`PASSWORD_POLL_INTERVAL`]
+/// while any session exists, asleep on `wake` while none does.
+///
+/// The sessions lock is held only to take the probes; every `tcgetattr`
+/// runs after it is released, and the probes go when the tick ends.
+async fn poll_password_input(watch: Weak<PasswordWatch>, wake: Arc<Notify>) {
+    let mut sampler = PasswordSampler::default();
+    loop {
+        let Some(live) = watch.upgrade() else { return };
+        if live.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        let republish = live.republish.swap(false, Ordering::SeqCst);
+        let probes = live.probes();
+        let reports = if republish {
+            sampler.snapshot(&probes)
+        } else {
+            sampler.tick(&probes)
+        };
+        let idle = probes.is_empty();
+        drop(probes);
+        for report in reports {
+            let _ = live.lifecycle.send(report);
+        }
+        #[cfg(test)]
+        if idle {
+            live.idle_waits.fetch_add(1, Ordering::SeqCst);
+        }
+        drop(live);
+        tokio::select! {
+            () = tokio::time::sleep(PASSWORD_POLL_INTERVAL), if !idle => {}
+            () = wake.notified() => {}
+        }
+    }
 }
 
 impl Default for PtySupervisor {
@@ -537,17 +773,77 @@ impl Default for PtySupervisor {
 
 impl PtySupervisor {
     pub fn new() -> Self {
-        let (lifecycle, _rx) = broadcast::channel(64);
+        Self::with_lifecycle_capacity(LIFECYCLE_CAPACITY)
+    }
+
+    /// [`Self::new`] with the lifecycle channel's depth stated, so a test
+    /// can overflow it with a handful of PTYs rather than more than a
+    /// process's default fd limit allows.
+    fn with_lifecycle_capacity(capacity: usize) -> Self {
+        let (lifecycle, _rx) = broadcast::channel(capacity);
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let password_watch = Arc::new(PasswordWatch {
+            sessions: Arc::clone(&sessions),
+            lifecycle: lifecycle.clone(),
+            wake: Arc::new(Notify::new()),
+            started: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            republish: AtomicBool::new(false),
+            #[cfg(test)]
+            idle_waits: AtomicU64::new(0),
+        });
         Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions,
             pending: Mutex::new(HashSet::new()),
             shutting_down: AtomicBool::new(false),
             sweep_started: AtomicBool::new(false),
             shutdown_gate: tokio::sync::Mutex::new(()),
             lifecycle,
+            next_incarnation: AtomicU64::new(1),
+            password_watch,
             #[cfg(feature = "server-vt")]
             server_vt: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Start sampling every PTY for a password prompt (plan 074 §D2),
+    /// reporting each spawn's first sample and every change after it as a
+    /// [`SupervisorEvent::PasswordInput`].
+    ///
+    /// The owner calls this, from inside a Tokio runtime — never `new`,
+    /// which has none to spawn on. Idempotent: the first call answers the
+    /// poller's handle, every later one `None`. The poller sleeps while
+    /// no session exists, never keeps this supervisor alive, and ends
+    /// when it is dropped or [`Self::shutdown_all`] begins.
+    pub fn start_password_poller(&self) -> Option<tokio::task::JoinHandle<()>> {
+        if self.password_watch.started.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        Some(tokio::spawn(poll_password_input(
+            Arc::downgrade(&self.password_watch),
+            Arc::clone(&self.password_watch.wake),
+        )))
+    }
+
+    /// The spawn `tab_id` names right now, or `None` when it has no live
+    /// PTY. What a [`SupervisorEvent::PasswordInput`] is checked against.
+    pub fn incarnation(&self, tab_id: i64) -> Option<u64> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(&tab_id)
+            .map(|session| session.incarnation)
+    }
+
+    /// Have the password poller's next regular tick send a
+    /// [`SupervisorEvent::PasswordSnapshot`] of every live tab — for an
+    /// owner that fell behind the lifecycle channel and has to resync
+    /// rather than replay. The snapshot carries incarnations and becomes
+    /// the poller's own record of what it said, so nothing is sampled
+    /// behind its back. Not a wake: a resync that lags again asks again,
+    /// and the poller's cadence is what keeps that from spinning.
+    pub fn republish_password_input(&self) {
+        self.password_watch.republish.store(true, Ordering::SeqCst);
     }
 
     /// Turn the server-VT pipeline on for every tab this supervisor
@@ -879,6 +1175,10 @@ impl PtySupervisor {
         let master_fd = pair.master.as_raw_fd().context("master pty has no fd")?;
         set_nonblocking(master_fd).context("master O_NONBLOCK")?;
         let reader_handle = dup_master(master_fd).context("dup master for reader")?;
+        let password_fd = Arc::new(OwnedFd::from(
+            dup_master(master_fd).context("dup master for the password poller")?,
+        ));
+        let password_watch_fd = Arc::downgrade(&password_fd);
         let writer = AsyncFd::with_interest(
             dup_master(master_fd).context("dup master for writer")?,
             Interest::WRITABLE,
@@ -1015,6 +1315,7 @@ impl PtySupervisor {
         // hang-up ends the wait (#409).
         tokio::spawn(async move {
             let _eof_on_drop = eof_on_drop;
+            let _password_fd = password_fd;
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     WriterCmd::Input(data) => {
@@ -1054,6 +1355,8 @@ impl PtySupervisor {
             tab_task: tab_pipe
                 .as_ref()
                 .map(|pipe| (pipe.cmd_tx.clone(), pipe.tab_generation)),
+            incarnation: self.next_incarnation.fetch_add(1, Ordering::Relaxed),
+            password_fd: password_watch_fd,
         };
         before_promote();
         // Promote the slot from pending → sessions atomically, BEFORE
@@ -1086,6 +1389,9 @@ impl PtySupervisor {
         // Either branch consumed the pending entry (ours, or the one
         // `close()` already took), so the guard has nothing left to do.
         slot.armed = false;
+        if unwanted.is_none() {
+            self.password_watch.wake.notify_one();
+        }
 
         // A `session.set_theme` that ran between this tab's terminal
         // build and its promotion snapshotted a sessions map this tab
@@ -1402,6 +1708,8 @@ impl PtySupervisor {
             let _pending = self.pending.lock().unwrap();
             self.shutting_down.store(true, Ordering::SeqCst);
         }
+        self.password_watch.stopped.store(true, Ordering::SeqCst);
+        self.password_watch.wake.notify_one();
 
         // Spawns that reserved their slot before the latch still have to
         // finish: they either install a session (which the sweep below
@@ -2511,6 +2819,460 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    // ---- the password poller (plan 074 §D2) -------------------------
+
+    /// A PTY pair with nothing on either end: the master is what the
+    /// poller samples, and the slave is where a test sets the line
+    /// discipline a child at a prompt would.
+    fn pty_pair() -> (OwnedFd, OwnedFd) {
+        use std::os::fd::FromRawFd;
+
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: `openpty` fills the two fds; nothing else is passed.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+        // SAFETY: both fds are fresh and owned by nothing else.
+        unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) }
+    }
+
+    fn set_line_discipline(slave: &OwnedFd, canonical: bool, echo: bool) {
+        // SAFETY: `tcgetattr`/`tcsetattr` read and write the `termios`
+        // handed to them, on an fd this test owns.
+        unsafe {
+            let mut termios: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave.as_raw_fd(), &mut termios), 0);
+            for (flag, on) in [(libc::ICANON, canonical), (libc::ECHO, echo)] {
+                if on {
+                    termios.c_lflag |= flag;
+                } else {
+                    termios.c_lflag &= !flag;
+                }
+            }
+            assert_eq!(
+                libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &termios),
+                0,
+                "tcsetattr: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    fn probe(tab_id: i64, incarnation: u64, fd: &Arc<OwnedFd>) -> PasswordProbe {
+        PasswordProbe {
+            tab_id,
+            incarnation,
+            fd: Arc::downgrade(fd),
+        }
+    }
+
+    /// `(tab_id, incarnation, password)` per report, so a mismatch
+    /// prints the sequence rather than a `Debug` of the enum.
+    fn reports(events: Vec<SupervisorEvent>) -> Vec<(i64, u64, bool)> {
+        events
+            .into_iter()
+            .map(|event| match event {
+                SupervisorEvent::PasswordInput {
+                    tab_id,
+                    incarnation,
+                    password,
+                } => (tab_id, incarnation, password),
+                other => panic!("the sampler reported a non-password event: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Ghostty's heuristic on a real line discipline, through all four
+    /// `ICANON`×`ECHO` combinations: only line mode with echo off is a
+    /// password prompt, and each move into or out of it is reported once.
+    #[test]
+    fn only_line_mode_with_echo_off_reads_as_a_password_prompt() {
+        let (master, slave) = pty_pair();
+        let master = Arc::new(master);
+        let mut sampler = PasswordSampler::default();
+        let mut seen = Vec::new();
+        for (canonical, echo) in [
+            (true, true),
+            (true, false),
+            (true, false),
+            (false, false),
+            (false, true),
+            (true, false),
+            (true, true),
+            (true, true),
+        ] {
+            set_line_discipline(&slave, canonical, echo);
+            assert_eq!(
+                at_password_prompt(master.as_fd()).expect("tcgetattr on the master"),
+                canonical && !echo,
+                "ICANON={canonical} ECHO={echo}"
+            );
+            seen.extend(reports(sampler.tick(&[probe(3, 1, &master)])));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (3, 1, false),
+                (3, 1, true),
+                (3, 1, false),
+                (3, 1, true),
+                (3, 1, false)
+            ],
+            "the spawn's first sample, then one report per move into or out \
+             of a prompt — none for the other three combinations or a \
+             repeated sample"
+        );
+    }
+
+    /// A master `tcgetattr` fails on reads as no prompt, and says so in
+    /// the log once for that spawn, not once per tick.
+    #[test]
+    fn a_failing_tcgetattr_reads_as_no_prompt_and_logs_once() {
+        let (master, slave) = pty_pair();
+        let master = Arc::new(master);
+        let not_a_tty = Arc::new(OwnedFd::from(File::open("/dev/null").expect("/dev/null")));
+        set_line_discipline(&slave, true, false);
+
+        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer = Arc::clone(&captured);
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || CapturedLog(Arc::clone(&writer)))
+            .finish();
+        let seen = tracing::subscriber::with_default(subscriber, || {
+            let mut sampler = PasswordSampler::default();
+            let mut seen = reports(sampler.tick(&[probe(3, 1, &master)]));
+            for _ in 0..3 {
+                seen.extend(reports(sampler.tick(&[probe(3, 1, &not_a_tty)])));
+            }
+            seen
+        });
+
+        assert_eq!(seen, [(3, 1, true), (3, 1, false)]);
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            log.matches("tcgetattr on the pty master failed").count(),
+            1,
+            "{log}"
+        );
+    }
+
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A tab id respawned under a raised flag: the replacement's first
+    /// sample is reported under its own incarnation even when it agrees
+    /// with the last thing reported for the tab — whether that was the
+    /// predecessor's own clear or nothing at all, because a tick with
+    /// neither spawn in the map came between them.
+    #[test]
+    fn a_respawns_first_sample_is_reported_whatever_came_before_it() {
+        let (old_master, old_slave) = pty_pair();
+        let (new_master, _new_slave) = pty_pair();
+        let (old_master, new_master) = (Arc::new(old_master), Arc::new(new_master));
+        let exited = Arc::new(OwnedFd::from(File::open("/dev/null").expect("/dev/null")));
+        set_line_discipline(&old_slave, true, false);
+
+        for gap in [vec![probe(3, 1, &exited)], Vec::new()] {
+            let mut sampler = PasswordSampler::default();
+            assert_eq!(
+                reports(sampler.tick(&[probe(3, 1, &old_master)])),
+                [(3, 1, true)]
+            );
+            sampler.tick(&gap);
+            assert_eq!(
+                reports(sampler.tick(&[probe(3, 2, &new_master)])),
+                [(3, 2, false)],
+                "a respawn after {} reported nothing",
+                if gap.is_empty() {
+                    "an empty tick"
+                } else {
+                    "its predecessor's clear"
+                }
+            );
+            assert_eq!(reports(sampler.tick(&[probe(3, 2, &new_master)])), []);
+        }
+    }
+
+    /// The whole sequence through the owner: A raises the flag and exits,
+    /// and B takes the tab id before A's clear is delivered, so that
+    /// clear is stale and A's exit is not B's. B's first sample is what
+    /// leaves the row down — the plan's "a new incarnation starts false",
+    /// end to end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_respawn_clears_the_prompt_its_predecessor_left() {
+        use crate::application::{apply_password_report, spawn_in};
+
+        let workspace = crate::Workspace::new();
+        let project = workspace.create_project("p", "/tmp").unwrap().id;
+        let tab = workspace.open_tab(project, "/tmp", "", true).unwrap().id;
+        let supervisor = Arc::new(PtySupervisor::new());
+        let apply = |events: Vec<SupervisorEvent>| {
+            for event in &events {
+                apply_password_report(&workspace, &supervisor, event);
+            }
+        };
+        let (a_master, a_slave) = pty_pair();
+        let (b_master, _b_slave) = pty_pair();
+        let (a_master, b_master) = (Arc::new(a_master), Arc::new(b_master));
+        let exited = Arc::new(OwnedFd::from(File::open("/dev/null").expect("/dev/null")));
+        set_line_discipline(&a_slave, true, false);
+        let mut sampler = PasswordSampler::default();
+
+        let _a = spawn_in(&supervisor, tab, std::path::Path::new("/tmp"), COOPERATIVE);
+        let a = supervisor.incarnation(tab).expect("A is live");
+        apply(sampler.tick(&[probe(tab, a, &a_master)]));
+        assert!(workspace.tab(tab).unwrap().password_input);
+
+        let a_cleared = sampler.tick(&[probe(tab, a, &exited)]);
+        supervisor.close(tab);
+        let _b = spawn_in(&supervisor, tab, std::path::Path::new("/tmp"), COOPERATIVE);
+        let b = supervisor.incarnation(tab).expect("B is live");
+        apply(a_cleared);
+        apply(vec![SupervisorEvent::TabExited {
+            tab_id: tab,
+            status: 0,
+        }]);
+        apply(sampler.tick(&[probe(tab, b, &b_master)]));
+        assert!(
+            !workspace.tab(tab).unwrap().password_input,
+            "B inherited A's prompt"
+        );
+    }
+
+    /// What a lagged owner's resync rides on: a snapshot reports every
+    /// live tab, unchanged ones included, in one message — and becomes
+    /// the record the next tick's changes are measured against.
+    #[test]
+    fn a_snapshot_reports_every_tab_in_one_message() {
+        let (prompt_master, prompt_slave) = pty_pair();
+        let (quiet_master, _quiet_slave) = pty_pair();
+        let (prompt_master, quiet_master) = (Arc::new(prompt_master), Arc::new(quiet_master));
+        set_line_discipline(&prompt_slave, true, false);
+        let probes = [probe(3, 1, &prompt_master), probe(4, 2, &quiet_master)];
+        let mut sampler = PasswordSampler::default();
+        sampler.tick(&probes);
+        assert_eq!(reports(sampler.tick(&probes)), []);
+
+        match sampler.snapshot(&probes).as_slice() {
+            [SupervisorEvent::PasswordSnapshot { entries }] => {
+                assert_eq!(entries, &[(3, 1, true), (4, 2, false)]);
+            }
+            other => panic!("a snapshot is one PasswordSnapshot, got {other:?}"),
+        }
+        assert_eq!(reports(sampler.tick(&probes)), []);
+    }
+
+    /// The poller's dup of the master closes with the writer task's master
+    /// handles, not with the session. A runtime torn down under a live
+    /// child drops the writer task; the session stays in the map, held by
+    /// a reap still waiting on that child. If the session held the dup, the
+    /// master would stay open past every other handle, and a child that
+    /// only ends on the hang-up the last master close sends would never
+    /// end (#594's macOS hang).
+    #[test]
+    fn a_session_holds_no_master_open_once_its_writer_is_gone() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let supervisor = Arc::new(PtySupervisor::new());
+        {
+            let _inside = runtime.enter();
+            let argv = ["/bin/sh", "-c", COOPERATIVE].map(String::from);
+            let socket = std::path::Path::new("/tmp/roost-test.sock");
+            supervisor
+                .spawn(1, "/tmp", &argv, 80, 24, socket)
+                .expect("spawn");
+        }
+        assert!(
+            supervisor.password_watch.probes()[0].fd.upgrade().is_some(),
+            "a live session's dup is reachable"
+        );
+
+        runtime.shutdown_background();
+        let probes = supervisor.password_watch.probes();
+        assert_eq!(probes.len(), 1, "the waiting reap keeps the session");
+        let held_open = probes[0].fd.upgrade().is_some();
+        drop(probes);
+        supervisor.close(1);
+        assert!(
+            !held_open,
+            "the session kept the master open past the writer's handles"
+        );
+    }
+
+    /// A lag recovery converges whatever the tab count. More tabs than the
+    /// lifecycle channel holds — a small one, so the PTYs stay few — are
+    /// raised behind the poller's back. Each
+    /// round, the republish the poller sends lands on the channel before
+    /// the owner reads any of it — the worst case — and the owner applies
+    /// what it can read and asks again whenever it lagged, as the applier
+    /// does. Every row must end at its PTY's real state, out of a prompt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lag_recovery_converges_with_more_tabs_than_the_channel_holds() {
+        use crate::application::{apply_password_report, spawn_in};
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let workspace = crate::Workspace::new();
+        let project = workspace.create_project("p", "/tmp").unwrap().id;
+        const CAPACITY: usize = 8;
+        let supervisor = Arc::new(PtySupervisor::with_lifecycle_capacity(CAPACITY));
+        let mut tabs = Vec::new();
+        let mut ptys = Vec::new();
+        for _ in 0..CAPACITY + 4 {
+            let tab = workspace.open_tab(project, "/tmp", "", true).unwrap().id;
+            ptys.push(spawn_in(
+                &supervisor,
+                tab,
+                std::path::Path::new("/tmp"),
+                COOPERATIVE,
+            ));
+            workspace.set_tab_password_input(tab, true);
+            tabs.push(tab);
+        }
+        let mut sampler = PasswordSampler::default();
+        let mut owner = supervisor.subscribe_lifecycle();
+
+        for _ in 0..3 {
+            for report in sampler.snapshot(&supervisor.password_watch.probes()) {
+                let _ = supervisor.lifecycle.send(report);
+            }
+            let mut lagged = false;
+            loop {
+                match owner.try_recv() {
+                    Ok(report) => apply_password_report(&workspace, &supervisor, &report),
+                    Err(TryRecvError::Lagged(_)) => lagged = true,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Closed) => panic!("the lifecycle channel closed"),
+                }
+            }
+            if !lagged {
+                break;
+            }
+        }
+
+        let raised: Vec<i64> = tabs
+            .iter()
+            .copied()
+            .filter(|tab| workspace.tab(*tab).unwrap().password_input)
+            .collect();
+        assert!(
+            raised.is_empty(),
+            "a lag recovery left {} of {} rows raised: {raised:?}",
+            raised.len(),
+            tabs.len()
+        );
+    }
+
+    /// `stty -echo` and a wait: canonical mode stays on in a
+    /// non-interactive `sh` (there is no line editor to turn it off), so
+    /// this is a password prompt until it reads a line.
+    const PROMPT: &str = "stty -echo icanon; read line; stty echo; exec sleep 60";
+
+    /// The incarnation of the next report that `tab_id` is or is not at a
+    /// prompt.
+    async fn reported(
+        lifecycle: &mut broadcast::Receiver<SupervisorEvent>,
+        tab_id: i64,
+        password: bool,
+    ) -> u64 {
+        let wait = async {
+            loop {
+                match lifecycle.recv().await {
+                    Ok(SupervisorEvent::PasswordInput {
+                        tab_id: id,
+                        incarnation,
+                        password: reported,
+                    }) if id == tab_id && reported == password => return incarnation,
+                    Ok(_) => {}
+                    Err(error) => panic!("lifecycle recv: {error:?}"),
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .unwrap_or_else(|_| panic!("no password={password} report within 10 s"))
+    }
+
+    /// The poller is asleep with nothing to sample when the tab spawns —
+    /// the test waits until it is — so the spawn has to wake it, and the
+    /// report has to name the spawn it was sampled from.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_poller_wakes_for_a_spawn_and_reports_its_prompt() {
+        let supervisor = Arc::new(PtySupervisor::new());
+        let mut lifecycle = supervisor.subscribe_lifecycle();
+        let _poller = supervisor
+            .start_password_poller()
+            .expect("the first start starts it");
+        assert!(
+            supervisor.start_password_poller().is_none(),
+            "a second start starts nothing"
+        );
+        let asleep = async {
+            while supervisor.password_watch.idle_waits.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), asleep)
+            .await
+            .expect("the poller never went idle");
+        let _pty =
+            crate::application::spawn_in(&supervisor, 7, std::path::Path::new("/tmp"), PROMPT);
+        let incarnation = supervisor.incarnation(7).expect("a live spawn");
+
+        assert_eq!(reported(&mut lifecycle, 7, true).await, incarnation);
+        supervisor
+            .write(7, b"secret\n".to_vec())
+            .await
+            .expect("answer the prompt");
+        assert_eq!(reported(&mut lifecycle, 7, false).await, incarnation);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_all_stops_the_poller() {
+        let supervisor = Arc::new(PtySupervisor::new());
+        let poller = supervisor.start_password_poller().expect("started");
+        let _pty =
+            crate::application::spawn_in(&supervisor, 7, std::path::Path::new("/tmp"), COOPERATIVE);
+        supervisor.shutdown_all(Duration::from_secs(5)).await;
+        tokio::time::timeout(Duration::from_secs(5), poller)
+            .await
+            .expect("the poller outlived shutdown_all")
+            .expect("the poller panicked");
+    }
+
+    /// An idle poller holds its supervisor only weakly, and the drop is
+    /// what wakes it to notice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_poller_ends_with_its_supervisor() {
+        let supervisor = PtySupervisor::new();
+        let poller = supervisor.start_password_poller().expect("started");
+        drop(supervisor);
+        tokio::time::timeout(Duration::from_secs(5), poller)
+            .await
+            .expect("the poller outlived its supervisor")
+            .expect("the poller panicked");
+    }
+
     /// The hang-up branch of `write_all_nonblocking` (#409), fenced
     /// without a child or a runtime shutdown to hide behind: a write
     /// waiting on a full slave input buffer ends when the slave hangs
@@ -2519,23 +3281,8 @@ mod tests {
     /// the readiness the one-time HUP edge came in on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_writer_waiting_on_a_full_buffer_ends_when_the_slave_hangs_up() {
-        use std::os::fd::{FromRawFd, OwnedFd};
-
-        let (mut master_fd, mut slave_fd) = (-1, -1);
-        // SAFETY: `openpty` fills the two fds; nothing else is passed.
-        let rc = unsafe {
-            libc::openpty(
-                &mut master_fd,
-                &mut slave_fd,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
-        // SAFETY: both fds are fresh and owned by nothing else.
-        let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
-        let slave = unsafe { OwnedFd::from_raw_fd(slave_fd) };
+        let (master, slave) = pty_pair();
+        let master_fd = master.as_raw_fd();
 
         set_nonblocking(master_fd).expect("O_NONBLOCK");
         let writer =
@@ -2544,13 +3291,7 @@ mod tests {
 
         // Non-canonical, so the input buffer fills instead of the line
         // discipline discarding past one line.
-        // SAFETY: termios round-trip on an fd this test owns.
-        unsafe {
-            let mut term: libc::termios = std::mem::zeroed();
-            assert_eq!(libc::tcgetattr(slave_fd, &mut term), 0);
-            term.c_lflag &= !libc::ICANON;
-            assert_eq!(libc::tcsetattr(slave_fd, libc::TCSANOW, &term), 0);
-        }
+        set_line_discipline(&slave, false, true);
 
         let payload = vec![b'x'; 1 << 20];
         let pending = tokio::spawn(async move { write_all_nonblocking(&writer, &payload).await });

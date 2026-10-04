@@ -338,6 +338,7 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ("project.deleted", OpClass::Event),
     ("active.changed", OpClass::Event),
     ("hook_active.changed", OpClass::Event),
+    ("tab.password_input", OpClass::Event),
     ("notification.fired", OpClass::Event),
     ("agent_report.changed", OpClass::Event),
     ("tabs.reordered", OpClass::Event),

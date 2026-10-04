@@ -76,6 +76,15 @@ pub struct Tab {
     pub agent_lifecycle: AgentLifecycle,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ownership: Option<Ownership>,
+    /// Whether the tab's PTY is at a password prompt right now: line mode
+    /// with echo off (`ICANON && !ECHO`), sampled off the PTY master. Live
+    /// state, never persisted.
+    ///
+    /// Omitted while `false`, so every tab a server sends without it — an
+    /// older session's included — reads as not at a prompt, and a vector
+    /// recorded before the field existed still round-trips byte for byte.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub password_input: bool,
 }
 
 impl Tab {
@@ -2126,6 +2135,17 @@ pub struct HookActiveChangedEvent {
     pub active: bool,
 }
 
+/// `tab.password_input` — [`Tab::password_input`] changed. Workspace
+/// state like any other tab field, so it is replayed into a resume, and a
+/// client that reconnects reads the standing value off `tab.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct TabPasswordInputEvent {
+    #[serde(with = "string_int64")]
+    #[schemars(with = "String")]
+    pub tab_id: i64,
+    pub password_input: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct NotificationFiredEvent {
     #[serde(with = "string_int64")]
@@ -3814,6 +3834,10 @@ pub mod ops {
     pub const EVENT_PROJECT_DELETED: &str = "project.deleted";
     pub const EVENT_ACTIVE_CHANGED: &str = "active.changed";
     pub const EVENT_HOOK_ACTIVE_CHANGED: &str = "hook_active.changed";
+    /// A tab's PTY entered or left a password prompt
+    /// ([`crate::messages::Tab::password_input`]). A new name inside the
+    /// existing batch, so no protocol bump: an older client skips it.
+    pub const EVENT_TAB_PASSWORD_INPUT: &str = "tab.password_input";
     pub const EVENT_NOTIFICATION_FIRED: &str = "notification.fired";
     pub const EVENT_AGENT_REPORT_CHANGED: &str = "agent_report.changed";
     /// Plural subjects: the event names the *set* that was reordered,
@@ -4318,6 +4342,7 @@ mod tests {
             shell_state: ShellState::ForegroundProcess,
             agent_lifecycle: AgentLifecycle::Inactive,
             ownership: None,
+            password_input: false,
         };
         round_trip(&t);
         let json = serde_json::to_string(&t).unwrap();
@@ -4370,6 +4395,7 @@ mod tests {
             shell_state: ShellState::default(),
             agent_lifecycle: AgentLifecycle::default(),
             ownership: None,
+            password_input: false,
         };
         let value = serde_json::to_value(&tab).unwrap();
         for key in ["shell_state", "agent_lifecycle"] {

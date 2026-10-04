@@ -1198,6 +1198,7 @@ mod tests {
             shell_state: Default::default(),
             agent_lifecycle: Default::default(),
             ownership: None,
+            password_input: false,
         }
     }
 

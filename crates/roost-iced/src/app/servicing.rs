@@ -5442,6 +5442,7 @@ mod tests {
             shell_state: roost_ipc::agent::ShellState::default(),
             agent_lifecycle: roost_ipc::agent::AgentLifecycle::default(),
             ownership: None,
+            password_input: false,
         }
     }
 

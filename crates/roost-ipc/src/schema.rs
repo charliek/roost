@@ -322,6 +322,7 @@ const OP_TYPES: &[Row] = &[
     event::<ProjectDeletedEvent>(ops::EVENT_PROJECT_DELETED),
     event::<ActiveChangedEvent>(ops::EVENT_ACTIVE_CHANGED),
     event::<HookActiveChangedEvent>(ops::EVENT_HOOK_ACTIVE_CHANGED),
+    event::<TabPasswordInputEvent>(ops::EVENT_TAB_PASSWORD_INPUT),
     event::<NotificationFiredEvent>(ops::EVENT_NOTIFICATION_FIRED),
     event::<AgentReportChangedEvent>(ops::EVENT_AGENT_REPORT_CHANGED),
     event::<TabsReorderedEvent>(ops::EVENT_TABS_REORDERED),

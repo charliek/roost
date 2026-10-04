@@ -237,6 +237,7 @@ pub async fn serve(
         Arc::clone(&supervisor),
         config.socket_path.clone(),
     );
+    client.watch_password_input();
 
     hydrate::hydrate(&client, config.first_project)
         .await
