@@ -19,10 +19,13 @@
 //!
 //! Exit codes: 0 done, 2 usage, 3 unavailable (a missing grant: the wrapper's
 //! skip), 4 refused (the console locked or switched away, Secure Input on, the
-//! target stopped being frontmost, another app holds a key window, or a click
-//! at a point would reach another app), 5 failed, 124 deadline.
+//! target stopped being frontmost or has no window on screen, another app
+//! holds a key window in front of the target's, or a click at a point would
+//! reach another app), 5 failed, 124 deadline.
 
 mod args;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod claims;
 // Off macOS this binary is a stub that exists to run the pure unit tests.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod input;

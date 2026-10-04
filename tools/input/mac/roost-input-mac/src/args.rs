@@ -65,6 +65,10 @@ pub enum Command {
         modifiers: Vec<Modifier>,
     },
     ReleaseAll,
+    /// Read only: who claims the keyboard, and where against `pid`'s window.
+    Claimants {
+        pid: i32,
+    },
     Mouse {
         pid: i32,
         action: MouseAction,
@@ -103,6 +107,7 @@ impl Command {
             Command::Window { .. } => "window",
             Command::WindowSet { .. } => "window-set",
             Command::Key { .. } | Command::ReleaseAll => "key",
+            Command::Claimants { .. } => "claimants",
             Command::Mouse { .. } => "mouse",
             Command::MenuBar { .. } => "menu-bar",
             Command::Popup { .. } => "popup",
@@ -215,7 +220,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, String> {
     let explicit_deadline = options.millis("deadline-ms")?;
     let (&name, rest) = positionals
         .split_first()
-        .ok_or("no command (want preflight, window, window-set, key, mouse, menu-bar, popup, press, event-tap or capture)")?;
+        .ok_or("no command (want preflight, window, window-set, key, claimants, mouse, menu-bar, popup, press, event-tap or capture)")?;
     let command = parse_command(name, rest, &mut options)?;
     options.finish()?;
     if allow_secure_input && !matches!(command, Command::Key { .. } | Command::Mouse { .. }) {
@@ -268,6 +273,7 @@ fn parse_command(name: &str, rest: &[&str], options: &mut Options) -> Result<Com
             codes: parse_codes(&options.require("code")?)?,
             modifiers: keys::parse_modifiers(&options.take("flags").unwrap_or_default())?,
         },
+        "claimants" => Command::Claimants { pid: pid(options)? },
         "mouse" => {
             let (&action, rest) = rest.split_first().ok_or(
                 "mouse needs an action: move, down, up, click, right-click, ctrl-click or drag",
@@ -454,6 +460,14 @@ mod tests {
         let parsed = parse(&args("--deadline-ms 2500 preflight")).unwrap();
         assert_eq!(parsed.deadline, Duration::from_millis(2500));
         assert_eq!(parsed.command, Command::Preflight { pid: None });
+    }
+
+    #[test]
+    fn claimants_needs_a_pid() {
+        let parsed = parse(&args("claimants --pid 42")).unwrap();
+        assert_eq!(parsed.command, Command::Claimants { pid: 42 });
+        assert_eq!(parsed.command.name(), "claimants");
+        assert!(parse(&args("claimants")).is_err());
     }
 
     #[test]

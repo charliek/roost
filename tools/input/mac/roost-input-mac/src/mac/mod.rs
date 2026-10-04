@@ -96,6 +96,10 @@ pub fn run(invocation: &Invocation) -> Outcome {
             require_posting()?;
             post::release_all()
         }
+        Command::Claimants { pid } => {
+            target(*pid)?;
+            ax::claimants(*pid)
+        }
         Command::Mouse { pid, action } => mouse(*pid, action, policy),
         Command::MenuBar { pid } => {
             ax_target(*pid)?;
