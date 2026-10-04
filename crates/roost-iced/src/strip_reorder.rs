@@ -884,6 +884,44 @@ impl<'a> From<ReorderStrip<'a>> for Element<'a, Message> {
     }
 }
 
+/// The first strip's state anywhere under `tree`, for a test of the view
+/// around it, which has no layout or renderer to press the strip through.
+#[cfg(test)]
+fn strip_state_under(tree: &mut Tree) -> Option<&mut State> {
+    if tree.tag == tree::Tag::of::<State>() {
+        return Some(tree.state.downcast_mut::<State>());
+    }
+    tree.children.iter_mut().find_map(strip_state_under)
+}
+
+/// Arm a press on `source_id` in the first strip under `tree`, as a left
+/// press on its pill does.
+#[cfg(test)]
+pub(crate) fn press_strip_under(tree: &mut Tree, source_id: i64) {
+    let state = strip_state_under(tree).expect("a strip under the tree");
+    let scope = StripScope {
+        host: HostId::LOCAL,
+        scope_id: 0,
+        context_generation: 0,
+    };
+    state.arm_press(
+        Point::ORIGIN,
+        Instant::now(),
+        scope,
+        source_id,
+        &[source_id],
+    );
+}
+
+/// The source of the gesture the first strip under `tree` holds.
+#[cfg(test)]
+pub(crate) fn strip_gesture_under(tree: &mut Tree) -> Option<i64> {
+    strip_state_under(tree)?
+        .gesture
+        .as_ref()
+        .map(|gesture| gesture.source_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -733,6 +733,49 @@ fn agent_hooks_row<'a>(
     .into()
 }
 
+/// The tab band: the strip and its `+` in a scroller, and the secure-input
+/// lock beside it while it shows.
+///
+/// One `Row` with the lock or without. Iced keys widget state by tree
+/// position, so a band that was the bare scroller without the lock would
+/// rebuild the strip whenever the lock came or went — and the press that
+/// selects a tab sitting at a password prompt does exactly that, in the
+/// update that armed `ReorderStrip`'s drag.
+fn tab_band<'a>(
+    tab_strip: ReorderStrip<'a>,
+    add_tab_button: Element<'a, Message>,
+    scroll_id: Id,
+    lock: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    // The `+` is a sibling of the strip — never inside its content, since
+    // the strip walks its own layout children for reorder hit-testing and
+    // an extra child there would corrupt the drag target index. As a
+    // sibling row inside the scrollable it hugs the last pill and scrolls
+    // with overflow (Mac parity: the Mac's trailing ＋ scrolls with the
+    // strip too; under overflow it scrolls offscreen — accepted, #281).
+    let tab_strip_row = row![tab_strip, add_tab_button]
+        .spacing(6)
+        .align_y(Alignment::Center);
+    // A zero-width scrollbar: any visible indicator overlays the 24px
+    // pills themselves and reads as a band across the tab row (#281) —
+    // the stock 10px filled rail, and even a 2px hover sliver, both did.
+    // Wheel/trackpad scrolling is independent of the scrollbar's size.
+    let tab_scroller = scrollable(tab_strip_row)
+        .id(scroll_id)
+        .direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::hidden(),
+        ))
+        .width(Fill)
+        .height(chrome::PILL_HEIGHT);
+    // The lock sits outside the scrollable, so it never scrolls away,
+    // and outside `ReorderStrip`, which hit-tests its own children.
+    row![tab_scroller]
+        .extend(lock)
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into()
+}
+
 /// The terminal area with its notice drawn in.
 ///
 /// Not a modal: the rest of the window stays live, because the user's
@@ -4715,7 +4758,8 @@ impl App {
     }
 
     /// A frame save's deadline, with the window's mode, outer position and
-    /// content size read at it.
+    /// content size read at it. A size the resize events missed takes the
+    /// delivered resize's own path, so the PTYs get its grid.
     pub fn window_frame_due(
         &mut self,
         generation: u64,
@@ -4723,9 +4767,25 @@ impl App {
         outer: Option<Point>,
         content: Size,
     ) {
-        self.full_screen_mode(mode);
-        self.window_frame
-            .save_due(&self.workspace, generation, outer, Some(content));
+        let answer = self.window_frame.deadline_answered(
+            &self.workspace,
+            generation,
+            mode,
+            outer,
+            content,
+            self.window_size,
+        );
+        if let Some(mode) = answer.mode {
+            self.sync_full_screen_title(mode);
+        }
+        if let Some(size) = answer.regrid {
+            tracing::debug!(
+                ?size,
+                gridded = ?self.window_size,
+                "window frame: re-grid for a resize the events missed"
+            );
+            self.resize(size);
+        }
     }
 
     fn arm_frame_save(&self, generation: Option<u64>) -> UiTask {
@@ -6778,41 +6838,19 @@ impl App {
             .padding(1)
             .style(chrome::transparent_button(&self.chrome))
             .on_press(Message::NewTab);
-        // The `+` is a sibling of the strip — never inside its content, since
-        // the strip walks its own layout children for reorder hit-testing and
-        // an extra child there would corrupt the drag target index. As a
-        // sibling row inside the scrollable it hugs the last pill and scrolls
-        // with overflow (Mac parity: the Mac's trailing ＋ scrolls with the
-        // strip too; under overflow it scrolls offscreen — accepted, #281).
-        let tab_strip_row = row![tab_strip, add_tab_button]
-            .spacing(6)
-            .align_y(Alignment::Center);
-        // A zero-width scrollbar: any visible indicator overlays the 24px
-        // pills themselves and reads as a band across the tab row (#281) —
-        // the stock 10px filled rail, and even a 2px hover sliver, both did.
-        // Wheel/trackpad scrolling is independent of the scrollbar's size.
-        let tab_scroller = scrollable(tab_strip_row)
-            .id(self.tab_strip_scroll_id.clone())
-            .direction(scrollable::Direction::Horizontal(
-                scrollable::Scrollbar::hidden(),
-            ))
-            .width(Fill)
-            .height(chrome::PILL_HEIGHT);
-        // The lock sits outside the scrollable, so it never scrolls away,
-        // and outside `ReorderStrip`, which hit-tests its own children.
-        let tab_band: Element<'_, Message> = if self.secure_input_indicator() {
-            row![tab_scroller, self.secure_input_lock()]
-                .spacing(6)
-                .align_y(Alignment::Center)
-                .into()
-        } else {
-            tab_scroller.into()
-        };
-        let tab_bar = container(tab_band)
-            .height(chrome::BAND_HEIGHT)
-            .width(Fill)
-            .padding([chrome::BAND_PILL_PADDING_Y, 8.0])
-            .style(chrome::band(&self.chrome));
+        let lock = self
+            .secure_input_indicator()
+            .then(|| self.secure_input_lock());
+        let tab_bar = container(tab_band(
+            tab_strip,
+            add_tab_button.into(),
+            self.tab_strip_scroll_id.clone(),
+            lock,
+        ))
+        .height(chrome::BAND_HEIGHT)
+        .width(Fill)
+        .padding([chrome::BAND_PILL_PADDING_Y, 8.0])
+        .style(chrome::band(&self.chrome));
 
         let terminal: Element<'_, Message> = match self.tabs.get(&active_key) {
             Some(tab) if tab.applied_metrics.is_some() => TerminalWidget {
@@ -11012,6 +11050,37 @@ mod tests {
         assert!(stored.label.len() < long.len());
         let (_, budget) = pill_title_metrics(false, false);
         assert!(stored.width <= budget);
+    }
+
+    #[test]
+    fn the_tab_strips_drag_survives_the_lock_coming_and_going() {
+        use iced::advanced::widget::Tree;
+
+        let band = |lock: bool| {
+            let pill = || Space::new().width(80).height(chrome::PILL_HEIGHT);
+            let strip =
+                ReorderStrip::tabs(row![pill(), pill()], HostId::LOCAL, 1, vec![7, 8], 0, true);
+            let add = Space::new()
+                .width(chrome::PILL_HEIGHT)
+                .height(chrome::PILL_HEIGHT);
+            let lock = lock.then(|| Space::new().width(16).height(chrome::PILL_HEIGHT).into());
+            tab_band(strip, add.into(), Id::new("tab-strip"), lock)
+        };
+        let mut tree = Tree::new(band(false));
+        crate::strip_reorder::press_strip_under(&mut tree, 8);
+
+        tree.diff(band(true));
+        assert_eq!(
+            crate::strip_reorder::strip_gesture_under(&mut tree),
+            Some(8),
+            "the press turned the lock on"
+        );
+        tree.diff(band(false));
+        assert_eq!(
+            crate::strip_reorder::strip_gesture_under(&mut tree),
+            Some(8),
+            "the press turned the lock off"
+        );
     }
 
     #[test]

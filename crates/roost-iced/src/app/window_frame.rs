@@ -124,6 +124,24 @@ pub(super) struct WindowFrameMemory {
     /// mode queries have not caught up with.
     toggling: bool,
     debounce: TrailingDebounce,
+    /// Every delivered resize and mode change, counted. A deadline reads
+    /// the window back some time after its arm, so once one of these has
+    /// reached `update` since, its answer can be older than what the App
+    /// applied — and a resize while full screen, or the creation's own,
+    /// arms nothing that would supersede it.
+    changes: u64,
+    /// `changes` at the latest arm.
+    changes_at_arm: u64,
+}
+
+/// What a save deadline's answer leaves the App to do.
+#[derive(Debug, PartialEq)]
+pub(super) struct DeadlineAnswer {
+    /// The mode it read back, when that was adopted: the menu's full-screen
+    /// title follows it.
+    pub(super) mode: Option<window::Mode>,
+    /// The size to re-grid the window at ([`missed_resize`]).
+    pub(super) regrid: Option<Size>,
 }
 
 impl WindowFrameMemory {
@@ -139,6 +157,8 @@ impl WindowFrameMemory {
             owed: false,
             toggling: false,
             debounce: TrailingDebounce::default(),
+            changes: 0,
+            changes_at_arm: 0,
         }
     }
 
@@ -190,6 +210,7 @@ impl WindowFrameMemory {
     /// created at is the creation's own; any other is a real one, and the
     /// check's answer arriving after it is no reason to lose it.
     pub(super) fn resized(&mut self, size: Size) -> Option<u64> {
+        self.changes = self.changes.wrapping_add(1);
         self.content = size;
         if !self.checked && size == self.opening.size {
             tracing::trace!(?size, "window frame: resize is the window's creation");
@@ -209,8 +230,11 @@ impl WindowFrameMemory {
     }
 
     pub(super) fn observe_mode(&mut self, mode: window::Mode) {
-        if mode != self.mode && self.remembers {
-            tracing::debug!(?mode, "window frame: mode changed");
+        if mode != self.mode {
+            self.changes = self.changes.wrapping_add(1);
+            if self.remembers {
+                tracing::debug!(?mode, "window frame: mode changed");
+            }
         }
         self.mode = mode;
         if mode == window::Mode::Fullscreen && self.owed {
@@ -219,9 +243,41 @@ impl WindowFrameMemory {
         }
     }
 
+    /// A save deadline answered with the mode, outer top-left and content
+    /// size it read back. The read-back mode and size are adopted only for
+    /// the latest arm with no resize or mode change delivered since it
+    /// (`changes`); the frame is saved by [`Self::save_due`]'s rules
+    /// either way.
+    pub(super) fn deadline_answered(
+        &mut self,
+        workspace: &Workspace,
+        generation: u64,
+        mode: window::Mode,
+        outer: Option<Point>,
+        content: Size,
+        gridded: Size,
+    ) -> DeadlineAnswer {
+        let current = self.debounce.is_latest(generation) && self.changes == self.changes_at_arm;
+        if current {
+            self.observe_mode(mode);
+        } else {
+            tracing::debug!(
+                generation,
+                ?mode,
+                ?content,
+                "window frame: deadline read back before a newer resize or mode"
+            );
+        }
+        let won = self.save_due(workspace, generation, outer, Some(content));
+        DeadlineAnswer {
+            mode: current.then_some(mode),
+            regrid: missed_resize(won.filter(|_| current), gridded),
+        }
+    }
+
     /// A save's deadline. Only the latest arm acts, and only while the
-    /// window is visible and not full screen — as of the mode query the
-    /// deadline itself made (`observe_mode` just before this).
+    /// window is visible and not full screen — as of the latest mode
+    /// `update` knows, which is the deadline's own when it was adopted.
     ///
     /// `outer` and `content` are what the deadline read back from the
     /// window, and they win over what the events left. winit converts a
@@ -230,16 +286,20 @@ impl WindowFrameMemory {
     /// wrong; and iced's subscriptions drop events when their channel is
     /// full, so the resize from the screen check's shrink can go missing
     /// while iced's own record of the size stays right.
-    pub(super) fn save_due(
+    ///
+    /// Returns the read-back `content` when it won — the latest deadline,
+    /// windowed — since the terminals are owed that size too
+    /// ([`missed_resize`]).
+    fn save_due(
         &mut self,
         workspace: &Workspace,
         generation: u64,
         outer: Option<Point>,
         content: Option<Size>,
-    ) {
+    ) -> Option<Size> {
         if !self.debounce.is_latest(generation) {
             tracing::trace!(generation, "window frame: deadline superseded");
-            return;
+            return None;
         }
         tracing::debug!(
             generation,
@@ -249,7 +309,7 @@ impl WindowFrameMemory {
             "window frame: save deadline"
         );
         if self.mode != window::Mode::Windowed {
-            return;
+            return None;
         }
         if outer.is_some() {
             self.outer = outer;
@@ -258,6 +318,7 @@ impl WindowFrameMemory {
             self.content = content;
         }
         self.write_owed(workspace, "deadline");
+        content
     }
 
     /// Roost's own full-screen toggle is about to run. Entering full screen
@@ -314,6 +375,7 @@ impl WindowFrameMemory {
         }
         self.owed = true;
         let generation = self.debounce.arm();
+        self.changes_at_arm = self.changes;
         tracing::trace!(
             cause,
             generation,
@@ -345,6 +407,15 @@ impl WindowFrameMemory {
         tracing::debug!(when, ?frame, "window frame: saved");
         workspace.set_window_frame(frame);
     }
+}
+
+/// The size the window re-grids at for a resize whose event never reached
+/// `update`: the size a deadline read back and won with
+/// ([`WindowFrameMemory::save_due`]), when the terminals are gridded for
+/// another. An equal size is no resize — a re-grid would still disarm a
+/// held drag's auto-scroll.
+fn missed_resize(won: Option<Size>, gridded: Size) -> Option<Size> {
+    won.filter(|size| *size != gridded)
 }
 
 /// `App::drop`'s persistence, in its required order: the frame a quit
@@ -648,6 +719,190 @@ mod tests {
             Some(Size::new(1512.0, 600.0)),
         );
         assert_eq!(workspace.window_frame(), Some(shrunk));
+    }
+
+    /// The screen check shrank a restored window onto the screen and the
+    /// resize that reports it was dropped, so the terminals are still
+    /// gridded for the size the window opened at. The memory and its arm.
+    fn shrunk_at_launch() -> (WindowFrameMemory, u64) {
+        let wide = WindowFrame {
+            content_width: 1800.0,
+            content_height: 600.0,
+            outer_x: 1600.0,
+            outer_y: 80.0,
+        };
+        let mut memory = WindowFrameMemory::new(true, OpeningFrame::from_saved(Some(wide), true));
+        assert!(memory.take_check().is_some());
+        let armed = memory
+            .checked(Some(CheckedFrame {
+                frame: WindowFrame {
+                    content_width: 1512.0,
+                    outer_x: 0.0,
+                    ..wide
+                },
+                adjusted: true,
+            }))
+            .expect("an adjusted frame arms a save");
+        (memory, armed)
+    }
+
+    /// The same missing resize, from the terminals' side.
+    #[test]
+    fn the_deadline_re_grids_the_window_at_a_size_the_resize_events_missed() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let (opened, shrunk) = (Size::new(1800.0, 600.0), Size::new(1512.0, 600.0));
+        let outer = Some(Point::new(0.0, 80.0));
+        let (mut memory, armed) = shrunk_at_launch();
+        // A mode query that finds nothing new changes nothing.
+        memory.observe_mode(window::Mode::Windowed);
+        assert_eq!(
+            memory.deadline_answered(
+                &workspace,
+                armed,
+                window::Mode::Windowed,
+                outer,
+                shrunk,
+                opened
+            ),
+            DeadlineAnswer {
+                mode: Some(window::Mode::Windowed),
+                regrid: Some(shrunk),
+            }
+        );
+
+        let (mut memory, armed) = shrunk_at_launch();
+        assert_eq!(
+            memory
+                .deadline_answered(
+                    &workspace,
+                    armed,
+                    window::Mode::Windowed,
+                    outer,
+                    shrunk,
+                    shrunk
+                )
+                .regrid,
+            None,
+            "a window already gridded at the size re-grids nothing"
+        );
+    }
+
+    #[test]
+    fn a_superseded_or_full_screen_deadline_re_grids_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let mut memory = checked_memory(true);
+        let (first, gridded) = (Size::new(1000.0, 700.0), Size::new(1100.0, 720.0));
+        let superseded = memory.resized(first).expect("armed");
+        let latest = memory.resized(gridded).expect("armed");
+        assert_eq!(
+            memory.deadline_answered(
+                &workspace,
+                superseded,
+                window::Mode::Windowed,
+                None,
+                first,
+                gridded
+            ),
+            DeadlineAnswer {
+                mode: None,
+                regrid: None,
+            },
+            "a superseded deadline read the window back before the resize that superseded it"
+        );
+        assert_eq!(
+            memory.deadline_answered(
+                &workspace,
+                latest,
+                window::Mode::Fullscreen,
+                None,
+                Size::new(1512.0, 982.0),
+                gridded
+            ),
+            DeadlineAnswer {
+                mode: Some(window::Mode::Fullscreen),
+                regrid: None,
+            }
+        );
+    }
+
+    /// Branch review (plan 074): the deadline read the window back while
+    /// it was windowed, and before its answer reached `update`, entering
+    /// full screen did — the mode, then a resize that gridded the
+    /// terminals for full screen and armed nothing.
+    #[test]
+    fn a_deadline_read_back_before_full_screen_neither_re_grids_nor_restores_windowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let mut memory = checked_memory(true);
+        let (windowed, full) = (Size::new(1100.0, 720.0), Size::new(1512.0, 982.0));
+        let armed = memory.resized(windowed).expect("armed");
+        memory.observe_mode(window::Mode::Fullscreen);
+        assert_eq!(
+            memory.resized(full),
+            None,
+            "a full-screen resize arms nothing"
+        );
+
+        let answer = memory.deadline_answered(
+            &workspace,
+            armed,
+            window::Mode::Windowed,
+            Some(Point::new(120.0, 80.0)),
+            windowed,
+            full,
+        );
+        assert_eq!(
+            answer,
+            DeadlineAnswer {
+                mode: None,
+                regrid: None,
+            }
+        );
+        assert_eq!(memory.mode, window::Mode::Fullscreen);
+    }
+
+    /// Either one alone is newer than a pending read-back: a mode change
+    /// with no resize, or a resize that arms nothing.
+    #[test]
+    fn a_mode_change_or_an_unarmed_resize_alone_outdates_a_pending_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(state(&dir));
+        let windowed = Size::new(1100.0, 720.0);
+        let mut memory = checked_memory(true);
+        let armed = memory.resized(windowed).expect("armed");
+        memory.observe_mode(window::Mode::Fullscreen);
+        let answer = memory.deadline_answered(
+            &workspace,
+            armed,
+            window::Mode::Windowed,
+            None,
+            windowed,
+            windowed,
+        );
+        assert_eq!(
+            answer.mode, None,
+            "the mode change came after the read-back"
+        );
+        assert_eq!(memory.mode, window::Mode::Fullscreen);
+
+        // Before the screen check, a resize to the size the window was
+        // created at is the creation's own and arms nothing.
+        let mut memory = WindowFrameMemory::new(true, OpeningFrame::from_saved(Some(FRAME), true));
+        assert!(memory.take_check().is_some());
+        let armed = memory.resized(windowed).expect("armed");
+        let created = Size::new(900.0, 600.0);
+        assert_eq!(memory.resized(created), None);
+        let answer = memory.deadline_answered(
+            &workspace,
+            armed,
+            window::Mode::Windowed,
+            None,
+            windowed,
+            created,
+        );
+        assert_eq!(answer.regrid, None, "the resize came after the read-back");
     }
 
     #[test]

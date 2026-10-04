@@ -2384,6 +2384,11 @@ impl App {
 
     pub fn full_screen_mode(&mut self, mode: window::Mode) {
         self.window_frame.observe_mode(mode);
+        self.sync_full_screen_title(mode);
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    pub(super) fn sync_full_screen_title(&self, mode: window::Mode) {
         #[cfg(target_os = "macos")]
         if let Some(mtm) = servicing::seam_on_main("full-screen menu title") {
             crate::macos::menu::sync_fullscreen_title(mtm, mode == window::Mode::Fullscreen);
