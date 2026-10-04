@@ -783,6 +783,7 @@ jobs:
           tools/roosttest/test_z_typography.py
           tools/roosttest/test_project_lifecycle.py
           tools/roosttest/test_sidebar_resize.py
+          tools/roosttest/test_window_geometry_persistence.py
           tools/roosttest/test_osc_pipeline.py
           tools/roosttest/test_palette_256.py
           tools/roosttest/test_tab_dump_scrollback.py
@@ -1063,6 +1064,7 @@ jobs:
           tools/roosttest/test_z_typography.py
           tools/roosttest/test_project_lifecycle.py
           tools/roosttest/test_sidebar_resize.py
+          tools/roosttest/test_window_geometry_persistence.py
           tools/roosttest/test_osc_pipeline.py
           tools/roosttest/test_palette_256.py
           tools/roosttest/test_tab_dump_scrollback.py
@@ -1668,6 +1670,21 @@ jobs:
           uv run --group test pytest tools/roosttest/test_real_input_mac.py \
             --roost-target iced -v \
             --junitxml="$ROOST_E2E_ARTIFACT_DIR/junit.xml"
+
+      # Proves the suite above ran every scenario and passed each one: a green
+      # pytest exit does not say a scenario was collected, and a skip or a
+      # teardown error recorded beside a pass would not turn the step red.
+      # It restates the JUnit path (env is not inherited across steps) and
+      # skips only when the suite step itself did not run.
+      - name: Check the Mac real-input JUnit covers every scenario (macOS)
+        if: always() && runner.os == 'macOS' && matrix.renderer == 'wgpu' && steps.real-input-mac.outcome != 'skipped'
+        shell: bash
+        env:
+          ROOST_E2E_ARTIFACT_DIR: ${{ runner.temp }}/roost-iced-e2e-mac-real-input-artifacts
+        run: >
+          python3 tools/roosttest/junit_guard.py
+          "$ROOST_E2E_ARTIFACT_DIR/junit.xml"
+          --scenarios tools/roosttest/test_real_input_mac.py
 
       # The step's `outcome`, written where a reader can find it: the job
       # summary, and outcome.txt beside the JUnit report (the promotion rule

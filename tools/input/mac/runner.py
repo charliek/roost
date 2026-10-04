@@ -617,3 +617,80 @@ class Helper:
 
 def _numbers(values) -> str:
     return ",".join(repr(float(value)) for value in values)
+
+
+# -- `make mac-real-input-check` (plan 075 §D4.4) ----------------------------
+
+
+def readiness_report(report: dict, claimants: dict | None) -> tuple[list[str], str | None]:
+    """The lines a readiness check prints, and the environment blocker or None.
+
+    Only `readiness`'s reasons block. Claimants are information: who would be
+    refused for the *current* frontmost app, which says nothing certain about
+    the window a test will later target."""
+    capabilities = report["capabilities"]
+    granted = ", ".join(f"{name}={'yes' if ok else 'NO'}" for name, ok in sorted(capabilities.items()))
+    console, session = report["console"], report["session"]
+    front = report.get("frontmost") or {}
+    lines = [
+        f"grants:        {granted}",
+        f"session:       available={session['available']} on_console={session.get('on_console')} "
+        f"locked={session['locked'] or console.get('locked')}",
+        f"secure input:  {report.get('secure_input_pid') or 'off'}",
+        f"input source:  {report['input_source']}",
+        f"frontmost:     pid {front.get('pid')} ({front.get('bundle_id')})",
+    ]
+    for display in report.get("displays", []):
+        lines.append(
+            f"display {display['id']}:     {display['bounds']['width']:.0f}x{display['bounds']['height']:.0f}"
+            f"{' main' if display.get('main') else ''}"
+            f" safe_area_top={display.get('safe_area_top')} menu_bar_inset={display.get('menu_bar_inset')}"
+        )
+    if claimants is not None:
+        rows = claimants["claimants"]
+        blocking = [row for row in rows if row["blocks"]]
+        lines.append(
+            f"claimants:     {len(rows)} other apps with a window on screen, "
+            f"{sum(1 for row in rows if row['claims_key'])} claim the keyboard, "
+            f"{len(blocking)} would refuse a key for pid {front.get('pid')} now"
+        )
+        for row in rows:
+            if row["claims_key"]:
+                lines.append(f"  claimant pid {row['pid']}: {row['position']} blocks={row['blocks']}")
+        lines.append(
+            "  (information only: readiness cannot predict where a later target's focus or click will land)"
+        )
+    return lines, readiness(report)
+
+
+def check(artifacts: Path) -> int:
+    """Preflight, then `claimants` against the frontmost app; non-zero only
+    when the environment cannot do real input."""
+    try:
+        with Helper(artifacts) as helper:
+            report = helper.preflight()
+            front = (report.get("frontmost") or {}).get("pid")
+            claimants = helper.claimants(front) if front is not None else None
+    except RealInputUnavailable as error:
+        print(f"mac-real-input-check: NOT READY ({mode()} mode): {error}")
+        return 1
+    except HELPER_ERRORS as error:
+        print(f"mac-real-input-check: the helper failed ({mode()} mode): {error}")
+        return 2
+    lines, blocker = readiness_report(report, claimants)
+    print(f"mac-real-input-check ({mode()} mode)")
+    print("\n".join(lines))
+    if blocker is not None:
+        print(f"NOT READY: {blocker}")
+        return 1
+    print("READY: every grant is held and the desktop can take real input")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    if sys.argv[1:] != ["check"]:
+        sys.exit("usage: runner.py check")
+    with tempfile.TemporaryDirectory(prefix="roost-ri-check-") as scratch:
+        sys.exit(check(Path(scratch)))
