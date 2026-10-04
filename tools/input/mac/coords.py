@@ -164,6 +164,36 @@ def displays(preflight: dict) -> list[Frame]:
     return [Frame.from_rect(display["bounds"]) for display in ordered]
 
 
+def _inset(display: dict, key: str) -> float:
+    value = display.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return 0.0
+    return max(float(value), 0.0)
+
+
+def full_screen_frames(preflight: dict) -> list[Frame]:
+    """The frames a full-screen window may settle at, per display (plan 075 §D3).
+
+    A display's bounds, and on a notched one (`safe_area_top` > 0) also its
+    bounds inset at the top by the menu bar (`menu_bar_inset`, what the window
+    measured on a notched MacBook sits below) or by the camera housing
+    (`safe_area_top`). Exact candidates, not a tolerance: a missing or invalid
+    inset is 0, which covers an older helper, an unnotched Mac and CI."""
+    found = preflight.get("displays")
+    if not found:
+        raise AssertionError(f"the preflight report names no displays: {found!r}")
+    frames: list[Frame] = []
+    for display in sorted(found, key=lambda display: not display.get("main")):
+        bounds = Frame.from_rect(display["bounds"])
+        frames.append(bounds)
+        safe = _inset(display, "safe_area_top")
+        if safe > 0:
+            for inset in (_inset(display, "menu_bar_inset"), safe):
+                if 0 < inset < bounds.height:
+                    frames.append(Frame(bounds.x, bounds.y + inset, bounds.width, bounds.height - inset))
+    return frames
+
+
 def on_one_display(frame: Frame, screens: list[Frame]) -> bool:
     """Whether the whole window lies on a single display: a frame split
     across two, or partly off every one, is not."""

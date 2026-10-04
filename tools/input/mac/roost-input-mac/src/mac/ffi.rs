@@ -263,6 +263,14 @@ extern "C" {
 }
 
 extern "C" {
+    #[cfg(target_arch = "x86_64")]
+    pub fn sysctlbyname(
+        name: *const c_char,
+        old: *mut c_void,
+        old_len: *mut usize,
+        new: *const c_void,
+        new_len: usize,
+    ) -> i32;
     pub fn getuid() -> u32;
     pub fn setpgid(pid: i32, pgid: i32) -> i32;
     pub fn kill(pid: i32, signal: i32) -> i32;
