@@ -114,8 +114,17 @@ def _hold(
     until `reached`, then release there. A timeout with a native focus loss
     between the press and the timeout raises `_NativeFocusLost`. Any other
     timeout fails the case and names the focus state."""
+    # A focus loss cancels the drag and the tick scrolls only a focused
+    # window. On a CI runner the app's own activation churn (an earlier
+    # module activating it) can unfocus the window after the seeding
+    # focused it, so focus it again right before the gesture starts, and
+    # count native losses only from there.
+    roost.app_set_window_focus(focus=True)
     _, before = _native_focus(roost)
-    top_at_press = roost.dump(tab)["rows_text"][0]
+    try:
+        top_at_press = roost.dump(tab)["rows_text"][0]
+    except Exception as error:
+        top_at_press = f"unread ({error!r})"
     _drag(roost, tab, "press", press)
     try:
         _drag(roost, tab, "motion", held, overshoot=overshoot)
@@ -162,12 +171,6 @@ def _assert_one_run(rows: list[int], first: int, last: int) -> None:
 
 
 def _drag(roost, tab: int, kind: str, cell: tuple[int, int], overshoot: int = 0) -> None:
-    if kind == "press":
-        # A focus loss cancels the drag and the tick scrolls only a focused
-        # window. On a CI runner the app's own activation churn (an earlier
-        # module activating it) can unfocus the window after the fixture
-        # focused it, so focus it again right before the gesture starts.
-        roost.app_set_window_focus(focus=True)
     roost.tab_dispatch_mouse_event(
         tab, kind=kind, button="left", cell_x=cell[0], cell_y=cell[1], overshoot=overshoot
     )
