@@ -439,6 +439,20 @@ class Roost:
         macOS, whose menu is the native popup, `RoostError('not-supported')`."""
         self.call("app.context_menu_open", {"target": target})
 
+    # -- a banner click's window raise (test mode) -------------------------
+    def notification_activate(self, tab: int | str, token: str | None = None) -> None:
+        """Test-mode only — click `tab`'s desktop banner, carrying `token`
+        as the notification server's activation token would (omit it for a
+        server that sends none). Returns once the click is queued, so wait
+        on its effect. Iced-only."""
+        self.call("app.notification_activate", {"tab_id": str(tab), "token": token})
+
+    def last_activation(self) -> dict:
+        """Test-mode only — what the last banner click's raise came to:
+        `{outcome, token, activation_global}`, every field `None` until one
+        has settled. Iced-only."""
+        return self.call("app.last_activation")
+
     # -- host sessions ----------------------------------------------------
     def host_status(self, id: str | None = None) -> dict:
         """Every saved host's live connection state, or just `id`'s.

@@ -10,6 +10,9 @@ mod fonts;
 /// connected `roost-session`, publishing onto the engine feed.
 mod host_conn;
 mod input;
+/// The Linux native seam, `cfg`'d whole for the reason [`macos`] is.
+#[cfg(target_os = "linux")]
+mod linux;
 /// The AppKit seam. `cfg`'d whole rather than stubbed per-function: every
 /// call site pairs with a `not(macos)` no-op of its own, so nothing outside
 /// macOS ever names an AppKit type.
@@ -104,6 +107,12 @@ enum Message {
         content: Size,
     },
     WindowFocus(window::Id, bool),
+    /// A banner click's activation token was spent on the window (#351).
+    #[cfg(target_os = "linux")]
+    NotificationRaised {
+        token: String,
+        attempt: linux::wayland::Attempt,
+    },
     ScreenshotCaptured(window::Screenshot),
     ClipboardReadCompleted {
         request_id: u64,
@@ -625,6 +634,11 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             app.set_window_focus(focused);
             task.chain(app.query_full_screen().map_task())
         }
+        #[cfg(target_os = "linux")]
+        Message::NotificationRaised { token, attempt } => {
+            app.notification_raised(token, attempt);
+            Task::none()
+        }
         Message::ScreenshotCaptured(capture) => app.screenshot_captured(&capture).map_task(),
         Message::ClipboardReadCompleted { request_id, value } => {
             app.clipboard_read_completed(request_id, value).map_task()
@@ -1052,6 +1066,27 @@ fn inspect_budget() -> Duration {
     INSPECT_BUDGET.mul_f64(crate::host_conn::task::scale())
 }
 
+/// Bring the window to the front. A click's activation token is spent
+/// first, through [`linux::wayland`] (which says why `gain_focus` alone does
+/// not reach a Wayland compositor); `gain_focus` still follows, and is what
+/// raises an X11 window.
+#[cfg(target_os = "linux")]
+fn raise(id: window::Id, token: Option<String>) -> Task<Message> {
+    let Some(token) = token else {
+        return window::gain_focus(id);
+    };
+    window::run(id, move |window| {
+        let attempt = linux::wayland::activate(window, &token);
+        Message::NotificationRaised { token, attempt }
+    })
+    .chain(window::gain_focus(id))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn raise(id: window::Id, _token: Option<String>) -> Task<Message> {
+    window::gain_focus(id)
+}
+
 trait UiTask {
     fn map_task(self) -> Task<Message>;
 }
@@ -1065,7 +1100,7 @@ impl UiTask for app::UiTask {
                 Task::batch([first.map_task(), second.map_task()])
             }
             app::UiTask::EngineOp(future) => Task::future(future).map(Message::EngineOp),
-            app::UiTask::Focus(id) => window::gain_focus(id),
+            app::UiTask::Raise { id, token } => raise(id, token),
             app::UiTask::FocusWidget(id) => iced::widget::operation::focus(id),
             app::UiTask::SelectAllWidget(id) => iced::widget::operation::select_all(id),
             // `iced::widget::operation` has a Task-returning `focus` but no

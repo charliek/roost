@@ -123,6 +123,8 @@ pub(crate) enum EngineFeed {
     /// ordered against the events that may have closed the tab meanwhile.
     NotificationActivated {
         tab: TabKey,
+        /// The server's activation token for the click, when it sent one.
+        token: Option<String>,
     },
     /// One connected host's workspace mirror moving forward, tagged with
     /// the connection *instance* that produced it.
@@ -783,6 +785,7 @@ mod tests {
             EngineFeed::Workspace(WorkspaceEvent::TabClosed { tab_id: 7 }),
             EngineFeed::NotificationActivated {
                 tab: TabKey::local(7),
+                token: None,
             },
         ] {
             let (tx, mut rx) = channel();

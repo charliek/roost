@@ -46,7 +46,7 @@ use roost_ipc::messages::AppNotificationStatusResult;
 use roost_ui_model::keys::TabKey;
 use tokio::sync::oneshot;
 
-use crate::notifications::{Payload, Shown};
+use crate::notifications::{Activated, Payload, Shown};
 
 /// The title a banner carries when the event supplied none. The seam
 /// passes an empty title through on purpose; substituting is the
@@ -428,7 +428,12 @@ pub(crate) async fn show(payload: Payload) -> Result<Shown, String> {
         // A closed channel is a dismissed banner, never a panic: a
         // replacing show drops the displaced sender while its listener is
         // still awaiting, and a panic there would kill that task.
-        activation: Some(Box::pin(async move { activation.await.unwrap_or(false) })),
+        activation: Some(Box::pin(async move {
+            activation
+                .await
+                .unwrap_or(false)
+                .then_some(Activated { token: None })
+        })),
     })
 }
 

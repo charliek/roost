@@ -33,11 +33,11 @@ use roost_engine::{
 use roost_ipc::agent;
 use roost_ipc::messages::{
     AgentHooksOutcome, AgentHooksSkipped, AgentSetHooksAgents, AgentSetHooksResult,
-    AppMenuDumpResult, AppNotificationStatusResult, AppRenderStatsResult, AppUpdateStatusResult,
-    HostConnectStatus, HostConnectionResult, HostStatus, HostStatusResult, PaletteItemView,
-    PalettePresentResult, PaletteStateResult, Project, SidebarDumpAgentRow, SidebarDumpHost,
-    SidebarDumpHostProject, SidebarDumpHostTab, SidebarDumpProject, SidebarDumpResult,
-    SidebarDumpSection, WindowMetricsResult,
+    AppLastActivationResult, AppMenuDumpResult, AppNotificationStatusResult, AppRenderStatsResult,
+    AppUpdateStatusResult, HostConnectStatus, HostConnectionResult, HostStatus, HostStatusResult,
+    PaletteItemView, PalettePresentResult, PaletteStateResult, Project, SidebarDumpAgentRow,
+    SidebarDumpHost, SidebarDumpHostProject, SidebarDumpHostTab, SidebarDumpProject,
+    SidebarDumpResult, SidebarDumpSection, WindowMetricsResult,
 };
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
 use roost_ipc::{codes, IpcServer, LocalBackendCell, LocalBackendMode};
@@ -2453,7 +2453,13 @@ pub enum UiTask {
     /// back as `Message::EngineOp`, never as a return value — the UI
     /// thread does not wait for the engine.
     EngineOp(EngineOpFuture),
-    Focus(window::Id),
+    /// Bring the window to the front, spending `token` — a notification
+    /// server's activation token for the click that asked — where the
+    /// platform needs one (#351).
+    Raise {
+        id: window::Id,
+        token: Option<String>,
+    },
     FocusWidget(Id),
     SelectAllWidget(Id),
     /// Take keyboard focus away from every focusable widget — how the Add
@@ -3040,6 +3046,7 @@ pub struct App {
     projects: Vec<Project>,
     sidebar_agents: HashMap<ProjectKey, Vec<agent_palette::SidebarAgentRow>>,
     notification_inbox: notification_inbox::NotificationInbox,
+    last_activation: AppLastActivationResult,
     window_id: Option<window::Id>,
     pending_window_resize: Option<Size>,
     screenshots: ScreenshotQueue,
@@ -3630,6 +3637,7 @@ impl App {
             projects: Vec::new(),
             sidebar_agents: HashMap::new(),
             notification_inbox: notification_inbox::NotificationInbox::new(),
+            last_activation: AppLastActivationResult::default(),
             window_id: None,
             pending_window_resize: None,
             screenshots: ScreenshotQueue::default(),

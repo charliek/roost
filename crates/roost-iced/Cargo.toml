@@ -216,6 +216,20 @@ objc2-user-notifications = { version = "0.3", default-features = false, features
 # app runtime.
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+# The Wayland native seam (`src/linux/`, plan 074 §D6): one
+# `xdg_activation_v1.activate` on winit's own display, which winit 0.30
+# has no API for. Both crates are already in the graph through winit and
+# must stay at ITS versions — a bump past what winit resolves would put a
+# second copy of the Wayland stack in the lock. `client` + `staging` are
+# where `xdg_activation_v1`'s client code lives. The seam's
+# `Backend::from_foreign_display` is `wayland-backend`'s `client_system`,
+# which winit turns on; enabling nothing here leaves every Wayland
+# crate's feature set exactly as winit resolved it.
+wayland-client = { version = "0.31.15", default-features = false }
+wayland-protocols = { version = "0.32.13", default-features = false, features = [
+    "client",
+    "staging",
+] }
 
 [dev-dependencies]
 swash = "=0.2.10"

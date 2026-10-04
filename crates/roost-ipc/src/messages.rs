@@ -1467,6 +1467,54 @@ pub struct AppSecureInputResult {
     pub password_input: bool,
 }
 
+/// `app.notification_activate` request: a click on the desktop banner for
+/// `tab_id`, put where a real click lands, carrying `token` as the
+/// notification server's spec 1.2 `ActivationToken` would. Gated on
+/// `ROOST_TEST_MODE=1`; a test seam, not a surface.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppNotificationActivateParams {
+    pub tab_id: WireTabRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+/// `app.last_activation` request — nullary envelope (`{}`). Gated like
+/// `app.notification_activate`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppLastActivationParams {}
+
+/// What the window raise a banner click asked for came to (#351).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ActivationOutcome {
+    /// `xdg_activation_v1.activate(token, surface)` was sent.
+    Activated,
+    /// A Wayland window, and a compositor that offers no
+    /// `xdg_activation_v1`.
+    NoGlobal,
+    /// Not a Wayland window: X11, or macOS.
+    NotWayland,
+    /// The click carried no activation token to spend.
+    NoToken,
+    /// The compositor could not be asked: the registry did not answer in
+    /// time, or the connection failed.
+    Failed,
+}
+
+/// What `app.last_activation` answers: the last banner click whose raise
+/// has settled. Every field is `null` until one has.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AppLastActivationResult {
+    pub outcome: Option<ActivationOutcome>,
+    /// The token the click carried.
+    pub token: Option<String>,
+    /// Whether the compositor's registry lists `xdg_activation_v1`, or
+    /// `null` when it was not asked or did not answer.
+    pub activation_global: Option<bool>,
+}
+
 /// `tab.expand_selection_at` response: the committed selection's
 /// bounds, mirroring `WordSpan`. `text` is the extracted selection
 /// content (same path `selection.dump` uses), or `None` when the
@@ -3802,6 +3850,13 @@ pub mod ops {
     /// `app.menu_dump`.
     pub const APP_NOTIFICATION_STATUS: &str = "app.notification_status";
 
+    /// Test-only click on a tab's desktop banner, with or without the
+    /// server's activation token, and the read of what the window raise
+    /// it asked for came to (#351). Same gate as `tab.feed_pty_bytes`,
+    /// on every platform.
+    pub const APP_NOTIFICATION_ACTIVATE: &str = "app.notification_activate";
+    pub const APP_LAST_ACTIVATION: &str = "app.last_activation";
+
     /// Test-only read of the host modal on screen — which one, what it
     /// says, and what its buttons are labelled. Same gate as
     /// `tab.feed_pty_bytes`. It exists so the IPC-only pytest harness
@@ -5300,6 +5355,43 @@ mod tests {
         round_trip(&AppSecureInputResult::default());
         let bad = r#"{"extra":"x"}"#;
         assert!(serde_json::from_str::<AppSecureInputParams>(bad).is_err());
+    }
+
+    #[test]
+    fn the_notification_raise_ops_round_trip_in_their_documented_spellings() {
+        let with_token: AppNotificationActivateParams =
+            serde_json::from_value(json!({"tab_id": "h3.7", "token": "t-1"})).unwrap();
+        assert_eq!(with_token.tab_id, WireTabRef::Host { host: 3, tab: 7 });
+        assert_eq!(with_token.token.as_deref(), Some("t-1"));
+        let bare: AppNotificationActivateParams =
+            serde_json::from_value(json!({"tab_id": "7"})).unwrap();
+        assert_eq!(bare.token, None, "a click without a token omits it");
+        assert_eq!(serde_json::to_value(&bare).unwrap(), json!({"tab_id": "7"}));
+        assert!(serde_json::from_value::<AppNotificationActivateParams>(
+            json!({"tab_id": "7", "extra": 1})
+        )
+        .is_err());
+
+        assert_eq!(
+            serde_json::to_value(AppLastActivationResult::default()).unwrap(),
+            json!({"outcome": null, "token": null, "activation_global": null}),
+            "nothing settled yet reads as nulls, never as missing keys"
+        );
+        for (outcome, spelling) in [
+            (ActivationOutcome::Activated, "activated"),
+            (ActivationOutcome::NoGlobal, "no-global"),
+            (ActivationOutcome::NotWayland, "not-wayland"),
+            (ActivationOutcome::NoToken, "no-token"),
+            (ActivationOutcome::Failed, "failed"),
+        ] {
+            assert_eq!(serde_json::to_value(outcome).unwrap(), json!(spelling));
+            round_trip(&AppLastActivationResult {
+                outcome: Some(outcome),
+                token: Some("t-1".into()),
+                activation_global: Some(false),
+            });
+        }
+        round_trip(&AppLastActivationParams {});
     }
 
     #[test]

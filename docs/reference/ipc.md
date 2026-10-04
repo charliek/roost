@@ -2167,6 +2167,57 @@ Secure Keyboard Entry does not exist there, and the
 `toggle_secure_input` action does nothing. The Swift Mac app answers
 `unknown-op`.
 
+### Notification raise test ops (`app.notification_activate` / `app.last_activation`) *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it both ops return `not-enabled`. A click on a desktop banner
+focuses its tab and raises the window. On Wayland the raise spends the
+`xdg-activation` token the notification server sends with the click
+(the spec 1.2 `ActivationToken` signal) as
+`xdg_activation_v1.activate`, because a plain focus request never
+reaches the compositor there. These two ops click a banner and read back
+what the raise came to. They are a test seam with no `roostctl` verb.
+
+`app.notification_activate` clicks `tab_id`'s banner, carrying `token`
+as the server's `ActivationToken` would. Omit `token` for a server that
+sends none. `tab_id` takes `tab.dump`'s ref: a bare id for one of this
+window's local tabs, or `h<host>.<id>` for a host's. Request:
+`{"params": {"tab_id": "7", "token": "t-1"}}`. Response: `{}`, as soon
+as the click is queued where a real one lands, so wait on its effect. A
+tab that is gone is a click on a stale banner: nothing moves. A bare id
+while the local session is not connected is `host-unavailable`.
+
+`app.last_activation` reads the last click whose raise has settled.
+Request: `{"params": {}}`. Response:
+
+```json
+{"outcome": "no-global", "token": "t-1", "activation_global": false}
+```
+
+Every field is `null` until a click has settled. `outcome` is one of:
+
+- `activated`: `xdg_activation_v1.activate(token, surface)` was sent.
+  Whether the compositor then raises the window is its decision.
+- `no-global`: a Wayland window, on a compositor that offers no
+  `xdg_activation_v1`.
+- `not-wayland`: an X11 window, or macOS, which has no tokens.
+- `no-token`: a click on Linux that carried no token.
+- `failed`: the compositor could not be asked. Either its registry did
+  not answer within 250 ms (the next click resumes the wait), or the
+  connection failed.
+
+`token` is the click's token. `activation_global` says whether the
+compositor's registry lists `xdg_activation_v1`. It is read off the
+registry rather than off `outcome`, so a test can work out which outcome
+it should have seen, and it is `null` when the raise never asked a
+Wayland compositor (`not-wayland`, `no-token`) or the registry never
+answered.
+
+The focus request still follows in every case, and is what raises an
+X11 or macOS window.
+
+Implemented by the iced UI only; the Swift app answers `unknown-op`.
+
 ### `window.resize` *(test-only — gated)*
 
 **Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**

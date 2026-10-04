@@ -1,5 +1,29 @@
 {
   "$defs": {
+    "ActivationOutcome": {
+      "oneOf": [
+        {
+          "const": "activated",
+          "type": "string"
+        },
+        {
+          "const": "no-global",
+          "type": "string"
+        },
+        {
+          "const": "not-wayland",
+          "type": "string"
+        },
+        {
+          "const": "no-token",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "type": "string"
+        }
+      ]
+    },
     "ActiveChangedEvent": {
       "properties": {
         "project_id": {
@@ -534,6 +558,42 @@
       ],
       "type": "object"
     },
+    "AppLastActivationParams": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "AppLastActivationResult": {
+      "properties": {
+        "activation_global": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActivationOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "token": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "outcome",
+        "token",
+        "activation_global"
+      ],
+      "type": "object"
+    },
     "AppMenuActivateParams": {
       "additionalProperties": false,
       "properties": {
@@ -708,6 +768,24 @@
         "placement",
         "message",
         "actions"
+      ],
+      "type": "object"
+    },
+    "AppNotificationActivateParams": {
+      "additionalProperties": false,
+      "properties": {
+        "tab_id": {
+          "$ref": "#/$defs/WireTabRef"
+        },
+        "token": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "tab_id"
       ],
       "type": "object"
     },
@@ -4286,6 +4364,14 @@
         "$ref": "#/$defs/EmptyResult"
       }
     },
+    "app.last_activation": {
+      "params": {
+        "$ref": "#/$defs/AppLastActivationParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AppLastActivationResult"
+      }
+    },
     "app.menu_activate": {
       "params": {
         "$ref": "#/$defs/AppMenuActivateParams"
@@ -4316,6 +4402,14 @@
       },
       "result": {
         "$ref": "#/$defs/AppNoticeDumpResult"
+      }
+    },
+    "app.notification_activate": {
+      "params": {
+        "$ref": "#/$defs/AppNotificationActivateParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
       }
     },
     "app.notification_status": {
