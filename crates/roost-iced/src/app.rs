@@ -5258,8 +5258,17 @@ impl App {
         )
     }
 
+    #[track_caller]
     pub fn resize(&mut self, size: Size) {
         let changed = self.window_size != size;
+        if self.tabs.values().any(TerminalTab::autoscroll_armed) {
+            tracing::info!(
+                ?size,
+                changed,
+                caller = %std::panic::Location::caller(),
+                "selection auto-scroll stopped by a re-grid"
+            );
+        }
         self.window_size = size;
         let grid = self.current_grid();
         self.note_host_grid(grid);

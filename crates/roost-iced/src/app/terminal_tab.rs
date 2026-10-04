@@ -63,11 +63,11 @@ pub(super) fn autoscroll_selections(
     for (key, tab) in tabs.iter_mut() {
         if *key != active || !window_focused {
             if tab.autoscroll.take().is_some() {
-                tracing::debug!(
+                tracing::info!(
                     tab_id = key.tab,
                     active = *key == active,
                     window_focused,
-                    "selection auto-scroll disarmed"
+                    "selection auto-scroll stopped: its tab is not shown in a focused window"
                 );
             }
             continue;
@@ -95,6 +95,13 @@ pub(super) fn cancel_tab_pointers(
     reason: &str,
 ) {
     for (key, tab) in tabs.iter_mut().filter(|(key, _)| Some(**key) != except) {
+        if tab.autoscroll_armed() {
+            tracing::info!(
+                tab_id = key.tab,
+                reason,
+                "selection auto-scroll stopped by a pointer cancel"
+            );
+        }
         match tab.prepare_pointer_cancel() {
             Ok(release) => {
                 // The cancel drops hover, so the link underline and
@@ -1132,6 +1139,7 @@ impl TerminalTab {
             },
             PointerAction::Release => match self.local_pointer_gesture.take() {
                 Some(LocalPointerGesture::Selection) => {
+                    self.autoscroll = None;
                     self.selection.update(&self.terminal, cell.0, cell.1)?;
                     Ok(NativePointerOutcome {
                         selection_completed: true,
@@ -1207,12 +1215,18 @@ impl TerminalTab {
     /// `selection.set`: a selection made from outside the pointer ends
     /// any drag that was stretching the one it replaces.
     pub(super) fn set_selection(&mut self, anchor: (u16, u16), cursor: (u16, u16)) -> Result<bool> {
+        if self.autoscroll_armed() {
+            tracing::info!("selection auto-scroll stopped: selection.set replaced its drag");
+        }
         self.end_selection_drag();
         Ok(self.selection.set(&self.terminal, anchor, cursor)?)
     }
 
     /// `selection.clear`, which ends any drag stretching the selection.
     pub(super) fn clear_selection(&mut self) -> bool {
+        if self.autoscroll_armed() {
+            tracing::info!("selection auto-scroll stopped: selection.clear ended its drag");
+        }
         self.end_selection_drag();
         self.selection.clear()
     }
@@ -1226,11 +1240,17 @@ impl TerminalTab {
     /// mouse tracking) disarms.
     pub(super) fn autoscroll_selection(&mut self) -> Result<()> {
         let Some(armed) = self.armed_autoscroll() else {
-            self.autoscroll = None;
+            if self.autoscroll.take().is_some() {
+                tracing::info!(
+                    gesture = ?self.local_pointer_gesture,
+                    "selection auto-scroll stopped: its drag is over"
+                );
+            }
             return Ok(());
         };
         let history_rows = autoscroll_history_rows(armed.overshoot);
         let Some(scrolled) = self.scroll.scroll_local(&mut self.terminal, history_rows) else {
+            tracing::info!("selection auto-scroll stopped: the viewport no longer scrolls locally");
             self.autoscroll = None;
             return Ok(());
         };
@@ -1254,6 +1274,9 @@ impl TerminalTab {
             self.refresh_snapshot()?;
         }
         if !extended? {
+            tracing::info!(
+                "selection auto-scroll stopped: the selection could not follow the edge"
+            );
             self.end_selection_drag();
         }
         Ok(())
