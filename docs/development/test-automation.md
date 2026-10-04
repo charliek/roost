@@ -126,6 +126,7 @@ that motivated the rule.
 | `make e2e-iced-exit` / `make e2e-iced-menu-quit` | Lifecycle lanes in their own runs — the UI they drive exits, so they cannot share a session-scoped fixture |
 | `make e2e-iced-bundle` / `make e2e-iced-sparkle` | macOS only: assemble `Roost-Iced.app` (test-keyed, for Sparkle) and run the curated smoke against the real bundle |
 | `make test-iced-real-input` / `make test-iced-wayland-input` | Layer 3 — X11 (Xvfb + xdotool) and Wayland (cage + a real uinput seat) |
+| `make e2e-iced-real-input-mac` | Layer 3 on macOS — real CGEvent/Accessibility input against the branch `Roost-Iced.app` (see [below](#the-mac-real-input-harness)) |
 | `make smoke-iced` / `make smoke-mac` | Layer 2 — screenshot-driven UI smoke against a running UI |
 
 `make e2e` **dispatches** rather than running the whole `tools/roosttest`
@@ -135,6 +136,50 @@ session-scoped fixture runs afterward. `e2e-iced` runs a curated list
 instead. **The enumerated-list trap:** a new roosttest module needs
 adding to `ICED_E2E_TESTS` in the `Makefile` *and* to the corresponding
 lists in `ci.yml`, or it never runs on the iced target.
+
+## The Mac real-input harness
+
+The functional suite's `app.key_event` and `app.context_menu_*` ops start
+after winit and AppKit have had their say, so a bug between the OS and Roost
+is invisible to them. The Mac real-input harness (`tools/input/mac/`) closes
+that gap with real CGEvents and the Accessibility API, driving a Roost-Iced
+the test launches itself. It covers Option as Meta by side, Shift+Enter, the
+native right-click popup, full screen, Secure Keyboard Entry, selection
+auto-scroll, the remembered window frame and SGR mouse clicks.
+
+- **Two modes.** On a dev Mac the harness runs in *runner mode*: its freely
+  rebuilt helper (`roost-input-mac`) runs as a child of `Roost Test Runner.app`,
+  a tiny app that is built once, granted Accessibility, Input Monitoring and
+  Screen Recording once, and never rebuilt (a rebuild changes the ad-hoc
+  signature and voids the grants). On GitHub's hosted macOS runner it runs in
+  *direct mode* (`ROOST_REAL_INPUT_MODE=direct`): the job's own processes
+  already hold those grants, so there is no grant step. CI runs it as an
+  experimental step.
+- **Running it.** `make e2e-iced-real-input-mac` builds the helper and the
+  bundle and runs `tools/roosttest/test_real_input_mac.py` with
+  `ROOST_REQUIRE_REAL_INPUT=1`, which turns every "cannot run here" skip (a
+  missing grant, a locked console) into a failure, per the skip policy below.
+- **Its own UI.** The module is marked `owns_ui`: the shared launcher stands
+  down and each test launches the branch's `mac/build/Roost-Iced.app` itself,
+  under `ROOST_BUNDLE_PROFILE=linux`, so it lives in the `Roost-linux`
+  namespace, apart from an installed Roost-Iced. Because that namespace is one
+  fixed location, a run holds `/tmp/roost-real-input.lock` and refuses to start
+  while the namespace's socket answers. Each launch gets its own state
+  directory, `ROOST_TEST_MODE=1` and a config that keeps local tabs in-process (no
+  `roost-session` starts) and turns agent hooks off.
+- **Safety rules.** The launched app is found, focused and quit by pid only,
+  after its environment proves it is this launch's; never by bundle id or
+  process name, since the branch build shares the installed app's bundle id.
+  Selection assertions read the private selection pasteboard, never the general
+  one. Every event is preceded by its own target check, and every press is
+  journaled so a failed or interrupted run releases exactly what it held and
+  nothing the person at the desk is holding.
+- **The screen-lock caveat.** Real events need an unlocked console; a locked
+  screen is a skip, or a failure under `ROOST_REQUIRE_REAL_INPUT=1`. The
+  harness Mac must stay logged in and awake.
+
+The one-time setup, the helper's commands and its accepted limits live in
+[`tools/input/mac/test-runner/README.md`](https://github.com/charliek/roost/blob/main/tools/input/mac/test-runner/README.md).
 
 ## CI lanes
 

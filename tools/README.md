@@ -13,7 +13,7 @@ tools/
   screenshot/     Layer 2 — visual (pixels): roostctl capture + pngtool inspect.
   input/          Layer 3 — real OS input injection, platform-specific.
     linux/          uinput key/pointer + clipboard + single-monitor (COSMIC/Wayland).
-    (mac/)          CGEvent equivalent — planned.
+    mac/            CGEvent + Accessibility helper, run through a never-rebuilt TCC anchor app.
   perf/           Render-path cost — a sibling axis, not a layer (see intro above).
   repro/          (non-tier — on-demand drivers for intermittent bugs; see repro/README.md)
   roosttest_unit/ (non-tier — fast unit tests for the harness wiring itself)
@@ -27,7 +27,7 @@ tools/
 | **1 — session** | [`roosttest/test_session.py`](roosttest/README.md) | JSON IPC (Python client), no UI | the `roost-session` daemon: lifecycle, `session.identify`/`session.stop`, `events.subscribe`'s revision-fence contract | linux + macOS (CI runs the lane on both; `roost-session` ships in the `.deb` and inside `Roost-Iced.app`) | ✅ `make e2e-session`, required |
 | **1 — live** | [`session/live/`](session/live/README.md) | `roostctl host status --json`, against a real `sshd` severed with `iptables` / `systemctl` | the ssh auto-reconnect ladder end to end: recover, spend the budget and settle, refuse to retry a changed host key, quit with a rung armed or an establish in flight, a refused port | linux, in a shed (needs `sudo`, real firewall rules) | ❌ not a CI lane; runs by hand in the shed |
 | **2 — visual** | [`screenshot/`](screenshot/README.md) | `roostctl` + `roostctl screenshot` | pixels: colors, badges, cursor, reflow, which tab/sidebar is shown | mac + iced | local |
-| **3 — real input** | [`input/`](input/linux/README.md) | OS key/pointer injection | the *real* key-encoder + mouse-gesture + clipboard path: selection, copy/paste, scroll | per-OS (linux now) | local |
+| **3 — real input** | [`input/linux/`](input/linux/README.md), [`input/mac/`](input/mac/test-runner/README.md) | OS key/pointer injection (uinput; CGEvent + Accessibility) | the *real* key-encoder + mouse-gesture + clipboard path: selection, copy/paste, scroll; on Mac also the native popup, Option as Meta, full screen, Secure Keyboard Entry | per-OS (linux, mac) | linux local; mac runner mode local, direct mode experimental in CI |
 
 ## Which layer for what
 
@@ -41,7 +41,8 @@ tools/
 - **Real input actually works** (drag-select text, Cmd/Ctrl-C → the OS
   clipboard → paste, the key encoder, scroll) → **Layer 3** (`input`).
   This is the only layer that goes through the OS input stack; it's
-  platform-specific and local-only (needs `/dev/uinput` on Linux, etc.).
+  platform-specific (needs `/dev/uinput` on Linux; a granted TCC anchor app on
+  a dev Mac, see [`input/mac/test-runner/README.md`](input/mac/test-runner/README.md)).
 
 ## Why this layout
 
@@ -50,7 +51,7 @@ three ways. Layer boundaries are about *capability*, not which PR added a
 file — e.g. `pngtool.py` (PNG inspection) is cross-platform and serves
 every screenshot check, so it lives in `screenshot/`, not under `linux/`.
 `input/` is a parent (not a flat `linux/`) because the real-input layer is
-inherently per-OS and a Mac CGEvent sibling is planned.
+inherently per-OS (`linux/` and `mac/`).
 
 See [`docs/development/test-automation.md`](../docs/development/test-automation.md)
 for the tiered CI plan and the relationship between these harnesses.

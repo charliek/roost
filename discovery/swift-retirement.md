@@ -126,7 +126,8 @@ idle:
   DL-16), and sidebar translucency.
 - **Neither app has:** a Services menu, a menu-bar icon, a Dock menu,
   reopen from the Dock, following light/dark mode, Secure Keyboard Entry,
-  window restoration.
+  window restoration. (Plan 074 gave iced Secure Keyboard Entry and window
+  restoration; Swift still has neither.)
 - **Swift is worse:** no IME, no agent-control surface, no host sessions.
 
 Downloads are small for every artifact: 1 to 8 per release, so a simple
@@ -231,11 +232,25 @@ terminal font (#580).
   class. The Swift app never had them.
 - Better editing in the palette text field.
 - Sidebar translucency (an `NSVisualEffectView` behind the wgpu surface).
-- Secure Keyboard Entry.
+- ~~Secure Keyboard Entry.~~ **Shipped in plan 074 (#593):** automatic at
+  password prompts, a remembered toggle, and a lock in the tab band.
 - An Intel universal build (#117).
 - `roostctl` on PATH from the app (#261).
-- A CGEvent real-input test harness for Mac (#189 and #285, merged into
-  one issue).
+- ~~A CGEvent real-input test harness for Mac (#189 and #285, merged into
+  one issue).~~ **Shipped in plan 074 (#189; #285 closed as its
+  duplicate):** `make e2e-iced-real-input-mac`, also an experimental step
+  on the hosted macOS runner.
+
+Plan 074 also shipped, from the lists above or found along the way:
+selection auto-scroll in iced (#342, filed against Swift); remembering the
+window frame on macOS (#595, the "window restoration" gap); the Wayland
+raise on a notification click (#351); the theme's `cursor-text` color
+(see [`text-rendering.md`](text-rendering.md)); press-sequenced mouse
+buttons so none is left held in a mouse-tracking app (#587); right-click
+New Tab on a project opening where ⌘T would (#589); and
+`test_device_queries.py` in the iced lanes (#596). **Deferred:** the
+Services menu stays deferred; chrome themes wait for after v0.1.0
+([`chrome-themes.md`](chrome-themes.md)).
 
 ### Accepted
 
@@ -544,7 +559,8 @@ Everything in the main repo that references the Swift app. Items marked
   possible but must update every filter in the same commit.
 - **The Mac-only e2e modules.** Nine modules appear in no Makefile list and
   no CI lane; today they run only because `e2e-mac` sweeps the whole
-  `tools/roosttest` directory: `test_device_queries`, `test_test_ops`,
+  `tools/roosttest` directory: `test_device_queries` (since plan 074 it also
+  runs in the iced lanes, #596), `test_test_ops`,
   `test_word_selection`, `test_ordering`, `test_sidebar_agents`,
   `test_terminal`, `test_launcher`, `test_sidebar_layout`,
   `test_sidebar_collapse_persistence`. Separately, the macOS iced cell
@@ -581,7 +597,7 @@ Nothing here happens until the matching work merges. State as of
 | #185 | Sharing mouse-motion helpers between Swift and Rust; the reason goes away. |
 | #286 | The facade, if it is deleted. |
 | #124 | A `--selftest` clean-install check for the Swift app; iced's bundle smoke covers it. Confirm first. |
-| #342 | Selection auto-scroll at window edges, reported against Swift. Check iced first; if iced lacks it too, rewrite instead. |
+| #342 | Selection auto-scroll at window edges, reported against Swift. Plan 074 implemented it for iced (the issue was filed against Swift), so close it with that work instead. |
 
 **Rewrite to drop the Swift half, keep open:**
 
@@ -594,9 +610,10 @@ Nothing here happens until the matching work merges. State as of
 - Old feature requests that still point at deleted code
   (`crates/roost-linux` and Swift files): #162, #163, #165, #166, #167,
   #168, #169, #170. Rewrite them for iced.
-- Merge #189 and #285 (the Mac real-input harness) into one.
+- ~~Merge #189 and #285 (the Mac real-input harness) into one.~~ Done in
+  plan 074: #189 shipped and #285 was closed as its duplicate.
 
-**Unaffected, though they mention macOS:** #572, #568, #553, #351.
+**Unaffected, though they mention macOS:** #572, #568, #553, #351 (shipped in plan 074 for Wayland).
 
 **Already closed** by plan 072 and related work: #556, #557, #562, #565,
 #559, #554, #193.

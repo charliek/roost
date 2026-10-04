@@ -234,9 +234,11 @@ wrapper small.
   exercises the actual key-encoder + mouse-gesture + clipboard path on
   Linux (COSMIC/Wayland) with no image libraries — `/dev/uinput`
   key/pointer injectors, a clipboard reader, and a single-monitor helper
-  for reliable absolute-pointer injection. Linux-only (a Mac CGEvent
-  sibling at `tools/input/mac/` is planned). See its README for the
-  screen↔window coordinate mapping and gotchas.
+  for reliable absolute-pointer injection. Linux-only. See its README for the
+  screen↔window coordinate mapping and gotchas. The Mac counterpart is
+  `tools/input/mac/` (real CGEvents + Accessibility via a never-rebuilt TCC
+  anchor app; `make e2e-iced-real-input-mac`) — see
+  [`test-automation.md`](docs/development/test-automation.md#the-mac-real-input-harness).
 - **Functional E2E (pytest)**: [`tools/roosttest/`](tools/roosttest/README.md)
   is the primary automated suite — a thin Python IPC client drives a real
   UI (`--roost-target mac|iced`) and asserts on the op set (`tab.dump` /

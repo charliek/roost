@@ -11,6 +11,9 @@ cursor, selection and cell-metrics items of Tier 1. They are marked ✅
 below, with [findings](#findings-from-plan-073). The "today" tables
 describe the code at `474e6b5`, before that work.
 
+**Update 2026-10-03:** plan 074 shipped the theme's `cursor-text` color (see
+Tier 1). #590, #591 and #592 stay open.
+
 iced's terminal text is good. The question here is which knobs exist to
 make it better, especially on macOS once the Core Text-based Swift app is
 gone, and what each costs.
@@ -279,6 +282,10 @@ state either (a known limitation in `docs/development/host-sessions.md`).
   *Shipped:* an opaque block cursor that inverts its glyph, and Ghostty's
   selection colors (an opaque `selection-background`, text in
   `selection-foreground`).
+  *Plan 074 shipped `cursor-text`:* the glyph under a block cursor takes
+  the theme's `cursor-text` color (Ghostty parity), unless it is absent or
+  equals the cursor fill, in which case it keeps the background. The
+  `cell-foreground` / `cell-background` keywords are ignored.
 - ✅ (macOS only) **Ghostty-style cell metrics:** round instead of floor, take line height
   and baseline from the font's own metrics, and add `adjust-cell-width` and
   `adjust-cell-height` options.
@@ -286,9 +293,9 @@ state either (a known limitation in `docs/development/host-sessions.md`).
   come from the font's own metrics, rounded **up**. **Still open:** Linux
   keeps floor and 1.2, and the `adjust-*` options don't exist.
 - **A macOS fallback list** with Menlo, Apple Symbols and SF Mono ahead of
-  the system UI font, swapped in once at startup.
-- **More sprite ranges:** powerline, braille and Legacy Computing, with
-  antialiased curves and diagonals and snapping to physical pixels.
+  the system UI font, swapped in once at startup. Tracked in #592.
+- **More sprite ranges:** powerline, braille and Legacy Computing (#591), with
+  antialiased curves and diagonals and snapping to physical pixels (#590).
 - **The raw drawing path** (`fill_raw` with widget-owned cosmic-text
   buffers). It enables `DISABLE_HINTING`, synthesized italic for families
   without an italic face, font features and exact weights. It is also a
@@ -339,7 +346,7 @@ satisfy.
 1. Tier 0 together: the size factor, hinting off on macOS, `web-colors`.
    Re-shoot with the capture recipe and use it daily for a while.
 2. Cursor and selection above the glyphs (Tier 1).
-3. Fallback sizing and the macOS fallback list.
+3. Fallback sizing (#585) and the macOS fallback list (#592).
 4. Decide on Tier 2 from the results and from performance needs.
 
 The size change fits naturally with the identity cutover in
