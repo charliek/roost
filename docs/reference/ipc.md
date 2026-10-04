@@ -1518,7 +1518,8 @@ Request: `{"params": {}}`.
 ```json
 {"window_width":1100.0,"window_height":700.0,"sidebar_width":220.0,
  "sidebar_collapsed":false,"terminal_top":34.0,"terminal_font_family":"Berkeley Mono",
- "terminal_left":220.0,"terminal_padding":0.0,"cell_width":8.0,"cell_height":16.0}
+ "terminal_left":220.0,"terminal_padding":0.0,"cell_width":8.0,"cell_height":16.0,
+ "window_focused":true,"native_focus_losses":0}
 ```
 
 `terminal_top` and `terminal_font_family` are optional for wire compatibility
@@ -1546,6 +1547,15 @@ terminal_padding + row × cell_height)`. The Mac real-input harness
 (`tools/input/mac/coords.py`) turns that into a screen point with the window's
 Accessibility frame, so a real click lands on a known cell without measuring
 pixels.
+
+`window_focused` and `native_focus_losses` are optional in the same way: the
+iced UI always reports them and the Mac UI does not. `window_focused` is the
+focus the UI acts on: the last native focus event, or a later
+`app.set_window_focus`. A selection auto-scroll runs only while it is true.
+`native_focus_losses` counts the times the OS has taken focus from the window
+since launch, and `app.set_window_focus` never adds to it. A test that forces
+focus can therefore tell a native focus loss that cancelled its gesture from
+its own.
 
 ### `app.sidebar_dump`
 

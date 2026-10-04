@@ -20,9 +20,11 @@ Swift app is frozen.
 from __future__ import annotations
 
 import os
+import warnings
 
 import pytest
 
+from client import Timeout
 from test_tab_dump_scrollback import line, numbered
 from util import wait_tab_attached, wait_tab_quiet
 
@@ -45,6 +47,12 @@ PAGES_UP = 4
 # How far past the grid the held pointer is: three rows a tick.
 OVERSHOOT = 3
 
+# How many gestures a case may make when the OS takes focus from the window
+# mid-gesture (a macOS runner's activation churn does). A focus loss disarms
+# the auto-scroll for good, and only a native loss earns another attempt, so
+# a drag that stalls in a focused window still fails on its first.
+FOCUS_ATTEMPTS = 3
+
 
 @pytest.fixture(autouse=True)
 def _iced_only(target):
@@ -55,9 +63,8 @@ def _iced_only(target):
 LAST_COL = len(line(0)) - 1
 
 
-@pytest.fixture
-def seeded(roost, project):
-    """The tab on screen, in a focused window, at the live bottom of a
+def _seed(roost, project) -> int:
+    """A new tab on screen, in a focused window, at the live bottom of a
     numbered history: its last row sits just above the empty cursor row.
 
     The tick scrolls only the tab on screen in a focused window, and a
@@ -74,6 +81,56 @@ def seeded(roost, project):
     roost.tab_feed_pty_bytes(tab, body.encode())
     roost.wait_text(tab, line(SEEDED_LINES - 1), timeout=30.0)
     return tab
+
+
+def _native_focus(roost) -> tuple[bool, int]:
+    metrics = roost.window_metrics()
+    return metrics["window_focused"], metrics["native_focus_losses"]
+
+
+class _NativeFocusLost(Exception):
+    """A held drag timed out after the OS took focus from the window."""
+
+
+def _on_a_seeded_tab(roost, project, case) -> None:
+    """Run `case` on a freshly seeded tab, and again on another one when
+    its held drag lost to the OS taking focus, at most `FOCUS_ATTEMPTS`
+    times in all."""
+    for attempt in range(1, FOCUS_ATTEMPTS + 1):
+        tab = _seed(roost, project)
+        try:
+            case(tab)
+            return
+        except _NativeFocusLost as lost:
+            if attempt == FOCUS_ATTEMPTS:
+                raise AssertionError(f"{lost}, on every one of {FOCUS_ATTEMPTS} attempts") from lost
+            warnings.warn(f"attempt {attempt}: {lost}; retrying on a new tab", stacklevel=2)
+
+
+def _hold(
+    roost, tab: int, press: tuple[int, int], held: tuple[int, int], overshoot: int, reached, what: str
+) -> None:
+    """Press at `press`, hold `overshoot` rows past the grid from `held`
+    until `reached`, then release there. A timeout with a native focus loss
+    between the press and the timeout raises `_NativeFocusLost`. Any other
+    timeout fails the case and names the focus state."""
+    _, before = _native_focus(roost)
+    _drag(roost, tab, "press", press)
+    try:
+        _drag(roost, tab, "motion", held, overshoot=overshoot)
+        try:
+            roost._wait(reached, 10.0, what)
+        except Timeout as timeout:
+            focused, after = _native_focus(roost)
+            if after > before:
+                raise _NativeFocusLost(
+                    f"{timeout}: the OS took focus from the window {after - before}x during the hold"
+                ) from timeout
+            raise AssertionError(
+                f"{timeout} (window_focused={focused}, no native focus loss during the hold)"
+            ) from timeout
+    finally:
+        _drag(roost, tab, "release", held, overshoot=overshoot)
 
 
 def _selected_rows(roost, tab: int) -> list[int]:
@@ -100,26 +157,28 @@ def _drag(roost, tab: int, kind: str, cell: tuple[int, int], overshoot: int = 0)
     )
 
 
-def test_a_drag_held_above_the_grid_selects_into_history(roost, seeded):
+def test_a_drag_held_above_the_grid_selects_into_history(roost, project):
     """Upward from the live bottom: the selection reaches a screen's
     worth of history above the viewport the drag started in, and
     releasing keeps exactly the run the scroll brought on screen."""
-    tab = seeded
+    _on_a_seeded_tab(roost, project, lambda tab: _held_above(roost, tab))
+
+
+def _held_above(roost, tab: int) -> None:
     dumped = roost.dump(tab)
     rows = dumped["rows"]
     top = numbered(dumped["rows_text"][0])
     anchor_row = dumped["rows_text"].index(line(SEEDED_LINES - 1))
 
-    _drag(roost, tab, "press", (LAST_COL, anchor_row))
-    try:
-        _drag(roost, tab, "motion", (0, 0), overshoot=-OVERSHOOT)
-        roost._wait(
-            lambda: (_selected_rows(roost, tab) or [top])[0] <= top - rows,
-            10.0,
-            f"the held drag to select a screen above row-{top:04d}",
-        )
-    finally:
-        _drag(roost, tab, "release", (0, 0), overshoot=-OVERSHOOT)
+    _hold(
+        roost,
+        tab,
+        (LAST_COL, anchor_row),
+        (0, 0),
+        -OVERSHOOT,
+        lambda: (_selected_rows(roost, tab) or [top])[0] <= top - rows,
+        f"the held drag to select a screen above row-{top:04d}",
+    )
 
     selected = _selected_rows(roost, tab)
     assert selected, "the release dropped the selection"
@@ -130,10 +189,13 @@ def test_a_drag_held_above_the_grid_selects_into_history(roost, seeded):
     )
 
 
-def test_a_drag_held_below_a_scrolled_up_grid_selects_toward_the_bottom(roost, seeded):
+def test_a_drag_held_below_a_scrolled_up_grid_selects_toward_the_bottom(roost, project):
     """Downward from a viewport already paged up: the selection reaches a
     screen's worth below the viewport the drag started in."""
-    tab = seeded
+    _on_a_seeded_tab(roost, project, lambda tab: _held_below(roost, tab))
+
+
+def _held_below(roost, tab: int) -> None:
     dumped = roost.dump(tab)
     rows = dumped["rows"]
     live_top = numbered(dumped["rows_text"][0])
@@ -147,16 +209,15 @@ def test_a_drag_held_below_a_scrolled_up_grid_selects_toward_the_bottom(roost, s
     )
     bottom = top + rows - 1
 
-    _drag(roost, tab, "press", (0, 0))
-    try:
-        _drag(roost, tab, "motion", (LAST_COL, rows - 1), overshoot=OVERSHOOT)
-        roost._wait(
-            lambda: (_selected_rows(roost, tab) or [bottom])[-1] >= bottom + rows,
-            10.0,
-            f"the held drag to select a screen below row-{bottom:04d}",
-        )
-    finally:
-        _drag(roost, tab, "release", (LAST_COL, rows - 1), overshoot=OVERSHOOT)
+    _hold(
+        roost,
+        tab,
+        (0, 0),
+        (LAST_COL, rows - 1),
+        OVERSHOOT,
+        lambda: (_selected_rows(roost, tab) or [bottom])[-1] >= bottom + rows,
+        f"the held drag to select a screen below row-{bottom:04d}",
+    )
 
     selected = _selected_rows(roost, tab)
     assert selected, "the release dropped the selection"

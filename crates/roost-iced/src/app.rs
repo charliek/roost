@@ -3100,6 +3100,8 @@ pub struct App {
     /// `state.json` on every frame.
     sidebar_drag_width: Option<f32>,
     window_focused: bool,
+    /// Native focus losses only; `app.window_metrics` reports it.
+    native_focus_losses: u64,
     /// App-identity name the window title falls back to, fixed at bootstrap
     /// from the resolved profile — see [`title_fallback`].
     title_fallback: &'static str,
@@ -3691,6 +3693,7 @@ impl App {
             ),
             sidebar_drag_width: None,
             window_focused: true,
+            native_focus_losses: 0,
             title_fallback: title_fallback(profile.kind),
             ime_discard: ImeDiscard::default(),
             modifiers: keyboard::Modifiers::default(),
@@ -5884,7 +5887,21 @@ impl App {
                 .is_some_and(host_tab::HostAttach::live)
     }
 
-    pub fn set_window_focus(&mut self, focused: bool) {
+    /// A focus change the OS reported.
+    pub fn native_window_focus(&mut self, focused: bool) {
+        if !focused {
+            self.native_focus_losses += 1;
+        }
+        self.set_window_focus(focused, "native");
+    }
+
+    pub fn set_window_focus(&mut self, focused: bool, source: &'static str) {
+        tracing::debug!(
+            from = self.window_focused,
+            to = focused,
+            source,
+            "window focus"
+        );
         let teardown = focus_teardown(focused);
         if teardown.rename_completion_key {
             self.rename_completion_key = None;

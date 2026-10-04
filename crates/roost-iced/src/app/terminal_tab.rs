@@ -62,7 +62,14 @@ pub(super) fn autoscroll_selections(
 ) {
     for (key, tab) in tabs.iter_mut() {
         if *key != active || !window_focused {
-            tab.autoscroll = None;
+            if tab.autoscroll.take().is_some() {
+                tracing::debug!(
+                    tab_id = key.tab,
+                    active = *key == active,
+                    window_focused,
+                    "selection auto-scroll disarmed"
+                );
+            }
             continue;
         }
         if let Err(error) = tab.autoscroll_selection() {

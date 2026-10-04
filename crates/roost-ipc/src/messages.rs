@@ -1898,6 +1898,16 @@ pub struct WindowMetricsResult {
     pub cell_width: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cell_height: Option<f64>,
+    /// The window focus the UI acts on: the last native focus event, or a
+    /// later `app.set_window_focus`. A selection auto-scroll runs only
+    /// while it is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_focused: Option<bool>,
+    /// How many times the OS has taken focus from the window since launch.
+    /// `app.set_window_focus` never counts, so a test that forces focus can
+    /// tell a native focus loss from its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_focus_losses: Option<u64>,
 }
 
 /// `app.sidebar_dump` request — nullary envelope (`{}`), matching
@@ -5021,6 +5031,8 @@ mod tests {
             terminal_padding: Some(0.0),
             cell_width: Some(7.8),
             cell_height: Some(15.6),
+            window_focused: Some(false),
+            native_focus_losses: Some(2),
         });
         let native = WindowMetricsResult {
             window_width: 1800.0,
@@ -5033,6 +5045,8 @@ mod tests {
             terminal_padding: None,
             cell_width: None,
             cell_height: None,
+            window_focused: None,
+            native_focus_losses: None,
         };
         let json = serde_json::to_string(&native).unwrap();
         for absent in [
@@ -5041,6 +5055,8 @@ mod tests {
             "terminal_padding",
             "cell_width",
             "cell_height",
+            "window_focused",
+            "native_focus_losses",
         ] {
             assert!(
                 !json.contains(absent),
@@ -5064,6 +5080,7 @@ mod tests {
             ),
             (None, None, None, None)
         );
+        assert_eq!((old.window_focused, old.native_focus_losses), (None, None));
     }
 
     #[test]

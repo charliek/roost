@@ -549,9 +549,9 @@ fn both_sidebar_dump_vectors_decode_as_the_current_typed_result() {
 }
 
 /// `app.window_metrics` before and after the real-input harness's cell
-/// geometry (plan 074 §D7): the recorded response carries none of the
-/// optional fields and re-encodes exactly, and the iced shape carries all of
-/// them and re-encodes exactly.
+/// geometry (plan 074 §D7), and with the window-focus state: the recorded
+/// response carries none of the optional fields and re-encodes exactly, and
+/// each later shape carries its own and re-encodes exactly.
 #[test]
 fn both_window_metrics_vectors_decode_as_the_current_typed_result() {
     let recorded = vector("app.window_metrics.response.json");
@@ -584,6 +584,23 @@ fn both_window_metrics_vectors_decode_as_the_current_typed_result() {
     assert_eq!(
         serde_json::to_value(&result).unwrap(),
         geometry["result"],
+        "typed re-encode must match the vector"
+    );
+    assert_eq!(
+        (result.window_focused, result.native_focus_losses),
+        (None, None)
+    );
+
+    let focus = vector("app.window_metrics.focus.response.json");
+    let result: WindowMetricsResult =
+        serde_json::from_value(focus["result"].clone()).expect("focus state decodes");
+    assert_eq!(
+        (result.window_focused, result.native_focus_losses),
+        (Some(false), Some(2))
+    );
+    assert_eq!(
+        serde_json::to_value(&result).unwrap(),
+        focus["result"],
         "typed re-encode must match the vector"
     );
 }

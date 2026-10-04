@@ -631,7 +631,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::WindowFocus(id, focused) => {
             let task = app.window_opened(id).map_task();
-            app.set_window_focus(focused);
+            app.native_window_focus(focused);
             task.chain(app.query_full_screen().map_task())
         }
         #[cfg(target_os = "linux")]
