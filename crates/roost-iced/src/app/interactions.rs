@@ -6650,6 +6650,37 @@ mod tests {
         supervisor.close(423);
     }
 
+    /// A motion with no press behind it is the pointer hovering, not the
+    /// held button's drag: it neither moves the selection's end nor stops
+    /// the auto-scroll (#606).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hover_during_a_held_drag_leaves_the_drag_alone() {
+        let (mut tab, supervisor) = history_tab(427);
+        press_left(&mut tab, (10, 30));
+        drag(&mut tab, (0, 0), -2);
+        let held = tab.selected_text().expect("selection text");
+
+        native_pointer(
+            &mut tab,
+            PointerAction::Motion,
+            None,
+            (1, 2),
+            0,
+            true,
+            false,
+        );
+        assert!(tab.autoscroll_armed(), "the hover leaves the drag armed");
+        assert_eq!(tab.selected_text().expect("selection text"), held);
+
+        tick(&mut tab);
+        assert_eq!(viewport_offset(&tab), 167, "the next tick still scrolls");
+        assert_eq!(
+            tab.selected_text().expect("selection text").as_deref(),
+            Some(history_span(167, 199).as_str())
+        );
+        supervisor.close(427);
+    }
+
     /// The arming table: only a selection drag past the top or bottom of
     /// the grid arms, a geometry change disarms, and the speed clamp
     /// holds at the far end of the range.

@@ -907,8 +907,10 @@ fn rewrap_lets_go(
     tabs: &mut HashMap<TabKey, TerminalTab>,
     press_floor: &mut u64,
 ) {
-    if std::mem::replace(observed, now) != now {
-        cancel_tab_pointers(tabs, None, "pointer cancel: the terminal was rewrapped");
+    let before = std::mem::replace(observed, now);
+    if before != now {
+        let reason = format!("pointer cancel: the terminal was rewrapped ({before:?} -> {now:?})");
+        cancel_tab_pointers(tabs, None, &reason);
         *press_floor = crate::terminal_widget::latest_press_seq();
     }
 }
@@ -3100,6 +3102,8 @@ pub struct App {
     /// `state.json` on every frame.
     sidebar_drag_width: Option<f32>,
     window_focused: bool,
+    /// Native focus losses only; `app.window_metrics` reports it.
+    native_focus_losses: u64,
     /// App-identity name the window title falls back to, fixed at bootstrap
     /// from the resolved profile — see [`title_fallback`].
     title_fallback: &'static str,
@@ -3691,6 +3695,7 @@ impl App {
             ),
             sidebar_drag_width: None,
             window_focused: true,
+            native_focus_losses: 0,
             title_fallback: title_fallback(profile.kind),
             ime_discard: ImeDiscard::default(),
             modifiers: keyboard::Modifiers::default(),
@@ -5255,8 +5260,17 @@ impl App {
         )
     }
 
+    #[track_caller]
     pub fn resize(&mut self, size: Size) {
         let changed = self.window_size != size;
+        if self.tabs.values().any(TerminalTab::autoscroll_armed) {
+            tracing::info!(
+                ?size,
+                changed,
+                caller = %std::panic::Location::caller(),
+                "selection auto-scroll stopped by a re-grid"
+            );
+        }
         self.window_size = size;
         let grid = self.current_grid();
         self.note_host_grid(grid);
@@ -5884,7 +5898,21 @@ impl App {
                 .is_some_and(host_tab::HostAttach::live)
     }
 
-    pub fn set_window_focus(&mut self, focused: bool) {
+    /// A focus change the OS reported.
+    pub fn native_window_focus(&mut self, focused: bool) {
+        if !focused {
+            self.native_focus_losses += 1;
+        }
+        self.set_window_focus(focused, "native");
+    }
+
+    pub fn set_window_focus(&mut self, focused: bool, source: &'static str) {
+        tracing::debug!(
+            from = self.window_focused,
+            to = focused,
+            source,
+            "window focus"
+        );
         let teardown = focus_teardown(focused);
         if teardown.rename_completion_key {
             self.rename_completion_key = None;
@@ -7955,6 +7983,17 @@ impl App {
     /// dialog, the rename editor, a notice, the bottom line, or a sidebar
     /// collapse.
     pub fn observe_terminal_wrapping(&mut self, notice_shown: bool) {
+        if self.tabs.values().any(TerminalTab::autoscroll_armed) {
+            let bottom = self.bottom_line().map(|line| line.text.into_owned());
+            if (bottom.is_some(), notice_shown)
+                != (
+                    self.terminal_wrapping.bottom_line,
+                    self.terminal_wrapping.notice,
+                )
+            {
+                tracing::info!(?bottom, notice = ?self.terminal_notice().map(|it| it.key), "the terminal's notice or bottom line changed under a held selection auto-scroll");
+            }
+        }
         let now = TerminalWrapping {
             sidebar_collapsed: self.workspace.sidebar_collapsed(),
             notice: notice_shown,

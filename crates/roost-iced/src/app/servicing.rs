@@ -3650,6 +3650,8 @@ impl App {
                     terminal_padding: Some(f64::from(TERMINAL_PADDING)),
                     cell_width: Some(f64::from(metrics.cell_width)),
                     cell_height: Some(f64::from(metrics.cell_height)),
+                    window_focused: Some(self.window_focused),
+                    native_focus_losses: Some(self.native_focus_losses),
                 }));
             }
             UiRequest::WindowResize {
@@ -3707,7 +3709,7 @@ impl App {
                     if let Some(id) = self.window_id {
                         task = task.then(self.window_opened(id));
                     }
-                    self.set_window_focus(focused);
+                    self.set_window_focus(focused, "app.set_window_focus");
                     Ok(())
                 } else {
                     Err("ROOST_TEST_MODE=1 is required".into())
