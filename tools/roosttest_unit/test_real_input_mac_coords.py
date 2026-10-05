@@ -164,5 +164,69 @@ class DisplayTests(unittest.TestCase):
                     coords.displays(empty)
 
 
+def display(id: int, bounds: tuple, main: bool = False, **insets) -> dict:
+    x, y, width, height = bounds
+    return {
+        "id": id,
+        "main": main,
+        "bounds": {"x": x, "y": y, "width": width, "height": height},
+        **insets,
+    }
+
+
+class FullScreenFramesTests(unittest.TestCase):
+    NOTCHED = (0, 0, 1470, 956)
+
+    def test_a_notched_display_also_offers_the_inset_frames(self) -> None:
+        report = {"displays": [display(1, self.NOTCHED, True, safe_area_top=32, menu_bar_inset=33)]}
+        frames = coords.full_screen_frames(report)
+        self.assertEqual(
+            frames,
+            [
+                coords.Frame(0, 0, 1470, 956),
+                coords.Frame(0, 33, 1470, 923),
+                coords.Frame(0, 32, 1470, 924),
+            ],
+        )
+
+    def test_a_missing_key_gives_the_bounds_only(self) -> None:
+        for extra in ({}, {"menu_bar_inset": 33}, {"safe_area_top": 0, "menu_bar_inset": 33}):
+            with self.subTest(extra=extra):
+                report = {"displays": [display(1, self.NOTCHED, True, **extra)]}
+                self.assertEqual(coords.full_screen_frames(report), [coords.Frame(0, 0, 1470, 956)])
+
+    def test_only_the_notched_display_gains_candidates(self) -> None:
+        report = {
+            "displays": [
+                display(2, (1470, 0, 1920, 1080), safe_area_top=0, menu_bar_inset=24),
+                display(1, self.NOTCHED, True, safe_area_top=32, menu_bar_inset=33),
+            ]
+        }
+        frames = coords.full_screen_frames(report)
+        self.assertEqual(frames[0], coords.Frame(0, 0, 1470, 956), "the main display first")
+        self.assertIn(coords.Frame(0, 33, 1470, 923), frames)
+        self.assertEqual(frames[-1], coords.Frame(1470, 0, 1920, 1080), "no candidates for the plain one")
+        self.assertEqual(len(frames), 4)
+
+    def test_a_non_zero_or_negative_origin_offsets_the_inset_frames(self) -> None:
+        report = {"displays": [display(3, (-1470, -956, 1470, 956), True, safe_area_top=32, menu_bar_inset=33)]}
+        self.assertIn(coords.Frame(-1470, -923, 1470, 923), coords.full_screen_frames(report))
+
+    def test_negative_or_non_finite_insets_are_no_inset(self) -> None:
+        for bad in (-5, float("nan"), float("inf"), None, "32", True):
+            with self.subTest(safe_area_top=bad):
+                report = {"displays": [display(1, self.NOTCHED, True, safe_area_top=bad, menu_bar_inset=33)]}
+                self.assertEqual(coords.full_screen_frames(report), [coords.Frame(0, 0, 1470, 956)])
+        report = {"displays": [display(1, self.NOTCHED, True, safe_area_top=32, menu_bar_inset=float("nan"))]}
+        self.assertEqual(
+            coords.full_screen_frames(report),
+            [coords.Frame(0, 0, 1470, 956), coords.Frame(0, 32, 1470, 924)],
+        )
+
+    def test_no_displays_is_an_error(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "no displays"):
+            coords.full_screen_frames({"displays": []})
+
+
 if __name__ == "__main__":
     unittest.main()

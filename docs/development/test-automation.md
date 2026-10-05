@@ -145,7 +145,9 @@ is invisible to them. The Mac real-input harness (`tools/input/mac/`) closes
 that gap with real CGEvents and the Accessibility API, driving a Roost-Iced
 the test launches itself. It covers Option as Meta by side, Shift+Enter, the
 native right-click popup, full screen, Secure Keyboard Entry, selection
-auto-scroll, the remembered window frame and SGR mouse clicks.
+auto-scroll, the remembered window frame and SGR mouse clicks, plus two
+controls on the helper's own foreign key-window guard, against a small
+fixture app built per run (`tools/input/mac/fixtures/key_panel.swift`).
 
 - **Two modes.** On a dev Mac the harness runs in *runner mode*: its freely
   rebuilt helper (`roost-input-mac`) runs as a child of `Roost Test Runner.app`,
@@ -175,6 +177,11 @@ auto-scroll, the remembered window frame and SGR mouse clicks.
   one. Every event is preceded by its own target check, and every press is
   journaled so a failed or interrupted run releases exactly what it held and
   nothing the person at the desk is holding.
+- **Other apps may stay open.** A key is refused only when another app claims
+  the keyboard with a window *in front of* Roost's, the way a non-activating
+  panel (Spotlight, a launcher, a password manager) does. A Zed, a second
+  Roost-Iced or any other app that claims the keyboard from a window behind
+  Roost's no longer blocks the keys (#604).
 - **The screen-lock caveat.** Real events need an unlocked console; a locked
   screen is a skip, or a failure under `ROOST_REQUIRE_REAL_INPUT=1`. The
   harness Mac must stay logged in and awake.
@@ -266,9 +273,21 @@ also what surfaced [#409](https://github.com/charliek/roost/issues/409).
 - **Rendering** — a Layer 2 check via `tools/screenshot/` and
   `pngtool.py`. `tab.dump` is text-only, so anything about color or
   layout needs pixels.
-- **Real key/pointer/clipboard behavior** — Layer 3, local, Linux for
-  now. A Mac CGEvent sibling is
-  [#285](https://github.com/charliek/roost/issues/285).
+- **Real key/pointer/clipboard behavior** — Layer 3. Linux:
+  `tools/input/linux/` (uinput/xdotool). Mac: `tools/input/mac/` (real
+  CGEvents + Accessibility through the never-rebuilt runner app; see
+  [the Mac real-input harness](#the-mac-real-input-harness)).
+
+## Agent verification
+
+An agent should be able to verify a change on the machine it has, without a
+human present. Three skills under `.claude/skills/` carry the recipes:
+`mac-test` (a local Mac, or a remote Mac over ssh, including the real-input
+harness), `linux-test` (Linux from a Mac, in a shed VM) and `popos-test` (a
+native Linux dev box). On a Mac, `make mac-real-input-check` answers "can this
+Mac take real input right now?" (grants, lock, Secure Input, input layout)
+before a real-input run. Skills use placeholders (`$MAC_HOST`, `$MAC_REPO`,
+`TEST_SHA`, `<shed>`) rather than machine names.
 
 The guiding rule: an agent should be able to go from "I changed X" to
 "here is the exact command that proves X still works" without guessing.

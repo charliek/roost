@@ -15,7 +15,7 @@ is slow for a cold ghostty (zig) build and it's a second toolchain path
 beside the shed's. A **shed** (Apple VZ Linux microVM,
 [`tools/shed/`](../shed)) of the target's own architecture is what CI itself
 uses (native runners per arch), so it's what the dev loop uses too:
-`roost-dev` (aarch64, local) and a shed on `mini3` (x86_64, remote server).
+`roost-dev` (aarch64, local) and a shed on a remote shed server `<server>` (x86_64).
 
 ## Prerequisites
 
@@ -57,11 +57,12 @@ tools/session/dev-session.sh launch ~/.cache/roost/dev-session/roost-session-<v>
 # All four in sequence.
 tools/session/dev-session.sh all roost-dev ssh://roost-dev@localhost:2222
 
-# A shed on a remote shed server (e.g. an x86_64 build box on mini3): pass
+# A shed on a remote shed server (e.g. an x86_64 build box; set SERVER to its
+# shed server alias first): pass
 # -s before the shed name for build/fetch/all. check/launch take a plain
 # ssh target and never need -s.
-tools/session/dev-session.sh build -s mini3 roost-build
-tools/session/dev-session.sh fetch -s mini3 roost-build
+tools/session/dev-session.sh build -s "$SERVER" roost-build
+tools/session/dev-session.sh fetch -s "$SERVER" roost-build
 ```
 
 ## The arch rule

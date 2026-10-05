@@ -8,6 +8,7 @@ use super::cf::{self, Cf};
 use super::ffi::*;
 use super::point_json;
 use crate::args::{Point, Rect};
+use crate::claims::{self, Claim, WindowEntry};
 use crate::{Failure, Outcome};
 use serde_json::{json, Value};
 use std::ffi::c_void;
@@ -203,13 +204,20 @@ impl Element {
     }
 }
 
-pub fn rect_json(rect: CGRect) -> Value {
-    json!({
-        "x": rect.origin.x,
-        "y": rect.origin.y,
-        "width": rect.size.width,
-        "height": rect.size.height,
-    })
+impl From<CGRect> for Rect {
+    fn from(rect: CGRect) -> Rect {
+        Rect {
+            x: rect.origin.x,
+            y: rect.origin.y,
+            width: rect.size.width,
+            height: rect.size.height,
+        }
+    }
+}
+
+pub fn rect_json(rect: impl Into<Rect>) -> Value {
+    let rect = rect.into();
+    json!({"x": rect.x, "y": rect.y, "width": rect.width, "height": rect.height})
 }
 
 fn system_wide() -> Result<Cf, Failure> {
@@ -270,56 +278,120 @@ pub fn describe_at(at: Point) -> Value {
     }
 }
 
-/// The apps other than `pid` (and this process) whose focused window says it
-/// is key. Every app keeps its own idea of key: while a foreign non-activating
-/// panel holds the keyboard, Roost's window still reports itself key, the
-/// front process is still Roost, and the system-wide focus queries answer
-/// `kAXErrorCannotComplete` — so the one signal left is the other app's own
-/// claim. An app that does not answer is taken as not claiming
-/// (test-runner/README.md, "Known limits").
+/// The apps other than `pid` (and this process) that claim the keyboard with
+/// a window in front of `pid`'s own (`claims`). Every app keeps its own idea
+/// of key: while a foreign non-activating panel holds the keyboard, Roost's
+/// window still reports itself key, the front process is still Roost, and the
+/// system-wide focus queries answer `kAXErrorCannotComplete` — so the one
+/// signal left is the other app's own claim. An app that does not answer is
+/// taken as not claiming (test-runner/README.md, "Known limits").
 pub fn foreign_key_windows(pid: i32) -> Result<Vec<i32>, Failure> {
     require_trusted()?;
-    // SAFETY: a Copy result adopted once; owner pids are read from the
-    // retained array elements and type-checked.
-    let owners: Vec<i32> = unsafe {
+    let windows = window_list()?;
+    let reference = claims::reference_index(&windows, pid)
+        .ok_or_else(|| Failure::Refused(format!("pid {pid} has no window on screen")))?;
+    Ok(
+        claims::foreign_owners(&windows, pid, std::process::id() as i32)
+            .into_iter()
+            .filter(|owner| {
+                key_claim(*owner).is_some_and(|claimed| {
+                    claims::judge(&windows, reference, *owner, claimed).blocks()
+                })
+            })
+            .collect(),
+    )
+}
+
+/// What `foreign_key_windows` would decide now, with its working, read only.
+/// An owner that does not claim the keyboard is placed by its frontmost
+/// window, so a report shows where it would sit if it did. `ahead` is
+/// `position == "ahead"` only; `blocks` is whether a key would be refused
+/// over this owner (an unlocated claim blocks without being ahead). Both are
+/// null when `pid` has no window to judge against.
+pub fn claimants(pid: i32) -> Outcome {
+    require_trusted()?;
+    let windows = window_list()?;
+    let reference = claims::reference_index(&windows, pid);
+    let rows: Vec<Value> = claims::foreign_owners(&windows, pid, std::process::id() as i32)
+        .into_iter()
+        .map(|owner| {
+            let claim = key_claim(owner);
+            let position = reference.and_then(|reference| match claim {
+                Some(claimed) => Some(claims::judge(&windows, reference, owner, claimed)),
+                None => claims::first_window(&windows, reference, owner),
+            });
+            json!({
+                "pid": owner,
+                "claims_key": claim.is_some(),
+                "claimed_bounds": claim.flatten().map(rect_json),
+                "position": position.map(Claim::name),
+                "ahead": position.map(|position| position == Claim::Ahead),
+                "blocks": position.map(|position| claim.is_some() && position.blocks()),
+                "layers": claims::layers(&windows, owner),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "pid": pid,
+        "reference": reference.map(|index| json!({
+            "index": index,
+            "layer": windows[index].layer,
+            "bounds": windows[index].bounds.map(rect_json),
+        })),
+        "layers": claims::layers(&windows, pid),
+        "claimants": rows,
+    }))
+}
+
+/// The on-screen windows, front to back: the order the window list documents
+/// for `kCGWindowListOptionOnScreenOnly`.
+fn window_list() -> Result<Vec<WindowEntry>, Failure> {
+    // SAFETY: a Copy result adopted once; each value is borrowed from its
+    // retained dictionary while it lives, and type-checked before it is read.
+    unsafe {
         let Some(list) = Cf::owned(CGWindowListCopyWindowInfo(
             kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
             0,
         )) else {
             return Err(Failure::Refused("the window list is unavailable".into()));
         };
-        let mut owners = Vec::new();
-        for info in cf::array_items(list.ptr()) {
-            if !cf::is_dict(info.ptr()) {
-                continue;
-            }
-            let owner = cf::to_i64(CFDictionaryGetValue(info.ptr(), kCGWindowOwnerPID))
-                .and_then(|owner| i32::try_from(owner).ok());
-            if let Some(owner) = owner {
-                if !owners.contains(&owner) {
-                    owners.push(owner);
+        let listed = cf::array_items(list.ptr())
+            .into_iter()
+            .map(|info| {
+                if !cf::is_dict(info.ptr()) {
+                    return (None, None, None);
                 }
-            }
-        }
-        owners
-    };
-    let me = std::process::id() as i32;
-    Ok(owners
-        .into_iter()
-        .filter(|owner| *owner != pid && *owner != me)
-        .filter(|owner| claims_key_window(*owner))
-        .collect())
+                let owner = cf::to_i64(CFDictionaryGetValue(info.ptr(), kCGWindowOwnerPID))
+                    .and_then(|owner| i32::try_from(owner).ok());
+                let layer = cf::to_i64(CFDictionaryGetValue(info.ptr(), kCGWindowLayer));
+                let bounds = CFDictionaryGetValue(info.ptr(), kCGWindowBounds);
+                let mut rect = CGRect::default();
+                let bounds = (cf::is_dict(bounds)
+                    && CGRectMakeWithDictionaryRepresentation(bounds, &mut rect)
+                    && [
+                        rect.origin.x,
+                        rect.origin.y,
+                        rect.size.width,
+                        rect.size.height,
+                    ]
+                    .iter()
+                    .all(|value| value.is_finite()))
+                .then(|| rect.into());
+                (owner, layer, bounds)
+            })
+            .collect();
+        claims::snapshot(listed).map_err(Failure::Refused)
+    }
 }
 
-fn claims_key_window(pid: i32) -> bool {
-    let Ok(app) = Element::application(pid) else {
-        return false;
-    };
+/// `None` when `pid` does not say a window of its own is key; otherwise the
+/// frame of the window it names (`None` inside when that has no frame).
+fn key_claim(pid: i32) -> Option<Option<Rect>> {
+    let app = Element::application(pid).ok()?;
     // SAFETY: a plain timeout on a live element.
     unsafe { AXUIElementSetMessagingTimeout(app.0.ptr(), FOREIGN_TIMEOUT) };
-    app.element("AXFocusedWindow")
-        .and_then(|window| window.boolean("AXFocused"))
-        .unwrap_or(false)
+    let window = app.element("AXFocusedWindow")?;
+    (window.boolean("AXFocused") == Some(true)).then(|| window.frame().map(Rect::from))
 }
 
 pub fn main_window(pid: i32) -> Result<Element, Failure> {

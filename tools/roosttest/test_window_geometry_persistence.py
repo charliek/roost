@@ -20,7 +20,7 @@ doesn't, and Wayland can't place a window), and Roost.app answers
 neither this file's ops nor its format. Skipped on CI like
 `test_sidebar_collapse_persistence.py` — the slow macOS LaunchServices
 respawn pushes a mid-test relaunch past `wait_alive`'s budget there — so
-it is a required mac-mini step instead.
+it is a required local Mac step instead.
 """
 
 from __future__ import annotations

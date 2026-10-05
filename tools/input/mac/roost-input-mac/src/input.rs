@@ -61,8 +61,9 @@ impl Event {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Check {
     /// Keys go to the app whose window is key: the target must be the
-    /// frontmost app, and no other app may hold a key window (a non-activating
-    /// panel can take the keyboard while its owner stays in the background).
+    /// frontmost app with a window on screen, and no other app may claim a
+    /// key window in front of the target's (a non-activating panel can take
+    /// the keyboard while its owner stays in the background).
     Frontmost(i32),
     /// A move or a press goes to whatever a click at the point reaches: it
     /// must be the target.
@@ -110,7 +111,9 @@ pub trait Journal {
 pub trait Desktop: Journal {
     fn session(&self) -> Result<Session, Failure>;
     fn frontmost(&self) -> Result<Option<i32>, Failure>;
-    /// The pids of apps other than `pid` whose focused window says it is key.
+    /// The pids of apps other than `pid` whose focused window says it is key
+    /// and is in front of `pid`'s window; refused when `pid` has no window on
+    /// screen.
     fn foreign_key_windows(&self, pid: i32) -> Result<Vec<i32>, Failure>;
     /// The pid of the app a click at `at` reaches; nothing slower.
     fn click_target(&self, at: Point) -> Result<i32, Failure>;
@@ -401,7 +404,7 @@ fn verify(desktop: &dyn Desktop, check: Check, policy: Policy) -> Result<(), Fai
             let others = desktop.foreign_key_windows(pid)?;
             if !others.is_empty() {
                 return Err(Failure::Refused(format!(
-                    "another app holds a key window (pid {others:?}), so keys would not reach pid {pid}"
+                    "another app holds a key window in front of pid {pid}'s (pid {others:?}), so keys would not reach it"
                 )));
             }
             require_frontmost(desktop, pid)
@@ -693,6 +696,8 @@ mod tests {
         frontmost: RefCell<VecDeque<i32>>,
         click: RefCell<VecDeque<i32>>,
         foreign: RefCell<VecDeque<Vec<i32>>>,
+        /// The refusal `foreign_key_windows` answers with instead, if any.
+        foreign_refusal: RefCell<Option<String>>,
         session: Cell<Session>,
         /// Journal writes that succeed before every later one fails.
         journal_writes: Cell<u32>,
@@ -709,6 +714,7 @@ mod tests {
                 frontmost: RefCell::new(frontmost.iter().copied().collect()),
                 click: RefCell::new(click.iter().copied().collect()),
                 foreign: RefCell::new(VecDeque::from([Vec::new()])),
+                foreign_refusal: RefCell::new(None),
                 session: Cell::new(UNLOCKED),
                 journal_writes: Cell::new(u32::MAX),
                 discard_fails: Cell::new(false),
@@ -756,6 +762,9 @@ mod tests {
 
         fn foreign_key_windows(&self, _pid: i32) -> Result<Vec<i32>, Failure> {
             self.note("foreign?".into());
+            if let Some(refusal) = self.foreign_refusal.borrow().clone() {
+                return Err(Failure::Refused(refusal));
+            }
             Ok(Fake::next(&self.foreign))
         }
 
@@ -874,6 +883,20 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(fake.posts().len(), 1, "only the modifier: {:?}", fake.log());
         assert_eq!(held.lock().unwrap().take_releases().len(), 1);
+    }
+
+    #[test]
+    fn a_target_with_no_window_on_screen_gets_no_key() {
+        let fake = Fake::new(&[PID], &[PID]);
+        *fake.foreign_refusal.borrow_mut() = Some(format!("pid {PID} has no window on screen"));
+        let (result, held) = run(&fake, &chord(PID, &[11], &[alt_left()]));
+        assert!(
+            matches!(result, Err(Failure::Refused(ref m)) if m.contains("no window on screen")),
+            "{result:?}"
+        );
+        assert!(fake.posts().is_empty());
+        assert!(!fake.log().contains(&"frontmost?".to_string()));
+        assert!(held.lock().unwrap().take_releases().is_empty());
     }
 
     #[test]

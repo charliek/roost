@@ -19,7 +19,8 @@ lists — the helper's own presses, never anything else held down.
 Results map onto three exceptions: :class:`RealInputUnavailable` (a missing
 grant or runner, a locked console — a skip, or a failure under
 ``ROOST_REQUIRE_REAL_INPUT=1``), :class:`RealInputRefused` (the target was not
-frontmost, or not topmost at the point — always a failure) and
+frontmost, had no window on screen, another app claimed the keyboard in front
+of it, or it was not topmost at the point — always a failure) and
 :class:`RealInputError` (anything else). This module is importable without
 pytest, so the lifecycle is unit-tested on any OS.
 """
@@ -62,7 +63,11 @@ class RealInputUnavailable(Exception):
 
 
 class RealInputRefused(AssertionError):
-    """The helper would not post: the target was not frontmost or not topmost."""
+    """The helper would not post: the target was not frontmost, had no window
+    on screen, another app claimed a key window in front of the target's, or
+    the target was not topmost at the point."""
+
+    released: list | None = None
 
 
 class RealInputError(RuntimeError):
@@ -79,15 +84,15 @@ def readiness(report: dict) -> str | None:
     locked console, Secure Input already on (someone else's: it blinds the
     event tap and Roost's own toggle can't be told apart from it), or an input
     source other than US, which the key scenarios' expected bytes assume."""
+    session, console = report.get("session") or {}, report.get("console") or {}
+    if not session.get("available"):
+        return "the helper is outside the GUI login session"
     missing = sorted(name for name, granted in report["capabilities"].items() if not granted)
     if missing:
         return f"not granted to the helper: {', '.join(missing)}"
-    session, console = report["session"], report["console"]
-    if not session["available"]:
-        return "the helper is outside the GUI login session"
     if session.get("on_console") is False or console.get("on_console") is False:
         return "the login session is not on the console"
-    if session["locked"] or console.get("locked"):
+    if session.get("locked") or console.get("locked"):
         return "the console is locked"
     if (holder := report.get("secure_input_pid")) is not None:
         return f"Secure Input is already on (ioreg names pid {holder}, the frontmost app)"
@@ -163,7 +168,9 @@ def _classify(command: str, status: int | None, stdout: str, stderr: str) -> dic
     if kind == "unavailable":
         raise RealInputUnavailable(message)
     if kind == "refused":
-        raise RealInputRefused(message)
+        refused = RealInputRefused(message)
+        refused.released = result.get("released")
+        raise refused
     raise RealInputError(f"{message} (kind={kind}, status={status})")
 
 
@@ -419,7 +426,9 @@ class Helper:
             if not release:
                 raise
             if isinstance(error, HELPER_ERRORS):
-                raise type(error)(f"{error}; tracked release: {self._recover(outdir)}") from error
+                wrapped = type(error)(f"{error}; tracked release: {self._recover(outdir)}")
+                wrapped.released = getattr(error, "released", None)
+                raise wrapped from error
             # The outcome could not be read, so the helper may still be
             # running: stop it, as a timeout does, before releasing.
             try:
@@ -521,6 +530,12 @@ class Helper:
             raise RealInputUnavailable(reason)
         return report
 
+    def claimants(self, pid: int) -> dict:
+        """Read only: every other app with a window on screen, whether it
+        claims the keyboard, and whether that is ahead of `pid`'s window —
+        what a `key` for `pid` would be refused over now."""
+        return self.run("claimants", "--pid", str(pid))
+
     def window(self, pid: int) -> dict:
         return self.run("window", "--pid", str(pid))
 
@@ -602,3 +617,83 @@ class Helper:
 
 def _numbers(values) -> str:
     return ",".join(repr(float(value)) for value in values)
+
+
+# -- `make mac-real-input-check` (plan 075 §D4.4) ----------------------------
+
+
+def readiness_report(report: dict, claimants: dict | None) -> tuple[list[str], str | None]:
+    """The lines a readiness check prints, and the environment blocker or None.
+
+    Only `readiness`'s reasons block. Claimants are information: who would be
+    refused for the *current* frontmost app, which says nothing certain about
+    the window a test will later target."""
+    capabilities = report.get("capabilities") or {}
+    granted = ", ".join(f"{name}={'yes' if ok else 'NO'}" for name, ok in sorted(capabilities.items()))
+    console, session = report.get("console") or {}, report.get("session") or {}
+    front = report.get("frontmost") or {}
+    lines = [
+        f"grants:        {granted}",
+        f"session:       available={session.get('available')} on_console={session.get('on_console')} "
+        f"locked={session.get('locked') or console.get('locked')}",
+        f"secure input:  {report.get('secure_input_pid') or 'off'}",
+        f"input source:  {report.get('input_source')}",
+        f"frontmost:     pid {front.get('pid')} ({front.get('bundle_id')})",
+    ]
+    for display in report.get("displays", []):
+        lines.append(
+            f"display {display['id']}:     {display['bounds']['width']:.0f}x{display['bounds']['height']:.0f}"
+            f"{' main' if display.get('main') else ''}"
+            f" safe_area_top={display.get('safe_area_top')} menu_bar_inset={display.get('menu_bar_inset')}"
+            + (f" insets={display['insets']}" if display.get("insets") else "")
+        )
+        if display.get("insets") == "unavailable-translated":
+            lines.append("  the helper runs under Rosetta: build it natively (arm64) or test_full_screen fails")
+    if claimants is not None:
+        rows = claimants["claimants"]
+        blocking = [row for row in rows if row["blocks"]]
+        lines.append(
+            f"claimants:     {len(rows)} other apps with a window on screen, "
+            f"{sum(1 for row in rows if row['claims_key'])} claim the keyboard, "
+            f"{len(blocking)} would refuse a key for pid {front.get('pid')} now"
+        )
+        for row in rows:
+            if row["claims_key"]:
+                lines.append(f"  claimant pid {row['pid']}: {row['position']} blocks={row['blocks']}")
+        lines.append(
+            "  (information only: readiness cannot predict where a later target's focus or click will land)"
+        )
+    return lines, readiness(report)
+
+
+def check(artifacts: Path) -> int:
+    """Preflight, then `claimants` against the frontmost app; non-zero only
+    when the environment cannot do real input."""
+    try:
+        with Helper(artifacts) as helper:
+            report = helper.preflight()
+            front = (report.get("frontmost") or {}).get("pid")
+            claimants = helper.claimants(front) if front is not None else None
+    except RealInputUnavailable as error:
+        print(f"mac-real-input-check: NOT READY ({mode()} mode): {error}")
+        return 1
+    except HELPER_ERRORS as error:
+        print(f"mac-real-input-check: the helper failed ({mode()} mode): {error}")
+        return 2
+    lines, blocker = readiness_report(report, claimants)
+    print(f"mac-real-input-check ({mode()} mode)")
+    print("\n".join(lines))
+    if blocker is not None:
+        print(f"NOT READY: {blocker}")
+        return 1
+    print("READY: every grant is held and the desktop can take real input")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    if sys.argv[1:] != ["check"]:
+        sys.exit("usage: runner.py check")
+    with tempfile.TemporaryDirectory(prefix="roost-ri-check-") as scratch:
+        sys.exit(check(Path(scratch)))

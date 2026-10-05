@@ -56,6 +56,13 @@ CI promotion rule (§D7), which needs every one in the JUnit report as passed:
    relaunch, and a saved frame off every display opens on one.
 8. #189's seed: with SGR mouse tracking on, a real click reports its press
    and release.
+9. The helper's foreign key-window guard against a real foreign app
+   (`tools/input/mac/fixtures/key_panel.swift`, built per run): a
+   non-activating panel that takes the keyboard in front of Roost refuses the
+   key, and a background app that claims the keyboard from behind Roost's
+   window (what Zed or a second Roost-Iced does, #604) does not. Each asserts
+   through the helper's `claimants` that the fixture really is in the shape it
+   stands for, so neither passes vacuously.
 
 Pointer positions come from the window's AX frame and `app.window_metrics`
 read together (`geometry`), afresh for every gesture: both go stale on any
@@ -79,6 +86,8 @@ import json
 import os
 import platform
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -115,6 +124,8 @@ SCENARIOS = (
     "test_selection_autoscroll_down",
     "test_window_frame",
     "test_mouse_tracking_click",
+    "test_foreign_panel_in_front_blocks_keys",
+    "test_background_claimant_does_not_block_keys",
 )
 
 # US-layout virtual keycodes (`kVK_*`, HIToolbox Events.h).
@@ -166,6 +177,9 @@ POPUP_PROBE_MS = 300
 #: "would like to access files on a removable volume" prompt for the shared
 #: bundle id. The system's Python lives on the boot volume.
 SYSTEM_PYTHON = "/usr/bin/python3"
+
+KEY_PANEL_SOURCE = ui.REPO_ROOT / "tools" / "input" / "mac" / "fixtures" / "key_panel.swift"
+FOREIGN_CLAIM = "holds a key window in front of"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -223,6 +237,27 @@ def _bundle_app() -> Path:
             "(make e2e-iced-real-input-mac does)"
         )
     return app.resolve()
+
+
+@pytest.fixture(scope="module")
+def key_panel_binary():
+    """`fixtures/key_panel.swift`, built for this run on the boot volume: no
+    grant covers it, and nothing else ever runs it."""
+    build = Path(tempfile.mkdtemp(prefix="roost-key-panel-", dir="/tmp"))
+    binary = build / "key_panel"
+    try:
+        built = subprocess.run(
+            ["swiftc", "-O", "-o", str(binary), str(KEY_PANEL_SOURCE)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=300,
+        )
+        if built.returncode != 0:
+            pytest.fail(f"swiftc could not build {KEY_PANEL_SOURCE}: {built.stderr[-2000:]}")
+        yield binary
+    finally:
+        shutil.rmtree(build, ignore_errors=True)
 
 
 @pytest.fixture
@@ -334,10 +369,29 @@ def require_no_secure_input(helper) -> int | None:
 # ---------------------------------------------------------------------------
 
 
+def report_displays(helper) -> None:
+    """Each display's bounds and top insets. CI's pytest runs without `-s`, so
+    a passing test's stdout never reaches the log; the job summary does."""
+    lines = [
+        f"display {d['id']} main={d['main']} bounds={d['bounds']} "
+        f"safe_area_top={d.get('safe_area_top')} menu_bar_inset={d.get('menu_bar_inset')}"
+        for d in helper.preflight()["displays"]
+    ]
+    print("\n".join(lines))
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        try:
+            with open(summary, "a", encoding="utf-8") as out:
+                out.write("\n".join(f"- {line}" for line in lines) + "\n")
+        except OSError as err:
+            print(f"GITHUB_STEP_SUMMARY not written: {err}")
+
+
 def test_preflight(helper, launch_ui):
     """Behind the `helper` fixture's readiness gate (the read-only grant
     checks, an unlocked console, a US input source), one real operation: a
     real key posted into Roost comes back out of `tab.capture_pty_input`."""
+    report_displays(helper)
     with real_input.unavailable_skips():
         roost = launch_ui()
         tab = roost.open_tab(["/bin/cat"])
@@ -479,7 +533,7 @@ def full_screen_rows(menus: list[dict]) -> list[tuple[str, str]]:
     ]
 
 
-def settle_in_full_screen(roost: RealInputUI, helper, screens: list[coords.Frame]) -> None:
+def settle_in_full_screen(roost: RealInputUI, helper, report: dict) -> None:
     """Wait until the window fills a display in full screen, the UI's content
     fills the window, and both have held still for `FULL_SCREEN_QUIET_S`.
 
@@ -489,13 +543,19 @@ def settle_in_full_screen(roost: RealInputUI, helper, screens: list[coords.Frame
     marks the animation's end, so the wait is for quiet: on the harness Mac 9
     of 10 exits sent as AXFullScreen turned were dropped, and 24 of 24 sent
     half a second or more later landed."""
+    translated = [d["id"] for d in report["displays"] if d.get("insets") == "unavailable-translated"]
+    assert not translated, (
+        f"displays {translated} have no inset readings because the helper runs under Rosetta: "
+        "build the helper natively (arm64)"
+    )
+    candidates = coords.full_screen_frames(report)
     quiet = scaled_timeout(FULL_SCREEN_QUIET_S)
     since: list = [None, 0.0]
 
     def read():
         window = helper.window(roost.pid)
         frame = coords.Frame.from_window(window)
-        if window["full_screen"] is not True or frame not in screens:
+        if window["full_screen"] is not True or frame not in candidates:
             return None
         return frame if roost.client.window_metrics()["window_height"] == frame.height else None
 
@@ -515,11 +575,11 @@ def test_full_screen(helper, launch_ui):
     roost = launch_ui()
     roost.bring_to_front(helper)
     before, _ = geometry(roost, helper)
-    screens = coords.displays(helper.preflight())
+    report = helper.preflight()
     assert full_screen_rows(helper.menu_bar(roost.pid)["menus"]) == [("View", "Enter Full Screen")]
 
     helper.press(roost.pid, ["window", "AXFullScreenButton"])
-    settle_in_full_screen(roost, helper, screens)
+    settle_in_full_screen(roost, helper, report)
     settle(
         lambda: full_screen_rows(roost.client.app_menu_dump()),
         lambda rows: rows == [("View", "Exit Full Screen")],
@@ -846,3 +906,126 @@ def test_mouse_tracking_click(helper, launch_ui):
     want = f"\x1b[<0;{col + 1};{row + 1}M\x1b[<0;{col + 1};{row + 1}m".encode()
     got = util.drain_until_match(roost.client, tab, re.escape(want))
     assert got + util.drain(roost.client, tab) == want
+
+
+class KeyPanel:
+    """A running `key_panel` fixture, launched by this process and quit by pid."""
+
+    def __init__(self, binary: Path, artifacts: Path, *args: str):
+        self.out = artifacts / f"key_panel-{args[0]}-{uuid.uuid4().hex[:8]}.out"
+        with open(self.out, "wb") as sink:
+            self._proc = subprocess.Popen(
+                [str(binary), *args],
+                stdin=subprocess.DEVNULL,
+                stdout=sink,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        self.pid = self._proc.pid
+
+    def __enter__(self) -> "KeyPanel":
+        try:
+            self.wait_for(f"ready {self.pid}")
+        except BaseException:
+            self.quit()
+            raise
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.quit()
+
+    def said(self, prefix: str) -> list[str]:
+        return [line for line in self.out.read_text().splitlines() if line.startswith(prefix)]
+
+    def wait_for(self, line: str) -> None:
+        def said() -> bool:
+            if self._proc.poll() is not None:
+                raise AssertionError(f"key_panel exited {self._proc.returncode}: {self.out.read_text()!r}")
+            return bool(self.said(line))
+
+        settle(said, bool, 10, f"key_panel to say {line!r}")
+
+    def quit(self) -> None:
+        if self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait(timeout=5)
+
+
+def fixture_claim(helper, roost: RealInputUI, fixture: KeyPanel, holds, what: str) -> dict:
+    """The fixture's `claimants` row against Roost's window, once `holds` it;
+    an AssertionError naming the whole report otherwise."""
+    report = None
+
+    def fixture_row():
+        nonlocal report
+        report = helper.claimants(roost.pid)
+        return next((row for row in report["claimants"] if row["pid"] == fixture.pid), None)
+
+    try:
+        return settle(fixture_row, lambda found: found is not None and holds(found), 5, what)
+    except AssertionError as error:
+        raise AssertionError(f"{error}; claimants: {json.dumps(report)}") from error
+
+
+def test_foreign_panel_in_front_blocks_keys(helper, launch_ui, key_panel_binary, artifacts):
+    """The negative control: with Roost still the front process, a
+    non-activating panel takes the keyboard in front of it, and the helper
+    refuses the key over that claim; nothing reaches Roost or the panel, and
+    once the panel is gone the same key reaches Roost."""
+    roost = launch_ui()
+    tab = roost.open_tab(["/bin/cat"])
+    trigger = artifacts / f"key_panel-{uuid.uuid4().hex[:8]}.trigger"
+    try:
+        with KeyPanel(key_panel_binary, artifacts, "panel", str(trigger)) as panel:
+            roost.bring_to_front(helper)
+            util.drain(roost.client, tab)
+            trigger.touch()
+            panel.wait_for("key ")
+            fixture_claim(
+                helper,
+                roost,
+                panel,
+                lambda row: row["claims_key"] and row["position"] == "ahead",
+                "the panel to claim the keyboard from a window located in front of Roost",
+            )
+            assert helper.preflight(pid=roost.pid)["target"]["frontmost"], (
+                "Roost is not the front process with the panel up, so a refusal would prove nothing"
+            )
+            with pytest.raises(real_input.RealInputRefused, match=FOREIGN_CLAIM) as refused:
+                helper.key(roost.pid, KEY_A)
+            # What the helper released on its way out, not the panel's event
+            # loop, says no key-down went out ahead of a refused key-up.
+            assert refused.value.released == [], str(refused.value)
+            assert util.drain(roost.client, tab) == b""
+    finally:
+        trigger.unlink(missing_ok=True)
+    assert panel.said("text ") == [], "a key reached the panel"
+    roost.bring_to_front(helper)
+    assert typed(roost, helper, tab, KEY_A) == b"a"
+
+
+def test_background_claimant_does_not_block_keys(helper, launch_ui, key_panel_binary, artifacts):
+    """#604: an app that claims the keyboard from a window behind Roost's
+    (a background Zed or a second Roost-Iced does) takes none of it, so the
+    key goes through."""
+    roost = launch_ui()
+    tab = roost.open_tab(["/bin/cat"])
+    with KeyPanel(key_panel_binary, artifacts, "claim") as claimant:
+        fixture_claim(
+            helper, roost, claimant, lambda row: row["claims_key"], "the fixture's window to claim the keyboard"
+        )
+        roost.bring_to_front(helper)
+        util.drain(roost.client, tab)
+        fixture_claim(
+            helper,
+            roost,
+            claimant,
+            lambda row: row["claims_key"] and row["position"] == "behind",
+            "the fixture to claim the keyboard from behind Roost; without both, "
+            "the fixture no longer reproduces #604",
+        )
+        assert typed(roost, helper, tab, KEY_A) == b"a"
