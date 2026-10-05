@@ -31,7 +31,8 @@ Mac products themselves (and real input on macOS) use `mac-test`.
 `target/` + ghostty outputs are never clobbered), then runs the three iced
 real-input lanes. Run it from the repo root. The persistent dev box (`SHED=` at the top
 of the script; `roost-dev` by default, written `$SHED` below where a command
-takes it: set `SHED=<your shed name>` first) IS the day-to-day cache (stop/start reuses its build cache); the
+takes it: set `SHED=roost-dev` to match. The script ignores an exported `SHED`,
+so to use another shed, edit its `SHED=` line and set the same name here) IS the day-to-day cache (stop/start reuses its build cache); the
 **snapshot is opt-in** — a bare run does NOT auto-snapshot, so run
 `--snapshot-base` once if you want fast cold re-creates after a teardown:
 

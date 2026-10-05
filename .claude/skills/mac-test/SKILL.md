@@ -274,12 +274,12 @@ rr 'test -z "$(git status --porcelain)"' || echo "DIRTY: stop and report"
 ```bash
 # pushed work (TEST_SHA may be abbreviated)
 git push origin "$BRANCH"
-rr "git fetch origin && git checkout --detach $TEST_SHA"
+rr "git fetch origin && git checkout --detach $(printf %q "$TEST_SHA")"
 
 # unpushed work: a bundle, fetched with a FORCED refspec so a re-sync overwrites the ref
 git bundle create /tmp/roost.bundle "$BRANCH"
 scp /tmp/roost.bundle "$MAC_HOST":/tmp/roost.bundle
-rr "git fetch /tmp/roost.bundle +$BRANCH:refs/remotes/transfer/$BRANCH && git checkout --detach $TEST_SHA"
+rr "git fetch /tmp/roost.bundle $(printf %q "+$BRANCH:refs/remotes/transfer/$BRANCH") && git checkout --detach $(printf %q "$TEST_SHA")"
 ```
 
 Here `rr` is given double quotes, so `$TEST_SHA` expands locally (export it, or
