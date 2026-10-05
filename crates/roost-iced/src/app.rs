@@ -14224,6 +14224,7 @@ mod tests {
             reduced_fidelity,
             resumed: None,
             persist_error: None,
+            running: roost_ipc::session_version::BuildId::default(),
         }
     }
 
@@ -14236,6 +14237,7 @@ mod tests {
             client_build: "gb-new".into(),
             session_payload_kinds: vec!["cells".into()],
             restart: crate::host_conn::state::RestartAction::RestartLocal,
+            running: roost_ipc::session_version::BuildId::default(),
         }
     }
 

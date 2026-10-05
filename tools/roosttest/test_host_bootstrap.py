@@ -322,17 +322,22 @@ class BootstrapJail:
         """The far side's environment, sourced by the fixture before it
         runs a remote command (`FAKE_SSH_SESSION_ENV`) — the hermeticity
         contract, spelled the way `bootstrap_test.rs::write_session_env`
-        spells it."""
-        return "\n".join(
-            [
-                f"HOME={sh_quote(str(self.home))}",
-                f"PATH={sh_quote(str(self.stub_bin))}",
-                "USER=fixture",
-                f"ROOST_BOOTSTRAP_FS_ROOT={sh_quote(str(self.fs_root))}",
-                "export HOME PATH USER ROOST_BOOTSTRAP_FS_ROOT",
-                "",
-            ]
-        )
+        spells it.
+
+        Plus `ROOST_TEST_MODE`, forwarded for the reason `daemon_env`
+        gives: a binary probed or started over `run-remote` reads its
+        test identity sidecar (plan 076 D2) only under it."""
+        lines = [
+            f"HOME={sh_quote(str(self.home))}",
+            f"PATH={sh_quote(str(self.stub_bin))}",
+            "USER=fixture",
+            f"ROOST_BOOTSTRAP_FS_ROOT={sh_quote(str(self.fs_root))}",
+            "export HOME PATH USER ROOST_BOOTSTRAP_FS_ROOT",
+        ]
+        test_mode = os.environ.get("ROOST_TEST_MODE")
+        if test_mode is not None:
+            lines += [f"ROOST_TEST_MODE={sh_quote(test_mode)}", "export ROOST_TEST_MODE"]
+        return "\n".join([*lines, ""])
 
     def daemon_env(self, **overrides: str) -> dict[str, str]:
         """The same four names `run-remote`'s `env -i` would hand a

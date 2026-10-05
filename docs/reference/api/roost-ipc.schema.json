@@ -2695,6 +2695,21 @@
         "app_version": {
           "type": "string"
         },
+        "dev": {
+          "type": "boolean"
+        },
+        "exe_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "libghostty_build": {
           "type": "string"
         },

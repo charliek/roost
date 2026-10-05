@@ -35,6 +35,11 @@ async fn a_session_serves_identifies_reaps_and_stops_clean() {
     assert_eq!(session.session_protocol, SESSION_PROTOCOL_VERSION);
     assert_eq!(session.app_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(session.session_id.len(), 32, "{}", session.session_id);
+    assert_eq!(session.dev, env!("ROOST_BUILD_DEV") == "1");
+    assert_eq!(
+        session.exe_path, None,
+        "the layout's config names no binary"
+    );
     assert!(session.started_at.ends_with('Z'), "{}", session.started_at);
     // Every tab has a server terminal behind it, so the snapshot kind
     // is a promise this session can keep — and the build string is what
@@ -161,4 +166,33 @@ async fn a_stopped_session_releases_its_locks() {
         .expect("the second session must stop within its budget")
         .expect("join")
         .expect("second run");
+}
+
+/// Plan 076 D2: `session.identify` reports the binary the daemon started
+/// from, and a test-mode sidecar renames its build there exactly as it
+/// does in `roost-session identify`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_identify_reports_its_binary_and_honours_a_sidecar() {
+    let layout = support::Layout::new();
+    let exe = layout.subdir("bin").join("roost-session");
+    let config = roost_session::SessionConfig {
+        exe_path: Some(exe.clone()),
+        identity_override: Some(roost_session::identity::IdentityOverride {
+            app_version: Some("0.0.1".into()),
+            dev: Some(false),
+            git_sha: Some(Some("f00ba12".into())),
+        }),
+        ..layout.config()
+    };
+    let served = layout.spawn_config(config);
+    let mut client = support::connect(&layout.socket_path()).await;
+
+    let session = support::session_identify(&mut client).await;
+    assert_eq!(session.exe_path.as_deref(), exe.to_str());
+    assert_eq!(session.app_version, "0.0.1");
+    assert!(!session.dev);
+    assert_eq!(session.git_sha.as_deref(), Some("f00ba12"));
+
+    support::session_stop(&mut client).await;
+    served.await.expect("join").expect("serve");
 }

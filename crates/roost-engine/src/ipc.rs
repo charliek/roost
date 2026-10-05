@@ -794,6 +794,12 @@ pub struct SessionInfo {
     /// [`AttachPayloadKind::GHOSTTY_SNAPSHOT`] to be negotiable. Empty
     /// for the same reason as `payload_kinds`.
     pub libghostty_build: String,
+    /// Built outside the release workflow (plan 076 D2).
+    pub dev: bool,
+    /// The commit this daemon was built from, when the build knew it.
+    pub git_sha: Option<String>,
+    /// The daemon's executable, canonicalised once at start.
+    pub exe_path: Option<String>,
     /// `(cols, rows)` a `tab.open` that omits both falls back to. A
     /// headless session has no window to measure, so the daemon states
     /// the size rather than inheriting a UI's 80×24.
@@ -2430,6 +2436,9 @@ async fn dispatch_outcome(
                 started_at: session.info.started_at.clone(),
                 persist_error: h.workspace.persist_error(),
                 ops: Some(h.serves(&h.local_route())),
+                dev: session.info.dev,
+                git_sha: session.info.git_sha.clone(),
+                exe_path: session.info.exe_path.clone(),
             };
             return encode(&result).map(HandlerOutcome::Reply);
         }
@@ -4759,6 +4768,9 @@ mod tests {
                 app_version: "9.9.9".into(),
                 payload_kinds: Vec::new(),
                 libghostty_build: String::new(),
+                dev: false,
+                git_sha: None,
+                exe_path: None,
                 default_tab_size: (120, 40),
                 test_mode: false,
             },

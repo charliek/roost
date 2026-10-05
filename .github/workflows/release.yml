@@ -263,8 +263,34 @@ jobs:
           key: cargo-release-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: cargo-release-${{ runner.os }}-${{ matrix.arch }}-
 
+      # ROOST_RELEASE_BUILD marks the binaries as release builds (plan 076
+      # D2) — stable tags only, so an rc never reads as the same build as
+      # its final release. Set at every release build site.
       - name: Build .deb
+        env:
+          ROOST_RELEASE_BUILD: ${{ !contains(github.ref_name, '-') && '1' || '' }}
         run: ./linux/scripts/build-deb.sh "${GITHUB_REF_NAME#v}"
+
+      # Plan 076 D2: a stable tag's roost-session must not call itself a dev
+      # build (`dev` absent from `identify`), and a prerelease must. A cargo
+      # cache that kept a dev build script's output, or a script that stopped
+      # passing ROOST_RELEASE_BUILD through to cargo, fails here, before
+      # anything is uploaded.
+      - name: Assert roost-session's release identity
+        run: |
+          set -euo pipefail
+          line="$("dist/roost-session" identify)"
+          echo "roost-session identify: ${line}"
+          case "${GITHUB_REF_NAME}" in
+            *-*) want="dev" ;;
+            *)   want="release" ;;
+          esac
+          if printf '%s' "${line}" | grep -q '"dev":true'; then got="dev"; else got="release"; fi
+          if [ "${got}" != "${want}" ]; then
+            echo "::error::${GITHUB_REF_NAME} built a ${got} roost-session; expected ${want} (ROOST_RELEASE_BUILD, plan 076 D2)"
+            exit 1
+          fi
+          echo "OK: ${got} build, as ${GITHUB_REF_NAME} requires"
 
       # This is the only thing in the release path that actually launches the
       # artifact being shipped. The assertions live in linux/scripts/
@@ -550,6 +576,7 @@ jobs:
       - name: Bundle Roost.app
         env:
           ROOST_DEVELOPER_ID_IDENTITY: ${{ env.CAN_NOTARIZE == 'true' && secrets.ROOST_DEVELOPER_ID_IDENTITY || '' }}
+          ROOST_RELEASE_BUILD: ${{ !contains(github.ref_name, '-') && '1' || '' }}
         run: ROOST_VERSION="${GITHUB_REF_NAME#v}" ./mac/scripts/bundle.sh release
 
       # Validate the *actual shipped artifact*: drive the release bundle
@@ -939,11 +966,33 @@ jobs:
         env:
           ROOST_DEVELOPER_ID_IDENTITY: ${{ env.CAN_NOTARIZE == 'true' && secrets.ROOST_DEVELOPER_ID_IDENTITY || '' }}
           ROOST_ICED_SPARKLE_FEED_URL: https://charliek.github.io/roost/appcast-iced.xml
+          ROOST_RELEASE_BUILD: ${{ !contains(github.ref_name, '-') && '1' || '' }}
         run: |
           set -euo pipefail
           ROOST_VERSION="${GITHUB_REF_NAME#v}" \
             ROOST_ICED_SPARKLE_ED_PUBLIC_KEY="$(cat mac/keys/roost-iced-sparkle-ed-public-key.txt)" \
             ./mac/scripts/bundle-iced.sh release
+
+      # Plan 076 D2: a stable tag's roost-session must not call itself a dev
+      # build (`dev` absent from `identify`), and a prerelease must. A cargo
+      # cache that kept a dev build script's output, or a script that stopped
+      # passing ROOST_RELEASE_BUILD through to cargo, fails here, before
+      # anything is uploaded.
+      - name: Assert roost-session's release identity
+        run: |
+          set -euo pipefail
+          line="$("mac/build/Roost-Iced.app/Contents/MacOS/roost-session" identify)"
+          echo "roost-session identify: ${line}"
+          case "${GITHUB_REF_NAME}" in
+            *-*) want="dev" ;;
+            *)   want="release" ;;
+          esac
+          if printf '%s' "${line}" | grep -q '"dev":true'; then got="dev"; else got="release"; fi
+          if [ "${got}" != "${want}" ]; then
+            echo "::error::${GITHUB_REF_NAME} built a ${got} roost-session; expected ${want} (ROOST_RELEASE_BUILD, plan 076 D2)"
+            exit 1
+          fi
+          echo "OK: ${got} build, as ${GITHUB_REF_NAME} requires"
 
       # The iced twin of the `mac` job's release-bundle E2E, deliberately a
       # cheap subset: the point is that the binary we are about to ship gets

@@ -3218,6 +3218,22 @@ when it was started with `ROOST_TEST_MODE=1`. Absent from an older
 session. It is discovery, not negotiation — the generation check below
 still comes first — and its contents are not a compatibility promise.
 
+Three more optional fields describe the build, all additive and absent
+from a session that predates them (plan 076):
+
+- `dev` — `true` when the release workflow did not produce this build:
+  any local build, debug or release profile, and every prerelease tag.
+  Omitted for a release build.
+- `git_sha` — the commit the build came from, 7 hex characters, when
+  the build could read it.
+- `exe_path` — the daemon's own executable, canonicalised once when it
+  started, with no fallback; omitted when that did not resolve. It is a
+  path to run, supplied by a peer, so a client uses it only for a
+  session on its own machine.
+
+`roost-session identify`, the offline identity a binary prints before
+it has ever run, carries `dev` and `git_sha` the same way.
+
 An optional `persist_error` rides beside them, present only when the
 last attempt to write `state.json` failed, carrying that write's
 message. It is the **standing** value behind the live-only
@@ -3284,6 +3300,17 @@ shape. It exists because the `vt` fallback *removes* the state the
 restart flow hangs off: with `vt` on offer a skewed client connects
 instead of refusing, so without this knob the only end-to-end test of
 the "needs restart" path would have had nothing left to reach.
+
+A third test-mode seam is a file, not a variable: a JSON object at
+`<the binary's canonical path>.test-identity` with any of
+`app_version`, `dev` and `git_sha` (a string, or `null` to clear it)
+replaces those fields in both `session.identify` and
+`roost-session identify`. Copies of one binary in different directories
+can then answer as different builds, which an update test needs and one
+process-wide variable cannot give. An unknown key, or a sidecar that
+does not parse, fails `roost-session identify` outright; a starting
+session logs it and ignores the file. Ignored entirely outside test
+mode.
 
 ### History: the interactive lease {: #sessionconnect }
 

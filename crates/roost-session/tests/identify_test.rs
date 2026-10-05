@@ -111,6 +111,63 @@ mod env_gate {
     }
 }
 
+/// Plan 076 D2's sidecar, through the real binary: a copy of it with a
+/// `.test-identity` file beside it answers as the build that file names,
+/// in test mode only, while its own build facts are otherwise intact.
+mod sidecar {
+    use super::*;
+
+    fn identify(exe: &std::path::Path, test_mode: bool) -> std::process::Output {
+        let mut command = Command::new(exe);
+        command
+            .arg("identify")
+            .env_remove("ROOST_SESSION_FAKE_BUILD");
+        if test_mode {
+            command.env("ROOST_TEST_MODE", "1");
+        } else {
+            command.env_remove("ROOST_TEST_MODE");
+        }
+        command.output().expect("run roost-session identify")
+    }
+
+    fn parse(output: &std::process::Output) -> SessionBinaryIdentity {
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout.clone()).expect("stdout is utf-8");
+        serde_json::from_str(stdout.trim()).expect("stdout parses as SessionBinaryIdentity")
+    }
+
+    fn planted(sidecar: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir.path().join("roost-session");
+        std::fs::copy(env!("CARGO_BIN_EXE_roost-session"), &exe).expect("copy the binary");
+        std::fs::write(dir.path().join("roost-session.test-identity"), sidecar)
+            .expect("write the sidecar");
+        (dir, exe)
+    }
+
+    #[test]
+    fn a_sidecar_renames_the_build_in_test_mode() {
+        let (_dir, exe) = planted(r#"{"app_version":"0.0.1","dev":false,"git_sha":"f00ba12"}"#);
+        let faked = parse(&identify(&exe, true));
+        assert_eq!(faked.app_version, "0.0.1");
+        assert!(!faked.dev);
+        assert_eq!(faked.git_sha.as_deref(), Some("f00ba12"));
+
+        let real = parse(&identify(&exe, false));
+        assert_eq!(real.app_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(real.dev, env!("ROOST_BUILD_DEV") == "1");
+    }
+
+    #[test]
+    fn a_broken_sidecar_fails_identify_in_test_mode_only() {
+        let (_dir, exe) = planted(r#"{"version":"0.0.1"}"#);
+        let output = identify(&exe, true);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        parse(&identify(&exe, false));
+    }
+}
+
 /// Plan 039 §3.1 relies on an old, pre-`identify` `roost-session` build
 /// reading as "needs upgrade" during bootstrap: clap's default handling
 /// of an unrecognized subcommand exits non-zero, which is what the

@@ -722,7 +722,7 @@ async fn open_control(
         &config.client_build,
         config.transport.restart_action(),
     )
-    .map_err(|mismatch| AttemptError::Incompatible(Box::new(mismatch)))?;
+    .map_err(AttemptError::Incompatible)?;
     let facts = ConnectFacts::new(&identity, &config.client_build, compatibility);
     if facts.reduced_fidelity {
         // Warn, not info: the connection is a working connection, but

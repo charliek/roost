@@ -367,6 +367,7 @@ mod tests {
             client_build: "gb-new".into(),
             session_payload_kinds: vec!["sixel-mosaic".into()],
             restart,
+            running: roost_ipc::session_version::BuildId::default(),
         }
     }
 

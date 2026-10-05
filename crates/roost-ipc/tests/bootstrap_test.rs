@@ -78,6 +78,7 @@ fn expected() -> SessionBinaryIdentity {
         app_version: CLIENT_VERSION.to_string(),
         session_protocol: SESSION_PROTOCOL_VERSION,
         libghostty_build: CLIENT_BUILD.to_string(),
+        ..SessionBinaryIdentity::default()
     }
 }
 
@@ -87,6 +88,7 @@ fn stale() -> SessionBinaryIdentity {
         app_version: "0.0.17".to_string(),
         session_protocol: SESSION_PROTOCOL_VERSION,
         libghostty_build: OTHER_BUILD.to_string(),
+        ..SessionBinaryIdentity::default()
     }
 }
 

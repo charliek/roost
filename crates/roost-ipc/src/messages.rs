@@ -2412,6 +2412,14 @@ pub struct SessionBinaryIdentity {
     pub app_version: String,
     pub session_protocol: u32,
     pub libghostty_build: String,
+    /// Built outside the release workflow (plan 076 D2). Absent on the
+    /// wire for a release build, and from every binary that predates it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dev: bool,
+    /// The commit this binary was built from, 7 hex characters, when
+    /// the build could read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_sha: Option<String>,
 }
 
 /// `session.identify` result — the first thing a client asks a host
@@ -2441,6 +2449,17 @@ pub struct SessionIdentify {
     /// for this socket. Absent from an older session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ops: Option<Vec<String>>,
+    /// As [`SessionBinaryIdentity::dev`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dev: bool,
+    /// As [`SessionBinaryIdentity::git_sha`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_sha: Option<String>,
+    /// The daemon's own executable, canonicalised once when it started,
+    /// and absent when that did not resolve. A path a peer supplied:
+    /// clients run it only for a session on this machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe_path: Option<String>,
 }
 
 /// `session.identify` params — empty today, a struct (not a bare

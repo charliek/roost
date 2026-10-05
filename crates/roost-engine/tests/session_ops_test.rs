@@ -35,6 +35,9 @@ fn session_info() -> SessionInfo {
         app_version: "9.9.9".into(),
         payload_kinds: Vec::new(),
         libghostty_build: String::new(),
+        dev: false,
+        git_sha: None,
+        exe_path: None,
         default_tab_size: (120, 40),
         test_mode: false,
     }

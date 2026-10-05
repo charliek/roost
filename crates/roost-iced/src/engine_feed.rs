@@ -710,6 +710,7 @@ mod tests {
                     reduced_fidelity: true,
                     resumed: None,
                     persist_error: None,
+                    running: roost_ipc::session_version::BuildId::default(),
                 },
             ),
         ] {

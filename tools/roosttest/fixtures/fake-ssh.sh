@@ -110,6 +110,10 @@
 #                                  probe lands inside the tempdir. A
 #                                  shipped ladder never expands it at
 #                                  all.
+#   ROOST_TEST_MODE=<0|1>          optional: forwarded so a remote
+#                                  `identify` reads its test identity
+#                                  sidecar (plan 076 D2). Empty when the
+#                                  caller set none, which reads as off.
 #
 # Without all three the suite would pass or fail according to whether
 # the developer's own box is a Mac and whether it has the deb
@@ -311,7 +315,7 @@ run-remote)
     # env *adds* to what cargo exported, so without this the far side
     # would still see the whole of a developer's shell — including
     # their own ROOST_BOOTSTRAP_FS_ROOT, which decides which binary the
-    # ladder resolves. The four names below are exactly the ones the
+    # ladder resolves. The names below are exactly the ones the
     # hermeticity contract above enumerates; anything else the remote
     # command needs, it does not get, which is the point.
     if [ -z "$fake_env" ]; then
@@ -323,6 +327,7 @@ run-remote)
         PATH="${PATH:-}" \
         USER="${USER:-}" \
         ROOST_BOOTSTRAP_FS_ROOT="${ROOST_BOOTSTRAP_FS_ROOT:-}" \
+        ROOST_TEST_MODE="${ROOST_TEST_MODE:-}" \
         sh -c "$remote"
     ;;
 drop-after:*)

@@ -23,6 +23,7 @@ use roost_ipc::bootstrap::{
     BootstrapError, BootstrapJob, BootstrapOptions, IdentityGate, Probe, ProbeOutcome, RemoteArch,
 };
 use roost_ipc::messages::{SessionBinaryIdentity, SESSION_PROTOCOL_VERSION};
+use roost_ipc::session_version::BuildId;
 use roost_ipc::ssh::{SshTarget, SshTunnelOptions};
 
 use crate::host_conn::state::Skew;
@@ -40,7 +41,39 @@ pub(crate) fn client_identity() -> SessionBinaryIdentity {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         session_protocol: SESSION_PROTOCOL_VERSION,
         libghostty_build: roost_vt::libghostty_build(),
+        dev: env!("ROOST_BUILD_DEV") == "1",
+        git_sha: Some(env!("ROOST_BUILD_SHA"))
+            .filter(|sha| !sha.is_empty())
+            .map(str::to_string),
     }
+}
+
+/// Test-mode override for this client's version in update
+/// classification only (plan 076 D2). Never applied to
+/// [`client_identity`], which is what an install has to equal: a test
+/// that pretends to be an older client must not make the installer
+/// fetch an asset of that version.
+pub(crate) const TEST_CLIENT_VERSION_ENV: &str = "ROOST_TEST_CLIENT_VERSION";
+
+/// This client's build, as the update logic orders sessions against it.
+#[expect(dead_code, reason = "plan 076 C2's update classification reads it")]
+pub(crate) fn client_build_id() -> BuildId {
+    let test_mode = std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1");
+    classification_build(
+        &client_identity(),
+        test_mode
+            .then(|| std::env::var(TEST_CLIENT_VERSION_ENV).ok())
+            .flatten()
+            .as_deref(),
+    )
+}
+
+fn classification_build(identity: &SessionBinaryIdentity, version: Option<&str>) -> BuildId {
+    let mut build = BuildId::from(identity);
+    if let Some(version) = version.filter(|version| !version.is_empty()) {
+        build.version = version.to_string();
+    }
+    build
 }
 
 /// Whether a session is running on the far side, as the *entry point*
@@ -857,11 +890,31 @@ async fn run_plan(
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_client_version_knob_moves_classification_only() {
+        let identity = client_identity();
+        let pretend = classification_build(&identity, Some("0.0.1"));
+        assert_eq!(pretend.version, "0.0.1");
+        assert_eq!(pretend.protocol, identity.session_protocol);
+        assert_eq!(pretend.dev, identity.dev);
+        assert_eq!(identity.app_version, env!("CARGO_PKG_VERSION"));
+
+        assert_eq!(
+            classification_build(&identity, None),
+            BuildId::from(&identity)
+        );
+        assert_eq!(
+            classification_build(&identity, Some("")),
+            BuildId::from(&identity)
+        );
+    }
+
     fn identity() -> SessionBinaryIdentity {
         SessionBinaryIdentity {
             app_version: "0.0.19".into(),
             session_protocol: SESSION_PROTOCOL_VERSION,
             libghostty_build: "ghostty-abc+snapshot.v1".into(),
+            ..SessionBinaryIdentity::default()
         }
     }
 

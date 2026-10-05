@@ -118,6 +118,9 @@ pub fn start(
     // `/proc/self/exe` then reads `… (deleted)` — resolving lazily at
     // the first spawn would hand tabs a path that no longer exists.
     roost_engine::process::set_agent_hook_binary(crate::agent_hook::hook_binary());
+    // The same window, the same reason: `session.identify.exe_path`
+    // must name the binary this daemon started from.
+    let exe_path = crate::identity::canonical_exe();
 
     if !foreground {
         *readiness = daemonize::daemonize()?;
@@ -168,7 +171,7 @@ pub fn start(
             Err(error) => return Err(anyhow::anyhow!("single-instance lock failed: {error}")),
         };
 
-    let config = SessionConfig::from_profile(profile, first_project);
+    let config = SessionConfig::from_profile(profile, first_project, exe_path);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("roost-session")

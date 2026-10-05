@@ -130,6 +130,14 @@ pub struct SessionConfig {
     /// from inside `serve` would be a `remove_var` on a live tokio
     /// runtime.
     pub first_project: FirstProject,
+    /// This daemon's executable, canonicalised once at start, before
+    /// the fork — what `session.identify.exe_path` reports. `None` when
+    /// it did not resolve.
+    pub exe_path: Option<PathBuf>,
+    /// The test-mode identity sidecar beside `exe_path`, already read.
+    /// `None` in every shipped run, filled the way
+    /// `fake_libghostty_build` is.
+    pub identity_override: Option<identity::IdentityOverride>,
 }
 
 impl SessionConfig {
@@ -137,8 +145,17 @@ impl SessionConfig {
     ///
     /// `first_project` comes in from `main`'s pre-fork capture; every
     /// other field is read from the profile or the environment here.
-    pub fn from_profile(profile: &BundleProfile, first_project: FirstProject) -> Self {
+    pub fn from_profile(
+        profile: &BundleProfile,
+        first_project: FirstProject,
+        exe_path: Option<PathBuf>,
+    ) -> Self {
         let (test_mode, fake_libghostty_build) = identity::test_mode_env();
+        let identity_override = identity::read_identity_override(exe_path.as_deref(), test_mode)
+            .unwrap_or_else(|error| {
+                warn!(%error, "ignoring the test identity sidecar");
+                None
+            });
         let replay_window = parse_replay_window(
             test_mode,
             std::env::var(crate::consts::REPLAY_WINDOW_ENV)
@@ -168,6 +185,8 @@ impl SessionConfig {
             legacy_payload_kinds: identity::legacy_kinds_env(test_mode),
             replay_window,
             first_project,
+            exe_path,
+            identity_override,
         }
     }
 }
@@ -255,10 +274,19 @@ pub async fn serve(
         done: Mutex::new(Some(done_tx)),
     });
 
+    // `identity::build_identity` is the one place this build's identity
+    // is resolved — `roost-session identify` (plan 039 §3.1) answers the
+    // same question for a binary that has never run, and a second copy
+    // here is exactly how the two would drift.
+    let build = identity::build_identity(
+        config.fake_libghostty_build.as_deref(),
+        config.test_mode,
+        config.identity_override.as_ref(),
+    );
     let session = SessionInfo {
         session_id: identity::session_id(),
         started_at: identity::rfc3339_utc(std::time::SystemTime::now()),
-        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        app_version: build.app_version,
         // Both answered for real now that every tab has a server
         // terminal behind it. The list is what an attach negotiates
         // against, in preference order; `identity::payload_kinds` is
@@ -270,16 +298,13 @@ pub async fn serve(
         // reproducible end to end without a second binary (plan 037
         // §3.7) — and cannot make the two disagree, which would be a
         // failure mode no client could make sense of.
-        //
-        // `identity::build_identity` is the one place this resolution
-        // happens — `roost-session identify` (plan 039 §3.1) answers the
-        // same question for a binary that has never run, and a second
-        // copy of this match here is exactly how the two would drift.
-        libghostty_build: identity::build_identity(
-            config.fake_libghostty_build.as_deref(),
-            config.test_mode,
-        )
-        .libghostty_build,
+        libghostty_build: build.libghostty_build,
+        dev: build.dev,
+        git_sha: build.git_sha,
+        exe_path: config
+            .exe_path
+            .clone()
+            .and_then(|path| path.into_os_string().into_string().ok()),
         default_tab_size: (DEFAULT_TAB_COLS, DEFAULT_TAB_ROWS),
         test_mode,
     };

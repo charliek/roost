@@ -1004,8 +1004,15 @@ pub fn parse_identity_line(stdout: &str) -> Option<SessionBinaryIdentity> {
 /// bump between them do not force a restart on every localhost user.
 /// Changing either side to match the other is a decision, not a
 /// cleanup.
+///
+/// Spelled out field by field rather than derived equality, so the
+/// build facts `dev` and `git_sha` (plan 076 D2) never join the install
+/// gate: a dev client installing a release asset of its own version
+/// still matches.
 pub fn identity_matches(expected: &SessionBinaryIdentity, found: &SessionBinaryIdentity) -> bool {
-    expected == found
+    expected.app_version == found.app_version
+        && expected.session_protocol == found.session_protocol
+        && expected.libghostty_build == found.libghostty_build
 }
 
 /// What the probe concluded about a host.
@@ -3775,6 +3782,7 @@ mod tests {
             // described the *stale* peer as the expected one.
             session_protocol: crate::messages::SESSION_PROTOCOL_VERSION,
             libghostty_build: build.to_string(),
+            ..SessionBinaryIdentity::default()
         }
     }
 
@@ -4882,6 +4890,27 @@ mod tests {
         assert!(!identity_matches(
             &identity("0.0.20", "g"),
             &identity("0.0.19", "g")
+        ));
+    }
+
+    /// Plan 076 D2: the build facts stay out of the install gate, so a
+    /// dev client still accepts the release asset of its own version.
+    #[test]
+    fn the_install_rule_ignores_dev_and_git_sha() {
+        let release = identity("0.0.22", "ghostty-abc+snapshot.v1");
+        let dev = SessionBinaryIdentity {
+            dev: true,
+            git_sha: Some("a1b2c3d".into()),
+            ..release.clone()
+        };
+        assert!(identity_matches(&release, &dev));
+        assert!(identity_matches(&dev, &release));
+        assert!(identity_matches(
+            &dev,
+            &SessionBinaryIdentity {
+                git_sha: Some("f00ba12".into()),
+                ..dev.clone()
+            }
         ));
     }
 

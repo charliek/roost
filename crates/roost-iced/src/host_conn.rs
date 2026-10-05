@@ -5552,6 +5552,7 @@ mod tests {
             reduced_fidelity: true,
             resumed: None,
             persist_error: None,
+            running: roost_ipc::session_version::BuildId::default(),
         }
     }
 
@@ -5683,6 +5684,7 @@ mod tests {
             client_build: "gb-new".into(),
             session_payload_kinds: vec!["ghostty-snapshot".into()],
             restart: state::RestartAction::RestartLocal,
+            running: roost_ipc::session_version::BuildId::default(),
         }
     }
 

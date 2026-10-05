@@ -697,6 +697,9 @@ mod tests {
     ///   server-internal use; it never rides the wire as a field of any
     ///   op, event, or nested type, so `bundle()` never calls
     ///   `subschema_for::<AgentTabState>()` and it has no `$defs` entry.
+    /// - `SessionBinaryIdentity`: what `roost-session identify` prints on
+    ///   stdout, never an op's params, result or event, so no op type
+    ///   reaches it either.
     const NOT_IN_DEFS: &[(&str, &str)] = &[
         ("RawAttachHandshake", "session_id"),
         ("RawAttachHandshake", "kinds"),
@@ -718,6 +721,7 @@ mod tests {
         ("RawAttachHandshakeReply", "snapshot_rows"),
         ("RawAttachHandshakeReply", "error"),
         ("AgentTabState", "ownership"),
+        ("SessionBinaryIdentity", "git_sha"),
     ];
 
     /// Finding 2: an `Option<T>` field with neither `#[serde(default)]`
