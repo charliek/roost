@@ -30,8 +30,8 @@ Mac products themselves (and real input on macOS) use `mac-test`.
 `roostctl` shed-local (via `tools/shed/build-in-shed.sh`, so your Mac
 `target/` + ghostty outputs are never clobbered), then runs the three iced
 real-input lanes. Run it from the repo root. The persistent dev box (`SHED=` at the top
-of the script; `roost-dev` by default, written `<shed>` below where a command
-takes it) IS the day-to-day cache (stop/start reuses its build cache); the
+of the script; `roost-dev` by default, written `$SHED` below where a command
+takes it: set `SHED=<your shed name>` first) IS the day-to-day cache (stop/start reuses its build cache); the
 **snapshot is opt-in** — a bare run does NOT auto-snapshot, so run
 `--snapshot-base` once if you want fast cold re-creates after a teardown:
 
@@ -71,7 +71,7 @@ read that override for the iced target — no bind-mount needed):
 
 ```bash
 tools/shed/shed-test.sh --build-only            # builds ~/rt/debug/{roost-iced,roostctl}
-shed exec <shed> -- bash -lc '
+shed exec "$SHED" -- bash -lc '
   cd ~/roost
   mkdir -p /tmp/xdgrt-iced && chmod 700 /tmp/xdgrt-iced
   # Wayland (primary): headless weston, the Iced CI Wayland lane.
@@ -204,7 +204,7 @@ not inline in the shell you're typing the command in.
   root-only each boot).
 - **Box model:** a long-lived dev shed (`roost-dev` by default) + a `roost-base` snapshot cache.
   Treat both as a *cache* — assume a shed upgrade invalidates them; just
-  `--reprovision` (or `shed delete <shed> -f; shed snapshot delete roost-base -f`)
+  `--reprovision` (or `shed delete "$SHED" -f; shed snapshot delete roost-base -f`)
   and re-run. The snapshot makes a fresh box boot in seconds instead of
   re-running the full install hook.
 - **`tools/shed/build-in-shed.sh`** — bind-mounts shed-local dirs over the

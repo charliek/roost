@@ -147,8 +147,9 @@ shares both). An answering socket does not prove the pid is yours, so first
 check its executable is inside the bundle you launched:
 
 ```bash
-ps -p <pid> -o command=   # must start with <repo>/mac/build/Roost-Iced.app/Contents/MacOS/
-kill <pid>                # SIGTERM, only if it did
+PID=...                   # the pid from identify --json
+ps -p "$PID" -o command= # must start with <repo>/mac/build/Roost-Iced.app/Contents/MacOS/
+kill "$PID"              # SIGTERM, only if it did
 ```
 
 The dev `roost-session` it started **outlives the app**; stop it with
@@ -272,17 +273,17 @@ rr 'test -z "$(git status --porcelain)"' || echo "DIRTY: stop and report"
 
 ```bash
 # pushed work (TEST_SHA may be abbreviated)
-git push origin <branch>
+git push origin "$BRANCH"
 rr "git fetch origin && git checkout --detach $TEST_SHA"
 
 # unpushed work: a bundle, fetched with a FORCED refspec so a re-sync overwrites the ref
-git bundle create /tmp/roost.bundle <branch>
+git bundle create /tmp/roost.bundle "$BRANCH"
 scp /tmp/roost.bundle "$MAC_HOST":/tmp/roost.bundle
-rr "git fetch /tmp/roost.bundle +<branch>:refs/remotes/transfer/<branch> && git checkout --detach $TEST_SHA"
+rr "git fetch /tmp/roost.bundle +$BRANCH:refs/remotes/transfer/$BRANCH && git checkout --detach $TEST_SHA"
 ```
 
 Here `rr` is given double quotes, so `$TEST_SHA` expands locally (export it, or
-paste the value); replace `<branch>` with the real branch name.
+paste the value), as do `$BRANCH` (set it to the branch name) and `$MAC_HOST`.
 
 **A locked Mac, or one at the login window: stop and report.** If
 `mac-real-input-check` says locked, no window server session, or off-console,
