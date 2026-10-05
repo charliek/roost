@@ -3278,6 +3278,7 @@ mod tests {
             state: host_sidebar::SectionState::Connected,
             transport: host_sidebar::HostTransportKind::Ssh,
             fidelity: None,
+            update: None,
         }];
 
         let frame = command_palette_frame(
@@ -3342,6 +3343,7 @@ mod tests {
             state: host_sidebar::SectionState::Connected,
             transport: host_sidebar::HostTransportKind::Ssh,
             fidelity: None,
+            update: None,
         }];
         let frame = host_picker_frame(&hosts, &[], IN_PROCESS);
         assert_eq!(frame.id, HOST_PICKER_FRAME_ID);
@@ -3363,6 +3365,7 @@ mod tests {
             state: host_sidebar::SectionState::Disconnected,
             transport: host_sidebar::HostTransportKind::Ssh,
             fidelity: None,
+            update: None,
         }];
         let items = host_verb_items(
             &hosts,

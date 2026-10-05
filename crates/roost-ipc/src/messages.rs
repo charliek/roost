@@ -3114,6 +3114,67 @@ pub struct HostStatus {
     /// comes and goes.
     #[serde(default)]
     pub tabs: usize,
+    /// Whether this host's session is up to date with this client, and
+    /// what a restart would run (plan 076 D7). Present whenever the
+    /// session's identity is known — connected, or refused at the gate
+    /// (`needs-restart`) — and absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<HostUpdateStatus>,
+}
+
+/// The `update` object on [`HostStatus`] (plan 076 D7).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HostUpdateStatus {
+    /// One of [`host_update_state`]'s spellings.
+    pub state: String,
+    /// Present only for `session-newer`: `true` when the session refused
+    /// this client, which then has to be updated to connect at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<bool>,
+    /// The running session's build.
+    pub session: BuildStatus,
+    /// This client's build, as the comparison read it.
+    pub client: BuildStatus,
+    pub restart: HostRestartStatus,
+}
+
+/// One build, as `host.status` names it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BuildStatus {
+    pub version: String,
+    /// As [`SessionBinaryIdentity::dev`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dev: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+}
+
+/// Whether Restart Session is offered for a host, and onto what.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HostRestartStatus {
+    pub offered: bool,
+    /// Why it is not offered when no binary a restart could run is
+    /// usable: `missing`, `unreadable`, `older`, `incompatible` or
+    /// `override`. Absent when it is offered, and when the state alone
+    /// rules a restart out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    /// The binary a restart would run, once it has been identified.
+    /// Absent while it has not been checked yet; the confirm resolves it
+    /// afresh either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<RestartTargetStatus>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RestartTargetStatus {
+    pub version: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dev: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    /// `bundled`, `running`, `override` or `installed`.
+    pub source: String,
 }
 
 /// What one connect attempt established about the session it reached
@@ -3190,6 +3251,34 @@ pub mod host_state {
     pub const CONNECTED: &str = "connected";
     pub const STOPPED: &str = "stopped";
     pub const NEEDS_RESTART: &str = "needs-restart";
+}
+
+/// [`HostUpdateStatus::state`]'s spellings.
+pub mod host_update_state {
+    pub const UP_TO_DATE: &str = "up-to-date";
+    pub const AVAILABLE: &str = "available";
+    pub const STAGED: &str = "staged";
+    pub const REQUIRED: &str = "required";
+    pub const SESSION_NEWER: &str = "session-newer";
+    pub const UNORDERED: &str = "unordered";
+    pub const UNKNOWN: &str = "unknown";
+}
+
+/// [`HostRestartStatus::why`]'s spellings.
+pub mod host_restart_why {
+    pub const MISSING: &str = "missing";
+    pub const UNREADABLE: &str = "unreadable";
+    pub const OLDER: &str = "older";
+    pub const INCOMPATIBLE: &str = "incompatible";
+    pub const OVERRIDE: &str = "override";
+}
+
+/// [`RestartTargetStatus::source`]'s spellings.
+pub mod host_restart_source {
+    pub const BUNDLED: &str = "bundled";
+    pub const RUNNING: &str = "running";
+    pub const OVERRIDE: &str = "override";
+    pub const INSTALLED: &str = "installed";
 }
 
 // ============================================================================
@@ -5621,6 +5710,7 @@ mod tests {
             payload_kind: None,
             connect: None,
             tabs: 0,
+            update: None,
         };
         round_trip(&armed);
         // #399: `reason` says *why* the rung is armed while the band's
@@ -5694,6 +5784,69 @@ mod tests {
                 "resumed": true,
                 "from_revision": 4_312,
             })
+        );
+
+        // Plan 076 D7: `update` is omitted, never null, without identity
+        // facts, and inside it every optional field is omitted too.
+        assert!(serde_json::to_value(&resumed)
+            .unwrap()
+            .get("update")
+            .is_none());
+        let staged = HostStatus {
+            update: Some(HostUpdateStatus {
+                state: host_update_state::STAGED.into(),
+                blocked: None,
+                session: BuildStatus {
+                    version: "0.0.21".into(),
+                    ..BuildStatus::default()
+                },
+                client: BuildStatus {
+                    version: "0.0.22".into(),
+                    dev: true,
+                    sha: Some("a1b2c3d".into()),
+                },
+                restart: HostRestartStatus {
+                    offered: true,
+                    why: None,
+                    target: Some(RestartTargetStatus {
+                        version: "0.0.22".into(),
+                        dev: false,
+                        sha: None,
+                        source: "bundled".into(),
+                    }),
+                },
+            }),
+            ..resumed.clone()
+        };
+        round_trip(&staged);
+        assert_eq!(
+            serde_json::to_value(&staged).unwrap()["update"],
+            serde_json::json!({
+                "state": "staged",
+                "session": {"version": "0.0.21"},
+                "client": {"version": "0.0.22", "dev": true, "sha": "a1b2c3d"},
+                "restart": {
+                    "offered": true,
+                    "target": {"version": "0.0.22", "source": "bundled"},
+                },
+            })
+        );
+        let blocked = HostUpdateStatus {
+            state: host_update_state::SESSION_NEWER.into(),
+            blocked: Some(true),
+            restart: HostRestartStatus {
+                offered: false,
+                why: Some("older".into()),
+                target: None,
+            },
+            ..HostUpdateStatus::default()
+        };
+        round_trip(&blocked);
+        let wire = serde_json::to_value(&blocked).unwrap();
+        assert_eq!(wire["blocked"], true);
+        assert_eq!(
+            wire["restart"],
+            serde_json::json!({"offered": false, "why": "older"})
         );
 
         // A fresh snapshot resumed from nothing, so the fence is omitted

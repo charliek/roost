@@ -249,6 +249,9 @@ pub(crate) struct ConnectFacts {
     /// D3) — settled at the identify gate like everything but
     /// `persist_error`.
     pub(crate) running: BuildId,
+    /// [`SessionIdentify::exe_path`], verbatim. A path a peer supplied:
+    /// only ever run for a session on this machine (plan 076 D4).
+    pub(crate) exe_path: Option<String>,
 }
 
 /// The two libghostty builds a reduced-fidelity connection sits between.
@@ -290,6 +293,7 @@ impl ConnectFacts {
             resumed: None,
             persist_error: identity.persist_error.clone(),
             running: BuildId::from(identity),
+            exe_path: identity.exe_path.clone(),
         }
     }
 }

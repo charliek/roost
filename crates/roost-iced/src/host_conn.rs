@@ -5553,6 +5553,7 @@ mod tests {
             resumed: None,
             persist_error: None,
             running: roost_ipc::session_version::BuildId::default(),
+            exe_path: None,
         }
     }
 

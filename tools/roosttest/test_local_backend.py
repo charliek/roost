@@ -3661,3 +3661,30 @@ def test_a_font_change_reaches_every_session_tabs_shell(lane: Lane):
                 if not line.strip().startswith("font-size")
             )
         )
+
+
+def test_the_slot_reports_where_its_session_stands_against_this_client(lane: Lane):
+    """Plan 076 AC3, on the slot: it is an ordinary localhost host, so it
+    carries the same `host.status.update`. A client pretending to be
+    0.0.1 (`ROOST_TEST_CLIENT_VERSION`, classification only) finds the
+    session it started newer than itself, and the binary that started it
+    — the only restart candidate under `ROOST_SESSION_BIN` — still usable,
+    because it is not older than what is running."""
+    roost = session_ui(lane, extra_env={"ROOST_TEST_CLIENT_VERSION": "0.0.1"})
+    slot = local_band(roost)["saved_id"]
+    version = lane.env.identify()["app_version"]
+
+    def resolved() -> dict | None:
+        update = roost.host_status(slot)["hosts"][0].get("update")
+        if update is None or "target" not in update["restart"]:
+            return None
+        return update
+
+    update = wait_until(resolved, 60.0, "the slot's restart candidate")
+    assert update["state"] == "session-newer", update
+    assert update["blocked"] is False, update
+    assert update["client"]["version"] == "0.0.1", update
+    assert update["session"]["version"] == version, update
+    assert update["restart"]["offered"] is True, update
+    assert update["restart"]["target"]["source"] == "override", update
+    assert update["restart"]["target"]["version"] == version, update

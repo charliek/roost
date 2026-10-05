@@ -183,6 +183,9 @@ pub(crate) enum EngineFeed {
     /// asks for. Boxed for [`Self::HostTunnel`]'s reason — every feed
     /// item pays for the largest.
     HostBootstrap(Box<crate::app::bootstrap::BootstrapEvent>),
+    /// A localhost session's restart candidates finished identifying on
+    /// the engine runtime (plan 076 D4). Boxed like every host item.
+    RestartTarget(Box<crate::app::update_knowledge::TargetResolved>),
     /// One phase of a local-backend switch finished on the engine
     /// runtime (plan 063 §D8).
     ///
@@ -289,6 +292,8 @@ impl EngineFeedReceiver {
                 // starts a connect — all three are what the sidebar and
                 // the chrome draw from.
                 | EngineFeed::HostBootstrap(..)
+                // It decides whether a host offers Restart.
+                | EngineFeed::RestartTarget(..)
                 // It either forgets a host — a registry change the
                 // sidebar and every palette read — or drops the claim.
                 | EngineFeed::HostEmptiness(..)
@@ -711,6 +716,7 @@ mod tests {
                     resumed: None,
                     persist_error: None,
                     running: roost_ipc::session_version::BuildId::default(),
+                    exe_path: None,
                 },
             ),
         ] {

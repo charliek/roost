@@ -885,6 +885,7 @@ mod tests {
             projects: vec![project(3, "/srv/p3", vec![tab(7, 3, "/srv/p3/t7")])],
             active_tab_id: 7,
             agents: 0,
+            update: None,
         }
     }
 

@@ -243,6 +243,7 @@ mod tests {
             state,
             transport: HostTransportKind::Ssh,
             fidelity: None,
+            update: None,
         }
     }
 

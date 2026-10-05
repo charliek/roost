@@ -103,6 +103,7 @@ mod servicing;
 mod tab_backend;
 mod tab_memory;
 mod terminal_tab;
+pub(crate) mod update_knowledge;
 pub(crate) mod window_frame;
 // The in-crate `#[ignore]`d perf harness — see `tools/perf/README.md` for
 // how to run it. Gated on `cfg(test)` like `terminal_tab`'s test-only
@@ -3380,6 +3381,9 @@ pub struct App {
     /// (plan 039 §3.5) — the probes keyed by saved host, the jobs by
     /// normalized target token.
     bootstraps: bootstrap::BootstrapsInFlight,
+    /// What each host's session could be restarted or updated onto
+    /// (plan 076 D4, D5), per running session.
+    update_knowledge: update_knowledge::UpdateKnowledge,
     /// The Add Host dialog's Name field, and whether it still owes a
     /// focus. Same one-shot shape as the rename editor's: the request is
     /// raised where the dialog opens and drained by whichever route
@@ -3529,6 +3533,9 @@ struct HostView {
     active_tab_id: i64,
     /// How many agent rows this host contributes, for the band's rollup.
     agents: usize,
+    /// Whether the session is up to date with this client, and what a
+    /// restart would run (plan 076 D3).
+    update: Option<roost_ui_model::session_update::UpdateFacts>,
 }
 
 /// The host row the window is showing (plan 037 §3.1). Both halves are
@@ -3804,6 +3811,7 @@ impl App {
             host_dialog: None,
             host_restarts: crate::host_conn::restart::RestartsInFlight::default(),
             bootstraps: bootstrap::BootstrapsInFlight::default(),
+            update_knowledge: update_knowledge::UpdateKnowledge::default(),
             add_host_name_id: Id::unique(),
             add_host_socket_id: Id::unique(),
             add_host_focus_requested: false,
@@ -8519,6 +8527,7 @@ impl App {
                     view.transport,
                     view.state,
                 ),
+                update: view.update.as_ref(),
             })
             .collect()
     }
@@ -8554,6 +8563,7 @@ impl App {
         if let Some(incarnation) = self.hosts.remove(saved_id) {
             self.purge_host_incarnation(incarnation);
         }
+        self.update_knowledge.forget(saved_id);
         // Keyed by name, so `purge_host_incarnation` cannot reach it:
         // a forgotten host's last save is nothing the user can act on
         // (#481).
@@ -9281,7 +9291,13 @@ impl App {
             same_host: live.is_some(),
             dialog_open: self.host_dialog.is_some(),
         };
-        match landed.landing() {
+        let landing = landed.landing();
+        if let (bootstrap::ProbeLanding::Offer | bootstrap::ProbeLanding::Deferred, Ok(probed)) =
+            (landing, &result)
+        {
+            self.learn_from_probe(saved_id, &probed.probe.outcome);
+        }
+        match landing {
             bootstrap::ProbeLanding::Offer => {}
             bootstrap::ProbeLanding::Stale => {
                 tracing::debug!(host = %saved_id, generation, "dropped a stale bootstrap probe");
@@ -12196,6 +12212,7 @@ mod tests {
                 projects: projects.iter().copied().map(empty_project).collect(),
                 active_tab_id: 0,
                 agents: 0,
+                update: None,
             }
         }
 
@@ -14225,6 +14242,7 @@ mod tests {
             resumed: None,
             persist_error: None,
             running: roost_ipc::session_version::BuildId::default(),
+            exe_path: None,
         }
     }
 
@@ -14395,6 +14413,7 @@ mod tests {
         let plan = bootstrap::plan_bootstrap(
             &roost_ipc::bootstrap::ProbeOutcome::Compatible {
                 path: "/usr/bin/roost-session".into(),
+                identity: bootstrap::client_identity(),
             },
             bootstrap::SessionState::Running,
         );

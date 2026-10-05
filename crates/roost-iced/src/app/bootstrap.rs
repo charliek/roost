@@ -56,16 +56,18 @@ pub(crate) fn client_identity() -> SessionBinaryIdentity {
 pub(crate) const TEST_CLIENT_VERSION_ENV: &str = "ROOST_TEST_CLIENT_VERSION";
 
 /// This client's build, as the update logic orders sessions against it.
-#[expect(dead_code, reason = "plan 076 C2's update classification reads it")]
-pub(crate) fn client_build_id() -> BuildId {
-    let test_mode = std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1");
-    classification_build(
-        &client_identity(),
-        test_mode
-            .then(|| std::env::var(TEST_CLIENT_VERSION_ENV).ok())
-            .flatten()
-            .as_deref(),
-    )
+pub(crate) fn client_build_id() -> &'static BuildId {
+    static BUILD: std::sync::OnceLock<BuildId> = std::sync::OnceLock::new();
+    BUILD.get_or_init(|| {
+        let test_mode = std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1");
+        classification_build(
+            &client_identity(),
+            test_mode
+                .then(|| std::env::var(TEST_CLIENT_VERSION_ENV).ok())
+                .flatten()
+                .as_deref(),
+        )
+    })
 }
 
 fn classification_build(identity: &SessionBinaryIdentity, version: Option<&str>) -> BuildId {
@@ -415,7 +417,7 @@ pub(crate) fn plan_bootstrap(outcome: &ProbeOutcome, session: SessionState) -> B
             gate: IdentityGate::Installed,
             found: Some(path.clone()),
         },
-        ProbeOutcome::Compatible { path } => BootstrapPlan {
+        ProbeOutcome::Compatible { path, .. } => BootstrapPlan {
             variant: if running {
                 BootstrapVariant::Update
             } else {
@@ -945,6 +947,7 @@ mod tests {
     fn compatible() -> ProbeOutcome {
         ProbeOutcome::Compatible {
             path: "/usr/bin/roost-session".into(),
+            identity: identity(),
         }
     }
 

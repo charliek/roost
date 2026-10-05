@@ -1037,11 +1037,14 @@ async fn a_matching_binary_on_the_first_rung_reads_as_compatible() {
     let probe = job.probe().await.expect("probe");
 
     assert_eq!(probe.arch, RemoteArch::Amd64);
-    assert_eq!(
-        probe.outcome,
-        ProbeOutcome::Compatible {
-            path: harness.remote("$HOME/.local/bin/roost-session")
-        }
+    assert!(
+        matches!(
+            &probe.outcome,
+            ProbeOutcome::Compatible { path, .. }
+                if *path == harness.remote("$HOME/.local/bin/roost-session")
+        ),
+        "{:?}",
+        probe.outcome
     );
     job.close().await;
 }
@@ -2132,7 +2135,7 @@ async fn a_start_only_flow_execs_the_path_the_probe_resolved() {
     let job = harness.job(harness.options()).await;
 
     let probe = job.probe().await.expect("probe");
-    let ProbeOutcome::Compatible { path } = probe.outcome.clone() else {
+    let ProbeOutcome::Compatible { path, .. } = probe.outcome.clone() else {
         panic!("expected a compatible deb install, got {:?}", probe.outcome);
     };
     assert_eq!(path, harness.remote("/usr/bin/roost-session"));
@@ -2611,11 +2614,14 @@ async fn the_far_side_sees_the_fixture_and_never_this_machine() {
     // resolved rather than the real `/usr/bin`.
     harness.plant("/usr/bin/roost-session", &Stub::matching("jailed"));
     let probe = job.probe().await.expect("probe again");
-    assert_eq!(
-        probe.outcome,
-        ProbeOutcome::Compatible {
-            path: harness.remote("/usr/bin/roost-session")
-        }
+    assert!(
+        matches!(
+            &probe.outcome,
+            ProbeOutcome::Compatible { path, .. }
+                if *path == harness.remote("/usr/bin/roost-session")
+        ),
+        "{:?}",
+        probe.outcome
     );
     assert!(
         harness

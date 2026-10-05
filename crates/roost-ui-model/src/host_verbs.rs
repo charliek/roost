@@ -100,6 +100,9 @@ pub struct HostRow<'a> {
     /// that is connected at exact fidelity or is not connected at all,
     /// which is the ordinary case.
     pub fidelity: Option<FidelityAction>,
+    /// Whether the session is up to date and what a restart would run
+    /// (plan 076 D3). `None` unless the session's identity is known.
+    pub update: Option<&'a crate::session_update::UpdateFacts>,
 }
 
 /// One forgotten host, as the recents rows read it (plan 063 §D7).
@@ -607,6 +610,7 @@ mod tests {
             state,
             transport: HostTransportKind::Ssh,
             fidelity: None,
+            update: None,
         }
     }
 
@@ -875,6 +879,7 @@ mod tests {
             state: SectionState::Disconnected,
             transport: HostTransportKind::Localhost,
             fidelity: None,
+            update: None,
         };
         let remote = host("h2", SectionState::Disconnected);
 
@@ -938,6 +943,7 @@ mod tests {
             // will not offer to leave a local session must not offer to
             // restart one either.
             fidelity: Some(FidelityAction::Restart),
+            update: None,
         };
         let offered = verbs(&[connected], NO_RECENTS, IN_PROCESS, GATED, false, ANSWERED);
         let items = ids(&offered);

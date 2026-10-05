@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import dataclasses
 import functools
 import json
 import os
@@ -107,7 +108,18 @@ os.environ["SHELL"] = "/bin/sh"
 # here: the one case that wants a reduced-fidelity session passes it to
 # its own daemon, and a relaunch that inherited it would come back
 # reduced too, with nothing left to prove.
-os.environ["ROOST_SESSION_BIN"] = str(sessionlib.session_binary())
+#
+# A copy rather than the tree's binary itself, so the update cases (plan
+# 076) can stand a different build in its place: with
+# `ROOST_SESSION_BIN` set it is the only restart candidate the UI ever
+# identifies (D4). `restore_candidate` puts the copy back after each.
+# `_REAL_SESSION` is read before the override moves: from here on
+# `session_binary()` answers `_CANDIDATE`, which a case may have replaced.
+_REAL_SESSION = sessionlib.session_binary()
+_CANDIDATE = _ROOT / "candidate" / "roost-session"
+_CANDIDATE.parent.mkdir()
+shutil.copy2(_REAL_SESSION, _CANDIDATE)
+os.environ["ROOST_SESSION_BIN"] = str(_CANDIDATE)
 
 # The UI is stood down by `ui.end_session`, a session-scoped fixture
 # teardown, so by the time this runs nothing is left holding the root.
@@ -143,8 +155,8 @@ pytestmark = pytest.mark.host_client
 NOT_RUNNING_EXIT = 3
 
 @functools.cache
-def client_libghostty_build() -> str:
-    """The libghostty build this client pins, as a string.
+def real_identity() -> dict:
+    """What this tree's `roost-session` says it is, offline.
 
     `roost-session identify` is compile-time identity — no socket, no
     profile — and this tree builds the daemon and the UI against one pin.
@@ -154,14 +166,19 @@ def client_libghostty_build() -> str:
     the card assertion tautological.
     """
     result = subprocess.run(
-        [str(sessionlib.session_binary()), "identify"],
+        [str(_REAL_SESSION), "identify"],
         env={"PATH": os.environ.get("PATH", "")},
         capture_output=True,
         text=True,
         timeout=scaled_timeout(30),
     )
     assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
-    return json.loads(result.stdout)["libghostty_build"]
+    return json.loads(result.stdout)
+
+
+def client_libghostty_build() -> str:
+    """The libghostty build this client pins, as a string."""
+    return real_identity()["libghostty_build"]
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +267,7 @@ def ground(roost: Roost):
 
     session_state = state_dir / ui.DERIVED_SESSION_SUBDIR
     shutil.rmtree(session_state, ignore_errors=True)
-    env = sessionlib.make_env(root=_ROOT, state_dir=session_state)
+    env = sessionlib.make_env(root=_ROOT, state_dir=session_state, binary=_REAL_SESSION)
 
     label = f"localhost-{uuid.uuid4().hex[:8]}"
     added = roost.call("host.add", {"label": label, "target": "localhost"})["host"]
@@ -627,3 +644,140 @@ def test_the_picker_row_steps_past_the_same_label(ground: Ground, roost: Roost):
                 roost.call("host.disconnect", {"id": host_id})
             with contextlib.suppress(Exception):
                 roost.call("host.remove", {"id": host_id})
+
+
+# ---------------------------------------------------------------------------
+# 5. What `host.status` says about updating (plan 076 D3/D4)
+# ---------------------------------------------------------------------------
+#
+# Every case runs its daemon from a copy of this tree's `roost-session`
+# with a `.test-identity` sidecar beside it, so one binary answers as
+# whichever build the case needs. The UI's only restart candidate is
+# `_CANDIDATE` (`ROOST_SESSION_BIN`), which a case may also replace.
+
+
+@pytest.fixture
+def restore_candidate():
+    """Put the real binary back at `_CANDIDATE` after a case replaced it."""
+    yield
+    _CANDIDATE.unlink(missing_ok=True)
+    _CANDIDATE.with_name(_CANDIDATE.name + ".test-identity").unlink(missing_ok=True)
+    shutil.copy2(_REAL_SESSION, _CANDIDATE)
+
+
+def start_as(ground: Ground, name: str, **identity) -> str:
+    """Start this lane's daemon from a copy that identifies as
+    `identity` (any of `app_version`, `dev`, `git_sha`)."""
+    copy = ground.host.env.root / f"build-{name}" / "roost-session"
+    copy.parent.mkdir(exist_ok=True)
+    shutil.copy2(_REAL_SESSION, copy)
+    if identity:
+        copy.with_name(copy.name + ".test-identity").write_text(json.dumps(identity))
+    env = dataclasses.replace(ground.host.env, binary=copy)
+    ground.pid = start_session(env).verdict.pid
+    session_id = ground.claim(ground.host.env.identify()["session_id"])
+    if "app_version" in identity:
+        assert ground.host.env.identify()["app_version"] == identity["app_version"]
+    return session_id
+
+
+def fake_candidate(identify_stdout: str) -> None:
+    """Stand a script at `_CANDIDATE` whose `identify` prints this."""
+    _CANDIDATE.unlink()
+    _CANDIDATE.write_text(f"#!/bin/sh\nprintf '%s\\n' '{identify_stdout}'\n")
+    _CANDIDATE.chmod(0o755)
+
+
+def resolved_update(ground: Ground, session_id: str, timeout: float = 60.0) -> dict:
+    """The host's `update` object once its restart candidate has been
+    identified for this session — a target or a reason, either way."""
+
+    def probe() -> dict | None:
+        row = host_status_row(ground.host.roost, ground.host.saved_id)
+        connect = row.get("connect")
+        update = row.get("update")
+        if connect is None or connect["session_id"] != session_id or update is None:
+            return None
+        restart = update["restart"]
+        if "target" not in restart and "why" not in restart:
+            return None
+        return update
+
+    return wait_until(probe, timeout, "the host's restart candidate to be identified")
+
+
+def connect_as(ground: Ground, name: str, **identity) -> dict:
+    session_id = start_as(ground, name, **identity)
+    ground.host.connect_and_wait()
+    assert wait_live_connect(ground.host)["connect"]["session_id"] == session_id
+    return resolved_update(ground, session_id)
+
+
+def test_the_same_build_on_both_sides_is_up_to_date(ground: Ground, restore_candidate):
+    real = real_identity()
+    update = connect_as(ground, "same")
+    # Two dev builds of one version are only `Same` with a sha to
+    # compare, which a tree built without git does not have.
+    want = "unordered" if real.get("dev") and not real.get("git_sha") else "up-to-date"
+    assert update["state"] == want, update
+    assert update["session"]["version"] == real["app_version"], update
+    assert update["restart"]["offered"] is True, update
+    assert update["restart"]["target"]["source"] == "override", update
+    assert update["restart"]["target"]["version"] == real["app_version"], update
+
+
+def test_an_older_session_with_a_newer_candidate_is_staged(ground: Ground, restore_candidate):
+    update = connect_as(ground, "old", app_version="0.0.1")
+    assert update["state"] == "staged", update
+    assert update["session"]["version"] == "0.0.1", update
+    assert update["restart"]["offered"] is True, update
+    assert update["restart"]["target"]["version"] == real_identity()["app_version"], update
+    assert update["restart"]["target"]["source"] == "override", update
+
+
+def test_a_newer_session_is_session_newer_and_never_restarted_older(
+    ground: Ground, restore_candidate
+):
+    update = connect_as(ground, "new", app_version="99.0.0")
+    assert update["state"] == "session-newer", update
+    assert update["blocked"] is False, update
+    assert update["restart"] == {"offered": False, "why": "older"}, update
+
+
+def test_a_dev_session_at_this_version_is_unordered(ground: Ground, restore_candidate):
+    update = connect_as(
+        ground,
+        "dev",
+        app_version=real_identity()["app_version"],
+        dev=True,
+        git_sha="0000000",
+    )
+    assert update["state"] == "unordered", update
+    assert update["session"] == {
+        "version": real_identity()["app_version"],
+        "dev": True,
+        "sha": "0000000",
+    }, update
+    # Unordered is not a downgrade: the candidate stays usable.
+    assert update["restart"]["offered"] is True, update
+
+
+def test_a_candidate_on_another_protocol_is_no_restart(ground: Ground, restore_candidate):
+    real = real_identity()
+    fake_candidate(
+        json.dumps({**real, "app_version": "99.0.0", "session_protocol": real["session_protocol"] + 1})
+    )
+    update = connect_as(ground, "incompatible")
+    assert update["restart"] == {"offered": False, "why": "incompatible"}, update
+
+
+def test_a_candidate_that_will_not_identify_is_no_restart(ground: Ground, restore_candidate):
+    fake_candidate("not an identity")
+    update = connect_as(ground, "unreadable")
+    assert update["restart"] == {"offered": False, "why": "unreadable"}, update
+
+
+def test_an_override_that_is_gone_is_the_whole_answer(ground: Ground, restore_candidate):
+    _CANDIDATE.unlink()
+    update = connect_as(ground, "override")
+    assert update["restart"] == {"offered": False, "why": "override"}, update

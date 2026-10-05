@@ -1018,8 +1018,13 @@ pub fn identity_matches(expected: &SessionBinaryIdentity, found: &SessionBinaryI
 /// What the probe concluded about a host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeOutcome {
-    /// A binary matching the client exactly, at `path`.
-    Compatible { path: String },
+    /// A binary matching the client exactly, at `path`. `identity` is
+    /// what it answered, build facts included, so a record of it carries
+    /// the observed build rather than an assumed one.
+    Compatible {
+        path: String,
+        identity: SessionBinaryIdentity,
+    },
     /// A `roost-session` is there but is not this build. `identity` is
     /// `None` when it is present but would not identify itself at all —
     /// a build older than the `identify` subcommand. Either way the
@@ -1060,9 +1065,10 @@ pub fn classify_probe(
     };
     let identity = parse_identity_line(stdout);
     match &identity {
-        Some(found) if identity_matches(expected, found) => {
-            ProbeOutcome::Compatible { path: path.clone() }
-        }
+        Some(found) if identity_matches(expected, found) => ProbeOutcome::Compatible {
+            path: path.clone(),
+            identity: found.clone(),
+        },
         _ => ProbeOutcome::Mismatch {
             path: path.clone(),
             identity,
@@ -3420,7 +3426,7 @@ async fn resolve_sibling(
 }
 
 /// Run `<path> identify` here, bounded, and read the one line back.
-async fn local_identity(path: &Path) -> Result<SessionBinaryIdentity, String> {
+pub async fn local_identity(path: &Path) -> Result<SessionBinaryIdentity, String> {
     let mut child = tokio::process::Command::new(path)
         .arg("identify")
         .stdin(Stdio::null())
@@ -4940,7 +4946,8 @@ mod tests {
         assert_eq!(
             classify_probe(&expected, &pairs),
             ProbeOutcome::Compatible {
-                path: "/usr/bin/roost-session".to_string()
+                path: "/usr/bin/roost-session".to_string(),
+                identity: identity("0.0.19", "ghostty-abc+snapshot.v1"),
             }
         );
     }

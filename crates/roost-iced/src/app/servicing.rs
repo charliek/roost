@@ -2401,12 +2401,17 @@ impl App {
                     // `session.identify`, which is the only place a
                     // client learns a durability failure it was not
                     // connected for (#481).
-                    if let Some(name) = self.hosts.owner_of(host) {
+                    let owner = self.hosts.owner_of(host);
+                    if let Some(name) = owner.clone() {
                         let error = facts.persist_error.clone();
                         self.set_durability(DurabilitySource::Host(name), error);
                     }
-                    self.hosts.note_connect_facts(host, facts)
+                    self.hosts.note_connect_facts(host, facts);
+                    if let Some(name) = owner {
+                        self.host_session_identified(&name, host);
+                    }
                 }
+                EngineFeed::RestartTarget(resolved) => self.restart_target_resolved(*resolved),
                 EngineFeed::ReconnectDue { host, request } => {
                     self.host_reconnect_due(&host, request)
                 }
@@ -3104,6 +3109,7 @@ impl App {
                 // Taken before `host.id` is moved into the view.
                 let reason = self.hosts.section_reason(&host.id).map(str::to_string);
                 let reduced_fidelity = self.hosts.reduced_fidelity(&host.id);
+                let update = self.host_update_facts(&host.id, &host.target);
                 let view_host = view_incarnation(incarnation);
                 let mut projects = mirror
                     .as_ref()
@@ -3125,6 +3131,7 @@ impl App {
                     projects,
                     active_tab_id: mirror.as_ref().map_or(0, |mirror| mirror.active_tab_id),
                     agents: 0,
+                    update,
                 }
             })
             .collect();
@@ -4490,6 +4497,12 @@ impl App {
                     self.host_sections.len(),
                 )));
             };
+            let update = self
+                .host_views
+                .iter()
+                .find(|view| view.saved_id == host.id)
+                .and_then(|view| view.update.as_ref())
+                .map(roost_ui_model::session_update::UpdateFacts::status);
             hosts.push(HostStatus {
                 id: host.id.clone(),
                 label: host.label,
@@ -4523,6 +4536,7 @@ impl App {
                     from_revision: facts.resumed.map(|resumed| resumed.from_revision),
                 }),
                 tabs: self.hosts.tabs(&host.id),
+                update,
             });
         }
         Ok(HostStatusResult { hosts })
@@ -7043,6 +7057,7 @@ mod tests {
             projects: Vec::new(),
             active_tab_id: 0,
             agents: 0,
+            update: None,
         };
         let views = [view];
 
@@ -7119,6 +7134,7 @@ mod tests {
             projects: Vec::new(),
             active_tab_id: 0,
             agents: 0,
+            update: None,
         }];
         let rows = host_exit_rows(&views, &hosts);
         assert!(!rows[0].connecting, "the band and the set agree it is over");
