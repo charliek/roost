@@ -43,6 +43,7 @@
 //! * [`target`] — CLI-side target selection for `roostctl`.
 //! * [`session_launch`] — the launch-cwd hint and the readiness verdict
 //!   line `roostctl session start` and `roost-session` exchange.
+//! * [`session_version`] — which of two `roost-session` builds is newer.
 //! * [`ssh`] — the SSH transport (host-sessions HS-3): classification of
 //!   a saved host's `target` string, the generated `ssh_config`, the
 //!   argv builders, `sun_path` sizing, connection-failure
@@ -72,6 +73,7 @@ pub mod messages;
 pub mod paths;
 pub mod schema;
 pub mod session_launch;
+pub mod session_version;
 pub mod socket_state;
 pub mod ssh;
 pub mod target;

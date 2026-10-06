@@ -43,6 +43,17 @@ pub const FAKE_BUILD_ENV: &str = "ROOST_SESSION_FAKE_BUILD";
 /// reachable without a second Ghostty pin.
 pub const LEGACY_KINDS_ENV: &str = "ROOST_SESSION_LEGACY_KINDS";
 
+/// Suffix of the test-mode identity sidecar (plan 076 D2): a JSON file
+/// at `<canonical current_exe>` + this suffix whose `app_version`,
+/// `dev` and `git_sha` replace this build's own, in both `identify` and
+/// `session.identify`.
+///
+/// Read **only** when `ROOST_TEST_MODE=1`. A file rather than an env
+/// var because the bootstrap probe and the update flows identify
+/// several copies of one binary side by side, and each copy needs to
+/// answer as a different build.
+pub const IDENTITY_SIDECAR_SUFFIX: &str = ".test-identity";
+
 /// Batch count for the workspace replay ring, overriding
 /// `roost_engine::workspace::REPLAY_WINDOW`.
 ///

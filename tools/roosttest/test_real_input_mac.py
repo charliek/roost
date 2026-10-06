@@ -473,7 +473,7 @@ def rename_through_popup(
     that row's rename editor — which opens with its draft selected — take
     `new_name` as the row's name."""
     entries = roost.client.context_menu_dump(target)
-    want = [(entry["label"], entry["enabled"]) for entry in entries if not entry.get("separator")]
+    want = [(entry["label"], entry["enabled"]) for entry in entries if "action" in entry]
     label = next(entry["label"] for entry in entries if entry.get("action") == action)
     try:
         helper.mouse(click, roost.pid, at)

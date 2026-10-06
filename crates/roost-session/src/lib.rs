@@ -55,6 +55,11 @@ pub mod serve;
 pub mod socket_guard;
 pub mod start;
 
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../../build/build_info.rs"]
+mod build_info;
+
 pub use readiness::{Readiness, Verdict};
 pub use serve::{serve, SessionConfig};
 pub use start::{

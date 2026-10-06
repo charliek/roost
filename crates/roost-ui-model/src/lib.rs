@@ -22,6 +22,7 @@ pub mod render_stats;
 pub mod reorder;
 pub mod rollup;
 pub mod selection_fallback;
+pub mod session_update;
 pub mod shell_escape;
 pub mod sprite;
 pub mod theme;

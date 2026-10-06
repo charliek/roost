@@ -28,6 +28,8 @@
 //! which tabs exist.
 
 use std::path::{Path, PathBuf};
+
+use roost_ipc::session_version::BuildId;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -215,6 +217,108 @@ pub(crate) struct ConnectionConfig {
     /// Held open across exactly the same edge as the lane above — see
     /// [`queue::Serving`].
     pub(crate) serving: queue::Serving,
+    /// A restart's target (plan 076 D8): when set, every spawn this task
+    /// makes runs exactly this binary, re-identified right before it
+    /// runs, and a missing or changed one fails the attempt instead of
+    /// falling back to the launch ladder.
+    pub(crate) spawn_bin: Option<SpawnPin>,
+}
+
+/// The binary a restart agreed to run, and the build it identified as.
+#[derive(Debug, Clone)]
+pub(crate) struct SpawnPin {
+    pub(crate) path: PathBuf,
+    pub(crate) identity: BuildId,
+    pub(crate) launches: LaunchGate,
+}
+
+/// The launches a restart's pin has out, shared by every connection
+/// that carries the pin, and whether the restart still wants any.
+///
+/// A launcher outlives the attempt that started it (see
+/// [`pinned_spawn`]), so a restart given up on part-way cannot simply
+/// forget its pin: [`Self::revoke`] stops any further launch and says
+/// whether one is still out, and the last one out reports
+/// [`crate::app::session_actions::ActionEvent::LaunchSettled`] when it
+/// is done.
+#[derive(Clone)]
+pub(crate) struct LaunchGate {
+    state: Arc<Mutex<LaunchState>>,
+    saved_id: String,
+    generation: u64,
+    feed: EngineFeedSender,
+}
+
+#[derive(Debug, Default)]
+struct LaunchState {
+    revoked: bool,
+    in_flight: usize,
+}
+
+impl std::fmt::Debug for LaunchGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchGate")
+            .field("state", &self.state)
+            .field("saved_id", &self.saved_id)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LaunchGate {
+    /// `generation` is the restart's claim, which the settle names.
+    pub(crate) fn new(saved_id: &str, generation: u64, feed: EngineFeedSender) -> Self {
+        Self {
+            state: Arc::default(),
+            saved_id: saved_id.to_string(),
+            generation,
+            feed,
+        }
+    }
+
+    /// One launch, unless the restart has given up.
+    fn begin(&self) -> Option<LaunchGuard> {
+        let mut state = self.state.lock().expect("launch gate");
+        if state.revoked {
+            return None;
+        }
+        state.in_flight += 1;
+        Some(LaunchGuard(self.clone()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_for_test(&self) -> impl Drop {
+        self.begin().expect("an open gate")
+    }
+
+    /// No launch starts from now on. `true` while one is still out.
+    pub(crate) fn revoke(&self) -> bool {
+        let mut state = self.state.lock().expect("launch gate");
+        state.revoked = true;
+        state.in_flight > 0
+    }
+}
+
+/// One launch out; dropped when its launcher has been reaped.
+struct LaunchGuard(LaunchGate);
+
+impl Drop for LaunchGuard {
+    fn drop(&mut self) {
+        let gate = &self.0;
+        let settled = {
+            let mut state = gate.state.lock().expect("launch gate");
+            state.in_flight -= 1;
+            state.in_flight == 0
+        };
+        if settled {
+            gate.feed.send(EngineFeed::HostAction(Box::new(
+                crate::app::session_actions::ActionEvent::LaunchSettled {
+                    saved_id: gate.saved_id.clone(),
+                    generation: gate.generation,
+                },
+            )));
+        }
+    }
 }
 
 /// The scale every budget in this module is stretched by, read once.
@@ -260,6 +364,13 @@ fn op_budget(op: &str) -> Duration {
 /// how patient this particular client feels.
 const SPAWN_VERDICT_BUDGET: Duration = session_launch::DEFAULT_VERDICT_BUDGET;
 const SPAWN_CONFIRM_BUDGET: Duration = session_launch::DEFAULT_CONFIRM_BUDGET;
+
+/// How long a restart's launch that ended without a serving session is
+/// still counted as out: `roost-session`'s own readiness budget
+/// (`PARENT_READY_TIMEOUT`). A launcher that gave up waiting leaves its
+/// daemon starting, and that daemon may yet bind; until the socket
+/// answers or this passes, nobody can say it will not.
+const DAEMON_START_GRACE: Duration = Duration::from_secs(30);
 
 /// How long a disconnected task may keep unwinding before it stops
 /// waiting for anything at all.
@@ -722,7 +833,7 @@ async fn open_control(
         &config.client_build,
         config.transport.restart_action(),
     )
-    .map_err(|mismatch| AttemptError::Incompatible(Box::new(mismatch)))?;
+    .map_err(AttemptError::Incompatible)?;
     let facts = ConnectFacts::new(&identity, &config.client_build, compatibility);
     if facts.reduced_fidelity {
         // Warn, not info: the connection is a working connection, but
@@ -869,13 +980,112 @@ async fn spawn_session(
             no_session_at(&config.socket)
         )));
     }
-    let scale = scale();
+    if let Some(pinned) = &config.spawn_bin {
+        return pinned_spawn(pinned, config.socket.clone(), first_project).await;
+    }
     let bin = session_launch::locate_session_binary(
         std::env::var_os(session_launch::BIN_ENV).as_deref(),
         std::env::current_exe().ok().as_deref(),
         std::env::var_os("PATH").as_deref(),
     )
-    .map_err(|error| spawn_failure(SpawnStage::Locate, &error))?;
+    .map_err(|error| spawn_failure(SpawnStage::Locate, &error))?
+    .path;
+    launch_from(&bin, &config.socket, first_project).await
+}
+
+/// A restart's launch, of its pinned target and nothing else.
+///
+/// Run as a task of its own and awaited, rather than inline: a
+/// disconnect drops the attempt waiting on it, and a launcher dropped
+/// mid-start would leave a session coming up with nobody holding the
+/// restart. Detached, it runs to its own verdict and reap — bounded by
+/// the launch budgets — and its [`LaunchGuard`] reports it settled.
+async fn pinned_spawn(
+    pinned: &SpawnPin,
+    socket: PathBuf,
+    first_project: FirstProject,
+) -> Result<(), AttemptError> {
+    pinned_spawn_within(
+        pinned,
+        socket,
+        first_project,
+        DAEMON_START_GRACE.mul_f64(scale()),
+    )
+    .await
+}
+
+/// [`pinned_spawn`], with the grace a launch that did not end serving is
+/// held for. The attempt hears the launch's answer as soon as there is
+/// one; only the launch's guard waits out the grace.
+async fn pinned_spawn_within(
+    pinned: &SpawnPin,
+    socket: PathBuf,
+    first_project: FirstProject,
+    grace: Duration,
+) -> Result<(), AttemptError> {
+    let Some(guard) = pinned.launches.begin() else {
+        return Err(AttemptError::Unrecoverable {
+            reason: "the restart was cancelled; nothing was started".to_string(),
+            detail: format!(
+                "the restart onto {} was given up on before it was launched",
+                pinned.path.display()
+            ),
+        });
+    };
+    let pinned = pinned.clone();
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _guard = guard;
+        let bin = match pinned_binary(&pinned).await {
+            Ok(bin) => bin,
+            Err(refused) => {
+                let _ = answer.send(Err(refused));
+                return;
+            }
+        };
+        let launched = launch_from(&bin, &socket, first_project).await;
+        let unknown = launched.is_err();
+        let _ = answer.send(launched);
+        if unknown {
+            await_serving(&socket, grace).await;
+        }
+    });
+    answered.await.unwrap_or_else(|_| {
+        Err(AttemptError::Transport(
+            "the launch ended without an answer".to_string(),
+        ))
+    })
+}
+
+/// Until a session answers `session.identify` at `socket`, or `grace`
+/// has passed. Only an answer counts: a socket nobody answers on, or a
+/// path that is not one, says nothing about the daemon.
+async fn await_serving(socket: &Path, grace: Duration) {
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        let budget = left.min(Duration::from_secs(1));
+        if let Ok(Ok(_)) =
+            tokio::time::timeout(budget, session_launch::identify(socket, budget)).await
+        {
+            return;
+        }
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(left.min(Duration::from_millis(100))).await;
+    }
+}
+
+/// Launch `bin` for `socket`, from this process's own directory and
+/// state seam.
+async fn launch_from(
+    bin: &Path,
+    socket: &Path,
+    first_project: FirstProject,
+) -> Result<(), AttemptError> {
+    let scale = scale();
     // A first-ever session seeds its project at its own `$HOME`, not
     // this cwd (plan 063 §D4) — the hint below is passed on regardless,
     // purely so the session's log can say where it was spawned from; a
@@ -888,22 +1098,51 @@ async fn spawn_session(
     })?;
 
     // Read here rather than inside the launcher, beside the `BIN_ENV`
-    // read above: the launcher is a function of what it is handed, and
-    // this is the process whose state dir the derivation is relative
-    // to. A daemon that inherited the raw value would refuse this UI's
-    // own `state.lock` (#397).
+    // read: the launcher is a function of what it is handed, and this is
+    // the process whose state dir the derivation is relative to. A
+    // daemon that inherited the raw value would refuse this UI's own
+    // `state.lock` (#397).
     let seam = std::env::var_os(roost_ipc::paths::STATE_DIR_ENV);
 
     launch_session(
-        &bin.path,
+        bin,
         &cwd,
         seam.as_deref(),
         first_project,
-        &config.socket,
+        socket,
         SPAWN_VERDICT_BUDGET.mul_f64(scale),
         SPAWN_CONFIRM_BUDGET.mul_f64(scale),
     )
     .await
+}
+
+/// A restart's pinned target, if it still identifies as the build the
+/// restart agreed to. Settles the attempt otherwise, naming the target:
+/// the ladder's pick could be a build nobody agreed to.
+async fn pinned_binary(pinned: &SpawnPin) -> Result<PathBuf, AttemptError> {
+    let path = pinned.path.display();
+    let found = roost_ipc::bootstrap::local_identity(&pinned.path)
+        .await
+        .map(|identity| BuildId::from(&identity));
+    match found {
+        Ok(build) if build == pinned.identity => Ok(pinned.path.clone()),
+        Ok(build) => Err(AttemptError::Unrecoverable {
+            reason: format!("restart target {path} changed; nothing was started"),
+            detail: format!(
+                "the restart was aimed at {path} as roost-session {}, which now identifies as \
+                 {}; nothing was started",
+                roost_ui_model::session_update::describe(&pinned.identity),
+                roost_ui_model::session_update::describe(&build)
+            ),
+        }),
+        Err(error) => Err(AttemptError::Unrecoverable {
+            reason: format!("restart target {path} is gone; nothing was started"),
+            detail: format!(
+                "the restart was aimed at {path}, which no longer runs ({error}); nothing was \
+                 started"
+            ),
+        }),
+    }
 }
 
 /// Run a located launcher and confirm what it says.
@@ -2188,7 +2427,323 @@ mod tests {
             theme: Arc::new(Mutex::new(super::super::blank_theme())),
             uploads: Uploads::default(),
             serving: queue::Serving::default(),
+            spawn_bin: None,
         }
+    }
+
+    /// A stub `roost-session` that identifies as `version` and leaves a
+    /// mark if anything ever tries to start it.
+    fn stub_session(dir: &Path, version: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("roost-session");
+        let started = dir.join("started");
+        let identity = serde_json::json!({
+            "app_version": version,
+            "session_protocol": roost_ipc::messages::SESSION_PROTOCOL_VERSION,
+            "libghostty_build": "g",
+        });
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = identify ]; then printf '%s\\n' '{identity}'; exit 0; fi\n\
+                 touch '{}'\nexit 1\n",
+                started.display()
+            ),
+        )
+        .expect("write the stub");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        (bin, started)
+    }
+
+    fn pin(path: PathBuf, version: &str) -> SpawnPin {
+        SpawnPin {
+            launches: LaunchGate::new("h1", 1, crate::engine_feed::channel().0),
+            path,
+            identity: BuildId {
+                version: version.into(),
+                protocol: roost_ipc::messages::SESSION_PROTOCOL_VERSION,
+                libghostty_build: "g".into(),
+                ..BuildId::default()
+            },
+        }
+    }
+
+    /// A restart's pinned target is the only thing a spawn may run, and
+    /// it is re-identified right before it runs (plan 076 D8): missing
+    /// or changed, the attempt settles naming it, nothing is started,
+    /// and the launch ladder is never consulted.
+    #[tokio::test]
+    async fn a_pinned_target_that_is_gone_or_changed_starts_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (bin, started) = stub_session(dir.path(), "0.0.22");
+        let mut config = config(
+            dir.path().join("absent.sock"),
+            HostTransport::LocalSession,
+            ConnectMode::SpawnIfMissing,
+        );
+        let shown = bin.display().to_string();
+
+        config.spawn_bin = Some(pin(bin.clone(), "0.0.23"));
+        match spawn_session(&config, FirstProject::Seed).await {
+            Err(AttemptError::Unrecoverable { reason, .. }) => {
+                assert_eq!(
+                    reason,
+                    format!("restart target {shown} changed; nothing was started")
+                );
+            }
+            other => panic!("a changed target must not start: {other:?}"),
+        }
+
+        config.spawn_bin = Some(pin(dir.path().join("missing"), "0.0.22"));
+        match spawn_session(&config, FirstProject::Seed).await {
+            Err(AttemptError::Unrecoverable { reason, .. }) => {
+                assert!(
+                    reason.ends_with("missing is gone; nothing was started"),
+                    "{reason}"
+                );
+            }
+            other => panic!("a missing target must not start: {other:?}"),
+        }
+        assert!(!started.exists(), "nothing may have been launched");
+
+        assert_eq!(
+            pinned_binary(&pin(bin.clone(), "0.0.22"))
+                .await
+                .expect("unchanged"),
+            bin
+        );
+    }
+
+    /// The last settle of each launch a gate saw, from its feed.
+    async fn launch_settled(feed: &mut crate::engine_feed::EngineFeedReceiver) -> u64 {
+        let mut batch = crate::engine_feed::EngineBatch::default();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while tokio::time::Instant::now() < deadline {
+            while let Some(item) = feed.try_next(&mut batch) {
+                if let EngineFeed::HostAction(event) = item {
+                    if let crate::app::session_actions::ActionEvent::LaunchSettled {
+                        generation,
+                        ..
+                    } = *event
+                    {
+                        return generation;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no launch settled");
+    }
+
+    /// Plan 076 D8: a restart given up on stops its pin launching
+    /// anything more, and says whether a launch is still out; the last
+    /// one out reports itself settled, naming the restart.
+    #[tokio::test]
+    async fn a_revoked_gate_launches_nothing_and_reports_the_last_launch_settled() {
+        let (feed, mut rx) = crate::engine_feed::channel();
+        let gate = LaunchGate::new("h1", 42, feed);
+        let first = gate.begin().expect("open");
+        let second = gate.begin().expect("open");
+        assert!(gate.revoke(), "two launches are out");
+        assert!(gate.begin().is_none(), "nothing launches once revoked");
+        drop(first);
+        let mut batch = crate::engine_feed::EngineBatch::default();
+        assert!(
+            std::iter::from_fn(|| rx.try_next(&mut batch))
+                .next()
+                .is_none(),
+            "a launch is still out, so nothing has settled"
+        );
+        drop(second);
+        assert_eq!(launch_settled(&mut rx).await, 42);
+        assert!(!gate.revoke(), "nothing is out any more");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (bin, started) = stub_session(dir.path(), "0.0.22");
+        let mut config = config(
+            dir.path().join("absent.sock"),
+            HostTransport::LocalSession,
+            ConnectMode::SpawnIfMissing,
+        );
+        let revoked = pin(bin, "0.0.22");
+        revoked.launches.revoke();
+        config.spawn_bin = Some(revoked);
+        match spawn_session(&config, FirstProject::Seed).await {
+            Err(AttemptError::Unrecoverable { reason, .. }) => {
+                assert_eq!(reason, "the restart was cancelled; nothing was started");
+            }
+            other => panic!("a cancelled restart must not launch: {other:?}"),
+        }
+        assert!(!started.exists());
+    }
+
+    /// A restart's stub `roost-session`: it identifies as 0.0.22, and its
+    /// `start` runs `body`.
+    fn launching_stub(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("roost-session");
+        let identity = serde_json::json!({
+            "app_version": "0.0.22",
+            "session_protocol": roost_ipc::messages::SESSION_PROTOCOL_VERSION,
+            "libghostty_build": "g",
+        });
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = identify ]; then printf '%s\\n' '{identity}'; exit 0; fi\n{body}"
+            ),
+        )
+        .expect("write the stub");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        bin
+    }
+
+    async fn until_exists(path: &Path) {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A disconnect drops the attempt waiting on a restart's launch; the
+    /// launcher it started runs on to its own end rather than being
+    /// killed or orphaned, and only then is the launch settled.
+    #[tokio::test]
+    async fn a_pinned_launch_outlives_the_attempt_that_started_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let started = dir.path().join("started");
+        let release = dir.path().join("release");
+        let finished = dir.path().join("finished");
+        let bin = launching_stub(
+            dir.path(),
+            &format!(
+                "touch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\ntouch '{}'\n\
+                 printf 'error: a stub\\n'\nexit 1\n",
+                started.display(),
+                release.display(),
+                finished.display()
+            ),
+        );
+        let (feed, mut rx) = crate::engine_feed::channel();
+        let mut pinned = pin(bin, "0.0.22");
+        pinned.launches = LaunchGate::new("h1", 7, feed);
+        let socket = dir.path().join("absent.sock");
+
+        tokio::select! {
+            outcome = pinned_spawn_within(&pinned, socket.clone(), FirstProject::Seed, Duration::ZERO) => {
+                panic!("the launcher is held until released: {outcome:?}")
+            }
+            () = until_exists(&started) => {}
+        }
+        assert!(pinned.launches.revoke(), "its launch is still out");
+        std::fs::write(&release, b"").expect("release the launcher");
+        assert_eq!(launch_settled(&mut rx).await, 7);
+        assert!(
+            finished.exists(),
+            "the launcher ran to its own end before the launch settled"
+        );
+    }
+
+    /// A launch that ended without a serving session — the launcher gave
+    /// up waiting, as a real one does, with its daemon still starting — is
+    /// held as out until something answers at the socket, and settles
+    /// then rather than at the launcher's answer.
+    #[tokio::test]
+    async fn a_launch_whose_daemon_may_still_bind_is_held_until_it_answers() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let bin = launching_stub(
+            dir.path(),
+            "printf 'error: the session did not report ready in time\\n'\nexit 1\n",
+        );
+        let (feed, mut rx) = crate::engine_feed::channel();
+        let mut pinned = pin(bin, "0.0.22");
+        pinned.launches = LaunchGate::new("h1", 9, feed);
+        let socket = dir.path().join("late.sock");
+
+        let outcome = pinned_spawn_within(
+            &pinned,
+            socket.clone(),
+            FirstProject::Seed,
+            DAEMON_START_GRACE,
+        )
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the attempt hears the failure at once: {outcome:?}"
+        );
+        let mut batch = crate::engine_feed::EngineBatch::default();
+        assert!(
+            std::iter::from_fn(|| rx.try_next(&mut batch))
+                .next()
+                .is_none(),
+            "the daemon's fate is unknown, so the launch is still out"
+        );
+        assert!(pinned.launches.revoke());
+
+        let daemon = tokio::net::UnixListener::bind(&socket).expect("bind the late daemon");
+        tokio::spawn(answer_identify(daemon));
+        assert_eq!(launch_settled(&mut rx).await, 9);
+    }
+
+    /// A stand-in session that answers `session.identify` and nothing
+    /// else.
+    async fn answer_identify(listener: tokio::net::UnixListener) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let (read, mut write) = stream.into_split();
+                let mut lines = tokio::io::BufReader::new(read).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let request: serde_json::Value =
+                        serde_json::from_str(&line).expect("a request");
+                    let id = request["id"]
+                        .as_str()
+                        .and_then(|id| id.parse().ok())
+                        .expect("an id");
+                    let answer = roost_ipc::messages::Response::ok(
+                        id,
+                        serde_json::to_value(roost_ipc::messages::SessionIdentify::default())
+                            .expect("an identity"),
+                    );
+                    let mut frame = serde_json::to_vec(&answer).expect("a frame");
+                    frame.push(b'\n');
+                    if write.write_all(&frame).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
+    /// Nothing short of an answer ends the wait: a path that is not a
+    /// socket, or a socket that accepts and never answers, keeps the
+    /// launch out for the whole grace.
+    #[tokio::test(start_paused = true)]
+    async fn only_an_answering_session_ends_the_grace_early() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let grace = Duration::from_secs(30);
+
+        let file = dir.path().join("not-a-socket");
+        std::fs::write(&file, b"").expect("a regular file");
+        let started = tokio::time::Instant::now();
+        await_serving(&file, grace).await;
+        assert!(started.elapsed() >= grace, "a regular file is no session");
+
+        let silent = dir.path().join("silent.sock");
+        let _held = tokio::net::UnixListener::bind(&silent).expect("bind");
+        let started = tokio::time::Instant::now();
+        await_serving(&silent, grace).await;
+        assert!(
+            started.elapsed() >= grace,
+            "a socket nobody answers on is no session"
+        );
+
+        let answering = dir.path().join("answering.sock");
+        tokio::spawn(answer_identify(
+            tokio::net::UnixListener::bind(&answering).expect("bind"),
+        ));
+        let started = tokio::time::Instant::now();
+        await_serving(&answering, grace).await;
+        assert!(started.elapsed() < grace, "an answer ends the wait");
     }
 
     /// A dial-mode attempt never probes and never spawns, which is what

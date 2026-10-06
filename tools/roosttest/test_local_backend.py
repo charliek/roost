@@ -3661,3 +3661,81 @@ def test_a_font_change_reaches_every_session_tabs_shell(lane: Lane):
                 if not line.strip().startswith("font-size")
             )
         )
+
+
+def test_the_slot_reports_where_its_session_stands_against_this_client(lane: Lane):
+    """Plan 076 AC3, on the slot: it is an ordinary localhost host, so it
+    carries the same `host.status.update`. A client pretending to be
+    0.0.1 (`ROOST_TEST_CLIENT_VERSION`, classification only) finds the
+    session it started newer than itself, and the binary that started it
+    — the only restart candidate under `ROOST_SESSION_BIN` — still usable,
+    because it is not older than what is running."""
+    roost = session_ui(lane, extra_env={"ROOST_TEST_CLIENT_VERSION": "0.0.1"})
+    slot = local_band(roost)["saved_id"]
+    version = lane.env.identify()["app_version"]
+
+    def resolved() -> dict | None:
+        update = roost.host_status(slot)["hosts"][0].get("update")
+        if update is None or "target" not in update["restart"]:
+            return None
+        return update
+
+    update = wait_until(resolved, 60.0, "the slot's restart candidate")
+    assert update["state"] == "session-newer", update
+    assert update["blocked"] is False, update
+    assert update["client"]["version"] == "0.0.1", update
+    assert update["session"]["version"] == version, update
+    assert update["restart"]["offered"] is True, update
+    assert update["restart"]["target"]["source"] == "override", update
+    assert update["restart"]["target"]["version"] == version, update
+
+
+def test_restarting_the_slot_keeps_its_layout_and_the_window(lane: Lane):
+    """Plan 076 AC9: Restart Session on the slot is the localhost
+    restart, and the slot is where this window's own tabs live. Every
+    project and tab comes back in its directory on a new session, and
+    the window never leaves `session` mode or stops answering."""
+    roost = session_ui(lane)
+    slot = local_band(roost)["saved_id"]
+    project = int(lane.session_projects()[0]["id"])
+    with lane.session() as c:
+        c.open_tab(project, cwd="/tmp", title="second-tab")
+    second = lane.env.root / "beta"
+    second.mkdir(exist_ok=True)
+    with lane.session() as c:
+        beta = c.create_project(name="beta", cwd=str(second))
+        c.open_tab(beta, cwd=str(second))
+
+    def shape() -> list[tuple]:
+        return [
+            (p["name"], tuple(t["cwd"] for t in p["tabs"])) for p in lane.session_projects()
+        ]
+
+    def three_tabs() -> list[tuple] | None:
+        now = shape()
+        return now if sum(len(cwds) for _, cwds in now) >= 3 else None
+
+    before = wait_until(three_tabs, 60.0, "three tabs across two projects on the slot")
+    session_id = lane.env.identify()["session_id"]
+
+    def resolved() -> dict | None:
+        update = roost.host_status(slot)["hosts"][0].get("update")
+        return update if update is not None and "target" in update["restart"] else None
+
+    wait_until(resolved, 60.0, "the slot's restart target")
+    assert roost.call("host.restart", {"id": slot, "confirm": True}) == {"accepted": True}
+
+    def restarted() -> dict | None:
+        row = roost.host_status(slot)["hosts"][0]
+        connect = row.get("connect")
+        update = row.get("update")
+        if connect is None or update is None or connect["session_id"] == session_id:
+            return None
+        return row if update.get("action", {}).get("phase") in ("done", "failed") else None
+
+    row = wait_until(restarted, 180.0, "the slot to come back on a new session")
+    assert row["update"]["action"]["phase"] == "done", row
+    assert lane.env.identify()["session_id"] == row["connect"]["session_id"]
+    assert shape() == before, "every project and tab reopens in its directory"
+    assert roost.identify()["local_backend"] == "session"
+    assert local_band(roost)["saved_id"] == slot

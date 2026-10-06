@@ -1102,7 +1102,10 @@ pub struct AppContextMenuDumpResult {
     pub entries: Vec<AppContextMenuEntry>,
 }
 
-/// One menu row: an item, or `{"separator": true}`.
+/// One menu row: an item, `{"separator": true}`, or a header's text.
+///
+/// Untagged, so the variant is the field set; `Header` is last so a
+/// payload with no header in it decodes exactly as it always did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum AppContextMenuEntry {
@@ -1114,6 +1117,10 @@ pub enum AppContextMenuEntry {
     },
     Separator {
         separator: bool,
+    },
+    /// Text only: never chosen, and not an item to activate.
+    Header {
+        header: String,
     },
 }
 
@@ -2007,6 +2014,10 @@ pub struct SidebarDumpSection {
     /// pill's action, absent when the band draws no pill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fidelity: Option<String>,
+    /// `"needs update"` | `"update Roost"` — the band's must-act pill
+    /// (plan 076 D6), absent when it draws none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_pill: Option<String>,
 }
 
 /// `app.sidebar_dump` response — the sidebar's **last-rendered** agent
@@ -2412,6 +2423,14 @@ pub struct SessionBinaryIdentity {
     pub app_version: String,
     pub session_protocol: u32,
     pub libghostty_build: String,
+    /// Built outside the release workflow (plan 076 D2). Absent on the
+    /// wire for a release build, and from every binary that predates it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dev: bool,
+    /// The commit this binary was built from, 7 hex characters, when
+    /// the build could read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_sha: Option<String>,
 }
 
 /// `session.identify` result — the first thing a client asks a host
@@ -2441,6 +2460,17 @@ pub struct SessionIdentify {
     /// for this socket. Absent from an older session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ops: Option<Vec<String>>,
+    /// As [`SessionBinaryIdentity::dev`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dev: bool,
+    /// As [`SessionBinaryIdentity::git_sha`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_sha: Option<String>,
+    /// The daemon's own executable, canonicalised once when it started,
+    /// and absent when that did not resolve. A path a peer supplied:
+    /// clients run it only for a session on this machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe_path: Option<String>,
 }
 
 /// `session.identify` params — empty today, a struct (not a bare
@@ -3011,6 +3041,25 @@ pub struct HostStatusParams {
     pub id: Option<String>,
 }
 
+/// `host.update` / `host.restart` request.
+///
+/// `confirm` has to be `true`: both act on a host's software or end its
+/// shells, and a caller that left it out is refused rather than obeyed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostActionParams {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub confirm: bool,
+}
+
+/// What `host.update` / `host.restart` answer: the action was started.
+/// Its outcome is `host.status.update.action`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HostActionResult {
+    pub accepted: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HostStatusResult {
     pub hosts: Vec<HostStatus>,
@@ -3095,6 +3144,87 @@ pub struct HostStatus {
     /// comes and goes.
     #[serde(default)]
     pub tabs: usize,
+    /// Whether this host's session is up to date with this client, and
+    /// what a restart would run (plan 076 D7). Present whenever the
+    /// session's identity is known — connected, or refused at the gate
+    /// (`needs-restart`) — and absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<HostUpdateStatus>,
+}
+
+/// The `update` object on [`HostStatus`] (plan 076 D7).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HostUpdateStatus {
+    /// One of [`host_update_state`]'s spellings.
+    pub state: String,
+    /// Present only for `session-newer`: `true` when the session refused
+    /// this client, which then has to be updated to connect at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked: Option<bool>,
+    /// The running session's build.
+    pub session: BuildStatus,
+    /// This client's build, as the comparison read it.
+    pub client: BuildStatus,
+    /// The newer build already in place on an ssh host — this client's
+    /// own install, or one a probe found — whether or not a restart can
+    /// run it (`restart` says). Absent when nothing newer is installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged: Option<BuildStatus>,
+    pub restart: HostRestartStatus,
+    /// The latest install, restart or update started on this host, kept
+    /// across reconnects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<HostActionStatus>,
+}
+
+/// One install, restart or update, as `host.status` reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HostActionStatus {
+    /// One of [`host_action_kind`]'s spellings.
+    pub kind: String,
+    /// One of [`host_action_phase`]'s spellings.
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// One build, as `host.status` names it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct BuildStatus {
+    pub version: String,
+    /// As [`SessionBinaryIdentity::dev`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dev: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+}
+
+/// Whether Restart Session is offered for a host, and onto what.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HostRestartStatus {
+    pub offered: bool,
+    /// Why it is not offered when no binary a restart could run is
+    /// usable: `missing`, `unreadable`, `older`, `incompatible` or
+    /// `override`. Absent when it is offered, and when the state alone
+    /// rules a restart out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    /// The binary a restart would run, once it has been identified.
+    /// Absent while it has not been checked yet; the confirm resolves it
+    /// afresh either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<RestartTargetStatus>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RestartTargetStatus {
+    pub version: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dev: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    /// `bundled`, `running`, `override` or `installed`.
+    pub source: String,
 }
 
 /// What one connect attempt established about the session it reached
@@ -3171,6 +3301,48 @@ pub mod host_state {
     pub const CONNECTED: &str = "connected";
     pub const STOPPED: &str = "stopped";
     pub const NEEDS_RESTART: &str = "needs-restart";
+}
+
+/// [`HostUpdateStatus::state`]'s spellings.
+pub mod host_update_state {
+    pub const UP_TO_DATE: &str = "up-to-date";
+    pub const AVAILABLE: &str = "available";
+    pub const STAGED: &str = "staged";
+    pub const REQUIRED: &str = "required";
+    pub const SESSION_NEWER: &str = "session-newer";
+    pub const UNORDERED: &str = "unordered";
+    pub const UNKNOWN: &str = "unknown";
+}
+
+/// [`HostRestartStatus::why`]'s spellings.
+pub mod host_restart_why {
+    pub const MISSING: &str = "missing";
+    pub const UNREADABLE: &str = "unreadable";
+    pub const OLDER: &str = "older";
+    pub const INCOMPATIBLE: &str = "incompatible";
+    pub const OVERRIDE: &str = "override";
+}
+
+/// [`HostActionStatus::kind`]'s spellings.
+pub mod host_action_kind {
+    pub const INSTALL: &str = "install";
+    pub const RESTART: &str = "restart";
+    pub const UPDATE: &str = "update";
+}
+
+/// [`HostActionStatus::phase`]'s spellings.
+pub mod host_action_phase {
+    pub const RUNNING: &str = "running";
+    pub const DONE: &str = "done";
+    pub const FAILED: &str = "failed";
+}
+
+/// [`RestartTargetStatus::source`]'s spellings.
+pub mod host_restart_source {
+    pub const BUNDLED: &str = "bundled";
+    pub const RUNNING: &str = "running";
+    pub const OVERRIDE: &str = "override";
+    pub const INSTALLED: &str = "installed";
 }
 
 // ============================================================================
@@ -3991,6 +4163,13 @@ pub mod ops {
     /// [`HOST_CONNECT`]'s reply, and the surface a harness asserts
     /// through instead of scraping the log (plan 042 §3.1).
     pub const HOST_STATUS: &str = "host.status";
+    /// Install this client's `roost-session` on an ssh host without
+    /// restarting it (plan 076 D7). Answers at once; the outcome shows
+    /// in `host.status.update.action`.
+    pub const HOST_UPDATE: &str = "host.update";
+    /// Restart a host's session onto the newest usable build (plan 076
+    /// D4, D8). Answers at once, like [`HOST_UPDATE`].
+    pub const HOST_RESTART: &str = "host.restart";
 }
 
 // ============================================================================
@@ -4359,6 +4538,9 @@ mod tests {
                     enabled: true,
                 },
                 AppContextMenuEntry::Separator { separator: true },
+                AppContextMenuEntry::Header {
+                    header: "mini3 · Session 0.0.22 · up to date".into(),
+                },
             ],
         };
         assert_eq!(
@@ -4366,6 +4548,7 @@ mod tests {
             json!({"entries": [
                 {"action": "close_tab", "label": "Close Tab", "enabled": true},
                 {"separator": true},
+                {"header": "mini3 · Session 0.0.22 · up to date"},
             ]})
         );
         round_trip(&dump);
@@ -5190,6 +5373,7 @@ mod tests {
                     saved_id: Some("hs-2f1c".to_string()),
                     reconnect_row: true,
                     fidelity: None,
+                    update_pill: Some("needs update".to_string()),
                 },
                 SidebarDumpSection {
                     role: "host".to_string(),
@@ -5199,6 +5383,7 @@ mod tests {
                     saved_id: Some("hs-9d40".to_string()),
                     reconnect_row: false,
                     fidelity: Some("update".to_string()),
+                    update_pill: None,
                 },
             ],
         };
@@ -5213,6 +5398,8 @@ mod tests {
             band.get("fidelity").is_none(),
             "a band with no pill omits the key"
         );
+        assert_eq!(band["update_pill"], "needs update");
+        assert!(encoded["sections"][1].get("update_pill").is_none());
     }
 
     #[test]
@@ -5566,6 +5753,23 @@ mod tests {
     }
 
     #[test]
+    fn host_action_params_default_to_unconfirmed() {
+        let bare: HostActionParams = serde_json::from_str(r#"{"id":"h"}"#).unwrap();
+        assert!(!bare.confirm);
+        let confirmed = HostActionParams {
+            id: "h".into(),
+            confirm: true,
+        };
+        round_trip(&confirmed);
+        assert_eq!(
+            serde_json::to_value(&confirmed).unwrap(),
+            serde_json::json!({"id": "h", "confirm": true})
+        );
+        assert!(serde_json::from_str::<HostActionParams>(r#"{"id":"h","force":true}"#).is_err());
+        round_trip(&HostActionResult { accepted: true });
+    }
+
+    #[test]
     fn host_status_round_trips() {
         round_trip(&HostStatusParams::default());
         round_trip(&HostStatusParams {
@@ -5602,6 +5806,7 @@ mod tests {
             payload_kind: None,
             connect: None,
             tabs: 0,
+            update: None,
         };
         round_trip(&armed);
         // #399: `reason` says *why* the rung is armed while the band's
@@ -5675,6 +5880,110 @@ mod tests {
                 "resumed": true,
                 "from_revision": 4_312,
             })
+        );
+
+        // Plan 076 D7: `update` is omitted, never null, without identity
+        // facts, and inside it every optional field is omitted too.
+        assert!(serde_json::to_value(&resumed)
+            .unwrap()
+            .get("update")
+            .is_none());
+        let staged = HostStatus {
+            update: Some(HostUpdateStatus {
+                state: host_update_state::STAGED.into(),
+                blocked: None,
+                session: BuildStatus {
+                    version: "0.0.21".into(),
+                    ..BuildStatus::default()
+                },
+                client: BuildStatus {
+                    version: "0.0.22".into(),
+                    dev: true,
+                    sha: Some("a1b2c3d".into()),
+                },
+                staged: None,
+                restart: HostRestartStatus {
+                    offered: true,
+                    why: None,
+                    target: Some(RestartTargetStatus {
+                        version: "0.0.22".into(),
+                        dev: false,
+                        sha: None,
+                        source: "bundled".into(),
+                    }),
+                },
+                action: None,
+            }),
+            ..resumed.clone()
+        };
+        round_trip(&staged);
+        assert_eq!(
+            serde_json::to_value(&staged).unwrap()["update"],
+            serde_json::json!({
+                "state": "staged",
+                "session": {"version": "0.0.21"},
+                "client": {"version": "0.0.22", "dev": true, "sha": "a1b2c3d"},
+                "restart": {
+                    "offered": true,
+                    "target": {"version": "0.0.22", "source": "bundled"},
+                },
+            })
+        );
+        // An ssh host's installed build rides beside a restart that
+        // cannot run it.
+        let installed = HostUpdateStatus {
+            staged: Some(BuildStatus {
+                version: "0.0.23".into(),
+                ..BuildStatus::default()
+            }),
+            restart: HostRestartStatus {
+                offered: false,
+                why: Some("incompatible".into()),
+                target: None,
+            },
+            ..staged.update.clone().unwrap()
+        };
+        round_trip(&installed);
+        let wire = serde_json::to_value(&installed).unwrap();
+        assert_eq!(wire["staged"], serde_json::json!({"version": "0.0.23"}));
+        assert_eq!(
+            wire["restart"],
+            serde_json::json!({"offered": false, "why": "incompatible"})
+        );
+        let blocked = HostUpdateStatus {
+            state: host_update_state::SESSION_NEWER.into(),
+            blocked: Some(true),
+            restart: HostRestartStatus {
+                offered: false,
+                why: Some("older".into()),
+                target: None,
+            },
+            ..HostUpdateStatus::default()
+        };
+        round_trip(&blocked);
+        let wire = serde_json::to_value(&blocked).unwrap();
+        assert_eq!(wire["blocked"], true);
+        assert!(wire.get("action").is_none());
+        let acting = HostUpdateStatus {
+            action: Some(HostActionStatus {
+                kind: host_action_kind::RESTART.into(),
+                phase: host_action_phase::FAILED.into(),
+                message: Some("the session changed; check again".into()),
+            }),
+            ..blocked.clone()
+        };
+        round_trip(&acting);
+        assert_eq!(
+            serde_json::to_value(&acting).unwrap()["action"],
+            serde_json::json!({
+                "kind": "restart",
+                "phase": "failed",
+                "message": "the session changed; check again",
+            })
+        );
+        assert_eq!(
+            wire["restart"],
+            serde_json::json!({"offered": false, "why": "older"})
         );
 
         // A fresh snapshot resumed from nothing, so the fence is omitted

@@ -326,6 +326,7 @@ fn host_verb_items(
         slot,
     )
     .into_iter()
+    .filter(|verb| verb.surfaces.palette)
     .map(|verb| {
         let trailing = (verb.id == host_verbs::NEW_PROJECT_ON_ID)
             .then_some(new_project_on_shortcut)
@@ -1761,16 +1762,25 @@ impl App {
                 self.clear_palette_state();
                 self.open_host_stop_dialog(&saved_id, &label);
             }
-            // **Neither consults `origin`**, exactly like `Stop` above.
+            // **None consults `origin`**, exactly like `Stop` above.
             // Plan 039 §3.5's rule is that a machine is never *prompted
-            // by a connect it did not ask for*; these two exist only on
-            // a person's connected, reduced-fidelity host, and their
-            // first remote activity is a consent card. Listing them is
-            // still gated on `HostRow.fidelity`, which nothing fills in
-            // until the sidebar does.
-            HostVerb::Update(saved_id) | HostVerb::Restart(saved_id) => {
+            // by a connect it did not ask for*; these are listed only
+            // when the update facts offer them, and their first remote
+            // activity is a card (plan 076 D7).
+            HostVerb::Update(saved_id) => {
                 self.clear_palette_state();
-                self.host_fidelity_action_requested(&saved_id);
+                self.host_update_requested(&saved_id)
+                    .map_err(|failure| failure.message)?;
+            }
+            HostVerb::Install(saved_id) => {
+                self.clear_palette_state();
+                self.host_install_requested(&saved_id, false)
+                    .map_err(|failure| failure.message)?;
+            }
+            HostVerb::Restart(saved_id) => {
+                self.clear_palette_state();
+                self.host_session_restart_requested(&saved_id, false)
+                    .map_err(|failure| failure.message)?;
             }
             HostVerb::Remove(saved_id) => {
                 self.clear_palette_state();
@@ -1851,7 +1861,7 @@ impl App {
                     .id
             }
         };
-        Ok(self.connect_then_create(&saved_id, origin))
+        self.connect_then_create(&saved_id, origin)
     }
 
     /// A row that names a host this client has to reach before it can
@@ -1870,23 +1880,25 @@ impl App {
         &mut self,
         saved_id: &str,
         origin: crate::host_conn::RequestOrigin,
-    ) -> EngineDispatch {
+    ) -> Result<EngineDispatch, String> {
         self.set_sidebar_collapsed(false);
         // Connected already: this row should have carried the ordinary
         // create-on-a-host id, but the frame may have been built a
         // moment ago — create now rather than dialing a live connection.
         if let Some(host) = self.hosts.incarnation(saved_id) {
             if self.interactive_host_view(host).is_some() {
-                return self.create_project_on(host);
+                return Ok(self.create_project_on(host));
             }
         }
+        self.refuse_connect_during_action(saved_id)
+            .map_err(|failure| failure.message)?;
         self.host_reconnect_for(
             saved_id,
             origin,
             crate::host_conn::AttemptCause::Explicit,
             local_backend::ConnectPurpose::CreateAfterConnect,
         );
-        EngineDispatch::default()
+        Ok(EngineDispatch::default())
     }
 
     /// A recents row (plan 063 §D7): save the forgotten host again and
@@ -1919,7 +1931,7 @@ impl App {
             .host_add_requested(&label, &recent.target, None)
             .map_err(|error| format!("could not save {}: {error}", recent.label))?;
         if create {
-            return Ok(self.connect_then_create(&host.id, origin));
+            return self.connect_then_create(&host.id, origin);
         }
         self.host_reconnect_requested(&host.id, origin, crate::host_conn::AttemptCause::Explicit);
         Ok(EngineDispatch::default())
@@ -1931,6 +1943,11 @@ impl App {
             .iter()
             .find(|view| view.saved_id == saved_id)
             .map(|view| view.label.clone())
+    }
+
+    pub(super) fn label_or_id(&self, saved_id: &str) -> String {
+        self.host_label(saved_id)
+            .unwrap_or_else(|| saved_id.to_string())
     }
 
     /// Refresh the host rows under an open palette.
@@ -3278,6 +3295,7 @@ mod tests {
             state: host_sidebar::SectionState::Connected,
             transport: host_sidebar::HostTransportKind::Ssh,
             fidelity: None,
+            update: None,
         }];
 
         let frame = command_palette_frame(
@@ -3342,6 +3360,7 @@ mod tests {
             state: host_sidebar::SectionState::Connected,
             transport: host_sidebar::HostTransportKind::Ssh,
             fidelity: None,
+            update: None,
         }];
         let frame = host_picker_frame(&hosts, &[], IN_PROCESS);
         assert_eq!(frame.id, HOST_PICKER_FRAME_ID);
@@ -3363,6 +3382,7 @@ mod tests {
             state: host_sidebar::SectionState::Disconnected,
             transport: host_sidebar::HostTransportKind::Ssh,
             fidelity: None,
+            update: None,
         }];
         let items = host_verb_items(
             &hosts,

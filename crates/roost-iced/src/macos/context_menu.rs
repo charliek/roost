@@ -159,6 +159,10 @@ pub(crate) fn pop_up(
                 menu.addItem(&item);
             }
             NativeRow::Separator => menu.addItem(&NSMenuItem::separatorItem(mtm)),
+            NativeRow::Header { title } => menu.addItem(&NSMenuItem::sectionHeaderWithTitle(
+                &NSString::from_str(title),
+                mtm,
+            )),
         }
     }
 

@@ -23,6 +23,7 @@ use roost_ipc::bootstrap::{
     BootstrapError, BootstrapJob, BootstrapOptions, IdentityGate, Probe, ProbeOutcome, RemoteArch,
 };
 use roost_ipc::messages::{SessionBinaryIdentity, SESSION_PROTOCOL_VERSION};
+use roost_ipc::session_version::BuildId;
 use roost_ipc::ssh::{SshTarget, SshTunnelOptions};
 
 use crate::host_conn::state::Skew;
@@ -40,7 +41,41 @@ pub(crate) fn client_identity() -> SessionBinaryIdentity {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         session_protocol: SESSION_PROTOCOL_VERSION,
         libghostty_build: roost_vt::libghostty_build(),
+        dev: env!("ROOST_BUILD_DEV") == "1",
+        git_sha: Some(env!("ROOST_BUILD_SHA"))
+            .filter(|sha| !sha.is_empty())
+            .map(str::to_string),
     }
+}
+
+/// Test-mode override for this client's version in update
+/// classification only (plan 076 D2). Never applied to
+/// [`client_identity`], which is what an install has to equal: a test
+/// that pretends to be an older client must not make the installer
+/// fetch an asset of that version.
+pub(crate) const TEST_CLIENT_VERSION_ENV: &str = "ROOST_TEST_CLIENT_VERSION";
+
+/// This client's build, as the update logic orders sessions against it.
+pub(crate) fn client_build_id() -> &'static BuildId {
+    static BUILD: std::sync::OnceLock<BuildId> = std::sync::OnceLock::new();
+    BUILD.get_or_init(|| {
+        let test_mode = std::env::var("ROOST_TEST_MODE").as_deref() == Ok("1");
+        classification_build(
+            &client_identity(),
+            test_mode
+                .then(|| std::env::var(TEST_CLIENT_VERSION_ENV).ok())
+                .flatten()
+                .as_deref(),
+        )
+    })
+}
+
+fn classification_build(identity: &SessionBinaryIdentity, version: Option<&str>) -> BuildId {
+    let mut build = BuildId::from(identity);
+    if let Some(version) = version.filter(|version| !version.is_empty()) {
+        build.version = version.to_string();
+    }
+    build
 }
 
 /// Whether a session is running on the far side, as the *entry point*
@@ -117,9 +152,13 @@ pub(crate) fn offer_for(
 pub(crate) struct OfferContext {
     /// The matrix's second input, as the entry point knows it.
     pub(crate) session: SessionState,
-    /// The session over there is *newer* than this client — a downgrade
-    /// warning, only ever known for a protocol skew.
-    pub(crate) session_is_newer: bool,
+    /// What the person asked for. Everything but [`ProbeIntent::Bootstrap`]
+    /// is one of plan 076's actions on a connected session.
+    pub(crate) intent: ProbeIntent,
+    /// The refused session the update prompt was about, which the card
+    /// and its job stay bound to (plan 076 D8). `None` for an offer about
+    /// a host where nothing is serving.
+    pub(crate) bound_session: Option<String>,
     /// The classified failure the offer is answering, where a connect
     /// attempt is what produced it. `None` for the upgrade prompt's
     /// remote branch (a running session, not a failure) and for the Add
@@ -130,6 +169,47 @@ pub(crate) struct OfferContext {
     /// about a session that is *up and attached*, and it carries the
     /// build pair its reason line prints.
     pub(crate) fidelity: Option<FidelityOffer>,
+}
+
+/// Why a probe went out (plan 076 D7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProbeIntent {
+    /// Plan 039's offer: set up or update a host this client cannot use.
+    Bootstrap,
+    /// Install Update on the session `session_id`. `ticket` is the
+    /// claim an op already holds: act on the answer, raise no card.
+    Install {
+        session_id: String,
+        ticket: Option<u64>,
+    },
+    /// Restart Session on the session `session_id`; `ticket` as above.
+    Restart {
+        session_id: String,
+        ticket: Option<u64>,
+    },
+}
+
+impl ProbeIntent {
+    /// An op is waiting on this answer, so nothing on screen may stop
+    /// it from being acted on.
+    pub(crate) fn ticketed(&self) -> bool {
+        match self {
+            Self::Bootstrap => false,
+            Self::Install { ticket, .. } | Self::Restart { ticket, .. } => ticket.is_some(),
+        }
+    }
+}
+
+/// A plan 076 action riding a bootstrap job: what its end is recorded as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActionTicket {
+    pub(crate) kind: super::session_actions::ActionKind,
+    /// The claim the action holds.
+    pub(crate) generation: u64,
+    /// The build it installs or restarts onto, for the status line.
+    pub(crate) build: BuildId,
+    /// The session it was planned against.
+    pub(crate) session_id: String,
 }
 
 /// The reduced-fidelity connection a card was opened about.
@@ -245,13 +325,15 @@ pub(crate) enum BootstrapVariant {
     Update,
     /// This build is already installed and nothing is serving.
     Start,
+    /// Install alone, under a session that keeps running (plan 076 D7).
+    InstallUpdate,
 }
 
 impl BootstrapVariant {
     /// The primary button.
     pub(crate) fn confirm_label(self) -> &'static str {
         match self {
-            Self::Install => "Install",
+            Self::Install | Self::InstallUpdate => "Install",
             Self::Update => "Update",
             Self::Start => "Start",
         }
@@ -265,6 +347,7 @@ impl BootstrapVariant {
             Self::Install => "install",
             Self::Update => "update",
             Self::Start => "start",
+            Self::InstallUpdate => "install_update",
         }
     }
 }
@@ -294,8 +377,16 @@ pub(crate) struct BootstrapPlan {
     /// success, but a round trip that can only succeed is one the user
     /// waits through for no reason.
     pub(crate) stop: bool,
-    pub(crate) start: StartFrom,
+    /// `None` for Install Update, which leaves the running session alone.
+    pub(crate) start: Option<StartFrom>,
     pub(crate) gate: IdentityGate,
+    /// The build a start from [`StartFrom::Probed`] has to come up as:
+    /// what the probe saw there.
+    pub(crate) target: Option<BuildId>,
+    /// What the job re-checks right before it stops or installs (plan
+    /// 076 D8). `None` for the plan 039 rows, whose offer is re-checked
+    /// by [`offer_still_stands`] at confirm.
+    pub(crate) expect: Option<Expect>,
     /// What the probe actually found on disk, wherever it found it —
     /// `None` when nothing usable is over there at all.
     ///
@@ -309,6 +400,14 @@ pub(crate) struct BootstrapPlan {
     pub(crate) found: Option<String>,
 }
 
+/// What a plan 076 card was built against: the session that must still
+/// be serving, and what the probe found at the exec rung.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Expect {
+    pub(crate) session_id: String,
+    pub(crate) outcome: ProbeOutcome,
+}
+
 /// Where the binary will be once this plan has run — the card's
 /// "where", and the only thing that answers it.
 ///
@@ -318,9 +417,12 @@ pub(crate) struct BootstrapPlan {
 /// than the `$HOME` the install script uses — the card is read by a
 /// person.
 pub(crate) fn card_dest(plan: &BootstrapPlan) -> String {
-    match &plan.start {
-        StartFrom::Probed(path) => path.clone(),
-        StartFrom::Installed => format!("~{}", roost_ipc::bootstrap::INSTALL_DEST_SUFFIX),
+    match (&plan.start, plan.install) {
+        (Some(StartFrom::Probed(path)), _) => path.clone(),
+        (Some(StartFrom::Installed), _) | (None, true) => {
+            format!("~{}", roost_ipc::bootstrap::INSTALL_DEST_SUFFIX)
+        }
+        (None, false) => plan.found.clone().unwrap_or_default(),
     }
 }
 
@@ -335,9 +437,12 @@ pub(crate) fn card_dest(plan: &BootstrapPlan) -> String {
 /// matched, and every in-place upgrade told the user the file it was
 /// about to overwrite (and back up) was "left where it is".
 pub(crate) fn dest_on_disk(plan: &BootstrapPlan, home: &str) -> String {
-    match &plan.start {
-        StartFrom::Probed(path) => path.clone(),
-        StartFrom::Installed => format!("{home}{}", roost_ipc::bootstrap::INSTALL_DEST_SUFFIX),
+    match (&plan.start, plan.install) {
+        (Some(StartFrom::Probed(path)), _) => path.clone(),
+        (Some(StartFrom::Installed), _) | (None, true) => {
+            format!("{home}{}", roost_ipc::bootstrap::INSTALL_DEST_SUFFIX)
+        }
+        (None, false) => plan.found.clone().unwrap_or_default(),
     }
 }
 
@@ -370,19 +475,23 @@ pub(crate) fn plan_bootstrap(outcome: &ProbeOutcome, session: SessionState) -> B
             },
             install: true,
             stop: running,
-            start: StartFrom::Installed,
+            start: Some(StartFrom::Installed),
             gate: IdentityGate::Installed,
+            target: None,
+            expect: None,
             found: None,
         },
         ProbeOutcome::Mismatch { path, .. } => BootstrapPlan {
             variant: BootstrapVariant::Update,
             install: true,
             stop: running,
-            start: StartFrom::Installed,
+            start: Some(StartFrom::Installed),
             gate: IdentityGate::Installed,
+            target: None,
+            expect: None,
             found: Some(path.clone()),
         },
-        ProbeOutcome::Compatible { path } => BootstrapPlan {
+        ProbeOutcome::Compatible { path, identity } => BootstrapPlan {
             variant: if running {
                 BootstrapVariant::Update
             } else {
@@ -390,10 +499,60 @@ pub(crate) fn plan_bootstrap(outcome: &ProbeOutcome, session: SessionState) -> B
             },
             install: false,
             stop: running,
-            start: StartFrom::Probed(path.clone()),
+            start: Some(StartFrom::Probed(path.clone())),
             gate: IdentityGate::Existing,
+            target: Some(BuildId::from(identity)),
+            expect: None,
             found: Some(path.clone()),
         },
+    }
+}
+
+/// Install Update's row (plan 076 D7): install, and nothing else. The
+/// running session and the stream to it are left alone.
+pub(crate) fn install_only_plan(outcome: &ProbeOutcome, session_id: &str) -> BootstrapPlan {
+    let found = match outcome {
+        ProbeOutcome::Missing => None,
+        ProbeOutcome::Compatible { path, .. } | ProbeOutcome::Mismatch { path, .. } => {
+            Some(path.clone())
+        }
+    };
+    BootstrapPlan {
+        variant: BootstrapVariant::InstallUpdate,
+        install: true,
+        stop: false,
+        start: None,
+        gate: IdentityGate::Installed,
+        target: None,
+        expect: Some(Expect {
+            session_id: session_id.to_string(),
+            outcome: outcome.clone(),
+        }),
+        found,
+    }
+}
+
+/// Restart Session's row over ssh (plan 076 D7): stop, then start the
+/// exec rung the probe identified, which has to come up as exactly that
+/// build.
+pub(crate) fn restart_only_plan(
+    outcome: &ProbeOutcome,
+    path: &str,
+    target: &BuildId,
+    session_id: &str,
+) -> BootstrapPlan {
+    BootstrapPlan {
+        variant: BootstrapVariant::Update,
+        install: false,
+        stop: true,
+        start: Some(StartFrom::Probed(path.to_string())),
+        gate: IdentityGate::Existing,
+        target: Some(target.clone()),
+        expect: Some(Expect {
+            session_id: session_id.to_string(),
+            outcome: outcome.clone(),
+        }),
+        found: Some(path.to_string()),
     }
 }
 
@@ -422,10 +581,6 @@ pub(crate) struct CopyInputs<'a> {
     /// [`roost_ipc::bootstrap::SourcePreview::describe`]'s answer.
     pub(crate) source: &'a str,
     pub(crate) plan: &'a BootstrapPlan,
-    /// The session over there is *newer* than this client. Only ever
-    /// known for a protocol skew — two libghostty build strings that
-    /// disagree are merely different (see `host_notice::vintage`).
-    pub(crate) session_is_newer: bool,
     /// The build pair a reduced-fidelity entry point is asking about,
     /// which the card leads with: this user is not being told a session
     /// is unreachable, they are being told why the one they are looking
@@ -451,9 +606,10 @@ pub(crate) struct CopyInputs<'a> {
 ///   running**. Row 2 of the matrix — a mismatched binary with nothing
 ///   serving — installs over a cold host, and telling that user their
 ///   shells will end would be a warning about nothing.
-/// * It says when the install is a **downgrade**, and still offers it.
-///   The user may have a reason; what they may not have is the fact
-///   hidden from them.
+/// * It is never raised to **downgrade** a session. A session newer
+///   than this client gets the blocked card instead (plan 076 D3 rule
+///   1, `host_notice::blocked_prompt`), which offers no install at all:
+///   the side that has to change is this Roost.
 /// * It leads with the **reason**, where the entry point had one. A
 ///   person who pressed `reduced fidelity` on a connected host is owed
 ///   the two builds that disagreed before they are told what an install
@@ -466,7 +622,6 @@ pub(crate) fn bootstrap_copy(inputs: CopyInputs<'_>) -> BootstrapCopy {
         dest_on_disk,
         source,
         plan,
-        session_is_newer,
         fidelity,
     } = inputs;
     let build = format!(
@@ -474,33 +629,42 @@ pub(crate) fn bootstrap_copy(inputs: CopyInputs<'_>) -> BootstrapCopy {
         identity.app_version, identity.libghostty_build
     );
 
+    let replaces = |found: Option<&str>| match found {
+        // The destination is what the probe found: a genuine
+        // overwrite, and the only case that may say so. Compared
+        // against the far side's spelling of the destination — `dest`
+        // itself is `~`-folded for the reader and would never equal a
+        // probe's expanded path.
+        Some(found) if found == dest_on_disk => {
+            format!("{build} will replace what is at {dest} on {label}, from {source}.")
+        }
+        // A different rung — `/usr/bin/roost-session` from a deb, most
+        // often. Nothing at the destination is replaced, and the copy
+        // over there is left alone.
+        Some(found) => format!(
+            "{build} will be installed to {dest} on {label}, from {source}. It goes ahead of \
+             the {found} already there; that copy is left where it is."
+        ),
+        // Nothing usable anywhere, and a session running off something
+        // this client cannot identify.
+        None => format!("{build} will be installed to {dest} on {label}, from {source}."),
+    };
     let (title, mut body) = match plan.variant {
+        BootstrapVariant::InstallUpdate => (
+            format!("Install roost-session {} on {label}?", identity.app_version),
+            format!(
+                "{} The running session keeps going. Restart it when you're ready to use the \
+                 new build.",
+                replaces(plan.found.as_deref())
+            ),
+        ),
         BootstrapVariant::Install => (
             format!("Install roost-session on {label}?"),
             format!("{build} will be installed to {dest} on {label}, from {source}."),
         ),
         BootstrapVariant::Update if plan.install => (
             format!("Update roost-session on {label}?"),
-            match plan.found.as_deref() {
-                // The destination is what the probe found: a genuine
-                // overwrite, and the only case that may say so. Compared
-                // against the far side's spelling of the destination —
-                // `dest` itself is `~`-folded for the reader and would
-                // never equal a probe's expanded path.
-                Some(found) if found == dest_on_disk => {
-                    format!("{build} will replace what is at {dest} on {label}, from {source}.")
-                }
-                // A different rung — `/usr/bin/roost-session` from a
-                // deb, most often. Nothing at the destination is
-                // replaced, and the copy over there is left alone.
-                Some(found) => format!(
-                    "{build} will be installed to {dest} on {label}, from {source}. It goes \
-                     ahead of the {found} already there; that copy is left where it is."
-                ),
-                // Nothing usable anywhere, and a session running off
-                // something this client cannot identify.
-                None => format!("{build} will be installed to {dest} on {label}, from {source}."),
-            },
+            replaces(plan.found.as_deref()),
         ),
         // The disk is already right; only the process is stale.
         BootstrapVariant::Update => (
@@ -522,13 +686,6 @@ pub(crate) fn bootstrap_copy(inputs: CopyInputs<'_>) -> BootstrapCopy {
             "Updating stops the running session — shells running in it end; tabs and layout are \
              kept.",
         );
-    }
-    if session_is_newer {
-        body.push(' ');
-        body.push_str(&format!(
-            "The session on {label} was started by a newer Roost, so this would install an older \
-             build; upgrading this Roost is likely the fix."
-        ));
     }
     if let Some(skew) = fidelity {
         body = format!(
@@ -717,6 +874,24 @@ pub(crate) struct BootstrapSuccess {
     /// `roost-session` by name. Not a failure — Roost execs the absolute
     /// path — so it rides along for the completion toast to append.
     pub(crate) path_warning: Option<String>,
+    /// What the file this job wrote answered once it was in place —
+    /// the asset's build, which a dev client does not share.
+    pub(crate) installed: Option<BuildId>,
+}
+
+impl BootstrapSuccess {
+    fn after(installed: Option<roost_ipc::bootstrap::Installed>) -> Self {
+        match installed {
+            Some(done) => Self {
+                installed: Some(BuildId::from(&done.identity)),
+                path_warning: done.path_warning,
+            },
+            None => Self {
+                path_warning: None,
+                installed: None,
+            },
+        }
+    }
 }
 
 /// Which request a step is answering.
@@ -736,6 +911,10 @@ pub(crate) struct BootstrapRequest {
     pub(crate) token: String,
     /// [`SshTarget::claim_key`] — what the job claim is keyed on.
     pub(crate) claim: String,
+    /// Reconnect once the job has run: whenever it started a session.
+    pub(crate) reconnect: bool,
+    /// The plan 076 action this job is, if it is one.
+    pub(crate) action: Option<ActionTicket>,
 }
 
 /// One bootstrap step reporting back, through the engine feed.
@@ -801,9 +980,10 @@ pub(crate) async fn run_bootstrap(
     options: BootstrapOptions,
     plan: BootstrapPlan,
     arch: RemoteArch,
+    release: Option<super::session_actions::StreamRelease>,
 ) -> Result<BootstrapSuccess, BootstrapError> {
     let job = BootstrapJob::open(&target, &ssh, options).await?;
-    let outcome = run_plan(&job, &plan, arch).await;
+    let outcome = run_plan(&job, &plan, arch, release.as_ref()).await;
     // Ordered, and on every path: the master is addressed through a file
     // in the directory the close removes, and `Drop` behind it is
     // blocking.
@@ -811,11 +991,19 @@ pub(crate) async fn run_bootstrap(
     outcome
 }
 
+/// Every destructive step is preceded, with nothing awaited in between
+/// but the check itself, by the re-check it depends on (plan 076 D8):
+/// the commit by the rung the card named and then the session, the stop
+/// by a session-bound stop, every launch by the rung it starts. Every
+/// check that can abort comes before the live stream is let go, except
+/// the stop itself and what has to follow it.
 async fn run_plan(
     job: &BootstrapJob,
     plan: &BootstrapPlan,
     arch: RemoteArch,
+    release: Option<&super::session_actions::StreamRelease>,
 ) -> Result<BootstrapSuccess, BootstrapError> {
+    let expect = plan.expect.as_ref();
     let mut installed = None;
     if plan.install {
         // Resolution is the job's *first* phase and never the connect
@@ -824,44 +1012,159 @@ async fn run_plan(
         // has not consented to.
         let source = job.resolve_source(arch).await?;
         tracing::info!(source = %source.describe(), "bootstrap: installing roost-session");
-        installed = Some(job.install(&source).await?);
+        installed = Some(
+            job.install_guarded(&source, || async {
+                match expect {
+                    Some(expect) => revalidate(job, expect).await,
+                    None => Ok(()),
+                }
+            })
+            .await?,
+        );
     }
+    let Some(start) = &plan.start else {
+        return Ok(BootstrapSuccess::after(installed));
+    };
+    // What the start runs and has to come up as: what this job just
+    // installed, as the installed file answered — never a later probe's
+    // reading of whatever is there by then — or the rung the card named.
+    let (path, target) = match (&installed, start, &plan.target) {
+        (Some(done), ..) => (done.dest.clone(), BuildId::from(&done.identity)),
+        (None, StartFrom::Probed(path), Some(target)) => (path.clone(), target.clone()),
+        // Unreachable through `plan_bootstrap` — every plan that starts
+        // from the destination also installs, and every probed start
+        // carries its build — and stated as a failure rather than an
+        // `expect` so a later matrix row cannot panic a UI thread's
+        // runtime.
+        (None, ..) => {
+            return Err(BootstrapError::Start(
+                "nothing was installed or identified, so there is nothing to start".to_string(),
+            ))
+        }
+    };
+    let mut before = None;
     if plan.stop {
-        job.stop_over_the_wire().await?;
+        if let Some(expect) = expect {
+            match &installed {
+                None => revalidate(job, expect).await?,
+                Some(_) => {
+                    rung_is(job, &path, &target).await?;
+                    same_session(job, &expect.session_id).await?;
+                }
+            }
+        }
+        if let Some(release) = release {
+            release.request().await?;
+        }
+        match expect {
+            Some(expect) => {
+                job.stop_session_if(&expect.session_id).await?;
+                before = Some(expect.session_id.clone());
+            }
+            None => {
+                before = job
+                    .session_identify()
+                    .await
+                    .map_err(BootstrapError::Stop)?
+                    .map(|serving| serving.session_id);
+                job.stop_over_the_wire().await?;
+            }
+        }
         // `session.stop` replies before the old process unlinks its
         // socket; starting on the reply alone loses that race and reads
         // the dying holder as `already-running`.
         job.await_gone().await?;
     }
-    let path = match (&installed, &plan.start) {
-        (Some(done), _) => done.dest.clone(),
-        (None, StartFrom::Probed(path)) => path.clone(),
-        // Unreachable through `plan_bootstrap` — every plan that starts
-        // from the destination also installs — and stated as a failure
-        // rather than an `expect` so a later matrix row cannot panic a
-        // UI thread's runtime.
-        (None, StartFrom::Installed) => {
-            return Err(BootstrapError::Start(
-                "nothing was installed, so there is no destination to start".to_string(),
-            ))
-        }
-    };
-    job.start(&path).await?;
-    job.post_start_identify(plan.gate).await?;
-    Ok(BootstrapSuccess {
-        path_warning: installed.and_then(|done| done.path_warning),
-    })
+    job.start_guarded(&path, || rung_is(job, &path, &target))
+        .await?;
+    let serving = job
+        .session_identify()
+        .await
+        .map_err(BootstrapError::Start)?
+        .ok_or_else(|| {
+            BootstrapError::Start("it reported ready and then no session was there".to_string())
+        })?;
+    let build = BuildId::from(&serving);
+    let installed_triple = plan.gate != IdentityGate::Installed
+        || build.same_install(&BuildId::from(&job.options().expected));
+    if !installed_triple {
+        return Err(BootstrapError::Unverified(
+            roost_ui_model::session_update::describe(&build),
+        ));
+    }
+    roost_ui_model::session_update::verify_restart(
+        before.as_deref().unwrap_or_default(),
+        &target,
+        &serving.session_id,
+        &build,
+    )
+    .map_err(BootstrapError::Unverified)?;
+    Ok(BootstrapSuccess::after(installed))
+}
+
+/// The exec rung is still `path`, answering as `target`.
+async fn rung_is(job: &BootstrapJob, path: &str, target: &BuildId) -> Result<(), BootstrapError> {
+    let outcome = job.probe().await?.outcome;
+    if outcome
+        .identified_rung()
+        .is_some_and(|(found, build)| found == path && build == *target)
+    {
+        return Ok(());
+    }
+    Err(BootstrapError::TargetChanged(path.to_string()))
+}
+
+/// The session the card was built against is still the one serving.
+async fn same_session(job: &BootstrapJob, session_id: &str) -> Result<(), BootstrapError> {
+    let serving = job
+        .session_identify()
+        .await
+        .map_err(BootstrapError::Probe)?;
+    if serving.map(|serving| serving.session_id).as_deref() != Some(session_id) {
+        return Err(BootstrapError::Changed);
+    }
+    Ok(())
+}
+
+/// D8's re-check: the exec rung still answers as it did, and then — last,
+/// so nothing slower stands between it and what it guards — the session
+/// the card was built against is still the one serving.
+async fn revalidate(job: &BootstrapJob, expect: &Expect) -> Result<(), BootstrapError> {
+    if job.probe().await?.outcome != expect.outcome {
+        return Err(BootstrapError::Changed);
+    }
+    same_session(job, &expect.session_id).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_client_version_knob_moves_classification_only() {
+        let identity = client_identity();
+        let pretend = classification_build(&identity, Some("0.0.1"));
+        assert_eq!(pretend.version, "0.0.1");
+        assert_eq!(pretend.protocol, identity.session_protocol);
+        assert_eq!(pretend.dev, identity.dev);
+        assert_eq!(identity.app_version, env!("CARGO_PKG_VERSION"));
+
+        assert_eq!(
+            classification_build(&identity, None),
+            BuildId::from(&identity)
+        );
+        assert_eq!(
+            classification_build(&identity, Some("")),
+            BuildId::from(&identity)
+        );
+    }
+
     fn identity() -> SessionBinaryIdentity {
         SessionBinaryIdentity {
             app_version: "0.0.19".into(),
             session_protocol: SESSION_PROTOCOL_VERSION,
             libghostty_build: "ghostty-abc+snapshot.v1".into(),
+            ..SessionBinaryIdentity::default()
         }
     }
 
@@ -892,6 +1195,7 @@ mod tests {
     fn compatible() -> ProbeOutcome {
         ProbeOutcome::Compatible {
             path: "/usr/bin/roost-session".into(),
+            identity: identity(),
         }
     }
 
@@ -1132,7 +1436,7 @@ mod tests {
     #[test]
     fn the_fidelity_card_leads_with_the_two_builds_that_disagreed() {
         let plan = plan_bootstrap(&compatible(), SessionState::Running);
-        let card = copy_with(&plan, "", false, Some(&skew()));
+        let card = copy_with(&plan, "", Some(&skew()));
         assert_eq!(card.confirm, "Update");
         assert!(card.title.starts_with("Update roost-session on pop-os"));
         assert!(
@@ -1155,7 +1459,7 @@ mod tests {
         // Every other entry point is answering a connect that failed,
         // and has no builds to name.
         assert!(
-            !copy(&plan, "", false).body.contains("reduced fidelity"),
+            !copy(&plan, "").body.contains("reduced fidelity"),
             "a card raised from a failed connect invents no reason"
         );
     }
@@ -1219,7 +1523,7 @@ mod tests {
         assert_eq!(missing_cold.variant, BootstrapVariant::Install);
         assert!(missing_cold.install);
         assert!(!missing_cold.stop, "there is nothing over there to stop");
-        assert_eq!(missing_cold.start, StartFrom::Installed);
+        assert_eq!(missing_cold.start, Some(StartFrom::Installed));
         assert_eq!(missing_cold.gate, IdentityGate::Installed);
         assert_eq!(
             missing_cold.found, None,
@@ -1238,7 +1542,7 @@ mod tests {
         );
         assert!(missing_hot.install);
         assert!(missing_hot.stop);
-        assert_eq!(missing_hot.start, StartFrom::Installed);
+        assert_eq!(missing_hot.start, Some(StartFrom::Installed));
         assert_eq!(missing_hot.gate, IdentityGate::Installed);
         assert_eq!(missing_hot.found, None);
 
@@ -1248,7 +1552,7 @@ mod tests {
         assert_eq!(stale_cold.variant, BootstrapVariant::Update);
         assert!(stale_cold.install);
         assert!(!stale_cold.stop);
-        assert_eq!(stale_cold.start, StartFrom::Installed);
+        assert_eq!(stale_cold.start, Some(StartFrom::Installed));
         assert_eq!(stale_cold.gate, IdentityGate::Installed);
         assert_eq!(
             stale_cold.found.as_deref(),
@@ -1264,7 +1568,7 @@ mod tests {
         assert!(!ready_cold.stop);
         assert_eq!(
             ready_cold.start,
-            StartFrom::Probed("/usr/bin/roost-session".into()),
+            Some(StartFrom::Probed("/usr/bin/roost-session".into())),
             "a deb at /usr/bin is not started through a ~/.local/bin that does not exist"
         );
         assert_eq!(ready_cold.gate, IdentityGate::Existing);
@@ -1275,7 +1579,7 @@ mod tests {
         assert_eq!(stale_hot.variant, BootstrapVariant::Update);
         assert!(stale_hot.install);
         assert!(stale_hot.stop);
-        assert_eq!(stale_hot.start, StartFrom::Installed);
+        assert_eq!(stale_hot.start, Some(StartFrom::Installed));
         assert_eq!(stale_hot.gate, IdentityGate::Installed);
         assert_eq!(stale_hot.found.as_deref(), Some("/usr/bin/roost-session"));
 
@@ -1286,7 +1590,7 @@ mod tests {
         assert!(ready_hot.stop);
         assert_eq!(
             ready_hot.start,
-            StartFrom::Probed("/usr/bin/roost-session".into())
+            Some(StartFrom::Probed("/usr/bin/roost-session".into()))
         );
         assert_eq!(ready_hot.gate, IdentityGate::Existing);
     }
@@ -1300,11 +1604,11 @@ mod tests {
         for outcome in [ProbeOutcome::Missing, mismatch(), compatible()] {
             for session in [SessionState::NoSession, SessionState::Running] {
                 let plan = plan_bootstrap(&outcome, session);
-                if plan.start == StartFrom::Installed {
+                if plan.start == Some(StartFrom::Installed) {
                     assert!(plan.install, "{outcome:?} / {session:?}");
                 }
                 if plan.install {
-                    assert_eq!(plan.start, StartFrom::Installed, "{outcome:?}");
+                    assert_eq!(plan.start, Some(StartFrom::Installed), "{outcome:?}");
                     assert_eq!(plan.gate, IdentityGate::Installed, "{outcome:?}");
                 }
                 assert_eq!(
@@ -1328,16 +1632,11 @@ mod tests {
     /// have made every row's copy test agree with a destination its own
     /// plan contradicts — a Start card whose plan starts
     /// `/usr/bin/roost-session` asserting on `~/.local/bin`.
-    fn copy(plan: &BootstrapPlan, source: &str, newer: bool) -> BootstrapCopy {
-        copy_with(plan, source, newer, None)
+    fn copy(plan: &BootstrapPlan, source: &str) -> BootstrapCopy {
+        copy_with(plan, source, None)
     }
 
-    fn copy_with(
-        plan: &BootstrapPlan,
-        source: &str,
-        newer: bool,
-        fidelity: Option<&Skew>,
-    ) -> BootstrapCopy {
+    fn copy_with(plan: &BootstrapPlan, source: &str, fidelity: Option<&Skew>) -> BootstrapCopy {
         bootstrap_copy(CopyInputs {
             label: "pop-os",
             identity: &identity(),
@@ -1345,7 +1644,6 @@ mod tests {
             dest_on_disk: &dest_on_disk(plan, REMOTE_HOME),
             source,
             plan,
-            session_is_newer: newer,
             fidelity,
         })
     }
@@ -1360,7 +1658,8 @@ mod tests {
     fn offer(session: SessionState, fidelity: Option<&str>) -> OfferContext {
         OfferContext {
             session,
-            session_is_newer: false,
+            intent: ProbeIntent::Bootstrap,
+            bound_session: None,
             failure: None,
             fidelity: fidelity.map(|session_id| FidelityOffer {
                 session_id: session_id.to_string(),
@@ -1427,7 +1726,6 @@ mod tests {
         let elsewhere = copy(
             &plan_bootstrap(&mismatch(), SessionState::Running),
             "this Roost's own roost-session",
-            false,
         );
         assert!(
             elsewhere.body.contains(&format!(
@@ -1454,7 +1752,6 @@ mod tests {
         let same = copy(
             &plan_bootstrap(&mismatch_at_dest(), SessionState::Running),
             "this Roost's own roost-session",
-            false,
         );
         assert!(
             same.body.contains(&format!(
@@ -1470,7 +1767,6 @@ mod tests {
         let nothing = copy(
             &plan_bootstrap(&ProbeOutcome::Missing, SessionState::Running),
             "this Roost's own roost-session",
-            false,
         );
         assert!(
             nothing.body.contains(&format!(
@@ -1490,7 +1786,6 @@ mod tests {
         let install = copy(
             &plan_bootstrap(&ProbeOutcome::Missing, SessionState::NoSession),
             "this Roost's own roost-session",
-            false,
         );
         assert_eq!(install.confirm, "Install");
         assert!(install.title.starts_with("Install roost-session on pop-os"));
@@ -1512,7 +1807,6 @@ mod tests {
         let start = copy(
             &plan_bootstrap(&compatible(), SessionState::NoSession),
             "unused",
-            false,
         );
         assert_eq!(start.confirm, "Start");
         assert!(start.title.starts_with("Start roost-session on pop-os"));
@@ -1541,7 +1835,6 @@ mod tests {
         let hot = copy(
             &plan_bootstrap(&mismatch(), SessionState::Running),
             "the release at https://example.test, checksum-verified",
-            false,
         );
         assert_eq!(hot.confirm, "Update");
         assert!(hot.title.starts_with("Update roost-session on pop-os"));
@@ -1565,7 +1858,6 @@ mod tests {
         let cold = copy(
             &plan_bootstrap(&mismatch(), SessionState::NoSession),
             "the release at https://example.test, checksum-verified",
-            false,
         );
         assert_eq!(cold.confirm, "Update");
         assert!(
@@ -1575,11 +1867,7 @@ mod tests {
 
         // Row 5: the binary is already right, so the card must not claim
         // anything will be written.
-        let restart = copy(
-            &plan_bootstrap(&compatible(), SessionState::Running),
-            "",
-            false,
-        );
+        let restart = copy(&plan_bootstrap(&compatible(), SessionState::Running), "");
         assert!(
             restart.body.contains("Nothing will be installed"),
             "{restart:?}"
@@ -1622,7 +1910,6 @@ mod tests {
         let card = copy(
             &plan_bootstrap(&ProbeOutcome::Missing, SessionState::NoSession),
             &source,
-            false,
         );
         assert!(card.body.contains(base), "{card:?}");
         assert!(
@@ -1654,7 +1941,6 @@ mod tests {
         let card = copy(
             &plan_bootstrap(&ProbeOutcome::Missing, SessionState::NoSession),
             &released,
-            false,
         );
         assert!(card.body.contains("github.com"), "{card:?}");
         assert!(!card.body.contains("ROOST_SESSION_ASSET_BASE"), "{card:?}");
@@ -1667,40 +1953,74 @@ mod tests {
             .source_preview(RemoteArch::Amd64)
             .expect("the override rung previews")
             .describe();
-        let card = copy(
-            &plan_bootstrap(&mismatch(), SessionState::Running),
-            &source,
-            false,
-        );
+        let card = copy(&plan_bootstrap(&mismatch(), SessionState::Running), &source);
         assert!(card.body.contains("/tmp/roost-session"), "{card:?}");
         assert!(card.body.contains("ROOST_SESSION_INSTALL_BIN"), "{card:?}");
     }
 
-    /// A downgrade is offered, and said out loud. Both halves matter:
-    /// the user may have a reason, and they may not have noticed.
+    /// Install Update's card (plan 076 D7): the version in the title,
+    /// the three destination variants, and the running session left
+    /// alone — no stop sentence, and the button says Install.
     #[test]
-    fn installing_over_a_newer_session_says_so_and_still_offers_it() {
-        let plan = plan_bootstrap(&mismatch(), SessionState::Running);
-        let downgrade = copy(&plan, "this Roost's own roost-session", true);
-        assert_eq!(
-            downgrade.confirm, "Update",
-            "the button is still there — this is a warning, not a refusal"
-        );
+    fn the_install_only_card_keeps_the_destinations_and_leaves_the_session() {
+        let session = "s-1";
+        let at_dest = install_only_plan(&mismatch_at_dest(), session);
+        assert_eq!(at_dest.start, None);
+        assert!(!at_dest.stop && at_dest.install);
+        assert_eq!(at_dest.expect.as_ref().unwrap().session_id, session);
+        let card = copy(&at_dest, "the release at example");
+        assert_eq!(card.title, "Install roost-session 0.0.19 on pop-os?");
+        assert_eq!(card.confirm, "Install");
         assert!(
-            downgrade.body.contains("install an older build"),
-            "{downgrade:?}"
+            card.body
+                .contains("will replace what is at ~/.local/bin/roost-session"),
+            "{card:?}"
         );
-        assert!(
-            downgrade
-                .body
-                .contains("upgrading this Roost is likely the fix"),
-            "{downgrade:?}"
-        );
+        assert!(card.body.ends_with(
+            "The running session keeps going. Restart it when you're ready to use the new build."
+        ));
+        assert!(!card.body.contains("shells running in it end"), "{card:?}");
 
-        let plain = copy(&plan, "this Roost's own roost-session", false);
+        let deb = copy(&install_only_plan(&mismatch(), session), "x");
         assert!(
-            !plain.body.contains("older build"),
-            "direction is claimed only where it is known: {plain:?}"
+            deb.body
+                .contains("goes ahead of the /usr/bin/roost-session"),
+            "{deb:?}"
+        );
+        let fresh = copy(&install_only_plan(&ProbeOutcome::Missing, session), "x");
+        assert!(
+            fresh
+                .body
+                .starts_with("roost-session 0.0.19 (ghostty-abc+snapshot.v1) will be installed to"),
+            "{fresh:?}"
+        );
+        assert_eq!(
+            BootstrapVariant::InstallUpdate.wire_name(),
+            "install_update"
+        );
+    }
+
+    /// Restart Session's ssh row: stop, start the probed rung, and judge
+    /// what comes up by that rung's own build — not this client's.
+    #[test]
+    fn the_restart_only_plan_starts_the_probed_rung_as_its_own_build() {
+        let target = BuildId {
+            version: "0.0.23".into(),
+            ..BuildId::default()
+        };
+        let plan = restart_only_plan(&compatible(), "/usr/bin/roost-session", &target, "s-1");
+        assert!(!plan.install && plan.stop);
+        assert_eq!(
+            plan.start,
+            Some(StartFrom::Probed("/usr/bin/roost-session".into()))
+        );
+        assert_eq!(plan.target, Some(target));
+        assert_eq!(
+            plan.expect,
+            Some(Expect {
+                session_id: "s-1".into(),
+                outcome: compatible(),
+            })
         );
     }
 

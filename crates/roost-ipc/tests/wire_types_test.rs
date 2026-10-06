@@ -60,6 +60,9 @@ fn sample_identify() -> SessionIdentify {
         started_at: "2026-08-27T14:03:11Z".into(),
         persist_error: None,
         ops: None,
+        dev: false,
+        git_sha: None,
+        exe_path: None,
     }
 }
 
@@ -265,6 +268,7 @@ fn session_binary_identity_matches_its_golden_json() {
         app_version: "0.0.19".into(),
         session_protocol: SESSION_PROTOCOL_VERSION,
         libghostty_build: "ghostty-abcdef0123456789+snapshot.v1".into(),
+        ..SessionBinaryIdentity::default()
     };
     round_trip(&value);
     assert_eq!(serde_json::to_string(&value).unwrap(), GOLDEN);
@@ -286,6 +290,111 @@ fn session_binary_identity_matches_its_golden_json() {
         keys,
         ["app_version", "libghostty_build", "session_protocol"]
     );
+}
+
+/// Plan 076 D2's build facts, on both identity shapes: additive and
+/// optional, so a release build's line is byte-identical to before.
+#[test]
+fn build_facts_ride_both_identities_and_are_omitted_when_unset() {
+    const BINARY: &str = concat!(
+        r#"{"app_version":"0.0.22","session_protocol":6,"#,
+        r#""libghostty_build":"g","dev":true,"git_sha":"a1b2c3d"}"#,
+    );
+    let binary = SessionBinaryIdentity {
+        app_version: "0.0.22".into(),
+        session_protocol: 6,
+        libghostty_build: "g".into(),
+        dev: true,
+        git_sha: Some("a1b2c3d".into()),
+    };
+    round_trip(&binary);
+    assert_eq!(serde_json::to_string(&binary).unwrap(), BINARY);
+
+    const RUNNING: &str = concat!(
+        r#"{"app_version":"0.0.18","session_protocol":6,"#,
+        r#""payload_kinds":["ghostty-snapshot","vt"],"#,
+        r#""libghostty_build":"ghostty-3f6b1c9a4d2e5f80+snapshot.v1","#,
+        r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","#,
+        r#""started_at":"2026-08-27T14:03:11Z","#,
+        r#""dev":true,"git_sha":"a1b2c3d","exe_path":"/opt/roost/roost-session"}"#,
+    );
+    let running = SessionIdentify {
+        dev: true,
+        git_sha: Some("a1b2c3d".into()),
+        exe_path: Some("/opt/roost/roost-session".into()),
+        ..sample_identify()
+    };
+    round_trip(&running);
+    assert_eq!(serde_json::to_string(&running).unwrap(), RUNNING);
+
+    let release = SessionIdentify {
+        dev: false,
+        git_sha: Some("a1b2c3d".into()),
+        ..sample_identify()
+    };
+    let value = serde_json::to_value(&release).unwrap();
+    assert!(value.get("dev").is_none(), "{value}");
+    assert!(value.get("exe_path").is_none(), "{value}");
+}
+
+/// AC2, both directions: a pre-076 line decodes with every new field at
+/// its default, and a new line decodes into the pre-076 shapes, which
+/// an older client still has.
+#[test]
+fn build_facts_cross_the_version_boundary_both_ways() {
+    let old: SessionBinaryIdentity = serde_json::from_str(
+        r#"{"app_version":"0.0.21","session_protocol":6,"libghostty_build":"g"}"#,
+    )
+    .unwrap();
+    assert!(!old.dev);
+    assert_eq!(old.git_sha, None);
+
+    let old: SessionIdentify = serde_json::to_string(&sample_identify())
+        .and_then(|line| serde_json::from_str(&line))
+        .unwrap();
+    assert!(!old.dev);
+    assert_eq!((old.git_sha, old.exe_path), (None, None));
+
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct PreBuildFactsBinary {
+        app_version: String,
+        session_protocol: u32,
+        libghostty_build: String,
+    }
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct PreBuildFactsIdentify {
+        app_version: String,
+        session_protocol: u32,
+        payload_kinds: Vec<AttachPayloadKind>,
+        libghostty_build: String,
+        session_id: String,
+        started_at: String,
+        #[serde(default)]
+        persist_error: Option<String>,
+        #[serde(default)]
+        ops: Option<Vec<String>>,
+    }
+    let new_binary = SessionBinaryIdentity {
+        app_version: "0.0.22".into(),
+        session_protocol: 6,
+        libghostty_build: "g".into(),
+        dev: true,
+        git_sha: Some("a1b2c3d".into()),
+    };
+    let decoded: PreBuildFactsBinary =
+        serde_json::from_str(&serde_json::to_string(&new_binary).unwrap()).unwrap();
+    assert_eq!(decoded.app_version, "0.0.22");
+    let new_running = SessionIdentify {
+        dev: true,
+        git_sha: Some("a1b2c3d".into()),
+        exe_path: Some("/usr/bin/roost-session".into()),
+        ..sample_identify()
+    };
+    let decoded: PreBuildFactsIdentify =
+        serde_json::from_str(&serde_json::to_string(&new_running).unwrap()).unwrap();
+    assert_eq!(decoded.session_id, sample_identify().session_id);
 }
 
 #[test]

@@ -4,7 +4,7 @@ use roost_engine::ipc::{DumpError, HostOpFailure, HostOpReply};
 use roost_ipc::codes;
 use roost_ipc::messages::{
     ActivationOutcome, AppContextMenuDumpResult, AppContextMenuTarget, AppSecureInputResult,
-    SentFile, SkippedFile, TabSendFileResult, WireProjectRef,
+    HostActionResult, SentFile, SkippedFile, TabSendFileResult, WireProjectRef,
 };
 use roost_ui_model::context_menu::{ContextAction, ContextTarget};
 use roost_ui_model::file_transfer::{status, Refusal, Skipped, Target};
@@ -377,6 +377,7 @@ fn section_dump(section: &host_sidebar::Section) -> SidebarDumpSection {
         saved_id: section.saved_id.clone(),
         reconnect_row: section.state.offers_reconnect(),
         fidelity: section.fidelity.map(|action| action.as_str().to_string()),
+        update_pill: section.update_pill.map(str::to_string),
     }
 }
 
@@ -2354,6 +2355,7 @@ impl App {
                             task = task.then(self.settle_connect_purpose(host));
                             self.rearm_initial_local_selection(host);
                         } else {
+                            self.host_action_connect_settled(host);
                             // #481. Kept while the ladder is still
                             // climbing — see `retire_host_durability`.
                             retire_host_durability(
@@ -2401,12 +2403,19 @@ impl App {
                     // `session.identify`, which is the only place a
                     // client learns a durability failure it was not
                     // connected for (#481).
-                    if let Some(name) = self.hosts.owner_of(host) {
+                    let owner = self.hosts.owner_of(host);
+                    if let Some(name) = owner.clone() {
                         let error = facts.persist_error.clone();
                         self.set_durability(DurabilitySource::Host(name), error);
                     }
-                    self.hosts.note_connect_facts(host, facts)
+                    self.hosts.note_connect_facts(host, facts);
+                    if let Some(name) = owner {
+                        self.host_session_identified(&name, host);
+                        self.host_action_facts_landed(&name);
+                    }
                 }
+                EngineFeed::RestartTarget(resolved) => self.restart_target_resolved(*resolved),
+                EngineFeed::HostAction(event) => self.host_action_event(*event),
                 EngineFeed::ReconnectDue { host, request } => {
                     self.host_reconnect_due(&host, request)
                 }
@@ -3104,6 +3113,7 @@ impl App {
                 // Taken before `host.id` is moved into the view.
                 let reason = self.hosts.section_reason(&host.id).map(str::to_string);
                 let reduced_fidelity = self.hosts.reduced_fidelity(&host.id);
+                let update = self.host_update_facts(&host.id, &host.target);
                 let view_host = view_incarnation(incarnation);
                 let mut projects = mirror
                     .as_ref()
@@ -3125,6 +3135,7 @@ impl App {
                     projects,
                     active_tab_id: mirror.as_ref().map_or(0, |mirror| mirror.active_tab_id),
                     agents: 0,
+                    update,
                 }
             })
             .collect();
@@ -3335,6 +3346,7 @@ impl App {
                 reduced_fidelity: view.reduced_fidelity,
                 agents: view.agents,
                 reason: view.reason.as_deref(),
+                update: view.update.as_ref(),
             })
             .collect();
         host_sidebar::sections(self.local_slot_input(), &hosts)
@@ -4280,6 +4292,18 @@ impl App {
             UiRequest::HostStatus { id, reply } => {
                 let _ = reply.send(self.host_status_op(id.as_deref()));
             }
+            // Plan 076 D7: the menu's own paths, with the claim taken
+            // up front and no card.
+            UiRequest::HostUpdate { id, reply } => {
+                let result = self.host_install_requested(&id, true);
+                self.reconcile();
+                let _ = reply.send(result.map(|()| HostActionResult { accepted: true }));
+            }
+            UiRequest::HostRestart { id, reply } => {
+                let result = self.host_session_restart_requested(&id, true);
+                self.reconcile();
+                let _ = reply.send(result.map(|()| HostActionResult { accepted: true }));
+            }
             UiRequest::AgentSetHooks { agents, reply } => {
                 self.agent_set_hooks_op(&agents, reply);
             }
@@ -4318,8 +4342,11 @@ impl App {
         &mut self,
         saved_id: &str,
         test_user_origin: bool,
-    ) -> Result<HostConnectionResult, roost_engine::WorkspaceError> {
-        let host = self.saved_host(saved_id)?;
+    ) -> Result<HostConnectionResult, HostOpFailure> {
+        let host = self
+            .saved_host(saved_id)
+            .map_err(|error| HostOpFailure::new(codes::NOT_FOUND, error.to_string()))?;
+        self.refuse_connect_during_action(saved_id)?;
         if test_user_origin && self.test_mode {
             self.host_connect_requested(saved_id, crate::host_conn::RequestOrigin::User);
         } else {
@@ -4490,6 +4517,12 @@ impl App {
                     self.host_sections.len(),
                 )));
             };
+            let update = self
+                .host_views
+                .iter()
+                .find(|view| view.saved_id == host.id)
+                .and_then(|view| view.update.as_ref());
+            let update = self.host_actions.update_status(&host.id, update);
             hosts.push(HostStatus {
                 id: host.id.clone(),
                 label: host.label,
@@ -4523,6 +4556,7 @@ impl App {
                     from_revision: facts.resumed.map(|resumed| resumed.from_revision),
                 }),
                 tabs: self.hosts.tabs(&host.id),
+                update,
             });
         }
         Ok(HostStatusResult { hosts })
@@ -4762,6 +4796,7 @@ mod tests {
             reduced_fidelity: false,
             agents: 0,
             reason: None,
+            update: None,
         };
         let ssh = HostInput {
             saved_id: "hs-box",
@@ -4772,6 +4807,7 @@ mod tests {
             reduced_fidelity: false,
             agents: 0,
             reason: None,
+            update: None,
         };
         let strip = |local: LocalSlot<'_>, hosts: &[HostInput<'_>]| {
             host_sidebar::sections(local, hosts)
@@ -7043,6 +7079,7 @@ mod tests {
             projects: Vec::new(),
             active_tab_id: 0,
             agents: 0,
+            update: None,
         };
         let views = [view];
 
@@ -7119,6 +7156,7 @@ mod tests {
             projects: Vec::new(),
             active_tab_id: 0,
             agents: 0,
+            update: None,
         }];
         let rows = host_exit_rows(&views, &hosts);
         assert!(!rows[0].connecting, "the band and the set agree it is over");

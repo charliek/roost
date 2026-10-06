@@ -2081,16 +2081,24 @@ pub(crate) async fn call_over<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     stdout: R,
     op: &str,
 ) -> Result<Response> {
-    const ID: i64 = 1;
+    call_on(stdin, &mut FrameReader::new(stdout), 1, op).await
+}
 
+/// [`call_over`] on a bridge already open, so that several calls reach
+/// the one session behind it.
+pub(crate) async fn call_on<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
+    stdin: &mut W,
+    reader: &mut FrameReader<R>,
+    id: i64,
+    op: &str,
+) -> Result<Response> {
     let request = RawRequest {
-        id: ID,
+        id,
         op: op.to_string(),
         params: serde_json::json!({}),
     };
     write_frame(stdin, &serde_json::to_vec(&request)?).await?;
 
-    let mut reader = FrameReader::new(stdout);
     loop {
         let Some(frame) = reader.read_line().await? else {
             return Err(anyhow!("the remote bridge closed without answering {op}"));
@@ -2102,8 +2110,8 @@ pub(crate) async fn call_over<W: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
             continue;
         }
         let response: Response = serde_json::from_value(value)?;
-        if response.id != ID {
-            return Err(anyhow!("answer carried id {}, not {ID}", response.id));
+        if response.id != id {
+            return Err(anyhow!("answer carried id {}, not {id}", response.id));
         }
         return Ok(response);
     }

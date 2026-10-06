@@ -3,12 +3,15 @@
 //!
 //! One model for every renderer — the macOS popup, the Linux overlay and
 //! the `app.context_menu_*` test ops all list and run what [`entries`]
-//! returns. A host's items are not decided here: they are
-//! [`host_verbs::verbs`]' own rows for that host, so the menu can never
-//! offer a verb the palette withholds, or word it differently.
+//! returns. Which host items exist is not decided here: they are
+//! [`host_verbs::verbs`]' own rows for that host that are marked for the
+//! menu, so the two surfaces can never disagree about what a verb does.
+//! Only their order, the header and the separators are the menu's
+//! (plan 076 D6).
 
 use crate::host_verbs::{self, HostVerb, VerbItem};
 use crate::keys::{ProjectKey, TabKey};
+use crate::session_update;
 
 /// The row a menu was opened on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,12 +38,13 @@ pub enum ContextAction {
     HostConnect,
     HostDisconnect,
     HostUpdateSession,
+    HostInstallUpdate,
     HostRestartSession,
     HostStopSession,
 }
 
 impl ContextAction {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::RenameTab,
         Self::NewTabHere,
         Self::CopyTabPath,
@@ -53,6 +57,7 @@ impl ContextAction {
         Self::HostConnect,
         Self::HostDisconnect,
         Self::HostUpdateSession,
+        Self::HostInstallUpdate,
         Self::HostRestartSession,
         Self::HostStopSession,
     ];
@@ -71,6 +76,7 @@ impl ContextAction {
             Self::HostConnect => "host_connect",
             Self::HostDisconnect => "host_disconnect",
             Self::HostUpdateSession => "host_update_session",
+            Self::HostInstallUpdate => "host_install_update",
             Self::HostRestartSession => "host_restart_session",
             Self::HostStopSession => "host_stop_session",
         }
@@ -88,6 +94,7 @@ impl ContextAction {
             Self::HostConnect => HostVerb::Connect(saved_id),
             Self::HostDisconnect => HostVerb::Disconnect(saved_id),
             Self::HostUpdateSession => HostVerb::Update(saved_id),
+            Self::HostInstallUpdate => HostVerb::Install(saved_id),
             Self::HostRestartSession => HostVerb::Restart(saved_id),
             Self::HostStopSession => HostVerb::Stop(saved_id),
             _ => return None,
@@ -103,6 +110,8 @@ pub enum ContextEntry {
         enabled: bool,
     },
     Separator,
+    /// Text only: never chosen, and the keys step past it.
+    Header(String),
 }
 
 /// What the app knows about the row, gathered fresh for every menu.
@@ -119,6 +128,12 @@ pub struct ContextFacts<'a> {
     /// can open it.
     pub on_this_machine: bool,
     pub cwd_known: bool,
+    /// The host's label, for the header a project's or tab's host block
+    /// opens with.
+    pub host_label: Option<&'a str>,
+    /// [`crate::session_update::session_line`] for the host, once its
+    /// session's identity is known.
+    pub session_line: Option<&'a str>,
 }
 
 const OPEN_FOLDER_LABEL: &str = if cfg!(target_os = "macos") {
@@ -135,14 +150,34 @@ pub fn entries(
     facts: &ContextFacts<'_>,
     verbs: &[VerbItem],
 ) -> Vec<ContextEntry> {
+    // A row's host block: the host named in its header, since the
+    // labels are short.
     let host_rows = || {
-        facts
-            .host
-            .map(|saved_id| host_items(verbs, saved_id))
-            .unwrap_or_default()
+        let Some(saved_id) = facts.host else {
+            return Vec::new();
+        };
+        let items = host_items(verbs, saved_id);
+        if items.is_empty() {
+            return items;
+        }
+        let label = facts.host_label.unwrap_or(saved_id);
+        let mut block = vec![ContextEntry::Header(session_update::host_header(
+            label,
+            facts.session_line,
+        ))];
+        block.extend(items);
+        block
     };
     match target {
-        ContextTarget::Host(saved_id) => host_items(verbs, saved_id),
+        ContextTarget::Host(saved_id) => {
+            let mut menu: Vec<ContextEntry> = facts
+                .session_line
+                .map(|line| ContextEntry::Header(line.to_string()))
+                .into_iter()
+                .collect();
+            menu.extend(host_items(verbs, saved_id));
+            menu
+        }
         _ if !facts.interactive => host_rows(),
         ContextTarget::Tab(_) => vec![
             item(ContextAction::RenameTab, "Rename…", true),
@@ -196,24 +231,55 @@ fn item(action: ContextAction, label: &str, enabled: bool) -> ContextEntry {
     }
 }
 
-/// `verbs`' rows for one saved host, under their own titles. Remove Host
-/// is left out (plan 073 decision g): it has no confirm card, and a
-/// right-click misfires more easily than a typed palette command.
+/// The order a host's items are listed in (D6's band-menu table): the
+/// way in, then what updates the session, then — after a separator —
+/// the ways to leave it.
+const HOST_ORDER: [ContextAction; 6] = [
+    ContextAction::HostConnect,
+    ContextAction::HostInstallUpdate,
+    ContextAction::HostUpdateSession,
+    ContextAction::HostRestartSession,
+    ContextAction::HostDisconnect,
+    ContextAction::HostStopSession,
+];
+
+/// Where the separator goes: before the first of these.
+const LEAVING: [ContextAction; 2] = [
+    ContextAction::HostDisconnect,
+    ContextAction::HostStopSession,
+];
+
+/// `verbs`' menu rows for one saved host, under their menu labels, in
+/// [`HOST_ORDER`]. Remove Host is never a menu row (plan 073 decision g):
+/// it has no confirm card, and a right-click misfires more easily than a
+/// typed palette command.
 fn host_items(verbs: &[VerbItem], saved_id: &str) -> Vec<ContextEntry> {
-    verbs
+    let mut rows: Vec<(ContextAction, &str)> = verbs
         .iter()
+        .filter(|row| row.surfaces.menu)
         .filter_map(|row| {
             let verb = host_verbs::parse(&row.id)?;
-            let action = ContextAction::ALL
+            let action = HOST_ORDER
                 .into_iter()
                 .find(|action| action.host_verb(saved_id).as_ref() == Some(&verb))?;
-            Some(item(action, &row.title, true))
+            Some((action, row.menu_label))
         })
-        .collect()
+        .collect();
+    rows.sort_by_key(|(action, _)| HOST_ORDER.iter().position(|listed| listed == action));
+    let mut menu = Vec::with_capacity(rows.len() + 1);
+    for (index, (action, label)) in rows.iter().enumerate() {
+        if index > 0 && LEAVING.contains(action) && !LEAVING.contains(&rows[index - 1].0) {
+            menu.push(ContextEntry::Separator);
+        }
+        menu.push(item(*action, label, true));
+    }
+    menu
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use roost_ipc::LocalBackendMode;
 
     use super::*;
@@ -232,6 +298,8 @@ mod tests {
             interactive: true,
             on_this_machine: true,
             cwd_known: true,
+            host_label: None,
+            session_line: None,
         }
     }
 
@@ -243,6 +311,7 @@ mod tests {
             state,
             transport: HostTransportKind::Ssh,
             fidelity: None,
+            update: None,
         }
     }
 
@@ -252,6 +321,7 @@ mod tests {
             .map(|entry| match entry {
                 ContextEntry::Item { label, .. } => label.as_str(),
                 ContextEntry::Separator => "─",
+                ContextEntry::Header(text) => text.as_str(),
             })
             .collect()
     }
@@ -261,37 +331,42 @@ mod tests {
             .iter()
             .map(|entry| match entry {
                 ContextEntry::Item { action, .. } => Some(*action),
-                ContextEntry::Separator => None,
+                ContextEntry::Separator | ContextEntry::Header(_) => None,
             })
             .collect()
     }
 
-    /// `verbs`' own rows addressed to `saved_id`, Remove Host aside, as
-    /// `(title, "host_<verb>")` — the oracle the menu's host items must
-    /// equal. Read off the row ids' spelling rather than through
-    /// `host_verbs::parse`, so it is not the mapping under test restated.
-    fn verbs_rows_for(verbs: &[VerbItem], saved_id: &str) -> Vec<(String, String)> {
+    /// `verbs`' menu rows addressed to `saved_id`, Remove Host aside, as
+    /// `(menu label, "host_<verb>")` — the oracle the menu's host items
+    /// must equal as a set. Read off the row ids' spelling rather than
+    /// through `host_verbs::parse`, so it is not the mapping under test
+    /// restated.
+    fn menu_rows_for(verbs: &[VerbItem], saved_id: &str) -> BTreeSet<(String, String)> {
         verbs
             .iter()
+            .filter(|verb| verb.surfaces.menu)
             .filter_map(|verb| {
                 let (word, id) = verb.id.strip_prefix("host:")?.split_once(':')?;
                 (id == saved_id && word != "remove")
-                    .then(|| (verb.title.clone(), format!("host_{word}")))
+                    .then(|| (verb.menu_label.to_string(), format!("host_{word}")))
             })
             .collect()
     }
 
-    /// The menu's items as `(label, action)`, the action's `_session`
-    /// suffix dropped to meet the row ids' spelling.
-    fn host_rows(entries: &[ContextEntry]) -> Vec<(String, String)> {
+    /// The menu's items as `(label, action)`, spelled the way the row ids
+    /// are: no `_session` suffix, and `host_install` for Install Update.
+    fn host_rows(entries: &[ContextEntry]) -> BTreeSet<(String, String)> {
         entries
             .iter()
             .filter_map(|entry| match entry {
                 ContextEntry::Item { action, label, .. } => Some((
                     label.clone(),
-                    action.as_str().trim_end_matches("_session").to_string(),
+                    action
+                        .as_str()
+                        .trim_end_matches("_session")
+                        .replace("host_install_update", "host_install"),
                 )),
-                ContextEntry::Separator => None,
+                ContextEntry::Separator | ContextEntry::Header(_) => None,
             })
             .collect()
     }
@@ -380,6 +455,8 @@ mod tests {
             interactive: true,
             on_this_machine: false,
             cwd_known: true,
+            host_label: Some("mini3"),
+            session_line: Some("Session 0.0.21 · 0.0.22 available"),
         };
         let menu = entries(
             &ContextTarget::Project(ProjectKey::new(HostId::new(2), 3)),
@@ -396,8 +473,9 @@ mod tests {
                 "─",
                 "Close Project…",
                 "─",
-                "Disconnect Host: aa",
-                "Stop Session: aa"
+                "mini3 · Session 0.0.21 · 0.0.22 available",
+                "Disconnect",
+                "Stop Session…"
             ]
         );
     }
@@ -418,14 +496,20 @@ mod tests {
             interactive: false,
             on_this_machine: false,
             cwd_known: true,
+            host_label: Some("box"),
+            session_line: None,
         };
         for target in [
             ContextTarget::Project(ProjectKey::new(HostId::new(2), 3)),
             ContextTarget::Tab(TabKey::new(HostId::new(2), 9)),
         ] {
             let menu = entries(&target, &facts, &verbs);
-            assert_eq!(labels(&menu), ["Connect Host: aa"], "{target:?}");
+            assert_eq!(labels(&menu), ["box", "Connect"], "{target:?}");
         }
+        // The band itself names no host, and a host with no session
+        // known has no line to open with.
+        let band = entries(&ContextTarget::Host("aa".into()), &facts, &verbs);
+        assert_eq!(labels(&band), ["Connect"]);
     }
 
     #[test]
@@ -437,13 +521,32 @@ mod tests {
         assert_eq!(ContextAction::from_wire("RenameTab"), None);
     }
 
-    /// The model parity test (plan 073 D9): for the same inputs, a host's
-    /// menu rows are exactly `verbs`' rows for that host, Remove Host
-    /// aside — in `verbs`' order, under `verbs`' titles, each running the
-    /// verb its row names. Two hosts in every case, so a filter that let
-    /// the other host's rows through would show.
+    fn update_facts(
+        state: crate::session_update::SessionUpdate,
+        offered: bool,
+    ) -> crate::session_update::UpdateFacts {
+        crate::session_update::UpdateFacts {
+            state,
+            running: Default::default(),
+            client: Default::default(),
+            restart: crate::session_update::RestartOffer {
+                offered,
+                why: None,
+                target: None,
+            },
+            staged: None,
+        }
+    }
+
+    /// The model parity test (plan 073 D9, rewritten for plan 076 D6):
+    /// for the same inputs, a host's menu items are exactly `verbs`' rows
+    /// for that host marked for the menu, Remove Host aside, under their
+    /// menu labels, each running the verb its row names. Two hosts in
+    /// every case, so a filter that let the other host's rows through
+    /// would show. The order is [`HOST_ORDER`]'s, asserted separately.
     #[test]
-    fn host_rows_equal_the_palettes_verbs_minus_remove() {
+    fn host_rows_equal_the_verbs_marked_for_the_menu_minus_remove() {
+        use crate::session_update::SessionUpdate;
         struct Case {
             name: &'static str,
             hosts: Vec<HostRow<'static>>,
@@ -451,6 +554,19 @@ mod tests {
             policy: VerbPolicy,
             expected: &'static [&'static str],
         }
+        static AVAILABLE: std::sync::LazyLock<crate::session_update::UpdateFacts> =
+            std::sync::LazyLock::new(|| update_facts(SessionUpdate::Available, true));
+        static UP_TO_DATE: std::sync::LazyLock<crate::session_update::UpdateFacts> =
+            std::sync::LazyLock::new(|| update_facts(SessionUpdate::UpToDate, true));
+        static REQUIRED: std::sync::LazyLock<crate::session_update::UpdateFacts> =
+            std::sync::LazyLock::new(|| update_facts(SessionUpdate::Required, true));
+        // `restart_offer` never offers a refused ssh session a Restart.
+        static REQUIRED_SSH: std::sync::LazyLock<crate::session_update::UpdateFacts> =
+            std::sync::LazyLock::new(|| update_facts(SessionUpdate::Required, false));
+        static BLOCKED: std::sync::LazyLock<crate::session_update::UpdateFacts> =
+            std::sync::LazyLock::new(|| {
+                update_facts(SessionUpdate::SessionNewer { blocked: true }, false)
+            });
         let connected = host("aa", SectionState::Connected);
         let other = host("bb", SectionState::Connected);
         let with_fidelity = |fidelity| HostRow {
@@ -461,6 +577,7 @@ mod tests {
             transport: HostTransportKind::Localhost,
             ..connected
         };
+        let refused = host("aa", SectionState::NeedsRestart);
         let session = LocalSlot {
             mode: LocalBackendMode::Session,
             slot_saved_id: Some("aa"),
@@ -474,50 +591,114 @@ mod tests {
                 hosts: vec![connected, other],
                 local: IN_PROCESS,
                 policy: VerbPolicy::current(),
-                expected: &["Disconnect Host: aa", "Stop Session: aa"],
+                expected: &["Disconnect", "Stop Session…"],
             },
             Case {
                 name: "offline",
                 hosts: vec![host("aa", SectionState::Disconnected), other],
                 local: IN_PROCESS,
                 policy: VerbPolicy::current(),
-                expected: &["Connect Host: aa"],
+                expected: &["Connect"],
+            },
+            Case {
+                name: "up to date",
+                hosts: vec![
+                    HostRow {
+                        update: Some(&UP_TO_DATE),
+                        ..connected
+                    },
+                    other,
+                ],
+                local: IN_PROCESS,
+                policy: VerbPolicy::current(),
+                expected: &["Restart Session…", "─", "Disconnect", "Stop Session…"],
+            },
+            Case {
+                name: "available",
+                hosts: vec![
+                    HostRow {
+                        update: Some(&AVAILABLE),
+                        ..connected
+                    },
+                    other,
+                ],
+                local: IN_PROCESS,
+                policy: VerbPolicy::current(),
+                expected: &[
+                    "Install Update…",
+                    "Restart Session…",
+                    "─",
+                    "Disconnect",
+                    "Stop Session…",
+                ],
+            },
+            Case {
+                name: "required over ssh",
+                hosts: vec![
+                    HostRow {
+                        update: Some(&REQUIRED_SSH),
+                        ..refused
+                    },
+                    other,
+                ],
+                local: IN_PROCESS,
+                policy: VerbPolicy::current(),
+                expected: &["Update roost-session…"],
+            },
+            Case {
+                name: "required on localhost",
+                hosts: vec![
+                    HostRow {
+                        transport: HostTransportKind::Localhost,
+                        update: Some(&REQUIRED),
+                        ..refused
+                    },
+                    other,
+                ],
+                local: IN_PROCESS,
+                policy: VerbPolicy::current(),
+                expected: &["Restart Session…"],
+            },
+            Case {
+                name: "blocked",
+                hosts: vec![
+                    HostRow {
+                        update: Some(&BLOCKED),
+                        ..refused
+                    },
+                    other,
+                ],
+                local: IN_PROCESS,
+                policy: VerbPolicy::current(),
+                expected: &[],
             },
             Case {
                 name: "fidelity update",
                 hosts: vec![with_fidelity(FidelityAction::Update), other],
                 local: IN_PROCESS,
                 policy: VerbPolicy::current(),
-                expected: &[
-                    "Disconnect Host: aa",
-                    "Stop Session: aa",
-                    "Update roost-session on aa",
-                ],
+                expected: &["Install Update…", "─", "Disconnect", "Stop Session…"],
             },
             Case {
                 name: "fidelity restart",
                 hosts: vec![with_fidelity(FidelityAction::Restart), other],
                 local: IN_PROCESS,
                 policy: VerbPolicy::current(),
-                expected: &[
-                    "Disconnect Host: aa",
-                    "Stop Session: aa",
-                    "Restart session on aa",
-                ],
+                expected: &["Restart Session…", "─", "Disconnect", "Stop Session…"],
             },
             Case {
                 name: "fidelity manual",
                 hosts: vec![with_fidelity(FidelityAction::Manual), other],
                 local: IN_PROCESS,
                 policy: VerbPolicy::current(),
-                expected: &["Disconnect Host: aa", "Stop Session: aa"],
+                expected: &["Disconnect", "Stop Session…"],
             },
             Case {
                 name: "the local session slot",
                 hosts: vec![slot, other],
                 local: session,
                 policy: VerbPolicy::current(),
-                expected: &["Disconnect Host: aa", "Stop Session: aa"],
+                expected: &["Disconnect", "Stop Session…"],
             },
             Case {
                 name: "localhost unreachable",
@@ -539,17 +720,122 @@ mod tests {
             let menu = entries(&ContextTarget::Host("aa".into()), &local_facts(), &verbs);
             assert_eq!(
                 host_rows(&menu),
-                verbs_rows_for(&verbs, "aa"),
+                menu_rows_for(&verbs, "aa"),
                 "{}",
                 case.name
             );
+            for entry in &menu {
+                if let ContextEntry::Item { action, label, .. } = entry {
+                    let verb = action.host_verb("aa").expect("a host action");
+                    assert!(
+                        verbs.iter().any(|row| row.surfaces.menu
+                            && row.menu_label == label
+                            && host_verbs::parse(&row.id).as_ref() == Some(&verb)),
+                        "{}: {label} does not run its row's verb",
+                        case.name
+                    );
+                }
+            }
             assert_eq!(labels(&menu), case.expected, "{}", case.name);
             assert!(
                 menu.iter()
-                    .all(|entry| matches!(entry, ContextEntry::Item { enabled: true, .. })),
+                    .all(|entry| !matches!(entry, ContextEntry::Item { enabled: false, .. })),
                 "{}: a host row is listed only when it applies",
                 case.name
             );
         }
+    }
+
+    /// The order is [`HOST_ORDER`]'s whatever order `verbs` lists the
+    /// rows in, with one separator before the ways to leave.
+    #[test]
+    fn host_items_follow_the_d6_table_order() {
+        let row = |id: &str, label: &'static str| {
+            let mut item = host_verbs::verbs(
+                &[],
+                &[],
+                IN_PROCESS,
+                VerbPolicy::current(),
+                false,
+                SlotHistory::Connected,
+            )
+            .remove(0);
+            item.id = id.to_string();
+            item.menu_label = label;
+            item.surfaces.menu = true;
+            item
+        };
+        let shuffled = [
+            row("host:stop:aa", "Stop Session…"),
+            row("host:restart:aa", "Restart Session…"),
+            row("host:disconnect:aa", "Disconnect"),
+            row("host:install:aa", "Install Update…"),
+        ];
+        let menu = entries(&ContextTarget::Host("aa".into()), &local_facts(), &shuffled);
+        assert_eq!(
+            actions(&menu),
+            [
+                Some(ContextAction::HostInstallUpdate),
+                Some(ContextAction::HostRestartSession),
+                None,
+                Some(ContextAction::HostDisconnect),
+                Some(ContextAction::HostStopSession),
+            ]
+        );
+        assert_eq!(&HOST_ORDER[4..], &LEAVING);
+    }
+
+    /// A band menu opens with the session line, and a project's host
+    /// block with the host's name and that line.
+    #[test]
+    fn the_session_line_heads_the_band_and_names_the_host_on_a_row() {
+        let hosts = [host("aa", SectionState::Connected)];
+        let verbs = host_verbs::verbs(
+            &hosts,
+            &[],
+            IN_PROCESS,
+            VerbPolicy::current(),
+            false,
+            SlotHistory::Connected,
+        );
+        let facts = ContextFacts {
+            host: Some("aa"),
+            interactive: true,
+            on_this_machine: false,
+            cwd_known: true,
+            host_label: Some("mini3"),
+            session_line: Some("Session 0.0.22 · up to date"),
+        };
+        let band = entries(&ContextTarget::Host("aa".into()), &facts, &verbs);
+        assert_eq!(
+            band[0],
+            ContextEntry::Header("Session 0.0.22 · up to date".into())
+        );
+        let tab = entries(
+            &ContextTarget::Tab(TabKey::new(HostId::new(2), 9)),
+            &facts,
+            &verbs,
+        );
+        assert_eq!(
+            labels(&tab),
+            ["Rename…", "New Tab Here", "Copy Path", "─", "Close Tab",],
+            "a tab's menu lists no host block"
+        );
+        let dimmed = ContextFacts {
+            interactive: false,
+            ..facts
+        };
+        assert_eq!(
+            labels(&entries(
+                &ContextTarget::Tab(TabKey::new(HostId::new(2), 9)),
+                &dimmed,
+                &verbs
+            )),
+            [
+                "mini3 · Session 0.0.22 · up to date",
+                "Disconnect",
+                "Stop Session…"
+            ]
+        );
     }
 }

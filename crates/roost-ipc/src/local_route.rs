@@ -323,6 +323,8 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ("host.connect", OpClass::UiOwned),
     ("host.disconnect", OpClass::UiOwned),
     ("host.status", OpClass::UiOwned),
+    ("host.update", OpClass::UiOwned),
+    ("host.restart", OpClass::UiOwned),
     // Deliberately not forwarded even though the slot would serve it.
     // A subscription handed out here would be a stream this socket
     // cannot fence (`tab.list`'s `revision` is stripped for the same

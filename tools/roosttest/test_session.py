@@ -30,6 +30,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -182,6 +183,38 @@ def test_a_session_names_the_ops_it_serves(env):
         plain = client.call("identify")
     assert set(plain["ops"]) == ops
     assert "instance_id" not in plain
+
+
+def test_identify_names_its_binary_and_honours_a_test_identity_sidecar(env):
+    """Plan 076 D2: `session.identify.exe_path` is the canonical binary
+    the daemon started from, and a `.test-identity` sidecar beside that
+    copy renames its build in both `session.identify` and the offline
+    `roost-session identify` — which is how update tests make one binary
+    answer as several builds."""
+    bin_dir = env.root / "sidecar-bin"
+    bin_dir.mkdir()
+    binary = bin_dir / "roost-session"
+    shutil.copy2(env.binary, binary)
+    sessionlib.plant_identity(binary, app_version="0.0.1", dev=False, git_sha="f00ba12")
+    env.binary = binary
+    started(env, ROOST_TEST_MODE="1")
+
+    identity = env.identify()
+    assert identity["exe_path"] == str(binary.resolve())
+    assert identity["app_version"] == "0.0.1"
+    assert "dev" not in identity, identity
+    assert identity["git_sha"] == "f00ba12"
+
+    offline = json.loads(
+        subprocess.run(
+            [str(binary), "identify"],
+            env=env.command_env(ROOST_TEST_MODE="1"),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    )
+    assert offline == {key: identity[key] for key in offline}, (offline, identity)
 
 
 # ---------------------------------------------------------------------------

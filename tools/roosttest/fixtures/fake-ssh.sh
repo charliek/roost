@@ -36,6 +36,15 @@
 #                         cancels a teardown mid-flight drives the
 #                         cancellation point with this instead of racing
 #                         the scheduler for it.
+#   FAKE_SSH_START_HOLD   optional directory that parks a `run-remote`
+#                         `roost-session start` (the `sh -c 'exec <path>
+#                         start'` a bootstrap or restart job sends) the
+#                         same way, before the start runs: `<dir>/started`,
+#                         then the wait for `<dir>/release`. Every other
+#                         remote command — an identify, a stop — runs
+#                         untouched, so a test can hold a job open between
+#                         its stop and its start without changing what the
+#                         job checks.
 #
 # Modes:
 #
@@ -110,6 +119,10 @@
 #                                  probe lands inside the tempdir. A
 #                                  shipped ladder never expands it at
 #                                  all.
+#   ROOST_TEST_MODE=<0|1>          optional: forwarded so a remote
+#                                  `identify` reads its test identity
+#                                  sidecar (plan 076 D2). Empty when the
+#                                  caller set none, which reads as off.
 #
 # Without all three the suite would pass or fail according to whether
 # the developer's own box is a Mac and whether it has the deb
@@ -189,18 +202,23 @@ for arg in "$@"; do
     remote="$arg"
 done
 
+# Park on `$1` until `$1/release` exists — see FAKE_SSH_EXIT_HOLD.
+park() {
+    : >"$1/started"
+    waited=0
+    while [ ! -e "$1/release" ]; do
+        if [ "$waited" -ge 6000 ]; then
+            printf '%s\n' "fake-ssh: $2 held through 6000 polls and never released" >&2
+            exit 70
+        fi
+        sleep 0.01
+        waited=$((waited + 1))
+    done
+}
+
 if [ "$is_exit" -eq 1 ]; then
     if [ -n "${FAKE_SSH_EXIT_HOLD:-}" ]; then
-        : >"$FAKE_SSH_EXIT_HOLD/started"
-        waited=0
-        while [ ! -e "$FAKE_SSH_EXIT_HOLD/release" ]; do
-            if [ "$waited" -ge 6000 ]; then
-                printf '%s\n' "fake-ssh: -O exit held through 6000 polls and never released" >&2
-                exit 70
-            fi
-            sleep 0.01
-            waited=$((waited + 1))
-        done
+        park "$FAKE_SSH_EXIT_HOLD" "-O exit"
     fi
     # The record goes down before the socket does: a kill that lands
     # between the two can then never read as "ctl gone, nothing logged",
@@ -311,18 +329,24 @@ run-remote)
     # env *adds* to what cargo exported, so without this the far side
     # would still see the whole of a developer's shell — including
     # their own ROOST_BOOTSTRAP_FS_ROOT, which decides which binary the
-    # ladder resolves. The four names below are exactly the ones the
+    # ladder resolves. The names below are exactly the ones the
     # hermeticity contract above enumerates; anything else the remote
     # command needs, it does not get, which is the point.
     if [ -z "$fake_env" ]; then
         printf '%s\n' "fake-ssh: run-remote needs env(1) and could not find it" >&2
         exit 1
     fi
+    if [ -n "${FAKE_SSH_START_HOLD:-}" ]; then
+        case "$remote" in
+        "sh -c 'exec "*" start'"*) park "$FAKE_SSH_START_HOLD" "roost-session start" ;;
+        esac
+    fi
     exec "$fake_env" -i \
         HOME="${HOME:-}" \
         PATH="${PATH:-}" \
         USER="${USER:-}" \
         ROOST_BOOTSTRAP_FS_ROOT="${ROOST_BOOTSTRAP_FS_ROOT:-}" \
+        ROOST_TEST_MODE="${ROOST_TEST_MODE:-}" \
         sh -c "$remote"
     ;;
 drop-after:*)

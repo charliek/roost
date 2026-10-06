@@ -19,6 +19,7 @@ use roost_ipc::LocalBackendMode;
 use crate::host_sidebar::{
     FidelityAction, HostTransportKind, LocalSlot, SectionState, LOCAL_LABEL,
 };
+use crate::session_update;
 
 /// Palette item ids. The prefix is what routes an activation back here;
 /// everything after the second colon is the saved host's id, which is
@@ -31,6 +32,7 @@ const STOP_PREFIX: &str = "host:stop:";
 const REMOVE_PREFIX: &str = "host:remove:";
 const CREATE_ON_PREFIX: &str = "host:create_on:";
 const UPDATE_PREFIX: &str = "host:update:";
+const INSTALL_PREFIX: &str = "host:install:";
 const RESTART_PREFIX: &str = "host:restart:";
 /// A forgotten host offered back (plan 063 §D7). Keyed by **target**,
 /// not by a saved id: the row exists precisely because the host is no
@@ -100,6 +102,9 @@ pub struct HostRow<'a> {
     /// that is connected at exact fidelity or is not connected at all,
     /// which is the ordinary case.
     pub fidelity: Option<FidelityAction>,
+    /// Whether the session is up to date and what a restart would run
+    /// (plan 076 D3). `None` unless the session's identity is known.
+    pub update: Option<&'a crate::session_update::UpdateFacts>,
 }
 
 /// One forgotten host, as the recents rows read it (plan 063 §D7).
@@ -151,10 +156,14 @@ pub enum HostVerb {
     /// Stop the session (confirmed). Connected only — stopping requires
     /// being attached to what you stop.
     Stop(String),
-    /// Send this ssh host a matching `roost-session` and restart it, so
-    /// the connection leaves the `vt` fallback.
+    /// Send a refused ssh host a matching `roost-session` and restart
+    /// it (plan 076 D6: offered only for `Required` over ssh).
     Update(String),
-    /// Restart this machine's own session, for the same reason.
+    /// Install this client's `roost-session` on an ssh host and leave the
+    /// running session alone; a Restart puts it to use (plan 076 D7).
+    Install(String),
+    /// Restart a host's session onto the newest usable build, on any
+    /// transport with a restart target (plan 076 D4).
     Restart(String),
     Remove(String),
     /// Drill into the "New Project on…" picker.
@@ -209,6 +218,9 @@ pub fn parse(id: &str) -> Option<HostVerb> {
     if let Some(host) = saved(UPDATE_PREFIX) {
         return Some(HostVerb::Update(host));
     }
+    if let Some(host) = saved(INSTALL_PREFIX) {
+        return Some(HostVerb::Install(host));
+    }
     if let Some(host) = saved(RESTART_PREFIX) {
         return Some(HostVerb::Restart(host));
     }
@@ -235,13 +247,25 @@ pub fn parse(id: &str) -> Option<HostVerb> {
     saved(CREATE_ON_PREFIX).map(|host| HostVerb::CreateOn(Some(host)))
 }
 
-/// One palette row: what the adapter turns into a `PaletteItem`.
+/// One host verb: a palette row, a right-click menu item, or both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerbItem {
     pub id: String,
     pub title: String,
     /// The one-line "what this does" from the approved mock.
     pub subtitle: Option<String>,
+    /// The menu item's label. Shorter than `title`: a menu is opened on
+    /// one host, so it never names it (plan 076 D6).
+    pub menu_label: &'static str,
+    pub surfaces: Surfaces,
+}
+
+/// Where a verb is offered (plan 076 D6's P2): the palette lists the
+/// update rows and the menu also lists the plain maintenance Restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Surfaces {
+    pub palette: bool,
+    pub menu: bool,
 }
 
 impl VerbItem {
@@ -250,6 +274,40 @@ impl VerbItem {
             id: id.into(),
             title: title.into(),
             subtitle: Some(subtitle.to_string()),
+            menu_label: "",
+            surfaces: Surfaces {
+                palette: true,
+                menu: false,
+            },
+        }
+    }
+
+    /// A palette-only row with no subtitle: a picker destination.
+    fn destination(id: impl Into<String>, title: impl Into<String>) -> Self {
+        Self {
+            subtitle: None,
+            ..Self::new(id, title, "")
+        }
+    }
+
+    fn in_menu(self, menu_label: &'static str) -> Self {
+        Self {
+            menu_label,
+            surfaces: Surfaces {
+                menu: true,
+                ..self.surfaces
+            },
+            ..self
+        }
+    }
+
+    fn in_palette(self, palette: bool) -> Self {
+        Self {
+            surfaces: Surfaces {
+                palette,
+                ..self.surfaces
+            },
+            ..self
         }
     }
 }
@@ -276,11 +334,10 @@ fn is_connected(state: SectionState) -> bool {
 ///   first and never stops the session), but never mid-dial, which would
 ///   race the attempt it is removing, and never on *the slot* under
 ///   `session` — see [`removable`].
-/// * `Update` / `Restart` — only on a connected host whose `fidelity`
-///   names one of them, which is plan 056 §3.4's matrix: an ssh host is
-///   sent a matching build, this machine's own session is restarted,
-///   and a socket target lists neither because nothing here can reach
-///   its binary.
+/// * `Install` / `Restart` / `Update` — as the session's update facts
+///   and the fidelity route offer them ([`update_rows`], plan 076 D6),
+///   each marked with the [`Surfaces`] it is listed on. A socket target
+///   lists none: nothing here can reach its binary.
 /// * The seeded `localhost` row appears while **no saved host has a
 ///   localhost transport** (plan 063 §D3 — before R9 that could only be
 ///   an empty registry), and only where the policy offers the localhost
@@ -334,29 +391,23 @@ pub fn verbs(
         let reachable = policy.localhost_surface || !host.transport.localhost();
         if is_connected(host.state) {
             if reachable {
-                items.push(VerbItem::new(
-                    format!("{DISCONNECT_PREFIX}{}", host.saved_id),
-                    format!("Disconnect Host: {}", host.label),
-                    "session keeps running",
-                ));
-                items.push(VerbItem::new(
-                    format!("{STOP_PREFIX}{}", host.saved_id),
-                    format!("Stop Session: {}", host.label),
-                    "ends shells, keeps layout",
-                ));
-                match host.fidelity {
-                    Some(FidelityAction::Update) => items.push(VerbItem::new(
-                        format!("{UPDATE_PREFIX}{}", host.saved_id),
-                        format!("Update roost-session on {}", host.label),
-                        "installs a matching build and restarts it",
-                    )),
-                    Some(FidelityAction::Restart) => items.push(VerbItem::new(
-                        format!("{RESTART_PREFIX}{}", host.saved_id),
-                        format!("Restart session on {}", host.label),
-                        "stops and starts it; ends shells, keeps layout",
-                    )),
-                    Some(FidelityAction::Manual) | None => {}
-                }
+                items.push(
+                    VerbItem::new(
+                        format!("{DISCONNECT_PREFIX}{}", host.saved_id),
+                        format!("Disconnect Host: {}", host.label),
+                        "session keeps running",
+                    )
+                    .in_menu("Disconnect"),
+                );
+                items.push(
+                    VerbItem::new(
+                        format!("{STOP_PREFIX}{}", host.saved_id),
+                        format!("Stop Session: {}", host.label),
+                        "ends shells, keeps layout",
+                    )
+                    .in_menu("Stop Session…"),
+                );
+                items.extend(update_rows(host));
             }
             if removable(host, local) {
                 items.push(VerbItem::new(
@@ -368,11 +419,31 @@ pub fn verbs(
             continue;
         }
         if reachable {
-            items.push(VerbItem::new(
+            let connect = VerbItem::new(
                 format!("{CONNECT_PREFIX}{}", host.saved_id),
                 format!("Connect Host: {}", host.label),
                 connect_subtitle(host.state),
-            ));
+            );
+            items.push(if connect_in_menu(host) {
+                connect.in_menu("Connect")
+            } else {
+                connect
+            });
+            if let Some(facts) = host.update {
+                if session_update::update_offered(facts, host.transport) {
+                    items.push(
+                        VerbItem::new(
+                            format!("{UPDATE_PREFIX}{}", host.saved_id),
+                            format!("Update roost-session on {}", host.label),
+                            "installs a matching build and restarts it",
+                        )
+                        .in_menu("Update roost-session…"),
+                    );
+                }
+                if facts.restart.offered {
+                    items.push(restart_row(host).in_palette(false));
+                }
+            }
         }
         if host.state != SectionState::Connecting && removable(host, local) {
             items.push(VerbItem::new(
@@ -398,6 +469,71 @@ pub fn verbs(
     // palette for.
     items.extend(switch_row(local.mode, policy, switching, slot));
     items
+}
+
+/// The update rows a connected host offers (plan 076 D6/D7).
+///
+/// At reduced fidelity the route is [`session_update::fidelity_route`]'s,
+/// so the band's pill and the palette are one offer. Install appears
+/// wherever it is offered. Restart is on the menu whenever a target is
+/// usable, and in the palette only once a build is staged or the route
+/// names it: the plain maintenance restart is menu-only (P2).
+fn update_rows(host: &HostRow<'_>) -> Vec<VerbItem> {
+    let route = session_update::fidelity_route(host.fidelity, host.update, host.transport);
+    let mut rows = Vec::new();
+    let install = route == Some(FidelityAction::Update)
+        || host
+            .update
+            .is_some_and(|facts| session_update::install_offer(facts, host.transport).is_ok());
+    if install {
+        rows.push(
+            VerbItem::new(
+                format!("{INSTALL_PREFIX}{}", host.saved_id),
+                format!("Install Update: {}", host.label),
+                "installs the matching build; the session keeps running",
+            )
+            .in_menu("Install Update…"),
+        );
+    }
+    let routed = route == Some(FidelityAction::Restart);
+    let (offered, staged) = host.update.map_or((routed, false), |facts| {
+        (
+            facts.restart.offered,
+            facts.state == session_update::SessionUpdate::Staged,
+        )
+    });
+    if offered {
+        rows.push(restart_row(host).in_palette(routed || staged));
+    }
+    rows
+}
+
+fn restart_row(host: &HostRow<'_>) -> VerbItem {
+    VerbItem::new(
+        format!("{RESTART_PREFIX}{}", host.saved_id),
+        format!("Restart session on {}", host.label),
+        "stops and starts it; ends shells, keeps layout",
+    )
+    .in_menu("Restart Session…")
+}
+
+/// Whether Connect is on a host's menu (D6). A refused session's menu
+/// offers what fixes it in its place, and a session too new for this
+/// client offers nothing; a socket host keeps today's rows.
+fn connect_in_menu(host: &HostRow<'_>) -> bool {
+    let Some(facts) = host.update else {
+        return true;
+    };
+    if host.transport == HostTransportKind::Socket {
+        return true;
+    }
+    match facts.state {
+        session_update::SessionUpdate::SessionNewer { blocked: true } => false,
+        session_update::SessionUpdate::Required => {
+            !(session_update::update_offered(facts, host.transport) || facts.restart.offered)
+        }
+        _ => true,
+    }
 }
 
 /// The one local-backend switch row this client offers, if any (plan
@@ -502,11 +638,7 @@ pub fn create_targets(
     // Under `session` there is no in-process workspace on screen, so
     // there is nothing for this row to create in.
     if local.mode == LocalBackendMode::InProcess {
-        items.push(VerbItem {
-            id: CREATE_ON_LOCAL_ID.to_string(),
-            title: local_label.to_string(),
-            subtitle: None,
-        });
+        items.push(VerbItem::destination(CREATE_ON_LOCAL_ID, local_label));
     }
     if policy.localhost_surface {
         items.push(localhost_target(slot));
@@ -518,10 +650,8 @@ pub fn create_targets(
             // The slot already has its row above, in the local band's
             // place; listing it again would be the same session twice.
             .filter(|host| Some(host.saved_id) != slot.map(|slot| slot.saved_id))
-            .map(|host| VerbItem {
-                id: format!("{CREATE_ON_PREFIX}{}", host.saved_id),
-                title: host.label.to_string(),
-                subtitle: None,
+            .map(|host| {
+                VerbItem::destination(format!("{CREATE_ON_PREFIX}{}", host.saved_id), host.label)
             }),
     );
     // Last, under the destinations that already exist: a recent is a
@@ -573,11 +703,9 @@ fn localhost_target(slot: Option<&HostRow<'_>>) -> VerbItem {
         // Ready: this is the ordinary create-on-a-host row, sitting in
         // the local band's position. Same id, so the activation is the
         // same one every other host row gets.
-        Some(slot) if is_connected(slot.state) => VerbItem {
-            id: format!("{CREATE_ON_PREFIX}{}", slot.saved_id),
-            title: slot.label.to_string(),
-            subtitle: None,
-        },
+        Some(slot) if is_connected(slot.state) => {
+            VerbItem::destination(format!("{CREATE_ON_PREFIX}{}", slot.saved_id), slot.label)
+        }
         Some(slot) => VerbItem::new(
             CREATE_ON_LOCALHOST_ID,
             slot.label,
@@ -607,6 +735,7 @@ mod tests {
             state,
             transport: HostTransportKind::Ssh,
             fidelity: None,
+            update: None,
         }
     }
 
@@ -875,6 +1004,7 @@ mod tests {
             state: SectionState::Disconnected,
             transport: HostTransportKind::Localhost,
             fidelity: None,
+            update: None,
         };
         let remote = host("h2", SectionState::Disconnected);
 
@@ -938,6 +1068,7 @@ mod tests {
             // will not offer to leave a local session must not offer to
             // restart one either.
             fidelity: Some(FidelityAction::Restart),
+            update: None,
         };
         let offered = verbs(&[connected], NO_RECENTS, IN_PROCESS, GATED, false, ANSWERED);
         let items = ids(&offered);
@@ -1106,7 +1237,7 @@ mod tests {
                 vec![
                     "host:disconnect:h",
                     "host:stop:h",
-                    "host:update:h",
+                    "host:install:h",
                     "host:remove:h",
                 ],
             ),
@@ -1187,9 +1318,9 @@ mod tests {
                 let offered = verbs(&[row], NO_RECENTS, IN_PROCESS, FULL, false, ANSWERED);
                 let items = ids(&offered);
                 assert!(
-                    !items
-                        .iter()
-                        .any(|id| id.starts_with(UPDATE_PREFIX) || id.starts_with(RESTART_PREFIX)),
+                    !items.iter().any(|id| id.starts_with(UPDATE_PREFIX)
+                        || id.starts_with(INSTALL_PREFIX)
+                        || id.starts_with(RESTART_PREFIX)),
                     "{state:?} {action:?}: {items:?}"
                 );
             }
@@ -1216,18 +1347,197 @@ mod tests {
                 ANSWERED,
             )
             .into_iter()
-            .find(|item| item.id.starts_with(UPDATE_PREFIX) || item.id.starts_with(RESTART_PREFIX))
+            .find(|item| item.id.starts_with(INSTALL_PREFIX) || item.id.starts_with(RESTART_PREFIX))
             .map(|item| item.title)
         };
         assert_eq!(
             title(HostTransportKind::Ssh).as_deref(),
-            Some("Update roost-session on pop-os")
+            Some("Install Update: pop-os")
         );
         assert_eq!(
             title(HostTransportKind::Localhost).as_deref(),
             Some("Restart session on pop-os")
         );
         assert_eq!(title(HostTransportKind::Socket), None);
+    }
+
+    /// Plan 076 D6's update rows, driven by the update facts, per
+    /// surface. The palette (P2): Install when it is offered, Restart only
+    /// once a build is staged, Update only for a refused ssh session, and
+    /// at reduced fidelity whichever Option 2 routes to. The menu also
+    /// lists the plain maintenance Restart wherever a target is usable.
+    #[test]
+    fn the_update_rows_follow_the_update_facts() {
+        use crate::session_update::{RestartOffer, SessionUpdate, UpdateFacts};
+        use roost_ipc::session_version::BuildId;
+        use HostTransportKind::{Localhost, Socket, Ssh};
+
+        let build = |version: &str| BuildId {
+            version: version.into(),
+            protocol: 7,
+            libghostty_build: "g".into(),
+            ..BuildId::default()
+        };
+        let facts = |state| UpdateFacts {
+            state,
+            running: build("0.0.21"),
+            client: build("0.0.22"),
+            restart: RestartOffer {
+                offered: true,
+                why: None,
+                target: None,
+            },
+            staged: None,
+        };
+        // (palette ids, menu ids) among the update rows.
+        let rows = |transport, state: SectionState, facts: &UpdateFacts, reduced: bool| {
+            let row = HostRow {
+                transport,
+                fidelity: fidelity_action(reduced, transport, state),
+                update: Some(facts),
+                ..host("h", state)
+            };
+            let items = verbs(&[row], NO_RECENTS, IN_PROCESS, FULL, false, ANSWERED);
+            let update_ids = |on: fn(&Surfaces) -> bool| {
+                items
+                    .iter()
+                    .filter(|item| on(&item.surfaces))
+                    .map(|item| item.id.as_str())
+                    .filter(|id| {
+                        id.starts_with(INSTALL_PREFIX)
+                            || id.starts_with(RESTART_PREFIX)
+                            || id.starts_with(UPDATE_PREFIX)
+                    })
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            };
+            (
+                update_ids(|surfaces| surfaces.palette),
+                update_ids(|surfaces| surfaces.menu),
+            )
+        };
+        let connected = SectionState::Connected;
+        assert_eq!(
+            rows(Ssh, connected, &facts(SessionUpdate::Available), false),
+            (
+                vec!["host:install:h".to_string()],
+                vec!["host:install:h".to_string(), "host:restart:h".to_string()]
+            )
+        );
+        for transport in [Ssh, Localhost] {
+            assert_eq!(
+                rows(transport, connected, &facts(SessionUpdate::Staged), false),
+                (
+                    vec!["host:restart:h".to_string()],
+                    vec!["host:restart:h".to_string()]
+                ),
+                "{transport:?}"
+            );
+        }
+        for state in [
+            SessionUpdate::UpToDate,
+            SessionUpdate::Unordered,
+            SessionUpdate::SessionNewer { blocked: false },
+        ] {
+            for transport in [Ssh, Localhost] {
+                assert_eq!(
+                    rows(transport, connected, &facts(state), false),
+                    (vec![], vec!["host:restart:h".to_string()]),
+                    "{state:?} over {transport:?}: the maintenance restart is menu-only"
+                );
+            }
+        }
+        // No usable target: no Restart anywhere.
+        let mut unusable = facts(SessionUpdate::UpToDate);
+        unusable.restart.offered = false;
+        assert_eq!(
+            rows(Localhost, connected, &unusable, false),
+            (vec![], vec![])
+        );
+        // Reduced fidelity: the routed action in both, and nothing in the
+        // palette when neither is offered.
+        let mut reduced = facts(SessionUpdate::Available);
+        reduced.running = build("0.0.22");
+        assert_eq!(rows(Ssh, connected, &reduced, true).0, ["host:install:h"]);
+        reduced.state = SessionUpdate::SessionNewer { blocked: false };
+        assert_eq!(
+            rows(Ssh, connected, &reduced, true),
+            (vec![], vec!["host:restart:h".to_string()])
+        );
+        let mut socket = facts(SessionUpdate::UpToDate);
+        socket.restart.offered = false;
+        assert_eq!(rows(Socket, connected, &socket, true), (vec![], vec![]));
+        // Required over ssh offers Update beside Connect; over localhost a
+        // restart, on the menu only.
+        let needs_restart = SectionState::NeedsRestart;
+        // `restart_offer` never offers a refused ssh session a Restart.
+        let mut required_ssh = facts(SessionUpdate::Required);
+        required_ssh.restart.offered = false;
+        assert_eq!(
+            rows(Ssh, needs_restart, &required_ssh, false),
+            (
+                vec!["host:update:h".to_string()],
+                vec!["host:update:h".to_string()]
+            )
+        );
+        assert_eq!(
+            rows(
+                Localhost,
+                needs_restart,
+                &facts(SessionUpdate::Required),
+                false
+            ),
+            (vec![], vec!["host:restart:h".to_string()])
+        );
+    }
+
+    /// D6: a refused session's menu offers the fix in Connect's place,
+    /// and one that is too new for this client offers nothing. The
+    /// palette keeps Connect, and a socket host keeps today's rows.
+    #[test]
+    fn connect_leaves_the_menu_where_the_fix_replaces_it() {
+        use crate::session_update::{RestartOffer, SessionUpdate, UpdateFacts};
+        use HostTransportKind::{Localhost, Socket, Ssh};
+
+        let facts = |state, offered| UpdateFacts {
+            state,
+            running: Default::default(),
+            client: Default::default(),
+            restart: RestartOffer {
+                offered,
+                why: None,
+                target: None,
+            },
+            staged: None,
+        };
+        let connect = |transport, facts: Option<&UpdateFacts>| {
+            let row = HostRow {
+                transport,
+                update: facts,
+                ..host("h", SectionState::NeedsRestart)
+            };
+            verbs(&[row], NO_RECENTS, IN_PROCESS, FULL, false, ANSWERED)
+                .into_iter()
+                .find(|item| item.id == "host:connect:h")
+                .map(|item| item.surfaces)
+                .expect("the palette always has Connect")
+        };
+        let menu = |transport, facts: Option<&UpdateFacts>| connect(transport, facts).menu;
+        let required = facts(SessionUpdate::Required, true);
+        let blocked = facts(SessionUpdate::SessionNewer { blocked: true }, false);
+        assert!(!menu(Ssh, Some(&required)));
+        assert!(!menu(Localhost, Some(&required)));
+        assert!(!menu(Ssh, Some(&blocked)));
+        assert!(!menu(Localhost, Some(&blocked)));
+        assert!(menu(Socket, Some(&required)));
+        assert!(menu(Socket, Some(&blocked)));
+        // A localhost refusal with no usable target keeps the way in.
+        assert!(menu(
+            Localhost,
+            Some(&facts(SessionUpdate::Required, false))
+        ));
+        assert!(menu(Ssh, None));
+        assert!(connect(Ssh, Some(&blocked)).palette);
     }
 
     /// Plan 063 §D8's table: the row offered is the one naming the
@@ -1495,6 +1805,10 @@ mod tests {
         assert_eq!(
             parse("host:update:abc"),
             Some(HostVerb::Update("abc".into()))
+        );
+        assert_eq!(
+            parse("host:install:abc"),
+            Some(HostVerb::Install("abc".into()))
         );
         assert_eq!(
             parse("host:restart:abc"),

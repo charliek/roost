@@ -341,6 +341,17 @@ pub const ELLIPSIS: &str = "…";
 /// `TerminalMetrics::measure_with_font` uses for the cell grid), so a
 /// budget computed here matches what will be drawn.
 pub fn text_width(content: &str, font: Font, size: f32) -> f32 {
+    text_width_shaped(content, font, size, advanced_text::Shaping::Advanced)
+}
+
+/// [`text_width`] under a given shaping: a run drawn with iced's default
+/// (`Auto`, Basic for plain ASCII) measures differently from Advanced.
+pub fn text_width_shaped(
+    content: &str,
+    font: Font,
+    size: f32,
+    shaping: advanced_text::Shaping,
+) -> f32 {
     if content.is_empty() {
         return 0.0;
     }
@@ -353,7 +364,7 @@ pub fn text_width(content: &str, font: Font, size: f32) -> f32 {
         font,
         align_x: advanced_text::Alignment::Default,
         align_y: iced::alignment::Vertical::Top,
-        shaping: advanced_text::Shaping::Advanced,
+        shaping,
         wrapping: advanced_text::Wrapping::None,
     })
     .min_bounds()

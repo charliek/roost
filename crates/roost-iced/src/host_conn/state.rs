@@ -10,6 +10,7 @@
 use std::time::Duration;
 
 use roost_ipc::messages::{AttachPayloadKind, SessionIdentify, SESSION_PROTOCOL_VERSION};
+use roost_ipc::session_version::BuildId;
 use roost_ui_model::keys::HostId;
 
 /// The payload kinds this client can decode, in the order its attach
@@ -146,6 +147,22 @@ pub(crate) struct BuildMismatch {
     /// What this client can offer about it — a local restart, a remote
     /// update, or nothing but a pointer at the docs.
     pub(crate) restart: RestartAction,
+    /// The refused session's build, as the update logic compares it
+    /// (plan 076 D3).
+    pub(crate) running: BuildId,
+    /// The refused session's own id and executable, so a restart of it
+    /// is bound to this session and can consider its binary (plan 076
+    /// D4, D8).
+    pub(crate) session_id: String,
+    pub(crate) exe_path: Option<String>,
+}
+
+impl BuildMismatch {
+    /// Whether the refused session speaks the newer protocol (plan 076
+    /// D3's `Gate::Failed`).
+    pub(crate) fn protocol_newer(&self) -> bool {
+        self.session_protocol > self.client_protocol
+    }
 }
 
 /// Run the compatibility gate against a `session.identify` reply.
@@ -156,19 +173,24 @@ pub(crate) fn check_compatibility(
     identity: &SessionIdentify,
     client_build: &str,
     restart: RestartAction,
-) -> Result<Compatibility, BuildMismatch> {
-    let mismatch = |kind| BuildMismatch {
-        kind,
-        session_protocol: identity.session_protocol,
-        client_protocol: SESSION_PROTOCOL_VERSION,
-        session_build: identity.libghostty_build.clone(),
-        client_build: client_build.to_string(),
-        session_payload_kinds: identity
-            .payload_kinds
-            .iter()
-            .map(|kind| kind.0.clone())
-            .collect(),
-        restart,
+) -> Result<Compatibility, Box<BuildMismatch>> {
+    let mismatch = |kind| {
+        Box::new(BuildMismatch {
+            kind,
+            session_protocol: identity.session_protocol,
+            client_protocol: SESSION_PROTOCOL_VERSION,
+            session_build: identity.libghostty_build.clone(),
+            client_build: client_build.to_string(),
+            session_payload_kinds: identity
+                .payload_kinds
+                .iter()
+                .map(|kind| kind.0.clone())
+                .collect(),
+            restart,
+            running: BuildId::from(identity),
+            session_id: identity.session_id.clone(),
+            exe_path: identity.exe_path.clone(),
+        })
     };
 
     let serves = |wanted: &str| identity.payload_kinds.iter().any(|kind| kind.0 == wanted);
@@ -238,6 +260,13 @@ pub(crate) struct ConnectFacts {
     /// gaps (the prologue's and a lagged stream's) are closed the same
     /// way.
     pub(crate) persist_error: Option<String>,
+    /// The session's build, as the update logic compares it (plan 076
+    /// D3) — settled at the identify gate like everything but
+    /// `persist_error`.
+    pub(crate) running: BuildId,
+    /// [`SessionIdentify::exe_path`], verbatim. A path a peer supplied:
+    /// only ever run for a session on this machine (plan 076 D4).
+    pub(crate) exe_path: Option<String>,
 }
 
 /// The two libghostty builds a reduced-fidelity connection sits between.
@@ -278,6 +307,8 @@ impl ConnectFacts {
             reduced_fidelity: compatibility == Compatibility::BuildSkew,
             resumed: None,
             persist_error: identity.persist_error.clone(),
+            running: BuildId::from(identity),
+            exe_path: identity.exe_path.clone(),
         }
     }
 }
@@ -571,8 +602,7 @@ mod tests {
             libghostty_build: build.into(),
             session_id: "sess-1".into(),
             started_at: "2026-08-29T00:00:00Z".into(),
-            persist_error: None,
-            ops: None,
+            ..SessionIdentify::default()
         }
     }
 
@@ -599,6 +629,9 @@ mod tests {
             client_build: "gb-1".into(),
             session_payload_kinds: vec![AttachPayloadKind::GHOSTTY_SNAPSHOT.to_string()],
             restart: RestartAction::RestartLocal,
+            running: BuildId::default(),
+            session_id: String::new(),
+            exe_path: None,
         });
         let cases = [
             (HostConnState::Connected, SectionState::Connected),
@@ -718,6 +751,37 @@ mod tests {
         assert_eq!(reduced.skew.client_build, "gb-new");
     }
 
+    /// Plan 076 D3 reads the session's version off both outcomes of the
+    /// gate, so both keep the whole build, dev facts included.
+    #[test]
+    fn both_gate_outcomes_carry_the_running_build() {
+        let mut reply = identity(SESSION_PROTOCOL_VERSION, &["vt"], "gb-1");
+        reply.app_version = "0.0.21".into();
+        reply.dev = true;
+        reply.git_sha = Some("a1b2c3d".into());
+        let want = BuildId {
+            version: "0.0.21".into(),
+            protocol: SESSION_PROTOCOL_VERSION,
+            libghostty_build: "gb-1".into(),
+            dev: true,
+            sha: Some("a1b2c3d".into()),
+        };
+        assert_eq!(
+            ConnectFacts::new(&reply, "gb-1", Compatibility::Exact).running,
+            want
+        );
+
+        reply.session_protocol = SESSION_PROTOCOL_VERSION + 1;
+        let refused = check_compatibility(&reply, "gb-1", RestartAction::None).unwrap_err();
+        assert_eq!(
+            refused.running,
+            BuildId {
+                protocol: SESSION_PROTOCOL_VERSION + 1,
+                ..want
+            }
+        );
+    }
+
     /// A session from before `vt` existed has only the build-coupled
     /// payload, so the same skew is terminal there — the pre-R3 daemon
     /// the restart flow is still for.
@@ -821,6 +885,7 @@ mod tests {
         )
         .unwrap_err();
 
+        let mismatch = *mismatch;
         let state = machine.needs_restart(mismatch.clone());
         assert_eq!(state, HostConnState::NeedsRestart(mismatch));
         assert!(state.retry_in().is_none(), "a mismatch never auto-retries");

@@ -317,6 +317,8 @@ const OP_TYPES: &[Row] = &[
     op::<HostConnectParams, HostConnectionResult>(ops::HOST_CONNECT),
     op::<HostDisconnectParams, HostConnectionResult>(ops::HOST_DISCONNECT),
     op::<HostStatusParams, HostStatusResult>(ops::HOST_STATUS),
+    op::<HostActionParams, HostActionResult>(ops::HOST_UPDATE),
+    op::<HostActionParams, HostActionResult>(ops::HOST_RESTART),
     event::<TabOpenedEvent>(ops::EVENT_TAB_OPENED),
     event::<TabClosedEvent>(ops::EVENT_TAB_CLOSED),
     event::<TabStateChangedEvent>(ops::EVENT_TAB_STATE_CHANGED),
@@ -697,6 +699,9 @@ mod tests {
     ///   server-internal use; it never rides the wire as a field of any
     ///   op, event, or nested type, so `bundle()` never calls
     ///   `subschema_for::<AgentTabState>()` and it has no `$defs` entry.
+    /// - `SessionBinaryIdentity`: what `roost-session identify` prints on
+    ///   stdout, never an op's params, result or event, so no op type
+    ///   reaches it either.
     const NOT_IN_DEFS: &[(&str, &str)] = &[
         ("RawAttachHandshake", "session_id"),
         ("RawAttachHandshake", "kinds"),
@@ -718,6 +723,7 @@ mod tests {
         ("RawAttachHandshakeReply", "snapshot_rows"),
         ("RawAttachHandshakeReply", "error"),
         ("AgentTabState", "ownership"),
+        ("SessionBinaryIdentity", "git_sha"),
     ];
 
     /// Finding 2: an `Option<T>` field with neither `#[serde(default)]`

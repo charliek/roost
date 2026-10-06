@@ -19,27 +19,123 @@
 
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use roost_ipc::messages::{AttachPayloadKind, SessionBinaryIdentity, SESSION_PROTOCOL_VERSION};
 
 /// This build's offline identity: what `roost-session identify` prints,
-/// and what `serve`'s `session.identify` answer's `libghostty_build`
-/// field is drawn from.
+/// and what `serve`'s `session.identify` answer's build fields are
+/// drawn from.
 ///
 /// `fake_libghostty_build` is the already-read `ROOST_SESSION_FAKE_BUILD`
-/// value (or `None`); `test_mode` re-gates it here rather than trusting
-/// the caller's gate alone, mirroring `serve.rs`'s
-/// `.filter(|_| config.test_mode)` — a caller that hand-builds test data
-/// with `test_mode: false` and a fake value set still gets the truth.
+/// value (or `None`), and `overrides` the already-read sidecar;
+/// `test_mode` re-gates both here rather than trusting the caller's gate
+/// alone — a caller that hand-builds test data with `test_mode: false`
+/// and a fake value set still gets the truth.
 pub fn build_identity(
     fake_libghostty_build: Option<&str>,
     test_mode: bool,
+    overrides: Option<&IdentityOverride>,
 ) -> SessionBinaryIdentity {
-    SessionBinaryIdentity {
+    let mut identity = SessionBinaryIdentity {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         session_protocol: SESSION_PROTOCOL_VERSION,
         libghostty_build: resolve_libghostty_build(fake_libghostty_build, test_mode),
+        dev: env!("ROOST_BUILD_DEV") == "1",
+        git_sha: Some(env!("ROOST_BUILD_SHA"))
+            .filter(|sha| !sha.is_empty())
+            .map(str::to_string),
+    };
+    if let Some(overrides) = overrides.filter(|_| test_mode) {
+        if let Some(version) = &overrides.app_version {
+            identity.app_version.clone_from(version);
+        }
+        if let Some(dev) = overrides.dev {
+            identity.dev = dev;
+        }
+        if let Some(sha) = &overrides.git_sha {
+            identity.git_sha.clone_from(sha);
+        }
+        if let Some(protocol) = overrides.session_protocol {
+            identity.session_protocol = protocol;
+        }
+    }
+    identity
+}
+
+/// The fields a test-mode sidecar ([`crate::consts::IDENTITY_SIDECAR_SUFFIX`])
+/// replaces; `None` leaves the build's own value. `git_sha` is doubly
+/// optional so a sidecar can also say `"git_sha": null`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdentityOverride {
+    pub app_version: Option<String>,
+    pub dev: Option<bool>,
+    pub git_sha: Option<Option<String>>,
+    pub session_protocol: Option<u32>,
+}
+
+impl IdentityOverride {
+    /// Parse a sidecar's JSON. An unknown key is an error, so a typo in
+    /// a fixture fails the test that planted it instead of being ignored.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|error| error.to_string())?;
+        let object = value.as_object().ok_or("not a JSON object")?;
+        let mut out = Self::default();
+        for (key, value) in object {
+            match key.as_str() {
+                "app_version" => {
+                    let version = value.as_str().ok_or("app_version is not a string")?;
+                    out.app_version = Some(version.to_string());
+                }
+                "dev" => out.dev = Some(value.as_bool().ok_or("dev is not a bool")?),
+                "git_sha" => {
+                    out.git_sha = Some(match value {
+                        serde_json::Value::Null => None,
+                        value => Some(value.as_str().ok_or("git_sha is not a string")?.to_string()),
+                    });
+                }
+                "session_protocol" => {
+                    let protocol = value
+                        .as_u64()
+                        .and_then(|protocol| u32::try_from(protocol).ok())
+                        .ok_or("session_protocol is not a u32")?;
+                    out.session_protocol = Some(protocol);
+                }
+                other => return Err(format!("unknown key {other:?}")),
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// This process's executable, canonicalised, or `None` when it does not
+/// resolve. Deliberately no fallback (unlike [`crate::agent_hook`]'s):
+/// `session.identify.exe_path` is a path clients may run, so a guess is
+/// worse than nothing.
+pub fn canonical_exe() -> Option<PathBuf> {
+    std::env::current_exe().ok()?.canonicalize().ok()
+}
+
+/// Read the sidecar beside `exe`, in test mode only. `Ok(None)` when
+/// there is none.
+pub fn read_identity_override(
+    exe: Option<&Path>,
+    test_mode: bool,
+) -> Result<Option<IdentityOverride>, String> {
+    let Some(exe) = exe.filter(|_| test_mode) else {
+        return Ok(None);
+    };
+    let mut path = exe.as_os_str().to_owned();
+    path.push(crate::consts::IDENTITY_SIDECAR_SUFFIX);
+    let path = PathBuf::from(path);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => IdentityOverride::parse(&text)
+            .map(Some)
+            .map_err(|error| format!("{}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{}: {error}", path.display())),
     }
 }
 
@@ -50,7 +146,18 @@ pub fn build_identity(
 /// so a binary that has never run can still answer it.
 pub fn run() -> i32 {
     let (test_mode, fake_libghostty_build) = test_mode_env();
-    let identity = build_identity(fake_libghostty_build.as_deref(), test_mode);
+    let overrides = match read_identity_override(canonical_exe().as_deref(), test_mode) {
+        Ok(overrides) => overrides,
+        Err(error) => {
+            eprintln!("roost-session identify: test identity sidecar: {error}");
+            return 1;
+        }
+    };
+    let identity = build_identity(
+        fake_libghostty_build.as_deref(),
+        test_mode,
+        overrides.as_ref(),
+    );
     let line = match serde_json::to_string(&identity) {
         Ok(line) => line,
         Err(error) => {
@@ -277,7 +384,7 @@ mod tests {
 
     #[test]
     fn build_identity_always_carries_the_real_app_version_and_protocol() {
-        let identity = build_identity(Some("fake-build"), true);
+        let identity = build_identity(Some("fake-build"), true, None);
         assert_eq!(identity.app_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(identity.session_protocol, SESSION_PROTOCOL_VERSION);
     }
@@ -288,17 +395,112 @@ mod tests {
     /// would race every other test in this binary.
     #[test]
     fn a_fake_build_only_applies_under_test_mode() {
-        let faked = build_identity(Some("fake-build-123"), true);
+        let faked = build_identity(Some("fake-build-123"), true, None);
         assert_eq!(faked.libghostty_build, "fake-build-123");
 
-        let real = build_identity(Some("fake-build-123"), false);
+        let real = build_identity(Some("fake-build-123"), false, None);
         assert_eq!(real.libghostty_build, roost_vt::libghostty_build());
         assert_ne!(real.libghostty_build, "fake-build-123");
     }
 
     #[test]
     fn no_fake_build_set_always_reports_the_real_value() {
-        let identity = build_identity(None, true);
+        let identity = build_identity(None, true, None);
         assert_eq!(identity.libghostty_build, roost_vt::libghostty_build());
+    }
+
+    #[test]
+    fn the_dev_flag_follows_the_compiled_build_marker() {
+        assert_eq!(
+            build_identity(None, false, None).dev,
+            env!("ROOST_BUILD_DEV") == "1"
+        );
+    }
+
+    #[test]
+    fn a_sidecar_overrides_only_under_test_mode() {
+        let overrides = IdentityOverride {
+            app_version: Some("0.0.21".into()),
+            dev: Some(false),
+            git_sha: Some(None),
+            session_protocol: Some(SESSION_PROTOCOL_VERSION - 1),
+        };
+        let faked = build_identity(None, true, Some(&overrides));
+        assert_eq!(faked.app_version, "0.0.21");
+        assert_eq!(faked.session_protocol, SESSION_PROTOCOL_VERSION - 1);
+        assert!(!faked.dev);
+        assert_eq!(faked.git_sha, None);
+        assert_eq!(faked.libghostty_build, roost_vt::libghostty_build());
+
+        let real = build_identity(None, false, Some(&overrides));
+        assert_eq!(real, build_identity(None, false, None));
+
+        let partial = IdentityOverride {
+            git_sha: Some(Some("a1b2c3d".into())),
+            ..IdentityOverride::default()
+        };
+        let sha_only = build_identity(None, true, Some(&partial));
+        assert_eq!(sha_only.git_sha.as_deref(), Some("a1b2c3d"));
+        assert_eq!(sha_only.app_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn a_sidecar_parses_every_field_and_refuses_strangers() {
+        assert_eq!(
+            IdentityOverride::parse(
+                r#"{"app_version":"0.0.23","dev":true,"git_sha":"f00ba12","session_protocol":3}"#
+            ),
+            Ok(IdentityOverride {
+                app_version: Some("0.0.23".into()),
+                dev: Some(true),
+                git_sha: Some(Some("f00ba12".into())),
+                session_protocol: Some(3),
+            })
+        );
+        assert_eq!(
+            IdentityOverride::parse(r#"{"git_sha":null}"#),
+            Ok(IdentityOverride {
+                git_sha: Some(None),
+                ..IdentityOverride::default()
+            })
+        );
+        assert_eq!(
+            IdentityOverride::parse("{}"),
+            Ok(IdentityOverride::default())
+        );
+        for bad in [
+            r#"{"version":"1"}"#,
+            r#"{"dev":"yes"}"#,
+            r#"{"session_protocol":-1}"#,
+            "[]",
+            "nope",
+        ] {
+            assert!(IdentityOverride::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_sidecar_sits_beside_the_binary_and_is_read_in_test_mode_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("roost-session");
+        assert_eq!(read_identity_override(Some(&exe), true), Ok(None));
+
+        std::fs::write(
+            dir.path().join("roost-session.test-identity"),
+            r#"{"app_version":"0.0.21"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_identity_override(Some(&exe), true),
+            Ok(Some(IdentityOverride {
+                app_version: Some("0.0.21".into()),
+                ..IdentityOverride::default()
+            }))
+        );
+        assert_eq!(read_identity_override(Some(&exe), false), Ok(None));
+        assert_eq!(read_identity_override(None, true), Ok(None));
+
+        std::fs::write(dir.path().join("roost-session.test-identity"), "{").unwrap();
+        assert!(read_identity_override(Some(&exe), true).is_err());
     }
 }

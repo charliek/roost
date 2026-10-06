@@ -617,6 +617,10 @@ pub(crate) struct HostConnSet {
     /// app. [`Self::abandon_reconnects`] is the only place they are
     /// aborted.
     displaced: Vec<AbortHandle>,
+    /// The binary every connect of a host must spawn from, if it has to
+    /// spawn at all: a restart's target, held from its relaunch until the
+    /// restart ends (plan 076 D8), whichever surface starts the connect.
+    spawn_pins: HashMap<String, task::SpawnPin>,
 }
 
 /// Everything the set holds for one saved host, keyed on
@@ -964,7 +968,30 @@ impl HostConnSet {
             next_generation: 0,
             next_ssh_request: 0,
             displaced: Vec::new(),
+            spawn_pins: HashMap::new(),
         }
+    }
+
+    /// Make every connect of `host` spawn from `pin` rather than the
+    /// launch ladder, should nothing be listening, until [`Self::unpin_spawn`].
+    pub(crate) fn pin_spawn(&mut self, host: &str, pin: task::SpawnPin) {
+        self.spawn_pins.insert(host.to_string(), pin);
+    }
+
+    /// Lift the pin. Connections already carrying it can no longer
+    /// launch from it.
+    pub(crate) fn unpin_spawn(&mut self, host: &str) {
+        if let Some(pin) = self.spawn_pins.remove(host) {
+            pin.launches.revoke();
+        }
+    }
+
+    /// Stop any further launch from this host's pin, keeping it in place.
+    /// `true` while a launch from it is still out.
+    pub(crate) fn revoke_spawn(&self, host: &str) -> bool {
+        self.spawn_pins
+            .get(host)
+            .is_some_and(|pin| pin.launches.revoke())
     }
 
     /// Whether this set holds any *live connection* — never "any state".
@@ -1081,6 +1108,7 @@ impl HostConnSet {
             theme: Arc::clone(&self.theme),
             uploads: ops.uploads(),
             serving: ops.serving(),
+            spawn_bin: self.spawn_pins.get(host).cloned(),
         };
         // Detached on purpose: the task owns its own shutdown, bounds it
         // (`task::SHUTDOWN_GRACE`), and answers its queue on the way
@@ -3218,6 +3246,76 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
+
+    /// The reason the next attempt that gives up settles with.
+    async fn settled_reason(feed: &mut crate::engine_feed::EngineFeedReceiver) -> String {
+        let mut batch = crate::engine_feed::EngineBatch::default();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while tokio::time::Instant::now() < deadline {
+            while let Some(item) = feed.try_next(&mut batch) {
+                if let crate::engine_feed::EngineFeed::HostState(
+                    _,
+                    HostConnState::Disconnected(disconnected),
+                ) = item
+                {
+                    if disconnected.retry_in.is_none() {
+                        return disconnected.reason;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no attempt settled");
+    }
+
+    /// Plan 076 D8: a restart's pin, once on the set, reaches every
+    /// connection the set starts for that host — the relaunch and any
+    /// connect behind it — and each re-identifies the target before it
+    /// would run it. A target answering as another build starts nothing.
+    #[tokio::test]
+    async fn a_spawn_pin_rides_every_connection_the_set_starts_for_its_host() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let bin = dir.path().join("roost-session");
+        let identity = serde_json::json!({
+            "app_version": "0.0.22",
+            "session_protocol": roost_ipc::messages::SESSION_PROTOCOL_VERSION,
+            "libghostty_build": "g",
+        });
+        std::fs::write(&bin, format!("#!/bin/sh\nprintf '%s\\n' '{identity}'\n"))
+            .expect("write the stub");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let (mut set, mut feed) = a_set();
+        let (gate_feed, _gate_rx) = crate::engine_feed::channel();
+        set.pin_spawn(
+            "h1",
+            task::SpawnPin {
+                path: bin.clone(),
+                identity: roost_ipc::session_version::BuildId {
+                    version: "0.0.23".into(),
+                    protocol: roost_ipc::messages::SESSION_PROTOCOL_VERSION,
+                    libghostty_build: "g".into(),
+                    ..roost_ipc::session_version::BuildId::default()
+                },
+                launches: task::LaunchGate::new("h1", 1, gate_feed),
+            },
+        );
+        let pinned = format!(
+            "restart target {} changed; nothing was started",
+            bin.display()
+        );
+        for attempt in ["the relaunch", "a connect behind it"] {
+            set.connect(
+                "h1",
+                "local",
+                dir.path().join("absent.sock"),
+                HostTransport::LocalSession,
+                ConnectMode::SpawnIfMissing,
+            );
+            assert_eq!(settled_reason(&mut feed).await, pinned, "{attempt}");
+        }
+    }
 
     #[test]
     fn minted_incarnations_are_unique_and_never_local() {
@@ -5552,6 +5650,8 @@ mod tests {
             reduced_fidelity: true,
             resumed: None,
             persist_error: None,
+            running: roost_ipc::session_version::BuildId::default(),
+            exe_path: None,
         }
     }
 
@@ -5683,6 +5783,9 @@ mod tests {
             client_build: "gb-new".into(),
             session_payload_kinds: vec!["ghostty-snapshot".into()],
             restart: state::RestartAction::RestartLocal,
+            running: roost_ipc::session_version::BuildId::default(),
+            session_id: String::new(),
+            exe_path: None,
         }
     }
 

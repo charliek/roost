@@ -20,11 +20,12 @@ use std::collections::HashMap;
 use clap::Subcommand;
 
 use roost_ipc::messages::{
-    ops, HostAddParams, HostAddResult, HostConnectParams, HostConnectionResult,
-    HostDisconnectParams, HostListResult, HostRemoveParams, HostStatus, HostStatusParams,
-    HostStatusResult,
+    host_update_state, ops, BuildStatus, HostAddParams, HostAddResult, HostConnectParams,
+    HostConnectionResult, HostDisconnectParams, HostListResult, HostRemoveParams, HostStatus,
+    HostStatusParams, HostStatusResult, HostUpdateStatus,
 };
 use roost_ipc::ssh;
+use roost_ui_model::session_update;
 
 use crate::error::CliError;
 use crate::UiSocket;
@@ -245,8 +246,14 @@ const REDUCED_FIDELITY_LINE: &str =
 fn status_lines(h: &HostStatus) -> Vec<String> {
     let mut lines = Vec::new();
     let rollup = h.rollup.as_deref().unwrap_or("");
-    let line = format!("{}  {}  {}  {}", h.id, h.label, h.state, rollup);
-    lines.push(line.trim_end().to_string());
+    let mut line = format!("{}  {}  {}  {}", h.id, h.label, h.state, rollup)
+        .trim_end()
+        .to_string();
+    if let Some(update) = &h.update {
+        line.push_str("  ");
+        line.push_str(&update_summary(update));
+    }
+    lines.push(line);
     // The band caps its line at 60 characters, so an ssh family's
     // sentence (a changed host key, say) is ellipsized there; when the
     // rollup did not carry the whole reason, print it in full
@@ -274,7 +281,70 @@ fn status_lines(h: &HostStatus) -> Vec<String> {
     if h.connect.as_ref().is_some_and(|c| c.reduced_fidelity) {
         lines.push(REDUCED_FIDELITY_LINE.to_string());
     }
+    if let Some(why) = h
+        .update
+        .as_ref()
+        .and_then(|update| update.restart.why.as_deref())
+    {
+        lines.push(format!("    no restart: {}", restart_why(why)));
+    }
     lines
+}
+
+fn label_of(build: &BuildStatus) -> String {
+    session_update::describe_parts(&build.version, build.dev, build.sha.as_deref())
+}
+
+/// The session's version and where it stands, e.g.
+/// `session 0.0.21 (0.0.22 available)` (plan 076 D7).
+fn update_summary(update: &HostUpdateStatus) -> String {
+    let session = label_of(&update.session);
+    let client = label_of(&update.client);
+    let note = match update.state.as_str() {
+        host_update_state::UP_TO_DATE => "up to date".to_string(),
+        host_update_state::AVAILABLE => format!("{client} available"),
+        // As the menu's line: an ssh host names the build it installed,
+        // localhost the build a restart would run; with neither known
+        // and no restart either, the `no restart:` line says it all.
+        host_update_state::STAGED => {
+            let restart = update.restart.offered;
+            let named = match (&update.staged, &update.restart.target) {
+                (Some(staged), _) => Some(format!("{} installed", label_of(staged))),
+                (None, Some(target)) => Some(format!(
+                    "{} available",
+                    session_update::describe_parts(
+                        &target.version,
+                        target.dev,
+                        target.sha.as_deref()
+                    )
+                )),
+                (None, None) => None,
+            };
+            match (named, restart) {
+                (Some(named), true) => format!("{named}, restart to use it"),
+                (Some(named), false) => named,
+                (None, true) => "restart to use a matching build".to_string(),
+                (None, false) => return format!("session {session}"),
+            }
+        }
+        host_update_state::REQUIRED => format!("{client} needed to connect"),
+        host_update_state::SESSION_NEWER if update.blocked == Some(true) => {
+            "update this Roost to connect".to_string()
+        }
+        host_update_state::SESSION_NEWER => "newer than this Roost".to_string(),
+        host_update_state::UNORDERED => format!("this Roost {client}"),
+        host_update_state::UNKNOWN => return "session version unknown".to_string(),
+        other => other.to_string(),
+    };
+    format!("session {session} ({note})")
+}
+
+/// The menu's wording for a wire `why`; an unknown one passes through.
+fn restart_why(why: &str) -> &str {
+    match session_update::Why::from_wire(why) {
+        Some(known) => known.reason(),
+        None => why,
+    }
 }
 
 async fn remove(ui: &mut UiSocket<'_>, id: &str, json: bool) -> Result<i32, CliError> {
@@ -349,7 +419,9 @@ async fn connection(
 mod tests {
     use super::*;
     use clap::Parser;
-    use roost_ipc::messages::{HostConnectStatus, RetrySchedule};
+    use roost_ipc::messages::{
+        HostConnectStatus, HostRestartStatus, RestartTargetStatus, RetrySchedule,
+    };
 
     /// A throwaway root so `clap` parses the subcommand exactly as
     /// `roostctl host …` does, without dragging the real `Cli` (and its
@@ -514,6 +586,119 @@ mod tests {
         assert_eq!(
             status_lines(&host),
             vec!["abc  workbox  disconnected".to_string()],
+        );
+    }
+
+    fn update(state: &str, session: &str, client: &str) -> HostUpdateStatus {
+        let build = |version: &str| BuildStatus {
+            version: version.to_string(),
+            ..Default::default()
+        };
+        HostUpdateStatus {
+            state: state.to_string(),
+            session: build(session),
+            client: build(client),
+            restart: HostRestartStatus {
+                offered: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Plan 076 D7: the row's line names the session's version and where
+    /// it stands against this client.
+    #[test]
+    fn status_lines_name_the_sessions_version_and_where_it_stands() {
+        let row = |update: HostUpdateStatus| {
+            status_lines(&HostStatus {
+                id: "abc".to_string(),
+                label: "mini3".to_string(),
+                state: "connected".to_string(),
+                update: Some(update),
+                ..Default::default()
+            })
+        };
+        let first = |update| row(update)[0].clone();
+
+        assert_eq!(
+            first(update("available", "0.0.21", "0.0.22")),
+            "abc  mini3  connected  session 0.0.21 (0.0.22 available)"
+        );
+        assert_eq!(
+            first(update("up-to-date", "0.0.22", "0.0.22")),
+            "abc  mini3  connected  session 0.0.22 (up to date)"
+        );
+        let mut staged = update("staged", "0.0.21", "0.0.21");
+        staged.restart.target = Some(RestartTargetStatus {
+            version: "0.0.22".to_string(),
+            source: "bundled".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(
+            first(staged),
+            "abc  mini3  connected  session 0.0.21 (0.0.22 available, restart to use it)"
+        );
+
+        // Review finding 1, ssh: the rung holds 0.0.23 speaking another
+        // protocol. The line names what is installed, not this client,
+        // and promises no restart.
+        let mut rung = update("staged", "0.0.21", "0.0.22");
+        rung.staged = Some(BuildStatus {
+            version: "0.0.23".to_string(),
+            ..Default::default()
+        });
+        rung.restart = HostRestartStatus {
+            offered: false,
+            why: Some("incompatible".to_string()),
+            target: None,
+        };
+        assert_eq!(
+            row(rung),
+            vec![
+                "abc  mini3  connected  session 0.0.21 (0.0.23 installed)".to_string(),
+                "    no restart: its roost-session can't talk to this Roost".to_string(),
+            ]
+        );
+        // Review finding 1, localhost at reduced fidelity with its
+        // candidate gone: nothing is available, only the reason.
+        let mut gone = update("staged", "0.0.22", "0.0.22");
+        gone.restart = HostRestartStatus {
+            offered: false,
+            why: Some("missing".to_string()),
+            target: None,
+        };
+        let lines = row(gone);
+        assert_eq!(lines[0], "abc  mini3  connected  session 0.0.22");
+        assert!(lines[1].starts_with("    no restart: "), "{lines:?}");
+        assert!(!lines.concat().contains("available"), "{lines:?}");
+        let mut blocked = update("session-newer", "0.0.23", "0.0.22");
+        blocked.blocked = Some(true);
+        assert_eq!(
+            first(blocked),
+            "abc  mini3  connected  session 0.0.23 (update this Roost to connect)"
+        );
+        let mut unordered = update("unordered", "0.0.22", "0.0.22");
+        unordered.session.dev = true;
+        unordered.session.sha = Some("a1b2c3d".to_string());
+        unordered.client.dev = true;
+        assert_eq!(
+            first(unordered),
+            "abc  mini3  connected  session 0.0.22 dev a1b2c3d (this Roost 0.0.22 dev)"
+        );
+
+        let mut older = update("session-newer", "0.0.23", "0.0.22");
+        older.restart = HostRestartStatus {
+            offered: false,
+            why: Some("older".to_string()),
+            target: None,
+        };
+        assert_eq!(
+            row(older),
+            vec![
+                "abc  mini3  connected  session 0.0.23 (newer than this Roost)".to_string(),
+                "    no restart: its roost-session is older".to_string(),
+            ]
         );
     }
 

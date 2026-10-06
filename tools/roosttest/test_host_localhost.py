@@ -49,13 +49,12 @@ from __future__ import annotations
 
 import atexit
 import contextlib
-import functools
+import dataclasses
 import json
 import os
 import platform
 import shutil
 import signal
-import subprocess
 import tempfile
 import uuid
 from dataclasses import dataclass, field
@@ -107,18 +106,33 @@ os.environ["SHELL"] = "/bin/sh"
 # here: the one case that wants a reduced-fidelity session passes it to
 # its own daemon, and a relaunch that inherited it would come back
 # reduced too, with nothing left to prove.
-os.environ["ROOST_SESSION_BIN"] = str(sessionlib.session_binary())
+#
+# A copy rather than the tree's binary itself, so the update cases (plan
+# 076) can stand a different build in its place: with
+# `ROOST_SESSION_BIN` set it is the only restart candidate the UI ever
+# identifies (D4). `restore_candidate` puts the copy back after each.
+# `_REAL_SESSION` is read before the override moves: from here on
+# `session_binary()` answers `_CANDIDATE`, which a case may have replaced.
+_REAL_SESSION = sessionlib.session_binary()
+_CANDIDATE = _ROOT / "candidate" / "roost-session"
+_CANDIDATE.parent.mkdir()
+shutil.copy2(_REAL_SESSION, _CANDIDATE)
+os.environ["ROOST_SESSION_BIN"] = str(_CANDIDATE)
 
 # The UI is stood down by `ui.end_session`, a session-scoped fixture
 # teardown, so by the time this runs nothing is left holding the root.
 atexit.register(shutil.rmtree, _ROOT, ignore_errors=True)
 
 import ui  # noqa: E402
-from client import Roost, scaled_timeout  # noqa: E402
+from client import Roost, RoostError, scaled_timeout  # noqa: E402
 from host_probe import host_key  # noqa: E402
 from test_host_client import (  # noqa: E402
     FAKE_BUILD,
     HostUnderTest,
+    band_menu,
+    described_build,
+    menu_items,
+    wait_host_section,
     first_project,
     host_row_ids,
     host_status_row,
@@ -142,26 +156,10 @@ pytestmark = pytest.mark.host_client
 # (`STATUS_NOT_RUNNING_EXIT`, `crates/roost-cli/src/session.rs`).
 NOT_RUNNING_EXIT = 3
 
-@functools.cache
-def client_libghostty_build() -> str:
-    """The libghostty build this client pins, as a string.
 
-    `roost-session identify` is compile-time identity — no socket, no
-    profile — and this tree builds the daemon and the UI against one pin.
-    Read from a **clean** environment because this lane runs with
-    `ROOST_TEST_MODE=1`, the very gate that would otherwise let a
-    developer's exported `ROOST_SESSION_FAKE_BUILD` answer here and make
-    the card assertion tautological.
-    """
-    result = subprocess.run(
-        [str(sessionlib.session_binary()), "identify"],
-        env={"PATH": os.environ.get("PATH", "")},
-        capture_output=True,
-        text=True,
-        timeout=scaled_timeout(30),
-    )
-    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
-    return json.loads(result.stdout)["libghostty_build"]
+def client_libghostty_build() -> str:
+    """The libghostty build this client pins, as a string."""
+    return sessionlib.real_identity()["libghostty_build"]
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +248,7 @@ def ground(roost: Roost):
 
     session_state = state_dir / ui.DERIVED_SESSION_SUBDIR
     shutil.rmtree(session_state, ignore_errors=True)
-    env = sessionlib.make_env(root=_ROOT, state_dir=session_state)
+    env = sessionlib.make_env(root=_ROOT, state_dir=session_state, binary=_REAL_SESSION)
 
     label = f"localhost-{uuid.uuid4().hex[:8]}"
     added = roost.call("host.add", {"label": label, "target": "localhost"})["host"]
@@ -419,13 +417,10 @@ def test_a_reduced_fidelity_localhost_host_restarts_from_the_palette_and_comes_b
     was classified `Localhost`, which is the one thing `host.status` will
     not say.
 
-    Confirming has to let go of the session **before** the job owns it,
-    and that is read once with no wait in front of it:
-    `app.dialog_answer` runs the confirm handler to completion before it
-    replies, and the disconnect inside it is synchronous, so this is a
-    fence rather than a race. The states are sampled for the whole
-    restart for the reason the ssh sibling names: a client that still had
-    a stream up when the job stopped the session would hear the stop.
+    The restart lets go of the stream once it has re-checked what it
+    stops, and before it stops it (plan 076 D8). The states are sampled
+    for the whole restart for the reason the ssh sibling names: a client
+    that still had a stream up when the session stopped would hear it.
 
     The layout is compared by **cwd**, never by title: a restored shell
     is a fresh one and is free to rewrite what it is called.
@@ -455,12 +450,6 @@ def test_a_reduced_fidelity_localhost_host_restarts_from_the_palette_and_comes_b
     assert client_libghostty_build() in card["body"], (client_libghostty_build(), card)
 
     answer(roost, "confirm")
-    handed_over = host_status_row(roost, ground.host.saved_id)
-    assert handed_over["state"] == "disconnected", (
-        "confirming has to let go of the session *before* the restart owns it "
-        f"— the host was still {handed_over['state']!r}: {handed_over}"
-    )
-    assert handed_over.get("connect") is None, handed_over
 
     landed, states = watch_the_restart(ground)
     assert landed["connect"]["reduced_fidelity"] is False, landed
@@ -627,3 +616,376 @@ def test_the_picker_row_steps_past_the_same_label(ground: Ground, roost: Roost):
                 roost.call("host.disconnect", {"id": host_id})
             with contextlib.suppress(Exception):
                 roost.call("host.remove", {"id": host_id})
+
+
+# ---------------------------------------------------------------------------
+# 5. What `host.status` says about updating (plan 076 D3/D4)
+# ---------------------------------------------------------------------------
+#
+# Every case runs its daemon from a copy of this tree's `roost-session`
+# with a `.test-identity` sidecar beside it, so one binary answers as
+# whichever build the case needs. The UI's only restart candidate is
+# `_CANDIDATE` (`ROOST_SESSION_BIN`), which a case may also replace.
+
+
+@pytest.fixture
+def restore_candidate():
+    """Put the real binary back at `_CANDIDATE` after a case replaced it."""
+    yield
+    _CANDIDATE.unlink(missing_ok=True)
+    sessionlib.identity_sidecar(_CANDIDATE).unlink(missing_ok=True)
+    shutil.copy2(_REAL_SESSION, _CANDIDATE)
+
+
+def start_as(ground: Ground, name: str, **identity) -> str:
+    """Start this lane's daemon from a copy that identifies as
+    `identity` (any of `app_version`, `dev`, `git_sha`)."""
+    copy = ground.host.env.root / f"build-{name}" / "roost-session"
+    copy.parent.mkdir(exist_ok=True)
+    shutil.copy2(_REAL_SESSION, copy)
+    sessionlib.plant_identity(copy, **identity)
+    env = dataclasses.replace(ground.host.env, binary=copy)
+    ground.pid = start_session(env).verdict.pid
+    session_id = ground.claim(ground.host.env.identify()["session_id"])
+    if "app_version" in identity:
+        assert ground.host.env.identify()["app_version"] == identity["app_version"]
+    return session_id
+
+
+def fake_candidate(identify_stdout: str) -> None:
+    """Stand a script at `_CANDIDATE` whose `identify` prints this."""
+    _CANDIDATE.unlink()
+    _CANDIDATE.write_text(f"#!/bin/sh\nprintf '%s\\n' '{identify_stdout}'\n")
+    _CANDIDATE.chmod(0o755)
+
+
+def host_update(host: HostUnderTest, session_id: str, timeout: float = 60.0) -> dict:
+    """The host's `update` object once its restart candidate has been
+    identified for this session — a target or a reason, either way."""
+
+    def probe() -> dict | None:
+        row = host_status_row(host.roost, host.saved_id)
+        connect = row.get("connect")
+        update = row.get("update")
+        if connect is None or connect["session_id"] != session_id or update is None:
+            return None
+        restart = update["restart"]
+        return update if "target" in restart or "why" in restart else None
+
+    return wait_until(probe, timeout, "the host's restart candidate to be identified")
+
+
+def connect_as(ground: Ground, name: str, **identity) -> dict:
+    session_id = start_as(ground, name, **identity)
+    ground.host.connect_and_wait()
+    assert wait_live_connect(ground.host)["connect"]["session_id"] == session_id
+    return host_update(ground.host, session_id)
+
+
+def this_roost(update: dict) -> str:
+    """The ` · this Roost dev …` an unordered line ends with, when this
+    client is a dev build (plan 076 D6)."""
+    client = update["client"]
+    if not client.get("dev"):
+        return ""
+    return f" · this Roost dev {client['sha']}" if client.get("sha") else " · this Roost dev"
+
+
+def leave_rows() -> list:
+    return [None, "Disconnect", "Stop Session…"]
+
+
+def test_the_same_build_on_both_sides_is_up_to_date(ground: Ground, restore_candidate):
+    real = sessionlib.real_identity()
+    update = connect_as(ground, "same")
+    # Two dev builds of one version are only `Same` with a sha to
+    # compare, which a tree built without git does not have.
+    want = "unordered" if real.get("dev") and not real.get("git_sha") else "up-to-date"
+    assert update["state"] == want, update
+    assert update["session"]["version"] == real["app_version"], update
+    assert update["restart"]["offered"] is True, update
+    assert update["restart"]["target"]["source"] == "override", update
+    assert update["restart"]["target"]["version"] == real["app_version"], update
+    # Plan 076 D6: the plain maintenance Restart is on the menu only.
+    session = described_build(update["session"])
+    line = (
+        f"Session {session}{this_roost(update)}"
+        if want == "unordered"
+        else f"Session {session} · up to date"
+    )
+    assert band_menu(ground.host.roost, ground.host.saved_id) == [
+        f"# {line}",
+        "Restart Session…",
+        *leave_rows(),
+    ]
+    rows = host_row_ids(ground.host.roost)
+    assert f"host:restart:{ground.host.saved_id}" not in rows, sorted(rows)
+
+
+def test_an_older_session_with_a_newer_candidate_is_staged(ground: Ground, restore_candidate):
+    update = connect_as(ground, "old", app_version="0.0.1")
+    assert update["state"] == "staged", update
+    assert update["session"]["version"] == "0.0.1", update
+    assert update["restart"]["offered"] is True, update
+    assert update["restart"]["target"]["version"] == sessionlib.real_identity()["app_version"], update
+    assert update["restart"]["target"]["source"] == "override", update
+    assert "staged" not in update, "nothing is installed on localhost"
+    # Localhost's staged reads "available": nothing was installed.
+    target = described_build(update["restart"]["target"])
+    line = f"Session {described_build(update['session'])} · {target} available"
+    assert band_menu(ground.host.roost, ground.host.saved_id) == [
+        f"# {line}",
+        "Restart Session…",
+        *leave_rows(),
+    ]
+    rows = host_row_ids(ground.host.roost)
+    assert f"host:restart:{ground.host.saved_id}" in rows, sorted(rows)
+    assert f"host:install:{ground.host.saved_id}" not in rows, sorted(rows)
+    # A project row's host block opens with the host's name.
+    section = wait_host_section(
+        ground.host.roost,
+        ground.host.saved_id,
+        lambda section: section["projects"],
+        "the host's projects to reach the sidebar",
+    )
+    project = menu_items(
+        ground.host.roost.context_menu_dump({"project_id": section["projects"][0]["key"]})
+    )
+    assert project[-6:] == [None, f"# {ground.host.label} · {line}", "Restart Session…", *leave_rows()], project
+
+
+def test_a_newer_session_is_session_newer_and_never_restarted_older(
+    ground: Ground, restore_candidate
+):
+    update = connect_as(ground, "new", app_version="99.0.0")
+    assert update["state"] == "session-newer", update
+    assert update["blocked"] is False, update
+    assert update["restart"] == {"offered": False, "why": "older"}, update
+    assert band_menu(ground.host.roost, ground.host.saved_id) == [
+        f"# Session {described_build(update['session'])} · newer than this Roost"
+        " · its roost-session is older",
+        "Disconnect",
+        "Stop Session…",
+    ]
+
+
+def test_a_dev_session_at_this_version_is_unordered(ground: Ground, restore_candidate):
+    update = connect_as(
+        ground,
+        "dev",
+        app_version=sessionlib.real_identity()["app_version"],
+        dev=True,
+        git_sha="0000000",
+    )
+    assert update["state"] == "unordered", update
+    assert update["session"] == {
+        "version": sessionlib.real_identity()["app_version"],
+        "dev": True,
+        "sha": "0000000",
+    }, update
+    # Unordered is not a downgrade: the candidate stays usable.
+    assert update["restart"]["offered"] is True, update
+    assert band_menu(ground.host.roost, ground.host.saved_id) == [
+        f"# Session {described_build(update['session'])}{this_roost(update)}",
+        "Restart Session…",
+        *leave_rows(),
+    ]
+
+
+def test_a_candidate_on_another_protocol_is_no_restart(ground: Ground, restore_candidate):
+    real = sessionlib.real_identity()
+    fake_candidate(
+        json.dumps({**real, "app_version": "99.0.0", "session_protocol": real["session_protocol"] + 1})
+    )
+    update = connect_as(ground, "incompatible")
+    assert update["restart"] == {"offered": False, "why": "incompatible"}, update
+    header = band_menu(ground.host.roost, ground.host.saved_id)[0]
+    assert header.endswith(" · its roost-session can't talk to this Roost"), header
+
+
+def test_a_candidate_that_will_not_identify_is_no_restart(ground: Ground, restore_candidate):
+    fake_candidate("not an identity")
+    update = connect_as(ground, "unreadable")
+    assert update["restart"] == {"offered": False, "why": "unreadable"}, update
+    header = band_menu(ground.host.roost, ground.host.saved_id)[0]
+    assert header.endswith(" · can't read its roost-session"), header
+
+
+def test_an_override_that_is_gone_is_the_whole_answer(ground: Ground, restore_candidate):
+    _CANDIDATE.unlink()
+    update = connect_as(ground, "override")
+    assert update["restart"] == {"offered": False, "why": "override"}, update
+    menu = band_menu(ground.host.roost, ground.host.saved_id)
+    assert menu[0].endswith(" · ROOST_SESSION_BIN names nothing this user can run"), menu
+    assert "Restart Session…" not in menu, menu
+
+
+# ---------------------------------------------------------------------------
+# 6. Restart Session (plan 076 D4, D7, D8)
+# ---------------------------------------------------------------------------
+
+
+def wait_restarted(ground: Ground, host: HostUnderTest, before: str, timeout: float = 180.0) -> dict:
+    """The row once a restart has settled on a session other than
+    `before`, claimed for the teardown."""
+
+    def landed() -> dict | None:
+        row = host_status_row(host.roost, host.saved_id)
+        connect = row.get("connect")
+        update = row.get("update")
+        if connect is not None:
+            ground.claim(connect["session_id"])
+        if connect is None or update is None or connect["session_id"] == before:
+            return None
+        action = update.get("action", {})
+        return row if action.get("phase") in ("done", "failed") else None
+
+    return wait_until(landed, timeout, "the restart to land a new session")
+
+
+def test_restart_runs_the_override_and_lands_up_to_date(ground: Ground, restore_candidate):
+    """Restart Session onto its D4 target. `ROOST_SESSION_BIN` is set, so
+    the override is the only candidate and the one the relaunch runs: the
+    new session's own `exe_path` says which binary that was."""
+    before = start_as(ground, "old", app_version="0.0.1")
+    ground.host.connect_and_wait()
+    update = host_update(ground.host, before)
+    assert update["state"] == "staged", update
+    assert update["restart"]["target"]["source"] == "override", update
+
+    accepted = ground.host.roost.call(
+        "host.restart", {"id": ground.host.saved_id, "confirm": True}
+    )
+    assert accepted == {"accepted": True}, accepted
+    # One action per session (D8): the claim is held from the op on.
+    with pytest.raises(RoostError) as busy:
+        ground.host.roost.call("host.restart", {"id": ground.host.saved_id, "confirm": True})
+    assert busy.value.code == "busy", busy.value
+
+    row = wait_restarted(ground, ground.host, before)
+    action = row["update"]["action"]
+    real = sessionlib.real_identity()
+    shown = sessionlib.describe_build(real)
+    assert action == {
+        "kind": "restart",
+        "phase": "done",
+        "message": f"{ground.host.label} restarted on roost-session {shown}",
+    }, action
+    assert row["update"]["session"]["version"] == real["app_version"], row
+    serving = ground.host.env.identify()
+    assert serving["session_id"] == row["connect"]["session_id"], serving
+    assert serving["exe_path"] == str(_CANDIDATE.resolve()), serving
+
+
+@contextlib.contextmanager
+def relaunched_ui(target: str, **env: str):
+    """This lane's UI again, with `env` over its environment; the usual
+    one is put back afterwards. `ROOST_SESSION_BIN` is read once by the
+    UI process, so a case that needs it unset needs its own UI."""
+    ui.quit(target)
+    try:
+        ui.launch(target, force=True, extra_env=env)
+        with Roost(str(ui.socket_path(target)), timeout=scaled_timeout(30.0)) as client:
+            yield client
+    finally:
+        with contextlib.suppress(Exception):
+            ui.quit(target)
+        ui.launch(target, force=True)
+
+
+def test_a_newer_session_restarts_onto_its_own_binary(
+    ground: Ground, target: str, restore_candidate
+):
+    """AC4/AC5: with no override, a session newer than both this client
+    and the bundled build restarts onto the binary it is running
+    (`exe_path`, source `current`) — never down onto the bundled one —
+    and stays `session-newer`."""
+    before = start_as(ground, "newer", app_version="99.0.0")
+    copy = (ground.host.env.root / "build-newer" / "roost-session").resolve()
+    # Empty is unset, as `locate_session_binary` reads it (plan 076 D4):
+    # the candidates are the bundled sibling and the running binary.
+    with relaunched_ui(target, ROOST_SESSION_BIN="") as roost:
+        host = dataclasses.replace(ground.host, roost=roost)
+        try:
+            host.connect_and_wait()
+            update = host_update(host, before)
+            assert update["state"] == "session-newer", update
+            assert update["restart"]["target"]["source"] == "running", update
+            assert update["restart"]["target"]["version"] == "99.0.0", update
+
+            roost.call("host.restart", {"id": host.saved_id, "confirm": True})
+            row = wait_restarted(ground, host, before)
+            assert row["update"]["action"]["phase"] == "done", row
+            assert row["update"]["session"]["version"] == "99.0.0", row
+            assert row["update"]["state"] == "session-newer", row
+            serving = ground.host.env.identify()
+            assert serving["exe_path"] == str(copy), serving
+        finally:
+            with contextlib.suppress(Exception):
+                host.disconnect()
+            with contextlib.suppress(Exception):
+                host.remove()
+
+
+def test_a_target_gone_before_the_relaunch_starts_nothing(ground: Ground, restore_candidate):
+    """AC8: the target is held for the whole attempt. It is deleted
+    while the old session is stopping — a tab that ignores SIGHUP holds
+    the stop open — and the restart fails naming it, with nothing
+    started in its place: no fall back to the launch ladder."""
+    before = start_as(ground, "old", app_version="0.0.1")
+    ground.host.connect_and_wait()
+    host_update(ground.host, before)
+    with ground.host.client() as session:
+        project = first_project(session)
+        hold = session.open_tab(
+            project,
+            cwd=str(ground.host.env.launch_cwd),
+            argv=["/bin/sh", "-c", "trap '' HUP TERM; while :; do sleep 1; done"],
+        )
+
+    ground.host.roost.call("host.restart", {"id": ground.host.saved_id, "confirm": True})
+
+    def stopping() -> bool:
+        # Once the stop is under way the session refuses every mutation;
+        # by then the restart has re-checked its target and moved on.
+        try:
+            with ground.host.client(timeout=5.0) as session:
+                session.call("tab.set_title", {"tab_id": str(hold), "title": "hold"})
+        except RoostError as error:
+            return error.code == "shutting-down"
+        except OSError:
+            return False
+        return False
+
+    wait_until(stopping, 60.0, "the old session to begin stopping", 0.02)
+    _CANDIDATE.unlink()
+    # The hold is what orders the unlink ahead of the restart's re-check:
+    # the old session is still serving, so its stop has not finished.
+    assert ground.host.env.answering() is not None, "the stop finished before the unlink"
+
+    # Mid-restart, with the stream let go: the action is still reported
+    # (D7), and a second one is `busy` rather than "not connected" (D8).
+    mid = host_status_row(ground.host.roost, ground.host.saved_id)
+    assert mid["state"] != "connected", mid
+    assert mid["update"]["action"] == {"kind": "restart", "phase": "running"}, mid
+    with pytest.raises(RoostError) as busy:
+        ground.host.roost.call("host.restart", {"id": ground.host.saved_id, "confirm": True})
+    assert busy.value.code == "busy", busy.value
+
+    def settled() -> dict | None:
+        row = host_status_row(ground.host.roost, ground.host.saved_id)
+        reason = row.get("reason") or ""
+        return row if str(_CANDIDATE) in reason else None
+
+    row = wait_until(settled, 120.0, "the restart to fail naming its target")
+    assert row["state"] == "disconnected", row
+    assert "nothing was started" in row["reason"], row
+    assert row.get("connect") is None, row
+    action = row["update"]["action"]
+    assert action["kind"] == "restart" and action["phase"] == "failed", row
+    assert str(_CANDIDATE) in action["message"], action
+    status = roostctl_session("status")
+    assert status.returncode == NOT_RUNNING_EXIT, (
+        "a restart whose target is gone must not start anything else: "
+        f"{status.stdout!r}"
+    )

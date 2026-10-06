@@ -331,6 +331,17 @@
             "separator"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "header": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "header"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1299,6 +1310,26 @@
       ],
       "type": "string"
     },
+    "BuildStatus": {
+      "properties": {
+        "dev": {
+          "type": "boolean"
+        },
+        "sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "version"
+      ],
+      "type": "object"
+    },
     "ClipboardDumpParams": {
       "additionalProperties": false,
       "properties": {
@@ -1501,6 +1532,53 @@
       ],
       "type": "object"
     },
+    "HostActionParams": {
+      "additionalProperties": false,
+      "properties": {
+        "confirm": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "HostActionResult": {
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "accepted"
+      ],
+      "type": "object"
+    },
+    "HostActionStatus": {
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "phase": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "phase"
+      ],
+      "type": "object"
+    },
     "HostAddParams": {
       "additionalProperties": false,
       "properties": {
@@ -1627,6 +1705,33 @@
       ],
       "type": "object"
     },
+    "HostRestartStatus": {
+      "properties": {
+        "offered": {
+          "type": "boolean"
+        },
+        "target": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RestartTargetStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "why": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "offered"
+      ],
+      "type": "object"
+    },
     "HostStatus": {
       "properties": {
         "connect": {
@@ -1701,6 +1806,16 @@
         },
         "target": {
           "type": "string"
+        },
+        "update": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostUpdateStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -1735,6 +1850,55 @@
       },
       "required": [
         "hosts"
+      ],
+      "type": "object"
+    },
+    "HostUpdateStatus": {
+      "properties": {
+        "action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostActionStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "blocked": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "client": {
+          "$ref": "#/$defs/BuildStatus"
+        },
+        "restart": {
+          "$ref": "#/$defs/HostRestartStatus"
+        },
+        "session": {
+          "$ref": "#/$defs/BuildStatus"
+        },
+        "staged": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BuildStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "session",
+        "client",
+        "restart"
       ],
       "type": "object"
     },
@@ -2497,6 +2661,30 @@
       ],
       "type": "object"
     },
+    "RestartTargetStatus": {
+      "properties": {
+        "dev": {
+          "type": "boolean"
+        },
+        "sha": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "source"
+      ],
+      "type": "object"
+    },
     "RetrySchedule": {
       "properties": {
         "armed_at": {
@@ -2694,6 +2882,21 @@
       "properties": {
         "app_version": {
           "type": "string"
+        },
+        "dev": {
+          "type": "boolean"
+        },
+        "exe_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git_sha": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "libghostty_build": {
           "type": "string"
@@ -3055,6 +3258,12 @@
         },
         "state": {
           "type": "string"
+        },
+        "update_pill": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -4606,12 +4815,28 @@
         "$ref": "#/$defs/EmptyResult"
       }
     },
+    "host.restart": {
+      "params": {
+        "$ref": "#/$defs/HostActionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostActionResult"
+      }
+    },
     "host.status": {
       "params": {
         "$ref": "#/$defs/HostStatusParams"
       },
       "result": {
         "$ref": "#/$defs/HostStatusResult"
+      }
+    },
+    "host.update": {
+      "params": {
+        "$ref": "#/$defs/HostActionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostActionResult"
       }
     },
     "identify": {

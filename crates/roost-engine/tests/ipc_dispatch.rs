@@ -488,7 +488,8 @@ async fn host_add_rejects_reserved_label_and_remove_reports_not_found() {
 async fn host_ops_route_to_an_attached_ui() {
     use roost_engine::ipc::UiRequest;
     use roost_ipc::messages::{
-        host_state, Host, HostAddResult, HostConnectionResult, HostStatus, HostStatusResult,
+        host_state, Host, HostActionResult, HostAddResult, HostConnectionResult, HostStatus,
+        HostStatusResult,
     };
 
     let dir = tempdir().unwrap();
@@ -531,12 +532,19 @@ async fn host_ops_route_to_an_attached_ui() {
                     recorder.lock().unwrap().push("remove");
                     let _ = reply.send(Ok(()));
                 }
-                UiRequest::HostConnect { reply, .. } => {
+                UiRequest::HostConnect { id, reply, .. } => {
                     recorder.lock().unwrap().push("connect");
-                    let _ = reply.send(Ok(HostConnectionResult {
-                        host: host("h1"),
-                        state: host_state::CONNECTING.to_string(),
-                    }));
+                    let _ = reply.send(if id == "h1" {
+                        Ok(HostConnectionResult {
+                            host: host("h1"),
+                            state: host_state::CONNECTING.to_string(),
+                        })
+                    } else {
+                        Err(roost_engine::ipc::HostOpFailure::new(
+                            "busy",
+                            "a restart/update is in progress on pop-os",
+                        ))
+                    });
                 }
                 UiRequest::HostDisconnect { id, reply } => {
                     recorder.lock().unwrap().push("disconnect");
@@ -555,6 +563,17 @@ async fn host_ops_route_to_an_attached_ui() {
                             ..HostStatus::default()
                         }],
                     }));
+                }
+                UiRequest::HostUpdate { reply, .. } => {
+                    recorder.lock().unwrap().push("update");
+                    let _ = reply.send(Ok(HostActionResult { accepted: true }));
+                }
+                UiRequest::HostRestart { reply, .. } => {
+                    recorder.lock().unwrap().push("restart");
+                    let _ = reply.send(Err(roost_engine::ipc::HostOpFailure::new(
+                        "busy",
+                        "a restart is already running on pop-os",
+                    )));
                 }
                 _ => {}
             }
@@ -581,6 +600,14 @@ async fn host_ops_route_to_an_attached_ui() {
         .await
         .expect("host.connect");
     assert_eq!(connected.state, host_state::CONNECTING);
+    // An action in flight answers a Connect `busy`, code intact.
+    match client
+        .call_raw(ops::HOST_CONNECT, serde_json::json!({"id": "h2"}))
+        .await
+    {
+        Err(roost_ipc::ClientError::Server { code, .. }) => assert_eq!(code, "busy"),
+        other => panic!("expected busy, got {other:?}"),
+    }
 
     // The UI's own refusal keeps its wire code: a `WorkspaceError`
     // crosses the seam, so `not-found` survives rather than flattening
@@ -608,6 +635,36 @@ async fn host_ops_route_to_an_attached_ui() {
         .expect("host.status");
     assert_eq!(status.hosts.len(), 1);
 
+    // Unconfirmed, both are refused at the dispatcher and never reach
+    // the app; confirmed, the app's own refusal keeps its wire code.
+    for op in [ops::HOST_UPDATE, ops::HOST_RESTART] {
+        match client.call_raw(op, serde_json::json!({"id": "h1"})).await {
+            Err(roost_ipc::ClientError::Server { code, message }) => {
+                assert_eq!(code, "invalid-param", "{op}");
+                assert!(message.contains("pass confirm: true"), "{op}: {message}");
+            }
+            other => panic!("{op}: expected invalid-param, got {other:?}"),
+        }
+    }
+    let accepted: HostActionResult = client
+        .call(
+            ops::HOST_UPDATE,
+            serde_json::json!({"id": "h1", "confirm": true}),
+        )
+        .await
+        .expect("host.update");
+    assert!(accepted.accepted);
+    match client
+        .call_raw(
+            ops::HOST_RESTART,
+            serde_json::json!({"id": "h1", "confirm": true}),
+        )
+        .await
+    {
+        Err(roost_ipc::ClientError::Server { code, .. }) => assert_eq!(code, "busy"),
+        other => panic!("expected busy, got {other:?}"),
+    }
+
     client
         .call::<_, serde_json::Value>(ops::HOST_REMOVE, serde_json::json!({"id": "h1"}))
         .await
@@ -615,7 +672,17 @@ async fn host_ops_route_to_an_attached_ui() {
 
     assert_eq!(
         *seen.lock().unwrap(),
-        vec!["add", "connect", "disconnect", "status", "status", "remove"]
+        vec![
+            "add",
+            "connect",
+            "connect",
+            "disconnect",
+            "status",
+            "status",
+            "update",
+            "restart",
+            "remove"
+        ]
     );
 }
 
@@ -640,9 +707,21 @@ async fn the_connection_ops_have_no_headless_answer() {
     });
     let mut client = connect_with_retry(&server_socket).await;
 
-    for op in [ops::HOST_CONNECT, ops::HOST_DISCONNECT, ops::HOST_STATUS] {
+    for (op, params) in [
+        (ops::HOST_CONNECT, serde_json::json!({"id": "h1"})),
+        (ops::HOST_DISCONNECT, serde_json::json!({"id": "h1"})),
+        (ops::HOST_STATUS, serde_json::json!({"id": "h1"})),
+        (
+            ops::HOST_UPDATE,
+            serde_json::json!({"id": "h1", "confirm": true}),
+        ),
+        (
+            ops::HOST_RESTART,
+            serde_json::json!({"id": "h1", "confirm": true}),
+        ),
+    ] {
         let err = client
-            .call_raw(op, serde_json::json!({"id": "h1"}))
+            .call_raw(op, params)
             .await
             .expect_err("expected error");
         match err {
@@ -855,8 +934,12 @@ impl SessionFixture {
                 session_id: "01K3S8TQ4F0Q9YB2K6WZ5D7XN".into(),
                 started_at: "2026-09-05T14:03:11Z".into(),
                 app_version: "9.9.9".into(),
+                session_protocol: roost_ipc::messages::SESSION_PROTOCOL_VERSION,
                 payload_kinds: Vec::new(),
                 libghostty_build: String::new(),
+                dev: false,
+                git_sha: None,
+                exe_path: None,
                 default_tab_size: (80, 24),
                 test_mode: false,
             },
