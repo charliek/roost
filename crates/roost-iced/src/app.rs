@@ -6396,10 +6396,7 @@ impl App {
             .filter(|_| section.saved_id.is_some())
             .map(|action| host_notice::FidelityOffer::new(action, section.fidelity_note));
         let pill = match fidelity {
-            Some(offer) => Some((
-                host_notice::FIDELITY_PILL,
-                host_notice::fidelity_chrome(offer, &section.label).pressable,
-            )),
+            Some(offer) => Some((host_notice::FIDELITY_PILL, offer.pressable())),
             None => section.update_pill.map(|pill| (pill, false)),
         };
         let fitted = band_text(
@@ -6425,7 +6422,7 @@ impl App {
         // warning are different facts and neither replaces the other.
         // The dot beside them both stays green — this connection is up.
         if let (Some(offer), Some(saved_id)) = (fidelity, section.saved_id.as_deref()) {
-            band = band.push(self.host_fidelity_pill(saved_id, &section.label, offer));
+            band = band.push(self.host_fidelity_pill(saved_id, offer));
         } else if let Some(pill) = section.update_pill {
             band = band.push(band_pill_text(pill, self.chrome.host_fidelity_text));
         }
@@ -6462,11 +6459,10 @@ impl App {
     fn host_fidelity_pill(
         &self,
         saved_id: &str,
-        label: &str,
         offer: host_notice::FidelityOffer,
     ) -> Element<'_, Message> {
         let pill = band_pill_text(host_notice::FIDELITY_PILL, self.chrome.host_fidelity_text);
-        if !host_notice::fidelity_chrome(offer, label).pressable {
+        if !offer.pressable() {
             return pill.into();
         }
         button(pill)
@@ -9854,32 +9850,20 @@ impl App {
             tracing::debug!(host = %saved_id, generation, "dropped a superseded action's completion");
             return;
         };
-        let version = roost_ui_model::session_update::describe(&build);
         // A successful restart or update reconnects to what it started;
         // anything that let go of the stream takes it back, success or
         // not. Neither ever spawns over ssh.
         let reconnect = (reconnect && result.is_ok()) || released;
-        let outcome = match (result, kind) {
-            (Ok(_), session_actions::ActionKind::Install) => {
-                if let Ok(host) = self.saved_host(saved_id) {
-                    self.update_knowledge.learned(
-                        saved_id,
-                        &host.target,
-                        &session_id,
-                        roost_ui_model::session_update::TargetKnowledge::NotChecked,
-                        roost_ui_model::session_update::InstallKnowledge::Staged(build),
-                    );
-                }
-                Ok(format!("Installed roost-session {version} on {label}"))
-            }
-            (Ok(_), session_actions::ActionKind::Update) => {
-                Ok(format!("Updated {label} to roost-session {version}"))
-            }
-            (Ok(_), session_actions::ActionKind::Restart) => {
-                Ok(format!("{label} restarted on roost-session {version}"))
-            }
-            (Err(error), _) => Err(error.message(target)),
-        };
+        let (outcome, staged) = session_actions::action_outcome(kind, result, build, label, target);
+        if let (Some(staged), Ok(host)) = (staged, self.saved_host(saved_id)) {
+            self.update_knowledge.learned(
+                saved_id,
+                &host.target,
+                &session_id,
+                roost_ui_model::session_update::TargetKnowledge::NotChecked,
+                roost_ui_model::session_update::InstallKnowledge::Staged(staged),
+            );
+        }
         self.finish_action(saved_id, generation, outcome);
         if reconnect {
             // The action record and the status line keep the verdict;

@@ -3165,6 +3165,11 @@ pub struct HostUpdateStatus {
     pub session: BuildStatus,
     /// This client's build, as the comparison read it.
     pub client: BuildStatus,
+    /// The newer build already in place on an ssh host — this client's
+    /// own install, or one a probe found — whether or not a restart can
+    /// run it (`restart` says). Absent when nothing newer is installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged: Option<BuildStatus>,
     pub restart: HostRestartStatus,
     /// The latest install, restart or update started on this host, kept
     /// across reconnects.
@@ -5896,6 +5901,7 @@ mod tests {
                     dev: true,
                     sha: Some("a1b2c3d".into()),
                 },
+                staged: None,
                 restart: HostRestartStatus {
                     offered: true,
                     why: None,
@@ -5922,6 +5928,27 @@ mod tests {
                     "target": {"version": "0.0.22", "source": "bundled"},
                 },
             })
+        );
+        // An ssh host's installed build rides beside a restart that
+        // cannot run it.
+        let installed = HostUpdateStatus {
+            staged: Some(BuildStatus {
+                version: "0.0.23".into(),
+                ..BuildStatus::default()
+            }),
+            restart: HostRestartStatus {
+                offered: false,
+                why: Some("incompatible".into()),
+                target: None,
+            },
+            ..staged.update.clone().unwrap()
+        };
+        round_trip(&installed);
+        let wire = serde_json::to_value(&installed).unwrap();
+        assert_eq!(wire["staged"], serde_json::json!({"version": "0.0.23"}));
+        assert_eq!(
+            wire["restart"],
+            serde_json::json!({"offered": false, "why": "incompatible"})
         );
         let blocked = HostUpdateStatus {
             state: host_update_state::SESSION_NEWER.into(),

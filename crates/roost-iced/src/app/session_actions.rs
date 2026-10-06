@@ -548,14 +548,7 @@ fn running_programs<'a>(
 
 /// The exec rung's build, where the probe could read one.
 pub(super) fn rung_build(outcome: &ProbeOutcome) -> Option<BuildId> {
-    match outcome {
-        ProbeOutcome::Compatible { identity, .. }
-        | ProbeOutcome::Mismatch {
-            identity: Some(identity),
-            ..
-        } => Some(BuildId::from(identity)),
-        _ => None,
-    }
+    outcome.identified_rung().map(|(_, build)| build)
 }
 
 impl App {
@@ -1737,10 +1730,105 @@ impl App {
     }
 }
 
+/// What a finished action's job amounts to: its status line, and for a
+/// successful Install the build it staged. A job that wrote a file names
+/// that file's own answer, not `ticket` — a dev client installs the
+/// release asset.
+pub(super) fn action_outcome(
+    kind: ActionKind,
+    result: Result<bootstrap::BootstrapSuccess, roost_ipc::bootstrap::BootstrapError>,
+    ticket: BuildId,
+    label: &str,
+    target: &str,
+) -> (Result<String, String>, Option<BuildId>) {
+    let success = match result {
+        Ok(success) => success,
+        Err(error) => return (Err(error.message(target)), None),
+    };
+    let build = success.installed.unwrap_or(ticket);
+    let version = describe(&build);
+    match kind {
+        ActionKind::Install => (
+            Ok(format!("Installed roost-session {version} on {label}")),
+            Some(build),
+        ),
+        ActionKind::Update => (
+            Ok(format!("Updated {label} to roost-session {version}")),
+            None,
+        ),
+        ActionKind::Restart => (
+            Ok(format!("{label} restarted on roost-session {version}")),
+            None,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use roost_ui_model::session_update::TargetSource;
+
+    /// Review finding: a dev client installs the release asset, so what
+    /// the install records and says is the file's answer, not the
+    /// client's own identity.
+    #[test]
+    fn an_install_names_the_build_it_wrote_not_this_client() {
+        let client = BuildId {
+            version: "0.0.22".into(),
+            dev: true,
+            sha: Some("a1b2c3d".into()),
+            ..BuildId::default()
+        };
+        let asset = BuildId {
+            version: "0.0.22".into(),
+            ..BuildId::default()
+        };
+        let wrote = || {
+            Ok(bootstrap::BootstrapSuccess {
+                path_warning: None,
+                installed: Some(asset.clone()),
+            })
+        };
+        let (outcome, staged) = action_outcome(
+            ActionKind::Install,
+            wrote(),
+            client.clone(),
+            "mini3",
+            "mini3",
+        );
+        assert_eq!(
+            outcome,
+            Ok("Installed roost-session 0.0.22 on mini3".to_string())
+        );
+        assert_eq!(staged, Some(asset.clone()));
+        let (outcome, staged) = action_outcome(
+            ActionKind::Update,
+            wrote(),
+            client.clone(),
+            "mini3",
+            "mini3",
+        );
+        assert_eq!(
+            outcome,
+            Ok("Updated mini3 to roost-session 0.0.22".to_string())
+        );
+        assert_eq!(staged, None);
+        // A restart wrote nothing; it names the build it started.
+        let (outcome, _) = action_outcome(
+            ActionKind::Restart,
+            Ok(bootstrap::BootstrapSuccess {
+                path_warning: None,
+                installed: None,
+            }),
+            client,
+            "mini3",
+            "mini3",
+        );
+        assert_eq!(
+            outcome,
+            Ok("mini3 restarted on roost-session 0.0.22 dev a1b2c3d".to_string())
+        );
+    }
 
     #[test]
     fn one_action_per_host_and_per_session() {

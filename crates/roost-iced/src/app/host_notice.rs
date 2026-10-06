@@ -22,10 +22,10 @@
 use crate::host_conn::state::{
     BuildMismatch, HostConnState, MismatchKind, RestartAction, Skew, CLIENT_PAYLOAD_KINDS,
 };
-use roost_ipc::session_version::{order, BuildId, VersionOrder};
+use roost_ipc::session_version::BuildId;
 use roost_ui_model::host_sidebar::FidelityAction;
 use roost_ui_model::notice;
-use roost_ui_model::session_update::{describe, FidelityNote, RestartTarget, TargetSource};
+use roost_ui_model::session_update::{self, describe, FidelityNote, RestartTarget, TargetSource};
 
 /// A frame nothing will ever update again, and why.
 ///
@@ -270,6 +270,12 @@ pub(super) enum FidelityOffer {
 }
 
 impl FidelityOffer {
+    /// Whether the pill and the row are buttons: only an offer with an
+    /// action behind it.
+    pub(super) fn pressable(self) -> bool {
+        matches!(self, Self::Update | Self::Restart)
+    }
+
     /// A band's routed action and, for `Manual`, the section's note.
     pub(super) fn new(action: FidelityAction, note: Option<FidelityNote>) -> Self {
         match action {
@@ -282,35 +288,29 @@ impl FidelityOffer {
 
 /// What the band and the row say for one [`FidelityOffer`].
 pub(super) fn fidelity_chrome(offer: FidelityOffer, label: &str) -> FidelityChrome {
-    let blocked = |row: String| FidelityChrome {
-        pressable: false,
-        row,
-    };
-    match offer {
-        FidelityOffer::Update => FidelityChrome {
-            pressable: true,
-            row: "⬆ Update roost-session".to_string(),
-        },
-        FidelityOffer::Restart => FidelityChrome {
-            pressable: true,
-            row: "↻ Restart session".to_string(),
-        },
+    let row = match offer {
+        FidelityOffer::Update => "⬆ Update roost-session".to_string(),
+        FidelityOffer::Restart => "↻ Restart session".to_string(),
         FidelityOffer::Blocked(FidelityNote::Socket) => {
-            blocked(format!("Restart it on {label} to restore fidelity"))
+            format!("Restart it on {label} to restore fidelity")
         }
-        FidelityOffer::Blocked(FidelityNote::UpdateRoost) => blocked(format!(
+        FidelityOffer::Blocked(FidelityNote::UpdateRoost) => format!(
             "This Roost is older than the session on {label}; update Roost to restore fidelity"
-        )),
-        FidelityOffer::Blocked(FidelityNote::Unordered) => blocked(format!(
+        ),
+        FidelityOffer::Blocked(FidelityNote::Unordered) => format!(
             "This Roost can't order its build against {label}'s; run matching builds to restore \
              fidelity"
-        )),
+        ),
         FidelityOffer::Blocked(FidelityNote::Unusable(why)) => {
-            blocked(format!("{label} can't be restarted: {}", why.reason()))
+            format!("{label} can't be restarted: {}", why.reason())
         }
-        FidelityOffer::Blocked(FidelityNote::NoMatchingBuild) => blocked(format!(
-            "{label} needs a matching roost-session to restore fidelity"
-        )),
+        FidelityOffer::Blocked(FidelityNote::NoMatchingBuild) => {
+            format!("{label} needs a matching roost-session to restore fidelity")
+        }
+    };
+    FidelityChrome {
+        pressable: offer.pressable(),
+        row,
     }
 }
 
@@ -366,13 +366,11 @@ pub(super) fn connect_route(
     }
 }
 
-/// Whether the refused session is the newer of the two — plan 076 D3
-/// rule 1: it speaks a newer protocol, or this client's version orders
-/// older than the session's. Two libghostty build strings never decide
-/// it; they are merely different.
+/// Whether the refused session is the newer of the two
+/// ([`session_update::refused_session_newer`]). Two libghostty build
+/// strings never decide it; they are merely different.
 pub(super) fn session_is_newer(mismatch: &BuildMismatch, client: &BuildId) -> bool {
-    mismatch.session_protocol > mismatch.client_protocol
-        || order(client, &mismatch.running) == VersionOrder::Older
+    session_update::refused_session_newer(&mismatch.running, client, mismatch.protocol_newer())
 }
 
 /// Which direction the skew runs, said only where it is actually known.

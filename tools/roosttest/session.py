@@ -66,6 +66,7 @@ explicitly through `argv`.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import os
 import platform
@@ -188,6 +189,44 @@ def describe_build(identity: dict) -> str:
         return identity["app_version"]
     sha = identity.get("git_sha")
     return f"{identity['app_version']} dev {sha}" if sha else f"{identity['app_version']} dev"
+
+
+@functools.cache
+def real_identity() -> dict:
+    """This tree's `roost-session identify`, offline.
+
+    It is compile-time identity — no socket, no profile — and this tree
+    builds the daemon and the UI against one pin. Read from a **clean**
+    environment because the update lanes run with `ROOST_TEST_MODE=1`,
+    the very gate that would otherwise let a developer's exported
+    `ROOST_SESSION_FAKE_BUILD` answer here and make card assertions
+    tautological.
+    """
+    result = subprocess.run(
+        [str(session_binary()), "identify"],
+        env={"PATH": os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        timeout=scaled_timeout(30),
+    )
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    return json.loads(result.stdout)
+
+
+def identity_sidecar(binary: Path) -> Path:
+    """The `.test-identity` file beside `binary` that renames its build
+    under `ROOST_TEST_MODE=1` (plan 076 D2)."""
+    return binary.with_name(binary.name + ".test-identity")
+
+
+def plant_identity(binary: Path, **identity) -> None:
+    """Make `binary` answer as `identity` (any of `app_version`, `dev`,
+    `git_sha`), or as itself when `identity` is empty."""
+    sidecar = identity_sidecar(binary)
+    if identity:
+        sidecar.write_text(json.dumps(identity))
+    else:
+        sidecar.unlink(missing_ok=True)
 
 
 def _is_debug_build(binary: Path) -> bool:

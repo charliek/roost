@@ -7,7 +7,7 @@
 //! the never-downgrade rule refuses only an `Older` target, and a build
 //! nobody can place is driven by hand.
 
-use crate::messages::{SessionBinaryIdentity, SessionIdentify};
+use crate::messages::{BuildStatus, SessionBinaryIdentity, SessionIdentify};
 
 /// One build of `roost-session` (or of the client), as the update logic
 /// compares them.
@@ -52,6 +52,29 @@ impl From<&SessionIdentify> for BuildId {
             dev: identity.dev,
             sha: identity.git_sha.clone(),
         }
+    }
+}
+
+impl From<&BuildId> for BuildStatus {
+    fn from(build: &BuildId) -> Self {
+        Self {
+            version: build.version.clone(),
+            dev: build.dev,
+            sha: build.sha.clone(),
+        }
+    }
+}
+
+impl BuildId {
+    /// The install gate's comparison: version, protocol and libghostty
+    /// build. Spelled out field by field rather than derived equality,
+    /// so the build facts `dev` and `sha` (plan 076 D2) never join it: a
+    /// dev client installing a release asset of its own version still
+    /// matches.
+    pub fn same_install(&self, other: &BuildId) -> bool {
+        self.version == other.version
+            && self.protocol == other.protocol
+            && self.libghostty_build == other.libghostty_build
     }
 }
 

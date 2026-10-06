@@ -1880,6 +1880,16 @@
         "session": {
           "$ref": "#/$defs/BuildStatus"
         },
+        "staged": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BuildStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "state": {
           "type": "string"
         }

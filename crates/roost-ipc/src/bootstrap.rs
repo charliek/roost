@@ -1006,15 +1006,8 @@ pub fn parse_identity_line(stdout: &str) -> Option<SessionBinaryIdentity> {
 /// bump between them do not force a restart on every localhost user.
 /// Changing either side to match the other is a decision, not a
 /// cleanup.
-///
-/// Spelled out field by field rather than derived equality, so the
-/// build facts `dev` and `git_sha` (plan 076 D2) never join the install
-/// gate: a dev client installing a release asset of its own version
-/// still matches.
 pub fn identity_matches(expected: &SessionBinaryIdentity, found: &SessionBinaryIdentity) -> bool {
-    expected.app_version == found.app_version
-        && expected.session_protocol == found.session_protocol
-        && expected.libghostty_build == found.libghostty_build
+    BuildId::from(expected).same_install(&BuildId::from(found))
 }
 
 /// What the probe concluded about a host.
@@ -1038,6 +1031,20 @@ pub enum ProbeOutcome {
     },
     /// No rung of the ladder exists.
     Missing,
+}
+
+impl ProbeOutcome {
+    /// The exec rung's path and build, where it identified itself.
+    pub fn identified_rung(&self) -> Option<(&str, BuildId)> {
+        match self {
+            Self::Compatible { path, identity }
+            | Self::Mismatch {
+                path,
+                identity: Some(identity),
+            } => Some((path, BuildId::from(identity))),
+            _ => None,
+        }
+    }
 }
 
 /// Turn [`identity_script`]'s pairs into an outcome.

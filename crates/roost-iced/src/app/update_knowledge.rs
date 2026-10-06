@@ -384,7 +384,7 @@ impl super::App {
             HostConnState::NeedsRestart(mismatch) => (
                 &mismatch.running,
                 Gate::Failed {
-                    protocol_newer: mismatch.session_protocol > mismatch.client_protocol,
+                    protocol_newer: mismatch.protocol_newer(),
                 },
                 None,
             ),

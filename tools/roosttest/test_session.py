@@ -195,9 +195,7 @@ def test_identify_names_its_binary_and_honours_a_test_identity_sidecar(env):
     bin_dir.mkdir()
     binary = bin_dir / "roost-session"
     shutil.copy2(env.binary, binary)
-    (bin_dir / "roost-session.test-identity").write_text(
-        json.dumps({"app_version": "0.0.1", "dev": False, "git_sha": "f00ba12"})
-    )
+    sessionlib.plant_identity(binary, app_version="0.0.1", dev=False, git_sha="f00ba12")
     env.binary = binary
     started(env, ROOST_TEST_MODE="1")
 

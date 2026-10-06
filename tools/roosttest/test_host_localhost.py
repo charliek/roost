@@ -50,13 +50,11 @@ from __future__ import annotations
 import atexit
 import contextlib
 import dataclasses
-import functools
 import json
 import os
 import platform
 import shutil
 import signal
-import subprocess
 import tempfile
 import uuid
 from dataclasses import dataclass, field
@@ -158,31 +156,10 @@ pytestmark = pytest.mark.host_client
 # (`STATUS_NOT_RUNNING_EXIT`, `crates/roost-cli/src/session.rs`).
 NOT_RUNNING_EXIT = 3
 
-@functools.cache
-def real_identity() -> dict:
-    """What this tree's `roost-session` says it is, offline.
-
-    `roost-session identify` is compile-time identity — no socket, no
-    profile — and this tree builds the daemon and the UI against one pin.
-    Read from a **clean** environment because this lane runs with
-    `ROOST_TEST_MODE=1`, the very gate that would otherwise let a
-    developer's exported `ROOST_SESSION_FAKE_BUILD` answer here and make
-    the card assertion tautological.
-    """
-    result = subprocess.run(
-        [str(_REAL_SESSION), "identify"],
-        env={"PATH": os.environ.get("PATH", "")},
-        capture_output=True,
-        text=True,
-        timeout=scaled_timeout(30),
-    )
-    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
-    return json.loads(result.stdout)
-
 
 def client_libghostty_build() -> str:
     """The libghostty build this client pins, as a string."""
-    return real_identity()["libghostty_build"]
+    return sessionlib.real_identity()["libghostty_build"]
 
 
 # ---------------------------------------------------------------------------
@@ -656,7 +633,7 @@ def restore_candidate():
     """Put the real binary back at `_CANDIDATE` after a case replaced it."""
     yield
     _CANDIDATE.unlink(missing_ok=True)
-    _CANDIDATE.with_name(_CANDIDATE.name + ".test-identity").unlink(missing_ok=True)
+    sessionlib.identity_sidecar(_CANDIDATE).unlink(missing_ok=True)
     shutil.copy2(_REAL_SESSION, _CANDIDATE)
 
 
@@ -666,8 +643,7 @@ def start_as(ground: Ground, name: str, **identity) -> str:
     copy = ground.host.env.root / f"build-{name}" / "roost-session"
     copy.parent.mkdir(exist_ok=True)
     shutil.copy2(_REAL_SESSION, copy)
-    if identity:
-        copy.with_name(copy.name + ".test-identity").write_text(json.dumps(identity))
+    sessionlib.plant_identity(copy, **identity)
     env = dataclasses.replace(ground.host.env, binary=copy)
     ground.pid = start_session(env).verdict.pid
     session_id = ground.claim(ground.host.env.identify()["session_id"])
@@ -683,20 +659,18 @@ def fake_candidate(identify_stdout: str) -> None:
     _CANDIDATE.chmod(0o755)
 
 
-def resolved_update(ground: Ground, session_id: str, timeout: float = 60.0) -> dict:
+def host_update(host: HostUnderTest, session_id: str, timeout: float = 60.0) -> dict:
     """The host's `update` object once its restart candidate has been
     identified for this session — a target or a reason, either way."""
 
     def probe() -> dict | None:
-        row = host_status_row(ground.host.roost, ground.host.saved_id)
+        row = host_status_row(host.roost, host.saved_id)
         connect = row.get("connect")
         update = row.get("update")
         if connect is None or connect["session_id"] != session_id or update is None:
             return None
         restart = update["restart"]
-        if "target" not in restart and "why" not in restart:
-            return None
-        return update
+        return update if "target" in restart or "why" in restart else None
 
     return wait_until(probe, timeout, "the host's restart candidate to be identified")
 
@@ -705,7 +679,7 @@ def connect_as(ground: Ground, name: str, **identity) -> dict:
     session_id = start_as(ground, name, **identity)
     ground.host.connect_and_wait()
     assert wait_live_connect(ground.host)["connect"]["session_id"] == session_id
-    return resolved_update(ground, session_id)
+    return host_update(ground.host, session_id)
 
 
 def this_roost(update: dict) -> str:
@@ -722,7 +696,7 @@ def leave_rows() -> list:
 
 
 def test_the_same_build_on_both_sides_is_up_to_date(ground: Ground, restore_candidate):
-    real = real_identity()
+    real = sessionlib.real_identity()
     update = connect_as(ground, "same")
     # Two dev builds of one version are only `Same` with a sha to
     # compare, which a tree built without git does not have.
@@ -753,8 +727,9 @@ def test_an_older_session_with_a_newer_candidate_is_staged(ground: Ground, resto
     assert update["state"] == "staged", update
     assert update["session"]["version"] == "0.0.1", update
     assert update["restart"]["offered"] is True, update
-    assert update["restart"]["target"]["version"] == real_identity()["app_version"], update
+    assert update["restart"]["target"]["version"] == sessionlib.real_identity()["app_version"], update
     assert update["restart"]["target"]["source"] == "override", update
+    assert "staged" not in update, "nothing is installed on localhost"
     # Localhost's staged reads "available": nothing was installed.
     target = described_build(update["restart"]["target"])
     line = f"Session {described_build(update['session'])} · {target} available"
@@ -798,13 +773,13 @@ def test_a_dev_session_at_this_version_is_unordered(ground: Ground, restore_cand
     update = connect_as(
         ground,
         "dev",
-        app_version=real_identity()["app_version"],
+        app_version=sessionlib.real_identity()["app_version"],
         dev=True,
         git_sha="0000000",
     )
     assert update["state"] == "unordered", update
     assert update["session"] == {
-        "version": real_identity()["app_version"],
+        "version": sessionlib.real_identity()["app_version"],
         "dev": True,
         "sha": "0000000",
     }, update
@@ -818,7 +793,7 @@ def test_a_dev_session_at_this_version_is_unordered(ground: Ground, restore_cand
 
 
 def test_a_candidate_on_another_protocol_is_no_restart(ground: Ground, restore_candidate):
-    real = real_identity()
+    real = sessionlib.real_identity()
     fake_candidate(
         json.dumps({**real, "app_version": "99.0.0", "session_protocol": real["session_protocol"] + 1})
     )
@@ -848,21 +823,6 @@ def test_an_override_that_is_gone_is_the_whole_answer(ground: Ground, restore_ca
 # ---------------------------------------------------------------------------
 # 6. Restart Session (plan 076 D4, D7, D8)
 # ---------------------------------------------------------------------------
-
-
-def host_update(host: HostUnderTest, session_id: str, timeout: float = 60.0) -> dict:
-    """`resolved_update`, for a host on whichever UI is up."""
-
-    def probe() -> dict | None:
-        row = host_status_row(host.roost, host.saved_id)
-        connect = row.get("connect")
-        update = row.get("update")
-        if connect is None or connect["session_id"] != session_id or update is None:
-            return None
-        restart = update["restart"]
-        return update if "target" in restart or "why" in restart else None
-
-    return wait_until(probe, timeout, "the host's restart candidate to be identified")
 
 
 def wait_restarted(ground: Ground, host: HostUnderTest, before: str, timeout: float = 180.0) -> dict:
@@ -904,7 +864,7 @@ def test_restart_runs_the_override_and_lands_up_to_date(ground: Ground, restore_
 
     row = wait_restarted(ground, ground.host, before)
     action = row["update"]["action"]
-    real = real_identity()
+    real = sessionlib.real_identity()
     shown = sessionlib.describe_build(real)
     assert action == {
         "kind": "restart",

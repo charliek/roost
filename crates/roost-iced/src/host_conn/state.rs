@@ -157,6 +157,14 @@ pub(crate) struct BuildMismatch {
     pub(crate) exe_path: Option<String>,
 }
 
+impl BuildMismatch {
+    /// Whether the refused session speaks the newer protocol (plan 076
+    /// D3's `Gate::Failed`).
+    pub(crate) fn protocol_newer(&self) -> bool {
+        self.session_protocol > self.client_protocol
+    }
+}
+
 /// Run the compatibility gate against a `session.identify` reply.
 ///
 /// `Ok` means every negotiation this client depends on holds; the error

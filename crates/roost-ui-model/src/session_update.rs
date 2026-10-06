@@ -87,6 +87,19 @@ impl Why {
         }
     }
 
+    /// The inverse of [`Why::wire`], for a reader of `host.status`.
+    pub fn from_wire(wire: &str) -> Option<Self> {
+        [
+            Self::Missing,
+            Self::Unreadable,
+            Self::Older,
+            Self::Incompatible,
+            Self::Override,
+        ]
+        .into_iter()
+        .find(|why| why.wire() == wire)
+    }
+
     pub fn reason(self) -> &'static str {
         match self {
             Self::Missing => "its roost-session is gone",
@@ -156,6 +169,12 @@ pub struct UpdateInputs<'a> {
     pub transport: HostTransportKind,
 }
 
+/// D3 rule 1: a refused session is the newer side when it speaks a newer
+/// protocol, or when this client's version orders older than its own.
+pub fn refused_session_newer(running: &BuildId, client: &BuildId, protocol_newer: bool) -> bool {
+    protocol_newer || order(client, running) == VersionOrder::Older
+}
+
 /// D3's precedence table; the first matching row wins.
 pub fn classify(inputs: UpdateInputs<'_>) -> SessionUpdate {
     let UpdateInputs {
@@ -169,7 +188,7 @@ pub fn classify(inputs: UpdateInputs<'_>) -> SessionUpdate {
     let client_vs_running = order(client, running);
 
     if let Gate::Failed { protocol_newer } = gate {
-        return if protocol_newer || client_vs_running == VersionOrder::Older {
+        return if refused_session_newer(running, client, protocol_newer) {
             SessionUpdate::SessionNewer { blocked: true }
         } else {
             SessionUpdate::Required
@@ -290,19 +309,15 @@ impl UpdateFacts {
 
     /// As `host.status` spells it (D7).
     pub fn status(&self) -> HostUpdateStatus {
-        let build = |build: &BuildId| BuildStatus {
-            version: build.version.clone(),
-            dev: build.dev,
-            sha: build.sha.clone(),
-        };
         HostUpdateStatus {
             state: self.state.wire().to_string(),
             blocked: match self.state {
                 SessionUpdate::SessionNewer { blocked } => Some(blocked),
                 _ => None,
             },
-            session: build(&self.running),
-            client: build(&self.client),
+            session: BuildStatus::from(&self.running),
+            client: BuildStatus::from(&self.client),
+            staged: self.staged.as_ref().map(BuildStatus::from),
             restart: HostRestartStatus {
                 offered: self.restart.offered,
                 why: self.restart.why.map(|why| why.wire().to_string()),
@@ -542,10 +557,7 @@ pub fn install_refusal(
         return Err(InstallRefusal::ProtocolDiffers);
     }
     if let Some(rung) = rung {
-        let same_triple = rung.version == client.version
-            && rung.protocol == client.protocol
-            && rung.libghostty_build == client.libghostty_build;
-        if same_triple || order(rung, client) == VersionOrder::Newer {
+        if rung.same_install(client) || order(rung, client) == VersionOrder::Newer {
             return Err(InstallRefusal::AlreadyInstalled);
         }
     }
@@ -610,15 +622,20 @@ pub fn fidelity_route(
 
 /// A build as a person reads it: `0.0.22`, or `0.0.22 dev a1b2c3d`.
 pub fn describe(build: &BuildId) -> String {
-    match dev_marker(build) {
-        Some(marker) => format!("{} {marker}", build.version),
-        None => build.version.clone(),
+    describe_parts(&build.version, build.dev, build.sha.as_deref())
+}
+
+/// [`describe`], from the fields `host.status` carries.
+pub fn describe_parts(version: &str, dev: bool, sha: Option<&str>) -> String {
+    match dev_marker(dev, sha) {
+        Some(marker) => format!("{version} {marker}"),
+        None => version.to_string(),
     }
 }
 
 /// `dev a1b2c3d`, or `dev` alone without a sha; `None` for a release.
-fn dev_marker(build: &BuildId) -> Option<String> {
-    match (build.dev, build.sha.as_deref()) {
+fn dev_marker(dev: bool, sha: Option<&str>) -> Option<String> {
+    match (dev, sha) {
         (false, _) => None,
         (true, Some(sha)) => Some(format!("dev {sha}")),
         (true, None) => Some("dev".to_string()),
@@ -660,7 +677,10 @@ pub fn session_line(facts: &UpdateFacts, transport: HostTransportKind) -> String
         (SessionUpdate::UpToDate, _) => format!("{session} · up to date"),
         (SessionUpdate::Available, _) => available(&facts.client),
         (SessionUpdate::Staged, HostTransportKind::Ssh) => match &facts.staged {
-            Some(staged) => format!("{} installed · restart to use it", describe(staged)),
+            Some(staged) if facts.restart.offered => {
+                format!("{} installed · restart to use it", describe(staged))
+            }
+            Some(staged) => format!("{} installed", describe(staged)),
             None => restart_to_match(),
         },
         (SessionUpdate::Staged, _) => match &facts.restart.target {
@@ -673,10 +693,12 @@ pub fn session_line(facts: &UpdateFacts, transport: HostTransportKind) -> String
         (SessionUpdate::SessionNewer { blocked: true }, _) => {
             format!("{session} · update this Roost to connect")
         }
-        (SessionUpdate::Unordered, _) => match dev_marker(&facts.client) {
-            Some(marker) => format!("{session} · this Roost {marker}"),
-            None => session.clone(),
-        },
+        (SessionUpdate::Unordered, _) => {
+            match dev_marker(facts.client.dev, facts.client.sha.as_deref()) {
+                Some(marker) => format!("{session} · this Roost {marker}"),
+                None => session.clone(),
+            }
+        }
         (SessionUpdate::Required, _) => {
             format!("{session} · {} needed to connect", describe(&facts.client))
         }
@@ -1268,6 +1290,7 @@ mod tests {
         assert_eq!(status.blocked, None);
         assert_eq!(status.session.version, "0.0.21");
         assert_eq!(status.client.version, "0.0.22");
+        assert_eq!(status.staged, None, "nothing was installed on localhost");
         assert!(status.restart.offered);
         assert_eq!(
             status.restart.target.map(|t| (t.version, t.source)),
@@ -1605,8 +1628,11 @@ mod tests {
         assert_eq!(facts.state, SessionUpdate::Staged);
         assert_eq!(
             session_line(&facts, Ssh),
-            "0.0.23 installed · restart to use it · its roost-session can't talk to this Roost"
+            "0.0.23 installed · its roost-session can't talk to this Roost"
         );
+        let status = facts.status();
+        assert_eq!(status.staged.map(|b| b.version), Some("0.0.23".to_string()));
+        assert!(!status.restart.offered);
         // This client's own install stages its own build.
         let own = UpdateFacts::new(UpdateInputs {
             running: &running,

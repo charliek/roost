@@ -874,6 +874,24 @@ pub(crate) struct BootstrapSuccess {
     /// `roost-session` by name. Not a failure — Roost execs the absolute
     /// path — so it rides along for the completion toast to append.
     pub(crate) path_warning: Option<String>,
+    /// What the file this job wrote answered once it was in place —
+    /// the asset's build, which a dev client does not share.
+    pub(crate) installed: Option<BuildId>,
+}
+
+impl BootstrapSuccess {
+    fn after(installed: Option<roost_ipc::bootstrap::Installed>) -> Self {
+        match installed {
+            Some(done) => Self {
+                installed: Some(BuildId::from(&done.identity)),
+                path_warning: done.path_warning,
+            },
+            None => Self {
+                path_warning: None,
+                installed: None,
+            },
+        }
+    }
 }
 
 /// Which request a step is answering.
@@ -1005,9 +1023,7 @@ async fn run_plan(
         );
     }
     let Some(start) = &plan.start else {
-        return Ok(BootstrapSuccess {
-            path_warning: installed.and_then(|done| done.path_warning),
-        });
+        return Ok(BootstrapSuccess::after(installed));
     };
     // What the start runs and has to come up as: what this job just
     // installed, as the installed file answered — never a later probe's
@@ -1070,38 +1086,28 @@ async fn run_plan(
         })?;
     let build = BuildId::from(&serving);
     let installed_triple = plan.gate != IdentityGate::Installed
-        || (serving.app_version == job.options().expected.app_version
-            && serving.session_protocol == job.options().expected.session_protocol
-            && serving.libghostty_build == job.options().expected.libghostty_build);
-    if build != target || !installed_triple {
+        || build.same_install(&BuildId::from(&job.options().expected));
+    if !installed_triple {
         return Err(BootstrapError::Unverified(
             roost_ui_model::session_update::describe(&build),
         ));
     }
-    if before.as_deref() == Some(serving.session_id.as_str()) {
-        return Err(BootstrapError::Unverified(format!(
-            "{} (the same session)",
-            roost_ui_model::session_update::describe(&build)
-        )));
-    }
-    Ok(BootstrapSuccess {
-        path_warning: installed.and_then(|done| done.path_warning),
-    })
+    roost_ui_model::session_update::verify_restart(
+        before.as_deref().unwrap_or_default(),
+        &target,
+        &serving.session_id,
+        &build,
+    )
+    .map_err(BootstrapError::Unverified)?;
+    Ok(BootstrapSuccess::after(installed))
 }
 
 /// The exec rung is still `path`, answering as `target`.
 async fn rung_is(job: &BootstrapJob, path: &str, target: &BuildId) -> Result<(), BootstrapError> {
-    let found = match job.probe().await?.outcome {
-        ProbeOutcome::Compatible { path, identity }
-        | ProbeOutcome::Mismatch {
-            path,
-            identity: Some(identity),
-        } => Some((path, BuildId::from(&identity))),
-        _ => None,
-    };
-    if found
-        .as_ref()
-        .is_some_and(|(found, build)| found == path && build == target)
+    let outcome = job.probe().await?.outcome;
+    if outcome
+        .identified_rung()
+        .is_some_and(|(found, build)| found == path && build == *target)
     {
         return Ok(());
     }
