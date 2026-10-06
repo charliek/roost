@@ -1102,7 +1102,10 @@ pub struct AppContextMenuDumpResult {
     pub entries: Vec<AppContextMenuEntry>,
 }
 
-/// One menu row: an item, or `{"separator": true}`.
+/// One menu row: an item, `{"separator": true}`, or a header's text.
+///
+/// Untagged, so the variant is the field set; `Header` is last so a
+/// payload with no header in it decodes exactly as it always did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum AppContextMenuEntry {
@@ -1114,6 +1117,10 @@ pub enum AppContextMenuEntry {
     },
     Separator {
         separator: bool,
+    },
+    /// Text only: never chosen, and not an item to activate.
+    Header {
+        header: String,
     },
 }
 
@@ -2007,6 +2014,10 @@ pub struct SidebarDumpSection {
     /// pill's action, absent when the band draws no pill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fidelity: Option<String>,
+    /// `"needs update"` | `"update Roost"` — the band's must-act pill
+    /// (plan 076 D6), absent when it draws none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_pill: Option<String>,
 }
 
 /// `app.sidebar_dump` response — the sidebar's **last-rendered** agent
@@ -4522,6 +4533,9 @@ mod tests {
                     enabled: true,
                 },
                 AppContextMenuEntry::Separator { separator: true },
+                AppContextMenuEntry::Header {
+                    header: "mini3 · Session 0.0.22 · up to date".into(),
+                },
             ],
         };
         assert_eq!(
@@ -4529,6 +4543,7 @@ mod tests {
             json!({"entries": [
                 {"action": "close_tab", "label": "Close Tab", "enabled": true},
                 {"separator": true},
+                {"header": "mini3 · Session 0.0.22 · up to date"},
             ]})
         );
         round_trip(&dump);
@@ -5353,6 +5368,7 @@ mod tests {
                     saved_id: Some("hs-2f1c".to_string()),
                     reconnect_row: true,
                     fidelity: None,
+                    update_pill: Some("needs update".to_string()),
                 },
                 SidebarDumpSection {
                     role: "host".to_string(),
@@ -5362,6 +5378,7 @@ mod tests {
                     saved_id: Some("hs-9d40".to_string()),
                     reconnect_row: false,
                     fidelity: Some("update".to_string()),
+                    update_pill: None,
                 },
             ],
         };
@@ -5376,6 +5393,8 @@ mod tests {
             band.get("fidelity").is_none(),
             "a band with no pill omits the key"
         );
+        assert_eq!(band["update_pill"], "needs update");
+        assert!(encoded["sections"][1].get("update_pill").is_none());
     }
 
     #[test]

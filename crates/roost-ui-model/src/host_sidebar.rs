@@ -297,6 +297,9 @@ pub struct HostInput<'a> {
     /// by [`SectionState::status_text_with_reason`]; `None` is the bare
     /// word.
     pub reason: Option<&'a str>,
+    /// What the session could be updated or restarted onto (plan 076
+    /// D3), once its identity is known.
+    pub update: Option<&'a crate::session_update::UpdateFacts>,
 }
 
 /// One rendered section header, in sidebar order.
@@ -317,8 +320,13 @@ pub struct Section {
     /// The reduced-fidelity indicator, and what pressing it would do.
     /// Drawn beside the rollup rather than in it — an agent count and a
     /// fidelity warning are different facts and neither replaces the
-    /// other.
+    /// other. Routed through Option 2 (plan 076 D6), so `Manual` when
+    /// neither Install nor Restart is offered.
     pub fidelity: Option<FidelityAction>,
+    /// Why a `Manual` fidelity pill offers nothing; `None` otherwise.
+    pub fidelity_note: Option<crate::session_update::FidelityNote>,
+    /// [`crate::session_update::band_pill`]: the must-act pill.
+    pub update_pill: Option<&'static str>,
 }
 
 impl Section {
@@ -381,6 +389,8 @@ fn in_process_sections(hosts: &[HostInput<'_>]) -> Vec<Section> {
         // and for the local workspace there is no "over there".
         rollup: None,
         fidelity: None,
+        fidelity_note: None,
+        update_pill: None,
     });
     out.extend(hosts.iter().map(host_section));
     out
@@ -401,7 +411,9 @@ fn session_sections(slot_saved_id: Option<&str>, hosts: &[HostInput<'_>]) -> Vec
             // "over there" to roll up. What it does have, once it is not
             // connected, is trouble worth naming.
             rollup: slot.state.status_text_with_reason(slot.reason),
-            fidelity: fidelity_action(slot.reduced_fidelity, slot.transport, slot.state),
+            fidelity: band_fidelity(slot),
+            fidelity_note: band_fidelity_note(slot),
+            update_pill: crate::session_update::band_pill(slot.update),
         },
         // Session mode with no localhost host saved: a transient the
         // launch path closes by adding one (plan 063 §D5). The band says
@@ -415,6 +427,8 @@ fn session_sections(slot_saved_id: Option<&str>, hosts: &[HostInput<'_>]) -> Vec
             state: SectionState::Connecting,
             rollup: SectionState::Connecting.status_text().map(str::to_string),
             fidelity: None,
+            fidelity_note: None,
+            update_pill: None,
         },
     });
     out.extend(
@@ -437,8 +451,25 @@ fn host_section(host: &HostInput<'_>) -> Section {
             .state
             .status_text_with_reason(host.reason)
             .or_else(|| agent_rollup(host.agents)),
-        fidelity: fidelity_action(host.reduced_fidelity, host.transport, host.state),
+        fidelity: band_fidelity(host),
+        fidelity_note: band_fidelity_note(host),
+        update_pill: crate::session_update::band_pill(host.update),
     }
+}
+
+/// The band's fidelity pill: the transport's offer, routed the way the
+/// pill's press is (plan 076 D6).
+fn band_fidelity(host: &HostInput<'_>) -> Option<FidelityAction> {
+    crate::session_update::fidelity_route(
+        fidelity_action(host.reduced_fidelity, host.transport, host.state),
+        host.update,
+        host.transport,
+    )
+}
+
+fn band_fidelity_note(host: &HostInput<'_>) -> Option<crate::session_update::FidelityNote> {
+    (band_fidelity(host) == Some(FidelityAction::Manual))
+        .then(|| crate::session_update::fidelity_note(host.update, host.transport))
 }
 
 /// The band that renders a given saved host, **found by key**.
@@ -575,6 +606,7 @@ mod tests {
             reduced_fidelity: false,
             agents,
             reason: None,
+            update: None,
         }
     }
 
@@ -907,6 +939,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Plan 076 D6: the fidelity pill presses into Option 2's route, so
+    /// a session neither Install nor Restart can help (session-newer,
+    /// unordered) draws it unpressable; and the two must-act states draw
+    /// their own pill.
+    #[test]
+    fn the_band_routes_its_fidelity_pill_and_draws_the_must_act_pills() {
+        use crate::session_update::{RestartOffer, SessionUpdate, UpdateFacts};
+        let facts = |state| UpdateFacts {
+            state,
+            running: Default::default(),
+            client: Default::default(),
+            restart: RestartOffer {
+                offered: true,
+                why: None,
+                target: None,
+            },
+            staged: None,
+        };
+        let newer = facts(SessionUpdate::SessionNewer { blocked: false });
+        let unordered = facts(SessionUpdate::Unordered);
+        let required = facts(SessionUpdate::Required);
+        let blocked = facts(SessionUpdate::SessionNewer { blocked: true });
+        let sections = in_process(&[
+            HostInput {
+                update: Some(&newer),
+                ..reduced("a", HostTransportKind::Ssh, 0)
+            },
+            HostInput {
+                update: Some(&unordered),
+                ..reduced("b", HostTransportKind::Ssh, 0)
+            },
+            HostInput {
+                update: Some(&required),
+                ..host("c", SectionState::NeedsRestart, 0)
+            },
+            HostInput {
+                update: Some(&blocked),
+                ..host("d", SectionState::NeedsRestart, 0)
+            },
+            HostInput {
+                update: Some(&newer),
+                ..host("e", SectionState::Connected, 0)
+            },
+        ]);
+        assert_eq!(
+            sections
+                .iter()
+                .map(|section| section.fidelity_note)
+                .collect::<Vec<_>>(),
+            vec![
+                None,
+                Some(crate::session_update::FidelityNote::UpdateRoost),
+                Some(crate::session_update::FidelityNote::Unordered),
+                None,
+                None,
+                None,
+            ]
+        );
+        assert_eq!(
+            sections
+                .iter()
+                .map(|section| (section.fidelity, section.update_pill))
+                .collect::<Vec<_>>(),
+            vec![
+                (None, None),
+                (Some(FidelityAction::Manual), None),
+                (Some(FidelityAction::Manual), None),
+                (None, Some("needs update")),
+                (None, Some("update Roost")),
+                (None, None),
+            ]
+        );
     }
 
     /// The pill is its own slot: it reaches the band beside the rollup,

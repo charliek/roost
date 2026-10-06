@@ -331,6 +331,17 @@
             "separator"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "header": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "header"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -3237,6 +3248,12 @@
         },
         "state": {
           "type": "string"
+        },
+        "update_pill": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

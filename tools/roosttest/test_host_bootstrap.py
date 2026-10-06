@@ -134,6 +134,9 @@ from client import Roost, RoostError, scaled_timeout
 
 from test_host_client import (
     SUBTITLE_NEEDS_RESTART,
+    band_menu,
+    band_section,
+    described_build,
     first_project,
     host_row,
     host_row_ids,
@@ -1640,6 +1643,13 @@ def activate_row(roost: Roost, row_id: str) -> None:
         roost.palette_dismiss()
 
 
+def up_to_date_line() -> str:
+    """The band's session line for a session on this tree's own build."""
+    if up_to_date_state() == "unordered":
+        return f"Session {described()} · this Roost dev"
+    return f"Session {described()} · up to date"
+
+
 def up_to_date_state() -> str:
     """Two dev builds of one version are only `Same` with a sha to
     compare, which a tree built without git does not have."""
@@ -1661,6 +1671,19 @@ def test_install_update_keeps_the_session_then_restart_moves_it(
     session_id = connect_old_session(bootstrap_host)
     row = update_row(bootstrap_host, lambda u: u["state"] == "available", "an available update")
     assert row["update"]["session"]["version"] == OLD_VERSION, row
+    # Plan 076 D6: the band names no host, and lists the plain Restart
+    # the palette leaves out.
+    assert band_menu(roost, bootstrap_host.saved_id) == [
+        f"# Session {described_build(row['update']['session'])} · {described()} available",
+        "Install Update…",
+        "Restart Session…",
+        None,
+        "Disconnect",
+        "Stop Session…",
+    ]
+    rows = host_row_ids(roost)
+    assert f"host:install:{bootstrap_host.saved_id}" in rows, sorted(rows)
+    assert f"host:restart:{bootstrap_host.saved_id}" not in rows, sorted(rows)
 
     assert "pass confirm: true" in refused(
         roost, "host.update", bootstrap_host.saved_id, "invalid-param"
@@ -1689,6 +1712,14 @@ def test_install_update_keeps_the_session_then_restart_moves_it(
     assert set(states) == {"connected"}, f"an install never lets go of the stream: {states}"
     assert row["connect"]["session_id"] == session_id, row
     assert row["update"]["state"] == "staged", row
+    assert band_menu(roost, bootstrap_host.saved_id) == [
+        f"# {described()} installed · restart to use it",
+        "Restart Session…",
+        None,
+        "Disconnect",
+        "Stop Session…",
+    ]
+    assert f"host:restart:{bootstrap_host.saved_id}" in host_row_ids(roost)
     dest = bootstrap_host.jail.dest()
     assert dest.read_bytes() == sessionlib.session_binary().read_bytes()
     assert _ASSET_SERVER.fetched(valid_asset), _ASSET_SERVER.requests
@@ -1712,6 +1743,8 @@ def test_install_update_keeps_the_session_then_restart_moves_it(
     ), action
     assert row["update"]["session"]["version"] == real_identity()["app_version"], row
     assert row["update"]["state"] == up_to_date_state(), row
+    assert band_menu(roost, bootstrap_host.saved_id)[0] == f"# {up_to_date_line()}"
+    assert f"host:restart:{bootstrap_host.saved_id}" not in host_row_ids(roost)
     serving = session_answering(bootstrap_host.jail.socket())
     assert serving is not None and serving["session_id"] == row["connect"]["session_id"]
 
@@ -1732,6 +1765,13 @@ def test_install_is_refused_to_a_client_older_than_the_session(
     roost.call("host.connect", {"id": bootstrap_host.saved_id})
     row = update_row(bootstrap_host, lambda u: u["state"] == "session-newer", "session-newer")
     assert row["update"]["blocked"] is False, row
+    assert band_menu(roost, bootstrap_host.saved_id) == [
+        f"# Session {described_build(row['update']['session'])} · newer than this Roost",
+        "Restart Session…",
+        None,
+        "Disconnect",
+        "Stop Session…",
+    ]
     message = refused(roost, "host.update", bootstrap_host.saved_id, "invalid-param", confirm=True)
     assert "newer than this Roost" in message, message
     assert f"host:install:{bootstrap_host.saved_id}" not in host_row_ids(roost)
@@ -1794,6 +1834,11 @@ def test_install_is_refused_to_a_session_on_another_protocol(
     roost.call("host.connect", {"id": bootstrap_host.saved_id})
     row = update_row(bootstrap_host, lambda u: u["state"] == "required", "required")
     assert row["state"] == "needs-restart", row
+    assert band_menu(roost, bootstrap_host.saved_id) == [
+        f"# Session {described_build(row['update']['session'])} · {described()} needed to connect",
+        "Update roost-session…",
+    ]
+    assert band_section(roost, bootstrap_host.saved_id).get("update_pill") == "needs update"
     message = refused(roost, "host.update", bootstrap_host.saved_id, "invalid-param", confirm=True)
     assert "speaks another protocol" in message, message
     rows = host_row_ids(roost)
@@ -1823,6 +1868,10 @@ def test_a_newer_session_this_client_cannot_talk_to_offers_no_install(
     bootstrap_host.connect_started()
     row = update_row(bootstrap_host, lambda u: u["state"] == "session-newer", "session-newer")
     assert row["update"]["blocked"] is True, row
+    assert band_menu(roost, bootstrap_host.saved_id) == [
+        f"# Session {described_build(row['update']['session'])} · update this Roost to connect",
+    ]
+    assert band_section(roost, bootstrap_host.saved_id).get("update_pill") == "update Roost"
     for op in ("host.update", "host.restart"):
         refused(roost, op, bootstrap_host.saved_id, "invalid-param", confirm=True)
     rows = host_row_ids(roost)
@@ -1856,6 +1905,14 @@ def test_a_rung_that_will_not_identify_is_never_restarted_onto(
     assert action["phase"] == "failed", row
     assert "can't read its roost-session" in action["message"], action
     assert row["update"]["restart"] == {"offered": False, "why": "unreadable"}, row
+    assert band_menu(roost, bootstrap_host.saved_id) == [
+        f"# Session {described_build(row['update']['session'])} · {described()} available"
+        " · can't read its roost-session",
+        "Install Update…",
+        None,
+        "Disconnect",
+        "Stop Session…",
+    ]
     assert row["connect"]["session_id"] == session_id, row
     assert session_answering(bootstrap_host.jail.socket())["session_id"] == session_id
 

@@ -91,7 +91,7 @@ impl Why {
         match self {
             Self::Missing => "its roost-session is gone",
             Self::Unreadable => "can't read its roost-session",
-            Self::Older => "its roost-session is older than the session",
+            Self::Older => "its roost-session is older",
             Self::Incompatible => "its roost-session can't talk to this Roost",
             Self::Override => "ROOST_SESSION_BIN names nothing this user can run",
         }
@@ -263,6 +263,10 @@ pub struct UpdateFacts {
     pub running: BuildId,
     pub client: BuildId,
     pub restart: RestartOffer,
+    /// The newer build an ssh host would exec next, as this client's own
+    /// install or a probe found it (D5) — what "installed" names,
+    /// whether or not a restart could use it.
+    pub staged: Option<BuildId>,
 }
 
 impl UpdateFacts {
@@ -273,6 +277,14 @@ impl UpdateFacts {
             running: inputs.running.clone(),
             client: inputs.client.clone(),
             restart: restart_offer(state, inputs.transport, inputs.target),
+            staged: match inputs.install {
+                InstallKnowledge::Staged(build)
+                    if order(build, inputs.running) == VersionOrder::Newer =>
+                {
+                    Some(build.clone())
+                }
+                _ => None,
+            },
         }
     }
 
@@ -582,8 +594,13 @@ pub fn fidelity_route(
     if install_offer(facts, transport).is_ok() {
         return Some(FidelityAction::Update);
     }
-    let restartable =
-        facts.state == SessionUpdate::Staged || transport == HostTransportKind::Localhost;
+    // A session newer than this client, or of a build it cannot order,
+    // is not one a restart onto "the newest build" would bring level.
+    let restartable = !matches!(
+        facts.state,
+        SessionUpdate::SessionNewer { .. } | SessionUpdate::Unordered
+    ) && (facts.state == SessionUpdate::Staged
+        || transport == HostTransportKind::Localhost);
     Some(if facts.restart.offered && restartable {
         FidelityAction::Restart
     } else {
@@ -593,10 +610,133 @@ pub fn fidelity_route(
 
 /// A build as a person reads it: `0.0.22`, or `0.0.22 dev a1b2c3d`.
 pub fn describe(build: &BuildId) -> String {
+    match dev_marker(build) {
+        Some(marker) => format!("{} {marker}", build.version),
+        None => build.version.clone(),
+    }
+}
+
+/// `dev a1b2c3d`, or `dev` alone without a sha; `None` for a release.
+fn dev_marker(build: &BuildId) -> Option<String> {
     match (build.dev, build.sha.as_deref()) {
-        (false, _) => build.version.clone(),
-        (true, Some(sha)) => format!("{} dev {sha}", build.version),
-        (true, None) => format!("{} dev", build.version),
+        (false, _) => None,
+        (true, Some(sha)) => Some(format!("dev {sha}")),
+        (true, None) => Some("dev".to_string()),
+    }
+}
+
+/// The line a host's menu opens with (D6's band-menu table): the
+/// session's build and what can be done about it, then why Restart is
+/// absent when a candidate was judged unusable.
+pub fn session_line(facts: &UpdateFacts, transport: HostTransportKind) -> String {
+    let running = &facts.running;
+    let session = if running.version.is_empty() {
+        "Session version unknown".to_string()
+    } else {
+        format!("Session {}", describe(running))
+    };
+    let available = |offered: &BuildId| {
+        // "Matching" only when it is this client's own build, every
+        // fidelity-relevant field of it, and the version reads the same
+        // as the running one's.
+        if offered == &facts.client && describe(offered) == describe(running) {
+            format!("{session} · a matching build available")
+        } else {
+            format!("{session} · {} available", describe(offered))
+        }
+    };
+    // Nothing is known to be installed or found, only that a restart is
+    // the fix — and with no usable target, not even that: the reason
+    // suffix says why.
+    let restart_to_match = || {
+        if facts.restart.offered {
+            format!("{session} · restart to use a matching build")
+        } else {
+            session.clone()
+        }
+    };
+    let line = match (facts.state, transport) {
+        (_, HostTransportKind::Socket) => session.clone(),
+        (SessionUpdate::UpToDate, _) => format!("{session} · up to date"),
+        (SessionUpdate::Available, _) => available(&facts.client),
+        (SessionUpdate::Staged, HostTransportKind::Ssh) => match &facts.staged {
+            Some(staged) => format!("{} installed · restart to use it", describe(staged)),
+            None => restart_to_match(),
+        },
+        (SessionUpdate::Staged, _) => match &facts.restart.target {
+            Some(target) => available(&target.identity),
+            None => restart_to_match(),
+        },
+        (SessionUpdate::SessionNewer { blocked: false }, _) => {
+            format!("{session} · newer than this Roost")
+        }
+        (SessionUpdate::SessionNewer { blocked: true }, _) => {
+            format!("{session} · update this Roost to connect")
+        }
+        (SessionUpdate::Unordered, _) => match dev_marker(&facts.client) {
+            Some(marker) => format!("{session} · this Roost {marker}"),
+            None => session.clone(),
+        },
+        (SessionUpdate::Required, _) => {
+            format!("{session} · {} needed to connect", describe(&facts.client))
+        }
+        (SessionUpdate::Unknown, _) => session.clone(),
+    };
+    match facts.restart.why {
+        Some(why) => format!("{line} · {}", why.reason()),
+        None => line,
+    }
+}
+
+/// Why a reduced-fidelity band offers nothing to press — what its row
+/// says in place of an action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FidelityNote {
+    /// Somebody else's process: whoever runs it restarts it.
+    Socket,
+    /// The session is newer than this client; this Roost is what needs
+    /// updating.
+    UpdateRoost,
+    /// Neither build orders against the other.
+    Unordered,
+    /// No candidate a restart could run is usable.
+    Unusable(Why),
+    /// Nothing more specific is known.
+    NoMatchingBuild,
+}
+
+/// [`FidelityNote`] for a band whose fidelity pill offers nothing.
+pub fn fidelity_note(facts: Option<&UpdateFacts>, transport: HostTransportKind) -> FidelityNote {
+    if transport == HostTransportKind::Socket {
+        return FidelityNote::Socket;
+    }
+    let Some(facts) = facts else {
+        return FidelityNote::NoMatchingBuild;
+    };
+    match (facts.state, facts.restart.why) {
+        (SessionUpdate::SessionNewer { .. }, _) => FidelityNote::UpdateRoost,
+        (SessionUpdate::Unordered, _) => FidelityNote::Unordered,
+        (_, Some(why)) => FidelityNote::Unusable(why),
+        _ => FidelityNote::NoMatchingBuild,
+    }
+}
+
+/// A project's or tab's host block header (D6): the host, and its
+/// session line once one is known.
+pub fn host_header(label: &str, session_line: Option<&str>) -> String {
+    match session_line {
+        Some(line) => format!("{label} · {line}"),
+        None => label.to_string(),
+    }
+}
+
+/// The band's must-act pill (D6): the session refused this client and
+/// one side has to change. Nothing else on the band names a version.
+pub fn band_pill(facts: Option<&UpdateFacts>) -> Option<&'static str> {
+    match facts?.state {
+        SessionUpdate::Required => Some("needs update"),
+        SessionUpdate::SessionNewer { blocked: true } => Some("update Roost"),
+        _ => None,
     }
 }
 
@@ -1145,6 +1285,7 @@ mod tests {
                 why: None,
                 target: None,
             },
+            staged: None,
         }
     }
 
@@ -1271,6 +1412,21 @@ mod tests {
             fidelity_route(Some(Restart), Some(&local), Localhost),
             Some(Manual)
         );
+        // Review finding 4: a localhost session newer than this client,
+        // or unordered against it, has a usable target (its own binary)
+        // and still nothing a restart would bring level.
+        local.restart.offered = true;
+        for state in [
+            SessionUpdate::SessionNewer { blocked: false },
+            SessionUpdate::Unordered,
+        ] {
+            local.state = state;
+            assert_eq!(
+                fidelity_route(Some(Restart), Some(&local), Localhost),
+                Some(Manual),
+                "{state:?}"
+            );
+        }
         // No facts yet: the transport's own answer.
         assert_eq!(fidelity_route(Some(Update), None, Ssh), Some(Update));
         assert_eq!(fidelity_route(None, Some(&local), Localhost), None);
@@ -1278,6 +1434,363 @@ mod tests {
             fidelity_route(Some(Manual), Some(&local), Socket),
             Some(Manual)
         );
+    }
+
+    /// D6's band-menu table, one row per state.
+    #[test]
+    fn the_session_line_follows_the_band_menu_table() {
+        let with = |state, running: BuildId, client: BuildId| UpdateFacts {
+            state,
+            running,
+            client,
+            restart: RestartOffer {
+                offered: true,
+                why: None,
+                target: None,
+            },
+            staged: None,
+        };
+        let targeted = |mut facts: UpdateFacts, identity: BuildId| {
+            facts.restart.target = Some(RestartTarget {
+                path: "/x".into(),
+                identity,
+                source: TargetSource::Bundled,
+                session_id: "s".into(),
+                generation: 1,
+            });
+            facts
+        };
+        let r = release;
+        let cases = [
+            (
+                with(SessionUpdate::UpToDate, r("0.0.22"), r("0.0.22")),
+                Ssh,
+                "Session 0.0.22 · up to date",
+            ),
+            (
+                with(SessionUpdate::Available, r("0.0.21"), r("0.0.22")),
+                Ssh,
+                "Session 0.0.21 · 0.0.22 available",
+            ),
+            // Reduced fidelity at an equal version: the build, not the
+            // version, is what is on offer.
+            (
+                with(SessionUpdate::Available, r("0.0.22"), r("0.0.22")),
+                Ssh,
+                "Session 0.0.22 · a matching build available",
+            ),
+            (
+                UpdateFacts {
+                    staged: Some(r("0.0.22")),
+                    ..with(SessionUpdate::Staged, r("0.0.21"), r("0.0.22"))
+                },
+                Ssh,
+                "0.0.22 installed · restart to use it",
+            ),
+            // Localhost's staged reads "available": nothing was
+            // installed, the bundled build is simply newer.
+            (
+                targeted(
+                    with(SessionUpdate::Staged, r("0.0.21"), r("0.0.21")),
+                    r("0.0.22"),
+                ),
+                Localhost,
+                "Session 0.0.21 · 0.0.22 available",
+            ),
+            (
+                with(
+                    SessionUpdate::SessionNewer { blocked: false },
+                    r("0.0.23"),
+                    r("0.0.22"),
+                ),
+                Localhost,
+                "Session 0.0.23 · newer than this Roost",
+            ),
+            (
+                with(
+                    SessionUpdate::Unordered,
+                    dev("0.0.22", "a1b2c3d"),
+                    r("0.0.22"),
+                ),
+                Ssh,
+                "Session 0.0.22 dev a1b2c3d",
+            ),
+            (
+                with(
+                    SessionUpdate::Unordered,
+                    dev("0.0.22", "a1b2c3d"),
+                    dev("0.0.22", "f00ba12"),
+                ),
+                Ssh,
+                "Session 0.0.22 dev a1b2c3d · this Roost dev f00ba12",
+            ),
+            (
+                with(
+                    SessionUpdate::Unordered,
+                    r("0.0.22"),
+                    BuildId {
+                        dev: true,
+                        ..r("0.0.22")
+                    },
+                ),
+                Localhost,
+                "Session 0.0.22 · this Roost dev",
+            ),
+            (
+                with(SessionUpdate::Required, r("0.0.19"), r("0.0.22")),
+                Ssh,
+                "Session 0.0.19 · 0.0.22 needed to connect",
+            ),
+            (
+                with(
+                    SessionUpdate::SessionNewer { blocked: true },
+                    r("0.0.23"),
+                    r("0.0.22"),
+                ),
+                Ssh,
+                "Session 0.0.23 · update this Roost to connect",
+            ),
+            // A socket host's session is somebody else's: the build, and
+            // nothing to do about it.
+            (
+                with(SessionUpdate::UpToDate, r("0.0.21"), r("0.0.22")),
+                Socket,
+                "Session 0.0.21",
+            ),
+            (
+                with(SessionUpdate::Unknown, r(""), r("0.0.22")),
+                Ssh,
+                "Session version unknown",
+            ),
+        ];
+        for (facts, transport, want) in cases {
+            assert_eq!(session_line(&facts, transport), want, "{:?}", facts.state);
+        }
+    }
+
+    /// Review finding 2: "installed" names the staged build itself, not
+    /// this client's, even when a restart cannot use it.
+    #[test]
+    fn the_ssh_staged_line_names_the_build_that_is_installed() {
+        let running = release("0.0.21");
+        let client = release("0.0.22");
+        let rung = BuildId {
+            protocol: PROTOCOL + 1,
+            ..release("0.0.23")
+        };
+        let (target, install) = ssh_knowledge(
+            &ProbeOutcome::Mismatch {
+                path: "/usr/bin/roost-session".into(),
+                identity: Some(roost_ipc::messages::SessionBinaryIdentity {
+                    app_version: "0.0.23".into(),
+                    session_protocol: PROTOCOL + 1,
+                    libghostty_build: "g".into(),
+                    ..Default::default()
+                }),
+            },
+            &running,
+            &client,
+            "s",
+            1,
+        );
+        assert_eq!(install, InstallKnowledge::Staged(rung));
+        let facts = UpdateFacts::new(UpdateInputs {
+            running: &running,
+            client: &client,
+            gate: Gate::Ok,
+            target: &target,
+            install: &install,
+            transport: Ssh,
+        });
+        assert_eq!(facts.state, SessionUpdate::Staged);
+        assert_eq!(
+            session_line(&facts, Ssh),
+            "0.0.23 installed · restart to use it · its roost-session can't talk to this Roost"
+        );
+        // This client's own install stages its own build.
+        let own = UpdateFacts::new(UpdateInputs {
+            running: &running,
+            client: &client,
+            gate: Gate::Ok,
+            target: &TargetKnowledge::NotChecked,
+            install: &InstallKnowledge::Staged(client.clone()),
+            transport: Ssh,
+        });
+        assert_eq!(
+            session_line(&own, Ssh),
+            "0.0.22 installed · restart to use it"
+        );
+    }
+
+    /// Review finding 1: a session with no version still says what state
+    /// it is in and why Restart is absent.
+    #[test]
+    fn an_unknown_version_keeps_the_state_and_the_reason() {
+        let unknown = |state| facts(state, "", "0.0.22");
+        assert_eq!(
+            session_line(&unknown(SessionUpdate::Required), Ssh),
+            "Session version unknown · 0.0.22 needed to connect"
+        );
+        assert_eq!(
+            session_line(&unknown(SessionUpdate::SessionNewer { blocked: true }), Ssh),
+            "Session version unknown · update this Roost to connect"
+        );
+        assert_eq!(
+            session_line(&unknown(SessionUpdate::Available), Ssh),
+            "Session version unknown · 0.0.22 available"
+        );
+        let mut staged = unknown(SessionUpdate::Staged);
+        staged.restart.target = Some(RestartTarget {
+            path: "/x".into(),
+            identity: release("0.0.22"),
+            source: TargetSource::Bundled,
+            session_id: "s".into(),
+            generation: 1,
+        });
+        assert_eq!(
+            session_line(&staged, Localhost),
+            "Session version unknown · 0.0.22 available"
+        );
+        let mut unreadable = unknown(SessionUpdate::Unknown);
+        unreadable.restart.offered = false;
+        unreadable.restart.why = Some(Why::Unreadable);
+        assert_eq!(
+            session_line(&unreadable, Localhost),
+            "Session version unknown · can't read its roost-session"
+        );
+    }
+
+    /// A reduced-fidelity localhost session is staged before its target
+    /// is resolved: "restart to use a matching build" while that is
+    /// pending, and only the reason once no candidate is usable.
+    #[test]
+    fn a_staged_session_with_no_target_says_restart_only_while_one_may_exist() {
+        let mut facts = facts(SessionUpdate::Staged, "0.0.22", "0.0.22");
+        assert_eq!(
+            session_line(&facts, Localhost),
+            "Session 0.0.22 · restart to use a matching build"
+        );
+        facts.restart.offered = false;
+        facts.restart.why = Some(Why::Missing);
+        assert_eq!(
+            session_line(&facts, Localhost),
+            "Session 0.0.22 · its roost-session is gone"
+        );
+    }
+
+    /// Review finding 5: "matching" only for this client's own build. A
+    /// target at the same version on another libghostty build is named.
+    #[test]
+    fn a_matching_build_is_this_clients_whole_identity() {
+        let mut facts = facts(SessionUpdate::Staged, "0.0.22", "0.0.22");
+        let skewed = BuildId {
+            libghostty_build: "other".into(),
+            ..release("0.0.22")
+        };
+        facts.restart.target = Some(RestartTarget {
+            path: "/x".into(),
+            identity: skewed,
+            source: TargetSource::Running,
+            session_id: "s".into(),
+            generation: 1,
+        });
+        assert_eq!(
+            session_line(&facts, Localhost),
+            "Session 0.0.22 · 0.0.22 available"
+        );
+        facts.restart.target.as_mut().unwrap().identity = release("0.0.22");
+        assert_eq!(
+            session_line(&facts, Localhost),
+            "Session 0.0.22 · a matching build available"
+        );
+    }
+
+    #[test]
+    fn a_blocked_fidelity_pill_says_why() {
+        let note = |state, why| {
+            let mut facts = facts(state, "0.0.22", "0.0.22");
+            facts.restart.why = why;
+            fidelity_note(Some(&facts), Ssh)
+        };
+        assert_eq!(
+            fidelity_note(None, Socket),
+            FidelityNote::Socket,
+            "a socket host, whatever is known"
+        );
+        assert_eq!(
+            note(
+                SessionUpdate::SessionNewer { blocked: false },
+                Some(Why::Older)
+            ),
+            FidelityNote::UpdateRoost
+        );
+        assert_eq!(
+            note(SessionUpdate::Unordered, None),
+            FidelityNote::Unordered
+        );
+        assert_eq!(
+            note(SessionUpdate::UpToDate, Some(Why::Missing)),
+            FidelityNote::Unusable(Why::Missing)
+        );
+        assert_eq!(
+            note(SessionUpdate::Unknown, None),
+            FidelityNote::NoMatchingBuild
+        );
+        assert_eq!(
+            fidelity_note(None, Localhost),
+            FidelityNote::NoMatchingBuild
+        );
+    }
+
+    #[test]
+    fn an_unusable_restart_says_why_after_the_line() {
+        let mut facts = facts(SessionUpdate::UpToDate, "0.0.22", "0.0.22");
+        facts.restart.offered = false;
+        for (why, suffix) in [
+            (Why::Missing, "its roost-session is gone"),
+            (Why::Unreadable, "can't read its roost-session"),
+            (Why::Older, "its roost-session is older"),
+            (
+                Why::Incompatible,
+                "its roost-session can't talk to this Roost",
+            ),
+        ] {
+            facts.restart.why = Some(why);
+            assert_eq!(
+                session_line(&facts, Localhost),
+                format!("Session 0.0.22 · up to date · {suffix}")
+            );
+        }
+    }
+
+    #[test]
+    fn a_project_menus_header_names_the_host_first() {
+        assert_eq!(
+            host_header("mini3", Some("Session 0.0.21 · 0.0.22 available")),
+            "mini3 · Session 0.0.21 · 0.0.22 available"
+        );
+        assert_eq!(host_header("mini3", None), "mini3");
+    }
+
+    #[test]
+    fn only_the_two_must_act_states_draw_a_band_pill() {
+        let pill = |state| band_pill(Some(&facts(state, "0.0.21", "0.0.22")));
+        assert_eq!(pill(SessionUpdate::Required), Some("needs update"));
+        assert_eq!(
+            pill(SessionUpdate::SessionNewer { blocked: true }),
+            Some("update Roost")
+        );
+        for state in [
+            SessionUpdate::UpToDate,
+            SessionUpdate::Available,
+            SessionUpdate::Staged,
+            SessionUpdate::SessionNewer { blocked: false },
+            SessionUpdate::Unordered,
+            SessionUpdate::Unknown,
+        ] {
+            assert_eq!(pill(state), None, "{state:?}");
+        }
+        assert_eq!(band_pill(None), None);
     }
 
     #[test]

@@ -25,7 +25,7 @@ use crate::host_conn::state::{
 use roost_ipc::session_version::{order, BuildId, VersionOrder};
 use roost_ui_model::host_sidebar::FidelityAction;
 use roost_ui_model::notice;
-use roost_ui_model::session_update::{describe, RestartTarget, TargetSource};
+use roost_ui_model::session_update::{describe, FidelityNote, RestartTarget, TargetSource};
 
 /// A frame nothing will ever update again, and why.
 ///
@@ -260,21 +260,57 @@ pub(super) struct FidelityChrome {
     pub(super) row: String,
 }
 
-/// What the band and the row say for one [`FidelityAction`].
-pub(super) fn fidelity_chrome(action: FidelityAction, label: &str) -> FidelityChrome {
-    match action {
-        FidelityAction::Update => FidelityChrome {
+/// What a reduced-fidelity band offers: an action to press, or why
+/// there is none (plan 076 D6) — the reason is not the action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FidelityOffer {
+    Update,
+    Restart,
+    Blocked(FidelityNote),
+}
+
+impl FidelityOffer {
+    /// A band's routed action and, for `Manual`, the section's note.
+    pub(super) fn new(action: FidelityAction, note: Option<FidelityNote>) -> Self {
+        match action {
+            FidelityAction::Update => Self::Update,
+            FidelityAction::Restart => Self::Restart,
+            FidelityAction::Manual => Self::Blocked(note.unwrap_or(FidelityNote::NoMatchingBuild)),
+        }
+    }
+}
+
+/// What the band and the row say for one [`FidelityOffer`].
+pub(super) fn fidelity_chrome(offer: FidelityOffer, label: &str) -> FidelityChrome {
+    let blocked = |row: String| FidelityChrome {
+        pressable: false,
+        row,
+    };
+    match offer {
+        FidelityOffer::Update => FidelityChrome {
             pressable: true,
             row: "⬆ Update roost-session".to_string(),
         },
-        FidelityAction::Restart => FidelityChrome {
+        FidelityOffer::Restart => FidelityChrome {
             pressable: true,
             row: "↻ Restart session".to_string(),
         },
-        FidelityAction::Manual => FidelityChrome {
-            pressable: false,
-            row: format!("Restart it on {label} to restore fidelity"),
-        },
+        FidelityOffer::Blocked(FidelityNote::Socket) => {
+            blocked(format!("Restart it on {label} to restore fidelity"))
+        }
+        FidelityOffer::Blocked(FidelityNote::UpdateRoost) => blocked(format!(
+            "This Roost is older than the session on {label}; update Roost to restore fidelity"
+        )),
+        FidelityOffer::Blocked(FidelityNote::Unordered) => blocked(format!(
+            "This Roost can't order its build against {label}'s; run matching builds to restore \
+             fidelity"
+        )),
+        FidelityOffer::Blocked(FidelityNote::Unusable(why)) => {
+            blocked(format!("{label} can't be restarted: {}", why.reason()))
+        }
+        FidelityOffer::Blocked(FidelityNote::NoMatchingBuild) => blocked(format!(
+            "{label} needs a matching roost-session to restore fidelity"
+        )),
     }
 }
 
@@ -746,15 +782,18 @@ mod tests {
     /// respond to a press.
     #[test]
     fn the_fidelity_matrix_answers_one_pair_of_widgets_per_action() {
-        let update = fidelity_chrome(FidelityAction::Update, "pop-os");
+        let update = fidelity_chrome(FidelityOffer::Update, "pop-os");
         assert!(update.pressable, "an ssh host can be sent a build");
         assert_eq!(update.row, "⬆ Update roost-session");
 
-        let restart = fidelity_chrome(FidelityAction::Restart, "localhost");
+        let restart = fidelity_chrome(FidelityOffer::Restart, "localhost");
         assert!(restart.pressable, "our own session is ours to restart");
         assert_eq!(restart.row, "↻ Restart session");
 
-        let manual = fidelity_chrome(FidelityAction::Manual, "build-box");
+        let manual = fidelity_chrome(
+            FidelityOffer::new(FidelityAction::Manual, Some(FidelityNote::Socket)),
+            "build-box",
+        );
         assert!(
             !manual.pressable,
             "a socket target's process is not this client's to touch"
@@ -764,6 +803,40 @@ mod tests {
             !manual.row.starts_with('⬆') && !manual.row.starts_with('↻'),
             "and it wears no action glyph, because it is not an action: {}",
             manual.row
+        );
+    }
+
+    /// Review finding 3: a blocked pill's row says why for the case it
+    /// is, and only a socket host is told to restart it.
+    #[test]
+    fn a_blocked_fidelity_row_names_its_own_reason() {
+        use roost_ui_model::session_update::Why;
+        let row = |note| fidelity_chrome(FidelityOffer::Blocked(note), "mini3");
+        for note in [
+            FidelityNote::UpdateRoost,
+            FidelityNote::Unordered,
+            FidelityNote::Unusable(Why::Older),
+            FidelityNote::NoMatchingBuild,
+        ] {
+            let chrome = row(note);
+            assert!(!chrome.pressable, "{note:?}");
+            assert!(
+                !chrome.row.starts_with("Restart it on"),
+                "{note:?}: {}",
+                chrome.row
+            );
+        }
+        assert_eq!(
+            row(FidelityNote::UpdateRoost).row,
+            "This Roost is older than the session on mini3; update Roost to restore fidelity"
+        );
+        assert_eq!(
+            row(FidelityNote::Unusable(Why::Older)).row,
+            "mini3 can't be restarted: its roost-session is older"
+        );
+        assert_eq!(
+            row(FidelityNote::Socket).row,
+            "Restart it on mini3 to restore fidelity"
         );
     }
 

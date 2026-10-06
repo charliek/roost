@@ -377,6 +377,7 @@ fn section_dump(section: &host_sidebar::Section) -> SidebarDumpSection {
         saved_id: section.saved_id.clone(),
         reconnect_row: section.state.offers_reconnect(),
         fidelity: section.fidelity.map(|action| action.as_str().to_string()),
+        update_pill: section.update_pill.map(str::to_string),
     }
 }
 
@@ -3345,6 +3346,7 @@ impl App {
                 reduced_fidelity: view.reduced_fidelity,
                 agents: view.agents,
                 reason: view.reason.as_deref(),
+                update: view.update.as_ref(),
             })
             .collect();
         host_sidebar::sections(self.local_slot_input(), &hosts)
@@ -4794,6 +4796,7 @@ mod tests {
             reduced_fidelity: false,
             agents: 0,
             reason: None,
+            update: None,
         };
         let ssh = HostInput {
             saved_id: "hs-box",
@@ -4804,6 +4807,7 @@ mod tests {
             reduced_fidelity: false,
             agents: 0,
             reason: None,
+            update: None,
         };
         let strip = |local: LocalSlot<'_>, hosts: &[HostInput<'_>]| {
             host_sidebar::sections(local, hosts)

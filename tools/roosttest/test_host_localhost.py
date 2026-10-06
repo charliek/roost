@@ -131,6 +131,10 @@ from host_probe import host_key  # noqa: E402
 from test_host_client import (  # noqa: E402
     FAKE_BUILD,
     HostUnderTest,
+    band_menu,
+    described_build,
+    menu_items,
+    wait_host_section,
     first_project,
     host_row_ids,
     host_status_row,
@@ -704,6 +708,19 @@ def connect_as(ground: Ground, name: str, **identity) -> dict:
     return resolved_update(ground, session_id)
 
 
+def this_roost(update: dict) -> str:
+    """The ` · this Roost dev …` an unordered line ends with, when this
+    client is a dev build (plan 076 D6)."""
+    client = update["client"]
+    if not client.get("dev"):
+        return ""
+    return f" · this Roost dev {client['sha']}" if client.get("sha") else " · this Roost dev"
+
+
+def leave_rows() -> list:
+    return [None, "Disconnect", "Stop Session…"]
+
+
 def test_the_same_build_on_both_sides_is_up_to_date(ground: Ground, restore_candidate):
     real = real_identity()
     update = connect_as(ground, "same")
@@ -715,6 +732,20 @@ def test_the_same_build_on_both_sides_is_up_to_date(ground: Ground, restore_cand
     assert update["restart"]["offered"] is True, update
     assert update["restart"]["target"]["source"] == "override", update
     assert update["restart"]["target"]["version"] == real["app_version"], update
+    # Plan 076 D6: the plain maintenance Restart is on the menu only.
+    session = described_build(update["session"])
+    line = (
+        f"Session {session}{this_roost(update)}"
+        if want == "unordered"
+        else f"Session {session} · up to date"
+    )
+    assert band_menu(ground.host.roost, ground.host.saved_id) == [
+        f"# {line}",
+        "Restart Session…",
+        *leave_rows(),
+    ]
+    rows = host_row_ids(ground.host.roost)
+    assert f"host:restart:{ground.host.saved_id}" not in rows, sorted(rows)
 
 
 def test_an_older_session_with_a_newer_candidate_is_staged(ground: Ground, restore_candidate):
@@ -724,6 +755,28 @@ def test_an_older_session_with_a_newer_candidate_is_staged(ground: Ground, resto
     assert update["restart"]["offered"] is True, update
     assert update["restart"]["target"]["version"] == real_identity()["app_version"], update
     assert update["restart"]["target"]["source"] == "override", update
+    # Localhost's staged reads "available": nothing was installed.
+    target = described_build(update["restart"]["target"])
+    line = f"Session {described_build(update['session'])} · {target} available"
+    assert band_menu(ground.host.roost, ground.host.saved_id) == [
+        f"# {line}",
+        "Restart Session…",
+        *leave_rows(),
+    ]
+    rows = host_row_ids(ground.host.roost)
+    assert f"host:restart:{ground.host.saved_id}" in rows, sorted(rows)
+    assert f"host:install:{ground.host.saved_id}" not in rows, sorted(rows)
+    # A project row's host block opens with the host's name.
+    section = wait_host_section(
+        ground.host.roost,
+        ground.host.saved_id,
+        lambda section: section["projects"],
+        "the host's projects to reach the sidebar",
+    )
+    project = menu_items(
+        ground.host.roost.context_menu_dump({"project_id": section["projects"][0]["key"]})
+    )
+    assert project[-6:] == [None, f"# {ground.host.label} · {line}", "Restart Session…", *leave_rows()], project
 
 
 def test_a_newer_session_is_session_newer_and_never_restarted_older(
@@ -733,6 +786,12 @@ def test_a_newer_session_is_session_newer_and_never_restarted_older(
     assert update["state"] == "session-newer", update
     assert update["blocked"] is False, update
     assert update["restart"] == {"offered": False, "why": "older"}, update
+    assert band_menu(ground.host.roost, ground.host.saved_id) == [
+        f"# Session {described_build(update['session'])} · newer than this Roost"
+        " · its roost-session is older",
+        "Disconnect",
+        "Stop Session…",
+    ]
 
 
 def test_a_dev_session_at_this_version_is_unordered(ground: Ground, restore_candidate):
@@ -751,6 +810,11 @@ def test_a_dev_session_at_this_version_is_unordered(ground: Ground, restore_cand
     }, update
     # Unordered is not a downgrade: the candidate stays usable.
     assert update["restart"]["offered"] is True, update
+    assert band_menu(ground.host.roost, ground.host.saved_id) == [
+        f"# Session {described_build(update['session'])}{this_roost(update)}",
+        "Restart Session…",
+        *leave_rows(),
+    ]
 
 
 def test_a_candidate_on_another_protocol_is_no_restart(ground: Ground, restore_candidate):
@@ -760,18 +824,25 @@ def test_a_candidate_on_another_protocol_is_no_restart(ground: Ground, restore_c
     )
     update = connect_as(ground, "incompatible")
     assert update["restart"] == {"offered": False, "why": "incompatible"}, update
+    header = band_menu(ground.host.roost, ground.host.saved_id)[0]
+    assert header.endswith(" · its roost-session can't talk to this Roost"), header
 
 
 def test_a_candidate_that_will_not_identify_is_no_restart(ground: Ground, restore_candidate):
     fake_candidate("not an identity")
     update = connect_as(ground, "unreadable")
     assert update["restart"] == {"offered": False, "why": "unreadable"}, update
+    header = band_menu(ground.host.roost, ground.host.saved_id)[0]
+    assert header.endswith(" · can't read its roost-session"), header
 
 
 def test_an_override_that_is_gone_is_the_whole_answer(ground: Ground, restore_candidate):
     _CANDIDATE.unlink()
     update = connect_as(ground, "override")
     assert update["restart"] == {"offered": False, "why": "override"}, update
+    menu = band_menu(ground.host.roost, ground.host.saved_id)
+    assert menu[0].endswith(" · ROOST_SESSION_BIN names nothing this user can run"), menu
+    assert "Restart Session…" not in menu, menu
 
 
 # ---------------------------------------------------------------------------

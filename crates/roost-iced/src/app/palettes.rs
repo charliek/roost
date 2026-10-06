@@ -326,6 +326,7 @@ fn host_verb_items(
         slot,
     )
     .into_iter()
+    .filter(|verb| verb.surfaces.palette)
     .map(|verb| {
         let trailing = (verb.id == host_verbs::NEW_PROJECT_ON_ID)
             .then_some(new_project_on_shortcut)

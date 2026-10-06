@@ -457,7 +457,9 @@ class Roost:
     # -- a row's right-click menu (test mode) ------------------------------
     def context_menu_dump(self, target: dict) -> list[dict]:
         """Test-mode only — the menu `target` would show now:
-        `[{action, label, enabled} | {separator: True}]`. `target` is
+        `[{action, label, enabled} | {separator: True} | {header: text}]`
+        — only an item has a `label`, so filter on `"action" in entry`
+        before reading one. `target` is
         `{"tab_id": ref}`, `{"project_id": ref}` or `{"host": saved_id}`;
         a ref is a bare id or the `h<host>.<id>` spelling. Iced-only."""
         return self.call("app.context_menu_dump", {"target": target})["entries"]

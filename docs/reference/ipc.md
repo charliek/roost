@@ -1659,7 +1659,14 @@ Each entry:
   addressed to `saved_id`.
 - `fidelity` — `"update"` | `"restart"` | `"manual"`, the reduced-fidelity
   pill's action (see [The upgrade / restart flow](../guides/host-sessions.md#the-upgrade-restart-flow)),
-  omitted when the band draws no pill.
+  omitted when the band draws no pill. It is what pressing the pill does:
+  `"manual"` (not pressable) whenever neither Install Update nor Restart
+  Session is offered — a socket host, or a session newer than this Roost
+  or of an unordered build.
+- `update_pill` — `"needs update"` when the session refused this Roost
+  and has to be updated (`host.status` `update.state` `required`), or
+  `"update Roost"` when it refused it for being too old (`session-newer`
+  with `blocked`); omitted otherwise.
 
 `sections` is **empty, and so omitted**, whenever the sidebar draws its
 classic single sticky `PROJECTS` header instead of a strip:
@@ -2483,11 +2490,36 @@ A project row lists `new_tab`, `rename_project`, `copy_project_path`,
 File Manager" on Linux, and only for a path on this machine), a
 separator and `close_project`. A project on a host adds a separator and the
 host's own items; a host band, and a dimmed or offline host's rows, list
-only those. The host items are the command palette's host rows for the
-same host, under the palette's titles: `host_connect`,
-`host_disconnect`, `host_update_session`, `host_install_update`,
-`host_restart_session` and `host_stop_session` ("Disconnect Host: workbox", "Stop Session:
-workbox", …). Remove Host is never on the menu.
+only those. The host items are the command palette's host verbs for
+the same host, under short labels that never name the host: Connect
+(`host_connect`), Install Update… (`host_install_update`), Update
+roost-session… (`host_update_session`), Restart Session…
+(`host_restart_session`), then a separator, Disconnect
+(`host_disconnect`) and Stop Session… (`host_stop_session`), each only
+when it applies. The menu also lists the plain maintenance Restart
+Session…, which the palette leaves out unless a newer build is staged
+or the connection is at reduced fidelity. A refused session lists the
+fix in Connect's place: Update roost-session… over ssh, Restart
+Session… on this machine, and nothing for a session too new for this
+Roost. Remove Host is never on the menu.
+
+A host's items can be introduced by a **header**, `{"header": "<text>"}`:
+text only, never activated, and skipped by the arrow keys. A host band's
+menu opens with the session line once the session's build is known —
+`Session 0.0.21 · 0.0.22 available`, `0.0.22 installed · restart to use
+it`, `Session 0.0.22 · up to date`, `Session 0.0.23 · newer than this
+Roost`, `Session 0.0.19 · 0.0.22 needed to connect`, `Session 0.0.23 ·
+update this Roost to connect`, `Session 0.0.22 dev a1b2c3d` (with
+` · this Roost dev f00ba12` when this Roost is a dev build), plain
+`Session 0.0.21` for a socket host, or `Session version unknown` —
+followed by ` · ` and the reason when no restart target is usable
+(`its roost-session is gone`, `can't read its roost-session`,
+`its roost-session is older`, `its roost-session can't talk to this
+Roost`). A disconnected host has no header. A project's or tab's host
+block always opens with one, naming the host first:
+`{"header": "workbox · Session 0.0.21 · 0.0.22 available"}`, or just
+`{"header": "workbox"}` while its session is not known. Read entries by
+their keys: an entry with `header` has no `action` or `label`.
 
 `app.context_menu_activate` runs one item through the dispatcher a
 click reaches. Request:
@@ -2515,8 +2547,8 @@ right-click on the row does, with its corner 40 points right of and
 below the window content area's top-left. Request:
 `{"params": {"target": {"tab_id": "7"}}}`. Response: `{}`. While the
 menu is up it owns the keyboard: through `app.key_event`, `ArrowUp`,
-`ArrowDown`, `Home` and `End` move its highlight past separators and
-disabled items, `Enter` runs the highlighted item, `Escape` closes it,
+`ArrowDown`, `Home` and `End` move its highlight past separators,
+headers and disabled items, `Enter` runs the highlighted item, `Escape` closes it,
 and every other key is swallowed — none reaches a shortcut or the
 terminal. A row that is gone, a row whose menu has no items, and a
 modal, the palette, a rename editor or an input-method composition

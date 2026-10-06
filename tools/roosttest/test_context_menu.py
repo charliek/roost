@@ -287,6 +287,50 @@ def test_a_project_rows_new_tab_opens_where_the_gesture_would_on_the_session_bac
                     roost.delete_project(doomed)
 
 
+def test_the_local_session_bands_menu_opens_with_its_session_line(target):
+    """Plan 076 D6, on the band a fresh install shows: the local
+    session's menu opens with a header naming its build, under short
+    labels that name no host, and the plain maintenance Restart is on the
+    menu but not in the palette. On the overlay the header is passed
+    over: one `ArrowDown` lands on Restart Session…, whose `Enter` asks
+    first."""
+    _overlay_platform()
+    with _session_backend_ui(target) as roost:
+        saved_id = roost.sidebar_local_band()["saved_id"]
+        band = {"host": saved_id}
+
+        def headed() -> list[dict] | None:
+            entries = roost.context_menu_dump(band)
+            return entries if entries and "header" in entries[0] else None
+
+        sessionlib.wait_until(headed, 30.0, "the session's build to be known")
+        entries = roost.context_menu_dump(band)
+        assert entries[0]["header"].startswith("Session "), entries
+        assert "action" not in entries[0] and "label" not in entries[0], entries
+        assert entries[1:] == [
+            item("host_restart_session", "Restart Session…"),
+            SEPARATOR,
+            item("host_disconnect", "Disconnect"),
+            item("host_stop_session", "Stop Session…"),
+        ], entries
+        ids = {row["id"] for row in roost.palette_items("commands")}
+        assert f"host:restart:{saved_id}" not in ids, sorted(ids)
+        assert f"host:stop:{saved_id}" in ids, sorted(ids)
+
+        roost.context_menu_open(band)
+        roost.key_event("ArrowDown")
+        roost.key_event("Enter")
+        try:
+            sessionlib.wait_until(
+                lambda: roost.call("app.dialog_dump", {}).get("dialog") == "confirm_restart",
+                30.0,
+                "Restart Session… to ask first",
+            )
+        finally:
+            with contextlib.suppress(RoostError):
+                roost.call("app.dialog_answer", {"action": "cancel"})
+
+
 def test_close_tab_closes_it(roost, project):
     _listed_tab(roost, project)
     tab = _listed_tab(roost, project)

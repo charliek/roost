@@ -1853,6 +1853,7 @@ mod tests {
                 why: None,
                 target: None,
             },
+            staged: None,
         };
         assert_eq!(actions.update_status("h", None), None);
         actions.remember("h", facts.clone());

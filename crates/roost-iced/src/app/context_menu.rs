@@ -19,6 +19,7 @@ use roost_ipc::messages::AppContextMenuEntry;
 use roost_ui_model::context_menu::{
     self, ContextAction, ContextEntry, ContextFacts, ContextTarget,
 };
+use roost_ui_model::session_update;
 
 use super::*;
 use crate::url_launcher;
@@ -103,6 +104,9 @@ struct ContextRow {
     project: Option<ProjectKey>,
     cwd: String,
     saved_host: Option<String>,
+    host_label: Option<String>,
+    /// [`session_update::session_line`], once the host's session is known.
+    session_line: Option<String>,
     on_this_machine: bool,
     interactive: bool,
 }
@@ -114,6 +118,8 @@ impl ContextRow {
             interactive: self.interactive,
             on_this_machine: self.on_this_machine,
             cwd_known: !self.cwd.is_empty(),
+            host_label: self.host_label.as_deref(),
+            session_line: self.session_line.as_deref(),
         }
     }
 }
@@ -161,6 +167,11 @@ fn context_row(
         project,
         cwd: cwd.to_string(),
         saved_host: view.map(|view| view.saved_id.clone()),
+        host_label: view.map(|view| view.label.clone()),
+        session_line: view.and_then(|view| {
+            let facts = view.update.as_ref()?;
+            Some(session_update::session_line(facts, view.transport))
+        }),
         on_this_machine: view.is_none_or(|view| view.transport.localhost()),
         interactive: view.is_none_or(|view| view.state.interactive()),
     })
@@ -196,6 +207,9 @@ pub(super) fn wire_entry(entry: &ContextEntry) -> AppContextMenuEntry {
             enabled: *enabled,
         },
         ContextEntry::Separator => AppContextMenuEntry::Separator { separator: true },
+        ContextEntry::Header(text) => AppContextMenuEntry::Header {
+            header: text.clone(),
+        },
     }
 }
 
@@ -209,6 +223,9 @@ pub(crate) enum NativeRow<'a> {
         tag: isize,
     },
     Separator,
+    Header {
+        title: &'a str,
+    },
 }
 
 /// The native popup for `entries`: its rows, and the action each item's
@@ -236,6 +253,7 @@ pub(crate) fn native_rows(entries: &[ContextEntry]) -> (Vec<NativeRow<'_>>, Vec<
                 }
             }
             ContextEntry::Separator => NativeRow::Separator,
+            ContextEntry::Header(title) => NativeRow::Header { title },
         })
         .collect();
     (rows, actions)
@@ -393,7 +411,7 @@ impl OpenContextMenu {
                 enabled: true,
                 ..
             } => Some(*action),
-            _ => None,
+            ContextEntry::Item { .. } | ContextEntry::Separator | ContextEntry::Header(_) => None,
         }
     }
 
@@ -451,7 +469,7 @@ fn stepped(entries: &[ContextEntry], from: Option<usize>, step: MenuStep) -> Opt
 
 fn entry_height(entry: &ContextEntry) -> f32 {
     match entry {
-        ContextEntry::Item { .. } => ITEM_HEIGHT,
+        ContextEntry::Item { .. } | ContextEntry::Header(_) => ITEM_HEIGHT,
         ContextEntry::Separator => SEPARATOR_HEIGHT,
     }
 }
@@ -465,7 +483,9 @@ fn fitted(entries: Vec<ContextEntry>) -> (Vec<ContextEntry>, Size) {
     let widest = entries
         .iter()
         .filter_map(|entry| match entry {
-            ContextEntry::Item { label, .. } => Some(chrome::text_width(label, font, LABEL_SIZE)),
+            ContextEntry::Item { label, .. } | ContextEntry::Header(label) => {
+                Some(chrome::text_width(label, font, LABEL_SIZE))
+            }
             ContextEntry::Separator => None,
         })
         .fold(0.0, f32::max);
@@ -485,6 +505,13 @@ fn fitted(entries: Vec<ContextEntry>) -> (Vec<ContextEntry>, Size) {
                     .into_owned(),
                 enabled,
             },
+            ContextEntry::Header(text) if chrome::text_width(&text, font, LABEL_SIZE) > budget => {
+                ContextEntry::Header(
+                    chrome::elide_to_width(&text, font, LABEL_SIZE, budget)
+                        .0
+                        .into_owned(),
+                )
+            }
             entry => entry,
         })
         .collect();
@@ -609,6 +636,17 @@ fn menu_row<'a>(
         .width(Fill)
         .center_y(SEPARATOR_HEIGHT)
         .padding([0.0, ITEM_PADDING_X / 2.0])
+        .into(),
+        ContextEntry::Header(title) => container(
+            text(title.as_str())
+                .size(LABEL_SIZE)
+                .color(chrome.muted_text)
+                .shaping(iced::widget::text::Shaping::Advanced)
+                .wrapping(iced::widget::text::Wrapping::None),
+        )
+        .width(Fill)
+        .center_y(ITEM_HEIGHT)
+        .padding([0.0, ITEM_PADDING_X])
         .into(),
         ContextEntry::Item {
             action,
@@ -1060,6 +1098,12 @@ mod tests {
             wire_entry(&ContextEntry::Separator),
             AppContextMenuEntry::Separator { separator: true }
         );
+        assert_eq!(
+            wire_entry(&ContextEntry::Header("Session 0.0.22 · up to date".into())),
+            AppContextMenuEntry::Header {
+                header: "Session 0.0.22 · up to date".into()
+            }
+        );
     }
 
     #[test]
@@ -1071,6 +1115,8 @@ mod tests {
                 interactive: true,
                 on_this_machine: true,
                 cwd_known: false,
+                host_label: None,
+                session_line: None,
             },
             &[],
         );
@@ -1108,6 +1154,45 @@ mod tests {
                 ContextAction::NewTabHere,
                 ContextAction::CopyTabPath,
                 ContextAction::CloseTab,
+            ]
+        );
+    }
+
+    /// A header is a section header on the native popup: text with no
+    /// tag, so the items after it keep their own.
+    #[test]
+    fn the_native_popup_shows_a_header_as_a_section_header() {
+        let entries = [
+            ContextEntry::Header("mini3 · Session 0.0.22 · up to date".into()),
+            row(ContextAction::HostRestartSession, true),
+            ContextEntry::Separator,
+            row(ContextAction::HostDisconnect, true),
+        ];
+        let (rows, actions) = native_rows(&entries);
+        assert_eq!(
+            rows,
+            [
+                NativeRow::Header {
+                    title: "mini3 · Session 0.0.22 · up to date"
+                },
+                NativeRow::Item {
+                    title: "host_restart_session",
+                    enabled: true,
+                    tag: 0
+                },
+                NativeRow::Separator,
+                NativeRow::Item {
+                    title: "host_disconnect",
+                    enabled: true,
+                    tag: 1
+                },
+            ]
+        );
+        assert_eq!(
+            actions,
+            [
+                ContextAction::HostRestartSession,
+                ContextAction::HostDisconnect
             ]
         );
     }
@@ -1209,12 +1294,13 @@ mod tests {
     }
 
     #[test]
-    fn the_keys_move_past_separators_and_disabled_rows_and_wrap() {
+    fn the_keys_move_past_separators_headers_and_disabled_rows_and_wrap() {
         let entries = [
             row(ContextAction::RenameTab, false),
             row(ContextAction::NewTabHere, true),
             row(ContextAction::CopyTabPath, true),
             ContextEntry::Separator,
+            ContextEntry::Header("box".into()),
             row(ContextAction::CloseTab, true),
             row(ContextAction::NewTab, false),
         ];
@@ -1224,28 +1310,36 @@ mod tests {
             Some(1),
             "past a disabled first row"
         );
-        assert_eq!(step(Some(2), MenuStep::Down), Some(4), "past the separator");
         assert_eq!(
-            step(Some(4), MenuStep::Down),
+            step(Some(2), MenuStep::Down),
+            Some(5),
+            "past the separator and the header"
+        );
+        assert_eq!(
+            step(Some(5), MenuStep::Down),
             Some(1),
             "past a disabled last row, to the top"
         );
         assert_eq!(
-            step(Some(4), MenuStep::Up),
+            step(Some(5), MenuStep::Up),
             Some(2),
-            "back past the separator"
+            "back past the header and the separator"
         );
         assert_eq!(
             step(Some(1), MenuStep::Up),
-            Some(4),
+            Some(5),
             "and from the top round to the bottom"
         );
-        assert_eq!(step(None, MenuStep::Up), Some(4));
+        assert_eq!(step(None, MenuStep::Up), Some(5));
         assert_eq!(step(Some(2), MenuStep::Home), Some(1));
-        assert_eq!(step(Some(1), MenuStep::End), Some(4));
+        assert_eq!(step(Some(1), MenuStep::End), Some(5));
         assert_eq!(
             stepped(
-                &[ContextEntry::Separator, row(ContextAction::CloseTab, false)],
+                &[
+                    ContextEntry::Header("box".into()),
+                    ContextEntry::Separator,
+                    row(ContextAction::CloseTab, false)
+                ],
                 None,
                 MenuStep::Down
             ),
@@ -1270,7 +1364,9 @@ mod tests {
             None,
             "the pointer on the separator"
         );
-        menu.hover(Some(5));
+        menu.hover(Some(4));
+        assert_eq!(menu.highlighted, None, "a header takes no highlight");
+        menu.hover(Some(6));
         assert_eq!(menu.highlighted, None, "a disabled row takes no highlight");
         menu.hover(Some(2));
         assert_eq!(menu.highlighted_action(), Some(ContextAction::CopyTabPath));

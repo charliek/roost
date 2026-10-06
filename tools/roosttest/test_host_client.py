@@ -3655,12 +3655,43 @@ def test_a_paste_while_a_new_host_tab_opens_is_refused(roost, session_env):
 # ---------------------------------------------------------------------------
 
 
+def described_build(build: dict) -> str:
+    """A `host.status` `update` build as `session_update::describe`
+    spells it."""
+    return sessionlib.describe_build(
+        {"app_version": build["version"], "dev": build.get("dev"), "git_sha": build.get("sha")}
+    )
+
+
+def menu_items(entries: list[dict]) -> list[str | None]:
+    """A dumped menu's rows: an item's label, `None` for a separator, and
+    `# <text>` for a header."""
+    return [
+        entry["label"] if "action" in entry else f"# {entry['header']}" if "header" in entry else None
+        for entry in entries
+    ]
+
+
+def band_menu(roost: Roost, saved_id: str) -> list[str | None]:
+    """[`menu_items`] of a host band's right-click menu."""
+    return menu_items(roost.context_menu_dump({"host": saved_id}))
+
+
+def band_section(roost: Roost, saved_id: str) -> dict:
+    """The sidebar's band for this saved host, as `app.sidebar_dump`
+    reports it."""
+    sections = roost.call("app.sidebar_dump", {}).get("sections", [])
+    return next(section for section in sections if section.get("saved_id") == saved_id)
+
+
 def test_a_host_rows_menu_lists_the_palettes_host_rows_and_stop_asks_first(host, roost):
     """The menu's host items are `host_verbs::verbs`' own rows for that
-    host, under the palette's titles, and Remove Host is never among them
-    (plan 073 decision g). Stop Session raises the same confirm card the
-    palette row does — it ends every shell over there, so it is never one
-    click — and cancelling it stops nothing."""
+    host under their short menu labels, and Remove Host is never among
+    them (plan 073 decision g). A socket host's band opens with its
+    session's build and nothing more, and a project's host block with the
+    host's name and that line (plan 076 D6). Stop Session raises the same
+    confirm card the palette row does — it ends every shell over there, so
+    it is never one click — and cancelling it stops nothing."""
     host.connect_and_wait()
     section = wait_host_section(
         roost,
@@ -3669,12 +3700,20 @@ def test_a_host_rows_menu_lists_the_palettes_host_rows_and_stop_asks_first(host,
         "the host's projects to reach the sidebar",
     )
     target = {"project_id": section["projects"][0]["key"]}
-    host_rows = [f"Disconnect Host: {host.label}", f"Stop Session: {host.label}"]
+    update = wait_until(
+        lambda: host_status_row(roost, host.saved_id).get("update"),
+        30.0,
+        "the session's build to be known",
+    )
+    line = f"Session {described_build(update['session'])}"
+    host_rows = ["Disconnect", "Stop Session…"]
 
-    labels = [entry.get("label") for entry in roost.context_menu_dump(target)]
-    assert labels[-3:] == [None, *host_rows], labels
+    labels = menu_items(roost.context_menu_dump(target))
+    assert labels[-4:] == [None, f"# {host.label} · {line}", *host_rows], labels
     band = roost.context_menu_dump({"host": host.saved_id})
-    assert [entry["label"] for entry in band] == host_rows, band
+    assert menu_items(band) == [f"# {line}", *host_rows], band
+    palette = host_row_ids(roost)
+    assert f"host:restart:{host.saved_id}" not in palette, sorted(palette)
 
     roost.context_menu_activate(target, "host_stop_session")
     try:
