@@ -1861,7 +1861,7 @@ impl App {
                     .id
             }
         };
-        Ok(self.connect_then_create(&saved_id, origin))
+        self.connect_then_create(&saved_id, origin)
     }
 
     /// A row that names a host this client has to reach before it can
@@ -1880,27 +1880,25 @@ impl App {
         &mut self,
         saved_id: &str,
         origin: crate::host_conn::RequestOrigin,
-    ) -> EngineDispatch {
+    ) -> Result<EngineDispatch, String> {
         self.set_sidebar_collapsed(false);
         // Connected already: this row should have carried the ordinary
         // create-on-a-host id, but the frame may have been built a
         // moment ago — create now rather than dialing a live connection.
         if let Some(host) = self.hosts.incarnation(saved_id) {
             if self.interactive_host_view(host).is_some() {
-                return self.create_project_on(host);
+                return Ok(self.create_project_on(host));
             }
         }
-        if let Err(failure) = self.refuse_connect_during_action(saved_id) {
-            self.set_status(failure.message);
-            return EngineDispatch::default();
-        }
+        self.refuse_connect_during_action(saved_id)
+            .map_err(|failure| failure.message)?;
         self.host_reconnect_for(
             saved_id,
             origin,
             crate::host_conn::AttemptCause::Explicit,
             local_backend::ConnectPurpose::CreateAfterConnect,
         );
-        EngineDispatch::default()
+        Ok(EngineDispatch::default())
     }
 
     /// A recents row (plan 063 §D7): save the forgotten host again and
@@ -1933,7 +1931,7 @@ impl App {
             .host_add_requested(&label, &recent.target, None)
             .map_err(|error| format!("could not save {}: {error}", recent.label))?;
         if create {
-            return Ok(self.connect_then_create(&host.id, origin));
+            return self.connect_then_create(&host.id, origin);
         }
         self.host_reconnect_requested(&host.id, origin, crate::host_conn::AttemptCause::Explicit);
         Ok(EngineDispatch::default())
