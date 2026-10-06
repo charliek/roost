@@ -74,6 +74,7 @@ fn fixture(socket: Socket) -> Fixture {
                     session_id: "01K3S8TQ4F0Q9YB2K6WZ5D7XN".into(),
                     started_at: "2026-09-04T00:00:00Z".into(),
                     app_version: "9.9.9".into(),
+                    session_protocol: roost_ipc::messages::SESSION_PROTOCOL_VERSION,
                     payload_kinds: Vec::new(),
                     libghostty_build: String::new(),
                     dev: false,

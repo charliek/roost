@@ -35,12 +35,13 @@ pub enum ContextAction {
     HostConnect,
     HostDisconnect,
     HostUpdateSession,
+    HostInstallUpdate,
     HostRestartSession,
     HostStopSession,
 }
 
 impl ContextAction {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::RenameTab,
         Self::NewTabHere,
         Self::CopyTabPath,
@@ -53,6 +54,7 @@ impl ContextAction {
         Self::HostConnect,
         Self::HostDisconnect,
         Self::HostUpdateSession,
+        Self::HostInstallUpdate,
         Self::HostRestartSession,
         Self::HostStopSession,
     ];
@@ -71,6 +73,7 @@ impl ContextAction {
             Self::HostConnect => "host_connect",
             Self::HostDisconnect => "host_disconnect",
             Self::HostUpdateSession => "host_update_session",
+            Self::HostInstallUpdate => "host_install_update",
             Self::HostRestartSession => "host_restart_session",
             Self::HostStopSession => "host_stop_session",
         }
@@ -88,6 +91,7 @@ impl ContextAction {
             Self::HostConnect => HostVerb::Connect(saved_id),
             Self::HostDisconnect => HostVerb::Disconnect(saved_id),
             Self::HostUpdateSession => HostVerb::Update(saved_id),
+            Self::HostInstallUpdate => HostVerb::Install(saved_id),
             Self::HostRestartSession => HostVerb::Restart(saved_id),
             Self::HostStopSession => HostVerb::Stop(saved_id),
             _ => return None,
@@ -282,15 +286,18 @@ mod tests {
             .collect()
     }
 
-    /// The menu's items as `(label, action)`, the action's `_session`
-    /// suffix dropped to meet the row ids' spelling.
+    /// The menu's items as `(label, action)`, spelled the way the row ids
+    /// are: no `_session` suffix, and `host_install` for Install Update.
     fn host_rows(entries: &[ContextEntry]) -> Vec<(String, String)> {
         entries
             .iter()
             .filter_map(|entry| match entry {
                 ContextEntry::Item { action, label, .. } => Some((
                     label.clone(),
-                    action.as_str().trim_end_matches("_session").to_string(),
+                    action
+                        .as_str()
+                        .trim_end_matches("_session")
+                        .replace("host_install_update", "host_install"),
                 )),
                 ContextEntry::Separator => None,
             })
@@ -492,7 +499,7 @@ mod tests {
                 expected: &[
                     "Disconnect Host: aa",
                     "Stop Session: aa",
-                    "Update roost-session on aa",
+                    "Install Update: aa",
                 ],
             },
             Case {

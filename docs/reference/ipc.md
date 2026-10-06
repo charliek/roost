@@ -2485,8 +2485,8 @@ separator and `close_project`. A project on a host adds a separator and the
 host's own items; a host band, and a dimmed or offline host's rows, list
 only those. The host items are the command palette's host rows for the
 same host, under the palette's titles: `host_connect`,
-`host_disconnect`, `host_update_session`, `host_restart_session` and
-`host_stop_session` ("Disconnect Host: workbox", "Stop Session:
+`host_disconnect`, `host_update_session`, `host_install_update`,
+`host_restart_session` and `host_stop_session` ("Disconnect Host: workbox", "Stop Session:
 workbox", …). Remove Host is never on the menu.
 
 `app.context_menu_activate` runs one item through the dispatcher a
@@ -2744,9 +2744,11 @@ A session socket answers `unknown-op` for every verb here — the same "no shado
 | `host.add` | `{"label": "pop-os", "target": "/home/charlie/.local/state/roost/roost-session.sock"}` | Saves a host. `target` is carried **opaquely by this op** — the workspace stores whatever string it's given, unvalidated — so classifying it (`roost_ipc::ssh::classify`: an SSH destination like `workbox` / `user@host` / `ssh://user@host:port`, only the `ssh://` spelling carrying a port; a Unix socket path, containing `/`; or the `localhost` sentinel) and refusing an unclassifiable string (empty, a leading `-`, a bare `host:port` with no scheme) is each **caller's** job, done client-side before this op is ever sent — `roostctl host add` and the Add Host dialog both classify first and never call this op on a target that fails. Registry-only beyond that — this does **not** dial `target`, so a typo'd-but-classifiable target still saves cleanly (the sidebar's dot reports it at the next connect attempt). `label` is trimmed, must be non-empty, Unicode-case-insensitive unique, and not `"local"` (the reserved LOCAL band). Response: `{"host": <Host>}`. |
 | `host.remove` | `{"id": "3f9a2b7c1d4e4f5a"}` | Forgets a saved host — the registry entry and the dimmed rows its last connection left behind. Never touches the session itself: its shells keep running. Response: `{}`. |
 | `host.list` | `{}` | Response: `{"hosts": [<Host>, ...]}`. |
-| `host.connect` | `{"id": "3f9a2b7c1d4e4f5a"}` | Starts (or restarts) a connection — a new, symmetric connection alongside any this client or another already has open, never a claim on one — and on a **localhost** target it spawns the session first if nothing is listening. Answers as soon as the attempt is under way, with the state the request *asked for* (`"connecting"`), not the far end's eventual verdict — watch the sidebar or poll `host.status` for the settled state. Response: `{"host": <Host>, "state": "connecting"}`. |
+| `host.connect` | `{"id": "3f9a2b7c1d4e4f5a"}` | Starts (or restarts) a connection — a new, symmetric connection alongside any this client or another already has open, never a claim on one — and on a **localhost** target it spawns the session first if nothing is listening. Answers as soon as the attempt is under way, with the state the request *asked for* (`"connecting"`), not the far end's eventual verdict — watch the sidebar or poll `host.status` for the settled state. While a `host.update` / `host.restart` (or the same action from a menu) holds the host, in any phase, it is refused `busy` with `a restart/update is in progress on <label>` rather than cancelling or racing it; `host.disconnect` is the way to give up on the action. Response: `{"host": <Host>, "state": "connecting"}`. |
 | `host.disconnect` | `{"id": "3f9a2b7c1d4e4f5a"}` | Drops the connection. Never stops the session — its shells keep running, and reconnecting picks them back up (disconnect ≠ stop). Response: `{"host": <Host>, "state": "disconnected"}`. |
 | `host.status` | `{}` or `{"id": "3f9a2b7c1d4e4f5a"}` | Every saved host's live connection state — the read-side twin of `host.connect`'s reply, and what a script polls instead of scraping the UI log. Bare `{}` answers for every saved host in registry order; `id` narrows it to one, and an unknown id is `not-found` exactly as `host.connect` gives. Response: `{"hosts": [<HostStatus>, ...]}`. Not test-mode gated: this is a read of state the user can already see in the sidebar. |
+| `host.update` | `{"id": "3f9a2b7c1d4e4f5a", "confirm": true}` | **Install Update** (plan 076): install this client's `roost-session` on an **ssh** host and leave the running session — and this client's stream to it — alone; a `host.restart` puts the new build to use. Response: `{"accepted": true}` as soon as the action starts; its outcome is `host.status`'s `update.action`. See [Install and restart](#install-and-restart) for every refusal. |
+| `host.restart` | `{"id": "3f9a2b7c1d4e4f5a", "confirm": true}` | **Restart Session** (plan 076): stop the host's session and start it again on the newest usable build Roost can find — never one older than the running session, never one this client cannot connect to. Every tab reopens as a fresh shell in its directory; running programs end. Response and outcome as `host.update`. |
 
 `Host` is `{"id": "<hex>", "label": "<string>", "target": "<string>", "last_connected"?: "<ISO-8601>"}`. `state` is one of the wire's connection-state spellings: `disconnected` | `connecting` | `connected` | `stopped` | `needs-restart`.
 
@@ -2797,10 +2799,26 @@ A **live** host additionally carries `connect` and `tabs`:
     - `session` / `client` — `{version, dev?, sha?}`. `dev` marks a build the release workflow did not make; `sha` is its 7-character commit when the build could read one. A session started before plan 076 reports neither and reads as a release build.
     - `restart.offered` — whether Restart Session is offered. Never on a socket-path host, a `session-newer` host with `blocked`, or a refused ssh host (its fix is the update). `restart.why` says why not when no binary a restart could run is usable: `missing`, `unreadable` (it would not identify itself), `older` (than the running session — a restart never downgrades), `incompatible` (it speaks a different session protocol than this client) or `override` (`ROOST_SESSION_BIN` is set and cannot be run; it is then the only candidate). `restart.target` is the binary it would run, `{version, dev?, sha?, source}` with `source` one of `bundled` (shipped beside this client), `running` (the running session's own executable), `override` (`ROOST_SESSION_BIN`) or `installed` (the host's own search path); absent until it has been identified.
     - On localhost the candidates are identified in the background once per session, after the connection lands. An ssh host is never probed in the background: what is known about its installed binary comes from probes a person started, so an ssh host reads `available` until one has looked.
+    - `action` — the latest install, restart or update started on this host, from any surface, kept across reconnects: `{"kind": "install" | "restart" | "update", "phase": "running" | "done" | "failed", "message"?}`. `message` is the status line it ended with — `"Installed roost-session 0.0.22 on mini3"`, `"mini3 restarted on roost-session 0.0.22"`, or why it failed. While the host is down, `update` still appears beside the action, carrying the facts last learned about the host.
+
+#### Install and restart
+
+`host.update` and `host.restart` run the same paths as the menu, palette and band, minus the card: an IPC caller is never shown one. Both answer immediately and report through `host.status.update.action`. Both refuse:
+
+- without `"confirm": true` — `invalid-param` (`host.update installs software; pass confirm: true`);
+- on a socket-path host — `not-supported`: nothing here can reach that session's binary;
+- when the action is not offered in the host's current state — `invalid-param`, naming the reason (`host.update` is offered only for an ssh host whose session is `available`; `host.restart` wherever `update.restart.offered` is `true`);
+- while another install, restart or update is under way for the host, or for the same session through another saved host — `busy`.
+
+`host.update` also refuses, after looking at the host, when this client is older than the running session, when the binary the host would run is already this build or newer (restart to use it), and when the session speaks another protocol (that session needs the update that also restarts it). Nothing is installed in any of those cases.
+
+Before anything is stopped or written, both re-identify the running session and the binary they were planned against; a different session or a changed binary fails the action with `the session changed; check again`, and nothing changes. A restart's new session has to be a **different** session running exactly the build it was aimed at, or the action fails with `restarted, but the session is still …`. On localhost the restart starts that binary and nothing else: if it is gone by then the action fails and nothing is started.
+
+A `host.disconnect` while one runs ends it as `failed`. Work already under way on the far side may still finish, and until it has reported the host stays `busy` — `host.connect` included, with `a restart/update on <label> is being cancelled` — but nothing follows from it: no reconnect, and no change to what `host.status` reports.
 
 Every optional field is omitted rather than `null`, so a host that has never connected is `{"id", "label", "target", "generation": 0, "state": "disconnected", "tabs": 0}` and nothing else — `tabs` is the one field that is always present (`0` included) rather than omitted, since a caller polling it across a reconnect needs a number every time, not a key that comes and goes.
 
-`host.add` / `host.remove` are `UiRequest`-style when a UI is attached (a `roostctl host add` is visible in the sidebar immediately, no restart needed) and fall back to a direct `Workspace` mutation for a headless embedder (the engine's own tests) — both paths mint the same `WorkspaceError` wire codes, so a caller cannot tell which one answered. `host.connect` / `host.disconnect` / `host.status` have no headless form: connection state is the app's alone, and a field that spelled "unknown" and "disconnected" the same way would be exactly the lie the op exists to remove.
+`host.add` / `host.remove` are `UiRequest`-style when a UI is attached (a `roostctl host add` is visible in the sidebar immediately, no restart needed) and fall back to a direct `Workspace` mutation for a headless embedder (the engine's own tests) — both paths mint the same `WorkspaceError` wire codes, so a caller cannot tell which one answered. `host.connect` / `host.disconnect` / `host.status` / `host.update` / `host.restart` have no headless form: connection state is the app's alone, and a field that spelled "unknown" and "disconnected" the same way would be exactly the lie the op exists to remove.
 
 ### `events.subscribe`
 
@@ -3318,8 +3336,8 @@ the "needs restart" path would have had nothing left to reach.
 
 A third test-mode seam is a file, not a variable: a JSON object at
 `<the binary's canonical path>.test-identity` with any of
-`app_version`, `dev` and `git_sha` (a string, or `null` to clear it)
-replaces those fields in both `session.identify` and
+`app_version`, `dev`, `git_sha` (a string, or `null` to clear it) and
+`session_protocol` (a number) replaces those fields in both `session.identify` and
 `roost-session identify`. Copies of one binary in different directories
 can then answer as different builds, which an update test needs and one
 process-wide variable cannot give. An unknown key, or a sidecar that

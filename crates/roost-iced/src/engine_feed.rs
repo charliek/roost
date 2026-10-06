@@ -186,6 +186,9 @@ pub(crate) enum EngineFeed {
     /// A localhost session's restart candidates finished identifying on
     /// the engine runtime (plan 076 D4). Boxed like every host item.
     RestartTarget(Box<crate::app::update_knowledge::TargetResolved>),
+    /// A localhost restart's step finished on the engine runtime (plan
+    /// 076 D8). Boxed like every host item.
+    HostAction(Box<crate::app::session_actions::ActionEvent>),
     /// One phase of a local-backend switch finished on the engine
     /// runtime (plan 063 §D8).
     ///
@@ -294,6 +297,8 @@ impl EngineFeedReceiver {
                 | EngineFeed::HostBootstrap(..)
                 // It decides whether a host offers Restart.
                 | EngineFeed::RestartTarget(..)
+                // It moves a host's connection and its action.
+                | EngineFeed::HostAction(..)
                 // It either forgets a host — a registry change the
                 // sidebar and every palette read — or drops the claim.
                 | EngineFeed::HostEmptiness(..)

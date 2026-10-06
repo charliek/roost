@@ -150,6 +150,11 @@ pub(crate) struct BuildMismatch {
     /// The refused session's build, as the update logic compares it
     /// (plan 076 D3).
     pub(crate) running: BuildId,
+    /// The refused session's own id and executable, so a restart of it
+    /// is bound to this session and can consider its binary (plan 076
+    /// D4, D8).
+    pub(crate) session_id: String,
+    pub(crate) exe_path: Option<String>,
 }
 
 /// Run the compatibility gate against a `session.identify` reply.
@@ -175,6 +180,8 @@ pub(crate) fn check_compatibility(
                 .collect(),
             restart,
             running: BuildId::from(identity),
+            session_id: identity.session_id.clone(),
+            exe_path: identity.exe_path.clone(),
         })
     };
 
@@ -615,6 +622,8 @@ mod tests {
             session_payload_kinds: vec![AttachPayloadKind::GHOSTTY_SNAPSHOT.to_string()],
             restart: RestartAction::RestartLocal,
             running: BuildId::default(),
+            session_id: String::new(),
+            exe_path: None,
         });
         let cases = [
             (HostConnState::Connected, SectionState::Connected),

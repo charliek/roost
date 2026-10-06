@@ -322,7 +322,9 @@ impl super::App {
             .identified(&saved_id, generation, restart)
         {
             tracing::debug!(host = %saved_id, generation, "dropped a superseded restart-target answer");
+            return;
         }
+        self.refresh_action_facts(&saved_id);
     }
 
     /// A probe a person started answered about an ssh host (D5): the
@@ -356,6 +358,7 @@ impl super::App {
         );
         self.update_knowledge
             .learned(saved_id, &host.target, &facts.session_id, restart, install);
+        self.refresh_action_facts(saved_id);
     }
 
     /// The update facts for one saved host, present whenever the

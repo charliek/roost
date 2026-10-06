@@ -100,6 +100,7 @@ mod palettes;
 mod pending_input;
 mod pending_selection;
 mod servicing;
+pub(crate) mod session_actions;
 mod tab_backend;
 mod tab_memory;
 mod terminal_tab;
@@ -1129,17 +1130,6 @@ pub enum EngineOpResult {
         target: String,
         result: Result<(), crate::host_conn::ConnectFailure>,
     },
-    /// The stopping half of an upgrade restart finished (plan 037 §3.7).
-    ///
-    /// No generation guard: unlike the Add Host dial there is nothing
-    /// still open to answer — the dialog closed when the button was
-    /// pressed — and the only consumer is a relaunch addressed to the
-    /// saved host, which is stable across everything but a `host.remove`
-    /// (and that is refused for a host with a live connection).
-    HostRestarted {
-        saved_id: String,
-        result: Result<(), String>,
-    },
     /// A bare-id IPC op forwarded to the slot has been answered (plan
     /// 063 §D10).
     ///
@@ -1248,8 +1238,6 @@ fn engine_op_status(result: EngineOpResult) -> Option<String> {
         // Add Host dialog, next to the field the user has to change —
         // a banner behind an open modal is the wrong place to say why
         // the modal did not close.
-        // And a restart's failure already names the rung it stopped at,
-        // so `host_restart_completed` puts that on the status bar itself.
         // And a forward has already answered the client it belongs to:
         // there is no second surface that owes anything.
         // And a background resize is nothing the user asked for.
@@ -1257,7 +1245,6 @@ fn engine_op_status(result: EngineOpResult) -> Option<String> {
         | EngineOpResult::TabsReordered { .. }
         | EngineOpResult::ProjectsReordered { .. }
         | EngineOpResult::HostVerified { .. }
-        | EngineOpResult::HostRestarted { .. }
         | EngineOpResult::LocalForward { .. }
         | EngineOpResult::BackgroundResized { .. } => None,
         EngineOpResult::TabOpened {
@@ -1315,10 +1302,8 @@ impl EngineOpResult {
             | Self::ProjectsReordered { op, .. }
             | Self::LocalForward { op, .. } => Some(*op),
             // Not workspace mutations: a verify dials a target that may
-            // not even be saved, and a restart is keyed by saved id.
-            Self::HostVerified { .. }
-            | Self::HostRestarted { .. }
-            | Self::BackgroundResized { .. } => None,
+            // not even be saved.
+            Self::HostVerified { .. } | Self::BackgroundResized { .. } => None,
         }
     }
 
@@ -1346,7 +1331,6 @@ impl EngineOpResult {
             // opens, so the `palette.activate` that opened it was
             // answered then.
             | Self::HostVerified { .. }
-            | Self::HostRestarted { .. }
             | Self::BackgroundResized { .. } => None,
         }
     }
@@ -3372,11 +3356,9 @@ pub struct App {
     /// §3.1). One field for both: they are the same kind of thing — an
     /// answer the user still owes — and only one can be up at a time.
     host_dialog: Option<host_dialog::HostDialog>,
-    /// The upgrade restarts under way (plan 037 §3.7). The prompt stays
-    /// reachable while one runs — the host is still `NeedsRestart` until
-    /// the relaunch connects — so the ladder is claimed here rather than
-    /// left for a second press to start again on the same socket.
-    host_restarts: crate::host_conn::restart::RestartsInFlight,
+    /// The installs and restarts under way, one per session, and the
+    /// latest per host (plan 076 D8).
+    host_actions: session_actions::HostActions,
     /// The probes and install jobs a bootstrap offer has in flight
     /// (plan 039 §3.5) — the probes keyed by saved host, the jobs by
     /// normalized target token.
@@ -3809,7 +3791,7 @@ impl App {
             host_selection: None,
             last_selection_frame: Vec::new(),
             host_dialog: None,
-            host_restarts: crate::host_conn::restart::RestartsInFlight::default(),
+            host_actions: session_actions::HostActions::default(),
             bootstraps: bootstrap::BootstrapsInFlight::default(),
             update_knowledge: update_knowledge::UpdateKnowledge::default(),
             add_host_name_id: Id::unique(),
@@ -4967,9 +4949,6 @@ impl App {
                 target,
                 result,
             } => self.add_host_verified(generation, &label, &target, result),
-            EngineOpResult::HostRestarted { saved_id, result } => {
-                self.host_restart_completed(&saved_id, result)
-            }
             // Handled ahead of the match, beside the retirement it has
             // to precede; what this arm is here for is the tail
             // `reconcile()`, which is how a forwarded mutation's effect
@@ -8380,6 +8359,10 @@ impl App {
             self.hosts.state(saved_id),
             Some(crate::host_conn::HostConnState::NeedsRestart(_))
         );
+        if let Err(failure) = self.refuse_connect_during_action(saved_id) {
+            self.set_status(failure.message);
+            return;
+        }
         if host_notice::connect_route(origin, needs_restart) == host_notice::ConnectRoute::Dial {
             return self.host_reconnect_requested(
                 saved_id,
@@ -8401,7 +8384,7 @@ impl App {
         // until its relaunch connects, so this door stays open under it —
         // and re-raising the prompt is how a second ladder gets started.
         // Say what is happening instead.
-        if self.host_restarts.contains(saved_id) {
+        if self.host_actions.busy(saved_id, &mismatch.session_id) {
             self.set_status(format!("{label} is already restarting"));
             return;
         }
@@ -8409,7 +8392,7 @@ impl App {
         // so there is none to name.
         self.open_host_restart_dialog(
             saved_id,
-            host_notice::restart_prompt(&label, &mismatch),
+            host_notice::restart_prompt(&label, &mismatch, bootstrap::client_build_id()),
             None,
         );
     }
@@ -8468,6 +8451,27 @@ impl App {
             |localhost| Some(dial_mode(localhost, purpose)),
             cause,
             purpose,
+        );
+    }
+
+    /// Connect again without ever starting a session: what an action
+    /// that let go of a stream does to take it back, whatever is serving.
+    pub(crate) fn host_redial(&mut self, saved_id: &str, origin: crate::host_conn::RequestOrigin) {
+        let Ok(host) = self.saved_host(saved_id) else {
+            return;
+        };
+        self.connect_saved_host(
+            &host,
+            origin,
+            |localhost| {
+                Some(if localhost {
+                    crate::host_conn::ConnectMode::IfPresent
+                } else {
+                    crate::host_conn::ConnectMode::Dial
+                })
+            },
+            crate::host_conn::AttemptCause::Explicit,
+            local_backend::ConnectPurpose::OrdinaryConnect,
         );
     }
 
@@ -8539,6 +8543,14 @@ impl App {
     /// `Connecting { previous }` that consumers purge off — this is that
     /// message's stand-in (`HostConnSet::disconnect`'s contract).
     pub(crate) fn host_disconnect_requested(&mut self, saved_id: &str) {
+        self.cancel_host_action(saved_id, "disconnected while the action ran");
+        self.drop_host_stream(saved_id);
+    }
+
+    /// The disconnect itself, which an action uses to let go of a
+    /// stream it is about to stop the session under — without cancelling
+    /// itself.
+    pub(crate) fn drop_host_stream(&mut self, saved_id: &str) {
         self.cancel_bootstrap_probe(saved_id);
         let Some(incarnation) = self.hosts.disconnect(saved_id) else {
             tracing::debug!(host = %saved_id, "disconnect requested for a host with no connection");
@@ -8564,6 +8576,8 @@ impl App {
             self.purge_host_incarnation(incarnation);
         }
         self.update_knowledge.forget(saved_id);
+        self.host_actions.forget(saved_id);
+        self.hosts.unpin_spawn(saved_id);
         // Keyed by name, so `purge_host_incarnation` cannot reach it:
         // a forgotten host's last save is nothing the user can act on
         // (#481).
@@ -8647,10 +8661,18 @@ impl App {
         prompt: host_notice::RestartPrompt,
         expected_session: Option<String>,
     ) {
+        let session_id = match self.hosts.state(saved_id) {
+            Some(crate::host_conn::HostConnState::NeedsRestart(mismatch)) => {
+                Some(mismatch.session_id.clone())
+            }
+            _ => None,
+        };
         self.open_host_dialog(host_dialog::HostDialog::ConfirmRestart {
             saved_id: saved_id.to_string(),
             prompt,
             expected_session,
+            session_id,
+            plan: None,
         });
     }
 
@@ -8817,28 +8839,40 @@ impl App {
     /// so instead: `undone` names what the compatibility-gate branch did
     /// not do, and the skew branch says what it did not change.
     ///
-    /// Answers with the host, its label, and which of the two questions
-    /// the prompt was asking.
+    /// Answers with the host and its label.
     fn take_confirmed_restart_prompt(
         &mut self,
         undone: &str,
-    ) -> Option<(String, String, RestartOrigin)> {
+    ) -> Option<(String, String, Option<String>)> {
         let Some(host_dialog::HostDialog::ConfirmRestart {
             saved_id,
             expected_session,
+            session_id,
             ..
         }) = self.host_dialog.take()
         else {
             return None;
         };
-        let label = self
-            .host_label(&saved_id)
-            .unwrap_or_else(|| saved_id.clone());
-        let Some(origin) = host_awaits_restart(
+        let label = self.label_or_id(&saved_id);
+        // Bound to the session the prompt described (plan 076 D8): a
+        // refused session replaced by another is not the one the person
+        // read about.
+        if let Some(bound) = &session_id {
+            let serving = self.acting_session(&saved_id).map(|(serving, ..)| serving);
+            if serving.as_deref() != Some(bound.as_str()) {
+                self.set_status(format!(
+                    "{label}: the session changed; check again — nothing was {undone}"
+                ));
+                return None;
+            }
+        }
+        if host_awaits_restart(
             self.hosts.state(&saved_id),
             self.hosts.facts(&saved_id),
             expected_session.as_deref(),
-        ) else {
+        )
+        .is_none()
+        {
             tracing::info!(
                 host = %saved_id,
                 skew = expected_session.is_some(),
@@ -8853,83 +8887,34 @@ impl App {
                 }
             });
             return None;
-        };
-        Some((saved_id, label, origin))
+        }
+        Some((saved_id, label, session_id))
     }
 
-    /// "Restart session" — the client-side composition, step by step
-    /// (plan 037 §3.7).
-    ///
-    /// The two waiting rungs run on the engine runtime because they are
-    /// socket work with minute-scale budgets, and the third
-    /// ([`crate::host_conn::restart::RestartStep::Relaunch`]) is an
-    /// ordinary Connect run on the UI thread when they answer.
-    ///
-    /// The socket and the may-I-restart-it answer both come from the
-    /// *connection*, not from the dialog's copy or a second resolve of
-    /// the registry: this stop has to be aimed at the session the prompt
-    /// is about, and "only a localhost session is ours to stop" is a fact
-    /// about the endpoint we are dialing. A remote host never reaches
-    /// here — its dialog has no button — and the live flag is what says
-    /// so rather than a snapshot taken when the dialog opened.
+    /// The upgrade prompt's localhost restart (plan 037 §3.7), run as
+    /// plan 076's restart: the target resolved fresh (D4), the session
+    /// re-checked before it stops, the relaunch held to that target, and
+    /// the session that comes back verified (D8).
     ///
     /// The state is re-read through
     /// [`Self::take_confirmed_restart_prompt`], which is the
     /// load-bearing part; `undone` is what a host that moved on is told
-    /// did not happen.
-    pub fn host_restart_confirmed(&mut self) -> UiTask {
-        let Some((saved_id, label, origin)) = self.take_confirmed_restart_prompt("stopped") else {
+    /// did not happen. A remote host never reaches here — its prompt's
+    /// button is the remote update — and the live endpoint is what says
+    /// so rather than a snapshot taken when the dialog opened.
+    fn host_restart_confirmed(&mut self) -> UiTask {
+        let Some((saved_id, label, bound)) = self.take_confirmed_restart_prompt("stopped") else {
             return UiTask::None;
         };
-        let Some((socket, localhost)) = self.hosts.endpoint(&saved_id) else {
-            tracing::debug!(host = %saved_id, "restart requested for a host with no connection");
-            return UiTask::None;
-        };
-        if !localhost {
-            return UiTask::None;
+        match (self.hosts.endpoint(&saved_id), bound) {
+            (Some((_, true)), Some(bound)) => {
+                self.host_mismatch_restart_confirmed(&saved_id, &label, &bound)
+            }
+            _ => {
+                tracing::debug!(host = %saved_id, "restart confirmed for a host with nothing to restart");
+            }
         }
-        let socket = socket.to_path_buf();
-        // One ladder per host: the prompt is re-raisable while this runs
-        // (the host stays `NeedsRestart` until the relaunch connects), and
-        // two stop+spawn ladders racing for one socket is the failure that
-        // makes.
-        if !self.host_restarts.begin(&saved_id) {
-            tracing::debug!(host = %saved_id, "a restart is already running for this host");
-            self.set_status(format!("{label} is already restarting"));
-            return UiTask::None;
-        }
-        // The ladder owns the session from here; the stream under it
-        // goes first (see [`RestartOrigin::holds_a_live_stream`]).
-        if origin.holds_a_live_stream() {
-            self.host_disconnect_requested(&saved_id);
-        }
-        tracing::info!(host = %saved_id, socket = %socket.display(), "restarting a host session");
-        self.set_status(format!("restarting the session on {label}…"));
-        self.engine_op(
-            crate::host_conn::restart::stop_and_wait_owned(socket),
-            move |result| EngineOpResult::HostRestarted { saved_id, result },
-        )
-    }
-
-    /// The stop half of a restart answered: relaunch, or say where it
-    /// stopped.
-    ///
-    /// The claim is released on both outcomes and before the relaunch:
-    /// what it guards is the stop+spawn ladder, and the relaunch is an
-    /// ordinary Connect from here on, with the connection state machine's
-    /// own replace-in-flight rules.
-    fn host_restart_completed(&mut self, saved_id: &str, result: Result<(), String>) {
-        self.host_restarts.finish(saved_id);
-        match result {
-            // The session is gone; connecting again spawns a fresh one
-            // through the shared ladder and hydrates the saved layout.
-            Ok(()) => self.host_reconnect_requested(
-                saved_id,
-                crate::host_conn::RequestOrigin::User,
-                crate::host_conn::AttemptCause::Explicit,
-            ),
-            Err(error) => self.set_status(error),
-        }
+        UiTask::None
     }
 
     // ── the test-mode dialog seam (plan 039 §3.5) ───────────────────
@@ -9026,6 +9011,24 @@ impl App {
     /// [`host_notice::restart_prompt`], and this is the only thing that
     /// reads that decision back out.
     fn host_restart_dialog_confirmed(&mut self) -> UiTask {
+        // A card with nothing to confirm — the blocked one above all,
+        // which says the fix is a newer Roost — only ever dismisses.
+        if matches!(
+            &self.host_dialog,
+            Some(host_dialog::HostDialog::ConfirmRestart { prompt, .. })
+                if prompt.confirm.is_none()
+                    || prompt.action == crate::host_conn::state::RestartAction::None
+        ) {
+            self.host_dialog_cancel();
+            return UiTask::None;
+        }
+        if matches!(
+            &self.host_dialog,
+            Some(host_dialog::HostDialog::ConfirmRestart { plan: Some(_), .. })
+        ) {
+            self.session_restart_confirmed();
+            return UiTask::None;
+        }
         let remote = matches!(
             &self.host_dialog,
             Some(host_dialog::HostDialog::ConfirmRestart { prompt, .. })
@@ -9052,14 +9055,15 @@ impl App {
     /// the pointer, not to the world, and a host that reconnected
     /// underneath it has nothing left to update.
     fn host_remote_update_requested(&mut self) {
-        let Some((saved_id, _, origin)) = self.take_confirmed_restart_prompt("changed") else {
+        let Some((saved_id, _, bound)) = self.take_confirmed_restart_prompt("changed") else {
             return;
         };
         self.start_bootstrap_probe(
             &saved_id,
             bootstrap::OfferContext {
                 session: bootstrap::SessionState::Running,
-                session_is_newer: origin.session_is_newer(),
+                intent: bootstrap::ProbeIntent::Bootstrap,
+                bound_session: bound,
                 // A running session, not a failed connect — there is no
                 // family to still agree with when this is confirmed.
                 failure: None,
@@ -9074,12 +9078,11 @@ impl App {
     /// `reduced fidelity` was pressed — on the band pill, on the inline
     /// row, or as a palette verb (plan 056 §3.6).
     ///
-    /// One entry for all three, so what a press does is decided once.
-    /// The transport decides which card: ssh can be updated from here
-    /// and gets the consent card with the reason on it, this machine's
-    /// own session gets the restart card, and a socket target gets
-    /// nothing at all — the verb is never listed and the pill is inert
-    /// text, because somebody else's process is not ours to restart.
+    /// One entry for all three, so what a press does is decided once:
+    /// plan 076's Option 2, [`Self::fidelity_route_requested`]. A stale
+    /// ssh rung gets Install Update, a staged build or this machine's
+    /// own session gets the Restart card, and anything else — a socket
+    /// target, a newer or unordered session — gets nothing to press.
     ///
     /// The two refusals ahead of that are this entry's own, and
     /// [`FidelityRefusal`] is where they and their order are decided.
@@ -9102,36 +9105,8 @@ impl App {
             tracing::debug!(host = %saved_id, "fidelity action for a host that is not reduced");
             return;
         }
-        let Some((session_id, skew)) = self
-            .hosts
-            .facts(saved_id)
-            .map(|facts| (facts.session_id.clone(), facts.skew.clone()))
-        else {
-            return;
-        };
-        match servicing::transport_kind(&host.target) {
-            host_sidebar::HostTransportKind::Ssh => self.start_bootstrap_probe(
-                saved_id,
-                bootstrap::OfferContext {
-                    // The session is up and attached — that is the
-                    // whole complaint — so the plan stops it.
-                    session: bootstrap::SessionState::Running,
-                    // A servable skew implies the protocols agree, and
-                    // two build strings do not order.
-                    session_is_newer: false,
-                    failure: None,
-                    fidelity: Some(bootstrap::FidelityOffer { session_id, skew }),
-                },
-            ),
-            host_sidebar::HostTransportKind::Localhost => {
-                let prompt = host_notice::restart_prompt_for_skew(&host.label, &skew);
-                self.open_host_restart_dialog(saved_id, prompt, Some(session_id));
-                self.reconcile();
-            }
-            host_sidebar::HostTransportKind::Socket => {
-                tracing::debug!(host = %saved_id, "a socket target's session is not ours to restart");
-            }
-        }
+        self.fidelity_route_requested(saved_id, &host.label, &host.target);
+        self.reconcile();
     }
 
     /// A user-driven connect failed; raise the offer if there is one.
@@ -9150,22 +9125,26 @@ impl App {
     /// Read-only from end to end, which is what makes it safe to run
     /// before anybody has agreed to anything: nothing is written,
     /// started or stopped until the dialog this opens is confirmed.
-    fn start_bootstrap_probe(&mut self, saved_id: &str, offer: bootstrap::OfferContext) {
+    ///
+    /// Answers whether a probe went out. An op's probe (a ticketed
+    /// [`bootstrap::ProbeIntent`]) raises no card, so an open dialog does
+    /// not stop it.
+    fn start_bootstrap_probe(&mut self, saved_id: &str, offer: bootstrap::OfferContext) -> bool {
         // A modal already up owns the pointer and the keyboard, and the
         // one that would open here is a question about a host the user
         // is not currently being asked about.
-        if self.host_dialog.is_some() {
+        if self.host_dialog.is_some() && !offer.intent.ticketed() {
             tracing::debug!(host = %saved_id, "not offering a bootstrap over an open dialog");
-            return;
+            return false;
         }
         let Ok(host) = self.saved_host(saved_id) else {
-            return;
+            return false;
         };
         let target = match roost_ipc::ssh::classify(&host.target) {
             Ok(roost_ipc::ssh::ResolvedTransport::Ssh(target)) => target,
             // Only an ssh host has a transport this can reach a binary
             // over; the other two are somebody else's process.
-            _ => return,
+            _ => return false,
         };
         // The debounce, and the anti-race. A second click while the
         // first probe is out would open two cards for one host; a probe
@@ -9173,11 +9152,11 @@ impl App {
         // again.
         if self.bootstraps.probing(saved_id) {
             tracing::debug!(host = %saved_id, "a bootstrap probe is already out for this host");
-            return;
+            return false;
         }
         if self.bootstraps.job_running(&target.claim_key) {
             self.set_status(format!("{} is already being set up", host.label));
-            return;
+            return false;
         }
         let generation = self.take_engine_op_id();
         self.bootstraps.begin_probe(saved_id, generation);
@@ -9201,6 +9180,8 @@ impl App {
             target: host.target.clone(),
             token: target.token.clone(),
             claim: target.claim_key.clone(),
+            reconnect: false,
+            action: None,
         };
         // Spawned rather than dispatched as an engine op: this is
         // reached from the feed drain and from a modal button, neither
@@ -9221,6 +9202,7 @@ impl App {
                 },
             )));
         });
+        true
     }
 
     /// Drop an in-flight probe, and the band line it left.
@@ -9278,18 +9260,14 @@ impl App {
         } = request;
         let saved_id = saved_id.as_str();
         let claimed = self.bootstraps.claim_probe(saved_id, generation);
-        let live = self.saved_host(saved_id).ok().and_then(|host| {
-            match roost_ipc::ssh::classify(&host.target) {
-                Ok(roost_ipc::ssh::ResolvedTransport::Ssh(live)) if live.token == token => {
-                    Some((host.label, live))
-                }
-                _ => None,
-            }
-        });
+        let live = self
+            .same_ssh_host(saved_id, &token)
+            .map(|(host, live)| (host.label, live));
         let landed = bootstrap::Landed {
             claimed,
             same_host: live.is_some(),
-            dialog_open: self.host_dialog.is_some(),
+            // An op's probe raises no card, so a modal is not in its way.
+            dialog_open: self.host_dialog.is_some() && !offer.intent.ticketed(),
         };
         let landing = landed.landing();
         if let (bootstrap::ProbeLanding::Offer | bootstrap::ProbeLanding::Deferred, Ok(probed)) =
@@ -9301,6 +9279,23 @@ impl App {
             bootstrap::ProbeLanding::Offer => {}
             bootstrap::ProbeLanding::Stale => {
                 tracing::debug!(host = %saved_id, generation, "dropped a stale bootstrap probe");
+                if let bootstrap::ProbeIntent::Install {
+                    ticket: Some(ticket),
+                    ..
+                }
+                | bootstrap::ProbeIntent::Restart {
+                    ticket: Some(ticket),
+                    ..
+                } = offer.intent
+                {
+                    self.finish_action(
+                        saved_id,
+                        ticket,
+                        Err(format!(
+                            "{asked_label}: the check was cancelled — nothing was changed"
+                        )),
+                    );
+                }
                 return;
             }
             bootstrap::ProbeLanding::Moved => {
@@ -9309,6 +9304,23 @@ impl App {
                     "dropped a bootstrap probe for a host that was removed or re-targeted"
                 );
                 self.hosts.set_bootstrap_note(saved_id, None);
+                if let bootstrap::ProbeIntent::Install {
+                    ticket: Some(ticket),
+                    ..
+                }
+                | bootstrap::ProbeIntent::Restart {
+                    ticket: Some(ticket),
+                    ..
+                } = offer.intent
+                {
+                    self.finish_action(
+                        saved_id,
+                        ticket,
+                        Err(format!(
+                            "{asked_label} was removed or re-targeted — nothing was changed"
+                        )),
+                    );
+                }
                 self.reconcile();
                 return;
             }
@@ -9343,11 +9355,45 @@ impl App {
         }
         let (label, live_target) = live.expect("Offer implies the host is still the same one");
         self.hosts.set_bootstrap_note(saved_id, None);
+        if offer.intent != bootstrap::ProbeIntent::Bootstrap {
+            return self.host_action_probed(
+                saved_id,
+                offer.intent,
+                offer.fidelity,
+                result,
+                (label, live_target),
+                &target,
+            );
+        }
         let probed = match result {
             Ok(probed) => probed,
             Err(error) => return self.report_bootstrap_failure(saved_id, &target, &error),
         };
-        let plan = bootstrap::plan_bootstrap(&probed.probe.outcome, offer.session);
+        // Never install over a build newer than this client (plan 076
+        // D7): a rung that is, is staged already, and the fix is a
+        // restart onto it or a newer Roost — not this card.
+        if let Some(rung) = session_actions::rung_build(&probed.probe.outcome) {
+            if roost_ipc::session_version::order(&rung, bootstrap::client_build_id())
+                == roost_ipc::session_version::VersionOrder::Newer
+            {
+                let message = format!(
+                    "roost-session {} on {label} is newer than this Roost; nothing was installed",
+                    roost_ui_model::session_update::describe(&rung)
+                );
+                self.set_status(message);
+                self.reconcile();
+                return;
+            }
+        }
+        let mut plan = bootstrap::plan_bootstrap(&probed.probe.outcome, offer.session);
+        // The update card stays bound to the refused session it was
+        // asked about and to the rung this probe saw (plan 076 D8).
+        if let Some(session_id) = &offer.bound_session {
+            plan.expect = Some(bootstrap::Expect {
+                session_id: session_id.clone(),
+                outcome: probed.probe.outcome.clone(),
+            });
+        }
         // Predicted, not resolved: choosing a rung for real means a
         // subprocess and possibly a download, and that is the job's
         // first phase rather than the offer's (plan 039 §3.3). The
@@ -9371,7 +9417,6 @@ impl App {
             dest_on_disk: &bootstrap::dest_on_disk(&plan, &probed.probe.home),
             source: &source,
             plan: &plan,
-            session_is_newer: offer.session_is_newer,
             fidelity: offer.fidelity.as_ref().map(|opened| &opened.skew),
         });
         self.open_host_dialog(host_dialog::HostDialog::Bootstrap(
@@ -9466,6 +9511,49 @@ impl App {
                 return;
             }
         };
+        // Install Update's card stands against the session it named,
+        // whatever its fidelity (plan 076 D8); the plan 039 cards
+        // against the state they were planned for.
+        if let bootstrap::ProbeIntent::Install { session_id, .. } = &draft.offer.intent {
+            let still = self
+                .hosts
+                .facts(&draft.saved_id)
+                .is_some_and(|facts| facts.session_id == *session_id);
+            if !still {
+                self.set_status(format!(
+                    "{}: the session changed; check again — nothing was installed",
+                    host.label
+                ));
+                self.reconcile();
+                return;
+            }
+            let session_id = session_id.clone();
+            let generation = match self.claim_action(
+                &draft.saved_id,
+                session_actions::ActionKind::Install,
+                &session_id,
+                &host.label,
+                crate::host_conn::RequestOrigin::User,
+            ) {
+                Ok(generation) => generation,
+                Err(failure) => {
+                    self.set_status(failure.message);
+                    return;
+                }
+            };
+            let identity = bootstrap::client_identity();
+            self.run_ssh_action(
+                &draft.saved_id,
+                generation,
+                &draft.token,
+                draft.arch,
+                draft.plan,
+                session_actions::ActionKind::Install,
+                roost_ipc::session_version::BuildId::from(&identity),
+                session_id,
+            );
+            return;
+        }
         let live = self.live_bootstrap_state(&draft.saved_id);
         if !bootstrap::offer_still_stands(&draft.offer, &live) {
             tracing::info!(
@@ -9481,16 +9569,56 @@ impl App {
             self.reconcile();
             return;
         }
-        let generation = self.take_engine_op_id();
-        if !self.bootstraps.begin_job(&draft.claim, generation) {
-            tracing::debug!(claim = %draft.claim, "a bootstrap is already running for this target");
-            self.set_status(format!("{} is already being set up", host.label));
+        // Updating a running session is plan 076's Update: bound to the
+        // session the prompt named, one action per session, recorded
+        // like the others.
+        let serving = self
+            .acting_session(&draft.saved_id)
+            .map(|(session_id, ..)| session_id);
+        if draft.offer.bound_session.is_some() && serving != draft.offer.bound_session {
+            self.set_status(format!(
+                "{}: the session changed; check again — nothing was changed",
+                host.label
+            ));
+            self.reconcile();
             return;
         }
+        let ticket = match (draft.offer.session, serving) {
+            (bootstrap::SessionState::Running, Some(session_id)) => {
+                match self.claim_action(
+                    &draft.saved_id,
+                    session_actions::ActionKind::Update,
+                    &session_id,
+                    &host.label,
+                    crate::host_conn::RequestOrigin::User,
+                ) {
+                    Ok(generation) => Some(bootstrap::ActionTicket {
+                        kind: session_actions::ActionKind::Update,
+                        generation,
+                        build: roost_ipc::session_version::BuildId::from(
+                            &bootstrap::client_identity(),
+                        ),
+                        session_id,
+                    }),
+                    Err(failure) => {
+                        self.set_status(failure.message);
+                        return;
+                    }
+                }
+            }
+            _ => None,
+        };
         // The job owns the session from here; the stream under it goes
-        // first (see [`bootstrap::LiveState::holds_a_live_stream`]).
-        if live.holds_a_live_stream() {
-            self.host_disconnect_requested(&draft.saved_id);
+        // first (see [`bootstrap::LiveState::holds_a_live_stream`]) — for
+        // an action, only once the job has re-checked what it stops.
+        let release = match &ticket {
+            Some(ticket) if draft.plan.stop => {
+                Some(self.stream_release(&draft.saved_id, ticket.generation))
+            }
+            _ => None,
+        };
+        if release.is_none() && live.holds_a_live_stream() {
+            self.drop_host_stream(&draft.saved_id);
         }
         tracing::info!(
             host = %draft.saved_id,
@@ -9499,42 +9627,80 @@ impl App {
             stop = draft.plan.stop,
             "setting up roost-session on a host"
         );
-        self.hosts.set_bootstrap_note(
-            &draft.saved_id,
-            Some("setting up roost-session…".to_string()),
-        );
-        self.set_status(format!("setting up roost-session on {}…", host.label));
+        let generation = ticket.as_ref().map(|ticket| ticket.generation);
+        if !self.launch_bootstrap_job(
+            &host,
+            target,
+            draft.plan,
+            draft.arch,
+            "setting up roost-session…",
+            ticket,
+            release,
+        ) {
+            if let Some(generation) = generation {
+                self.finish_action(
+                    &draft.saved_id,
+                    generation,
+                    Err(format!("{} is already being set up", host.label)),
+                );
+            }
+            tracing::debug!(claim = %draft.claim, "a bootstrap is already running for this target");
+            self.set_status(format!("{} is already being set up", host.label));
+        }
+    }
+
+    /// Claim a box and run a confirmed plan on it, reporting back as
+    /// [`bootstrap::BootstrapEvent::Finished`]. `false` when a job
+    /// already holds the box. Shared by the plan 039 cards and plan
+    /// 076's actions, so the one job runner is the only one.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_bootstrap_job(
+        &mut self,
+        host: &roost_engine::persistence::HostSnapshot,
+        target: roost_ipc::ssh::SshTarget,
+        plan: bootstrap::BootstrapPlan,
+        arch: roost_ipc::bootstrap::RemoteArch,
+        note: &str,
+        action: Option<bootstrap::ActionTicket>,
+        release: Option<session_actions::StreamRelease>,
+    ) -> bool {
+        let generation = action
+            .as_ref()
+            .map_or_else(|| self.take_engine_op_id(), |ticket| ticket.generation);
+        if !self.bootstraps.begin_job(&target.claim_key, generation) {
+            return false;
+        }
+        if action.is_some() {
+            self.action_working(&host.id, generation);
+        }
+        self.hosts
+            .set_bootstrap_note(&host.id, Some(note.to_string()));
+        self.set_status(format!("{note} ({})", host.label));
         self.reconcile();
 
         let feed = self.feed_tx.clone();
         let ssh = roost_ipc::ssh::SshTunnelOptions::from_env();
-        let bootstrap::BootstrapDraft {
-            saved_id,
-            label,
-            token,
-            claim,
-            arch,
-            plan,
-            ..
-        } = draft;
         let request = bootstrap::BootstrapRequest {
-            saved_id,
+            saved_id: host.id.clone(),
             generation,
-            label,
+            label: host.label.clone(),
             target: host.target.clone(),
-            token,
-            claim,
+            token: target.token.clone(),
+            claim: target.claim_key.clone(),
+            reconnect: plan.start.is_some(),
+            action,
         };
         self.runtime_handle.spawn(async move {
             // Off the UI thread for `start_bootstrap_probe`'s reason:
             // `from_env` walks `$PATH` looking for a sibling binary.
             let options =
                 roost_ipc::bootstrap::BootstrapOptions::from_env(bootstrap::client_identity());
-            let result = bootstrap::run_bootstrap(target, ssh, options, plan, arch).await;
+            let result = bootstrap::run_bootstrap(target, ssh, options, plan, arch, release).await;
             feed.send(crate::engine_feed::EngineFeed::HostBootstrap(Box::new(
                 bootstrap::BootstrapEvent::Finished { request, result },
             )));
         });
+        true
     }
 
     /// The job finished. Reconnect on success; say where it stopped
@@ -9554,12 +9720,17 @@ impl App {
             label,
             target,
             claim,
+            reconnect,
+            action,
             ..
         } = request;
         let saved_id = saved_id.as_str();
         if !self.bootstraps.claim_job(&claim, generation) {
             tracing::debug!(%claim, generation, "dropped a superseded bootstrap completion");
             return;
+        }
+        if let Some(ticket) = action {
+            return self.action_job_finished(saved_id, &label, &target, reconnect, ticket, result);
         }
         match result {
             Ok(success) => {
@@ -9588,6 +9759,73 @@ impl App {
             Err(error) => self.report_bootstrap_failure(saved_id, &target, &error),
         }
         self.reconcile();
+    }
+
+    /// A plan 076 action's job ended: record it, learn what an install
+    /// staged, and take the session back after a restart. An ssh
+    /// restart reconnects either way — a connect never spawns over ssh,
+    /// so it reaches whatever is serving, old or new. A job whose claim
+    /// is gone was cancelled, and its end changes nothing: the
+    /// cancellation already said what there is to say.
+    fn action_job_finished(
+        &mut self,
+        saved_id: &str,
+        label: &str,
+        target: &str,
+        reconnect: bool,
+        ticket: bootstrap::ActionTicket,
+        result: Result<bootstrap::BootstrapSuccess, roost_ipc::bootstrap::BootstrapError>,
+    ) {
+        let bootstrap::ActionTicket {
+            kind,
+            generation,
+            build,
+            session_id,
+        } = ticket;
+        if self.settle_cancelled_action(saved_id, generation) {
+            return;
+        }
+        let Some((origin, released)) = self.host_actions_held(saved_id, generation) else {
+            tracing::debug!(host = %saved_id, generation, "dropped a superseded action's completion");
+            return;
+        };
+        let version = roost_ui_model::session_update::describe(&build);
+        // A successful restart or update reconnects to what it started;
+        // anything that let go of the stream takes it back, success or
+        // not. Neither ever spawns over ssh.
+        let reconnect = (reconnect && result.is_ok()) || released;
+        let outcome = match (result, kind) {
+            (Ok(_), session_actions::ActionKind::Install) => {
+                if let Ok(host) = self.saved_host(saved_id) {
+                    self.update_knowledge.learned(
+                        saved_id,
+                        &host.target,
+                        &session_id,
+                        roost_ui_model::session_update::TargetKnowledge::NotChecked,
+                        roost_ui_model::session_update::InstallKnowledge::Staged(build),
+                    );
+                }
+                Ok(format!("Installed roost-session {version} on {label}"))
+            }
+            (Ok(_), session_actions::ActionKind::Update) => {
+                Ok(format!("Updated {label} to roost-session {version}"))
+            }
+            (Ok(_), session_actions::ActionKind::Restart) => {
+                Ok(format!("{label} restarted on roost-session {version}"))
+            }
+            (Err(error), _) => Err(error.message(target)),
+        };
+        self.finish_action(saved_id, generation, outcome);
+        if reconnect {
+            // The action record and the status line keep the verdict;
+            // the band's line is the connection's again.
+            self.hosts.set_bootstrap_note(saved_id, None);
+            self.host_reconnect_requested(
+                saved_id,
+                origin,
+                crate::host_conn::AttemptCause::Explicit,
+            );
+        }
     }
 
     /// One classified bootstrap failure, through plan 038's own
@@ -9724,7 +9962,8 @@ impl App {
                         &host.id,
                         bootstrap::OfferContext {
                             session,
-                            session_is_newer: false,
+                            intent: bootstrap::ProbeIntent::Bootstrap,
+                            bound_session: None,
                             failure: family,
                             // The dialog verified and never connected;
                             // there is no live session to be reduced.
@@ -10039,32 +10278,10 @@ fn local_launch_cwd(workspace: &Workspace, supervisor: &PtySupervisor, tab: i64)
 enum RestartOrigin {
     /// The compatibility gate refused: nothing this client can talk to
     /// is serving over there (plan 037 §3.7).
-    Mismatch(crate::host_conn::state::BuildMismatch),
+    Mismatch,
     /// A live session, attached across a libghostty build skew (plan
     /// 056 §3.6).
     Skew,
-}
-
-impl RestartOrigin {
-    /// Whether the session over there is the newer of the two — a
-    /// downgrade warning the remote branch carries onto its card.
-    /// `false` for a skew, for [`App::host_fidelity_action_requested`]'s
-    /// reason.
-    fn session_is_newer(&self) -> bool {
-        match self {
-            Self::Mismatch(mismatch) => host_notice::session_is_newer(mismatch),
-            Self::Skew => false,
-        }
-    }
-
-    /// [`bootstrap::LiveState::holds_a_live_stream`]'s question, asked
-    /// of the restart ladder's own two arms.
-    fn holds_a_live_stream(&self) -> bool {
-        match self {
-            Self::Skew => true,
-            Self::Mismatch(_) => false,
-        }
-    }
 }
 
 /// What a press on `reduced fidelity` runs into before it can ask
@@ -10135,8 +10352,8 @@ fn host_awaits_restart(
     expected: Option<&str>,
 ) -> Option<RestartOrigin> {
     match state? {
-        crate::host_conn::HostConnState::NeedsRestart(mismatch) if expected.is_none() => {
-            Some(RestartOrigin::Mismatch(mismatch.clone()))
+        crate::host_conn::HostConnState::NeedsRestart(_) if expected.is_none() => {
+            Some(RestartOrigin::Mismatch)
         }
         crate::host_conn::HostConnState::Connected => {
             let facts = facts?;
@@ -14256,6 +14473,8 @@ mod tests {
             session_payload_kinds: vec!["cells".into()],
             restart: crate::host_conn::state::RestartAction::RestartLocal,
             running: roost_ipc::session_version::BuildId::default(),
+            session_id: String::new(),
+            exe_path: None,
         }
     }
 
@@ -14279,7 +14498,7 @@ mod tests {
         // for a host that is still refusing.
         assert_eq!(
             host_awaits_restart(Some(&needs_restart), None, None),
-            Some(RestartOrigin::Mismatch(build_mismatch()))
+            Some(RestartOrigin::Mismatch)
         );
         assert_eq!(
             host_awaits_restart(None, None, None),
@@ -14346,24 +14565,6 @@ mod tests {
         }
     }
 
-    /// The restart ladder's half of "which confirm tears a stream down
-    /// first" — [`bootstrap::LiveState::holds_a_live_stream`] is the
-    /// other, and the two have to agree because they are the same
-    /// question about the same two entry points.
-    #[test]
-    fn only_the_skew_arm_restarts_a_session_this_client_is_attached_to() {
-        assert!(RestartOrigin::Skew.holds_a_live_stream());
-        assert!(
-            !RestartOrigin::Mismatch(build_mismatch()).holds_a_live_stream(),
-            "the compatibility gate refused; nothing is attached to tear down"
-        );
-
-        assert!(
-            !RestartOrigin::Skew.session_is_newer(),
-            "a servable skew claims no direction"
-        );
-    }
-
     /// Both refusals a fidelity press can hit, in the order they are
     /// asked and with the copy each is answered with.
     ///
@@ -14404,8 +14605,8 @@ mod tests {
     /// `dialog_dump` is `tools/roosttest/`'s only view of a modal, so a
     /// card whose reason line went missing would be caught here or by
     /// nothing. Composed through the production halves — `plan_bootstrap`
-    /// then `bootstrap_copy`, `restart_prompt_for_skew` — so the dump
-    /// and the widget cannot disagree.
+    /// then `bootstrap_copy`, `restart_card` — so the dump and the widget
+    /// cannot disagree.
     #[test]
     fn both_fidelity_cards_dump_the_reason_they_were_opened_for() {
         // ssh: the consent card, at the variant a matching binary under
@@ -14424,7 +14625,6 @@ mod tests {
             dest_on_disk: &bootstrap::dest_on_disk(&plan, "/home/u"),
             source: "",
             plan: &plan,
-            session_is_newer: false,
             fidelity: Some(&skew()),
         });
         let card = dialog_shape(&host_dialog::HostDialog::Bootstrap(
@@ -14438,7 +14638,8 @@ mod tests {
                 copy,
                 offer: bootstrap::OfferContext {
                     session: bootstrap::SessionState::Running,
-                    session_is_newer: false,
+                    intent: bootstrap::ProbeIntent::Bootstrap,
+                    bound_session: None,
                     failure: None,
                     fidelity: Some(bootstrap::FidelityOffer {
                         session_id: "s-1".into(),
@@ -14459,10 +14660,26 @@ mod tests {
         assert_eq!(card.buttons, vec!["Cancel", "Update"]);
 
         // localhost: the restart card.
+        let target = roost_ui_model::session_update::RestartTarget {
+            path: "/usr/bin/roost-session".into(),
+            identity: roost_ipc::session_version::BuildId {
+                version: "0.0.22".into(),
+                ..roost_ipc::session_version::BuildId::default()
+            },
+            source: roost_ui_model::session_update::TargetSource::Bundled,
+            session_id: "s-1".into(),
+            generation: 1,
+        };
+        let lead = host_notice::reduced_fidelity_reason(&skew());
         let restart = dialog_shape(&host_dialog::HostDialog::ConfirmRestart {
             saved_id: "h2".into(),
-            prompt: host_notice::restart_prompt_for_skew("localhost", &skew()),
-            expected_session: Some("s-1".into()),
+            prompt: host_notice::restart_card("localhost", Some(&lead), &target, &[]),
+            expected_session: None,
+            session_id: Some("s-1".into()),
+            plan: Some(session_actions::RestartPlan::Local {
+                session_id: "s-1".into(),
+                target,
+            }),
         });
         assert_eq!(restart.dialog.as_deref(), Some("confirm_restart"));
         assert_eq!(restart.variant, None);
@@ -14476,7 +14693,7 @@ mod tests {
             restart.body.contains("Running programs end."),
             "{restart:?}"
         );
-        assert_eq!(restart.buttons, vec!["Not now", "Restart session"]);
+        assert_eq!(restart.buttons, vec!["Not now", "Restart Session"]);
     }
 
     /// The agent-hooks card's own dump: the pinned copy, the mode, and

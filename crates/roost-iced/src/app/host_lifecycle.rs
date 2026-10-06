@@ -285,7 +285,8 @@ pub(crate) fn bootstrap_offer(hosts: &HostConnSet, saved_id: &str) -> Option<Off
     )?;
     Some(OfferContext {
         session,
-        session_is_newer: false,
+        intent: bootstrap::ProbeIntent::Bootstrap,
+        bound_session: None,
         failure,
         // A connect that failed: there is no live session to be at
         // reduced fidelity with.
@@ -617,7 +618,8 @@ mod tests {
             bootstrap_offer(&set, "h1"),
             Some(OfferContext {
                 session: SessionState::NoSession,
-                session_is_newer: false,
+                intent: bootstrap::ProbeIntent::Bootstrap,
+                bound_session: None,
                 failure: Some(SshFailure::NotFound),
                 fidelity: None,
             }),

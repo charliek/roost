@@ -270,6 +270,14 @@ pub(super) enum HostDialog {
         /// which is raised at a host with no session this client can
         /// name at all.
         expected_session: Option<String>,
+        /// The session the prompt or card describes, which confirming
+        /// must still find serving (plan 076 D8). `None` only where
+        /// there is no session to name.
+        session_id: Option<String>,
+        /// Set for plan 076's Restart card: the session it was built
+        /// against and the binary it would run (D8). Its confirm is
+        /// `App::session_restart_confirmed`.
+        plan: Option<super::session_actions::RestartPlan>,
     },
     /// Move the local band between backends (plan 063 §D8).
     ///

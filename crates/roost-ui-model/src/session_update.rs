@@ -86,6 +86,16 @@ impl Why {
             Self::Override => why::OVERRIDE,
         }
     }
+
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Missing => "its roost-session is gone",
+            Self::Unreadable => "can't read its roost-session",
+            Self::Older => "its roost-session is older than the session",
+            Self::Incompatible => "its roost-session can't talk to this Roost",
+            Self::Override => "ROOST_SESSION_BIN names nothing this user can run",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +305,7 @@ impl UpdateFacts {
                         source: target.source.wire().to_string(),
                     }),
             },
+            action: None,
         }
     }
 }
@@ -438,6 +449,173 @@ pub fn ssh_knowledge(
     };
     let selected = select_target(rung.into_iter().collect(), running, client);
     (target_knowledge(selected, session_id, generation), install)
+}
+
+// ---------------------------------------------------------------------------
+// D7: which action is offered, and why not
+// ---------------------------------------------------------------------------
+
+/// Why Install Update is not offered (D7). Each is also what the op
+/// answers and what a card says instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallRefusal {
+    /// Only an ssh host has a binary this client can replace.
+    NotSsh,
+    /// This client is older than the running session.
+    ClientOlder,
+    /// The session speaks another protocol, so it needs the update that
+    /// also restarts it. Installing alone would leave the tabs' agent
+    /// hooks talking a protocol their daemon does not.
+    ProtocolDiffers,
+    /// The exec rung is already this client's build, or newer.
+    AlreadyInstalled,
+    /// The state has nothing for an install to fix.
+    NotOffered(SessionUpdate),
+}
+
+impl InstallRefusal {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::NotSsh => "only an ssh host has a roost-session this Roost can install",
+            Self::ClientOlder => "the session is newer than this Roost; update this Roost instead",
+            Self::ProtocolDiffers => {
+                "the session speaks another protocol; it needs Update roost-session, which also \
+                 restarts it"
+            }
+            Self::AlreadyInstalled => "that build is already installed; restart to use it",
+            Self::NotOffered(state) => match state {
+                SessionUpdate::UpToDate => "the session is already up to date",
+                SessionUpdate::Staged => "the update is already installed; restart to use it",
+                SessionUpdate::Required => "the session needs Update roost-session",
+                SessionUpdate::SessionNewer { .. } => "the session is newer than this Roost",
+                SessionUpdate::Unordered => {
+                    "this Roost cannot tell whether its build is newer than the session's"
+                }
+                SessionUpdate::Unknown => "the session did not say which build it runs",
+                SessionUpdate::Available => "nothing to install",
+            },
+        }
+    }
+}
+
+/// Whether Install Update is offered, before anything has been probed.
+pub fn install_offer(
+    facts: &UpdateFacts,
+    transport: HostTransportKind,
+) -> Result<(), InstallRefusal> {
+    if transport != HostTransportKind::Ssh {
+        return Err(InstallRefusal::NotSsh);
+    }
+    install_refusal(&facts.running, &facts.client, None)?;
+    match facts.state {
+        SessionUpdate::Available => Ok(()),
+        state => Err(InstallRefusal::NotOffered(state)),
+    }
+}
+
+/// D7's refusals, including what a probe found at the exec rung.
+///
+/// A rung that matches this client by version, protocol and build is
+/// "already installed" whatever its dev facts say: that is the triple an
+/// install is judged by, so writing it again would change nothing.
+pub fn install_refusal(
+    running: &BuildId,
+    client: &BuildId,
+    rung: Option<&BuildId>,
+) -> Result<(), InstallRefusal> {
+    if order(client, running) == VersionOrder::Older {
+        return Err(InstallRefusal::ClientOlder);
+    }
+    if client.protocol != running.protocol {
+        return Err(InstallRefusal::ProtocolDiffers);
+    }
+    if let Some(rung) = rung {
+        let same_triple = rung.version == client.version
+            && rung.protocol == client.protocol
+            && rung.libghostty_build == client.libghostty_build;
+        if same_triple || order(rung, client) == VersionOrder::Newer {
+            return Err(InstallRefusal::AlreadyInstalled);
+        }
+    }
+    Ok(())
+}
+
+/// Whether Update roost-session (install, then restart) is offered: only
+/// for a refused ssh session (D6).
+pub fn update_offered(facts: &UpdateFacts, transport: HostTransportKind) -> bool {
+    transport == HostTransportKind::Ssh && facts.state == SessionUpdate::Required
+}
+
+/// Why Restart Session is not offered, or `None` when it is.
+pub fn restart_refusal(facts: &UpdateFacts, transport: HostTransportKind) -> Option<&'static str> {
+    if facts.restart.offered {
+        return None;
+    }
+    Some(match (facts.restart.why, facts.state, transport) {
+        (Some(why), ..) => why.reason(),
+        (None, _, HostTransportKind::Socket) => {
+            "a socket host's session is not this Roost's to restart"
+        }
+        (None, SessionUpdate::SessionNewer { .. }, _) => {
+            "the session is newer than this Roost; update this Roost to connect"
+        }
+        (None, SessionUpdate::Required, _) => "the session needs Update roost-session",
+        (None, ..) => "nothing to restart onto",
+    })
+}
+
+/// What the band, the palette and the pill offer for a reduced-fidelity
+/// connection under Option 2 (D6): Install when the ssh rung is stale,
+/// Restart when a build is staged or the host is this machine, and
+/// nothing to press otherwise. Without update facts the transport's
+/// own answer stands.
+pub fn fidelity_route(
+    action: Option<crate::host_sidebar::FidelityAction>,
+    facts: Option<&UpdateFacts>,
+    transport: HostTransportKind,
+) -> Option<crate::host_sidebar::FidelityAction> {
+    use crate::host_sidebar::FidelityAction;
+    let (Some(FidelityAction::Update | FidelityAction::Restart), Some(facts)) = (action, facts)
+    else {
+        return action;
+    };
+    if install_offer(facts, transport).is_ok() {
+        return Some(FidelityAction::Update);
+    }
+    let restartable =
+        facts.state == SessionUpdate::Staged || transport == HostTransportKind::Localhost;
+    Some(if facts.restart.offered && restartable {
+        FidelityAction::Restart
+    } else {
+        FidelityAction::Manual
+    })
+}
+
+/// A build as a person reads it: `0.0.22`, or `0.0.22 dev a1b2c3d`.
+pub fn describe(build: &BuildId) -> String {
+    match (build.dev, build.sha.as_deref()) {
+        (false, _) => build.version.clone(),
+        (true, Some(sha)) => format!("{} dev {sha}", build.version),
+        (true, None) => format!("{} dev", build.version),
+    }
+}
+
+/// D8's check after a restart: a different session, running exactly
+/// the build the restart was aimed at. `Err` carries what is serving,
+/// for "restarted, but the session is still …".
+pub fn verify_restart(
+    before: &str,
+    target: &BuildId,
+    after_id: &str,
+    after: &BuildId,
+) -> Result<(), String> {
+    if after_id != before && after == target {
+        return Ok(());
+    }
+    if after_id == before {
+        return Err(format!("{} (the same session)", describe(after)));
+    }
+    Err(describe(after))
 }
 
 #[cfg(test)]
@@ -954,6 +1132,177 @@ mod tests {
         assert_eq!(
             status.restart.target.map(|t| (t.version, t.source)),
             Some(("0.0.22".to_string(), "bundled".to_string()))
+        );
+    }
+
+    fn facts(state: SessionUpdate, running: &str, client: &str) -> UpdateFacts {
+        UpdateFacts {
+            state,
+            running: release(running),
+            client: release(client),
+            restart: RestartOffer {
+                offered: true,
+                why: None,
+                target: None,
+            },
+        }
+    }
+
+    #[test]
+    fn install_is_offered_only_over_ssh_for_an_available_build() {
+        let available = facts(SessionUpdate::Available, "0.0.21", "0.0.22");
+        assert_eq!(install_offer(&available, Ssh), Ok(()));
+        assert_eq!(
+            install_offer(&available, Localhost),
+            Err(InstallRefusal::NotSsh)
+        );
+        assert_eq!(
+            install_offer(&available, Socket),
+            Err(InstallRefusal::NotSsh)
+        );
+        for state in [
+            SessionUpdate::UpToDate,
+            SessionUpdate::Staged,
+            SessionUpdate::Required,
+            SessionUpdate::Unordered,
+            SessionUpdate::Unknown,
+        ] {
+            let other = UpdateFacts {
+                state,
+                ..available.clone()
+            };
+            assert_eq!(
+                install_offer(&other, Ssh),
+                Err(InstallRefusal::NotOffered(state))
+            );
+        }
+    }
+
+    #[test]
+    fn install_is_refused_by_each_of_d7s_three_rules() {
+        let running = release("0.0.21");
+        let client = release("0.0.22");
+        assert_eq!(install_refusal(&running, &client, None), Ok(()));
+        // This client is older than the session.
+        assert_eq!(
+            install_refusal(&release("0.0.23"), &client, None),
+            Err(InstallRefusal::ClientOlder)
+        );
+        // The protocols differ.
+        let other_protocol = BuildId {
+            protocol: PROTOCOL + 1,
+            ..release("0.0.21")
+        };
+        assert_eq!(
+            install_refusal(&other_protocol, &client, None),
+            Err(InstallRefusal::ProtocolDiffers)
+        );
+        // The rung is newer than this client, or already it.
+        for rung in [release("0.0.23"), release("0.0.22"), dev("0.0.22", "b")] {
+            assert_eq!(
+                install_refusal(&running, &client, Some(&rung)),
+                Err(InstallRefusal::AlreadyInstalled),
+                "{rung:?}"
+            );
+        }
+        // A stale rung is what an install replaces.
+        assert_eq!(
+            install_refusal(&running, &client, Some(&release("0.0.20"))),
+            Ok(())
+        );
+        // An older client is refused ahead of anything a probe found.
+        let available = facts(SessionUpdate::Available, "0.0.23", "0.0.22");
+        assert_eq!(
+            install_offer(&available, Ssh),
+            Err(InstallRefusal::ClientOlder)
+        );
+    }
+
+    #[test]
+    fn update_is_the_refused_ssh_sessions_alone() {
+        let required = facts(SessionUpdate::Required, "0.0.19", "0.0.22");
+        assert!(update_offered(&required, Ssh));
+        assert!(!update_offered(&required, Localhost));
+        assert!(!update_offered(
+            &facts(SessionUpdate::Available, "0.0.21", "0.0.22"),
+            Ssh
+        ));
+    }
+
+    #[test]
+    fn a_restart_refusal_names_its_reason() {
+        let mut offered = facts(SessionUpdate::Staged, "0.0.21", "0.0.22");
+        assert_eq!(restart_refusal(&offered, Localhost), None);
+        offered.restart.offered = false;
+        offered.restart.why = Some(Why::Missing);
+        assert_eq!(
+            restart_refusal(&offered, Localhost),
+            Some("its roost-session is gone")
+        );
+        offered.restart.why = None;
+        offered.state = SessionUpdate::SessionNewer { blocked: true };
+        assert!(restart_refusal(&offered, Ssh)
+            .unwrap()
+            .contains("update this Roost"));
+        assert!(restart_refusal(&offered, Socket)
+            .unwrap()
+            .contains("socket host"));
+    }
+
+    #[test]
+    fn reduced_fidelity_routes_to_option_2() {
+        use crate::host_sidebar::FidelityAction::{Manual, Restart, Update};
+        let mut ssh = facts(SessionUpdate::Available, "0.0.22", "0.0.22");
+        assert_eq!(fidelity_route(Some(Update), Some(&ssh), Ssh), Some(Update));
+        ssh.state = SessionUpdate::Staged;
+        assert_eq!(fidelity_route(Some(Update), Some(&ssh), Ssh), Some(Restart));
+        ssh.state = SessionUpdate::SessionNewer { blocked: false };
+        assert_eq!(fidelity_route(Some(Update), Some(&ssh), Ssh), Some(Manual));
+        ssh.state = SessionUpdate::Unordered;
+        assert_eq!(fidelity_route(Some(Update), Some(&ssh), Ssh), Some(Manual));
+
+        let mut local = facts(SessionUpdate::Staged, "0.0.22", "0.0.22");
+        assert_eq!(
+            fidelity_route(Some(Restart), Some(&local), Localhost),
+            Some(Restart)
+        );
+        local.restart.offered = false;
+        assert_eq!(
+            fidelity_route(Some(Restart), Some(&local), Localhost),
+            Some(Manual)
+        );
+        // No facts yet: the transport's own answer.
+        assert_eq!(fidelity_route(Some(Update), None, Ssh), Some(Update));
+        assert_eq!(fidelity_route(None, Some(&local), Localhost), None);
+        assert_eq!(
+            fidelity_route(Some(Manual), Some(&local), Socket),
+            Some(Manual)
+        );
+    }
+
+    #[test]
+    fn a_restart_is_verified_by_session_and_by_build() {
+        let target = release("0.0.22");
+        assert_eq!(verify_restart("a", &target, "b", &target), Ok(()));
+        assert_eq!(
+            verify_restart("a", &target, "a", &target),
+            Err("0.0.22 (the same session)".into())
+        );
+        assert_eq!(
+            verify_restart("a", &target, "b", &release("0.0.21")),
+            Err("0.0.21".into())
+        );
+        // Dev facts are part of the build a restart was aimed at.
+        assert_eq!(
+            verify_restart("a", &dev("0.0.22", "abc"), "b", &dev("0.0.22", "def")),
+            Err("0.0.22 dev def".into())
+        );
+        assert_eq!(
+            describe(&BuildId {
+                dev: true,
+                ..release("0.0.22")
+            }),
+            "0.0.22 dev"
         );
     }
 }

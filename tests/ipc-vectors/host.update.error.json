@@ -1,0 +1,8 @@
+{
+  "id": "35",
+  "ok": false,
+  "error": {
+    "code": "invalid-param",
+    "message": "host.update installs software; pass confirm: true"
+  }
+}

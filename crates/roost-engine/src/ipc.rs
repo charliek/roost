@@ -37,27 +37,27 @@ use roost_ipc::messages::{
     AppRenderStatsResult, AppSelectedTabIdParams, AppSelectedTabIdResult, AppSetWindowFocusParams,
     AppUpdateCheckParams, AppUpdateStatusParams, AppUpdateStatusResult, AttachPayloadKind,
     ClipboardDumpParams, ClipboardDumpResult, ClipboardWriteFilesParams, ClipboardWriteParams,
-    EventsSubscribeParams, EventsSubscribeResult, Host, HostAddParams, HostAddResult,
-    HostConnectParams, HostConnectionResult, HostDisconnectParams, HostListParams, HostListResult,
-    HostRemoveParams, HostStatusParams, HostStatusResult, IdentifyParams, IdentifyResult,
-    NotificationCreateParams, PaletteActivateParams, PaletteDismissParams, PaletteOpenParams,
-    PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateParams,
-    PaletteStateResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
-    ProjectEnsureParams, ProjectEnsureResult, ProjectRenameParams, ProjectReorderParams,
-    ResolvedCell, ScreenshotParams, ScreenshotResult, SelectionClearParams, SelectionDumpParams,
-    SelectionDumpResult, SelectionSetParams, SessionIdentify, SessionIdentifyParams,
-    SessionPutFileParams, SessionPutFileResult, SessionSetAgentHooksParams, SessionSetThemeParams,
-    SessionStopParams, SessionStopResult, SidebarDumpParams, SidebarDumpResult,
-    SidebarSetWidthParams, TabAgentReportResult, TabCapturePtyInputParams,
-    TabCapturePtyInputResult, TabClearNotificationParams, TabClearNotificationResult,
-    TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams,
-    TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams,
-    TabExpandSelectionAtResult, TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams,
-    TabFocusResult, TabListResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
-    TabSendFileParams, TabSendFileResult, TabSetHookActiveParams, TabSetStateParams,
-    TabSetTitleParams, TabWriteParams, WindowMetricsParams, WindowMetricsResult,
-    WindowResizeParams, WireProjectRef, WireTabRef, MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES,
-    SESSION_PROTOCOL_VERSION,
+    EventsSubscribeParams, EventsSubscribeResult, Host, HostActionParams, HostActionResult,
+    HostAddParams, HostAddResult, HostConnectParams, HostConnectionResult, HostDisconnectParams,
+    HostListParams, HostListResult, HostRemoveParams, HostStatusParams, HostStatusResult,
+    IdentifyParams, IdentifyResult, NotificationCreateParams, PaletteActivateParams,
+    PaletteDismissParams, PaletteOpenParams, PalettePresentParams, PalettePresentResult,
+    PaletteQueryParams, PaletteStateParams, PaletteStateResult, ProjectCreateParams,
+    ProjectCreateResult, ProjectDeleteParams, ProjectEnsureParams, ProjectEnsureResult,
+    ProjectRenameParams, ProjectReorderParams, ResolvedCell, ScreenshotParams, ScreenshotResult,
+    SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
+    SessionIdentify, SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult,
+    SessionSetAgentHooksParams, SessionSetThemeParams, SessionStopParams, SessionStopResult,
+    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
+    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams,
+    TabClearNotificationResult, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
+    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
+    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
+    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
+    TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams, TabSendFileResult,
+    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
+    WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef, WireTabRef,
+    MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{AttachHandshake, SessionSetThemeResult};
@@ -724,13 +724,14 @@ pub enum UiRequest {
     },
     /// `host.connect` — the palette's `Connect Host` and the sidebar's
     /// ↻ Reconnect, as an op. It displaces nobody, and it may start a
-    /// localhost session that is not running.
+    /// localhost session that is not running. `busy` while an Install
+    /// Update or Restart Session holds the host (plan 076 D8).
     HostConnect {
         id: String,
         /// `HostConnectParams::test_user_origin`, carried through
         /// verbatim — see that field's doc for what it is and why.
         test_user_origin: bool,
-        reply: HostReply<HostConnectionResult>,
+        reply: HostOpReply<HostConnectionResult>,
     },
     /// `host.disconnect` — drop the connection, leave the session
     /// running.
@@ -744,6 +745,19 @@ pub enum UiRequest {
     HostStatus {
         id: Option<String>,
         reply: HostReply<HostStatusResult>,
+    },
+    /// `host.update` — install this client's build on an ssh host,
+    /// without restarting it (plan 076 D7). Already confirmed: the
+    /// dispatcher refuses a request without `confirm: true`.
+    HostUpdate {
+        id: String,
+        reply: HostOpReply<HostActionResult>,
+    },
+    /// `host.restart` — restart a host's session onto its newest usable
+    /// build (plan 076 D4, D8). Already confirmed, like `HostUpdate`.
+    HostRestart {
+        id: String,
+        reply: HostOpReply<HostActionResult>,
     },
 }
 
@@ -786,6 +800,9 @@ pub struct SessionInfo {
     /// RFC3339, carried as a string on the wire.
     pub started_at: String,
     pub app_version: String,
+    /// What `session.identify` reports as `session_protocol`: this
+    /// build's, unless a test-mode identity sidecar names another.
+    pub session_protocol: u32,
     /// What this session can encode a tab's attach payload as. Empty
     /// when the daemon runs without the server-VT pipeline — an honest
     /// "attach unavailable" rather than a promise it cannot keep.
@@ -2429,7 +2446,7 @@ async fn dispatch_outcome(
             let _p: SessionIdentifyParams = decode(params)?;
             let result = SessionIdentify {
                 app_version: session.info.app_version.clone(),
-                session_protocol: SESSION_PROTOCOL_VERSION,
+                session_protocol: session.info.session_protocol,
                 payload_kinds: session.info.payload_kinds.clone(),
                 libghostty_build: session.info.libghostty_build.clone(),
                 session_id: session.info.session_id.clone(),
@@ -2463,6 +2480,8 @@ async fn dispatch_outcome(
         | ops::HOST_CONNECT
         | ops::HOST_DISCONNECT
         | ops::HOST_STATUS
+        | ops::HOST_UPDATE
+        | ops::HOST_RESTART
         | ops::AGENT_SET_HOOKS => {
             return Err(HandlerError::unknown_op(op));
         }
@@ -4349,29 +4368,27 @@ async fn dispatch(
             }
             Ok(serde_json::json!({}))
         }
-        ops::HOST_CONNECT | ops::HOST_DISCONNECT => {
-            // Connection state is the app's alone — there is no headless
-            // fallback to give, and `no UI attached` is the honest
-            // answer for a socket with no window behind it.
-            let (id, test_user_origin) = if op == ops::HOST_CONNECT {
-                let p = decode::<HostConnectParams>(params)?;
-                (p.id, p.test_user_origin)
-            } else {
-                (decode::<HostDisconnectParams>(params)?.id, false)
-            };
-            let connect = op == ops::HOST_CONNECT;
+        // Connection state is the app's alone — there is no headless
+        // fallback to give, and `no UI attached` is the honest answer for
+        // a socket with no window behind it.
+        ops::HOST_CONNECT => {
+            let HostConnectParams {
+                id,
+                test_user_origin,
+            } = decode(params)?;
             let result = h
-                .ui_call(move |reply| {
-                    if connect {
-                        UiRequest::HostConnect {
-                            id,
-                            test_user_origin,
-                            reply,
-                        }
-                    } else {
-                        UiRequest::HostDisconnect { id, reply }
-                    }
+                .ui_call(move |reply| UiRequest::HostConnect {
+                    id,
+                    test_user_origin,
+                    reply,
                 })
+                .await??;
+            encode(&result)
+        }
+        ops::HOST_DISCONNECT => {
+            let id = decode::<HostDisconnectParams>(params)?.id;
+            let result = h
+                .ui_call(move |reply| UiRequest::HostDisconnect { id, reply })
                 .await?
                 .map_err(ws_err)?;
             encode(&result)
@@ -4387,6 +4404,28 @@ async fn dispatch(
                 .ui_call(move |reply| UiRequest::HostStatus { id: p.id, reply })
                 .await?
                 .map_err(ws_err)?;
+            encode(&result)
+        }
+        ops::HOST_UPDATE | ops::HOST_RESTART => {
+            let p: HostActionParams = decode(params)?;
+            let install = op == ops::HOST_UPDATE;
+            if !p.confirm {
+                return Err(HandlerError::invalid_param(if install {
+                    "host.update installs software; pass confirm: true"
+                } else {
+                    "host.restart ends the session's shells; pass confirm: true"
+                }));
+            }
+            let id = p.id;
+            let result = h
+                .ui_call(move |reply| {
+                    if install {
+                        UiRequest::HostUpdate { id, reply }
+                    } else {
+                        UiRequest::HostRestart { id, reply }
+                    }
+                })
+                .await??;
             encode(&result)
         }
         other => Err(HandlerError::unknown_op(other)),
@@ -4532,6 +4571,8 @@ const DISPATCHED_OPS: &[(&str, &[Withheld])] = {
         (ops::HOST_DISCONNECT, &[UiSocketOnly, NeedsUi]),
         (ops::HOST_LIST, &[UiSocketOnly]),
         (ops::HOST_STATUS, &[UiSocketOnly, NeedsUi]),
+        (ops::HOST_UPDATE, &[UiSocketOnly, NeedsUi]),
+        (ops::HOST_RESTART, &[UiSocketOnly, NeedsUi]),
         (ops::SESSION_IDENTIFY, &[SessionOnly]),
         (ops::SESSION_STOP, &[SessionOnly]),
         (ops::SESSION_SET_THEME, &[SessionOnly, ServerVt]),
@@ -4766,6 +4807,7 @@ mod tests {
                 session_id: "test".into(),
                 started_at: "2026-08-27T14:03:11Z".into(),
                 app_version: "9.9.9".into(),
+                session_protocol: roost_ipc::messages::SESSION_PROTOCOL_VERSION,
                 payload_kinds: Vec::new(),
                 libghostty_build: String::new(),
                 dev: false,
@@ -5726,7 +5768,9 @@ mod tests {
         "host.disconnect",
         "host.list",
         "host.remove",
+        "host.restart",
         "host.status",
+        "host.update",
         "identify",
         "notification.create",
         "palette.activate",

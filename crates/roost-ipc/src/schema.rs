@@ -317,6 +317,8 @@ const OP_TYPES: &[Row] = &[
     op::<HostConnectParams, HostConnectionResult>(ops::HOST_CONNECT),
     op::<HostDisconnectParams, HostConnectionResult>(ops::HOST_DISCONNECT),
     op::<HostStatusParams, HostStatusResult>(ops::HOST_STATUS),
+    op::<HostActionParams, HostActionResult>(ops::HOST_UPDATE),
+    op::<HostActionParams, HostActionResult>(ops::HOST_RESTART),
     event::<TabOpenedEvent>(ops::EVENT_TAB_OPENED),
     event::<TabClosedEvent>(ops::EVENT_TAB_CLOSED),
     event::<TabStateChangedEvent>(ops::EVENT_TAB_STATE_CHANGED),

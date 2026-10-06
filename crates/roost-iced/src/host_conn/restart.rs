@@ -16,43 +16,9 @@
 //! — naming the step that failed, because "restart failed" is useless
 //! and "could not stop the session" is not.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use roost_ipc::session_launch;
-
-/// The restarts this client has under way, by saved host id.
-///
-/// A restart is a ladder of socket work with minute-scale budgets, and
-/// the prompt that starts it is still reachable while it runs — the host
-/// stays in `NeedsRestart` until the relaunch connects, so a second
-/// Connect re-raises the same dialog. Two ladders on one socket race:
-/// the second `session.stop` can land on the session the first one's
-/// relaunch just spawned, and the two spawns then fight over the bind.
-///
-/// So the ladder is claimed, not merely started. `HashSet` rather than a
-/// flag because two hosts may legitimately restart at once.
-#[derive(Debug, Default)]
-pub(crate) struct RestartsInFlight(std::collections::HashSet<String>);
-
-impl RestartsInFlight {
-    /// Claim the ladder for a host. `false` when one is already running,
-    /// which makes the second press a no-op rather than a second
-    /// stop+relaunch.
-    pub(crate) fn begin(&mut self, host: &str) -> bool {
-        self.0.insert(host.to_string())
-    }
-
-    /// Release the claim. Called on **every** outcome — a ladder that
-    /// failed at its first rung must not wedge the host out of ever
-    /// being restarted again.
-    pub(crate) fn finish(&mut self, host: &str) {
-        self.0.remove(host);
-    }
-
-    pub(crate) fn contains(&self, host: &str) -> bool {
-        self.0.contains(host)
-    }
-}
 
 /// One rung of a restart, in the order they run.
 ///
@@ -104,14 +70,19 @@ impl std::fmt::Display for RestartFailure {
 /// Run the two rungs a restart owes before the connection set can dial
 /// again: stop, then wait for the socket to go.
 ///
-/// `Ok(())` means nothing is listening at `socket` any more — either
-/// because this stopped it or because it was already gone, which is the
-/// same state and the same success. The caller then performs
-/// [`RestartStep::Relaunch`] through its ordinary Connect entry.
-pub(crate) async fn stop_and_wait(socket: &Path) -> Result<(), RestartFailure> {
+/// `expected` names the only session this may stop (plan 076 D8): the
+/// answer is `Ok(false)` when another session — or none — is serving
+/// there, and nothing was stopped. Without it, `Ok(true)` also covers a
+/// socket nobody was listening at, which is the same state a stop asks
+/// for.
+pub(crate) async fn stop_and_wait(
+    socket: &Path,
+    expected: Option<&str>,
+) -> Result<bool, RestartFailure> {
     let scale = session_launch::timeout_scale();
-    let report = session_launch::stop_session(
+    let stopped = session_launch::stop_session_if(
         socket,
+        expected,
         session_launch::DEFAULT_STOP_CALL_BUDGET.mul_f64(scale),
     )
     .await
@@ -119,11 +90,10 @@ pub(crate) async fn stop_and_wait(socket: &Path) -> Result<(), RestartFailure> {
         step: RestartStep::Stop,
         message: format!("{error:#}"),
     })?;
-    // Nothing was listening: there is no session id to wait for leaving,
-    // and no wait to spend. Restarting a session that is already down is
-    // just starting one.
-    let Some(report) = report else {
-        return Ok(());
+    let report = match stopped {
+        session_launch::Stop::Stopped(report) => report,
+        session_launch::Stop::Gone => return Ok(expected.is_none()),
+        session_launch::Stop::NotExpected(_) => return Ok(false),
     };
     session_launch::await_stopped(
         socket,
@@ -134,16 +104,8 @@ pub(crate) async fn stop_and_wait(socket: &Path) -> Result<(), RestartFailure> {
     .map_err(|error| RestartFailure {
         step: RestartStep::AwaitGone,
         message: format!("{error:#}"),
-    })
-}
-
-/// The owned form the app hands to an engine op — the future must
-/// outlive the borrow of whatever resolved the target.
-pub(crate) async fn stop_and_wait_owned(socket: PathBuf) -> Result<(), String> {
-    stop_and_wait(&socket).await.map_err(|failure| {
-        tracing::warn!(socket = %socket.display(), %failure, "host restart failed");
-        failure.to_string()
-    })
+    })?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -182,40 +144,21 @@ mod tests {
         }
     }
 
-    /// The whole point of claiming: the second press of "Restart
-    /// session" is a no-op while the first ladder is running, because
-    /// two stop+spawn ladders on one socket race — the second stop can
-    /// reap the session the first one's relaunch just spawned.
-    ///
-    /// And the claim is per host, so two hosts restarting at once do not
-    /// block each other.
-    #[test]
-    fn a_second_restart_is_refused_until_the_first_finishes() {
-        let mut in_flight = RestartsInFlight::default();
-        assert!(in_flight.begin("h1"), "the first press claims the ladder");
-        assert!(!in_flight.begin("h1"), "the second press is a no-op");
-        assert!(in_flight.contains("h1"));
-        assert!(in_flight.begin("h2"), "another host is unaffected");
-
-        in_flight.finish("h1");
-        assert!(!in_flight.contains("h1"));
-        assert!(
-            in_flight.begin("h1"),
-            "and a finished ladder can be run again — a failed stop must \
-             not wedge the host out of restarting"
-        );
-        assert!(in_flight.contains("h2"), "which never touched the other");
-    }
-
     /// A restart of a session that is already down succeeds without a
     /// daemon and without spending either budget — the path a user takes
     /// when the mismatched session has since exited on its own.
     #[tokio::test]
     async fn a_session_that_is_already_gone_needs_no_stopping() {
         let dir = tempfile::tempdir().expect("temp dir");
-        stop_and_wait(&dir.path().join("absent.sock"))
+        assert!(stop_and_wait(&dir.path().join("absent.sock"), None)
             .await
-            .expect("nothing to stop is not a failure");
+            .expect("nothing to stop is not a failure"));
+        assert!(
+            !stop_and_wait(&dir.path().join("absent.sock"), Some("s-1"))
+                .await
+                .expect("not a failure either"),
+            "but the session a restart named is not there to stop"
+        );
     }
 
     /// A socket that is bound but serves nothing fails at
@@ -236,7 +179,7 @@ mod tests {
             }
         });
 
-        let failure = stop_and_wait(&socket)
+        let failure = stop_and_wait(&socket, None)
             .await
             .expect_err("a socket nobody serves cannot be stopped");
         accepting.abort();

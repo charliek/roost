@@ -181,6 +181,7 @@ async fn session_identify_reports_its_binary_and_honours_a_sidecar() {
             app_version: Some("0.0.1".into()),
             dev: Some(false),
             git_sha: Some(Some("f00ba12".into())),
+            session_protocol: Some(roost_ipc::messages::SESSION_PROTOCOL_VERSION - 1),
         }),
         ..layout.config()
     };
@@ -192,6 +193,10 @@ async fn session_identify_reports_its_binary_and_honours_a_sidecar() {
     assert_eq!(session.app_version, "0.0.1");
     assert!(!session.dev);
     assert_eq!(session.git_sha.as_deref(), Some("f00ba12"));
+    assert_eq!(
+        session.session_protocol,
+        roost_ipc::messages::SESSION_PROTOCOL_VERSION - 1
+    );
 
     support::session_stop(&mut client).await;
     served.await.expect("join").expect("serve");

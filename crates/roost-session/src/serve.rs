@@ -287,6 +287,7 @@ pub async fn serve(
         session_id: identity::session_id(),
         started_at: identity::rfc3339_utc(std::time::SystemTime::now()),
         app_version: build.app_version,
+        session_protocol: build.session_protocol,
         // Both answered for real now that every tab has a server
         // terminal behind it. The list is what an attach negotiates
         // against, in preference order; `identity::payload_kinds` is

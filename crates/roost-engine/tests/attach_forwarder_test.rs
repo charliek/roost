@@ -165,6 +165,7 @@ async fn harness_with(
             session_id: session_id.into(),
             started_at: "2026-08-27T14:03:11Z".into(),
             app_version: "9.9.9".into(),
+            session_protocol: roost_ipc::messages::SESSION_PROTOCOL_VERSION,
             payload_kinds,
             libghostty_build: roost_vt::libghostty_build(),
             dev: false,

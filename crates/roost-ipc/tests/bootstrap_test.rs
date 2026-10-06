@@ -135,6 +135,11 @@ enum Bridge {
     Hangs(u32),
     /// The bridge dies with a diagnostic nothing classifies.
     Fails(String),
+    /// A session serving this client's build, as session
+    /// `sess-fixture`, that answers every request on one bridge in turn —
+    /// the real bridge is a pipe to one connection — and logs each to
+    /// `<state>/<name>.requests`.
+    Persistent,
 }
 
 impl Bridge {
@@ -190,6 +195,10 @@ struct Stub {
     /// binary that passes the gate and then stops answering — which is
     /// the one shape that exercises the rollback.
     only_when_staged: bool,
+    /// What `identify` answers from anywhere but the staged temporary,
+    /// when that differs from `identify`: a file that passes the staged
+    /// gate and is something else once committed.
+    committed: Option<SessionBinaryIdentity>,
     bridge: Bridge,
     start: Start,
 }
@@ -200,6 +209,7 @@ impl Stub {
             name: name.to_string(),
             identify,
             only_when_staged: false,
+            committed: None,
             bridge: Bridge::NoSession,
             start: Start::Ready(4242),
         }
@@ -223,6 +233,11 @@ impl Stub {
     /// A binary that identifies from the staging path and nowhere else.
     fn only_when_staged(mut self) -> Self {
         self.only_when_staged = true;
+        self
+    }
+
+    fn once_committed(mut self, identity: SessionBinaryIdentity) -> Self {
+        self.committed = Some(identity);
         self
     }
 
@@ -272,12 +287,17 @@ impl Stub {
             "  printf '%s\\n' {}\n  exit 0\n",
             shell_quote(&serde_json::to_string(identity).expect("serialize an identity"))
         );
-        if !self.only_when_staged {
-            return answer;
-        }
+        let elsewhere = match &self.committed {
+            Some(committed) => format!(
+                "  printf '%s\\n' {}\n  exit 0\n",
+                shell_quote(&serde_json::to_string(committed).expect("serialize an identity"))
+            ),
+            None if self.only_when_staged => silent.to_string(),
+            None => return answer,
+        };
         // `$0` is the path it was exec'd through: the staged temporary
         // for the pre-commit gate, the destination for the re-verify.
-        format!("  case \"$0\" in\n  *.tmp.*)\n{answer}    ;;\n  *)\n{silent}    ;;\n  esac\n")
+        format!("  case \"$0\" in\n  *.tmp.*)\n{answer}    ;;\n  *)\n{elsewhere}    ;;\n  esac\n")
     }
 
     fn start_body(&self) -> String {
@@ -344,6 +364,23 @@ impl Stub {
                     "  read -r request || request=\n  case \"$request\" in\n  *session.stop*)\n    \
                      printf '%s\\n' {stop}\n    exit 0\n    ;;\n  *)\n{finalize}    printf '%s\\n' \
                      {identify}\n    exit 0\n    ;;\n  esac\n",
+                    stop = shell_quote(stop),
+                    identify = shell_quote(&identify),
+                )
+            }
+            Bridge::Persistent => {
+                let stop =
+                    r#"{"id":"%s","ok":true,"result":{"reaped":[],"killed":[],"abandoned":[]}}\n"#;
+                let identify = format!(
+                    r#"{{"id":"%s","ok":true,"result":{}}}\n"#,
+                    running_identity(CLIENT_VERSION, CLIENT_BUILD)
+                );
+                format!(
+                    "  while read -r request; do\n    printf '%s\\n' \"$request\" >> \
+                     \"$STATE/$SELF.requests\"\n    id=${{request#*\\\"id\\\":\\\"}}; \
+                     id=${{id%%\\\"*}}\n    case \"$request\" in\n    *session.stop*)\n      \
+                     printf {stop} \"$id\"\n      exit 0\n      ;;\n    *)\n      printf \
+                     {identify} \"$id\"\n      ;;\n    esac\n  done\n  exit 0\n",
                     stop = shell_quote(stop),
                     identify = shell_quote(&identify),
                 )
@@ -1296,6 +1333,63 @@ async fn a_commit_that_lands_and_then_fails_identify_puts_the_incumbent_back() {
     job.close().await;
 }
 
+/// Plan 076 D8: what the staged file answered is the build a start is
+/// later held to, so the committed file has to answer with every build
+/// fact the same — not only the install gate's triple. A destination
+/// that passes the triple as another sha is rolled back.
+#[tokio::test]
+async fn a_committed_file_that_is_another_build_of_the_same_triple_is_rolled_back() {
+    let harness = Harness::new();
+    let incumbent = b"#!/bin/sh\n# the install that must survive this\nexit 7\n".to_vec();
+    let dest = harness.plant_bytes("$HOME/.local/bin/roost-session", &incumbent);
+    let mut staged = expected();
+    staged.git_sha = Some("aaaaaaa".into());
+    let mut swapped = staged.clone();
+    swapped.git_sha = Some("bbbbbbb".into());
+
+    let source = harness.source_file(&Stub::new("swapped", Some(staged)).once_committed(swapped));
+    let mut options = harness.options();
+    options.install_bin = Some(source);
+    let job = harness.job(options).await;
+    let resolved = job
+        .resolve_source(RemoteArch::Amd64)
+        .await
+        .expect("resolve");
+
+    match job.install(&resolved).await {
+        Err(BootstrapError::PostCommit { restored, .. }) => assert!(restored),
+        other => panic!("another build at the destination must not install: {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(&dest).expect("read the destination"),
+        incumbent,
+        "the previous install is back, byte for byte"
+    );
+    job.close().await;
+}
+
+/// The identity an install hands back is the one the staged file
+/// answered with, build facts and all.
+#[tokio::test]
+async fn an_install_reports_the_identity_it_staged() {
+    let harness = Harness::new();
+    let mut staged = expected();
+    staged.git_sha = Some("aaaaaaa".into());
+    staged.dev = true;
+    let source = harness.source_file(&Stub::new("staged", Some(staged.clone())));
+    let mut options = harness.options();
+    options.install_bin = Some(source);
+    let job = harness.job(options).await;
+    let resolved = job
+        .resolve_source(RemoteArch::Amd64)
+        .await
+        .expect("resolve");
+
+    let installed = job.install(&resolved).await.expect("install");
+    assert_eq!(installed.identity, staged);
+    job.close().await;
+}
+
 /// The same failure on a host that had nothing installed: there is
 /// nothing to put back, and the copy says so instead of promising a
 /// restore that never happened.
@@ -1990,6 +2084,107 @@ async fn the_stop_accepts_only_the_shutting_down_code() {
         }
         job.close().await;
     }
+}
+
+/// Plan 076 D8: an ssh stop is bound to the session it names. The
+/// identify and the stop share one bridge, so the session that said who
+/// it was is the one that is stopped — and any other is left alone.
+#[tokio::test]
+async fn a_session_bound_stop_reaches_only_the_session_it_names() {
+    for (expected, stops) in [("sess-fixture", true), ("someone-else", false)] {
+        let harness = Harness::new();
+        harness.plant(
+            "$HOME/.local/bin/roost-session",
+            &Stub::matching("bound").bridge(Bridge::Persistent),
+        );
+        let job = harness.job(harness.options()).await;
+
+        let result = job.stop_session_if(expected).await;
+
+        let requests =
+            std::fs::read_to_string(harness.state.join("bound.requests")).unwrap_or_default();
+        let ops: Vec<&str> = requests
+            .lines()
+            .map(|line| {
+                if line.contains("session.stop") {
+                    "stop"
+                } else {
+                    "identify"
+                }
+            })
+            .collect();
+        if stops {
+            result.unwrap_or_else(|error| panic!("{expected}: {error:?}"));
+            assert_eq!(ops, ["identify", "stop"], "one bridge, both calls");
+        } else {
+            assert!(
+                matches!(result, Err(BootstrapError::Changed)),
+                "{expected}: {result:?}"
+            );
+            assert_eq!(ops, ["identify"], "no stop may reach another session");
+        }
+        job.close().await;
+    }
+
+    let harness = Harness::new();
+    harness.plant(
+        "$HOME/.local/bin/roost-session",
+        &Stub::matching("gone").bridge(Bridge::NoSession),
+    );
+    let job = harness.job(harness.options()).await;
+    assert!(
+        matches!(
+            job.stop_session_if("sess-fixture").await,
+            Err(BootstrapError::Changed)
+        ),
+        "a session that is not there is not the one named"
+    );
+    job.close().await;
+}
+
+/// The check before a start runs before every launch, the retries after
+/// `already-running` included, and a refusal there launches nothing.
+#[tokio::test]
+async fn a_guarded_start_rechecks_before_every_launch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let harness = Harness::new();
+    let remote = harness.remote("$HOME/.local/bin/roost-session");
+    harness.plant(
+        "$HOME/.local/bin/roost-session",
+        &Stub::matching("racing").start(Start::AlreadyRunningThenReady { first: 1, then: 2 }),
+    );
+    let job = harness.job(harness.options()).await;
+    // The stub's own count of `start` runs.
+    let launches = || {
+        std::fs::read_to_string(harness.state.join("racing.start"))
+            .map_or(0, |n| n.trim().parse::<usize>().expect("a count"))
+    };
+    let checks = AtomicUsize::new(0);
+
+    let verdict = job
+        .start_guarded(&remote, || async {
+            let check = checks.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(launches(), check, "check {check} runs before its launch");
+            Ok(())
+        })
+        .await
+        .expect("start");
+    assert!(matches!(verdict, Verdict::Ready(2)), "{verdict:?}");
+    assert_eq!(checks.load(Ordering::SeqCst), 2);
+    assert_eq!(launches(), 2);
+
+    let refused = job
+        .start_guarded(&remote, || async {
+            Err(BootstrapError::TargetChanged(remote.clone()))
+        })
+        .await;
+    assert!(
+        matches!(refused, Err(BootstrapError::TargetChanged(_))),
+        "{refused:?}"
+    );
+    assert_eq!(launches(), 2, "a refused check launches nothing");
+    job.close().await;
 }
 
 #[tokio::test]

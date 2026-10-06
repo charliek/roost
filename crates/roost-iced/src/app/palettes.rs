@@ -1761,16 +1761,25 @@ impl App {
                 self.clear_palette_state();
                 self.open_host_stop_dialog(&saved_id, &label);
             }
-            // **Neither consults `origin`**, exactly like `Stop` above.
+            // **None consults `origin`**, exactly like `Stop` above.
             // Plan 039 §3.5's rule is that a machine is never *prompted
-            // by a connect it did not ask for*; these two exist only on
-            // a person's connected, reduced-fidelity host, and their
-            // first remote activity is a consent card. Listing them is
-            // still gated on `HostRow.fidelity`, which nothing fills in
-            // until the sidebar does.
-            HostVerb::Update(saved_id) | HostVerb::Restart(saved_id) => {
+            // by a connect it did not ask for*; these are listed only
+            // when the update facts offer them, and their first remote
+            // activity is a card (plan 076 D7).
+            HostVerb::Update(saved_id) => {
                 self.clear_palette_state();
-                self.host_fidelity_action_requested(&saved_id);
+                self.host_update_requested(&saved_id)
+                    .map_err(|failure| failure.message)?;
+            }
+            HostVerb::Install(saved_id) => {
+                self.clear_palette_state();
+                self.host_install_requested(&saved_id, false)
+                    .map_err(|failure| failure.message)?;
+            }
+            HostVerb::Restart(saved_id) => {
+                self.clear_palette_state();
+                self.host_session_restart_requested(&saved_id, false)
+                    .map_err(|failure| failure.message)?;
             }
             HostVerb::Remove(saved_id) => {
                 self.clear_palette_state();
@@ -1880,6 +1889,10 @@ impl App {
                 return self.create_project_on(host);
             }
         }
+        if let Err(failure) = self.refuse_connect_during_action(saved_id) {
+            self.set_status(failure.message);
+            return EngineDispatch::default();
+        }
         self.host_reconnect_for(
             saved_id,
             origin,
@@ -1931,6 +1944,11 @@ impl App {
             .iter()
             .find(|view| view.saved_id == saved_id)
             .map(|view| view.label.clone())
+    }
+
+    pub(super) fn label_or_id(&self, saved_id: &str) -> String {
+        self.host_label(saved_id)
+            .unwrap_or_else(|| saved_id.to_string())
     }
 
     /// Refresh the host rows under an open palette.

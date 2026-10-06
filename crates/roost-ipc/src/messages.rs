@@ -3030,6 +3030,25 @@ pub struct HostStatusParams {
     pub id: Option<String>,
 }
 
+/// `host.update` / `host.restart` request.
+///
+/// `confirm` has to be `true`: both act on a host's software or end its
+/// shells, and a caller that left it out is refused rather than obeyed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostActionParams {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub confirm: bool,
+}
+
+/// What `host.update` / `host.restart` answer: the action was started.
+/// Its outcome is `host.status.update.action`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HostActionResult {
+    pub accepted: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HostStatusResult {
     pub hosts: Vec<HostStatus>,
@@ -3136,6 +3155,21 @@ pub struct HostUpdateStatus {
     /// This client's build, as the comparison read it.
     pub client: BuildStatus,
     pub restart: HostRestartStatus,
+    /// The latest install, restart or update started on this host, kept
+    /// across reconnects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<HostActionStatus>,
+}
+
+/// One install, restart or update, as `host.status` reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HostActionStatus {
+    /// One of [`host_action_kind`]'s spellings.
+    pub kind: String,
+    /// One of [`host_action_phase`]'s spellings.
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// One build, as `host.status` names it.
@@ -3271,6 +3305,20 @@ pub mod host_restart_why {
     pub const OLDER: &str = "older";
     pub const INCOMPATIBLE: &str = "incompatible";
     pub const OVERRIDE: &str = "override";
+}
+
+/// [`HostActionStatus::kind`]'s spellings.
+pub mod host_action_kind {
+    pub const INSTALL: &str = "install";
+    pub const RESTART: &str = "restart";
+    pub const UPDATE: &str = "update";
+}
+
+/// [`HostActionStatus::phase`]'s spellings.
+pub mod host_action_phase {
+    pub const RUNNING: &str = "running";
+    pub const DONE: &str = "done";
+    pub const FAILED: &str = "failed";
 }
 
 /// [`RestartTargetStatus::source`]'s spellings.
@@ -4099,6 +4147,13 @@ pub mod ops {
     /// [`HOST_CONNECT`]'s reply, and the surface a harness asserts
     /// through instead of scraping the log (plan 042 §3.1).
     pub const HOST_STATUS: &str = "host.status";
+    /// Install this client's `roost-session` on an ssh host without
+    /// restarting it (plan 076 D7). Answers at once; the outcome shows
+    /// in `host.status.update.action`.
+    pub const HOST_UPDATE: &str = "host.update";
+    /// Restart a host's session onto the newest usable build (plan 076
+    /// D4, D8). Answers at once, like [`HOST_UPDATE`].
+    pub const HOST_RESTART: &str = "host.restart";
 }
 
 // ============================================================================
@@ -5674,6 +5729,23 @@ mod tests {
     }
 
     #[test]
+    fn host_action_params_default_to_unconfirmed() {
+        let bare: HostActionParams = serde_json::from_str(r#"{"id":"h"}"#).unwrap();
+        assert!(!bare.confirm);
+        let confirmed = HostActionParams {
+            id: "h".into(),
+            confirm: true,
+        };
+        round_trip(&confirmed);
+        assert_eq!(
+            serde_json::to_value(&confirmed).unwrap(),
+            serde_json::json!({"id": "h", "confirm": true})
+        );
+        assert!(serde_json::from_str::<HostActionParams>(r#"{"id":"h","force":true}"#).is_err());
+        round_trip(&HostActionResult { accepted: true });
+    }
+
+    #[test]
     fn host_status_round_trips() {
         round_trip(&HostStatusParams::default());
         round_trip(&HostStatusParams {
@@ -5815,6 +5887,7 @@ mod tests {
                         source: "bundled".into(),
                     }),
                 },
+                action: None,
             }),
             ..resumed.clone()
         };
@@ -5844,6 +5917,24 @@ mod tests {
         round_trip(&blocked);
         let wire = serde_json::to_value(&blocked).unwrap();
         assert_eq!(wire["blocked"], true);
+        assert!(wire.get("action").is_none());
+        let acting = HostUpdateStatus {
+            action: Some(HostActionStatus {
+                kind: host_action_kind::RESTART.into(),
+                phase: host_action_phase::FAILED.into(),
+                message: Some("the session changed; check again".into()),
+            }),
+            ..blocked.clone()
+        };
+        round_trip(&acting);
+        assert_eq!(
+            serde_json::to_value(&acting).unwrap()["action"],
+            serde_json::json!({
+                "kind": "restart",
+                "phase": "failed",
+                "message": "the session changed; check again",
+            })
+        );
         assert_eq!(
             wire["restart"],
             serde_json::json!({"offered": false, "why": "older"})

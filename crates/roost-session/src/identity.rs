@@ -57,6 +57,9 @@ pub fn build_identity(
         if let Some(sha) = &overrides.git_sha {
             identity.git_sha.clone_from(sha);
         }
+        if let Some(protocol) = overrides.session_protocol {
+            identity.session_protocol = protocol;
+        }
     }
     identity
 }
@@ -69,6 +72,7 @@ pub struct IdentityOverride {
     pub app_version: Option<String>,
     pub dev: Option<bool>,
     pub git_sha: Option<Option<String>>,
+    pub session_protocol: Option<u32>,
 }
 
 impl IdentityOverride {
@@ -91,6 +95,13 @@ impl IdentityOverride {
                         serde_json::Value::Null => None,
                         value => Some(value.as_str().ok_or("git_sha is not a string")?.to_string()),
                     });
+                }
+                "session_protocol" => {
+                    let protocol = value
+                        .as_u64()
+                        .and_then(|protocol| u32::try_from(protocol).ok())
+                        .ok_or("session_protocol is not a u32")?;
+                    out.session_protocol = Some(protocol);
                 }
                 other => return Err(format!("unknown key {other:?}")),
             }
@@ -412,9 +423,11 @@ mod tests {
             app_version: Some("0.0.21".into()),
             dev: Some(false),
             git_sha: Some(None),
+            session_protocol: Some(SESSION_PROTOCOL_VERSION - 1),
         };
         let faked = build_identity(None, true, Some(&overrides));
         assert_eq!(faked.app_version, "0.0.21");
+        assert_eq!(faked.session_protocol, SESSION_PROTOCOL_VERSION - 1);
         assert!(!faked.dev);
         assert_eq!(faked.git_sha, None);
         assert_eq!(faked.libghostty_build, roost_vt::libghostty_build());
@@ -434,11 +447,14 @@ mod tests {
     #[test]
     fn a_sidecar_parses_every_field_and_refuses_strangers() {
         assert_eq!(
-            IdentityOverride::parse(r#"{"app_version":"0.0.23","dev":true,"git_sha":"f00ba12"}"#),
+            IdentityOverride::parse(
+                r#"{"app_version":"0.0.23","dev":true,"git_sha":"f00ba12","session_protocol":3}"#
+            ),
             Ok(IdentityOverride {
                 app_version: Some("0.0.23".into()),
                 dev: Some(true),
                 git_sha: Some(Some("f00ba12".into())),
+                session_protocol: Some(3),
             })
         );
         assert_eq!(
@@ -452,7 +468,13 @@ mod tests {
             IdentityOverride::parse("{}"),
             Ok(IdentityOverride::default())
         );
-        for bad in [r#"{"version":"1"}"#, r#"{"dev":"yes"}"#, "[]", "nope"] {
+        for bad in [
+            r#"{"version":"1"}"#,
+            r#"{"dev":"yes"}"#,
+            r#"{"session_protocol":-1}"#,
+            "[]",
+            "nope",
+        ] {
             assert!(IdentityOverride::parse(bad).is_err(), "{bad}");
         }
     }

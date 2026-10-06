@@ -126,7 +126,7 @@ os.environ["ROOST_SESSION_BIN"] = str(_CANDIDATE)
 atexit.register(shutil.rmtree, _ROOT, ignore_errors=True)
 
 import ui  # noqa: E402
-from client import Roost, scaled_timeout  # noqa: E402
+from client import Roost, RoostError, scaled_timeout  # noqa: E402
 from host_probe import host_key  # noqa: E402
 from test_host_client import (  # noqa: E402
     FAKE_BUILD,
@@ -436,13 +436,10 @@ def test_a_reduced_fidelity_localhost_host_restarts_from_the_palette_and_comes_b
     was classified `Localhost`, which is the one thing `host.status` will
     not say.
 
-    Confirming has to let go of the session **before** the job owns it,
-    and that is read once with no wait in front of it:
-    `app.dialog_answer` runs the confirm handler to completion before it
-    replies, and the disconnect inside it is synchronous, so this is a
-    fence rather than a race. The states are sampled for the whole
-    restart for the reason the ssh sibling names: a client that still had
-    a stream up when the job stopped the session would hear the stop.
+    The restart lets go of the stream once it has re-checked what it
+    stops, and before it stops it (plan 076 D8). The states are sampled
+    for the whole restart for the reason the ssh sibling names: a client
+    that still had a stream up when the session stopped would hear it.
 
     The layout is compared by **cwd**, never by title: a restored shell
     is a fresh one and is free to rewrite what it is called.
@@ -472,12 +469,6 @@ def test_a_reduced_fidelity_localhost_host_restarts_from_the_palette_and_comes_b
     assert client_libghostty_build() in card["body"], (client_libghostty_build(), card)
 
     answer(roost, "confirm")
-    handed_over = host_status_row(roost, ground.host.saved_id)
-    assert handed_over["state"] == "disconnected", (
-        "confirming has to let go of the session *before* the restart owns it "
-        f"— the host was still {handed_over['state']!r}: {handed_over}"
-    )
-    assert handed_over.get("connect") is None, handed_over
 
     landed, states = watch_the_restart(ground)
     assert landed["connect"]["reduced_fidelity"] is False, landed
@@ -781,3 +772,189 @@ def test_an_override_that_is_gone_is_the_whole_answer(ground: Ground, restore_ca
     _CANDIDATE.unlink()
     update = connect_as(ground, "override")
     assert update["restart"] == {"offered": False, "why": "override"}, update
+
+
+# ---------------------------------------------------------------------------
+# 6. Restart Session (plan 076 D4, D7, D8)
+# ---------------------------------------------------------------------------
+
+
+def host_update(host: HostUnderTest, session_id: str, timeout: float = 60.0) -> dict:
+    """`resolved_update`, for a host on whichever UI is up."""
+
+    def probe() -> dict | None:
+        row = host_status_row(host.roost, host.saved_id)
+        connect = row.get("connect")
+        update = row.get("update")
+        if connect is None or connect["session_id"] != session_id or update is None:
+            return None
+        restart = update["restart"]
+        return update if "target" in restart or "why" in restart else None
+
+    return wait_until(probe, timeout, "the host's restart candidate to be identified")
+
+
+def wait_restarted(ground: Ground, host: HostUnderTest, before: str, timeout: float = 180.0) -> dict:
+    """The row once a restart has settled on a session other than
+    `before`, claimed for the teardown."""
+
+    def landed() -> dict | None:
+        row = host_status_row(host.roost, host.saved_id)
+        connect = row.get("connect")
+        update = row.get("update")
+        if connect is not None:
+            ground.claim(connect["session_id"])
+        if connect is None or update is None or connect["session_id"] == before:
+            return None
+        action = update.get("action", {})
+        return row if action.get("phase") in ("done", "failed") else None
+
+    return wait_until(landed, timeout, "the restart to land a new session")
+
+
+def test_restart_runs_the_override_and_lands_up_to_date(ground: Ground, restore_candidate):
+    """Restart Session onto its D4 target. `ROOST_SESSION_BIN` is set, so
+    the override is the only candidate and the one the relaunch runs: the
+    new session's own `exe_path` says which binary that was."""
+    before = start_as(ground, "old", app_version="0.0.1")
+    ground.host.connect_and_wait()
+    update = host_update(ground.host, before)
+    assert update["state"] == "staged", update
+    assert update["restart"]["target"]["source"] == "override", update
+
+    accepted = ground.host.roost.call(
+        "host.restart", {"id": ground.host.saved_id, "confirm": True}
+    )
+    assert accepted == {"accepted": True}, accepted
+    # One action per session (D8): the claim is held from the op on.
+    with pytest.raises(RoostError) as busy:
+        ground.host.roost.call("host.restart", {"id": ground.host.saved_id, "confirm": True})
+    assert busy.value.code == "busy", busy.value
+
+    row = wait_restarted(ground, ground.host, before)
+    action = row["update"]["action"]
+    real = real_identity()
+    shown = sessionlib.describe_build(real)
+    assert action == {
+        "kind": "restart",
+        "phase": "done",
+        "message": f"{ground.host.label} restarted on roost-session {shown}",
+    }, action
+    assert row["update"]["session"]["version"] == real["app_version"], row
+    serving = ground.host.env.identify()
+    assert serving["session_id"] == row["connect"]["session_id"], serving
+    assert serving["exe_path"] == str(_CANDIDATE.resolve()), serving
+
+
+@contextlib.contextmanager
+def relaunched_ui(target: str, **env: str):
+    """This lane's UI again, with `env` over its environment; the usual
+    one is put back afterwards. `ROOST_SESSION_BIN` is read once by the
+    UI process, so a case that needs it unset needs its own UI."""
+    ui.quit(target)
+    try:
+        ui.launch(target, force=True, extra_env=env)
+        with Roost(str(ui.socket_path(target)), timeout=scaled_timeout(30.0)) as client:
+            yield client
+    finally:
+        with contextlib.suppress(Exception):
+            ui.quit(target)
+        ui.launch(target, force=True)
+
+
+def test_a_newer_session_restarts_onto_its_own_binary(
+    ground: Ground, target: str, restore_candidate
+):
+    """AC4/AC5: with no override, a session newer than both this client
+    and the bundled build restarts onto the binary it is running
+    (`exe_path`, source `current`) — never down onto the bundled one —
+    and stays `session-newer`."""
+    before = start_as(ground, "newer", app_version="99.0.0")
+    copy = (ground.host.env.root / "build-newer" / "roost-session").resolve()
+    # Empty is unset, as `locate_session_binary` reads it (plan 076 D4):
+    # the candidates are the bundled sibling and the running binary.
+    with relaunched_ui(target, ROOST_SESSION_BIN="") as roost:
+        host = dataclasses.replace(ground.host, roost=roost)
+        try:
+            host.connect_and_wait()
+            update = host_update(host, before)
+            assert update["state"] == "session-newer", update
+            assert update["restart"]["target"]["source"] == "running", update
+            assert update["restart"]["target"]["version"] == "99.0.0", update
+
+            roost.call("host.restart", {"id": host.saved_id, "confirm": True})
+            row = wait_restarted(ground, host, before)
+            assert row["update"]["action"]["phase"] == "done", row
+            assert row["update"]["session"]["version"] == "99.0.0", row
+            assert row["update"]["state"] == "session-newer", row
+            serving = ground.host.env.identify()
+            assert serving["exe_path"] == str(copy), serving
+        finally:
+            with contextlib.suppress(Exception):
+                host.disconnect()
+            with contextlib.suppress(Exception):
+                host.remove()
+
+
+def test_a_target_gone_before_the_relaunch_starts_nothing(ground: Ground, restore_candidate):
+    """AC8: the target is held for the whole attempt. It is deleted
+    while the old session is stopping — a tab that ignores SIGHUP holds
+    the stop open — and the restart fails naming it, with nothing
+    started in its place: no fall back to the launch ladder."""
+    before = start_as(ground, "old", app_version="0.0.1")
+    ground.host.connect_and_wait()
+    host_update(ground.host, before)
+    with ground.host.client() as session:
+        project = first_project(session)
+        hold = session.open_tab(
+            project,
+            cwd=str(ground.host.env.launch_cwd),
+            argv=["/bin/sh", "-c", "trap '' HUP TERM; while :; do sleep 1; done"],
+        )
+
+    ground.host.roost.call("host.restart", {"id": ground.host.saved_id, "confirm": True})
+
+    def stopping() -> bool:
+        # Once the stop is under way the session refuses every mutation;
+        # by then the restart has re-checked its target and moved on.
+        try:
+            with ground.host.client(timeout=5.0) as session:
+                session.call("tab.set_title", {"tab_id": str(hold), "title": "hold"})
+        except RoostError as error:
+            return error.code == "shutting-down"
+        except OSError:
+            return False
+        return False
+
+    wait_until(stopping, 60.0, "the old session to begin stopping", 0.02)
+    _CANDIDATE.unlink()
+    # The hold is what orders the unlink ahead of the restart's re-check:
+    # the old session is still serving, so its stop has not finished.
+    assert ground.host.env.answering() is not None, "the stop finished before the unlink"
+
+    # Mid-restart, with the stream let go: the action is still reported
+    # (D7), and a second one is `busy` rather than "not connected" (D8).
+    mid = host_status_row(ground.host.roost, ground.host.saved_id)
+    assert mid["state"] != "connected", mid
+    assert mid["update"]["action"] == {"kind": "restart", "phase": "running"}, mid
+    with pytest.raises(RoostError) as busy:
+        ground.host.roost.call("host.restart", {"id": ground.host.saved_id, "confirm": True})
+    assert busy.value.code == "busy", busy.value
+
+    def settled() -> dict | None:
+        row = host_status_row(ground.host.roost, ground.host.saved_id)
+        reason = row.get("reason") or ""
+        return row if str(_CANDIDATE) in reason else None
+
+    row = wait_until(settled, 120.0, "the restart to fail naming its target")
+    assert row["state"] == "disconnected", row
+    assert "nothing was started" in row["reason"], row
+    assert row.get("connect") is None, row
+    action = row["update"]["action"]
+    assert action["kind"] == "restart" and action["phase"] == "failed", row
+    assert str(_CANDIDATE) in action["message"], action
+    status = roostctl_session("status")
+    assert status.returncode == NOT_RUNNING_EXIT, (
+        "a restart whose target is gone must not start anything else: "
+        f"{status.stdout!r}"
+    )

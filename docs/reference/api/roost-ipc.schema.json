@@ -1521,6 +1521,53 @@
       ],
       "type": "object"
     },
+    "HostActionParams": {
+      "additionalProperties": false,
+      "properties": {
+        "confirm": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "HostActionResult": {
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "accepted"
+      ],
+      "type": "object"
+    },
+    "HostActionStatus": {
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "phase": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "phase"
+      ],
+      "type": "object"
+    },
     "HostAddParams": {
       "additionalProperties": false,
       "properties": {
@@ -1797,6 +1844,16 @@
     },
     "HostUpdateStatus": {
       "properties": {
+        "action": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostActionStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "blocked": {
           "type": [
             "boolean",
@@ -4731,12 +4788,28 @@
         "$ref": "#/$defs/EmptyResult"
       }
     },
+    "host.restart": {
+      "params": {
+        "$ref": "#/$defs/HostActionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostActionResult"
+      }
+    },
     "host.status": {
       "params": {
         "$ref": "#/$defs/HostStatusParams"
       },
       "result": {
         "$ref": "#/$defs/HostStatusResult"
+      }
+    },
+    "host.update": {
+      "params": {
+        "$ref": "#/$defs/HostActionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/HostActionResult"
       }
     },
     "identify": {

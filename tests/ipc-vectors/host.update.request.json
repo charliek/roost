@@ -1,0 +1,8 @@
+{
+  "id": "35",
+  "op": "host.update",
+  "params": {
+    "id": "3f9a2b7c1d4e4f5a",
+    "confirm": true
+  }
+}

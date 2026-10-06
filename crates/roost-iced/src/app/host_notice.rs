@@ -4,8 +4,8 @@
 //! all — a protocol it does not speak, no payload kind it can decode,
 //! or a build skew against a session too old to serve `vt`. A skew a
 //! session *can* serve connects instead, at reduced fidelity, and is
-//! asked about from the band rather than from this gate —
-//! [`restart_prompt_for_skew`] is that question.
+//! asked about from the band rather than from this gate — plan 076's
+//! [`restart_card`] is that question.
 //!
 //! Pure, and deliberately kept away from the widgets: "which frame,
 //! which buttons, and is there a restart button at all" is the part that
@@ -22,8 +22,10 @@
 use crate::host_conn::state::{
     BuildMismatch, HostConnState, MismatchKind, RestartAction, Skew, CLIENT_PAYLOAD_KINDS,
 };
+use roost_ipc::session_version::{order, BuildId, VersionOrder};
 use roost_ui_model::host_sidebar::FidelityAction;
 use roost_ui_model::notice;
+use roost_ui_model::session_update::{describe, RestartTarget, TargetSource};
 
 /// A frame nothing will ever update again, and why.
 ///
@@ -118,7 +120,14 @@ impl RestartPrompt {
 /// says what will happen and a button that does it — the *offer* is
 /// structural (this is an ssh host), and whether a matching build
 /// actually exists to install is resolved when the user confirms.
-pub(super) fn restart_prompt(label: &str, mismatch: &BuildMismatch) -> RestartPrompt {
+pub(super) fn restart_prompt(
+    label: &str,
+    mismatch: &BuildMismatch,
+    client: &BuildId,
+) -> RestartPrompt {
+    if session_is_newer(mismatch, client) {
+        return blocked_prompt(label, mismatch, client);
+    }
     let vintage = vintage(mismatch);
     let detail = detail(mismatch);
     match mismatch.restart {
@@ -138,15 +147,7 @@ pub(super) fn restart_prompt(label: &str, mismatch: &BuildMismatch) -> RestartPr
                 "This session was started by {vintage} ({detail}). Roost can \
                  install the matching roost-session on {label} over ssh and \
                  restart the session there — it will show you what it would do \
-                 before anything is changed.{}",
-                // Said here as well as on the consent card, because this
-                // is where the user decides whether to look at all.
-                if session_is_newer(mismatch) {
-                    " That session is newer than this Roost, so it would install \
-                     an older build; upgrading this Roost is likely the fix."
-                } else {
-                    ""
-                }
+                 before anything is changed.",
             ),
             action: mismatch.restart,
             confirm: Some(format!("Update roost-session on {label}")),
@@ -165,6 +166,63 @@ pub(super) fn restart_prompt(label: &str, mismatch: &BuildMismatch) -> RestartPr
     }
 }
 
+/// The card for a session that refused this client because it is the
+/// newer of the two (plan 076 D3 rule 1, D7): nothing here can fix it,
+/// so it names both builds and offers nothing to press.
+fn blocked_prompt(label: &str, mismatch: &BuildMismatch, client: &BuildId) -> RestartPrompt {
+    RestartPrompt {
+        title: format!("The session on {label} is newer than this Roost"),
+        body: format!(
+            "Update this Roost to connect. The session runs roost-session {}; this Roost is {}.",
+            describe(&mismatch.running),
+            describe(client)
+        ),
+        action: RestartAction::None,
+        confirm: None,
+    }
+}
+
+/// The Restart Session card (plan 076 D7): which build it runs, which
+/// tabs it ends, and what it costs. `lead` is the reason the card was
+/// raised, when there is one worth leading with.
+pub(super) fn restart_card(
+    label: &str,
+    lead: Option<&str>,
+    target: &RestartTarget,
+    ends: &[String],
+) -> RestartPrompt {
+    let source = match target.source {
+        TargetSource::Bundled => "bundled",
+        TargetSource::Installed => "installed",
+        TargetSource::Running => "current",
+        TargetSource::Override => "override",
+    };
+    let ends = if ends.is_empty() {
+        "nothing running".to_string()
+    } else {
+        ends.join(", ")
+    };
+    let mut body = String::new();
+    if let Some(lead) = lead {
+        body.push_str(lead);
+        body.push(' ');
+    }
+    body.push_str(&format!(
+        "Runs: roost-session {} ({source}). Ends: {ends}. Every tab reopens as a fresh shell in \
+         its directory. Running programs end.",
+        describe(&target.identity)
+    ));
+    RestartPrompt {
+        title: format!("Restart the session on {label}?"),
+        body,
+        action: RestartAction::RestartLocal,
+        confirm: Some(RESTART_SESSION_CONFIRM.to_string()),
+    }
+}
+
+/// The Restart card's button.
+pub(super) const RESTART_SESSION_CONFIRM: &str = "Restart Session";
+
 /// Why a connection is at reduced fidelity, and what that costs — the
 /// sentences both cards raised from the band lead with (plan 056 §3.6).
 ///
@@ -179,32 +237,6 @@ pub(super) fn reduced_fidelity_reason(skew: &Skew) -> String {
          and soft wrapping are off until it runs the matching build.",
         skew.session_build, skew.client_build
     )
-}
-
-/// Compose the restart dialog for a **localhost** session this client
-/// is attached to across a libghostty build skew (plan 056 §3.6).
-///
-/// The sibling of [`restart_prompt`]'s `RestartLocal` arm, and a
-/// separate function rather than a fourth arm of it because the two
-/// answer different questions. That one is raised at a host this client
-/// **cannot talk to**; this one at a host it is talking to right now,
-/// on the `vt` fallback, whose links and alternate screen are gone. The
-/// only way to reuse the arm would be to synthesize a [`BuildMismatch`]
-/// with a kind that lies about protocol fields it never had.
-///
-/// It claims no direction, for [`vintage`]'s reason: two libghostty
-/// build strings are merely different.
-pub(super) fn restart_prompt_for_skew(label: &str, skew: &Skew) -> RestartPrompt {
-    RestartPrompt {
-        title: format!("Restart the session on {label}?"),
-        body: format!(
-            "{} Restarting reopens every tab as a fresh shell in its directory. Running \
-             programs end.",
-            reduced_fidelity_reason(skew)
-        ),
-        action: RestartAction::RestartLocal,
-        confirm: Some("Restart session".to_string()),
-    }
 }
 
 /// The band's pill, on every transport. The *fact* does not vary — this
@@ -298,16 +330,13 @@ pub(super) fn connect_route(
     }
 }
 
-/// Whether the *session* is the newer of the two, where that is
-/// knowable at all.
-///
-/// [`vintage`]'s direction, as a predicate: protocol numbers order, so
-/// "newer" is a fact there; two libghostty build strings that disagree
-/// are merely different, and a downgrade warning guessed off one would
-/// be a dialog inventing a direction.
-pub(super) fn session_is_newer(mismatch: &BuildMismatch) -> bool {
-    matches!(mismatch.kind, MismatchKind::Protocol)
-        && mismatch.session_protocol > mismatch.client_protocol
+/// Whether the refused session is the newer of the two — plan 076 D3
+/// rule 1: it speaks a newer protocol, or this client's version orders
+/// older than the session's. Two libghostty build strings never decide
+/// it; they are merely different.
+pub(super) fn session_is_newer(mismatch: &BuildMismatch, client: &BuildId) -> bool {
+    mismatch.session_protocol > mismatch.client_protocol
+        || order(client, &mismatch.running) == VersionOrder::Older
 }
 
 /// Which direction the skew runs, said only where it is actually known.
@@ -358,6 +387,14 @@ mod tests {
     use crate::host_conn::state::Disconnected;
     use roost_ipc::messages::SESSION_PROTOCOL_VERSION;
 
+    fn client() -> BuildId {
+        BuildId {
+            version: "0.0.22".into(),
+            protocol: SESSION_PROTOCOL_VERSION,
+            ..BuildId::default()
+        }
+    }
+
     fn mismatch(kind: MismatchKind, restart: RestartAction) -> BuildMismatch {
         BuildMismatch {
             kind,
@@ -368,6 +405,8 @@ mod tests {
             session_payload_kinds: vec!["sixel-mosaic".into()],
             restart,
             running: roost_ipc::session_version::BuildId::default(),
+            session_id: String::new(),
+            exe_path: None,
         }
     }
 
@@ -474,6 +513,7 @@ mod tests {
         let local = restart_prompt(
             "localhost",
             &mismatch(MismatchKind::Build, RestartAction::RestartLocal),
+            &client(),
         );
         assert_eq!(local.confirm.as_deref(), Some("Restart session"));
         assert_eq!(local.dismiss_label(), "Not now");
@@ -487,6 +527,7 @@ mod tests {
         let offer = restart_prompt(
             "pop-os",
             &mismatch(MismatchKind::Build, RestartAction::OfferRemoteUpdate),
+            &client(),
         );
         assert_eq!(
             offer.confirm.as_deref(),
@@ -510,6 +551,7 @@ mod tests {
         let none = restart_prompt(
             "remote.sock",
             &mismatch(MismatchKind::Build, RestartAction::None),
+            &client(),
         );
         assert_eq!(none.confirm, None);
         assert_eq!(none.dismiss_label(), "Close");
@@ -525,50 +567,52 @@ mod tests {
         );
     }
 
-    /// The fourth prompt, and the one raised at a host this client is
-    /// **attached to**: it leads with the two builds that disagreed,
-    /// then says what a restart costs, and claims no direction.
+    /// The Restart card leads with its reason, then names the build it
+    /// runs, the tabs it ends, and what a restart costs.
     #[test]
-    fn the_skew_prompt_names_both_builds_and_what_a_restart_costs() {
+    fn the_restart_card_says_what_it_runs_and_what_it_ends() {
         let skew = Skew {
             session_build: "gb-old".into(),
             client_build: "gb-new".into(),
         };
-        let prompt = restart_prompt_for_skew("localhost", &skew);
-
-        assert_eq!(prompt.title, "Restart the session on localhost?");
-        assert_eq!(prompt.action, RestartAction::RestartLocal);
-        assert_eq!(prompt.confirm.as_deref(), Some("Restart session"));
-        assert_eq!(prompt.dismiss_label(), "Not now");
+        let target = RestartTarget {
+            path: "/usr/bin/roost-session".into(),
+            identity: BuildId {
+                version: "0.0.22".into(),
+                ..BuildId::default()
+            },
+            source: TargetSource::Bundled,
+            session_id: "s".into(),
+            generation: 1,
+        };
+        let lead = reduced_fidelity_reason(&skew);
+        let card = restart_card("mini3", Some(&lead), &target, &[]);
+        assert_eq!(card.title, "Restart the session on mini3?");
+        assert_eq!(card.confirm.as_deref(), Some("Restart Session"));
+        assert!(card.body.starts_with(&lead), "{}", card.body);
         assert!(
-            prompt.body.starts_with(
-                "This session is attached at reduced fidelity: it was started by a roost-session \
-                 built against gb-old, and this Roost is built against gb-new."
-            ),
+            card.body
+                .contains("Runs: roost-session 0.0.22 (bundled). Ends: nothing running."),
             "{}",
-            prompt.body
+            card.body
+        );
+        assert!(card.body.ends_with(
+            "Every tab reopens as a fresh shell in its directory. Running programs end."
+        ));
+        let ends = restart_card(
+            "mini3",
+            None,
+            &RestartTarget {
+                source: TargetSource::Running,
+                ..target
+            },
+            &["vim".into(), "claude".into()],
         );
         assert!(
-            prompt
-                .body
-                .contains("Links, the alternate screen and soft wrapping are off"),
-            "the user is told what they have lost: {}",
-            prompt.body
-        );
-        assert!(
-            prompt.body.contains("Running programs end."),
-            "and what a restart costs: {}",
-            prompt.body
-        );
-        assert!(
-            !prompt.body.contains("older") && !prompt.body.contains("newer"),
-            "two build strings are merely different: {}",
-            prompt.body
-        );
-        assert!(
-            !prompt.body.contains("needs a restart"),
-            "this host is connected and serving; it is not waiting for anything: {}",
-            prompt.body
+            ends.body
+                .starts_with("Runs: roost-session 0.0.22 (current). Ends: vim, claude."),
+            "{}",
+            ends.body
         );
     }
 
@@ -603,37 +647,41 @@ mod tests {
         }
     }
 
-    /// The remote offer says which way the skew runs, but only where
-    /// that is knowable — and it keeps its button either way. A
-    /// downgrade the user has a reason for is theirs to make; a
-    /// downgrade they did not notice is not.
+    /// D3 rule 1 replaces the downgrade offer: a session newer than this
+    /// client — by protocol, or by version — gets a card naming both
+    /// builds and no button, on every transport.
     #[test]
-    fn the_remote_offer_names_a_downgrade_and_still_offers_it() {
+    fn a_newer_session_is_blocked_and_offered_nothing() {
         let mut newer = mismatch(MismatchKind::Protocol, RestartAction::OfferRemoteUpdate);
         newer.session_protocol = SESSION_PROTOCOL_VERSION + 1;
-        assert!(session_is_newer(&newer));
-        let prompt = restart_prompt("pop-os", &newer);
-        assert!(
-            prompt.body.contains("install an older build"),
-            "{}",
-            prompt.body
+        newer.running.version = "0.0.23".into();
+        assert!(session_is_newer(&newer, &client()));
+        let prompt = restart_prompt("pop-os", &newer, &client());
+        assert_eq!(prompt.confirm, None);
+        assert_eq!(prompt.action, RestartAction::None);
+        assert!(prompt.body.starts_with("Update this Roost to connect."));
+        assert!(prompt.body.contains("0.0.23") && prompt.body.contains("0.0.22"));
+
+        // By version alone, on a localhost restart prompt too.
+        let mut by_version = mismatch(MismatchKind::PayloadKind, RestartAction::RestartLocal);
+        by_version.running.version = "0.0.23".into();
+        assert!(session_is_newer(&by_version, &client()));
+        assert_eq!(
+            restart_prompt("localhost", &by_version, &client()).confirm,
+            None
         );
-        assert!(prompt.confirm.is_some(), "the offer stands");
 
         let mut older = mismatch(MismatchKind::Protocol, RestartAction::OfferRemoteUpdate);
         older.session_protocol = SESSION_PROTOCOL_VERSION - 1;
-        assert!(!session_is_newer(&older));
-        assert!(!restart_prompt("pop-os", &older)
-            .body
-            .contains("older build"));
+        older.running.version = "0.0.19".into();
+        assert!(!session_is_newer(&older, &client()));
+        assert!(restart_prompt("pop-os", &older, &client())
+            .confirm
+            .is_some());
 
-        // Two build strings that disagree are merely different, so no
-        // direction is claimed.
+        // Two build strings that disagree are merely different.
         let build = mismatch(MismatchKind::Build, RestartAction::OfferRemoteUpdate);
-        assert!(!session_is_newer(&build));
-        assert!(!restart_prompt("pop-os", &build)
-            .body
-            .contains("older build"));
+        assert!(!session_is_newer(&build, &client()));
     }
 
     /// Direction is claimed only where it is known. Protocol numbers

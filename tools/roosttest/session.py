@@ -181,6 +181,15 @@ def session_binary() -> Path:
     return built
 
 
+def describe_build(identity: dict) -> str:
+    """A build as the status lines spell it (`session_update::describe`):
+    `0.0.22`, or `0.0.22 dev a1b2c3d`."""
+    if not identity.get("dev"):
+        return identity["app_version"]
+    sha = identity.get("git_sha")
+    return f"{identity['app_version']} dev {sha}" if sha else f"{identity['app_version']} dev"
+
+
 def _is_debug_build(binary: Path) -> bool:
     """Which pair of directory names the daemon will resolve.
 

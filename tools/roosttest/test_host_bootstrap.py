@@ -1201,7 +1201,9 @@ def test_a_reduced_fidelity_ssh_host_updates_from_the_palette_and_comes_back_who
 
     The route is one handler (`App::host_fidelity_action_requested`)
     behind three entry points; the palette verb is the one an op can
-    reach, so it is the one asserted. It is activated over plain IPC with
+    reach, so it is the one asserted. Since plan 076 that verb is
+    Install Update, and a rung that is already this build turns it into
+    the Restart card. It is activated over plain IPC with
     no `test_user_origin` seam, deliberately: these verbs do not consult
     origin (§3.6, and `host:stop:` before them) — plan 039 §3.5's rule is
     that a *machine* is never prompted by a connect it did not ask for,
@@ -1219,18 +1221,11 @@ def test_a_reduced_fidelity_ssh_host_updates_from_the_palette_and_comes_back_who
     action matrix: stop, await-gone, start, reconnect, and nothing
     installed.
 
-    **Confirm letting go before the job runs is what this scenario
-    exists to fence** (§3.6, C6), and nothing else in the repo does:
-    `roost-iced` has no lib target, so no unit test constructs an `App`,
-    and deleting the disconnect leaves every Rust test green.
+    **Letting go of the stream before the stop is what this scenario
+    exists to fence** (§3.6, C6). Since plan 076 D8 the job lets go
+    only once it has re-checked what it stops, so an abort leaves the
+    connection alone; two assertions carry the order:
 
-    Three assertions carry it, deliberately at different distances:
-
-    * the host is `disconnected` with no `connect` object the instant
-      confirm returns — the sharp one, and the one that actually fails
-      when the call site goes. It is a fence rather than a race because
-      `app.dialog_answer` runs the confirm handler to completion before
-      it replies.
     * no state outside `connected`/`disconnected`/`connecting` for the
       whole job. `stopped` is the tell — that is what the far side's
       `session.stopping` looks like to a client still listening, and it
@@ -1254,37 +1249,33 @@ def test_a_reduced_fidelity_ssh_host_updates_from_the_palette_and_comes_back_who
     assert row["connect"]["reduced_fidelity"] is True, row
     assert row["connect"]["session_id"], row
 
-    update_id = f"host:update:{bootstrap_host.saved_id}"
-    assert update_id in host_row_ids(roost), sorted(host_row_ids(roost))
+    # Option 2 (plan 076 D6): a reduced-fidelity ssh session offers
+    # Install Update, never the combined update.
+    install_id = f"host:install:{bootstrap_host.saved_id}"
+    assert install_id in host_row_ids(roost), sorted(host_row_ids(roost))
+    assert f"host:update:{bootstrap_host.saved_id}" not in host_row_ids(roost)
 
     roost.palette_open("commands")
     try:
-        roost.palette_activate(update_id)
+        roost.palette_activate(install_id)
     finally:
         roost.palette_dismiss()
 
-    dump = wait_dialog(roost, "bootstrap", "update")
+    # The binary is already this build — only the *process* is stale —
+    # so the install card gives way to the Restart card that puts it to
+    # use (plan 076 D5), still leading with the two builds.
+    dump = wait_dialog(roost, "confirm_restart")
     assert FAKE_BUILD in dump["body"], dump
     assert client_libghostty_build() in dump["body"], (client_libghostty_build(), dump)
-    # Compatible binary, stale process: the matrix says stop and start,
-    # and says so on the card before anyone confirms.
-    assert "Nothing will be installed" in dump["body"], dump
+    assert "is already installed at" in dump["body"], dump
+    assert "restart to use it" in dump["body"], dump
+    assert dump["buttons"] == ["Not now", "Restart Session"], dump
 
     answer(roost, "confirm")
-    # Read once, immediately, with no wait in front of it — the whole
-    # claim is that the stream is *already* gone when confirm returns.
-    # `app.dialog_answer` runs `host_bootstrap_confirmed` to completion
-    # before it replies (`servicing.rs::AppDialogAnswer`), and the
-    # disconnect is synchronous inside it (`HostConnSet::disconnect`),
-    # so this is a fence and not a race: the job's first remote step
-    # cannot have run yet either way.
-    handed_over = status(bootstrap_host)
-    assert handed_over["state"] == "disconnected", (
-        "confirming has to let go of the session *before* the job owns it "
-        f"(§3.6) — the host was still {handed_over['state']!r}: {handed_over}"
-    )
-    assert handed_over.get("connect") is None, handed_over
-
+    # Plan 076 D8 moved the let-go from the confirm into the job: the
+    # stream goes once the job has re-checked what it stops, and before
+    # it stops it. The sample below is what still proves the order — a
+    # client still listening at the stop would show `stopped`.
     row, states = watch_the_update_job(bootstrap_host)
 
     # Everything a *let-go* host can be while a job runs, and nothing
@@ -1561,3 +1552,433 @@ def test_roostctl_never_prompts_on_a_not_found_target(roost: Roost, target):
     finally:
         with contextlib.suppress(Exception):
             roost.call("host.remove", {"id": saved_id})
+
+
+# ---------------------------------------------------------------------------
+# 11. Plan 076: Install Update and Restart Session, as ops and as cards
+# ---------------------------------------------------------------------------
+#
+# Every case runs a real daemon in the jail from a planted copy of this
+# tree's `roost-session`, with a `.test-identity` sidecar beside it
+# (plan 076 D2) so the copy answers as whichever build the case needs.
+# The old session lives at `/usr/bin` (a deb's rung) so an install lands
+# at `~/.local/bin`, ahead of it, as on a real host.
+
+OLD_VERSION = "0.0.1"
+NEWER_VERSION = "99.0.0"
+
+
+@functools.cache
+def real_identity() -> dict:
+    """This tree's `roost-session identify`, offline and from a clean
+    environment — `client_libghostty_build`'s reason."""
+    result = subprocess.run(
+        [str(sessionlib.session_binary()), "identify"],
+        env={"PATH": os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        timeout=scaled_timeout(30),
+    )
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    return json.loads(result.stdout)
+
+
+def described() -> str:
+    """This tree's build as the status lines spell it."""
+    return sessionlib.describe_build(real_identity())
+
+
+def plant_build(jail: BootstrapJail, remote: str, **identity) -> Path:
+    """This tree's binary at `remote`, answering as `identity`."""
+    planted = jail.plant(remote, sessionlib.session_binary())
+    sidecar = planted.with_name(planted.name + ".test-identity")
+    if identity:
+        sidecar.write_text(json.dumps(identity))
+    else:
+        sidecar.unlink(missing_ok=True)
+    return planted
+
+
+def connect_old_session(host: BootstrapHost, **overrides: str) -> str:
+    """Start an old session from `/usr/bin` and connect to it over ssh.
+    Answers its session id."""
+    binary = plant_build(host.jail, "/usr/bin/roost-session", app_version=OLD_VERSION)
+    start_daemon_in_jail(host.jail, binary, **overrides)
+    result = host.roost.call("host.connect", {"id": host.saved_id})
+    assert result["state"] in CONNECT_STARTED, result
+    return wait_live_connect(host)["connect"]["session_id"]
+
+
+def update_row(host: BootstrapHost, accept, what: str, timeout: float = 120.0) -> dict:
+    """Wait for the host's `host.status` row whose `update` passes
+    `accept`, and hand the row back."""
+
+    def probe() -> dict | None:
+        row = status(host)
+        update = row.get("update")
+        return row if update is not None and accept(update) else None
+
+    return wait_until(probe, timeout, what)
+
+
+def action_settled(update: dict) -> bool:
+    return update.get("action", {}).get("phase") in ("done", "failed")
+
+
+def refused(roost: Roost, op: str, saved_id: str, code: str, **extra) -> str:
+    with pytest.raises(RoostError) as raised:
+        roost.call(op, {"id": saved_id, **extra})
+    assert raised.value.code == code, (op, raised.value)
+    return raised.value.message
+
+
+def activate_row(roost: Roost, row_id: str) -> None:
+    roost.palette_open("commands")
+    try:
+        roost.palette_activate(row_id)
+    finally:
+        roost.palette_dismiss()
+
+
+def up_to_date_state() -> str:
+    """Two dev builds of one version are only `Same` with a sha to
+    compare, which a tree built without git does not have."""
+    real = real_identity()
+    return "unordered" if real.get("dev") and not real.get("git_sha") else "up-to-date"
+
+
+def test_install_update_keeps_the_session_then_restart_moves_it(
+    bootstrap_host: BootstrapHost, roost: Roost, valid_asset: str
+):
+    """AC5's whole path over ssh: `available` → Install Update leaves the
+    session and the stream alone → `staged` → Restart Session lands a
+    new session on the installed build → up to date.
+
+    The ops' own guards ride along, because this is the one case with an
+    action in flight to collide with: no `confirm` is `invalid-param`,
+    and a second action while one runs is `busy`.
+    """
+    session_id = connect_old_session(bootstrap_host)
+    row = update_row(bootstrap_host, lambda u: u["state"] == "available", "an available update")
+    assert row["update"]["session"]["version"] == OLD_VERSION, row
+
+    assert "pass confirm: true" in refused(
+        roost, "host.update", bootstrap_host.saved_id, "invalid-param"
+    )
+    assert refused(roost, "host.restart", bootstrap_host.saved_id, "invalid-param")
+
+    accepted = roost.call("host.update", {"id": bootstrap_host.saved_id, "confirm": True})
+    assert accepted == {"accepted": True}, accepted
+    for op in ("host.update", "host.restart"):
+        refused(roost, op, bootstrap_host.saved_id, "busy", confirm=True)
+
+    states: list[str] = []
+
+    def installed() -> dict | None:
+        row = status(bootstrap_host)
+        states.append(row["state"])
+        update = row.get("update")
+        return row if update is not None and action_settled(update) else None
+
+    row = wait_until(installed, 120.0, "the install to finish", interval=0.05)
+    action = row["update"]["action"]
+    assert action["kind"] == "install" and action["phase"] == "done", row
+    assert action["message"] == (
+        f"Installed roost-session {described()} on {bootstrap_host.label}"
+    ), action
+    assert set(states) == {"connected"}, f"an install never lets go of the stream: {states}"
+    assert row["connect"]["session_id"] == session_id, row
+    assert row["update"]["state"] == "staged", row
+    dest = bootstrap_host.jail.dest()
+    assert dest.read_bytes() == sessionlib.session_binary().read_bytes()
+    assert _ASSET_SERVER.fetched(valid_asset), _ASSET_SERVER.requests
+
+    accepted = roost.call("host.restart", {"id": bootstrap_host.saved_id, "confirm": True})
+    assert accepted == {"accepted": True}, accepted
+
+    def restarted() -> dict | None:
+        row = status(bootstrap_host)
+        connect = row.get("connect")
+        update = row.get("update")
+        if connect is None or update is None or connect["session_id"] == session_id:
+            return None
+        return row if update.get("action", {}).get("kind") == "restart" and action_settled(update) else None
+
+    row = wait_until(restarted, 180.0, "the restart to land a new session")
+    action = row["update"]["action"]
+    assert action["phase"] == "done", row
+    assert action["message"] == (
+        f"{bootstrap_host.label} restarted on roost-session {described()}"
+    ), action
+    assert row["update"]["session"]["version"] == real_identity()["app_version"], row
+    assert row["update"]["state"] == up_to_date_state(), row
+    serving = session_answering(bootstrap_host.jail.socket())
+    assert serving is not None and serving["session_id"] == row["connect"]["session_id"]
+
+    # Down, the host still reports the action — with the session it
+    # learned last, not the one the restart started from.
+    roost.call("host.disconnect", {"id": bootstrap_host.saved_id})
+    row = update_row(bootstrap_host, lambda u: True, "the update facts while disconnected")
+    assert row["state"] == "disconnected", row
+    assert row["update"]["session"]["version"] == real_identity()["app_version"], row
+    assert row["update"]["action"]["kind"] == "restart", row
+
+
+def test_install_is_refused_to_a_client_older_than_the_session(
+    bootstrap_host: BootstrapHost, roost: Roost
+):
+    binary = plant_build(bootstrap_host.jail, "/usr/bin/roost-session", app_version=NEWER_VERSION)
+    start_daemon_in_jail(bootstrap_host.jail, binary)
+    roost.call("host.connect", {"id": bootstrap_host.saved_id})
+    row = update_row(bootstrap_host, lambda u: u["state"] == "session-newer", "session-newer")
+    assert row["update"]["blocked"] is False, row
+    message = refused(roost, "host.update", bootstrap_host.saved_id, "invalid-param", confirm=True)
+    assert "newer than this Roost" in message, message
+    assert f"host:install:{bootstrap_host.saved_id}" not in host_row_ids(roost)
+    assert not bootstrap_host.jail.dest().exists()
+
+
+def test_install_over_a_newer_rung_offers_the_restart_instead(
+    bootstrap_host: BootstrapHost, roost: Roost, valid_asset: str
+):
+    """D7's second refusal: the rung the host would exec is newer than
+    this client, so nothing is installed. The op's probe finds it, fails
+    with the reason, and teaches `staged` (D5) — after which the menu
+    offers the Restart that would run it instead of an install."""
+    session_id = connect_old_session(bootstrap_host)
+    rung = plant_build(bootstrap_host.jail, "$HOME/.local/bin/roost-session", app_version=NEWER_VERSION)
+    before = rung.read_bytes()
+    update_row(bootstrap_host, lambda u: u["state"] == "available", "an available update")
+
+    roost.call("host.update", {"id": bootstrap_host.saved_id, "confirm": True})
+    row = update_row(bootstrap_host, action_settled, "the refused install to settle")
+    action = row["update"]["action"]
+    assert action["phase"] == "failed", row
+    assert "already installed; restart to use it" in action["message"], action
+    assert row["update"]["state"] == "staged", row
+    assert row["connect"]["session_id"] == session_id, row
+    assert rung.read_bytes() == before, "a newer rung must never be overwritten"
+    assert not _ASSET_SERVER.fetched(valid_asset), _ASSET_SERVER.requests
+
+    message = refused(roost, "host.update", bootstrap_host.saved_id, "invalid-param", confirm=True)
+    assert "already installed; restart to use it" in message, message
+    rows = host_row_ids(roost)
+    assert f"host:install:{bootstrap_host.saved_id}" not in rows, sorted(rows)
+    activate_row(roost, f"host:restart:{bootstrap_host.saved_id}")
+    card = wait_dialog(roost, "confirm_restart")
+    assert card["title"] == f"Restart the session on {bootstrap_host.label}?", card
+    assert f"Runs: roost-session {NEWER_VERSION}" in card["body"], card
+    assert "(installed). Ends: nothing running." in card["body"], card
+    answer(roost, "cancel")
+    wait_no_dialog(roost)
+    assert status(bootstrap_host)["connect"]["session_id"] == session_id
+
+
+def test_install_is_refused_to_a_session_on_another_protocol(
+    bootstrap_host: BootstrapHost, roost: Roost
+):
+    """D7's third refusal, on a real protocol mismatch (the sidecar's
+    `session_protocol`): Install Update would leave the old daemon
+    running beside agent hooks of another protocol, so it is refused,
+    through the UI and the op. The combined Update, which stops that
+    daemon at once, is what is offered."""
+    protocol = real_identity()["session_protocol"]
+    binary = plant_build(
+        bootstrap_host.jail,
+        "/usr/bin/roost-session",
+        app_version=OLD_VERSION,
+        session_protocol=protocol - 1,
+    )
+    start_daemon_in_jail(bootstrap_host.jail, binary)
+    assert session_answering(bootstrap_host.jail.socket())["session_protocol"] == protocol - 1
+    roost.call("host.connect", {"id": bootstrap_host.saved_id})
+    row = update_row(bootstrap_host, lambda u: u["state"] == "required", "required")
+    assert row["state"] == "needs-restart", row
+    message = refused(roost, "host.update", bootstrap_host.saved_id, "invalid-param", confirm=True)
+    assert "speaks another protocol" in message, message
+    rows = host_row_ids(roost)
+    assert f"host:install:{bootstrap_host.saved_id}" not in rows, sorted(rows)
+    assert f"host:update:{bootstrap_host.saved_id}" in rows, sorted(rows)
+
+    activate_row(roost, f"host:update:{bootstrap_host.saved_id}")
+    card = wait_dialog(roost, "bootstrap", "update")
+    assert card["buttons"] == ["Cancel", "Update"], card
+    answer(roost, "cancel")
+    wait_no_dialog(roost)
+    assert not bootstrap_host.jail.dest().exists()
+
+
+def test_a_newer_session_this_client_cannot_talk_to_offers_no_install(
+    bootstrap_host: BootstrapHost, roost: Roost
+):
+    """`session-newer` with `blocked` (AC6): the card names both builds
+    and has no button, and neither op acts."""
+    binary = plant_build(bootstrap_host.jail, "/usr/bin/roost-session", app_version=NEWER_VERSION)
+    start_daemon_in_jail(
+        bootstrap_host.jail,
+        binary,
+        ROOST_SESSION_FAKE_BUILD=FAKE_BUILD,
+        ROOST_SESSION_LEGACY_KINDS="1",
+    )
+    bootstrap_host.connect_started()
+    row = update_row(bootstrap_host, lambda u: u["state"] == "session-newer", "session-newer")
+    assert row["update"]["blocked"] is True, row
+    for op in ("host.update", "host.restart"):
+        refused(roost, op, bootstrap_host.saved_id, "invalid-param", confirm=True)
+    rows = host_row_ids(roost)
+    assert not {
+        f"host:update:{bootstrap_host.saved_id}",
+        f"host:install:{bootstrap_host.saved_id}",
+    } & set(rows), sorted(rows)
+
+    bootstrap_host.connect()
+    card = wait_dialog(roost, "confirm_restart")
+    assert card["buttons"] == ["Close"], card
+    assert card["body"].startswith("Update this Roost to connect."), card
+    assert NEWER_VERSION in card["body"], card
+    answer(roost, "cancel")
+    wait_no_dialog(roost)
+    assert not bootstrap_host.jail.dest().exists()
+
+
+def test_a_rung_that_will_not_identify_is_never_restarted_onto(
+    bootstrap_host: BootstrapHost, roost: Roost
+):
+    session_id = connect_old_session(bootstrap_host)
+    # Planted after the connect: the live bridge already runs from
+    # `/usr/bin`, and the probe reads this one.
+    bootstrap_host.jail.plant_stub(
+        "$HOME/.local/bin/roost-session", "#!/bin/sh\nprintf 'not an identity\\n'\n"
+    )
+    roost.call("host.restart", {"id": bootstrap_host.saved_id, "confirm": True})
+    row = update_row(bootstrap_host, action_settled, "the restart to be refused")
+    action = row["update"]["action"]
+    assert action["phase"] == "failed", row
+    assert "can't read its roost-session" in action["message"], action
+    assert row["update"]["restart"] == {"offered": False, "why": "unreadable"}, row
+    assert row["connect"]["session_id"] == session_id, row
+    assert session_answering(bootstrap_host.jail.socket())["session_id"] == session_id
+
+
+def test_cancelling_the_install_card_changes_nothing(
+    bootstrap_host: BootstrapHost, roost: Roost, valid_asset: str
+):
+    session_id = connect_old_session(bootstrap_host)
+    update_row(bootstrap_host, lambda u: u["state"] == "available", "an available update")
+
+    activate_row(roost, f"host:install:{bootstrap_host.saved_id}")
+    card = wait_dialog(roost, "bootstrap", "install_update")
+    assert card["title"] == (
+        f"Install roost-session {real_identity()['app_version']} on {bootstrap_host.label}?"
+    ), card
+    assert "goes ahead of the" in card["body"] and "/usr/bin/roost-session" in card["body"], card
+    assert card["body"].endswith(
+        "The running session keeps going. Restart it when you're ready to use the new build."
+    ), card
+    assert card["buttons"] == ["Cancel", "Install"], card
+    answer(roost, "cancel")
+    wait_no_dialog(roost)
+
+    row = status(bootstrap_host)
+    assert row["connect"]["session_id"] == session_id, row
+    assert "action" not in row["update"], row
+    assert not bootstrap_host.jail.dest().exists()
+    assert not _ASSET_SERVER.requests, _ASSET_SERVER.requests
+
+
+def test_a_rung_swapped_under_the_restart_card_aborts_before_anything_stops(
+    bootstrap_host: BootstrapHost, roost: Roost
+):
+    """AC8: the card is a snapshot; the confirm re-checks the binary it
+    named, and a different one aborts with "the session changed" before
+    the session is stopped."""
+    session_id = connect_old_session(bootstrap_host)
+    rung = plant_build(bootstrap_host.jail, "$HOME/.local/bin/roost-session")
+    update_row(bootstrap_host, lambda u: u["state"] == "available", "an available update")
+
+    activate_row(roost, f"host:install:{bootstrap_host.saved_id}")
+    card = wait_dialog(roost, "confirm_restart")
+    assert "is already installed at" in card["body"], card
+
+    rung.with_name(rung.name + ".test-identity").write_text(json.dumps({"app_version": "0.0.50"}))
+    generation = status(bootstrap_host)["generation"]
+    answer(roost, "confirm")
+
+    states: list[str] = []
+
+    def aborted() -> dict | None:
+        row = status(bootstrap_host)
+        states.append(row["state"])
+        update = row.get("update")
+        return row if update is not None and action_settled(update) else None
+
+    row = wait_until(aborted, 120.0, "the restart to abort", interval=0.02)
+    assert set(states) == {"connected"}, (
+        f"an abort must leave the connection untouched, but the host was {sorted(set(states))}"
+    )
+    assert row["generation"] == generation, ("no new connection may have been made", row)
+    action = row["update"]["action"]
+    assert action["phase"] == "failed", row
+    assert "the session on" in action["message"] and "changed; check again" in action["message"], (
+        action
+    )
+    assert row["connect"]["session_id"] == session_id, (
+        f"the abort must come before the stop: {row}"
+    )
+
+
+def test_a_cancelled_action_does_not_leave_the_host_busy(
+    bootstrap_host: BootstrapHost, roost: Roost
+):
+    """D8, cancellation. While a restart holds the host a Connect is
+    `busy` rather than a second connection. A Disconnect once the
+    destructive half has begun — the stream let go — ends the action as
+    failed, but the host stays `busy` while the job is still out over
+    there. The job's completion releases it and changes nothing else: no
+    reconnect behind the Disconnect. Only then is a Connect accepted."""
+    old = connect_old_session(bootstrap_host)
+    plant_build(bootstrap_host.jail, "$HOME/.local/bin/roost-session")
+    update_row(bootstrap_host, lambda u: u["state"] == "available", "an available update")
+
+    accepted = roost.call("host.restart", {"id": bootstrap_host.saved_id, "confirm": True})
+    assert accepted == {"accepted": True}, accepted
+    message = refused(roost, "host.connect", bootstrap_host.saved_id, "busy")
+    assert message == f"a restart/update is in progress on {bootstrap_host.label}", message
+
+    def released() -> dict | None:
+        row = status(bootstrap_host)
+        running = row.get("update", {}).get("action", {}).get("phase") == "running"
+        return row if running and row["state"] != "connected" else None
+
+    wait_until(released, 120.0, "the restart to let go of the stream", interval=0.01)
+    roost.call("host.disconnect", {"id": bootstrap_host.saved_id})
+    message = refused(roost, "host.connect", bootstrap_host.saved_id, "busy")
+    assert message == f"a restart/update on {bootstrap_host.label} is being cancelled", message
+    row = status(bootstrap_host)
+    action = row["update"]["action"]
+    assert action["phase"] == "failed", row
+    assert "disconnected while the action ran" in action["message"], action
+    generation = row["generation"]
+
+    def replaced() -> dict | None:
+        serving = session_answering(bootstrap_host.jail.socket())
+        return serving if serving is not None and serving["session_id"] != old else None
+
+    wait_until(replaced, 120.0, "the cancelled job to finish its restart")
+
+    def connected_once_free() -> dict | None:
+        row = status(bootstrap_host)
+        assert row["state"] == "disconnected", ("a cancelled job reconnected the host", row)
+        assert row["generation"] == generation, ("no connection may follow a cancel", row)
+        assert row["update"]["action"]["phase"] == "failed", row
+        try:
+            return roost.call("host.connect", {"id": bootstrap_host.saved_id})
+        except RoostError as error:
+            assert error.code == "busy", error
+            return None
+
+    result = wait_until(
+        connected_once_free, 120.0, "the cancelled job's completion to release the host"
+    )
+    assert result["state"] in CONNECT_STARTED, result
+    wait_live_connect(bootstrap_host)

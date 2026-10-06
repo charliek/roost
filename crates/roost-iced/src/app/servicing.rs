@@ -4,7 +4,7 @@ use roost_engine::ipc::{DumpError, HostOpFailure, HostOpReply};
 use roost_ipc::codes;
 use roost_ipc::messages::{
     ActivationOutcome, AppContextMenuDumpResult, AppContextMenuTarget, AppSecureInputResult,
-    SentFile, SkippedFile, TabSendFileResult, WireProjectRef,
+    HostActionResult, SentFile, SkippedFile, TabSendFileResult, WireProjectRef,
 };
 use roost_ui_model::context_menu::{ContextAction, ContextTarget};
 use roost_ui_model::file_transfer::{status, Refusal, Skipped, Target};
@@ -2354,6 +2354,7 @@ impl App {
                             task = task.then(self.settle_connect_purpose(host));
                             self.rearm_initial_local_selection(host);
                         } else {
+                            self.host_action_connect_settled(host);
                             // #481. Kept while the ladder is still
                             // climbing — see `retire_host_durability`.
                             retire_host_durability(
@@ -2409,9 +2410,11 @@ impl App {
                     self.hosts.note_connect_facts(host, facts);
                     if let Some(name) = owner {
                         self.host_session_identified(&name, host);
+                        self.host_action_facts_landed(&name);
                     }
                 }
                 EngineFeed::RestartTarget(resolved) => self.restart_target_resolved(*resolved),
+                EngineFeed::HostAction(event) => self.host_action_event(*event),
                 EngineFeed::ReconnectDue { host, request } => {
                     self.host_reconnect_due(&host, request)
                 }
@@ -4287,6 +4290,18 @@ impl App {
             UiRequest::HostStatus { id, reply } => {
                 let _ = reply.send(self.host_status_op(id.as_deref()));
             }
+            // Plan 076 D7: the menu's own paths, with the claim taken
+            // up front and no card.
+            UiRequest::HostUpdate { id, reply } => {
+                let result = self.host_install_requested(&id, true);
+                self.reconcile();
+                let _ = reply.send(result.map(|()| HostActionResult { accepted: true }));
+            }
+            UiRequest::HostRestart { id, reply } => {
+                let result = self.host_session_restart_requested(&id, true);
+                self.reconcile();
+                let _ = reply.send(result.map(|()| HostActionResult { accepted: true }));
+            }
             UiRequest::AgentSetHooks { agents, reply } => {
                 self.agent_set_hooks_op(&agents, reply);
             }
@@ -4325,8 +4340,11 @@ impl App {
         &mut self,
         saved_id: &str,
         test_user_origin: bool,
-    ) -> Result<HostConnectionResult, roost_engine::WorkspaceError> {
-        let host = self.saved_host(saved_id)?;
+    ) -> Result<HostConnectionResult, HostOpFailure> {
+        let host = self
+            .saved_host(saved_id)
+            .map_err(|error| HostOpFailure::new(codes::NOT_FOUND, error.to_string()))?;
+        self.refuse_connect_during_action(saved_id)?;
         if test_user_origin && self.test_mode {
             self.host_connect_requested(saved_id, crate::host_conn::RequestOrigin::User);
         } else {
@@ -4501,8 +4519,8 @@ impl App {
                 .host_views
                 .iter()
                 .find(|view| view.saved_id == host.id)
-                .and_then(|view| view.update.as_ref())
-                .map(roost_ui_model::session_update::UpdateFacts::status);
+                .and_then(|view| view.update.as_ref());
+            let update = self.host_actions.update_status(&host.id, update);
             hosts.push(HostStatus {
                 id: host.id.clone(),
                 label: host.label,

@@ -746,6 +746,10 @@ async fn launch(
         // does not exist yet to misread.
         command.env(NO_SEED_ENV, "1");
     }
+    // Every path below reaps it; this is for the future being dropped
+    // part-way, which would otherwise leave the launcher running with
+    // nobody reading its verdict.
+    command.kill_on_drop(true);
     let mut child = command
         .spawn()
         .with_context(|| format!("spawn {}", bin.display()))?;
@@ -1041,8 +1045,34 @@ pub struct StopReport {
 /// `roostctl session stop` and the UI's client-side restart composition
 /// (plan 037 §3.7) climb the same pair.
 pub async fn stop_session(socket: &Path, budget: Duration) -> Result<Option<StopReport>> {
+    match stop_session_if(socket, None, budget).await? {
+        Stop::Gone => Ok(None),
+        Stop::Stopped(report) => Ok(Some(*report)),
+        Stop::NotExpected(_) => unreachable!("no session id was expected"),
+    }
+}
+
+/// What [`stop_session_if`] did.
+#[derive(Debug, Clone)]
+pub enum Stop {
+    /// Nothing was listening.
+    Gone,
+    /// The session that answered is not the expected one; it was left
+    /// running. Carries its id.
+    NotExpected(String),
+    Stopped(Box<StopReport>),
+}
+
+/// [`stop_session`], refusing unless the session that answers is
+/// `expected`. The comparison is made on the very connection the stop is
+/// sent over, so no other session can take the socket in between.
+pub async fn stop_session_if(
+    socket: &Path,
+    expected: Option<&str>,
+    budget: Duration,
+) -> Result<Stop> {
     if probe_gone(socket).await {
-        return Ok(None);
+        return Ok(Stop::Gone);
     }
     // `budget` is the *reap* budget and is deliberately generous; the two
     // legs before it are ordinary control-plane calls and get the
@@ -1057,12 +1087,15 @@ pub async fn stop_session(socket: &Path, budget: Duration) -> Result<Option<Stop
             ops::SESSION_IDENTIFY
         )
     })?;
+    if expected.is_some_and(|expected| expected != identity.session_id) {
+        return Ok(Stop::NotExpected(identity.session_id));
+    }
     let reap: SessionStopResult =
         tokio::time::timeout(budget, client.call(ops::SESSION_STOP, SessionStopParams {}))
             .await
             .map_err(|_| anyhow!("{} did not answer within {budget:?}", ops::SESSION_STOP))?
             .context(ops::SESSION_STOP)?;
-    Ok(Some(StopReport { identity, reap }))
+    Ok(Stop::Stopped(Box::new(StopReport { identity, reap })))
 }
 
 /// Wait for the stopped session to actually leave, bounded by `budget`.
@@ -1394,6 +1427,59 @@ mod tests {
         ));
         // Fail-safe: an unanswerable socket is never called dead.
         assert!(!stop_completed(PollObservation::Indeterminate, "sess-1"));
+    }
+
+    /// A stop aimed at one session is never delivered to another: the
+    /// identify on the stop's own connection decides, and a mismatch
+    /// sends no `session.stop` at all.
+    #[tokio::test]
+    async fn a_stop_aimed_at_one_session_leaves_another_running() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("other.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = std::sync::Arc::clone(&seen);
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (read, mut write) = stream.into_split();
+                let mut lines = BufReader::new(read).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let op = request["op"].as_str().unwrap_or_default().to_string();
+                    recorded.lock().unwrap().push(op.clone());
+                    let result = serde_json::to_value(crate::messages::SessionIdentify {
+                        session_id: "someone-else".into(),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                    let reply =
+                        serde_json::json!({"id": request["id"], "ok": true, "result": result});
+                    let mut frame = reply.to_string();
+                    frame.push('\n');
+                    if write.write_all(frame.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        let outcome = stop_session_if(&socket, Some("mine"), DEFAULT_STOP_CALL_BUDGET)
+            .await
+            .expect("the identify answered");
+        server.abort();
+        assert!(
+            matches!(&outcome, Stop::NotExpected(id) if id == "someone-else"),
+            "{outcome:?}"
+        );
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|op| op == ops::SESSION_STOP),
+            "no stop may reach a session that was not the one named: {:?}",
+            seen.lock().unwrap()
+        );
     }
 
     /// Stopping a path nothing is listening at is a success that costs

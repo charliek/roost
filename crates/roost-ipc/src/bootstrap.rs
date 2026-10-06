@@ -58,8 +58,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::messages::{ops, SessionBinaryIdentity, SessionIdentify};
+use crate::framing::FrameReader;
+use crate::messages::{ops, Response, SessionBinaryIdentity, SessionIdentify};
 use crate::session_launch::{drain_tail, reap_by, Tail, Verdict};
+use crate::session_version::BuildId;
 use crate::ssh::{
     classify_ssh_failure, exit_master, last_line, pick_socket_dir, scaled, SshFailure, SshTarget,
     SshTunnelOptions,
@@ -1461,6 +1463,17 @@ pub enum BootstrapError {
     Stop(String),
     /// The session would not start.
     Start(String),
+    /// The running session, or the binary the job was planned against,
+    /// is no longer what the person agreed to act on (plan 076 D8).
+    /// Nothing was stopped or written.
+    Changed,
+    /// A restart ran, and the session serving afterwards is not the
+    /// build it was meant to start. Carries what is serving.
+    Unverified(String),
+    /// The session stopped, and the binary it was to be started from is
+    /// no longer the build that was agreed to. Nothing was started.
+    /// Carries its path.
+    TargetChanged(String),
 }
 
 impl BootstrapError {
@@ -1549,6 +1562,16 @@ impl BootstrapError {
             Self::Start(detail) => format!(
                 "roost-session is installed on {target} but wouldn't start: {detail}. Try \
                  `roostctl session start` on {target}."
+            ),
+            Self::Changed => format!(
+                "the session on {target} changed; check again. Nothing was stopped or installed."
+            ),
+            Self::Unverified(serving) => {
+                format!("{target} restarted, but the session is still {serving}")
+            }
+            Self::TargetChanged(path) => format!(
+                "the session on {target} stopped, but {path} is no longer the build it was to \
+                 start; nothing was started"
             ),
         }
     }
@@ -2154,6 +2177,34 @@ pub struct Installed {
     /// path — so it rides along on the success value for the toast to
     /// append (plan 039 §3.4). Nothing edits a dotfile over this.
     pub path_warning: Option<String>,
+    /// What the installed file answered once it was in place: the build
+    /// a start from `dest` has to come up as (plan 076 D8).
+    pub identity: SessionBinaryIdentity,
+}
+
+/// One bridge's `session.identify`, then — only if `expected` answered —
+/// its `session.stop`. `Ok(Ok(None))` is another session serving;
+/// `Ok(Err(_))` is the identify refused.
+async fn identify_then_stop<W, R>(
+    sink: &mut W,
+    reader: &mut FrameReader<R>,
+    expected: &str,
+) -> anyhow::Result<Result<Option<Response>, String>>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+{
+    let identify = crate::ssh::call_on(sink, reader, 1, ops::SESSION_IDENTIFY).await?;
+    if !identify.ok {
+        return Ok(Err(crate::ssh::render_response_error(&identify)));
+    }
+    let serving: SessionIdentify =
+        serde_json::from_value(identify.result.unwrap_or(serde_json::Value::Null))?;
+    if serving.session_id != expected {
+        return Ok(Ok(None));
+    }
+    let stop = crate::ssh::call_on(sink, reader, 2, ops::SESSION_STOP).await?;
+    Ok(Ok(Some(stop)))
 }
 
 /// What the far side's bridge said to one op.
@@ -2441,6 +2492,23 @@ impl BootstrapJob {
     /// never leaves a `.bak.` behind either, because the commit exec
     /// creates and consumes one within a single exec's lifetime.
     pub async fn install(&self, source: &ResolvedSource) -> Result<Installed, BootstrapError> {
+        self.install_guarded(source, || async { Ok(()) }).await
+    }
+
+    /// [`Self::install`], asking `before_commit` immediately before the
+    /// staged file replaces anything: an error there abandons the
+    /// install with the destination untouched. What a caller checks
+    /// there is whatever must still hold at the moment of the overwrite
+    /// (plan 076 D8).
+    pub async fn install_guarded<F, Fut>(
+        &self,
+        source: &ResolvedSource,
+        before_commit: F,
+    ) -> Result<Installed, BootstrapError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), BootstrapError>>,
+    {
         let prepared = self
             .run_script(&prepare_script(), INSTALL_BUDGET, SMALL_STDOUT_CAP)
             .await
@@ -2451,8 +2519,11 @@ impl BootstrapJob {
             })?;
         let staged = parse_prepare(&prepared.stdout)?;
 
-        match self.install_staged(source, &staged).await {
-            Ok(()) => self.discard_backup(&staged.backup).await,
+        let identity = match self.install_staged(source, &staged, before_commit).await {
+            Ok(identity) => {
+                self.discard_backup(&staged.backup).await;
+                identity
+            }
             Err(error) => {
                 let restored = self.rollback(&staged.dest, &staged.backup).await;
                 self.cleanup(&staged.tmp).await;
@@ -2465,22 +2536,28 @@ impl BootstrapJob {
                     other => other,
                 });
             }
-        }
+        };
 
         Ok(Installed {
             dest: staged.dest.clone(),
             path_warning: self.path_warning(&staged.dest).await,
+            identity,
         })
     }
 
     /// [`Self::install`]'s middle, split out so that one `?` on any of
     /// its steps is one cleanup at the caller — rather than four
     /// hand-written cleanup paths that have to stay in agreement.
-    async fn install_staged(
+    async fn install_staged<F, Fut>(
         &self,
         source: &ResolvedSource,
         staged: &Staged,
-    ) -> Result<(), BootstrapError> {
+        before_commit: F,
+    ) -> Result<SessionBinaryIdentity, BootstrapError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), BootstrapError>>,
+    {
         self.run_command(
             &stream_command(&staged.tmp),
             ExecStdin::Source(source),
@@ -2503,7 +2580,9 @@ impl BootstrapJob {
             .await
             .and_then(ExecOutcome::require_ok)
             .map_err(BootstrapError::Verify)?;
-        self.require_identity(&String::from_utf8_lossy(&verified.stdout), Staging::Staged)?;
+        let staged_identity =
+            self.require_identity(&String::from_utf8_lossy(&verified.stdout), Staging::Staged)?;
+        before_commit().await?;
 
         self.run_script(
             &commit_script(&staged.tmp, &staged.dest, &staged.backup),
@@ -2520,8 +2599,21 @@ impl BootstrapJob {
         // The same question again, of the file that is now installed:
         // the staged verify proved the *temporary* was right, and a
         // `mv` is not the only thing that can happen to a path between
-        // two execs.
-        self.identify_binary(&staged.dest).await
+        // two execs. Every build fact has to match what was staged, not
+        // only the install gate's triple, because what the staged file
+        // answered is what a start from here is then held to (plan 076
+        // D8).
+        let installed = self.identify_binary(&staged.dest).await?;
+        if BuildId::from(&installed) != BuildId::from(&staged_identity) {
+            return Err(BootstrapError::PostCommit {
+                detail: format!(
+                    "{} answered as another build than the one staged there",
+                    staged.dest
+                ),
+                restored: false,
+            });
+        }
+        Ok(staged_identity)
     }
 
     /// Ask the binary at `path` who it is, and require this client's
@@ -2531,7 +2623,7 @@ impl BootstrapJob {
     /// [`BootstrapError::Verify`]: by the time this runs the new file is
     /// the installed one, and the two families exist to tell those apart
     /// in the copy.
-    async fn identify_binary(&self, path: &str) -> Result<(), BootstrapError> {
+    async fn identify_binary(&self, path: &str) -> Result<SessionBinaryIdentity, BootstrapError> {
         let asked = vec![path.to_string()];
         let outcome = self
             .run_script(
@@ -2556,7 +2648,11 @@ impl BootstrapJob {
     }
 
     /// The install rule, applied to one `identify` answer.
-    fn require_identity(&self, stdout: &str, staging: Staging) -> Result<(), BootstrapError> {
+    fn require_identity(
+        &self,
+        stdout: &str,
+        staging: Staging,
+    ) -> Result<SessionBinaryIdentity, BootstrapError> {
         let expected = &self.options.expected;
         let refuse = |detail: String| match staging {
             Staging::Staged => BootstrapError::Verify(detail),
@@ -2566,7 +2662,7 @@ impl BootstrapJob {
             },
         };
         match parse_identity_line(stdout) {
-            Some(found) if identity_matches(expected, &found) => Ok(()),
+            Some(found) if identity_matches(expected, &found) => Ok(found),
             Some(found) => Err(refuse(format!(
                 "it reports {} / protocol {} / {}, and this Roost needs {} / protocol {} / {}",
                 found.app_version,
@@ -2717,6 +2813,75 @@ impl BootstrapJob {
         }
     }
 
+    /// [`Self::stop_over_the_wire`], refusing with
+    /// [`BootstrapError::Changed`] unless the session that answers is
+    /// `expected`. The identify and the stop travel over one bridge, so
+    /// one connection to one session, and nothing can take the socket in
+    /// between (plan 076 D8).
+    pub async fn stop_session_if(&self, expected: &str) -> Result<(), BootstrapError> {
+        let JobChild {
+            mut child,
+            tail,
+            mut sink,
+            stdout,
+        } = self
+            .spawn_exec(&exec_chain_command(self.options.jail_fs_root))
+            .map_err(BootstrapError::Stop)?;
+        let deadline = Instant::now() + scaled(IDENTIFY_BUDGET) + scaled(STOP_BUDGET);
+        let mut reader = FrameReader::new(stdout);
+        let exchange = tokio::time::timeout_at(
+            deadline,
+            identify_then_stop(&mut sink, &mut reader, expected),
+        )
+        .await;
+        drop(sink);
+        let answered = match exchange {
+            Ok(inner) => inner,
+            Err(_elapsed) => Err(anyhow!("{} did not answer in time", ops::SESSION_STOP)),
+        };
+        let stop = match answered {
+            Ok(Ok(Some(stop))) => {
+                reap_by(&mut child, deadline).await;
+                stop
+            }
+            Ok(Ok(None)) => {
+                reap_by(&mut child, deadline).await;
+                return Err(BootstrapError::Changed);
+            }
+            Ok(Err(detail)) => {
+                reap_by(&mut child, deadline).await;
+                return Err(BootstrapError::Stop(detail));
+            }
+            Err(error) => {
+                reap_by(&mut child, Instant::now()).await;
+                let tail = drain_tail(tail, deadline).await.text;
+                let code = child
+                    .try_wait()
+                    .ok()
+                    .flatten()
+                    .and_then(|status| status.code());
+                if matches!(classify_ssh_failure(code, &tail), SshFailure::NoSession) {
+                    return Err(BootstrapError::Changed);
+                }
+                return Err(BootstrapError::Stop(match last_line(&tail) {
+                    Some(line) => format!("{error:#} ({line})"),
+                    None => format!("{error:#}"),
+                }));
+            }
+        };
+        if stop.ok {
+            return Ok(());
+        }
+        let code = stop.error.as_ref().map(|error| error.code.as_str());
+        if code == Some(crate::codes::SHUTTING_DOWN) {
+            tracing::info!(host = %self.target, "bootstrap: the session was already shutting down; waiting for it to go");
+            return Ok(());
+        }
+        Err(BootstrapError::Stop(crate::ssh::render_response_error(
+            &stop,
+        )))
+    }
+
     /// Poll until the far side reports no session.
     ///
     /// Load-bearing, not belt-and-braces: `session.stop` replies from a
@@ -2793,8 +2958,25 @@ impl BootstrapJob {
     /// safe is [`Self::post_start_identify`], which asks the session
     /// that is actually serving who it is.
     pub async fn start(&self, path: &str) -> Result<Verdict, BootstrapError> {
+        self.start_guarded(path, || async { Ok(()) }).await
+    }
+
+    /// [`Self::start`], asking `before_each` immediately before every
+    /// launch, retries included: an error there launches nothing. What a
+    /// caller checks there is that `path` is still the build it agreed
+    /// to run (plan 076 D8).
+    pub async fn start_guarded<F, Fut>(
+        &self,
+        path: &str,
+        before_each: F,
+    ) -> Result<Verdict, BootstrapError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<(), BootstrapError>>,
+    {
         let deadline = Instant::now() + scaled(ALREADY_RUNNING_BUDGET);
         loop {
+            before_each().await?;
             let verdict = self.start_once(path).await?;
             match verdict {
                 Verdict::AlreadyRunning(_) if Instant::now() < deadline => {
@@ -2834,6 +3016,21 @@ impl BootstrapJob {
         Err(BootstrapError::Start(
             "it printed no readiness line at all".to_string(),
         ))
+    }
+
+    /// Ask whatever session is serving over there who it is: `None`
+    /// when nothing is.
+    pub async fn session_identify(&self) -> Result<Option<SessionIdentify>, String> {
+        match self
+            .bridge_call(ops::SESSION_IDENTIFY, scaled(IDENTIFY_BUDGET))
+            .await?
+        {
+            BridgeAnswer::NoSession => Ok(None),
+            BridgeAnswer::Refused { detail, .. } => Err(detail),
+            BridgeAnswer::Ok(value) => serde_json::from_value(value)
+                .map(Some)
+                .map_err(|error| format!("its identity did not parse: {error}")),
+        }
     }
 
     /// Ask the session that is now *running* who it is, before the job
