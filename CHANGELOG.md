@@ -11,6 +11,50 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+### Added
+
+- **Session versions and separate Install / Restart actions (plan 076)** —
+  in Roost-Iced, every host's right-click menu now shows its session
+  version in a header (`Session 0.0.21 · 0.0.22 available`, `up to date`,
+  `0.0.22 installed · restart to use it`, `newer than this Roost`,
+  `needed to connect`), and project and tab menus open the host's rows
+  with a header naming the host. **Install Update…** (SSH only) installs
+  the matching `roost-session` without restarting, so the running session
+  and your programs keep going; **Restart Session…** (every transport with
+  a usable build) restarts onto the newest usable build and says which one
+  it will run and which tabs it will end. The band gains a `needs update`
+  pill for a session that cannot connect and `update Roost` for one newer
+  than this Roost. Both actions re-check the session and the binary on
+  confirm and abort with "the session changed; check again" if either
+  moved.
+- **Never downgrade** — a restart never runs a build older than the
+  running session or one this Roost cannot connect to, and an install is
+  refused when this Roost is older than the session or the host already has
+  a newer build. A session newer than this Roost now shows "Update this
+  Roost to connect" instead of offering to install an older build.
+- **Dev marker** — builds not produced by the release workflow (local
+  builds, prerelease tags) report `dev` and a short git sha in
+  `session.identify`; the menu shows `dev a1b2c3d`. Sessions started before
+  this release report neither, so a pre-076 dev session reads as a release
+  build until it is restarted.
+- **`host.update` and `host.restart` ops, and `host.status` `update`** —
+  UI-socket ops (`{id, confirm: true}`, no `roostctl` verbs) that run the
+  same paths as the menu rows; `host.status` gains an optional `update`
+  object (state, session and client builds, the restart offer, and the
+  latest action's `running`/`done`/`failed` outcome). See
+  [`ipc.md`](docs/reference/ipc.md) and the
+  [host sessions guide](docs/guides/host-sessions.md#seeing-and-changing-a-hosts-session-version).
+
+### Changed
+
+- **Restart works over SSH, and Update is for sessions that cannot
+  connect** — the one all-or-nothing "update and restart" is split in two.
+  `host:update:<id>` (**Update roost-session…**) is now offered only when
+  the session cannot connect over SSH; reduced fidelity opens Install
+  Update… or Restart Session… depending on where the stale build is.
+  Roost never probes an SSH host in the background, so another machine's
+  install shows as "available" until you start an action.
+
 ## v0.0.22 — 2026-10-04
 
 _The Mac-gap release before v0.1.0 (plans 073 and 074): Roost-Iced gains
