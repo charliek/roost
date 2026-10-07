@@ -267,6 +267,15 @@ class Lane:
         self.pid = self.env.start_daemonized().verdict.pid
         return self.env.identify()["session_id"]
 
+    def socket_answers(self) -> bool:
+        """`lane.start` returns before the UI has spawned the session, so
+        its socket can still be missing (or not yet listening) here."""
+        try:
+            with self.session():
+                return True
+        except (FileNotFoundError, ConnectionRefusedError):
+            return False
+
     def session_projects(self) -> list[dict]:
         with self.session() as c:
             return c.list()
@@ -1632,7 +1641,7 @@ def session_ui(lane: Lane, **launch) -> Roost:
     """
     roost = lane.start("session", **launch)
     wait_until(
-        lambda: bool(lane.session_projects()),
+        lambda: lane.socket_answers() and bool(lane.session_projects()),
         120.0,
         "the slot to come up holding a project",
     )
