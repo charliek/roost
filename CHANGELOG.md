@@ -11,6 +11,15 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+## v0.0.23 — 2026-10-07
+
+_The session-update release (plan 076): Roost-Iced now shows each host's
+session version in its right-click menu, and updating a session is two
+separate, confirmed steps, Install Update and Restart Session, under one
+rule: never downgrade. The Swift app is unchanged. There is no
+session-protocol bump. A running 0.0.22 `roost-session` keeps working, and
+the menu offers to move it to 0.0.23 when you're ready._
+
 ### Added
 
 - **Session versions and separate Install / Restart actions (plan 076)** —
@@ -54,6 +63,14 @@ release workflow asserts they agree).
   Update… or Restart Session… depending on where the stale build is.
   Roost never probes an SSH host in the background, so another machine's
   install shows as "available" until you start an action.
+
+### Fixed
+
+- **Readable session header in the macOS right-click menu (#613)** — the
+  host block's header was drawn in AppKit's faint section-header gray.
+  It's now a label in the system's secondary text color, still skipped by
+  the arrow keys, and capped at the menu's width so a long host label is
+  truncated rather than widening the menu.
 
 ## v0.0.22 — 2026-10-04
 
