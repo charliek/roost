@@ -202,7 +202,7 @@ fn section_header(title: &str, mtm: MainThreadMarker) -> Retained<NSMenuItem> {
     label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
     label.sizeToFit();
     let mut size = label.frame().size;
-    size.width = size.width.min(HEADER_MAX_WIDTH);
+    size.width = size.width.min(HEADER_MAX_WIDTH - 2.0 * HEADER_INSET_X);
     label.setFrame(NSRect::new(
         NSPoint::new(HEADER_INSET_X, HEADER_INSET_Y),
         size,
