@@ -17,8 +17,10 @@ use std::cell::RefCell;
 use objc2::rc::Retained;
 use objc2::runtime::NSObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSEvent, NSMenu, NSMenuItem};
-use objc2_foundation::NSString;
+use objc2_app_kit::{
+    NSColor, NSEvent, NSFont, NSLineBreakMode, NSMenu, NSMenuItem, NSTextField, NSView,
+};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 use roost_ui_model::context_menu::{ContextEntry, ContextTarget};
 
 use crate::app::context_menu::{native_rows, NativeRow, NativeTable};
@@ -159,10 +161,7 @@ pub(crate) fn pop_up(
                 menu.addItem(&item);
             }
             NativeRow::Separator => menu.addItem(&NSMenuItem::separatorItem(mtm)),
-            NativeRow::Header { title } => menu.addItem(&NSMenuItem::sectionHeaderWithTitle(
-                &NSString::from_str(title),
-                mtm,
-            )),
+            NativeRow::Header { title } => menu.addItem(&section_header(title, mtm)),
         }
     }
 
@@ -188,3 +187,48 @@ pub(crate) fn pop_up(
     POPUPS.with(|cell| cell.borrow_mut().tracking = false);
     tracing::debug!(picked, generation, "context menu closed");
 }
+
+/// A section header drawn by a label in `secondaryLabelColor`. AppKit
+/// paints a section header, and a disabled item, in its own faint gray
+/// whatever color the title asks for, too faint for the session line this
+/// row carries; a view is the one thing it draws as given. Disabled, so
+/// it is never chosen and the arrow keys pass it by.
+fn section_header(title: &str, mtm: MainThreadMarker) -> Retained<NSMenuItem> {
+    let label = NSTextField::labelWithString(&NSString::from_str(title), mtm);
+    label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    label.setFont(Some(&NSFont::boldSystemFontOfSize(
+        NSFont::smallSystemFontSize(),
+    )));
+    label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+    label.sizeToFit();
+    let mut size = label.frame().size;
+    size.width = size.width.min(HEADER_MAX_WIDTH);
+    label.setFrame(NSRect::new(
+        NSPoint::new(HEADER_INSET_X, HEADER_INSET_Y),
+        size,
+    ));
+    let view = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(
+                size.width + 2.0 * HEADER_INSET_X,
+                size.height + 2.0 * HEADER_INSET_Y,
+            ),
+        ),
+    );
+    view.addSubview(&label);
+    let item = NSMenuItem::new(mtm);
+    item.setTitle(&NSString::from_str(title));
+    item.setEnabled(false);
+    item.setView(Some(&view));
+    item
+}
+
+/// Where AppKit starts an item's title, so the header lines up with the
+/// rows under it.
+const HEADER_INSET_X: f64 = 14.0;
+const HEADER_INSET_Y: f64 = 3.0;
+/// The overlay's widest menu (`MENU_MAX_WIDTH`), so a long host label is
+/// elided here as it is there rather than widening the whole menu.
+const HEADER_MAX_WIDTH: f64 = 360.0;
