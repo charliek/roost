@@ -127,7 +127,18 @@ mod sidecar {
         } else {
             command.env_remove("ROOST_TEST_MODE");
         }
-        command.output().expect("run roost-session identify")
+        // A copy written a moment ago can still be open for writing in
+        // a child some parallel test forked meanwhile; Linux refuses to
+        // exec it (ETXTBSY) until that child execs or exits.
+        for _ in 0..100 {
+            match command.output() {
+                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                result => return result.expect("run roost-session identify"),
+            }
+        }
+        panic!("roost-session identify stayed busy for 2s");
     }
 
     fn parse(output: &std::process::Output) -> SessionBinaryIdentity {
