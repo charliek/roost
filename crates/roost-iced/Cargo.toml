@@ -157,6 +157,12 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSEvent",
     "NSMenu",
     "NSMenuItem",
+    # The context menu's section header, a label in a readable color
+    # (`macos::context_menu`).
+    "NSControl",
+    "NSFont",
+    "NSParagraphStyle",
+    "NSTextField",
     # The selection pasteboard and the file-list write (`macos::pasteboard`).
     "NSPasteboard",
     "NSPasteboardItem",
