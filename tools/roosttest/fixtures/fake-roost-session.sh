@@ -7,6 +7,10 @@
 # that die on start and the restart targets in
 # `crates/roost-iced/src/host_conn/task.rs` and `host_conn.rs`, and the
 # restart candidates in `crates/roost-iced/src/app/update_knowledge.rs`.
+# Other tests that exec a script use it the same way: the `$SHELL`s in
+# `crates/roost-cli/src/doctor.rs` (through `fake_launcher` in
+# `crates/roost-cli/src/session.rs`) and the `$ROOST_AGENT_HOOK` stubs in
+# `crates/roost-agent-install/src/command.rs`.
 #
 # It has no behaviour of its own. A test symlinks this file to
 # `<dir>/roost-session` (or another name a case needs) and writes what
