@@ -375,7 +375,7 @@ pub enum AttentionEffect {
 }
 
 /// Why [`apply_report`] dropped a report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DropReason {
     /// A `preserve` or `release` from anyone but the owner, including

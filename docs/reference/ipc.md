@@ -235,7 +235,8 @@ this tab's server refused (`accepted: false`) and keeps the latest:
 owner, including any report to a tab nobody owns) or `"nested_claim"`.
 An agent whose reports keep landing as `not_owner` on a tab with no
 owner has lost the tab: nothing it sends shows until it claims again,
-and `roostctl doctor` says so. The field is live diagnostic state on the
+and `roostctl doctor` points it out. The record is history, never
+cleared, so check `last.at` against when the agent last ran. The field is live diagnostic state on the
 server that holds the tab, never persisted and carried by no event, so
 read it from that server rather than from a window mirroring a remote
 host. The key is omitted until something is dropped, so an older server
