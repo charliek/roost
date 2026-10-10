@@ -34,8 +34,9 @@ release workflow asserts they agree).
   place. Roost now ignores a claim from a different agent while the
   owner is mid-turn under a foreground process; a new agent started
   after the old one exits to the prompt still takes the tab. Needs
-  shell integration. Roost-Iced and `roost-session` only; the Swift app
-  is unchanged. See
+  shell integration that marks command starts (zsh, or bash 4.4 or
+  newer). Roost-Iced and `roost-session` only; the Swift app is
+  unchanged. See
   [Agent Hooks → Ownership](docs/guides/agents.md#ownership).
 
 ## v0.0.23 — 2026-10-07

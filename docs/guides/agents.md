@@ -303,12 +303,17 @@ and fires its own hooks into the same tab. Roost ignores it while the
 outer agent is mid-turn in the foreground, so the outer agent keeps
 the tab, its status and its notifications. Once that agent exits back
 to the shell prompt, the next agent you start takes the tab as usual.
-This needs [shell integration](cwd-tracking.md); without it the inner
-agent takes the tab over, as it did before. ([Claim
-rules](../reference/ipc.md#tabagent_report).) Every pane of tmux,
-herdr or an ssh session running inside one tab shares that tab's
-`ROOST_TAB_ID` the same way, so the first agent mid-turn there holds
-the tab and the others don't show until it finishes.
+This needs [shell integration](cwd-tracking.md) that marks each
+command's start: zsh, or bash 4.4 or newer. macOS's own `/bin/bash`
+3.2 can't
+([details](cwd-tracking.md#switching-macos-default-to-homebrew-bash)),
+and without the mark the inner agent takes the tab over, as it did
+before. ([Claim rules](../reference/ipc.md#tabagent_report).)
+
+Agent status isn't supported inside tmux, herdr or an ssh session
+running in a tab. Every pane there shares the tab's `ROOST_TAB_ID`, so
+the tab can show only one of their agents, and not reliably the one
+you're looking at.
 
 Doctor's
 `owning` checks read this off the running UI's tab list — there is no
