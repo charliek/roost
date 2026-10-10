@@ -1505,6 +1505,14 @@ impl App {
                     self.cycle_tab(-1)?;
                     self.clear_palette_state();
                 }
+                "cycle_project_next" => {
+                    self.cycle_project(1)?;
+                    self.clear_palette_state();
+                }
+                "cycle_project_prev" => {
+                    self.cycle_project(-1)?;
+                    self.clear_palette_state();
+                }
                 "toggle_sidebar" => {
                     self.clear_palette_state();
                     self.toggle_sidebar();

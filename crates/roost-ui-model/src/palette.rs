@@ -246,6 +246,8 @@ impl PaletteCommands {
         ("rename_tab", "Rename Tab"),
         ("cycle_tab_next", "Next Tab"),
         ("cycle_tab_prev", "Previous Tab"),
+        ("cycle_project_next", "Next Project"),
+        ("cycle_project_prev", "Previous Project"),
         ("new_project", "New Project"),
         ("rename_project", "Rename Project"),
         ("close_project", "Close Project"),

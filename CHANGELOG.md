@@ -11,6 +11,17 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+### Added
+
+- **Next / Previous Project** — `cycle_project_next` and
+  `cycle_project_prev` step through the sidebar's projects in Roost-Iced:
+  `Cmd-Shift-→` / `Cmd-Shift-←` on macOS, `Alt-Shift-→` / `Alt-Shift-←` on
+  Linux. Like tab cycling, they stop at the first and last project rather
+  than wrapping, and they skip projects with no tabs. Both are in the
+  command palette ("Next Project", "Previous Project") and, on macOS, the
+  File menu. The Swift app is unchanged. See
+  [Keybindings](docs/getting-started/keybindings.md#available-actions).
+
 ## v0.0.23 — 2026-10-07
 
 _The session-update release (plan 076): Roost-Iced now shows each host's

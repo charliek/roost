@@ -310,6 +310,11 @@ fn key_equivalent(key: &str) -> Option<String> {
         "tab" => "\t",
         "escape" => "\u{1b}",
         "backspace" => "\u{7f}",
+        // AppKit's NS{Up,Down,Left,Right}ArrowFunctionKey.
+        "up" => "\u{F700}",
+        "down" => "\u{F701}",
+        "left" => "\u{F702}",
+        "right" => "\u{F703}",
         _ => return None,
     };
     Some(mapped.to_string())
@@ -682,6 +687,8 @@ fn build(
         None,
         Some(("Previous Tab", KeybindAction::CycleTabPrev)),
         Some(("Next Tab", KeybindAction::CycleTabNext)),
+        Some(("Previous Project", KeybindAction::CycleProjectPrev)),
+        Some(("Next Project", KeybindAction::CycleProjectNext)),
     ] {
         add_action_item(mtm, &mut menu, &file_menu, spec, keybindings);
     }
@@ -1290,6 +1297,10 @@ mod tests {
             ("super+plus", "+"),
             ("super+equal", "="),
             ("super+minus", "-"),
+            ("super+up", "\u{F700}"),
+            ("super+down", "\u{F701}"),
+            ("super+shift+left", "\u{F702}"),
+            ("super+shift+right", "\u{F703}"),
         ] {
             assert_eq!(
                 accel_to_key_equivalent(&accel(trigger)).map(|(key, _)| key),

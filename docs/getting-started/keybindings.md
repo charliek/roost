@@ -28,6 +28,8 @@ Every binding is overridable in `config.conf` (see [Custom keybindings](#custom-
 | `Cmd-B`              | Toggle the projects sidebar                 |
 | `Cmd-Shift-A`        | Toggle agent rows under each project in the sidebar |
 | `Cmd-Shift-U`        | Jump to the next tab with a pending notification (active project first, then others) |
+| `Cmd-Shift-→`        | Cycle to the next project in the sidebar (skips projects with no tabs; stops at the last project; no wrap-around). Roost-Iced only |
+| `Cmd-Shift-←`        | Cycle to the previous project in the sidebar (skips projects with no tabs; stops at the first project; no wrap-around). Roost-Iced only |
 | `Cmd-1` … `Cmd-9`    | Switch to the project at sidebar position 1 .. 9 |
 
 ### Commands
@@ -84,6 +86,8 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 | `Alt-B`              | Toggle the projects sidebar                 |
 | `Alt-Shift-A`        | Toggle agent rows under each project in the sidebar |
 | `Alt-Shift-U`       | Jump to the next tab with a pending notification (active project first, then others) |
+| `Alt-Shift-→`        | Cycle to the next project in the sidebar (skips projects with no tabs; stops at the last project; no wrap-around) |
+| `Alt-Shift-←`        | Cycle to the previous project in the sidebar (skips projects with no tabs; stops at the first project; no wrap-around) |
 | `Alt-1` … `Alt-9`    | Switch to the project at sidebar position 1 .. 9 |
 
 ### Commands
@@ -219,6 +223,8 @@ Use only leading-line `#` comments. A `#` after a `keybind` value is treated as 
 | `rename_tab`          | `super+r` / `alt+r`                                    |
 | `cycle_tab_prev`      | `super+shift+bracketleft` / `alt+shift+bracketleft`   |
 | `cycle_tab_next`      | `super+shift+bracketright` / `alt+shift+bracketright` |
+| `cycle_project_prev`  | `super+shift+left` / `alt+shift+left`                  |
+| `cycle_project_next`  | `super+shift+right` / `alt+shift+right`                |
 | `paste`               | `super+v`, `ctrl+shift+v` / `alt+v`, `ctrl+shift+v`    |
 | `copy`                | `super+c`, `ctrl+shift+c` / `alt+c`, `ctrl+shift+c`    |
 | `new_project`         | `super+n` / `alt+n`                                    |
@@ -245,6 +251,8 @@ Use only leading-line `#` comments. A `#` after a `keybind` value is treated as 
 `open_config` opens `config.conf` in your default text editor, creating it first if it does not exist; edits apply when Roost restarts. `open_docs` opens this documentation site. `toggle_fullscreen` flips the window in and out of full screen. All three are also in the command palette ("Open Settings File", "Open Documentation", "Toggle Full Screen"), and on macOS in the menu bar (Roost → Settings…, Help → Roost Help, View → Enter Full Screen).
 
 `toggle_secure_input` flips the always-on Secure Keyboard Entry setting on macOS (`macos-secure-keyboard-entry`), the same as Roost → Secure Keyboard Entry in the menu bar and "Toggle Secure Keyboard Entry" in the command palette; Roost writes the choice to `config.conf`. It has no default shortcut. On Linux the action is accepted and does nothing. See [Secure Keyboard Entry](../reference/config.md#secure-keyboard-entry).
+
+`cycle_project_prev` and `cycle_project_next` are honored by Roost-Iced; the Swift Mac app (Roost.app) does not have them and logs the names as unknown actions.
 
 Defaults with multiple triggers (`cycle_tab_*`, `paste`, `copy`) keep both triggers; an `unbind` line removes only the listed one.
 

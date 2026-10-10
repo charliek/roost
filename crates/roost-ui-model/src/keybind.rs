@@ -38,6 +38,11 @@ pub enum KeybindAction {
     JumpToUnread,
     CycleTabPrev,
     CycleTabNext,
+    /// Step through the sidebar's projects, stopping at either end
+    /// ([`crate::host_sidebar::ring_step`]). Roost-Iced only: the Swift
+    /// app does not know these names and logs them as unknown.
+    CycleProjectPrev,
+    CycleProjectNext,
     Copy,
     Paste,
     ToggleSidebar,
@@ -132,6 +137,8 @@ impl KeybindAction {
             "jump_to_unread" => Some(Self::JumpToUnread),
             "cycle_tab_prev" => Some(Self::CycleTabPrev),
             "cycle_tab_next" => Some(Self::CycleTabNext),
+            "cycle_project_prev" => Some(Self::CycleProjectPrev),
+            "cycle_project_next" => Some(Self::CycleProjectNext),
             "copy" => Some(Self::Copy),
             "paste" => Some(Self::Paste),
             "toggle_sidebar" => Some(Self::ToggleSidebar),
@@ -184,6 +191,8 @@ impl KeybindAction {
             Self::JumpToUnread => "jump_to_unread".into(),
             Self::CycleTabPrev => "cycle_tab_prev".into(),
             Self::CycleTabNext => "cycle_tab_next".into(),
+            Self::CycleProjectPrev => "cycle_project_prev".into(),
+            Self::CycleProjectNext => "cycle_project_next".into(),
             Self::Copy => "copy".into(),
             Self::Paste => "paste".into(),
             Self::ToggleSidebar => "toggle_sidebar".into(),
@@ -401,6 +410,19 @@ pub fn default_bindings() -> Vec<(Accel, KeybindAction)> {
         &mut out,
         &format!("{primary}+shift+braceright"),
         KeybindAction::CycleTabNext,
+    );
+
+    // Arrows rather than `<`/`>`: those are layout-dependent, and
+    // `alt+shift+comma`/`period` is readline's `M-<`/`M->`.
+    add(
+        &mut out,
+        &format!("{primary}+shift+left"),
+        KeybindAction::CycleProjectPrev,
+    );
+    add(
+        &mut out,
+        &format!("{primary}+shift+right"),
+        KeybindAction::CycleProjectNext,
     );
 
     // Clipboard: native modifier first, plus Ctrl+Shift+C/V on every
@@ -642,6 +664,8 @@ mod tests {
             KeybindAction::JumpToUnread,
             KeybindAction::CycleTabPrev,
             KeybindAction::CycleTabNext,
+            KeybindAction::CycleProjectPrev,
+            KeybindAction::CycleProjectNext,
             KeybindAction::Copy,
             KeybindAction::Paste,
             KeybindAction::ToggleSidebar,
@@ -1139,6 +1163,24 @@ mod tests {
         assert_eq!(
             defaults.get(&parse_trigger(next).unwrap()),
             Some(&KeybindAction::CycleTabNext)
+        );
+    }
+
+    #[test]
+    fn cycle_project_defaults_are_host_appropriate() {
+        let defaults: HashMap<_, _> = default_bindings().into_iter().collect();
+        let (prev, next) = if cfg!(target_os = "macos") {
+            ("super+shift+left", "super+shift+right")
+        } else {
+            ("alt+shift+left", "alt+shift+right")
+        };
+        assert_eq!(
+            defaults.get(&parse_trigger(prev).unwrap()),
+            Some(&KeybindAction::CycleProjectPrev)
+        );
+        assert_eq!(
+            defaults.get(&parse_trigger(next).unwrap()),
+            Some(&KeybindAction::CycleProjectNext)
         );
     }
 

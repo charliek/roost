@@ -5796,6 +5796,14 @@ impl App {
                 self.cycle_tab(1)?;
                 Ok(UiTask::None)
             }
+            KeybindAction::CycleProjectPrev => {
+                self.cycle_project(-1)?;
+                Ok(UiTask::None)
+            }
+            KeybindAction::CycleProjectNext => {
+                self.cycle_project(1)?;
+                Ok(UiTask::None)
+            }
             KeybindAction::Copy => Ok(self.copy_active_selection()),
             KeybindAction::Paste => self.paste_into_active(ClipboardOp::System),
             KeybindAction::ToggleSidebar => {
@@ -7750,6 +7758,18 @@ impl App {
         }
         self.focus_tab_and_clear(tabs[next], false)?;
         Ok(())
+    }
+
+    fn cycle_project(&mut self, delta: isize) -> Result<(), String> {
+        let Some(project) =
+            host_sidebar::ring_step(&self.ring_sections(), self.active_project_key(), delta)
+        else {
+            return Ok(());
+        };
+        let Some(tab) = self.preferred_tab_key(project) else {
+            return Ok(());
+        };
+        self.focus_tab_and_clear(tab, false)
     }
 
     /// Every section the navigation ring walks, top to bottom — the
