@@ -139,6 +139,7 @@ fn event_envelope_round_trip() {
                 agent_lifecycle: Default::default(),
                 ownership: None,
                 password_input: false,
+                dropped_reports: None,
             },
         })
         .unwrap(),

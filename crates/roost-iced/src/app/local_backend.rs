@@ -4141,6 +4141,7 @@ mod tests {
             agent_lifecycle: Default::default(),
             ownership: None,
             password_input: false,
+            dropped_reports: None,
         }
     }
 
@@ -4784,6 +4785,7 @@ mod switch_tests {
             agent_lifecycle: Default::default(),
             ownership: None,
             password_input: false,
+            dropped_reports: None,
         }
     }
 
@@ -5596,6 +5598,7 @@ mod migration_tests {
                     agent_lifecycle: Default::default(),
                     ownership: None,
                     password_input: false,
+                    dropped_reports: None,
                 })
                 .collect(),
         }

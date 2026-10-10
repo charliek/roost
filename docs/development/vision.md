@@ -413,7 +413,12 @@ rule without a hardcoded path, since it's stated as "the PTY was
 replaced," not "the tab was closed"). (Amended by plan 052: the
 `pty_replaced` primitive was removed with no caller; a close drops
 the row, and #170's hard-restart rebuilds the reset with its
-respawn.)
+respawn.) (Amended 2026-10-10: a claim is no longer quite
+unconditional. One from a different agent while the owner is mid-turn
+under a foreground process is a *nested* agent the owner is running,
+which inherited `ROOST_TAB_ID`, and it is dropped. The shell axis,
+not a timestamp, makes that call, so AD-3 stands. See
+[`tab.agent_report`](../reference/ipc.md#tabagent_report).)
 
 Raw-OSC suppression (dropping OSC 9/99/777 while a live agent owns the
 tab) is the **one exception that gets a real failsafe**, because it's

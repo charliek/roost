@@ -21,6 +21,33 @@ release workflow asserts they agree).
   command palette ("Next Project", "Previous Project") and, on macOS, the
   File menu. The Swift app is unchanged. See
   [Keybindings](docs/getting-started/keybindings.md#available-actions).
+- **Dropped agent reports are visible.** A `tab.agent_report` the server
+  refuses used to vanish without a trace. Each tab now counts the
+  reports it dropped and keeps the latest, with its reason (`not_owner`
+  or `nested_claim`, and whether the tab had an owner then), on
+  `Tab.dropped_reports`. The server logs the first drop of each
+  `(source, session, reason)`, remembering the last 16 per tab, and
+  `roostctl doctor` shows the record and flags a report dropped while no
+  agent owned the tab: if that agent is still running, it has lost the
+  tab until its next session start. See
+  [`Tab.dropped_reports`](docs/reference/ipc.md#shared-types).
+
+### Fixed
+
+- **An agent another agent runs no longer steals its tab.** A
+  `codex exec` review (or any agent CLI) started from inside a Claude
+  Code turn inherits the tab's `ROOST_TAB_ID`. Its `SessionStart` used
+  to evict Claude as the tab's owner and its `SessionEnd` then released
+  the tab, so the sidebar row disappeared while Claude kept working.
+  Claude's later status and its "Turn complete" notification were
+  dropped too, and the inner agent's own notification fired in their
+  place. Roost now ignores a claim from a different agent while the
+  owner is mid-turn under a foreground process; a new agent started
+  after the old one exits to the prompt still takes the tab. Needs
+  shell integration that marks command starts (zsh, or bash 4.4 or
+  newer). Roost-Iced and `roost-session` only; the Swift app is
+  unchanged. See
+  [Agent Hooks → Ownership](docs/guides/agents.md#ownership).
 
 ## v0.0.23 — 2026-10-07
 

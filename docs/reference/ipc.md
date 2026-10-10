@@ -172,7 +172,8 @@ terminal from. It shares the socket path but not the framing; see
     "shell_state": "<ShellState>",
     "agent_lifecycle": "<AgentLifecycle>",
     "ownership": "<Ownership, omitted when unowned>",
-    "password_input": "<bool, omitted while false>"
+    "password_input": "<bool, omitted while false>",
+    "dropped_reports": "<DroppedReports, omitted until a report is dropped>"
   },
   "Project": {
     "id": "<string-int64>",
@@ -221,6 +222,29 @@ zsh prompt does not set it: their line editors run the terminal raw,
 outside canonical mode. The key is omitted while `false`, so a server
 that predates the field, and a tab that is not at a prompt, look the
 same — both read as `false`, with no protocol bump.
+
+`Tab.dropped_reports` counts the [`tab.agent_report`](#tabagent_report)s
+this tab's server refused (`accepted: false`) and keeps the latest:
+
+```json
+{"count": 9, "last": {"source": "codex", "session_id": "01a12677…",
+  "ownership_action": "release", "reason": "not_owner",
+  "tab_had_owner": true, "at": 1791648366}}
+```
+
+`reason` is `"not_owner"` (a `preserve` or `release` from anyone but the
+owner, including any report to a tab nobody owns) or `"nested_claim"`.
+`tab_had_owner` says whether any agent owned the tab when the report was
+dropped. An agent whose reports land as `not_owner` with
+`tab_had_owner: false` has lost the tab: nothing it sends shows until it
+claims again, and `roostctl doctor` points it out. The record is
+history, never cleared, so check `last.at` against when the agent last
+ran. A client that can't read the record (a newer server's new
+`reason`, say) treats it as absent rather than failing the tab. The field is live diagnostic state on the
+server that holds the tab, never persisted and carried by no event, so
+read it from that server rather than from a window mirroring a remote
+host. The key is omitted until something is dropped, so an older server
+reads the same as a tab with nothing dropped.
 
 ### `tab.state` / `hook_active` — derived, and the compatibility contract
 
@@ -1366,9 +1390,20 @@ Request:
 `ownership_action` semantics, enforced under one lock so the check and
 the mutation can't race a concurrent report:
 
-* **`claim`** always takes ownership, replacing any existing owner
-  unconditionally — the only path that can take a tab from a live
-  owner (a `SessionStart`, or a manual override via `tab.set_state`).
+* **`claim`** takes ownership, replacing any existing owner — the only
+  path that can take a tab from a live owner (a `SessionStart`, or a
+  manual override via `tab.set_state`). One exception: a **nested
+  claim** is dropped. When the owner is mid-turn (`agent_lifecycle`
+  `working` or `waiting`) under a foreground process
+  (`shell_state: "foreground_process"`), a claim from a *different*
+  agent `source` comes from an agent the owner itself is running, such
+  as a `codex exec` review. That agent inherited the tab's
+  `ROOST_TAB_ID`, and honoring it would evict the owner and then
+  release the tab out from under it. The same `source` under a new
+  `session_id` still supersedes, since that is the agent switching
+  sessions itself. `manual` and `legacy` claims always supersede. A tab
+  whose shell has no integration (`shell_state: "unknown"`) never
+  treats a claim as nested.
 * **`preserve`** requires the report's `(source, session_id)` to match
   the current owner; a mismatch is dropped (see `accepted` below).
   `detail`/`metadata` **merge** onto the existing owner rather than
@@ -1431,7 +1466,9 @@ Response:
 ```
 
 `accepted` is `false` when the report lost the ownership-matching
-check above — `tab` is then the tab **unchanged**. The full `Tab` is
+check above, or was a nested claim. `tab` is then the tab
+**unchanged** apart from its
+[`dropped_reports`](#shared-types) count. The full `Tab` is
 always returned so an adapter never needs a follow-up `tab.list` to
 see what its own report did.
 

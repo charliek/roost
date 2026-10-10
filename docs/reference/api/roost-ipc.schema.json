@@ -1399,6 +1399,67 @@
       ],
       "type": "object"
     },
+    "DropReason": {
+      "oneOf": [
+        {
+          "const": "not_owner",
+          "type": "string"
+        },
+        {
+          "const": "nested_claim",
+          "type": "string"
+        }
+      ]
+    },
+    "DroppedReport": {
+      "properties": {
+        "at": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "ownership_action": {
+          "$ref": "#/$defs/OwnershipAction"
+        },
+        "reason": {
+          "$ref": "#/$defs/DropReason"
+        },
+        "session_id": {
+          "default": "",
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "tab_had_owner": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "source",
+        "ownership_action",
+        "reason",
+        "tab_had_owner",
+        "at"
+      ],
+      "type": "object"
+    },
+    "DroppedReports": {
+      "properties": {
+        "count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last": {
+          "$ref": "#/$defs/DroppedReport"
+        }
+      },
+      "required": [
+        "count",
+        "last"
+      ],
+      "type": "object"
+    },
     "DurabilityChangedEvent": {
       "properties": {
         "error": {
@@ -3326,6 +3387,16 @@
         },
         "cwd": {
           "type": "string"
+        },
+        "dropped_reports": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DroppedReports"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "has_notification": {
           "type": "boolean"

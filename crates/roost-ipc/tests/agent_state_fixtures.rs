@@ -269,7 +269,7 @@ fn every_agent_state_fixture_matches_the_rust_implementation() {
                     };
                     let out = apply_report(&current, &case.report, case.now);
                     let (f, o, e) = (&mut failures, &out, &case.expect);
-                    check(f, &at, "accepted", &o.accepted, &e.accepted);
+                    check(f, &at, "accepted", &o.accepted(), &e.accepted);
                     check(
                         f,
                         &at,

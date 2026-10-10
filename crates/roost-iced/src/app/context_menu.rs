@@ -896,6 +896,7 @@ mod tests {
             agent_lifecycle: Default::default(),
             ownership: None,
             password_input: false,
+            dropped_reports: None,
         }
     }
 

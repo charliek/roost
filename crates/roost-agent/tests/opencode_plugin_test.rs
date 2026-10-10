@@ -700,7 +700,7 @@ fn a_first_seen_child_session_adopts_its_parent_as_the_root() {
         payload["session_id"] = json!(CHILD);
         for report in opencode_event_to_reports(record.event(), &payload, TAB) {
             let outcome = apply_report(&root_state, &report, NOW);
-            assert!(!outcome.accepted, "{}", record.event());
+            assert!(!outcome.accepted(), "{}", record.event());
             assert_eq!(outcome.state, root_state);
         }
     }

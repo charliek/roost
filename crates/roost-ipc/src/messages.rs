@@ -21,7 +21,7 @@ use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::agent::{AgentLifecycle, AgentTabState, Ownership, ShellState};
+use crate::agent::{AgentLifecycle, AgentTabState, DroppedReports, Ownership, ShellState};
 use crate::local_route::LocalBackendMode;
 
 // ============================================================================
@@ -85,6 +85,22 @@ pub struct Tab {
     /// recorded before the field existed still round-trips byte for byte.
     #[serde(default, skip_serializing_if = "is_false")]
     pub password_input: bool,
+    /// Agent reports this tab's server dropped (`tab.agent_report`
+    /// answered `accepted: false`): how many, and the latest. Live
+    /// diagnostic state on the server that holds the tab, never persisted
+    /// and carried by no event, so read it from that server. Omitted until
+    /// a report is dropped.
+    ///
+    /// Decoded leniently: a record this build can't read (a newer
+    /// server's new `reason`, say) reads as absent rather than failing
+    /// the whole `Tab`, since a diagnostic must never cost a client its
+    /// tab list.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_dropped_reports"
+    )]
+    pub dropped_reports: Option<DroppedReports>,
 }
 
 impl Tab {
@@ -3010,6 +3026,14 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn lenient_dropped_reports<'de, D>(deserializer: D) -> Result<Option<DroppedReports>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| serde_json::from_value(value).ok()))
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HostDisconnectParams {
@@ -4641,6 +4665,7 @@ mod tests {
             agent_lifecycle: AgentLifecycle::Inactive,
             ownership: None,
             password_input: false,
+            dropped_reports: None,
         };
         round_trip(&t);
         let json = serde_json::to_string(&t).unwrap();
@@ -4648,6 +4673,36 @@ mod tests {
             json.contains("\"id\":\"12345\""),
             "id must be string: {json}"
         );
+    }
+
+    #[test]
+    fn a_dropped_reports_record_this_build_cannot_read_leaves_the_tab_intact() {
+        let tab_with = |dropped: &str| {
+            format!(
+                r#"{{"id":"5","project_id":"1","title":"zsh","cwd":"/tmp",
+                "state":"running","has_notification":false,"is_active":true,
+                "user_titled":false,"position":0,"created_at":1,"last_active":2,
+                "hook_active":false,"dropped_reports":{dropped}}}"#
+            )
+        };
+        let last = r#""source":"codex","session_id":"s","ownership_action":"release","at":9"#;
+        let readable = tab_with(&format!(
+            r#"{{"count":2,"last":{{{last},"reason":"not_owner","tab_had_owner":true}}}}"#
+        ));
+        let tab: Tab = serde_json::from_str(&readable).unwrap();
+        assert_eq!(tab.dropped_reports.unwrap().count, 2);
+
+        for unreadable in [
+            format!(
+                r#"{{"count":2,"last":{{{last},"reason":"later_reason","tab_had_owner":true}}}}"#
+            ),
+            format!(r#"{{"count":2,"last":{{{last},"reason":"not_owner"}}}}"#),
+            "null".to_string(),
+        ] {
+            let tab: Tab = serde_json::from_str(&tab_with(&unreadable)).unwrap();
+            assert_eq!(tab.dropped_reports, None, "{unreadable}");
+            assert_eq!(tab.title, "zsh");
+        }
     }
 
     /// The agent axes are additive: a `Tab` encoded by a pre-plan-002
@@ -4694,6 +4749,7 @@ mod tests {
             agent_lifecycle: AgentLifecycle::default(),
             ownership: None,
             password_input: false,
+            dropped_reports: None,
         };
         let value = serde_json::to_value(&tab).unwrap();
         for key in ["shell_state", "agent_lifecycle"] {

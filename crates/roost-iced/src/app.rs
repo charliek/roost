@@ -12891,6 +12891,7 @@ mod tests {
             agent_lifecycle: AgentLifecycle::default(),
             ownership: None,
             password_input: false,
+            dropped_reports: None,
         }];
         listed.answer(Ok(serde_json::to_value(TabListResult {
             projects: vec![project],
@@ -12977,6 +12978,7 @@ mod tests {
             agent_lifecycle: Default::default(),
             ownership: None,
             password_input: false,
+            dropped_reports: None,
         };
         open.answer(Ok(serde_json::to_value(TabOpenResult { tab }).unwrap()));
 
@@ -13015,6 +13017,7 @@ mod tests {
             agent_lifecycle: Default::default(),
             ownership: None,
             password_input: false,
+            dropped_reports: None,
         }
     }
 

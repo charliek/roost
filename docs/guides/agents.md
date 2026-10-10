@@ -295,7 +295,33 @@ schedule, so this is a real race, not a theoretical one.
 ## Ownership
 
 A tab is "owned" by whichever agent's hook last reported activity on
-it, via `tab.agent_report`'s `(source, session_id)` pair. Doctor's
+it, via `tab.agent_report`'s `(source, session_id)` pair.
+
+An agent that another agent runs, such as a `codex exec` review
+started from a Claude Code turn, inherits the tab's `ROOST_TAB_ID`
+and fires its own hooks into the same tab. Roost ignores it while the
+outer agent is mid-turn in the foreground, so the outer agent keeps
+the tab, its status and its notifications. Once that agent exits back
+to the shell prompt, the next agent you start takes the tab as usual.
+This needs [shell integration](cwd-tracking.md) that marks each
+command's start: zsh, or bash 4.4 or newer. macOS's own `/bin/bash`
+3.2 can't
+([details](cwd-tracking.md#switching-macos-default-to-homebrew-bash)),
+and without the mark the inner agent takes the tab over, as it did
+before. ([Claim rules](../reference/ipc.md#tabagent_report).)
+
+Agent status isn't supported inside tmux, herdr or an ssh session
+running in a tab. Every pane there shares the tab's `ROOST_TAB_ID`, so
+the tab can show only one of their agents, and not reliably the one
+you're looking at.
+
+When a tab's agent row disappears while the agent is still running,
+`roostctl doctor` shows the reports the tab dropped
+(`tab.dropped_reports`). An agent whose reports are dropped on a tab
+nobody owns has lost the tab, and its next session start (in Claude
+Code, `/compact` or `/clear`) takes it back.
+
+Doctor's
 `owning` checks read this off the running UI's tab list — there is no
 durable "ever observed" store, so they can only say who owns a tab
 *right now*, not whether an agent has ever fired here.

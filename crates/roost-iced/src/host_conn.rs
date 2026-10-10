@@ -2995,6 +2995,7 @@ pub(crate) mod fixtures {
                             agent_lifecycle: Default::default(),
                             ownership: None,
                             password_input: false,
+                            dropped_reports: None,
                         }
                     })
                     .collect(),

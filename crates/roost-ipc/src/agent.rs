@@ -374,14 +374,47 @@ pub enum AttentionEffect {
     Unchanged,
 }
 
+/// Why [`apply_report`] dropped a report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DropReason {
+    /// A `preserve` or `release` from anyone but the owner, including
+    /// any report to a tab nobody owns.
+    NotOwner,
+    /// A claim from an agent the owner is running; see
+    /// [`is_nested_claim`].
+    NestedClaim,
+}
+
+/// One report a server dropped, as `Tab.dropped_reports` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DroppedReport {
+    pub source: String,
+    #[serde(default)]
+    pub session_id: String,
+    pub ownership_action: OwnershipAction,
+    pub reason: DropReason,
+    /// Whether any agent owned the tab when this report was dropped.
+    pub tab_had_owner: bool,
+    /// Server receipt time.
+    pub at: i64,
+}
+
+/// How many reports a tab's server has dropped, and the latest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DroppedReports {
+    pub count: u64,
+    pub last: DroppedReport,
+}
+
 /// Result of applying a report: the new state plus everything the
 /// caller needs to emit events without re-deriving it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyOutcome {
     pub state: AgentTabState,
-    /// False when the report was dropped on an ownership mismatch; the
-    /// state is then returned unchanged.
-    pub accepted: bool,
+    /// Set when the report was dropped; the state is then returned
+    /// unchanged.
+    pub dropped: Option<DropReason>,
     /// Whether the owner's **identity or presence** changed. A refreshed
     /// `last_event_at` (or merged metadata) is not an ownership change —
     /// otherwise every accepted report would look like one.
@@ -390,14 +423,21 @@ pub struct ApplyOutcome {
     pub attention: AttentionEffect,
 }
 
+impl ApplyOutcome {
+    pub fn accepted(&self) -> bool {
+        self.dropped.is_none()
+    }
+}
+
 /// Apply a report to the current state, enforcing session scoping
 /// (plan §3.3 + §3.6). Pure: the caller owns the mutation and the event
 /// emission, this decides what they should be.
 ///
 /// * Identity is the pair `(source, session_id)`; a report that does
 ///   not match the current owner is dropped.
-/// * `Claim` always takes ownership, replacing any existing owner. It
-///   is the sole supersede path.
+/// * `Claim` takes ownership, replacing any existing owner — the sole
+///   supersede path — unless it is a [nested claim](is_nested_claim),
+///   which is dropped like a mismatch.
 /// * `Release` requires a match; it clears ownership and forces
 ///   lifecycle `Inactive`.
 /// * `lifecycle_if` gates the lifecycle patch and any `attention: Set`
@@ -411,14 +451,18 @@ pub fn apply_report(
     report: &TabAgentReportParams,
     now: i64,
 ) -> ApplyOutcome {
-    let authorized = match report.ownership_action {
-        OwnershipAction::Claim => true,
-        OwnershipAction::Preserve | OwnershipAction::Release => owner_matches(current, report),
+    let dropped = match report.ownership_action {
+        OwnershipAction::Claim => {
+            is_nested_claim(current, report).then_some(DropReason::NestedClaim)
+        }
+        OwnershipAction::Preserve | OwnershipAction::Release => {
+            (!owner_matches(current, report)).then_some(DropReason::NotOwner)
+        }
     };
-    if !authorized {
+    if dropped.is_some() {
         return ApplyOutcome {
             state: current.clone(),
-            accepted: false,
+            dropped,
             ownership_changed: false,
             lifecycle_changed: false,
             attention: AttentionEffect::Unchanged,
@@ -485,12 +529,54 @@ pub fn apply_report(
     };
 
     ApplyOutcome {
-        accepted: true,
+        dropped: None,
         ownership_changed: identity(&state.ownership) != identity(&current.ownership),
         lifecycle_changed: state.lifecycle != current.lifecycle,
         attention,
         state,
     }
+}
+
+/// Whether a claim comes from an agent the current owner is running —
+/// a `codex exec` review, a headless `gx -p` — rather than one taking
+/// the tab over.
+///
+/// Anything an agent runs from a tool call inherits the tab's
+/// `ROOST_TAB_ID`. Honored, the inner agent's `SessionStart` evicts the
+/// owner and its `SessionEnd` then releases the tab, so the outer agent,
+/// still mid-turn, is left with no owner and every report it sends after
+/// that is dropped. The shell axis tells the two cases apart without a
+/// timestamp: another agent can only replace the owner once the owner's
+/// foreground command has exited, and the prompt mark that follows
+/// drops the lifecycle to `Inactive`. A live owner still `Working` or
+/// `Waiting` under a foreground process has not exited, so a different
+/// agent claiming now is running inside it.
+///
+/// The same source under a new session id still supersedes: that is
+/// the agent switching sessions itself (Claude's `/clear`). `manual`
+/// and `legacy` are someone taking the wheel, never nested. With no
+/// shell integration the shell axis stays `Unknown`, so claims
+/// supersede as they always did — no prompt mark would ever free a tab
+/// whose owner died.
+///
+/// The Swift port does not carry this rule; it is frozen pending its
+/// retirement.
+fn is_nested_claim(current: &AgentTabState, report: &TabAgentReportParams) -> bool {
+    let Some(owner) = &current.ownership else {
+        return false;
+    };
+    current.shell == ShellState::ForegroundProcess
+        && matches!(
+            current.lifecycle,
+            AgentLifecycle::Working | AgentLifecycle::Waiting
+        )
+        && owner.source != report.source
+        && is_agent_source(&owner.source)
+        && is_agent_source(&report.source)
+}
+
+fn is_agent_source(source: &str) -> bool {
+    !source.is_empty() && source != SOURCE_MANUAL && source != SOURCE_LEGACY
 }
 
 fn owner_matches(current: &AgentTabState, report: &TabAgentReportParams) -> bool {
@@ -649,6 +735,157 @@ mod tests {
         assert!(is_live(&after), "ownership survives as a label");
         assert!(!suppress_raw_osc(&after), "raw OSC re-opens");
         assert_eq!(effective(&after), TabState::None);
+    }
+
+    fn mid_turn(lifecycle: AgentLifecycle, source: &str, session: &str) -> AgentTabState {
+        AgentTabState {
+            shell: ShellState::ForegroundProcess,
+            lifecycle,
+            ownership: owner(source, session),
+        }
+    }
+
+    #[test]
+    fn a_nested_agents_whole_session_leaves_the_owner_in_place() {
+        let claude = mid_turn(AgentLifecycle::Working, "claude", "outer");
+
+        let claim = TabAgentReportParams {
+            lifecycle: Some(AgentLifecycle::Inactive),
+            ..report("codex", "inner", OwnershipAction::Claim)
+        };
+        let stop = TabAgentReportParams {
+            lifecycle: Some(AgentLifecycle::Finished),
+            attention: AttentionOp::Set,
+            title: "Codex".into(),
+            body: "Turn complete".into(),
+            ..report("codex", "inner", OwnershipAction::Preserve)
+        };
+        let end = report("codex", "inner", OwnershipAction::Release);
+        for (nested, reason) in [
+            (&claim, DropReason::NestedClaim),
+            (&stop, DropReason::NotOwner),
+            (&end, DropReason::NotOwner),
+        ] {
+            let out = apply_report(&claude, nested, 1_700_000_100);
+            assert_eq!(out.dropped, Some(reason), "{:?}", nested.ownership_action);
+            assert_eq!(out.state, claude);
+            assert_eq!(out.attention, AttentionEffect::Unchanged);
+        }
+
+        let next_tool = TabAgentReportParams {
+            lifecycle: Some(AgentLifecycle::Working),
+            ..report("claude", "outer", OwnershipAction::Preserve)
+        };
+        let out = apply_report(&claude, &next_tool, 1_700_000_200);
+        assert!(out.accepted(), "the outer agent still owns the tab");
+        assert_eq!(out.state.ownership.unwrap().last_event_at, 1_700_000_200);
+    }
+
+    #[test]
+    fn a_claim_while_the_owner_waits_is_nested_too() {
+        // An approved tool runs before the owner leaves `Waiting`.
+        let claude = mid_turn(AgentLifecycle::Waiting, "claude", "outer");
+        let out = apply_report(
+            &claude,
+            &report("codex", "inner", OwnershipAction::Claim),
+            1_700_000_100,
+        );
+        assert_eq!(out.dropped, Some(DropReason::NestedClaim));
+        assert_eq!(out.state, claude);
+    }
+
+    #[test]
+    fn a_claim_that_is_not_nested_still_supersedes() {
+        let cases = [
+            (
+                "the owner's turn is over",
+                mid_turn(AgentLifecycle::Finished, "claude", "outer"),
+                report("codex", "next", OwnershipAction::Claim),
+            ),
+            (
+                "the owner's turn failed",
+                mid_turn(AgentLifecycle::Failed, "claude", "outer"),
+                report("codex", "next", OwnershipAction::Claim),
+            ),
+            (
+                "the owner is a label left by the prompt mark",
+                AgentTabState {
+                    shell: ShellState::AtPrompt,
+                    lifecycle: AgentLifecycle::Inactive,
+                    ownership: owner("claude", "outer"),
+                },
+                report("codex", "next", OwnershipAction::Claim),
+            ),
+            (
+                "no shell integration ever resets a dead owner",
+                AgentTabState {
+                    shell: ShellState::Unknown,
+                    lifecycle: AgentLifecycle::Working,
+                    ownership: owner("claude", "outer"),
+                },
+                report("codex", "next", OwnershipAction::Claim),
+            ),
+            (
+                "the same agent switches sessions mid-turn",
+                mid_turn(AgentLifecycle::Waiting, "claude", "outer"),
+                report("claude", "cleared", OwnershipAction::Claim),
+            ),
+            (
+                "a human takes the wheel",
+                mid_turn(AgentLifecycle::Working, "claude", "outer"),
+                report(SOURCE_MANUAL, "", OwnershipAction::Claim),
+            ),
+            (
+                "the owner is a human, not an agent",
+                mid_turn(AgentLifecycle::Working, SOURCE_MANUAL, ""),
+                report("claude", "outer", OwnershipAction::Claim),
+            ),
+            (
+                "nobody owns the tab",
+                AgentTabState {
+                    shell: ShellState::ForegroundProcess,
+                    lifecycle: AgentLifecycle::Working,
+                    ownership: None,
+                },
+                report("codex", "next", OwnershipAction::Claim),
+            ),
+        ];
+        for (why, current, claim) in cases {
+            let out = apply_report(&current, &claim, 1_700_000_100);
+            assert!(out.accepted(), "{why}");
+            let new_owner = out.state.ownership.expect(why);
+            assert_eq!(
+                (new_owner.source.as_str(), new_owner.session_id.as_str()),
+                (claim.source.as_str(), claim.session_id.as_str()),
+                "{why}"
+            );
+        }
+    }
+
+    #[test]
+    fn dropped_reports_serialize_in_the_documented_shape() {
+        let dropped = DroppedReports {
+            count: 9,
+            last: DroppedReport {
+                source: "codex".into(),
+                session_id: "inner".into(),
+                ownership_action: OwnershipAction::Release,
+                reason: DropReason::NotOwner,
+                tab_had_owner: true,
+                at: 1_791_648_366,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&dropped).unwrap(),
+            serde_json::json!({"count": 9, "last": {
+                "source": "codex", "session_id": "inner", "ownership_action": "release",
+                "reason": "not_owner", "tab_had_owner": true, "at": 1_791_648_366,
+            }})
+        );
+        assert_eq!(
+            serde_json::to_string(&DropReason::NestedClaim).unwrap(),
+            "\"nested_claim\""
+        );
     }
 
     #[test]
