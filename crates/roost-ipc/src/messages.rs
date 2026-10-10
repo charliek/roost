@@ -21,7 +21,7 @@ use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::agent::{AgentLifecycle, AgentTabState, Ownership, ShellState};
+use crate::agent::{AgentLifecycle, AgentTabState, DroppedReports, Ownership, ShellState};
 use crate::local_route::LocalBackendMode;
 
 // ============================================================================
@@ -85,6 +85,13 @@ pub struct Tab {
     /// recorded before the field existed still round-trips byte for byte.
     #[serde(default, skip_serializing_if = "is_false")]
     pub password_input: bool,
+    /// Agent reports this tab's server dropped (`tab.agent_report`
+    /// answered `accepted: false`): how many, and the latest. Live
+    /// diagnostic state on the server that holds the tab, never persisted
+    /// and carried by no event, so read it from that server. Omitted until
+    /// a report is dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_reports: Option<DroppedReports>,
 }
 
 impl Tab {
@@ -4641,6 +4648,7 @@ mod tests {
             agent_lifecycle: AgentLifecycle::Inactive,
             ownership: None,
             password_input: false,
+            dropped_reports: None,
         };
         round_trip(&t);
         let json = serde_json::to_string(&t).unwrap();
@@ -4694,6 +4702,7 @@ mod tests {
             agent_lifecycle: AgentLifecycle::default(),
             ownership: None,
             password_input: false,
+            dropped_reports: None,
         };
         let value = serde_json::to_value(&tab).unwrap();
         for key in ["shell_state", "agent_lifecycle"] {

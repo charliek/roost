@@ -172,7 +172,8 @@ terminal from. It shares the socket path but not the framing; see
     "shell_state": "<ShellState>",
     "agent_lifecycle": "<AgentLifecycle>",
     "ownership": "<Ownership, omitted when unowned>",
-    "password_input": "<bool, omitted while false>"
+    "password_input": "<bool, omitted while false>",
+    "dropped_reports": "<DroppedReports, omitted until a report is dropped>"
   },
   "Project": {
     "id": "<string-int64>",
@@ -221,6 +222,24 @@ zsh prompt does not set it: their line editors run the terminal raw,
 outside canonical mode. The key is omitted while `false`, so a server
 that predates the field, and a tab that is not at a prompt, look the
 same — both read as `false`, with no protocol bump.
+
+`Tab.dropped_reports` counts the [`tab.agent_report`](#tabagent_report)s
+this tab's server refused (`accepted: false`) and keeps the latest:
+
+```json
+{"count": 9, "last": {"source": "codex", "session_id": "01a12677…",
+  "ownership_action": "release", "reason": "not_owner", "at": 1791648366}}
+```
+
+`reason` is `"not_owner"` (a `preserve` or `release` from anyone but the
+owner, including any report to a tab nobody owns) or `"nested_claim"`.
+An agent whose reports keep landing as `not_owner` on a tab with no
+owner has lost the tab: nothing it sends shows until it claims again,
+and `roostctl doctor` says so. The field is live diagnostic state on the
+server that holds the tab, never persisted and carried by no event, so
+read it from that server rather than from a window mirroring a remote
+host. The key is omitted until something is dropped, so an older server
+reads the same as a tab with nothing dropped.
 
 ### `tab.state` / `hook_active` — derived, and the compatibility contract
 
@@ -1443,7 +1462,8 @@ Response:
 
 `accepted` is `false` when the report lost the ownership-matching
 check above, or was a nested claim. `tab` is then the tab
-**unchanged**. The full `Tab` is
+**unchanged** apart from its
+[`dropped_reports`](#shared-types) count. The full `Tab` is
 always returned so an adapter never needs a follow-up `tab.list` to
 see what its own report did.
 

@@ -374,20 +374,57 @@ pub enum AttentionEffect {
     Unchanged,
 }
 
+/// Why [`apply_report`] dropped a report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DropReason {
+    /// A `preserve` or `release` from anyone but the owner, including
+    /// any report to a tab nobody owns.
+    NotOwner,
+    /// A claim from an agent the owner is running; see
+    /// [`is_nested_claim`].
+    NestedClaim,
+}
+
+/// One report a server dropped, as `Tab.dropped_reports` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DroppedReport {
+    pub source: String,
+    #[serde(default)]
+    pub session_id: String,
+    pub ownership_action: OwnershipAction,
+    pub reason: DropReason,
+    /// Server receipt time.
+    pub at: i64,
+}
+
+/// How many reports a tab's server has dropped, and the latest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DroppedReports {
+    pub count: u64,
+    pub last: DroppedReport,
+}
+
 /// Result of applying a report: the new state plus everything the
 /// caller needs to emit events without re-deriving it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyOutcome {
     pub state: AgentTabState,
-    /// False when the report was dropped on an ownership mismatch or as
-    /// a nested claim; the state is then returned unchanged.
-    pub accepted: bool,
+    /// Set when the report was dropped; the state is then returned
+    /// unchanged.
+    pub dropped: Option<DropReason>,
     /// Whether the owner's **identity or presence** changed. A refreshed
     /// `last_event_at` (or merged metadata) is not an ownership change —
     /// otherwise every accepted report would look like one.
     pub ownership_changed: bool,
     pub lifecycle_changed: bool,
     pub attention: AttentionEffect,
+}
+
+impl ApplyOutcome {
+    pub fn accepted(&self) -> bool {
+        self.dropped.is_none()
+    }
 }
 
 /// Apply a report to the current state, enforcing session scoping
@@ -412,14 +449,18 @@ pub fn apply_report(
     report: &TabAgentReportParams,
     now: i64,
 ) -> ApplyOutcome {
-    let authorized = match report.ownership_action {
-        OwnershipAction::Claim => !is_nested_claim(current, report),
-        OwnershipAction::Preserve | OwnershipAction::Release => owner_matches(current, report),
+    let dropped = match report.ownership_action {
+        OwnershipAction::Claim => {
+            is_nested_claim(current, report).then_some(DropReason::NestedClaim)
+        }
+        OwnershipAction::Preserve | OwnershipAction::Release => {
+            (!owner_matches(current, report)).then_some(DropReason::NotOwner)
+        }
     };
-    if !authorized {
+    if dropped.is_some() {
         return ApplyOutcome {
             state: current.clone(),
-            accepted: false,
+            dropped,
             ownership_changed: false,
             lifecycle_changed: false,
             attention: AttentionEffect::Unchanged,
@@ -486,7 +527,7 @@ pub fn apply_report(
     };
 
     ApplyOutcome {
-        accepted: true,
+        dropped: None,
         ownership_changed: identity(&state.ownership) != identity(&current.ownership),
         lifecycle_changed: state.lifecycle != current.lifecycle,
         attention,
@@ -718,13 +759,13 @@ mod tests {
             ..report("codex", "inner", OwnershipAction::Preserve)
         };
         let end = report("codex", "inner", OwnershipAction::Release);
-        for nested in [&claim, &stop, &end] {
+        for (nested, reason) in [
+            (&claim, DropReason::NestedClaim),
+            (&stop, DropReason::NotOwner),
+            (&end, DropReason::NotOwner),
+        ] {
             let out = apply_report(&claude, nested, 1_700_000_100);
-            assert!(
-                !out.accepted,
-                "{:?} must be dropped",
-                nested.ownership_action
-            );
+            assert_eq!(out.dropped, Some(reason), "{:?}", nested.ownership_action);
             assert_eq!(out.state, claude);
             assert_eq!(out.attention, AttentionEffect::Unchanged);
         }
@@ -734,7 +775,7 @@ mod tests {
             ..report("claude", "outer", OwnershipAction::Preserve)
         };
         let out = apply_report(&claude, &next_tool, 1_700_000_200);
-        assert!(out.accepted, "the outer agent still owns the tab");
+        assert!(out.accepted(), "the outer agent still owns the tab");
         assert_eq!(out.state.ownership.unwrap().last_event_at, 1_700_000_200);
     }
 
@@ -747,7 +788,7 @@ mod tests {
             &report("codex", "inner", OwnershipAction::Claim),
             1_700_000_100,
         );
-        assert!(!out.accepted);
+        assert_eq!(out.dropped, Some(DropReason::NestedClaim));
         assert_eq!(out.state, claude);
     }
 
@@ -809,7 +850,7 @@ mod tests {
         ];
         for (why, current, claim) in cases {
             let out = apply_report(&current, &claim, 1_700_000_100);
-            assert!(out.accepted, "{why}");
+            assert!(out.accepted(), "{why}");
             let new_owner = out.state.ownership.expect(why);
             assert_eq!(
                 (new_owner.source.as_str(), new_owner.session_id.as_str()),
@@ -817,6 +858,31 @@ mod tests {
                 "{why}"
             );
         }
+    }
+
+    #[test]
+    fn dropped_reports_serialize_in_the_documented_shape() {
+        let dropped = DroppedReports {
+            count: 9,
+            last: DroppedReport {
+                source: "codex".into(),
+                session_id: "inner".into(),
+                ownership_action: OwnershipAction::Release,
+                reason: DropReason::NotOwner,
+                at: 1_791_648_366,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&dropped).unwrap(),
+            serde_json::json!({"count": 9, "last": {
+                "source": "codex", "session_id": "inner", "ownership_action": "release",
+                "reason": "not_owner", "at": 1_791_648_366,
+            }})
+        );
+        assert_eq!(
+            serde_json::to_string(&DropReason::NestedClaim).unwrap(),
+            "\"nested_claim\""
+        );
     }
 
     #[test]

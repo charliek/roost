@@ -558,6 +558,7 @@ mod tests {
             agent_lifecycle: AgentLifecycle::Inactive,
             ownership: None,
             password_input: false,
+            dropped_reports: None,
         }
     }
 

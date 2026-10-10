@@ -30,8 +30,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use roost_ipc::agent::{
-    self, AgentLifecycle, AgentTabState, AttentionEffect, OwnershipAction, TabAgentReportParams,
-    SOURCE_LEGACY, SOURCE_MANUAL,
+    self, AgentLifecycle, AgentTabState, AttentionEffect, DropReason, DroppedReport,
+    DroppedReports, OwnershipAction, TabAgentReportParams, SOURCE_LEGACY, SOURCE_MANUAL,
 };
 use roost_ipc::messages::{Project, Tab, TabState};
 use serde::{Deserialize, Serialize};
@@ -122,6 +122,9 @@ struct TabRow {
     /// Not persisted, like `has_notification`: a relaunch reopens fresh
     /// shells, and none of them starts at a prompt.
     password_input: bool,
+    /// Reports [`Workspace::agent_report`] dropped; see
+    /// `Tab.dropped_reports`. Not persisted.
+    dropped_reports: Option<DroppedReports>,
     user_titled: bool,
     position: i32,
     created_at: i64,
@@ -1588,6 +1591,7 @@ impl Workspace {
             has_notification: false,
             notification_generation: 0,
             password_input: false,
+            dropped_reports: None,
             // Always start with user_titled=false. The caller-
             // supplied `title` is a placeholder (e.g. UI's
             // "roost-mac N" / CLI's "roostctl" default) that
@@ -2004,7 +2008,8 @@ impl Workspace {
         let mut attention = AttentionEffect::Unchanged;
         for report in std::iter::once(first).chain(then) {
             let outcome = agent::apply_report(&next, report, now);
-            if !outcome.accepted {
+            if let Some(reason) = outcome.dropped {
+                record_drop(row, report, reason, now);
                 continue;
             }
             accepted = true;
@@ -2928,6 +2933,34 @@ fn retained_tabs(saved: &RestoreProject) -> Vec<crate::persistence::TabSnapshot>
         .collect()
 }
 
+/// Count a dropped report on its tab. Only the first drop of a
+/// `(source, session_id, reason)` is logged, so a nested agent's whole
+/// session, or every hook of an agent that lost the tab, costs one line;
+/// the count carries the rest.
+fn record_drop(row: &mut TabRow, report: &TabAgentReportParams, reason: DropReason, now: i64) {
+    let last = DroppedReport {
+        source: report.source.clone(),
+        session_id: report.session_id.clone(),
+        ownership_action: report.ownership_action,
+        reason,
+        at: now,
+    };
+    let repeat = row.dropped_reports.as_ref().is_some_and(|d| {
+        (&d.last.source, &d.last.session_id, d.last.reason)
+            == (&last.source, &last.session_id, reason)
+    });
+    if !repeat {
+        let owner = row.agent.ownership.as_ref().map_or_else(
+            || "none".to_string(),
+            |o| format!("{}/{}", o.source, o.session_id),
+        );
+        tracing::info!(tab_id = row.id, source = %last.source, session_id = %last.session_id,
+            action = ?last.ownership_action, ?reason, %owner, "agent report dropped");
+    }
+    let count = row.dropped_reports.as_ref().map_or(0, |d| d.count) + 1;
+    row.dropped_reports = Some(DroppedReports { count, last });
+}
+
 fn wire_tab(row: &TabRow, is_active: bool) -> Tab {
     Tab {
         id: row.id,
@@ -2946,6 +2979,7 @@ fn wire_tab(row: &TabRow, is_active: bool) -> Tab {
         agent_lifecycle: row.agent.lifecycle,
         ownership: row.agent.ownership.clone(),
         password_input: row.password_input,
+        dropped_reports: row.dropped_reports.clone(),
     }
 }
 
@@ -4289,6 +4323,51 @@ mod tests {
             ))
             .unwrap();
         assert!(!accepted);
+    }
+
+    #[test]
+    fn dropped_reports_are_counted_on_the_tab_with_the_latest_reason() {
+        let (ws, tid) = agent_ws();
+        assert_eq!(ws.tab(tid).unwrap().dropped_reports, None);
+
+        let lost = report(tid, "claude", "s1", OwnershipAction::Preserve, None);
+        let (accepted, tab) = ws.agent_report(&lost).unwrap();
+        assert!(!accepted);
+        let dropped = tab.dropped_reports.expect("the refused report is recorded");
+        assert_eq!(dropped.count, 1);
+        assert_eq!(
+            (
+                dropped.last.source.as_str(),
+                dropped.last.session_id.as_str()
+            ),
+            ("claude", "s1")
+        );
+        assert_eq!(dropped.last.ownership_action, OwnershipAction::Preserve);
+        assert_eq!(dropped.last.reason, DropReason::NotOwner);
+
+        let claim = report(
+            tid,
+            "claude",
+            "s1",
+            OwnershipAction::Claim,
+            Some(AgentLifecycle::Working),
+        );
+        let (accepted, tab) = ws.agent_report(&claim).unwrap();
+        assert!(accepted);
+        assert_eq!(
+            tab.dropped_reports.unwrap().count,
+            1,
+            "accepted reports are not counted"
+        );
+
+        ws.apply_shell_mark(tid, "C").unwrap();
+        let nested = report(tid, "codex", "inner", OwnershipAction::Claim, None);
+        let (accepted, tab) = ws.agent_report(&nested).unwrap();
+        assert!(!accepted);
+        let dropped = tab.dropped_reports.unwrap();
+        assert_eq!(dropped.count, 2);
+        assert_eq!(dropped.last.reason, DropReason::NestedClaim);
+        assert_eq!(ws.tab(tid).unwrap().dropped_reports, Some(dropped));
     }
 
     #[test]

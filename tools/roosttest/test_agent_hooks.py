@@ -268,10 +268,16 @@ def test_a_codex_session_inside_a_claude_turn_leaves_claude_the_tab(roost, proje
     agent_hook(target, tab, "claude", {**claude, "hook_event_name": "UserPromptSubmit", "prompt": "review it"})
     expect(roost, tab, "claude", "Claude's turn", "working", "outer", "user_prompt_submit")
 
-    for _, payload in fixture("codex"):
+    codex = fixture("codex")
+    for _, payload in codex:
         agent_hook(target, tab, "codex", payload)
     assert (roost.ownership(tab) or {}).get("source") == "claude", roost.tab(tab)
     assert roost.has_notification(tab) is False, "codex's Stop must not banner Claude's tab"
+    # #620: every refused codex report is counted, the last being its release.
+    dropped = roost.tab(tab)["dropped_reports"]
+    assert dropped["count"] == len(codex), dropped
+    assert (dropped["last"]["source"], dropped["last"]["ownership_action"],
+            dropped["last"]["reason"]) == ("codex", "release", "not_owner"), dropped
 
     agent_hook(target, tab, "claude", {
         **claude, "hook_event_name": "PreToolUse",

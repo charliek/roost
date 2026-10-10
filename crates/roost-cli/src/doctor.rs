@@ -35,7 +35,8 @@ use roost_agent_install::{
     ALL_AGENTS as ALL_INSTALL_AGENTS,
 };
 use roost_ipc::agent::{
-    effective_lifecycle, is_live, suppress_raw_osc, AgentLifecycle, ShellState,
+    effective_lifecycle, is_live, suppress_raw_osc, AgentLifecycle, DropReason, DroppedReports,
+    OwnershipAction, ShellState,
 };
 use roost_ipc::messages::{ops, IdentifyParams, IdentifyResult, Tab, TabListResult};
 use roost_ipc::session_launch::timeout_scale;
@@ -160,6 +161,7 @@ const DOC_TARGETS: &[(&str, Doc)] = &[
         "tab.raw_osc",
         doc!("guides/notifications", "hook-session-osc-suppression"),
     ),
+    ("tab.dropped_reports", doc!("guides/agents", "ownership")),
     (
         "claude.binary",
         doc!("guides/claude-code", "troubleshooting"),
@@ -2723,6 +2725,7 @@ fn tab_checks(
             axis_unavailable("tab.ownership", "Ownership"),
             axis_unavailable("tab.derived", "Derived state"),
             axis_unavailable("tab.raw_osc", "Raw OSC suppression"),
+            axis_unavailable("tab.dropped_reports", "Dropped reports"),
         ];
     };
 
@@ -2794,7 +2797,51 @@ fn tab_checks(
                 "raw OSC 9/99/777 notifications are delivered"
             },
         ),
+        observation(
+            "tab.dropped_reports",
+            "Dropped reports",
+            match &tab.dropped_reports {
+                Some(dropped) => describe_dropped(inputs.now_unix, tab, dropped),
+                None => "none".to_string(),
+            },
+        ),
     ]
+}
+
+/// The tab's dropped-report record, plus the one pattern worth naming: an
+/// agent still reporting into a tab nobody owns has lost the tab, and
+/// nothing it sends is shown until it claims again. A nested agent's
+/// drops land under a live owner, so they never read as this.
+fn describe_dropped(now: i64, tab: &Tab, dropped: &DroppedReports) -> String {
+    let last = &dropped.last;
+    let action = match last.ownership_action {
+        OwnershipAction::Claim => "claim",
+        OwnershipAction::Preserve => "preserve",
+        OwnershipAction::Release => "release",
+    };
+    let reason = match last.reason {
+        DropReason::NotOwner => "not_owner",
+        DropReason::NestedClaim => "nested_claim",
+    };
+    let lost = last.reason == DropReason::NotOwner
+        && last.ownership_action == OwnershipAction::Preserve
+        && tab.ownership.is_none();
+    format!(
+        "count={} last: source={} session={} action={action} reason={reason} at={}{}",
+        dropped.count,
+        redact(&last.source),
+        fingerprint(&last.session_id),
+        describe_age(now, last.at),
+        if lost {
+            format!(
+                " — `{}` is still reporting here but no agent owns this tab, so its status \
+                 is ignored until its next session start (in Claude Code, /compact or /clear)",
+                redact(&last.source)
+            )
+        } else {
+            String::new()
+        },
+    )
 }
 
 /// Why the selected tab's axes are not observable. Shared with
@@ -3862,6 +3909,7 @@ mod tests {
             agent_lifecycle: AgentLifecycle::Inactive,
             ownership: None,
             password_input: false,
+            dropped_reports: None,
         }
     }
 
@@ -3974,7 +4022,7 @@ mod tests {
     }
 
     /// The fixed inventory (§3.7): 31 checks + 8 observations.
-    const CHECK_COUNT: usize = 39;
+    const CHECK_COUNT: usize = 40;
 
     // ------------------------------------------------- applicability (AC 7)
 
@@ -4343,6 +4391,7 @@ mod tests {
             "tab.ownership",
             "tab.derived",
             "tab.raw_osc",
+            "tab.dropped_reports",
         ] {
             let c = find(&report, id);
             // An observation that could not be observed: `skipped` is
@@ -5620,6 +5669,61 @@ mod tests {
         assert!(detail.contains("60s ago"), "{detail}");
     }
 
+    fn dropped(
+        source: &str,
+        action: OwnershipAction,
+        reason: DropReason,
+    ) -> Option<roost_ipc::agent::DroppedReports> {
+        Some(roost_ipc::agent::DroppedReports {
+            count: 4,
+            last: roost_ipc::agent::DroppedReport {
+                source: source.into(),
+                session_id: "sess-abcdef123456".into(),
+                ownership_action: action,
+                reason,
+                at: 1_700_000_040,
+            },
+        })
+    }
+
+    fn dropped_detail(tab: Tab) -> String {
+        let inputs = Inputs {
+            tab_list: Ok(tab_list(&[tab])),
+            ..healthy()
+        };
+        find(&evaluate(&inputs), "tab.dropped_reports")
+            .detail
+            .clone()
+    }
+
+    #[test]
+    fn dropped_reports_are_observed_with_the_lost_tab_called_out() {
+        assert_eq!(dropped_detail(tab(7)), "none");
+
+        let lost = dropped_detail(Tab {
+            dropped_reports: dropped("claude", OwnershipAction::Preserve, DropReason::NotOwner),
+            ..tab(7)
+        });
+        assert!(lost.starts_with("count=4 last: source=claude"), "{lost}");
+        assert!(lost.contains("action=preserve reason=not_owner"), "{lost}");
+        assert!(lost.contains("60s ago"), "{lost}");
+        assert!(!lost.contains("sess-abcdef123456"), "{lost}");
+        assert!(lost.contains("no agent owns this tab"), "{lost}");
+
+        // A nested agent's drops land under a live owner: no hint.
+        let nested = dropped_detail(Tab {
+            ownership: Some(Ownership {
+                source: "claude".into(),
+                session_id: "outer".into(),
+                ..Ownership::default()
+            }),
+            dropped_reports: dropped("codex", OwnershipAction::Release, DropReason::NotOwner),
+            ..tab(7)
+        });
+        assert!(nested.contains("reason=not_owner"), "{nested}");
+        assert!(!nested.contains("no agent owns"), "{nested}");
+    }
+
     // ------------------------------------------------------- exit + render
 
     #[test]
@@ -6578,6 +6682,7 @@ mod tests {
             ("tab.ownership", "Ownership"),
             ("tab.derived", "Derived state"),
             ("tab.raw_osc", "Raw OSC suppression"),
+            ("tab.dropped_reports", "Dropped reports"),
             ("claude.binary", "`claude` on PATH"),
             ("claude.settings", "Settings file"),
             ("claude.hook_events", "Registered events"),
@@ -6633,6 +6738,7 @@ mod tests {
             "tab.ownership",
             "tab.derived",
             "tab.raw_osc",
+            "tab.dropped_reports",
         ];
         for inputs in doc_url_battery() {
             let report = evaluate(&inputs);

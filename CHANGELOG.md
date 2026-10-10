@@ -21,6 +21,14 @@ release workflow asserts they agree).
   command palette ("Next Project", "Previous Project") and, on macOS, the
   File menu. The Swift app is unchanged. See
   [Keybindings](docs/getting-started/keybindings.md#available-actions).
+- **Dropped agent reports are visible.** A `tab.agent_report` the server
+  refuses used to vanish without a trace. Each tab now counts the
+  reports it dropped and keeps the latest, with its reason (`not_owner`
+  or `nested_claim`), on `Tab.dropped_reports`. The server logs one line
+  per dropped stream, and `roostctl doctor` shows the record and says
+  when an agent is still reporting into a tab nobody owns (it has lost
+  the tab until its next session start). See
+  [`Tab.dropped_reports`](docs/reference/ipc.md#shared-types).
 
 ### Fixed
 

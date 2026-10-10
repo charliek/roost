@@ -315,6 +315,12 @@ running in a tab. Every pane there shares the tab's `ROOST_TAB_ID`, so
 the tab can show only one of their agents, and not reliably the one
 you're looking at.
 
+When a tab's agent row disappears while the agent is still running,
+`roostctl doctor` shows the reports the tab dropped
+(`tab.dropped_reports`). An agent whose reports are dropped on a tab
+nobody owns has lost the tab, and its next session start (in Claude
+Code, `/compact` or `/clear`) takes it back.
+
 Doctor's
 `owning` checks read this off the running UI's tab list — there is no
 durable "ever observed" store, so they can only say who owns a tab
