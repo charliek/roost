@@ -2014,7 +2014,7 @@ impl Workspace {
         for report in std::iter::once(first).chain(then) {
             let outcome = agent::apply_report(&next, report, now);
             if let Some(reason) = outcome.dropped {
-                drop_logs.extend(record_drop(row, &next, report, reason, now));
+                drop_logs.push(record_drop(row, &next, report, reason, now));
                 continue;
             }
             accepted = true;
@@ -2944,18 +2944,18 @@ fn retained_tabs(saved: &RestoreProject) -> Vec<crate::persistence::TabSnapshot>
 /// How many dropped-report streams a tab remembers having logged.
 const LOGGED_DROP_STREAMS: usize = 16;
 
-/// Count a dropped report on its tab, and return a log line for the first
-/// drop of each `(source, session_id, reason)` stream the tab remembers, so
-/// a nested agent's whole session, or every hook of an agent that lost the
-/// tab, costs one line. The caller emits it once the workspace lock is
-/// released.
+/// Count a dropped report on its tab, and return its log line: INFO for
+/// the first drop of each `(source, session_id, reason)` stream the tab
+/// remembers, DEBUG for the repeats, so a nested agent's whole session, or
+/// every hook of an agent that lost the tab, costs one INFO line. The
+/// caller emits it once the workspace lock is released.
 fn record_drop(
     row: &mut TabRow,
     seen: &AgentTabState,
     report: &TabAgentReportParams,
     reason: DropReason,
     now: i64,
-) -> Option<DropLog> {
+) -> DropLog {
     let count = row.dropped_reports.as_ref().map_or(0, |d| d.count) + 1;
     row.dropped_reports = Some(DroppedReports {
         count,
@@ -2975,14 +2975,15 @@ fn record_drop(
         (&report.source, &report.session_id, reason).hash(&mut hasher);
         hasher.finish()
     };
-    if row.logged_drop_streams.contains(&stream) {
-        return None;
+    let first = !row.logged_drop_streams.contains(&stream);
+    if first {
+        if row.logged_drop_streams.len() == LOGGED_DROP_STREAMS {
+            row.logged_drop_streams.pop_front();
+        }
+        row.logged_drop_streams.push_back(stream);
     }
-    if row.logged_drop_streams.len() == LOGGED_DROP_STREAMS {
-        row.logged_drop_streams.pop_front();
-    }
-    row.logged_drop_streams.push_back(stream);
-    Some(DropLog {
+    DropLog {
+        first,
         tab_id: row.id,
         source: log_clip(&report.source),
         session_id: log_clip(&report.session_id),
@@ -2992,7 +2993,7 @@ fn record_drop(
             || "none".to_string(),
             |o| log_clip(&format!("{}/{}", o.source, o.session_id)),
         ),
-    })
+    }
 }
 
 /// An agent-supplied string, capped for a log line. Fields are written
@@ -3002,6 +3003,8 @@ fn log_clip(value: &str) -> String {
 }
 
 struct DropLog {
+    /// The first drop of its stream (INFO) rather than a repeat (DEBUG).
+    first: bool,
     tab_id: i64,
     source: String,
     session_id: String,
@@ -3012,15 +3015,24 @@ struct DropLog {
 
 impl DropLog {
     fn emit(&self) {
-        tracing::info!(
-            tab_id = self.tab_id,
-            source = ?self.source,
-            session_id = ?self.session_id,
-            action = ?self.action,
-            reason = ?self.reason,
-            owner = ?self.owner,
-            "agent report dropped"
-        );
+        macro_rules! dropped {
+            ($level:ident) => {
+                tracing::$level!(
+                    tab_id = self.tab_id,
+                    source = ?self.source,
+                    session_id = ?self.session_id,
+                    action = ?self.action,
+                    reason = ?self.reason,
+                    owner = ?self.owner,
+                    "agent report dropped"
+                )
+            };
+        }
+        if self.first {
+            dropped!(info);
+        } else {
+            dropped!(debug);
+        }
     }
 }
 
@@ -4456,7 +4468,7 @@ mod tests {
         let a = report(tid, "codex", "a", OwnershipAction::Preserve, None);
         let b = report(tid, "codex", "b", OwnershipAction::Preserve, None);
         let logged = |row: &mut TabRow, r: &TabAgentReportParams, reason| {
-            record_drop(row, &AgentTabState::default(), r, reason, 1).is_some()
+            record_drop(row, &AgentTabState::default(), r, reason, 1).first
         };
 
         assert!(logged(row, &a, DropReason::NotOwner));
@@ -4488,7 +4500,7 @@ mod tests {
         }
         assert_eq!(row.logged_drop_streams.len(), LOGGED_DROP_STREAMS);
         assert!(
-            record_drop(row, &AgentTabState::default(), &a, DropReason::NotOwner, 1).is_some(),
+            record_drop(row, &AgentTabState::default(), &a, DropReason::NotOwner, 1).first,
             "the memory is bounded, oldest first"
         );
     }

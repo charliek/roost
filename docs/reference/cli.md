@@ -1029,7 +1029,7 @@ roostctl doctor --color=always
 |---|---|---|---|
 | `--tab` | int | `$ROOST_TAB_ID` / the UI's active tab | Inspect this tab instead. Doctor reads the env var itself rather than through the parse every other `--tab` command shares, so an unparsable `$ROOST_TAB_ID` becomes a diagnostic (`env.tab_id: fail`) instead of exit 2 `usage` |
 | `--json` | flag | `false` | Machine-readable report (the global flag; see [JSON output](#json-output)) |
-| `-v` / `--verbose` | flag | `false` | Print the full per-check report — all 39 entries with details and doc links — instead of the one-line-per-section summary. Ignored by `--json`, which always carries everything |
+| `-v` / `--verbose` | flag | `false` | Print the full per-check report — all 40 entries with details and doc links — instead of the one-line-per-section summary. Ignored by `--json`, which always carries everything |
 | `--color` | `auto` \| `always` \| `never` | `auto` | Colorize the text output. `auto` enables color only when stdout is a TTY, `NO_COLOR` is unset **or empty**, and `TERM` is not `dumb`; `always` bypasses all three checks; `never` always disables. Per <https://no-color.org/>, `NO_COLOR=` (present but empty) does **not** disable — only a non-empty value does. Ignored by `--json` |
 
 Doctor diagnoses the Roost any other verb would dial: from inside a local
@@ -1062,9 +1062,9 @@ version it can't identify).
 
 **Observations** carry no verdict at all — `status` is `null` — because
 they report a fact with no correct value: the selected tab's four agent
-axes (plus the state derived from them and whether raw OSC 9/99/777 is
-suppressed), `ROOST_SOCKET`, and the current shell. The exception worth
-naming: those same six `tab.*` axes carry `skipped` rather than `null`
+axes (plus the state derived from them, whether raw OSC 9/99/777 is
+suppressed, and its dropped reports), `ROOST_SOCKET`, and the current
+shell. The exception worth naming: those same seven `tab.*` axes carry `skipped` rather than `null`
 when the UI predates the agent state model, because then they genuinely
 cannot be observed — `tab.ownership: null` ("nothing owns it") and
 `tab.ownership: "skipped"` ("can't tell") are different findings, and a
@@ -1106,7 +1106,7 @@ something to say with nothing running — only the tab-scoped `owning`
 checks and `agent.hook_binary` (which needs to be inside a tab at all)
 come back `skipped` here.
 
-`-v` prints all 39 entries grouped by section, with the status column
+`-v` prints all 40 entries grouped by section, with the status column
 blank for `null`-status observations (not for `skipped` — that word
 still prints, because it *is* a status) and a doc link under every
 `fail`/`warn`. Same capture, `-v`, trimmed with `[…]` to the sections
@@ -1182,7 +1182,7 @@ anything fail" from the check list), and every entry's stable `id`,
 observations, one of `ok`/`warn`/`fail`/`skipped` for checks. That's the
 shape to script against; the text output's column widths are not.
 `--json` is also unaffected by `-v` and `--color`: it always carries all
-39 entries and never contains a color escape, regardless of either
+40 entries and never contains a color escape, regardless of either
 flag.
 
 ## Environment
