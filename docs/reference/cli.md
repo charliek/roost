@@ -1029,7 +1029,7 @@ roostctl doctor --color=always
 |---|---|---|---|
 | `--tab` | int | `$ROOST_TAB_ID` / the UI's active tab | Inspect this tab instead. Doctor reads the env var itself rather than through the parse every other `--tab` command shares, so an unparsable `$ROOST_TAB_ID` becomes a diagnostic (`env.tab_id: fail`) instead of exit 2 `usage` |
 | `--json` | flag | `false` | Machine-readable report (the global flag; see [JSON output](#json-output)) |
-| `-v` / `--verbose` | flag | `false` | Print the full per-check report — all 39 entries with details and doc links — instead of the one-line-per-section summary. Ignored by `--json`, which always carries everything |
+| `-v` / `--verbose` | flag | `false` | Print the full per-check report — all 40 entries with details and doc links — instead of the one-line-per-section summary. Ignored by `--json`, which always carries everything |
 | `--color` | `auto` \| `always` \| `never` | `auto` | Colorize the text output. `auto` enables color only when stdout is a TTY, `NO_COLOR` is unset **or empty**, and `TERM` is not `dumb`; `always` bypasses all three checks; `never` always disables. Per <https://no-color.org/>, `NO_COLOR=` (present but empty) does **not** disable — only a non-empty value does. Ignored by `--json` |
 
 Doctor diagnoses the Roost any other verb would dial: from inside a local
@@ -1046,7 +1046,7 @@ judge a *tab* fact unless the selected tab is doctor's own tab.
 | `env` | process | Are `ROOST_TAB_ID` / `ROOST_SOCKET` set, and valid? |
 | `ui` | ui | Which UI did target resolution pick, is its socket reachable, does `identify` succeed, does its version match `roostctl`'s, and does it speak the current agent-state wire format? |
 | `shell` | process (`shell.marks_observed` is tab-scoped) | Is the shell-integration contract offered, can this shell/version emit the OSC 133 marks that drive the running dot, and has a mark actually been observed on doctor's own tab? |
-| `tab` | tab | Which tab is selected — the one check in the section, and it can fail if a `--tab`/`$ROOST_TAB_ID` no longer exists — then, for that tab, its four agent axes (shell state, agent lifecycle, attention, ownership), the state derived from them, and whether raw OSC 9/99/777 is currently suppressed. Those six are observations, not verdicts. |
+| `tab` | tab | Which tab is selected — the one check in the section, and it can fail if a `--tab`/`$ROOST_TAB_ID` no longer exists — then, for that tab, its four agent axes (shell state, agent lifecycle, attention, ownership), the state derived from them, whether raw OSC 9/99/777 is currently suppressed, and the agent reports the tab's server has dropped (how many, the latest, and a note when the latest was dropped while no agent owned the tab and that agent doesn't own it now: if it is still running, it has lost the tab). Those seven are observations, not verdicts. |
 | `claude` | process (`claude.observed` is tab-scoped) | Is `claude` on `PATH`, does `~/.claude/settings.json` parse and register every lifecycle event Roost maps, does each hook command resolve to a runnable `roostctl`, has this tab actually seen a Claude hook fire? Pre-046 checks, kept for the settings-file shape they've always covered — see the `agents` section below for the other four agents and for Claude's newer, agent-hooks-specific facts |
 | `agents` | process (the `owning` checks are tab-scoped) | Is `$ROOST_AGENT_HOOK` set and executable from this tab; per agent (claude, codex, grok, cursor, opencode), is Roost's hook entry present and at the current integration version, and does that source currently own a tab on this UI; for codex, does its `trusted_hash` on disk match what codex would compute; is a legacy `~/.config/roost/claude-settings.json` or shell alias still lying around? See the [Agent Hooks](../guides/agents.md) guide |
 
@@ -1062,9 +1062,9 @@ version it can't identify).
 
 **Observations** carry no verdict at all — `status` is `null` — because
 they report a fact with no correct value: the selected tab's four agent
-axes (plus the state derived from them and whether raw OSC 9/99/777 is
-suppressed), `ROOST_SOCKET`, and the current shell. The exception worth
-naming: those same six `tab.*` axes carry `skipped` rather than `null`
+axes (plus the state derived from them, whether raw OSC 9/99/777 is
+suppressed, and its dropped reports), `ROOST_SOCKET`, and the current
+shell. The exception worth naming: those same seven `tab.*` axes carry `skipped` rather than `null`
 when the UI predates the agent state model, because then they genuinely
 cannot be observed — `tab.ownership: null` ("nothing owns it") and
 `tab.ownership: "skipped"` ("can't tell") are different findings, and a
@@ -1106,7 +1106,7 @@ something to say with nothing running — only the tab-scoped `owning`
 checks and `agent.hook_binary` (which needs to be inside a tab at all)
 come back `skipped` here.
 
-`-v` prints all 39 entries grouped by section, with the status column
+`-v` prints all 40 entries grouped by section, with the status column
 blank for `null`-status observations (not for `skipped` — that word
 still prints, because it *is* a status) and a doc link under every
 `fail`/`warn`. Same capture, `-v`, trimmed with `[…]` to the sections
@@ -1139,6 +1139,7 @@ Selected tab (tab)
   skipped tab.ownership            unavailable (no tab.list from a running UI)
   skipped tab.derived              unavailable (no tab.list from a running UI)
   skipped tab.raw_osc              unavailable (no tab.list from a running UI)
+  skipped tab.dropped_reports      unavailable (no tab.list from a running UI)
 
 Claude Code (process)
   ok      claude.binary            2.1.261 (Claude Code)
@@ -1181,7 +1182,7 @@ anything fail" from the check list), and every entry's stable `id`,
 observations, one of `ok`/`warn`/`fail`/`skipped` for checks. That's the
 shape to script against; the text output's column widths are not.
 `--json` is also unaffected by `-v` and `--color`: it always carries all
-39 entries and never contains a color escape, regardless of either
+40 entries and never contains a color escape, regardless of either
 flag.
 
 ## Environment

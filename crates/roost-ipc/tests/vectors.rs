@@ -196,7 +196,7 @@ fn agent_report_vector_decodes_into_its_typed_params() {
         }),
     };
     let out = roost_ipc::agent::apply_report(&finished, &guarded, 1_700_000_060);
-    assert!(out.accepted, "a vetoed report still matched the owner");
+    assert!(out.accepted(), "a vetoed report still matched the owner");
     assert_eq!(out.state.lifecycle, AgentLifecycle::Finished);
     assert_eq!(out.attention, AttentionEffect::Unchanged);
 

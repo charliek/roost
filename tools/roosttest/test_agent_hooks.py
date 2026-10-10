@@ -252,6 +252,44 @@ def test_claude_replays_through_the_generic_verb(roost, project, target):
     assert roost.hook_active(tab) is False
 
 
+def test_a_codex_session_inside_a_claude_turn_leaves_claude_the_tab(roost, project, target):
+    """#619 through the real verb. A `codex exec` review that Claude runs
+    from a tool call inherits the tab's `ROOST_TAB_ID`, so the whole
+    captured codex session lands on the tab while Claude is mid-turn. Its
+    `SessionStart` used to evict Claude and its `SessionEnd` then
+    released the tab, so every report Claude sent after it was dropped."""
+    if target != "iced":
+        pytest.skip("the frozen Swift app does not carry the nested-claim rule")
+    tab = agent_tab(roost, project)
+    roost.tab_feed_pty_bytes(tab, b"\x1b]133;C\x07")
+    roost.wait_shell_state(tab, "foreground_process")
+    claude = {"session_id": "outer", "cwd": "/tmp", "transcript_path": "/tmp/outer.jsonl"}
+    agent_hook(target, tab, "claude", {**claude, "hook_event_name": "SessionStart", "source": "startup"})
+    agent_hook(target, tab, "claude", {**claude, "hook_event_name": "UserPromptSubmit", "prompt": "review it"})
+    expect(roost, tab, "claude", "Claude's turn", "working", "outer", "user_prompt_submit")
+
+    codex = fixture("codex")
+    for _, payload in codex:
+        agent_hook(target, tab, "codex", payload)
+    assert (roost.ownership(tab) or {}).get("source") == "claude", roost.tab(tab)
+    assert roost.has_notification(tab) is False, "codex's Stop must not banner Claude's tab"
+    # #620: every refused codex report is counted, the last being its release.
+    dropped = roost.tab(tab)["dropped_reports"]
+    assert dropped["count"] == len(codex), dropped
+    assert (dropped["last"]["source"], dropped["last"]["ownership_action"],
+            dropped["last"]["reason"], dropped["last"]["tab_had_owner"]) == (
+        "codex", "release", "not_owner", True), dropped
+
+    agent_hook(target, tab, "claude", {
+        **claude, "hook_event_name": "PreToolUse",
+        "tool_name": "Bash", "tool_input": {}, "tool_use_id": "t2",
+    })
+    expect(roost, tab, "claude", "Claude's next tool", "working", "outer", "pre_tool_use")
+    agent_hook(target, tab, "claude", {**claude, "hook_event_name": "Stop", "stop_hook_active": False})
+    expect(roost, tab, "claude", "Claude's Stop", "finished", "outer", "stop")
+    roost.wait_notification(tab, True)
+
+
 def test_grok_replays_through_the_generic_verb(roost, project, target):
     """grok's third captured session — the one that hit plan mode, which
     is grok's only blocked signal (a `notification` carrying

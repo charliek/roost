@@ -820,6 +820,7 @@ fn every_workspace_event_has_a_wire_name() {
         agent_lifecycle: AgentLifecycle::Inactive,
         ownership: None,
         password_input: false,
+        dropped_reports: None,
     };
     let project = Project {
         id: 1,

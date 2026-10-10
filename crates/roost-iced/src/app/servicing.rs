@@ -5695,6 +5695,7 @@ mod tests {
             agent_lifecycle: roost_ipc::agent::AgentLifecycle::default(),
             ownership: None,
             password_input: false,
+            dropped_reports: None,
         }
     }
 

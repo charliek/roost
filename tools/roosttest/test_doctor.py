@@ -64,6 +64,7 @@ EXPECTED_CHECK_IDS = {
     "tab.ownership",
     "tab.derived",
     "tab.raw_osc",
+    "tab.dropped_reports",
     "claude.binary",
     "claude.settings",
     "claude.hook_events",
@@ -84,9 +85,9 @@ EXPECTED_CHECK_IDS = {
     "agent.opencode.owning",
 }
 
-# The `tab` section's six axis checks (everything but `tab.selection`).
+# The `tab` section's seven axis checks (everything but `tab.selection`).
 # They are observations: a resolved tab gives each a status-less fact,
-# and when no tab could be resolved all six carry `skipped` plus one
+# and when no tab could be resolved all seven carry `skipped` plus one
 # shared placeholder line. `axes_are_resolved` discriminates on both.
 TAB_AXIS_IDS = (
     "tab.shell_state",
@@ -95,6 +96,7 @@ TAB_AXIS_IDS = (
     "tab.ownership",
     "tab.derived",
     "tab.raw_osc",
+    "tab.dropped_reports",
 )
 
 # The four `tab.list` fields a mutation would land in — see
@@ -172,7 +174,7 @@ def axes_are_resolved(checks: dict[str, dict]) -> bool:
     Structural, not textual, on two independent signals. A resolved axis
     is a plain fact (`status: null`); an unobservable one is `skipped` —
     that split is the machine-readable half of schema 2. The placeholder
-    branch also gives all six axes one *identical* detail (they share a
+    branch also gives all seven axes one *identical* detail (they share a
     single reason string), while a resolved tab gives each its own, so
     "more than one distinct detail" still holds with no prose baked in.
     """

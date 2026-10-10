@@ -407,6 +407,7 @@ mod tests {
             agent_lifecycle: AgentLifecycle::default(),
             ownership: None,
             password_input: false,
+            dropped_reports: None,
         }
     }
 

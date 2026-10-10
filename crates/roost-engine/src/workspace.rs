@@ -30,8 +30,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use roost_ipc::agent::{
-    self, AgentLifecycle, AgentTabState, AttentionEffect, OwnershipAction, TabAgentReportParams,
-    SOURCE_LEGACY, SOURCE_MANUAL,
+    self, AgentLifecycle, AgentTabState, AttentionEffect, DropReason, DroppedReport,
+    DroppedReports, OwnershipAction, TabAgentReportParams, SOURCE_LEGACY, SOURCE_MANUAL,
 };
 use roost_ipc::messages::{Project, Tab, TabState};
 use serde::{Deserialize, Serialize};
@@ -122,6 +122,12 @@ struct TabRow {
     /// Not persisted, like `has_notification`: a relaunch reopens fresh
     /// shells, and none of them starts at a prompt.
     password_input: bool,
+    /// Reports [`Workspace::agent_report`] dropped; see
+    /// `Tab.dropped_reports`. Not persisted.
+    dropped_reports: Option<DroppedReports>,
+    /// The dropped-report streams already logged, most recent last;
+    /// see [`record_drop`].
+    logged_drop_streams: VecDeque<u64>,
     user_titled: bool,
     position: i32,
     created_at: i64,
@@ -1588,6 +1594,8 @@ impl Workspace {
             has_notification: false,
             notification_generation: 0,
             password_input: false,
+            dropped_reports: None,
+            logged_drop_streams: VecDeque::new(),
             // Always start with user_titled=false. The caller-
             // supplied `title` is a placeholder (e.g. UI's
             // "roost-mac N" / CLI's "roostctl" default) that
@@ -2002,9 +2010,11 @@ impl Workspace {
         let mut next = row.agent.clone();
         let mut accepted = false;
         let mut attention = AttentionEffect::Unchanged;
+        let mut drop_logs = Vec::new();
         for report in std::iter::once(first).chain(then) {
             let outcome = agent::apply_report(&next, report, now);
-            if !outcome.accepted {
+            if let Some(reason) = outcome.dropped {
+                drop_logs.push(record_drop(row, &next, report, reason, now));
                 continue;
             }
             accepted = true;
@@ -2045,6 +2055,9 @@ impl Workspace {
         let tab = wire_tab(row, is_active);
         // Run state isn't in the persisted snapshot — emit only.
         self.commit(inner, events, Persist::Skip);
+        for log in drop_logs {
+            log.emit();
+        }
         Ok((accepted, tab))
     }
 
@@ -2928,6 +2941,101 @@ fn retained_tabs(saved: &RestoreProject) -> Vec<crate::persistence::TabSnapshot>
         .collect()
 }
 
+/// How many dropped-report streams a tab remembers having logged.
+const LOGGED_DROP_STREAMS: usize = 16;
+
+/// Count a dropped report on its tab, and return its log line: INFO for
+/// the first drop of each `(source, session_id, reason)` stream the tab
+/// remembers, DEBUG for the repeats, so a nested agent's whole session, or
+/// every hook of an agent that lost the tab, costs one INFO line. The
+/// caller emits it once the workspace lock is released.
+fn record_drop(
+    row: &mut TabRow,
+    seen: &AgentTabState,
+    report: &TabAgentReportParams,
+    reason: DropReason,
+    now: i64,
+) -> DropLog {
+    let count = row.dropped_reports.as_ref().map_or(0, |d| d.count) + 1;
+    row.dropped_reports = Some(DroppedReports {
+        count,
+        last: DroppedReport {
+            source: report.source.clone(),
+            session_id: report.session_id.clone(),
+            ownership_action: report.ownership_action,
+            reason,
+            tab_had_owner: agent::is_live(seen),
+            at: now,
+        },
+    });
+
+    let stream = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (&report.source, &report.session_id, reason).hash(&mut hasher);
+        hasher.finish()
+    };
+    let first = !row.logged_drop_streams.contains(&stream);
+    if first {
+        if row.logged_drop_streams.len() == LOGGED_DROP_STREAMS {
+            row.logged_drop_streams.pop_front();
+        }
+        row.logged_drop_streams.push_back(stream);
+    }
+    DropLog {
+        first,
+        tab_id: row.id,
+        source: log_clip(&report.source),
+        session_id: log_clip(&report.session_id),
+        action: report.ownership_action,
+        reason,
+        owner: seen.ownership.as_ref().map_or_else(
+            || "none".to_string(),
+            |o| log_clip(&format!("{}/{}", o.source, o.session_id)),
+        ),
+    }
+}
+
+/// An agent-supplied string, capped for a log line. Fields are written
+/// with `?`, which escapes control characters, so none can forge a line.
+fn log_clip(value: &str) -> String {
+    value.chars().take(64).collect()
+}
+
+struct DropLog {
+    /// The first drop of its stream (INFO) rather than a repeat (DEBUG).
+    first: bool,
+    tab_id: i64,
+    source: String,
+    session_id: String,
+    action: OwnershipAction,
+    reason: DropReason,
+    owner: String,
+}
+
+impl DropLog {
+    fn emit(&self) {
+        macro_rules! dropped {
+            ($level:ident) => {
+                tracing::$level!(
+                    tab_id = self.tab_id,
+                    source = ?self.source,
+                    session_id = ?self.session_id,
+                    action = ?self.action,
+                    reason = ?self.reason,
+                    owner = ?self.owner,
+                    "agent report dropped"
+                )
+            };
+        }
+        if self.first {
+            dropped!(info);
+        } else {
+            dropped!(debug);
+        }
+    }
+}
+
 fn wire_tab(row: &TabRow, is_active: bool) -> Tab {
     Tab {
         id: row.id,
@@ -2946,6 +3054,7 @@ fn wire_tab(row: &TabRow, is_active: bool) -> Tab {
         agent_lifecycle: row.agent.lifecycle,
         ownership: row.agent.ownership.clone(),
         password_input: row.password_input,
+        dropped_reports: row.dropped_reports.clone(),
     }
 }
 
@@ -4289,6 +4398,111 @@ mod tests {
             ))
             .unwrap();
         assert!(!accepted);
+    }
+
+    #[test]
+    fn dropped_reports_are_counted_on_the_tab_with_the_latest_reason() {
+        let (ws, tid) = agent_ws();
+        assert_eq!(ws.tab(tid).unwrap().dropped_reports, None);
+
+        let lost = report(tid, "claude", "s1", OwnershipAction::Preserve, None);
+        let (accepted, tab) = ws.agent_report(&lost).unwrap();
+        assert!(!accepted);
+        let dropped = tab.dropped_reports.expect("the refused report is recorded");
+        assert_eq!(dropped.count, 1);
+        assert_eq!(
+            (
+                dropped.last.source.as_str(),
+                dropped.last.session_id.as_str()
+            ),
+            ("claude", "s1")
+        );
+        assert_eq!(dropped.last.ownership_action, OwnershipAction::Preserve);
+        assert_eq!(dropped.last.reason, DropReason::NotOwner);
+        assert!(!dropped.last.tab_had_owner);
+
+        let claim = report(
+            tid,
+            "claude",
+            "s1",
+            OwnershipAction::Claim,
+            Some(AgentLifecycle::Working),
+        );
+        let (accepted, tab) = ws.agent_report(&claim).unwrap();
+        assert!(accepted);
+        assert_eq!(
+            tab.dropped_reports.unwrap().count,
+            1,
+            "accepted reports are not counted"
+        );
+
+        ws.apply_shell_mark(tid, "C").unwrap();
+        let nested = report(tid, "codex", "inner", OwnershipAction::Claim, None);
+        let (accepted, tab) = ws.agent_report(&nested).unwrap();
+        assert!(!accepted);
+        let dropped = tab.dropped_reports.unwrap();
+        assert_eq!(dropped.count, 2);
+        assert_eq!(dropped.last.reason, DropReason::NestedClaim);
+        assert!(dropped.last.tab_had_owner);
+        assert_eq!(ws.tab(tid).unwrap().dropped_reports, Some(dropped));
+
+        // `set-state none` is a claim then a release, both accepted.
+        ws.set_tab_state(tid, TabState::None).unwrap();
+        assert_eq!(ws.tab(tid).unwrap().dropped_reports.unwrap().count, 2);
+
+        // A legacy release from a non-owner is refused like any other.
+        ws.set_tab_hook_active(tid, false).unwrap();
+        let dropped = ws.tab(tid).unwrap().dropped_reports.unwrap();
+        assert_eq!(dropped.count, 3);
+        assert_eq!(
+            (dropped.last.source.as_str(), dropped.last.ownership_action),
+            (SOURCE_LEGACY, OwnershipAction::Release)
+        );
+    }
+
+    #[test]
+    fn a_dropped_report_stream_is_logged_once_however_streams_interleave() {
+        let (ws, tid) = agent_ws();
+        let mut inner = ws.inner.lock().unwrap();
+        let row = inner.tabs.get_mut(&tid).unwrap();
+        let a = report(tid, "codex", "a", OwnershipAction::Preserve, None);
+        let b = report(tid, "codex", "b", OwnershipAction::Preserve, None);
+        let logged = |row: &mut TabRow, r: &TabAgentReportParams, reason| {
+            record_drop(row, &AgentTabState::default(), r, reason, 1).first
+        };
+
+        assert!(logged(row, &a, DropReason::NotOwner));
+        assert!(logged(row, &b, DropReason::NotOwner));
+        assert!(!logged(row, &a, DropReason::NotOwner), "A again, after B");
+        assert!(!logged(row, &b, DropReason::NotOwner));
+        assert!(
+            logged(row, &a, DropReason::NestedClaim),
+            "a new reason is a new stream"
+        );
+        assert!(!logged(row, &a, DropReason::NotOwner));
+        assert_eq!(row.dropped_reports.as_ref().unwrap().count, 6);
+
+        for n in 0..LOGGED_DROP_STREAMS {
+            let other = report(
+                tid,
+                "codex",
+                &format!("s{n}"),
+                OwnershipAction::Preserve,
+                None,
+            );
+            record_drop(
+                row,
+                &AgentTabState::default(),
+                &other,
+                DropReason::NotOwner,
+                1,
+            );
+        }
+        assert_eq!(row.logged_drop_streams.len(), LOGGED_DROP_STREAMS);
+        assert!(
+            record_drop(row, &AgentTabState::default(), &a, DropReason::NotOwner, 1).first,
+            "the memory is bounded, oldest first"
+        );
     }
 
     #[test]
