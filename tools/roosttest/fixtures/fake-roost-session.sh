@@ -2,13 +2,17 @@
 # A stand-in `roost-session` for the launcher tests — the seven lifecycle
 # cases in `crates/roost-cli/src/session.rs`, the state-dir seam in
 # `crates/roost-ipc/tests/session_launch_state_dir_test.rs`, the stderr
-# tail in `crates/roost-ipc/src/session_launch.rs`, and the launchers that
-# die on start in `crates/roost-iced/src/host_conn/task.rs`.
+# tail in `crates/roost-ipc/src/session_launch.rs`, and, through
+# `fake_launcher` in `crates/roost-iced/src/host_conn.rs`, the launchers
+# that die on start and the restart targets in
+# `crates/roost-iced/src/host_conn/task.rs` and `host_conn.rs`, and the
+# restart candidates in `crates/roost-iced/src/app/update_knowledge.rs`.
 #
 # It has no behaviour of its own. A test symlinks this file to
-# `<dir>/roost-session` and writes what the launcher should do — print a
-# verdict, hang, close stdout, flood, say nothing — to
-# `<dir>/roost-session.conf`, which is sourced here. The split is about
+# `<dir>/roost-session` (or another name a case needs) and writes what
+# the launcher should do — print a verdict or an identity, hang, close
+# stdout, flood, say nothing — to the link's path plus `.conf`
+# (`<dir>/roost-session.conf`), which is sourced here. The split is about
 # how the tests run, not what they test: the Rust harness runs a binary's
 # cases in parallel threads, and a script written by one thread while
 # another thread is forking races `execve` — the forked child inherits
