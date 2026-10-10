@@ -1366,9 +1366,20 @@ Request:
 `ownership_action` semantics, enforced under one lock so the check and
 the mutation can't race a concurrent report:
 
-* **`claim`** always takes ownership, replacing any existing owner
-  unconditionally — the only path that can take a tab from a live
-  owner (a `SessionStart`, or a manual override via `tab.set_state`).
+* **`claim`** takes ownership, replacing any existing owner — the only
+  path that can take a tab from a live owner (a `SessionStart`, or a
+  manual override via `tab.set_state`). One exception: a **nested
+  claim** is dropped. When the owner is mid-turn (`agent_lifecycle`
+  `working` or `waiting`) under a foreground process
+  (`shell_state: "foreground_process"`), a claim from a *different*
+  agent `source` comes from an agent the owner itself is running, such
+  as a `codex exec` review. That agent inherited the tab's
+  `ROOST_TAB_ID`, and honoring it would evict the owner and then
+  release the tab out from under it. The same `source` under a new
+  `session_id` still supersedes, since that is the agent switching
+  sessions itself. `manual` and `legacy` claims always supersede. A tab
+  whose shell has no integration (`shell_state: "unknown"`) never
+  treats a claim as nested.
 * **`preserve`** requires the report's `(source, session_id)` to match
   the current owner; a mismatch is dropped (see `accepted` below).
   `detail`/`metadata` **merge** onto the existing owner rather than
@@ -1431,7 +1442,8 @@ Response:
 ```
 
 `accepted` is `false` when the report lost the ownership-matching
-check above — `tab` is then the tab **unchanged**. The full `Tab` is
+check above, or was a nested claim. `tab` is then the tab
+**unchanged**. The full `Tab` is
 always returned so an adapter never needs a follow-up `tab.list` to
 see what its own report did.
 

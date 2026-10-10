@@ -22,6 +22,22 @@ release workflow asserts they agree).
   File menu. The Swift app is unchanged. See
   [Keybindings](docs/getting-started/keybindings.md#available-actions).
 
+### Fixed
+
+- **An agent another agent runs no longer steals its tab.** A
+  `codex exec` review (or any agent CLI) started from inside a Claude
+  Code turn inherits the tab's `ROOST_TAB_ID`. Its `SessionStart` used
+  to evict Claude as the tab's owner and its `SessionEnd` then released
+  the tab, so the sidebar row disappeared while Claude kept working.
+  Claude's later status and its "Turn complete" notification were
+  dropped too, and the inner agent's own notification fired in their
+  place. Roost now ignores a claim from a different agent while the
+  owner is mid-turn under a foreground process; a new agent started
+  after the old one exits to the prompt still takes the tab. Needs
+  shell integration. Roost-Iced and `roost-session` only; the Swift app
+  is unchanged. See
+  [Agent Hooks → Ownership](docs/guides/agents.md#ownership).
+
 ## v0.0.23 — 2026-10-07
 
 _The session-update release (plan 076): Roost-Iced now shows each host's

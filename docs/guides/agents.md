@@ -295,7 +295,22 @@ schedule, so this is a real race, not a theoretical one.
 ## Ownership
 
 A tab is "owned" by whichever agent's hook last reported activity on
-it, via `tab.agent_report`'s `(source, session_id)` pair. Doctor's
+it, via `tab.agent_report`'s `(source, session_id)` pair.
+
+An agent that another agent runs, such as a `codex exec` review
+started from a Claude Code turn, inherits the tab's `ROOST_TAB_ID`
+and fires its own hooks into the same tab. Roost ignores it while the
+outer agent is mid-turn in the foreground, so the outer agent keeps
+the tab, its status and its notifications. Once that agent exits back
+to the shell prompt, the next agent you start takes the tab as usual.
+This needs [shell integration](cwd-tracking.md); without it the inner
+agent takes the tab over, as it did before. ([Claim
+rules](../reference/ipc.md#tabagent_report).) Every pane of tmux,
+herdr or an ssh session running inside one tab shares that tab's
+`ROOST_TAB_ID` the same way, so the first agent mid-turn there holds
+the tab and the others don't show until it finishes.
+
+Doctor's
 `owning` checks read this off the running UI's tab list — there is no
 durable "ever observed" store, so they can only say who owns a tab
 *right now*, not whether an agent has ever fired here.
