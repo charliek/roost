@@ -11,6 +11,16 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+## v0.0.24 — 2026-10-10
+
+_The agent-indicator release (#619, #620): an agent that another agent
+runs, such as a `codex exec` review started from a Claude Code turn, no
+longer takes the tab from it, and the agent reports Roost drops are now
+visible on the tab and in `roostctl doctor`. Roost-Iced also gains Next /
+Previous Project keybinds. The Swift app is unchanged. There is no
+session-protocol bump. Session tabs get the ownership fix once their
+`roost-session` is on 0.0.24: Install Update, then Restart Session._
+
 ### Added
 
 - **Next / Previous Project** — `cycle_project_next` and
@@ -48,6 +58,11 @@ release workflow asserts they agree).
   newer). Roost-Iced and `roost-session` only; the Swift app is
   unchanged. See
   [Agent Hooks → Ownership](docs/guides/agents.md#ownership).
+- **Test suites no longer exec a script they just wrote (#615, #618).**
+  A sibling test forking in the same process could hold the script's
+  write descriptor, so the exec failed with `Text file busy`. The iced,
+  CLI, agent and agent-install suites now run committed fixtures, and the
+  agent-install fallback tests also prove the hook actually ran.
 
 ## v0.0.23 — 2026-10-07
 
