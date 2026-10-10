@@ -474,16 +474,12 @@ mod tests {
     #[test]
     fn a_working_hook_binary_gets_the_argv_and_the_stdin() {
         let dir = tempfile::tempdir().unwrap();
-        let argv_out = dir.path().join("argv");
-        let stdin_out = dir.path().join("stdin");
         let hook = stub_hook(
             dir.path(),
-            &format!(
-                "printf '%s\\n' \"$@\" > '{}'\ncat > '{}'\nprintf '{{}}'\n",
-                argv_out.display(),
-                stdin_out.display()
-            ),
+            "printf '%s\\n' \"$@\" > \"$0.argv\"\ncat > \"$0.stdin\"\nprintf '{}'\n",
         );
+        let argv_out = dir.path().join("hook.sh.argv");
+        let stdin_out = dir.path().join("hook.sh.stdin");
 
         let payload = br#"{"hook_event_name":"SessionStart","session_id":"s-1"}"#;
         let ran = run(Agent::Codex, Some(hook.to_str().unwrap()), payload);
@@ -510,12 +506,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hook = stub_hook(
             dir.path(),
-            "cat >/dev/null\nprintf '{\"decision\":\"blo'\nexit 1\n",
+            "cat >/dev/null\nprintf '{\"decision\":\"blo'\n: > \"$0.printed\"\nexit 1\n",
         );
+        let printed = dir.path().join("hook.sh.printed");
         let ran = run(Agent::Claude, Some(hook.to_str().unwrap()), b"{}");
 
         assert_eq!(ran.stdout, "{}", "partial output reached the agent");
         assert_eq!(ran.code, Some(0));
+        // A hook that never ran answers `{}` too, so the stdout check
+        // alone cannot tell the case under test from no case at all.
+        assert!(printed.exists(), "the hook never printed its fragment");
     }
 
     /// And the answer a working hook produces is still the one the agent
@@ -538,12 +538,14 @@ mod tests {
     #[test]
     fn a_failing_hook_binary_falls_back_to_the_inert_answer() {
         let dir = tempfile::tempdir().unwrap();
-        let hook = stub_hook(dir.path(), "echo boom >&2\nexit 127\n");
+        let hook = stub_hook(dir.path(), "echo boom >&2\n: > \"$0.failed\"\nexit 127\n");
+        let failed = dir.path().join("hook.sh.failed");
         let payload = vec![b'y'; STDIN_BYTES];
 
         let ran = run(Agent::Cursor, Some(hook.to_str().unwrap()), &payload);
         assert_eq!(ran.stdout, "{}");
         assert_eq!(ran.code, Some(0));
         assert!(ran.wrote_all_stdin, "stdin was not drained after a failure");
+        assert!(failed.exists(), "the hook never ran, so nothing failed");
     }
 }
