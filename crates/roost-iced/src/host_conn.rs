@@ -2897,7 +2897,8 @@ pub(crate) fn blank_theme() -> OscColorsParams {
 /// drive this set through the app's lifted edges
 /// ([`crate::app::host_lifecycle`]). Promoted out of `mod tests`
 /// unchanged — every body here is the one the inline cases were
-/// written against.
+/// written against — except `fake_launcher`, which also takes the
+/// link's name.
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::*;
@@ -3240,6 +3241,21 @@ pub(crate) mod fixtures {
             }
         }
     }
+
+    /// A launcher at `dir/name` that runs `body`, through the committed
+    /// fixture rather than a script written here — see the fixture's
+    /// header for the ETXTBSY race a written script would run.
+    pub(crate) fn fake_launcher(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        std::fs::write(dir.join(format!("{name}.conf")), format!("{body}\n"))
+            .expect("write the body");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/roosttest/fixtures/fake-roost-session.sh")
+            .canonicalize()
+            .expect("the fake-roost-session fixture must exist");
+        let path = dir.join(name);
+        std::os::unix::fs::symlink(fixture, &path).expect("link the fixture");
+        path
+    }
 }
 
 #[cfg(test)]
@@ -3274,17 +3290,17 @@ mod tests {
     /// would run it. A target answering as another build starts nothing.
     #[tokio::test]
     async fn a_spawn_pin_rides_every_connection_the_set_starts_for_its_host() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("temp dir");
-        let bin = dir.path().join("roost-session");
         let identity = serde_json::json!({
             "app_version": "0.0.22",
             "session_protocol": roost_ipc::messages::SESSION_PROTOCOL_VERSION,
             "libghostty_build": "g",
         });
-        std::fs::write(&bin, format!("#!/bin/sh\nprintf '%s\\n' '{identity}'\n"))
-            .expect("write the stub");
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let bin = fake_launcher(
+            dir.path(),
+            "roost-session",
+            &format!("printf '%s\\n' '{identity}'"),
+        );
 
         let (mut set, mut feed) = a_set();
         let (gate_feed, _gate_rx) = crate::engine_feed::channel();

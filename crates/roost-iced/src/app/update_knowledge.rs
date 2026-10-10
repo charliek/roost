@@ -410,6 +410,7 @@ impl super::App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_conn::fixtures::fake_launcher;
 
     const FIRST: HostId = HostId::new(1);
     const SECOND: HostId = HostId::new(2);
@@ -582,8 +583,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn an_empty_override_is_no_override_as_the_launch_ladder_reads_it() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let caller = dir.path().join("roost");
         let empty = std::ffi::OsString::new();
@@ -603,9 +602,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let running_exe = dir.path().join("running-session");
-        std::fs::write(&running_exe, format!("#!/bin/sh\necho '{line}'\n")).unwrap();
-        std::fs::set_permissions(&running_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let running_exe = fake_launcher(dir.path(), "running-session", &format!("echo '{line}'"));
 
         let knowledge = identify_localhost(
             LaunchFacts {
@@ -629,12 +626,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_sibling_that_will_not_identify_is_unreadable_and_exe_path_still_counts() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
-        let sibling = dir.path().join("roost-session");
-        std::fs::write(&sibling, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Not a second `fake_launcher`: `identify_localhost` canonicalizes
+        // both candidates, and two links to the one fixture are one
+        // binary to it, so the running one would never be identified.
+        std::os::unix::fs::symlink("/usr/bin/true", dir.path().join("roost-session")).unwrap();
         let line = serde_json::to_string(&roost_ipc::messages::SessionBinaryIdentity {
             app_version: "0.0.23".into(),
             session_protocol: roost_ipc::messages::SESSION_PROTOCOL_VERSION,
@@ -642,9 +638,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let running_exe = dir.path().join("running-session");
-        std::fs::write(&running_exe, format!("#!/bin/sh\necho '{line}'\n")).unwrap();
-        std::fs::set_permissions(&running_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let running_exe = fake_launcher(dir.path(), "running-session", &format!("echo '{line}'"));
 
         let caller = dir.path().join("roost");
         let only_sibling = identify_localhost(

@@ -1753,6 +1753,7 @@ mod tests {
     use roost_ipc::messages::{EventEnvelope, EventsSubscribeParams, Project};
 
     use super::*;
+    use crate::host_conn::fixtures::fake_launcher;
 
     fn feed_items(rx: &mut crate::engine_feed::EngineFeedReceiver) -> Vec<EngineFeed> {
         let mut batch = crate::engine_feed::EngineBatch::default();
@@ -1921,20 +1922,6 @@ mod tests {
             .expect("a temp dir under /tmp")
     }
 
-    /// A launcher that runs `body`, through the committed fixture rather
-    /// than a script written here — see the fixture's header for the
-    /// ETXTBSY race a written script would run.
-    fn fake_launcher(dir: &Path, body: &str) -> PathBuf {
-        let path = dir.join(session_launch::BIN_NAME);
-        std::fs::write(path.with_extension("conf"), format!("{body}\n")).expect("write the body");
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tools/roosttest/fixtures/fake-roost-session.sh")
-            .canonicalize()
-            .expect("the fake-roost-session fixture must exist");
-        std::os::unix::fs::symlink(fixture, &path).expect("link the fixture");
-        path
-    }
-
     /// A launch against a socket nothing will ever bind, with a confirm
     /// short enough for a test.
     async fn launch_into_nothing(bin: &Path, dir: &Path, verdict: Duration) -> AttemptError {
@@ -1976,7 +1963,11 @@ mod tests {
     #[tokio::test]
     async fn what_a_dying_launcher_said_on_stderr_is_in_the_detail() {
         let dir = short_dir();
-        let bin = fake_launcher(dir.path(), "echo boom >&2; exit 1");
+        let bin = fake_launcher(
+            dir.path(),
+            session_launch::BIN_NAME,
+            "echo boom >&2; exit 1",
+        );
         let error = launch_into_nothing(&bin, dir.path(), Duration::from_secs(5)).await;
         assert_eq!(
             settled(&error),
@@ -1992,7 +1983,7 @@ mod tests {
     #[tokio::test]
     async fn a_launcher_killed_by_a_signal_names_the_signal() {
         let dir = short_dir();
-        let bin = fake_launcher(dir.path(), "kill -SEGV $$");
+        let bin = fake_launcher(dir.path(), session_launch::BIN_NAME, "kill -SEGV $$");
         let error = launch_into_nothing(&bin, dir.path(), Duration::from_secs(5)).await;
         assert_eq!(
             settled(&error),
@@ -2009,7 +2000,7 @@ mod tests {
     async fn a_launcher_still_alive_past_its_verdict_budget_stays_retryable() {
         for body in ["exec >&-\nexec sleep 30", "exec sleep 30"] {
             let dir = short_dir();
-            let bin = fake_launcher(dir.path(), body);
+            let bin = fake_launcher(dir.path(), session_launch::BIN_NAME, body);
             let error = launch_into_nothing(&bin, dir.path(), Duration::from_millis(500)).await;
             transport(&error);
         }
@@ -2025,6 +2016,7 @@ mod tests {
         let bound = dir.path().join("bind-now");
         let bin = fake_launcher(
             dir.path(),
+            session_launch::BIN_NAME,
             &format!(
                 "( sleep 0.3; : > '{}' ) </dev/null >/dev/null 2>&1 &\nexit 0",
                 bound.display()
@@ -2434,24 +2426,21 @@ mod tests {
     /// A stub `roost-session` that identifies as `version` and leaves a
     /// mark if anything ever tries to start it.
     fn stub_session(dir: &Path, version: &str) -> (PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-        let bin = dir.join("roost-session");
         let started = dir.join("started");
         let identity = serde_json::json!({
             "app_version": version,
             "session_protocol": roost_ipc::messages::SESSION_PROTOCOL_VERSION,
             "libghostty_build": "g",
         });
-        std::fs::write(
-            &bin,
-            format!(
-                "#!/bin/sh\nif [ \"$1\" = identify ]; then printf '%s\\n' '{identity}'; exit 0; fi\n\
-                 touch '{}'\nexit 1\n",
+        let bin = fake_launcher(
+            dir,
+            session_launch::BIN_NAME,
+            &format!(
+                "if [ \"$1\" = identify ]; then printf '%s\\n' '{identity}'; exit 0; fi\n\
+                 touch '{}'\nexit 1",
                 started.display()
             ),
-        )
-        .expect("write the stub");
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        );
         (bin, started)
     }
 
@@ -2580,22 +2569,18 @@ mod tests {
     /// A restart's stub `roost-session`: it identifies as 0.0.22, and its
     /// `start` runs `body`.
     fn launching_stub(dir: &Path, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let bin = dir.join("roost-session");
         let identity = serde_json::json!({
             "app_version": "0.0.22",
             "session_protocol": roost_ipc::messages::SESSION_PROTOCOL_VERSION,
             "libghostty_build": "g",
         });
-        std::fs::write(
-            &bin,
-            format!(
-                "#!/bin/sh\nif [ \"$1\" = identify ]; then printf '%s\\n' '{identity}'; exit 0; fi\n{body}"
+        fake_launcher(
+            dir,
+            session_launch::BIN_NAME,
+            &format!(
+                "if [ \"$1\" = identify ]; then printf '%s\\n' '{identity}'; exit 0; fi\n{body}"
             ),
         )
-        .expect("write the stub");
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        bin
     }
 
     async fn until_exists(path: &Path) {
