@@ -17,7 +17,12 @@ import uuid
 import pytest
 import ui
 from client import RoostError
-from util import BARE_SHELL_ARGV, wait_for_config_line, wait_tab_attached
+from util import (
+    BARE_SHELL_ARGV,
+    palette_command,
+    wait_for_config_line,
+    wait_tab_attached,
+)
 
 # The shared `palette` fixture (drive from closed, leave closed) lives in
 # conftest.py so the notification + launcher suites reuse it.
@@ -45,6 +50,11 @@ COMMON_COMMAND_IDS = (
 )
 
 
+# Roost-Iced only: the Swift app is frozen without project cycling, which
+# is why these are not in COMMON_COMMAND_IDS.
+PROJECT_CYCLE_IDS = ("cycle_project_next", "cycle_project_prev")
+
+
 def test_open_lists_common_commands(palette):
     st = palette.palette_open()
     assert st["open"] is True
@@ -52,6 +62,97 @@ def test_open_lists_common_commands(palette):
     ids = palette.palette_item_ids(st)
     missing = [c for c in COMMON_COMMAND_IDS if c not in ids]
     assert not missing, f"command rows missing {missing}; got {ids}"
+
+
+def test_open_lists_project_cycle_commands(target, palette):
+    if target != "iced":
+        pytest.skip("project cycling is Roost-Iced only; the Swift app is frozen")
+    ids = palette.palette_item_ids(palette.palette_open())
+    missing = [c for c in PROJECT_CYCLE_IDS if c not in ids]
+    assert not missing, f"command rows missing {missing}; got {ids}"
+
+
+def _project_ids(roost) -> list[int]:
+    return [int(p["id"]) for p in roost.list()]
+
+
+def _active_project(roost) -> int:
+    return roost.identify()["active_project_id"]
+
+
+def test_cycle_project_walks_sidebar_order_and_stops_at_the_ends(target, roost, palette):
+    """Next/Previous Project step through the sidebar, walk past a project
+    with no tabs, and stop at the first and last project rather than wrap.
+
+    The session is shared, so the ends belong to projects other tests left
+    behind: this test reorders its own three to the top, then to the bottom,
+    rather than assuming where the ends are. A step that moves has landed
+    before `palette.activate` returns (the focus change is synchronous), so
+    the "stayed put" reads need no wait.
+
+    The ends are read off `project.list`, which is the whole ring only while
+    the sidebar draws no section strip: a saved host or `local-backend =
+    session` puts rows on the ring that list never shows.
+    """
+    if target != "iced":
+        pytest.skip("project cycling is Roost-Iced only; the Swift app is frozen")
+    if roost.sidebar_sections():
+        pytest.skip("the sidebar has host sections, so project.list is not the whole ring")
+    tag = uuid.uuid4().hex[:6]
+    ours: list[int] = []
+    try:
+        for role in ("first", "gap", "last"):
+            ours.append(roost.create_project(name=f"pytest-cycle-{role}-{tag}", cwd="/tmp"))
+        first, _gap, last = ours
+        first_tab = roost.open_tab(first, cwd="/tmp", argv=BARE_SHELL_ARGV)
+        roost.open_tab(last, cwd="/tmp", argv=BARE_SHELL_ARGV)
+        others = [pid for pid in _project_ids(roost) if pid not in ours]
+
+        roost.reorder_projects(ours)
+        roost._wait(
+            lambda: _project_ids(roost) == ours + others,
+            5.0,
+            "our projects lead the sidebar",
+        )
+        roost.focus(first_tab)
+        roost._wait(
+            lambda: _active_project(roost) == first,
+            5.0,
+            "focusing its tab makes the top project active",
+        )
+        palette_command(roost, "cycle_project_prev")
+        assert _active_project(roost) == first, "Previous Project stops at the top"
+        palette_command(roost, "cycle_project_next")
+        roost._wait(
+            lambda: _active_project(roost) == last,
+            5.0,
+            "Next Project walks past the project with no tabs",
+        )
+
+        roost.reorder_projects(others + ours)
+        roost._wait(
+            lambda: _project_ids(roost) == others + ours,
+            5.0,
+            "our projects close the sidebar",
+        )
+        palette_command(roost, "cycle_project_next")
+        assert _active_project(roost) == last, "Next Project stops at the bottom"
+        palette_command(roost, "cycle_project_prev")
+        roost._wait(
+            lambda: _active_project(roost) == first,
+            5.0,
+            "Previous Project walks back past the project with no tabs",
+        )
+    finally:
+        failure = None
+        for pid in ours:
+            try:
+                roost.delete_project(pid)
+            except RoostError as e:
+                if e.code != "not-found" and failure is None:
+                    failure = e
+        if failure is not None:
+            raise failure
 
 
 def test_state_reflects_open_then_closed(palette):

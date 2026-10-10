@@ -542,6 +542,10 @@ pub fn ring(sections: &[RingSection]) -> Vec<ProjectKey> {
 }
 
 fn ring_iter(sections: &[RingSection]) -> impl Iterator<Item = ProjectKey> + '_ {
+    ring_rows(sections).map(|(key, _)| key)
+}
+
+fn ring_rows(sections: &[RingSection]) -> impl Iterator<Item = (ProjectKey, &RingProject)> + '_ {
     sections
         .iter()
         .filter(|section| section.navigable)
@@ -549,7 +553,7 @@ fn ring_iter(sections: &[RingSection]) -> impl Iterator<Item = ProjectKey> + '_ 
             section
                 .projects
                 .iter()
-                .map(|project| ProjectKey::new(section.host, project.id))
+                .map(|project| (ProjectKey::new(section.host, project.id), project))
         })
 }
 
@@ -560,36 +564,37 @@ pub fn ring_index(sections: &[RingSection], index: u8) -> Option<ProjectKey> {
     ring_iter(sections).nth(index)
 }
 
-/// The project `delta` steps from `current` around the ring, wrapping at
-/// both ends. `None` when the ring is empty; a `current` the ring does
-/// not contain (its section went away, or is disconnected) starts the
-/// walk from the top.
+/// The project `delta` steps from `current` along the ring — what
+/// `cycle_project_prev`/`next` land on. Projects with no tabs are stepped
+/// over, never landed on ([`RingProject`]).
 ///
-/// **No caller yet, by design.** The plan's ring rule — "next/prev
-/// project walks the sidebar top-to-bottom across host boundaries" —
-/// comes with "no new navigation bindings", and Roost binds no next/prev
-/// project action today (`switch_project_N`, which [`ring_index`]
-/// answers, and the sidebar rows are the whole of project navigation).
-/// This is the step the binding would use the day one is added; it is
-/// specified and tested here so the ring has one definition rather than
-/// two.
+/// The walk stops at the ends rather than wrapping, as tab cycling does:
+/// `None` when no project with tabs lies that way, which a caller treats
+/// as "stay put". A `current` the ring does not contain (its section went
+/// away, or is disconnected) lands on the ring's first project with tabs,
+/// whichever way the step points.
 pub fn ring_step(
     sections: &[RingSection],
     current: ProjectKey,
     delta: isize,
 ) -> Option<ProjectKey> {
-    let ring = ring(sections);
-    if ring.is_empty() {
-        return None;
+    let rows: Vec<_> = ring_rows(sections).collect();
+    let tabbed =
+        |(key, project): &(ProjectKey, &RingProject)| (!project.tabs.is_empty()).then_some(*key);
+    let Some(at) = rows.iter().position(|(key, _)| *key == current) else {
+        return rows.iter().find_map(tabbed);
+    };
+    let steps = delta.unsigned_abs();
+    if delta < 0 {
+        rows[..at]
+            .iter()
+            .rev()
+            .filter_map(tabbed)
+            .take(steps)
+            .last()
+    } else {
+        rows[at + 1..].iter().filter_map(tabbed).take(steps).last()
     }
-    let len = ring.len() as isize;
-    let at = ring
-        .iter()
-        .position(|project| *project == current)
-        .map(|at| at as isize)
-        .unwrap_or(0);
-    let next = (at + delta).rem_euclid(len) as usize;
-    ring.get(next).copied()
 }
 
 #[cfg(test)]
@@ -1335,28 +1340,97 @@ mod tests {
     }
 
     #[test]
-    fn ring_step_wraps_and_crosses_host_boundaries() {
+    fn ring_step_stops_at_the_ends_and_crosses_host_boundaries() {
         let sections = a_ring();
+        let five = ProjectKey::new(HostId::new(5), 3);
         assert_eq!(
             ring_step(&sections, ProjectKey::local(2), 1),
-            Some(ProjectKey::new(HostId::new(5), 3)),
-            "the step leaves the local section without a mode switch"
+            Some(five),
+            "the step leaves the local section without a mode switch, \
+             past the disconnected one"
         );
-        assert_eq!(
-            ring_step(&sections, ProjectKey::new(HostId::new(5), 3), 1),
-            Some(ProjectKey::local(1)),
-            "and wraps back to the top"
-        );
+        assert_eq!(ring_step(&sections, five, -1), Some(ProjectKey::local(2)));
+        assert_eq!(ring_step(&sections, five, 1), None, "no wrap at the bottom");
         assert_eq!(
             ring_step(&sections, ProjectKey::local(1), -1),
-            Some(ProjectKey::new(HostId::new(5), 3))
+            None,
+            "no wrap at the top"
+        );
+        assert_eq!(
+            ring_step(&sections, ProjectKey::local(1), 5),
+            Some(five),
+            "a long step stops at the last project"
         );
         // A selection inside the skipped section is not on the ring, so
-        // the walk restarts from the top rather than answering nothing.
+        // either direction starts over at the top.
+        let stranded = ProjectKey::new(HostId::new(4), 7);
         assert_eq!(
-            ring_step(&sections, ProjectKey::new(HostId::new(4), 7), 1),
-            Some(ProjectKey::local(2))
+            ring_step(&sections, stranded, 1),
+            Some(ProjectKey::local(1))
+        );
+        assert_eq!(
+            ring_step(&sections, stranded, -1),
+            Some(ProjectKey::local(1))
         );
         assert_eq!(ring_step(&[], ProjectKey::local(1), 1), None);
+        assert_eq!(ring_step(&[], ProjectKey::local(1), -1), None);
+    }
+
+    #[test]
+    fn ring_step_steps_over_projects_with_no_tabs() {
+        let row = |id: i64, tabs: &[i64]| RingProject {
+            id,
+            tabs: tabs.to_vec(),
+        };
+        let sections = vec![
+            RingSection {
+                saved_id: None,
+                host: HostId::LOCAL,
+                navigable: true,
+                projects: vec![row(1, &[]), row(2, &[20]), row(3, &[]), row(4, &[40])],
+            },
+            RingSection {
+                saved_id: Some("hs-five".to_string()),
+                host: HostId::new(5),
+                navigable: true,
+                projects: vec![row(5, &[])],
+            },
+        ];
+        let local = ProjectKey::local;
+        assert_eq!(ring_step(&sections, local(2), 1), Some(local(4)));
+        assert_eq!(ring_step(&sections, local(4), -1), Some(local(2)));
+        assert_eq!(
+            ring_step(&sections, local(4), 1),
+            None,
+            "only a tabless project lies below"
+        );
+        assert_eq!(
+            ring_step(&sections, local(2), -1),
+            None,
+            "only a tabless project lies above"
+        );
+        assert_eq!(ring_step(&sections, local(3), 1), Some(local(4)));
+        assert_eq!(ring_step(&sections, local(3), -1), Some(local(2)));
+        let stranded = ProjectKey::new(HostId::new(9), 1);
+        assert_eq!(
+            ring_step(&sections, stranded, 1),
+            Some(local(2)),
+            "the first project with tabs, not the first project"
+        );
+        assert_eq!(ring_step(&sections, stranded, -1), Some(local(2)));
+
+        let tabless = vec![RingSection {
+            saved_id: None,
+            host: HostId::LOCAL,
+            navigable: true,
+            projects: vec![row(1, &[]), row(2, &[])],
+        }];
+        for (current, delta) in [(local(1), 1), (local(2), -1), (stranded, 1), (stranded, -1)] {
+            assert_eq!(
+                ring_step(&tabless, current, delta),
+                None,
+                "{current:?} {delta}"
+            );
+        }
     }
 }

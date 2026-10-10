@@ -122,6 +122,9 @@ STATIC_MENUS: dict[str, list[tuple | None]] = {
         None,
         ("Previous Tab", "[", ["shift", "super"], True, "cycle_tab_prev"),
         ("Next Tab", "]", ["shift", "super"], True, "cycle_tab_next"),
+        # AppKit's NSLeftArrowFunctionKey / NSRightArrowFunctionKey.
+        ("Previous Project", "\uf702", ["shift", "super"], True, "cycle_project_prev"),
+        ("Next Project", "\uf703", ["shift", "super"], True, "cycle_project_next"),
     ],
     "View": [
         ("Command Palette…", "p", ["shift", "super"], True, "command_palette"),

@@ -5153,6 +5153,8 @@ mod switch_tests {
             RenameProject,
             CycleTabNext,
             CycleTabPrev,
+            CycleProjectNext,
+            CycleProjectPrev,
             JumpToUnread,
             Copy,
             Paste,
@@ -5172,6 +5174,8 @@ mod switch_tests {
             "toggle_secure_input",
             "jump_to_unread",
             "cycle_tab_next",
+            "cycle_project_next",
+            "cycle_project_prev",
             roost_ui_model::host_verbs::ADD_ID,
             roost_ui_model::host_verbs::USE_SESSION_ID,
         ] {
