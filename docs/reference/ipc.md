@@ -239,7 +239,8 @@ dropped. An agent whose reports land as `not_owner` with
 `tab_had_owner: false` has lost the tab: nothing it sends shows until it
 claims again, and `roostctl doctor` points it out. The record is
 history, never cleared, so check `last.at` against when the agent last
-ran. The field is live diagnostic state on the
+ran. A client that can't read the record (a newer server's new
+`reason`, say) treats it as absent rather than failing the tab. The field is live diagnostic state on the
 server that holds the tab, never persisted and carried by no event, so
 read it from that server rather than from a window mirroring a remote
 host. The key is omitted until something is dropped, so an older server

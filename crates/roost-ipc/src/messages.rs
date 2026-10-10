@@ -90,7 +90,16 @@ pub struct Tab {
     /// diagnostic state on the server that holds the tab, never persisted
     /// and carried by no event, so read it from that server. Omitted until
     /// a report is dropped.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Decoded leniently: a record this build can't read (a newer
+    /// server's new `reason`, say) reads as absent rather than failing
+    /// the whole `Tab`, since a diagnostic must never cost a client its
+    /// tab list.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_dropped_reports"
+    )]
     pub dropped_reports: Option<DroppedReports>,
 }
 
@@ -3017,6 +3026,14 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn lenient_dropped_reports<'de, D>(deserializer: D) -> Result<Option<DroppedReports>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| serde_json::from_value(value).ok()))
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HostDisconnectParams {
@@ -4656,6 +4673,36 @@ mod tests {
             json.contains("\"id\":\"12345\""),
             "id must be string: {json}"
         );
+    }
+
+    #[test]
+    fn a_dropped_reports_record_this_build_cannot_read_leaves_the_tab_intact() {
+        let tab_with = |dropped: &str| {
+            format!(
+                r#"{{"id":"5","project_id":"1","title":"zsh","cwd":"/tmp",
+                "state":"running","has_notification":false,"is_active":true,
+                "user_titled":false,"position":0,"created_at":1,"last_active":2,
+                "hook_active":false,"dropped_reports":{dropped}}}"#
+            )
+        };
+        let last = r#""source":"codex","session_id":"s","ownership_action":"release","at":9"#;
+        let readable = tab_with(&format!(
+            r#"{{"count":2,"last":{{{last},"reason":"not_owner","tab_had_owner":true}}}}"#
+        ));
+        let tab: Tab = serde_json::from_str(&readable).unwrap();
+        assert_eq!(tab.dropped_reports.unwrap().count, 2);
+
+        for unreadable in [
+            format!(
+                r#"{{"count":2,"last":{{{last},"reason":"later_reason","tab_had_owner":true}}}}"#
+            ),
+            format!(r#"{{"count":2,"last":{{{last},"reason":"not_owner"}}}}"#),
+            "null".to_string(),
+        ] {
+            let tab: Tab = serde_json::from_str(&tab_with(&unreadable)).unwrap();
+            assert_eq!(tab.dropped_reports, None, "{unreadable}");
+            assert_eq!(tab.title, "zsh");
+        }
     }
 
     /// The agent axes are additive: a `Tab` encoded by a pre-plan-002
