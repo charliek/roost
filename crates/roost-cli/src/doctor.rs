@@ -3818,6 +3818,7 @@ pub fn render(report: &Report, json: bool, style: Style, verbose: bool) -> anyho
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::fixtures::fake_launcher;
     use roost_ipc::agent::{AgentLifecycle, Ownership, ShellState};
     use roost_ipc::messages::TabState;
     use roost_ipc::LocalBackendMode;
@@ -7938,10 +7939,7 @@ mod tests {
     async fn version_subprocesses_run_under_the_c_locale() {
         let _env = ENV.lock().await;
         let dir = TmpDir::new("locale");
-        let script = dir.join("echo-locale");
-        std::fs::write(&script, "#!/bin/sh\necho \"LC_ALL=$LC_ALL LANG=$LANG\"\n")
-            .expect("write script");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let script = fake_launcher(&dir.0, "echo-locale", "echo \"LC_ALL=$LC_ALL LANG=$LANG\"");
         let _shell = EnvVar::set("SHELL", &script);
         let _lc = EnvVar::set("LC_ALL", "de_DE.UTF-8");
         let _lang = EnvVar::set("LANG", "de_DE.UTF-8");
@@ -7962,19 +7960,14 @@ mod tests {
         let _env = ENV.lock().await;
         let dir = TmpDir::new("slow-shell");
         let pidfile = dir.join("pid");
-        let script = dir.join("slow-sh");
         // `exec` so the pid the script reports is the pid tokio spawned:
         // a forked grandchild would outlive the kill, which is a known
         // limit (plan §9) rather than what this pins.
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
-                pidfile.display()
-            ),
-        )
-        .expect("write script");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let script = fake_launcher(
+            &dir.0,
+            "slow-sh",
+            &format!("echo $$ > '{}'\nexec sleep 30", pidfile.display()),
+        );
         let _shell = EnvVar::set("SHELL", &script);
 
         let started = std::time::Instant::now();

@@ -361,7 +361,37 @@ fn session_socket() -> Result<std::path::PathBuf, CliError> {
 }
 
 #[cfg(test)]
+pub(crate) mod fixtures {
+    use std::path::{Path, PathBuf};
+
+    /// An executable at `dir/name` that runs `body`.
+    ///
+    /// A symlink to the committed fixture plus `body` in a plain
+    /// `<name>.conf` file beside it, never a script of our own: this
+    /// binary's cases run in parallel threads, and an executable written
+    /// while a sibling is forking races `execve` — the fork inherits our
+    /// still-open write descriptor, and the exec answers ETXTBSY on
+    /// Linux (#431). The fixture sources the conf, which has no such
+    /// window, and pins the `PATH` the body runs under — see its header.
+    pub(crate) fn fake_launcher(dir: &Path, name: &str, body: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(dir.join(format!("{name}.conf")), format!("{body}\n")).unwrap();
+        std::os::unix::fs::symlink(launcher_fixture(), &path).unwrap();
+        path
+    }
+
+    fn launcher_fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/roosttest/fixtures/fake-roost-session.sh")
+            .canonicalize()
+            .expect("the fake-roost-session fixture must exist")
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::fixtures::fake_launcher;
     use super::*;
     use std::ffi::OsStr;
     use std::os::unix::fs::PermissionsExt;
@@ -378,30 +408,6 @@ mod tests {
         std::fs::write(&path, b"#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
-    }
-
-    /// A `roost-session` launcher that behaves well or badly, per `body`.
-    ///
-    /// A symlink to the committed fixture plus `body` in a plain
-    /// `.conf` file beside it, never a script of our own: these cases
-    /// run in parallel threads, and an executable written while a
-    /// sibling is forking races `execve` — the fork inherits our
-    /// still-open write descriptor, and the exec answers ETXTBSY on
-    /// Linux (#431). The fixture sources the conf, which has no such
-    /// window, and pins the `PATH` the body runs under — see its header.
-    fn fake_launcher(dir: &Path, body: &str) -> PathBuf {
-        std::fs::create_dir_all(dir).unwrap();
-        let path = dir.join(BIN_NAME);
-        std::fs::write(path.with_extension("conf"), format!("{body}\n")).unwrap();
-        std::os::unix::fs::symlink(launcher_fixture(), &path).unwrap();
-        path
-    }
-
-    fn launcher_fixture() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tools/roosttest/fixtures/fake-roost-session.sh")
-            .canonicalize()
-            .expect("the fake-roost-session fixture must exist")
     }
 
     /// A unique scratch directory. `std::env::temp_dir()` plus the test
@@ -813,7 +819,7 @@ mod tests {
 
     async fn run_launcher(tag: &str, body: &str) -> (anyhow::Result<Verdict>, Duration) {
         let dir = scratch(tag);
-        let bin = fake_launcher(&dir, body);
+        let bin = fake_launcher(&dir, BIN_NAME, body);
         let started = std::time::Instant::now();
         let verdict =
             spawn_and_read_verdict(&bin, &dir, None, FirstProject::Seed, TEST_BUDGET).await;

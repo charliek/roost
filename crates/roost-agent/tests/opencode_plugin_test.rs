@@ -52,29 +52,6 @@ const DIRECTORY: &str = "/tmp/project";
 /// test must never drift from what the install engine writes out.
 const PLUGIN: &str = include_str!("../assets/opencode/roost-agent-state.js");
 
-/// Records argv and stdin of one `agent-hook` invocation into its own
-/// file, named for the sequence number it takes *after* finishing — so
-/// the file names are completion order, which is the order Roost would
-/// have seen these reports arrive.
-///
-/// Three behaviours ride on env vars, each off by default: wedge the
-/// first invocation, stall one named event, and nothing else.
-const STUB: &str = r#"#!/bin/sh
-if [ -n "$ROOST_TEST_HANG_DIR" ] && mkdir "$ROOST_TEST_HANG_DIR/hung" 2>/dev/null; then
-  printf '%s\n' "$$" > "$ROOST_TEST_PID_FILE"
-  exec sleep 30
-fi
-out=$(mktemp "$ROOST_TEST_STAGE_DIR/rec.XXXXXX")
-printf '%s\n' "$*" > "$out"
-cat >> "$out"
-if [ -n "$ROOST_TEST_SLOW_EVENT" ] && grep -q "\"hook_event_name\":\"$ROOST_TEST_SLOW_EVENT\"" "$out"; then
-  sleep "$ROOST_TEST_SLOW_SECONDS"
-fi
-i=0
-while ! mkdir "$ROOST_TEST_SEQ_DIR/$i" 2>/dev/null; do i=$((i + 1)); done
-mv "$out" "$ROOST_TEST_RECORD_DIR/$i"
-"#;
-
 /// Emits every bus event back to back, then disposes, then reads the
 /// records in completion order. Nothing here waits on a hook.
 const HARNESS: &str = r#"
@@ -337,7 +314,6 @@ impl Harness {
         for path in [&records, &stage, &seq] {
             fs::create_dir(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         }
-        let stub = dir.join("hook.sh");
         let ordered = dir.join("ordered.json");
         let pids = dir.join("hung.pids");
 
@@ -345,17 +321,11 @@ impl Harness {
         write(&dir.join("package.json"), "{ \"type\": \"module\" }\n");
         write(&dir.join("harness.mjs"), HARNESS);
         write(&dir.join("events.json"), &steps.to_string());
-        write(&stub, STUB);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
-        }
 
         let hook = if self.missing_hook {
             dir.join("no-such-hook")
         } else {
-            stub.clone()
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opencode-hook-stub.sh")
         };
         let mut node = Command::new("node");
         node.arg("harness.mjs")

@@ -399,11 +399,17 @@ mod tests {
         }
     }
 
+    /// A hook at `dir/hook.sh` that runs `body`, through the committed
+    /// fixture rather than a script written here — see the fixture's
+    /// header for the ETXTBSY race a written script would run.
     fn stub_hook(dir: &Path, body: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(dir.join("hook.sh.conf"), body).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/roosttest/fixtures/fake-roost-session.sh")
+            .canonicalize()
+            .expect("the fake-roost-session fixture must exist");
         let path = dir.join("hook.sh");
-        std::fs::write(&path, body).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(fixture, &path).unwrap();
         path
     }
 
@@ -473,7 +479,7 @@ mod tests {
         let hook = stub_hook(
             dir.path(),
             &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\nprintf '{{}}'\n",
+                "printf '%s\\n' \"$@\" > '{}'\ncat > '{}'\nprintf '{{}}'\n",
                 argv_out.display(),
                 stdin_out.display()
             ),
@@ -504,7 +510,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hook = stub_hook(
             dir.path(),
-            "#!/bin/sh\ncat >/dev/null\nprintf '{\"decision\":\"blo'\nexit 1\n",
+            "cat >/dev/null\nprintf '{\"decision\":\"blo'\nexit 1\n",
         );
         let ran = run(Agent::Claude, Some(hook.to_str().unwrap()), b"{}");
 
@@ -519,7 +525,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hook = stub_hook(
             dir.path(),
-            "#!/bin/sh\ncat >/dev/null\nprintf '{\"decision\":\"approve\"}'\n",
+            "cat >/dev/null\nprintf '{\"decision\":\"approve\"}'\n",
         );
         let ran = run(Agent::Claude, Some(hook.to_str().unwrap()), b"{}");
 
@@ -532,7 +538,7 @@ mod tests {
     #[test]
     fn a_failing_hook_binary_falls_back_to_the_inert_answer() {
         let dir = tempfile::tempdir().unwrap();
-        let hook = stub_hook(dir.path(), "#!/bin/sh\necho boom >&2\nexit 127\n");
+        let hook = stub_hook(dir.path(), "echo boom >&2\nexit 127\n");
         let payload = vec![b'y'; STDIN_BYTES];
 
         let ran = run(Agent::Cursor, Some(hook.to_str().unwrap()), &payload);
