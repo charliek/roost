@@ -2809,10 +2809,11 @@ fn tab_checks(
 }
 
 /// The tab's dropped-report record, plus the one pattern worth naming: an
-/// agent reporting into a tab nobody owns has lost the tab, and nothing it
+/// agent reporting into a tab nobody owned has lost the tab, and nothing it
 /// sends shows until it claims again. A nested agent's drops land under a
 /// live owner, so they never read as this. The record is history, never
-/// cleared, so the note is conditional and the age says how old it is.
+/// cleared, so the note is conditional, skipped once that agent owns the
+/// tab again, and the age says how old it is.
 fn describe_dropped(now: i64, tab: &Tab, dropped: &DroppedReports) -> String {
     let last = &dropped.last;
     let action = match last.ownership_action {
@@ -2824,9 +2825,14 @@ fn describe_dropped(now: i64, tab: &Tab, dropped: &DroppedReports) -> String {
         DropReason::NotOwner => "not_owner",
         DropReason::NestedClaim => "nested_claim",
     };
+    let owns_it_now = tab
+        .ownership
+        .as_ref()
+        .is_some_and(|o| (&o.source, &o.session_id) == (&last.source, &last.session_id));
     let lost = last.reason == DropReason::NotOwner
         && last.ownership_action == OwnershipAction::Preserve
-        && tab.ownership.is_none();
+        && !last.tab_had_owner
+        && !owns_it_now;
     format!(
         "count={} last: source={} session={} action={action} reason={reason} at={}{}",
         dropped.count,
@@ -5675,6 +5681,7 @@ mod tests {
         source: &str,
         action: OwnershipAction,
         reason: DropReason,
+        tab_had_owner: bool,
     ) -> Option<roost_ipc::agent::DroppedReports> {
         Some(roost_ipc::agent::DroppedReports {
             count: 4,
@@ -5683,6 +5690,7 @@ mod tests {
                 session_id: "sess-abcdef123456".into(),
                 ownership_action: action,
                 reason,
+                tab_had_owner,
                 at: 1_700_000_040,
             },
         })
@@ -5703,7 +5711,12 @@ mod tests {
         assert_eq!(dropped_detail(tab(7)), "none");
 
         let lost = dropped_detail(Tab {
-            dropped_reports: dropped("claude", OwnershipAction::Preserve, DropReason::NotOwner),
+            dropped_reports: dropped(
+                "claude",
+                OwnershipAction::Preserve,
+                DropReason::NotOwner,
+                false,
+            ),
             ..tab(7)
         });
         assert!(lost.starts_with("count=4 last: source=claude"), "{lost}");
@@ -5719,16 +5732,56 @@ mod tests {
                 session_id: "outer".into(),
                 ..Ownership::default()
             }),
-            dropped_reports: dropped("codex", OwnershipAction::Preserve, DropReason::NotOwner),
+            dropped_reports: dropped(
+                "codex",
+                OwnershipAction::Preserve,
+                DropReason::NotOwner,
+                true,
+            ),
             ..tab(7)
         });
         assert!(nested.contains("reason=not_owner"), "{nested}");
         assert!(!nested.contains("no agent owned"), "{nested}");
 
+        // Dropped under an owner who has since released: the tab was not
+        // ownerless when it arrived, whatever it is now.
+        let then_owned = dropped_detail(Tab {
+            dropped_reports: dropped(
+                "codex",
+                OwnershipAction::Preserve,
+                DropReason::NotOwner,
+                true,
+            ),
+            ..tab(7)
+        });
+        assert!(!then_owned.contains("no agent owned"), "{then_owned}");
+
+        // The agent that lost the tab has claimed it back.
+        let recovered = dropped_detail(Tab {
+            ownership: Some(Ownership {
+                source: "claude".into(),
+                session_id: "sess-abcdef123456".into(),
+                ..Ownership::default()
+            }),
+            dropped_reports: dropped(
+                "claude",
+                OwnershipAction::Preserve,
+                DropReason::NotOwner,
+                false,
+            ),
+            ..tab(7)
+        });
+        assert!(!recovered.contains("no agent owned"), "{recovered}");
+
         // A refused release on an unowned tab is a departing agent, not a
         // lost one.
         let leaving = dropped_detail(Tab {
-            dropped_reports: dropped("codex", OwnershipAction::Release, DropReason::NotOwner),
+            dropped_reports: dropped(
+                "codex",
+                OwnershipAction::Release,
+                DropReason::NotOwner,
+                false,
+            ),
             ..tab(7)
         });
         assert!(!leaving.contains("no agent owned"), "{leaving}");

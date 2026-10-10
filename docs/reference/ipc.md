@@ -228,15 +228,18 @@ this tab's server refused (`accepted: false`) and keeps the latest:
 
 ```json
 {"count": 9, "last": {"source": "codex", "session_id": "01a12677…",
-  "ownership_action": "release", "reason": "not_owner", "at": 1791648366}}
+  "ownership_action": "release", "reason": "not_owner",
+  "tab_had_owner": true, "at": 1791648366}}
 ```
 
 `reason` is `"not_owner"` (a `preserve` or `release` from anyone but the
 owner, including any report to a tab nobody owns) or `"nested_claim"`.
-An agent whose reports keep landing as `not_owner` on a tab with no
-owner has lost the tab: nothing it sends shows until it claims again,
-and `roostctl doctor` points it out. The record is history, never
-cleared, so check `last.at` against when the agent last ran. The field is live diagnostic state on the
+`tab_had_owner` says whether any agent owned the tab when the report was
+dropped. An agent whose reports land as `not_owner` with
+`tab_had_owner: false` has lost the tab: nothing it sends shows until it
+claims again, and `roostctl doctor` points it out. The record is
+history, never cleared, so check `last.at` against when the agent last
+ran. The field is live diagnostic state on the
 server that holds the tab, never persisted and carried by no event, so
 read it from that server rather than from a window mirroring a remote
 host. The key is omitted until something is dropped, so an older server

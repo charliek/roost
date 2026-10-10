@@ -394,6 +394,8 @@ pub struct DroppedReport {
     pub session_id: String,
     pub ownership_action: OwnershipAction,
     pub reason: DropReason,
+    /// Whether any agent owned the tab when this report was dropped.
+    pub tab_had_owner: bool,
     /// Server receipt time.
     pub at: i64,
 }
@@ -869,6 +871,7 @@ mod tests {
                 session_id: "inner".into(),
                 ownership_action: OwnershipAction::Release,
                 reason: DropReason::NotOwner,
+                tab_had_owner: true,
                 at: 1_791_648_366,
             },
         };
@@ -876,7 +879,7 @@ mod tests {
             serde_json::to_value(&dropped).unwrap(),
             serde_json::json!({"count": 9, "last": {
                 "source": "codex", "session_id": "inner", "ownership_action": "release",
-                "reason": "not_owner", "at": 1_791_648_366,
+                "reason": "not_owner", "tab_had_owner": true, "at": 1_791_648_366,
             }})
         );
         assert_eq!(

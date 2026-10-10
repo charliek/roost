@@ -277,7 +277,8 @@ def test_a_codex_session_inside_a_claude_turn_leaves_claude_the_tab(roost, proje
     dropped = roost.tab(tab)["dropped_reports"]
     assert dropped["count"] == len(codex), dropped
     assert (dropped["last"]["source"], dropped["last"]["ownership_action"],
-            dropped["last"]["reason"]) == ("codex", "release", "not_owner"), dropped
+            dropped["last"]["reason"], dropped["last"]["tab_had_owner"]) == (
+        "codex", "release", "not_owner", True), dropped
 
     agent_hook(target, tab, "claude", {
         **claude, "hook_event_name": "PreToolUse",

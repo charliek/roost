@@ -1429,12 +1429,16 @@
         },
         "source": {
           "type": "string"
+        },
+        "tab_had_owner": {
+          "type": "boolean"
         }
       },
       "required": [
         "source",
         "ownership_action",
         "reason",
+        "tab_had_owner",
         "at"
       ],
       "type": "object"

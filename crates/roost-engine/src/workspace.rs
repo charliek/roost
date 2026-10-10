@@ -2014,7 +2014,7 @@ impl Workspace {
         for report in std::iter::once(first).chain(then) {
             let outcome = agent::apply_report(&next, report, now);
             if let Some(reason) = outcome.dropped {
-                drop_logs.extend(record_drop(row, report, reason, now));
+                drop_logs.extend(record_drop(row, &next, report, reason, now));
                 continue;
             }
             accepted = true;
@@ -2951,6 +2951,7 @@ const LOGGED_DROP_STREAMS: usize = 16;
 /// released.
 fn record_drop(
     row: &mut TabRow,
+    seen: &AgentTabState,
     report: &TabAgentReportParams,
     reason: DropReason,
     now: i64,
@@ -2963,6 +2964,7 @@ fn record_drop(
             session_id: report.session_id.clone(),
             ownership_action: report.ownership_action,
             reason,
+            tab_had_owner: agent::is_live(seen),
             at: now,
         },
     });
@@ -2986,7 +2988,7 @@ fn record_drop(
         session_id: log_clip(&report.session_id),
         action: report.ownership_action,
         reason,
-        owner: row.agent.ownership.as_ref().map_or_else(
+        owner: seen.ownership.as_ref().map_or_else(
             || "none".to_string(),
             |o| log_clip(&format!("{}/{}", o.source, o.session_id)),
         ),
@@ -4405,6 +4407,7 @@ mod tests {
         );
         assert_eq!(dropped.last.ownership_action, OwnershipAction::Preserve);
         assert_eq!(dropped.last.reason, DropReason::NotOwner);
+        assert!(!dropped.last.tab_had_owner);
 
         let claim = report(
             tid,
@@ -4428,6 +4431,7 @@ mod tests {
         let dropped = tab.dropped_reports.unwrap();
         assert_eq!(dropped.count, 2);
         assert_eq!(dropped.last.reason, DropReason::NestedClaim);
+        assert!(dropped.last.tab_had_owner);
         assert_eq!(ws.tab(tid).unwrap().dropped_reports, Some(dropped));
 
         // `set-state none` is a claim then a release, both accepted.
@@ -4452,7 +4456,7 @@ mod tests {
         let a = report(tid, "codex", "a", OwnershipAction::Preserve, None);
         let b = report(tid, "codex", "b", OwnershipAction::Preserve, None);
         let logged = |row: &mut TabRow, r: &TabAgentReportParams, reason| {
-            record_drop(row, r, reason, 1).is_some()
+            record_drop(row, &AgentTabState::default(), r, reason, 1).is_some()
         };
 
         assert!(logged(row, &a, DropReason::NotOwner));
@@ -4474,11 +4478,17 @@ mod tests {
                 OwnershipAction::Preserve,
                 None,
             );
-            record_drop(row, &other, DropReason::NotOwner, 1);
+            record_drop(
+                row,
+                &AgentTabState::default(),
+                &other,
+                DropReason::NotOwner,
+                1,
+            );
         }
         assert_eq!(row.logged_drop_streams.len(), LOGGED_DROP_STREAMS);
         assert!(
-            record_drop(row, &a, DropReason::NotOwner, 1).is_some(),
+            record_drop(row, &AgentTabState::default(), &a, DropReason::NotOwner, 1).is_some(),
             "the memory is bounded, oldest first"
         );
     }

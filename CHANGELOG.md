@@ -24,11 +24,12 @@ release workflow asserts they agree).
 - **Dropped agent reports are visible.** A `tab.agent_report` the server
   refuses used to vanish without a trace. Each tab now counts the
   reports it dropped and keeps the latest, with its reason (`not_owner`
-  or `nested_claim`), on `Tab.dropped_reports`. The server logs the
-  first drop of each agent session once, and `roostctl doctor` shows the
-  record and flags a report that arrived while no agent owned the tab:
-  if that agent is still running, it has lost the tab until its next
-  session start. See
+  or `nested_claim`, and whether the tab had an owner then), on
+  `Tab.dropped_reports`. The server logs the first drop of each
+  `(source, session, reason)`, remembering the last 16 per tab, and
+  `roostctl doctor` shows the record and flags a report dropped while no
+  agent owned the tab: if that agent is still running, it has lost the
+  tab until its next session start. See
   [`Tab.dropped_reports`](docs/reference/ipc.md#shared-types).
 
 ### Fixed
