@@ -6230,6 +6230,7 @@ impl App {
                 .iter()
                 .map(|tab| agent::effective_lifecycle(&tab.agent_state())),
         );
+        let rollup_color = agent_color(&self.chrome, rollup);
         let notifying = project.tabs.iter().any(|tab| tab.has_notification);
         let stripe = container(
             iced::widget::Space::new()
@@ -6240,7 +6241,7 @@ impl App {
             let color = if rollup == roost_ipc::agent::AgentLifecycle::Inactive {
                 Color::TRANSPARENT
             } else {
-                agent_color(rollup).scale_alpha(alpha)
+                rollup_color.scale_alpha(alpha)
             };
             iced::widget::container::Style::default()
                 .background(color)
@@ -6343,7 +6344,7 @@ impl App {
             for agent in self.sidebar_agents.get(&project_key).into_iter().flatten() {
                 let name = agent.name.clone();
                 let detail = format!("{} · {}", agent.status_text, agent.time_text);
-                let dot_color = agent_color(agent.lifecycle).scale_alpha(alpha);
+                let dot_color = agent_color(&self.chrome, agent.lifecycle).scale_alpha(alpha);
                 let dot =
                     container(iced::widget::Space::new().width(8).height(8)).style(move |_| {
                         iced::widget::container::Style::default()
@@ -6768,7 +6769,7 @@ impl App {
                 .as_ref()
                 .filter(|editor| editor.target == RenameTarget::Tab(tab_key));
             let lifecycle = agent::effective_lifecycle(&tab.agent_state());
-            let status_color = tab_status_color(lifecycle);
+            let status_color = tab_status_color(&self.chrome, lifecycle);
             let dot = container(
                 iced::widget::Space::new()
                     .width(chrome::TAB_STATUS_SIZE)
@@ -7035,7 +7036,7 @@ impl App {
             };
             let label: Element<'_, Message> = if let Some(agent) = item.agent {
                 let lifecycle_color = if actionable {
-                    agent_color(agent.effective_lifecycle)
+                    agent_color(&self.chrome, agent.effective_lifecycle)
                 } else {
                     self.chrome.palette_placeholder.scale_alpha(0.6)
                 };
@@ -10558,22 +10559,22 @@ fn canonical_pointer_shape(name: &str) -> &str {
     }
 }
 
-fn agent_color(lifecycle: roost_ipc::agent::AgentLifecycle) -> Color {
+fn agent_color(chrome: &ChromePalette, lifecycle: roost_ipc::agent::AgentLifecycle) -> Color {
     use roost_ipc::agent::AgentLifecycle;
     match lifecycle {
-        AgentLifecycle::Working => Color::from_rgb8(0x5f, 0xa3, 0xf0),
-        AgentLifecycle::Waiting => Color::from_rgb8(0xf0, 0xa0, 0x40),
-        AgentLifecycle::Finished => Color::from_rgb8(0x7a, 0x7a, 0x7a),
-        AgentLifecycle::Failed => Color::from_rgb8(0xe0, 0x52, 0x52),
-        AgentLifecycle::Inactive => Color::from_rgba8(0x7a, 0x7a, 0x7a, 0.5),
+        AgentLifecycle::Working => chrome.agent_working,
+        AgentLifecycle::Waiting => chrome.agent_waiting,
+        AgentLifecycle::Finished => chrome.agent_finished,
+        AgentLifecycle::Failed => chrome.agent_failed,
+        AgentLifecycle::Inactive => chrome.agent_inactive,
     }
 }
 
-fn tab_status_color(lifecycle: roost_ipc::agent::AgentLifecycle) -> Color {
+fn tab_status_color(chrome: &ChromePalette, lifecycle: roost_ipc::agent::AgentLifecycle) -> Color {
     if lifecycle == roost_ipc::agent::AgentLifecycle::Inactive {
         Color::TRANSPARENT
     } else {
-        agent_color(lifecycle)
+        agent_color(chrome, lifecycle)
     }
 }
 
@@ -14497,30 +14498,31 @@ mod tests {
     #[test]
     fn agent_colors_match_the_shipped_linux_and_appkit_palette() {
         use roost_ipc::agent::AgentLifecycle;
+        let chrome = ChromePalette::roost_dark(chrome::DEFAULT_ACCENT);
         assert_eq!(
-            agent_color(AgentLifecycle::Working),
+            agent_color(&chrome, AgentLifecycle::Working),
             Color::from_rgb8(0x5f, 0xa3, 0xf0)
         );
         assert_eq!(
-            agent_color(AgentLifecycle::Waiting),
+            agent_color(&chrome, AgentLifecycle::Waiting),
             Color::from_rgb8(0xf0, 0xa0, 0x40)
         );
         assert_eq!(
-            agent_color(AgentLifecycle::Finished),
+            agent_color(&chrome, AgentLifecycle::Finished),
             Color::from_rgb8(0x7a, 0x7a, 0x7a)
         );
         assert_eq!(
-            agent_color(AgentLifecycle::Failed),
+            agent_color(&chrome, AgentLifecycle::Failed),
             Color::from_rgb8(0xe0, 0x52, 0x52)
         );
         assert_eq!(
-            tab_status_color(AgentLifecycle::Inactive),
+            tab_status_color(&chrome, AgentLifecycle::Inactive),
             Color::TRANSPARENT,
             "inactive tabs reserve the status slot without painting a dot"
         );
         assert_eq!(
-            tab_status_color(AgentLifecycle::Working),
-            agent_color(AgentLifecycle::Working)
+            tab_status_color(&chrome, AgentLifecycle::Working),
+            agent_color(&chrome, AgentLifecycle::Working)
         );
     }
 

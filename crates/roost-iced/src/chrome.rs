@@ -205,6 +205,19 @@ pub struct ChromePalette {
     pub error_text: Color,
     pub danger: Color,
     pub danger_accent: Color,
+    /// Agent lifecycle colors: sidebar dots and stripes, the tab status dot,
+    /// and the agents panel. They do not follow the accent.
+    pub agent_working: Color,
+    pub agent_waiting: Color,
+    pub agent_finished: Color,
+    pub agent_failed: Color,
+    pub agent_inactive: Color,
+    /// The agents panel's group headers.
+    pub agent_group_text: Color,
+    /// The sidebar's project-list / agents-panel split handle, at rest and
+    /// hovered.
+    pub split_handle: Color,
+    pub split_handle_hover: Color,
 }
 
 impl ChromePalette {
@@ -254,6 +267,14 @@ impl ChromePalette {
             error_text: Color::from_rgb8(0xee, 0x78, 0x78),
             danger: Color::from_rgb8(0x8a, 0x2a, 0x2a),
             danger_accent: Color::from_rgb8(0xa8, 0x33, 0x33),
+            agent_working: Color::from_rgb8(0x5f, 0xa3, 0xf0),
+            agent_waiting: Color::from_rgb8(0xf0, 0xa0, 0x40),
+            agent_finished: Color::from_rgb8(0x7a, 0x7a, 0x7a),
+            agent_failed: Color::from_rgb8(0xe0, 0x52, 0x52),
+            agent_inactive: Color::from_rgba8(0x7a, 0x7a, 0x7a, 0.5),
+            agent_group_text: Color::from_rgb8(0x6e, 0x74, 0x7a),
+            split_handle: Color::from_rgb8(0x3c, 0x42, 0x46),
+            split_handle_hover: Color::from_rgb8(0xa0, 0xa4, 0xb0),
         };
         let channels = rgb8(accent);
         if channels == rgb8(DEFAULT_ACCENT) {
@@ -914,6 +935,14 @@ mod tests {
             error_text: Color::from_rgb8(0xee, 0x78, 0x78),
             danger: Color::from_rgb8(0x8a, 0x2a, 0x2a),
             danger_accent: Color::from_rgb8(0xa8, 0x33, 0x33),
+            agent_working: Color::from_rgb8(0x5f, 0xa3, 0xf0),
+            agent_waiting: Color::from_rgb8(0xf0, 0xa0, 0x40),
+            agent_finished: Color::from_rgb8(0x7a, 0x7a, 0x7a),
+            agent_failed: Color::from_rgb8(0xe0, 0x52, 0x52),
+            agent_inactive: Color::from_rgba8(0x7a, 0x7a, 0x7a, 0.5),
+            agent_group_text: Color::from_rgb8(0x6e, 0x74, 0x7a),
+            split_handle: Color::from_rgb8(0x3c, 0x42, 0x46),
+            split_handle_hover: Color::from_rgb8(0xa0, 0xa4, 0xb0),
         };
         assert_eq!(ChromePalette::roost_dark(DEFAULT_ACCENT), expected);
         assert_eq!(

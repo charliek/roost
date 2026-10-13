@@ -752,7 +752,19 @@ mod tests {
             PanelEntry::Group { .. } => panic!("Priority draws no heads"),
         })
         .collect();
-        assert_eq!(palette.len(), 8);
+        let local_tab = TabKey::local;
+        let popos_tab = |id| TabKey::new(POPOS, id);
+        let expected = vec![
+            local_tab(5),
+            local_tab(2),
+            popos_tab(2),
+            local_tab(4),
+            local_tab(1),
+            popos_tab(1),
+            local_tab(3),
+            popos_tab(6),
+        ];
+        assert_eq!(palette, expected);
         assert_eq!(panel, palette);
     }
 

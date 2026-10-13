@@ -622,6 +622,7 @@ impl RoostConfig {
                     if let Some(v) = AgentPanelSort::parse(value) {
                         cfg.agent_panel_sort = v;
                     } else {
+                        cfg.agent_panel_sort = AgentPanelSort::default();
                         tracing::warn!(
                             value,
                             "unknown agent-panel-sort value; expected grouped|priority|recent, \
@@ -1644,7 +1645,11 @@ mod tests {
     /// A6: a value this build does not know warns and reads as `grouped`.
     #[test]
     fn agent_panel_sort_unknown_value_falls_back_to_grouped() {
-        for line in ["agent-panel-sort = state", "agent-panel-sort = "] {
+        for line in [
+            "agent-panel-sort = state",
+            "agent-panel-sort = ",
+            "agent-panel-sort = priority\nagent-panel-sort = state",
+        ] {
             assert_eq!(
                 RoostConfig::parse(line).agent_panel_sort,
                 AgentPanelSort::Grouped,
