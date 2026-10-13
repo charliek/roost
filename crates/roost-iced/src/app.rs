@@ -5814,6 +5814,10 @@ impl App {
                 self.toggle_sidebar_agents();
                 Ok(UiTask::None)
             }
+            KeybindAction::CycleAgentPanelSort => {
+                self.cycle_agent_panel_sort();
+                Ok(UiTask::None)
+            }
             KeybindAction::ToggleSecureInput => {
                 self.toggle_secure_input();
                 Ok(UiTask::None)
@@ -7265,6 +7269,12 @@ impl App {
             "false"
         };
         self.config_writer.set("show-sidebar-agents", value);
+    }
+
+    fn cycle_agent_panel_sort(&mut self) {
+        let sort = self.config.agent_panel_sort.next();
+        self.config.agent_panel_sort = sort;
+        self.config_writer.set("agent-panel-sort", sort.as_str());
     }
 
     /// Flip the remembered Secure Keyboard Entry toggle (plan 074 §D3).

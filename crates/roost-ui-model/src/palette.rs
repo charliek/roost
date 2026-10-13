@@ -235,6 +235,8 @@ impl PaletteCommands {
         // lands right after `SELECT_FONT_ID`) pushes this entry to sit
         // immediately after "Clear All Notifications" — plan 007 §3.7.
         ("toggle_sidebar_agents", "Toggle Sidebar Agents"),
+        // Roost-Iced only: the Swift list has no Agents panel to sort.
+        ("cycle_agent_panel_sort", "Cycle Agent Panel Sort"),
         // The one surface that changes `agent-hooks` after the first
         // launch, and the row the wiring toast points at by name.
         ("agent_hooks", "Agent Hooks\u{2026}"),
@@ -773,6 +775,19 @@ mod tests {
         assert!(PaletteCommands::SPECS
             .iter()
             .any(|(id, _)| *id == "jump_to_unread"));
+    }
+
+    #[test]
+    fn cycle_agent_panel_sort_sits_after_toggle_sidebar_agents() {
+        let ids: Vec<&str> = PaletteCommands::SPECS.iter().map(|(id, _)| *id).collect();
+        let toggle = ids
+            .iter()
+            .position(|id| *id == "toggle_sidebar_agents")
+            .expect("toggle_sidebar_agents present");
+        assert_eq!(
+            PaletteCommands::SPECS[toggle + 1],
+            ("cycle_agent_panel_sort", "Cycle Agent Panel Sort")
+        );
     }
 
     #[test]

@@ -52,6 +52,12 @@ pub enum KeybindAction {
     /// toggle — `dispatch_action`'s `is_picker_toggle` allowlist
     /// doesn't include it.
     ToggleSidebarAgents,
+    /// Step the sidebar Agents panel's sort, grouped → priority → recent
+    /// (plan 080 D7), and write it to `agent-panel-sort`. **Default
+    /// unbound**: the panel header's sort word does the same on a click,
+    /// and the palette reaches it by name. Roost-Iced only: the Swift app
+    /// does not know this name and logs it as unknown.
+    CycleAgentPanelSort,
     /// Open the agent-hooks consent card in preferences mode (plan 064
     /// §3.5) — the same card the first launch raises, with Cancel/Apply
     /// instead of Decide later/Instrument N. **Default unbound**: it is
@@ -143,6 +149,7 @@ impl KeybindAction {
             "paste" => Some(Self::Paste),
             "toggle_sidebar" => Some(Self::ToggleSidebar),
             "toggle_sidebar_agents" => Some(Self::ToggleSidebarAgents),
+            "cycle_agent_panel_sort" => Some(Self::CycleAgentPanelSort),
             "agent_hooks" => Some(Self::AgentHooks),
             "open_config" => Some(Self::OpenConfig),
             "open_docs" => Some(Self::OpenDocs),
@@ -197,6 +204,7 @@ impl KeybindAction {
             Self::Paste => "paste".into(),
             Self::ToggleSidebar => "toggle_sidebar".into(),
             Self::ToggleSidebarAgents => "toggle_sidebar_agents".into(),
+            Self::CycleAgentPanelSort => "cycle_agent_panel_sort".into(),
             Self::AgentHooks => "agent_hooks".into(),
             Self::OpenConfig => "open_config".into(),
             Self::OpenDocs => "open_docs".into(),
@@ -670,6 +678,7 @@ mod tests {
             KeybindAction::Paste,
             KeybindAction::ToggleSidebar,
             KeybindAction::ToggleSidebarAgents,
+            KeybindAction::CycleAgentPanelSort,
             KeybindAction::AgentHooks,
             KeybindAction::OpenConfig,
             KeybindAction::OpenDocs,
@@ -1112,6 +1121,17 @@ mod tests {
         assert!(!defaults
             .values()
             .any(|action| *action == KeybindAction::OpenDocs));
+    }
+
+    #[test]
+    fn cycle_agent_panel_sort_is_named_and_unbound() {
+        assert_eq!(
+            KeybindAction::from_name("cycle_agent_panel_sort"),
+            Some(KeybindAction::CycleAgentPanelSort)
+        );
+        assert!(!default_bindings()
+            .iter()
+            .any(|(_, action)| *action == KeybindAction::CycleAgentPanelSort));
     }
 
     /// Ghostty binds nothing to it either: a chord that flips a security
