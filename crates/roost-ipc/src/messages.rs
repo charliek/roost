@@ -2087,8 +2087,11 @@ pub struct SidebarDumpAgentPanel {
     /// `"grouped"` | `"priority"` | `"recent"` — `agent-panel-sort`.
     pub sort: String,
     /// The panel's share of the split, in thousandths: the dragged value
-    /// mid-drag, else the remembered one. The floors that keep both
-    /// halves usable clamp only what is drawn, never this.
+    /// mid-drag, else the remembered one. The floors that keep both halves
+    /// usable clamp only how a share is drawn, so a remembered or op-set
+    /// value is kept as given; where the sidebar is too short for both, the
+    /// project list keeps its own. A drag publishes the share drawn at each
+    /// move, and its release commits the last one.
     pub fraction_permille: u16,
     pub entries: Vec<SidebarDumpPanelEntry>,
 }

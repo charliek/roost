@@ -114,10 +114,12 @@ const DIVIDER_CHILD: usize = 2;
 pub(crate) struct AgentsSplitDrag {
     live: Option<f32>,
     /// Which drags are still the grip's. The grip records it at a press and
-    /// stamps it on what it publishes; an end the app forces moves it on,
-    /// so a drag it ended can neither resume in a widget that outlived the
-    /// end (an op mid-drag, the seam grip taking the release) nor come back
-    /// through a message already queued behind the end.
+    /// stamps it on what it publishes; every end the app forces moves it
+    /// on, so a drag it ended can neither resume in a widget that outlived
+    /// the end (an op mid-drag, a seam drag over a divider drag whose
+    /// release was lost) nor come back through a message already queued
+    /// behind the end. A press that an end overtakes within one batch is
+    /// let go too, and has to be made again.
     epoch: u64,
 }
 
@@ -141,7 +143,11 @@ impl AgentsSplitDrag {
     }
 
     /// The grip's own end — its release, or the window losing focus — with
-    /// the fraction to commit when one was in flight.
+    /// the share to commit: the last one a move published, as it is, or
+    /// none for a press that never moved. Each was clamped to what its own
+    /// move drew, and a floor or a resize since clamps the stored share's
+    /// drawing as it did the live one's, so the commit leaves the divider
+    /// where it was.
     pub(crate) fn ended(&mut self, epoch: u64) -> Option<f32> {
         if epoch != self.epoch {
             return None;
@@ -173,6 +179,8 @@ struct Drag {
     /// How far below the divider's top it was grabbed.
     grab: f32,
     epoch: u64,
+    /// The share this drag last published.
+    published: Option<f32>,
 }
 
 type State = GripState<Drag>;
@@ -247,17 +255,26 @@ impl Gesture for Divider {
         self.bounds.contains(at).then_some(Drag {
             grab: at.y - self.bounds.y,
             epoch: self.epoch,
+            published: None,
         })
     }
 
     fn moved(&self, drag: Drag, at: Point) -> Motion<SplitEvent> {
-        // Measured against the fraction the split was laid out at, not the
-        // height it drew: a floor holds the drawn height while the fraction
-        // under it goes stale — a sort that raises the panel's, a window
-        // that shrinks under the list's — and a release would commit that.
-        // Anything else that draws the same split publishes nothing.
-        let fraction = dragged_panel(self, drag, at.y) / self.below;
-        Motion::Continue((fraction != self.fraction).then_some(SplitEvent::Dragged { fraction }))
+        // Published when it differs from the fraction the split was laid
+        // out at — not the height it drew: a floor holds the drawn height
+        // while the fraction under it goes stale (a sort that raises the
+        // panel's, a window that shrinks under the list's) — or from the
+        // last one this drag published, which a batch of moves drained
+        // together has not been laid out at yet: out and back within one
+        // frame would leave the panel showing the way out. Anything else
+        // draws the same split and publishes nothing.
+        // Clamped again after the pixel rounding, which can land a hair
+        // outside the bounds: the workspace would round it back on commit
+        // and move the stored share. Inside the bounds it draws the same.
+        let fraction =
+            (dragged_panel(self, drag, at.y) / self.below).clamp(MIN_FRACTION, MAX_FRACTION);
+        let news = fraction != self.fraction || drag.published.is_some_and(|told| told != fraction);
+        Motion::Continue(news.then_some(SplitEvent::Dragged { fraction }))
     }
 
     fn ended(&self) -> SplitEvent {
@@ -266,7 +283,8 @@ impl Gesture for Divider {
 }
 
 /// [`resize_grip::owns_event`] over the divider, once a drag the app has
-/// ended since its press is let go.
+/// ended since its press is let go, and then noting on a drag what its
+/// move published.
 fn owns_event(
     state: &mut State,
     event: &Event,
@@ -278,7 +296,13 @@ fn owns_event(
             state.drag = None;
         }
     }
-    resize_grip::owns_event(state, event, cursor, divider)
+    let ownership = resize_grip::owns_event(state, event, cursor, divider);
+    if let (resize_grip::Ownership::Own(Some(SplitEvent::Dragged { fraction })), Some(drag)) =
+        (ownership, state.drag.as_mut())
+    {
+        drag.published = Some(fraction);
+    }
+    ownership
 }
 
 fn split_message(event: SplitEvent, epoch: u64) -> Message {
@@ -704,6 +728,7 @@ mod tests {
             drag: Some(Drag {
                 grab: GRAB - DIVIDER_TOP,
                 epoch: 0,
+                published: None,
             }),
             ..State::default()
         }
@@ -800,6 +825,7 @@ mod tests {
             Some(Drag {
                 grab: GRAB - DIVIDER_TOP,
                 epoch: 7,
+                published: None,
             }),
             "the press records where on the divider it landed, and the epoch it was drawn at"
         );
@@ -924,14 +950,16 @@ mod tests {
         // A taller grip reaches the fraction's own bounds first.
         let tall = 1000.0;
         let below = tall - DIVIDER;
+        // Its rounded heights land just outside them (845/994, 149/994);
+        // the published share is the bound itself, which draws the same.
         let up = dragged_to(&mut dragging(), tall, -500.0);
-        assert_eq!(up, (MAX_FRACTION * below).round() / below);
+        assert_eq!(up, MAX_FRACTION);
         assert_eq!(
             heights(tall, split(up)).panel,
             (MAX_FRACTION * below).round()
         );
         let down = dragged_to(&mut dragging(), tall, 3000.0);
-        assert_eq!(down, (MIN_FRACTION * below).round() / below);
+        assert_eq!(down, MIN_FRACTION);
         assert_eq!(
             heights(tall, split(down)).panel,
             (MIN_FRACTION * below).round()
@@ -1333,41 +1361,127 @@ mod tests {
         assert_eq!(wired.shown(), 401.0 / 718.0);
     }
 
-    /// A floor that rises mid-drag holds the drawn panel above what the
-    /// drag's share asks for: `grouped`'s head over its one row, or a
-    /// window shrinking under the project list's floor. The next move
-    /// publishes the share the panel is drawn at, so the release commits
-    /// what is on screen.
+    /// A floor that changes mid-drag, or a window that shrinks under the
+    /// project list's, holds the drawn panel off the share the drag last
+    /// published. The release commits that share as it is, and the drawing
+    /// clamps the stored share as it did the live one: the divider stays
+    /// where it was.
     #[test]
-    fn a_floor_raised_mid_drag_is_what_the_release_commits() {
+    fn a_release_after_a_floor_change_commits_the_dragged_share_in_place() {
         // `panel_height`'s floors (app/agents_panel.rs).
         let priority = HEADER + chrome::AGENT_PANEL_LIST_PADDING_Y + chrome::AGENT_PANEL_ROW_HEIGHT;
         let grouped = priority + chrome::AGENT_PANEL_GROUP_HEIGHT;
         assert_eq!((priority, grouped), (77.0, 101.0));
+        let below = 300.0 - DIVIDER;
+        let at = |panel: f32| 300.0 - DIVIDER - panel + 3.0;
 
+        // Priority to grouped: the panel is held up at grouped's floor.
         let mut wired = Wired::new(300.0, priority);
-        let top = wired.laid().projects;
-        wired.press_at(top + 3.0);
-        let at_88 = 300.0 - DIVIDER - 88.0 + 3.0;
-        wired.step(&moved(at_88), at_88);
-        assert_eq!(wired.laid().panel, 88.0);
+        wired.press_at(wired.laid().projects + 3.0);
+        wired.step(&moved(at(88.0)), at(88.0));
+        assert_eq!(wired.shown(), 88.0 / below);
         wired.floor = grouped;
-        assert_eq!(wired.laid().panel, 101.0);
-        wired.step(&moved(at_88 + 1.0), at_88 + 1.0);
-        wired.step(&release(), at_88 + 1.0);
-        assert_eq!(wired.stored, 101.0 / 294.0);
-        assert_eq!(wired.laid().panel, 101.0);
+        let held = wired.laid();
+        assert_eq!(held.panel, 101.0);
+        wired.step(&release(), at(88.0));
+        assert_eq!(wired.stored, 88.0 / below, "the share the drag published");
+        assert_eq!(wired.laid(), held, "the release moved the divider");
 
+        // Grouped to priority, the pointer asking for less than either
+        // floor: the move published grouped's floor, and that stays.
+        let mut wired = Wired::new(300.0, grouped);
+        wired.press_at(wired.laid().projects + 3.0);
+        wired.step(&moved(at(50.0)), at(50.0));
+        assert_eq!(wired.shown(), 101.0 / below);
+        wired.floor = priority;
+        let held = wired.laid();
+        assert_eq!(held.panel, 101.0);
+        wired.step(&release(), at(50.0));
+        assert_eq!(wired.stored, 101.0 / below);
+        assert_eq!(wired.laid(), held, "the release moved the divider");
+
+        // A window that shrinks under the project list's floor.
         let mut wired = Wired::new(TOTAL, FLOOR);
         wired.press_at(GRAB);
         let at_520 = TOTAL - DIVIDER - 520.0 + 3.0;
         wired.step(&moved(at_520), at_520);
-        assert_eq!(wired.laid().panel, 520.0);
         wired.total = 400.0;
-        let most = 400.0 - DIVIDER - PROJECTS_FLOOR;
-        assert_eq!(wired.laid().panel, most);
-        wired.step(&moved(50.0), 50.0);
-        wired.step(&release(), 50.0);
-        assert_eq!(wired.stored, most / (400.0 - DIVIDER));
+        let held = wired.laid();
+        assert_eq!(held.panel, 400.0 - DIVIDER - PROJECTS_FLOOR);
+        wired.step(&release(), at_520);
+        assert_eq!(wired.stored, 520.0 / BELOW);
+        assert_eq!(wired.laid(), held, "the release moved the divider");
+    }
+
+    /// iced runs a whole batch of events through the tree before it drains
+    /// their messages, so a move is measured against a split not yet laid
+    /// out at the move before it. Out to 310px and back to 300 in one batch
+    /// shows 300, and the release commits 300.
+    #[test]
+    fn a_batch_that_goes_out_and_back_lands_where_it_ended() {
+        let at = |panel: f32| TOTAL - DIVIDER - panel + 3.0;
+        let mut wired = Wired::new(TOTAL, FLOOR);
+        wired.press_at(GRAB);
+        wired.step(&moved(at(300.0)), at(300.0));
+        assert_eq!(wired.laid().panel, 300.0);
+
+        let out = wired.grip(&moved(at(310.0)), at(310.0)).1;
+        let back = wired.grip(&moved(at(300.0)), at(300.0)).1;
+        let end = wired.grip(&release(), at(300.0)).1;
+        for message in [out, back].iter().flatten() {
+            wired.deliver(message);
+        }
+        assert_eq!(
+            wired.shown(),
+            300.0 / BELOW,
+            "the panel shows where it ended"
+        );
+        wired.deliver(&end.expect("the release publishes"));
+        assert_eq!(wired.stored, 300.0 / BELOW);
+    }
+
+    /// A press that has not moved yet, then `sidebar.set_agents_fraction`,
+    /// then the release: nothing was dragged, so the op's share stands,
+    /// whether the release reaches the grip after the op or was queued
+    /// behind it.
+    #[test]
+    fn a_release_with_nothing_dragged_commits_nothing_over_an_op() {
+        let mut wired = Wired::new(TOTAL, FLOOR);
+        wired.press_at(GRAB);
+        wired.set_fraction(0.6);
+        assert_eq!(wired.step(&release(), GRAB), Ownership::Delegate);
+        assert_eq!((wired.stored, wired.shown()), (0.6, 0.6));
+
+        let mut wired = Wired::new(TOTAL, FLOOR);
+        wired.press_at(GRAB);
+        let end = wired.grip(&release(), GRAB).1;
+        wired.set_fraction(0.6);
+        wired.deliver(&end.expect("the release publishes"));
+        assert_eq!((wired.stored, wired.shown()), (0.6, 0.6));
+    }
+
+    /// An end the app forces after a press, drained before the press's
+    /// first move — a toast expiring, the seam grip moving — lets the press
+    /// go: the move is from before the end and is dropped, so nothing is
+    /// left live for a grip the end rebuilt to strand. The next press is a
+    /// drag of its own.
+    #[test]
+    fn an_end_forced_before_a_presss_first_move_lets_the_press_go() {
+        let mut wired = Wired::new(TOTAL, FLOOR);
+        wired.press_at(GRAB);
+        let first = wired.grip(&moved(GRAB - 22.0), GRAB - 22.0).1;
+        wired.interrupt();
+        wired.deliver(&first.expect("the move publishes"));
+        assert_eq!(wired.shown(), DEFAULT_FRACTION, "nothing live");
+        assert_eq!(
+            wired.step(&moved(GRAB - 30.0), GRAB - 30.0),
+            Ownership::Delegate
+        );
+        assert_eq!(wired.grip.drag, None);
+
+        wired.press_at(GRAB);
+        wired.step(&moved(GRAB - 30.0), GRAB - 30.0);
+        wired.step(&release(), GRAB - 30.0);
+        assert_eq!(wired.stored, (PANEL + 30.0) / BELOW);
     }
 }

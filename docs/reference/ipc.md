@@ -1739,9 +1739,13 @@ change shows in the very next dump, with no event in between.
   project list, in thousandths: the dragged value while the divider is
   being dragged, else the remembered one, which
   [`sidebar.set_agents_fraction`](#sidebarset_agents_fraction-test-only-gated)
-  sets. The panel draws at least one whole row and the project list at
-  least a band and two rows, but those floors clamp only what is drawn,
-  never this value.
+  sets. The panel draws at least its header and one whole row (under
+  `grouped`, a group head too) and the project list at least a band and
+  two rows, unless the sidebar is too short for both: then the project
+  list keeps its floor and the panel gets what is left, down to its
+  header. Those floors clamp only how a share is drawn: a remembered or
+  op-set value is kept as given. A drag publishes the share drawn at each
+  of its moves, and its release commits the last one.
 - `entries` — tagged by `kind`:
     - `"group"` — a `grouped` head for one host's project: `label` as drawn
       (`LOCAL › roost`, `WORKBENCH › craze`, or the bare project name
@@ -2415,11 +2419,11 @@ it back as `app.sidebar_dump`'s `agent_panel.fraction_permille`.
 `fraction` must be finite and positive; anything else is rejected with
 `invalid-param` before reaching the UI.
 
-The floors listed under
+The fraction is kept as given within that band: the floors listed under
 [`fraction_permille`](#agent_panel-the-agents-panel-plan-080) clamp only
-the drawn split, so a short window shows less than a stored `0.85`. A
-divider drag in flight is committed and then ended, so the op's fraction
-stands: the rest of that drag moves nothing until the next press.
+how it is drawn, so a short window shows less than a stored `0.85`. The op
+ends a divider drag in flight, committing one that has moved first, so the
+op's fraction stands until the next press.
 
 Implemented by the iced UI only; the Swift app answers `unknown-op`.
 

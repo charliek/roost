@@ -7270,9 +7270,12 @@ impl App {
     }
 
     pub fn sidebar_resize_ended(&mut self) {
-        // The divider's drag too, as in `sidebar_resize_dragged`: a press
-        // and release with no move between publishes only this.
-        self.commit_resize_drags();
+        // Not the divider's drag: only the seam's moves end that. A seam
+        // release can be drained after a divider press made in the same
+        // batch, and ending would let that press go — which leaves a seam
+        // click that moves nothing unable to end a divider drag whose
+        // release was lost.
+        self.commit_sidebar_drag();
     }
 
     /// The grip dragged the seam past the collapse threshold. Same discipline
