@@ -48,16 +48,16 @@ use roost_ipc::messages::{
     SelectionClearParams, SelectionDumpParams, SelectionDumpResult, SelectionSetParams,
     SessionIdentify, SessionIdentifyParams, SessionPutFileParams, SessionPutFileResult,
     SessionSetAgentHooksParams, SessionSetThemeParams, SessionStopParams, SessionStopResult,
-    SidebarDumpParams, SidebarDumpResult, SidebarSetWidthParams, TabAgentReportResult,
-    TabCapturePtyInputParams, TabCapturePtyInputResult, TabClearNotificationParams,
-    TabClearNotificationResult, TabCloseParams, TabDispatchMouseEventParams, TabDumpCursor,
-    TabDumpParams, TabDumpResolvedParams, TabDumpResolvedResult, TabDumpResult,
-    TabExpandSelectionAtParams, TabExpandSelectionAtResult, TabFeedImeParams,
-    TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult, TabOpenParams,
-    TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams, TabSendFileResult,
-    TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams, TabWriteParams,
-    WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef, WireTabRef,
-    MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES,
+    SidebarDumpParams, SidebarDumpResult, SidebarSetAgentsFractionParams, SidebarSetWidthParams,
+    TabAgentReportResult, TabCapturePtyInputParams, TabCapturePtyInputResult,
+    TabClearNotificationParams, TabClearNotificationResult, TabCloseParams,
+    TabDispatchMouseEventParams, TabDumpCursor, TabDumpParams, TabDumpResolvedParams,
+    TabDumpResolvedResult, TabDumpResult, TabExpandSelectionAtParams, TabExpandSelectionAtResult,
+    TabFeedImeParams, TabFeedPtyBytesParams, TabFocusParams, TabFocusResult, TabListResult,
+    TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams, TabSendFileParams,
+    TabSendFileResult, TabSetHookActiveParams, TabSetStateParams, TabSetTitleParams,
+    TabWriteParams, WindowMetricsParams, WindowMetricsResult, WindowResizeParams, WireProjectRef,
+    WireTabRef, MAX_DUMP_SCROLLBACK, MAX_PUT_FILE_BYTES,
 };
 #[cfg(feature = "server-vt")]
 use roost_ipc::messages::{AttachHandshake, SessionSetThemeResult};
@@ -445,6 +445,10 @@ pub enum UiRequest {
     /// `TabFeedPtyBytes` (ROOST_TEST_MODE=1); drives the sidebar-resize
     /// e2e.
     SidebarSetWidth { width: f64, reply: UnitReply },
+    /// `sidebar.set_agents_fraction` — programmatically set the sidebar's
+    /// Agents panel share, through `Workspace::set_agents_panel_fraction`,
+    /// which clamps and persists. Gated like `SidebarSetWidth`.
+    SidebarSetAgentsFraction { fraction: f64, reply: UnitReply },
     /// `tab.dispatch_mouse_event` — drive a synthetic mouse event
     /// into the production routing path at cell-grid coords. Same
     /// path the real GestureClick / GestureDrag / EventControllerMotion
@@ -1531,10 +1535,11 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Reads (`identify`, `tab.list`, `tab.dump*`, `session.identify`) stay
 /// answerable throughout, so a client can still find out what happened.
 /// The UI-only ops (`palette.*`, `window.*`, `app.*`, clipboard,
-/// selection, `sidebar.set_width`, `tab.dispatch_mouse_event`,
-/// `tab.feed_ime`) are not listed: they act on the UI rather than on the
-/// workspace a switch moves, and a session socket has no UI attached, so
-/// there they already fail with `internal: no UI attached`.
+/// selection, `sidebar.set_width`, `sidebar.set_agents_fraction`,
+/// `tab.dispatch_mouse_event`, `tab.feed_ime`) are not listed: they act
+/// on the UI rather than on the workspace a switch moves, and a session
+/// socket has no UI attached, so there they already fail with
+/// `internal: no UI attached`.
 /// `tab.feed_pty_bytes` is the exception — on a session it writes into
 /// the tab task's terminal, which is a mutation like any other — and so
 /// is `tab.send_file`, which pastes into a tab a switch is about to
@@ -4015,6 +4020,22 @@ async fn dispatch(
             .map_err(map_test_op_err)?;
             Ok(serde_json::json!({}))
         }
+        ops::SIDEBAR_SET_AGENTS_FRACTION => {
+            let p: SidebarSetAgentsFractionParams = decode(params)?;
+            if !(p.fraction.is_finite() && p.fraction > 0.0) {
+                return Err(HandlerError::invalid_param(format!(
+                    "fraction must be positive and finite (got {})",
+                    p.fraction
+                )));
+            }
+            h.ui_call(|reply| UiRequest::SidebarSetAgentsFraction {
+                fraction: p.fraction,
+                reply,
+            })
+            .await?
+            .map_err(map_test_op_err)?;
+            Ok(serde_json::json!({}))
+        }
         ops::TAB_DUMP_RESOLVED => {
             let p: TabDumpResolvedParams = decode(params)?;
             let dump = match served::dump_resolved(h, p.tab_id).await {
@@ -4536,6 +4557,7 @@ const DISPATCHED_OPS: &[(&str, &[Withheld])] = {
         (ops::TAB_FEED_IME, &[NeedsUi, TestMode]),
         (ops::WINDOW_RESIZE, &[NeedsUi, TestMode]),
         (ops::SIDEBAR_SET_WIDTH, &[NeedsUi, TestMode]),
+        (ops::SIDEBAR_SET_AGENTS_FRACTION, &[NeedsUi, TestMode]),
         (ops::TAB_DUMP_RESOLVED, &[NeedsATerminal]),
         (ops::TAB_DISPATCH_MOUSE_EVENT, &[NeedsUi, TestMode]),
         (ops::APP_SET_WINDOW_FOCUS, &[NeedsUi, TestMode]),
@@ -5822,6 +5844,7 @@ mod tests {
         "app.notification_activate",
         "app.set_window_focus",
         "clipboard.write_files",
+        "sidebar.set_agents_fraction",
         "sidebar.set_width",
         "tab.capture_pty_input",
         "tab.dispatch_mouse_event",

@@ -22,7 +22,9 @@ release workflow asserts they agree).
   is working or waiting. Project rows keep their rail and notification
   dot and gain an agent count, and a disconnected host's agents stay
   listed, dimmed. Toggle Sidebar Agents (`show-sidebar-agents`) now shows
-  and hides the panel. **Agents panel sort** — new `agent-panel-sort =
+  and hides the panel. Drag the divider between the projects and the
+  panel to resize it; its height is remembered across relaunches.
+  **Agents panel sort** — new `agent-panel-sort =
   grouped|priority|recent` config key (default `grouped`; an unknown
   value warns and falls back), cycled by the new unbound
   `cycle_agent_panel_sort` action, the palette's "Cycle Agent Panel Sort"
@@ -30,6 +32,16 @@ release workflow asserts they agree).
   `config.conf`. `app.sidebar_dump` gains `agent_panel`
   ([IPC](docs/reference/ipc.md#agent_panel-the-agents-panel-plan-080)).
   Roost-Iced only; the Swift app is unchanged.
+
+### Fixed
+
+- **A sidebar drag survives a toast going away, and quitting.** In
+  Roost-Iced, if a toast expired or was cleared while you were dragging
+  the sidebar's edge, or you quit before releasing, the dragged width
+  was never saved. The next relaunch restored the old width, and after
+  a toast expiry the sidebar stayed pinned at the dragged width until
+  the next drag. Both now keep the width the drag reached, and the same
+  holds for the new Agents panel divider.
 
 ## v0.0.24 — 2026-10-10
 

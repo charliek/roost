@@ -80,7 +80,8 @@ pub use tab_task::{
 pub use workspace::{
     AttentionSource, PersistOutcome, ReplayBounds, RestoreLayout, RestoreProject, RestoreTab,
     ResumeCut, ResumeError, TabEffectKind, VersionedWorkspaceEvent, Workspace, WorkspaceError,
-    WorkspaceEvent, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    WorkspaceEvent, AGENTS_PANEL_DEFAULT_FRACTION, AGENTS_PANEL_MAX_FRACTION,
+    AGENTS_PANEL_MIN_FRACTION, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
 
 #[cfg(test)]

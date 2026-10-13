@@ -15,12 +15,23 @@ relative order: a reused dev UI may have other agents open. The sort and
 the toggle are written back to `config.conf`, so the cases that change
 them need a harness-owned config and skip on a reused instance.
 
+The split between the projects and the panel is the divider's to drag;
+its share is set here through the test-mode `sidebar.set_agents_fraction`
+(plan 080 D8), read back as `fraction_permille`, off `state.json`, and —
+for the floors, which clamp only what is drawn — off the divider's own
+fill in a capture. Those cases need `ROOST_TEST_MODE=1`, and put the share
+back as they found it.
+
 Condition waits only — except the one read the cycling case makes
 straight after the palette activation, which is the point of it.
 """
 
 from __future__ import annotations
 
+import json
+import math
+import os
+import struct
 import time
 import uuid
 
@@ -28,9 +39,13 @@ import pytest
 
 import session as sessionlib
 import ui
+from client import Roost, RoostError
+from conftest import skip_on_live_wayland_desktop
 from test_agent_palette import _seed
 from test_sidebar_agents import _palette_agent_tab_ids, _set_agents_visible
-from util import BARE_SHELL_ARGV, is_fresh, wait_for_config_line
+from test_sidebar_collapse_persistence import _toggle_to_visible
+from test_sidebar_pixels import _blobs, _capture
+from util import BARE_SHELL_ARGV, is_fresh, skip_on_ci, wait_for_config_line
 
 SEPARATOR = " › "
 
@@ -293,6 +308,11 @@ def test_is_active_follows_tab_focus(roost, project):
 
 
 def test_the_split_reports_its_share(roost):
+    if not is_fresh():
+        pytest.skip(
+            "the default share needs a fresh harness-owned instance (--roost-fresh); "
+            "a dev UI remembers whatever its divider was dragged to"
+        )
     assert _panel(roost)["fraction_permille"] == 450
 
 
@@ -324,3 +344,269 @@ def test_long_and_unicode_text_round_trips_untruncated(roost, owned_config):
         assert entry["location_text"] == _location(roost, project_name)
     finally:
         roost.delete_project(pid)
+
+
+# ---------------------------------------------------------------------------
+# The divider's share (plan 080 D8)
+# ---------------------------------------------------------------------------
+
+TEST_MODE = os.environ.get("ROOST_TEST_MODE") == "1"
+
+needs_test_mode = pytest.mark.skipif(
+    not TEST_MODE,
+    reason="sidebar.set_agents_fraction requires ROOST_TEST_MODE=1 in the UI's launch env",
+)
+
+_skip_wayland = skip_on_live_wayland_desktop(
+    "test_the_floors_clamp_only_what_is_drawn[panel]",
+    "test_the_floors_clamp_only_what_is_drawn[projects]",
+)
+
+# The workspace's clamp band (`AGENTS_PANEL_{MIN,MAX}_FRACTION`).
+MIN_PERMILLE = 150
+MAX_PERMILLE = 850
+# The bound that presses each floor: the largest share squeezes the project
+# list, the smallest the panel.
+FLOOR_SHARES = {"projects": MAX_PERMILLE, "panel": MIN_PERMILLE}
+
+# Sidebar geometry, in logical points, verbatim from `crates/roost-iced/
+# src/chrome.rs`: the divider's height and fill, the band a project list
+# keeps at least two rows under, and the footer below everything.
+DIVIDER_HEIGHT = 6
+DIVIDER_FILL = (0x1A, 0x1D, 0x1E)
+BAND_HEIGHT = 32
+ROW_HEIGHT = 32
+# `agents_split.rs`'s `PROJECTS_FLOOR`.
+PROJECTS_FLOOR = BAND_HEIGHT + 2 * ROW_HEIGHT
+# `app/agents_panel.rs`'s `panel_height` under `grouped`: the header, the
+# list padding, a group head and one whole agent row.
+GROUPED_PANEL_FLOOR = BAND_HEIGHT + 3 + 24 + 42
+# The panel's header (`AGENT_PANEL_HEADER_HEIGHT`), which stays even where
+# the project list's floor leaves less.
+PANEL_HEADER = BAND_HEIGHT
+FOOTER_HEIGHT = 44
+# A column through the divider's fill, clear of its centered nub.
+PROBE_X = 40
+
+
+@pytest.fixture
+def kept_share(roost, target):
+    """The panel's share as this test found it, put back afterwards —
+    through a client of its own, since the relaunch case outlives the
+    `roost` one."""
+    before = _permille(roost)
+    yield before
+    with Roost(ui.socket_path(target)) as client:
+        client.sidebar_set_agents_fraction(before / 1000)
+
+
+def _permille(roost) -> int:
+    return _panel(roost)["fraction_permille"]
+
+
+def _saved_fraction() -> float | None:
+    """`state.json`'s `agents_panel_fraction`, or None while it has none.
+    The UI writes the file with tmp + rename, so a read never sees half."""
+    state_dir = ui.session_state_dir()
+    assert state_dir is not None, "needs a harness-owned instance"
+    try:
+        state = json.loads((state_dir / "state.json").read_text())
+    except FileNotFoundError:
+        return None
+    return state.get("agents_panel_fraction")
+
+
+def _wait_saved(roost, fraction: float) -> None:
+    roost._wait(
+        lambda: _saved_fraction() == fraction,
+        5.0,
+        f"state.json to remember agents_panel_fraction {fraction}",
+    )
+
+
+@needs_test_mode
+def test_set_agents_fraction_reports_clamps_and_persists(roost, kept_share):
+    roost.sidebar_set_agents_fraction(0.6)
+    assert _permille(roost) == 600
+    roost.sidebar_set_agents_fraction(0.01)
+    assert _permille(roost) == MIN_PERMILLE, "an out-of-band share lands on the bound"
+    roost.sidebar_set_agents_fraction(5.0)
+    assert _permille(roost) == MAX_PERMILLE
+    for bad in (0, -0.5):
+        with pytest.raises(RoostError) as exc:
+            roost.sidebar_set_agents_fraction(bad)
+        assert exc.value.code == "invalid-param", exc.value
+    assert _permille(roost) == MAX_PERMILLE, "a rejected share moved nothing"
+
+    if ui.session_state_dir() is not None:
+        _wait_saved(roost, MAX_PERMILLE / 1000)
+
+
+@needs_test_mode
+def test_hiding_the_panel_keeps_its_share(roost, owned_config, kept_share):
+    _set_agents_visible(roost, True)
+    roost.sidebar_set_agents_fraction(0.3)
+    _set_agents_visible(roost, False)
+    panel = _panel(roost)
+    assert panel["visible"] is False
+    assert panel["fraction_permille"] == 300
+    _set_agents_visible(roost, True)
+    assert _permille(roost) == 300
+
+
+def _split_drawn(roost, path) -> tuple[int, int, int] | None:
+    """The project list's and the panel's drawn heights, and the window's,
+    in logical points, off one scale-1 capture (which is in logical
+    points) — None while it is mid-relayout or shows no divider yet. The
+    capture, not `app.window_metrics`, says how big the window is: a
+    compositor may refuse a `window.resize` the UI has already recorded.
+    The divider is the only run of its fill this tall in the probe column
+    (the sidebar's hairline is a column, not a run)."""
+    shot = _capture(roost, path)
+    if shot is None:
+        return None
+    _width, height, _bpp, _px = shot
+    runs = [
+        top
+        for _x0, top, _x1, bottom in _blobs(shot, DIVIDER_FILL, x0=PROBE_X, x1=PROBE_X + 1)
+        if bottom - top + 1 == DIVIDER_HEIGHT
+    ]
+    if not runs:
+        return None
+    assert len(runs) == 1, f"expected one divider run at x={PROBE_X}, got {runs}"
+    top = runs[0]
+    grip_top = BAND_HEIGHT if not roost.sidebar_sections() else 0
+    return top - grip_top, height - FOOTER_HEIGHT - (top + DIVIDER_HEIGHT), height
+
+
+def _resize(roost, path, width: float, height: int) -> None:
+    """Asks for a window `height` tall, and gives the capture a moment to
+    show it. A compositor may keep a height of its own instead."""
+    roost.window_resize(width, height)
+    try:
+        sessionlib.wait_until(
+            lambda: (drawn := _split_drawn(roost, path)) and drawn[2] == height,
+            1.5,
+            f"the split drawn at a {height}pt window",
+        )
+    except TimeoutError:
+        pass
+
+
+def _f32(value: float) -> float:
+    """`value` as an f32 holds it: the UI lays the split out in f32."""
+    return struct.unpack("f", struct.pack("f", value))[0]
+
+
+def _expected_panel(permille: int, below: int) -> tuple[int, str | None]:
+    """The panel `agents_split.rs`'s `shown_panel` draws for a stored
+    `permille` share of the `below` points under the divider, and which
+    floor, if either, holds it there: the share rounded, then raised to the
+    panel's floor, then cut to what the project list's floor leaves."""
+    wanted = math.floor(_f32(_f32(permille / 1000) * below) + 0.5)
+    most = min(max(below - PROJECTS_FLOOR, PANEL_HEADER), below)
+    if max(wanted, GROUPED_PANEL_FLOOR) > most:
+        return most, "projects"
+    if wanted < GROUPED_PANEL_FLOOR:
+        return GROUPED_PANEL_FLOOR, "panel"
+    return wanted, None
+
+
+def _drawn_share(roost, path, permille: int) -> tuple[int, str | None]:
+    """Sets a `permille` share and asserts the split it draws, exactly, at
+    whatever height the window has: that height, and the floor holding the
+    panel there, if one does."""
+    roost.sidebar_set_agents_fraction(permille / 1000)
+    # A capture can trail the op by a frame, so wait for the split this
+    # share draws; the last one is judged either way.
+    seen: list[tuple[int, int, int]] = []
+
+    def settled():
+        drawn = _split_drawn(roost, path)
+        if drawn is None:
+            return False
+        seen.append(drawn)
+        projects, panel, _window = drawn
+        return panel == _expected_panel(permille, projects + panel)[0]
+
+    try:
+        sessionlib.wait_until(settled, 10.0, f"the split a {permille}‰ share draws")
+    except TimeoutError:
+        pass
+    assert seen, "no capture showed the divider"
+    projects, panel, window = seen[-1]
+    below = projects + panel
+    expected, floor = _expected_panel(permille, below)
+    assert panel == expected, (
+        f"a {permille}‰ share of {below}pt (a {window}pt window) drew a "
+        f"{panel}pt panel, not {expected}pt (floor: {floor})"
+    )
+    assert _permille(roost) == permille, "the floors never touch the stored share"
+    return window, floor
+
+
+@needs_test_mode
+@pytest.mark.parametrize("floor", sorted(FLOOR_SHARES))
+def test_the_floors_clamp_only_what_is_drawn(
+    roost, project, tmp_path, owned_config, kept_share, floor
+):
+    """At a short window, the bound share that presses `floor` leaves
+    exactly the floor: a band and two rows for the project list, a head and
+    one row for the panel. The stored share is untouched, and a window with
+    room draws all of it again. Each case is judged at the height the
+    compositor keeps, and the floor is skipped where no share reaches it
+    there."""
+    permille = FLOOR_SHARES[floor]
+    tab = roost.open_tab(project, cwd="/tmp", argv=BARE_SHELL_ARGV)
+    _seed(roost, tab, lifecycle="working", name="panel-floors")
+    _wait_listed(roost, {str(tab)})
+    _set_agents_visible(roost, True)
+    _set_sort(roost, "grouped")
+    _toggle_to_visible(roost)
+    before = roost.window_metrics()
+    path = tmp_path / "split.png"
+    held = False
+    kept = []
+    try:
+        for height in (480, 900):
+            _resize(roost, path, before["window_width"], height)
+            window, at = _drawn_share(roost, path, permille)
+            kept.append(window)
+            held = held or at == floor
+    finally:
+        roost.window_resize(before["window_width"], before["window_height"])
+    if not held:
+        pytest.skip(
+            f"the compositor kept {kept}pt windows, where no share reaches the {floor} "
+            "floor; each drew its split exactly"
+        )
+
+
+@needs_test_mode
+def test_the_share_survives_relaunch(roost, target, kept_share):
+    if ui.owned_session_config_path() is None:
+        pytest.skip(
+            "quit + relaunch would close a developer's own UI; requires a "
+            "harness-owned instance (--roost-fresh / ROOST_TEST_FRESH=1, or no "
+            "UI already running)"
+        )
+    skip_on_ci(
+        "quit + relaunch is unreliable on CI: iced xvfb has no WM",
+        alt_coverage="Rust agents_panel_fraction_persists_across_reopen + "
+        "test_set_agents_fraction_reports_clamps_and_persists",
+    )
+    roost.sidebar_set_agents_fraction(0.6)
+    _wait_saved(roost, 0.6)
+
+    roost.close()
+    ui.quit(target)
+    ui.launch(target)
+
+    # The workspace restores it as it opens `state.json`, before the
+    # socket `launch` waits on answers.
+    fresh = Roost(ui.socket_path(target))
+    try:
+        assert _permille(fresh) == 600
+    finally:
+        fresh.close()
+

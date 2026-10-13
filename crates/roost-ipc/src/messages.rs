@@ -2206,6 +2206,17 @@ pub struct SidebarSetWidthParams {
     pub width: f64,
 }
 
+/// `sidebar.set_agents_fraction` request — programmatically set the
+/// sidebar's Agents panel share (plan 080 D8). The UI clamps through the
+/// workspace to `AGENTS_PANEL_MIN_FRACTION..=AGENTS_PANEL_MAX_FRACTION`;
+/// the floors that keep both halves usable clamp only what is drawn.
+/// Test-mode only; see the op const comment block below.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SidebarSetAgentsFractionParams {
+    pub fraction: f64,
+}
+
 // ============================================================================
 // Event data types
 // ============================================================================
@@ -4049,6 +4060,10 @@ pub mod ops {
     /// sidebar resize e2e (`tools/roosttest`); a real user drags the
     /// seam. The width is clamped by the workspace, not by the wire.
     pub const SIDEBAR_SET_WIDTH: &str = "sidebar.set_width";
+    /// Programmatically set the sidebar's Agents panel share. Gated like
+    /// `sidebar.set_width`, for the same reason: a real user drags the
+    /// divider. The fraction is clamped by the workspace, not by the wire.
+    pub const SIDEBAR_SET_AGENTS_FRACTION: &str = "sidebar.set_agents_fraction";
     /// Ungated companion: a richer read of the same render state
     /// `tab.dump` already exposes. Pins the resolver call site
     /// (theme bold-color → `resolve_cell_colors`) end-to-end.
@@ -5671,6 +5686,13 @@ mod tests {
         round_trip(&SidebarSetWidthParams { width: 260.0 });
         let bad = r#"{"width":260.0,"extra":"x"}"#;
         assert!(serde_json::from_str::<SidebarSetWidthParams>(bad).is_err());
+    }
+
+    #[test]
+    fn sidebar_set_agents_fraction_params_reject_unknown_field() {
+        round_trip(&SidebarSetAgentsFractionParams { fraction: 0.6 });
+        let bad = r#"{"fraction":0.6,"extra":"x"}"#;
+        assert!(serde_json::from_str::<SidebarSetAgentsFractionParams>(bad).is_err());
     }
 
     #[test]

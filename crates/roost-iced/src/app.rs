@@ -63,6 +63,7 @@ use roost_vt::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::agents_split::AgentsSplitDrag;
 use crate::chrome::{self, ChromePalette};
 use crate::context_press::ContextPressArea;
 use crate::engine_feed::{self, EngineBatch, EngineFeed, EngineFeedReceiver, EngineFeedSender};
@@ -899,6 +900,18 @@ struct TerminalWrapping {
     rename_editor: bool,
     palette: bool,
     modal: bool,
+}
+
+impl TerminalWrapping {
+    /// Whether going from `self` to `now` rebuilds the sidebar's resize
+    /// grips as well: all of it wraps them but the notice, which wraps the
+    /// terminal alone.
+    fn rewraps_grips(self, now: Self) -> bool {
+        Self {
+            notice: now.notice,
+            ..self
+        } != now
+    }
 }
 
 /// [`App::observe_terminal_wrapping`]'s step: record `now`, and when it
@@ -3168,6 +3181,8 @@ pub struct App {
     /// committed width, and persisting per pointer-move would rewrite
     /// `state.json` on every frame.
     sidebar_drag_width: Option<f32>,
+    /// The Agents panel divider's drag, held off `state.json` the same way.
+    agents_split_drag: AgentsSplitDrag,
     window_focused: bool,
     /// Native focus losses only; `app.window_metrics` reports it.
     native_focus_losses: u64,
@@ -3768,6 +3783,7 @@ impl App {
                 opening,
             ),
             sidebar_drag_width: None,
+            agents_split_drag: AgentsSplitDrag::default(),
             window_focused: true,
             native_focus_losses: 0,
             title_fallback: title_fallback(profile.kind),
@@ -5298,9 +5314,9 @@ impl App {
     }
 
     fn set_status_as(&mut self, message: impl Into<String>, severity: Severity) {
-        // A toast restructures the root widget tree, which drops the grip's
+        // A toast restructures the root widget tree, which drops the grips'
         // widget state — a live drag would never publish its end.
-        self.commit_sidebar_drag();
+        self.commit_resize_drags();
         self.status.set_at(message, severity, Instant::now());
     }
 
@@ -7237,6 +7253,11 @@ impl App {
     }
 
     pub fn sidebar_resize_dragged(&mut self, width: f32) {
+        // The seam grip can start a drag over a live divider drag — a press
+        // after the divider's release went astray — and it takes that press
+        // and its release, so the divider grip would keep its drag and
+        // resize the panel on the moves after it, button up.
+        self.commit_agents_split_drag();
         if !drag_width_is_actionable(
             self.workspace.sidebar_collapsed(),
             self.live_sidebar_width(),
@@ -7249,7 +7270,9 @@ impl App {
     }
 
     pub fn sidebar_resize_ended(&mut self) {
-        self.commit_sidebar_drag();
+        // The divider's drag too, as in `sidebar_resize_dragged`: a press
+        // and release with no move between publishes only this.
+        self.commit_resize_drags();
     }
 
     /// The grip dragged the seam past the collapse threshold. Same discipline
@@ -7272,6 +7295,12 @@ impl App {
         }
     }
 
+    /// Ends both resize drags in flight, keeping the sizes they reached.
+    fn commit_resize_drags(&mut self) {
+        self.commit_sidebar_drag();
+        self.commit_agents_split_drag();
+    }
+
     fn set_sidebar_collapsed(&mut self, collapsed: bool) {
         // Collapsing drops the grip widget from the tree, so a drag that is
         // still live never publishes its end. Commit first so the width the
@@ -7284,11 +7313,13 @@ impl App {
             self.commit_sidebar_drag();
         }
         self.workspace.set_sidebar_collapsed(collapsed);
+        self.settle_agents_split_drag();
         self.resize(self.window_size);
     }
 
     fn toggle_sidebar_agents(&mut self) {
         self.config.show_sidebar_agents = !self.config.show_sidebar_agents;
+        self.settle_agents_split_drag();
         let value = if self.config.show_sidebar_agents {
             "true"
         } else {
@@ -8109,12 +8140,20 @@ impl App {
             palette: self.palette.is_some(),
             modal: self.confirm_delete.is_some() || self.host_dialog.is_some(),
         };
+        let before = self.terminal_wrapping;
         rewrap_lets_go(
             &mut self.terminal_wrapping,
             now,
             &mut self.tabs,
             &mut self.press_floor,
         );
+        // A grip rebuilt mid-drag never publishes the drag's end, whatever
+        // rebuilt it: the toast going or coming by any path (its expiry, a
+        // keybind clearing it, a durability failure raised or retired), or
+        // any other wrapper.
+        if before.rewraps_grips(now) {
+            self.commit_resize_drags();
+        }
     }
 
     /// Record which notice is on screen now, so the next dump or answer
@@ -10636,6 +10675,10 @@ impl Drop for App {
         // than the process being killed under it — the exit-on-empty path
         // depends on this running. There is no surface left to raise a
         // failure on, so the log is where it goes (#481).
+        //
+        // A quit with the button still down — a signal, a keybind — ends a
+        // resize no release will: the size it reached goes into the flush.
+        self.commit_resize_drags();
         match window_frame::flush_on_exit(&self.workspace, &mut self.window_frame) {
             Ok(()) => tracing::info!("workspace state flushed on shutdown"),
             Err(error) => {
@@ -11469,6 +11512,49 @@ mod tests {
         assert_eq!(effective_sidebar_width(false, 220.0), 220.0);
         assert_eq!(effective_sidebar_width(false, 340.0), 340.0);
         assert_eq!(effective_sidebar_width(true, 340.0), 0.0);
+    }
+
+    /// The toast, a palette, a modal, the rename editor's catcher and the
+    /// collapse all sit above the sidebar's grips; the notice wraps the
+    /// terminal alone.
+    #[test]
+    fn every_wrapper_but_the_notice_rewraps_the_grips() {
+        let base = TerminalWrapping::default();
+        assert!(!base.rewraps_grips(base));
+        assert!(!base.rewraps_grips(TerminalWrapping {
+            notice: true,
+            ..base
+        }));
+        for now in [
+            TerminalWrapping {
+                bottom_line: true,
+                ..base
+            },
+            TerminalWrapping {
+                sidebar_collapsed: true,
+                ..base
+            },
+            TerminalWrapping {
+                rename_editor: true,
+                ..base
+            },
+            TerminalWrapping {
+                palette: true,
+                ..base
+            },
+            TerminalWrapping {
+                modal: true,
+                ..base
+            },
+        ] {
+            assert!(base.rewraps_grips(now), "{base:?} -> {now:?}");
+            assert!(now.rewraps_grips(base), "{now:?} -> {base:?}");
+            let noticed = TerminalWrapping {
+                notice: true,
+                ..now
+            };
+            assert!(base.rewraps_grips(noticed), "{base:?} -> {noticed:?}");
+        }
     }
 
     #[test]

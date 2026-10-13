@@ -24,6 +24,7 @@ mod palette_scroll;
 mod paste_image;
 mod perf;
 mod png_encode;
+mod resize_grip;
 mod screenshot;
 /// Secure Keyboard Entry's state machine. Compiled where it is used —
 /// macOS — and wherever the tests run, which is every host.
@@ -291,6 +292,13 @@ enum Message {
     },
     SidebarResizeEnded,
     SidebarDragCollapsed,
+    AgentsSplitDragged {
+        fraction: f32,
+        epoch: u64,
+    },
+    AgentsSplitEnded {
+        epoch: u64,
+    },
     PaletteQueryChanged(String),
     PaletteActivate(String),
     PaletteConfirm,
@@ -747,6 +755,14 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::SidebarDragCollapsed => {
             app.sidebar_drag_collapsed();
+            Task::none()
+        }
+        Message::AgentsSplitDragged { fraction, epoch } => {
+            app.agents_split_dragged(fraction, epoch);
+            Task::none()
+        }
+        Message::AgentsSplitEnded { epoch } => {
+            app.agents_split_ended(epoch);
             Task::none()
         }
         Message::RenameSubmit => app.submit_rename_editor().map_task(),

@@ -3449,6 +3449,19 @@
       ],
       "type": "object"
     },
+    "SidebarSetAgentsFractionParams": {
+      "additionalProperties": false,
+      "properties": {
+        "fraction": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "fraction"
+      ],
+      "type": "object"
+    },
     "SidebarSetWidthParams": {
       "additionalProperties": false,
       "properties": {
@@ -5189,6 +5202,14 @@
       },
       "result": {
         "$ref": "#/$defs/SessionStopResult"
+      }
+    },
+    "sidebar.set_agents_fraction": {
+      "params": {
+        "$ref": "#/$defs/SidebarSetAgentsFractionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
       }
     },
     "sidebar.set_width": {

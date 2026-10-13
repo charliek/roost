@@ -7,9 +7,12 @@ use iced::advanced::overlay;
 use iced::advanced::renderer;
 use iced::advanced::widget::{tree, Operation, Tree};
 use iced::advanced::{mouse, Clipboard, Layout, Shell, Widget};
-use iced::{window, Element, Event, Length, Point, Rectangle, Size, Vector};
+#[cfg(test)]
+use iced::window;
+use iced::{Element, Event, Length, Point, Rectangle, Size, Vector};
 use roost_engine::{SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH};
 
+use crate::resize_grip::{self, Gesture, GripState, Motion};
 use crate::Message;
 
 /// Half-width of the pointer hit zone straddling the seam.
@@ -42,11 +45,7 @@ struct Drag {
     start_width: f32,
 }
 
-#[derive(Debug, Default)]
-struct State {
-    drag: Option<Drag>,
-    last_cursor: Option<Point>,
-}
+type State = GripState<Drag>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum GripEvent {
@@ -59,16 +58,7 @@ enum GripEvent {
     Collapse,
 }
 
-/// `capture_event` alone does not stop delegation, so ownership has to be
-/// decided before the content is offered the event at all.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Ownership {
-    Delegate,
-    /// Captured by the grip; the content never sees the event.
-    Own(Option<GripEvent>),
-    /// The grip reacts, but the event still belongs to the whole tree.
-    PublishAndDelegate(GripEvent),
-}
+type Ownership = resize_grip::Ownership<GripEvent>;
 
 fn seam_x(layout: Layout<'_>) -> Option<f32> {
     layout.children().next().map(|sidebar| {
@@ -104,6 +94,43 @@ fn dragged_width(drag: Drag, x: f32) -> f32 {
     unclamped_width(drag, x).clamp(MIN_WIDTH, MAX_WIDTH)
 }
 
+/// The seam as laid out, and the width the sidebar has right now.
+struct Seam<'a> {
+    layout: Layout<'a>,
+    current_width: f32,
+}
+
+impl Gesture for Seam<'_> {
+    type Drag = Drag;
+    type Event = GripEvent;
+
+    fn press(&self, at: Point) -> Option<Drag> {
+        over_seam_at(self.layout, at).then_some(Drag {
+            start_x: at.x,
+            start_width: self.current_width,
+        })
+    }
+
+    fn moved(&self, drag: Drag, at: Point) -> Motion<GripEvent> {
+        // Ordering is the contract: the collapse is decided before the
+        // clamped width is published, so no `Dragged { 160 }` can follow the
+        // close, and it ends the drag so nothing later publishes a width for
+        // a sidebar that is already gone.
+        if unclamped_width(drag, at.x) < COLLAPSE_THRESHOLD {
+            return Motion::End(GripEvent::Collapse);
+        }
+        // A pointer travelling past a clamp bound recomputes the same width
+        // every move; publishing it would request a redraw per move for a
+        // frame that cannot differ.
+        let width = dragged_width(drag, at.x);
+        Motion::Continue((width != self.current_width).then_some(GripEvent::Dragged { width }))
+    }
+
+    fn ended(&self) -> GripEvent {
+        GripEvent::Ended
+    }
+}
+
 fn owns_event(
     state: &mut State,
     event: &Event,
@@ -111,85 +138,15 @@ fn owns_event(
     cursor: mouse::Cursor,
     current_width: f32,
 ) -> Ownership {
-    // Recorded before every early return: `ButtonPressed` carries no position
-    // of its own, and iced hit-tests it against the newest cursor of the batch
-    // it was drained with. A frame behind, that is wherever the pointer
-    // travelled *after* the button went down, so the last move the grip
-    // actually saw is the honest press anchor (issue #295). A pointer that
-    // left the window invalidates it — the next entry can land anywhere, and
-    // no move need be observed before the press. Moves consumed by an iced
-    // overlay never reach the grip and fire no CursorLeft, so the anchor can
-    // sit stale across an overlay session; accepted — the first post-overlay
-    // move refreshes it, and a press before that is a narrow window.
-    match event {
-        Event::Mouse(mouse::Event::CursorMoved { position, .. }) => {
-            state.last_cursor = Some(*position);
-        }
-        Event::Mouse(mouse::Event::CursorLeft) => state.last_cursor = None,
-        _ => {}
-    }
-    // Anchoring only ever *replaces* an available batch cursor. With no cursor
-    // at all the grip has always been a no-op, and a stale anchor must not
-    // start arming presses it used to ignore.
-    let anchored = cursor
-        .position()
-        .map(|batch| state.last_cursor.unwrap_or(batch));
-
-    match event {
-        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-            // A second press during a live drag belongs to the grip too: it
-            // owns the matching release, so letting the content have the press
-            // starts a terminal selection that can never be completed.
-            if state.drag.is_some() {
-                return Ownership::Own(None);
-            }
-            let Some(position) = anchored.filter(|position| over_seam_at(layout, *position)) else {
-                return Ownership::Delegate;
-            };
-            state.drag = Some(Drag {
-                start_x: position.x,
-                start_width: current_width,
-            });
-            Ownership::Own(None)
-        }
-        // The move's own position keeps the drag live once the pointer leaves
-        // the window, where `mouse::Cursor` reports nothing.
-        Event::Mouse(mouse::Event::CursorMoved { position, .. }) => match state.drag {
-            Some(drag) => {
-                // Ordering is the contract: the collapse is decided before the
-                // clamped width is published, so no `Dragged { 160 }` can
-                // follow the close, and the drag is dropped in the same arm so
-                // no later move in this batch (or the next) publishes a width
-                // for a sidebar that is already gone.
-                if unclamped_width(drag, position.x) < COLLAPSE_THRESHOLD {
-                    state.drag = None;
-                    return Ownership::Own(Some(GripEvent::Collapse));
-                }
-                // A pointer travelling past a clamp bound recomputes the same
-                // width every move; publishing it would request a redraw per
-                // move for a frame that cannot differ.
-                let width = dragged_width(drag, position.x);
-                Ownership::Own((width != current_width).then_some(GripEvent::Dragged { width }))
-            }
-            None => Ownership::Delegate,
-        },
-        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-            if state.drag.take().is_none() {
-                return Ownership::Delegate;
-            }
-            Ownership::Own(Some(GripEvent::Ended))
-        }
-        // A half-finished resize is a valid width, so losing focus commits it
-        // rather than reverting. Unfocus is broadcast to the whole tree, so it
-        // still has to reach the content — a focused text input needs it.
-        Event::Window(window::Event::Unfocused) => {
-            if state.drag.take().is_none() {
-                return Ownership::Delegate;
-            }
-            Ownership::PublishAndDelegate(GripEvent::Ended)
-        }
-        _ => Ownership::Delegate,
-    }
+    resize_grip::owns_event(
+        state,
+        event,
+        cursor,
+        Some(&Seam {
+            layout,
+            current_width,
+        }),
+    )
 }
 
 fn grip_message(event: GripEvent) -> Message {
@@ -198,6 +155,27 @@ fn grip_message(event: GripEvent) -> Message {
         GripEvent::Ended => Message::SidebarResizeEnded,
         GripEvent::Collapse => Message::SidebarDragCollapsed,
     }
+}
+
+/// Whether the grip, wrapping a sidebar `sidebar_width` wide in a window
+/// `size` big, takes a left press at `at` from its content.
+#[cfg(test)]
+pub(crate) fn keeps_press(sidebar_width: f32, size: Size, at: Point) -> bool {
+    let sidebar = layout::Node::new(Size::new(sidebar_width, size.height));
+    let main = layout::Node::new(Size::new(size.width - sidebar_width, size.height))
+        .move_to(Point::new(sidebar_width, 0.0));
+    let node = layout::Node::with_children(size, vec![sidebar, main]);
+    let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+    matches!(
+        owns_event(
+            &mut State::default(),
+            &press,
+            Layout::new(&node),
+            mouse::Cursor::Available(at),
+            sidebar_width,
+        ),
+        Ownership::Own(_)
+    )
 }
 
 impl Widget<Message, iced::Theme, iced::Renderer> for SidebarResizeGrip<'_> {
@@ -255,22 +233,15 @@ impl Widget<Message, iced::Theme, iced::Renderer> for SidebarResizeGrip<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        match owns_event(
+        let ownership = owns_event(
             tree.state.downcast_mut::<State>(),
             event,
             layout,
             cursor,
             self.current_width,
-        ) {
-            Ownership::Delegate => {}
-            Ownership::PublishAndDelegate(event) => shell.publish(grip_message(event)),
-            Ownership::Own(publish) => {
-                if let Some(event) = publish {
-                    shell.publish(grip_message(event));
-                }
-                shell.capture_event();
-                return;
-            }
+        );
+        if !resize_grip::claim(ownership, shell, grip_message) {
+            return;
         }
 
         self.content.as_widget_mut().update(

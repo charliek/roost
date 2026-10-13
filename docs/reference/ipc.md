@@ -1736,9 +1736,12 @@ change shows in the very next dump, with no event in between.
 - `sort` — `"grouped"` | `"priority"` | `"recent"`, the
   `agent-panel-sort` key.
 - `fraction_permille` — the panel's share of the sidebar below the
-  project list, in thousandths. The panel draws at least one whole row
-  and the project list at least a band and two rows, but those floors
-  clamp only what is drawn, never this value.
+  project list, in thousandths: the dragged value while the divider is
+  being dragged, else the remembered one, which
+  [`sidebar.set_agents_fraction`](#sidebarset_agents_fraction-test-only-gated)
+  sets. The panel draws at least one whole row and the project list at
+  least a band and two rows, but those floors clamp only what is drawn,
+  never this value.
 - `entries` — tagged by `kind`:
     - `"group"` — a `grouped` head for one host's project: `label` as drawn
       (`LOCAL › roost`, `WORKBENCH › craze`, or the bare project name
@@ -2394,6 +2397,31 @@ follows what was actually laid out.
 And the op is not defined concurrent with a live pointer drag of the
 seam: a drag in flight re-anchors on its press-time width and its
 release wins. Harnesses drive one or the other, never both at once.
+
+### `sidebar.set_agents_fraction` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Sets the share of the
+sidebar the [Agents panel](#agent_panel-the-agents-panel-plan-080) takes
+below its divider — the programmatic twin of dragging that divider, as
+`sidebar.set_width` is of dragging the seam.
+
+Request: `{"params": {"fraction": 0.6}}`. Response: `{}`.
+
+The UI routes the fraction through the workspace, which **clamps** it to
+`[0.15, 0.85]` and persists it (`agents_panel_fraction` in `state.json`),
+so an out-of-band fraction succeeds and lands on the nearest bound. Read
+it back as `app.sidebar_dump`'s `agent_panel.fraction_permille`.
+`fraction` must be finite and positive; anything else is rejected with
+`invalid-param` before reaching the UI.
+
+The floors listed under
+[`fraction_permille`](#agent_panel-the-agents-panel-plan-080) clamp only
+the drawn split, so a short window shows less than a stored `0.85`. A
+divider drag in flight is committed and then ended, so the op's fraction
+stands: the rest of that drag moves nothing until the next press.
+
+Implemented by the iced UI only; the Swift app answers `unknown-op`.
 
 ### Host bootstrap test ops (`app.dialog_dump` / `app.dialog_answer` / `app.keybind_dispatch`) *(test-only — gated)*
 

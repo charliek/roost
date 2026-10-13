@@ -14,7 +14,7 @@ use roost_ipc::messages::{SidebarDumpAgentPanel, SidebarDumpPanelEntry};
 use roost_ui_model::agent_panel::{self, AgentPanelSort, PanelAgentRow, PanelEntry};
 
 use super::*;
-use crate::agents_split::{self, AgentsSplitGrip, PanelHeight};
+use crate::agents_split::{AgentsSplitGrip, PanelHeight};
 
 /// How often the panel's ages are recomputed while one is counting.
 pub(crate) const AGENTS_CLOCK_INTERVAL: Duration = Duration::from_secs(15);
@@ -71,6 +71,38 @@ fn permille(fraction: f32) -> u16 {
     (fraction * 1000.0).round().clamp(0.0, 1000.0) as u16
 }
 
+/// How tall the panel is: hidden by the toggle, sized to its one line when
+/// there are no agents, else split at `fraction` with room for one whole
+/// agent row — under a head, when there are heads.
+fn panel_height(visible: bool, empty: bool, sort: AgentPanelSort, fraction: f32) -> PanelHeight {
+    if !visible {
+        return PanelHeight::Hidden;
+    }
+    if empty {
+        return PanelHeight::Content(
+            chrome::AGENT_PANEL_HEADER_HEIGHT + chrome::AGENT_PANEL_EMPTY_HEIGHT,
+        );
+    }
+    let head = if sort == AgentPanelSort::Grouped {
+        chrome::AGENT_PANEL_GROUP_HEIGHT
+    } else {
+        0.0
+    };
+    PanelHeight::Split {
+        fraction,
+        floor: chrome::AGENT_PANEL_HEADER_HEIGHT
+            + chrome::AGENT_PANEL_LIST_PADDING_Y
+            + head
+            + chrome::AGENT_PANEL_ROW_HEIGHT,
+    }
+}
+
+/// Whether the divider is on screen: the panel splits, in a sidebar that
+/// is not collapsed.
+fn divider_drawn(panel: PanelHeight, sidebar_collapsed: bool) -> bool {
+    !sidebar_collapsed && matches!(panel, PanelHeight::Split { .. })
+}
+
 impl App {
     /// The sidebar's project list over its Agents panel (plan 080 D1).
     pub(super) fn agents_split<'a>(
@@ -82,6 +114,7 @@ impl App {
             projects,
             self.agent_panel(),
             self.agent_panel_height(),
+            self.agents_split_drag.epoch(),
         )
         .into()
     }
@@ -121,33 +154,56 @@ impl App {
         })
     }
 
-    /// The panel's share of the split.
+    /// The panel's share of the split: a drag's while one is in flight,
+    /// else the workspace's.
     fn agents_panel_fraction(&self) -> f32 {
-        agents_split::DEFAULT_FRACTION
+        self.agents_split_drag
+            .fraction(self.workspace.agents_panel_fraction() as f32)
     }
 
     fn agent_panel_height(&self) -> PanelHeight {
-        if !self.config.show_sidebar_agents {
-            return PanelHeight::Hidden;
+        panel_height(
+            self.config.show_sidebar_agents,
+            self.agent_panel_rows.is_empty(),
+            self.config.agent_panel_sort,
+            self.agents_panel_fraction(),
+        )
+    }
+
+    fn agents_divider_drawn(&self) -> bool {
+        divider_drawn(
+            self.agent_panel_height(),
+            self.workspace.sidebar_collapsed(),
+        )
+    }
+
+    pub fn agents_split_dragged(&mut self, fraction: f32, epoch: u64) {
+        let drawn = self.agents_divider_drawn();
+        self.agents_split_drag.dragged(epoch, fraction, drawn);
+    }
+
+    pub fn agents_split_ended(&mut self, epoch: u64) {
+        if let Some(fraction) = self.agents_split_drag.ended(epoch) {
+            self.workspace
+                .set_agents_panel_fraction(f64::from(fraction));
         }
-        if self.agent_panel_rows.is_empty() {
-            return PanelHeight::Content(
-                chrome::AGENT_PANEL_HEADER_HEIGHT + chrome::AGENT_PANEL_EMPTY_HEIGHT,
-            );
+    }
+
+    /// Ends a divider drag from the app's side, writing its fraction
+    /// through. The grip lets its own half of the drag go too.
+    pub(super) fn commit_agents_split_drag(&mut self) {
+        if let Some(fraction) = self.agents_split_drag.interrupt() {
+            self.workspace
+                .set_agents_panel_fraction(f64::from(fraction));
         }
-        // Enough for one whole agent row — under a head, when there are
-        // heads.
-        let head = if self.config.agent_panel_sort == AgentPanelSort::Grouped {
-            chrome::AGENT_PANEL_GROUP_HEIGHT
-        } else {
-            0.0
-        };
-        PanelHeight::Split {
-            fraction: self.agents_panel_fraction(),
-            floor: chrome::AGENT_PANEL_HEADER_HEIGHT
-                + chrome::AGENT_PANEL_LIST_PADDING_Y
-                + head
-                + chrome::AGENT_PANEL_ROW_HEIGHT,
+    }
+
+    /// Ends a divider drag whose divider a change just took away.
+    pub(super) fn settle_agents_split_drag(&mut self) {
+        let drawn = self.agents_divider_drawn();
+        if let Some(fraction) = self.agents_split_drag.settle(drawn) {
+            self.workspace
+                .set_agents_panel_fraction(f64::from(fraction));
         }
     }
 
@@ -426,6 +482,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents_split::AgentsSplitDrag;
 
     /// The fixed slots hold the text they are sized for, so an age or a
     /// count never spills into the name beside it.
@@ -501,9 +558,133 @@ mod tests {
 
     #[test]
     fn the_fraction_is_reported_in_whole_thousandths() {
-        assert_eq!(permille(agents_split::DEFAULT_FRACTION), 450);
+        assert_eq!(
+            permille(roost_engine::AGENTS_PANEL_DEFAULT_FRACTION as f32),
+            450
+        );
         assert_eq!(permille(0.1234), 123);
         assert_eq!(permille(2.0), 1000);
         assert_eq!(permille(-1.0), 0);
+    }
+
+    // ── The divider's drag (plan 080 D8) ────────────────────────────
+    //
+    // roost-iced has no `App` fixture, so each `App` path is pinned on
+    // the rule it calls.
+
+    const STORED: f32 = 0.45;
+
+    fn mid_drag() -> AgentsSplitDrag {
+        let mut drag = AgentsSplitDrag::default();
+        drag.dragged(drag.epoch(), 0.3, true);
+        drag
+    }
+
+    #[test]
+    fn a_drag_shows_its_fraction_until_its_release_commits_it() {
+        let mut drag = AgentsSplitDrag::default();
+        let epoch = drag.epoch();
+        assert_eq!(drag.fraction(STORED), STORED);
+        drag.dragged(epoch, 0.3, true);
+        drag.dragged(epoch, 0.32, true);
+        assert_eq!(drag.fraction(STORED), 0.32, "the panel shows the drag");
+        assert_eq!(
+            drag.ended(epoch),
+            Some(0.32),
+            "the release commits the last move"
+        );
+        assert_eq!(drag.fraction(STORED), STORED, "then the stored share again");
+        assert_eq!(drag.ended(epoch), None, "a second release commits nothing");
+    }
+
+    #[test]
+    fn a_move_for_a_divider_that_is_gone_starts_no_drag() {
+        let mut drag = AgentsSplitDrag::default();
+        let epoch = drag.epoch();
+        drag.dragged(epoch, 0.3, false);
+        assert_eq!(drag.fraction(STORED), STORED);
+        assert_eq!(drag.ended(epoch), None);
+    }
+
+    #[test]
+    fn a_toast_interrupt_commits_the_drag_with_the_divider_still_drawn() {
+        let mut drag = mid_drag();
+        assert_eq!(drag.settle(true), None);
+        assert_eq!(drag.interrupt(), Some(0.3));
+    }
+
+    fn drawn(visible: bool, empty: bool, sidebar_collapsed: bool) -> bool {
+        divider_drawn(
+            panel_height(visible, empty, AgentPanelSort::Grouped, 0.3),
+            sidebar_collapsed,
+        )
+    }
+
+    #[test]
+    fn toggling_the_panel_off_mid_drag_commits_the_drag() {
+        let mut drag = mid_drag();
+        assert_eq!(drag.settle(drawn(false, false, false)), Some(0.3));
+    }
+
+    #[test]
+    fn the_last_agent_exiting_mid_drag_commits_the_drag() {
+        let mut drag = mid_drag();
+        assert_eq!(drag.settle(drawn(true, true, false)), Some(0.3));
+    }
+
+    #[test]
+    fn collapsing_the_sidebar_mid_drag_commits_the_drag() {
+        let mut drag = mid_drag();
+        assert_eq!(drag.settle(drawn(true, false, true)), Some(0.3));
+    }
+
+    /// A change that keeps the divider — another agent, a sort change —
+    /// leaves the drag to the grip.
+    #[test]
+    fn a_change_that_keeps_the_divider_keeps_the_drag() {
+        for sort in [
+            AgentPanelSort::Grouped,
+            AgentPanelSort::Priority,
+            AgentPanelSort::Recent,
+        ] {
+            let mut drag = mid_drag();
+            let panel = panel_height(true, false, sort, drag.fraction(STORED));
+            assert_eq!(drag.settle(divider_drawn(panel, false)), None, "{sort:?}");
+            assert_eq!(drag.fraction(STORED), 0.3);
+        }
+    }
+
+    #[test]
+    fn the_panel_splits_only_while_shown_with_agents() {
+        for empty in [false, true] {
+            assert_eq!(
+                panel_height(false, empty, AgentPanelSort::Grouped, 0.3),
+                PanelHeight::Hidden
+            );
+        }
+        assert_eq!(
+            panel_height(true, true, AgentPanelSort::Priority, 0.3),
+            PanelHeight::Content(
+                chrome::AGENT_PANEL_HEADER_HEIGHT + chrome::AGENT_PANEL_EMPTY_HEIGHT
+            )
+        );
+        let row = chrome::AGENT_PANEL_HEADER_HEIGHT
+            + chrome::AGENT_PANEL_LIST_PADDING_Y
+            + chrome::AGENT_PANEL_ROW_HEIGHT;
+        assert_eq!(
+            panel_height(true, false, AgentPanelSort::Priority, 0.3),
+            PanelHeight::Split {
+                fraction: 0.3,
+                floor: row,
+            }
+        );
+        assert_eq!(
+            panel_height(true, false, AgentPanelSort::Grouped, 0.3),
+            PanelHeight::Split {
+                fraction: 0.3,
+                floor: row + chrome::AGENT_PANEL_GROUP_HEIGHT,
+            },
+            "under grouped, the one row has its head above it"
+        );
     }
 }

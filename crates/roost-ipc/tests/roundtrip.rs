@@ -610,6 +610,27 @@ fn the_agent_panel_vector_decodes_and_the_older_ones_have_no_panel() {
     );
 }
 
+/// Plan 080 D8's test-mode op, `sidebar.set_width`'s twin for the Agents
+/// panel's share: the request decodes into its typed params under the op
+/// it names, and the reply is the empty result.
+#[test]
+fn the_set_agents_fraction_vectors_decode_into_their_typed_shapes() {
+    let request: RawRequest =
+        serde_json::from_value(vector("sidebar.set_agents_fraction.request.json"))
+            .expect("decode the request envelope");
+    assert_eq!(request.op, ops::SIDEBAR_SET_AGENTS_FRACTION);
+    let params: SidebarSetAgentsFractionParams =
+        serde_json::from_value(request.params).expect("decode the params");
+    assert_eq!(params, SidebarSetAgentsFractionParams { fraction: 0.6 });
+
+    let response: Response =
+        serde_json::from_value(vector("sidebar.set_agents_fraction.response.json"))
+            .expect("decode the response envelope");
+    assert!(response.ok);
+    assert_eq!(response.id, request.id);
+    assert_eq!(response.result, Some(serde_json::json!({})));
+}
+
 /// `app.window_metrics` before and after the real-input harness's cell
 /// geometry (plan 074 §D7), and with the window-focus state: the recorded
 /// response carries none of the optional fields and re-encodes exactly, and
