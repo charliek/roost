@@ -3724,3 +3724,67 @@ def test_a_host_rows_menu_lists_the_palettes_host_rows_and_stop_asks_first(host,
         roost.call("app.dialog_answer", {"action": "cancel"})
     assert roost.call("app.dialog_dump", {}).get("dialog") is None
     host.wait_connected()
+
+
+# ---------------------------------------------------------------------------
+# 21. Plan 080 — a host's agents in the sidebar's Agents panel
+# ---------------------------------------------------------------------------
+
+
+def panel_agent(roost: Roost, tab: int) -> dict | None:
+    """The Agents panel's entry for a host's bare tab id `tab`, and the
+    head above it, from `app.sidebar_dump`. A local tab with the same
+    number is a different row — its key carries no host part."""
+    panel = roost.sidebar_dump()["agent_panel"]
+    head = None
+    for entry in panel["entries"]:
+        if entry["kind"] == "group":
+            head = entry
+        elif re.fullmatch(rf"h\d+\.{tab}", entry["tab"]):
+            return {**entry, "head": head, "sort": panel["sort"]}
+    return None
+
+
+def test_a_hosts_agent_is_listed_under_its_host_qualified_key_and_names_its_host(
+    host, roost
+):
+    """D3/D10: the panel lists a host's agent under the `h<host>.<id>` key
+    the tab ops take, and because the sidebar draws the local band and
+    this host's, the row's text names the host — its band label in the
+    head, as written in the location. A dropped connection keeps the row,
+    dimmed."""
+    host.connect_and_wait()
+    with host.client() as session:
+        project = first_project(session)
+        project_name = session.project(project)["name"]
+        tab = quiet_tab(session, project, host.env.launch_cwd)
+        session.agent_report(
+            tab, "e2e-panel", "claim", session_id=uuid.uuid4().hex, lifecycle="working"
+        )
+        entry = wait_until(
+            lambda: panel_agent(roost, tab), 30.0, "the host's agent in the Agents panel"
+        )
+        listed = {
+            listed_tab["key"]
+            for listed_project in roost.sidebar_host(host.saved_id)["projects"]
+            for listed_tab in listed_project["tabs"]
+        }
+        assert entry["tab"] in listed, (entry, sorted(listed))
+        assert entry["lifecycle"] == "working", entry
+        assert entry["dimmed"] is False, entry
+
+        assert len(roost.sidebar_sections()) > 1
+        if entry["sort"] == "grouped":
+            assert entry["head"]["label"] == f"{host.label.upper()} › {project_name}", entry
+            assert entry["location_text"] == "", entry
+        else:
+            assert entry["location_text"] == f"{host.label} › {project_name}", entry
+
+        host.disconnect()
+        host.wait_not_connected()
+        dimmed = wait_until(
+            lambda: (row := panel_agent(roost, tab)) is not None and row["dimmed"] and row,
+            30.0,
+            "the dropped host's agent to stay listed, dimmed",
+        )
+        assert dimmed["tab"] == entry["tab"], "a dimmed row keeps the incarnation it was listed under"

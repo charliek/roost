@@ -3145,6 +3145,35 @@
       ],
       "type": "string"
     },
+    "SidebarDumpAgentPanel": {
+      "properties": {
+        "entries": {
+          "items": {
+            "$ref": "#/$defs/SidebarDumpPanelEntry"
+          },
+          "type": "array"
+        },
+        "fraction_permille": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sort": {
+          "type": "string"
+        },
+        "visible": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "visible",
+        "sort",
+        "fraction_permille",
+        "entries"
+      ],
+      "type": "object"
+    },
     "SidebarDumpAgentRow": {
       "properties": {
         "is_active": {
@@ -3239,6 +3268,80 @@
       ],
       "type": "object"
     },
+    "SidebarDumpPanelEntry": {
+      "oneOf": [
+        {
+          "properties": {
+            "count": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "group",
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "label",
+            "count"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "dimmed": {
+              "type": "boolean"
+            },
+            "is_active": {
+              "type": "boolean"
+            },
+            "kind": {
+              "const": "agent",
+              "type": "string"
+            },
+            "lifecycle": {
+              "$ref": "#/$defs/AgentLifecycle"
+            },
+            "location_text": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "status_text": {
+              "type": "string"
+            },
+            "tab": {
+              "type": "string"
+            },
+            "time_text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "tab",
+            "name",
+            "agent",
+            "lifecycle",
+            "location_text",
+            "status_text",
+            "time_text",
+            "is_active",
+            "dimmed"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "SidebarDumpParams": {
       "additionalProperties": false,
       "type": "object"
@@ -3263,6 +3366,16 @@
     },
     "SidebarDumpResult": {
       "properties": {
+        "agent_panel": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SidebarDumpAgentPanel"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "agents_visible": {
           "type": "boolean"
         },

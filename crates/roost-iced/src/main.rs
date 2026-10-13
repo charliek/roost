@@ -1,3 +1,4 @@
+mod agents_split;
 mod app;
 mod chrome;
 mod config_writer;
@@ -89,6 +90,9 @@ enum Message {
     /// A selection drag is held past the terminal's edge. Armed only
     /// while one is.
     SelectionAutoscrollTick,
+    /// The Agents panel shows a working or waiting agent, whose age has
+    /// to keep counting. Armed only while it does.
+    AgentsClockTick,
     /// A file-drop debounce window elapsed — a one-shot, not a timer.
     FileDropDeadline,
     FullScreenSettled(u64),
@@ -173,6 +177,8 @@ enum Message {
     ProjectSelected(ProjectKey),
     BeginRenameProject(ProjectKey),
     AgentSelected(TabKey),
+    /// The Agents panel header's sort word.
+    CycleAgentPanelSort,
     TabSelected(TabKey),
     BeginRenameTab(TabKey),
     TabStrip(strip_reorder::StripEvent),
@@ -610,6 +616,10 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
             app.selection_autoscroll_tick();
             Task::none()
         }
+        Message::AgentsClockTick => {
+            app.agents_clock_tick();
+            Task::none()
+        }
         Message::FileDropDeadline => app.file_drop_deadline().map_task(),
         Message::FullScreenSettled(generation) => app.full_screen_settled(generation).map_task(),
         Message::BackgroundResizeDeadline => {
@@ -794,6 +804,7 @@ fn dispatch(app: &mut App, message: Message) -> Task<Message> {
         message @ (Message::ProjectSelected(_)
         | Message::BeginRenameProject(_)
         | Message::AgentSelected(_)
+        | Message::CycleAgentPanelSort
         | Message::TabSelected(_)
         | Message::BeginRenameTab(_)
         | Message::CloseTab(_)
@@ -840,6 +851,7 @@ struct ArmedTimers {
     add_host_pointer: bool,
     pending_selection: bool,
     selection_autoscroll: bool,
+    agents_clock: bool,
 }
 
 impl ArmedTimers {
@@ -852,6 +864,7 @@ impl ArmedTimers {
             add_host_pointer: app.add_host_dialog_open(),
             pending_selection: app.pending_selection_waiting(),
             selection_autoscroll: app.selection_autoscroll_pending(),
+            agents_clock: app.agents_clock_armed(),
         }
     }
 
@@ -866,6 +879,7 @@ impl ArmedTimers {
             + usize::from(self.add_host_pointer)
             + usize::from(self.pending_selection)
             + usize::from(self.selection_autoscroll)
+            + usize::from(self.agents_clock)
     }
 }
 
@@ -928,6 +942,9 @@ fn subscription_with(wake: Arc<tokio::sync::Notify>, armed: ArmedTimers) -> Subs
             time::every(app::SELECTION_AUTOSCROLL_INTERVAL)
                 .map(|_| Message::SelectionAutoscrollTick),
         );
+    }
+    if armed.agents_clock {
+        members.push(time::every(app::AGENTS_CLOCK_INTERVAL).map(|_| Message::AgentsClockTick));
     }
     if armed.add_host_pointer {
         // Deliberately status-blind, unlike the keyboard member above: a
@@ -1357,6 +1374,9 @@ impl UiTask for app::UiTask {
                 ))
                 .discard()
             }
+            app::UiTask::SnapToTop(id) => {
+                iced::widget::operation::snap_to(id, iced::widget::operation::RelativeOffset::START)
+            }
             // One message hop before `iced::exit()`, deliberately. The
             // `project.delete` that emptied the workspace is served on the
             // engine runtime: its handler mutates the workspace (which
@@ -1404,23 +1424,18 @@ mod tests {
             .collect()
     }
 
-    fn armed(
-        status: bool,
-        palette_retry: bool,
-        attach_retry: bool,
-        reorder_hold: bool,
-        add_host_pointer: bool,
-        pending_selection: bool,
-        selection_autoscroll: bool,
-    ) -> ArmedTimers {
+    /// One member per bit, in field order.
+    fn armed(bits: u16) -> ArmedTimers {
+        let bit = |n: u16| bits & (1 << n) != 0;
         ArmedTimers {
-            status,
-            palette_retry,
-            attach_retry,
-            reorder_hold,
-            add_host_pointer,
-            pending_selection,
-            selection_autoscroll,
+            status: bit(0),
+            palette_retry: bit(1),
+            attach_retry: bit(2),
+            reorder_hold: bit(3),
+            add_host_pointer: bit(4),
+            pending_selection: bit(5),
+            selection_autoscroll: bit(6),
+            agents_clock: bit(7),
         }
     }
 
@@ -1449,16 +1464,8 @@ mod tests {
 
         // Every combination, so a member that forgot its own arming
         // condition (or shares a recipe id with another) is caught.
-        for bits in 0u8..128 {
-            let timers = armed(
-                bits & 1 != 0,
-                bits & 2 != 0,
-                bits & 4 != 0,
-                bits & 8 != 0,
-                bits & 16 != 0,
-                bits & 32 != 0,
-                bits & 64 != 0,
-            );
+        for bits in 0u16..256 {
+            let timers = armed(bits);
             let ids = recipe_ids(subscription_with(Arc::clone(&wake), timers));
             let unique: HashSet<u64> = ids.iter().copied().collect();
             assert_eq!(

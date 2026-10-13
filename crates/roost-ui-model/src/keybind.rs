@@ -46,11 +46,11 @@ pub enum KeybindAction {
     Copy,
     Paste,
     ToggleSidebar,
-    /// Show/hide the per-agent rows nested under each project in the
-    /// sidebar (plan 007 §3.7). Default `projectMod+shift+a` —
-    /// Cmd+Shift+A on macOS (Iced), Alt+Shift+A on Linux. Not a picker
-    /// toggle — `dispatch_action`'s `is_picker_toggle` allowlist
-    /// doesn't include it.
+    /// Show/hide the sidebar's Agents panel (plan 080 D2; the Swift
+    /// app's per-project agent rows, plan 007 §3.7). Default
+    /// `projectMod+shift+a` — Cmd+Shift+A on macOS (Iced), Alt+Shift+A
+    /// on Linux. Not a picker toggle — `dispatch_action`'s
+    /// `is_picker_toggle` allowlist doesn't include it.
     ToggleSidebarAgents,
     /// Step the sidebar Agents panel's sort, grouped → priority → recent
     /// (plan 080 D7), and write it to `agent-panel-sort`. **Default

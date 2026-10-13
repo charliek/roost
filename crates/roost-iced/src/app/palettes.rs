@@ -1523,7 +1523,7 @@ impl App {
                 }
                 "cycle_agent_panel_sort" => {
                     self.clear_palette_state();
-                    self.cycle_agent_panel_sort();
+                    dispatch.task = self.cycle_agent_panel_sort();
                 }
                 SECURE_INPUT_ROW_ID => {
                     self.clear_palette_state();
@@ -2236,18 +2236,28 @@ impl App {
     /// its rows cannot be activated, and a palette row that does nothing
     /// is worse than a row that is not there.
     fn agent_sources<'a>(&'a self, local: &'a [Project]) -> Vec<agent_palette::AgentSource<'a>> {
-        let mut sources = Vec::with_capacity(self.host_views.len() + 1);
-        sources.push(agent_palette::AgentSource::local(
+        let mut sources = self.all_agent_sources(local);
+        sources.retain(|source| !source.dimmed);
+        sources
+    }
+
+    /// The local workspace's agents, then every host view's in registry
+    /// order, connected or not — the order both the palette and the
+    /// Agents panel break ties in.
+    pub(super) fn all_agent_sources<'a>(
+        &'a self,
+        local: &'a [Project],
+    ) -> Vec<agent_palette::AgentSource<'a>> {
+        std::iter::once(agent_palette::AgentSource::local(
             local,
             self.backend.host(),
-        ));
-        sources.extend(
+        ))
+        .chain(
             self.host_views
                 .iter()
-                .filter(|view| view.state.interactive())
                 .map(|view| self.host_agent_source(view)),
-        );
-        sources
+        )
+        .collect()
     }
 
     /// One host view as an agent source, connected or not: a view that

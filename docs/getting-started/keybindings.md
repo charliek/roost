@@ -26,7 +26,7 @@ Every binding is overridable in `config.conf` (see [Custom keybindings](#custom-
 | `Cmd-Shift-R`        | Rename the active project                   |
 | `Cmd-Shift-W`        | Close the active project (confirms when the project has 2+ tabs) |
 | `Cmd-B`              | Toggle the projects sidebar                 |
-| `Cmd-Shift-A`        | Toggle agent rows under each project in the sidebar |
+| `Cmd-Shift-A`        | Toggle the sidebar's Agents panel (in the Swift app, the agent rows under each project) |
 | `Cmd-Shift-U`        | Jump to the next tab with a pending notification (active project first, then others) |
 | `Cmd-Shift-→`        | Cycle to the next project in the sidebar (skips projects with no tabs; stops at the last project; no wrap-around). Roost-Iced only |
 | `Cmd-Shift-←`        | Cycle to the previous project in the sidebar (skips projects with no tabs; stops at the first project; no wrap-around). Roost-Iced only |
@@ -84,7 +84,7 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 | `Alt-Shift-R`        | Rename the active project                   |
 | `Alt-Shift-W`        | Close the active project (confirms when the project has 2+ tabs) |
 | `Alt-B`              | Toggle the projects sidebar                 |
-| `Alt-Shift-A`        | Toggle agent rows under each project in the sidebar |
+| `Alt-Shift-A`        | Toggle the sidebar's Agents panel |
 | `Alt-Shift-U`       | Jump to the next tab with a pending notification (active project first, then others) |
 | `Alt-Shift-→`        | Cycle to the next project in the sidebar (skips projects with no tabs; stops at the last project; no wrap-around) |
 | `Alt-Shift-←`        | Cycle to the previous project in the sidebar (skips projects with no tabs; stops at the first project; no wrap-around) |

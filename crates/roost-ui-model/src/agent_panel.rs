@@ -3,9 +3,9 @@
 //! One neutral row per agent-owned tab across every workspace, the three
 //! orders the panel offers, and the label rules its text follows. The
 //! agents palette ([`crate::agent_palette::agent_items_across`]) and the
-//! per-project sidebar rows ([`crate::agent_palette::sidebar_agents`]) are
-//! built from the same rows, so no two agent surfaces can disagree about
-//! who is an agent or what its row says.
+//! per-project rows ([`crate::agent_palette::sidebar_agents_by_project`])
+//! are built from the same rows, so no two agent surfaces can disagree
+//! about who is an agent or what its row says.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -241,8 +241,9 @@ fn recent_order(a: &PanelAgentRow, b: &PanelAgentRow) -> Ordering {
         .then_with(|| priority_order(a, b))
 }
 
-/// The order inside one project: [`crate::agent_palette::sidebar_agents`],
-/// and Grouped under each head.
+/// The order inside one project:
+/// [`crate::agent_palette::sidebar_agents_by_project`], and Grouped under
+/// each head.
 pub(crate) fn within_project_order(a: &PanelAgentRow, b: &PanelAgentRow) -> Ordering {
     rank(b)
         .cmp(&rank(a))

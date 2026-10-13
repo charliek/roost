@@ -11,6 +11,26 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+### Added
+
+- **Sidebar Agents panel** — Roost-Iced's sidebar lists every agent on
+  every host in one panel below the projects, in place of the agent rows
+  nested under each project. A row shows the agent's state dot, its name
+  and its age on one line and its status on the next — after its host
+  and project when the panel isn't grouped — elided to the sidebar's
+  width rather than wrapped, and the ages keep counting while an agent
+  is working or waiting. Project rows keep their rail and notification
+  dot and gain an agent count, and a disconnected host's agents stay
+  listed, dimmed. Toggle Sidebar Agents (`show-sidebar-agents`) now shows
+  and hides the panel. **Agents panel sort** — new `agent-panel-sort =
+  grouped|priority|recent` config key (default `grouped`; an unknown
+  value warns and falls back), cycled by the new unbound
+  `cycle_agent_panel_sort` action, the palette's "Cycle Agent Panel Sort"
+  and the panel header's sort word, which write the choice back to
+  `config.conf`. `app.sidebar_dump` gains `agent_panel`
+  ([IPC](docs/reference/ipc.md#agent_panel-the-agents-panel-plan-080)).
+  Roost-Iced only; the Swift app is unchanged.
+
 ## v0.0.24 — 2026-10-10
 
 _The agent-indicator release (#619, #620): an agent that another agent

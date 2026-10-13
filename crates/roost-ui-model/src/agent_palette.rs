@@ -23,7 +23,7 @@ use roost_ipc::agent::{self, AgentLifecycle, Ownership, SOURCE_LEGACY, SOURCE_MA
 use roost_ipc::messages::{Project, Tab};
 
 use crate::agent_panel::{self, PanelAgentRow};
-use crate::keys::{HostId, TabKey};
+use crate::keys::{HostId, ProjectKey, TabKey};
 use crate::notification_inbox;
 use crate::palette::{AgentRowData, PaletteFrame, PaletteItem};
 
@@ -146,10 +146,10 @@ pub fn agent_tab_cwds_across(sources: &[AgentSource<'_>]) -> HashMap<TabKey, Str
     cwds
 }
 
-/// One row under a project in the sidebar (plan 007 §3.1) — the same
-/// fields the palette renders, scoped to a single project. There is no
-/// `project` field: the sidebar nests this row under its project
-/// visually, so the row never needs to say which one it's in.
+/// One of a project's agent rows (plan 007 §3.1) — the same fields the
+/// palette renders, scoped to a single project. There is no `project`
+/// field: the rows are keyed by their project, so a row never needs to
+/// say which one it's in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarAgentRow {
     pub tab: TabKey,
@@ -159,24 +159,44 @@ pub struct SidebarAgentRow {
     pub time_text: String,
 }
 
-/// A single project's agent rows, in
-/// [`agent_panel::within_project_order`]. Ordering across projects is the
-/// caller's problem (it owns the project list order already).
-pub fn sidebar_agents(project: &Project, host: HostId, now: i64) -> Vec<SidebarAgentRow> {
+/// One project's agent rows built on their own, which is what
+/// [`sidebar_agents_by_project`] must say for that project.
+#[cfg(test)]
+fn sidebar_agents(project: &Project, host: HostId, now: i64) -> Vec<SidebarAgentRow> {
     let mut rows = agent_panel::panel_rows(
         &[AgentSource::local(std::slice::from_ref(project), host)],
         now,
     );
     rows.sort_by(agent_panel::within_project_order);
-    rows.into_iter()
-        .map(|row| SidebarAgentRow {
+    rows.iter().map(SidebarAgentRow::from).collect()
+}
+
+/// Every project's agent rows, keyed by project, each project's in
+/// [`agent_panel::within_project_order`]. Ordering across projects is the
+/// caller's problem (it owns the project list order already). A project
+/// with no agent has no entry.
+pub fn sidebar_agents_by_project(
+    rows: &[PanelAgentRow],
+) -> HashMap<ProjectKey, Vec<SidebarAgentRow>> {
+    let mut sorted: Vec<&PanelAgentRow> = rows.iter().collect();
+    sorted.sort_by(|a, b| agent_panel::within_project_order(a, b));
+    let mut by_project: HashMap<ProjectKey, Vec<SidebarAgentRow>> = HashMap::new();
+    for row in sorted {
+        by_project.entry(row.project).or_default().push(row.into());
+    }
+    by_project
+}
+
+impl From<&PanelAgentRow> for SidebarAgentRow {
+    fn from(row: &PanelAgentRow) -> Self {
+        Self {
             tab: row.tab,
-            name: row.name,
+            name: row.name.clone(),
             lifecycle: row.lifecycle,
-            status_text: row.status_text,
-            time_text: row.time_text,
-        })
-        .collect()
+            status_text: row.status_text.clone(),
+            time_text: row.time_text.clone(),
+        }
+    }
 }
 
 /// The ownership record of a tab that belongs in the palette: live
@@ -1262,6 +1282,50 @@ mod tests {
         // rank: Failed > Waiting > Working; then within Working, position
         // 0 before position 5, then id 3 before id 30.
         assert_eq!(ids, vec![1, 4, 3, 30, 20]);
+    }
+
+    /// One pass over every source keys each project by its host, so the
+    /// same numeric project on two hosts is two entries, and each entry
+    /// is exactly what [`sidebar_agents`] says for that project alone.
+    #[test]
+    fn sidebar_agents_by_project_matches_the_per_project_rows_on_every_host() {
+        let roost = project(
+            1,
+            "roost",
+            vec![
+                owned(tab(1, "a"), "claude", AgentLifecycle::Working, NOW),
+                owned(tab(2, "b"), "claude", AgentLifecycle::Failed, NOW - 9),
+                tab(3, "plain shell"),
+            ],
+        );
+        let quiet = project(2, "quiet", vec![tab(4, "plain shell")]);
+        let local = [roost.clone(), quiet];
+        let remote = [roost.clone()];
+        let host = HostId::new(4);
+        let rows = agent_panel::panel_rows(
+            &[
+                AgentSource::local(&local, HostId::LOCAL),
+                AgentSource::local(&remote, host),
+            ],
+            NOW,
+        );
+        let by_project = sidebar_agents_by_project(&rows);
+        assert_eq!(by_project.len(), 2, "a project with no agent has no entry");
+        assert_eq!(
+            by_project[&ProjectKey::local(1)],
+            sidebar_agents(&roost, HostId::LOCAL, NOW)
+        );
+        assert_eq!(
+            by_project[&ProjectKey::new(host, 1)],
+            sidebar_agents(&roost, host, NOW)
+        );
+        assert_eq!(
+            by_project[&ProjectKey::local(1)]
+                .iter()
+                .map(|row| row.tab.tab)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
     }
 
     #[test]

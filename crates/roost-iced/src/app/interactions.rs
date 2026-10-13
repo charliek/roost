@@ -1548,13 +1548,6 @@ enum ProjectDragSettlement {
     Dispatched { ordered_ids: Vec<i64>, op: u64 },
 }
 
-/// Agent sub-rows change every project group's height, so they are hidden
-/// only once the gesture crosses the drag threshold — the strip publishes
-/// its start on a bare press, which must leave the sidebar untouched.
-pub(super) fn agent_rows_hidden(preview: Option<&ProjectDragPreview>) -> bool {
-    preview.is_some_and(|preview| preview.dragging)
-}
-
 fn project_drag_commit_is_valid(
     preview: Option<&ProjectDragPreview>,
     authoritative_ids: &[i64],
@@ -1598,9 +1591,9 @@ fn settle_project_drag_commit(
 
     if let Some(preview) = preview.as_mut() {
         preview.pending_op = Some(op);
-        // The pointer is up: the row stops looking dragged and the agent
-        // sub-rows come back now, exactly as they did when the preview
-        // died at the release. Only the order is held back.
+        // The pointer is up: the row stops looking dragged now, exactly
+        // as it did when the preview died at the release. Only the order
+        // is held back.
         preview.dragging = false;
     }
     ProjectDragSettlement::Dispatched {
@@ -4456,21 +4449,15 @@ mod tests {
     }
 
     #[test]
-    fn project_drag_threshold_gates_agent_row_hiding() {
+    fn only_the_gesture_that_armed_the_preview_marks_it_dragging() {
         let context = ProjectDragContext {
             host: HostId::LOCAL,
             source_id: 10,
             generation: 4,
         };
-        assert!(!agent_rows_hidden(None));
-
         let mut pressed = Some(project_drag_preview(false));
-        assert!(
-            !agent_rows_hidden(pressed.as_ref()),
-            "an ordinary click must leave the agent rows in place"
-        );
         assert!(mark_project_drag_dragging(&mut pressed, 4, &context));
-        assert!(agent_rows_hidden(pressed.as_ref()));
+        assert!(pressed.is_some_and(|preview| preview.dragging));
 
         let mut stale = Some(project_drag_preview(false));
         assert!(!mark_project_drag_dragging(&mut stale, 5, &context));
@@ -4483,7 +4470,7 @@ mod tests {
                 generation: 4,
             }
         ));
-        assert!(!agent_rows_hidden(stale.as_ref()));
+        assert!(stale.is_some_and(|preview| !preview.dragging));
 
         let mut absent = None;
         assert!(!mark_project_drag_dragging(&mut absent, 4, &context));
@@ -4748,9 +4735,6 @@ mod tests {
         ));
         let dispatched = preview.expect("the dispatched preview stays on screen");
         assert!(dispatched.orders_the_strip(5));
-        // Everything else about the gesture ends at the release: the row
-        // stops looking dragged and the agent sub-rows come back.
-        assert!(!agent_rows_hidden(Some(&dispatched)));
 
         let tab = TabDragPreview {
             pending_op: Some(9),
@@ -4797,7 +4781,7 @@ mod tests {
     }
 
     #[test]
-    fn project_drag_commit_after_the_agent_row_hide_uses_the_gesture_id_list() {
+    fn project_drag_commit_past_the_threshold_uses_the_gesture_id_list() {
         let ids = vec![10, 20, 30];
         let context = ProjectDragContext {
             host: HostId::LOCAL,
@@ -4806,13 +4790,10 @@ mod tests {
         };
         let mut preview =
             arm_project_drag_preview(&ids, 4, local_project_context(10, 4), ids.clone());
-        assert!(!agent_rows_hidden(preview.as_ref()));
         assert!(mark_project_drag_dragging(&mut preview, 4, &context));
-        assert!(agent_rows_hidden(preview.as_ref()));
 
-        // Hiding the agent rows reflows every group, so the strip recomputes
-        // its target index from live bounds; settlement compares ids only and
-        // is unaffected by the changed geometry.
+        // The strip recomputes its target index from live bounds;
+        // settlement compares ids only and is unaffected by geometry.
         assert!(preview_project_drag_if_owned(
             &mut preview,
             &ids,

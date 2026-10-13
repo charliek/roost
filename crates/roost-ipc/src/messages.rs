@@ -2070,6 +2070,54 @@ pub struct SidebarDumpResult {
     /// saved hosts, which is also every Swift Mac reply.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sections: Vec<SidebarDumpSection>,
+    /// The sidebar's Agents panel (plan 080 D10). Omitted by the Swift
+    /// Mac app, which has no panel, so its replies keep decoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_panel: Option<SidebarDumpAgentPanel>,
+}
+
+/// The sidebar's Agents panel: every agent the sidebar draws, on every
+/// host, in the order the panel's sort puts them. Derived from the same
+/// row cache the panel paints from, like `projects[].agents`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SidebarDumpAgentPanel {
+    /// The `show-sidebar-agents` toggle, as `agents_visible`. `entries`
+    /// stays populated while the panel is hidden.
+    pub visible: bool,
+    /// `"grouped"` | `"priority"` | `"recent"` — `agent-panel-sort`.
+    pub sort: String,
+    /// The panel's share of the split, in thousandths: the dragged value
+    /// mid-drag, else the remembered one. The floors that keep both
+    /// halves usable clamp only what is drawn, never this.
+    pub fraction_permille: u16,
+    pub entries: Vec<SidebarDumpPanelEntry>,
+}
+
+/// One line of the Agents panel. Every text field is the full string,
+/// never the width-elided one drawn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SidebarDumpPanelEntry {
+    /// A `grouped` head for one (host, project), with how many agent
+    /// entries follow it.
+    Group { label: String, count: u32 },
+    Agent {
+        /// The tab in the wire spelling the tab ops take: `"7"` in this
+        /// UI's own workspace, `"h3.7"` on a host.
+        tab: String,
+        name: String,
+        /// The agent's display name, as the agents palette shows it.
+        agent: String,
+        lifecycle: AgentLifecycle,
+        /// `[host › ]project`, the row's location; `""` under `grouped`,
+        /// where the head above the row says it.
+        location_text: String,
+        status_text: String,
+        time_text: String,
+        is_active: bool,
+        /// A disconnected host's last-known agent: listed, not pressable.
+        dimmed: bool,
+    },
 }
 
 /// `app.render_stats` request — read the running UI's render-path
@@ -5345,6 +5393,7 @@ mod tests {
             ],
             hosts: Vec::new(),
             sections: Vec::new(),
+            agent_panel: None,
         });
     }
 
@@ -5376,6 +5425,7 @@ mod tests {
                 },
             ],
             sections: Vec::new(),
+            agent_panel: None,
         });
     }
 
@@ -5394,6 +5444,7 @@ mod tests {
             projects: Vec::new(),
             hosts: Vec::new(),
             sections: Vec::new(),
+            agent_panel: None,
         })
         .unwrap();
         assert_eq!(encoded, r#"{"agents_visible":true,"projects":[]}"#);
@@ -5442,6 +5493,7 @@ mod tests {
                     update_pill: None,
                 },
             ],
+            agent_panel: None,
         };
         round_trip(&dump);
 
@@ -5456,6 +5508,63 @@ mod tests {
         );
         assert_eq!(band["update_pill"], "needs update");
         assert!(encoded["sections"][1].get("update_pill").is_none());
+    }
+
+    /// Plan 080 D10: the Agents panel is additive like the strip — a
+    /// Swift reply (no panel) still decodes and re-encodes byte for
+    /// byte — and its entries are tagged by `kind`, with the tab in the
+    /// host-qualified spelling the tab ops take.
+    #[test]
+    fn sidebar_dump_result_round_trips_the_agents_panel() {
+        let swift: SidebarDumpResult =
+            serde_json::from_str(r#"{"agents_visible":true,"projects":[]}"#).unwrap();
+        assert_eq!(swift.agent_panel, None);
+        assert_eq!(
+            serde_json::to_string(&swift).unwrap(),
+            r#"{"agents_visible":true,"projects":[]}"#
+        );
+
+        let dump = SidebarDumpResult {
+            agents_visible: false,
+            projects: Vec::new(),
+            hosts: Vec::new(),
+            sections: Vec::new(),
+            agent_panel: Some(SidebarDumpAgentPanel {
+                visible: false,
+                sort: "grouped".to_string(),
+                fraction_permille: 450,
+                entries: vec![
+                    SidebarDumpPanelEntry::Group {
+                        label: "POPOS › craze".to_string(),
+                        count: 1,
+                    },
+                    SidebarDumpPanelEntry::Agent {
+                        tab: "h3.7".to_string(),
+                        name: "slauth-refactor".to_string(),
+                        agent: "Claude Code".to_string(),
+                        lifecycle: AgentLifecycle::Waiting,
+                        location_text: String::new(),
+                        status_text: "Waiting for input".to_string(),
+                        time_text: "2m".to_string(),
+                        is_active: false,
+                        dimmed: true,
+                    },
+                ],
+            }),
+        };
+        round_trip(&dump);
+
+        let encoded = serde_json::to_value(&dump).unwrap();
+        let panel = &encoded["agent_panel"];
+        assert_eq!(panel["fraction_permille"], 450);
+        assert_eq!(panel["entries"][0]["kind"], "group");
+        assert_eq!(panel["entries"][0]["count"], 1);
+        let agent = &panel["entries"][1];
+        assert_eq!(agent["kind"], "agent");
+        assert_eq!(agent["tab"], "h3.7");
+        assert_eq!(agent["lifecycle"], "waiting");
+        assert_eq!(agent["location_text"], "");
+        assert_eq!(agent["dimmed"], true);
     }
 
     #[test]

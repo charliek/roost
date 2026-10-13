@@ -72,11 +72,12 @@ pub struct RoostConfig {
     /// only; Linux's Alt is already Meta.
     pub macos_option_as_alt: OptionAsAlt,
 
-    /// `show-sidebar-agents` — whether the sidebar renders one row
-    /// per agent-owned tab under its project (plan 007). Defaults to
-    /// `true`. Toggled at runtime via the `toggle_sidebar_agents`
-    /// keybind / palette row / Mac View menu item, which writes the
-    /// live value straight back here through `set_key`.
+    /// `show-sidebar-agents` — whether the sidebar shows its Agents
+    /// panel and the project rows' agent counts (plan 080 D2; the Swift
+    /// app's per-project agent rows, plan 007). Defaults to `true`.
+    /// Toggled at runtime via the `toggle_sidebar_agents` keybind /
+    /// palette row / Mac View menu item, which writes the live value
+    /// straight back here through `set_key`.
     pub show_sidebar_agents: bool,
 
     /// `agent-panel-sort` — how the sidebar's Agents panel orders its

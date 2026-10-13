@@ -1710,6 +1710,53 @@ classic single sticky `PROJECTS` header instead of a strip:
 `in-process` with no saved hosts, which is also every Swift Mac reply —
 the same absent-tolerant contract `hosts` uses, for the same reason.
 
+#### `agent_panel` — the Agents panel (plan 080)
+
+Roost-Iced's sidebar lists its agents in one panel below the projects:
+every agent on every host the sidebar draws, in the order the panel's
+sort puts them. `agent_panel` is that list, derived from the same row
+cache the panel paints from at the moment of the read — so a sort
+change shows in the very next dump, with no event in between.
+
+```json
+{ "agents_visible": true,
+  "projects": [ ... ],
+  "agent_panel": {
+    "visible": true, "sort": "grouped", "fraction_permille": 450,
+    "entries": [
+      { "kind": "group", "label": "WORKBENCH › craze", "count": 1 },
+      { "kind": "agent", "tab": "h3.9", "name": "e2e flake hunt",
+        "agent": "Claude Code", "lifecycle": "failed", "location_text": "",
+        "status_text": "Failed", "time_text": "14m",
+        "is_active": false, "dimmed": true } ] } }
+```
+
+- `visible` — the `show-sidebar-agents` toggle, the same value as
+  `agents_visible`. `entries` stays populated while the panel is hidden.
+- `sort` — `"grouped"` | `"priority"` | `"recent"`, the
+  `agent-panel-sort` key.
+- `fraction_permille` — the panel's share of the sidebar below the
+  project list, in thousandths. The panel draws at least one whole row
+  and the project list at least a band and two rows, but those floors
+  clamp only what is drawn, never this value.
+- `entries` — tagged by `kind`:
+    - `"group"` — a `grouped` head for one host's project: `label` as drawn
+      (`LOCAL › roost`, `WORKBENCH › craze`, or the bare project name
+      while the sidebar draws a single band), and `count`, the agent
+      entries that follow it.
+    - `"agent"` — one agent-owned tab. `tab` is the key the tab ops take
+      (`"7"` in this UI's workspace, `"h3.9"` on a host); `agent` is the
+      agent's display name as the agents palette shows it; `location_text`
+      is the row's `[host › ]project` line, `""` under `grouped`, where
+      the head says it; `is_active` is whether it is the active tab;
+      `dimmed` marks a disconnected host's last-known agent, listed but
+      not pressable.
+
+Every text field is the full string, never the width-elided one the
+panel draws. Under `local-backend = session` the in-process workspace is
+not drawn, so its agents are not listed. The Swift Mac app has no panel
+and **omits** `agent_panel`, so read it as absent-tolerant.
+
 Ungated, read-only — always available, matching `app.window_metrics`.
 
 ### `app.notice_dump`

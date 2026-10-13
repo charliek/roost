@@ -1,0 +1,84 @@
+{
+  "id": "23",
+  "ok": true,
+  "result": {
+    "agents_visible": true,
+    "projects": [
+      {
+        "project_id": "1",
+        "agents": [
+          {
+            "tab_id": "7",
+            "name": "slauth-refactor",
+            "lifecycle": "waiting",
+            "status_text": "Waiting for input",
+            "time_text": "2m",
+            "is_active": true
+          }
+        ]
+      }
+    ],
+    "hosts": [
+      {
+        "id": "hs-2f1c",
+        "label": "workbench",
+        "state": "disconnected",
+        "projects": [
+          {
+            "key": "h3.4",
+            "name": "craze",
+            "tabs": [{ "key": "h3.9", "title": "claude" }]
+          }
+        ]
+      }
+    ],
+    "sections": [
+      {
+        "role": "local",
+        "label": "LOCAL",
+        "state": "connected",
+        "dot": "connected",
+        "reconnect_row": false
+      },
+      {
+        "role": "host",
+        "label": "WORKBENCH",
+        "state": "disconnected",
+        "dot": "offline",
+        "saved_id": "hs-2f1c",
+        "reconnect_row": true
+      }
+    ],
+    "agent_panel": {
+      "visible": true,
+      "sort": "priority",
+      "fraction_permille": 450,
+      "entries": [
+        {
+          "kind": "agent",
+          "tab": "7",
+          "name": "slauth-refactor",
+          "agent": "Claude Code",
+          "lifecycle": "waiting",
+          "location_text": "local › roost",
+          "status_text": "Waiting for input",
+          "time_text": "2m",
+          "is_active": true,
+          "dimmed": false
+        },
+        {
+          "kind": "agent",
+          "tab": "h3.9",
+          "name": "claude",
+          "agent": "Claude Code",
+          "lifecycle": "failed",
+          "location_text": "workbench › craze",
+          "status_text": "Failed",
+          "time_text": "14m",
+          "is_active": false,
+          "dimmed": true
+        }
+      ]
+    }
+  }
+}

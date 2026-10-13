@@ -549,6 +549,67 @@ fn both_sidebar_dump_vectors_decode_as_the_current_typed_result() {
     );
 }
 
+/// Plan 080 D10's Agents panel: both pre-080 vectors (what the Swift
+/// app still answers) decode with no panel and re-encode exactly, and
+/// the panel vector carries every host's agents in one list — a host
+/// row under its `h<host>.<id>` key, dimmed while its host is down.
+#[test]
+fn the_agent_panel_vector_decodes_and_the_older_ones_have_no_panel() {
+    for name in [
+        "app.sidebar_dump.response.json",
+        "app.sidebar_dump.session.response.json",
+    ] {
+        let older = vector(name);
+        let result: SidebarDumpResult =
+            serde_json::from_value(older["result"].clone()).expect("pre-080 sidebar dump decodes");
+        assert_eq!(result.agent_panel, None, "{name}");
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            older["result"],
+            "{name}"
+        );
+    }
+
+    let recorded = vector("app.sidebar_dump.agent_panel.response.json");
+    let result: SidebarDumpResult = serde_json::from_value(recorded["result"].clone())
+        .expect("the agent panel sidebar dump decodes");
+    let panel = result.agent_panel.as_ref().expect("the panel is present");
+    assert!(panel.visible);
+    assert_eq!(panel.sort, "priority");
+    assert_eq!(panel.fraction_permille, 450);
+    let tabs: Vec<&str> = panel
+        .entries
+        .iter()
+        .map(|entry| match entry {
+            SidebarDumpPanelEntry::Agent { tab, .. } => tab.as_str(),
+            SidebarDumpPanelEntry::Group { .. } => panic!("priority draws no heads"),
+        })
+        .collect();
+    assert_eq!(tabs, ["7", "h3.9"]);
+    assert_eq!(
+        WireTabRef::parse(tabs[1]),
+        Some(WireTabRef::Host { host: 3, tab: 9 }),
+        "a host row's key is one the tab ops parse"
+    );
+    let SidebarDumpPanelEntry::Agent {
+        lifecycle,
+        location_text,
+        dimmed,
+        ..
+    } = &panel.entries[1]
+    else {
+        unreachable!()
+    };
+    assert_eq!(*lifecycle, AgentLifecycle::Failed);
+    assert_eq!(location_text, "workbench › craze");
+    assert!(*dimmed);
+    assert_eq!(
+        serde_json::to_value(&result).unwrap(),
+        recorded["result"],
+        "typed re-encode must match the vector"
+    );
+}
+
 /// `app.window_metrics` before and after the real-input harness's cell
 /// geometry (plan 074 §D7), and with the window-focus state: the recorded
 /// response carries none of the optional fields and re-encodes exactly, and

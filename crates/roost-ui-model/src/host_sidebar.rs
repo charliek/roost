@@ -407,7 +407,7 @@ fn session_sections(slot_saved_id: Option<&str>, hosts: &[HostInput<'_>]) -> Vec
             label: PROJECTS_LABEL.to_string(),
             state: slot.state,
             // Bare while connected, exactly as the LOCAL band is: the
-            // agent rows below carry the count, and a local band has no
+            // project rows below carry the count, and a local band has no
             // "over there" to roll up. What it does have, once it is not
             // connected, is trouble worth naming.
             rollup: slot.state.status_text_with_reason(slot.reason),
@@ -1115,7 +1115,7 @@ mod tests {
         assert_eq!(up[0].saved_id.as_deref(), Some("slot"));
         assert_eq!(up[0].state.dot(), HostDot::Connected);
         assert!(!up[0].state.offers_reconnect());
-        // Parity with today's LOCAL: the agent rows below carry the
+        // Parity with today's LOCAL: the project rows below carry the
         // count, and a connected local band says nothing.
         assert_eq!(up[0].rollup, None);
         assert_eq!(up[0].fidelity, None);

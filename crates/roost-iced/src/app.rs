@@ -44,7 +44,7 @@ use roost_ipc::{codes, IpcServer, LocalBackendCell, LocalBackendMode};
 use roost_ui_model::theme::Theme;
 use roost_ui_model::typography::{self, FamilyApply, TerminalTypography};
 use roost_ui_model::{
-    agent_palette,
+    agent_palette, agent_panel,
     config::{self, ChromeAccent, RoostConfig},
     context_menu::ContextTarget,
     custom_command, host_sidebar, host_verbs,
@@ -85,6 +85,7 @@ use crate::Message;
 // `palettes` (it hosts the command/agent/provider/notification palettes).
 pub(crate) mod agent_hooks;
 pub(crate) mod agent_hooks_dialog;
+mod agents_panel;
 pub(crate) mod background_resize;
 pub(crate) mod bootstrap;
 pub(crate) mod context_menu;
@@ -113,14 +114,14 @@ pub(crate) mod window_frame;
 #[cfg(test)]
 mod perf_bench;
 
+pub(crate) use self::agents_panel::AGENTS_CLOCK_INTERVAL;
 pub(crate) use self::interactions::host_reorder_hold_tick;
 pub(crate) use self::interactions::RenameTarget;
 use self::interactions::{
-    agent_rows_hidden, any_preview_is_held, arm_rename_completion_for_open_editor,
-    consume_rename_completion_key, enqueue_osc_clipboard_write, host_section_is_reorderable,
-    native_file_drop_origin, paste_bytes, visual_tab_ids, ClipboardQueue, FileDropQueue,
-    ProjectDragPreview, RenameCompletionKey, RenameEditor, ScreenshotQueue, TabDragPreview,
-    TrailingDebounce,
+    any_preview_is_held, arm_rename_completion_for_open_editor, consume_rename_completion_key,
+    enqueue_osc_clipboard_write, host_section_is_reorderable, native_file_drop_origin, paste_bytes,
+    visual_tab_ids, ClipboardQueue, FileDropQueue, ProjectDragPreview, RenameCompletionKey,
+    RenameEditor, ScreenshotQueue, TabDragPreview, TrailingDebounce,
 };
 pub(crate) use self::palettes::ProviderRunResult;
 pub(crate) use self::palettes::PALETTE_RETRY_INTERVAL;
@@ -2113,6 +2114,28 @@ fn band_text<'a>(
     BandText { label, rollup }
 }
 
+/// What a project row's label may spend at `sidebar_width` beside its
+/// agent count and notification dot (plan 080 D6), so the three stay on
+/// one line however long the name.
+fn project_label_budget(sidebar_width: f32, counted: bool, notifying: bool) -> f32 {
+    let pill = sidebar_width
+        - chrome::DIVIDER_WIDTH
+        - 2.0 * chrome::PROJECT_PILL_INSET_X
+        - chrome::PROJECT_LABEL_INSET
+        - chrome::PROJECT_DOT_INSET;
+    let count = if counted {
+        chrome::PROJECT_AGENT_COUNT_SLOT
+    } else {
+        0.0
+    };
+    let dot = match (notifying, counted) {
+        (false, _) => 0.0,
+        (true, false) => chrome::NOTIFICATION_DOT_SIZE,
+        (true, true) => chrome::NOTIFICATION_DOT_SIZE + chrome::PROJECT_AGENT_COUNT_GAP,
+    };
+    (pill - count - dot).max(0.0)
+}
+
 /// A band pill's text, drawn exactly as [`band_pill_width`] measures it.
 fn band_pill_text<'a>(pill: &'a str, color: Color) -> iced::widget::Text<'a> {
     text(pill)
@@ -2663,6 +2686,8 @@ pub enum UiTask {
         measurement_generation: u64,
         reveal: bool,
     },
+    /// Scroll a scrollable back to its start.
+    SnapToTop(Id),
     /// Scroll the tab strip so the newly activated pill is fully on
     /// screen — the same scroll-into-view operation the palette uses,
     /// walked along the strip's horizontal axis.
@@ -3123,7 +3148,15 @@ pub struct App {
     client: LocalClient,
     tabs: HashMap<TabKey, TerminalTab>,
     projects: Vec<Project>,
+    /// Every drawn project's agent rows, keyed by project: the counts on
+    /// the project rows and `app.sidebar_dump`'s `projects[].agents`.
     sidebar_agents: HashMap<ProjectKey, Vec<agent_palette::SidebarAgentRow>>,
+    /// Every agent the sidebar's Agents panel lists, in no particular
+    /// order — the panel sorts at draw time (plan 080 D4).
+    agent_panel_rows: Vec<agent_panel::PanelAgentRow>,
+    agent_panel_scroll_id: Id,
+    /// The sidebar's elided labels, kept across frames.
+    sidebar_elisions: chrome::ElisionMemo,
     notification_inbox: notification_inbox::NotificationInbox,
     last_activation: AppLastActivationResult,
     window_id: Option<window::Id>,
@@ -3721,6 +3754,9 @@ impl App {
             tabs: HashMap::new(),
             projects: Vec::new(),
             sidebar_agents: HashMap::new(),
+            agent_panel_rows: Vec::new(),
+            agent_panel_scroll_id: Id::unique(),
+            sidebar_elisions: chrome::ElisionMemo::default(),
             notification_inbox: notification_inbox::NotificationInbox::new(),
             last_activation: AppLastActivationResult::default(),
             window_id: None,
@@ -5814,10 +5850,7 @@ impl App {
                 self.toggle_sidebar_agents();
                 Ok(UiTask::None)
             }
-            KeybindAction::CycleAgentPanelSort => {
-                self.cycle_agent_panel_sort();
-                Ok(UiTask::None)
-            }
+            KeybindAction::CycleAgentPanelSort => Ok(self.cycle_agent_panel_sort()),
             KeybindAction::ToggleSecureInput => {
                 self.toggle_secure_input();
                 Ok(UiTask::None)
@@ -6202,10 +6235,12 @@ impl App {
         ))
     }
 
-    /// One sidebar project row plus its agent rows — the same widgets
-    /// under every host, which is plan 037 §3.1's "project rows render
-    /// identically" made literal: there is one builder, and the section
-    /// header above a row is the only thing that says where it runs.
+    /// One sidebar project row — the same widgets under every host, which
+    /// is plan 037 §3.1's "project rows render identically" made literal:
+    /// there is one builder, and the section header above a row is the
+    /// only thing that says where it runs. Its agents are listed in the
+    /// Agents panel below the list (plan 080 D1); the row says only how
+    /// many there are.
     ///
     /// `dim` is the disconnected-section treatment. Colors drop to
     /// [`chrome::HOST_SECTION_DIM`] and no row publishes a message, so a
@@ -6221,8 +6256,6 @@ impl App {
         dim: bool,
     ) -> Element<'a, Message> {
         let active = project_key == self.active_project_key();
-        let active_key = self.active_tab_key();
-        let hide_agent_rows = agent_rows_hidden(self.project_drag_preview.as_ref());
         let alpha = if dim { chrome::HOST_SECTION_DIM } else { 1.0 };
         let rollup = project_rollup(
             project
@@ -6265,13 +6298,13 @@ impl App {
                     .style(chrome::inline_rename_input(&self.chrome))
                     .into()
             }
-            // Label leading, notification-dot slot trailing: the spacer
-            // holds that slot open against the pill's trailing inset
-            // (`PROJECT_DOT_INSET`, matched by the pill container's own
-            // right padding — chrome::badge lands 8px from the pill's
+            // Label leading, agent count and notification-dot slot
+            // trailing: the spacer holds them against the pill's trailing
+            // inset (`PROJECT_DOT_INSET`, matched by the pill container's
+            // own right padding — chrome::badge lands 8px from the pill's
             // right edge for free). The rename editor keeps the whole
             // pill instead — a fill spacer beside it would halve the
-            // field, and no dot renders beside the editor.
+            // field, and no count or dot renders beside the editor.
             _ => {
                 let label_color = if active {
                     self.chrome.project_label_active
@@ -6279,11 +6312,44 @@ impl App {
                     self.chrome.project_label_inactive
                 }
                 .scale_alpha(alpha);
+                let agents = if self.config.show_sidebar_agents {
+                    self.sidebar_agents.get(&project_key).map_or(0, Vec::len)
+                } else {
+                    0
+                };
+                let font = chrome::chrome_font(font::Weight::Normal);
+                let label = self.sidebar_elisions.elide(
+                    &project.name,
+                    font,
+                    chrome::PROJECT_LABEL_SIZE,
+                    project_label_budget(self.live_sidebar_width(), agents > 0, notifying),
+                );
                 let mut label_row = row![
-                    text(&project.name).size(13).color(label_color),
+                    text(label)
+                        .size(chrome::PROJECT_LABEL_SIZE)
+                        .color(label_color)
+                        .font(font)
+                        .shaping(iced::widget::text::Shaping::Advanced)
+                        .wrapping(iced::widget::text::Wrapping::None),
                     iced::widget::Space::new().width(Fill)
                 ]
                 .align_y(Alignment::Center);
+                if agents > 0 {
+                    label_row = label_row.push(
+                        text(agents.to_string())
+                            .size(chrome::PROJECT_AGENT_COUNT_SIZE)
+                            .color(self.chrome.host_rollup_text.scale_alpha(alpha))
+                            .font(font)
+                            .width(chrome::PROJECT_AGENT_COUNT_SLOT)
+                            .align_x(iced::alignment::Horizontal::Right)
+                            .wrapping(iced::widget::text::Wrapping::None),
+                    );
+                    if notifying {
+                        label_row = label_row.push(
+                            iced::widget::Space::new().width(chrome::PROJECT_AGENT_COUNT_GAP),
+                        );
+                    }
+                }
                 if notifying {
                     label_row = label_row.push(
                         container(
@@ -6333,54 +6399,12 @@ impl App {
         // publishes nothing at all on press — so those rows are simply
         // press-less, which is the whole of "nothing here is actionable
         // until the connection is back".
-        let project_row: Element<'a, Message> = ContextPressArea::new(
+        ContextPressArea::new(
             project_row,
             ContextTarget::Project(project_key),
             self.modifiers,
         )
-        .into();
-        let mut project_group = column![project_row].spacing(2);
-        if self.config.show_sidebar_agents && !hide_agent_rows {
-            for agent in self.sidebar_agents.get(&project_key).into_iter().flatten() {
-                let name = agent.name.clone();
-                let detail = format!("{} · {}", agent.status_text, agent.time_text);
-                let dot_color = agent_color(&self.chrome, agent.lifecycle).scale_alpha(alpha);
-                let dot =
-                    container(iced::widget::Space::new().width(8).height(8)).style(move |_| {
-                        iced::widget::container::Style::default()
-                            .background(dot_color)
-                            .border(iced::border::rounded(3))
-                    });
-                let agent_row = row![
-                    dot,
-                    text(name).size(11),
-                    text(detail)
-                        .size(9)
-                        .color(self.chrome.muted_text.scale_alpha(alpha))
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center);
-                // A dimmed row keeps its `button` so the layout is
-                // identical; without `on_press` iced renders it Disabled,
-                // which is the same reduced-contrast reading the colors
-                // above give the rest of the row.
-                let mut agent_button = button(agent_row)
-                    .width(Fill)
-                    .height(chrome::ROW_HEIGHT)
-                    .padding(iced::Padding {
-                        top: 3.0,
-                        right: 8.0,
-                        bottom: 3.0,
-                        left: chrome::AGENT_DOT_INSET,
-                    })
-                    .style(chrome::agent_button(&self.chrome, agent.tab == active_key));
-                if !dim {
-                    agent_button = agent_button.on_press(Message::AgentSelected(agent.tab));
-                }
-                project_group = project_group.push(agent_button);
-            }
-        }
-        project_group.into()
+        .into()
     }
 
     /// One host section's band: the dot, the uppercase label, and the
@@ -6721,6 +6745,7 @@ impl App {
             .width(Fill)
             .height(Fill)
             .style(chrome::list(&self.chrome));
+        let split = self.agents_split(sidebar_list);
         let mut sidebar_column = column![];
         if let Some(header) = sidebar_header {
             sidebar_column = sidebar_column.push(header);
@@ -6729,7 +6754,7 @@ impl App {
         // container paints it and pads the three region fills off it — so the
         // terminal grid keeps every pixel `sidebar_width` leaves it and the
         // resize grip's seam still lands on the sidebar's right edge.
-        let sidebar = container(sidebar_column.push(sidebar_list).push(sidebar_footer))
+        let sidebar = container(sidebar_column.push(split).push(sidebar_footer))
             .width(self.live_sidebar_width())
             .height(Fill)
             .padding(iced::Padding::default().right(chrome::DIVIDER_WIDTH))
@@ -7272,10 +7297,13 @@ impl App {
         self.config_writer.set("show-sidebar-agents", value);
     }
 
-    fn cycle_agent_panel_sort(&mut self) {
+    /// The keybind, the palette command and the panel header's sort word
+    /// all land here. The new order starts at the top (plan 080 D5).
+    fn cycle_agent_panel_sort(&mut self) -> UiTask {
         let sort = self.config.agent_panel_sort.next();
         self.config.agent_panel_sort = sort;
         self.config_writer.set("agent-panel-sort", sort.as_str());
+        UiTask::SnapToTop(self.agent_panel_scroll_id.clone())
     }
 
     /// Flip the remembered Secure Keyboard Entry toggle (plan 074 §D3).
@@ -11019,6 +11047,7 @@ impl Message {
             Self::ProjectSelected(project_id) => app.select_project(project_id),
             Self::BeginRenameProject(project_id) => return app.begin_rename_project(project_id),
             Self::AgentSelected(tab_id) => app.select_agent(tab_id),
+            Self::CycleAgentPanelSort => return app.cycle_agent_panel_sort(),
             Self::TabSelected(tab_id) => app.select_tab(tab_id),
             Self::BeginRenameTab(tab_id) => return app.begin_rename_tab(tab_id),
             Self::CloseTab(tab_id) => return app.close_tab(tab_id),
@@ -11735,6 +11764,30 @@ mod tests {
             Some(rollup),
             "a reason with room is drawn whole"
         );
+    }
+
+    #[test]
+    fn a_project_label_gives_way_to_its_agent_count_and_dot() {
+        let narrowest = roost_engine::SIDEBAR_MIN_WIDTH as f32;
+        let bare = project_label_budget(narrowest, false, false);
+        let dotted = project_label_budget(narrowest, false, true);
+        let counted = project_label_budget(narrowest, true, false);
+        let both = project_label_budget(narrowest, true, true);
+        assert!(bare > counted && counted > both, "{bare} {counted} {both}");
+        assert!(bare > dotted && dotted > both, "{bare} {dotted} {both}");
+        assert!(both >= 60.0, "{both}px leaves a label no room");
+
+        let font = chrome::chrome_font(font::Weight::Normal);
+        let name = "a project name far too long for any sidebar";
+        let (label, width) = chrome::elide_to_width(name, font, chrome::PROJECT_LABEL_SIZE, both);
+        assert!(
+            label.ends_with(chrome::ELLIPSIS) && width <= both,
+            "{label}"
+        );
+        let trailing = chrome::PROJECT_AGENT_COUNT_SLOT
+            + chrome::PROJECT_AGENT_COUNT_GAP
+            + chrome::NOTIFICATION_DOT_SIZE;
+        assert!(width + trailing <= bare, "{width} + {trailing} > {bare}");
     }
 
     /// The laid-out width of a fitted band: every child and every gap.
