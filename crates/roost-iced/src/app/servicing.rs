@@ -3325,7 +3325,6 @@ impl App {
             self.host_sections.is_empty() || self.host_sections.iter().any(band_owns_local_strip);
         rows.retain(|row| local_drawn || row.project.host != local);
         self.agent_panel_rows = rows;
-        self.settle_agents_split_drag();
     }
 
     /// The sidebar's bands, off the views this reconcile holds.

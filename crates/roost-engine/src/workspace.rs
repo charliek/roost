@@ -87,7 +87,7 @@ fn normalize_sidebar_width(width: f64) -> Option<f64> {
 
 /// The Agents panel's share of the sidebar below its divider (plan 080
 /// D8) before the user has ever dragged it.
-pub const AGENTS_PANEL_DEFAULT_FRACTION: f64 = 0.45;
+pub const AGENTS_PANEL_DEFAULT_FRACTION: f64 = 0.37;
 /// The smallest share a drag or a restore may leave the Agents panel.
 pub const AGENTS_PANEL_MIN_FRACTION: f64 = 0.15;
 /// The largest share a drag or a restore may give the Agents panel.

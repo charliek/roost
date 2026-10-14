@@ -23,7 +23,10 @@ release workflow asserts they agree).
   dot and gain an agent count, and a disconnected host's agents stay
   listed, dimmed. Toggle Sidebar Agents (`show-sidebar-agents`) now shows
   and hides the panel. Drag the divider between the projects and the
-  panel to resize it; its height is remembered across relaunches.
+  panel to resize it; its height is remembered across relaunches. The
+  divider is always there, and the panel keeps its height whether or not
+  any agents are running, so nothing moves when the first one starts or
+  the last one exits.
   **Agents panel sort** — new `agent-panel-sort =
   grouped|priority|recent` config key (default `grouped`; an unknown
   value warns and falls back), cycled by the new unbound

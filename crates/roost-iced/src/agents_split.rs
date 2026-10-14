@@ -5,9 +5,8 @@
 //! them. The divider is the grip — dragging it is this widget's own
 //! gesture — so it is drawn exactly where the panel starts and no row
 //! loses a press to it. Both children are always present: hiding the panel
-//! gives it and the divider zero height, and emptying it the divider,
-//! rather than a different tree, so the project list keeps its scroll
-//! position across both.
+//! gives it and the divider zero height rather than a different tree, so
+//! the project list keeps its scroll position across the toggle.
 
 use iced::advanced::layout;
 use iced::advanced::overlay;
@@ -33,8 +32,6 @@ const PROJECTS_FLOOR: f32 = chrome::BAND_HEIGHT + 2.0 * chrome::ROW_HEIGHT;
 pub(crate) enum PanelHeight {
     /// `show-sidebar-agents = false`: no divider and no panel.
     Hidden,
-    /// No agents: no divider, and the panel is exactly this tall.
-    Content(f32),
     /// The split: `fraction` of the height below the divider, never less
     /// than `floor` while the project list keeps [`PROJECTS_FLOOR`].
     Split { fraction: f32, floor: f32 },
@@ -55,20 +52,15 @@ struct Heights {
 /// would pass `draw`'s zero-height filter.
 fn heights(total: f32, panel: PanelHeight) -> Heights {
     let total = total.max(0.0);
-    let (divider, panel) = match panel {
-        PanelHeight::Hidden => {
-            return Heights {
-                projects: total,
-                divider: 0.0,
-                panel: 0.0,
-            };
-        }
-        PanelHeight::Content(height) => (0.0, height.min(total)),
-        PanelHeight::Split { fraction, floor } => {
-            let divider = chrome::AGENTS_SPLIT_DIVIDER_HEIGHT.min(total);
-            (divider, shown_panel(fraction, total - divider, floor))
-        }
+    let PanelHeight::Split { fraction, floor } = panel else {
+        return Heights {
+            projects: total,
+            divider: 0.0,
+            panel: 0.0,
+        };
     };
+    let divider = chrome::AGENTS_SPLIT_DIVIDER_HEIGHT.min(total);
+    let panel = shown_panel(fraction, total - divider, floor);
     let projects = (total - divider - panel).floor().max(0.0);
     Heights {
         projects,
@@ -108,8 +100,9 @@ const DIVIDER_CHILD: usize = 2;
 ///
 /// Every path that can strand the grip mid-drag ends it — the release,
 /// anything that rebuilds the root (a toast, an overlay, a collapse) and
-/// anything that takes the divider away (the toggle, the last agent going)
-/// — or the panel would keep showing a fraction no relaunch restores.
+/// the toggle, which takes the divider away — or the panel would keep
+/// showing a fraction no relaunch restores. Agents starting and exiting
+/// take nothing away, so a drag outlives them.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub(crate) struct AgentsSplitDrag {
     live: Option<f32>,
@@ -205,7 +198,7 @@ struct Divider {
 
 impl Divider {
     /// The divider in the grip's `layout`, or `None` while there is none to
-    /// drag: the panel hidden or empty.
+    /// drag: the panel hidden.
     fn of(layout: Layout<'_>, panel: PanelHeight, epoch: u64) -> Option<Self> {
         let PanelHeight::Split { fraction, floor } = panel else {
             return None;
@@ -550,6 +543,33 @@ impl<'a> From<AgentsSplitGrip<'a>> for Element<'a, Message> {
 }
 
 #[cfg(test)]
+fn split_state_under(tree: &mut Tree) -> Option<&mut State> {
+    if tree.tag == tree::Tag::of::<State>() {
+        return Some(tree.state.downcast_mut::<State>());
+    }
+    tree.children.iter_mut().find_map(split_state_under)
+}
+
+/// Start a divider drag in the first split under `tree`, as a press on
+/// the divider does.
+#[cfg(test)]
+pub(crate) fn press_divider_under(tree: &mut Tree) {
+    split_state_under(tree)
+        .expect("a split under the tree")
+        .drag = Some(Drag {
+        grab: 3.0,
+        epoch: 0,
+        published: None,
+    });
+}
+
+/// Whether the first split under `tree` holds a divider drag.
+#[cfg(test)]
+pub(crate) fn divider_dragged_under(tree: &mut Tree) -> bool {
+    split_state_under(tree).is_some_and(|state| state.drag.is_some())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -575,8 +595,8 @@ mod tests {
         let laid = heights(total, split(DEFAULT_FRACTION));
         assert_eq!(laid.divider, DIVIDER);
         assert_eq!(laid.panel, (DEFAULT_FRACTION * (total - DIVIDER)).round());
-        assert_eq!(laid.panel, 278.0);
-        assert_eq!(laid.projects, 340.0);
+        assert_eq!(laid.panel, 229.0);
+        assert_eq!(laid.projects, 389.0);
         assert_eq!(sum(laid), total);
     }
 
@@ -647,19 +667,6 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_panel_is_sized_to_its_content_with_no_divider() {
-        let content = HEADER + chrome::AGENT_PANEL_EMPTY_HEIGHT;
-        assert_eq!(
-            heights(600.0, PanelHeight::Content(content)),
-            Heights {
-                projects: 600.0 - content,
-                divider: 0.0,
-                panel: content,
-            }
-        );
-    }
-
-    #[test]
     fn a_non_finite_fraction_falls_back_to_the_floor() {
         let laid = heights(600.0, split(f32::NAN));
         assert_eq!(laid.panel, FLOOR);
@@ -676,8 +683,8 @@ mod tests {
     const TOTAL: f32 = 624.0;
     /// Where the divider starts at the default, and the panel it leaves —
     /// the first test pins both.
-    const DIVIDER_TOP: f32 = 340.0;
-    const PANEL: f32 = 278.0;
+    const DIVIDER_TOP: f32 = 389.0;
+    const PANEL: f32 = 229.0;
     const BELOW: f32 = TOTAL - DIVIDER;
     /// Mid-divider.
     const GRAB: f32 = DIVIDER_TOP + 3.0;
@@ -1046,38 +1053,33 @@ mod tests {
 
     #[test]
     fn with_no_divider_the_grip_owns_nothing_and_drops_a_live_drag() {
-        let empty = PanelHeight::Content(HEADER + chrome::AGENT_PANEL_EMPTY_HEIGHT);
-        for panel in [PanelHeight::Hidden, empty] {
-            let node = grip_in(TOTAL, panel);
-            assert_eq!(Divider::of(Layout::new(&node), panel, 0), None, "{panel:?}");
-            for y in [DIVIDER_TOP, GRAB, TOTAL - HEADER] {
-                let mut state = State::default();
-                assert_eq!(
-                    owns(&mut state, &press(), panel, Some(y)),
-                    Ownership::Delegate,
-                    "{panel:?}: a press at y {y}"
-                );
-            }
-
-            let mut live = dragging();
+        let hidden = PanelHeight::Hidden;
+        let node = grip_in(TOTAL, hidden);
+        assert_eq!(Divider::of(Layout::new(&node), hidden, 0), None);
+        for y in [DIVIDER_TOP, GRAB, TOTAL - HEADER] {
+            let mut state = State::default();
             assert_eq!(
-                owns(&mut live, &moved(GRAB - 22.0), panel, Some(GRAB - 22.0)),
+                owns(&mut state, &press(), hidden, Some(y)),
                 Ownership::Delegate,
-                "{panel:?}"
-            );
-            assert_eq!(live.drag, None, "{panel:?}: the drag goes with the divider");
-            assert_eq!(
-                owns(&mut live, &release(), panel, Some(GRAB)),
-                Ownership::Delegate,
-                "{panel:?}"
-            );
-            let mut live = dragging();
-            assert_eq!(
-                owns(&mut live, &unfocused(), panel, None),
-                Ownership::Delegate,
-                "{panel:?}"
+                "a press at y {y}"
             );
         }
+
+        let mut live = dragging();
+        assert_eq!(
+            owns(&mut live, &moved(GRAB - 22.0), hidden, Some(GRAB - 22.0)),
+            Ownership::Delegate
+        );
+        assert_eq!(live.drag, None, "the drag goes with the divider");
+        assert_eq!(
+            owns(&mut live, &release(), hidden, Some(GRAB)),
+            Ownership::Delegate
+        );
+        let mut live = dragging();
+        assert_eq!(
+            owns(&mut live, &unfocused(), hidden, None),
+            Ownership::Delegate
+        );
     }
 
     #[test]

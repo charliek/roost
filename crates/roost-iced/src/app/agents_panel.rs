@@ -71,17 +71,14 @@ fn permille(fraction: f32) -> u16 {
     (fraction * 1000.0).round().clamp(0.0, 1000.0) as u16
 }
 
-/// How tall the panel is: hidden by the toggle, sized to its one line when
-/// there are no agents, else split at `fraction` with room for one whole
-/// agent row — under a head, when there are heads.
-fn panel_height(visible: bool, empty: bool, sort: AgentPanelSort, fraction: f32) -> PanelHeight {
+/// How tall the panel is: hidden by the toggle, else split at `fraction`
+/// with room for one whole agent row — under a head, when there are heads.
+/// It never asks whether any agent is running (plan 080 R1): an empty
+/// panel keeps that room, so nothing moves when the first agent starts or
+/// the last one exits.
+fn panel_height(visible: bool, sort: AgentPanelSort, fraction: f32) -> PanelHeight {
     if !visible {
         return PanelHeight::Hidden;
-    }
-    if empty {
-        return PanelHeight::Content(
-            chrome::AGENT_PANEL_HEADER_HEIGHT + chrome::AGENT_PANEL_EMPTY_HEIGHT,
-        );
     }
     let head = if sort == AgentPanelSort::Grouped {
         chrome::AGENT_PANEL_GROUP_HEIGHT
@@ -97,7 +94,7 @@ fn panel_height(visible: bool, empty: bool, sort: AgentPanelSort, fraction: f32)
     }
 }
 
-/// Whether the divider is on screen: the panel splits, in a sidebar that
+/// Whether the divider is on screen: the panel is shown, in a sidebar that
 /// is not collapsed.
 fn divider_drawn(panel: PanelHeight, sidebar_collapsed: bool) -> bool {
     !sidebar_collapsed && matches!(panel, PanelHeight::Split { .. })
@@ -164,7 +161,6 @@ impl App {
     fn agent_panel_height(&self) -> PanelHeight {
         panel_height(
             self.config.show_sidebar_agents,
-            self.agent_panel_rows.is_empty(),
             self.config.agent_panel_sort,
             self.agents_panel_fraction(),
         )
@@ -208,7 +204,7 @@ impl App {
     }
 
     /// The panel: its header over its rows, or over the one line saying
-    /// there are none.
+    /// there are none, with the list's background below it.
     fn agent_panel(&self) -> Element<'_, Message> {
         let header = self.agent_panel_header();
         let body: Element<'_, Message> = if !self.config.show_sidebar_agents {
@@ -560,7 +556,7 @@ mod tests {
     fn the_fraction_is_reported_in_whole_thousandths() {
         assert_eq!(
             permille(roost_engine::AGENTS_PANEL_DEFAULT_FRACTION as f32),
-            450
+            370
         );
         assert_eq!(permille(0.1234), 123);
         assert_eq!(permille(2.0), 1000);
@@ -572,7 +568,7 @@ mod tests {
     // roost-iced has no `App` fixture, so each `App` path is pinned on
     // the rule it calls.
 
-    const STORED: f32 = 0.45;
+    const STORED: f32 = 0.37;
 
     fn mid_drag() -> AgentsSplitDrag {
         let mut drag = AgentsSplitDrag::default();
@@ -613,9 +609,9 @@ mod tests {
         assert_eq!(drag.interrupt(), Some(0.3));
     }
 
-    fn drawn(visible: bool, empty: bool, sidebar_collapsed: bool) -> bool {
+    fn drawn(visible: bool, sidebar_collapsed: bool) -> bool {
         divider_drawn(
-            panel_height(visible, empty, AgentPanelSort::Grouped, 0.3),
+            panel_height(visible, AgentPanelSort::Grouped, 0.3),
             sidebar_collapsed,
         )
     }
@@ -623,23 +619,17 @@ mod tests {
     #[test]
     fn toggling_the_panel_off_mid_drag_commits_the_drag() {
         let mut drag = mid_drag();
-        assert_eq!(drag.settle(drawn(false, false, false)), Some(0.3));
-    }
-
-    #[test]
-    fn the_last_agent_exiting_mid_drag_commits_the_drag() {
-        let mut drag = mid_drag();
-        assert_eq!(drag.settle(drawn(true, true, false)), Some(0.3));
+        assert_eq!(drag.settle(drawn(false, false)), Some(0.3));
     }
 
     #[test]
     fn collapsing_the_sidebar_mid_drag_commits_the_drag() {
         let mut drag = mid_drag();
-        assert_eq!(drag.settle(drawn(true, false, true)), Some(0.3));
+        assert_eq!(drag.settle(drawn(true, true)), Some(0.3));
     }
 
-    /// A change that keeps the divider — another agent, a sort change —
-    /// leaves the drag to the grip.
+    /// A change that keeps the divider — an agent starting, the last one
+    /// exiting, a sort change — leaves the drag to the grip.
     #[test]
     fn a_change_that_keeps_the_divider_keeps_the_drag() {
         for sort in [
@@ -648,38 +638,33 @@ mod tests {
             AgentPanelSort::Recent,
         ] {
             let mut drag = mid_drag();
-            let panel = panel_height(true, false, sort, drag.fraction(STORED));
+            let panel = panel_height(true, sort, drag.fraction(STORED));
             assert_eq!(drag.settle(divider_drawn(panel, false)), None, "{sort:?}");
             assert_eq!(drag.fraction(STORED), 0.3);
         }
     }
 
     #[test]
-    fn the_panel_splits_only_while_shown_with_agents() {
-        for empty in [false, true] {
-            assert_eq!(
-                panel_height(false, empty, AgentPanelSort::Grouped, 0.3),
-                PanelHeight::Hidden
-            );
-        }
+    fn a_shown_panel_splits_with_room_for_one_row_of_its_sort() {
         assert_eq!(
-            panel_height(true, true, AgentPanelSort::Priority, 0.3),
-            PanelHeight::Content(
-                chrome::AGENT_PANEL_HEADER_HEIGHT + chrome::AGENT_PANEL_EMPTY_HEIGHT
-            )
+            panel_height(false, AgentPanelSort::Grouped, 0.3),
+            PanelHeight::Hidden
         );
         let row = chrome::AGENT_PANEL_HEADER_HEIGHT
             + chrome::AGENT_PANEL_LIST_PADDING_Y
             + chrome::AGENT_PANEL_ROW_HEIGHT;
+        for sort in [AgentPanelSort::Priority, AgentPanelSort::Recent] {
+            assert_eq!(
+                panel_height(true, sort, 0.3),
+                PanelHeight::Split {
+                    fraction: 0.3,
+                    floor: row,
+                },
+                "{sort:?}"
+            );
+        }
         assert_eq!(
-            panel_height(true, false, AgentPanelSort::Priority, 0.3),
-            PanelHeight::Split {
-                fraction: 0.3,
-                floor: row,
-            }
-        );
-        assert_eq!(
-            panel_height(true, false, AgentPanelSort::Grouped, 0.3),
+            panel_height(true, AgentPanelSort::Grouped, 0.3),
             PanelHeight::Split {
                 fraction: 0.3,
                 floor: row + chrome::AGENT_PANEL_GROUP_HEIGHT,

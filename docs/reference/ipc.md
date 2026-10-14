@@ -1722,7 +1722,7 @@ change shows in the very next dump, with no event in between.
 { "agents_visible": true,
   "projects": [ ... ],
   "agent_panel": {
-    "visible": true, "sort": "grouped", "fraction_permille": 450,
+    "visible": true, "sort": "grouped", "fraction_permille": 370,
     "entries": [
       { "kind": "group", "label": "WORKBENCH › craze", "count": 1 },
       { "kind": "agent", "tab": "h3.9", "name": "e2e flake hunt",
@@ -1739,13 +1739,17 @@ change shows in the very next dump, with no event in between.
   project list, in thousandths: the dragged value while the divider is
   being dragged, else the remembered one, which
   [`sidebar.set_agents_fraction`](#sidebarset_agents_fraction-test-only-gated)
-  sets. The panel draws at least its header and one whole row (under
-  `grouped`, a group head too) and the project list at least a band and
-  two rows, unless the sidebar is too short for both: then the project
-  list keeps its floor and the panel gets what is left, down to its
-  header. Those floors clamp only how a share is drawn: a remembered or
-  op-set value is kept as given. A drag publishes the share drawn at each
-  of its moves, and its release commits the last one.
+  sets — `370` until a drag or the op first sets one. While the panel is
+  shown its divider is drawn at that share whether or not any agent is
+  running: an empty panel says "No agents running" under its header and
+  keeps its height. The panel draws at least its header and room for one
+  whole row (under `grouped`, a group head too), agents or not, and the
+  project list at least a band and two rows, unless the sidebar is too
+  short for both: then the project list keeps its floor and the panel
+  gets what is left, down to its header. Those floors clamp only how a
+  share is drawn: a remembered or op-set value is kept as given. A drag
+  publishes the share drawn at each of its moves, and its release
+  commits the last one.
 - `entries` — tagged by `kind`:
     - `"group"` — a `grouped` head for one host's project: `label` as drawn
       (`LOCAL › roost`, `WORKBENCH › craze`, or the bare project name

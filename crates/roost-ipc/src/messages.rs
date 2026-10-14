@@ -5550,7 +5550,7 @@ mod tests {
             agent_panel: Some(SidebarDumpAgentPanel {
                 visible: false,
                 sort: "grouped".to_string(),
-                fraction_permille: 450,
+                fraction_permille: 370,
                 entries: vec![
                     SidebarDumpPanelEntry::Group {
                         label: "POPOS › craze".to_string(),
@@ -5574,7 +5574,7 @@ mod tests {
 
         let encoded = serde_json::to_value(&dump).unwrap();
         let panel = &encoded["agent_panel"];
-        assert_eq!(panel["fraction_permille"], 450);
+        assert_eq!(panel["fraction_permille"], 370);
         assert_eq!(panel["entries"][0]["kind"], "group");
         assert_eq!(panel["entries"][0]["count"], 1);
         let agent = &panel["entries"][1];

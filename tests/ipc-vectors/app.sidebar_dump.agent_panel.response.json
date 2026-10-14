@@ -52,7 +52,7 @@
     "agent_panel": {
       "visible": true,
       "sort": "priority",
-      "fraction_permille": 450,
+      "fraction_permille": 370,
       "entries": [
         {
           "kind": "agent",

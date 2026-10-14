@@ -2071,6 +2071,23 @@ fn sidebar_band_label_font() -> Font {
     chrome::chrome_font(font::Weight::Semibold)
 }
 
+/// The sidebar top to bottom: its sticky header, the split, its footer.
+/// The header keeps its slot when there is none, because iced matches
+/// children by position: a split that moved when the first host band
+/// appeared or the last one went would be rebuilt, dropping a divider drag
+/// mid-gesture with its release unseen.
+fn sidebar_column<'a>(
+    header: Option<Element<'a, Message>>,
+    split: impl Into<Element<'a, Message>>,
+    footer: impl Into<Element<'a, Message>>,
+) -> Column<'a, Message> {
+    column![
+        header.unwrap_or_else(|| Space::new().into()),
+        split.into(),
+        footer.into()
+    ]
+}
+
 /// A band's label, in the one weight and size every band uses.
 fn sidebar_band_label<'a>(chrome: &ChromePalette, label: &'a str) -> Element<'a, Message> {
     text(label)
@@ -6761,16 +6778,16 @@ impl App {
             .width(Fill)
             .height(Fill)
             .style(chrome::list(&self.chrome));
-        let split = self.agents_split(sidebar_list);
-        let mut sidebar_column = column![];
-        if let Some(header) = sidebar_header {
-            sidebar_column = sidebar_column.push(header);
-        }
+        let sidebar_column = sidebar_column(
+            sidebar_header,
+            self.agents_split(sidebar_list),
+            sidebar_footer,
+        );
         // The hairline lives inside the sidebar's own width — the outer
         // container paints it and pads the three region fills off it — so the
         // terminal grid keeps every pixel `sidebar_width` leaves it and the
         // resize grip's seam still lands on the sidebar's right edge.
-        let sidebar = container(sidebar_column.push(split).push(sidebar_footer))
+        let sidebar = container(sidebar_column)
             .width(self.live_sidebar_width())
             .height(Fill)
             .padding(iced::Padding::default().right(chrome::DIVIDER_WIDTH))
@@ -11508,6 +11525,32 @@ mod tests {
             Some(8),
             "the press turned the lock off"
         );
+    }
+
+    #[test]
+    fn a_divider_drag_survives_the_projects_header_coming_and_going() {
+        use crate::agents_split::{
+            divider_dragged_under, press_divider_under, AgentsSplitGrip, PanelHeight,
+        };
+        use iced::advanced::widget::Tree;
+
+        let palette = ChromePalette::roost_dark(chrome::DEFAULT_ACCENT);
+        let sidebar = |header: bool| -> Element<'_, Message> {
+            let panel = PanelHeight::Split {
+                fraction: 0.37,
+                floor: 0.0,
+            };
+            let split = AgentsSplitGrip::new(&palette, Space::new(), Space::new(), panel, 0);
+            let header = header.then(|| Space::new().height(chrome::BAND_HEIGHT).into());
+            sidebar_column(header, split, Space::new()).into()
+        };
+        let mut tree = Tree::new(sidebar(true));
+        press_divider_under(&mut tree);
+
+        tree.diff(sidebar(false));
+        assert!(divider_dragged_under(&mut tree), "the header went");
+        tree.diff(sidebar(true));
+        assert!(divider_dragged_under(&mut tree), "the header came back");
     }
 
     #[test]

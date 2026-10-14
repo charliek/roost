@@ -576,7 +576,7 @@ fn the_agent_panel_vector_decodes_and_the_older_ones_have_no_panel() {
     let panel = result.agent_panel.as_ref().expect("the panel is present");
     assert!(panel.visible);
     assert_eq!(panel.sort, "priority");
-    assert_eq!(panel.fraction_permille, 450);
+    assert_eq!(panel.fraction_permille, 370);
     let tabs: Vec<&str> = panel
         .entries
         .iter()

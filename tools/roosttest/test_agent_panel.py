@@ -313,7 +313,7 @@ def test_the_split_reports_its_share(roost):
             "the default share needs a fresh harness-owned instance (--roost-fresh); "
             "a dev UI remembers whatever its divider was dragged to"
         )
-    assert _panel(roost)["fraction_permille"] == 450
+    assert _panel(roost)["fraction_permille"] == 370
 
 
 def test_no_agents_means_no_entries(roost):
@@ -457,7 +457,8 @@ def test_hiding_the_panel_keeps_its_share(roost, owned_config, kept_share):
 def _split_drawn(roost, path) -> tuple[int, int, int] | None:
     """The project list's and the panel's drawn heights, and the window's,
     in logical points, off one scale-1 capture (which is in logical
-    points) — None while it is mid-relayout or shows no divider yet. The
+    points) — None while it is mid-relayout, or draws no divider: the
+    panel is hidden or the sidebar collapsed. The
     capture, not `app.window_metrics`, says how big the window is: a
     compositor may refuse a `window.resize` the UI has already recorded.
     The divider is the only run of its fill this tall in the probe column
@@ -580,6 +581,29 @@ def test_the_floors_clamp_only_what_is_drawn(
             f"the compositor kept {kept}pt windows, where no share reaches the {floor} "
             "floor; each drew its split exactly"
         )
+
+
+@needs_test_mode
+def test_an_empty_panel_keeps_its_divider_at_the_share(
+    roost, tmp_path, owned_config, kept_share
+):
+    """With no agents running, the panel keeps its divider and its height
+    (plan 080 R1): the divider is drawn at the share it found, and a share
+    set through the op moves it, held by the floor a panel with agents has
+    — the smallest share presses it at the default window."""
+    if not is_fresh():
+        pytest.skip(
+            "an empty Agents panel needs a fresh harness-owned instance "
+            "(--roost-fresh); a dev UI likely has agents open"
+        )
+    _set_agents_visible(roost, True)
+    _set_sort(roost, "grouped")
+    _toggle_to_visible(roost)
+    roost._wait(lambda: _panel(roost)["entries"] == [], 10.0, "the Agents panel to empty")
+    path = tmp_path / "split.png"
+    for permille in (kept_share, MIN_PERMILLE, 600):
+        _drawn_share(roost, path, permille)
+    assert _panel(roost)["entries"] == [], "an agent reached the panel mid-test"
 
 
 @needs_test_mode
