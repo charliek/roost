@@ -820,8 +820,8 @@ def _keybind_dispatch(launch: Launch) -> tuple[int, int]:
     )
     _assert_no_pty_input(launch, [other_tab], "out-of-range project shortcut")
 
-    # Jump-to-unread must clear the engine notification and reveal its target
-    # even when the sidebar was hidden at dispatch time.
+    # Jump-to-unread must clear the engine notification and focus its target,
+    # and leave a collapsed sidebar collapsed (plan 080 R3).
     launch.client.notify(home_tab, "Shortcut unread")
     launch.client.wait_notification(home_tab, True)
     if not launch.client.window_metrics()["sidebar_collapsed"]:
@@ -837,9 +837,9 @@ def _keybind_dispatch(launch: Launch) -> tuple[int, int]:
         "jump-to-unread focus",
     )
     _wait_until(lambda: not launch.client.has_notification(home_tab), "unread clear")
-    _wait_until(
-        lambda: not launch.client.window_metrics()["sidebar_collapsed"],
-        "jump-to-unread sidebar reveal",
+    _assert_stays(
+        lambda: launch.client.window_metrics()["sidebar_collapsed"],
+        "jump-to-unread leaves the sidebar collapsed",
     )
     _assert_no_pty_input(launch, [other_tab, home_tab], "jump-to-unread shortcut")
 

@@ -2807,8 +2807,9 @@ render, so this row can never disagree with them. `metrics_text` is
 present once resolved — `"—"` for a clean repo, a non-repo cwd, or any
 probe failure/timeout; otherwise `"<n>f +<adds> -<dels>"` (minus is
 ASCII `-`) — so pending vs. resolved is observable on the wire. Activating
-an `agent:<id>` row jumps to that tab (revealing the sidebar if it was
-collapsed); the empty-state row (`"agents:empty"`) is not actionable.
+an `agent:<id>` row jumps to that tab (Roost-Iced leaves a collapsed
+sidebar collapsed; the Swift app reveals it); the empty-state row
+(`"agents:empty"`) is not actionable.
 
 | Op | Request params | Notes |
 |---|---|---|

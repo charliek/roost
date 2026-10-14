@@ -2452,7 +2452,7 @@ impl App {
                         // same pair its sidebar row does. A tab whose
                         // host has since dropped selects nothing — the
                         // banner outlived what it named.
-                        match self.focus_host_tab_and_clear(tab, true) {
+                        match self.focus_host_tab_and_clear(tab) {
                             Ok(()) => {
                                 batch.mark_reconciled();
                                 task = task.then(self.notification_raise(token));
@@ -2464,12 +2464,11 @@ impl App {
                             ),
                         }
                     } else if notification_activation(&self.workspace, tab) {
-                        // The rest of a notification jump, exactly as the
-                        // palette's rows do it: reveal the sidebar so the
-                        // user sees which project they landed in, and fold
-                        // the two ops above into the cache now rather than
+                        // The rest of a notification jump: fold the two
+                        // ops above into the cache now rather than
                         // waiting for their broadcast to come back around.
-                        self.set_sidebar_collapsed(false);
+                        // A collapsed sidebar stays collapsed, as it does
+                        // for the palette's rows.
                         self.reconcile();
                         batch.mark_reconciled();
                         task = task.then(self.notification_raise(token));
@@ -4228,7 +4227,7 @@ impl App {
                 // keyboard route move together), then the attach.
                 if let Some(reply) = self.awaiting_listing.park(key, reply) {
                     let result = self
-                        .focus_host_tab_and_clear(key, false)
+                        .focus_host_tab_and_clear(key)
                         .map_err(|_| roost_engine::WorkspaceError::TabNotFound(tab_id));
                     let _ = reply.send(result);
                 }

@@ -5732,10 +5732,10 @@ impl App {
                 self.dispatch_keybind_action(action, false)
             }
             // The Window menu's rows take the same paths the sidebar and
-            // tab strip take (`Message::ProjectSelected`/`TabSelected`) —
-            // never revealing the sidebar, matching Swift's ⌘1-9 (plan
-            // 072 D10): opening a tab never expands the sidebar (071's
-            // ruling), including opening a tab on a host
+            // tab strip take (`Message::ProjectSelected`/`TabSelected`),
+            // like every other focus path (`focus_tab_and_clear`): none
+            // expands a collapsed sidebar (plan 072 D10, 071's ruling),
+            // including opening a tab on a host
             // (`resolve_pending_host_selection`).
             MenuEvent::SelectProject(project_id) => {
                 if !command_enabled(self.menu_gating(), false) {
@@ -5853,7 +5853,7 @@ impl App {
                     &self.notification_inbox,
                     self.active_project_key(),
                 ) {
-                    self.focus_tab_and_clear(tab, true)?;
+                    self.focus_tab_and_clear(tab)?;
                 }
                 Ok(UiTask::None)
             }
@@ -7249,18 +7249,18 @@ impl App {
             tracing::debug!(?project, "project selection resolves to no tab");
             return;
         };
-        let _ = self.focus_tab_and_clear(tab, false);
+        let _ = self.focus_tab_and_clear(tab);
     }
 
     pub fn select_tab(&mut self, tab: TabKey) {
         self.cancel_editor_for_interaction();
-        let _ = self.focus_tab_and_clear(tab, false);
+        let _ = self.focus_tab_and_clear(tab);
     }
 
     pub fn select_agent(&mut self, tab: TabKey) {
         self.cancel_drags();
         self.cancel_editor_for_interaction();
-        let _ = self.focus_tab_and_clear(tab, true);
+        let _ = self.focus_tab_and_clear(tab);
     }
 
     pub fn toggle_sidebar(&mut self) {
@@ -7846,7 +7846,7 @@ impl App {
         if next == current {
             return Ok(());
         }
-        self.focus_tab_and_clear(tabs[next], false)?;
+        self.focus_tab_and_clear(tabs[next])?;
         Ok(())
     }
 
@@ -7859,7 +7859,7 @@ impl App {
         let Some(tab) = self.preferred_tab_key(project) else {
             return Ok(());
         };
-        self.focus_tab_and_clear(tab, false)
+        self.focus_tab_and_clear(tab)
     }
 
     /// Every section the navigation ring walks, top to bottom — the
@@ -7916,7 +7916,7 @@ impl App {
         let Some(tab) = self.preferred_tab_key(project) else {
             return Ok(());
         };
-        self.focus_tab_and_clear(tab, false)
+        self.focus_tab_and_clear(tab)
     }
 
     /// The tab a project row lands on, on either side of the ring.
@@ -7937,16 +7937,18 @@ impl App {
         else {
             return Ok(());
         };
-        self.focus_tab_and_clear(tab, false)
+        self.focus_tab_and_clear(tab)
     }
 
     /// Every focus change in the UI — strip clicks, sidebar rows, the
     /// cycle/switch keybinds, jump-to-unread, the agent and notification
     /// palettes — funnels through here, so this is the one place that owes
-    /// them a reconcile.
-    fn focus_tab_and_clear(&mut self, tab: TabKey, reveal_sidebar: bool) -> Result<(), String> {
+    /// them a reconcile. None of them opens a collapsed sidebar (plan 072
+    /// D10, 071's ruling); only creating or renaming a project does,
+    /// because its editor lives there.
+    fn focus_tab_and_clear(&mut self, tab: TabKey) -> Result<(), String> {
         if !tab.is_local() {
-            return self.focus_host_tab_and_clear(tab, reveal_sidebar);
+            return self.focus_host_tab_and_clear(tab);
         }
         // A local focus ends any host selection: the two are one
         // selection, and the local workspace is the one that persists it.
@@ -7954,9 +7956,6 @@ impl App {
         let landed = focus_tab_in_core(&self.workspace, tab);
         self.pending_keyboard_user_focus(landed)?;
         self.note_user_focus();
-        if reveal_sidebar {
-            self.set_sidebar_collapsed(false);
-        }
         // Both mutations above broadcast, so a reconcile would eventually
         // arrive on the feed — but only after the bridge task runs, which
         // is not ordered against the next IPC request the same feed
@@ -7974,11 +7973,7 @@ impl App {
     /// of "dimmed rows are non-interactive": the row publishes nothing,
     /// and a selection arriving by any other route (a stale palette row,
     /// a notification jump) still lands nowhere.
-    fn focus_host_tab_and_clear(
-        &mut self,
-        tab: TabKey,
-        reveal_sidebar: bool,
-    ) -> Result<(), String> {
+    fn focus_host_tab_and_clear(&mut self, tab: TabKey) -> Result<(), String> {
         let landed = self
             .host_project_of(tab)
             .ok_or_else(|| format!("tab {tab} is not listed by a connected host"));
@@ -7989,9 +7984,6 @@ impl App {
             tab,
             local_active: self.workspace.active().1,
         }));
-        if reveal_sidebar {
-            self.set_sidebar_collapsed(false);
-        }
         self.host_clear_notification(tab);
         self.host_focus_tab(tab);
         self.reconcile();

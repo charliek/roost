@@ -36,6 +36,15 @@ release workflow asserts they agree).
   ([IPC](docs/reference/ipc.md#agent_panel-the-agents-panel-plan-080)).
   Roost-Iced only; the Swift app is unchanged.
 
+### Changed
+
+- **Jumping to a tab no longer opens a collapsed sidebar** — in
+  Roost-Iced, choosing an agent in the agents palette, a row in the
+  notifications palette, Jump to Unread or clicking a notification
+  banner now focuses the tab and leaves a collapsed sidebar collapsed,
+  as the Cmd-1..9 shortcuts and new tabs already did. The Swift app is
+  unchanged.
+
 ### Fixed
 
 - **A sidebar drag survives a toast going away, and quitting.** In

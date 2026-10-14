@@ -1563,7 +1563,7 @@ impl App {
                         self.active_project_key(),
                     );
                     if let Some(tab) = target {
-                        self.focus_tab_and_clear(tab, true)?;
+                        self.focus_tab_and_clear(tab)?;
                     }
                     self.clear_palette_state();
                 }
@@ -1625,13 +1625,13 @@ impl App {
             agent_palette::FRAME_ID => {
                 let tab = agent_palette::agent_tab_key(&item.id)
                     .ok_or_else(|| format!("agent row {:?} cannot be activated", item.id))?;
-                self.focus_tab_and_clear(tab, true)?;
+                self.focus_tab_and_clear(tab)?;
                 self.clear_palette_state();
             }
             "notifications" => {
                 let tab = notification_inbox::tab_key(&item.id)
                     .ok_or_else(|| format!("notification row {:?} cannot be activated", item.id))?;
-                self.focus_tab_and_clear(tab, true)?;
+                self.focus_tab_and_clear(tab)?;
                 self.clear_palette_state();
             }
             "custom" => {
