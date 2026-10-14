@@ -3731,16 +3731,34 @@ def test_a_host_rows_menu_lists_the_palettes_host_rows_and_stop_asks_first(host,
 # ---------------------------------------------------------------------------
 
 
-def panel_agent(roost: Roost, tab: int) -> dict | None:
-    """The Agents panel's entry for a host's bare tab id `tab`, and the
-    head above it, from `app.sidebar_dump`. A local tab with the same
-    number is a different row — its key carries no host part."""
+def host_tab_key(roost: Roost, saved_id: str, tab: int) -> str | None:
+    """The qualified key (`h<host>.<id>`) the band of host `saved_id`
+    lists its bare tab id `tab` under. Another host's tab with the same
+    number has a different key, so matching by key keeps a reused UI's
+    other hosts out."""
+    band = roost.sidebar_host(saved_id)
+    if band is None:
+        return None
+    return next(
+        (
+            listed["key"]
+            for project in band["projects"]
+            for listed in project["tabs"]
+            if re.fullmatch(rf"h\d+\.{tab}", listed["key"])
+        ),
+        None,
+    )
+
+
+def panel_agent(roost: Roost, key: str) -> dict | None:
+    """The Agents panel's entry for the qualified tab `key`, and the head
+    above it, from `app.sidebar_dump`."""
     panel = roost.sidebar_dump()["agent_panel"]
     head = None
     for entry in panel["entries"]:
         if entry["kind"] == "group":
             head = entry
-        elif re.fullmatch(rf"h\d+\.{tab}", entry["tab"]):
+        elif entry["tab"] == key:
             return {**entry, "head": head, "sort": panel["sort"]}
     return None
 
@@ -3760,15 +3778,12 @@ def test_a_hosts_agent_is_listed_under_its_host_qualified_key_and_names_its_host
         session.agent_report(
             tab, "e2e-panel", "claim", session_id=uuid.uuid4().hex, lifecycle="working"
         )
-        entry = wait_until(
-            lambda: panel_agent(roost, tab), 30.0, "the host's agent in the Agents panel"
+        key = wait_until(
+            lambda: host_tab_key(roost, host.saved_id, tab), 30.0, "the host's band to list the tab"
         )
-        listed = {
-            listed_tab["key"]
-            for listed_project in roost.sidebar_host(host.saved_id)["projects"]
-            for listed_tab in listed_project["tabs"]
-        }
-        assert entry["tab"] in listed, (entry, sorted(listed))
+        entry = wait_until(
+            lambda: panel_agent(roost, key), 30.0, "the host's agent in the Agents panel"
+        )
         assert entry["lifecycle"] == "working", entry
         assert entry["dimmed"] is False, entry
 
@@ -3781,9 +3796,8 @@ def test_a_hosts_agent_is_listed_under_its_host_qualified_key_and_names_its_host
 
         host.disconnect()
         host.wait_not_connected()
-        dimmed = wait_until(
-            lambda: (row := panel_agent(roost, tab)) is not None and row["dimmed"] and row,
+        wait_until(
+            lambda: (row := panel_agent(roost, key)) is not None and row["dimmed"],
             30.0,
-            "the dropped host's agent to stay listed, dimmed",
+            "the dropped host's agent to stay listed, dimmed, under the key it was listed under",
         )
-        assert dimmed["tab"] == entry["tab"], "a dimmed row keeps the incarnation it was listed under"
