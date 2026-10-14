@@ -153,8 +153,8 @@ pub const AGENT_PANEL_GROUP_HEIGHT: f32 =
     AGENT_PANEL_GROUP_PADDING_TOP + AGENT_PANEL_GROUP_LINE + AGENT_PANEL_GROUP_PADDING_BOTTOM;
 pub const AGENT_PANEL_GROUP_PADDING_TOP: f32 = 8.0;
 pub const AGENT_PANEL_GROUP_PADDING_BOTTOM: f32 = 3.0;
-pub const AGENT_PANEL_GROUP_SIZE: f32 = 10.0;
-pub const AGENT_PANEL_GROUP_LINE: f32 = 13.0;
+pub const AGENT_PANEL_GROUP_SIZE: f32 = 12.0;
+pub const AGENT_PANEL_GROUP_LINE: f32 = 16.0;
 pub const AGENT_PANEL_GROUP_COUNT_SLOT: f32 = 20.0;
 pub const AGENT_PANEL_EMPTY_HEIGHT: f32 = 40.0;
 pub const AGENT_PANEL_EMPTY_SIZE: f32 = 11.5;
@@ -270,8 +270,6 @@ pub struct ChromePalette {
     pub agent_finished: Color,
     pub agent_failed: Color,
     pub agent_inactive: Color,
-    /// The agents panel's group headers.
-    pub agent_group_text: Color,
     /// The sidebar's project-list / agents-panel split handle, at rest and
     /// hovered.
     pub split_handle: Color,
@@ -330,7 +328,6 @@ impl ChromePalette {
             agent_finished: Color::from_rgb8(0x7a, 0x7a, 0x7a),
             agent_failed: Color::from_rgb8(0xe0, 0x52, 0x52),
             agent_inactive: Color::from_rgba8(0x7a, 0x7a, 0x7a, 0.5),
-            agent_group_text: Color::from_rgb8(0x6e, 0x74, 0x7a),
             split_handle: Color::from_rgb8(0x3c, 0x42, 0x46),
             split_handle_hover: Color::from_rgb8(0xa0, 0xa4, 0xb0),
         };
@@ -1082,7 +1079,6 @@ mod tests {
             agent_finished: Color::from_rgb8(0x7a, 0x7a, 0x7a),
             agent_failed: Color::from_rgb8(0xe0, 0x52, 0x52),
             agent_inactive: Color::from_rgba8(0x7a, 0x7a, 0x7a, 0.5),
-            agent_group_text: Color::from_rgb8(0x6e, 0x74, 0x7a),
             split_handle: Color::from_rgb8(0x3c, 0x42, 0x46),
             split_handle_hover: Color::from_rgb8(0xa0, 0xa4, 0xb0),
         };
@@ -1233,7 +1229,7 @@ mod tests {
     #[test]
     fn agent_panel_rows_and_heads_are_whole_pixels() {
         assert_eq!(AGENT_PANEL_ROW_HEIGHT, 42.0);
-        assert_eq!(AGENT_PANEL_GROUP_HEIGHT, 24.0);
+        assert_eq!(AGENT_PANEL_GROUP_HEIGHT, 27.0);
         for metric in [
             AGENT_PANEL_HEADER_HEIGHT,
             AGENT_PANEL_LIST_PADDING_Y,

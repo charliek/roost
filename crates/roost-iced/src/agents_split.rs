@@ -1373,7 +1373,7 @@ mod tests {
         // `panel_height`'s floors (app/agents_panel.rs).
         let priority = HEADER + chrome::AGENT_PANEL_LIST_PADDING_Y + chrome::AGENT_PANEL_ROW_HEIGHT;
         let grouped = priority + chrome::AGENT_PANEL_GROUP_HEIGHT;
-        assert_eq!((priority, grouped), (77.0, 101.0));
+        assert_eq!((priority, grouped), (77.0, 104.0));
         let below = 300.0 - DIVIDER;
         let at = |panel: f32| 300.0 - DIVIDER - panel + 3.0;
 
@@ -1384,7 +1384,7 @@ mod tests {
         assert_eq!(wired.shown(), 88.0 / below);
         wired.floor = grouped;
         let held = wired.laid();
-        assert_eq!(held.panel, 101.0);
+        assert_eq!(held.panel, grouped);
         wired.step(&release(), at(88.0));
         assert_eq!(wired.stored, 88.0 / below, "the share the drag published");
         assert_eq!(wired.laid(), held, "the release moved the divider");
@@ -1394,12 +1394,12 @@ mod tests {
         let mut wired = Wired::new(300.0, grouped);
         wired.press_at(wired.laid().projects + 3.0);
         wired.step(&moved(at(50.0)), at(50.0));
-        assert_eq!(wired.shown(), 101.0 / below);
+        assert_eq!(wired.shown(), grouped / below);
         wired.floor = priority;
         let held = wired.laid();
-        assert_eq!(held.panel, 101.0);
+        assert_eq!(held.panel, grouped);
         wired.step(&release(), at(50.0));
-        assert_eq!(wired.stored, 101.0 / below);
+        assert_eq!(wired.stored, grouped / below);
         assert_eq!(wired.laid(), held, "the release moved the divider");
 
         // A window that shrinks under the project list's floor.

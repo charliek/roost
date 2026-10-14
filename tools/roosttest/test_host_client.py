@@ -3750,9 +3750,8 @@ def test_a_hosts_agent_is_listed_under_its_host_qualified_key_and_names_its_host
 ):
     """D3/D10: the panel lists a host's agent under the `h<host>.<id>` key
     the tab ops take, and because the sidebar draws the local band and
-    this host's, the row's text names the host — its band label in the
-    head, as written in the location. A dropped connection keeps the row,
-    dimmed."""
+    this host's, the row's text names the host as saved, in the head and
+    the location alike. A dropped connection keeps the row, dimmed."""
     host.connect_and_wait()
     with host.client() as session:
         project = first_project(session)
@@ -3775,7 +3774,7 @@ def test_a_hosts_agent_is_listed_under_its_host_qualified_key_and_names_its_host
 
         assert len(roost.sidebar_sections()) > 1
         if entry["sort"] == "grouped":
-            assert entry["head"]["label"] == f"{host.label.upper()} › {project_name}", entry
+            assert entry["head"]["label"] == f"{host.label} › {project_name}", entry
             assert entry["location_text"] == "", entry
         else:
             assert entry["location_text"] == f"{host.label} › {project_name}", entry

@@ -221,7 +221,7 @@ def test_grouped_heads_each_project_with_its_count(roost, project, project2, own
 
     def head(pid: int) -> str:
         name = roost.project(pid)["name"]
-        return f"LOCAL{SEPARATOR}{name}" if multi_host else name
+        return f"local{SEPARATOR}{name}" if multi_host else name
 
     groups = _groups(panel)
     labels = [label for label, _, _ in groups]
@@ -380,7 +380,7 @@ ROW_HEIGHT = 32
 PROJECTS_FLOOR = BAND_HEIGHT + 2 * ROW_HEIGHT
 # `app/agents_panel.rs`'s `panel_height` under `grouped`: the header, the
 # list padding, a group head and one whole agent row.
-GROUPED_PANEL_FLOOR = BAND_HEIGHT + 3 + 24 + 42
+GROUPED_PANEL_FLOOR = BAND_HEIGHT + 3 + 27 + 42
 # The panel's header (`AGENT_PANEL_HEADER_HEIGHT`), which stays even where
 # the project list's floor leaves less.
 PANEL_HEADER = BAND_HEIGHT

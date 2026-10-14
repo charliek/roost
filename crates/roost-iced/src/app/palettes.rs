@@ -2534,14 +2534,14 @@ mod tests {
     #[test]
     fn the_panel_reads_local_for_the_slot_and_localhost_for_a_saved_host() {
         let head = |on_slot| {
-            roost_ui_model::agent_panel::group_label(
+            roost_ui_model::agent_panel::location_text(
                 agent_source_label("localhost", on_slot),
                 "roost",
                 true,
             )
         };
-        assert_eq!(head(true), "LOCAL \u{203a} roost");
-        assert_eq!(head(false), "LOCALHOST \u{203a} roost");
+        assert_eq!(head(true), "local \u{203a} roost");
+        assert_eq!(head(false), "localhost \u{203a} roost");
     }
 
     /// Every row that dispatches an engine op dismisses the palette

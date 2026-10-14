@@ -213,7 +213,7 @@ impl App {
             container(
                 text(EMPTY_TEXT)
                     .size(chrome::AGENT_PANEL_EMPTY_SIZE)
-                    .color(self.chrome.host_rollup_text)
+                    .color(self.chrome.muted_text)
                     .wrapping(Wrapping::None),
             )
             .width(Fill)
@@ -286,7 +286,7 @@ impl App {
         budget: f32,
     ) -> Element<'_, Message> {
         let font = chrome::chrome_font(font::Weight::Semibold);
-        let color = self.chrome.agent_group_text;
+        let color = self.chrome.muted_text;
         let label =
             self.sidebar_elisions
                 .elide(label, font, chrome::AGENT_PANEL_GROUP_SIZE, budget);

@@ -1724,7 +1724,7 @@ change shows in the very next dump, with no event in between.
   "agent_panel": {
     "visible": true, "sort": "grouped", "fraction_permille": 370,
     "entries": [
-      { "kind": "group", "label": "WORKBENCH › craze", "count": 1 },
+      { "kind": "group", "label": "workbench › craze", "count": 1 },
       { "kind": "agent", "tab": "h3.9", "name": "e2e flake hunt",
         "agent": "Claude Code", "lifecycle": "failed", "location_text": "",
         "status_text": "Failed", "time_text": "14m",
@@ -1752,8 +1752,9 @@ change shows in the very next dump, with no event in between.
   commits the last one.
 - `entries` — tagged by `kind`:
     - `"group"` — a `grouped` head for one host's project: `label` as drawn
-      (`LOCAL › roost`, `WORKBENCH › craze`, or the bare project name
-      while the sidebar draws a single band), and `count`, the agent
+      (`local › roost`, `workbench › craze` — the host's label as saved,
+      `local` for this machine — or the bare project name while the
+      sidebar draws a single band), and `count`, the agent
       entries that follow it.
     - `"agent"` — one agent-owned tab. `tab` is the key the tab ops take
       (`"7"` in this UI's workspace, `"h3.9"` on a host); `agent` is the

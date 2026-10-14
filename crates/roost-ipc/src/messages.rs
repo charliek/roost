@@ -5553,7 +5553,7 @@ mod tests {
                 fraction_permille: 370,
                 entries: vec![
                     SidebarDumpPanelEntry::Group {
-                        label: "POPOS › craze".to_string(),
+                        label: "popos › craze".to_string(),
                         count: 1,
                     },
                     SidebarDumpPanelEntry::Agent {

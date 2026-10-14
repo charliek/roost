@@ -17,15 +17,12 @@ use crate::agent_palette::{
     agent_display_name, agent_owner, elapsed_text, normalize_line, row_name, status_text,
     AgentSource,
 };
-use crate::host_sidebar;
 use crate::keys::{HostId, ProjectKey, TabKey};
 
-/// Between a row's host and its project: `LOCAL › roost`.
+/// Between a row's host and its project: `local › roost`.
 const HOST_SEPARATOR: &str = " \u{203a} ";
 
-/// A local row's host, as a row's location line spells it. Its group head
-/// spells it [`host_sidebar::LOCAL_LABEL`] — the same word, uppercased the
-/// way every band label is.
+/// A local row's host, as a location line and a group head spell it.
 const LOCAL_HOST: &str = "local";
 
 /// How the panel orders its rows: `agent-panel-sort`.
@@ -175,7 +172,7 @@ pub fn panel_entries(
                 .chunk_by(|a, b| a.project == b.project)
                 .flat_map(|group| {
                     let head = PanelEntry::Group {
-                        label: group_label(
+                        label: location_text(
                             group[0].panel_label.as_deref(),
                             &group[0].project_name,
                             multi_host,
@@ -190,19 +187,7 @@ pub fn panel_entries(
     sorted.iter().map(agent).collect()
 }
 
-/// A group head for a row's [`PanelAgentRow::panel_label`] and project:
-/// `LOCAL › roost`, `POPOS › craze`, or the bare project name when the
-/// sidebar draws one band. The host part is uppercased like its band; the
-/// project name is kept as written.
-pub fn group_label(panel_label: Option<&str>, project_name: &str, multi_host: bool) -> String {
-    if !multi_host {
-        return project_name.to_string();
-    }
-    let host = host_sidebar::section_label(panel_label.unwrap_or(LOCAL_HOST));
-    format!("{host}{HOST_SEPARATOR}{project_name}")
-}
-
-/// A row's location line outside Grouped: `local › roost`, `popos ›
+/// A group head and a row's location line: `local › roost`, `popos ›
 /// craze` (the saved label as written), or the bare project name when the
 /// sidebar draws one band.
 pub fn location_text(panel_label: Option<&str>, project_name: &str, multi_host: bool) -> String {
@@ -497,7 +482,7 @@ mod tests {
                 &bands(&[SLOT, POPOS]),
                 true
             )),
-            vec!["[LOCAL › roost (1)]", "h5.1", "[POPOS › craze (1)]", "h2.1"]
+            vec!["[local › roost (1)]", "h5.1", "[popos › craze (1)]", "h2.1"]
         );
         assert_eq!(
             sorted(&rows, AgentPanelSort::Priority, &bands(&[SLOT, POPOS])),
@@ -507,7 +492,7 @@ mod tests {
     }
 
     /// Under `in-process` a saved host labelled `localhost` is an ordinary
-    /// host in its registry place, reading `LOCALHOST`. The local source
+    /// host in its registry place, reading `localhost`. The local source
     /// is passed last so the order can only have come from the bands.
     #[test]
     fn grouped_puts_the_in_process_local_first_and_a_saved_localhost_in_its_band() {
@@ -530,11 +515,11 @@ mod tests {
                 true
             )),
             vec![
-                "[LOCAL › roost (1)]",
+                "[local › roost (1)]",
                 "1",
-                "[POPOS › craze (1)]",
+                "[popos › craze (1)]",
                 "h2.1",
-                "[LOCALHOST › scratch (1)]",
+                "[localhost › scratch (1)]",
                 "h5.1",
             ]
         );
@@ -574,7 +559,7 @@ mod tests {
                 &bands(&[HostId::LOCAL, POPOS]),
                 true
             )),
-            vec!["[LOCAL › roost (1)]", "3", "[POPOS › roost (1)]", "h2.3"]
+            vec!["[local › roost (1)]", "3", "[popos › roost (1)]", "h2.3"]
         );
     }
 
@@ -664,39 +649,17 @@ mod tests {
         }
     }
 
-    /// One band → no host part anywhere; more than one → `LOCAL` for this
-    /// machine and the saved label for any other host, uppercased in a
-    /// head and as written in a location. The project keeps its case.
+    /// One band → no host part; more than one → `local` for this machine
+    /// and the saved label as written for any other host. The project
+    /// keeps its case.
     #[test]
     fn labels_name_hosts_only_when_the_sidebar_draws_several_bands() {
-        let both = |label: Option<&str>, multi_host| {
-            (
-                group_label(label, "Roost", multi_host),
-                location_text(label, "Roost", multi_host),
-            )
-        };
-        let bare = ("Roost".to_string(), "Roost".to_string());
-        assert_eq!(both(None, false), bare);
-        assert_eq!(both(Some("PopOS-box"), false), bare);
-
-        let named = |head: &str, location: &str| (head.to_string(), location.to_string());
-        assert_eq!(both(None, true), named("LOCAL › Roost", "local › Roost"));
-        assert_eq!(
-            both(Some("PopOS-box"), true),
-            named("POPOS-BOX › Roost", "PopOS-box › Roost")
-        );
-        assert_eq!(
-            both(Some("localhost"), true),
-            named("LOCALHOST › Roost", "localhost › Roost")
-        );
-    }
-
-    #[test]
-    fn the_local_head_is_the_reserved_band_label() {
-        assert_eq!(
-            host_sidebar::section_label(LOCAL_HOST),
-            host_sidebar::LOCAL_LABEL
-        );
+        let both = |label: Option<&str>, multi_host| location_text(label, "Roost", multi_host);
+        assert_eq!(both(None, false), "Roost");
+        assert_eq!(both(Some("PopOS-box"), false), "Roost");
+        assert_eq!(both(None, true), "local › Roost");
+        assert_eq!(both(Some("PopOS-box"), true), "PopOS-box › Roost");
+        assert_eq!(both(Some("localhost"), true), "localhost › Roost");
     }
 
     /// A4: over live rows, Priority is exactly the agents palette's order.
