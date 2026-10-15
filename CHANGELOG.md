@@ -11,6 +11,16 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+## v0.0.25 — 2026-10-15
+
+_The Agents panel release (#629): Roost-Iced's sidebar lists every agent
+on every host in one panel under the projects, with a divider you drag
+and a sort you pick, in place of the agent rows nested under each
+project. Jumping to a tab from the agents or notifications palette, Jump
+to Unread or a notification banner no longer opens a collapsed sidebar,
+and a sidebar width drag now survives a toast expiring or a quit. The
+Swift app is unchanged. There is no session-protocol bump._
+
 ### Added
 
 - **Sidebar Agents panel** — Roost-Iced's sidebar lists every agent on
