@@ -1,0 +1,7 @@
+{
+  "id": "43",
+  "op": "sidebar.set_agents_fraction",
+  "params": {
+    "fraction": 0.6
+  }
+}

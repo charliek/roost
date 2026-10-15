@@ -422,6 +422,8 @@ fn a_sidebar_dump_response_without_hosts_still_decodes() {
         serde_json::from_value(resp["result"].clone()).expect("decode a Mac-shaped result");
     assert!(result.hosts.is_empty());
     assert_eq!(result.projects.len(), 2);
+    // Nor an `agent_panel` (plan 080 D10): the Agents panel is iced-only.
+    assert!(result.agent_panel.is_none());
 }
 
 /// `app.notice_dump` into its typed shapes: `generation` is a plain

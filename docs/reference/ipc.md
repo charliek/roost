@@ -1710,6 +1710,65 @@ classic single sticky `PROJECTS` header instead of a strip:
 `in-process` with no saved hosts, which is also every Swift Mac reply —
 the same absent-tolerant contract `hosts` uses, for the same reason.
 
+#### `agent_panel` — the Agents panel (plan 080)
+
+Roost-Iced's sidebar lists its agents in one panel below the projects:
+every agent on every host the sidebar draws, in the order the panel's
+sort puts them. `agent_panel` is that list, derived from the same row
+cache the panel paints from at the moment of the read — so a sort
+change shows in the very next dump, with no event in between.
+
+```json
+{ "agents_visible": true,
+  "projects": [ ... ],
+  "agent_panel": {
+    "visible": true, "sort": "grouped", "fraction_permille": 370,
+    "entries": [
+      { "kind": "group", "label": "workbench › craze", "count": 1 },
+      { "kind": "agent", "tab": "h3.9", "name": "e2e flake hunt",
+        "agent": "Claude Code", "lifecycle": "failed", "location_text": "",
+        "status_text": "Failed", "time_text": "14m",
+        "is_active": false, "dimmed": true } ] } }
+```
+
+- `visible` — the `show-sidebar-agents` toggle, the same value as
+  `agents_visible`. `entries` stays populated while the panel is hidden.
+- `sort` — `"grouped"` | `"priority"` | `"recent"`, the
+  `agent-panel-sort` key.
+- `fraction_permille` — the panel's share of the sidebar below the
+  project list, in thousandths: the dragged value while the divider is
+  being dragged, else the remembered one, which
+  [`sidebar.set_agents_fraction`](#sidebarset_agents_fraction-test-only-gated)
+  sets — `370` until a drag or the op first sets one. While the panel is
+  shown its divider is drawn at that share whether or not any agent is
+  running: an empty panel says "No agents running" under its header and
+  keeps its height. The panel draws at least its header and room for one
+  whole row (under `grouped`, a group head too), agents or not, and the
+  project list at least a band and two rows, unless the sidebar is too
+  short for both: then the project list keeps its floor and the panel
+  gets what is left, down to its header. Those floors clamp only how a
+  share is drawn: a remembered or op-set value is kept as given. A drag
+  publishes the share drawn at each of its moves, and its release
+  commits the last one.
+- `entries` — tagged by `kind`:
+    - `"group"` — a `grouped` head for one host's project: `label` as drawn
+      (`local › roost`, `workbench › craze` — the host's label as saved,
+      `local` for this machine — or the bare project name while the
+      sidebar draws a single band), and `count`, the agent
+      entries that follow it.
+    - `"agent"` — one agent-owned tab. `tab` is the key the tab ops take
+      (`"7"` in this UI's workspace, `"h3.9"` on a host); `agent` is the
+      agent's display name as the agents palette shows it; `location_text`
+      is the row's `[host › ]project` line, `""` under `grouped`, where
+      the head says it; `is_active` is whether it is the active tab;
+      `dimmed` marks a disconnected host's last-known agent, listed but
+      not pressable.
+
+Every text field is the full string, never the width-elided one the
+panel draws. Under `local-backend = session` the in-process workspace is
+not drawn, so its agents are not listed. The Swift Mac app has no panel
+and **omits** `agent_panel`, so read it as absent-tolerant.
+
 Ungated, read-only — always available, matching `app.window_metrics`.
 
 ### `app.notice_dump`
@@ -2348,6 +2407,31 @@ And the op is not defined concurrent with a live pointer drag of the
 seam: a drag in flight re-anchors on its press-time width and its
 release wins. Harnesses drive one or the other, never both at once.
 
+### `sidebar.set_agents_fraction` *(test-only — gated)*
+
+**Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
+Without it the server returns `not-enabled`. Sets the share of the
+sidebar the [Agents panel](#agent_panel-the-agents-panel-plan-080) takes
+below its divider — the programmatic twin of dragging that divider, as
+`sidebar.set_width` is of dragging the seam.
+
+Request: `{"params": {"fraction": 0.6}}`. Response: `{}`.
+
+The UI routes the fraction through the workspace, which **clamps** it to
+`[0.15, 0.85]` and persists it (`agents_panel_fraction` in `state.json`),
+so an out-of-band fraction succeeds and lands on the nearest bound. Read
+it back as `app.sidebar_dump`'s `agent_panel.fraction_permille`.
+`fraction` must be finite and positive; anything else is rejected with
+`invalid-param` before reaching the UI.
+
+The fraction is kept as given within that band: the floors listed under
+[`fraction_permille`](#agent_panel-the-agents-panel-plan-080) clamp only
+how it is drawn, so a short window shows less than a stored `0.85`. The op
+ends a divider drag in flight, committing one that has moved first, so the
+op's fraction stands until the next press.
+
+Implemented by the iced UI only; the Swift app answers `unknown-op`.
+
 ### Host bootstrap test ops (`app.dialog_dump` / `app.dialog_answer` / `app.keybind_dispatch`) *(test-only — gated)*
 
 **Requires `ROOST_TEST_MODE=1` set in the UI's launch environment.**
@@ -2723,8 +2807,9 @@ render, so this row can never disagree with them. `metrics_text` is
 present once resolved — `"—"` for a clean repo, a non-repo cwd, or any
 probe failure/timeout; otherwise `"<n>f +<adds> -<dels>"` (minus is
 ASCII `-`) — so pending vs. resolved is observable on the wire. Activating
-an `agent:<id>` row jumps to that tab (revealing the sidebar if it was
-collapsed); the empty-state row (`"agents:empty"`) is not actionable.
+an `agent:<id>` row jumps to that tab (Roost-Iced leaves a collapsed
+sidebar collapsed; the Swift app reveals it); the empty-state row
+(`"agents:empty"`) is not actionable.
 
 | Op | Request params | Notes |
 |---|---|---|

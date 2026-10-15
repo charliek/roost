@@ -1521,6 +1521,10 @@ impl App {
                     self.clear_palette_state();
                     self.toggle_sidebar_agents();
                 }
+                "cycle_agent_panel_sort" => {
+                    self.clear_palette_state();
+                    dispatch.task = self.cycle_agent_panel_sort();
+                }
                 SECURE_INPUT_ROW_ID => {
                     self.clear_palette_state();
                     self.toggle_secure_input();
@@ -1559,7 +1563,7 @@ impl App {
                         self.active_project_key(),
                     );
                     if let Some(tab) = target {
-                        self.focus_tab_and_clear(tab, true)?;
+                        self.focus_tab_and_clear(tab)?;
                     }
                     self.clear_palette_state();
                 }
@@ -1621,13 +1625,13 @@ impl App {
             agent_palette::FRAME_ID => {
                 let tab = agent_palette::agent_tab_key(&item.id)
                     .ok_or_else(|| format!("agent row {:?} cannot be activated", item.id))?;
-                self.focus_tab_and_clear(tab, true)?;
+                self.focus_tab_and_clear(tab)?;
                 self.clear_palette_state();
             }
             "notifications" => {
                 let tab = notification_inbox::tab_key(&item.id)
                     .ok_or_else(|| format!("notification row {:?} cannot be activated", item.id))?;
-                self.focus_tab_and_clear(tab, true)?;
+                self.focus_tab_and_clear(tab)?;
                 self.clear_palette_state();
             }
             "custom" => {
@@ -2232,22 +2236,41 @@ impl App {
     /// its rows cannot be activated, and a palette row that does nothing
     /// is worse than a row that is not there.
     fn agent_sources<'a>(&'a self, local: &'a [Project]) -> Vec<agent_palette::AgentSource<'a>> {
-        let mut sources = Vec::with_capacity(self.host_views.len() + 1);
-        sources.push(agent_palette::AgentSource::local(
+        let mut sources = self.all_agent_sources(local);
+        sources.retain(|source| !source.dimmed);
+        sources
+    }
+
+    /// The local workspace's agents, then every host view's in registry
+    /// order, connected or not — the order both the palette and the
+    /// Agents panel break ties in.
+    pub(super) fn all_agent_sources<'a>(
+        &'a self,
+        local: &'a [Project],
+    ) -> Vec<agent_palette::AgentSource<'a>> {
+        std::iter::once(agent_palette::AgentSource::local(
             local,
             self.backend.host(),
-        ));
-        sources.extend(
+        ))
+        .chain(
             self.host_views
                 .iter()
-                .filter(|view| view.state.interactive())
-                .map(|view| agent_palette::AgentSource {
-                    projects: &view.projects,
-                    host: view.host,
-                    label: agent_source_label(&view.label, self.is_local_slot(view.host)),
-                }),
-        );
-        sources
+                .map(|view| self.host_agent_source(view)),
+        )
+        .collect()
+    }
+
+    /// One host view as an agent source, connected or not: a view that
+    /// is not interactive comes out `dimmed`.
+    fn host_agent_source<'a>(&self, view: &'a super::HostView) -> agent_palette::AgentSource<'a> {
+        let label = agent_source_label(&view.label, self.is_local_slot(view.host));
+        agent_palette::AgentSource {
+            projects: &view.projects,
+            host: view.host,
+            label,
+            dimmed: !view.state.interactive(),
+            panel_label: label,
+        }
     }
 
     /// The agents frame as of right now, across every host.
@@ -2476,10 +2499,11 @@ impl App {
     }
 }
 
-/// [`App::agent_sources`]'s label for one host view (#567): the session
-/// slot reads as local everywhere else (plan 071 D8), so its agent rows
-/// carry no host label either. A real host the user named "localhost"
-/// under in-process mode keeps its own.
+/// [`App::host_agent_source`]'s label for one host view, for the palette
+/// (#567) and the Agents panel (plan 080 D3) alike: the session slot reads
+/// as local everywhere else (plan 071 D8), so its agent rows carry no host
+/// label either. A real host the user named "localhost" under in-process
+/// mode keeps its own.
 fn agent_source_label(label: &str, on_slot: bool) -> Option<&str> {
     (!on_slot).then_some(label)
 }
@@ -2503,6 +2527,21 @@ mod tests {
     fn agent_source_label_drops_only_for_the_slot() {
         assert_eq!(agent_source_label("localhost", true), None);
         assert_eq!(agent_source_label("localhost", false), Some("localhost"));
+    }
+
+    /// Which view is the slot is `is_local_slot`'s (mode-gated) answer,
+    /// passed in here as `on_slot`.
+    #[test]
+    fn the_panel_reads_local_for_the_slot_and_localhost_for_a_saved_host() {
+        let head = |on_slot| {
+            roost_ui_model::agent_panel::location_text(
+                agent_source_label("localhost", on_slot),
+                "roost",
+                true,
+            )
+        };
+        assert_eq!(head(true), "local \u{203a} roost");
+        assert_eq!(head(false), "localhost \u{203a} roost");
     }
 
     /// Every row that dispatches an engine op dismisses the palette

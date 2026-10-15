@@ -71,6 +71,14 @@ pub struct SnapshotFile {
     /// [`SIDEBAR_MAX_WIDTH`]: crate::SIDEBAR_MAX_WIDTH
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f64,
+    /// The sidebar's Agents panel's share of the height below its
+    /// divider (plan 080 D8), so a relaunch restores the user's drag.
+    /// Only the iced UI sets it, so it is omitted while `None`, like
+    /// `window`: the daemon's file and every file that never stored one
+    /// stay what older builds wrote. Restored through the workspace,
+    /// which clamps it and drops a non-finite one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents_panel_fraction: Option<f64>,
     /// The UI window's frame at save time, so a relaunch reopens it
     /// where it was (plan 074 §D5b). Only the macOS iced UI writes it —
     /// Ghostty remembers the frame on macOS alone — so it is omitted
@@ -116,6 +124,7 @@ impl Default for SnapshotFile {
             active_tab_position: 0,
             sidebar_collapsed: false,
             sidebar_width: default_sidebar_width(),
+            agents_panel_fraction: None,
             window: None,
             hosts: Vec::new(),
             recent_hosts: Vec::new(),
@@ -374,6 +383,7 @@ mod tests {
             active_tab_position: 1,
             sidebar_collapsed: true,
             sidebar_width: 300.0,
+            agents_panel_fraction: Some(0.6),
             window: Some(WindowFrame {
                 content_width: 1280.0,
                 content_height: 800.0,
@@ -510,6 +520,22 @@ mod tests {
     }
 
     #[test]
+    fn a_file_without_an_agents_panel_fraction_rewrites_without_one() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("state.json");
+        std::fs::write(&p, br#"{"next_id":5,"projects":[],"sidebar_width":220.0}"#).unwrap();
+        let back = read_state(&p).unwrap().expect("present");
+        assert_eq!(back.agents_panel_fraction, None);
+
+        persist_state(&p, &back, false).unwrap();
+        let raw = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            !raw.contains("agents_panel_fraction"),
+            "an unset fraction must not grow the file: {raw}"
+        );
+    }
+
+    #[test]
     fn a_window_frame_is_valid_only_when_finite_with_positive_sizes() {
         let frame = WindowFrame {
             content_width: 900.0,
@@ -614,6 +640,11 @@ mod tests {
             SnapshotFile::default().sidebar_width,
             crate::workspace::SIDEBAR_DEFAULT_WIDTH
         );
+    }
+
+    #[test]
+    fn default_snapshot_carries_no_agents_panel_fraction() {
+        assert_eq!(SnapshotFile::default().agents_panel_fraction, None);
     }
 
     #[test]

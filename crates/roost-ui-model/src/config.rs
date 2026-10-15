@@ -16,6 +16,7 @@ use roost_agent::{Agent, ALL_AGENTS};
 use roost_ipc::LocalBackendMode;
 use roost_vt::OptionAsAlt;
 
+use crate::agent_panel::AgentPanelSort;
 use crate::custom_command::{self, CustomCommand};
 use crate::keybind::{self, AccelMods};
 use crate::provider::{self, Provider};
@@ -71,12 +72,19 @@ pub struct RoostConfig {
     /// only; Linux's Alt is already Meta.
     pub macos_option_as_alt: OptionAsAlt,
 
-    /// `show-sidebar-agents` — whether the sidebar renders one row
-    /// per agent-owned tab under its project (plan 007). Defaults to
-    /// `true`. Toggled at runtime via the `toggle_sidebar_agents`
-    /// keybind / palette row / Mac View menu item, which writes the
-    /// live value straight back here through `set_key`.
+    /// `show-sidebar-agents` — whether the sidebar shows its Agents
+    /// panel and the project rows' agent counts (plan 080 D2; the Swift
+    /// app's per-project agent rows, plan 007). Defaults to `true`.
+    /// Toggled at runtime via the `toggle_sidebar_agents` keybind /
+    /// palette row / Mac View menu item, which writes the live value
+    /// straight back here through `set_key`.
     pub show_sidebar_agents: bool,
+
+    /// `agent-panel-sort` — how the sidebar's Agents panel orders its
+    /// rows (plan 080 D7). Defaults to [`AgentPanelSort::Grouped`], which
+    /// an unparseable value also resolves to. The
+    /// `cycle_agent_panel_sort` action writes it back through `set_key`.
+    pub agent_panel_sort: AgentPanelSort,
 
     /// `agent-hooks` — which coding agents Roost is allowed to wire its
     /// hook entries into, or whether the user has been asked at all
@@ -133,6 +141,7 @@ impl Default for RoostConfig {
             link_modifier: None,
             macos_option_as_alt: OptionAsAlt::default(),
             show_sidebar_agents: true,
+            agent_panel_sort: AgentPanelSort::default(),
             agent_hooks: AgentHooks::default(),
             local_backend: LocalBackend::default(),
             local_backend_key_present: false,
@@ -610,6 +619,18 @@ impl RoostConfig {
                         );
                     }
                 }
+                "agent-panel-sort" => {
+                    if let Some(v) = AgentPanelSort::parse(value) {
+                        cfg.agent_panel_sort = v;
+                    } else {
+                        cfg.agent_panel_sort = AgentPanelSort::default();
+                        tracing::warn!(
+                            value,
+                            "unknown agent-panel-sort value; expected grouped|priority|recent, \
+                             falling back to default `grouped`"
+                        );
+                    }
+                }
                 "macos-auto-secure-input" => {
                     cfg.macos_auto_secure_input = parse_bool_like(value).unwrap_or_else(|| {
                         tracing::warn!(
@@ -958,7 +979,7 @@ impl ConfigLock {
 /// `command = …` entries are accumulated by the parser into vectors;
 /// calling `set_key("keybind", …)` would collapse every keybind line
 /// into one. Restrict callers to single-valued keys (`theme`,
-/// `font-family`, `font-size`, `show-sidebar-agents`).
+/// `font-family`, `font-size`, `show-sidebar-agents`, `agent-panel-sort`).
 ///
 /// `value` is written verbatim — callers are responsible for adding
 /// surrounding quotes when the value contains spaces (`font-family`
@@ -1594,6 +1615,63 @@ mod tests {
     fn show_sidebar_agents_unknown_value_keeps_default() {
         let cfg = RoostConfig::parse("show-sidebar-agents = pancakes");
         assert!(cfg.show_sidebar_agents);
+    }
+
+    #[test]
+    fn agent_panel_sort_defaults_to_grouped() {
+        assert_eq!(
+            RoostConfig::parse("").agent_panel_sort,
+            AgentPanelSort::Grouped
+        );
+    }
+
+    #[test]
+    fn agent_panel_sort_accepts_its_three_values_in_any_case() {
+        for (line, want) in [
+            ("agent-panel-sort = grouped", AgentPanelSort::Grouped),
+            ("agent-panel-sort = priority", AgentPanelSort::Priority),
+            ("agent-panel-sort = recent", AgentPanelSort::Recent),
+            ("agent-panel-sort = Priority", AgentPanelSort::Priority),
+            ("agent-panel-sort = RECENT", AgentPanelSort::Recent),
+            ("agent-panel-sort = \"recent\"", AgentPanelSort::Recent),
+            (
+                "agent-panel-sort =   priority  \r\n",
+                AgentPanelSort::Priority,
+            ),
+        ] {
+            assert_eq!(RoostConfig::parse(line).agent_panel_sort, want, "{line:?}");
+        }
+    }
+
+    /// A6: a value this build does not know warns and reads as `grouped`.
+    #[test]
+    fn agent_panel_sort_unknown_value_falls_back_to_grouped() {
+        for line in [
+            "agent-panel-sort = state",
+            "agent-panel-sort = ",
+            "agent-panel-sort = priority\nagent-panel-sort = state",
+        ] {
+            assert_eq!(
+                RoostConfig::parse(line).agent_panel_sort,
+                AgentPanelSort::Grouped,
+                "{line:?}"
+            );
+        }
+    }
+
+    /// What the cycle action writes is what the next launch reads.
+    #[test]
+    fn agent_panel_sort_round_trips_through_set_key() {
+        let mut file = "agent-panel-sort = grouped\n".to_string();
+        for sort in [
+            AgentPanelSort::Priority,
+            AgentPanelSort::Recent,
+            AgentPanelSort::Grouped,
+        ] {
+            file = render_set_key(&file, "agent-panel-sort", sort.as_str());
+            assert_eq!(RoostConfig::parse(&file).agent_panel_sort, sort, "{file:?}");
+        }
+        assert_eq!(file, "agent-panel-sort = grouped\n");
     }
 
     #[test]

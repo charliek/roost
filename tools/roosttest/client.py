@@ -364,6 +364,13 @@ class Roost:
         back with window_metrics()."""
         self.call("sidebar.set_width", {"width": float(width)})
 
+    def sidebar_set_agents_fraction(self, fraction: float) -> None:
+        """Test-mode only, iced only — set the Agents panel's share of the
+        sidebar below its divider. The UI clamps to [0.15, 0.85] through
+        the workspace; read it back as sidebar_dump()'s
+        agent_panel.fraction_permille."""
+        self.call("sidebar.set_agents_fraction", {"fraction": float(fraction)})
+
     def sidebar_dump(self) -> dict:
         """{agents_visible, projects: [{project_id, agents: [{tab_id,
         name, lifecycle, status_text, time_text, is_active}]}],
@@ -391,7 +398,13 @@ class Roost:
         band is itself a host. Omitted when the sidebar draws its classic
         single sticky `PROJECTS` header instead of a strip (in-process
         with no saved hosts, and every Swift reply), so read it with
-        `.get("sections", [])`."""
+        `.get("sections", [])`.
+
+        `agent_panel` is iced's Agents panel (plan 080): {visible, sort,
+        fraction_permille, entries: [{kind: "group", label, count} |
+        {kind: "agent", tab, name, agent, lifecycle, location_text,
+        status_text, time_text, is_active, dimmed}]}, every host's agents
+        in the panel's order, text in full. The Swift app omits it."""
         return self.call("app.sidebar_dump", {})
 
     def sidebar_hosts(self) -> list[dict]:

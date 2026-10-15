@@ -1,7 +1,8 @@
 """Sidebar agent-row pixel guards — plan 007, both targets
 (`--roost-target mac|iced`). The only two things about the rendered rows
 that `app.sidebar_dump` cannot see: the lifecycle DOT COLOUR and the
-column the dots line up in.
+column the dots line up in. On iced the rows are the Agents panel's at the
+bottom of the sidebar (plan 080); on mac they sit under each project.
 
 Low-flake by construction, so the scope is deliberately narrow:
 
@@ -25,7 +26,9 @@ filter is what makes the reads unambiguous: the project row's 3px
 lifecycle stripe wears the same four colours but is too narrow, and
 antialiased grey text pixels near `#7a7a7a` are too small. The scan is
 also clipped to the sidebar's own width, so the tab pill's status dot
-(same palette, different chrome) can't be mistaken for a sidebar dot.
+(same palette, different chrome) can't be mistaken for a sidebar dot —
+and on iced to the panel's dot column, since a waiting or failed row's
+status text wears its dot's colour too.
 
 `window.resize` is test-mode-gated, so the file skips without
 `ROOST_TEST_MODE=1` — same convention as `test_sidebar_layout.py`.
@@ -84,8 +87,15 @@ ICED_ACTIVE_PROJECT = (0x13, 0x50, 0x9D)
 # invariant — every dot on one edge — is asserted exactly below; this
 # band only catches gross indentation, which is the regression it exists
 # for (the dot was 10px past the project name and still is caught).
-DOT_LEFT_X = {"iced": 25, "mac": 25}
+#
+# Iced's is the Agents panel's dot (plan 080 D5): the row's 6px inset, its
+# 12px leading padding and the 3px that centre the 8px dot in its 14px slot.
+DOT_LEFT_X = {"iced": 21, "mac": 25}
 DOT_LEFT_TOLERANCE = {"iced": 2, "mac": 3}
+# How far either side of iced's dot column the scan reaches — enough for
+# the tolerance band, never as far as the name or status text beside it.
+ICED_DOT_COLUMN_SLACK = 4
+DOT_SIZE = 8
 
 # Both UIs draw an 8x8 rounded dot (AppKit uses a 4px radius; Iced uses
 # 3px to retain a solid renderer-neutral edge). The saturated core is
@@ -155,10 +165,18 @@ def _blobs(
     ]
 
 
-def _dot_blobs(shot, max_x: int) -> dict[str, list[tuple[int, int, int, int]]]:
-    """Solid, dot-sized blobs of each lifecycle colour within `max_x`."""
+def _dot_column(target: str, sidebar_w: int) -> tuple[int, int]:
+    """The x range [x0, x1) the dots are looked for in."""
+    if target != "iced":
+        return 0, sidebar_w
+    left = DOT_LEFT_X["iced"] - ICED_DOT_COLUMN_SLACK
+    return left, min(sidebar_w, DOT_LEFT_X["iced"] + DOT_SIZE + ICED_DOT_COLUMN_SLACK)
+
+
+def _dot_blobs(shot, x0: int, x1: int) -> dict[str, list[tuple[int, int, int, int]]]:
+    """Solid, dot-sized blobs of each lifecycle colour within [x0, x1)."""
     return {
-        name: _blobs(shot, color, x1=max_x, tol=COLOR_TOL, min_side=MIN_DOT_SIDE)
+        name: _blobs(shot, color, x0=x0, x1=x1, tol=COLOR_TOL, min_side=MIN_DOT_SIDE)
         for name, color in LIFECYCLE_COLORS.items()
     }
 
@@ -253,7 +271,7 @@ def test_lifecycle_dot_colors_and_shared_left_edge(roost, project, target, tmp_p
         shot = _capture(roost, shot_path)
         if shot is None:
             return False
-        blobs = _dot_blobs(shot, sidebar_w)
+        blobs = _dot_blobs(shot, *_dot_column(target, sidebar_w))
         state["shot"], state["blobs"] = shot, blobs
         return all(blobs[name] for name in LIFECYCLE_COLORS)
 
@@ -291,13 +309,13 @@ def test_lifecycle_dot_colors_and_shared_left_edge(roost, project, target, tmp_p
         f"(screenshot: {shot_path})"
     )
 
-    # That shared edge sits where the project label starts. Compared with a
-    # tolerance rather than exactly: the dot's offset is our own CSS/constraint
-    # inset nested inside the toolkit's own row padding, so a different
-    # libadwaita minor on a Linux runner can shift it a pixel or two. The
-    # regression this guards — the dot indented past the project name — was
-    # 10px, so the band still catches it. Asserting the label's own edge
-    # instead would mean measuring antialiased text, which is genuinely flaky.
+    # That shared edge sits at the target's column (`DOT_LEFT_X`). Compared
+    # with a tolerance rather than exactly: the dot's offset is our own inset
+    # nested inside the toolkit's own row padding, and the renderers round a
+    # dot's edge differently, so it can shift a pixel or two. The regression
+    # this guards — a dot indented 10px past where it belongs — is still
+    # caught. Asserting a label's own edge instead would mean measuring
+    # antialiased text, which is genuinely flaky.
     tolerance = DOT_LEFT_TOLERANCE[target]
     assert abs(observed[0] - expected_x) <= tolerance, (
         f"agent dots start at x={observed[0]} on {target}, expected "

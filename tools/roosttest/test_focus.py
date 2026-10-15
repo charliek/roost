@@ -19,7 +19,9 @@ import time
 import pytest
 
 from client import Roost, RoostError, scaled_timeout
+from test_agent_palette import _seed
 from util import (
+    BARE_SHELL_ARGV,
     drain,
     drain_until_match,
     press_new_tab,
@@ -376,3 +378,91 @@ def test_new_tab_leaves_a_collapsed_sidebar_collapsed(roost, project):
         )
     finally:
         set_sidebar_collapsed(roost, False)
+
+
+def _jump_leaves_collapsed_sidebar(roost, project, jump, *, seed_agent=False):
+    """Collapse the sidebar, run `jump(target)` against a background tab,
+    and assert it lands on the target without reopening the sidebar. The
+    target is notified (or agent-seeded) first so every jump surface has
+    a row to activate."""
+    argv = BARE_SHELL_ARGV if seed_agent else None
+    target = roost.open_tab(project, cwd="/tmp", argv=argv)
+    active = roost.open_tab(project, cwd="/tmp")
+    wait_tab_attached(roost, active)
+    Roost._wait(
+        lambda: roost.identify()["active_tab_id"] == active,
+        timeout=4.0,
+        what="the second tab to become active",
+    )
+    if seed_agent:
+        _seed(roost, target, lifecycle="working", name="collapsed-jump")
+    else:
+        roost.notify(target, "CollapsedJump")
+    try:
+        set_sidebar_collapsed(roost, True)
+        jump(target)
+        Roost._wait(
+            lambda: roost.identify()["active_tab_id"] == target,
+            timeout=scaled_timeout(10.0),
+            what="the jump to land on the target tab",
+        )
+        assert roost.window_metrics()["sidebar_collapsed"], (
+            "a jump to a tab expanded a collapsed sidebar"
+        )
+    finally:
+        roost.palette_dismiss()
+        set_sidebar_collapsed(roost, False)
+
+
+def test_agents_palette_jump_leaves_a_collapsed_sidebar_collapsed(roost, project):
+    """Plan 080 R3: choosing an agent in the agents palette focuses its
+    tab and leaves a collapsed sidebar collapsed, like a new tab."""
+
+    def jump(target):
+        roost.palette_dismiss()
+        roost.palette_open(kind="agents")
+        roost.palette_activate(f"agent:{target}")
+
+    _jump_leaves_collapsed_sidebar(roost, project, jump, seed_agent=True)
+
+
+def test_notifications_palette_jump_leaves_a_collapsed_sidebar_collapsed(
+    roost, project, palette
+):
+    """Plan 080 R3: activating a notification-inbox row focuses its tab
+    and leaves a collapsed sidebar collapsed."""
+
+    def jump(target):
+        def inbox_has_target():
+            roost.palette_dismiss()
+            roost.palette_open()
+            st = roost.palette_activate("view_notifications")
+            if f"notif:{target}" in roost.palette_item_ids(st):
+                return True
+            roost.palette_dismiss()
+            return False
+
+        Roost._wait(inbox_has_target, 5.0, "the inbox to list the target tab")
+        roost.palette_activate(f"notif:{target}")
+
+    _jump_leaves_collapsed_sidebar(roost, project, jump)
+
+
+def test_jump_to_unread_leaves_a_collapsed_sidebar_collapsed(roost, project, palette):
+    """Plan 080 R3: Jump to Unread focuses the notified tab and leaves a
+    collapsed sidebar collapsed."""
+
+    def jump(target):
+        def inbox_has_target():
+            roost.palette_dismiss()
+            roost.palette_open()
+            st = roost.palette_activate("view_notifications")
+            found = f"notif:{target}" in roost.palette_item_ids(st)
+            roost.palette_dismiss()
+            return found
+
+        Roost._wait(inbox_has_target, 5.0, "the inbox to list the target tab")
+        roost.palette_open()
+        roost.palette_activate("jump_to_unread")
+
+    _jump_leaves_collapsed_sidebar(roost, project, jump)

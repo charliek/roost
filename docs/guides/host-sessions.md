@@ -181,7 +181,7 @@ Creation follows context, so you never have to think about "which host am I on" 
 | `Cmd-Shift-N` / `Alt-Shift-N` | Opens **New Project on…** — pick LOCAL or any connected host explicitly. |
 | `Cmd-T` / `Alt-T`, or the tab bar's **+** | A new tab on the **project's own host** — a tab can never land on a different host than its project. |
 
-`Cmd-Shift-A` / `Alt-Shift-A` (toggle sidebar agent rows) and the agents palette (`Cmd-Shift-O` / `Alt-Shift-O`) both span every host — a running Claude session on `pop-os` shows up next to a local one, suffixed `project · pop-os` in the palette. See [Keybindings](../getting-started/keybindings.md) for the complete table.
+The sidebar's Agents panel (toggled by `Cmd-Shift-A` / `Alt-Shift-A`) and the agents palette (`Cmd-Shift-O` / `Alt-Shift-O`) both span every host — a running Claude session on `pop-os` shows up next to a local one: under a `POP-OS › project` head in the panel (`pop-os › project` on the row itself when it is sorted by priority or recency), suffixed `project · pop-os` in the palette. A disconnected host's agents stay in the panel, dimmed, until it reconnects. See [Keybindings](../getting-started/keybindings.md) for the complete table.
 
 ## Disconnect vs. Stop
 

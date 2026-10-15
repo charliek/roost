@@ -22,7 +22,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use roost_ipc::agent::{self, AgentLifecycle, Ownership, SOURCE_LEGACY, SOURCE_MANUAL};
 use roost_ipc::messages::{Project, Tab};
 
-use crate::keys::{HostId, TabKey};
+use crate::agent_panel::{self, PanelAgentRow};
+use crate::keys::{HostId, ProjectKey, TabKey};
 use crate::notification_inbox;
 use crate::palette::{AgentRowData, PaletteFrame, PaletteItem};
 
@@ -70,6 +71,16 @@ pub struct AgentSource<'a> {
     /// nothing to disambiguate it from, and a bare install's rows must
     /// read exactly as they do today.
     pub label: Option<&'a str>,
+    /// Whether these rows are listed but cannot be activated: a
+    /// disconnected host's last-known agents in the sidebar's Agents
+    /// panel (plan 080 D4). The palette is never given such a source.
+    pub dimmed: bool,
+    /// The host part of the Agents panel's text (plan 080 D3). `None`
+    /// is this machine — the in-process workspace, or under
+    /// `local-backend = session` the slot — and reads `LOCAL`; any other
+    /// host is its saved label. The palette ignores it and keeps
+    /// [`Self::label`].
+    pub panel_label: Option<&'a str>,
 }
 
 impl<'a> AgentSource<'a> {
@@ -78,6 +89,8 @@ impl<'a> AgentSource<'a> {
             projects,
             host,
             label: None,
+            dimmed: false,
+            panel_label: None,
         }
     }
 }
@@ -98,44 +111,12 @@ pub fn agent_items(projects: &[Project], host: HostId, now: i64) -> Vec<PaletteI
 /// carry `project · host` as their context so the fuzzy filter can find
 /// them by machine.
 pub fn agent_items_across(sources: &[AgentSource<'_>], now: i64) -> Vec<PaletteItem> {
-    let mut rows: Vec<Row> = Vec::new();
-    for (source_index, source) in sources.iter().enumerate() {
-        for project in source.projects {
-            for tab in &project.tabs {
-                let axes = tab.agent_state();
-                let Some(owner) = agent_owner(&axes) else {
-                    continue;
-                };
-                rows.push(row_for(
-                    project,
-                    source,
-                    source_index,
-                    tab,
-                    owner,
-                    agent::effective_lifecycle(&axes),
-                    now,
-                ));
-            }
-        }
-    }
+    let mut rows = agent_panel::panel_rows(sources, now);
     if rows.is_empty() {
         return vec![PaletteItem::new(EMPTY_ROW_ID, EMPTY_ROW_TITLE).with_actionable(false)];
     }
-    // Total order (§3.5): urgency, then recency, then the workspace's
-    // own deterministic layout order. Whole-second `last_event_at` ties
-    // are common, so the positional tiebreaks are load-bearing — and
-    // `source_index` is one of them now, since two hosts' projects can
-    // sit at the same position.
-    rows.sort_by(|a, b| {
-        b.rank
-            .cmp(&a.rank)
-            .then(b.last_event_at.cmp(&a.last_event_at))
-            .then(a.source_index.cmp(&b.source_index))
-            .then(a.project_position.cmp(&b.project_position))
-            .then(a.tab_position.cmp(&b.tab_position))
-            .then(a.tab_id.cmp(&b.tab_id))
-    });
-    rows.into_iter().map(|r| r.item).collect()
+    rows.sort_by(agent_panel::priority_order);
+    rows.into_iter().map(palette_item).collect()
 }
 
 /// The working directory of every tab that gets a row, keyed by tab id.
@@ -165,10 +146,10 @@ pub fn agent_tab_cwds_across(sources: &[AgentSource<'_>]) -> HashMap<TabKey, Str
     cwds
 }
 
-/// One row under a project in the sidebar (plan 007 §3.1) — the same
-/// fields the palette renders, scoped to a single project. There is no
-/// `project` field: the sidebar nests this row under its project
-/// visually, so the row never needs to say which one it's in.
+/// One of a project's agent rows (plan 007 §3.1) — the same fields the
+/// palette renders, scoped to a single project. There is no `project`
+/// field: the rows are keyed by their project, so a row never needs to
+/// say which one it's in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarAgentRow {
     pub tab: TabKey,
@@ -178,54 +159,50 @@ pub struct SidebarAgentRow {
     pub time_text: String,
 }
 
-/// A single project's agent rows, in the palette's within-project order:
-/// rank ↓, `last_event_at` ↓, tab position, tab id. `project_position`
-/// drops out of the key relative to [`agent_items`]'s — every row here
-/// already shares one project, so ordering across projects is the
-/// caller's problem (it owns the project list order already).
-pub fn sidebar_agents(project: &Project, host: HostId, now: i64) -> Vec<SidebarAgentRow> {
-    struct Keyed {
-        rank: u8,
-        last_event_at: i64,
-        tab_position: i32,
-        tab_id: i64,
-        row: SidebarAgentRow,
+/// One project's agent rows built on their own, which is what
+/// [`sidebar_agents_by_project`] must say for that project.
+#[cfg(test)]
+fn sidebar_agents(project: &Project, host: HostId, now: i64) -> Vec<SidebarAgentRow> {
+    let mut rows = agent_panel::panel_rows(
+        &[AgentSource::local(std::slice::from_ref(project), host)],
+        now,
+    );
+    rows.sort_by(agent_panel::within_project_order);
+    rows.iter().map(SidebarAgentRow::from).collect()
+}
+
+/// Every project's agent rows, keyed by project, each project's in
+/// [`agent_panel::within_project_order`]. Ordering across projects is the
+/// caller's problem (it owns the project list order already). A project
+/// with no agent has no entry.
+pub fn sidebar_agents_by_project(
+    rows: &[PanelAgentRow],
+) -> HashMap<ProjectKey, Vec<SidebarAgentRow>> {
+    let mut sorted: Vec<&PanelAgentRow> = rows.iter().collect();
+    sorted.sort_by(|a, b| agent_panel::within_project_order(a, b));
+    let mut by_project: HashMap<ProjectKey, Vec<SidebarAgentRow>> = HashMap::new();
+    for row in sorted {
+        by_project.entry(row.project).or_default().push(row.into());
     }
-    let mut rows: Vec<Keyed> = Vec::new();
-    for tab in &project.tabs {
-        let axes = tab.agent_state();
-        let Some(owner) = agent_owner(&axes) else {
-            continue;
-        };
-        let effective = agent::effective_lifecycle(&axes);
-        rows.push(Keyed {
-            rank: agent::rank(effective),
-            last_event_at: owner.last_event_at,
-            tab_position: tab.position,
-            tab_id: tab.id,
-            row: SidebarAgentRow {
-                tab: TabKey::new(host, tab.id),
-                name: row_name(tab, owner),
-                lifecycle: effective,
-                status_text: status_text(effective, tab.agent_lifecycle, &owner.detail),
-                time_text: elapsed_text(now, owner.last_event_at),
-            },
-        });
+    by_project
+}
+
+impl From<&PanelAgentRow> for SidebarAgentRow {
+    fn from(row: &PanelAgentRow) -> Self {
+        Self {
+            tab: row.tab,
+            name: row.name.clone(),
+            lifecycle: row.lifecycle,
+            status_text: row.status_text.clone(),
+            time_text: row.time_text.clone(),
+        }
     }
-    rows.sort_by(|a, b| {
-        b.rank
-            .cmp(&a.rank)
-            .then(b.last_event_at.cmp(&a.last_event_at))
-            .then(a.tab_position.cmp(&b.tab_position))
-            .then(a.tab_id.cmp(&b.tab_id))
-    });
-    rows.into_iter().map(|k| k.row).collect()
 }
 
 /// The ownership record of a tab that belongs in the palette: live
 /// ownership from a source that isn't one of Roost's own internal
 /// (non-agent) claims. `None` means "no row for this tab".
-fn agent_owner(axes: &agent::AgentTabState) -> Option<&Ownership> {
+pub(crate) fn agent_owner(axes: &agent::AgentTabState) -> Option<&Ownership> {
     if !agent::is_live(axes) {
         return None;
     }
@@ -391,65 +368,35 @@ pub fn metrics_role_hex(role: MetricsRole) -> &'static str {
     }
 }
 
-/// A row plus its sort keys.
-struct Row {
-    rank: u8,
-    last_event_at: i64,
-    source_index: usize,
-    project_position: i32,
-    tab_position: i32,
-    tab_id: i64,
-    item: PaletteItem,
-}
-
-fn row_for(
-    project: &Project,
-    source: &AgentSource<'_>,
-    source_index: usize,
-    tab: &Tab,
-    owner: &Ownership,
-    effective: AgentLifecycle,
-    now: i64,
-) -> Row {
-    let key = TabKey::new(source.host, tab.id);
+fn palette_item(row: PanelAgentRow) -> PaletteItem {
     // The row's context column: the project, plus the machine it runs on
     // once there is more than one. Composed on the same `·` separator the
     // title uses, so "disc pop" fuzzy-matches a remote row.
-    let project_name = normalize_line(&project.name);
-    let project_name = match source.label {
-        Some(label) if !label.is_empty() => compose_title(&project_name, &normalize_line(label)),
-        _ => project_name,
+    let project = match row.palette_label.as_deref() {
+        Some(label) if !label.is_empty() => {
+            compose_title(&row.project_name, &normalize_line(label))
+        }
+        _ => row.project_name,
     };
-    let name = row_name(tab, owner);
-    let agent_name = agent_display_name(&owner.source).to_string();
-    let item = PaletteItem::new(
-        format!("{ROW_ID_PREFIX}{key}"),
-        compose_title(&agent_name, &compose_title(&project_name, &name)),
+    PaletteItem::new(
+        format!("{ROW_ID_PREFIX}{}", row.tab),
+        compose_title(&row.agent, &compose_title(&project, &row.name)),
     )
     .with_agent(AgentRowData {
-        effective_lifecycle: effective,
-        agent: agent_name,
-        project: project_name,
-        name,
-        status_text: status_text(effective, tab.agent_lifecycle, &owner.detail),
-        time_text: elapsed_text(now, owner.last_event_at),
+        effective_lifecycle: row.lifecycle,
+        agent: row.agent,
+        project,
+        name: row.name,
+        status_text: row.status_text,
+        time_text: row.time_text,
         // Filled by the git-metrics probe; absent means pending.
         metrics_text: None,
-    });
-    Row {
-        rank: agent::rank(effective),
-        last_event_at: owner.last_event_at,
-        source_index,
-        project_position: project.position,
-        tab_position: tab.position,
-        tab_id: tab.id,
-        item,
-    }
+    })
 }
 
 /// The agent's own session name when it published one, else the tab
 /// title, else a stable placeholder.
-fn row_name(tab: &Tab, owner: &Ownership) -> String {
+pub(crate) fn row_name(tab: &Tab, owner: &Ownership) -> String {
     let session_title = owner
         .metadata
         .get(SESSION_TITLE_KEY)
@@ -509,7 +456,7 @@ fn display_detail(detail: &str) -> String {
 /// Collapse an open string to one printable line. `metadata` and
 /// `detail` come from arbitrary adapters, so a newline or an escape
 /// sequence must not be able to reshape a palette row.
-fn normalize_line(text: &str) -> String {
+pub(crate) fn normalize_line(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_control())
         .collect::<String>()
@@ -630,6 +577,8 @@ mod tests {
                     projects: &remote,
                     host: HostId::new(3),
                     label: Some("pop-os"),
+                    dimmed: false,
+                    panel_label: Some("pop-os"),
                 },
             ],
             NOW,
@@ -672,6 +621,8 @@ mod tests {
                     projects: &remote,
                     host: HostId::new(3),
                     label: Some("pop-os"),
+                    dimmed: false,
+                    panel_label: Some("pop-os"),
                 },
             ],
             NOW,
@@ -704,6 +655,8 @@ mod tests {
                 projects: &remote,
                 host: HostId::new(3),
                 label: Some("pop-os"),
+                dimmed: false,
+                panel_label: Some("pop-os"),
             },
         ]);
         assert_eq!(cwds.len(), 2);
@@ -1329,6 +1282,50 @@ mod tests {
         // rank: Failed > Waiting > Working; then within Working, position
         // 0 before position 5, then id 3 before id 30.
         assert_eq!(ids, vec![1, 4, 3, 30, 20]);
+    }
+
+    /// One pass over every source keys each project by its host, so the
+    /// same numeric project on two hosts is two entries, and each entry
+    /// is exactly what [`sidebar_agents`] says for that project alone.
+    #[test]
+    fn sidebar_agents_by_project_matches_the_per_project_rows_on_every_host() {
+        let roost = project(
+            1,
+            "roost",
+            vec![
+                owned(tab(1, "a"), "claude", AgentLifecycle::Working, NOW),
+                owned(tab(2, "b"), "claude", AgentLifecycle::Failed, NOW - 9),
+                tab(3, "plain shell"),
+            ],
+        );
+        let quiet = project(2, "quiet", vec![tab(4, "plain shell")]);
+        let local = [roost.clone(), quiet];
+        let remote = [roost.clone()];
+        let host = HostId::new(4);
+        let rows = agent_panel::panel_rows(
+            &[
+                AgentSource::local(&local, HostId::LOCAL),
+                AgentSource::local(&remote, host),
+            ],
+            NOW,
+        );
+        let by_project = sidebar_agents_by_project(&rows);
+        assert_eq!(by_project.len(), 2, "a project with no agent has no entry");
+        assert_eq!(
+            by_project[&ProjectKey::local(1)],
+            sidebar_agents(&roost, HostId::LOCAL, NOW)
+        );
+        assert_eq!(
+            by_project[&ProjectKey::new(host, 1)],
+            sidebar_agents(&roost, host, NOW)
+        );
+        assert_eq!(
+            by_project[&ProjectKey::local(1)]
+                .iter()
+                .map(|row| row.tab.tab)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
     }
 
     #[test]

@@ -26,7 +26,7 @@ Every binding is overridable in `config.conf` (see [Custom keybindings](#custom-
 | `Cmd-Shift-R`        | Rename the active project                   |
 | `Cmd-Shift-W`        | Close the active project (confirms when the project has 2+ tabs) |
 | `Cmd-B`              | Toggle the projects sidebar                 |
-| `Cmd-Shift-A`        | Toggle agent rows under each project in the sidebar |
+| `Cmd-Shift-A`        | Toggle the sidebar's Agents panel (in the Swift app, the agent rows under each project) |
 | `Cmd-Shift-U`        | Jump to the next tab with a pending notification (active project first, then others) |
 | `Cmd-Shift-→`        | Cycle to the next project in the sidebar (skips projects with no tabs; stops at the last project; no wrap-around). Roost-Iced only |
 | `Cmd-Shift-←`        | Cycle to the previous project in the sidebar (skips projects with no tabs; stops at the first project; no wrap-around). Roost-Iced only |
@@ -84,7 +84,7 @@ Font size adjustments are per-tab and held in memory only. They do not persist a
 | `Alt-Shift-R`        | Rename the active project                   |
 | `Alt-Shift-W`        | Close the active project (confirms when the project has 2+ tabs) |
 | `Alt-B`              | Toggle the projects sidebar                 |
-| `Alt-Shift-A`        | Toggle agent rows under each project in the sidebar |
+| `Alt-Shift-A`        | Toggle the sidebar's Agents panel |
 | `Alt-Shift-U`       | Jump to the next tab with a pending notification (active project first, then others) |
 | `Alt-Shift-→`        | Cycle to the next project in the sidebar (skips projects with no tabs; stops at the last project; no wrap-around) |
 | `Alt-Shift-←`        | Cycle to the previous project in the sidebar (skips projects with no tabs; stops at the first project; no wrap-around) |
@@ -233,6 +233,7 @@ Use only leading-line `#` comments. A `#` after a `keybind` value is treated as 
 | `close_project`       | `super+shift+w` / `alt+shift+w`                        |
 | `toggle_sidebar`      | `super+b` / `alt+b`                                    |
 | `toggle_sidebar_agents` | `super+shift+a` / `alt+shift+a`                      |
+| `cycle_agent_panel_sort` | unbound / unbound                                 |
 | `jump_to_unread`      | `super+shift+u` / `alt+shift+u`                        |
 | `command_palette`     | `super+shift+p` / `alt+shift+p`                        |
 | `command_launcher`    | `super+shift+t` / `alt+shift+t`                        |
@@ -253,6 +254,8 @@ Use only leading-line `#` comments. A `#` after a `keybind` value is treated as 
 `toggle_secure_input` flips the always-on Secure Keyboard Entry setting on macOS (`macos-secure-keyboard-entry`), the same as Roost → Secure Keyboard Entry in the menu bar and "Toggle Secure Keyboard Entry" in the command palette; Roost writes the choice to `config.conf`. It has no default shortcut. On Linux the action is accepted and does nothing. See [Secure Keyboard Entry](../reference/config.md#secure-keyboard-entry).
 
 `cycle_project_prev` and `cycle_project_next` are honored by Roost-Iced; the Swift Mac app (Roost.app) does not have them and logs the names as unknown actions.
+
+`cycle_agent_panel_sort` steps the sidebar Agents panel's sort — grouped, priority, recent, and back — and writes the choice to `agent-panel-sort` in `config.conf`. It has no default shortcut; the command palette has it as "Cycle Agent Panel Sort". Roost-Iced only, like project cycling.
 
 Defaults with multiple triggers (`cycle_tab_*`, `paste`, `copy`) keep both triggers; an `unbind` line removes only the listed one.
 

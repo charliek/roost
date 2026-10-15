@@ -3,6 +3,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod agent_palette;
+pub mod agent_panel;
 pub mod bracketed_paste;
 pub mod config;
 pub mod context_menu;

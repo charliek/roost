@@ -774,6 +774,7 @@ jobs:
           tools/roosttest/test_agent_hooks.py
           tools/roosttest/test_agent_hooks_dialog.py
           tools/roosttest/test_agent_palette.py
+          tools/roosttest/test_agent_panel.py
           tools/roosttest/test_doctor.py
           tools/roosttest/test_provider.py
           tools/roosttest/test_sidebar_pixels.py
@@ -1055,6 +1056,7 @@ jobs:
           tools/roosttest/test_agent_hooks.py
           tools/roosttest/test_agent_hooks_dialog.py
           tools/roosttest/test_agent_palette.py
+          tools/roosttest/test_agent_panel.py
           tools/roosttest/test_doctor.py
           tools/roosttest/test_provider.py
           tools/roosttest/test_sidebar_pixels.py
@@ -1278,6 +1280,7 @@ jobs:
           tools/roosttest/test_agent_hooks.py
           tools/roosttest/test_agent_hooks_dialog.py
           tools/roosttest/test_agent_palette.py
+          tools/roosttest/test_agent_panel.py
           tools/roosttest/test_doctor.py
           tools/roosttest/test_provider.py
           tools/roosttest/test_sidebar_pixels.py

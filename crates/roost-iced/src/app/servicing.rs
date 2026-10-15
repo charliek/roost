@@ -2452,7 +2452,7 @@ impl App {
                         // same pair its sidebar row does. A tab whose
                         // host has since dropped selects nothing — the
                         // banner outlived what it named.
-                        match self.focus_host_tab_and_clear(tab, true) {
+                        match self.focus_host_tab_and_clear(tab) {
                             Ok(()) => {
                                 batch.mark_reconciled();
                                 task = task.then(self.notification_raise(token));
@@ -2464,12 +2464,11 @@ impl App {
                             ),
                         }
                     } else if notification_activation(&self.workspace, tab) {
-                        // The rest of a notification jump, exactly as the
-                        // palette's rows do it: reveal the sidebar so the
-                        // user sees which project they landed in, and fold
-                        // the two ops above into the cache now rather than
+                        // The rest of a notification jump: fold the two
+                        // ops above into the cache now rather than
                         // waiting for their broadcast to come back around.
-                        self.set_sidebar_collapsed(false);
+                        // A collapsed sidebar stays collapsed, as it does
+                        // for the palette's rows.
                         self.reconcile();
                         batch.mark_reconciled();
                         task = task.then(self.notification_raise(token));
@@ -3292,37 +3291,39 @@ impl App {
             && self.local_slot_view().is_some_and(|slot| slot.host == host)
     }
 
-    fn refresh_sidebar_agents(&mut self) {
-        let host = self.backend.host();
-        let now = agent_palette::now_unix();
-        let mut rows: HashMap<ProjectKey, Vec<agent_palette::SidebarAgentRow>> = self
-            .projects
-            .iter()
-            .map(|project| {
-                (
-                    ProjectKey::new(host, project.id),
-                    agent_palette::sidebar_agents(project, host, now),
-                )
-            })
-            .collect();
-        // Host sections carry the same rows under the same keys — the
-        // ⌘⇧A toggle and the row widget are host-blind by construction
-        // (plan 037 §3.1). A disconnected host's rows are still built:
-        // they render dimmed rather than disappearing, and the count they
-        // feed is what its band would say if the state left the rollup
-        // slot free.
+    /// Rebuild every agent row the sidebar draws, from the local
+    /// workspace and **every** host view — a disconnected host's rows are
+    /// still built: they render dimmed rather than disappearing, and the
+    /// count they feed is what its band would say if the state left the
+    /// rollup slot free. One pass feeds the Agents panel, the project rows'
+    /// counts and the bands' rollups (plan 080 D4).
+    pub(super) fn refresh_sidebar_agents(&mut self) {
+        let mut rows = agent_panel::panel_rows(
+            &self.all_agent_sources(&self.projects),
+            agent_palette::now_unix(),
+        );
+        self.sidebar_agents = agent_palette::sidebar_agents_by_project(&rows);
         for view in &mut self.host_views {
-            let mut agents = 0;
-            for project in &view.projects {
-                let project_rows = agent_palette::sidebar_agents(project, view.host, now);
-                agents += project_rows.len();
-                rows.insert(ProjectKey::new(view.host, project.id), project_rows);
-            }
-            view.agents = agents;
+            view.agents = view
+                .projects
+                .iter()
+                .filter_map(|project| {
+                    self.sidebar_agents
+                        .get(&ProjectKey::new(view.host, project.id))
+                })
+                .map(Vec::len)
+                .sum();
         }
-        self.sidebar_agents = rows;
-        // Last, because the rollups read the counts filled just above.
+        // After the counts, because the rollups read them.
         self.host_sections = self.host_sections_now();
+        // The in-process workspace is drawn with no bands at all, or under
+        // the one band that owns it — never under `local-backend =
+        // session` (plan 063 §D3) — and so are its agents.
+        let local = self.backend.host();
+        let local_drawn =
+            self.host_sections.is_empty() || self.host_sections.iter().any(band_owns_local_strip);
+        rows.retain(|row| local_drawn || row.project.host != local);
+        self.agent_panel_rows = rows;
     }
 
     /// The sidebar's bands, off the views this reconcile holds.
@@ -3384,6 +3385,7 @@ impl App {
             projects,
             hosts: self.host_views.iter().map(host_dump).collect(),
             sections: self.host_sections.iter().map(section_dump).collect(),
+            agent_panel: Some(self.agent_panel_dump()),
         }
     }
 
@@ -3703,6 +3705,16 @@ impl App {
                     self.commit_sidebar_drag();
                     self.workspace.set_sidebar_width(width);
                     self.resize(self.window_size);
+                    Ok(())
+                };
+                let _ = reply.send(result);
+            }
+            UiRequest::SidebarSetAgentsFraction { fraction, reply } => {
+                let result = if !self.test_mode {
+                    Err("ROOST_TEST_MODE=1 is required".into())
+                } else {
+                    self.commit_agents_split_drag();
+                    self.workspace.set_agents_panel_fraction(fraction);
                     Ok(())
                 };
                 let _ = reply.send(result);
@@ -4215,7 +4227,7 @@ impl App {
                 // keyboard route move together), then the attach.
                 if let Some(reply) = self.awaiting_listing.park(key, reply) {
                     let result = self
-                        .focus_host_tab_and_clear(key, false)
+                        .focus_host_tab_and_clear(key)
                         .map_err(|_| roost_engine::WorkspaceError::TabNotFound(tab_id));
                     let _ = reply.send(result);
                 }

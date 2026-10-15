@@ -85,6 +85,23 @@ fn normalize_sidebar_width(width: f64) -> Option<f64> {
         .then(|| width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH))
 }
 
+/// The Agents panel's share of the sidebar below its divider (plan 080
+/// D8) before the user has ever dragged it.
+pub const AGENTS_PANEL_DEFAULT_FRACTION: f64 = 0.37;
+/// The smallest share a drag or a restore may leave the Agents panel.
+pub const AGENTS_PANEL_MIN_FRACTION: f64 = 0.15;
+/// The largest share a drag or a restore may give the Agents panel.
+pub const AGENTS_PANEL_MAX_FRACTION: f64 = 0.85;
+
+/// [`normalize_sidebar_width`]'s twin for the Agents panel's share: a
+/// non-finite fraction is none at all, anything else clamps into
+/// [`AGENTS_PANEL_MIN_FRACTION`]..=[`AGENTS_PANEL_MAX_FRACTION`].
+fn normalize_agents_panel_fraction(fraction: f64) -> Option<f64> {
+    fraction
+        .is_finite()
+        .then(|| fraction.clamp(AGENTS_PANEL_MIN_FRACTION, AGENTS_PANEL_MAX_FRACTION))
+}
+
 #[derive(Clone, Debug)]
 struct ProjectRow {
     id: i64,
@@ -158,6 +175,9 @@ struct Inner {
     /// (Rust UI adapter (Iced) parity with the Mac UI's
     /// `RoostSidebarWidth`).
     sidebar_width: f64,
+    /// The Agents panel's share of the sidebar (plan 080 D8). UI-set via
+    /// `set_agents_panel_fraction`; `None` until one is set.
+    agents_panel_fraction: Option<f64>,
     /// The UI window's last frame (plan 074 §D5b). UI-set via
     /// `set_window_frame`; persisted so a relaunch reopens the window
     /// where it was. Only the macOS UI ever sets it.
@@ -224,6 +244,7 @@ impl Default for Inner {
             active_tab_id: 0,
             sidebar_collapsed: false,
             sidebar_width: SIDEBAR_DEFAULT_WIDTH,
+            agents_panel_fraction: None,
             window_frame: None,
             hosts: Vec::new(),
             recent_hosts: Vec::new(),
@@ -897,6 +918,9 @@ impl Workspace {
             sidebar_collapsed: snapshot.sidebar_collapsed,
             sidebar_width: normalize_sidebar_width(snapshot.sidebar_width)
                 .unwrap_or(SIDEBAR_DEFAULT_WIDTH),
+            agents_panel_fraction: snapshot
+                .agents_panel_fraction
+                .and_then(normalize_agents_panel_fraction),
             window_frame: snapshot.window.filter(WindowFrame::is_valid),
             hosts: std::mem::take(&mut snapshot.hosts),
             recent_hosts: std::mem::take(&mut snapshot.recent_hosts),
@@ -1034,6 +1058,33 @@ impl Workspace {
             return;
         }
         inner.sidebar_width = width;
+        self.commit(inner, Vec::new(), Persist::Write);
+    }
+
+    /// The Agents panel's share of the sidebar below its divider: the
+    /// last one set, or [`AGENTS_PANEL_DEFAULT_FRACTION`].
+    pub fn agents_panel_fraction(&self) -> f64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents_panel_fraction
+            .unwrap_or(AGENTS_PANEL_DEFAULT_FRACTION)
+    }
+
+    /// Record the Agents panel's share and persist it, clamped into
+    /// [`AGENTS_PANEL_MIN_FRACTION`]..=[`AGENTS_PANEL_MAX_FRACTION`] —
+    /// [`Self::set_sidebar_width`]'s contract: no event, no write when the
+    /// normalized fraction is the one already stored, and a non-finite
+    /// fraction ignored outright.
+    pub fn set_agents_panel_fraction(&self, fraction: f64) {
+        let Some(fraction) = normalize_agents_panel_fraction(fraction) else {
+            return;
+        };
+        let mut inner = self.inner.lock().unwrap();
+        if inner.agents_panel_fraction == Some(fraction) {
+            return;
+        }
+        inner.agents_panel_fraction = Some(fraction);
         self.commit(inner, Vec::new(), Persist::Write);
     }
 
@@ -2870,6 +2921,7 @@ impl Inner {
             active_tab_position,
             sidebar_collapsed: self.sidebar_collapsed,
             sidebar_width: self.sidebar_width,
+            agents_panel_fraction: self.agents_panel_fraction,
             window: self.window_frame,
             hosts: self.hosts.clone(),
             recent_hosts: self.recent_hosts.clone(),
@@ -5718,6 +5770,158 @@ mod tests {
             revision + 1,
             "both clamp to the max, so only the first commits"
         );
+    }
+
+    #[test]
+    fn agents_panel_fraction_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        {
+            let ws = Workspace::open(path.clone());
+            assert_eq!(ws.agents_panel_fraction(), AGENTS_PANEL_DEFAULT_FRACTION);
+            ws.set_agents_panel_fraction(0.6);
+            assert_eq!(ws.agents_panel_fraction(), 0.6);
+        }
+        let ws2 = Workspace::open(path.clone());
+        assert_eq!(
+            ws2.agents_panel_fraction(),
+            0.6,
+            "the share must survive reopen"
+        );
+        ws2.set_agents_panel_fraction(0.3);
+        drop(ws2);
+        let ws3 = Workspace::open(path);
+        assert_eq!(
+            ws3.agents_panel_fraction(),
+            0.3,
+            "a later drag persists too"
+        );
+    }
+
+    #[test]
+    fn agents_panel_fraction_defaults_when_state_file_absent_or_malformed() {
+        assert_eq!(
+            Workspace::new().agents_panel_fraction(),
+            AGENTS_PANEL_DEFAULT_FRACTION
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("state.json");
+        assert_eq!(
+            Workspace::open(missing).agents_panel_fraction(),
+            AGENTS_PANEL_DEFAULT_FRACTION
+        );
+
+        let malformed = dir.path().join("malformed.json");
+        std::fs::write(&malformed, b"not json").unwrap();
+        assert_eq!(
+            Workspace::open(malformed).agents_panel_fraction(),
+            AGENTS_PANEL_DEFAULT_FRACTION
+        );
+    }
+
+    #[test]
+    fn agents_panel_fraction_defaults_for_a_file_without_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(&path, br#"{"next_id":5,"projects":[]}"#).unwrap();
+        assert_eq!(
+            Workspace::open(path).agents_panel_fraction(),
+            AGENTS_PANEL_DEFAULT_FRACTION,
+            "a file predating the key loads as the default share"
+        );
+    }
+
+    #[test]
+    fn agents_panel_fraction_clamps_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        for (stored, expected) in [
+            (0.01, AGENTS_PANEL_MIN_FRACTION),
+            (0.99, AGENTS_PANEL_MAX_FRACTION),
+            (-3.0, AGENTS_PANEL_MIN_FRACTION),
+        ] {
+            let path = dir.path().join(format!("state-{stored}.json"));
+            std::fs::write(
+                &path,
+                format!(r#"{{"next_id":1,"projects":[],"agents_panel_fraction":{stored}}}"#),
+            )
+            .unwrap();
+            assert_eq!(Workspace::open(path).agents_panel_fraction(), expected);
+        }
+    }
+
+    #[test]
+    fn agents_panel_fraction_restore_drops_a_non_finite_value() {
+        // No file can carry one — JSON has no NaN/Infinity literal and
+        // serde_json refuses an overflowing number, failing the whole
+        // load — so the restore's guard is pinned on the rule it applies.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(normalize_agents_panel_fraction(bad), None, "{bad}");
+        }
+        assert_eq!(normalize_agents_panel_fraction(0.6), Some(0.6));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            br#"{"next_id":1,"projects":[],"agents_panel_fraction":1e400}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Workspace::open(path).agents_panel_fraction(),
+            AGENTS_PANEL_DEFAULT_FRACTION
+        );
+    }
+
+    #[test]
+    fn agents_panel_fraction_clamps_in_setter() {
+        let ws = Workspace::new();
+        ws.set_agents_panel_fraction(0.01);
+        assert_eq!(ws.agents_panel_fraction(), AGENTS_PANEL_MIN_FRACTION);
+        ws.set_agents_panel_fraction(2.0);
+        assert_eq!(ws.agents_panel_fraction(), AGENTS_PANEL_MAX_FRACTION);
+    }
+
+    #[test]
+    fn agents_panel_fraction_ignores_non_finite_input() {
+        let ws = Workspace::new();
+        ws.set_agents_panel_fraction(0.6);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            ws.set_agents_panel_fraction(bad);
+            assert_eq!(ws.agents_panel_fraction(), 0.6, "{bad} must be ignored");
+        }
+    }
+
+    #[test]
+    fn agents_panel_fraction_unchanged_does_not_commit() {
+        let ws = Workspace::new();
+        ws.set_agents_panel_fraction(0.6);
+        let (revision, _) = ws.snapshot_with_revision();
+        ws.set_agents_panel_fraction(0.6);
+        ws.set_agents_panel_fraction(f64::NAN);
+        assert_eq!(ws.snapshot_with_revision().0, revision);
+        ws.set_agents_panel_fraction(0.9);
+        ws.set_agents_panel_fraction(0.95);
+        assert_eq!(
+            ws.snapshot_with_revision().0,
+            revision + 1,
+            "both clamp to the max, so only the first commits"
+        );
+    }
+
+    #[test]
+    fn a_commit_that_is_not_a_fraction_writes_no_fraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let ws = Workspace::open(path.clone());
+        ws.set_sidebar_width(300.0);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("agents_panel_fraction"), "{raw}");
+
+        ws.set_agents_panel_fraction(0.6);
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["agents_panel_fraction"], 0.6, "{raw}");
     }
 
     #[test]

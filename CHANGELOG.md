@@ -11,6 +11,50 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+### Added
+
+- **Sidebar Agents panel** — Roost-Iced's sidebar lists every agent on
+  every host in one panel below the projects, in place of the agent rows
+  nested under each project. A row shows the agent's state dot, its name
+  and its age on one line and its status on the next — after its host
+  and project when the panel isn't grouped — elided to the sidebar's
+  width rather than wrapped, and the ages keep counting while an agent
+  is working or waiting. Project rows keep their rail and notification
+  dot and gain an agent count, and a disconnected host's agents stay
+  listed, dimmed. Toggle Sidebar Agents (`show-sidebar-agents`) now shows
+  and hides the panel. Drag the divider between the projects and the
+  panel to resize it; its height is remembered across relaunches. The
+  divider is always there, and the panel keeps its height whether or not
+  any agents are running, so nothing moves when the first one starts or
+  the last one exits.
+  **Agents panel sort** — new `agent-panel-sort =
+  grouped|priority|recent` config key (default `grouped`; an unknown
+  value warns and falls back), cycled by the new unbound
+  `cycle_agent_panel_sort` action, the palette's "Cycle Agent Panel Sort"
+  and the panel header's sort word, which write the choice back to
+  `config.conf`. `app.sidebar_dump` gains `agent_panel`
+  ([IPC](docs/reference/ipc.md#agent_panel-the-agents-panel-plan-080)).
+  Roost-Iced only; the Swift app is unchanged.
+
+### Changed
+
+- **Jumping to a tab no longer opens a collapsed sidebar** — in
+  Roost-Iced, choosing an agent in the agents palette, a row in the
+  notifications palette, Jump to Unread or clicking a notification
+  banner now focuses the tab and leaves a collapsed sidebar collapsed,
+  as the Cmd-1..9 shortcuts and new tabs already did. The Swift app is
+  unchanged.
+
+### Fixed
+
+- **A sidebar drag survives a toast going away, and quitting.** In
+  Roost-Iced, if a toast expired or was cleared while you were dragging
+  the sidebar's edge, or you quit before releasing, the dragged width
+  was never saved. The next relaunch restored the old width, and after
+  a toast expiry the sidebar stayed pinned at the dragged width until
+  the next drag. Both now keep the width the drag reached, and the same
+  holds for the new Agents panel divider.
+
 ## v0.0.24 — 2026-10-10
 
 _The agent-indicator release (#619, #620): an agent that another agent

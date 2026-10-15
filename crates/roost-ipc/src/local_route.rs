@@ -278,9 +278,10 @@ pub const OP_CLASSES: &[(&str, OpClass)] = &[
     ("clipboard.write", OpClass::UiOwned),
     ("clipboard.write_files", OpClass::UiOwned),
     ("window.resize", OpClass::UiOwned),
-    // The sidebar's own width, which belongs to this window and not to
-    // whatever backend its tabs run on.
+    // The sidebar's own width and its Agents panel's share, which belong
+    // to this window and not to whatever backend its tabs run on.
     ("sidebar.set_width", OpClass::UiOwned),
+    ("sidebar.set_agents_fraction", OpClass::UiOwned),
     ("app.set_window_focus", OpClass::UiOwned),
     ("app.cursor_shape", OpClass::UiOwned),
     ("app.active_terminal_focused", OpClass::UiOwned),

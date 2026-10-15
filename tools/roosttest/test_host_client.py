@@ -3724,3 +3724,80 @@ def test_a_host_rows_menu_lists_the_palettes_host_rows_and_stop_asks_first(host,
         roost.call("app.dialog_answer", {"action": "cancel"})
     assert roost.call("app.dialog_dump", {}).get("dialog") is None
     host.wait_connected()
+
+
+# ---------------------------------------------------------------------------
+# 21. Plan 080 — a host's agents in the sidebar's Agents panel
+# ---------------------------------------------------------------------------
+
+
+def host_tab_key(roost: Roost, saved_id: str, tab: int) -> str | None:
+    """The qualified key (`h<host>.<id>`) the band of host `saved_id`
+    lists its bare tab id `tab` under. Another host's tab with the same
+    number has a different key, so matching by key keeps a reused UI's
+    other hosts out."""
+    band = roost.sidebar_host(saved_id)
+    if band is None:
+        return None
+    return next(
+        (
+            listed["key"]
+            for project in band["projects"]
+            for listed in project["tabs"]
+            if re.fullmatch(rf"h\d+\.{tab}", listed["key"])
+        ),
+        None,
+    )
+
+
+def panel_agent(roost: Roost, key: str) -> dict | None:
+    """The Agents panel's entry for the qualified tab `key`, and the head
+    above it, from `app.sidebar_dump`."""
+    panel = roost.sidebar_dump()["agent_panel"]
+    head = None
+    for entry in panel["entries"]:
+        if entry["kind"] == "group":
+            head = entry
+        elif entry["tab"] == key:
+            return {**entry, "head": head, "sort": panel["sort"]}
+    return None
+
+
+def test_a_hosts_agent_is_listed_under_its_host_qualified_key_and_names_its_host(
+    host, roost
+):
+    """D3/D10: the panel lists a host's agent under the `h<host>.<id>` key
+    the tab ops take, and because the sidebar draws the local band and
+    this host's, the row's text names the host as saved, in the head and
+    the location alike. A dropped connection keeps the row, dimmed."""
+    host.connect_and_wait()
+    with host.client() as session:
+        project = first_project(session)
+        project_name = session.project(project)["name"]
+        tab = quiet_tab(session, project, host.env.launch_cwd)
+        session.agent_report(
+            tab, "e2e-panel", "claim", session_id=uuid.uuid4().hex, lifecycle="working"
+        )
+        key = wait_until(
+            lambda: host_tab_key(roost, host.saved_id, tab), 30.0, "the host's band to list the tab"
+        )
+        entry = wait_until(
+            lambda: panel_agent(roost, key), 30.0, "the host's agent in the Agents panel"
+        )
+        assert entry["lifecycle"] == "working", entry
+        assert entry["dimmed"] is False, entry
+
+        assert len(roost.sidebar_sections()) > 1
+        if entry["sort"] == "grouped":
+            assert entry["head"]["label"] == f"{host.label} › {project_name}", entry
+            assert entry["location_text"] == "", entry
+        else:
+            assert entry["location_text"] == f"{host.label} › {project_name}", entry
+
+        host.disconnect()
+        host.wait_not_connected()
+        wait_until(
+            lambda: (row := panel_agent(roost, key)) is not None and row["dimmed"],
+            30.0,
+            "the dropped host's agent to stay listed, dimmed, under the key it was listed under",
+        )

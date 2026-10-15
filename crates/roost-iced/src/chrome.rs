@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::Instant;
 
@@ -38,11 +40,9 @@ pub const PROJECT_STRIPE_INSET_Y: f32 = 5.0;
 pub const PROJECT_PILL_INSET_X: f32 = 6.0;
 pub const PROJECT_PILL_INSET_Y: f32 = 1.0;
 /// Label leading inset and notification-dot trailing inset, both measured
-/// from the pill's own edges. The label inset is what puts the project name
-/// on the same left edge as the agent rows nested under it.
+/// from the pill's own edges.
 pub const PROJECT_LABEL_INSET: f32 = 18.0;
 pub const PROJECT_DOT_INSET: f32 = 8.0;
-pub const AGENT_DOT_INSET: f32 = 25.0;
 pub const TAB_STATUS_SIZE: f32 = 7.0;
 pub const NOTIFICATION_DOT_SIZE: f32 = 9.0;
 /// Tab-pill width band, from the Mac (`App.swift:4757-4763`, config
@@ -105,6 +105,64 @@ pub const HOST_ROLLUP_SIZE: f32 = 10.0;
 pub const HOST_SECTION_DIM: f32 = 0.45;
 pub const HOST_BANNER_TEXT_SIZE: f32 = 12.0;
 pub const HOST_BANNER_ACTION_SIZE: f32 = 11.5;
+
+/// The project row's label, and its agent count (plan 080 D6), which
+/// sits in a fixed slot so the label's budget never has to measure it.
+pub const PROJECT_LABEL_SIZE: f32 = 13.0;
+pub const PROJECT_AGENT_COUNT_SIZE: f32 = 10.5;
+pub const PROJECT_AGENT_COUNT_SLOT: f32 = 18.0;
+/// Between the count and the notification dot.
+pub const PROJECT_AGENT_COUNT_GAP: f32 = 6.0;
+
+/// The divider between the project list and the Agents panel (plan 080
+/// D8), and the handle nub centered on it (mockup `.split`).
+pub const AGENTS_SPLIT_DIVIDER_HEIGHT: f32 = 6.0;
+pub const AGENTS_SPLIT_NUB: Size = Size::new(28.0, 2.0);
+
+/// The sidebar's Agents panel (plan 080 D5), after the approved mockup.
+/// Every height is whole and every row's lines have absolute line
+/// heights, so a row lands on the pixel grid wherever the split puts it.
+pub const AGENT_PANEL_HEADER_HEIGHT: f32 = BAND_HEIGHT;
+pub const AGENT_PANEL_LIST_PADDING_Y: f32 = 3.0;
+pub const AGENT_PANEL_ROW_HEIGHT: f32 =
+    2.0 * AGENT_PANEL_ROW_PADDING_Y + AGENT_PANEL_NAME_LINE + AGENT_PANEL_DETAIL_LINE;
+pub const AGENT_PANEL_ROW_PADDING_Y: f32 = 4.0;
+/// Each row's fill is inset this far from the panel's sides.
+pub const AGENT_PANEL_INSET_X: f32 = 6.0;
+pub const AGENT_PANEL_ROW_PADDING_LEFT: f32 = 12.0;
+pub const AGENT_PANEL_ROW_PADDING_RIGHT: f32 = 10.0;
+pub const AGENT_PANEL_ROW_RADIUS: f32 = 6.0;
+/// The dot is centered in a slot of its own, so the name column starts
+/// at the same x on every row.
+pub const AGENT_PANEL_DOT_SIZE: f32 = 8.0;
+/// Short of round: the straight run a 3px radius leaves on each side of
+/// the 8px dot is painted solid by every renderer, which is the edge the
+/// sidebar pixel lane reads (a full circle's edge pixel is blended
+/// differently by wgpu and tiny-skia).
+pub const AGENT_PANEL_DOT_RADIUS: f32 = 3.0;
+pub const AGENT_PANEL_DOT_SLOT: f32 = 14.0;
+pub const AGENT_PANEL_GAP: f32 = 6.0;
+/// The age ("45s", "12m", "3d") is right-aligned in a fixed slot, so a
+/// changing age never moves the name.
+pub const AGENT_PANEL_AGE_SLOT: f32 = 28.0;
+pub const AGENT_PANEL_NAME_SIZE: f32 = 13.0;
+pub const AGENT_PANEL_NAME_LINE: f32 = 18.0;
+pub const AGENT_PANEL_DETAIL_SIZE: f32 = 11.0;
+pub const AGENT_PANEL_DETAIL_LINE: f32 = 16.0;
+pub const AGENT_PANEL_GROUP_HEIGHT: f32 =
+    AGENT_PANEL_GROUP_PADDING_TOP + AGENT_PANEL_GROUP_LINE + AGENT_PANEL_GROUP_PADDING_BOTTOM;
+pub const AGENT_PANEL_GROUP_PADDING_TOP: f32 = 8.0;
+pub const AGENT_PANEL_GROUP_PADDING_BOTTOM: f32 = 3.0;
+pub const AGENT_PANEL_GROUP_SIZE: f32 = 12.0;
+pub const AGENT_PANEL_GROUP_LINE: f32 = 16.0;
+pub const AGENT_PANEL_GROUP_COUNT_SLOT: f32 = 20.0;
+pub const AGENT_PANEL_EMPTY_HEIGHT: f32 = 40.0;
+pub const AGENT_PANEL_EMPTY_SIZE: f32 = 11.5;
+pub const AGENT_PANEL_SORT_SIZE: f32 = 11.0;
+pub const AGENT_PANEL_SORT_PADDING: [f32; 2] = [2.0, 6.0];
+/// The panel's scrollbar overlays the rows' right inset rather than
+/// taking layout width.
+pub const AGENT_PANEL_SCROLLBAR_WIDTH: f32 = 4.0;
 
 /// Roost's blue: the Mac's `NSColor.controlAccentColor` under the default
 /// accent (`App.swift:4772`, `:5207`), and what `chrome-accent = system`
@@ -205,6 +263,17 @@ pub struct ChromePalette {
     pub error_text: Color,
     pub danger: Color,
     pub danger_accent: Color,
+    /// Agent lifecycle colors: sidebar dots and stripes, the tab status dot,
+    /// and the agents panel. They do not follow the accent.
+    pub agent_working: Color,
+    pub agent_waiting: Color,
+    pub agent_finished: Color,
+    pub agent_failed: Color,
+    pub agent_inactive: Color,
+    /// The sidebar's project-list / agents-panel split handle, at rest and
+    /// hovered.
+    pub split_handle: Color,
+    pub split_handle_hover: Color,
 }
 
 impl ChromePalette {
@@ -254,6 +323,13 @@ impl ChromePalette {
             error_text: Color::from_rgb8(0xee, 0x78, 0x78),
             danger: Color::from_rgb8(0x8a, 0x2a, 0x2a),
             danger_accent: Color::from_rgb8(0xa8, 0x33, 0x33),
+            agent_working: Color::from_rgb8(0x5f, 0xa3, 0xf0),
+            agent_waiting: Color::from_rgb8(0xf0, 0xa0, 0x40),
+            agent_finished: Color::from_rgb8(0x7a, 0x7a, 0x7a),
+            agent_failed: Color::from_rgb8(0xe0, 0x52, 0x52),
+            agent_inactive: Color::from_rgba8(0x7a, 0x7a, 0x7a, 0.5),
+            split_handle: Color::from_rgb8(0x3c, 0x42, 0x46),
+            split_handle_hover: Color::from_rgb8(0xa0, 0xa4, 0xb0),
         };
         let channels = rgb8(accent);
         if channels == rgb8(DEFAULT_ACCENT) {
@@ -414,6 +490,50 @@ pub fn elide_to_width(content: &str, font: Font, size: f32, max_width: f32) -> (
     result
 }
 
+/// How many elisions [`ElisionMemo`] keeps before it starts over.
+const ELISION_MEMO_CAPACITY: usize = 1024;
+
+/// [`elide_to_width`], remembered across frames.
+///
+/// The sidebar's labels are elided while `view` builds them, and `view`
+/// runs on every keystroke — plan 029 F1's guard (`test_view_perf.py`)
+/// counts every elision on that path. Every input is in the key, so a
+/// hit is exactly what a fresh elision would return. The measurement
+/// leads the key so a hit looks its text up by `&str`, allocating no key.
+/// Interior mutability because `view` holds `&App`.
+#[derive(Debug, Default)]
+pub struct ElisionMemo {
+    entries: RefCell<HashMap<Measure, HashMap<String, String>>>,
+    len: Cell<usize>,
+}
+
+/// The font, size and width bits an elision was measured at.
+type Measure = (Font, u32, u32);
+
+impl ElisionMemo {
+    pub fn elide(&self, text: &str, font: Font, size: f32, max_width: f32) -> String {
+        let measure = (font, size.to_bits(), max_width.to_bits());
+        let mut entries = self.entries.borrow_mut();
+        if let Some(hit) = entries.get(&measure).and_then(|texts| texts.get(text)) {
+            return hit.clone();
+        }
+        let elided = elide_to_width(text, font, size, max_width).0.into_owned();
+        // A sidebar drag mints a key per width it passes through; starting
+        // over at the cap bounds that without tracking which keys a frame
+        // still uses.
+        if self.len.get() >= ELISION_MEMO_CAPACITY {
+            entries.clear();
+            self.len.set(0);
+        }
+        entries
+            .entry(measure)
+            .or_default()
+            .insert(text.to_owned(), elided.clone());
+        self.len.set(self.len.get() + 1);
+        elided
+    }
+}
+
 fn fixed(style: container::Style) -> impl Fn(&Theme) -> container::Style {
     move |_| style
 }
@@ -506,17 +626,57 @@ pub fn project_pill(
     fixed(pill(chrome, chrome.active_row, 6.0, active, dragging))
 }
 
-pub fn agent_button(
-    chrome: &ChromePalette,
-    active: bool,
-) -> impl Fn(&Theme, button::Status) -> button::Style {
-    chrome_button(chrome, active.then_some(chrome.active_agent), 4.0)
-}
-
 pub fn transparent_button(
     chrome: &ChromePalette,
 ) -> impl Fn(&Theme, button::Status) -> button::Style {
     chrome_button(chrome, None, 4.0)
+}
+
+/// One Agents panel row (plan 080 D5): filled when its tab is the active
+/// one, and on hover.
+pub fn agent_panel_row(
+    chrome: &ChromePalette,
+    active: bool,
+) -> impl Fn(&Theme, button::Status) -> button::Style {
+    chrome_button(
+        chrome,
+        active.then_some(chrome.active_agent),
+        AGENT_PANEL_ROW_RADIUS,
+    )
+}
+
+/// The Agents panel header's sort word (plan 080 D7): borderless and
+/// muted like the band label beside it until the pointer is on it.
+pub fn agent_panel_sort_button(
+    chrome: &ChromePalette,
+) -> impl Fn(&Theme, button::Status) -> button::Style {
+    let (hover, text, muted_text) = (chrome.hover, chrome.text, chrome.muted_text);
+    move |_, status| {
+        let lit = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: lit.then_some(Background::Color(hover)),
+            text_color: if lit { text } else { muted_text },
+            border: Border::default().rounded(4),
+            shadow: Shadow::default(),
+            snap: true,
+        }
+    }
+}
+
+/// A solid `color` fill with corners of `radius`: a status dot, a nub.
+pub fn rounded_fill(color: Color, radius: f32) -> impl Fn(&Theme) -> container::Style {
+    fixed(container::background(color).border(Border::default().rounded(radius)))
+}
+
+/// The nub centered on the project list / Agents panel divider (plan
+/// 080 D8), lit while the divider is hovered or dragged.
+pub fn split_handle(chrome: &ChromePalette, hovered: bool) -> impl Fn(&Theme) -> container::Style {
+    let color = if hovered {
+        chrome.split_handle_hover
+    } else {
+        chrome.split_handle
+    };
+    rounded_fill(color, AGENTS_SPLIT_NUB.height / 2.0)
 }
 
 /// The active tab pill's `×`. Deliberately NOT a `chrome_button`: a filled
@@ -914,6 +1074,13 @@ mod tests {
             error_text: Color::from_rgb8(0xee, 0x78, 0x78),
             danger: Color::from_rgb8(0x8a, 0x2a, 0x2a),
             danger_accent: Color::from_rgb8(0xa8, 0x33, 0x33),
+            agent_working: Color::from_rgb8(0x5f, 0xa3, 0xf0),
+            agent_waiting: Color::from_rgb8(0xf0, 0xa0, 0x40),
+            agent_finished: Color::from_rgb8(0x7a, 0x7a, 0x7a),
+            agent_failed: Color::from_rgb8(0xe0, 0x52, 0x52),
+            agent_inactive: Color::from_rgba8(0x7a, 0x7a, 0x7a, 0.5),
+            split_handle: Color::from_rgb8(0x3c, 0x42, 0x46),
+            split_handle_hover: Color::from_rgb8(0xa0, 0xa4, 0xb0),
         };
         assert_eq!(ChromePalette::roost_dark(DEFAULT_ACCENT), expected);
         assert_eq!(
@@ -1054,11 +1221,113 @@ mod tests {
     }
 
     #[test]
-    fn project_and_agent_content_share_the_reference_left_edge() {
-        let project_text = PROJECT_PILL_INSET_X + PROJECT_LABEL_INSET;
-        assert!((project_text - AGENT_DOT_INSET).abs() <= 1.0);
+    fn status_and_notification_dots_keep_their_sizes() {
         assert_eq!(TAB_STATUS_SIZE, 7.0);
         assert_eq!(NOTIFICATION_DOT_SIZE, 9.0);
+    }
+
+    #[test]
+    fn agent_panel_rows_and_heads_are_whole_pixels() {
+        assert_eq!(AGENT_PANEL_ROW_HEIGHT, 42.0);
+        assert_eq!(AGENT_PANEL_GROUP_HEIGHT, 27.0);
+        for metric in [
+            AGENT_PANEL_HEADER_HEIGHT,
+            AGENT_PANEL_LIST_PADDING_Y,
+            AGENT_PANEL_EMPTY_HEIGHT,
+            AGENTS_SPLIT_DIVIDER_HEIGHT,
+            (AGENT_PANEL_NAME_LINE - AGENT_PANEL_DOT_SIZE) / 2.0,
+            (AGENTS_SPLIT_DIVIDER_HEIGHT - AGENTS_SPLIT_NUB.height) / 2.0,
+            (AGENT_PANEL_DOT_SLOT - AGENT_PANEL_DOT_SIZE) / 2.0,
+        ] {
+            assert_eq!(metric.fract(), 0.0, "{metric} is not a whole pixel");
+        }
+    }
+
+    #[test]
+    fn agent_panel_rows_fill_only_when_active_or_hovered() {
+        let chrome = roost();
+        let theme = Theme::Dark;
+        let resting = agent_panel_row(&chrome, false);
+        assert_eq!(resting(&theme, button::Status::Active).background, None);
+        assert_eq!(
+            resting(&theme, button::Status::Hovered).background,
+            Some(Background::Color(chrome.hover))
+        );
+        assert_eq!(
+            agent_panel_row(&chrome, true)(&theme, button::Status::Active).background,
+            Some(Background::Color(chrome.active_agent))
+        );
+        assert_eq!(
+            resting(&theme, button::Status::Active).border.radius,
+            AGENT_PANEL_ROW_RADIUS.into()
+        );
+    }
+
+    #[test]
+    fn the_sort_word_is_muted_until_the_pointer_is_on_it() {
+        let chrome = roost();
+        let theme = Theme::Dark;
+        let style = agent_panel_sort_button(&chrome);
+        let resting = style(&theme, button::Status::Active);
+        assert_eq!(resting.background, None);
+        assert_eq!(resting.border.width, 0.0, "borderless");
+        assert_eq!(resting.text_color, chrome.muted_text);
+        let hovered = style(&theme, button::Status::Hovered);
+        assert_eq!(hovered.background, Some(Background::Color(chrome.hover)));
+        assert_eq!(hovered.text_color, chrome.text);
+    }
+
+    #[test]
+    fn the_split_handle_lights_while_hovered() {
+        let chrome = roost();
+        let theme = Theme::Dark;
+        assert_eq!(
+            split_handle(&chrome, false)(&theme).background,
+            Some(Background::Color(chrome.split_handle))
+        );
+        assert_eq!(
+            split_handle(&chrome, true)(&theme).background,
+            Some(Background::Color(chrome.split_handle_hover))
+        );
+    }
+
+    /// A hit is answered from the memo without eliding again: a value
+    /// planted under a key comes back verbatim, which no elision of the
+    /// text would produce.
+    #[test]
+    fn the_elision_memo_answers_a_repeat_from_memory() {
+        let font = chrome_font(iced::font::Weight::Normal);
+        let memo = ElisionMemo::default();
+        let long = "a long project name that cannot fit";
+        let fresh = memo.elide(long, font, 13.0, 60.0);
+        assert_eq!(fresh, elide_to_width(long, font, 13.0, 60.0).0);
+        assert_eq!(memo.len.get(), 1);
+
+        let planted = "planted".to_string();
+        memo.entries
+            .borrow_mut()
+            .entry((font, 13.0f32.to_bits(), 60.0f32.to_bits()))
+            .or_default()
+            .insert(long.to_string(), planted.clone());
+        assert_eq!(memo.elide(long, font, 13.0, 60.0), planted);
+        assert_ne!(
+            memo.elide(long, font, 13.0, 61.0),
+            planted,
+            "every input is in the key: another width is another elision"
+        );
+    }
+
+    #[test]
+    fn the_elision_memo_starts_over_at_its_cap() {
+        let font = chrome_font(iced::font::Weight::Normal);
+        let memo = ElisionMemo::default();
+        for width in 0..ELISION_MEMO_CAPACITY {
+            memo.elide("x", font, 13.0, width as f32);
+        }
+        assert_eq!(memo.len.get(), ELISION_MEMO_CAPACITY);
+        memo.elide("x", font, 13.0, -1.0);
+        assert_eq!(memo.len.get(), 1);
+        assert_eq!(memo.entries.borrow().len(), 1);
     }
 
     #[test]
