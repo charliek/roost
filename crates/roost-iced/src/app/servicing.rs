@@ -129,6 +129,52 @@ fn slot_unavailable<T>() -> Result<T, HostOpFailure> {
     ))
 }
 
+/// How far a tab ref gets towards a terminal this UI holds.
+#[derive(Clone, Copy)]
+enum TabPresence<'a> {
+    /// A bare id while the slot it would name is down
+    /// ([`App::wire_tab_key`]).
+    SlotDown,
+    /// No backend lists the tab.
+    Unlisted,
+    /// Listed, with no terminal attached: a host tab the window has not
+    /// shown, or a local tab whose PTY is still being spawned.
+    Unattached,
+    Attached(&'a TerminalTab),
+}
+
+/// What `tab.capture_pty_input` reads, or why it cannot. The gate goes
+/// first, so `not-enabled` means test mode is off whatever the ref names.
+fn capture_source<'a>(
+    test_mode: bool,
+    tab_id: roost_ipc::messages::WireTabRef,
+    presence: TabPresence<'a>,
+) -> Result<&'a InputCapture, HostOpFailure> {
+    if !test_mode {
+        return Err(HostOpFailure::new(
+            codes::NOT_ENABLED,
+            "ROOST_TEST_MODE=1 is required",
+        ));
+    }
+    match presence {
+        TabPresence::SlotDown => slot_unavailable(),
+        TabPresence::Unlisted => Err(HostOpFailure::new(
+            codes::NOT_FOUND,
+            format!("tab {tab_id} not found"),
+        )),
+        TabPresence::Unattached => Err(HostOpFailure::new(
+            codes::NOT_FOUND,
+            format!("tab {tab_id} has no live terminal"),
+        )),
+        TabPresence::Attached(tab) => tab.session.capture().ok_or_else(|| {
+            HostOpFailure::new(
+                codes::INTERNAL,
+                format!("tab {tab_id} has no input capture"),
+            )
+        }),
+    }
+}
+
 /// The slot a forward is put to: the connected one, and only while it is
 /// still the incarnation the handler addressed, when it addressed one
 /// (`UiRequest::LocalSessionForward::expected_host`).
@@ -1973,6 +2019,27 @@ impl App {
         }
     }
 
+    /// [`TabPresence`] for an IPC ref: listed means what the instance the
+    /// key names lists — the workspace for a local id, the host's last
+    /// mirror for any other — attached or not.
+    fn tab_presence(&self, tab: roost_ipc::messages::WireTabRef) -> TabPresence<'_> {
+        let Some(key) = self.wire_tab_key(tab) else {
+            return TabPresence::SlotDown;
+        };
+        if let Some(attached) = self.tabs.get(&key) {
+            return TabPresence::Attached(attached);
+        }
+        let listed = match key.local_tab() {
+            Some(tab_id) => self.workspace.tab(tab_id).is_ok(),
+            None => self.host_listed_project_of(key).is_some(),
+        };
+        if listed {
+            TabPresence::Unattached
+        } else {
+            TabPresence::Unlisted
+        }
+    }
+
     /// The raise a banner click earned (#351) — best-effort: a window that
     /// has not opened yet has nothing to raise. What it comes to is recorded
     /// here when the window need not be asked (macOS is never Wayland, and a
@@ -2174,6 +2241,31 @@ impl App {
         }
     }
 
+    /// Attach each pending tab whose PTY is already live, ahead of an IPC
+    /// request. `tab.open` answers once its PTY is promoted, but an attach
+    /// that ran before then waits for the next 25 ms retry tick, and the
+    /// request a client sends on that answer must find the terminal rather
+    /// than race the tick. A tab that is not live yet, or that the
+    /// workspace no longer lists (a close in flight), is left to the tick
+    /// and the reconcile: nothing here records a failure, so a burst of
+    /// requests cannot spend a tab's retry budget.
+    fn attach_ready_pending(&mut self) {
+        for key in self.pending_attachments.retry_keys() {
+            if self.tabs.contains_key(&key) {
+                self.pending_attachments.clear(key);
+                continue;
+            }
+            let ready = key.host == self.backend.host()
+                && self.backend.is_live(key.tab)
+                && key
+                    .local_tab()
+                    .is_some_and(|tab_id| self.workspace.tab(tab_id).is_ok());
+            if ready && self.attach_tab(key) {
+                self.pending_attachments.clear(key);
+            }
+        }
+    }
+
     /// The bounded attach-retry driver behind `Message::AttachRetryTick`.
     /// The subscription that calls it is armed only while some tab is
     /// still owed a retry, so an idle app never runs it.
@@ -2237,6 +2329,7 @@ impl App {
                         self.reconcile();
                         batch.mark_reconciled();
                     }
+                    self.attach_ready_pending();
                     task = task.then(self.apply_ui_request(request));
                     // The request may itself have mutated the workspace
                     // (`tab.open`, `palette.activate`), and the reconcile
@@ -3540,11 +3633,7 @@ impl App {
                 drain,
                 reply,
             } => {
-                let result = self
-                    .wire_tab_key(tab_id)
-                    .and_then(|key| self.tabs.get(&key))
-                    .and_then(|tab| tab.session.capture())
-                    .ok_or_else(|| "ROOST_TEST_MODE=1 is required or tab is missing".to_string())
+                let result = capture_source(self.test_mode, tab_id, self.tab_presence(tab_id))
                     .and_then(|capture| {
                         capture
                             .lock()
@@ -3555,7 +3644,12 @@ impl App {
                                     bytes.clone()
                                 }
                             })
-                            .map_err(|_| "PTY input capture lock poisoned".to_string())
+                            .map_err(|_| {
+                                HostOpFailure::new(
+                                    codes::INTERNAL,
+                                    "PTY input capture lock poisoned",
+                                )
+                            })
                     });
                 let _ = reply.send(result);
             }
@@ -5909,6 +6003,60 @@ mod tests {
         let (feed_tx, _) = engine_feed::channel();
         let (tab, supervisor) = attach_test_terminal(tab_id, feed_tx);
         (HashMap::from([(TabKey::local(tab_id), tab)]), supervisor)
+    }
+
+    fn capture_refusal(test_mode: bool, presence: TabPresence<'_>) -> HostOpFailure {
+        capture_source(
+            test_mode,
+            roost_ipc::messages::WireTabRef::Local(7),
+            presence,
+        )
+        .map(|_| ())
+        .expect_err("a refusal")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_capture_without_test_mode_is_not_enabled_whatever_the_ref_names() {
+        let (tabs, supervisor) = attached(7);
+        let tab = &tabs[&TabKey::local(7)];
+        let presences = [
+            TabPresence::SlotDown,
+            TabPresence::Unlisted,
+            TabPresence::Unattached,
+            TabPresence::Attached(tab),
+        ];
+        for presence in presences {
+            let refusal = capture_refusal(false, presence);
+            assert_eq!(refusal.code, codes::NOT_ENABLED, "{refusal:?}");
+        }
+        assert!(
+            capture_source(
+                true,
+                roost_ipc::messages::WireTabRef::Local(7),
+                TabPresence::Attached(tab)
+            )
+            .is_ok(),
+            "test mode reads an attached tab's capture"
+        );
+        drop(tabs);
+        supervisor.close(7);
+    }
+
+    #[test]
+    fn a_capture_in_test_mode_names_why_the_ref_has_no_terminal() {
+        let slot_down = capture_refusal(true, TabPresence::SlotDown);
+        assert_eq!(
+            slot_down.code,
+            roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
+            "{slot_down:?}"
+        );
+
+        let unlisted = capture_refusal(true, TabPresence::Unlisted);
+        let unattached = capture_refusal(true, TabPresence::Unattached);
+        assert_eq!(unlisted.code, codes::NOT_FOUND, "{unlisted:?}");
+        assert_eq!(unattached.code, codes::NOT_FOUND, "{unattached:?}");
+        assert_eq!(unlisted.message, "tab 7 not found");
+        assert_eq!(unattached.message, "tab 7 has no live terminal");
     }
 
     /// The race the retry exists for, against a real supervisor: the

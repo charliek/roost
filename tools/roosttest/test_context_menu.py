@@ -153,6 +153,8 @@ def test_new_tab_here_opens_where_an_unshown_tab_is_and_takes_the_keys(roost, pr
             5.0,
             "the new tab takes the selection",
         )
+        # Listed and selected before its PTY is spawned, so not yet attached.
+        wait_tab_attached(roost, opened)
         drain_until_match(roost, opened, rb"echo MARK_\$\(\(6\*7\)\)")
         assert b"MARK" not in drain(roost, shown), "the tab that was on screen was sent the keys"
         _assert_shell_in(roost, opened, LIVE_CWD)

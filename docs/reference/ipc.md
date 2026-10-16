@@ -949,6 +949,19 @@ defaults to `false` (peek). Response:
 {"data": "G10xMTtyZ2I6MDAwMC8xMTExLzIyMjIH"}
 ```
 
+A UI socket's errors. Under [`local-backend =
+session`](#a-ui-socket-under-local-backend-session) a bare `tab_id` is
+routed first, as for every op, so while the local session is not
+connected it answers `host-unavailable` before anything below is
+checked. Otherwise, in the order they are checked:
+
+1. `not-enabled` — the UI was launched without `ROOST_TEST_MODE=1`,
+   whatever `tab_id` names.
+2. `not-found` — `tab_id` names no tab (`tab 7 not found`), or a tab
+   this UI lists but holds no terminal for (`tab 7 has no live
+   terminal`): a host tab the window has not shown, or a local tab whose
+   PTY is still being spawned. Same code, two messages.
+
 On a **host-session socket** it reads the same buffer one level down:
 the bytes the tab task queued for the child's PTY, which is where a
 session's terminal replies (DA/DSR/color queries) and any `INPUT`
