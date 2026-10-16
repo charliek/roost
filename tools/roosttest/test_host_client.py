@@ -113,6 +113,10 @@ ATTACH_BUDGET_S = 0.5
 
 # A tab id no test run allocates: projects and tabs share one counter.
 UNLISTED_TAB = 9_000_000_000
+# The same id qualified to an incarnation no run reaches (`h<n>.<id>`,
+# n a u32). A qualified ref is never rewritten onto the local session
+# slot, so it reaches the op itself whatever `local-backend` says.
+UNLISTED_HOST_TAB = f"h{2**32 - 1}.{UNLISTED_TAB}"
 
 # What `ROOST_SESSION_FAKE_BUILD` puts on the wire — shaped like a real
 # build string, impossible to mistake for one. Same value the session
@@ -163,24 +167,24 @@ def require_test_mode(roost: Roost) -> None:
     This lane reads what the UI queued toward a host
     (`tab.capture_pty_input`), which is one of the test-gated ops. The
     gate is the first thing that op checks, so `not-enabled` says test
-    mode is off whatever the id names, and a UI in test mode answers an
-    id nothing lists `not-found`: the probe needs no live tab. A UI on
-    `local-backend = session` with its slot down routes the bare id
-    first and answers `host-unavailable`, which says nothing about test
-    mode either way — leave it to the one case that needs the op.
+    mode is off whatever the ref names, and a UI in test mode answers a
+    ref nothing lists `not-found`: the probe needs no live tab. It is
+    host-qualified so that a UI on `local-backend = session` with its
+    slot down cannot answer `host-unavailable` for the bare id before
+    the gate is reached.
     """
     try:
-        roost.tab_capture_pty_input(UNLISTED_TAB, drain=False)
+        roost.tab_capture_pty_input(UNLISTED_HOST_TAB, drain=False)
     except RoostError as error:
         if error.code == "not-enabled":
             pytest.skip(
                 "the UI under test was launched without ROOST_TEST_MODE=1; "
                 "run this lane via `make e2e-host-client`"
             )
-        if error.code not in ("not-found", "host-unavailable"):
+        if error.code != "not-found":
             raise
     else:
-        raise AssertionError(f"tab {UNLISTED_TAB} was read, so something lists it")
+        raise AssertionError(f"tab {UNLISTED_HOST_TAB} was read, so something lists it")
 
 
 # ---------------------------------------------------------------------------
