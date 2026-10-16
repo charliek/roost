@@ -214,11 +214,6 @@ type ClipboardDumpReply = tokio::sync::oneshot::Sender<Result<Option<String>, St
 /// has no live terminal or `ROOST_TEST_MODE=1` was absent at launch.
 type UnitReply = tokio::sync::oneshot::Sender<Result<(), String>>;
 
-/// Reply for [`UiRequest::TabCapturePtyInput`]: the bytes the UI has
-/// queued onto this tab's PTY-input channel since the last drain.
-/// `Err` for unknown tab or missing test-mode env var.
-type CapturedBytesReply = tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>;
-
 /// Reply for [`UiRequest::TabDumpResolved`]: every cell on the tab's
 /// terminal viewport after the production color resolver has run.
 /// `Err` only for unknown tab; this op is ungated.
@@ -373,12 +368,14 @@ pub enum UiRequest {
         reply: UnitReply,
     },
     /// `tab.capture_pty_input` — read (and optionally drain) the
-    /// bytes the UI has queued onto a tab's PTY-input channel.
-    /// Gated like `TabFeedPtyBytes`.
+    /// bytes the UI has queued onto a tab's PTY-input channel since the
+    /// last drain. Gated like `TabFeedPtyBytes`. The refusal carries its
+    /// own code: its causes need different ones, and `map_test_op_err`
+    /// can only guess a code from the words of a message.
     TabCapturePtyInput {
         tab_id: WireTabRef,
         drain: bool,
-        reply: CapturedBytesReply,
+        reply: HostOpReply<Vec<u8>>,
     },
     /// `tab.dump_resolved` — return every cell on a tab's terminal
     /// viewport after the production color resolver has run. Ungated
@@ -3917,14 +3914,14 @@ async fn dispatch(
             let p: TabCapturePtyInputParams = decode(params)?;
             let data = match served::capture_pty_input(h, p.tab_id, p.drain).await {
                 Some(served) => served?,
-                None => h
-                    .ui_call(|reply| UiRequest::TabCapturePtyInput {
+                None => {
+                    h.ui_call(|reply| UiRequest::TabCapturePtyInput {
                         tab_id: p.tab_id,
                         drain: p.drain,
                         reply,
                     })
-                    .await?
-                    .map_err(map_test_op_err)?,
+                    .await??
+                }
             };
             encode(&TabCapturePtyInputResult { data })
         }

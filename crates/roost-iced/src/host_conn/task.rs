@@ -365,6 +365,21 @@ fn op_budget(op: &str) -> Duration {
 const SPAWN_VERDICT_BUDGET: Duration = session_launch::DEFAULT_VERDICT_BUDGET;
 const SPAWN_CONFIRM_BUDGET: Duration = session_launch::DEFAULT_CONFIRM_BUDGET;
 
+/// Test seam: [`SPAWN_CONFIRM_BUDGET`] in milliseconds, before the
+/// timeout scale. A launcher that dies on start spends the whole confirm
+/// before its slot can say so, so a lane about what the slot says then
+/// waits it out on every launch; a shorter one still has to expire first.
+const SPAWN_CONFIRM_BUDGET_MS_ENV: &str = "ROOST_TEST_SPAWN_CONFIRM_BUDGET_MS";
+
+/// [`SPAWN_CONFIRM_BUDGET`], or its test override.
+fn spawn_confirm_budget() -> Duration {
+    use super::reconnect::{parse_millis, test_override};
+    parse_millis(
+        test_override(SPAWN_CONFIRM_BUDGET_MS_ENV).as_deref(),
+        SPAWN_CONFIRM_BUDGET,
+    )
+}
+
 /// How long a restart's launch that ended without a serving session is
 /// still counted as out: `roost-session`'s own readiness budget
 /// (`PARENT_READY_TIMEOUT`). A launcher that gave up waiting leaves its
@@ -1111,7 +1126,7 @@ async fn launch_from(
         first_project,
         socket,
         SPAWN_VERDICT_BUDGET.mul_f64(scale),
-        SPAWN_CONFIRM_BUDGET.mul_f64(scale),
+        spawn_confirm_budget().mul_f64(scale),
     )
     .await
 }

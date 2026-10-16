@@ -111,6 +111,13 @@ COLS, ROWS = 80, 24
 # every other budget here, so a loaded CI runner widens it.
 ATTACH_BUDGET_S = 0.5
 
+# A tab id no test run allocates: projects and tabs share one counter.
+UNLISTED_TAB = 9_000_000_000
+# The same id qualified to an incarnation no run reaches (`h<n>.<id>`,
+# n a u32). A qualified ref is never rewritten onto the local session
+# slot, so it reaches the op itself whatever `local-backend` says.
+UNLISTED_HOST_TAB = f"h{2**32 - 1}.{UNLISTED_TAB}"
+
 # What `ROOST_SESSION_FAKE_BUILD` puts on the wire — shaped like a real
 # build string, impossible to mistake for one. Same value the session
 # lane uses; restated because this file is the client side of that seam.
@@ -159,24 +166,25 @@ def require_test_mode(roost: Roost) -> None:
 
     This lane reads what the UI queued toward a host
     (`tab.capture_pty_input`), which is one of the test-gated ops. The
-    probe has to use a **live** tab: the UI answers the same
-    "ROOST_TEST_MODE=1 is required or tab is missing" for a disabled op
-    and for an unknown id, so probing a made-up id would report every
-    healthy UI as misconfigured. With no local tab to probe there is
-    nothing to conclude — leave it to the one case that needs the op.
+    gate is the first thing that op checks, so `not-enabled` says test
+    mode is off whatever the ref names, and a UI in test mode answers a
+    ref nothing lists `not-found`: the probe needs no live tab. It is
+    host-qualified so that a UI on `local-backend = session` with its
+    slot down cannot answer `host-unavailable` for the bare id before
+    the gate is reached.
     """
-    live = [int(row["id"]) for row in roost.tabs()]
-    if not live:
-        return
     try:
-        roost.tab_capture_pty_input(live[0], drain=False)
+        roost.tab_capture_pty_input(UNLISTED_HOST_TAB, drain=False)
     except RoostError as error:
         if error.code == "not-enabled":
             pytest.skip(
                 "the UI under test was launched without ROOST_TEST_MODE=1; "
                 "run this lane via `make e2e-host-client`"
             )
-        raise
+        if error.code != "not-found":
+            raise
+    else:
+        raise AssertionError(f"tab {UNLISTED_HOST_TAB} was read, so something lists it")
 
 
 # ---------------------------------------------------------------------------
@@ -3108,6 +3116,52 @@ def test_send_file_on_a_local_tab_pastes_the_escaped_local_path(roost, project, 
     assert result["skipped"] == [], result
     assert result["pasted"] == str(source).replace(" ", r"\ "), result
     drain_until_match(roost, tab, re.escape(result["pasted"].encode()))
+
+
+def test_a_local_tab_answers_the_request_sent_on_its_open_reply(roost, project, tmp_path):
+    """`tab.open` answers once the tab's PTY exists, and the next request
+    finds the UI's terminal for it.
+
+    The UI's own attach can run before the PTY is promoted and fail
+    (#267). Its retry is a 25 ms tick, so the UI retries ahead of each
+    request too, or a client that reads the moment it is answered lands
+    in the gap. Three tabs, because a race against a tick is one a
+    single open can miss.
+    """
+    for _ in range(3):
+        tab = quiet_tab(roost, project, tmp_path)
+        roost.dump_text(tab)
+
+
+def test_a_capture_of_a_tab_nothing_lists_is_not_found(roost):
+    """`not-enabled` is the test-mode gate's answer and nothing else's
+    (`require_test_mode` relies on that): an id no backend lists, bare or
+    host-qualified, is `not-found`."""
+    for ref in (str(UNLISTED_TAB), "h999.1"):
+        refusal = refused(roost.tab_capture_pty_input, ref)
+        assert refusal.code == "not-found", (ref, refusal)
+        assert refusal.message == f"tab {ref} not found", (ref, refusal)
+
+
+def test_a_capture_of_a_host_tab_the_window_has_not_shown_is_not_found(
+    connected_host_tab, roost
+):
+    """Listed is not attached: the window holds no terminal for a host tab
+    it has not shown, so there is nothing to read. Still `not-found`, with
+    its own message, so a caller can tell it from an id nothing lists."""
+    host, key = connected_host_tab
+    incarnation = key.split(".", 1)[0]
+    with host.client() as session:
+        parked = quiet_tab(session, first_project(session), host.env.launch_cwd)
+    wait_until(
+        lambda: parked in listed_host_tabs(roost, host.saved_id),
+        30.0,
+        "the client to list the parked tab",
+    )
+    unshown = f"{incarnation}.{parked}"
+    refusal = refused(roost.tab_capture_pty_input, unshown)
+    assert refusal.code == "not-found", refusal
+    assert refusal.message == f"tab {unshown} has no live terminal", refusal
 
 
 def test_roostctl_tab_send_file_prints_the_host_path_it_pasted(

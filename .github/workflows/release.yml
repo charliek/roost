@@ -62,13 +62,12 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
-# Release runs save no Rust, SwiftPM or libghostty-vt cache (`cache: false`
-# on the toolchain, `actions/cache/restore` for libghostty-vt). An entry
-# saved here is scoped to its tag, so no later release can read it, and
-# each release's ~3.4 GB pushed the main entries ci.yml restores out of
-# the repo's 10 GB cache. A macOS job still restores main's libghostty-vt.
-# (mise and uv keep their own caches, keyed like main's, so they hit
-# main's entries rather than save new ones.)
+# Release runs restore caches but save none (`cache: false` on the
+# toolchain, `actions/cache/restore` for libghostty-vt, `cache_save` /
+# `save-cache: false` on mise and uv). An entry saved here is scoped to
+# its tag, so no later release can read it, and each release's ~3.4 GB
+# pushed the main entries ci.yml restores out of the repo's 10 GB cache.
+# A macOS job still restores main's libghostty-vt, mise and uv entries.
 jobs:
   version-check:
     runs-on: ubuntu-latest
@@ -248,6 +247,8 @@ jobs:
           cache: false
 
       - uses: jdx/mise-action@v4
+        with:
+          cache_save: false
 
       - name: Restore vendored libghostty-vt
         id: cache-ghostty
@@ -399,9 +400,13 @@ jobs:
           cache: false
 
       - uses: jdx/mise-action@v4
+        with:
+          cache_save: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
+        with:
+          save-cache: false
 
       - name: Restore vendored libghostty-vt
         id: cache-ghostty
@@ -798,9 +803,13 @@ jobs:
           cache: false
 
       - uses: jdx/mise-action@v4
+        with:
+          cache_save: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
+        with:
+          save-cache: false
 
       - name: Restore vendored libghostty-vt
         id: cache-ghostty

@@ -11,6 +11,21 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+### Fixed
+
+- **A request right after `tab.open` no longer races the window's
+  attach.** In Roost-Iced, `tab dump`, `tab send-file` or a test-mode op
+  sent as soon as `roostctl tab open` (or any `tab.open` client)
+  answered could get `not-found: tab N has no live terminal` for up to
+  25 ms, until the window's next attach retry. The window now attaches
+  a waiting local tab whose terminal is ready before it answers a
+  request. A narrower window, a tab listed before its PTY exists, is
+  tracked in #640.
+  `tab.capture_pty_input` answers `not-enabled` only when
+  `ROOST_TEST_MODE=1` is missing, and `not-found` for an unknown or
+  not-yet-attached tab, where it used to answer `not-enabled` for all
+  three (#637).
+
 ## v0.0.25 — 2026-10-15
 
 _The Agents panel release (#629): Roost-Iced's sidebar lists every agent

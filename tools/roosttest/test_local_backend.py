@@ -143,6 +143,22 @@ CANNOT_START_ACTIONS = [
 ]
 #: The reverse switch's receipt (`local_backend.rs`).
 BACK_IN_ROOST = "local tabs run in Roost again"
+#: The rollback budget a launch over a SIGSTOPped daemon is given, in
+#: place of `ROLLBACK_BUDGET`'s 20 s (`crates/roost-iced/src/app.rs`).
+#: Still scaled, and still spent whole: nothing answers a stopped daemon.
+#: Honoured only under `ROOST_TEST_MODE=1`, which every lane running this
+#: module sets.
+ROLLBACK_BUDGET_S = 1.0
+SHORT_ROLLBACK = {"ROOST_TEST_ROLLBACK_BUDGET_MS": str(int(ROLLBACK_BUDGET_S * 1000))}
+#: The same for the confirm a dead launcher gets, in place of
+#: `SPAWN_CONFIRM_BUDGET`'s 10 s (`crates/roost-iced/src/host_conn/task.rs`):
+#: nothing binds behind the stub, so it too is spent whole.
+SHORT_CONFIRM = {"ROOST_TEST_SPAWN_CONFIRM_BUDGET_MS": "1000"}
+#: `BACKOFF_BASE` (`crates/roost-iced/src/host_conn/state.rs`), in seconds:
+#: the first rung of a localhost slot's redial ladder, which doubles per
+#: rung. Jitter puts the first redial between half of it and all of it,
+#: so this is the latest that redial can come.
+LOCALHOST_FIRST_REDIAL_S = 0.25
 
 
 def crashing_session() -> dict[str, str]:
@@ -833,10 +849,12 @@ def test_a_session_that_dies_on_start_is_named_and_not_dialled_again(lane: Lane)
     else, and a retry was armed every few seconds forever. Now the band
     names the exit, `detail` carries what the launcher said on stderr,
     and nothing dials again — held over a window, because "no retry"
-    has no edge to wait on. The settle waits out the one confirm a dead
-    launcher gets, for a daemon it may have left binding.
+    has no edge to wait on. The window is four times the redial ladder's
+    first rung, so its first two redials (one rung, then twice that)
+    would both land inside it. The settle waits out the one confirm a
+    dead launcher gets, for a daemon it may have left binding.
     """
-    roost = lane.start("session", extra_env=crashing_session())
+    roost = lane.start("session", extra_env={**crashing_session(), **SHORT_CONFIRM})
 
     last: dict | None = None
 
@@ -860,7 +878,7 @@ def test_a_session_that_dies_on_start_is_named_and_not_dialled_again(lane: Lane)
         "roost-session exited before it was ready (exit status 1): boom: died on start"
     ), row
 
-    deadline = time.monotonic() + scaled_timeout(5.0)
+    deadline = time.monotonic() + scaled_timeout(4 * LOCALHOST_FIRST_REDIAL_S)
     while time.monotonic() < deadline:
         assert the_slot() == row, "the slot moved after it settled"
         time.sleep(0.1)
@@ -1451,14 +1469,17 @@ def test_a_bootstrap_rollback_cannot_hang_the_launch(lane: Lane):
     os.kill(lane.pid, signal.SIGSTOP)
     try:
         started = time.monotonic()
-        roost = lane.restart()
+        roost = lane.restart(extra_env=SHORT_ROLLBACK)
         elapsed = time.monotonic() - started
     finally:
         os.kill(lane.pid, signal.SIGCONT)
 
     assert roost.identify()["local_backend"] == "in-process", "the rollback still decided"
     assert layout(roost.list()) == want, "and the source is untouched"
-    assert elapsed < scaled_timeout(90.0), (
+    # The budget plus a launch: short of the shipped 20 s budget, so a
+    # rollback that overruns what it was given fails here rather than at
+    # the harness's own 30 s boot wait.
+    assert elapsed < scaled_timeout(ROLLBACK_BUDGET_S + 10.0), (
         f"the launch waited {elapsed:.0f}s on a session that was never going to answer"
     )
     assert lane.journal() is not None, (
@@ -2668,7 +2689,7 @@ def test_a_migration_adopts_an_unresolved_rollback_instead_of_orphaning_it(lane:
     assert lane.pid is not None
     os.kill(lane.pid, signal.SIGSTOP)
     try:
-        roost = lane.restart()
+        roost = lane.restart(extra_env=SHORT_ROLLBACK)
     finally:
         os.kill(lane.pid, signal.SIGCONT)
     assert roost.identify()["local_backend"] == "session"
@@ -3528,7 +3549,7 @@ def test_a_local_session_that_cannot_start_says_so_and_offers_the_way_out(
     is confirmed. Confirming lands in-process with a tab to show, the
     key written, no journal left, and the dead slot forgotten.
     """
-    env = NO_SESSION if launch == "missing" else crashing_session()
+    env = NO_SESSION if launch == "missing" else {**crashing_session(), **SHORT_CONFIRM}
     roost = lane.start("session", extra_env=env)
     first = shown_notice(roost, "the notice in the empty window")
     slot = local_band(roost)["saved_id"]

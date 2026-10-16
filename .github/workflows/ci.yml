@@ -650,15 +650,24 @@ jobs:
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true' || needs.changes.outputs.macbundle == 'true'
     strategy:
       fail-fast: false
+      # Linux runs X11 and Wayland as separate cells, in parallel: run in
+      # series in one cell they took ~23 of its ~27 warm minutes.
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        renderer: [wgpu, tiny-skia]
+        include:
+          - { os: ubuntu-latest, renderer: wgpu, display: x11 }
+          - { os: ubuntu-latest, renderer: wgpu, display: wayland }
+          - { os: ubuntu-latest, renderer: tiny-skia, display: x11 }
+          - { os: ubuntu-latest, renderer: tiny-skia, display: wayland }
+          - { os: macos-latest, renderer: wgpu, display: macos }
+          - { os: macos-latest, renderer: tiny-skia, display: macos }
     runs-on: ${{ matrix.os }}
-    # A warm Ubuntu cell takes ~27 min and a cold one (empty `iced-debug`
-    # cache: libghostty-vt, the dependency graph and the test/clippy builds
-    # from scratch) ~41, so 40 cancelled every cold run on main (2026-10-07,
-    # 2026-10-15). 50 covers a cold cell with room for runner variance.
-    timeout-minutes: 50
+    # Sized for a cold cell (an empty `iced-debug` cache: libghostty-vt,
+    # the dependency graph and the test/clippy builds from scratch). When
+    # X11 and Wayland shared one Ubuntu cell, a cold one took ~41 min and 40
+    # cancelled it (2026-10-07, 2026-10-15). Split, the X11 cell sheds the
+    # ~10 min Wayland pass (and plan 081's shorter local-backend lane ~4
+    # more), so 40 leaves a cold one room again.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
         with:
@@ -671,11 +680,13 @@ jobs:
             fonts-noto-cjk libclang-dev libxkbcommon-x11-0 libwayland-client0 \
             mesa-vulkan-drivers weston xvfb xdotool zsh
 
+      # A Wayland cell runs neither `cargo test` nor clippy, so what it
+      # would save lacks their artifacts; only the cells that run them save.
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache-shared-key: iced-debug
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' && matrix.display != 'wayland' }}
 
       - uses: jdx/mise-action@v4
 
@@ -703,6 +714,7 @@ jobs:
         run: cargo build -p roost-iced -p roost-cli -p roost-session
 
       - name: Test and lint Iced
+        if: matrix.display != 'wayland'
         run: |
           cargo test -p roost-iced
           cargo clippy -p roost-iced --all-targets -- -D warnings
@@ -715,6 +727,7 @@ jobs:
           cargo clippy -p roost-iced --features linux-package --all-targets -- -D warnings
 
       - name: Verify toolkit dependency boundaries
+        if: matrix.display != 'wayland'
         shell: bash
         run: |
           set -euo pipefail
@@ -741,7 +754,7 @@ jobs:
           fi
 
       - name: Run Iced functional E2E (Linux X11)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'x11'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -803,7 +816,7 @@ jobs:
       # module deletes the last project, which ends the app (plan 026 D8),
       # so it must own the instance it drives.
       - name: Run Iced exit-on-empty E2E (Linux X11)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'x11'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -826,7 +839,7 @@ jobs:
       # all three lanes anyway for structural symmetry with the
       # exit-on-empty step above.
       - name: Run Iced menu-Quit E2E (Linux X11)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'x11'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -849,7 +862,7 @@ jobs:
       # runs (`e2e-mac`, release.yml) and the macOS cells deselect it;
       # see the Makefile's DAEMON_E2E_DESELECT for every mirror.
       - name: Run host-client E2E (Linux X11)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'x11'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -870,7 +883,7 @@ jobs:
       # tell two connected hosts' tabs apart (`make e2e-host-ssh` carries
       # the same warning).
       - name: Run SSH-transport E2E (Linux X11)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'x11'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -893,7 +906,7 @@ jobs:
       # host lane in this UI would attempt (`make e2e-host-missing-daemon`
       # carries the same warning).
       - name: Run missing-daemon E2E (Linux X11)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'x11'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -917,7 +930,7 @@ jobs:
       # answers there (`make e2e-host-local-spawn` carries the same
       # warning).
       - name: Run local-spawn E2E (Linux X11)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'x11'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -940,7 +953,7 @@ jobs:
       # the incarnation probe that cannot tell two connected hosts' tabs
       # apart (`make e2e-host-localhost` carries the same warning).
       - name: Run localhost E2E (Linux X11)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'x11'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -965,7 +978,7 @@ jobs:
       # `local-backend` no other lane expects, which is the second
       # reason it runs alone.
       - name: Run local-backend switch E2E (Linux X11)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'x11'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -986,7 +999,7 @@ jobs:
       # probe that cannot tell two connected hosts' tabs apart
       # (`make e2e-host-bootstrap` carries the same warning).
       - name: Run bootstrap E2E (Linux X11)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'x11'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1001,7 +1014,7 @@ jobs:
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced real-input clipboard (Linux X11)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'x11'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1013,7 +1026,7 @@ jobs:
         run: python3 tools/input/linux/iced_clipboard_check.py
 
       - name: Run Iced functional E2E (Linux Wayland)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'wayland'
         # weston's headless backend has no input seat. Iced 0.14's
         # smithay-clipboard correctly refuses wl_data_device ownership without
         # a focused seat/serial, so native clipboard coverage runs in the X11
@@ -1079,7 +1092,7 @@ jobs:
           --roost-target iced --roost-fresh -v
 
       - name: Run Iced exit-on-empty E2E (Linux Wayland)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'wayland'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1096,7 +1109,7 @@ jobs:
       # See the Linux X11 lane's comment above the same-named step: kept
       # in every lane for structural symmetry, self-skips off macOS.
       - name: Run Iced menu-Quit E2E (Linux Wayland)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'wayland'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1115,7 +1128,7 @@ jobs:
       # what makes "Linux client support" a tested claim rather than a
       # structural one.
       - name: Run host-client E2E (Linux Wayland)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'wayland'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1132,7 +1145,7 @@ jobs:
       # The Wayland twin of the X11 SSH-transport step. Same ordering
       # rule: after the host-client step, never beside it.
       - name: Run SSH-transport E2E (Linux Wayland)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'wayland'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1150,7 +1163,7 @@ jobs:
       # rule: after the SSH-transport step, never beside it or the
       # host-client step.
       - name: Run missing-daemon E2E (Linux Wayland)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'wayland'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1168,7 +1181,7 @@ jobs:
       # and one more reason for it: this lane owns the runner's default
       # session socket for its duration.
       - name: Run local-spawn E2E (Linux Wayland)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'wayland'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1186,7 +1199,7 @@ jobs:
       # and the lane the module's private `XDG_RUNTIME_DIR` is riskiest
       # in — `agent_jail.make_private_runtime_dir` says why.
       - name: Run localhost E2E (Linux Wayland)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'wayland'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1205,7 +1218,7 @@ jobs:
       # for: the press it dispatches goes through the UI's own pointer
       # handler.
       - name: Run local-backend switch E2E (Linux Wayland)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'wayland'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1223,7 +1236,7 @@ jobs:
       # after the SSH-transport step, never beside it or the host-client
       # step.
       - name: Run bootstrap E2E (Linux Wayland)
-        if: runner.os == 'Linux'
+        if: matrix.display == 'wayland'
         env:
           ICED_BACKEND: ${{ matrix.renderer }}
           RUST_LOG: warn
@@ -1864,7 +1877,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-iced-${{ matrix.os }}-${{ matrix.renderer }}-diagnostics
+          name: e2e-iced-${{ matrix.os }}-${{ matrix.renderer }}-${{ matrix.display }}-diagnostics
           path: diagnostics/
           if-no-files-found: ignore
           retention-days: 14
