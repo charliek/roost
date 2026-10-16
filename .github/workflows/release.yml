@@ -62,6 +62,13 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+# Release runs save no Rust, SwiftPM or libghostty-vt cache (`cache: false`
+# on the toolchain, `actions/cache/restore` for libghostty-vt). An entry
+# saved here is scoped to its tag, so no later release can read it, and
+# each release's ~3.4 GB pushed the main entries ci.yml restores out of
+# the repo's 10 GB cache. A macOS job still restores main's libghostty-vt.
+# (mise and uv keep their own caches, keyed like main's, so they hit
+# main's entries rather than save new ones.)
 jobs:
   version-check:
     runs-on: ubuntu-latest
@@ -237,12 +244,14 @@ jobs:
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
 
       - uses: jdx/mise-action@v4
 
-      - name: Cache vendored libghostty-vt
+      - name: Restore vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@v5
+        uses: actions/cache/restore@v5
         with:
           path: |
             third_party/ghostty/out
@@ -252,16 +261,6 @@ jobs:
       - name: Build libghostty-vt
         if: steps.cache-ghostty.outputs.cache-hit != 'true'
         run: ./third_party/ghostty/build.sh
-
-      - name: Cache cargo registry + target
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-release-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
-          restore-keys: cargo-release-${{ runner.os }}-${{ matrix.arch }}-
 
       # ROOST_RELEASE_BUILD marks the binaries as release builds (plan 076
       # D2) — stable tags only, so an rc never reads as the same build as
@@ -396,15 +395,17 @@ jobs:
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
 
       - uses: jdx/mise-action@v4
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
 
-      - name: Cache vendored libghostty-vt
+      - name: Restore vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@v5
+        uses: actions/cache/restore@v5
         with:
           path: |
             third_party/ghostty/out
@@ -414,25 +415,6 @@ jobs:
       - name: Build libghostty-vt
         if: steps.cache-ghostty.outputs.cache-hit != 'true'
         run: ./third_party/ghostty/build.sh
-
-      - name: Cache SwiftPM artifacts
-        uses: actions/cache@v5
-        with:
-          path: |
-            mac/.build
-            ~/Library/Caches/org.swift.swiftpm
-          key: swiftpm-release-${{ runner.os }}-${{ hashFiles('mac/Package.swift', 'mac/Package.resolved') }}
-          restore-keys: swiftpm-release-${{ runner.os }}-
-
-      - name: Cache cargo registry + target
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-release-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
-          restore-keys: cargo-release-${{ runner.os }}-
 
       # Inert until all six Apple secrets exist (the CAN_NOTARIZE gate). Imports
       # the Developer ID Application cert into a throwaway keychain so codesign
@@ -785,8 +767,8 @@ jobs:
   # same runner, same six-secret CAN_NOTARIZE gate, same certificate import,
   # same notarize/sign/upload shape — with three deliberate carve-outs:
   #
-  #   * No SwiftPM cache: this bundle is a `cargo build`, not `swift build`,
-  #     and no mac/.build exists here (which is also why the Sparkle signing
+  #   * No SwiftPM build: this bundle is a `cargo build`, not `swift build`,
+  #     and no mac/.build exists here (which is why the Sparkle signing
   #     step below uses the vendored third_party/sparkle/out/bin/sign_update
   #     instead of the SwiftPM artifact path the `mac` job finds).
   #   * No Swift throwaway-key grep: superseded by the key-file fail-fast
@@ -812,15 +794,17 @@ jobs:
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
 
       - uses: jdx/mise-action@v4
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
 
-      - name: Cache vendored libghostty-vt
+      - name: Restore vendored libghostty-vt
         id: cache-ghostty
-        uses: actions/cache@v5
+        uses: actions/cache/restore@v5
         with:
           path: |
             third_party/ghostty/out
@@ -830,18 +814,6 @@ jobs:
       - name: Build libghostty-vt
         if: steps.cache-ghostty.outputs.cache-hit != 'true'
         run: ./third_party/ghostty/build.sh
-
-      # Own cache key, not the `mac` job's `cargo-release-*`: these two jobs
-      # run in parallel and would otherwise both try to SAVE the same key.
-      - name: Cache cargo registry + target
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-release-iced-${{ runner.os }}-${{ hashFiles('**/Cargo.toml', 'rust-toolchain.toml') }}
-          restore-keys: cargo-release-iced-${{ runner.os }}-
 
       # Deliberately uncached (unlike ci.yml's iced lanes): fetch.sh
       # re-verifies the pinned SHA256 on every download, and the release path
