@@ -314,7 +314,7 @@ real-input run.
   `test_real_input_mac.py` ran and passed.
 - `continue-on-error` steps hide failures in the job conclusion and the steps
   API: read the log body and the diagnostics artifact
-  (`e2e-iced-<os>-<renderer>-diagnostics`).
+  (`e2e-iced-<os>-<renderer>-<display>-diagnostics`, display `macos` on a Mac).
 - `ci.yml` has no `workflow_dispatch`: an on-runner loop needs a scratch PR.
 - The hosted macOS runners are slower and are scaled by
   `ROOST_TEST_TIMEOUT_SCALE=3`; measure timing questions on the runner, not
