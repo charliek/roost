@@ -235,7 +235,7 @@ fn ssh_backoff_base() -> Duration {
 /// The gate is the same one every other test seam in the tree uses: a
 /// variable that shortens a security-relevant ladder must not be
 /// reachable by setting one name in a shipped build's environment.
-fn test_override(name: &str) -> Option<String> {
+pub(crate) fn test_override(name: &str) -> Option<String> {
     if !std::env::var("ROOST_TEST_MODE").is_ok_and(|value| value == "1") {
         return None;
     }
@@ -254,13 +254,19 @@ fn parse_attempt_budget(raw: Option<&str>) -> u32 {
         .unwrap_or(SSH_ATTEMPT_BUDGET)
 }
 
-/// [`ssh_backoff_base`]'s rule, over an already-read value. A zero base
-/// would spin, so it falls back like any other nonsense.
+/// [`ssh_backoff_base`]'s rule, over an already-read value.
 fn parse_backoff_base(raw: Option<&str>) -> Duration {
+    parse_millis(raw, SSH_BACKOFF_BASE)
+}
+
+/// A millisecond override's rule, over an already-read value. Zero falls
+/// back like any other nonsense: a zero base would spin, and a zero
+/// budget expires before the thing it bounds has started.
+pub(crate) fn parse_millis(raw: Option<&str>, shipped: Duration) -> Duration {
     raw.and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|millis| *millis > 0)
         .map(Duration::from_millis)
-        .unwrap_or(SSH_BACKOFF_BASE)
+        .unwrap_or(shipped)
 }
 
 #[cfg(test)]

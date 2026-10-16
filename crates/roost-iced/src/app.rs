@@ -10845,7 +10845,7 @@ async fn roll_back_switch_destination(targets: &[(i64, Option<usize>)]) -> bool 
     // running app's driver and does not reach this path. On expiry the
     // journal stays exactly where it is, which is the same answer a
     // session that is not there gets.
-    let budget = ROLLBACK_BUDGET.mul_f64(roost_ipc::session_launch::timeout_scale());
+    let budget = rollback_budget().mul_f64(roost_ipc::session_launch::timeout_scale());
     match tokio::time::timeout(budget, delete_switch_destination(targets)).await {
         Ok(complete) => complete,
         Err(_elapsed) => {
@@ -10865,6 +10865,21 @@ async fn roll_back_switch_destination(targets: &[(i64, Option<usize>)]) -> bool 
 /// socket on this machine — and short enough that a wedged daemon costs
 /// a slow start rather than no start at all.
 const ROLLBACK_BUDGET: Duration = Duration::from_secs(20);
+
+/// Test seam: [`ROLLBACK_BUDGET`] in milliseconds, before the timeout
+/// scale. A lane that wedges the daemon on purpose spends the whole
+/// budget on every launch that rolls back, a minute each at CI's scale;
+/// a shorter one still has to expire before the window comes up.
+const ROLLBACK_BUDGET_MS_ENV: &str = "ROOST_TEST_ROLLBACK_BUDGET_MS";
+
+/// [`ROLLBACK_BUDGET`], or its test override.
+fn rollback_budget() -> Duration {
+    use crate::host_conn::reconnect::{parse_millis, test_override};
+    parse_millis(
+        test_override(ROLLBACK_BUDGET_MS_ENV).as_deref(),
+        ROLLBACK_BUDGET,
+    )
+}
 
 async fn delete_switch_destination(targets: &[(i64, Option<usize>)]) -> bool {
     let Some(socket) = roost_ipc::session_socket_path() else {
