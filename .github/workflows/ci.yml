@@ -1751,7 +1751,15 @@ jobs:
           ./mac/scripts/make-dmg.sh 0.0.0-ci
           dmg="mac/build/Roost-Iced-ci-smoke.dmg"
           mnt="$(mktemp -d)"
-          hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mnt" >/dev/null
+          # Hosted macOS runners fail an attach now and then with "Resource
+          # temporarily unavailable" (2026-10-06), the same contention
+          # make-dmg.sh retries its `hdiutil create` through.
+          for attempt in 1 2 3; do
+            hdiutil attach "$dmg" -readonly -nobrowse -mountpoint "$mnt" >/dev/null && break
+            [ "$attempt" = 3 ] && { echo "FAIL: hdiutil attach failed $attempt times"; exit 1; }
+            echo "hdiutil attach failed (attempt $attempt); retrying in 5s"
+            sleep 5
+          done
           trap 'hdiutil detach "$mnt" >/dev/null 2>&1 || true' EXIT
           ls -la "$mnt"
           [ -d "$mnt/Roost-Iced.app" ] \
