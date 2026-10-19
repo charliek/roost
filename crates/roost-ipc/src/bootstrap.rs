@@ -6344,6 +6344,40 @@ mod tests {
         assert!(!dir.path().join("dl").exists(), "nothing was downloaded");
     }
 
+    /// The sibling is this client's own binary, so it is offered only to
+    /// a host of the same OS *and* arch: an arm64 Linux client's ELF is no
+    /// use to an arm64 Mac, and the preview must not promise it either.
+    #[tokio::test]
+    async fn the_sibling_rung_refuses_a_host_of_another_os_with_the_same_arch() {
+        let Some(local) = client_platform() else {
+            return;
+        };
+        let other = RemotePlatform {
+            os: match local.os {
+                RemoteOs::Linux => RemoteOs::Darwin,
+                RemoteOs::Darwin => RemoteOs::Linux,
+            },
+            arch: local.arch,
+        };
+        let dir = scratch_parent();
+        let mut opts = options();
+        opts.sibling_bin = Some(PathBuf::from("/nonexistent/roost-session"));
+        opts.source = Some(InstallSource::Sibling);
+
+        assert!(matches!(
+            opts.source_preview(other),
+            Err(BootstrapError::NoSource { .. })
+        ));
+        let error = resolve_source(&opts, other, &dir.path().join("dl"))
+            .await
+            .expect_err("another OS's host can't run this client's binary");
+        assert!(
+            matches!(&error, BootstrapError::Source(detail)
+                if detail.contains(&format!("is a {local} build and that host is {other}"))),
+            "{error:?}"
+        );
+    }
+
     // ------------------------------------------------------------------
     // download plumbing
     // ------------------------------------------------------------------
