@@ -9,7 +9,15 @@ builds the DMG + `.deb`s and publishes to the apt repo. Bump
 `[workspace.package].version` in `Cargo.toml` to match before tagging (the
 release workflow asserts they agree).
 
-## Unreleased
+## v0.0.26 — 2026-10-19
+
+_The Mac-host release (#643): Roost-Iced can install and upgrade
+`roost-session` on an Apple-silicon Mac reached over SSH, the same as a
+Linux box, and the release now publishes a `darwin-arm64` session binary
+for Linux clients to download. A request sent right after `tab.open`
+also no longer races the tab's attach. The Swift app is unchanged. There
+is no session-protocol bump. To update a Mac host, only the client
+needs this release: a Mac client sends its own bundled `roost-session`._
 
 ### Added
 
