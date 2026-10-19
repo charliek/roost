@@ -366,12 +366,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ASSET_LABEL: ${{ matrix.session_label }}
           CHECKSUM_LABEL: ${{ matrix.session_checksum_label }}
+          ASSET_PATH: ${{ steps.stage_session.outputs.asset_path }}
+          CHECKSUM_PATH: ${{ steps.stage_session.outputs.checksum_path }}
         run: |
           set -euo pipefail
-          gh release upload "${GITHUB_REF_NAME}" \
-            "${{ steps.stage_session.outputs.asset_path }}#${ASSET_LABEL}" --clobber
-          gh release upload "${GITHUB_REF_NAME}" \
-            "${{ steps.stage_session.outputs.checksum_path }}#${CHECKSUM_LABEL}" --clobber
+          gh release upload "${GITHUB_REF_NAME}" "${ASSET_PATH}#${ASSET_LABEL}" --clobber
+          gh release upload "${GITHUB_REF_NAME}" "${CHECKSUM_PATH}#${CHECKSUM_LABEL}" --clobber
 
   mac:
     needs: create-release
@@ -1050,12 +1050,14 @@ jobs:
       - name: Upload roost-session standalone artifact + checksum to the Release
         env:
           GH_TOKEN: ${{ github.token }}
+          ASSET_PATH: ${{ steps.stage_session.outputs.asset_path }}
+          CHECKSUM_PATH: ${{ steps.stage_session.outputs.checksum_path }}
         run: |
           set -euo pipefail
           gh release upload "${GITHUB_REF_NAME}" \
-            "${{ steps.stage_session.outputs.asset_path }}#macOS session daemon — Apple silicon (standalone binary)" --clobber
+            "${ASSET_PATH}#macOS session daemon — Apple silicon (standalone binary)" --clobber
           gh release upload "${GITHUB_REF_NAME}" \
-            "${{ steps.stage_session.outputs.checksum_path }}#macOS session daemon — Apple silicon (sha256)" --clobber
+            "${CHECKSUM_PATH}#macOS session daemon — Apple silicon (sha256)" --clobber
 
       # The overrides are what keep this DMG's contents named Roost-Iced.app:
       # with defaults make-dmg.sh packages the Swift bundle, and an iced DMG
