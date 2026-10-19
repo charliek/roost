@@ -255,7 +255,7 @@ What a probe outcome and the far side's session state add up to, once the user c
 | `Compatible{path}` | no session | start(path) only — nothing written |
 | `Mismatch` | running | install → stop → await-gone → start(installed dest) |
 | `Compatible{path}` | running but mismatched (binary already updated on disk, process stale) | stop → await-gone → start(path); no install |
-| Darwin remote / unmapped arch / no source available | — | classified failure, host untouched |
+| OS with no build (not Linux or macOS) / arch with no build for that OS (e.g. an Intel Mac) / no source available | — | classified failure, host untouched |
 
 The `Compatible` + running row is the asymmetry worth noticing: the disk is already right, so the job is a restart, not an install.
 

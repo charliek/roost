@@ -1209,6 +1209,11 @@ async fn an_architecture_with_no_build_is_refused_by_name() {
 #[tokio::test]
 async fn an_intel_mac_is_refused_by_name() {
     let harness = Harness::with_uname("Darwin", "x86_64");
+    // An Intel Mac has no such oid at all.
+    harness.override_tool(
+        "sysctl",
+        "#!/bin/sh\nprintf '%s\\n' 'sysctl: unknown oid' >&2\nexit 1\n",
+    );
     let job = harness.job(harness.options()).await;
 
     let error = job.probe().await.expect_err("no darwin-amd64 build exists");
@@ -1220,6 +1225,38 @@ async fn an_intel_mac_is_refused_by_name() {
             arch: "x86_64".to_string()
         }
     );
+    job.close().await;
+}
+
+/// A login shell running under Rosetta makes `uname -m` say `x86_64` on
+/// Apple silicon. The probe asks the hardware instead, so the Mac is
+/// offered the arm64 build it can run rather than refused as Intel.
+#[tokio::test]
+async fn an_apple_silicon_mac_under_rosetta_is_still_arm64() {
+    let harness = Harness::with_uname("Darwin", "x86_64");
+    harness.override_tool(
+        "sysctl",
+        "#!/bin/sh\n[ \"$1 $2\" = '-n hw.optional.arm64' ] && printf '%s\\n' 1\n",
+    );
+    let job = harness.job(harness.options()).await;
+
+    let probe = job.probe().await.expect("Apple silicon has a build");
+
+    assert_eq!(probe.platform, RemotePlatform::DARWIN_ARM64);
+    job.close().await;
+}
+
+/// The hardware check is Mac-only: a Linux host's `uname -m` is the
+/// answer even where a `sysctl` would claim otherwise.
+#[tokio::test]
+async fn a_linux_host_is_never_reread_as_arm64() {
+    let harness = Harness::with_uname("Linux", "x86_64");
+    harness.override_tool("sysctl", "#!/bin/sh\nprintf '%s\\n' 1\n");
+    let job = harness.job(harness.options()).await;
+
+    let probe = job.probe().await.expect("probe");
+
+    assert_eq!(probe.platform, RemotePlatform::LINUX_AMD64);
     job.close().await;
 }
 

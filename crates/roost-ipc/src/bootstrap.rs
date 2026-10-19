@@ -375,6 +375,13 @@ fn guarded(requires: &[&str], body: String) -> String {
 /// `uname -s`, `uname -m`, `$HOME`, then one field per rung that exists
 /// and is executable — and exits 0 whatever it found.
 ///
+/// On a Mac the machine field is the *hardware's*: a login shell that
+/// runs under Rosetta makes `uname -m` answer `x86_64` on Apple silicon,
+/// and the arm64 build that is then installed runs natively whatever
+/// launched it. `hw.optional.arm64` is 1 on Apple silicon under
+/// translation or not, and absent on an Intel Mac. `sysctl` by name,
+/// so a missing one degrades to `uname -m` rather than failing.
+///
 /// `$HOME` is emitted (possibly empty) because the install destination
 /// is `$HOME` + [`INSTALL_DEST_SUFFIX`], expanded on the *far* side:
 /// without the remote's own answer this side cannot tell whether the
@@ -394,8 +401,13 @@ fn guarded(requires: &[&str], body: String) -> String {
 /// everywhere but a test lane; see [`FS_ROOT_ENV`].
 pub fn discovery_script(jailed: bool) -> String {
     let mut out = String::new();
-    out.push_str("printf '%s\\0' \"$(uname -s 2>/dev/null)\"\n");
-    out.push_str("printf '%s\\0' \"$(uname -m 2>/dev/null)\"\n");
+    out.push_str("s=\"$(uname -s 2>/dev/null)\"\n");
+    out.push_str("m=\"$(uname -m 2>/dev/null)\"\n");
+    out.push_str(
+        "if [ \"$s\" = Darwin ] && [ \"$(sysctl -n hw.optional.arm64 2>/dev/null)\" = 1 ]; then \
+         m=arm64; fi\n",
+    );
+    out.push_str("printf '%s\\0' \"$s\" \"$m\"\n");
     out.push_str("printf '%s\\0' \"${HOME:-}\"\n");
     for candidate in CANDIDATES {
         out.push_str(&candidate.step("printf '%s\\0' \"$p\"", jailed));
@@ -807,7 +819,8 @@ pub fn parse_nul_fields(bytes: &[u8]) -> Result<Vec<String>, BootstrapError> {
 pub struct Discovery {
     /// `uname -s`, trimmed.
     pub os: String,
-    /// `uname -m`, trimmed.
+    /// `uname -m`, trimmed — or `arm64` on an Apple-silicon Mac whose
+    /// shell runs under Rosetta; see [`discovery_script`].
     pub arch: String,
     /// The remote's `$HOME`, verbatim — empty when it has none.
     ///

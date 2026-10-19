@@ -602,6 +602,12 @@ and a standalone darwin `roost-session` release artifact — both
 deliberately deferred to HS-4c. The Swift `Roost.app` remains
 permanently excluded, unchanged from DL-18.
 
+*Superseded 2026-10-18:* both have shipped. The probe maps `uname` onto
+a published platform (`linux-amd64`, `linux-arm64`, `darwin-arm64`), so
+an Apple-silicon Mac is an SSH host the bootstrap installs and upgrades,
+and `release.yml` publishes `roost-session-<version>-darwin-arm64` from
+the bundle's own copy. An Intel Mac still has no build.
+
 See [`guides/host-sessions.md`](../guides/host-sessions.md) for the
 user-facing shape, including the new [launchd supervision
 recipe](../guides/host-sessions.md#surviving-reboots-launchd) for
