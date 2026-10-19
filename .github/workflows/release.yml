@@ -10,6 +10,9 @@ name: Release
 #       install rung fetches directly)
 #   * roost-session-<version>-linux-amd64.sha256 / -arm64.sha256  (its
 #       checksum sidecar, sha256sum two-field format)
+#   * roost-session-<version>-darwin-arm64 + .sha256  (the same, for a Mac
+#       host: the copy Roost-Iced.app bundles, so an SSH client on Linux can
+#       install onto a Mac — a Mac client sends its own bundled copy)
 # then fires repository_dispatch at charliek/apt-charliek so the .deb lands in
 # the apt repo. The build-deps / ghostty-cache patterns mirror ci.yml.
 #
@@ -20,8 +23,8 @@ name: Release
 #   (Gatekeeper requires right-click → Open).
 #
 # The Release is created as a DRAFT and stays one until `publish-release`
-#   flips it, after all eight assets above are attached, plausibly sized (the
-#   two .sha256 sidecars are tiny by design, so their floor is the smallest
+#   flips it, after all ten assets above are attached, plausibly sized (the
+#   three .sha256 sidecars are tiny by design, so their floor is the smallest
 #   `sha256sum` record their reader accepts, not 1 MiB) and
 #   named for the tag. Publishing up front let two things go wrong: a failed
 #   build left a public, empty release behind, and apt-charliek could consume
@@ -363,12 +366,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ASSET_LABEL: ${{ matrix.session_label }}
           CHECKSUM_LABEL: ${{ matrix.session_checksum_label }}
+          ASSET_PATH: ${{ steps.stage_session.outputs.asset_path }}
+          CHECKSUM_PATH: ${{ steps.stage_session.outputs.checksum_path }}
         run: |
           set -euo pipefail
-          gh release upload "${GITHUB_REF_NAME}" \
-            "${{ steps.stage_session.outputs.asset_path }}#${ASSET_LABEL}" --clobber
-          gh release upload "${GITHUB_REF_NAME}" \
-            "${{ steps.stage_session.outputs.checksum_path }}#${CHECKSUM_LABEL}" --clobber
+          gh release upload "${GITHUB_REF_NAME}" "${ASSET_PATH}#${ASSET_LABEL}" --clobber
+          gh release upload "${GITHUB_REF_NAME}" "${CHECKSUM_PATH}#${CHECKSUM_LABEL}" --clobber
 
   mac:
     needs: create-release
@@ -1022,6 +1025,40 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: ./mac/scripts/notarize.sh --app mac/build/Roost-Iced.app
 
+      # The Mac twin of the linux job's standalone roost-session asset: the
+      # bootstrap install rung on a Linux client fetches it to install onto
+      # a Mac host. It is the bundle's own copy — already signed with the
+      # app, identity-asserted above — so there is no second cargo build,
+      # and staging after the notarize means it is byte-for-byte what ships.
+      # lipo pins the arch the asset's name claims: Roost-Iced.app is
+      # Apple-silicon only, and a Mac client refuses no other.
+      - name: Stage the roost-session standalone artifact + checksum
+        id: stage_session
+        run: |
+          set -euo pipefail
+          bin="mac/build/Roost-Iced.app/Contents/MacOS/roost-session"
+          lipo "${bin}" -verify_arch arm64
+          dist="${RUNNER_TEMP}/session-dist"
+          mkdir -p "${dist}"
+          cp "${bin}" "${dist}/roost-session"
+          out="$(./linux/scripts/stage-session-artifact.sh "${GITHUB_REF_NAME#v}" arm64 --os darwin --dist-dir "${dist}")"
+          asset_path="$(printf '%s\n' "${out}" | sed -n '1p')"
+          checksum_path="$(printf '%s\n' "${out}" | sed -n '2p')"
+          echo "asset_path=${asset_path}" >> "$GITHUB_OUTPUT"
+          echo "checksum_path=${checksum_path}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload roost-session standalone artifact + checksum to the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET_PATH: ${{ steps.stage_session.outputs.asset_path }}
+          CHECKSUM_PATH: ${{ steps.stage_session.outputs.checksum_path }}
+        run: |
+          set -euo pipefail
+          gh release upload "${GITHUB_REF_NAME}" \
+            "${ASSET_PATH}#macOS session daemon — Apple silicon (standalone binary)" --clobber
+          gh release upload "${GITHUB_REF_NAME}" \
+            "${CHECKSUM_PATH}#macOS session daemon — Apple silicon (sha256)" --clobber
+
       # The overrides are what keep this DMG's contents named Roost-Iced.app:
       # with defaults make-dmg.sh packages the Swift bundle, and an iced DMG
       # containing a "Roost.app" would drag-install OVER the Swift app.
@@ -1194,18 +1231,19 @@ jobs:
           # globs and what the appcast's enclosure URL is built from, so that
           # is what we check.
           #
-          # Eight assets total (plan 039 §3.7): the two .debs, the two macOS
-          # DMGs, and — new — a standalone `roost-session` binary per Linux
-          # arch plus its `.sha256` checksum sidecar. The bootstrap install
-          # rung on a connecting client fetches the binary + checksum
-          # directly (crates/roost-ipc/src/bootstrap.rs `asset_name`/
-          # `checksum_name`), independent of the .deb.
+          # Ten assets total (plan 039 §3.7): the two .debs, the two macOS
+          # DMGs, and a standalone `roost-session` binary per published
+          # platform — linux-amd64, linux-arm64, darwin-arm64 — plus its
+          # `.sha256` checksum sidecar. The bootstrap install rung on a
+          # connecting client fetches the binary + checksum directly
+          # (crates/roost-ipc/src/bootstrap.rs `asset_name`/`checksum_name`,
+          # `RemotePlatform::PUBLISHED`), independent of the .deb and the DMG.
           #
-          # Two size floors. The six binary/package assets keep the original
+          # Two size floors. The seven binary/package assets keep the original
           # 1 MiB floor rather than "non-empty": every one of them is
           # multi-megabyte, and a truncated upload lands somewhere above
           # zero, so `> 0` would wave through exactly the corruption worth
-          # catching. The two `.sha256` sidecars are NOT exempted from a size
+          # catching. The three `.sha256` sidecars are NOT exempted from a size
           # check — they're just tiny by design, and their floor is derived
           # per asset below rather than being a constant here: a bare 64-byte
           # hash is not a `sha256sum` record at all (no filename field), and
@@ -1239,18 +1277,20 @@ jobs:
                      "Roost-${ver}.dmg" \
                      "Roost-Iced-${ver}.dmg" \
                      "roost-session-${ver}-linux-amd64" \
-                     "roost-session-${ver}-linux-arm64"; do
+                     "roost-session-${ver}-linux-arm64" \
+                     "roost-session-${ver}-darwin-arm64"; do
             expected_names="${expected_names}${expected_names:+ }$(printf '%s' "${raw}" | tr -c 'A-Za-z0-9._-' '.')"
           done
           checksum_names=""
           for raw in "roost-session-${ver}-linux-amd64.sha256" \
-                     "roost-session-${ver}-linux-arm64.sha256"; do
+                     "roost-session-${ver}-linux-arm64.sha256" \
+                     "roost-session-${ver}-darwin-arm64.sha256"; do
             checksum_names="${checksum_names}${checksum_names:+ }$(printf '%s' "${raw}" | tr -c 'A-Za-z0-9._-' '.')"
           done
           echo "expected asset names (after GitHub's filename sanitization): ${expected_names} ${checksum_names}"
 
           # One check, parameterized by floor, called once per size tier —
-          # the six big assets and the two checksum sidecars share every rule
+          # the seven big assets and the three checksum sidecars share every rule
           # except the floor.
           check_asset() {
             expected="$1"

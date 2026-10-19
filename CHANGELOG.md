@@ -11,6 +11,18 @@ release workflow asserts they agree).
 
 ## Unreleased
 
+### Added
+
+- **Roost-Iced can install and upgrade `roost-session` on a Mac over
+  SSH.** An Apple-silicon Mac host now gets the same **Install Update…**,
+  install-on-connect and restart flows as a Linux box, where it used to be
+  refused with "roost-session is built for Linux only today". A Mac client
+  sends its own bundled `roost-session`; a Linux client downloads the new
+  `roost-session-<version>-darwin-arm64` release asset, checksum-verified.
+  The install lands in `~/.local/bin` on the Mac, independent of any
+  Roost-Iced.app installed there. Intel Macs have no build and are refused
+  before anything is offered.
+
 ### Fixed
 
 - **A request right after `tab.open` no longer races the window's

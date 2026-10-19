@@ -20,7 +20,8 @@
 use std::collections::HashMap;
 
 use roost_ipc::bootstrap::{
-    BootstrapError, BootstrapJob, BootstrapOptions, IdentityGate, Probe, ProbeOutcome, RemoteArch,
+    BootstrapError, BootstrapJob, BootstrapOptions, IdentityGate, Probe, ProbeOutcome,
+    RemotePlatform,
 };
 use roost_ipc::messages::{SessionBinaryIdentity, SESSION_PROTOCOL_VERSION};
 use roost_ipc::session_version::BuildId;
@@ -718,7 +719,7 @@ pub(crate) struct BootstrapDraft {
     pub(crate) token: String,
     /// [`SshTarget::claim_key`] — what the job claim is keyed on.
     pub(crate) claim: String,
-    pub(crate) arch: RemoteArch,
+    pub(crate) platform: RemotePlatform,
     pub(crate) plan: BootstrapPlan,
     pub(crate) copy: BootstrapCopy,
     /// What the entry point knew when it asked, for
@@ -937,7 +938,7 @@ pub(crate) enum BootstrapEvent {
 /// What a read-only look answered, and the "from where" line a card
 /// could honestly claim for it.
 ///
-/// The two travel together because the second needs the first's arch
+/// The two travel together because the second needs the first's platform
 /// *and* a [`BootstrapOptions`], and building one of those walks `$PATH`
 /// for a sibling binary — pure, but blocking, and the thread that would
 /// otherwise do it is the one drawing frames.
@@ -965,7 +966,9 @@ pub(crate) async fn run_probe(
     let probe = job.probe().await;
     job.close().await;
     let probe = probe?;
-    let source = previewed.source_preview(probe.arch).map(|p| p.describe());
+    let source = previewed
+        .source_preview(probe.platform)
+        .map(|p| p.describe());
     Ok(Probed { probe, source })
 }
 
@@ -979,11 +982,11 @@ pub(crate) async fn run_bootstrap(
     ssh: SshTunnelOptions,
     options: BootstrapOptions,
     plan: BootstrapPlan,
-    arch: RemoteArch,
+    platform: RemotePlatform,
     release: Option<super::session_actions::StreamRelease>,
 ) -> Result<BootstrapSuccess, BootstrapError> {
     let job = BootstrapJob::open(&target, &ssh, options).await?;
-    let outcome = run_plan(&job, &plan, arch, release.as_ref()).await;
+    let outcome = run_plan(&job, &plan, platform, release.as_ref()).await;
     // Ordered, and on every path: the master is addressed through a file
     // in the directory the close removes, and `Drop` behind it is
     // blocking.
@@ -1000,7 +1003,7 @@ pub(crate) async fn run_bootstrap(
 async fn run_plan(
     job: &BootstrapJob,
     plan: &BootstrapPlan,
-    arch: RemoteArch,
+    platform: RemotePlatform,
     release: Option<&super::session_actions::StreamRelease>,
 ) -> Result<BootstrapSuccess, BootstrapError> {
     let expect = plan.expect.as_ref();
@@ -1010,7 +1013,7 @@ async fn run_plan(
         // path's (plan 039 §3.3): choosing a rung can mean a subprocess
         // and a download, and neither belongs behind a Connect the user
         // has not consented to.
-        let source = job.resolve_source(arch).await?;
+        let source = job.resolve_source(platform).await?;
         tracing::info!(source = %source.describe(), "bootstrap: installing roost-session");
         installed = Some(
             job.install_guarded(&source, || async {
@@ -1904,7 +1907,7 @@ mod tests {
     fn the_origin_the_card_shows_is_the_origin_the_ladder_predicted() {
         let base = "http://127.0.0.1:9/assets";
         let source = overridden_options(Some(base), None)
-            .source_preview(RemoteArch::Amd64)
+            .source_preview(RemotePlatform::LINUX_AMD64)
             .expect("the asset rung previews")
             .describe();
         let card = copy(
@@ -1935,7 +1938,7 @@ mod tests {
         // is about the override surviving, not about the word being
         // unreachable.
         let released = overridden_options(None, None)
-            .source_preview(RemoteArch::Amd64)
+            .source_preview(RemotePlatform::LINUX_AMD64)
             .expect("the asset rung previews")
             .describe();
         let card = copy(
@@ -1950,7 +1953,7 @@ mod tests {
         );
 
         let source = overridden_options(None, Some("/tmp/roost-session"))
-            .source_preview(RemoteArch::Amd64)
+            .source_preview(RemotePlatform::LINUX_AMD64)
             .expect("the override rung previews")
             .describe();
         let card = copy(&plan_bootstrap(&mismatch(), SessionState::Running), &source);
