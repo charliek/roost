@@ -57,7 +57,7 @@ use std::time::Duration;
 use roost_ipc::bootstrap::{
     asset_name, checksum_name, shell_quote, sniff_binary, BootstrapError, BootstrapJob,
     BootstrapOptions, IdentityGate, InstallPhase, InstallSource, ProbeOutcome, RemoteArch,
-    ResolvedSource, Sniff, SourceOrigin, PROBE_BUDGET,
+    RemoteOs, RemotePlatform, ResolvedSource, Sniff, SourceOrigin, PROBE_BUDGET,
 };
 use roost_ipc::messages::{SessionBinaryIdentity, SESSION_PROTOCOL_VERSION};
 use roost_ipc::session_launch::Verdict;
@@ -1042,8 +1042,8 @@ impl Drop for AssetServer {
 
 /// The asset name a client of [`CLIENT_VERSION`] would fetch, and its
 /// checksum sibling.
-fn asset_paths(arch: RemoteArch) -> (String, String) {
-    let asset = asset_name(CLIENT_VERSION, arch);
+fn asset_paths(platform: RemotePlatform) -> (String, String) {
+    let asset = asset_name(CLIENT_VERSION, platform);
     let checksum = checksum_name(&asset);
     (asset, checksum)
 }
@@ -1051,7 +1051,7 @@ fn asset_paths(arch: RemoteArch) -> (String, String) {
 /// A route table serving `body` as the asset and a correct `sha256sum`
 /// record for it.
 fn release_routes(body: &[u8]) -> Vec<(String, Route)> {
-    let (asset, checksum) = asset_paths(RemoteArch::Amd64);
+    let (asset, checksum) = asset_paths(RemotePlatform::LINUX_AMD64);
     vec![
         (format!("/{asset}"), Route::ok(body.to_vec())),
         (
@@ -1073,7 +1073,7 @@ async fn a_matching_binary_on_the_first_rung_reads_as_compatible() {
 
     let probe = job.probe().await.expect("probe");
 
-    assert_eq!(probe.arch, RemoteArch::Amd64);
+    assert_eq!(probe.platform, RemotePlatform::LINUX_AMD64);
     assert!(
         matches!(
             &probe.outcome,
@@ -1177,14 +1177,14 @@ async fn a_stale_preferred_rung_outranks_a_compatible_one_below_it() {
 }
 
 #[tokio::test]
-async fn a_darwin_remote_is_refused_before_anything_is_offered() {
-    let harness = Harness::with_uname("Darwin", "arm64");
+async fn an_os_with_no_build_is_refused_before_anything_is_offered() {
+    let harness = Harness::with_uname("FreeBSD", "amd64");
     let job = harness.job(harness.options()).await;
 
-    let error = job.probe().await.expect_err("a Mac host has no build");
+    let error = job.probe().await.expect_err("a FreeBSD host has no build");
 
-    assert_eq!(error, BootstrapError::UnsupportedOs("Darwin".to_string()));
-    assert!(error.message("workbox").contains("Linux only"));
+    assert_eq!(error, BootstrapError::UnsupportedOs("FreeBSD".to_string()));
+    assert!(error.message("workbox").contains("Linux and macOS only"));
     job.close().await;
 }
 
@@ -1197,9 +1197,66 @@ async fn an_architecture_with_no_build_is_refused_by_name() {
 
     assert_eq!(
         error,
-        BootstrapError::UnsupportedArch("ppc64le".to_string())
+        BootstrapError::UnsupportedArch {
+            os: RemoteOs::Linux,
+            arch: "ppc64le".to_string()
+        }
     );
     assert!(error.message("workbox").contains("ppc64le"));
+    job.close().await;
+}
+
+#[tokio::test]
+async fn an_intel_mac_is_refused_by_name() {
+    let harness = Harness::with_uname("Darwin", "x86_64");
+    let job = harness.job(harness.options()).await;
+
+    let error = job.probe().await.expect_err("no darwin-amd64 build exists");
+
+    assert_eq!(
+        error,
+        BootstrapError::UnsupportedArch {
+            os: RemoteOs::Darwin,
+            arch: "x86_64".to_string()
+        }
+    );
+    job.close().await;
+}
+
+/// A Mac host takes the same probe, install, and start as a Linux one —
+/// the scripts are POSIX and BSD-safe, so only the platform differs.
+#[tokio::test]
+async fn a_mac_host_probes_installs_and_starts_like_a_linux_one() {
+    let harness = Harness::with_uname("Darwin", "arm64");
+    harness.plant(
+        "$HOME/.local/bin/roost-session",
+        &Stub::stale("outgoing").bridge(Bridge::NoSession),
+    );
+    let replacement = Stub::matching("incoming")
+        .start(Start::Ready(9001))
+        .bridge(Bridge::serving(None));
+    let source = harness.source_file(&replacement);
+    let mut options = harness.options();
+    options.install_bin = Some(source);
+    let job = harness.job(options).await;
+
+    let probe = job.probe().await.expect("a Mac host has a build");
+    assert_eq!(probe.platform, RemotePlatform::DARWIN_ARM64);
+    assert!(
+        matches!(probe.outcome, ProbeOutcome::Mismatch { .. }),
+        "{:?}",
+        probe.outcome
+    );
+
+    let resolved = job
+        .resolve_source(probe.platform)
+        .await
+        .expect("a script is unrecognizable, not wrong, for a Mac too");
+    let installed = job.install(&resolved).await.expect("install");
+    assert_eq!(
+        job.start(&installed.dest).await.expect("start"),
+        Verdict::Ready(9001)
+    );
     job.close().await;
 }
 
@@ -1216,7 +1273,7 @@ async fn an_install_streams_verifies_and_commits_the_binary() {
     let job = harness.job(options).await;
 
     let resolved = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect("resolve the override");
     assert_eq!(*resolved.origin(), SourceOrigin::Override);
@@ -1299,7 +1356,7 @@ async fn a_commit_that_lands_and_then_fails_identify_puts_the_incumbent_back() {
     options.install_bin = Some(source);
     let job = harness.job(options).await;
     let resolved = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect("resolve");
 
@@ -1352,7 +1409,7 @@ async fn a_committed_file_that_is_another_build_of_the_same_triple_is_rolled_bac
     options.install_bin = Some(source);
     let job = harness.job(options).await;
     let resolved = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect("resolve");
 
@@ -1381,7 +1438,7 @@ async fn an_install_reports_the_identity_it_staged() {
     options.install_bin = Some(source);
     let job = harness.job(options).await;
     let resolved = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect("resolve");
 
@@ -1401,7 +1458,7 @@ async fn the_same_failure_with_no_incumbent_says_there_was_nothing_to_restore() 
     options.install_bin = Some(source);
     let job = harness.job(options).await;
     let resolved = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect("resolve");
 
@@ -1432,7 +1489,7 @@ async fn a_wrong_build_leaves_the_previous_install_byte_for_byte() {
     options.install_bin = Some(source);
     let job = harness.job(options).await;
     let resolved = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect("resolve");
 
@@ -1467,7 +1524,7 @@ async fn a_checksum_valid_but_wrong_build_still_leaves_the_destination_alone() {
     let job = harness.asset_job(&server).await;
 
     let resolved = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect("the checksum matches, so the download resolves");
     let error = job.install(&resolved).await.expect_err("wrong build");
@@ -1499,7 +1556,7 @@ async fn a_stream_that_dies_part_way_removes_the_staged_file() {
     options.install_bin = Some(source);
     let job = harness.job(options).await;
     let resolved = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect("resolve");
 
@@ -1538,7 +1595,7 @@ async fn a_source_that_cannot_be_read_fails_the_stream_and_stages_nothing() {
     options.install_bin = Some(source.clone());
     let job = harness.job(options).await;
     let resolved = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect("resolve");
     std::fs::remove_file(&source).expect("take the source away after it resolved");
@@ -1628,8 +1685,52 @@ fn sniff_recognizes_every_mach_o_magic() {
     for magic in MACH_O_MAGICS {
         let mut file = magic.to_vec();
         file.extend_from_slice(&[0u8; 60]);
-        assert_eq!(sniff_binary(&file), Sniff::MachO, "{magic:02x?}");
+        assert_eq!(sniff_binary(&file), Sniff::MachO(None), "{magic:02x?}");
     }
+}
+
+const CPU_TYPE_X86_64: u32 = 0x0100_0007;
+const CPU_TYPE_ARM64: u32 = 0x0100_000c;
+
+/// A thin Mach-O header: `magic` then `cputype` in the byte order the
+/// magic declares, padded to a full peek.
+fn mach_o_header(little_endian: bool, cputype: u32) -> Vec<u8> {
+    let mut file = if little_endian {
+        let mut file = vec![0xcf, 0xfa, 0xed, 0xfe];
+        file.extend_from_slice(&cputype.to_le_bytes());
+        file
+    } else {
+        let mut file = vec![0xfe, 0xed, 0xfa, 0xcf];
+        file.extend_from_slice(&cputype.to_be_bytes());
+        file
+    };
+    file.resize(64, 0);
+    file
+}
+
+/// A thin image's `cputype` is read in the byte order its magic
+/// declares; a universal binary carries several, so it names none.
+#[test]
+fn sniff_reads_the_arch_of_a_thin_mach_o() {
+    for little_endian in [true, false] {
+        assert_eq!(
+            sniff_binary(&mach_o_header(little_endian, CPU_TYPE_ARM64)),
+            Sniff::MachO(Some(RemoteArch::Arm64)),
+            "little-endian {little_endian}"
+        );
+        assert_eq!(
+            sniff_binary(&mach_o_header(little_endian, CPU_TYPE_X86_64)),
+            Sniff::MachO(Some(RemoteArch::Amd64)),
+            "little-endian {little_endian}"
+        );
+    }
+    let mut fat = vec![0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 2];
+    fat.extend_from_slice(&CPU_TYPE_ARM64.to_be_bytes());
+    fat.resize(64, 0);
+    assert_eq!(sniff_binary(&fat), Sniff::MachO(None));
+    // A magic and nothing after it is still a Mach-O, just not one
+    // whose arch can be read.
+    assert_eq!(sniff_binary(&[0xcf, 0xfa, 0xed, 0xfe]), Sniff::MachO(None));
 }
 
 /// The fall-through half of the guard, and the half the rest of this
@@ -1658,7 +1759,7 @@ async fn an_install_bin_of_the_wrong_arch_is_refused_before_anything_is_streamed
     let job = harness.job(options).await;
 
     let error = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect_err("an arm64 binary is not installable on an amd64 host");
     let BootstrapError::Source(detail) = &error else {
@@ -1685,7 +1786,7 @@ async fn an_install_bin_that_is_a_macos_binary_is_refused() {
     let job = harness.job(options).await;
 
     let error = job
-        .resolve_source(RemoteArch::Arm64)
+        .resolve_source(RemotePlatform::LINUX_ARM64)
         .await
         .expect_err("a Mach-O will never run on a Linux host");
     assert!(
@@ -1694,6 +1795,46 @@ async fn an_install_bin_that_is_a_macos_binary_is_refused() {
     );
     assert!(!harness.dest().exists(), "nothing was installed");
     job.close().await;
+}
+
+/// The mirror image, for a Mac host: an ELF can never run there, and a
+/// thin Mach-O of the other arch is as wrong as a wrong-arch ELF is on
+/// Linux. A universal binary is left to the staged verify.
+#[tokio::test]
+async fn an_install_bin_that_cannot_run_on_a_mac_is_refused() {
+    let harness = Harness::with_uname("Darwin", "arm64");
+    let elf = harness.source_bytes("elf", &elf_header(2, 1, 0xb7));
+    let intel = harness.source_bytes("intel", &mach_o_header(true, CPU_TYPE_X86_64));
+    for (source, expect) in [(elf, "a Linux binary"), (intel, "an amd64 macOS binary")] {
+        let mut options = harness.options();
+        options.install_bin = Some(source.clone());
+        let job = harness.job(options).await;
+        let error = job
+            .resolve_source(RemotePlatform::DARWIN_ARM64)
+            .await
+            .expect_err("not runnable on an Apple-silicon Mac");
+        assert!(
+            matches!(&error, BootstrapError::Source(detail) if detail.contains(expect)),
+            "{source:?}: {error:?}"
+        );
+        job.close().await;
+    }
+    assert!(!harness.dest().exists(), "nothing was installed");
+
+    let mut fat = vec![0xca, 0xfe, 0xba, 0xbe];
+    fat.resize(64, 0);
+    for (name, bytes) in [("thin", mach_o_header(true, CPU_TYPE_ARM64)), ("fat", fat)] {
+        let source = harness.source_bytes(name, &bytes);
+        let mut options = harness.options();
+        options.install_bin = Some(source.clone());
+        let job = harness.job(options).await;
+        let resolved = job
+            .resolve_source(RemotePlatform::DARWIN_ARM64)
+            .await
+            .expect("an arm64 or universal Mach-O goes on to the staged verify");
+        assert_eq!(resolved.path(), source);
+        job.close().await;
+    }
 }
 
 #[tokio::test]
@@ -1705,7 +1846,7 @@ async fn an_install_bin_for_an_unsupported_machine_is_refused_naming_it() {
     let job = harness.job(options).await;
 
     let error = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect_err("roost publishes no riscv64 build");
     assert!(
@@ -1728,7 +1869,7 @@ async fn an_install_bin_the_guard_cannot_classify_still_resolves() {
     let job = harness.job(options).await;
 
     let resolved = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect("a script is unrecognizable, not wrong");
     assert_eq!(resolved.path(), source);
@@ -1749,7 +1890,7 @@ async fn a_release_asset_is_downloaded_checksum_verified_and_installed() {
     let job = harness.asset_job(&server).await;
 
     let resolved = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect("download and verify");
     assert_eq!(
@@ -1767,7 +1908,7 @@ async fn a_release_asset_is_downloaded_checksum_verified_and_installed() {
 
     job.install(&resolved).await.expect("install the download");
 
-    let (asset, checksum) = asset_paths(RemoteArch::Amd64);
+    let (asset, checksum) = asset_paths(RemotePlatform::LINUX_AMD64);
     assert_eq!(
         server.requests(),
         vec![format!("/{asset}"), format!("/{checksum}")],
@@ -1785,7 +1926,7 @@ async fn a_checksum_that_does_not_match_sends_nothing() {
     let harness = Harness::new();
     let published = harness.source_file(&Stub::matching("mismatched"));
     let body = std::fs::read(&published).expect("read the published body");
-    let (asset, checksum) = asset_paths(RemoteArch::Amd64);
+    let (asset, checksum) = asset_paths(RemotePlatform::LINUX_AMD64);
     let server = AssetServer::new(vec![
         (format!("/{asset}"), Route::ok(body)),
         (
@@ -1796,7 +1937,7 @@ async fn a_checksum_that_does_not_match_sends_nothing() {
     let job = harness.asset_job(&server).await;
 
     let error = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect_err("the hash does not match");
 
@@ -1811,7 +1952,7 @@ async fn a_malformed_checksum_file_sends_nothing() {
     let harness = Harness::new();
     let published = harness.source_file(&Stub::matching("malformed"));
     let body = std::fs::read(&published).expect("read the published body");
-    let (asset, checksum) = asset_paths(RemoteArch::Amd64);
+    let (asset, checksum) = asset_paths(RemotePlatform::LINUX_AMD64);
     let server = AssetServer::new(vec![
         (format!("/{asset}"), Route::ok(body)),
         (
@@ -1822,7 +1963,7 @@ async fn a_malformed_checksum_file_sends_nothing() {
     let job = harness.asset_job(&server).await;
 
     let error = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect_err("that is not a sha256sum record");
 
@@ -1836,7 +1977,7 @@ async fn a_checksum_naming_another_file_sends_nothing() {
     let harness = Harness::new();
     let published = harness.source_file(&Stub::matching("misnamed"));
     let body = std::fs::read(&published).expect("read the published body");
-    let (asset, checksum) = asset_paths(RemoteArch::Amd64);
+    let (asset, checksum) = asset_paths(RemotePlatform::LINUX_AMD64);
     let server = AssetServer::new(vec![
         (format!("/{asset}"), Route::ok(body.clone())),
         (
@@ -1847,7 +1988,7 @@ async fn a_checksum_naming_another_file_sends_nothing() {
     let job = harness.asset_job(&server).await;
 
     let error = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect_err("a hash for bytes nobody downloaded");
 
@@ -1867,7 +2008,7 @@ async fn a_checksum_naming_another_file_sends_nothing() {
 #[tokio::test]
 async fn an_asset_past_the_size_cap_is_refused() {
     let harness = Harness::new();
-    let (asset, checksum) = asset_paths(RemoteArch::Amd64);
+    let (asset, checksum) = asset_paths(RemotePlatform::LINUX_AMD64);
     let server = AssetServer::new(vec![
         (
             format!("/{asset}"),
@@ -1878,7 +2019,7 @@ async fn an_asset_past_the_size_cap_is_refused() {
     let job = harness.asset_job(&server).await;
 
     let error = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect_err("300 MiB is past the cap");
 
@@ -1901,7 +2042,7 @@ async fn a_response_with_no_declared_length_is_still_capped() {
     let harness = Harness::new();
     let published = harness.source_file(&Stub::matching("undeclared"));
     let body = std::fs::read(&published).expect("read the published body");
-    let (asset, checksum) = asset_paths(RemoteArch::Amd64);
+    let (asset, checksum) = asset_paths(RemotePlatform::LINUX_AMD64);
     let server = AssetServer::new(vec![
         (format!("/{asset}"), Route::ok(body)),
         (
@@ -1914,7 +2055,7 @@ async fn a_response_with_no_declared_length_is_still_capped() {
     let job = harness.asset_job(&server).await;
 
     let error = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect_err("an unbounded body must be cut off");
 
@@ -1933,7 +2074,7 @@ async fn a_missing_curl_is_classified_rather_than_panicked_on() {
     let job = harness.job(options).await;
 
     let error = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect_err("no curl, no download");
 
@@ -1960,7 +2101,7 @@ async fn a_plaintext_asset_base_that_is_not_loopback_is_refused_before_any_fetch
     let job = harness.job(options).await;
 
     let error = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect_err("plain http off loopback");
 
@@ -2469,7 +2610,7 @@ async fn every_exec_runs_over_the_jobs_own_control_socket() {
 
     job.probe().await.expect("probe");
     let resolved = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect("resolve");
     job.install(&resolved).await.expect("install");
@@ -2536,9 +2677,9 @@ async fn closing_a_job_exits_its_master_while_the_socket_is_still_there() {
 
 #[tokio::test]
 async fn a_failed_job_still_takes_its_scratch_directory_with_it() {
-    let harness = Harness::with_uname("Darwin", "arm64");
+    let harness = Harness::with_uname("FreeBSD", "amd64");
     let job = harness.job(harness.options()).await;
-    job.probe().await.expect_err("a Mac remote");
+    job.probe().await.expect_err("an OS with no build");
 
     job.close().await;
 
@@ -2575,7 +2716,7 @@ async fn a_cancelled_install_leaves_a_temporary_that_the_next_one_sweeps() {
     options.install_bin = Some(source.clone());
     let job = harness.job(options).await;
     let resolved = job
-        .resolve_source(RemoteArch::Amd64)
+        .resolve_source(RemotePlatform::LINUX_AMD64)
         .await
         .expect("resolve");
 
@@ -2776,7 +2917,7 @@ async fn a_remote_step_that_never_answers_is_killed_reaped_and_classified() {
 
 /// The acceptance criterion of plan 039 §3.8, asserted rather than
 /// assumed. This test would fail on a Mac if the fixture leaked the real
-/// `uname` (the probe would classify `Darwin` as unsupported), and it
+/// `uname` (the probe would report `darwin-arm64`), and it
 /// would fail on a deb-installed Linux box if the jail leaked (a real
 /// `/usr/bin/roost-session` would answer, and the candidate list would
 /// not be empty).
@@ -2788,9 +2929,9 @@ async fn the_far_side_sees_the_fixture_and_never_this_machine() {
     let probe = job.probe().await.expect("probe");
 
     assert_eq!(
-        probe.arch,
-        RemoteArch::Amd64,
-        "the arch comes from the fixture's uname, whatever this machine is"
+        probe.platform,
+        RemotePlatform::LINUX_AMD64,
+        "the platform comes from the fixture's uname, whatever this machine is"
     );
     assert_eq!(
         probe.home,
@@ -2856,8 +2997,8 @@ async fn the_probe_reports_the_fixtures_uname_and_not_this_machines() {
     let probe = job.probe().await.expect("probe");
 
     assert_eq!(
-        probe.arch,
-        RemoteArch::Arm64,
+        probe.platform,
+        RemotePlatform::LINUX_ARM64,
         "the arch came from the fixture, not from this machine"
     );
     job.close().await;
@@ -2888,7 +3029,7 @@ async fn a_mismatched_install_is_replaced_and_then_started() {
         probe.outcome
     );
 
-    let resolved: ResolvedSource = job.resolve_source(probe.arch).await.expect("resolve");
+    let resolved: ResolvedSource = job.resolve_source(probe.platform).await.expect("resolve");
     let installed = job.install(&resolved).await.expect("install");
     // Nothing was running, so the action matrix skips the stop and the
     // await-gone that follows it and goes straight to the start.

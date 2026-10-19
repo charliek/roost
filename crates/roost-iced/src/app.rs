@@ -9596,7 +9596,7 @@ impl App {
                 label,
                 token,
                 claim: live_target.claim_key,
-                arch: probed.probe.arch,
+                platform: probed.probe.platform,
                 plan,
                 copy,
                 offer,
@@ -9717,7 +9717,7 @@ impl App {
                 &draft.saved_id,
                 generation,
                 &draft.token,
-                draft.arch,
+                draft.platform,
                 draft.plan,
                 session_actions::ActionKind::Install,
                 roost_ipc::session_version::BuildId::from(&identity),
@@ -9803,7 +9803,7 @@ impl App {
             &host,
             target,
             draft.plan,
-            draft.arch,
+            draft.platform,
             "setting up roost-session…",
             ticket,
             release,
@@ -9830,7 +9830,7 @@ impl App {
         host: &roost_engine::persistence::HostSnapshot,
         target: roost_ipc::ssh::SshTarget,
         plan: bootstrap::BootstrapPlan,
-        arch: roost_ipc::bootstrap::RemoteArch,
+        platform: roost_ipc::bootstrap::RemotePlatform,
         note: &str,
         action: Option<bootstrap::ActionTicket>,
         release: Option<session_actions::StreamRelease>,
@@ -9866,7 +9866,8 @@ impl App {
             // `from_env` walks `$PATH` looking for a sibling binary.
             let options =
                 roost_ipc::bootstrap::BootstrapOptions::from_env(bootstrap::client_identity());
-            let result = bootstrap::run_bootstrap(target, ssh, options, plan, arch, release).await;
+            let result =
+                bootstrap::run_bootstrap(target, ssh, options, plan, platform, release).await;
             feed.send(crate::engine_feed::EngineFeed::HostBootstrap(Box::new(
                 bootstrap::BootstrapEvent::Finished { request, result },
             )));
@@ -14983,7 +14984,7 @@ mod tests {
                 label: "pop-os".into(),
                 token: "tok".into(),
                 claim: "claim".into(),
-                arch: roost_ipc::bootstrap::RemoteArch::Amd64,
+                platform: roost_ipc::bootstrap::RemotePlatform::LINUX_AMD64,
                 plan,
                 copy,
                 offer: bootstrap::OfferContext {

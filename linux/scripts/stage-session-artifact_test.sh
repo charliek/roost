@@ -138,4 +138,41 @@ grep -q "roost-session" "${work_dir}/missing.err" \
   || fail "missing dist/roost-session: error message did not mention the missing file"
 pass "missing dist/roost-session fails loudly with a clear error"
 
+# ---------------------------------------------------------------------
+# Case 4: the macOS asset — the name bootstrap.rs requests for a Mac host
+# (RemotePlatform::DARWIN_ARM64), from release.yml's mac-iced job.
+# ---------------------------------------------------------------------
+dist4="${work_dir}/darwin/dist"
+mkdir -p "${dist4}"
+printf 'not a real mach-o, just test bytes\n' > "${dist4}/roost-session"
+
+out4="$("${STAGE_SCRIPT}" 0.0.19 arm64 --os darwin --dist-dir "${dist4}")"
+asset_path4="$(printf '%s\n' "${out4}" | sed -n '1p')"
+checksum_path4="$(printf '%s\n' "${out4}" | sed -n '2p')"
+[ "$(basename "${asset_path4}")" = "roost-session-0.0.19-darwin-arm64" ] \
+  || fail "darwin: asset path basename '$(basename "${asset_path4}")' != 'roost-session-0.0.19-darwin-arm64'"
+[ "$(basename "${checksum_path4}")" = "roost-session-0.0.19-darwin-arm64.sha256" ] \
+  || fail "darwin: checksum path basename '$(basename "${checksum_path4}")'"
+expected_line4="$(cd "${dist4}" && "${checksum_cmd[@]}" -- roost-session-0.0.19-darwin-arm64)"
+[ "$(cat "${checksum_path4}")" = "${expected_line4}" ] \
+  || fail "darwin: checksum content '$(cat "${checksum_path4}")' != '${expected_line4}'"
+pass "--os darwin produces roost-session-0.0.19-darwin-arm64 + matching .sha256"
+
+# ---------------------------------------------------------------------
+# Case 5: a platform nothing is published for is refused, producing
+# nothing — Roost-Iced.app is Apple-silicon only.
+# ---------------------------------------------------------------------
+for bad in darwin-amd64 freebsd-amd64; do
+  dist5="${work_dir}/unpublished-${bad}/dist"
+  mkdir -p "${dist5}"
+  printf 'bytes\n' > "${dist5}/roost-session"
+  if "${STAGE_SCRIPT}" 0.0.19 "${bad#*-}" --os "${bad%-*}" --dist-dir "${dist5}" >/dev/null 2>"${work_dir}/unpublished.err"; then
+    fail "${bad}: script should have refused an unpublished platform, but exited 0"
+  fi
+  grep -q "unsupported platform '${bad}'" "${work_dir}/unpublished.err" \
+    || fail "${bad}: error did not name the platform: $(cat "${work_dir}/unpublished.err")"
+  [ ! -e "${dist5}/roost-session-0.0.19-${bad}" ] || fail "${bad}: an asset was produced anyway"
+done
+pass "an unpublished platform (darwin-amd64, freebsd-amd64) is refused and produces nothing"
+
 echo "All stage-session-artifact.sh tests passed."

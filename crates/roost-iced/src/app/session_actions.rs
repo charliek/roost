@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use roost_engine::ipc::HostOpFailure;
 use roost_ipc::agent::{AgentLifecycle, ShellState};
-use roost_ipc::bootstrap::{ProbeOutcome, RemoteArch};
+use roost_ipc::bootstrap::{ProbeOutcome, RemotePlatform};
 use roost_ipc::codes;
 use roost_ipc::messages::{host_action_kind, host_action_phase, HostActionStatus, SessionIdentify};
 use roost_ipc::session_version::BuildId;
@@ -369,7 +369,7 @@ pub(crate) enum RestartPlan {
         session_id: String,
         /// [`roost_ipc::ssh::SshTarget::token`] when the card opened.
         token: String,
-        arch: RemoteArch,
+        platform: RemotePlatform,
         outcome: ProbeOutcome,
         target: RestartTarget,
     },
@@ -1215,7 +1215,7 @@ impl App {
             RestartPlan::Ssh {
                 session_id,
                 token,
-                arch,
+                platform,
                 outcome,
                 target,
             } => {
@@ -1229,7 +1229,7 @@ impl App {
                     &saved_id,
                     generation,
                     &token,
-                    arch,
+                    platform,
                     plan,
                     ActionKind::Restart,
                     target.identity,
@@ -1248,7 +1248,7 @@ impl App {
         saved_id: &str,
         generation: u64,
         token: &str,
-        arch: RemoteArch,
+        platform: RemotePlatform,
         plan: bootstrap::BootstrapPlan,
         kind: ActionKind,
         build: BuildId,
@@ -1276,7 +1276,7 @@ impl App {
             session_id,
         };
         let release = plan.stop.then(|| self.stream_release(saved_id, generation));
-        if !self.launch_bootstrap_job(&host, live, plan, arch, note, Some(ticket), release) {
+        if !self.launch_bootstrap_job(&host, live, plan, platform, note, Some(ticket), release) {
             self.finish_action(
                 saved_id,
                 generation,
@@ -1577,7 +1577,7 @@ impl App {
         let restart_plan = |target: RestartTarget| RestartPlan::Ssh {
             session_id: serving.clone(),
             token: ssh_target.token.clone(),
-            arch: probed.probe.arch,
+            platform: probed.probe.platform,
             outcome: outcome.clone(),
             target,
         };
@@ -1625,7 +1625,7 @@ impl App {
                     saved_id,
                     ticket,
                     &ssh_target.token,
-                    probed.probe.arch,
+                    probed.probe.platform,
                     plan,
                     ActionKind::Install,
                     BuildId::from(&identity),
@@ -1647,7 +1647,7 @@ impl App {
                     label,
                     token: ssh_target.token.clone(),
                     claim: ssh_target.claim_key.clone(),
-                    arch: probed.probe.arch,
+                    platform: probed.probe.platform,
                     plan,
                     copy,
                     offer: OfferContext {
@@ -1692,7 +1692,7 @@ impl App {
                     saved_id,
                     ticket,
                     &ssh_target.token,
-                    probed.probe.arch,
+                    probed.probe.platform,
                     plan,
                     ActionKind::Restart,
                     target.identity,

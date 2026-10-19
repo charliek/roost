@@ -572,7 +572,7 @@ pub const INSTALL_DEST_SUFFIX: &str = "/.local/bin/roost-session";
 ///   `: > "$tmp"` creates it with `O_EXCL`, and `[ ! -L "$tmp" ]` refuses
 ///   a symlink outright — without which a pre-planted symlink at the
 ///   predictable `<dest>.tmp.<pid>` would have `tee` follow it and write
-///   the streamed ELF wherever it pointed.
+///   the streamed binary wherever it pointed.
 pub fn prepare_script() -> String {
     let mut out = String::from("set -eu\n");
     out.push_str(
@@ -911,7 +911,7 @@ pub fn parse_identity_pairs(
 /// into `tee`, `chmod`, `mv` and `rm` on the far side, under a consent
 /// dialog that named `~/.local/bin/roost-session` — a remote that
 /// answers `dest=/home/u/.ssh/authorized_keys`, whether compromised or
-/// merely mangled by a chatty shell rc, must not get the streamed ELF
+/// merely mangled by a chatty shell rc, must not get the streamed binary
 /// written and renamed there.
 ///
 /// So: both absolute, `dest` ending in the whole of
@@ -1089,6 +1089,31 @@ pub fn classify_probe(
 // The platform map
 // ============================================================================
 
+/// An operating system roost publishes a `roost-session` build for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteOs {
+    Linux,
+    Darwin,
+}
+
+impl RemoteOs {
+    /// The spelling in a release asset's name: `uname -s`, lowercased.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Linux => "linux",
+            Self::Darwin => "darwin",
+        }
+    }
+
+    /// What a person calls it, for copy.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Linux => "Linux",
+            Self::Darwin => "macOS",
+        }
+    }
+}
+
 /// An architecture roost publishes a `roost-session` build for. The
 /// spelling matches the deb naming, because the release assets and the
 /// packages come off the same matrix.
@@ -1113,45 +1138,88 @@ impl std::fmt::Display for RemoteArch {
     }
 }
 
-/// `uname -s` → is there anything to install here at all?
-///
-/// Linux only this slice. A Darwin remote is a classified refusal
-/// rather than an attempted install: no Mac `roost-session` is built,
-/// so every later rung of the source ladder would fail anyway and the
-/// honest place to say so is before the user consents to anything.
-pub fn check_os(uname_s: &str) -> Result<(), BootstrapError> {
-    let os = uname_s.trim();
-    if os.eq_ignore_ascii_case("linux") {
-        return Ok(());
-    }
-    Err(BootstrapError::UnsupportedOs(os.to_string()))
+/// One build roost publishes: the pair a release asset is named for,
+/// and the pair a binary has to match to run over there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemotePlatform {
+    pub os: RemoteOs,
+    pub arch: RemoteArch,
 }
 
-/// `uname -m` → the build we publish for it.
-pub fn map_arch(uname_m: &str) -> Result<RemoteArch, BootstrapError> {
-    let arch = uname_m.trim();
-    match arch.to_ascii_lowercase().as_str() {
-        "x86_64" | "amd64" => Ok(RemoteArch::Amd64),
-        "aarch64" | "arm64" => Ok(RemoteArch::Arm64),
-        _ => Err(BootstrapError::UnsupportedArch(arch.to_string())),
+impl RemotePlatform {
+    pub const LINUX_AMD64: Self = Self {
+        os: RemoteOs::Linux,
+        arch: RemoteArch::Amd64,
+    };
+    pub const LINUX_ARM64: Self = Self {
+        os: RemoteOs::Linux,
+        arch: RemoteArch::Arm64,
+    };
+    pub const DARWIN_ARM64: Self = Self {
+        os: RemoteOs::Darwin,
+        arch: RemoteArch::Arm64,
+    };
+
+    /// Every platform with a published build, which is release.yml's
+    /// matrix: the two deb arches, and the Mac app's one. Roost-Iced.app
+    /// is Apple-silicon only, so there is no `darwin-amd64` to fetch and
+    /// no Intel Mac client whose own binary could stand in for one.
+    pub const PUBLISHED: [Self; 3] = [Self::LINUX_AMD64, Self::LINUX_ARM64, Self::DARWIN_ARM64];
+}
+
+/// `linux-amd64`, the spelling a release asset's name ends in.
+impl std::fmt::Display for RemotePlatform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{}", self.os.as_str(), self.arch)
     }
+}
+
+/// `uname -s` and `uname -m` → the build roost publishes for that host,
+/// or the refusal that says why there is none.
+///
+/// A refusal here is classified rather than attempted: with no build,
+/// every rung of the source ladder would fail anyway, and the honest
+/// place to say so is before the user consents to anything. The OS is
+/// judged first, so a host roost builds nothing for at all is told that
+/// rather than having its architecture blamed.
+pub fn map_platform(uname_s: &str, uname_m: &str) -> Result<RemotePlatform, BootstrapError> {
+    let os_raw = uname_s.trim();
+    let os = match os_raw.to_ascii_lowercase().as_str() {
+        "linux" => RemoteOs::Linux,
+        "darwin" => RemoteOs::Darwin,
+        _ => return Err(BootstrapError::UnsupportedOs(os_raw.to_string())),
+    };
+    let arch_raw = uname_m.trim();
+    let arch = match arch_raw.to_ascii_lowercase().as_str() {
+        "x86_64" | "amd64" => Some(RemoteArch::Amd64),
+        "aarch64" | "arm64" => Some(RemoteArch::Arm64),
+        _ => None,
+    };
+    arch.map(|arch| RemotePlatform { os, arch })
+        .filter(|platform| RemotePlatform::PUBLISHED.contains(platform))
+        .ok_or_else(|| BootstrapError::UnsupportedArch {
+            os,
+            arch: arch_raw.to_string(),
+        })
 }
 
 /// What the first bytes of a candidate `roost-session` say it is.
 ///
 /// Deliberately coarse, and deliberately biased towards
 /// [`Sniff::Unknown`]: the only callers use this to refuse what is
-/// *provably* wrong for a Linux host, and everything it cannot identify
-/// has to keep flowing to the far side's staged verify, which is the
-/// gate that actually decides.
+/// *provably* wrong for the host's platform, and everything it cannot
+/// identify has to keep flowing to the far side's staged verify, which
+/// is the gate that actually decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sniff {
     /// An ELF for an architecture roost publishes a build for.
     Elf(RemoteArch),
     /// An ELF for some other machine, carrying the raw `e_machine`.
     ElfOther(u16),
-    /// A Mach-O object or universal binary — the Mac-developer mistake.
-    MachO,
+    /// A Mach-O object or universal binary. Carries the architecture of
+    /// a thin arm64 or x86_64 image; `None` for a universal binary or any
+    /// other CPU, which only the far side's staged verify can rule on.
+    MachO(Option<RemoteArch>),
     /// A script, a short file, or a format this doesn't know.
     Unknown,
 }
@@ -1176,6 +1244,9 @@ const MACHO_MAGICS: [[u8; 4]; 6] = [
     [0xbe, 0xba, 0xfe, 0xca],
 ];
 
+const CPU_TYPE_X86_64: u32 = 0x0100_0007;
+const CPU_TYPE_ARM64: u32 = 0x0100_000c;
+
 /// Classify a file's leading bytes. Pure, total, and never panics on a
 /// short slice — a truncated header is [`Sniff::Unknown`], not a guess.
 ///
@@ -1184,9 +1255,24 @@ const MACHO_MAGICS: [[u8; 4]; 6] = [
 /// 20 bytes is everything this needs. An ELF whose `EI_CLASS` or
 /// `EI_DATA` is not one of the two defined values is unreadable rather
 /// than wrong, and falls through as unknown.
+///
+/// A thin Mach-O's `cputype` follows its magic at offset 4, in the byte
+/// order the magic was written in.
 pub fn sniff_binary(bytes: &[u8]) -> Sniff {
     if MACHO_MAGICS.iter().any(|magic| bytes.starts_with(magic)) {
-        return Sniff::MachO;
+        let cputype = bytes.get(4..8).and_then(|raw| {
+            let raw: [u8; 4] = raw.try_into().ok()?;
+            match bytes[..4] {
+                [0xfe, 0xed, 0xfa, _] => Some(u32::from_be_bytes(raw)),
+                [_, 0xfa, 0xed, 0xfe] => Some(u32::from_le_bytes(raw)),
+                _ => None,
+            }
+        });
+        return Sniff::MachO(match cputype {
+            Some(CPU_TYPE_X86_64) => Some(RemoteArch::Amd64),
+            Some(CPU_TYPE_ARM64) => Some(RemoteArch::Arm64),
+            _ => None,
+        });
     }
     if bytes.len() < 20 || !bytes.starts_with(&ELF_MAGIC) {
         return Sniff::Unknown;
@@ -1211,12 +1297,12 @@ pub fn sniff_binary(bytes: &[u8]) -> Sniff {
 /// The GitHub release the default asset base points into.
 const RELEASE_BASE: &str = "https://github.com/charliek/roost/releases/download";
 
-/// `roost-session-<version>-linux-<arch>` — the raw ELF, no tarball, so
-/// the published checksum covers exactly the bytes that get streamed.
-/// Every character stays inside GitHub's `[A-Za-z0-9._-]` asset-name
-/// sanitization, so what is uploaded is what is fetched.
-pub fn asset_name(version: &str, arch: RemoteArch) -> String {
-    format!("{SESSION_BIN_NAME}-{version}-linux-{arch}")
+/// `roost-session-<version>-<os>-<arch>` — the raw executable, no
+/// tarball, so the published checksum covers exactly the bytes that get
+/// streamed. Every character stays inside GitHub's `[A-Za-z0-9._-]`
+/// asset-name sanitization, so what is uploaded is what is fetched.
+pub fn asset_name(version: &str, platform: RemotePlatform) -> String {
+    format!("{SESSION_BIN_NAME}-{version}-{platform}")
 }
 
 /// The `sha256sum` sibling of an asset.
@@ -1437,10 +1523,11 @@ pub enum BootstrapError {
     /// Looking at the far side failed — the exec, its output, or its
     /// shape.
     Probe(String),
-    /// The remote is not Linux.
+    /// The remote is neither Linux nor macOS. Carries `uname -s`.
     UnsupportedOs(String),
-    /// The remote's architecture has no build.
-    UnsupportedArch(String),
+    /// The remote's architecture has no build for its OS. Carries the
+    /// OS and `uname -m`.
+    UnsupportedArch { os: RemoteOs, arch: String },
     /// Rung 4 of the source ladder: nothing can supply this build.
     NoSource { app_version: String },
     /// The chosen local source could not be used.
@@ -1496,13 +1583,22 @@ impl BootstrapError {
                 format!("couldn't check what's installed on {target}: {detail}. Nothing was changed there.")
             }
             Self::UnsupportedOs(os) => format!(
-                "{target} reports itself as {os}. roost-session is built for Linux only today, \
-                 so there is nothing to install there."
+                "{target} reports itself as {os}. roost-session is built for Linux and macOS \
+                 only, so there is nothing to install there."
             ),
-            Self::UnsupportedArch(arch) => format!(
-                "{target}'s architecture ({arch}) has no roost-session build — roost publishes \
-                 amd64 and arm64 only."
-            ),
+            Self::UnsupportedArch { os, arch } => {
+                let published = RemotePlatform::PUBLISHED
+                    .iter()
+                    .filter(|platform| platform.os == *os)
+                    .map(|platform| platform.arch.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" and ");
+                format!(
+                    "{target}'s architecture ({arch}) has no roost-session build — roost \
+                     publishes {} builds for {published} only.",
+                    os.display_name()
+                )
+            }
             Self::NoSource { app_version } => format!(
                 "no roost-session build matching {app_version} is available to install. Build \
                  one on {target}, or point ROOST_SESSION_INSTALL_BIN at a matching binary. \
@@ -1711,7 +1807,7 @@ impl BootstrapOptions {
         }
     }
 
-    /// Where the release asset for `arch` lives, and whether that
+    /// Where the release asset for `platform` lives, and whether that
     /// answer came from an override.
     ///
     /// The base is validated before any URL is built from it, so an
@@ -1721,13 +1817,13 @@ impl BootstrapOptions {
     /// its trailing slashes are stripped, or `"https://host "` would be
     /// stored with the space still in it and every joined URL would
     /// carry one in the middle.
-    pub fn asset_plan(&self, arch: RemoteArch) -> Result<AssetPlan, BootstrapError> {
+    pub fn asset_plan(&self, platform: RemotePlatform) -> Result<AssetPlan, BootstrapError> {
         let (base, overridden) = match &self.asset_base {
             Some(base) => (base.trim().trim_end_matches('/').to_string(), true),
             None => (default_asset_base(&self.expected.app_version)?, false),
         };
         check_asset_base(&base)?;
-        let asset_name = asset_name(&self.expected.app_version, arch);
+        let asset_name = asset_name(&self.expected.app_version, platform);
         Ok(AssetPlan {
             asset_url: format!("{base}/{asset_name}"),
             checksum_url: format!("{base}/{}", checksum_name(&asset_name)),
@@ -1737,7 +1833,7 @@ impl BootstrapOptions {
         })
     }
 
-    /// Which rung [`resolve_source`] will try first for `arch`, and what
+    /// Which rung [`resolve_source`] will try first for `platform`, and what
     /// it would fall through to — **without doing any of it**.
     ///
     /// The consent dialog has to name where the bytes will come from
@@ -1756,11 +1852,14 @@ impl BootstrapOptions {
     /// one would have said something untrue at the only moment the user
     /// could act on it. Naming both, in order, is what this can honestly
     /// claim.
-    pub fn source_preview(&self, arch: RemoteArch) -> Result<SourcePreview, BootstrapError> {
+    pub fn source_preview(
+        &self,
+        platform: RemotePlatform,
+    ) -> Result<SourcePreview, BootstrapError> {
         let forced = self.source;
         let wanted = |rung: InstallSource| forced.is_none() || forced == Some(rung);
         let asset = || {
-            self.asset_plan(arch).map(|plan| SourceOrigin::Asset {
+            self.asset_plan(platform).map(|plan| SourceOrigin::Asset {
                 base: plan.base,
                 overridden: plan.overridden,
             })
@@ -1777,7 +1876,7 @@ impl BootstrapOptions {
         }
         if wanted(InstallSource::Sibling)
             && self.sibling_bin.is_some()
-            && client_arch() == Some(arch)
+            && client_platform() == Some(platform)
         {
             return Ok(SourcePreview {
                 first: SourceOrigin::Sibling,
@@ -1982,8 +2081,8 @@ const SH_STDIN: &str = "/bin/sh -s";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Probe {
     pub outcome: ProbeOutcome,
-    /// The remote's architecture, for the source ladder.
-    pub arch: RemoteArch,
+    /// The remote's platform, for the source ladder.
+    pub platform: RemotePlatform,
     /// [`Discovery::home`] — the remote's `$HOME`, so a caller can
     /// expand the install destination the far side would write and
     /// compare it against [`ProbeOutcome`]'s path.
@@ -2389,8 +2488,7 @@ impl BootstrapJob {
             .and_then(ExecOutcome::require_ok)
             .map_err(BootstrapError::Probe)?;
         let found = parse_discovery(&discovery.stdout)?;
-        check_os(&found.os)?;
-        let arch = map_arch(&found.arch)?;
+        let platform = map_platform(&found.os, &found.arch)?;
 
         let mut candidates = found.candidates;
         if let Some(extra) = self.remote_shell_hit(&candidates).await {
@@ -2415,15 +2513,14 @@ impl BootstrapJob {
 
         tracing::info!(
             host = %self.target,
-            os = %found.os,
-            %arch,
+            %platform,
             candidates = candidates.len(),
             outcome = ?outcome,
             "bootstrap: probed"
         );
         Ok(Probe {
             outcome,
-            arch,
+            platform,
             home: found.home,
             candidates,
         })
@@ -3298,11 +3395,14 @@ impl BootstrapJob {
     /// let a second resolution — a retry, a concurrent one — write over
     /// an asset the first had already hashed and was about to stream,
     /// which is a checksum gate that checks one file and sends another.
-    pub async fn resolve_source(&self, arch: RemoteArch) -> Result<ResolvedSource, BootstrapError> {
+    pub async fn resolve_source(
+        &self,
+        platform: RemotePlatform,
+    ) -> Result<ResolvedSource, BootstrapError> {
         let serial = self.downloads.fetch_add(1, Ordering::Relaxed);
         resolve_source(
             &self.options,
-            arch,
+            platform,
             &self.dir.join(format!("download-{serial}")),
         )
         .await
@@ -3437,18 +3537,23 @@ async fn read_capped<R: AsyncRead + Unpin>(mut reader: R, cap: usize) -> Result<
 // Which bytes to install
 // ============================================================================
 
-/// The architecture this client's own `roost-session` would be built
-/// for, or `None` when this client is not on a platform roost publishes
-/// a session for at all.
+/// The platform this client's own `roost-session` is built for, or
+/// `None` when this client is not on a platform roost publishes a
+/// session for at all.
 ///
 /// Compile-time facts, not environment: what it answers is "could the
 /// binary sitting next to me run over there", and only the target triple
-/// this was built for can say.
-pub fn client_arch() -> Option<RemoteArch> {
-    if !cfg!(target_os = "linux") {
+/// this was built for can say. Spelled the way `uname` would, so the one
+/// map judges both sides.
+pub fn client_platform() -> Option<RemotePlatform> {
+    let os = if cfg!(target_os = "linux") {
+        "Linux"
+    } else if cfg!(target_os = "macos") {
+        "Darwin"
+    } else {
         return None;
-    }
-    map_arch(std::env::consts::ARCH).ok()
+    };
+    map_platform(os, std::env::consts::ARCH).ok()
 }
 
 /// Which local file gets streamed, and where it came from — plan 039
@@ -3457,7 +3562,7 @@ pub fn client_arch() -> Option<RemoteArch> {
 ///
 /// 1. [`BootstrapOptions::install_bin`] — an explicit local file.
 /// 2. The **sibling**: this client's own `roost-session`, but only when
-///    this client is a Linux build of the remote's architecture, and only
+///    this client is a build for the remote's OS and architecture, and only
 ///    when running it locally produces the exact expected triple. A stale
 ///    `target/debug/roost-session` fails that and falls through — it is a
 ///    real binary, it is simply not this build, and shipping it would
@@ -3480,7 +3585,7 @@ pub fn client_arch() -> Option<RemoteArch> {
 /// what actually runs over there.
 pub async fn resolve_source(
     options: &BootstrapOptions,
-    arch: RemoteArch,
+    platform: RemotePlatform,
     scratch: &Path,
 ) -> Result<ResolvedSource, BootstrapError> {
     let forced = options.source;
@@ -3488,7 +3593,7 @@ pub async fn resolve_source(
 
     if wanted(InstallSource::Env) {
         match &options.install_bin {
-            Some(path) => return resolve_override(path, arch),
+            Some(path) => return resolve_override(path, platform),
             None if forced == Some(InstallSource::Env) => {
                 return Err(BootstrapError::Source(format!(
                     "{INSTALL_BIN_ENV} was forced as the install source but is not set"
@@ -3499,7 +3604,7 @@ pub async fn resolve_source(
     }
 
     if wanted(InstallSource::Sibling) {
-        match resolve_sibling(options, arch).await {
+        match resolve_sibling(options, platform).await {
             Ok(source) => return Ok(source),
             Err(detail) if forced == Some(InstallSource::Sibling) => {
                 return Err(BootstrapError::Source(detail))
@@ -3514,7 +3619,7 @@ pub async fn resolve_source(
     }
 
     if wanted(InstallSource::Asset) {
-        let plan = options.asset_plan(arch)?;
+        let plan = options.asset_plan(platform)?;
         return download_asset(options, &plan, scratch).await;
     }
 
@@ -3532,11 +3637,12 @@ pub async fn resolve_source(
 /// failing.
 ///
 /// What is checked **here** is only what can be settled from the file's
-/// own first bytes ([`sniff_binary`]): its architecture class against
-/// the remote's, and formats that are provably not a Linux binary for
-/// that host — a wrong-arch ELF, an ELF for a machine roost has no build
-/// for, a Mach-O. Anything else — a shell script, a short file, an
-/// unrecognized format — passes through untouched.
+/// own first bytes ([`sniff_binary`]): its format and architecture
+/// against the remote's platform, refusing what provably cannot run
+/// there — a Mach-O for a Linux host, an ELF for a Mac, a wrong-arch
+/// image of the right format, an ELF for a machine roost has no build
+/// for. Anything else — a shell script, a short file, a universal
+/// binary, an unrecognized format — passes through untouched.
 ///
 /// What stays the far side's job is being the *right build*: the staged
 /// verify before the commit runs `identify` over there and is the same
@@ -3548,7 +3654,10 @@ pub async fn resolve_source(
 /// swapped in between is a TOCTOU window on the developer's own machine.
 /// That is fine, because this guard is early feedback on a dev escape
 /// hatch — not a security boundary. The staged verify is.
-fn resolve_override(path: &Path, arch: RemoteArch) -> Result<ResolvedSource, BootstrapError> {
+fn resolve_override(
+    path: &Path,
+    platform: RemotePlatform,
+) -> Result<ResolvedSource, BootstrapError> {
     let unreadable = |error: std::io::Error| {
         BootstrapError::Source(format!(
             "{INSTALL_BIN_ENV}={} could not be read: {error}",
@@ -3570,20 +3679,26 @@ fn resolve_override(path: &Path, arch: RemoteArch) -> Result<ResolvedSource, Boo
             file.take(HEADER_PEEK).read_to_end(&mut head)
         })
         .map_err(unreadable)?;
-    match sniff_binary(&head) {
-        Sniff::Elf(found) if found != arch => Err(BootstrapError::Source(format!(
-            "{INSTALL_BIN_ENV}={} is an {found} Linux binary but that host is {arch}",
+    let RemotePlatform { os, arch } = platform;
+    let refuse = |what: String| {
+        Err(BootstrapError::Source(format!(
+            "{INSTALL_BIN_ENV}={} is {what}",
             path.display()
-        ))),
-        Sniff::ElfOther(machine) => Err(BootstrapError::Source(format!(
-            "{INSTALL_BIN_ENV}={} is an ELF for machine 0x{machine:x}, not amd64/arm64",
-            path.display()
-        ))),
-        Sniff::MachO => Err(BootstrapError::Source(format!(
-            "{INSTALL_BIN_ENV}={} is a macOS binary, not a Linux one",
-            path.display()
-        ))),
-        Sniff::Elf(_) | Sniff::Unknown => Ok(ResolvedSource {
+        )))
+    };
+    match (os, sniff_binary(&head)) {
+        (RemoteOs::Darwin, Sniff::Elf(_) | Sniff::ElfOther(_)) => {
+            refuse("a Linux binary, not a macOS one".to_string())
+        }
+        (RemoteOs::Linux, Sniff::MachO(_)) => refuse("a macOS binary, not a Linux one".to_string()),
+        (_, Sniff::Elf(found) | Sniff::MachO(Some(found))) if found != arch => refuse(format!(
+            "an {found} {} binary but that host is {arch}",
+            os.display_name()
+        )),
+        (_, Sniff::ElfOther(machine)) => {
+            refuse(format!("an ELF for machine 0x{machine:x}, not amd64/arm64"))
+        }
+        (_, Sniff::Elf(_) | Sniff::MachO(_) | Sniff::Unknown) => Ok(ResolvedSource {
             path: path.to_path_buf(),
             origin: SourceOrigin::Override,
             verified: None,
@@ -3595,17 +3710,18 @@ fn resolve_override(path: &Path, arch: RemoteArch) -> Result<ResolvedSource, Boo
 /// and if it says it is this build.
 async fn resolve_sibling(
     options: &BootstrapOptions,
-    arch: RemoteArch,
+    platform: RemotePlatform,
 ) -> Result<ResolvedSource, String> {
-    let Some(local_arch) = client_arch() else {
+    let Some(local) = client_platform() else {
         return Err(
-            "this Roost is not a Linux build, so its own roost-session can't run on a Linux host"
+            "this Roost is not built for a platform roost-session is published for, so its own \
+             roost-session can't run over there"
                 .to_string(),
         );
     };
-    if local_arch != arch {
+    if local != platform {
         return Err(format!(
-            "this Roost is a {local_arch} build and that host is {arch}"
+            "this Roost is a {local} build and that host is {platform}"
         ));
     }
     let Some(path) = options.sibling_bin.as_deref() else {
@@ -5031,42 +5147,104 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn linux_is_the_only_platform_with_a_build() {
-        check_os("Linux").expect("Linux");
-        check_os(" linux \n").expect("trimmed and case-blind");
-        for os in ["Darwin", "FreeBSD", "SunOS", ""] {
-            let error = check_os(os).expect_err("{os} has no build");
+    fn linux_and_macos_are_the_platforms_with_a_build() {
+        assert_eq!(
+            map_platform("Linux", "x86_64").expect("Linux"),
+            RemotePlatform::LINUX_AMD64
+        );
+        assert_eq!(
+            map_platform(" linux \n", "aarch64").expect("trimmed and case-blind"),
+            RemotePlatform::LINUX_ARM64
+        );
+        assert_eq!(
+            map_platform("Darwin", "arm64").expect("Apple silicon"),
+            RemotePlatform::DARWIN_ARM64
+        );
+        for os in ["FreeBSD", "SunOS", ""] {
+            let error = map_platform(os, "x86_64").expect_err("{os} has no build");
             assert!(
                 matches!(error, BootstrapError::UnsupportedOs(_)),
                 "{error:?}"
             );
         }
-        assert!(check_os("Darwin")
-            .unwrap_err()
-            .message("box")
-            .contains("Linux only"));
+        assert!(
+            map_platform("FreeBSD", "riscv64")
+                .unwrap_err()
+                .message("box")
+                .contains("Linux and macOS only"),
+            "an OS with no build is refused as an OS, before its arch is looked at"
+        );
     }
 
     #[test]
     fn the_arch_map_covers_both_spellings_of_both_builds() {
         for raw in ["x86_64", "amd64", " X86_64 "] {
-            assert_eq!(map_arch(raw).expect(raw), RemoteArch::Amd64);
+            assert_eq!(
+                map_platform("Linux", raw).expect(raw),
+                RemotePlatform::LINUX_AMD64
+            );
         }
         for raw in ["aarch64", "arm64", "ARM64"] {
-            assert_eq!(map_arch(raw).expect(raw), RemoteArch::Arm64);
+            assert_eq!(
+                map_platform("Linux", raw).expect(raw),
+                RemotePlatform::LINUX_ARM64
+            );
+            assert_eq!(
+                map_platform("Darwin", raw).expect(raw),
+                RemotePlatform::DARWIN_ARM64
+            );
         }
         for raw in ["armv7l", "riscv64", "i686", ""] {
-            let error = map_arch(raw).expect_err("no build");
+            let error = map_platform("Linux", raw).expect_err("no build");
             assert!(
-                matches!(error, BootstrapError::UnsupportedArch(_)),
+                matches!(
+                    error,
+                    BootstrapError::UnsupportedArch {
+                        os: RemoteOs::Linux,
+                        ..
+                    }
+                ),
                 "{error:?}"
             );
         }
-        // The copy names the arch it refused.
-        assert!(map_arch("riscv64")
-            .unwrap_err()
-            .message("box")
-            .contains("riscv64"));
+        // The copy names the arch it refused, and what is published.
+        let copy = map_platform("Linux", "riscv64").unwrap_err().message("box");
+        assert!(copy.contains("riscv64"), "{copy}");
+        assert!(
+            copy.contains("Linux builds for amd64 and arm64 only"),
+            "{copy}"
+        );
+    }
+
+    /// Roost-Iced.app is Apple-silicon only, so an Intel Mac is a known
+    /// OS with an arch nothing is published for — refused before consent,
+    /// with copy that says which Mac build exists.
+    #[test]
+    fn an_intel_mac_has_no_build() {
+        let error = map_platform("Darwin", "x86_64").expect_err("no darwin-amd64");
+        assert_eq!(
+            error,
+            BootstrapError::UnsupportedArch {
+                os: RemoteOs::Darwin,
+                arch: "x86_64".to_string()
+            }
+        );
+        let copy = error.message("box");
+        assert!(copy.contains("macOS builds for arm64 only"), "{copy}");
+    }
+
+    #[test]
+    fn this_client_maps_onto_a_published_platform() {
+        let expected = if cfg!(target_os = "linux") {
+            "linux"
+        } else if cfg!(target_os = "macos") {
+            "darwin"
+        } else {
+            return;
+        };
+        let platform = client_platform().expect("a published platform");
+        assert_eq!(platform.os.as_str(), expected);
+        assert!(RemotePlatform::PUBLISHED.contains(&platform));
     }
 
     // ------------------------------------------------------------------
@@ -5273,21 +5451,25 @@ mod tests {
     #[test]
     fn asset_names_are_versioned_per_arch_and_github_safe() {
         assert_eq!(
-            asset_name("0.0.19", RemoteArch::Amd64),
+            asset_name("0.0.19", RemotePlatform::LINUX_AMD64),
             "roost-session-0.0.19-linux-amd64"
         );
         assert_eq!(
-            asset_name("0.0.19", RemoteArch::Arm64),
+            asset_name("0.0.19", RemotePlatform::LINUX_ARM64),
             "roost-session-0.0.19-linux-arm64"
         );
         assert_eq!(
-            checksum_name(&asset_name("0.0.19", RemoteArch::Arm64)),
+            checksum_name(&asset_name("0.0.19", RemotePlatform::LINUX_ARM64)),
             "roost-session-0.0.19-linux-arm64.sha256"
         );
-        for name in [
-            asset_name("0.0.19", RemoteArch::Amd64),
-            checksum_name(&asset_name("0.0.19", RemoteArch::Amd64)),
-        ] {
+        assert_eq!(
+            asset_name("0.0.19", RemotePlatform::DARWIN_ARM64),
+            "roost-session-0.0.19-darwin-arm64"
+        );
+        for name in RemotePlatform::PUBLISHED.into_iter().flat_map(|platform| {
+            let asset = asset_name("0.0.19", platform);
+            [checksum_name(&asset), asset]
+        }) {
             assert!(
                 name.bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')),
@@ -5395,7 +5577,7 @@ mod tests {
     #[test]
     fn the_asset_plan_names_the_actual_origin() {
         let plan = options()
-            .asset_plan(RemoteArch::Amd64)
+            .asset_plan(RemotePlatform::LINUX_AMD64)
             .expect("default base");
         assert!(!plan.overridden);
         assert_eq!(
@@ -5407,7 +5589,9 @@ mod tests {
 
         let mut overridden = options();
         overridden.asset_base = Some("http://127.0.0.1:9/assets/".to_string());
-        let plan = overridden.asset_plan(RemoteArch::Arm64).expect("override");
+        let plan = overridden
+            .asset_plan(RemotePlatform::LINUX_ARM64)
+            .expect("override");
         assert!(
             plan.overridden,
             "an override must never render as github.com"
@@ -5422,7 +5606,9 @@ mod tests {
         // would be stored and land in the middle of every joined URL.
         let mut padded = options();
         padded.asset_base = Some("  http://127.0.0.1:9/assets/  ".to_string());
-        let plan = padded.asset_plan(RemoteArch::Arm64).expect("override");
+        let plan = padded
+            .asset_plan(RemotePlatform::LINUX_ARM64)
+            .expect("override");
         assert_eq!(plan.base, "http://127.0.0.1:9/assets");
         assert_eq!(
             plan.asset_url,
@@ -5432,28 +5618,30 @@ mod tests {
         let mut ipv6 = options();
         ipv6.asset_base = Some("http://[::1]:53535".to_string());
         assert_eq!(
-            ipv6.asset_plan(RemoteArch::Amd64).expect("ipv6").asset_url,
+            ipv6.asset_plan(RemotePlatform::LINUX_AMD64)
+                .expect("ipv6")
+                .asset_url,
             "http://[::1]:53535/roost-session-0.0.19-linux-amd64"
         );
 
         let mut query = options();
         query.asset_base = Some("https://host/download?token=x".to_string());
         assert!(matches!(
-            query.asset_plan(RemoteArch::Amd64),
+            query.asset_plan(RemotePlatform::LINUX_AMD64),
             Err(BootstrapError::Download(_))
         ));
 
         let mut downgrade = options();
         downgrade.asset_base = Some("http://example.com/assets".to_string());
         assert!(matches!(
-            downgrade.asset_plan(RemoteArch::Amd64),
+            downgrade.asset_plan(RemotePlatform::LINUX_AMD64),
             Err(BootstrapError::Download(_))
         ));
 
         let mut prerelease = options();
         prerelease.expected.app_version = "0.0.19-rc1".to_string();
         assert!(matches!(
-            prerelease.asset_plan(RemoteArch::Amd64),
+            prerelease.asset_plan(RemotePlatform::LINUX_AMD64),
             Err(BootstrapError::NoSource { .. })
         ));
     }
@@ -5466,12 +5654,12 @@ mod tests {
     /// first, override before sibling before asset.
     #[test]
     fn the_preview_walks_the_same_ladder_resolution_does() {
-        let arch = client_arch().unwrap_or(RemoteArch::Amd64);
+        let platform = client_platform().unwrap_or(RemotePlatform::LINUX_AMD64);
 
         let mut env = options();
         env.install_bin = Some(PathBuf::from("/tmp/roost-session"));
         env.sibling_bin = Some(PathBuf::from("/usr/bin/roost-session"));
-        let preview = env.source_preview(arch).expect("override rung");
+        let preview = env.source_preview(platform).expect("override rung");
         assert_eq!(preview.first, SourceOrigin::Override);
         assert_eq!(preview.fallback, None, "an override is taken or nothing is");
         assert!(
@@ -5485,8 +5673,8 @@ mod tests {
         // over there at all, which is a compile-time fact.
         let mut sibling = options();
         sibling.sibling_bin = Some(PathBuf::from("/usr/bin/roost-session"));
-        let preview = sibling.source_preview(arch).expect("some rung");
-        if client_arch() == Some(arch) {
+        let preview = sibling.source_preview(platform).expect("some rung");
+        if client_platform() == Some(platform) {
             assert_eq!(preview.first, SourceOrigin::Sibling);
             assert!(
                 matches!(preview.fallback, Some(SourceOrigin::Asset { .. })),
@@ -5505,7 +5693,7 @@ mod tests {
             );
         }
 
-        let bare = options().source_preview(arch).expect("asset rung");
+        let bare = options().source_preview(platform).expect("asset rung");
         assert!(matches!(bare.first, SourceOrigin::Asset { .. }));
         assert_eq!(bare.fallback, None);
     }
@@ -5520,7 +5708,7 @@ mod tests {
         overridden.asset_base = Some("http://127.0.0.1:9/assets".to_string());
         overridden.source = Some(InstallSource::Asset);
         let copy = overridden
-            .source_preview(RemoteArch::Amd64)
+            .source_preview(RemotePlatform::LINUX_AMD64)
             .expect("asset rung")
             .describe();
         assert!(copy.contains("http://127.0.0.1:9/assets"), "{copy}");
@@ -5536,7 +5724,7 @@ mod tests {
         );
 
         let default = options()
-            .source_preview(RemoteArch::Amd64)
+            .source_preview(RemotePlatform::LINUX_AMD64)
             .expect("asset rung");
         let copy = default.describe();
         assert!(copy.contains("github.com"), "{copy}");
@@ -5554,12 +5742,12 @@ mod tests {
     /// next one.
     #[test]
     fn a_forced_rung_previews_without_a_fall_through() {
-        let arch = client_arch().unwrap_or(RemoteArch::Amd64);
+        let platform = client_platform().unwrap_or(RemotePlatform::LINUX_AMD64);
         let mut forced = options();
         forced.sibling_bin = Some(PathBuf::from("/usr/bin/roost-session"));
         forced.source = Some(InstallSource::Sibling);
-        if client_arch() == Some(arch) {
-            let preview = forced.source_preview(arch).expect("forced sibling");
+        if client_platform() == Some(platform) {
+            let preview = forced.source_preview(platform).expect("forced sibling");
             assert_eq!(preview.first, SourceOrigin::Sibling);
             assert_eq!(preview.fallback, None);
         }
@@ -5569,7 +5757,7 @@ mod tests {
         let mut nothing = options();
         nothing.source = Some(InstallSource::Env);
         assert!(matches!(
-            nothing.source_preview(arch),
+            nothing.source_preview(platform),
             Err(BootstrapError::NoSource { .. })
         ));
     }
@@ -5582,7 +5770,7 @@ mod tests {
         let mut prerelease = options();
         prerelease.expected.app_version = "0.0.19-rc1".to_string();
         assert!(matches!(
-            prerelease.source_preview(RemoteArch::Amd64),
+            prerelease.source_preview(RemotePlatform::LINUX_AMD64),
             Err(BootstrapError::NoSource { .. })
         ));
     }
@@ -5716,7 +5904,10 @@ mod tests {
         let families = [
             BootstrapError::Probe("no answer".into()),
             BootstrapError::UnsupportedOs("Darwin".into()),
-            BootstrapError::UnsupportedArch("riscv64".into()),
+            BootstrapError::UnsupportedArch {
+                os: RemoteOs::Linux,
+                arch: "riscv64".into(),
+            },
             BootstrapError::NoSource {
                 app_version: "0.0.19".into(),
             },
@@ -6029,7 +6220,7 @@ mod tests {
         let mut opts = options();
         opts.install_bin = Some(bin.clone());
 
-        let source = resolve_source(&opts, RemoteArch::Amd64, &dir.path().join("dl"))
+        let source = resolve_source(&opts, RemotePlatform::LINUX_AMD64, &dir.path().join("dl"))
             .await
             .expect("the override rung");
         assert_eq!(source.path(), bin);
@@ -6043,7 +6234,7 @@ mod tests {
         for path in [dir.path().join("nope"), dir.path().to_path_buf()] {
             let mut opts = options();
             opts.install_bin = Some(path.clone());
-            let error = resolve_source(&opts, RemoteArch::Amd64, &dir.path().join("dl"))
+            let error = resolve_source(&opts, RemotePlatform::LINUX_AMD64, &dir.path().join("dl"))
                 .await
                 .expect_err("an unusable override must not fall through");
             assert!(
@@ -6069,7 +6260,7 @@ mod tests {
         opts.curl_bin = PathBuf::from("/nonexistent/curl");
         opts.asset_base = Some("https://127.0.0.1:1/assets".to_string());
 
-        let error = resolve_source(&opts, RemoteArch::Amd64, &dir.path().join("dl"))
+        let error = resolve_source(&opts, RemotePlatform::LINUX_AMD64, &dir.path().join("dl"))
             .await
             .expect_err("the download must be attempted, not the override");
         assert!(
@@ -6088,7 +6279,7 @@ mod tests {
         opts.curl_bin = PathBuf::from("/nonexistent/curl");
         opts.asset_base = Some("https://example.invalid/assets".to_string());
 
-        let error = resolve_source(&opts, RemoteArch::Arm64, &dir.path().join("dl"))
+        let error = resolve_source(&opts, RemotePlatform::LINUX_ARM64, &dir.path().join("dl"))
             .await
             .expect_err("no curl, no download");
         let message = error.message("workbox");
@@ -6101,7 +6292,7 @@ mod tests {
         let dir = scratch_parent();
         let mut opts = options();
         opts.source = Some(InstallSource::Env);
-        let error = resolve_source(&opts, RemoteArch::Amd64, &dir.path().join("dl"))
+        let error = resolve_source(&opts, RemotePlatform::LINUX_AMD64, &dir.path().join("dl"))
             .await
             .expect_err("forced at a rung with nothing on it");
         assert!(
@@ -6112,7 +6303,7 @@ mod tests {
         let mut opts = options();
         opts.source = Some(InstallSource::Sibling);
         opts.sibling_bin = None;
-        let error = resolve_source(&opts, RemoteArch::Amd64, &dir.path().join("dl"))
+        let error = resolve_source(&opts, RemotePlatform::LINUX_AMD64, &dir.path().join("dl"))
             .await
             .expect_err("forced at the sibling rung with no sibling");
         assert!(matches!(error, BootstrapError::Source(_)), "{error:?}");
@@ -6128,7 +6319,7 @@ mod tests {
         opts.expected.app_version = "0.0.19-rc1".to_string();
         opts.source = Some(InstallSource::Asset);
 
-        let error = resolve_source(&opts, RemoteArch::Amd64, &dir.path().join("dl"))
+        let error = resolve_source(&opts, RemotePlatform::LINUX_AMD64, &dir.path().join("dl"))
             .await
             .expect_err("no tag spelling to guess at");
         assert_eq!(
@@ -6138,19 +6329,6 @@ mod tests {
             }
         );
         assert!(!dir.path().join("dl").exists(), "nothing was downloaded");
-    }
-
-    /// The sibling rung is a Linux-to-Linux affair: it streams the
-    /// binary next to *this* client, which is an ELF for this client's
-    /// own architecture.
-    #[test]
-    fn the_sibling_rung_only_applies_to_a_linux_build_of_the_right_arch() {
-        let arch = client_arch();
-        if cfg!(target_os = "linux") {
-            assert!(arch.is_some(), "a Linux build knows its own arch");
-        } else {
-            assert_eq!(arch, None, "no roost-session is built for this platform");
-        }
     }
 
     // ------------------------------------------------------------------

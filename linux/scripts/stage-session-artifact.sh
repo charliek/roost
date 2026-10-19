@@ -8,7 +8,8 @@
 # copies that existing product to the exact name the release-asset install
 # rung of the client (`asset_name`/`checksum_name` in
 # crates/roost-ipc/src/bootstrap.rs) requests, and writes the checksum
-# sidecar that rung verifies before install.
+# sidecar that rung verifies before install. release.yml's mac-iced job
+# runs it too, with `--os darwin`, on the copy Roost-Iced.app bundles.
 #
 # Factored out of release.yml (plan 039 §3.7) so it can be exercised by a
 # shell test (stage-session-artifact_test.sh) without cutting a release.
@@ -18,13 +19,15 @@
 # changes the asset-name shape, update the other and re-run both.
 #
 # Usage:
-#   ./linux/scripts/stage-session-artifact.sh <version> <arch> [--dist-dir <dir>]
+#   ./linux/scripts/stage-session-artifact.sh <version> <arch> [--os <os>] [--dist-dir <dir>]
 #
 # <version> is the CARGO_PKG_VERSION-shaped string (e.g. 0.0.19, or
 # 0.0.19-rc1 for a prerelease tag) — this script does not judge whether it
 # is stable; only the client's URL construction cares about that
 # (bootstrap.rs `is_stable_version`). <arch> is "amd64" or "arm64", matching
-# release.yml's Linux matrix. `--dist-dir` overrides where the source binary
+# release.yml's Linux matrix. `--os` is "linux" (the default) or "darwin",
+# and darwin is arm64 only — the pairs bootstrap.rs's
+# `RemotePlatform::PUBLISHED` lists. `--dist-dir` overrides where the source binary
 # is read from and the outputs are written (default: <repo-root>/dist) — the
 # test seam.
 #
@@ -37,17 +40,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${SCRIPT_DIR}/_common.sh"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-USAGE="usage: $(basename "$0") <version> <arch> [--dist-dir <dir>]"
+USAGE="usage: $(basename "$0") <version> <arch> [--os <os>] [--dist-dir <dir>]"
 usage() { printf '%s\n' "${USAGE}"; }
 
 version=""
 arch=""
+os="linux"
 dist_dir=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -h|--help)
       usage
       exit 0
+      ;;
+    --os)
+      [ "$#" -ge 2 ] || { usage >&2; die "--os requires a value"; }
+      os="$2"
+      shift 2
       ;;
     --dist-dir)
       [ "$#" -ge 2 ] || { usage >&2; die "--dist-dir requires a value"; }
@@ -75,9 +84,9 @@ done
 
 [ -n "${version}" ] || { usage >&2; die "missing <version>"; }
 [ -n "${arch}" ] || { usage >&2; die "missing <arch>"; }
-case "${arch}" in
-  amd64|arm64) ;;
-  *) die "unsupported <arch> '${arch}' — expected amd64 or arm64" ;;
+case "${os}-${arch}" in
+  linux-amd64|linux-arm64|darwin-arm64) ;;
+  *) die "unsupported platform '${os}-${arch}' — expected linux-amd64, linux-arm64 or darwin-arm64" ;;
 esac
 
 require_tools install
@@ -101,7 +110,7 @@ dist_dir="$(cd "${dist_dir}" && pwd)"
 src="${dist_dir}/roost-session"
 [ -f "${src}" ] || die "${src} not found — run linux/scripts/build-deb.sh first (it stages roost-session there alongside the UI and roostctl)."
 
-asset_name="roost-session-${version}-linux-${arch}"
+asset_name="roost-session-${version}-${os}-${arch}"
 checksum_name="${asset_name}.sha256"
 asset_path="${dist_dir}/${asset_name}"
 checksum_path="${dist_dir}/${checksum_name}"
