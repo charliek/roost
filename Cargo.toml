@@ -104,18 +104,16 @@ lto         = "thin"
 codegen-units = 1
 strip       = "debuginfo"
 
+# Cheap debug info in dev (and none for dependencies), as slaudio and imgmcp
+# do, so incremental builds and the target dir stay small. Binaries and tests
+# keep file:line for panic backtraces; the cost is variable inspection under
+# lldb. (`test` inherits this, so it needs no profile of its own.)
 [profile.dev]
-debug = "limited"
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 2
-
-# Test binaries keep file:line for panic backtraces and drop the rest:
-# `dev` is already "limited", and what remains is mostly what makes the
-# 46 test binaries slow to link. Costs variable inspection under lldb
-# for tests only.
-[profile.test]
-debug = "line-tables-only"
+debug = false
 
 [patch.crates-io]
 # Vendored swash 0.2.10 carrying the #292 zero-long-metrics guard.
