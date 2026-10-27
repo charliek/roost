@@ -20,8 +20,9 @@ tabs, with a real terminal, from a phone, a tablet or a foldable. The
 app is optimized for large screens first and collapses down to phones.
 Where the desktop relies on hotkeys, the app offers touch-native
 controls instead. It is a client of `roost-session`, just as Roost-Iced
-is when it shows a host, so it adds no new op set. Everything routes
-through the session ops `roost-ipc` already defines.
+is when it shows a host, so it adds no new op set. It reuses the
+control-plane session ops and the data-plane attach protocol that
+`roost-ipc` already defines.
 
 **Decisions taken in the planning conversation:**
 
@@ -150,12 +151,18 @@ The proposed event API keeps today's shape: `HostEvent` mirrors the
 `Emptiness`, `Tab(TabKey, HostTabFrame)`, plus the self-wakes).
 `HostConnSet`'s methods are already the command API.
 
-**Two invariants must survive the move.**
+**Three invariants must survive the move.**
 
 1. All of a host's events go through a single FIFO, and the client is
    re-entered on one owner thread. Incarnation attribution and the
    "decoder is dropped on the main thread" rule depend on both.
-2. Under `local-backend = session`, which a fresh Roost-Iced install
+2. **Drop order.** `HostConnSet` and the host attaches must drop before
+   the runtime they run on, because their `Drop` signals runtime tasks
+   to wind down. iced gets this from field order
+   (`crates/roost-iced/src/app.rs:3413-3423`). Whatever owns them in
+   `roost-mobile` (`RoostApp` below) needs the same field order, or an
+   explicit `Drop`.
+3. Under `local-backend = session`, which a fresh Roost-Iced install
    uses, every desktop user's local tabs run over this same
    `HostConnSet`.
 
@@ -348,22 +355,36 @@ the desktop's background resize wave resizes tabs the phone is using
    you type. It's simple, and right when the device is the only one
    looking. On an unfolded foldable or a tablet the grid is close to
    desktop width, so the fight matters less.
-2. **Mirror.** The app declares the PTY's current grid
-   (`snapshot_cols`/`snapshot_rows` from the attach reply) as its own
-   geometry and pans and zooms locally. `INPUT` then carries the same
-   size and resizes nothing. It goes stale if another client resizes
-   the tab. The app can detect that by polling `tab.dump` or by
-   re-attaching, but an event would be better.
-3. **Line input over `tab.write`.** The compose box and quick replies
-   send through the control plane, which never resizes. Ordering
-   between this and data-plane `INPUT` from the same client isn't
-   guaranteed, since they are separate connections into one tab task.
-   That's fine for whole lines, and it's wrong for interleaved
-   keystrokes **(inferred)**.
+2. **Mirror.** The app attaches with `focus: false` at the PTY's grid
+   (`snapshot_cols`/`snapshot_rows` from the attach reply) and pans and
+   zooms locally. **It must not send data-plane `INPUT`.** The
+   connection's declared geometry never updates when another client
+   resizes the tab, and the server applies that geometry ahead of each
+   `INPUT` (`crates/roost-engine/src/attach.rs:950-962`). So a
+   keystroke sent after someone else's resize would put the old size
+   back. Instead, Mirror sends *all* of this client's input (encoded
+   keys, pastes, mouse reports) over control-plane `tab.write`, which
+   carries no geometry. One control connection is served serially
+   (`docs/reference/ipc.md:694-697`), so the client's own input stays
+   in order. The costs:
+   - Keystrokes share the host's sequential op queue with other ops,
+     so latency is higher **(unmeasured)**.
+   - The local view still goes stale after a foreign resize. That
+     affects only what you see, not the tab. The app notices by
+     polling `tab.dump` or by re-attaching until a resize event
+     exists.
+3. **Line input over `tab.write` in Fit mode.** The compose box and
+   quick replies send through the control plane, which never resizes.
+   In Fit mode, ordering between this and data-plane `INPUT` from the
+   same client isn't guaranteed, since they are separate connections
+   into one tab task. That's fine for whole lines, and it's wrong for
+   interleaved keystrokes **(inferred)**.
 
 **Leaning:** Fit on expanded layouts and Mirror on compact ones, each
 with a one-tap toggle. The compose box and quick replies always use
-`tab.write`.
+`tab.write`. If `tab.write` keystroke latency turns out to be too high,
+Mirror waits on the server-side resize event below. Data-plane `INPUT`
+in Mirror is only safe once the client is told about foreign resizes.
 
 **Server-side work that would make Mirror solid.** It isn't needed for
 the MVP, and it overlaps G2.
@@ -553,7 +574,8 @@ for the MVP.
      `e2e-iced` stays green.
    - Add `Dialer` and `UnixDialer`.
    - Write a minimal connection task (prologue, mirror, reconnect) and
-     an attach/hydration path that owns a `roost_vt::Terminal`.
+     an attach/hydration path behind an `AttachTarget`. `roost-mobile`
+     owns each attached tab's `roost_vt::Terminal`.
    - Tests run against a local session.
 3. **The Flutter shell on the Linux desktop, against a local session.**
    - FRB scaffolding with cargokit.

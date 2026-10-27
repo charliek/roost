@@ -82,9 +82,11 @@ G2 next.
 ### G1. Finding the session depends on `XDG_RUNTIME_DIR` (Linux)
 
 **What happens.** The session socket is
-`$XDG_RUNTIME_DIR/roost-session/roost.sock` when that variable is set,
-and `/tmp/roost-session-<uid>/roost.sock` when it isn't
-(`resolve_paths_linux` in `crates/roost-ipc/src/paths.rs`). The code
+`$XDG_RUNTIME_DIR/roost-session/roost.sock` when that variable is
+non-empty and absolute, and `/tmp/roost-session-<uid>/roost.sock`
+otherwise (`resolve_paths_linux` and `valid_dir` in
+`crates/roost-ipc/src/paths.rs`). The resolver doesn't check that the
+directory exists. The code
 picks exactly one of the two and never checks the other. Everything
 that looks for the session goes through that one resolver:
 
