@@ -494,9 +494,21 @@ pub fn app_for_source(source: &str) -> Option<&'static str> {
     }
 }
 
-/// A terminal's status sink, drained, in the composition layer's types.
+/// Empty a terminal's status sink ([`roost_vt::Terminal::set_status_sink`])
+/// into the composition layer's types. Never call it from inside a
+/// `vt_write`: libghostty's callbacks push under the same lock.
 #[cfg(feature = "vt")]
-pub fn from_vt(events: Vec<roost_vt::TerminalEvent>) -> Vec<StatusEvent> {
+pub fn drain(sink: &std::sync::Mutex<Vec<roost_vt::TerminalEvent>>) -> Vec<StatusEvent> {
+    let events = std::mem::take(
+        &mut *sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    from_vt(events)
+}
+
+#[cfg(feature = "vt")]
+fn from_vt(events: Vec<roost_vt::TerminalEvent>) -> Vec<StatusEvent> {
     use roost_vt::{
         ProgramStatusKind as VtKind, ProgramStatusState as VtState, PromptMark as VtMark,
         TerminalEvent,

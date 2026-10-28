@@ -133,7 +133,7 @@ fn validate(params: &TabAgentReportParams) -> Result<(), CliError> {
 /// `TabAgentReportParams`, in the same order `run_on_ui` used to inline:
 /// ownership intent, source, metadata, lifecycle(s), then the server's
 /// own shape check. Keeps the dispatch arm to call-then-print, same as
-/// `dump_tab` for `tab dump`.
+/// `read_tab` for `tab dump`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_params(
     tab_id: i64,

@@ -180,7 +180,6 @@ impl HostMirror {
                     // subscriber never re-runs the projection.
                     tab.state = data.state;
                     tab.hook_active = data.hook_active;
-                    // Absent means the tab has no records left.
                     tab.program_status = data.program_status.clone();
                 });
             }

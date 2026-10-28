@@ -136,13 +136,15 @@ def _iced_lane(roost: Roost, project: int):
     yield Lane("iced", roost, ui.socket_path("iced"), open_quiet)
 
 
-def next_agent_change(stream: EventStream, tab: int, fence: int) -> tuple[dict, int, list[dict]]:
-    """The next `agent_report.changed` for `tab`, the fence to continue
-    from, and every batch read on the way. A UI socket may carry other
-    tabs' changes too; they are read past."""
+def next_for_tab(
+    stream: EventStream, event: str, tab: int, fence: int
+) -> tuple[dict, int, list[dict]]:
+    """The next `event` for `tab`, the fence to continue from, and every
+    batch read on the way. A UI socket may carry other tabs' events too;
+    they are read past."""
     seen: list[dict] = []
     while True:
-        batches, envelope = stream.recv_until("agent_report.changed", timeout=30.0)
+        batches, envelope = stream.recv_until(event, timeout=30.0)
         stream.expect_contiguous(batches, fence)
         fence = int(batches[-1]["revision"])
         seen += batches
@@ -249,12 +251,12 @@ def test_the_last_clear_sends_an_event_without_program_status(lane):
     with EventStream(lane.events_socket) as stream:
         fence = stream.subscribe()
         lane.client.tab_feed_pty_bytes(tab, osc7501(state="working", id="a", app="pi"))
-        data, fence, _ = next_agent_change(stream, tab, fence)
+        data, fence, _ = next_for_tab(stream, "agent_report.changed", tab, fence)
         assert data["program_status"]["record"]["id"] == "a", data
         assert data["state"] == "running", data
 
         lane.client.tab_feed_pty_bytes(tab, osc7501(state="clear", id="a"))
-        data, fence, _ = next_agent_change(stream, tab, fence)
+        data, fence, _ = next_for_tab(stream, "agent_report.changed", tab, fence)
         assert "program_status" not in data, data
         assert data["state"] == "none", data
 
@@ -272,7 +274,7 @@ def test_a_message_change_alone_produces_an_event(lane):
         lane.client.tab_feed_pty_bytes(
             tab, osc7501(state="working", app="claude-code", msg="writing", progress="50")
         )
-        data, fence, batches = next_agent_change(stream, tab, fence)
+        data, fence, batches = next_for_tab(stream, "agent_report.changed", tab, fence)
         record = data["program_status"]["record"]
         assert record["msg"] == "writing", data
         assert "progress" not in record, f"the message change had no event of its own: {data}"
@@ -420,22 +422,12 @@ def test_a_record_banner_carries_its_title_and_message(iced_lane):
     iced_lane.quiet_tab()
     with EventStream(iced_lane.events_socket) as stream:
         fence = stream.subscribe()
-
-        def next_banner() -> dict:
-            nonlocal fence
-            while True:
-                batches, envelope = stream.recv_until("notification.fired", timeout=30.0)
-                stream.expect_contiguous(batches, fence)
-                fence = int(batches[-1]["revision"])
-                if envelope["data"]["tab_id"] == str(tab):
-                    return envelope["data"]
-
         roost.tab_feed_pty_bytes(
             tab, osc7501(state="blocked", app="claude-code", msg="approve Bash")
         )
-        banner = next_banner()
+        banner, fence, _ = next_for_tab(stream, "notification.fired", tab, fence)
         assert (banner["title"], banner["body"]) == ("Claude Code", "approve Bash"), banner
 
         roost.tab_feed_pty_bytes(tab, osc7501(state="error", app="claude-code", title="nightly"))
-        banner = next_banner()
+        banner, fence, _ = next_for_tab(stream, "notification.fired", tab, fence)
         assert (banner["title"], banner["body"]) == ("nightly", "Failed"), banner

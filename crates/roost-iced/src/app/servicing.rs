@@ -4936,12 +4936,8 @@ impl App {
     }
 
     fn apply_chunk_effects(&mut self, chunk: ChunkEffects) -> UiTask {
-        self.apply_program_status(chunk.key, chunk.status);
+        apply_program_status(&self.workspace, chunk.key, chunk.status);
         self.apply_osc_actions(chunk.key, chunk.actions)
-    }
-
-    fn apply_program_status(&self, key: TabKey, events: Vec<StatusEvent>) {
-        apply_program_status(&self.workspace, key, events);
     }
 
     pub(super) fn apply_osc_actions(&mut self, key: TabKey, actions: Vec<OscAction>) -> UiTask {

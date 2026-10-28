@@ -1673,7 +1673,10 @@ async fn run_on_ui(
         }
         Cmd::Tab(TabCmd::Dump { tab, scrollback }) => {
             let flag = tab.as_deref().map(parse_tab_flag).transpose()?;
-            let result = dump_tab(ui, flag, tab_env, scrollback).await?;
+            let result: TabDumpResult = read_tab(ui, ops::TAB_DUMP, flag, tab_env, |tab_id| {
+                TabDumpParams { tab_id, scrollback }
+            })
+            .await?;
             if json {
                 print_json(&result)?;
             } else {
@@ -1692,7 +1695,11 @@ async fn run_on_ui(
         }
         Cmd::Tab(TabCmd::Memory { tab }) => {
             let flag = tab.as_deref().map(parse_tab_flag).transpose()?;
-            let result = tab_memory(ui, flag, tab_env).await?;
+            let result: TabMemoryUsageResult =
+                read_tab(ui, ops::TAB_MEMORY_USAGE, flag, tab_env, |tab_id| {
+                    TabMemoryUsageParams { tab_id }
+                })
+                .await?;
             if json {
                 print_json(&result)?;
             } else {
@@ -2755,7 +2762,8 @@ async fn here_tab(ui: &UiSocket<'_>, tab_env: Option<&str>) -> Result<i64, CliEr
     named_tab::<i64>(None, tab_env)?.ok_or_else(|| CliError::Usage(NO_TAB.to_string()))
 }
 
-/// `tab dump` of `--tab`, `ROOST_TAB_ID`, or else the UI's active tab.
+/// A per-tab read (`tab dump`, `tab memory`) of `--tab`, `ROOST_TAB_ID`,
+/// or else the UI's active tab.
 ///
 /// A bare id is read off the socket that owns the tabs, the one `wait`
 /// reads ([`events::resolve`]): under `local-backend = session` the UI
@@ -2763,60 +2771,27 @@ async fn here_tab(ui: &UiSocket<'_>, tab_env: Option<&str>) -> Result<i64, CliEr
 /// the session's to answer, and asking it there is one hop. An
 /// `h<host>.<id>` names that client-side terminal itself, so it stays on
 /// the UI socket.
-async fn dump_tab(
+async fn read_tab<P: Serialize, R: DeserializeOwned>(
     ui: &mut UiSocket<'_>,
+    op: &str,
     flag: Option<WireTabRef>,
     tab_env: Option<&str>,
-    scrollback: u32,
-) -> Result<TabDumpResult, CliError> {
+    params: impl Fn(WireTabRef) -> P,
+) -> Result<R, CliError> {
     let named = named_tab(flag, tab_env)?;
     if let Some(tab_id @ WireTabRef::Host { .. }) = named {
-        return ui
-            .call(ops::TAB_DUMP, TabDumpParams { tab_id, scrollback })
-            .await;
+        return ui.call(op, params(tab_id)).await;
     }
     let identify = identify(ui.client().await?).await?;
     let tab_id = match named {
         Some(tab) => tab,
         None => WireTabRef::Local(active_tab(&identify)?),
     };
-    let params = TabDumpParams { tab_id, scrollback };
     let source = events::resolve(ui.socket_path(), &identify);
     if source.socket == ui.socket_path() {
-        return ui.call(ops::TAB_DUMP, params).await;
+        return ui.call(op, params(tab_id)).await;
     }
-    Ok(dial(&source.socket)
-        .await?
-        .call(ops::TAB_DUMP, params)
-        .await?)
-}
-
-/// `tab memory`'s read, routed exactly as [`dump_tab`] routes its own.
-async fn tab_memory(
-    ui: &mut UiSocket<'_>,
-    flag: Option<WireTabRef>,
-    tab_env: Option<&str>,
-) -> Result<TabMemoryUsageResult, CliError> {
-    let named = named_tab(flag, tab_env)?;
-    if let Some(tab_id @ WireTabRef::Host { .. }) = named {
-        return ui
-            .call(ops::TAB_MEMORY_USAGE, TabMemoryUsageParams { tab_id })
-            .await;
-    }
-    let identify = identify(ui.client().await?).await?;
-    let tab_id = match named {
-        Some(tab) => tab,
-        None => WireTabRef::Local(active_tab(&identify)?),
-    };
-    let params = TabMemoryUsageParams { tab_id };
-    let source = events::resolve(ui.socket_path(), &identify);
-    if source.socket == ui.socket_path() {
-        return ui.call(ops::TAB_MEMORY_USAGE, params).await;
-    }
-    Ok(dial(&source.socket)
-        .await?
-        .call(ops::TAB_MEMORY_USAGE, params)
-        .await?)
+    Ok(dial(&source.socket).await?.call(op, params(tab_id)).await?)
 }
 
 /// `terminal: 802816 bytes resident, 3211264 bytes virtual, 2 pages

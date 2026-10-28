@@ -743,9 +743,8 @@ impl TerminalTab {
 
     /// Apply a chunk of terminal output that has ALREADY been scanned
     /// — everything arriving from the PTY, which the session's drain
-    /// scanned as it read it. Returns the chunk's program-status events,
-    /// for the caller to apply before the chunk's OSC actions (plan 082
-    /// D4.3); always empty for a tab without a status sink.
+    /// scanned as it read it. Returns the chunk's program-status events;
+    /// always empty for a tab without a status sink.
     pub(super) fn write_vt(&mut self, bytes: &[u8]) -> Vec<StatusEvent> {
         self.terminal.vt_write(bytes);
         self.drain_terminal_replies();
@@ -768,21 +767,11 @@ impl TerminalTab {
         (status, actions)
     }
 
-    /// Drain the status sink. Never held across a `vt_write`, which takes
-    /// the same lock from inside.
     fn take_status(&self) -> Vec<StatusEvent> {
-        let Some(sink) = &self.status_sink else {
-            return Vec::new();
-        };
-        let events = std::mem::take(
-            &mut *sink
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
-        if events.is_empty() {
-            return Vec::new();
-        }
-        roost_engine::program_status::from_vt(events)
+        self.status_sink
+            .as_deref()
+            .map(roost_engine::program_status::drain)
+            .unwrap_or_default()
     }
 
     fn drain_terminal_replies(&self) {

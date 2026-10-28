@@ -944,9 +944,7 @@ impl TabTask {
             self.last_byte_seq = seq;
             seq
         });
-        // 2. the authoritative terminal, then its program-status records
-        //    from the ordered sink, before the OSC actions below hand the
-        //    same OSC 133 marks to the hook layer.
+        // 2. the authoritative terminal, then its program-status records.
         self.vt.terminal.vt_write(&data);
         self.take_status();
         // 3. OSC scan, applied in wire order.
@@ -1024,24 +1022,15 @@ impl TabTask {
         }
     }
 
-    /// Apply whatever the status sink collected. The lock is released
-    /// before the workspace is called, and never held across a
-    /// `vt_write`, which takes it from inside.
+    /// Apply whatever the status sink collected.
     fn take_status(&mut self) {
-        let events = {
-            let mut guard = self
-                .vt
-                .status
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if guard.is_empty() {
-                return;
-            }
-            std::mem::take(&mut *guard)
-        };
+        let events = crate::program_status::drain(&self.vt.status);
+        if events.is_empty() {
+            return;
+        }
         self.vt.state.workspace.apply_program_status(
             self.tab_id,
-            crate::program_status::from_vt(events),
+            events,
             crate::workspace::unix_now_ms(),
         );
     }
