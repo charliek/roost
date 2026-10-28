@@ -858,7 +858,7 @@ async fn open_control(
             session_build = %facts.skew.session_build,
             client_build = %facts.skew.client_build,
             "libghostty build skew: attaching in the vt fallback, without the \
-             inactive screen, soft-wrap flags or per-cell hyperlinks"
+             inactive screen, soft-wrap flags or Kitty images"
         );
     }
     Ok((control, facts))

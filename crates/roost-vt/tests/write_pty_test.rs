@@ -8,7 +8,7 @@
 //! (`third_party/ghostty/src/src/terminal/c/terminal.zig`, "set write_pty
 //! callback") plus roost's replacement/clear/drop semantics.
 //!
-//! Since the pin moved to ghostty `f2d5758f6` (upstream `14c829883`,
+//! At the pinned ghostty `6ba14415` (since upstream `14c829883`,
 //! "terminal: report OSC color queries in lib-vt") the same callback
 //! also carries the OSC 4 / 10 / 11 / 12 color-query replies Roost used
 //! to synthesize itself. The `osc_*` cases below pin that: the exact

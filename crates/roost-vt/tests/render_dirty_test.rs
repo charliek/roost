@@ -260,7 +260,7 @@ fn output_driven_scroll_reports_full() {
 
     // Writing past the last row scrolls the viewport by one line via
     // normal PTY output — no explicit `scroll_viewport` call. Per
-    // third_party/ghostty/src/src/terminal/render.zig:299-302 ("If our
+    // third_party/ghostty/src/src/terminal/render.zig:1018-1021 ("If our
     // viewport pin changed, we do a full rebuild"), libghostty reports
     // this the same way as `viewport_scroll_reports_full` above: a full
     // rebuild, not an incremental per-row change. Streaming output that
@@ -415,7 +415,7 @@ fn osc_default_color_change_reports_clean_known_limitation() {
 fn decscnm_swaps_reported_colors_without_marking_dirty() {
     // Same class of limitation as the OSC 10/11 test above: libghostty's
     // colors() swap on DECSCNM (reverse video) only applies when BOTH
-    // defaults are set — render.zig:326-339 does `orelse break :bg_fg` —
+    // defaults are set — render.zig:1053-1066 does `orelse break :bg_fg` —
     // and even then the swap itself marks nothing dirty. Since roost
     // always sets both defaults at attach, this is the transition the
     // iced consumer actually hits: it must compare the default fg/bg

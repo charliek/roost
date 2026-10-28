@@ -252,7 +252,7 @@ class TestOscPipeline:
         limitation" slot; plan 026's D10 moved iced's scan onto the PTY
         drain and pinned *pre-chunk* semantics (the SET was applied to
         a chunk-start snapshot, so a QUERY beside it saw the old color).
-        The libghostty pin `f2d5758f6` made the terminal answer color
+        Upstream ghostty `14c829883` made the terminal answer color
         queries itself, sequentially and in wire order — so Roost's own
         reply became a duplicate carrying a different (pre-chunk) color,
         and was removed. What the terminal reports is the just-set

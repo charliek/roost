@@ -33,6 +33,9 @@ const TAG_TERMINAL: u16 = 1;
 const TAG_PAGE: u16 = 3;
 const TAG_READY: u16 = 5;
 const TAG_FINISH: u16 = 6;
+const TAG_KITTY_IMAGE_STORAGE: u16 = 8;
+const TAG_KITTY_IMAGE_PAYLOAD: u16 = 9;
+const TAG_KITTY_IMAGE_PAGE_PLACEMENTS: u16 = 10;
 
 fn term(options: TerminalOptions) -> Terminal {
     Terminal::new(options).expect("Terminal::new")
@@ -925,6 +928,11 @@ struct Fragmented {
     /// How many bytes had been fed when READY landed.
     ready_after_bytes: usize,
     pages: usize,
+    images: usize,
+    /// Bytes fed when each page step came back, in order.
+    page_at: Vec<usize>,
+    /// Bytes fed when each image step came back, in order.
+    image_at: Vec<usize>,
     /// `try_next` calls that reported the next record was not buffered
     /// yet — the state a real transport pump spends most of its time in.
     need_more_bytes: usize,
@@ -944,6 +952,9 @@ fn decode_in_chunks(bytes: &[u8], cuts: &[usize]) -> Fragmented {
     let mut fed = 0usize;
     let mut ready_after_bytes = None;
     let mut pages = 0usize;
+    let mut images = 0usize;
+    let mut page_at = Vec::new();
+    let mut image_at = Vec::new();
     let mut need_more_bytes = 0usize;
     let mut finished = false;
 
@@ -966,7 +977,14 @@ fn decode_in_chunks(bytes: &[u8], cuts: &[usize]) -> Fragmented {
         }
         match decode.try_next().expect("try_next") {
             HistoryStep::NeedMoreBytes => need_more_bytes += 1,
-            HistoryStep::Page { .. } => pages += 1,
+            HistoryStep::Page { .. } => {
+                pages += 1;
+                page_at.push(fed);
+            }
+            HistoryStep::Image { .. } => {
+                images += 1;
+                image_at.push(fed);
+            }
             HistoryStep::Finished => finished = true,
         }
     }
@@ -978,7 +996,14 @@ fn decode_in_chunks(bytes: &[u8], cuts: &[usize]) -> Fragmented {
     while !finished {
         match decode.try_next().expect("try_next after the last chunk") {
             HistoryStep::NeedMoreBytes => panic!("the whole stream is fed; nothing can be missing"),
-            HistoryStep::Page { .. } => pages += 1,
+            HistoryStep::Page { .. } => {
+                pages += 1;
+                page_at.push(fed);
+            }
+            HistoryStep::Image { .. } => {
+                images += 1;
+                image_at.push(fed);
+            }
             HistoryStep::Finished => finished = true,
         }
     }
@@ -987,8 +1012,60 @@ fn decode_in_chunks(bytes: &[u8], cuts: &[usize]) -> Fragmented {
         decoded: decode.finish().expect("finish"),
         ready_after_bytes: ready_after_bytes.expect("READY must land"),
         pages,
+        images,
+        page_at,
+        image_at,
         need_more_bytes,
     }
+}
+
+/// The records after READY, in stream order.
+fn history_records(bytes: &[u8]) -> Vec<Record> {
+    let ready_end = first_record(bytes, TAG_READY).end;
+    records(bytes)
+        .into_iter()
+        .filter(|record| record.start >= ready_end)
+        .collect()
+}
+
+/// Where a byte-drip must see each history page step: once the next
+/// known record's header is in, since the decoder reads that far ahead,
+/// or the whole placements record when that is what follows. Unknown
+/// records between are part of the step.
+fn page_stops(bytes: &[u8]) -> Vec<usize> {
+    let after = history_records(bytes);
+    after
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| record.tag == TAG_PAGE)
+        .map(|(index, _)| {
+            let next = after[index + 1..]
+                .iter()
+                .find(|record| (1..=TAG_KITTY_IMAGE_PAGE_PLACEMENTS).contains(&record.tag))
+                .expect("a known record after every history page");
+            if next.tag == TAG_KITTY_IMAGE_PAGE_PLACEMENTS {
+                next.end
+            } else {
+                next.payload_start
+            }
+        })
+        .collect()
+}
+
+/// A byte-drip steps each page on the very byte that completes its
+/// stop, not when the stream ends — so every page but one whose
+/// read-ahead is FINISH's own header steps before FINISH is fed.
+fn assert_steps_while_streaming(fragmented: &Fragmented, bytes: &[u8]) {
+    let stops = page_stops(bytes);
+    assert_eq!(
+        fragmented.page_at, stops,
+        "each page steps on the byte that completes its read-ahead"
+    );
+    let finish = first_record(bytes, TAG_FINISH);
+    assert!(
+        stops[0] < finish.start,
+        "the first page's stop lies before FINISH: {stops:?}"
+    );
 }
 
 /// Compare a fragmented decode against a source terminal fed the same
@@ -1047,6 +1124,7 @@ fn a_one_byte_at_a_time_stream_decodes_identically() {
         fragmented.need_more_bytes > 0,
         "a byte-drip must spend most calls waiting for the next record"
     );
+    assert_steps_while_streaming(&fragmented, &bytes);
 
     assert_matches_source(&mut fragmented, &mut source, bytes.len());
 }
@@ -1190,6 +1268,7 @@ fn a_cut_finish_record_never_finishes() {
     loop {
         match decode.try_next().expect("try_next") {
             HistoryStep::Page { .. } => {}
+            HistoryStep::Image { .. } => panic!("this fixture holds no images"),
             HistoryStep::NeedMoreBytes => break,
             HistoryStep::Finished => panic!("FINISH was cut off; it cannot validate"),
         }
@@ -1259,6 +1338,7 @@ fn a_resize_between_pages_still_reaches_finish() {
         match decode.try_next().expect("try_next") {
             HistoryStep::Finished => break,
             HistoryStep::NeedMoreBytes => panic!("the whole stream is buffered"),
+            HistoryStep::Image { .. } => panic!("this fixture holds no images"),
             HistoryStep::Page { rows_prepended, .. } => {
                 pages_after_resize += 1;
                 rows_after_resize += rows_prepended;
@@ -1615,4 +1695,205 @@ fn perf_snapshot_encode_and_decode() {
     println!("encode_ms={:.3}", ms(encode));
     println!("time_to_ready_ms={:.3}", ms(time_to_ready));
     println!("full_decode_ms={:.3}", ms(full_decode));
+}
+
+// ============================================================================
+// Read-ahead: Kitty images and unknown records
+// ============================================================================
+
+/// A 2x2 RGB image transmitted directly and placed at the cursor, then
+/// enough lines that its placement's page scrolls into history: the
+/// encoder writes the pixels as a KITTY_IMAGE_PAYLOAD after READY and the
+/// placement as a KITTY_IMAGE_PAGE_PLACEMENTS right after its history
+/// PAGE.
+fn kitty_fixture() -> Terminal {
+    let mut terminal = term(fixture_options());
+    terminal.vt_write(b"above the image\r\n");
+    terminal.vt_write(b"\x1b_Ga=T,f=24,s=2,v=2,i=7,q=2;AAECAwQFBgcICQoL\x1b\\");
+    terminal.vt_write(b"\r\n");
+    for i in 0..FRAGMENT_LINES {
+        terminal.vt_write(format!("line {i:04} below the image\r\n").as_bytes());
+    }
+    terminal
+}
+
+/// The Kitty records of an encoded stream, in order, with their payloads.
+fn kitty_records(bytes: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    records(bytes)
+        .into_iter()
+        .filter(|record| {
+            (TAG_KITTY_IMAGE_STORAGE..=TAG_KITTY_IMAGE_PAGE_PLACEMENTS).contains(&record.tag)
+        })
+        .map(|record| (record.tag, bytes[record.payload_start..record.end].to_vec()))
+        .collect()
+}
+
+/// The Kitty fixture's stream has the shape the read-ahead is about:
+/// the placements right after a history PAGE, and the pixels after READY.
+fn assert_kitty_layout(bytes: &[u8]) {
+    let ready_end = first_record(bytes, TAG_READY).end;
+    let all = records(bytes);
+    assert!(
+        all.windows(2).any(|pair| pair[0].tag == TAG_PAGE
+            && pair[0].start >= ready_end
+            && pair[1].tag == TAG_KITTY_IMAGE_PAGE_PLACEMENTS),
+        "a history PAGE followed by its placements"
+    );
+    assert!(
+        all.iter()
+            .any(|record| record.tag == TAG_KITTY_IMAGE_PAYLOAD && record.start >= ready_end),
+        "the image's pixels after READY"
+    );
+}
+
+/// Fully buffered: the decoded terminal re-encodes to the very same
+/// stream, images, placements and pixels included.
+#[test]
+fn a_kitty_image_snapshot_decodes_fully_buffered() {
+    let bytes = kitty_fixture().snapshot().expect("snapshot");
+    assert_kitty_layout(&bytes);
+
+    let mut decode = ready_decoder(&bytes);
+    let steps = drain_history(&mut decode);
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|step| matches!(step, HistoryStep::Image { bytes: 12, .. }))
+            .count(),
+        1,
+        "one image step carrying the 2x2 RGB pixels: {steps:?}"
+    );
+    let decoded = decode.finish().expect("finish");
+    assert_eq!(
+        decoded.source_offset,
+        bytes.len(),
+        "source offset at FINISH"
+    );
+    assert!(
+        decoded.terminal.snapshot().expect("re-encode") == bytes,
+        "the decoded terminal re-encodes to the same stream"
+    );
+}
+
+/// Every split point, with live input at READY: the read-ahead after the
+/// placement's PAGE and the payload record are crossed mid-field, and the
+/// Kitty state still matches a source fed the same input.
+#[test]
+fn a_kitty_image_snapshot_decodes_at_every_split() {
+    let mut source = kitty_fixture();
+    let bytes = source.snapshot().expect("snapshot");
+    assert_kitty_layout(&bytes);
+
+    let cuts: Vec<usize> = (1..=bytes.len()).collect();
+    let mut fragmented = decode_in_chunks(&bytes, &cuts);
+    assert_eq!(fragmented.images, 1, "one image step");
+    assert!(fragmented.pages > 1, "several history pages");
+    assert_steps_while_streaming(&fragmented, &bytes);
+    assert_eq!(
+        fragmented.image_at,
+        vec![first_record(&bytes, TAG_KITTY_IMAGE_PAYLOAD).end],
+        "the image steps on the byte that completes its payload, before FINISH"
+    );
+    assert_matches_source(&mut fragmented, &mut source, bytes.len());
+    assert_eq!(
+        kitty_records(&fragmented.decoded.terminal.snapshot().expect("re-encode")),
+        kitty_records(&source.snapshot().expect("re-encode the source")),
+        "images, placements and pixels match the source"
+    );
+}
+
+/// CRC32C (Castagnoli), as the record header carries it.
+fn crc32c(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0x82f6_3b78
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// A record whose checksum covers `tag u16 | payload_len u32 | payload`,
+/// all little-endian (`record.zig`'s `encodeChecksumPrefix`).
+fn encode_record(tag: u16, payload: &[u8]) -> Vec<u8> {
+    let len = u32::try_from(payload.len()).expect("payload length");
+    let mut covered = Vec::new();
+    covered.extend_from_slice(&tag.to_le_bytes());
+    covered.extend_from_slice(&len.to_le_bytes());
+    covered.extend_from_slice(payload);
+    let mut out = Vec::new();
+    out.extend_from_slice(&tag.to_le_bytes());
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&crc32c(&covered).to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// The fixture's stream with a record of a tag no libghostty knows
+/// spliced in right after the first history page — a newer encoder's
+/// optional record, which the decoder skips during its read-ahead.
+fn with_unknown_record_after_a_page(bytes: &[u8]) -> Vec<u8> {
+    let page = first_history_page(bytes);
+    let mut out = bytes[..page.end].to_vec();
+    out.extend_from_slice(&encode_record(0x7777, b"a record from the future"));
+    out.extend_from_slice(&bytes[page.end..]);
+    out
+}
+
+#[test]
+fn the_test_crc_matches_the_encoders() {
+    let bytes = fixture_bytes(HEADROOM_LINES);
+    let page = first_history_page(&bytes);
+    assert_eq!(
+        encode_record(TAG_PAGE, &bytes[page.payload_start..page.end]),
+        bytes[page.start..page.end],
+        "a re-encoded PAGE matches the encoder's, checksum and all"
+    );
+}
+
+#[test]
+fn an_unknown_record_after_a_page_is_skipped_fully_buffered() {
+    let mut source = fixture(FRAGMENT_LINES, false);
+    let bytes = with_unknown_record_after_a_page(&source.snapshot().expect("snapshot"));
+
+    let mut decoded =
+        SnapshotDecoder::decode_bytes(bytes.clone(), SnapshotDecodeOptions::default())
+            .expect("an unknown record is skipped");
+    assert_eq!(
+        decoded.source_offset,
+        bytes.len(),
+        "source offset at FINISH"
+    );
+    assert_eq!(dump(&decoded.terminal), dump(&source), "active grid");
+    assert_eq!(
+        dump_scrollback_top(&mut decoded.terminal),
+        dump_scrollback_top(&mut source),
+        "history"
+    );
+}
+
+#[test]
+fn an_unknown_record_after_a_page_is_skipped_at_every_split() {
+    let mut source = fixture(FRAGMENT_LINES, false);
+    let bytes = with_unknown_record_after_a_page(&source.snapshot().expect("snapshot"));
+
+    let cuts: Vec<usize> = (1..=bytes.len()).collect();
+    let mut fragmented = decode_in_chunks(&bytes, &cuts);
+    assert!(fragmented.pages > 1, "several history pages");
+    let unknown = records(&bytes)
+        .into_iter()
+        .find(|record| record.tag == 0x7777)
+        .expect("the spliced record");
+    assert_eq!(
+        page_stops(&bytes)[0],
+        unknown.end + RECORD_HEADER_LEN,
+        "the first page's read-ahead spans the unknown record and the next header"
+    );
+    assert_steps_while_streaming(&fragmented, &bytes);
+    assert_matches_source(&mut fragmented, &mut source, bytes.len());
 }

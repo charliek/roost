@@ -498,6 +498,7 @@ async fn drain_until_finish<R: AsyncRead + Unpin>(
             loop {
                 match decoder.try_next().expect("try_next") {
                     HistoryStep::NeedMoreBytes => break,
+                    HistoryStep::Image { .. } => panic!("this fixture holds no images"),
                     HistoryStep::Page { rows_prepended, .. } => {
                         trace.pages += 1;
                         trace.rows_prepended += rows_prepended;

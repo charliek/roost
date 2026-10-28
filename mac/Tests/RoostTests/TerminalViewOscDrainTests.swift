@@ -3,7 +3,7 @@
 //
 // Roost used to synthesise the OSC 4 / 10 / 11 / 12 query replies here.
 // It no longer does: libghostty answers them itself through the
-// `write_pty` effect as of the pinned ghostty `f2d5758f6` (upstream
+// `write_pty` effect at the pinned ghostty `6ba14415` (since upstream
 // `14c829883`), and `appendBytes` drains that buffer into `onKey` after
 // `vt_write`. Answering on both sides put a SECOND reply on the wire.
 //

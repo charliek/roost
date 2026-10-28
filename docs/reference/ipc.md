@@ -4134,14 +4134,6 @@ degraded-but-equivalent one:
   (`ghostty-snapshot` carries both);
 * **soft-wrap flags** — a wrapped row replays as a hard row, so copy
   and reflow-on-resize differ from the server's;
-* **per-cell hyperlinks** — VT content emits `OSC 8` only for HTML, so
-  only the pen's link survives and **link hover and click stop working
-  on such a tab**. Roost injects `FORCE_HYPERLINK=1` into every tab, so
-  this is a visible loss, not a theoretical one;
-* **text-free background-only rows in history** — a row erased under a
-  background color with no text in it. Viewport rows of that shape are
-  refilled explicitly; history rows cannot be, there being no cursor
-  addressing into history;
 * **the saved cursor** (`DECSC`) and the **kitty-keyboard stack** —
   only the live cursor and the current kitty flags are carried;
 * **modes outside the carried allowlist**, deliberately: `DECCOLM`
@@ -4151,7 +4143,8 @@ degraded-but-equivalent one:
   freeze rendering mid-frame. A program that set two members of one
   mouse-tracking or mouse-format family replays as the last of them,
   since libghostty collapses each family onto a single field;
-* **Kitty images** — same as `ghostty-snapshot`;
+* **Kitty images** — `ghostty-snapshot` carries their state, `vt`
+  does not (Roost doesn't draw Kitty images yet either way, #645);
 * **pending-wrap under origin mode** — restoring `DECOM` homes the
   cursor in libghostty, so the repositioning that follows clears the
   flag. This is the one cursor state `vt` cannot reproduce;

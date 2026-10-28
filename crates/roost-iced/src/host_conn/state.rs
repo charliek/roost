@@ -18,7 +18,7 @@ use roost_ui_model::keys::HostId;
 /// nothing to hand us, whatever else it supports.
 ///
 /// `ghostty-snapshot` leads because it carries what `vt` cannot (the
-/// inactive screen, soft-wrap flags, per-cell hyperlinks); `vt` is the
+/// inactive screen, soft-wrap flags, Kitty images); `vt` is the
 /// build-independent fallback. Which one an attach lands on is the
 /// server's to negotiate — this list is only what may be asked for.
 pub(crate) const CLIENT_PAYLOAD_KINDS: [&str; 2] =
