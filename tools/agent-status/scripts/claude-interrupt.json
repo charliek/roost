@@ -1,0 +1,9 @@
+[{"quiet":3, "timeout":40},
+ {"send":"write a 600 word story about a lighthouse"},
+ {"sleep":1}, {"send":"\r"},
+ {"wait7501":"state=working", "timeout":30},
+ {"sleep":2.5},
+ {"send":"\u001b"},
+ {"wait7501":"state=(done|idle|error)", "timeout":40},
+ {"quiet":3, "timeout":20},
+ {"send":"\u0003"}, {"sleep":0.7}, {"send":"\u0003"}, {"sleep":3}]
