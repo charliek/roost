@@ -295,12 +295,16 @@ pub fn status_text(effective: AgentLifecycle, raw: AgentLifecycle, detail: &str)
 /// [`status_text`] for `tab` showing `effective`: while its records
 /// decide, the deciding record's `msg` is the why a Waiting, Working or
 /// Failed row names (plan 082 D8.2) — already sanitized at ingest, and
-/// capped here like a hook's `detail`. A deciding record without a `msg`
-/// shows the plain word: the hook layer's `detail` belongs to the state
-/// the record overrode.
+/// capped here like a hook's `detail`. The hook layer's `detail` is shown
+/// only while hooks decide: under a record, deciding or kept, it belongs
+/// to a state the record overrode.
 pub fn tab_status_text(tab: &Tab, effective: AgentLifecycle, detail: &str) -> String {
+    let decided_by = tab.program_status.as_ref().map(|status| status.decided_by);
     let Some(record) = deciding_record(tab) else {
-        return status_text(effective, tab.agent_lifecycle, detail);
+        return match decided_by {
+            Some(DecidedBy::KeptRecord) => status_text(effective, effective, ""),
+            _ => status_text(effective, tab.agent_lifecycle, detail),
+        };
     };
     let word = match effective {
         AgentLifecycle::Waiting => Some("Waiting"),
@@ -758,6 +762,11 @@ mod tests {
             Some(view(Error, "claude-code", "crashed", NOW)),
         );
         assert_eq!(tab_status_text(&kept, AgentLifecycle::Failed, ""), "Failed");
+        assert_eq!(
+            tab_status_text(&kept, AgentLifecycle::Failed, "rate_limit"),
+            "Failed",
+            "a kept record decides; the hook's detail is stale"
+        );
     }
 
     #[test]
