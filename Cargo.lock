@@ -3154,6 +3154,7 @@ version = "0.0.26"
 dependencies = [
  "bindgen",
  "thiserror 1.0.69",
+ "tracing",
  "unicode-width",
 ]
 

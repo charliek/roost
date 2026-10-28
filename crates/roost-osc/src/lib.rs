@@ -265,9 +265,9 @@ impl OscScanner {
                     // Limitation: this state machine models OSC only, so
                     // a BEL carried inside a DCS/APC/PM/SOS string
                     // (sixel, tmux passthrough) also lands here and is
-                    // counted. libghostty's own bell callback would not
-                    // — wiring it needs the `OPT_USERDATA` callback
-                    // multiplexing that `roost-vt` defers.
+                    // counted. libghostty's own bell callback would not;
+                    // `roost-vt`'s `CallbackCtx` now multiplexes
+                    // `OPT_USERDATA`, so wiring it is one more sink there.
                     self.bells = self.bells.saturating_add(1);
                 }
             }

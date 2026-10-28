@@ -143,7 +143,11 @@ mod formatter;
 #[cfg(feature = "ffi")]
 mod key_encoder;
 #[cfg(feature = "ffi")]
+mod memory;
+#[cfg(feature = "ffi")]
 mod mouse_encoder;
+#[cfg(feature = "ffi")]
+mod program_status;
 #[cfg(feature = "ffi")]
 mod render_state;
 #[cfg(feature = "ffi")]
@@ -166,8 +170,14 @@ pub use formatter::{scrollback_rows, scrollback_text, UNWRAP_SOFT_WRAPPED_LINES}
 #[cfg(feature = "ffi")]
 pub use key_encoder::{key_action, mods, Key, KeyAction, KeyEncoder, KeyEvent, Mods};
 #[cfg(feature = "ffi")]
+pub use memory::{MemoryUsage, ScreenMemory};
+#[cfg(feature = "ffi")]
 pub use mouse_encoder::{
     mouse_action, mouse_button, MouseAction, MouseButton, MouseEncoder, MouseEvent,
+};
+#[cfg(feature = "ffi")]
+pub use program_status::{
+    ProgramStatusKind, ProgramStatusReport, ProgramStatusState, PromptMark, TerminalEvent,
 };
 #[cfg(feature = "ffi")]
 pub use render_state::{
