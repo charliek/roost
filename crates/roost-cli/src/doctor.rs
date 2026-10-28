@@ -38,6 +38,7 @@ use roost_ipc::agent::{
     effective_lifecycle, is_live, suppress_raw_osc, AgentLifecycle, DropReason, DroppedReports,
     OwnershipAction, ShellState,
 };
+use roost_ipc::format_chars::is_format;
 use roost_ipc::messages::{ops, IdentifyParams, IdentifyResult, Tab, TabListResult};
 use roost_ipc::session_launch::timeout_scale;
 use roost_ipc::socket_state::{self, describe_file_type, SocketState};
@@ -1628,44 +1629,6 @@ fn escape_controls(s: &str) -> String {
     out
 }
 
-/// `General_Category=Cf`, as ranges. `char` exposes `is_control` (Cc) and
-/// nothing else, and a Unicode-table crate is a large dependency to carry
-/// for one diagnostic string, so the category is spelled out here:
-/// Unicode 16.0's Cf, coalesced from a full scalar-by-scalar walk of
-/// `UnicodeData.txt`.
-///
-/// Two ranges are widened past the real category to keep the table short.
-/// U+2065 and U+E0002–U+E001F are unassigned holes inside a format block;
-/// over-broad is the safe direction here, since escaping an unassigned
-/// scalar costs a diagnostic nothing while a missed range costs it the
-/// vector in [`escape_controls`].
-const FORMAT_RANGES: [(u32, u32); 19] = [
-    (0x00ad, 0x00ad),           // SOFT HYPHEN
-    (0x0600, 0x0605),           // ARABIC NUMBER SIGN … ARABIC NUMBER MARK ABOVE
-    (0x061c, 0x061c),           // ARABIC LETTER MARK
-    (0x06dd, 0x06dd),           // ARABIC END OF AYAH
-    (0x070f, 0x070f),           // SYRIAC ABBREVIATION MARK
-    (0x0890, 0x0891),           // ARABIC POUND / PIASTRE MARK ABOVE
-    (0x08e2, 0x08e2),           // ARABIC DISPUTED END OF AYAH
-    (0x180e, 0x180e),           // MONGOLIAN VOWEL SEPARATOR
-    (0x200b, 0x200f),           // ZWSP, ZWNJ, ZWJ, LRM, RLM
-    (0x202a, 0x202e),           // LRE, RLE, PDF, LRO, RLO — the bidi overrides
-    (0x2060, 0x206f),           // WORD JOINER … the deprecated format controls
-    (0xfeff, 0xfeff),           // ZERO WIDTH NO-BREAK SPACE (BOM)
-    (0xfff9, 0xfffb),           // INTERLINEAR ANNOTATION ANCHOR/SEPARATOR/TERMINATOR
-    (0x0001_10bd, 0x0001_10bd), // KAITHI NUMBER SIGN
-    (0x0001_10cd, 0x0001_10cd), // KAITHI NUMBER SIGN ABOVE
-    (0x0001_3430, 0x0001_343f), // EGYPTIAN HIEROGLYPH format controls
-    (0x0001_bca0, 0x0001_bca3), // SHORTHAND FORMAT letter overlap … up step
-    (0x0001_d173, 0x0001_d17a), // MUSICAL SYMBOL BEGIN BEAM … END PHRASE
-    (0x000e_0001, 0x000e_007f), // LANGUAGE TAG + the TAG characters
-];
-
-fn is_format(c: char) -> bool {
-    let cp = c as u32;
-    FORMAT_RANGES.iter().any(|(lo, hi)| cp >= *lo && cp <= *hi)
-}
-
 /// Escape, then cap for display — counted in characters, with the true
 /// length shown so a truncation is never mistaken for the whole value.
 fn redact(raw: &str) -> String {
@@ -2824,6 +2787,8 @@ fn describe_dropped(now: i64, tab: &Tab, dropped: &DroppedReports) -> String {
     let reason = match last.reason {
         DropReason::NotOwner => "not_owner",
         DropReason::NestedClaim => "nested_claim",
+        DropReason::ProgramStatus => "program_status",
+        DropReason::ForeignApp => "foreign_app",
     };
     let owns_it_now = tab
         .ownership
@@ -3875,6 +3840,7 @@ mod tests {
     use super::*;
     use crate::session::fixtures::fake_launcher;
     use roost_ipc::agent::{AgentLifecycle, Ownership, ShellState};
+    use roost_ipc::format_chars::FORMAT_RANGES;
     use roost_ipc::messages::TabState;
     use roost_ipc::LocalBackendMode;
 
@@ -5309,12 +5275,6 @@ mod tests {
         // Ordinary non-ASCII text, spelled the way a user would have it.
         for raw in ["/Users/münchen/日本語/bin/zsh", "café ✓ 🐦 — ok"] {
             assert_eq!(redact(raw), raw);
-        }
-        // Sorted, non-empty and disjoint, so `is_format`'s linear scan is a
-        // table anyone can read against `UnicodeData.txt` rather than a pile.
-        for pair in FORMAT_RANGES.windows(2) {
-            assert!(pair[0].0 <= pair[0].1, "{pair:?}");
-            assert!(pair[0].1 < pair[1].0, "{pair:?}");
         }
 
         // End to end, with the review's own repro: the reversal must not

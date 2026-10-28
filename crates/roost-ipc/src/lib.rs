@@ -17,6 +17,10 @@
 //! * [`agent`] — the agent state model (shell / lifecycle / ownership
 //!   axes) and the pure state machine that derives `TabState` from it.
 //!   Shared with the Swift port via `tests/agent-state-fixtures/`.
+//! * [`program_status`] — OSC 7501 reports and the OSC 133 prompt marks
+//!   ordered with them, as `roost-engine`'s composition layer reads them.
+//! * [`format_chars`] — the Unicode `Cf` table that `roostctl doctor`
+//!   escapes and program-status text drops.
 //! * [`framing`] — newline-delimited JSON read/write over a
 //!   `tokio::net::UnixStream`. Enforces the 16 MiB line limit.
 //! * [`dataframe`] — the binary framing a host-session attach
@@ -67,10 +71,12 @@ pub mod agent;
 pub mod bootstrap;
 pub mod codes;
 pub mod dataframe;
+pub mod format_chars;
 pub mod framing;
 pub mod local_route;
 pub mod messages;
 pub mod paths;
+pub mod program_status;
 pub mod schema;
 pub mod session_launch;
 pub mod session_version;

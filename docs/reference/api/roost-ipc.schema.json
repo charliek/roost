@@ -1408,6 +1408,14 @@
         {
           "const": "nested_claim",
           "type": "string"
+        },
+        {
+          "const": "program_status",
+          "type": "string"
+        },
+        {
+          "const": "foreign_app",
+          "type": "string"
         }
       ]
     },
