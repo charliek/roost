@@ -96,15 +96,16 @@ use roost_agent_install::Guard;
 use roost_ipc::agent::TabAgentReportParams;
 use roost_ipc::messages::ops;
 use roost_ipc::messages::{
-    AppRenderStatsParams, AppRenderStatsResult, IdentifyParams, IdentifyResult,
+    AppRenderStatsParams, AppRenderStatsResult, IdentifyParams, IdentifyResult, MemoryUsage,
     NotificationCreateParams, PaletteActivateParams, PaletteItemView, PaletteOpenParams,
     PalettePresentParams, PalettePresentResult, PaletteQueryParams, PaletteStateResult,
     ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectEnsureParams,
     ProjectEnsureResult, ProjectRenameParams, ProjectReorderParams, ScreenshotParams,
     ScreenshotResult, TabAgentReportResult, TabClearNotificationParams, TabCloseParams,
-    TabDumpParams, TabDumpResult, TabFocusParams, TabListResult, TabOpenParams, TabOpenResult,
-    TabReorderParams, TabResizeParams, TabSendFileParams, TabSendFileResult, TabSetStateParams,
-    TabSetTitleParams, TabState, TabWriteParams, WireProjectRef, WireTabRef,
+    TabDumpParams, TabDumpResult, TabFocusParams, TabListResult, TabMemoryUsageParams,
+    TabMemoryUsageResult, TabOpenParams, TabOpenResult, TabReorderParams, TabResizeParams,
+    TabSendFileParams, TabSendFileResult, TabSetStateParams, TabSetTitleParams, TabState,
+    TabWriteParams, WireProjectRef, WireTabRef,
 };
 use roost_ipc::paths::BundleProfileKind;
 use roost_ipc::session_launch::timeout_scale;
@@ -819,6 +820,16 @@ enum TabCmd {
         /// before this flag existed.
         #[arg(long, default_value_t = 0)]
         scrollback: u32,
+    },
+    /// Print how much memory the tab's terminal holds, as libghostty
+    /// measures it — one line for the tab's authoritative terminal, and
+    /// a `mirror` line for a host tab the window holds a copy of.
+    /// `--json` emits the full result. `--tab` takes what `tab dump`'s
+    /// does.
+    Memory {
+        /// The tab. Defaults to `$ROOST_TAB_ID`, then the UI's active tab.
+        #[arg(long)]
+        tab: Option<String>,
     },
     /// Persist a new tab ordering within a project. `--order`
     /// is a comma-separated list of tab ids in the target
@@ -1676,6 +1687,18 @@ async fn run_on_ui(
                 }
                 for line in &result.rows_text {
                     println!("{line}");
+                }
+            }
+        }
+        Cmd::Tab(TabCmd::Memory { tab }) => {
+            let flag = tab.as_deref().map(parse_tab_flag).transpose()?;
+            let result = tab_memory(ui, flag, tab_env).await?;
+            if json {
+                print_json(&result)?;
+            } else {
+                println!("{}", memory_line("terminal", &result.terminal));
+                if let Some(mirror) = &result.mirror {
+                    println!("{}", memory_line("mirror", mirror));
                 }
             }
         }
@@ -2768,6 +2791,47 @@ async fn dump_tab(
         .await?)
 }
 
+/// `tab memory`'s read, routed exactly as [`dump_tab`] routes its own.
+async fn tab_memory(
+    ui: &mut UiSocket<'_>,
+    flag: Option<WireTabRef>,
+    tab_env: Option<&str>,
+) -> Result<TabMemoryUsageResult, CliError> {
+    let named = named_tab(flag, tab_env)?;
+    if let Some(tab_id @ WireTabRef::Host { .. }) = named {
+        return ui
+            .call(ops::TAB_MEMORY_USAGE, TabMemoryUsageParams { tab_id })
+            .await;
+    }
+    let identify = identify(ui.client().await?).await?;
+    let tab_id = match named {
+        Some(tab) => tab,
+        None => WireTabRef::Local(active_tab(&identify)?),
+    };
+    let params = TabMemoryUsageParams { tab_id };
+    let source = events::resolve(ui.socket_path(), &identify);
+    if source.socket == ui.socket_path() {
+        return ui.call(ops::TAB_MEMORY_USAGE, params).await;
+    }
+    Ok(dial(&source.socket)
+        .await?
+        .call(ops::TAB_MEMORY_USAGE, params)
+        .await?)
+}
+
+/// `terminal: 802816 bytes resident, 3211264 bytes virtual, 2 pages
+/// (primary 2, alternate 0)`.
+fn memory_line(label: &str, usage: &MemoryUsage) -> String {
+    format!(
+        "{label}: {} bytes resident, {} bytes virtual, {} pages (primary {}, alternate {})",
+        usage.resident_bytes,
+        usage.virtual_bytes,
+        usage.primary.pages.saturating_add(usage.alternate.pages),
+        usage.primary.pages,
+        usage.alternate.pages,
+    )
+}
+
 /// The UI's active tab, refused when it has none rather than sent
 /// `tab_id = 0` for a confusing `not-found`.
 fn active_tab(identify: &IdentifyResult) -> Result<i64, CliError> {
@@ -2939,6 +3003,40 @@ mod tests {
             panic!("expected tab dump")
         };
         assert_eq!(scrollback, 500);
+    }
+
+    #[test]
+    fn tab_memory_takes_an_optional_tab_of_either_spelling() {
+        for (argv, want) in [
+            (&["roostctl", "tab", "memory"][..], None),
+            (&["roostctl", "tab", "memory", "--tab", "7"][..], Some("7")),
+            (
+                &["roostctl", "tab", "memory", "--tab", "h2.7"][..],
+                Some("h2.7"),
+            ),
+        ] {
+            let args = Args::try_parse_from(argv).expect("tab memory parses");
+            let Cmd::Tab(TabCmd::Memory { tab }) = args.command else {
+                panic!("expected tab memory")
+            };
+            assert_eq!(tab.as_deref(), want, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_memory_line_names_the_totals_and_each_screens_pages() {
+        use roost_ipc::messages::ScreenMemory;
+        let screen = |pages, resident_bytes, virtual_bytes| ScreenMemory {
+            pages,
+            resident_bytes,
+            virtual_bytes,
+            ..ScreenMemory::default()
+        };
+        let usage = MemoryUsage::new(true, screen(2, 800, 3000), screen(1, 200, 1000));
+        assert_eq!(
+            memory_line("mirror", &usage),
+            "mirror: 1000 bytes resident, 4000 bytes virtual, 3 pages (primary 2, alternate 1)"
+        );
     }
 
     /// `tab send-file` requires `--tab` — unlike every other per-tab
@@ -3516,6 +3614,7 @@ mod tests {
         &["tab", "send", "--bytes", "x"],
         &["tab", "resize", "--cols", "80", "--rows", "24"],
         &["tab", "dump"],
+        &["tab", "memory"],
         &["tab", "reorder", "--project-id", "1", "--order", "1,2"],
         &["tab", "prompt", "--timeout", "5", "hello"],
         &[
@@ -5629,7 +5728,14 @@ mod tests {
     /// other, so it cannot pick up the active-tab fallback by omission.
     #[test]
     fn every_verb_that_takes_a_tab_is_mutating_or_a_known_reader() {
-        const READERS: &[&str] = &["wait", "events", "tab dump", "tab send-file", "doctor"];
+        const READERS: &[&str] = &[
+            "wait",
+            "events",
+            "tab dump",
+            "tab memory",
+            "tab send-file",
+            "doctor",
+        ];
         let mut with_tab: Vec<String> = leaf_verbs()
             .into_iter()
             .filter(|(_, cmd)| cmd.get_arguments().any(|arg| arg.get_id() == "tab"))

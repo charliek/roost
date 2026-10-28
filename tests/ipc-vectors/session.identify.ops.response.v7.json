@@ -33,6 +33,7 @@
       "tab.agent_report",
       "notification.create",
       "tab.dump_resolved",
+      "tab.memory_usage",
       "events.subscribe",
       "session.identify",
       "session.stop",

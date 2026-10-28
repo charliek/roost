@@ -2101,6 +2101,37 @@
         }
       ]
     },
+    "MemoryUsage": {
+      "properties": {
+        "alternate": {
+          "$ref": "#/$defs/ScreenMemory"
+        },
+        "compression_supported": {
+          "type": "boolean"
+        },
+        "primary": {
+          "$ref": "#/$defs/ScreenMemory"
+        },
+        "resident_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "virtual_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "compression_supported",
+        "primary",
+        "alternate",
+        "resident_bytes",
+        "virtual_bytes"
+      ],
+      "type": "object"
+    },
     "MenuDump": {
       "properties": {
         "items": {
@@ -2921,6 +2952,49 @@
       },
       "required": [
         "delay_ms"
+      ],
+      "type": "object"
+    },
+    "ScreenMemory": {
+      "properties": {
+        "compressed_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "compressed_pages": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "image_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pages": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "resident_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "virtual_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "pages",
+        "virtual_bytes",
+        "resident_bytes",
+        "compressed_pages",
+        "compressed_bytes",
+        "image_bytes"
       ],
       "type": "object"
     },
@@ -4291,6 +4365,43 @@
       ],
       "type": "object"
     },
+    "TabMemoryUsageParams": {
+      "additionalProperties": false,
+      "properties": {
+        "tab_id": {
+          "$ref": "#/$defs/WireTabRef"
+        }
+      },
+      "required": [
+        "tab_id"
+      ],
+      "type": "object"
+    },
+    "TabMemoryUsageResult": {
+      "properties": {
+        "mirror": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryUsage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tab_id": {
+          "$ref": "#/$defs/WireTabRef"
+        },
+        "terminal": {
+          "$ref": "#/$defs/MemoryUsage"
+        }
+      },
+      "required": [
+        "tab_id",
+        "terminal"
+      ],
+      "type": "object"
+    },
     "TabNotificationEvent": {
       "properties": {
         "has_pending": {
@@ -5461,6 +5572,14 @@
       },
       "result": {
         "$ref": "#/$defs/TabListResult"
+      }
+    },
+    "tab.memory_usage": {
+      "params": {
+        "$ref": "#/$defs/TabMemoryUsageParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TabMemoryUsageResult"
       }
     },
     "tab.open": {

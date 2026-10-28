@@ -32,6 +32,7 @@ roostctl [--socket <PATH>] [--target <mac|linux|iced|session>] [--json] <COMMAND
 | `wait` | Block until a tab reaches a state, shows a string, or closes |
 | `events` | Print the event stream, one JSON line per event |
 | `tab open` / `close` / `send` / `resize` / `reorder` | Tab lifecycle + I/O |
+| `tab memory` | Print how much memory a tab's terminal holds |
 | `tab report` | Report an agent-hook event straight to `tab.agent_report` |
 | `tab prompt` | Submit a prompt to a tab's agent and wait for the turn it starts |
 | `project list` / `create` / `ensure` / `rename` / `delete` / `reorder` | Project lifecycle |
@@ -139,13 +140,13 @@ Outside a tab — a CI runner, a second terminal, an agent driving Roost
 from elsewhere — pass `--tab`; the UI's active tab is whatever a person
 last clicked, which is no answer for a command that writes to a tab.
 
-The read-only `tab dump` and `wait` still fall back to the UI's active
+The read-only `tab dump`, `tab memory` and `wait` still fall back to the UI's active
 tab when `ROOST_TAB_ID` is unset too. `tab send-file` has always required `--tab`.
 `events --tab` is a filter, not a target, so it reads neither: without the
 flag every event prints.
 A `ROOST_TAB_ID` that is not a tab id is refused the same way (exit 2).
 
-Only `tab focus`, `tab dump` and `tab send-file` take a host tab's
+Only `tab focus`, `tab dump`, `tab memory` and `tab send-file` take a host tab's
 `h<host>.<id>`. Every other `--tab` names a local tab and refuses a host
 ref, canonical or not, before it dials anything (exit 2):
 
@@ -432,6 +433,35 @@ These compose: `--after-tab X --focus -- <cmd>` is the "open a command in a tab 
 Omitting the flag sends the identical request bytes roostctl always sent, so nothing changes against an older Roost. **Using** it against one does not degrade quietly, though: `tab.dump`'s params are strict, so a UI or session that predates the field answers `unknown-field` and the whole request fails rather than returning a viewport-only result you might mistake for an empty history. Against a host session there is no capability list to consult: protocol 5 deleted `session.identify.features`, and the session integer now carries the whole contract — a session this Roost will talk to at all serves the field.
 
 `--tab` on `dump` (and the `tab.dump_resolved` op, plus the test-only `tab.capture_pty_input`) accepts the same host-qualified `h<host>.<id>` spelling `tab focus` does, reading an attached host tab's **client-side** terminal — the UI's own copy, distinct from the session's own `tab dump` served over its socket. See [Host Sessions](../guides/host-sessions.md).
+
+## `tab memory`
+
+```bash
+roostctl tab memory --tab 5
+roostctl tab memory --tab h2.7 --json
+```
+
+Print how much memory a tab's terminal holds, as libghostty measures it
+(the `tab.memory_usage` op — see [ipc.md](ipc.md#tabmemory_usage)). One
+line for the tab's authoritative terminal:
+
+```text
+terminal: 802816 bytes resident, 3211264 bytes virtual, 2 pages (primary 2, alternate 0)
+```
+
+`resident` and `virtual` are both screens summed; the pages are counted
+per screen. A host tab whose terminal the window holds a copy of — one
+it has shown — gets a second line, `mirror: …`, for that copy. `--json`
+prints the op's result: both screens' figures in full, including the
+compressed and image bytes.
+
+`--tab` takes what [`tab dump`](#tab-open-close-send-resize-reorder-dump)'s
+does, and the tab is chosen and routed the same way: `$ROOST_TAB_ID`,
+then the UI's active tab, and under `local-backend = session` a bare id
+is read from the session `identify.local_session_socket` names. An
+`h<host>.<id>` goes to the UI, which reads the figure from that host's
+session. The Swift Mac app does not serve the op and answers
+`unknown-op`.
 
 ## `tab send-file`
 

@@ -1170,6 +1170,18 @@ pub enum EngineOpResult {
         focus_generation: u64,
         answer: Box<Result<serde_json::Value, roost_engine::ipc::HostOpFailure>>,
     },
+    /// A host tab's `tab.memory_usage`, answered by its session (plan 082
+    /// D6.2). Its caller's `oneshot` is parked on `App::memory_replies`
+    /// under `op`, as [`Self::LocalForward`]'s is, so the reply is built
+    /// and written on the UI thread — where the window's own copy of
+    /// `tab` can be read. `sent` is the ref the caller wrote, which the
+    /// reply echoes.
+    HostTabMemory {
+        op: u64,
+        tab: TabKey,
+        sent: roost_ipc::messages::WireTabRef,
+        answer: Box<Result<serde_json::Value, roost_engine::ipc::HostOpFailure>>,
+    },
     /// A background resize wave on the local session, answered (plan 072
     /// D5). `connection` is the incarnation it went to.
     BackgroundResized {
@@ -1260,6 +1272,7 @@ fn engine_op_status(result: EngineOpResult) -> Option<String> {
         | EngineOpResult::ProjectsReordered { .. }
         | EngineOpResult::HostVerified { .. }
         | EngineOpResult::LocalForward { .. }
+        | EngineOpResult::HostTabMemory { .. }
         | EngineOpResult::BackgroundResized { .. } => None,
         EngineOpResult::TabOpened {
             project, result, ..
@@ -1317,7 +1330,9 @@ impl EngineOpResult {
             | Self::LocalForward { op, .. } => Some(*op),
             // Not workspace mutations: a verify dials a target that may
             // not even be saved.
-            Self::HostVerified { .. } | Self::BackgroundResized { .. } => None,
+            Self::HostVerified { .. }
+            | Self::HostTabMemory { .. }
+            | Self::BackgroundResized { .. } => None,
         }
     }
 
@@ -1340,6 +1355,7 @@ impl EngineOpResult {
             | Self::TabsReordered { .. }
             | Self::ProjectsReordered { .. }
             | Self::LocalForward { .. }
+            | Self::HostTabMemory { .. }
             // Add Host and the upgrade prompt are dialogs, not palette
             // rows: the palette is already dismissed by the time either
             // opens, so the `palette.activate` that opened it was
@@ -3404,6 +3420,9 @@ pub struct App {
     /// dispatch so the answer is written on the main thread, in the same
     /// step that retires the op — see [`EngineOpResult::LocalForward`].
     forward_replies: HashMap<u64, roost_engine::ipc::HostOpReply<serde_json::Value>>,
+    /// Where a host tab's `tab.memory_usage` caller is waiting, keyed by
+    /// the dispatch id — see [`EngineOpResult::HostTabMemory`].
+    memory_replies: servicing::MemoryReplies,
     clipboard: ClipboardQueue,
     desktop_notifications: DesktopNotifications,
     /// Connected host sessions and their workspace mirrors (plan 037).
@@ -3892,6 +3911,7 @@ impl App {
             palette_present_reply: None,
             palette_activate_replies: HashMap::new(),
             forward_replies: HashMap::new(),
+            memory_replies: servicing::MemoryReplies::default(),
             clipboard: ClipboardQueue::default(),
             desktop_notifications: DesktopNotifications::new(
                 runtime.handle(),
@@ -5072,6 +5092,12 @@ impl App {
             // `reconcile()`, which is how a forwarded mutation's effect
             // on the slot reaches the auto-remove and the exit rule.
             EngineOpResult::LocalForward { .. } => {}
+            EngineOpResult::HostTabMemory {
+                op,
+                tab,
+                sent,
+                answer,
+            } => self.host_tab_memory_answered(op, tab, sent, *answer),
             EngineOpResult::BackgroundResized {
                 connection,
                 outcomes,

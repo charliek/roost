@@ -2756,6 +2756,20 @@ impl HostConnSet {
         self.owner_of(incarnation).is_some()
     }
 
+    /// Whether `incarnation` is still its host's current, connected
+    /// incarnation: [`Self::owns`], narrowed to the incarnation the
+    /// connection last reported and to a connection still `Connected`.
+    ///
+    /// For an answer that left on an incarnation and lands later: a
+    /// worker winding down can still deliver one inside its shutdown
+    /// grace, after the host was disconnected or replaced.
+    pub(crate) fn serves(&self, incarnation: HostId) -> bool {
+        self.owner_of(incarnation).is_some_and(|host| {
+            self.incarnation(&host) == Some(incarnation)
+                && self.state(&host).is_some_and(HostConnState::is_connected)
+        })
+    }
+
     /// Which live connection an incarnation belongs to. `None` for one
     /// this set no longer holds — the stale-key drop pattern
     /// (`app.rs:2903`), applied to whole connections.
@@ -2792,7 +2806,7 @@ impl HostConnSet {
     /// A fresh incarnation for a host's *current* connection, as its
     /// task would mint one.
     #[cfg(test)]
-    fn mint_for(&self, host: &str) -> HostId {
+    pub(crate) fn mint_for(&self, host: &str) -> HostId {
         self.minter.mint(host, self.conn(host).generation)
     }
 
@@ -5261,6 +5275,41 @@ mod tests {
         // Removed: the host is gone, and so is every id it minted.
         assert_eq!(set.remove("h1"), Some(live));
         assert!(!set.owns(live));
+    }
+
+    /// [`HostConnSet::serves`]: owned is not enough — a connection can be
+    /// owned while it is not connected at all — and a retry's fresh
+    /// incarnation retires the one before it.
+    #[tokio::test]
+    async fn only_the_current_connected_incarnation_serves() {
+        let (mut set, _feed) = a_set();
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from("/nonexistent/roost-set-serves.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+        );
+        let live = set.mint_for("h1");
+        assert!(!set.serves(live), "never reached Connected");
+        set.apply_state(live, HostConnState::Connected);
+        assert!(set.serves(live));
+        assert!(!set.serves(HostId::new(9_999)));
+
+        let retry = set.mint_for("h1");
+        set.apply_state(
+            retry,
+            HostConnState::Connecting {
+                previous: Some(live),
+            },
+        );
+        assert!(!set.serves(live), "a retry replaced it");
+        assert!(!set.serves(retry), "connecting is not connected");
+        set.apply_state(retry, HostConnState::Connected);
+        assert!(set.serves(retry));
+
+        set.disconnect("h1");
+        assert!(!set.serves(retry));
     }
 
     /// Zero hosts is the zero-change baseline: nothing is spawned, and

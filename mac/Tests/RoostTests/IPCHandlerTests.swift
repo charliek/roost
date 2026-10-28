@@ -76,6 +76,19 @@ struct IPCHandlerDispatchTests {
         await expectError("unknown-op", "not.a.real.op", nil, on: handler)
     }
 
+    /// Plan 082 D6.2: `tab.memory_usage` is served by a session and the
+    /// iced UI only; the frozen Swift app refuses it as it refuses any
+    /// op it has no case for.
+    @Test func tabMemoryUsageIsUnknownOp() async {
+        let handler = await makeHandler()
+        await expectError(
+            "unknown-op",
+            "tab.memory_usage",
+            AnyCodable(["tab_id": "1"] as [String: Any]),
+            on: handler
+        )
+    }
+
     @Test func unknownParamFieldRejected() async {
         // decodeParams mirrors the Rust deny_unknown_fields policy.
         let handler = await makeHandler()

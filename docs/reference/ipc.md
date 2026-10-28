@@ -469,7 +469,8 @@ by name if one is ever added without a row:
   `h<n>.<id>` request is routed by its own parser as if this mode did
   not exist. This is everything that is really client state rather than
   a workspace row — a terminal this client has hydrated
-  (`tab.dump`, `tab.dump_resolved`, `tab.capture_pty_input`), this
+  (`tab.dump`, `tab.dump_resolved`, `tab.capture_pty_input`, and
+  `tab.memory_usage`, which reads the slot's figure through the UI), this
   client's own selection (`tab.focus`, `selection.set` /
   `selection.clear` / `selection.dump`), a file this client is reading
   off its own filesystem (`tab.send_file`), the order this client's
@@ -944,6 +945,66 @@ On a **UI socket**, `tab_id` accepts the host-qualified `h<host>.<id>`
 spelling too, resolving to an attached host tab's client-side Terminal
 exactly as [`tab.dump`](#tabdump) does above; a session socket refuses
 it the same way.
+
+### `tab.memory_usage`
+
+What one tab's terminal holds, as libghostty measures it: pages,
+bytes, and the share of each that compression or images account for,
+per screen. Ungated — it is a read. Served by a host-session socket
+and by the iced UI; the Swift Mac app has no case for it and answers
+`unknown-op`. CLI: `roostctl tab memory`.
+
+Request: `{"params": {"tab_id": "h3.7"}}`. Params are strict: an
+unknown field is `unknown-field`.
+Response:
+
+```json
+{"tab_id": "h3.7",
+ "terminal": {
+   "compression_supported": true,
+   "primary": {"pages": 2, "virtual_bytes": 3211264, "resident_bytes": 802816,
+               "compressed_pages": 0, "compressed_bytes": 0, "image_bytes": 0},
+   "alternate": {"pages": 0, "virtual_bytes": 0, "resident_bytes": 0,
+                 "compressed_pages": 0, "compressed_bytes": 0, "image_bytes": 0},
+   "resident_bytes": 802816, "virtual_bytes": 3211264},
+ "mirror": {"compression_supported": true, "primary": {"pages": 1, "…": 0},
+            "alternate": {"…": 0}, "resident_bytes": 401408, "virtual_bytes": 1605632}}
+```
+
+- `tab_id` is the ref **as the caller sent it** — bare on a session
+  socket; bare or `h<host>.<id>` on a UI socket. A bare id answered from
+  the slot under
+  [`local-backend = session`](#a-ui-socket-under-local-backend-session)
+  comes back bare.
+- `terminal` is always the tab's **authoritative** terminal: a session
+  tab's server Terminal, or an in-process iced tab's own.
+- `mirror` is present only for a host tab on a UI socket whose window
+  holds a client-side Terminal for it when the session's answer
+  arrives. It is that copy's figure, so a caller can compare the two
+  halves of an attach.
+- Each `MemoryUsage` carries both screens and two totals,
+  `resident_bytes` and `virtual_bytes`, each the sum of the two
+  screens. `resident_bytes` is the figure to budget against;
+  `image_bytes` is not part of it. The alternate screen is all zero
+  until a program first switches to it. Every count is a plain JSON
+  number.
+
+On a **UI socket**, a host tab (`h<host>.<id>`, or a bare id under
+`local-backend = session`) is read by **its host's session**: the UI
+puts `{"tab_id": "<id>"}` to that session over the host's connection,
+fenced at the incarnation the ref names, and adds `mirror`. Errors:
+
+- an id no backend lists, or a tab whose terminal is gone: `not-found`
+  (a host's own `not-found` crosses unchanged);
+- an `h<host>` naming no connection this UI holds: `not-found`
+  ("no connected host with that incarnation");
+- a connection that drops, or is replaced, before the session answers:
+  `host-unavailable`;
+- under `local-backend = session` with the slot down, a bare id:
+  `host-unavailable`.
+
+A session socket refuses the `h<host>.<id>` form with `invalid-param`,
+as [`tab.dump`](#tabdump) does.
 
 ### `tab.feed_pty_bytes` *(test-only — gated)*
 
@@ -3440,8 +3501,9 @@ from construction. Three consequences a client can observe:
   attached. The *server* answers, exactly once; a client that is
   attached and runs its own terminal over the same bytes must discard
   its own reply buffer, or the child sees the answer twice.
-* **The terminal is readable.** [`tab.dump`](#tabdump) and
-  [`tab.dump_resolved`](#tabdump_resolved) are served from it — and
+* **The terminal is readable.** [`tab.dump`](#tabdump),
+  [`tab.dump_resolved`](#tabdump_resolved) and
+  [`tab.memory_usage`](#tabmemory_usage) are served from it — and
   since plan 053 `tab.dump` reaches into those 2000 lines of history,
   not just the viewport.
 * **The terminal is streamable.** One [data connection](#data-plane)

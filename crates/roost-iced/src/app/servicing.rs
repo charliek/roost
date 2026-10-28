@@ -4,7 +4,8 @@ use roost_engine::ipc::{DumpError, HostOpFailure, HostOpReply};
 use roost_ipc::codes;
 use roost_ipc::messages::{
     ActivationOutcome, AppContextMenuDumpResult, AppContextMenuTarget, AppSecureInputResult,
-    HostActionResult, SentFile, SkippedFile, TabSendFileResult, WireProjectRef,
+    HostActionResult, MemoryUsage, SentFile, SkippedFile, TabMemoryUsageParams,
+    TabMemoryUsageResult, TabSendFileResult, WireProjectRef, WireTabRef,
 };
 use roost_ui_model::context_menu::{ContextAction, ContextTarget};
 use roost_ui_model::file_transfer::{status, Refusal, Skipped, Target};
@@ -127,6 +128,82 @@ fn slot_unavailable<T>() -> Result<T, HostOpFailure> {
         roost_ipc::local_route::SLOT_UNAVAILABLE_CODE,
         roost_ipc::local_route::SLOT_UNAVAILABLE,
     ))
+}
+
+/// Where host-tab `tab.memory_usage` callers wait, keyed by dispatch id
+/// — see [`EngineOpResult::HostTabMemory`].
+#[derive(Default)]
+pub(super) struct MemoryReplies(HashMap<u64, HostOpReply<TabMemoryUsageResult>>);
+
+impl MemoryReplies {
+    pub(super) fn park(&mut self, op: u64, reply: HostOpReply<TabMemoryUsageResult>) {
+        self.0.insert(op, reply);
+    }
+
+    /// Answer, and forget, the caller parked under `op`. `serving` is
+    /// whether the incarnation the op went to is still its host's
+    /// current, connected one ([`crate::host_conn::HostConnSet::serves`]);
+    /// `mirror` is read only for an answer that is going to be sent.
+    pub(super) fn answer(
+        &mut self,
+        op: u64,
+        serving: bool,
+        sent: WireTabRef,
+        answer: Result<serde_json::Value, HostOpFailure>,
+        mirror: impl FnOnce() -> Option<roost_vt::Result<MemoryUsage>>,
+    ) {
+        let Some(reply) = self.0.remove(&op) else {
+            return;
+        };
+        let _ = reply.send(host_tab_memory(serving, answer, sent, mirror));
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// A host tab's `tab.memory_usage`, finished on the UI thread (plan 082
+/// D6.2): the session's figure, the ref the caller sent, and `mirror` —
+/// this window's own copy of the tab, read when the answer landed, if it
+/// held one then.
+///
+/// A refusal crosses as [`host_op_failure`] made it: the session's
+/// `not-found` for a tab it does not run, `host-unavailable` for a
+/// connection that dropped or was replaced while the op was queued. An
+/// answer that arrives after its incarnation stopped `serving` is
+/// `host-unavailable` too, whatever it says: a worker winding down can
+/// still deliver one after the host was disconnected or replaced.
+fn host_tab_memory(
+    serving: bool,
+    answer: Result<serde_json::Value, HostOpFailure>,
+    sent: WireTabRef,
+    mirror: impl FnOnce() -> Option<roost_vt::Result<MemoryUsage>>,
+) -> Result<TabMemoryUsageResult, HostOpFailure> {
+    if !serving {
+        return Err(host_unavailable(format!(
+            "tab {sent}: the host's connection ended before it answered"
+        )));
+    }
+    let mut result: TabMemoryUsageResult = serde_json::from_value(answer?).map_err(|error| {
+        HostOpFailure::new(
+            codes::INTERNAL,
+            format!("tab {sent}: the host's memory usage did not decode: {error}"),
+        )
+    })?;
+    result.tab_id = sent;
+    result.mirror = mirror()
+        .transpose()
+        .map_err(|error| memory_unreadable(sent, &error))?;
+    Ok(result)
+}
+
+fn memory_unreadable(tab: WireTabRef, error: &roost_vt::Error) -> HostOpFailure {
+    HostOpFailure::new(
+        codes::INTERNAL,
+        format!("tab {tab}: reading its terminal's memory usage failed: {error}"),
+    )
 }
 
 /// How far a tab ref gets towards a terminal this UI holds.
@@ -3774,6 +3851,13 @@ impl App {
                     .ok_or_else(|| format!("tab {tab_id} has no live terminal"));
                 let _ = reply.send(result);
             }
+            UiRequest::TabMemoryUsage {
+                tab_id,
+                sent,
+                reply,
+            } => {
+                task = task.then(self.tab_memory_usage(tab_id, sent, reply));
+            }
             UiRequest::AppRenderStats { reset, reply } => {
                 let stats = crate::perf::snapshot();
                 if reset {
@@ -4612,6 +4696,89 @@ impl App {
         )
     }
 
+    /// `tab.memory_usage` on the UI socket (plan 082 D6.2).
+    ///
+    /// An in-process tab's terminal is the authoritative one and is read
+    /// here. A host tab's is its session's, so the op is put to that
+    /// host — any host, not only the slot — fenced at the incarnation the
+    /// ref names, so a reconnect between this dispatch and the send
+    /// cannot read whatever tab the replacement session numbers the same.
+    /// The answer is finished in [`App::host_tab_memory_answered`].
+    fn tab_memory_usage(
+        &mut self,
+        tab_id: WireTabRef,
+        sent: WireTabRef,
+        reply: HostOpReply<TabMemoryUsageResult>,
+    ) -> UiTask {
+        let Some(key) = self.wire_tab_key(tab_id) else {
+            let _ = reply.send(slot_unavailable());
+            return UiTask::None;
+        };
+        if key.local_tab().is_some() {
+            let answer = match self.tabs.get(&key) {
+                Some(tab) => roost_engine::memory::of(&tab.terminal)
+                    .map(|terminal| TabMemoryUsageResult {
+                        tab_id: sent,
+                        terminal,
+                        mirror: None,
+                    })
+                    .map_err(|error| memory_unreadable(sent, &error)),
+                None => Err(HostOpFailure::new(
+                    codes::NOT_FOUND,
+                    format!("tab {sent} has no live terminal"),
+                )),
+            };
+            let _ = reply.send(answer);
+            return UiTask::None;
+        }
+        let Some(queue) = self.hosts.ops_for(key.host) else {
+            let _ = reply.send(Err(no_connected_host()));
+            return UiTask::None;
+        };
+        let params = match serde_json::to_value(TabMemoryUsageParams {
+            tab_id: WireTabRef::Local(key.tab),
+        }) {
+            Ok(params) => params,
+            Err(error) => {
+                let _ = reply.send(Err(HostOpFailure::new(codes::INTERNAL, error.to_string())));
+                return UiTask::None;
+            }
+        };
+        let call = queue.call_at(key.host, roost_ipc::messages::ops::TAB_MEMORY_USAGE, params);
+        let op = self.take_engine_op_id();
+        self.memory_replies.park(op, reply);
+        self.engine_op(
+            async move { Ok::<_, String>(call.await.map_err(|error| host_op_failure(&error))) },
+            move |joined| EngineOpResult::HostTabMemory {
+                op,
+                tab: key,
+                sent,
+                answer: Box::new(
+                    joined.unwrap_or_else(|error| Err(HostOpFailure::new(codes::INTERNAL, error))),
+                ),
+            },
+        )
+    }
+
+    /// [`EngineOpResult::HostTabMemory`], on the UI thread: whether the
+    /// incarnation still serves, and the mirror — whatever terminal this
+    /// window holds for the tab *now* — are both read here, which is what
+    /// makes "connected and attached at completion" one main-thread fact.
+    pub(super) fn host_tab_memory_answered(
+        &mut self,
+        op: u64,
+        tab: TabKey,
+        sent: WireTabRef,
+        answer: Result<serde_json::Value, HostOpFailure>,
+    ) {
+        let serving = self.hosts.serves(tab.host);
+        let tabs = &self.tabs;
+        self.memory_replies.answer(op, serving, sent, answer, || {
+            tabs.get(&tab)
+                .map(|attached| roost_engine::memory::of(&attached.terminal))
+        });
+    }
+
     fn host_reorder_op(
         &self,
         host: HostId,
@@ -4950,6 +5117,143 @@ mod tests {
             slot_unavailable::<()>().unwrap_err().code,
             "host-unavailable"
         );
+    }
+
+    // ── plan 082 D6.2: a host tab's `tab.memory_usage` completion ────
+
+    const SENT: WireTabRef = WireTabRef::Host { host: 3, tab: 7 };
+
+    fn usage(resident: u64) -> MemoryUsage {
+        MemoryUsage::new(
+            false,
+            roost_ipc::messages::ScreenMemory {
+                pages: 1,
+                resident_bytes: resident,
+                virtual_bytes: resident * 2,
+                ..Default::default()
+            },
+            roost_ipc::messages::ScreenMemory::default(),
+        )
+    }
+
+    /// What the session sends: its own bare id, and no mirror.
+    fn session_reply(resident: u64) -> serde_json::Value {
+        serde_json::to_value(TabMemoryUsageResult {
+            tab_id: WireTabRef::Local(7),
+            terminal: usage(resident),
+            mirror: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_host_tab_with_no_local_terminal_answers_the_sessions_figure_alone() {
+        let answered =
+            host_tab_memory(true, Ok(session_reply(4096)), SENT, || None).expect("answered");
+        assert_eq!(
+            answered,
+            TabMemoryUsageResult {
+                tab_id: SENT,
+                terminal: usage(4096),
+                mirror: None,
+            }
+        );
+    }
+
+    #[test]
+    fn an_attached_host_tab_adds_the_windows_copy_beside_the_sessions() {
+        let answered = host_tab_memory(true, Ok(session_reply(4096)), SENT, || {
+            Some(Ok(usage(1024)))
+        })
+        .expect("answered");
+        assert_eq!(
+            answered.tab_id, SENT,
+            "the caller's ref, not the session's bare id"
+        );
+        assert_eq!(answered.terminal, usage(4096));
+        assert_eq!(answered.mirror, Some(usage(1024)));
+    }
+
+    #[test]
+    fn a_malformed_session_reply_is_internal() {
+        for reply in [
+            serde_json::json!({"tab_id": "7"}),
+            serde_json::json!({"tab_id": "7", "terminal": "lots"}),
+            serde_json::Value::Null,
+        ] {
+            let failure = host_tab_memory(true, Ok(reply.clone()), SENT, || None).unwrap_err();
+            assert_eq!(failure.code, codes::INTERNAL, "{reply}");
+            assert!(failure.message.starts_with("tab h3.7: "), "{failure:?}");
+        }
+    }
+
+    #[test]
+    fn a_disconnect_is_host_unavailable_and_the_sessions_not_found_crosses() {
+        use crate::host_conn::HostOpError;
+        use roost_ipc::client::ServerCode;
+
+        let dropped = host_op_failure(&HostOpError::Disconnected);
+        let failure = host_tab_memory(true, Err(dropped), SENT, || Some(Ok(usage(1)))).unwrap_err();
+        assert_eq!(failure.code, codes::HOST_UNAVAILABLE);
+
+        let gone = host_op_failure(&HostOpError::Rejected {
+            code: ServerCode::from_wire("not-found"),
+            message: "tab 7 has no live terminal".into(),
+        });
+        let failure = host_tab_memory(true, Err(gone), SENT, || None).unwrap_err();
+        assert_eq!(
+            (failure.code.as_str(), failure.message.as_str()),
+            ("not-found", "tab 7 has no live terminal")
+        );
+    }
+
+    /// The race a fabricated `Disconnected` cannot reach: the op left on a
+    /// connected incarnation, the host was disconnected while its answer
+    /// was outstanding, and the answer still arrived as `Ok` — a worker
+    /// winding down can deliver one inside its shutdown grace. The
+    /// completion asks the set whether the incarnation still serves, as
+    /// [`App::host_tab_memory_answered`] does, and refuses.
+    #[tokio::test]
+    async fn an_answer_that_outlives_its_connection_is_host_unavailable() {
+        use crate::host_conn::fixtures::a_set;
+        use crate::host_conn::{ConnectMode, HostConnState, HostOpError, HostTransport};
+
+        let (mut set, _feed) = a_set();
+        set.connect(
+            "h1",
+            "one",
+            PathBuf::from("/nonexistent/roost-memory-race.sock"),
+            HostTransport::UnixSocket,
+            ConnectMode::Dial,
+        );
+        let incarnation = set.mint_for("h1");
+        set.apply_state(incarnation, HostConnState::Connected);
+        assert!(set.serves(incarnation));
+
+        let mut replies = MemoryReplies::default();
+        let (reply, caller) = tokio::sync::oneshot::channel();
+        replies.park(1, reply);
+        let (release, held) = tokio::sync::oneshot::channel::<Result<_, HostOpError>>();
+        let dispatched = tokio::spawn(async move {
+            held.await
+                .unwrap_or(Err(HostOpError::Disconnected))
+                .map_err(|error| host_op_failure(&error))
+        });
+
+        set.disconnect("h1");
+        release.send(Ok(session_reply(4096))).unwrap();
+        let answer = dispatched.await.unwrap();
+        assert!(answer.is_ok(), "the session did answer");
+
+        replies.answer(1, set.serves(incarnation), SENT, answer, || {
+            Some(Ok(usage(1)))
+        });
+        let answered = caller.await.expect("answered");
+        assert!(
+            matches!(&answered, Err(failure) if failure.code == codes::HOST_UNAVAILABLE),
+            "{answered:?}"
+        );
+        assert!(replies.is_empty(), "the parked sender is gone");
     }
 
     /// `app.sidebar_dump`'s band strip, one row per plan 063 §D2

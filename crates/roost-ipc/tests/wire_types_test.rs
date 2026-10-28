@@ -1224,6 +1224,35 @@ fn identify_carries_ops_and_an_instance_id_only_where_a_server_sends_them() {
     );
 }
 
+/// Plan 082 D6.1: the host-tab exemplar — the caller's `h<n>.<id>`, the
+/// session's figure and the window's copy — with each total the sum of
+/// its two screens.
+#[test]
+fn tab_memory_usage_vectors_decode_into_their_typed_shapes() {
+    use roost_ipc::messages::{TabMemoryUsageParams, TabMemoryUsageResult, WireTabRef};
+
+    let request: roost_ipc::messages::RawRequest =
+        serde_json::from_str(&read_vector("tab.memory_usage.request.json")).unwrap();
+    assert_eq!(request.op, roost_ipc::messages::ops::TAB_MEMORY_USAGE);
+    let params: TabMemoryUsageParams = serde_json::from_value(request.params).unwrap();
+    let host_tab = WireTabRef::Host { host: 3, tab: 7 };
+    assert_eq!(params.tab_id, host_tab);
+
+    let response: roost_ipc::messages::Response =
+        serde_json::from_str(&read_vector("tab.memory_usage.response.json")).unwrap();
+    let result: TabMemoryUsageResult = serde_json::from_value(response.result.unwrap()).unwrap();
+    assert_eq!(result.tab_id, host_tab);
+    let mirror = result.mirror.expect("the exemplar is an attached host tab");
+    for usage in [result.terminal, mirror] {
+        let summed = roost_ipc::messages::MemoryUsage::new(
+            usage.compression_supported,
+            usage.primary,
+            usage.alternate,
+        );
+        assert_eq!(usage, summed);
+    }
+}
+
 #[test]
 fn session_set_theme_vectors_decode_into_their_typed_shapes() {
     let raw = read_vector("session.set_theme.request.json");

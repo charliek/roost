@@ -442,6 +442,38 @@ async fn dump_and_dump_resolved_match_the_shared_densifier() {
     sup.close(913);
 }
 
+/// `tab.memory_usage`'s session half (plan 082 D6.2): the task reads its
+/// own terminal, so history written through the tab grows the figure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_usage_reads_the_tabs_own_terminal() {
+    let (sup, _workspace) = enabled_supervisor(false);
+    let _output = sup
+        .spawn(935, "/tmp", &sh("exec sleep 30"), 80, 24, &socket("memory"))
+        .expect("spawn");
+    let commands = sup.tab_commands(935).expect("server-vt tab task");
+
+    let before = ask(&commands, TabCmd::MemoryUsage).await.expect("memory");
+    let history: String = (0..2000)
+        .map(|line| format!("history line {line}\r\n"))
+        .collect();
+    feed(&commands, history.as_bytes()).await;
+    quiesce(&commands).await;
+    let after = ask(&commands, TabCmd::MemoryUsage).await.expect("memory");
+
+    assert!(before.primary.pages > 0, "{before:?}");
+    assert!(
+        after.primary.pages > before.primary.pages,
+        "{before:?} -> {after:?}"
+    );
+    assert_eq!(
+        after.resident_bytes,
+        after.primary.resident_bytes + after.alternate.resident_bytes
+    );
+
+    drop(commands);
+    sup.close(935);
+}
+
 /// D6's ring validity window, at all four boundaries. `last_assigned + 1`
 /// is a *hit* with an empty slice — the client missed nothing — which is
 /// the case a naive `from_seq <= last_assigned` check gets wrong.

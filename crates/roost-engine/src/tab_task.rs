@@ -38,7 +38,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use portable_pty::PtySize;
-use roost_ipc::messages::{AttachPayloadKind, ClipboardEffectTarget, CLIPBOARD_EFFECT_MAX_BYTES};
+use roost_ipc::messages::{
+    AttachPayloadKind, ClipboardEffectTarget, MemoryUsage, CLIPBOARD_EFFECT_MAX_BYTES,
+};
 use roost_ipc::program_status::StatusEvent;
 use roost_vt::{
     Cell, Colors, CursorInfo, RenderState, RenderedRow, Terminal, TerminalEvent, TerminalOptions,
@@ -481,6 +483,8 @@ pub enum TabCmd {
         reply: oneshot::Sender<Result<DumpData, TabError>>,
     },
     DumpResolved(oneshot::Sender<Result<ResolvedCellsData, TabError>>),
+    /// `tab.memory_usage` — this tab's terminal, as libghostty measures it.
+    MemoryUsage(oneshot::Sender<Result<MemoryUsage, TabError>>),
     /// Test-mode byte injection — the same pipeline a real chunk takes.
     FeedBytes(Vec<u8>),
     /// Test-mode: everything the task has queued toward the PTY writer
@@ -1381,6 +1385,9 @@ impl TabTask {
             }
             TabCmd::DumpResolved(reply) => {
                 let _ = reply.send(self.dump_resolved());
+            }
+            TabCmd::MemoryUsage(reply) => {
+                let _ = reply.send(crate::memory::of(&self.vt.terminal).map_err(TabError::from));
             }
             TabCmd::FeedBytes(data) => self.ingest(data),
             TabCmd::CaptureInput { drain, reply } => {

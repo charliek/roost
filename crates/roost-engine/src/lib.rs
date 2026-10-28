@@ -23,6 +23,8 @@ pub mod events;
 pub mod facade;
 pub mod git_metrics;
 pub mod ipc;
+#[cfg(feature = "vt")]
+pub mod memory;
 pub mod osc;
 pub mod persistence;
 pub mod pointer;
