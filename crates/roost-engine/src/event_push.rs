@@ -191,15 +191,20 @@ pub fn envelope(event: &WorkspaceEvent) -> Option<EventEnvelope> {
         // The one event whose wire shape is not its in-process shape:
         // the wire carries the two projections (`state`, `hook_active`)
         // pre-derived so no subscriber has to re-run them.
-        WorkspaceEvent::AgentChanged { tab_id, agent } => (
+        WorkspaceEvent::AgentChanged {
+            tab_id,
+            agent,
+            program_status,
+        } => (
             ops::EVENT_AGENT_REPORT_CHANGED,
             to_value(AgentReportChangedEvent {
                 tab_id: *tab_id,
                 shell_state: agent.shell,
                 agent_lifecycle: agent.lifecycle,
                 ownership: agent.ownership.clone(),
-                state: roost_ipc::agent::effective(agent),
+                state: roost_ipc::program_status::effective(agent, program_status.as_ref()),
                 hook_active: roost_ipc::agent::is_live(agent),
+                program_status: program_status.clone(),
             }),
         ),
         WorkspaceEvent::NotificationFired {

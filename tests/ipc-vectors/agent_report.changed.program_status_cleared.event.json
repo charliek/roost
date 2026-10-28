@@ -1,0 +1,17 @@
+{
+  "event": "agent_report.changed",
+  "data": {
+    "tab_id": "5",
+    "shell_state": "foreground_process",
+    "agent_lifecycle": "working",
+    "ownership": {
+      "source": "claude",
+      "session_id": "abc123",
+      "last_event_at": 1793158440,
+      "detail": "",
+      "metadata": {}
+    },
+    "state": "running",
+    "hook_active": true
+  }
+}

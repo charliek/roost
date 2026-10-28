@@ -173,7 +173,8 @@ terminal from. It shares the socket path but not the framing; see
     "agent_lifecycle": "<AgentLifecycle>",
     "ownership": "<Ownership, omitted when unowned>",
     "password_input": "<bool, omitted while false>",
-    "dropped_reports": "<DroppedReports, omitted until a report is dropped>"
+    "dropped_reports": "<DroppedReports, omitted until a report is dropped or vetoed>",
+    "program_status": "<ProgramStatus, omitted while the tab has no record>"
   },
   "Project": {
     "id": "<string-int64>",
@@ -224,7 +225,8 @@ that predates the field, and a tab that is not at a prompt, look the
 same — both read as `false`, with no protocol bump.
 
 `Tab.dropped_reports` counts the [`tab.agent_report`](#tabagent_report)s
-this tab's server refused (`accepted: false`) and keeps the latest:
+this tab's server refused (`accepted: false`), plus the program-status
+vetoes it accepted (below), and keeps the latest refusal:
 
 ```json
 {"count": 9, "last": {"source": "codex", "session_id": "01a12677…",
@@ -233,7 +235,15 @@ this tab's server refused (`accepted: false`) and keeps the latest:
 ```
 
 `reason` is `"not_owner"` (a `preserve` or `release` from anyone but the
-owner, including any report to a tab nobody owns) or `"nested_claim"`.
+owner, including any report to a tab nobody owns), `"nested_claim"`,
+`"foreign_app"` (a claim from an agent other than the one whose
+[program-status](#tabprogram_status-osc-7501) record decides the tab), or
+`"program_status"`. A `program_status` report was **accepted**, but the
+deciding record overrode the lifecycle change or the notification it
+would otherwise have made: it is counted once per `(source,
+session_id)` stream, never replaces a refusal as `last`, and is `last`
+only on a tab that has refused nothing. The last two are new at session
+protocol `7`.
 `tab_had_owner` says whether any agent owned the tab when the report was
 dropped. An agent whose reports land as `not_owner` with
 `tab_had_owner: false` has lost the tab: nothing it sends shows until it
@@ -246,11 +256,57 @@ read it from that server rather than from a window mirroring a remote
 host. The key is omitted until something is dropped, so an older server
 reads the same as a tab with nothing dropped.
 
+### `Tab.program_status` — OSC 7501
+
+A program can report its own status with OSC 7501 (state, kind,
+message, app, title, progress, and an `id` for child records). A
+session tab's terminal, the session's, answers the `OSC 7501 ; ?` probe
+and keeps the tab's records. Prompt marks (OSC 133 `A`, `B`, `D`) drop `working` and `blocked`
+records. While a `working` or `blocked` record exists, or a root record
+no prompt mark has followed, the records decide what the tab shows and
+the hook layer keeps only its identity.
+
+`Tab.program_status` is present while the tab has any record:
+
+```json
+"program_status": {
+  "effective_lifecycle": "waiting",
+  "decided_by": "records",
+  "children": 1,
+  "record": {
+    "state": "blocked", "kind": "permission", "msg": "approve Bash: cargo test",
+    "app": "claude-code", "title": "Tests", "progress": 40,
+    "id": "build/test", "updated_at": 1793158450
+  }
+}
+```
+
+* `effective_lifecycle` is the `AgentLifecycle` the tab presents.
+* `decided_by` is `records`, `kept_record` (a root `done` or `error` a
+  prompt mark ended the authority of, still shown while no hook drives
+  the tab), or `hooks`.
+* `children` counts the records other than the root; they are not
+  listed.
+* `record` is the deciding record, absent when `decided_by` is `hooks`.
+  `state` is `idle`, `working`, `done`, `blocked` or `error`; `kind` is
+  `permission`, `question` or `auth`; `app` is inherited from the
+  nearest `/`-ancestor when the record names none; `updated_at` is the
+  server's receipt time in unix seconds. Text the program did not send
+  is omitted.
+
+The object and its enums are **open**: a client that cannot read a value
+reads the whole object as absent rather than failing the tab.
+`shell_state`, `agent_lifecycle` and `ownership` stay the hook layer's
+values; read the presented lifecycle as `program_status.effective_lifecycle`
+when present, else the derivation below. New at session protocol `7`.
+
 ### `tab.state` / `hook_active` — derived, and the compatibility contract
 
 `Tab.state` and `Tab.hook_active` are **derived** fields, computed
-server-side from `shell_state` + `agent_lifecycle` + `ownership`, not
-independently settable:
+server-side, not independently settable. `state` is the projection of
+`program_status.effective_lifecycle` when the tab has program-status
+records; otherwise both come from `shell_state` + `agent_lifecycle` +
+`ownership`:
 
 * `hook_active` = `ownership` is present with a non-empty `source`
   ("is-live").
@@ -3161,7 +3217,7 @@ ignored — HS-2 scope. Silently serving an unfiltered stream to a client
 that asked for one tab would make it mis-attribute every other tab's
 events.
 
-At `SESSION_PROTOCOL_VERSION` `6` this op gates on nothing but the
+At `SESSION_PROTOCOL_VERSION` `7` this op gates on nothing but the
 socket's own same-UID check, and there is no other classification left
 to describe — every subscriber gets every event. That is a change, not a
 constant: generations 2 through 4 required the lease here, and a
@@ -3402,7 +3458,7 @@ Params: `{}`. Response:
 ```json
 {
   "app_version": "0.0.18",
-  "session_protocol": 6,
+  "session_protocol": 7,
   "payload_kinds": ["ghostty-snapshot", "vt"],
   "libghostty_build": "ghostty-3f6b1c9a4d2e5f80+snapshot.v1",
   "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
@@ -3446,8 +3502,8 @@ The handshake a client runs before anything binary exists, so every
 incompatibility is caught on stable JSON. `session_protocol` is
 `SESSION_PROTOCOL_VERSION` — deliberately separate from the
 request/response `protocol_version` in [`identify`](#identify), because
-the two version different things and move independently. It is **`6`**.
-There is no `features` field: at `6` the integer is the whole
+the two version different things and move independently. It is **`7`**.
+There is no `features` field: at `7` the integer is the whole
 negotiation, and there is no other capability a client needs to
 detect. **The compatibility rule is one comparison:** a conforming
 client checks `session_protocol` for exact equality against its own
@@ -3455,7 +3511,7 @@ constant before anything else, and refuses to proceed on a mismatch —
 the [attach handshake](#data-plane) carries the same integer and
 enforces it server-side too, before it reads any other term. Every
 op on this page assumes that equality already holds; what came before
-`6` — the interactive lease, `session.connect`, per-connection
+`7` — the interactive lease, `session.connect`, per-connection
 classification, the `features` list that once carried intra-generation
 capabilities, and `session.set_agent_hooks`'s own `mode`/`skip` shape —
 is history, not this build's contract, and lives in CHANGELOG rather
@@ -3806,7 +3862,7 @@ the first line only, so a request stream can never be diverted
 mid-flight by a payload that happens to look like a handshake.
 
 ```json
-{"attach": "7", "protocol_version": 6,
+{"attach": "7", "protocol_version": 7,
  "session_id": "01K3S8TQ4F0Q9YB2K6WZ5D7XN",
  "kinds": ["ghostty-snapshot", "vt"], "cols": 100, "rows": 30,
  "cell_w_px": 8, "cell_h_px": 16,
@@ -4300,9 +4356,13 @@ discipline, the last frame before the stream closes. See
   standing value off [`tab.list`](#tablist). An older client that does
   not know the name skips it.
 * `notification.fired` — `{"tab_id": "<id>", "title": "<string>", "body": "<string>", "generation": <int>}`. Mirrors the legacy proto's `NotificationEvent`; useful for tools that mirror notifications elsewhere. `generation` numbers the raises on that tab, counting from one; a client acknowledging this raise sends it back on [`tab.clear_notification`](#tabclear_notification) — see [Notifications fan out](#notifications-fan-out). Live-only on a session's event stream: never replayed into a resume.
-* `agent_report.changed` — `{"tab_id": "<id>", "shell_state": "<ShellState>", "agent_lifecycle": "<AgentLifecycle>", "ownership": "<Ownership, omitted when unowned>", "state": "<TabState>", "hook_active": <bool>}`.
-  Fires whenever an accepted `tab.agent_report` or an OSC 133 shell
-  mark changes the agent record. `tab.state_changed` and
+* `agent_report.changed` — `{"tab_id": "<id>", "shell_state": "<ShellState>", "agent_lifecycle": "<AgentLifecycle>", "ownership": "<Ownership, omitted when unowned>", "state": "<TabState>", "hook_active": <bool>, "program_status": "<ProgramStatus, omitted when the tab has no record>"}`.
+  Fires whenever an accepted `tab.agent_report`, an OSC 133 shell
+  mark or an OSC 7501 report changes the agent record or its
+  [`program_status`](#tabprogram_status-osc-7501) (a message change
+  alone included; a repeat that moves only `updated_at` does not). An
+  event without `program_status` means the tab has no records left, so
+  a mirror assigns the field as it comes, absent included. `tab.state_changed` and
   `hook_active.changed` still fire for their (derived) slices, so
   existing subscribers keep working unmodified — this event carries
   what those two projections lose: which lifecycle, whose session, and
@@ -4346,7 +4406,7 @@ is the UI socket's schema version — currently **`1`**
 (`roost_ipc::PROTOCOL_VERSION`); it is reported by
 [`identify`](#identify) but nothing compares it, so the UI socket has no
 handshake gate. `session.identify.session_protocol` is the session
-sockets' — currently **`6`** (`roost_ipc::messages::SESSION_PROTOCOL_VERSION`),
+sockets' — currently **`7`** (`roost_ipc::messages::SESSION_PROTOCOL_VERSION`),
 covering both the session JSON ops and the binary [data
 plane](#data-plane); conforming clients check it for equality before
 anything else and the [attach handshake](#the-handshake) refuses a
@@ -4378,7 +4438,7 @@ is one document:
 
 ```json
 {"$schema": "https://json-schema.org/draft/2020-12/schema",
- "schema_version": 1, "protocol_version": 1, "session_protocol_version": 6,
+ "schema_version": 1, "protocol_version": 1, "session_protocol_version": 7,
  "envelopes": {"request": …, "response": …, "error": …, "event_batch": …,
                "session_stopping": …, "stream_ended": …},
  "ops": {"tab.open": {"params": …, "result": …}, …},

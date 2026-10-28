@@ -1,0 +1,67 @@
+{
+  "id": "4",
+  "ok": true,
+  "result": {
+    "projects": [
+      {
+        "id": "1",
+        "name": "Roost",
+        "cwd": "/Users/me/projects/roost",
+        "position": 0,
+        "created_at": 1700000000,
+        "tabs": [
+          {
+            "id": "5",
+            "project_id": "1",
+            "title": "claude",
+            "cwd": "/Users/me/projects/roost",
+            "state": "needs_input",
+            "has_notification": true,
+            "is_active": false,
+            "user_titled": false,
+            "position": 0,
+            "created_at": 1700000000,
+            "last_active": 1700000050,
+            "hook_active": true,
+            "shell_state": "foreground_process",
+            "agent_lifecycle": "working",
+            "ownership": {
+              "source": "claude",
+              "session_id": "abc123",
+              "last_event_at": 1793158440,
+              "detail": "",
+              "metadata": {}
+            },
+            "dropped_reports": {
+              "count": 1,
+              "last": {
+                "source": "claude",
+                "session_id": "abc123",
+                "ownership_action": "preserve",
+                "reason": "program_status",
+                "tab_had_owner": true,
+                "at": 1793158452
+              }
+            },
+            "program_status": {
+              "effective_lifecycle": "waiting",
+              "decided_by": "records",
+              "children": 1,
+              "record": {
+                "state": "blocked",
+                "kind": "permission",
+                "msg": "approve Bash: cargo test",
+                "app": "claude-code",
+                "title": "Tests",
+                "progress": 40,
+                "id": "build/test",
+                "updated_at": 1793158450
+              }
+            }
+          }
+        ]
+      }
+    ],
+    "revision": 42
+  }
+}

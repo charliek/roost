@@ -23,6 +23,7 @@ fn tab(id: i64, project_id: i64, position: i32, is_active: bool) -> Tab {
         ownership: None,
         password_input: false,
         dropped_reports: None,
+        program_status: None,
     }
 }
 

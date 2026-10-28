@@ -35,11 +35,11 @@ use roost_agent_install::{
     ALL_AGENTS as ALL_INSTALL_AGENTS,
 };
 use roost_ipc::agent::{
-    effective_lifecycle, is_live, suppress_raw_osc, AgentLifecycle, DropReason, DroppedReports,
-    OwnershipAction, ShellState,
+    is_live, AgentLifecycle, DropReason, DroppedReports, OwnershipAction, ShellState,
 };
 use roost_ipc::format_chars::is_format;
 use roost_ipc::messages::{ops, IdentifyParams, IdentifyResult, Tab, TabListResult};
+use roost_ipc::program_status::{suppress_raw_osc, DecidedBy};
 use roost_ipc::session_launch::timeout_scale;
 use roost_ipc::socket_state::{self, describe_file_type, SocketState};
 use roost_ipc::target::{TargetError, TargetOrigin, TargetSelector};
@@ -2693,7 +2693,11 @@ fn tab_checks(
     };
 
     let state = tab.agent_state();
-    let lifecycle = effective_lifecycle(&state);
+    let lifecycle = tab.effective_lifecycle();
+    let records_decide = tab
+        .program_status
+        .as_ref()
+        .is_some_and(|status| status.decided_by != DecidedBy::Hooks);
 
     let ownership = match &tab.ownership {
         Some(owner) => observation(
@@ -2748,14 +2752,18 @@ fn tab_checks(
                 crate::format_state(tab.state),
                 tab.hook_active,
                 lifecycle_name(lifecycle),
-                inactive_explanation(&state, lifecycle),
+                if records_decide {
+                    " — the tab's program status (OSC 7501) decides it".to_string()
+                } else {
+                    inactive_explanation(&state, lifecycle)
+                },
             ),
         ),
         observation(
             "tab.raw_osc",
             "Raw OSC suppression",
-            if suppress_raw_osc(&state) {
-                "raw OSC 9/99/777 notifications are suppressed while this agent drives the tab"
+            if suppress_raw_osc(&state, tab.program_status.as_ref()) {
+                "raw OSC 9/99/777 notifications are suppressed while an agent drives the tab"
             } else {
                 "raw OSC 9/99/777 notifications are delivered"
             },
@@ -3884,6 +3892,7 @@ mod tests {
             ownership: None,
             password_input: false,
             dropped_reports: None,
+            program_status: None,
         }
     }
 
@@ -4880,6 +4889,44 @@ mod tests {
             .detail
             .contains("suppressed"));
         assert!(find(&evaluate(&healthy()), "tab.raw_osc")
+            .detail
+            .contains("delivered"));
+    }
+
+    /// Plan 082 D5.6: the row reads the composed predicate, so a tab whose
+    /// program-status records decide reports suppression with no hook
+    /// owner at all, and its derived state names the records.
+    #[test]
+    fn raw_osc_suppression_and_the_derived_state_follow_program_status() {
+        use roost_ipc::program_status::ProgramStatusSummary;
+        let status = |decided_by| ProgramStatusSummary {
+            effective_lifecycle: AgentLifecycle::Working,
+            decided_by,
+            children: 0,
+            record: None,
+        };
+        let records = Inputs {
+            tab_list: Ok(tab_list(&[Tab {
+                state: TabState::Running,
+                program_status: Some(status(DecidedBy::Records)),
+                ..tab(7)
+            }])),
+            ..healthy()
+        };
+        let checks = evaluate(&records);
+        assert!(find(&checks, "tab.raw_osc").detail.contains("suppressed"));
+        let derived = find(&checks, "tab.derived").detail.clone();
+        assert!(derived.contains("lifecycle=working"), "{derived}");
+        assert!(derived.contains("program status"), "{derived}");
+
+        let hooks = Inputs {
+            tab_list: Ok(tab_list(&[Tab {
+                program_status: Some(status(DecidedBy::Hooks)),
+                ..tab(7)
+            }])),
+            ..healthy()
+        };
+        assert!(find(&evaluate(&hooks), "tab.raw_osc")
             .detail
             .contains("delivered"));
     }

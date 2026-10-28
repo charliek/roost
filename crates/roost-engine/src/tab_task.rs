@@ -39,7 +39,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use portable_pty::PtySize;
 use roost_ipc::messages::{AttachPayloadKind, ClipboardEffectTarget, CLIPBOARD_EFFECT_MAX_BYTES};
-use roost_vt::{Cell, Colors, CursorInfo, RenderState, RenderedRow, Terminal, TerminalOptions};
+use roost_ipc::program_status::StatusEvent;
+use roost_vt::{
+    Cell, Colors, CursorInfo, RenderState, RenderedRow, Terminal, TerminalEvent, TerminalOptions,
+};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc, oneshot, Semaphore};
 use tracing::{debug, warn};
@@ -115,6 +118,11 @@ pub trait ServerVtWorkspace: Send + Sync + 'static {
     /// changes around it. A clipboard write's text is user content: it
     /// goes on the wire and into no log line.
     fn tab_effect(&self, tab_id: i64, effect: TabEffectKind);
+    /// Apply one chunk's OSC 7501 reports and OSC 133 prompt marks, in
+    /// byte order, to the tab's program-status records. Called after the
+    /// chunk's `vt_write` and before its OSC actions, so the hook layer
+    /// sees the chunk's marks after the records do (plan 082 D4.3).
+    fn apply_program_status(&self, tab_id: i64, events: Vec<StatusEvent>, now_ms: i64);
 }
 
 impl ServerVtWorkspace for crate::Workspace {
@@ -130,6 +138,12 @@ impl ServerVtWorkspace for crate::Workspace {
 
     fn tab_effect(&self, tab_id: i64, effect: TabEffectKind) {
         self.publish_tab_effect(tab_id, effect);
+    }
+
+    fn apply_program_status(&self, tab_id: i64, events: Vec<StatusEvent>, now_ms: i64) {
+        if let Err(error) = crate::Workspace::apply_program_status(self, tab_id, events, now_ms) {
+            debug!(tab_id, %error, "program status for a tab whose row is gone");
+        }
     }
 }
 
@@ -511,6 +525,9 @@ pub(crate) struct TabVt {
     state: Arc<ServerVtState>,
     terminal: Terminal,
     replies: Arc<Mutex<Vec<u8>>>,
+    /// OSC 7501 reports and OSC 133 marks, in byte order. Drained after
+    /// every `vt_write`, like `replies`.
+    status: Arc<Mutex<Vec<TerminalEvent>>>,
     router: OscRouter,
     colors: OscColorState,
     render: RenderState,
@@ -554,12 +571,17 @@ impl TabVt {
         // Installed before the first byte: a device query in the very
         // first chunk must be answered like any other.
         terminal.set_write_pty_buffer(Arc::clone(&replies))?;
+        // Beside it, for the same reason: this terminal answers the
+        // program-status probe and is the one whose reports count.
+        let status = Arc::new(Mutex::new(Vec::new()));
+        terminal.set_status_sink(Arc::clone(&status))?;
         let colors = OscColorState::new(color_seed(&terminal)?);
         let render = RenderState::new()?;
         Ok(Self {
             state: Arc::clone(state),
             terminal,
             replies,
+            status,
             router: OscRouter::new(),
             colors,
             render,
@@ -918,8 +940,11 @@ impl TabTask {
             self.last_byte_seq = seq;
             seq
         });
-        // 2. the authoritative terminal.
+        // 2. the authoritative terminal, then its program-status records
+        //    from the ordered sink, before the OSC actions below hand the
+        //    same OSC 133 marks to the hook layer.
         self.vt.terminal.vt_write(&data);
+        self.take_status();
         // 3. OSC scan, applied in wire order.
         let actions = self.vt.router.feed_stateful(&data, &mut self.vt.colors);
         for action in actions {
@@ -993,6 +1018,28 @@ impl TabTask {
                 );
             }
         }
+    }
+
+    /// Apply whatever the status sink collected. The lock is released
+    /// before the workspace is called, and never held across a
+    /// `vt_write`, which takes it from inside.
+    fn take_status(&mut self) {
+        let events = {
+            let mut guard = self
+                .vt
+                .status
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if guard.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *guard)
+        };
+        self.vt.state.workspace.apply_program_status(
+            self.tab_id,
+            crate::program_status::from_vt(events),
+            crate::workspace::unix_now_ms(),
+        );
     }
 
     /// Move whatever libghostty emitted into the pending queue. The lock

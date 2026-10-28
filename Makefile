@@ -123,7 +123,7 @@ ICED_RELEASE_E2E_TESTS := tools/roosttest/test_smoke.py tools/roosttest/test_ice
 # harness UI. The marker splits it — `e2e-session` selects
 # `-m session_daemon`, and the iced lanes deselect the daemon markers
 # (DAEMON_E2E_DESELECT).
-SESSION_E2E_TESTS := tools/roosttest/test_session.py tools/roosttest/test_session_attach.py tools/roosttest/test_session_effects.py tools/roosttest/test_ssh_transport.py tools/roosttest/test_password_input.py
+SESSION_E2E_TESTS := tools/roosttest/test_session.py tools/roosttest/test_session_attach.py tools/roosttest/test_session_effects.py tools/roosttest/test_ssh_transport.py tools/roosttest/test_password_input.py tools/roosttest/test_program_status.py
 # The HS-2 host-client lane (plan 037 C9). It drives BOTH a `roost-session`
 # daemon and the harness UI, so it is neither a member of SESSION_E2E_TESTS
 # (which runs headless and would stand the UI down) nor of ICED_E2E_TESTS

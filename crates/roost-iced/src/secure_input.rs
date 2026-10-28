@@ -339,6 +339,7 @@ mod tests {
             ownership: None,
             password_input,
             dropped_reports: None,
+            program_status: None,
         }
     }
 

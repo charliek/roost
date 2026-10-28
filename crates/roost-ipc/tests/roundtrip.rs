@@ -140,6 +140,7 @@ fn event_envelope_round_trip() {
                 ownership: None,
                 password_input: false,
                 dropped_reports: None,
+                program_status: None,
             },
         })
         .unwrap(),
@@ -686,4 +687,119 @@ fn both_window_metrics_vectors_decode_as_the_current_typed_result() {
         focus["result"],
         "typed re-encode must match the vector"
     );
+}
+
+/// Plan 082 D5.10's vectors: `program_status` on a listed tab and on
+/// `agent_report.changed` decodes into its typed shape, re-encodes byte
+/// for byte, and drives `Tab::effective_lifecycle`; an event without it
+/// decodes as a tab with no records.
+#[test]
+fn the_program_status_vectors_decode_into_their_typed_shapes() {
+    use roost_ipc::agent::DropReason;
+    use roost_ipc::program_status::{DecidedBy, ProgramStatusKind, ProgramStatusState};
+
+    let response = vector("tab.list.program_status.response.json");
+    let result: TabListResult = serde_json::from_value(response["result"].clone()).unwrap();
+    let tab = &result.projects[0].tabs[0];
+    let status = tab.program_status.as_ref().expect("program_status decodes");
+    assert_eq!(status.effective_lifecycle, AgentLifecycle::Waiting);
+    assert_eq!(status.decided_by, DecidedBy::Records);
+    assert_eq!(status.children, 1);
+    let record = status.record.as_ref().expect("the deciding record");
+    assert_eq!(
+        (
+            record.state,
+            record.kind,
+            record.id.as_str(),
+            record.progress
+        ),
+        (
+            ProgramStatusState::Blocked,
+            Some(ProgramStatusKind::Permission),
+            "build/test",
+            Some(40)
+        )
+    );
+    // The hook layer says Working; the tab presents what the records say.
+    assert_eq!(tab.agent_lifecycle, AgentLifecycle::Working);
+    assert_eq!(tab.effective_lifecycle(), AgentLifecycle::Waiting);
+    assert_eq!(tab.state, TabState::NeedsInput);
+    assert_eq!(serde_json::to_value(&result).unwrap(), response["result"]);
+
+    for (name, reason, count) in [
+        (
+            "tab.list.dropped_reports.program_status.response.json",
+            DropReason::ProgramStatus,
+            1,
+        ),
+        (
+            "tab.list.dropped_reports.foreign_app.response.json",
+            DropReason::ForeignApp,
+            2,
+        ),
+    ] {
+        let response = vector(name);
+        let result: TabListResult = serde_json::from_value(response["result"].clone()).unwrap();
+        let dropped = result.projects[0].tabs[0]
+            .dropped_reports
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name}: dropped_reports decodes"));
+        assert_eq!(
+            (dropped.last.reason, dropped.count),
+            (reason, count),
+            "{name}"
+        );
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            response["result"],
+            "{name}"
+        );
+    }
+
+    let event = vector("agent_report.changed.program_status.event.json");
+    let data: AgentReportChangedEvent = serde_json::from_value(event["data"].clone()).unwrap();
+    assert_eq!(data.program_status.as_ref(), Some(status));
+    assert_eq!(data.state, TabState::NeedsInput);
+    assert_eq!(serde_json::to_value(&data).unwrap(), event["data"]);
+
+    let cleared = vector("agent_report.changed.program_status_cleared.event.json");
+    let data: AgentReportChangedEvent = serde_json::from_value(cleared["data"].clone()).unwrap();
+    assert_eq!(data.program_status, None);
+    assert_eq!(data.state, TabState::Running);
+    assert_eq!(serde_json::to_value(&data).unwrap(), cleared["data"]);
+}
+
+/// `program_status` is an open shape with open enum values: a value this
+/// build can't read (a newer 7501 state, kind or `decided_by`) reads the
+/// whole summary as absent, on a tab and on the event, and never costs the
+/// client the tab or the event.
+#[test]
+fn an_unreadable_program_status_reads_as_absent() {
+    let mut response = vector("tab.list.program_status.response.json");
+    let mut event = vector("agent_report.changed.program_status.event.json");
+    for (pointer, junk) in [
+        ("/program_status/record/state", "paused"),
+        ("/program_status/record/kind", "payment"),
+        ("/program_status/decided_by", "the_moon"),
+        ("/program_status/effective_lifecycle", "asleep"),
+    ] {
+        let tab = &mut response["result"]["projects"][0]["tabs"][0];
+        let mut tab = tab.clone();
+        *tab.pointer_mut(pointer).unwrap() = serde_json::json!(junk);
+        let decoded: Tab = serde_json::from_value(tab).expect("the tab still decodes");
+        assert_eq!(decoded.program_status, None, "{pointer}");
+        assert_eq!(decoded.title, "claude");
+
+        let mut data = event["data"].clone();
+        *data.pointer_mut(pointer).unwrap() = serde_json::json!(junk);
+        let decoded: AgentReportChangedEvent =
+            serde_json::from_value(data).expect("the event still decodes");
+        assert_eq!(decoded.program_status, None, "{pointer}");
+    }
+    // Untouched, both still carry it.
+    let tab: Tab =
+        serde_json::from_value(response["result"]["projects"][0]["tabs"][0].take()).unwrap();
+    assert!(tab.program_status.is_some());
+    let data: AgentReportChangedEvent = serde_json::from_value(event["data"].take()).unwrap();
+    assert!(data.program_status.is_some());
 }

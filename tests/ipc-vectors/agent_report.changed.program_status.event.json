@@ -1,0 +1,32 @@
+{
+  "event": "agent_report.changed",
+  "data": {
+    "tab_id": "5",
+    "shell_state": "foreground_process",
+    "agent_lifecycle": "working",
+    "ownership": {
+      "source": "claude",
+      "session_id": "abc123",
+      "last_event_at": 1793158440,
+      "detail": "",
+      "metadata": {}
+    },
+    "state": "needs_input",
+    "hook_active": true,
+    "program_status": {
+      "effective_lifecycle": "waiting",
+      "decided_by": "records",
+      "children": 1,
+      "record": {
+        "state": "blocked",
+        "kind": "permission",
+        "msg": "approve Bash: cargo test",
+        "app": "claude-code",
+        "title": "Tests",
+        "progress": 40,
+        "id": "build/test",
+        "updated_at": 1793158450
+      }
+    }
+  }
+}

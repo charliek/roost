@@ -14,8 +14,10 @@ use roost_ipc::agent::{
 };
 use roost_ipc::format_chars::is_format;
 use roost_ipc::messages::TabState;
+pub use roost_ipc::program_status::DecidedBy;
 use roost_ipc::program_status::{
-    ProgramStatusKind, ProgramStatusReport, ProgramStatusState, PromptMark, StatusEvent,
+    ProgramStatusKind, ProgramStatusRecordView, ProgramStatusReport, ProgramStatusState,
+    ProgramStatusSummary, PromptMark, StatusEvent,
 };
 
 /// Child records a tab keeps beside its root. The root is always accepted.
@@ -66,16 +68,6 @@ pub struct ProgramStatusRecords {
     cap_warned: bool,
 }
 
-/// Who decided a tab's composed lifecycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecidedBy {
-    Records,
-    /// A root `done`/`error` a prompt mark ended the authority of, still
-    /// displayed because no hook drives the tab.
-    KeptRecord,
-    Hooks,
-}
-
 /// The deciding record, with the app it inherits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordView<'a> {
@@ -98,12 +90,7 @@ pub struct Composed<'a> {
 impl Composed<'_> {
     /// The legacy `Tab.state`, mapped as [`agent::effective`] maps it.
     pub fn tab_state(&self) -> TabState {
-        match self.lifecycle {
-            AgentLifecycle::Inactive => TabState::None,
-            AgentLifecycle::Working => TabState::Running,
-            AgentLifecycle::Waiting | AgentLifecycle::Failed => TabState::NeedsInput,
-            AgentLifecycle::Finished => TabState::Idle,
-        }
+        roost_ipc::program_status::tab_state(self.lifecycle)
     }
 }
 
@@ -379,6 +366,33 @@ pub fn compose<'a>(agent: &AgentTabState, records: &'a ProgramStatusRecords) -> 
         decided_by: DecidedBy::Hooks,
         record: None,
     }
+}
+
+/// `program_status` as the wire carries it: [`compose`]'s result with the
+/// deciding record's text, or `None` for a tab with no records.
+pub fn summary(
+    agent: &AgentTabState,
+    records: &ProgramStatusRecords,
+) -> Option<ProgramStatusSummary> {
+    if records.is_empty() {
+        return None;
+    }
+    let composed = compose(agent, records);
+    Some(ProgramStatusSummary {
+        effective_lifecycle: composed.lifecycle,
+        decided_by: composed.decided_by,
+        children: u32::try_from(records.children()).unwrap_or(u32::MAX),
+        record: composed.record.map(|view| ProgramStatusRecordView {
+            state: view.record.state,
+            kind: view.record.kind,
+            msg: view.record.msg.clone(),
+            app: view.app.to_owned(),
+            title: view.record.title.clone(),
+            progress: view.record.progress,
+            id: view.id.to_owned(),
+            updated_at: view.record.updated_at,
+        }),
+    })
 }
 
 /// [`agent::apply_report`] with program status in front of it (rule 5).

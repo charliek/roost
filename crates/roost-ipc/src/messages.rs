@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 
 use crate::agent::{AgentLifecycle, AgentTabState, DroppedReports, Ownership, ShellState};
 use crate::local_route::LocalBackendMode;
+use crate::program_status::ProgramStatusSummary;
 
 // ============================================================================
 // Shared types
@@ -43,9 +44,12 @@ pub enum TabState {
 
 /// Tab snapshot. Used in `tab.open` / `tab.list` / `tab.opened` event.
 ///
-/// `state` and `hook_active` are **derived** from the three agent axes
-/// below (`crate::agent::effective` / `crate::agent::is_live`), not
-/// stored alongside them. They stay on the wire because every shipped
+/// `state` and `hook_active` are **derived**, not stored alongside what
+/// they derive from. `hook_active` is the hook layer's
+/// (`crate::agent::is_live`); `state` is the composed lifecycle's legacy
+/// projection: [`Self::program_status`]'s `effective_lifecycle` when the
+/// tab has program-status records, else `crate::agent::effective` of the
+/// three agent axes below. They stay on the wire because every shipped
 /// client reads them; `state` stays a closed four-value enum for the
 /// reason spelled out on [`crate::agent::effective`].
 ///
@@ -86,10 +90,12 @@ pub struct Tab {
     #[serde(default, skip_serializing_if = "is_false")]
     pub password_input: bool,
     /// Agent reports this tab's server dropped (`tab.agent_report`
-    /// answered `accepted: false`): how many, and the latest. Live
-    /// diagnostic state on the server that holds the tab, never persisted
-    /// and carried by no event, so read it from that server. Omitted until
-    /// a report is dropped.
+    /// answered `accepted: false`), plus a count of program-status vetoes,
+    /// which were accepted: how many, and the latest drop. A veto is
+    /// counted once per `(source, session_id)` stream and never becomes
+    /// `last`. Live diagnostic state on the server that holds the tab,
+    /// never persisted and carried by no event, so read it from that
+    /// server. Omitted until a report is dropped or vetoed.
     ///
     /// Decoded leniently: a record this build can't read (a newer
     /// server's new `reason`, say) reads as absent rather than failing
@@ -101,19 +107,36 @@ pub struct Tab {
         deserialize_with = "lenient_dropped_reports"
     )]
     pub dropped_reports: Option<DroppedReports>,
+    /// The tab's program status (OSC 7501) composed with its hook layer;
+    /// see [`ProgramStatusSummary`]. Present while the tab has any record.
+    /// Decoded leniently, like `dropped_reports`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_program_status"
+    )]
+    pub program_status: Option<ProgramStatusSummary>,
 }
 
 impl Tab {
     /// The three agent axes as the one record `crate::agent` operates
-    /// on. Consumers that need to re-derive (the sidebar rollup, a
-    /// reconnecting UI rebuilding its per-tab cache) go through this
-    /// rather than reading `state` / `hook_active` back off the wire.
+    /// on: the hook layer, without program status. Consumers that need
+    /// what the tab shows read [`Self::effective_lifecycle`] instead.
     pub fn agent_state(&self) -> AgentTabState {
         AgentTabState {
             shell: self.shell_state,
             lifecycle: self.agent_lifecycle,
             ownership: self.ownership.clone(),
         }
+    }
+
+    /// The lifecycle the tab presents: program status's composed one when
+    /// the tab has records, else the hook layer's.
+    pub fn effective_lifecycle(&self) -> AgentLifecycle {
+        crate::program_status::effective_lifecycle(
+            &self.agent_state(),
+            self.program_status.as_ref(),
+        )
     }
 }
 
@@ -2386,10 +2409,18 @@ pub struct AgentReportChangedEvent {
     pub agent_lifecycle: AgentLifecycle,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ownership: Option<Ownership>,
-    /// The projection this record produces on `Tab.state`, so a
-    /// subscriber never re-derives it.
+    /// `Tab.state` after this change (the composed lifecycle's
+    /// projection), so a subscriber never re-derives it.
     pub state: TabState,
     pub hook_active: bool,
+    /// `Tab.program_status` after this change. Absent means the tab has no
+    /// records any more, so a mirror assigns it unconditionally.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_program_status"
+    )]
+    pub program_status: Option<ProgramStatusSummary>,
 }
 
 // ============================================================================
@@ -2420,6 +2451,21 @@ pub struct AgentReportChangedEvent {
 /// client widens the host's own `agent-hooks` key with its own
 /// allow-list and can only ever add to it (plan 064 §3.3).
 ///
+/// # The contract at `7`
+///
+/// Everything above, plus program status (OSC 7501). A session tab's
+/// terminal answers the program-status probe and keeps the tab's records;
+/// `Tab.program_status` and `agent_report.changed`'s `program_status`
+/// carry what they compose to, and `Tab.state` /
+/// `AgentReportChangedEvent.state` are that composed lifecycle's
+/// projection rather than the hook layer's alone. `agent_lifecycle`,
+/// `shell_state` and `ownership` stay the hook layer's.
+/// `DroppedReport.reason` gains `program_status` and `foreign_app`, which
+/// a closed enum makes a break. An `agent_report.changed` without
+/// `program_status` means the tab has no records: a mirror clears its
+/// copy. A Swift UI target keeps no records, so its `Tab.state` is never
+/// composed.
+///
 /// # The versioning rule
 ///
 /// **A session-socket change bumps this when a pre-bump peer could not
@@ -2433,7 +2479,7 @@ pub struct AgentReportChangedEvent {
 /// [`SessionIdentify::session_protocol`] for **equality** and refuses
 /// anything else, so the integer is the whole negotiation. What each
 /// generation changed is `CHANGELOG.md`'s to tell.
-pub const SESSION_PROTOCOL_VERSION: u32 = 6;
+pub const SESSION_PROTOCOL_VERSION: u32 = 7;
 
 /// What a host session can encode a tab's attach payload as.
 ///
@@ -3089,6 +3135,16 @@ fn is_false(value: &bool) -> bool {
 }
 
 fn lenient_dropped_reports<'de, D>(deserializer: D) -> Result<Option<DroppedReports>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<Value>::deserialize(deserializer)?;
+    Ok(raw.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+/// An unknown state, kind or `decided_by` reads the whole summary as
+/// absent: the shape and its enums are open (ipc-compatibility.md).
+fn lenient_program_status<'de, D>(deserializer: D) -> Result<Option<ProgramStatusSummary>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -4732,6 +4788,7 @@ mod tests {
             ownership: None,
             password_input: false,
             dropped_reports: None,
+            program_status: None,
         };
         round_trip(&t);
         let json = serde_json::to_string(&t).unwrap();
@@ -4816,6 +4873,7 @@ mod tests {
             ownership: None,
             password_input: false,
             dropped_reports: None,
+            program_status: None,
         };
         let value = serde_json::to_value(&tab).unwrap();
         for key in ["shell_state", "agent_lifecycle"] {
@@ -4870,6 +4928,7 @@ mod tests {
             }),
             state: TabState::NeedsInput,
             hook_active: true,
+            program_status: None,
         };
         round_trip(&ev);
         let json = serde_json::to_string(&ev).unwrap();

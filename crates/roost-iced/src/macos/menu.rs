@@ -1235,6 +1235,7 @@ mod tests {
             ownership: None,
             password_input: false,
             dropped_reports: None,
+            program_status: None,
         }
     }
 

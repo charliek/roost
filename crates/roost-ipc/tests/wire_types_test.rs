@@ -95,14 +95,14 @@ where
     );
 }
 
-/// `6` reshapes `session.set_agent_hooks` into a pure raise: `mode` +
-/// `skip` are gone, replaced by a single `agents` allow-list, and the
-/// op can no longer spell `off` or a narrowing — breaking in both
-/// directions (plan 064 §3.3). The request/response wire version did
-/// not move with it — the two version different things.
+/// `7` puts program status (OSC 7501) on the session wire: `Tab.state`
+/// and `agent_report.changed`'s `state` become the composed lifecycle's
+/// projection, and `DroppedReport.reason`, a closed enum, gains
+/// `program_status` and `foreign_app` (plan 082 D7.1). The request/response
+/// wire version did not move with it — the two version different things.
 #[test]
-fn session_protocol_version_is_six() {
-    assert_eq!(SESSION_PROTOCOL_VERSION, 6);
+fn session_protocol_version_is_seven() {
+    assert_eq!(SESSION_PROTOCOL_VERSION, 7);
     assert_eq!(roost_ipc::PROTOCOL_VERSION, 1);
 }
 
@@ -239,7 +239,7 @@ fn unknown_attach_payload_kind_survives_a_round_trip() {
 #[test]
 fn session_identify_matches_its_golden_json() {
     const GOLDEN: &str = concat!(
-        r#"{"app_version":"0.0.18","session_protocol":6,"#,
+        r#"{"app_version":"0.0.18","session_protocol":7,"#,
         r#""payload_kinds":["ghostty-snapshot","vt"],"#,
         r#""libghostty_build":"ghostty-3f6b1c9a4d2e5f80+snapshot.v1","#,
         r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","#,
@@ -260,7 +260,7 @@ fn session_identify_matches_its_golden_json() {
 #[test]
 fn session_binary_identity_matches_its_golden_json() {
     const GOLDEN: &str = concat!(
-        r#"{"app_version":"0.0.19","session_protocol":6,"#,
+        r#"{"app_version":"0.0.19","session_protocol":7,"#,
         r#""libghostty_build":"ghostty-abcdef0123456789+snapshot.v1"}"#,
     );
 
@@ -311,7 +311,7 @@ fn build_facts_ride_both_identities_and_are_omitted_when_unset() {
     assert_eq!(serde_json::to_string(&binary).unwrap(), BINARY);
 
     const RUNNING: &str = concat!(
-        r#"{"app_version":"0.0.18","session_protocol":6,"#,
+        r#"{"app_version":"0.0.18","session_protocol":7,"#,
         r#""payload_kinds":["ghostty-snapshot","vt"],"#,
         r#""libghostty_build":"ghostty-3f6b1c9a4d2e5f80+snapshot.v1","#,
         r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","#,
@@ -573,13 +573,13 @@ const EPOCH: u64 = 6_032_428_321_756_423_947;
 #[test]
 fn an_attach_handshake_matches_its_golden_json() {
     const SNAPSHOT: &str = concat!(
-        r#"{"attach":"7","protocol_version":6,"#,
+        r#"{"attach":"7","protocol_version":7,"#,
         r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","kinds":["ghostty-snapshot","vt"],"#,
         r#""cols":100,"rows":30,"cell_w_px":8,"cell_h_px":16,"#,
         r#""libghostty_build":"ghostty-1a2b3c4d5e6f7a8b+snapshot.v1","focus":true}"#,
     );
     const RESUME: &str = concat!(
-        r#"{"attach":"7","protocol_version":6,"#,
+        r#"{"attach":"7","protocol_version":7,"#,
         r#""session_id":"01K3S8TQ4F0Q9YB2K6WZ5D7XN","kinds":["ghostty-snapshot","vt"],"#,
         r#""cols":100,"rows":30,"cell_w_px":8,"cell_h_px":16,"#,
         r#""libghostty_build":"ghostty-1a2b3c4d5e6f7a8b+snapshot.v1","focus":true,"#,
@@ -639,7 +639,7 @@ fn a_handshake_missing_a_required_term_names_it() {
     ] {
         let mut line = serde_json::json!({
             "attach": "7",
-            "protocol_version": 6,
+            "protocol_version": 7,
             "session_id": "s",
             "kinds": ["vt"],
             "cols": 80,

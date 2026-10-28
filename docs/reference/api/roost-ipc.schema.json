@@ -140,6 +140,16 @@
             }
           ]
         },
+        "program_status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProgramStatusSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "shell_state": {
           "$ref": "#/$defs/ShellState",
           "default": "unknown"
@@ -1399,6 +1409,21 @@
       ],
       "type": "object"
     },
+    "DecidedBy": {
+      "oneOf": [
+        {
+          "enum": [
+            "records",
+            "hooks"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "kept_record",
+          "type": "string"
+        }
+      ]
+    },
     "DropReason": {
       "oneOf": [
         {
@@ -2431,6 +2456,110 @@
       },
       "required": [
         "open"
+      ],
+      "type": "object"
+    },
+    "ProgramStatusKind": {
+      "enum": [
+        "permission",
+        "question",
+        "auth"
+      ],
+      "type": "string"
+    },
+    "ProgramStatusRecordView": {
+      "properties": {
+        "app": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProgramStatusKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "msg": {
+          "type": "string"
+        },
+        "progress": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/ProgramStatusState"
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "state",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "ProgramStatusState": {
+      "oneOf": [
+        {
+          "enum": [
+            "idle",
+            "working",
+            "done",
+            "blocked",
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "clear",
+          "type": "string"
+        }
+      ]
+    },
+    "ProgramStatusSummary": {
+      "properties": {
+        "children": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "decided_by": {
+          "$ref": "#/$defs/DecidedBy"
+        },
+        "effective_lifecycle": {
+          "$ref": "#/$defs/AgentLifecycle"
+        },
+        "record": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProgramStatusRecordView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "effective_lifecycle",
+        "decided_by",
+        "children"
       ],
       "type": "object"
     },
@@ -3564,6 +3693,16 @@
         "position": {
           "format": "int32",
           "type": "integer"
+        },
+        "program_status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProgramStatusSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "project_id": {
           "type": "string"
@@ -5399,5 +5538,5 @@
   },
   "protocol_version": 1,
   "schema_version": 1,
-  "session_protocol_version": 6
+  "session_protocol_version": 7
 }

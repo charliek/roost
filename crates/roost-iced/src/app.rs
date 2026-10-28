@@ -30,7 +30,6 @@ use roost_engine::{
     Hydration, LocalClient, OnRestoreError, PtySupervisor, Workspace, WorkspaceError,
     WorkspaceEvent,
 };
-use roost_ipc::agent;
 use roost_ipc::messages::{
     AgentHooksOutcome, AgentHooksSkipped, AgentSetHooksAgents, AgentSetHooksResult,
     AppLastActivationResult, AppMenuDumpResult, AppNotificationStatusResult, AppRenderStatsResult,
@@ -6294,7 +6293,7 @@ impl App {
             project
                 .tabs
                 .iter()
-                .map(|tab| agent::effective_lifecycle(&tab.agent_state())),
+                .map(roost_ipc::messages::Tab::effective_lifecycle),
         );
         let rollup_color = agent_color(&self.chrome, rollup);
         let notifying = project.tabs.iter().any(|tab| tab.has_notification);
@@ -6826,7 +6825,7 @@ impl App {
                 .rename_editor
                 .as_ref()
                 .filter(|editor| editor.target == RenameTarget::Tab(tab_key));
-            let lifecycle = agent::effective_lifecycle(&tab.agent_state());
+            let lifecycle = tab.effective_lifecycle();
             let status_color = tab_status_color(&self.chrome, lifecycle);
             let dot = container(
                 iced::widget::Space::new()
@@ -13096,6 +13095,7 @@ mod tests {
             ownership: None,
             password_input: false,
             dropped_reports: None,
+            program_status: None,
         }];
         listed.answer(Ok(serde_json::to_value(TabListResult {
             projects: vec![project],
@@ -13183,6 +13183,7 @@ mod tests {
             ownership: None,
             password_input: false,
             dropped_reports: None,
+            program_status: None,
         };
         open.answer(Ok(serde_json::to_value(TabOpenResult { tab }).unwrap()));
 
@@ -13222,6 +13223,7 @@ mod tests {
             ownership: None,
             password_input: false,
             dropped_reports: None,
+            program_status: None,
         }
     }
 

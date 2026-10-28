@@ -75,6 +75,13 @@ impl ServerVtWorkspace for NoopWorkspace {
     fn apply_osc(&self, _tab_id: i64, _command: u32, _payload: &str) {}
     fn close_row(&self, _tab_id: i64) {}
     fn tab_effect(&self, _tab_id: i64, _effect: roost_engine::TabEffectKind) {}
+    fn apply_program_status(
+        &self,
+        _tab_id: i64,
+        _events: Vec<roost_ipc::program_status::StatusEvent>,
+        _now_ms: i64,
+    ) {
+    }
 }
 
 const SESSION_ID: &str = "01K3S8TQ4F0Q9YB2K6WZ5D7XN";
