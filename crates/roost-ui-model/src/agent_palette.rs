@@ -295,18 +295,23 @@ pub fn status_text(effective: AgentLifecycle, raw: AgentLifecycle, detail: &str)
 /// [`status_text`] for `tab` showing `effective`: while its records
 /// decide, the deciding record's `msg` is the why a Waiting, Working or
 /// Failed row names (plan 082 D8.2) — already sanitized at ingest, and
-/// capped here like a hook's `detail`.
+/// capped here like a hook's `detail`. A deciding record without a `msg`
+/// shows the plain word: the hook layer's `detail` belongs to the state
+/// the record overrode.
 pub fn tab_status_text(tab: &Tab, effective: AgentLifecycle, detail: &str) -> String {
+    let Some(record) = deciding_record(tab) else {
+        return status_text(effective, tab.agent_lifecycle, detail);
+    };
     let word = match effective {
         AgentLifecycle::Waiting => Some("Waiting"),
         AgentLifecycle::Working => Some("Working"),
         AgentLifecycle::Failed => Some("Failed"),
         AgentLifecycle::Finished | AgentLifecycle::Inactive => None,
     };
-    let msg = deciding_record(tab).map(|record| display_detail(&record.msg));
-    match (word, msg) {
-        (Some(word), Some(msg)) if !msg.is_empty() => format!("{word} · {msg}"),
-        _ => status_text(effective, tab.agent_lifecycle, detail),
+    let msg = display_detail(&record.msg);
+    match word {
+        Some(word) if !msg.is_empty() => format!("{word} · {msg}"),
+        _ => status_text(effective, effective, ""),
     }
 }
 
@@ -753,6 +758,32 @@ mod tests {
             Some(view(Error, "claude-code", "crashed", NOW)),
         );
         assert_eq!(tab_status_text(&kept, AgentLifecycle::Failed, ""), "Failed");
+    }
+
+    #[test]
+    fn a_deciding_record_without_a_msg_never_shows_the_hooks_detail() {
+        use roost_ipc::program_status::ProgramStatusState::{Error, Working};
+        let hooked = owned(tab(1, "t"), "claude", AgentLifecycle::Failed, NOW);
+        let failed = recorded(
+            hooked.clone(),
+            AgentLifecycle::Failed,
+            DecidedBy::Records,
+            Some(view(Error, "claude-code", "", NOW)),
+        );
+        assert_eq!(
+            tab_status_text(&failed, AgentLifecycle::Failed, "rate_limit"),
+            "Failed"
+        );
+        let working = recorded(
+            hooked,
+            AgentLifecycle::Working,
+            DecidedBy::Records,
+            Some(view(Working, "claude-code", "", NOW)),
+        );
+        assert_eq!(
+            tab_status_text(&working, AgentLifecycle::Working, "background_tasks:3"),
+            "Working"
+        );
     }
 
     #[test]
