@@ -1,7 +1,11 @@
 # Sessions everywhere: work that doesn't care where you sit
 
-**Status: discovery, 2026-10-23.** Working notes for a planning
-conversation. Nothing here is decided or scheduled. It came out of
+**Status: discovery, 2026-10-23. Partly decided on 2026-10-28.**
+[protocol-7-release.md](protocol-7-release.md) is now the source of
+truth for G1, G2 and the new G9, and supersedes the leanings below
+where they differ. The [decision summary](#decided-2026-10-28-protocol-7-release)
+lists what changed. Everything else here is still undecided. This note
+came out of
 running a real two-machine setup (a MacBook driving a Pop!_OS box) and
 finding where the shipped host-session design stops short of that
 workflow. Things checked against code or a live system are cited.
@@ -76,6 +80,44 @@ would fail the same way and back out with "nothing was changed"
 (`crates/roost-iced/src/app/local_backend.rs:2158-2170`, `:2765-2781`).
 That's safe, but it's a dead end. That is gap G1. Getting past it shows
 G2 next.
+
+## Decided 2026-10-28 (protocol-7 release)
+
+The details are in [protocol-7-release.md](protocol-7-release.md).
+
+- **G1:** none of the options below. **The Linux session socket moves
+  under the home directory:**
+  `<passwd home>/.local/state/roost-session/run/roost.sock`, with a
+  `ROOST_SESSION_SOCKET_DIR` override.
+  - It uses the passwd home directory, not `$HOME` or `$XDG_STATE_HOME`,
+    because those can also differ between logins.
+  - The Mac already follows the same "under the home directory" rule.
+  - Old paths are probed only to identify and stop an old session
+    during an upgrade.
+  - Why not `/run/user`: logout deletes it unless linger is on, and the
+    session should outlive logins without a service.
+  - A shipped user service isn't wanted.
+- **G2:** a fuller version of options 1–3. **Explicit size ownership:**
+  - deliberate interaction makes a client the owner: an explicit tab
+    switch, keys, paste, clicks and wheel (delivered first), a copy
+    (after it's captured), a settled scroll, a focused window resize,
+    or Take size;
+  - just showing a tab, automatic re-attaches, unfocused resizes,
+    focus reports and automatic replies don't;
+  - other clients' resizes are advisory;
+  - when the owner leaves, the most recent advisory grid takes over;
+  - background resizes are refused on owned tabs;
+  - a `tab.resized` event tells every client.
+
+  This replaces last-interactor (DL-25/26). Rex's owner model was the
+  input; typing transferring ownership is the difference.
+- **G9 (new, below):** a tab's environment reflects where it was
+  opened from.
+- **Open questions answered:** "Default size policy" is the ownership
+  rules above. "Phones" is [mobile-client.md](mobile-client.md), still
+  a native client, not a browser host.
+- **G3/G4 (auto-connect, user service, which binary)** are deferred.
+  No service is required for the intended use.
 
 ## Gaps
 
@@ -315,6 +357,34 @@ window which session it owns, five verbs stay on the session, and exit
 main path. It's worth re-reading this section with that end state in
 mind rather than patching it piece by piece.
 
+### G9. A tab's environment comes from whoever started the daemon (added 2026-10-27)
+
+**What happens.** A tab's process inherits the daemon's environment.
+`tab.open` has no environment field, and the PTY spawn only adds the
+`ROOST_*` variables. Nothing scrubs what the daemon inherited, so
+whoever started the daemon decides every tab's environment.
+
+**Seen on 2026-10-27.**
+- *This Pop!_OS box.* The live daemon was started over Tailscale SSH
+  from the Mac. It has `SSH_CLIENT` set and no `DISPLAY`,
+  `WAYLAND_DISPLAY` or `XDG_RUNTIME_DIR`. A tab couldn't open a GUI
+  window on the machine's own Wayland desktop: a headed browser failed
+  with "Missing X server or $DISPLAY".
+- *The mac-mini.* Both daemons were started over SSH, and every tab
+  carries `SSH_CLIENT`. An SSH-started process there runs in launchd's
+  `Background` context, yet the clipboard, `open` and the keychain all
+  worked. Only `SSH_AUTH_SOCK` was missing.
+
+**Why it matters.** Tools decide "am I remote?" from `SSH_CONNECTION`.
+- Claude Code uses it to choose its clipboard path and whether to open
+  a browser. Its copy also always emits OSC 52, so copying reaches the
+  viewer either way.
+- A forwarded agent socket dies when the SSH connection that started
+  the daemon closes.
+
+**Decided:** environment by opener, in
+[protocol-7-release.md](protocol-7-release.md) M4.
+
 ## Retiring in-process local tabs (later)
 
 Not proposed now. This section records what it would involve so it can
@@ -345,6 +415,10 @@ from issues and direct feedback. Decide up front what signal would
 count.
 
 ## A possible order
+
+*Steps 1 and 2 are now the protocol-7 release
+([protocol-7-release.md](protocol-7-release.md)). Step 3's shipped
+user service is dropped. Step 4 follows that release.*
 
 1. **Finding the session (G1)**: option A plus B or C, and the `doctor`
    check. Small, low risk, and it unblocks the field-report workflow
