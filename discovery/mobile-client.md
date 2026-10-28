@@ -1,7 +1,22 @@
 # Roost on mobile: a Flutter client for host sessions
 
-**Status: discovery, 2026-10-27.** A thought experiment that might
-become an MVP. Nothing here is planned or scheduled. Pursuing it would
+**Status: discovery, 2026-10-27. Direction decided on 2026-10-28.**
+The MVP will be built on a feature branch *after* the protocol-7
+release ([protocol-7-release.md](protocol-7-release.md)). That release
+lands the prerequisites on `main`, each of which is also a desktop
+improvement:
+- finding the session (G1);
+- tab size ownership (G2), which **supersedes the Fit/Mirror design in
+  [Sizing](#sizing-the-one-real-protocol-question)**;
+- tab environment by opener;
+- OSC 7501 program status;
+- Ghostty main with Zig 0.17;
+- the first `roost-client` extraction (B1).
+
+[Decisions from the 2026-10-27/28 review](#decisions-from-the-2026-1027-28-review)
+lists what changed. A mockup canvas is at
+https://claude.ai/artifact/BncmJWCp6miDoBij1gHaPS (private). Pursuing
+this would
 amend roadmap decision
 [D1](host-sessions-roadmap.md#d1--client-and-products), which puts any
 web or mobile client out of scope. That amendment, and any
@@ -34,6 +49,22 @@ control-plane session ops and the data-plane attach protocol that
 | Platforms | Android first. Keep iOS possible: nothing Android-only in the shared layers. |
 | Form factors | Tablets, foldables and phones are all in scope. Lay out for the large screen first. |
 | SSH transport | In-process SSH in Rust (russh) behind a `Dialer` seam, so the transport can change later ([why](#ssh-transport)). |
+
+### Decisions from the 2026-10-27/28 review
+
+These amend the table above and the sections below.
+
+| Question | Decision |
+|---|---|
+| Build approach | The real MVP order, not a throwaway proof of concept. The prerequisites land on `main` first as the protocol-7 release. Then the MVP is built on a feature branch. |
+| Size mode | **No mode switch.** Protocol-7 ownership applies: a phone that switches to a tab, types, taps, scrolls or copies takes the size. When it goes to the background it sends `release`, and the size goes back to the desk. Switching to a tab on the phone resizes it immediately, even just to read; Charlie chose that on 2026-10-28. This supersedes the Fit/Mirror modes and the `tab.write`-for-everything workaround in [Sizing](#sizing-the-one-real-protocol-question). The compose box and quick replies still use `tab.write`, which never takes ownership. Typing on the soft keyboard goes over the data plane and does. |
+| Background notifications | The MVP is **foreground only**, but build the seams: a process-scoped `RoostApp` and runtime that a later foreground service can keep alive, and a `Notifier` trait whose MVP implementation is in-app only. |
+| Test devices | Samsung Galaxy S25 (compact) and Galaxy Tab S6 Lite (about 800 dp in portrait, about 1333 dp in landscape; roughly medium and expanded). Develop on the Flutter Linux desktop target resized across the breakpoints, plus emulators with matching custom hardware profiles. The foldable tabletop layout drops to nice-to-have. |
+| Soft keyboard | **Samsung Keyboard** is the default on both devices, so the keyboard spike tests it before Gboard. The Tab S6 Lite is the low-end floor for painter performance. |
+| Quick replies | Keys, not words: 1/2/3, Enter, Esc, arrows. A "Yes" chip would type the word into a numbered menu. |
+| Inbox text after a reconnect | OSC 7501 `blocked` records carry `kind` and `msg`, and protocol 7 exposes them on the agent record. That gives a durable "why" after a reconnect, which the live-only `notification.fired` can't. |
+| Toolchain | Ghostty main needs Zig 0.17. The spike built Android with 0.16. M1 of the protocol-7 release re-checks the `aarch64-linux-android` build with 0.17. |
+| Prior art | Superlogical's Rex ships a native iOS app with iPad and Duo layouts. Its mobile client originally relied on client-local reflow ("Authoritative server has no idea"). Rex later adopted the owner model this release adapts. See `../superlogical/research/notes/2026-10-27-rex-update.md`. |
 
 **Out of scope for the MVP:**
 
@@ -333,6 +364,13 @@ stays out of scope.
 
 ## Sizing: the one real protocol question
 
+> **Superseded on 2026-10-28.** Protocol 7's size-ownership rules
+> ([protocol-7-release.md](protocol-7-release.md) M3) answer this
+> section. User-initiated input takes ownership, foreign resizes are
+> announced with `tab.resized`, and the owner leaving hands the size
+> back. The facts below describe protocol 6 and are kept as the
+> reasoning that led there.
+
 Facts, from the code and confirmed by spike step 8:
 
 | Action | Resizes the PTY? |
@@ -563,6 +601,15 @@ for the MVP.
 
 ## A possible MVP order
 
+*Amended on 2026-10-28.* The protocol-7 release runs first, on `main`.
+It covers step 2's first part (B1, its M5), the server-side work in
+step 7 (the `tab.resized` event, now with ownership), and the G1 fix
+from the open questions. So the feature branch starts at step 1's
+mobile-only plumbing (build targets, `peer.rs`, the stream-generic
+`IpcClient`, the Android CI job), then continues with the rest of step
+2, the `Dialer` and the minimal connection task. "Fit and Mirror
+modes" in step 4 no longer exist.
+
 1. **Plumbing.**
    - Target-aware `build.sh` and `build.rs`.
    - Fix the `peer.rs` Android warnings.
@@ -642,15 +689,18 @@ user chose Fit.
 - **Host list sync.** Should the app import hosts from a desktop's
   `state.json` (`HostSnapshot`, `crates/roost-engine/src/persistence.rs:175-187`),
   or stay independent?
-- **Default size mode per form factor.** Is Fit on expanded and Mirror
-  on compact right? Should a user be able to pin it per host?
-- **G1 exposure.** If a host runs Tailscale SSH and its session was
+- **Default size mode per form factor.** *Resolved:* there are no modes;
+  the protocol-7 ownership rules apply. Rex's local-only reflow on the
+  phone is a possible later experiment.
+- **G1 exposure.** *Resolved:* protocol-7 M2 moves the Linux session
+  socket under HOME. If a host runs Tailscale SSH and its session was
   started from the desktop, the phone's `client-bridge` looks for the
   session in the wrong place (sessions-everywhere G1). Fix it in the
   session (option A or D) before the app ships, or document it?
-- **Where keys live.** Key generation in Rust (russh, as the spike did)
-  or in Dart (shed-mobile's pinenacl path)? Rust keeps SSH in one
-  language. Dart reuses existing code.
+- **Where keys live.** *Leaning (2026-10-27):* generate keys in Rust
+  (russh, as the spike did), so SSH stays in one language. The
+  alternative was Dart (shed-mobile's pinenacl path), which reuses
+  existing code.
 - **iOS.** Background networking is far stricter there. Is "reconnect on
   foreground" enough for iOS v1? Ghostty already builds an iOS
   xcframework (`src/build/GhosttyLibVt.zig:148-215`).
