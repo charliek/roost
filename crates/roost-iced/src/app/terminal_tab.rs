@@ -492,6 +492,9 @@ pub(super) struct TerminalTab {
     /// place UI code reaches the terminal's backend.
     pub(super) session: TabHandle,
     reply_buffer: Arc<Mutex<Vec<u8>>>,
+    /// OSC 7501 reports and OSC 133 marks, in byte order — installed only
+    /// where this terminal is the tab's authoritative one (plan 082 D4.2).
+    status_sink: Option<Arc<Mutex<Vec<roost_vt::TerminalEvent>>>>,
     pub(super) pointer_shape: String,
     pub(super) theme: Theme,
     /// The live platform-IME composition, mirrored into every snapshot
@@ -568,6 +571,19 @@ impl TerminalTab {
         terminal
             .set_write_pty_buffer(Arc::clone(&reply_buffer))
             .context("install libghostty PTY reply buffer")?;
+        // Only a terminal whose replies reach the PTY answers the program:
+        // a host tab's server terminal answers the probe and keeps the
+        // records, so a sink here would make a second authority.
+        let status_sink = match session.reply_policy() {
+            ReplyPolicy::DrainToPty => {
+                let sink = Arc::new(Mutex::new(Vec::new()));
+                terminal
+                    .set_status_sink(Arc::clone(&sink))
+                    .context("install libghostty program-status sink")?;
+                Some(sink)
+            }
+            ReplyPolicy::Discard => None,
+        };
         let snapshot = TerminalSnapshot::blank_themed(cols, rows, &theme);
         Ok(Self {
             terminal,
@@ -592,6 +608,7 @@ impl TerminalTab {
             input_started_at: Instant::now(),
             session,
             reply_buffer,
+            status_sink,
             pointer_shape: "default".into(),
             theme,
             preedit: None,
@@ -726,10 +743,13 @@ impl TerminalTab {
 
     /// Apply a chunk of terminal output that has ALREADY been scanned
     /// — everything arriving from the PTY, which the session's drain
-    /// scanned as it read it.
-    pub(super) fn write_vt(&mut self, bytes: &[u8]) {
+    /// scanned as it read it. Returns the chunk's program-status events,
+    /// for the caller to apply before the chunk's OSC actions (plan 082
+    /// D4.3); always empty for a tab without a status sink.
+    pub(super) fn write_vt(&mut self, bytes: &[u8]) -> Vec<StatusEvent> {
         self.terminal.vt_write(bytes);
         self.drain_terminal_replies();
+        self.take_status()
     }
 
     /// Apply a chunk that has NOT been scanned yet: `tab.feed_pty_bytes`
@@ -742,10 +762,27 @@ impl TerminalTab {
     /// tests still exercise the production pipeline rather than a
     /// UI-side replica of it. The returned actions are the non-reply
     /// ones, exactly as `TabOutput::Scanned` carries them.
-    pub(super) fn scan_and_write_vt(&mut self, bytes: &[u8]) -> Vec<OscAction> {
+    pub(super) fn scan_and_write_vt(&mut self, bytes: &[u8]) -> (Vec<StatusEvent>, Vec<OscAction>) {
         let actions = self.session.scan_osc(bytes);
-        self.write_vt(bytes);
-        actions
+        let status = self.write_vt(bytes);
+        (status, actions)
+    }
+
+    /// Drain the status sink. Never held across a `vt_write`, which takes
+    /// the same lock from inside.
+    fn take_status(&self) -> Vec<StatusEvent> {
+        let Some(sink) = &self.status_sink else {
+            return Vec::new();
+        };
+        let events = std::mem::take(
+            &mut *sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if events.is_empty() {
+            return Vec::new();
+        }
+        roost_engine::program_status::from_vt(events)
     }
 
     fn drain_terminal_replies(&self) {
@@ -1670,6 +1707,48 @@ impl TerminalTab {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roost_ipc::program_status::{ProgramStatusState, PromptMark};
+
+    const WORKING: &[u8] = b"\x1b]7501;state=working:app=pi\x1b\\";
+
+    /// Plan 082 D4.2/D4.3: an in-process tab's terminal is the tab's
+    /// authoritative one, so its status sink hands each chunk's reports and
+    /// prompt marks back from `write_vt`, in byte order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_in_process_tab_hands_back_its_chunks_program_status() {
+        let (feed_tx, _feed_rx) = engine_feed::channel();
+        let (mut tab, supervisor) = attach_test_terminal(41, feed_tx);
+
+        let mut chunk = WORKING.to_vec();
+        chunk.extend_from_slice(b"\x1b]133;D;0\x07");
+        let events = tab.write_vt(&chunk);
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    StatusEvent::Report(report),
+                    StatusEvent::Prompt(PromptMark::CommandEnd),
+                ] if report.state == ProgramStatusState::Working && report.app == "pi"
+            ),
+            "{events:?}"
+        );
+        assert!(tab.write_vt(b"plain").is_empty(), "the sink was drained");
+        supervisor.close(41);
+    }
+
+    /// A host tab's server terminal is the authoritative one; the client's
+    /// stand-in and the hydrated terminal that replaces it keep no records.
+    #[test]
+    fn a_host_tab_keeps_no_program_status() {
+        let (input_tx, _input_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (mut tab, _capture) = attach_test_host_terminal(80, 24, input_tx);
+        assert!(tab.write_vt(WORKING).is_empty());
+
+        let hydrated = tab.hydration_terminal(80, 24).expect("hydration terminal");
+        tab.swap_terminal(hydrated, 80, 24).expect("swap");
+        assert!(tab.write_vt(WORKING).is_empty());
+    }
 
     /// D9 (#545): a session tab's first frame — before the host's
     /// hydration replaces it — must read as the active theme, not the

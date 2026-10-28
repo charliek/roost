@@ -1,14 +1,15 @@
 //! Toolkit-neutral agent palette frame builder for the `agents` frame
 //! (plan 005 §3.2–§3.6).
 //!
-//! One row per tab an agent owns: status dot + project + name + status
-//! text + elapsed time (+ git metrics, filled asynchronously). Every
+//! One row per tab an agent owns, or whose program-status record names
+//! an app: status dot + project + name + status text + elapsed time (+
+//! git metrics, filled asynchronously). Every
 //! rendered value is derived here from the core workspace snapshot, so
 //! each UI adapter's overlay stays a dumb renderer and the whole mapping —
 //! population filter, status vocabulary, name fallback, time buckets,
 //! ordering — is unit-testable without a UI toolkit.
 //!
-//! The lifecycle input is [`agent::effective_lifecycle`], the same value
+//! The lifecycle input is [`Tab::effective_lifecycle`], the same value
 //! the tab pill, the TabPage icon, and the sidebar rollup render, so the
 //! palette can never disagree with them. Ordering reuses
 //! [`agent::rank`], the shipped definition of "most urgent".
@@ -21,6 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use roost_ipc::agent::{self, AgentLifecycle, Ownership, SOURCE_LEGACY, SOURCE_MANUAL};
 use roost_ipc::messages::{Project, Tab};
+use roost_ipc::program_status::{app_label, DecidedBy, ProgramStatusRecordView};
 
 use crate::agent_panel::{self, PanelAgentRow};
 use crate::keys::{HostId, ProjectKey, TabKey};
@@ -137,7 +139,7 @@ pub fn agent_tab_cwds_across(sources: &[AgentSource<'_>]) -> HashMap<TabKey, Str
     for source in sources {
         for project in source.projects {
             for tab in &project.tabs {
-                if agent_owner(&tab.agent_state()).is_some() {
+                if row_agent(tab).is_some() {
                     cwds.insert(TabKey::new(source.host, tab.id), tab.cwd.clone());
                 }
             }
@@ -201,13 +203,50 @@ impl From<&PanelAgentRow> for SidebarAgentRow {
 
 /// The ownership record of a tab that belongs in the palette: live
 /// ownership from a source that isn't one of Roost's own internal
-/// (non-agent) claims. `None` means "no row for this tab".
-pub(crate) fn agent_owner(axes: &agent::AgentTabState) -> Option<&Ownership> {
+/// (non-agent) claims.
+fn agent_owner(axes: &agent::AgentTabState) -> Option<&Ownership> {
     if !agent::is_live(axes) {
         return None;
     }
     let owner = axes.ownership.as_ref()?;
     (!NON_AGENT_SOURCES.contains(&owner.source.as_str())).then_some(owner)
+}
+
+/// What a tab's agent row says about who runs it, and when it last spoke.
+pub(crate) struct RowAgent {
+    /// The agent's display name.
+    pub(crate) agent: String,
+    pub(crate) name: String,
+    /// The hook layer's open `detail`; empty for a status-only row.
+    pub(crate) detail: String,
+    pub(crate) last_event_at: i64,
+}
+
+/// A tab's agent row, or `None` for a tab that gets none (plan 082 D8.1):
+/// a live hook owner, else a program-status record naming an app — a
+/// 7501 agent without hooks (crush, pi, a Claude without hook consent).
+/// The second is a row without an owner: no hook ownership is made up
+/// for it.
+pub(crate) fn row_agent(tab: &Tab) -> Option<RowAgent> {
+    let axes = tab.agent_state();
+    if let Some(owner) = agent_owner(&axes) {
+        return Some(RowAgent {
+            agent: agent_display_name(&owner.source).to_string(),
+            name: row_name(tab, owner),
+            detail: owner.detail.clone(),
+            last_event_at: owner.last_event_at,
+        });
+    }
+    let record = tab.program_status.as_ref()?.record.as_ref()?;
+    if record.app.is_empty() {
+        return None;
+    }
+    Some(RowAgent {
+        agent: normalize_line(app_label(&record.app).unwrap_or(&record.app)),
+        name: title_name(tab),
+        detail: String::new(),
+        last_event_at: record.updated_at,
+    })
 }
 
 /// The tab an agent row activates, or `None` for the empty sentinel
@@ -251,6 +290,33 @@ pub fn status_text(effective: AgentLifecycle, raw: AgentLifecycle, detail: &str)
         }
         AgentLifecycle::Inactive => "Idle".to_string(),
     }
+}
+
+/// [`status_text`] for `tab` showing `effective`: while its records
+/// decide, the deciding record's `msg` is the why a Waiting, Working or
+/// Failed row names (plan 082 D8.2) — already sanitized at ingest, and
+/// capped here like a hook's `detail`.
+pub fn tab_status_text(tab: &Tab, effective: AgentLifecycle, detail: &str) -> String {
+    let word = match effective {
+        AgentLifecycle::Waiting => Some("Waiting"),
+        AgentLifecycle::Working => Some("Working"),
+        AgentLifecycle::Failed => Some("Failed"),
+        AgentLifecycle::Finished | AgentLifecycle::Inactive => None,
+    };
+    let msg = deciding_record(tab).map(|record| display_detail(&record.msg));
+    match (word, msg) {
+        (Some(word), Some(msg)) if !msg.is_empty() => format!("{word} · {msg}"),
+        _ => status_text(effective, tab.agent_lifecycle, detail),
+    }
+}
+
+/// The record that decides `tab` while its records are authoritative.
+fn deciding_record(tab: &Tab) -> Option<&ProgramStatusRecordView> {
+    let status = tab.program_status.as_ref()?;
+    if status.decided_by != DecidedBy::Records {
+        return None;
+    }
+    status.record.as_ref()
 }
 
 /// Elapsed since `last_event_at` (§3.6). Clock skew — a stamp in the
@@ -396,7 +462,7 @@ fn palette_item(row: PanelAgentRow) -> PaletteItem {
 
 /// The agent's own session name when it published one, else the tab
 /// title, else a stable placeholder.
-pub(crate) fn row_name(tab: &Tab, owner: &Ownership) -> String {
+fn row_name(tab: &Tab, owner: &Ownership) -> String {
     let session_title = owner
         .metadata
         .get(SESSION_TITLE_KEY)
@@ -405,6 +471,11 @@ pub(crate) fn row_name(tab: &Tab, owner: &Ownership) -> String {
     if !session_title.is_empty() {
         return session_title;
     }
+    title_name(tab)
+}
+
+/// The tab title as a row name, else a stable placeholder.
+fn title_name(tab: &Tab) -> String {
     let title = strip_leading_marker(&normalize_line(&tab.title));
     if !title.is_empty() {
         return title;
@@ -543,6 +614,160 @@ mod tests {
 
     fn agent_of(item: &PaletteItem) -> &AgentRowData {
         item.agent.as_ref().expect("agent row payload")
+    }
+
+    // ----- program-status rows (plan 082 D8.1/D8.2) ------------------
+
+    fn recorded(
+        mut tab: Tab,
+        lifecycle: AgentLifecycle,
+        decided_by: DecidedBy,
+        record: Option<ProgramStatusRecordView>,
+    ) -> Tab {
+        tab.program_status = Some(roost_ipc::program_status::ProgramStatusSummary {
+            effective_lifecycle: lifecycle,
+            decided_by,
+            children: 0,
+            record,
+        });
+        tab
+    }
+
+    fn view(
+        state: roost_ipc::program_status::ProgramStatusState,
+        app: &str,
+        msg: &str,
+        at: i64,
+    ) -> ProgramStatusRecordView {
+        ProgramStatusRecordView {
+            state,
+            kind: None,
+            msg: msg.to_string(),
+            app: app.to_string(),
+            title: String::new(),
+            progress: None,
+            id: String::new(),
+            updated_at: at,
+        }
+    }
+
+    #[test]
+    fn a_record_naming_an_app_gives_an_ownerless_tab_a_row() {
+        use roost_ipc::program_status::ProgramStatusState::Blocked;
+        let tabs = vec![
+            recorded(
+                tab(1, "✳ deploy"),
+                AgentLifecycle::Waiting,
+                DecidedBy::Records,
+                Some(view(Blocked, "crush", "approve Bash", NOW - 90)),
+            ),
+            recorded(
+                tab(2, "raw"),
+                AgentLifecycle::Waiting,
+                DecidedBy::Records,
+                Some(view(Blocked, "my-agent", "", NOW - 5)),
+            ),
+            // No app anywhere in the record's ancestry: no claim to a row.
+            recorded(
+                tab(3, "nameless"),
+                AgentLifecycle::Waiting,
+                DecidedBy::Records,
+                Some(view(Blocked, "", "who", NOW)),
+            ),
+            // The hooks decide, so no record rides along.
+            recorded(
+                tab(4, "hooks"),
+                AgentLifecycle::Inactive,
+                DecidedBy::Hooks,
+                None,
+            ),
+        ];
+        let projects = vec![project(1, "roost", tabs)];
+        let items = agent_items(&projects, HostId::LOCAL, NOW);
+        let rows: Vec<(&str, &str, &str, &str)> = items
+            .iter()
+            .map(|item| {
+                let row = agent_of(item);
+                (
+                    row.agent.as_str(),
+                    row.name.as_str(),
+                    row.status_text.as_str(),
+                    row.time_text.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("my-agent", "raw", "Waiting for input", "5s"),
+                ("Crush", "deploy", "Waiting · approve Bash", "1m"),
+            ],
+            "most recent record first, as an owner's last event would sort"
+        );
+        assert_eq!(
+            agent_tab_cwds(&projects, HostId::LOCAL)
+                .into_keys()
+                .collect::<std::collections::HashSet<_>>(),
+            [TabKey::local(1), TabKey::local(2)].into(),
+            "the git probe follows the same population"
+        );
+    }
+
+    #[test]
+    fn a_hook_owner_keeps_its_row_and_a_deciding_record_names_the_why() {
+        use roost_ipc::program_status::ProgramStatusState::{Error, Working};
+        let hooked = owned(tab(1, "t"), "claude", AgentLifecycle::Working, NOW - 3);
+        let working = recorded(
+            hooked.clone(),
+            AgentLifecycle::Working,
+            DecidedBy::Records,
+            Some(view(Working, "claude-code", "reading\nfiles", NOW - 600)),
+        );
+        let row = row_agent(&working).expect("a row");
+        assert_eq!(
+            (row.agent.as_str(), row.last_event_at),
+            ("Claude Code", NOW - 3)
+        );
+        assert_eq!(
+            tab_status_text(&working, AgentLifecycle::Working, ""),
+            "Working · readingfiles"
+        );
+
+        let failed = recorded(
+            hooked.clone(),
+            AgentLifecycle::Failed,
+            DecidedBy::Records,
+            Some(view(Error, "claude-code", "x".repeat(60).as_str(), NOW)),
+        );
+        let text = tab_status_text(&failed, AgentLifecycle::Failed, "");
+        assert_eq!(
+            text.chars().count(),
+            "Failed · ".chars().count() + DETAIL_MAX_CHARS
+        );
+
+        // A kept record is shown, but it isn't why the tab is in its state.
+        let kept = recorded(
+            hooked,
+            AgentLifecycle::Failed,
+            DecidedBy::KeptRecord,
+            Some(view(Error, "claude-code", "crashed", NOW)),
+        );
+        assert_eq!(tab_status_text(&kept, AgentLifecycle::Failed, ""), "Failed");
+    }
+
+    #[test]
+    fn a_finished_record_keeps_the_plain_vocabulary() {
+        use roost_ipc::program_status::ProgramStatusState::Done;
+        let done = recorded(
+            tab(1, "t"),
+            AgentLifecycle::Finished,
+            DecidedBy::Records,
+            Some(view(Done, "pi", "all green", NOW)),
+        );
+        assert_eq!(
+            tab_status_text(&done, AgentLifecycle::Finished, ""),
+            "Finished"
+        );
     }
 
     // ----- host-blind rows (plan 037 §3.1) ---------------------------

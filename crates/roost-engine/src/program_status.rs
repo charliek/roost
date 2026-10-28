@@ -14,7 +14,7 @@ use roost_ipc::agent::{
 };
 use roost_ipc::format_chars::is_format;
 use roost_ipc::messages::TabState;
-pub use roost_ipc::program_status::DecidedBy;
+pub use roost_ipc::program_status::{app_label, DecidedBy};
 use roost_ipc::program_status::{
     ProgramStatusKind, ProgramStatusRecordView, ProgramStatusReport, ProgramStatusState,
     ProgramStatusSummary, PromptMark, StatusEvent,
@@ -490,19 +490,6 @@ pub fn app_for_source(source: &str) -> Option<&'static str> {
         "codex" => Some("codex"),
         "grok" => Some("grok-build"),
         "opencode" => Some("opencode"),
-        _ => None,
-    }
-}
-
-/// A known app's display name.
-pub fn app_label(app: &str) -> Option<&'static str> {
-    match app {
-        "claude-code" => Some("Claude Code"),
-        "codex" => Some("Codex"),
-        "grok-build" => Some("Grok"),
-        "opencode" => Some("OpenCode"),
-        "crush" => Some("Crush"),
-        "pi" => Some("Pi"),
         _ => None,
     }
 }

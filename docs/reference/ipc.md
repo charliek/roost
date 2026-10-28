@@ -259,9 +259,12 @@ reads the same as a tab with nothing dropped.
 ### `Tab.program_status` — OSC 7501
 
 A program can report its own status with OSC 7501 (state, kind,
-message, app, title, progress, and an `id` for child records). A
-session tab's terminal, the session's, answers the `OSC 7501 ; ?` probe
-and keeps the tab's records. Prompt marks (OSC 133 `A`, `B`, `D`) drop `working` and `blocked`
+message, app, title, progress, and an `id` for child records). The
+tab's authoritative terminal answers the `OSC 7501 ; ?` probe and keeps
+the tab's records: a session tab's, inside the session, and an
+in-process tab's, inside Roost-Iced. A Roost-Iced window showing a host
+tab mirrors the session's summary and keeps none of its own; the Swift
+app keeps none. Prompt marks (OSC 133 `A`, `B`, `D`) drop `working` and `blocked`
 records. While a `working` or `blocked` record exists, or a root record
 no prompt mark has followed, the records decide what the tab shows and
 the hook layer keeps only its identity.

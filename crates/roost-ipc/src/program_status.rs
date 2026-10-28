@@ -161,3 +161,17 @@ pub fn suppress_raw_osc(hooks: &AgentTabState, summary: Option<&ProgramStatusSum
     agent::suppress_raw_osc(hooks)
         || summary.is_some_and(|status| status.decided_by == DecidedBy::Records)
 }
+
+/// A known OSC 7501 `app`'s display name: a record banner's title and a
+/// status-only agent row's name.
+pub fn app_label(app: &str) -> Option<&'static str> {
+    match app {
+        "claude-code" => Some("Claude Code"),
+        "codex" => Some("Codex"),
+        "grok-build" => Some("Grok"),
+        "opencode" => Some("OpenCode"),
+        "crush" => Some("Crush"),
+        "pi" => Some("Pi"),
+        _ => None,
+    }
+}

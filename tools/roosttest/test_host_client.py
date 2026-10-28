@@ -83,6 +83,7 @@ from agent_jail import (
 from client import Roost, RoostError, scaled_timeout
 from eventstream import EventStream
 from host_probe import host_key, sibling_key  # noqa: F401  (re-exported)
+from test_program_status import PROBE, PROBE_REPLY, osc7501
 from util import (
     assert_opened_in,
     drain,
@@ -3932,3 +3933,80 @@ def test_a_hosts_agent_is_listed_under_its_host_qualified_key_and_names_its_host
             30.0,
             "the dropped host's agent to stay listed, dimmed, under the key it was listed under",
         )
+
+
+# ---------------------------------------------------------------------------
+# 22. Plan 082 B-3h — program status through the host mirror
+# ---------------------------------------------------------------------------
+
+
+def test_a_session_tabs_record_reaches_the_mirror_survives_a_reconnect_and_clears(host, roost):
+    """The session's terminal keeps the records; the client's mirror only
+    carries what they compose to (`agent_report.changed` live, `tab.list`
+    on a reconnect), and an event without `program_status` clears it. Read
+    through the Agents panel, which lists a record-only agent off the
+    mirror's tab (D8.1)."""
+    host.connect_and_wait()
+    with host.client() as session:
+        tab = quiet_tab(session, first_project(session), host.env.launch_cwd)
+        key = wait_until(
+            lambda: host_tab_key(roost, host.saved_id, tab), 30.0, "the host's band to list the tab"
+        )
+        session.tab_feed_pty_bytes(tab, osc7501(state="blocked", app="pi", msg="approve Bash"))
+
+        def mirrored(key: str):
+            entry = panel_agent(roost, key)
+            if entry is None or entry["dimmed"] or entry["lifecycle"] != "waiting":
+                return None
+            return entry
+
+        entry = wait_until(lambda: mirrored(key), 30.0, "the record on the mirror's tab")
+        assert (entry["agent"], entry["status_text"]) == ("Pi", "Waiting · approve Bash"), entry
+
+        host.disconnect()
+        host.wait_not_connected()
+        host.connect_and_wait()
+        again = wait_until(
+            lambda: (k := host_tab_key(roost, host.saved_id, tab)) != key and k,
+            30.0,
+            "the reconnected band to list the tab under a fresh incarnation",
+        )
+        entry = wait_until(lambda: mirrored(again), 30.0, "the record on the re-listed tab")
+        assert entry["status_text"] == "Waiting · approve Bash", entry
+
+        session.tab_feed_pty_bytes(tab, osc7501(state="clear"))
+        wait_until(
+            lambda: panel_agent(roost, again) is None,
+            30.0,
+            "the cleared record to leave the mirror",
+        )
+
+
+def test_the_probe_is_answered_once_while_a_client_is_attached(host, roost):
+    """Only the session's terminal answers `OSC 7501 ; ?` (D4.2): the
+    client's hydrated terminal installs no status sink, and a host tab's
+    replies are discarded anyway. Keys typed into the attached tab after
+    the probe reached it ride the same input path a client reply would, so
+    once they arrive any second reply already has."""
+    host.connect_and_wait()
+    with host.client() as session:
+        tab = quiet_tab(session, first_project(session), host.env.launch_cwd)
+        key = host_key(roost, tab)
+        ready = marker("ATTACHED")
+        session.tab_feed_pty_bytes(tab, f"{ready}\r\n".encode())
+        wait_dump_contains(roost, key, ready)
+        session.tab_capture_pty_input(tab, drain=True)
+
+        after = marker("PROBED")
+        session.tab_feed_pty_bytes(tab, PROBE + f"{after}\r\n".encode())
+        wait_dump_contains(roost, key, after)
+        roost.type_text("q")
+
+        seen = bytearray()
+
+        def typed() -> bool:
+            seen.extend(session.tab_capture_pty_input(tab, drain=True))
+            return b"q" in seen
+
+        wait_until(typed, 30.0, "the key typed into the attached tab to reach the session")
+        assert bytes(seen).count(PROBE_REPLY) == 1, bytes(seen)

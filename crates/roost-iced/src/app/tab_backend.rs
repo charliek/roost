@@ -214,7 +214,7 @@ impl TabHandle {
         }
     }
 
-    fn reply_policy(&self) -> ReplyPolicy {
+    pub(super) fn reply_policy(&self) -> ReplyPolicy {
         match self.kind {
             TabHandleKind::InProcess(_) => ReplyPolicy::DrainToPty,
             TabHandleKind::Host(_) => ReplyPolicy::Discard,

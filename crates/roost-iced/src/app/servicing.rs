@@ -555,9 +555,34 @@ pub(super) struct TabOutputBatch {
     /// snapshot needs rebuilding. Every other tab renders the snapshot it
     /// already has.
     pub(super) touched: HashSet<TabKey>,
-    pub(super) osc_actions: Vec<(TabKey, Vec<OscAction>)>,
+    /// Per chunk, in arrival order: what the batch tail applies.
+    pub(super) effects: Vec<ChunkEffects>,
     pub(super) exited: Vec<TabKey>,
     pub(super) error: Option<String>,
+}
+
+/// One chunk's program-status events and its OSC actions, applied in that
+/// order — a session tab task's ingest order (plan 082 D4.3), so the
+/// record layer sees the chunk's prompt marks before the hook layer does.
+#[derive(Debug, PartialEq)]
+pub(super) struct ChunkEffects {
+    pub(super) key: TabKey,
+    pub(super) status: Vec<StatusEvent>,
+    pub(super) actions: Vec<OscAction>,
+}
+
+impl TabOutputBatch {
+    fn push_effects(&mut self, key: TabKey, status: Vec<StatusEvent>, actions: Vec<OscAction>) {
+        // Most chunks of a flood carry neither; an empty entry would
+        // still cost a push and a hop at the tail.
+        if !status.is_empty() || !actions.is_empty() {
+            self.effects.push(ChunkEffects {
+                key,
+                status,
+                actions,
+            });
+        }
+    }
 }
 
 pub(super) fn collect_tab_output(
@@ -582,16 +607,13 @@ pub(super) fn collect_tab_output(
         // (now-removed) GTK UI's — and cannot occur on this path; treat
         // it as a chunk with no actions rather than asserting.
         TabOutput::Bytes(bytes) => {
-            tab.write_vt(&bytes);
+            let status = tab.write_vt(&bytes);
+            collected.push_effects(key, status, Vec::new());
             collected.touched.insert(key);
         }
         TabOutput::Scanned { data, actions } => {
-            tab.write_vt(&data);
-            // Most chunks of a flood carry no OSC at all; an empty entry
-            // would still cost a push and an `apply_osc_actions` hop.
-            if !actions.is_empty() {
-                collected.osc_actions.push((key, actions));
-            }
+            let status = tab.write_vt(&data);
+            collected.push_effects(key, status, actions);
             collected.touched.insert(key);
         }
         TabOutput::Exit { status, reason } => {
@@ -604,6 +626,45 @@ pub(super) fn collect_tab_output(
             collected.error = Some(format!("tab {tab_id}: {error}"));
             tracing::error!(tab_id, %error, "PTY output stream lost bytes");
         }
+    }
+}
+
+/// `tab.feed_pty_bytes`' write, ordered with the batch it lands in. The
+/// chunks already queued in `pty` were written to the terminal before these
+/// bytes, so their effects come first, then the injected chunk's: the
+/// workspace sees statuses in the order the terminal parsed them, wherever
+/// the batch boundary fell. `None` when the tab has no live terminal (and
+/// then nothing is taken from `pty`).
+pub(super) fn inject_pty_bytes(
+    tabs: &mut HashMap<TabKey, TerminalTab>,
+    pty: &mut TabOutputBatch,
+    key: TabKey,
+    data: &[u8],
+) -> Option<Vec<ChunkEffects>> {
+    let (status, actions) = tabs.get_mut(&key)?.scan_and_write_vt(data);
+    let mut effects = std::mem::take(&mut pty.effects);
+    effects.push(ChunkEffects {
+        key,
+        status,
+        actions,
+    });
+    Some(effects)
+}
+
+/// A chunk's program-status events, to the workspace whose terminal
+/// produced them. Only an in-process tab has a status sink, so a key from
+/// any other instance never carries any.
+fn apply_program_status(workspace: &Workspace, key: TabKey, events: Vec<StatusEvent>) {
+    if events.is_empty() {
+        return;
+    }
+    let Some(tab_id) = key.local_tab() else {
+        tracing::debug!(?key, "program status from another instance");
+        return;
+    };
+    let now_ms = roost_engine::workspace::unix_now_ms();
+    if let Err(error) = workspace.apply_program_status(tab_id, events, now_ms) {
+        tracing::debug!(tab_id, %error, "program status for a tab whose row is gone");
     }
 }
 
@@ -2330,7 +2391,7 @@ impl App {
                         batch.mark_reconciled();
                     }
                     self.attach_ready_pending();
-                    task = task.then(self.apply_ui_request(request));
+                    task = task.then(self.apply_ui_request(request, &mut pty));
                     // The request may itself have mutated the workspace
                     // (`tab.open`, `palette.activate`), and the reconcile
                     // above — if it ran — predates that.
@@ -2583,8 +2644,8 @@ impl App {
         // so a vanished tab is a no-op rather than a panic. The
         // touched-tab refresh below and the exit list further down are
         // guarded the same way.
-        for (key, actions) in pty.osc_actions {
-            task = task.then(self.apply_osc_actions(key, actions));
+        for chunk in pty.effects {
+            task = task.then(self.apply_chunk_effects(chunk));
         }
         for key in &pty.touched {
             if let Some(tab) = self.tabs.get_mut(key) {
@@ -3566,7 +3627,7 @@ impl App {
     /// one of the local backend's bare ids — `backend.tab_key` is the
     /// joint that qualifies them, exactly as the workspace's active
     /// selection is qualified.
-    fn apply_ui_request(&mut self, request: UiRequest) -> UiTask {
+    fn apply_ui_request(&mut self, request: UiRequest, pty: &mut TabOutputBatch) -> UiTask {
         let mut task = UiTask::None;
         match request {
             UiRequest::Activate => {
@@ -3609,13 +3670,13 @@ impl App {
                 let result = if !self.test_mode {
                     Err("ROOST_TEST_MODE=1 is required".to_string())
                 } else {
-                    let scanned = key.and_then(|key| {
-                        let actions = self.tabs.get_mut(&key)?.scan_and_write_vt(&data);
-                        Some((key, actions))
-                    });
-                    match scanned {
-                        Some((key, actions)) => {
-                            task = task.then(self.apply_osc_actions(key, actions));
+                    let effects =
+                        key.and_then(|key| inject_pty_bytes(&mut self.tabs, pty, key, &data));
+                    match (key, effects) {
+                        (Some(key), Some(effects)) => {
+                            for chunk in effects {
+                                task = task.then(self.apply_chunk_effects(chunk));
+                            }
                             self.tabs
                                 .get_mut(&key)
                                 .ok_or_else(|| format!("tab {tab_id} has no live terminal"))
@@ -3623,7 +3684,7 @@ impl App {
                                     tab.refresh_snapshot().map_err(|error| error.to_string())
                                 })
                         }
-                        None => Err(format!("tab {tab_id} has no live terminal")),
+                        _ => Err(format!("tab {tab_id} has no live terminal")),
                     }
                 };
                 let _ = reply.send(result);
@@ -4705,6 +4766,15 @@ impl App {
             host: host.into(),
             state: state.wire().to_string(),
         }
+    }
+
+    fn apply_chunk_effects(&mut self, chunk: ChunkEffects) -> UiTask {
+        self.apply_program_status(chunk.key, chunk.status);
+        self.apply_osc_actions(chunk.key, chunk.actions)
+    }
+
+    fn apply_program_status(&self, key: TabKey, events: Vec<StatusEvent>) {
+        apply_program_status(&self.workspace, key, events);
     }
 
     pub(super) fn apply_osc_actions(&mut self, key: TabKey, actions: Vec<OscAction>) -> UiTask {
@@ -6316,7 +6386,7 @@ mod tests {
 
         assert_eq!(collected.touched, HashSet::from([TabKey::local(70)]));
         assert!(
-            collected.osc_actions.is_empty(),
+            collected.effects.is_empty(),
             "plain output carries no OSC, so the tail has nothing to apply"
         );
         assert!(collected.exited.is_empty());
@@ -6349,11 +6419,12 @@ mod tests {
 
         assert_eq!(collected.touched, HashSet::from([TabKey::local(75)]));
         assert_eq!(
-            collected.osc_actions,
-            vec![(
-                TabKey::local(75),
-                vec![OscAction::PointerShape("pointer".into())]
-            )]
+            collected.effects,
+            vec![ChunkEffects {
+                key: TabKey::local(75),
+                status: Vec::new(),
+                actions: vec![OscAction::PointerShape("pointer".into())],
+            }]
         );
         let tab = tabs
             .get_mut(&TabKey::local(75))
@@ -6361,6 +6432,92 @@ mod tests {
         tab.refresh_snapshot().expect("refresh the touched tab");
         assert_eq!(tab.snapshot.grid[0].text, "hello");
         supervisor.close(75);
+    }
+
+    /// Plan 082 D4.3: each chunk's program-status events ride with its OSC
+    /// actions, chunk by chunk in arrival order, so the tail applies them
+    /// in a session tab task's order — the records, then the actions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn each_chunks_program_status_rides_ahead_of_its_actions() {
+        let (mut tabs, supervisor) = attached(76);
+        let mut collected = TabOutputBatch::default();
+        let key = TabKey::local(76);
+
+        for output in [
+            TabOutput::Scanned {
+                data: b"\x1b]7501;state=blocked:app=pi\x1b\\".to_vec(),
+                actions: vec![OscAction::PointerShape("pointer".into())],
+            },
+            TabOutput::Bytes(b"quiet".to_vec()),
+            TabOutput::Scanned {
+                data: b"\x1b]133;A\x07".to_vec(),
+                actions: Vec::new(),
+            },
+        ] {
+            collect_tab_output(&mut tabs, &mut collected, key, output);
+        }
+
+        let shape: Vec<(usize, usize)> = collected
+            .effects
+            .iter()
+            .map(|chunk| (chunk.status.len(), chunk.actions.len()))
+            .collect();
+        assert_eq!(shape, vec![(1, 1), (1, 0)], "{:?}", collected.effects);
+        assert!(collected.effects.iter().all(|chunk| chunk.key == key));
+        assert!(matches!(
+            collected.effects[1].status.as_slice(),
+            [StatusEvent::Prompt(
+                roost_ipc::program_status::PromptMark::PromptStart
+            )]
+        ));
+        supervisor.close(76);
+    }
+
+    /// Review of B5: a PTY chunk still queued in the batch, then an
+    /// injected `tab.feed_pty_bytes` for the same tab. The terminal parsed
+    /// `working` then `clear`, so the workspace must see them in that order
+    /// — not the feed's `clear` first and the queued `working` at the tail,
+    /// which would bring the cleared record back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_injected_feed_applies_after_the_chunks_queued_ahead_of_it() {
+        let workspace = Workspace::new();
+        let project = workspace.create_project("p", "/tmp").unwrap();
+        let tab_id = workspace
+            .open_tab(project.id, "/tmp", "t", true)
+            .unwrap()
+            .id;
+        let (mut tabs, supervisor) = attached(tab_id);
+        let key = TabKey::local(tab_id);
+        let mut pty = TabOutputBatch::default();
+
+        collect_tab_output(
+            &mut tabs,
+            &mut pty,
+            key,
+            TabOutput::Scanned {
+                data: b"\x1b]7501;state=working:app=pi\x1b\\".to_vec(),
+                actions: Vec::new(),
+            },
+        );
+        let effects = inject_pty_bytes(&mut tabs, &mut pty, key, b"\x1b]7501;state=clear\x1b\\")
+            .expect("the tab is attached");
+        let queued: Vec<usize> = effects
+            .iter()
+            .chain(&pty.effects)
+            .map(|chunk| chunk.status.len())
+            .collect();
+        assert_eq!(queued, vec![1, 1], "both reports reached a queue");
+        // What the App does: the feed's effects now, the batch tail later.
+        for chunk in effects.into_iter().chain(std::mem::take(&mut pty.effects)) {
+            apply_program_status(&workspace, chunk.key, chunk.status);
+        }
+
+        let listed = workspace.tab(tab_id).expect("the tab is listed");
+        assert_eq!(
+            listed.program_status, None,
+            "the clear came last: {listed:?}"
+        );
+        supervisor.close(tab_id);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6380,7 +6537,7 @@ mod tests {
         }
 
         assert!(collected.touched.is_empty());
-        assert!(collected.osc_actions.is_empty());
+        assert!(collected.effects.is_empty());
         assert!(collected.exited.is_empty());
         assert!(collected.error.is_none());
         supervisor.close(71);
@@ -6414,7 +6571,7 @@ mod tests {
         }
 
         assert!(collected.touched.is_empty());
-        assert!(collected.osc_actions.is_empty());
+        assert!(collected.effects.is_empty());
         assert!(collected.exited.is_empty());
         assert!(collected.error.is_none());
         let tab = tabs

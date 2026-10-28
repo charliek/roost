@@ -814,6 +814,7 @@ jobs:
           tools/roosttest/test_context_menu.py
           tools/roosttest/test_device_queries.py
           tools/roosttest/test_selection_autoscroll.py
+          tools/roosttest/test_program_status.py
           tools/roosttest/test_password_input.py
           tools/roosttest/test_secure_input.py
           tools/roosttest/test_osc52.py
@@ -1096,6 +1097,7 @@ jobs:
           tools/roosttest/test_context_menu.py
           tools/roosttest/test_device_queries.py
           tools/roosttest/test_selection_autoscroll.py
+          tools/roosttest/test_program_status.py
           tools/roosttest/test_password_input.py
           tools/roosttest/test_secure_input.py
           -m 'not session_daemon and not host_client'
@@ -1316,6 +1318,7 @@ jobs:
           tools/roosttest/test_context_menu.py
           tools/roosttest/test_device_queries.py
           tools/roosttest/test_selection_autoscroll.py
+          tools/roosttest/test_program_status.py
           tools/roosttest/test_password_input.py
           tools/roosttest/test_secure_input.py
           tools/roosttest/test_osc52.py

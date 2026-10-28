@@ -39,6 +39,7 @@ use roost_ipc::messages::{
     SidebarDumpResult, SidebarDumpSection, WindowMetricsResult,
 };
 use roost_ipc::paths::{BundleProfile, BundleProfileKind};
+use roost_ipc::program_status::StatusEvent;
 use roost_ipc::{codes, IpcServer, LocalBackendCell, LocalBackendMode};
 use roost_ui_model::theme::Theme;
 use roost_ui_model::typography::{self, FamilyApply, TerminalTypography};
@@ -133,7 +134,7 @@ use self::palettes::{
 use self::pending_input::{PendingInput, PendingKeyboard};
 use self::pending_selection::{Creation, PendingHostSelection, PendingStep};
 pub(crate) use self::servicing::{AgentMetricsResult, ATTACH_RETRY_INTERVAL};
-use self::tab_backend::{TabBackend, TabHandle};
+use self::tab_backend::{ReplyPolicy, TabBackend, TabHandle};
 use self::terminal_tab::{
     apply_geometry_batch, autoscroll_selections, cancel_tab_pointers, clear_preedit_or_warn,
     pointer_origin_tab, refresh_or_warn, refuse_stale_press, release_host_pointer_before_detach,
