@@ -109,6 +109,8 @@ pub struct Banner {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct StatusApplied {
     pub banners: Vec<Banner>,
+    /// Per [`StatusEvent::Notification`], in order.
+    pub notifications: Vec<PlacedNotification>,
     /// Children the cap refused, one per warning owed.
     refused: Vec<String>,
 }
@@ -125,6 +127,104 @@ impl StatusApplied {
                 "program-status record refused: the tab is at its child-record cap"
             );
         }
+    }
+}
+
+/// A notification libghostty placed in the status stream, with whether
+/// the records were authoritative at that point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedNotification {
+    pub title: String,
+    pub body: String,
+    pub authoritative: bool,
+}
+
+/// Whether the records were authoritative at each of one chunk's raw OSC
+/// 9 / 777 notifications (plan 082 D5.8 and its amendment), so each is
+/// judged against the records as they stood at its own bytes rather than
+/// at the end of whatever read it arrived in.
+///
+/// libghostty places the notifications and roost-osc raises them, and the
+/// two parsers don't accept quite the same forms (the matrix in this
+/// module's tests). So each of roost-osc's notifications takes the first
+/// unclaimed place with the same text, not the next place, and a place
+/// roost-osc would never raise (an `OSC 9` body its own classifier calls
+/// ConEmu) isn't claimable at all, so it can't stand in for a later
+/// notification with the same text. One only roost-osc accepts finds no
+/// place and is judged at the chunk's end.
+///
+/// Known residuals, each judged at the chunk's end rather than at its
+/// place: a body over libghostty's 2047-byte OSC cap (libghostty places
+/// nothing), an `OSC 777;notify;;<text>` whose text reads as a ConEmu
+/// command (libghostty reports it like an `OSC 9`), and any other form the
+/// two parsers disagree on.
+#[derive(Debug, Default)]
+pub struct RawOscAuthority {
+    places: Vec<Option<((String, String), bool)>>,
+    unplaced_logged: bool,
+}
+
+impl RawOscAuthority {
+    pub fn new(placed: Vec<PlacedNotification>) -> Self {
+        Self {
+            places: placed
+                .into_iter()
+                .filter(|place| {
+                    !place.title.is_empty() || roost_osc::is_osc9_notification(&place.body)
+                })
+                .map(|place| {
+                    Some((
+                        notification_key(&place.title, &place.body),
+                        place.authoritative,
+                    ))
+                })
+                .collect(),
+            unplaced_logged: false,
+        }
+    }
+
+    /// Claim the place of roost-osc's notification `title` / `body` and
+    /// say whether the records were authoritative there. `None` when
+    /// libghostty placed no such notification in the chunk: the caller
+    /// then reads the records as they stand, at the chunk's end.
+    pub fn claim(&mut self, tab_id: i64, title: &str, body: &str) -> Option<bool> {
+        let key = notification_key(title, body);
+        let claimed = self
+            .places
+            .iter_mut()
+            .find(|place| place.as_ref().is_some_and(|(placed, _)| *placed == key))
+            .and_then(Option::take)
+            .map(|(_, authoritative)| authoritative);
+        if claimed.is_none() && !std::mem::replace(&mut self.unplaced_logged, true) {
+            tracing::debug!(
+                tab_id,
+                "a raw OSC notification libghostty didn't place: judged at the chunk's end"
+            );
+        }
+        claimed
+    }
+}
+
+/// A notification's text as both parsers can agree on it.
+///
+/// * Both parsers drop C0 controls before decoding (roost-osc to match
+///   libghostty), so what is compared is already the same text. DEL, C1
+///   and format characters are dropped here as well, as everywhere text
+///   reaches the user, so none of them decides a match.
+/// * A lone text is the title. OSC 9 carries one text, which roost-osc
+///   delivers as the title and libghostty as the body; OSC 777 with an
+///   empty title shows its body alone, which is the same thing.
+fn notification_key(title: &str, body: &str) -> (String, String) {
+    let strip = |text: &str| -> String {
+        text.chars()
+            .filter(|c| !c.is_control() && !is_format(*c))
+            .collect()
+    };
+    let (title, body) = (strip(title), strip(body));
+    if title.is_empty() {
+        (body, String::new())
+    } else {
+        (title, body)
     }
 }
 
@@ -190,6 +290,14 @@ impl ProgramStatusRecords {
                     if let Some(next) = agent::apply_shell_mark(&hooks, osc133_body(mark)) {
                         hooks = next;
                     }
+                }
+                StatusEvent::Notification { title, body } => {
+                    applied.notifications.push(PlacedNotification {
+                        title,
+                        body,
+                        authoritative: self.is_authoritative(),
+                    });
+                    continue;
                 }
             }
             if self.children() < MAX_CHILDREN {
@@ -542,12 +650,21 @@ fn from_vt(events: Vec<roost_vt::TerminalEvent>) -> Vec<StatusEvent> {
                 VtMark::OutputStart => PromptMark::OutputStart,
                 VtMark::CommandEnd => PromptMark::CommandEnd,
             }),
+            TerminalEvent::Notification { title, body } => {
+                StatusEvent::Notification { title, body }
+            }
         })
         .collect()
 }
 
 /// The OSC 133 body roost-osc hands the hook layer for the byte libghostty
 /// reported as `mark`.
+///
+/// Not exact, a known residual (plan 082, the amendment after D5.8):
+/// libghostty reports `133;P;k=i` and `133;N` as a primary prompt start,
+/// which the hook layer ignores, and filters `133;A;k=s`, which the hook
+/// layer takes as `A`. A banner can then depend on the read boundary when
+/// a shell emits those marks in the same read as a record change.
 fn osc133_body(mark: PromptMark) -> &'static str {
     match mark {
         PromptMark::PromptStart => "A",
@@ -1932,6 +2049,10 @@ mod tests {
             TerminalEvent::Prompt(VtMark::InputStart),
             TerminalEvent::Prompt(VtMark::OutputStart),
             TerminalEvent::Prompt(VtMark::CommandEnd),
+            TerminalEvent::Notification {
+                title: "Build".into(),
+                body: "done".into(),
+            },
         ]);
         assert_eq!(
             converted,
@@ -1948,7 +2069,195 @@ mod tests {
                 StatusEvent::Prompt(PromptMark::InputStart),
                 StatusEvent::Prompt(PromptMark::OutputStart),
                 StatusEvent::Prompt(PromptMark::CommandEnd),
+                StatusEvent::Notification {
+                    title: "Build".into(),
+                    body: "done".into(),
+                },
             ]
         );
+    }
+
+    /// D5.8's amendment rests on libghostty placing the notifications
+    /// roost-osc raises, with text that matches once normalised. The
+    /// common forms agree, text and all. The rest is pinned as it is, so a
+    /// change on either side shows here: a form only roost-osc raises is
+    /// judged at the chunk's end, and one only libghostty places is a
+    /// place nobody claims.
+    #[cfg(feature = "vt")]
+    #[test]
+    fn libghostty_and_roost_osc_notification_counts() {
+        use crate::osc::{OscAction, OscRouter};
+
+        // (bytes, libghostty's places, roost-osc's notifications)
+        let matrix: [(&[u8], usize, usize); 22] = [
+            (b"\x1b]9;Build done\x07", 1, 1),
+            (b"\x1b]9;Build done\x1b\\", 1, 1),
+            (b"\x1b]9;\x07", 1, 1),
+            (b"\x1b]9;13 tests passed\x07", 1, 1),
+            (b"\x1b]777;notify;Build;done\x07", 1, 1),
+            (b"\x1b]777;notify;;done\x07", 1, 1),
+            (b"\x1b]9;a\tb\x01c\x7fd \xe2\x80\x8de\x07", 1, 1),
+            (b"\x1b]777;notify;T\tx;B\x01y\x07", 1, 1),
+            (b"\x1b]9;4;1;50\x07", 0, 0),
+            (b"\x1b]9;4;0\x07", 0, 0),
+            (b"\x1b]9;1;100\x07", 0, 0),
+            (b"\x1b]9;2;message box\x07", 0, 0),
+            (b"\x1b]9;9;/tmp\x07", 0, 0),
+            (b"\x1b]777;set-color;1\x07", 0, 0),
+            // Disagreements: roost-osc's OSC 777 accepts a title alone and
+            // OSC 9 with no `;`; libghostty takes an OSC 9 body that starts
+            // `5` or `12` as ConEmu's wait-for-input and prompt mark, and
+            // reads a bare ConEmu number, or a progress or `10` sub-command
+            // with a value it doesn't know, as a notification.
+            (b"\x1b]777;notify;Build done\x07", 0, 1),
+            (b"\x1b]9\x07", 0, 1),
+            (b"\x1b]9;5 tests failed\x07", 0, 1),
+            (b"\x1b]9;12 done\x07", 0, 1),
+            (b"\x1b]9;1\x07", 1, 0),
+            (b"\x1b]9;4\x07", 1, 0),
+            (b"\x1b]9;4;9\x07", 1, 0),
+            (b"\x1b]9;10;7\x07", 1, 0),
+        ];
+        for (bytes, places, notifications) in matrix {
+            let mut term = roost_vt::Terminal::new(roost_vt::TerminalOptions {
+                cols: 80,
+                rows: 24,
+                max_scrollback: 0,
+                ..Default::default()
+            })
+            .expect("terminal");
+            let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            term.set_status_sink(std::sync::Arc::clone(&sink))
+                .expect("status sink");
+            term.vt_write(bytes);
+            let placed: Vec<(String, String)> = drain(&sink)
+                .into_iter()
+                .filter_map(|event| match event {
+                    StatusEvent::Notification { title, body } => {
+                        Some(notification_key(&title, &body))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let raised: Vec<(String, String)> = OscRouter::new()
+                .feed(bytes)
+                .into_iter()
+                .filter_map(|action| match action {
+                    OscAction::Workspace {
+                        command: command @ (9 | 777),
+                        payload,
+                    } => {
+                        let (title, body) =
+                            crate::application::parse_notification_payload(command, &payload);
+                        Some(notification_key(&title, &body))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let shown = String::from_utf8_lossy(bytes);
+            assert_eq!(
+                (placed.len(), raised.len()),
+                (places, notifications),
+                "{shown:?}"
+            );
+            if places == notifications {
+                assert_eq!(placed, raised, "{shown:?}: the same text");
+            }
+        }
+    }
+
+    fn placed(body: &str) -> StatusEvent {
+        StatusEvent::Notification {
+            title: String::new(),
+            body: body.into(),
+        }
+    }
+
+    fn place(body: &str, authoritative: bool) -> PlacedNotification {
+        PlacedNotification {
+            title: String::new(),
+            body: body.into(),
+            authoritative,
+        }
+    }
+
+    /// The D5.8 records half at each notification's place: the flag is the
+    /// records' authority after everything before it in the batch, and a
+    /// place changes nothing else.
+    #[test]
+    fn a_notification_place_records_the_authority_there_and_changes_nothing() {
+        let agent = AgentTabState::default();
+        let stream = [
+            placed("one"),
+            report(S::Blocked, "", "pi", ""),
+            placed("two"),
+            StatusEvent::Prompt(PromptMark::PromptStart),
+            placed("three"),
+        ];
+
+        let mut records = ProgramStatusRecords::default();
+        let applied = records.apply(&agent, stream.iter().cloned(), LATE);
+        assert_eq!(
+            applied.notifications,
+            [
+                place("one", false),
+                place("two", true),
+                place("three", false)
+            ]
+        );
+
+        let without: Vec<StatusEvent> = stream
+            .iter()
+            .filter(|event| !matches!(event, StatusEvent::Notification { .. }))
+            .cloned()
+            .collect();
+        let mut plain = ProgramStatusRecords::default();
+        let plain_applied = plain.apply(&agent, without, LATE);
+        assert_eq!(records, plain, "the records");
+        assert_eq!(applied.banners, plain_applied.banners, "the banners");
+        assert_eq!(applied.banners, [banner("Pi", "Needs your input")]);
+    }
+
+    /// A notification claims the first unclaimed place with its text; a
+    /// place no notification matches is skipped, and a notification with
+    /// no place left gets none.
+    #[test]
+    fn a_notification_claims_the_first_unclaimed_place_with_its_text() {
+        let mut authority = RawOscAuthority::new(vec![
+            place("4", false),
+            place("same", true),
+            place("same", false),
+            place("done", true),
+        ]);
+        assert_eq!(authority.claim(1, "done", ""), Some(true));
+        assert_eq!(authority.claim(1, "same", ""), Some(true));
+        assert_eq!(authority.claim(1, "same", ""), Some(false));
+        assert_eq!(authority.claim(1, "same", ""), None);
+        assert_eq!(authority.claim(1, "roost-osc only", ""), None);
+        assert_eq!(
+            authority.claim(1, "4", ""),
+            None,
+            "a bare `OSC 9;4` is ConEmu to roost-osc, so its place is nobody's"
+        );
+    }
+
+    /// The normalisation both sides go through: OSC 9's lone text is the
+    /// title whichever field carried it, and control and format characters
+    /// are dropped.
+    #[test]
+    fn notification_text_is_compared_normalised() {
+        assert_eq!(
+            notification_key("", "Build done"),
+            notification_key("Build done", "")
+        );
+        assert_eq!(
+            notification_key("", "a\tb\u{1}c\u{7f}d"),
+            ("abcd".into(), String::new())
+        );
+        assert_eq!(
+            notification_key("T\u{200d}", "B\u{85}"),
+            ("T".into(), "B".into())
+        );
+        assert_ne!(notification_key("T", "B"), notification_key("B", "T"));
     }
 }

@@ -1,5 +1,5 @@
-//! The shared callback context: `set_status_sink` (OSC 7501 reports and
-//! OSC 133 marks into one ordered sink) alongside `set_write_pty_buffer`,
+//! The shared callback context: `set_status_sink` (OSC 7501 reports, OSC
+//! 133 marks and OSC 9 / 777 notification places into one ordered sink) alongside `set_write_pty_buffer`,
 //! through real bytes fed to `vt_write`. The crafted-struct guards (short
 //! and long structs, unknown state) are inline in `src/program_status.rs`.
 #![cfg(feature = "ffi")]
@@ -121,6 +121,7 @@ fn clearing_the_status_sink_keeps_write_pty_working() {
     assert_eq!(take(&replies), b"\x1b[0n");
     term.vt_write(&osc7501("state=done"));
     term.vt_write(b"\x1b]133;A\x07");
+    term.vt_write(b"\x1b]9;Build done\x07");
     assert!(take(&sink).is_empty(), "the status sink is cleared");
     assert_eq!(Arc::strong_count(&sink), 1, "the cleared sink was dropped");
 }
@@ -384,5 +385,78 @@ fn events_do_not_depend_on_write_boundaries() {
         term.vt_write(head);
         term.vt_write(tail);
         assert_eq!(take(&sink), expected, "split at {split}");
+    }
+}
+
+/// Plan 082 D5.8's amendment: a desktop notification is placed among the
+/// reports and marks of the same write, in byte order.
+#[test]
+fn notifications_keep_their_place_among_reports_and_marks() {
+    let mut term = new_terminal();
+    let sink = install_sink(&mut term);
+    let mut bytes = osc7501("state=blocked:app=pi");
+    bytes.extend_from_slice(b"\x1b]9;turn over\x07");
+    bytes.extend_from_slice(b"\x1b]133;A\x07");
+    bytes.extend_from_slice(b"\x1b]777;notify;Build;done\x1b\\");
+    bytes.extend_from_slice(&osc7501("state=working"));
+    term.vt_write(&bytes);
+
+    assert_eq!(
+        take(&sink),
+        vec![
+            TerminalEvent::Status(ProgramStatusReport {
+                app: "pi".into(),
+                ..report(ProgramStatusState::Blocked)
+            }),
+            notification("", "turn over"),
+            TerminalEvent::Prompt(PromptMark::PromptStart),
+            notification("Build", "done"),
+            status(ProgramStatusState::Working),
+        ]
+    );
+}
+
+fn notification(title: &str, body: &str) -> TerminalEvent {
+    TerminalEvent::Notification {
+        title: title.into(),
+        body: body.into(),
+    }
+}
+
+/// What libghostty calls a desktop notification, and its text: OSC 9's
+/// iTerm2 form (all body) and OSC 777's `notify`, not OSC 9's ConEmu
+/// sub-commands (progress, sleep, message box, cwd) nor another OSC 777
+/// extension.
+#[test]
+fn osc_9_and_777_notify_and_conemu_sub_commands_do_not() {
+    for (bytes, expected) in [
+        (
+            &b"\x1b]9;Build done\x07"[..],
+            vec![notification("", "Build done")],
+        ),
+        (
+            b"\x1b]9;Build done\x1b\\",
+            vec![notification("", "Build done")],
+        ),
+        (
+            b"\x1b]777;notify;Build;done\x07",
+            vec![notification("Build", "done")],
+        ),
+        (b"\x1b]9;4;1;50\x07", vec![]),
+        (b"\x1b]9;4;0\x07", vec![]),
+        (b"\x1b]9;1;100\x07", vec![]),
+        (b"\x1b]9;2;message box\x07", vec![]),
+        (b"\x1b]9;9;/tmp\x07", vec![]),
+        (b"\x1b]777;set-color;1\x07", vec![]),
+    ] {
+        let mut term = new_terminal();
+        let sink = install_sink(&mut term);
+        term.vt_write(bytes);
+        assert_eq!(
+            take(&sink),
+            expected,
+            "{:?}",
+            String::from_utf8_lossy(bytes)
+        );
     }
 }

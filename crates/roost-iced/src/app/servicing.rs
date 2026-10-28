@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use roost_engine::ipc::{DumpError, HostOpFailure, HostOpReply};
+use roost_engine::program_status::RawOscAuthority;
 use roost_ipc::codes;
 use roost_ipc::messages::{
     ActivationOutcome, AppContextMenuDumpResult, AppContextMenuTarget, AppSecureInputResult,
@@ -729,20 +730,28 @@ pub(super) fn inject_pty_bytes(
 }
 
 /// A chunk's program-status events, to the workspace whose terminal
-/// produced them. Only an in-process tab has a status sink, so a key from
-/// any other instance never carries any.
-fn apply_program_status(workspace: &Workspace, key: TabKey, events: Vec<StatusEvent>) {
+/// produced them, and the records' authority at each notification they
+/// placed, for the chunk's OSC actions. Only an in-process tab has a
+/// status sink, so a key from any other instance never carries any.
+fn apply_program_status(
+    workspace: &Workspace,
+    key: TabKey,
+    events: Vec<StatusEvent>,
+) -> RawOscAuthority {
     if events.is_empty() {
-        return;
+        return RawOscAuthority::default();
     }
     let Some(tab_id) = key.local_tab() else {
         tracing::debug!(?key, "program status from another instance");
-        return;
+        return RawOscAuthority::default();
     };
     let now_ms = roost_engine::workspace::unix_now_ms();
-    if let Err(error) = workspace.apply_program_status(tab_id, events, now_ms) {
-        tracing::debug!(tab_id, %error, "program status for a tab whose row is gone");
-    }
+    workspace
+        .apply_program_status(tab_id, events, now_ms)
+        .unwrap_or_else(|error| {
+            tracing::debug!(tab_id, %error, "program status for a tab whose row is gone");
+            RawOscAuthority::default()
+        })
 }
 
 /// A click on the OS notification banner, decided off the core alone so it
@@ -4936,11 +4945,16 @@ impl App {
     }
 
     fn apply_chunk_effects(&mut self, chunk: ChunkEffects) -> UiTask {
-        apply_program_status(&self.workspace, chunk.key, chunk.status);
-        self.apply_osc_actions(chunk.key, chunk.actions)
+        let mut authority = apply_program_status(&self.workspace, chunk.key, chunk.status);
+        self.apply_osc_actions(chunk.key, chunk.actions, &mut authority)
     }
 
-    pub(super) fn apply_osc_actions(&mut self, key: TabKey, actions: Vec<OscAction>) -> UiTask {
+    fn apply_osc_actions(
+        &mut self,
+        key: TabKey,
+        actions: Vec<OscAction>,
+        authority: &mut RawOscAuthority,
+    ) -> UiTask {
         let tab_id = key.tab;
         for action in actions {
             match action {
@@ -4949,7 +4963,10 @@ impl App {
                 // title/cwd/agent claim to whatever local tab shares its
                 // number. HS-2 sends it to that host's client instead.
                 OscAction::Workspace { command, payload } => match key.local_tab() {
-                    Some(local_tab) => self.client.apply_osc(local_tab, command, &payload),
+                    Some(local_tab) => {
+                        self.client
+                            .apply_osc(local_tab, command, &payload, authority);
+                    }
                     None => tracing::debug!(
                         ?key,
                         %command,
@@ -6818,6 +6835,66 @@ mod tests {
             "the clear came last: {listed:?}"
         );
         supervisor.close(tab_id);
+    }
+
+    /// Plan 082 D5.8's amendment, the branch review's sequence on an
+    /// in-process tab: a `blocked` record, the program's own OSC 9, then the
+    /// `A` ending the record's authority, on an unwatched tab no hook owns.
+    /// Each chunk is applied as `App::apply_chunk_effects` applies it, and
+    /// the record's banner is the only one however the bytes were read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_raw_notification_is_judged_where_it_falls_whatever_the_reads() {
+        let workspace = Workspace::new();
+        workspace.set_window_focused(false);
+        let project = workspace.create_project("p", "/tmp").unwrap().id;
+        let mut stream = b"\x1b]7501;state=blocked:app=pi\x1b\\".to_vec();
+        stream.extend_from_slice(b"\x1b]9;turn over\x07\x1b]133;A\x07");
+
+        let banners = |chunks: &[&[u8]]| {
+            let tab_id = workspace.open_tab(project, "/tmp", "t", false).unwrap().id;
+            let (mut tabs, supervisor) = attached(tab_id);
+            let key = TabKey::local(tab_id);
+            let mut events = workspace.subscribe();
+            for chunk in chunks {
+                let mut pty = TabOutputBatch::default();
+                for effects in inject_pty_bytes(&mut tabs, &mut pty, key, chunk).unwrap() {
+                    let mut authority = apply_program_status(&workspace, key, effects.status);
+                    for action in effects.actions {
+                        if let OscAction::Workspace { command, payload } = action {
+                            roost_engine::application::apply_osc(
+                                &workspace,
+                                tab_id,
+                                command,
+                                &payload,
+                                &mut authority,
+                            );
+                        }
+                    }
+                }
+            }
+            supervisor.close(tab_id);
+            let mut fired = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if let WorkspaceEvent::NotificationFired { title, body, .. } = event {
+                    fired.push((title, body));
+                }
+            }
+            fired
+        };
+
+        let whole = banners(&[&stream]);
+        assert_eq!(
+            whole,
+            vec![("Pi".to_string(), "Needs your input".to_string())],
+            "the record's banner, and not the OSC 9 it covered"
+        );
+        for cut in 1..stream.len() {
+            assert_eq!(
+                banners(&[&stream[..cut], &stream[cut..]]),
+                whole,
+                "split at byte {cut}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

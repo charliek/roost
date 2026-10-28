@@ -51,6 +51,7 @@ use tracing::{debug, warn};
 
 use crate::ipc::{DumpData, ResolvedCellData, ResolvedCellsData};
 use crate::osc::{ClipboardTarget, OscAction, OscColorSnapshot, OscColorState, OscRgb, OscRouter};
+use crate::program_status::RawOscAuthority;
 use crate::pty::{Geometry, PtyOutputEvent, WriterCmd};
 use crate::workspace::TabEffectKind;
 
@@ -110,7 +111,9 @@ const HEADLESS_BG: roost_vt::ColorRgb = roost_vt::ColorRgb { r: 0, g: 0, b: 0 };
 /// without standing up a persisted workspace.
 pub trait ServerVtWorkspace: Send + Sync + 'static {
     /// Apply one `OscAction::Workspace` — same routing a UI does.
-    fn apply_osc(&self, tab_id: i64, command: u32, payload: &str);
+    /// `authority` is what [`Self::apply_program_status`] returned for the
+    /// same chunk.
+    fn apply_osc(&self, tab_id: i64, command: u32, payload: &str, authority: &mut RawOscAuthority);
     /// The tab's PTY is gone; drop its workspace row.
     fn close_row(&self, tab_id: i64);
     /// Publish one client-local effect (plan 037 §3.6) — a bell or an
@@ -124,12 +127,17 @@ pub trait ServerVtWorkspace: Send + Sync + 'static {
     /// byte order, to the tab's program-status records. Called after the
     /// chunk's `vt_write` and before its OSC actions, so the hook layer
     /// sees the chunk's marks after the records do (plan 082 D4.3).
-    fn apply_program_status(&self, tab_id: i64, events: Vec<StatusEvent>, now_ms: i64);
+    fn apply_program_status(
+        &self,
+        tab_id: i64,
+        events: Vec<StatusEvent>,
+        now_ms: i64,
+    ) -> RawOscAuthority;
 }
 
 impl ServerVtWorkspace for crate::Workspace {
-    fn apply_osc(&self, tab_id: i64, command: u32, payload: &str) {
-        crate::application::apply_osc(self, tab_id, command, payload);
+    fn apply_osc(&self, tab_id: i64, command: u32, payload: &str, authority: &mut RawOscAuthority) {
+        crate::application::apply_osc(self, tab_id, command, payload, authority);
     }
 
     fn close_row(&self, tab_id: i64) {
@@ -142,10 +150,18 @@ impl ServerVtWorkspace for crate::Workspace {
         self.publish_tab_effect(tab_id, effect);
     }
 
-    fn apply_program_status(&self, tab_id: i64, events: Vec<StatusEvent>, now_ms: i64) {
-        if let Err(error) = crate::Workspace::apply_program_status(self, tab_id, events, now_ms) {
-            debug!(tab_id, %error, "program status for a tab whose row is gone");
-        }
+    fn apply_program_status(
+        &self,
+        tab_id: i64,
+        events: Vec<StatusEvent>,
+        now_ms: i64,
+    ) -> RawOscAuthority {
+        crate::Workspace::apply_program_status(self, tab_id, events, now_ms).unwrap_or_else(
+            |error| {
+                debug!(tab_id, %error, "program status for a tab whose row is gone");
+                RawOscAuthority::default()
+            },
+        )
     }
 }
 
@@ -946,11 +962,11 @@ impl TabTask {
         });
         // 2. the authoritative terminal, then its program-status records.
         self.vt.terminal.vt_write(&data);
-        self.take_status();
+        let mut authority = self.take_status();
         // 3. OSC scan, applied in wire order.
         let actions = self.vt.router.feed_stateful(&data, &mut self.vt.colors);
         for action in actions {
-            self.apply_action(action);
+            self.apply_action(action, &mut authority);
         }
         // One `bell` per chunk that carried at least one BEL, not one
         // per byte: a program that rings twenty times in a burst wants
@@ -974,13 +990,13 @@ impl TabTask {
         }
     }
 
-    fn apply_action(&self, action: OscAction) {
+    fn apply_action(&self, action: OscAction, authority: &mut RawOscAuthority) {
         match action {
             OscAction::Workspace { command, payload } => {
                 self.vt
                     .state
                     .workspace
-                    .apply_osc(self.tab_id, command, &payload);
+                    .apply_osc(self.tab_id, command, &payload, authority);
             }
             // Client-local effects. A session has no view, so the only
             // thing it can do with one is hand it to whoever is
@@ -1023,16 +1039,16 @@ impl TabTask {
     }
 
     /// Apply whatever the status sink collected.
-    fn take_status(&mut self) {
+    fn take_status(&mut self) -> RawOscAuthority {
         let events = crate::program_status::drain(&self.vt.status);
         if events.is_empty() {
-            return;
+            return RawOscAuthority::default();
         }
         self.vt.state.workspace.apply_program_status(
             self.tab_id,
             events,
             crate::workspace::unix_now_ms(),
-        );
+        )
     }
 
     /// Move whatever libghostty emitted into the pending queue. The lock

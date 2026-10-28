@@ -21,6 +21,7 @@ use roost_ipc::session_launch::FirstProject;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
+use crate::program_status::RawOscAuthority;
 use crate::{
     AttentionSource, PtyError, PtySupervisor, RestoreTab, SupervisorEvent, Workspace,
     WorkspaceError,
@@ -328,8 +329,14 @@ impl LocalClient {
     /// The legacy code path round-tripped this through the daemon
     /// via `ReportOsc`; in M3b the UI parses OSC in-process and
     /// updates state locally with no round-trip.
-    pub fn apply_osc(&self, tab_id: i64, command: u32, payload: &str) {
-        apply_osc(&self.workspace, tab_id, command, payload);
+    pub fn apply_osc(
+        &self,
+        tab_id: i64,
+        command: u32,
+        payload: &str,
+        authority: &mut RawOscAuthority,
+    ) {
+        apply_osc(&self.workspace, tab_id, command, payload, authority);
     }
 
     /// Start the supervisor's password poller and keep this workspace's
@@ -622,7 +629,16 @@ where
 /// consumer that holds only a `Workspace` can apply the same transitions
 /// — the server-VT tab task does, and routing it through a `LocalClient`
 /// would put an `Arc<PtySupervisor>` back inside the supervisor.
-pub fn apply_osc(workspace: &Workspace, tab_id: i64, command: u32, payload: &str) {
+///
+/// `authority` is what [`Workspace::apply_program_status`] returned for
+/// the same chunk; each notification claims its own place in it.
+pub fn apply_osc(
+    workspace: &Workspace,
+    tab_id: i64,
+    command: u32,
+    payload: &str,
+    authority: &mut RawOscAuthority,
+) {
     match command {
         0..=2 => {
             // Title set from the shell. OSC-from-shell path
@@ -649,7 +665,10 @@ pub fn apply_osc(workspace: &Workspace, tab_id: i64, command: u32, payload: &str
             // here first would let a concurrent claim slip between
             // the check and the commit.
             let (title, body) = parse_notification_payload(command, payload);
-            let _ = workspace.raise_attention(tab_id, &title, &body, AttentionSource::RawOsc);
+            let source = AttentionSource::RawOsc {
+                records_authoritative: authority.claim(tab_id, &title, &body),
+            };
+            let _ = workspace.raise_attention(tab_id, &title, &body, source);
         }
         133 => {
             // OSC 133 prompt/command mark → the shell axis. Never
@@ -689,7 +708,7 @@ pub(crate) fn pty_dim(value: u32, default: u16, field: &str) -> Result<u16> {
     u16::try_from(value).map_err(|_| anyhow::anyhow!("{field} out of u16 range: {value}"))
 }
 
-fn parse_notification_payload(command: u32, payload: &str) -> (String, String) {
+pub(crate) fn parse_notification_payload(command: u32, payload: &str) -> (String, String) {
     match command {
         // OSC 777 ;notify;Title;Body — drop the leading `notify;`.
         777 => {
@@ -935,7 +954,7 @@ mod tests {
     fn raw_osc_notifications_are_suppressed_under_a_live_agent() {
         let (client, tab_id) = client_with_tab();
 
-        client.apply_osc(tab_id, 9, "Build done");
+        client.apply_osc(tab_id, 9, "Build done", &mut RawOscAuthority::default());
         assert!(client.workspace.tab(tab_id).unwrap().has_notification);
 
         let _ = client.workspace.set_tab_has_notification(tab_id, false);
@@ -944,7 +963,12 @@ mod tests {
             .agent_report(&claim(tab_id, AgentLifecycle::Working))
             .unwrap();
         for command in [9, 99, 777] {
-            client.apply_osc(tab_id, command, "notify;Wrapper;Noise");
+            client.apply_osc(
+                tab_id,
+                command,
+                "notify;Wrapper;Noise",
+                &mut RawOscAuthority::default(),
+            );
             assert!(
                 !client.workspace.tab(tab_id).unwrap().has_notification,
                 "OSC {command} should be suppressed mid-turn"
@@ -953,9 +977,9 @@ mod tests {
 
         // The `D` failsafe re-opens the gate even though ownership
         // survives as a label.
-        client.apply_osc(tab_id, 133, "D;0");
+        client.apply_osc(tab_id, 133, "D;0", &mut RawOscAuthority::default());
         assert!(client.workspace.tab(tab_id).unwrap().hook_active);
-        client.apply_osc(tab_id, 9, "Build done");
+        client.apply_osc(tab_id, 9, "Build done", &mut RawOscAuthority::default());
         assert!(client.workspace.tab(tab_id).unwrap().has_notification);
     }
 
@@ -979,15 +1003,15 @@ mod tests {
     #[test]
     fn osc133_writes_the_shell_axis_through_apply_osc() {
         let (client, tab_id) = client_with_tab();
-        client.apply_osc(tab_id, 133, "C");
+        client.apply_osc(tab_id, 133, "C", &mut RawOscAuthority::default());
         assert_eq!(
             client.workspace.tab(tab_id).unwrap().state,
             TabState::Running
         );
-        client.apply_osc(tab_id, 133, "D;0");
+        client.apply_osc(tab_id, 133, "D;0", &mut RawOscAuthority::default());
         assert_eq!(client.workspace.tab(tab_id).unwrap().state, TabState::None);
         // Undefined mark bodies are no-change.
-        client.apply_osc(tab_id, 133, "Z");
+        client.apply_osc(tab_id, 133, "Z", &mut RawOscAuthority::default());
         assert_eq!(client.workspace.tab(tab_id).unwrap().state, TabState::None);
     }
 

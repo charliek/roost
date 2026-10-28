@@ -43,7 +43,7 @@ use crate::persistence::{
     persist_state, read_state, HostSnapshot, HostTabMemory, ProjectSnapshot, SnapshotFile,
     WindowFrame,
 };
-use crate::program_status::{self, ProgramStatusRecords, VetoStream};
+use crate::program_status::{self, ProgramStatusRecords, RawOscAuthority, VetoStream};
 
 /// How many events the broadcast channel buffers per subscriber.
 /// Subscribers that fall behind get a `Lagged` and resync via
@@ -1917,11 +1917,16 @@ impl Workspace {
         // `notification.create` / `roostctl notify` is never suppressed
         // this way (plan §3.4) — the agent's own adapter is what emits
         // those, so gating them would mute the very source it protects.
-        if source == AttentionSource::RawOsc
-            && (agent::suppress_raw_osc(&row.agent) || row.program_status.is_authoritative())
+        if let AttentionSource::RawOsc {
+            records_authoritative,
+        } = source
         {
-            tracing::debug!(tab_id, "raw OSC notification suppressed (agent owns tab)");
-            return Ok(false);
+            let records =
+                records_authoritative.unwrap_or_else(|| row.program_status.is_authoritative());
+            if agent::suppress_raw_osc(&row.agent) || records {
+                tracing::debug!(tab_id, "raw OSC notification suppressed (agent owns tab)");
+                return Ok(false);
+            }
         }
         if watched {
             return Ok(false);
@@ -2062,12 +2067,16 @@ impl Workspace {
     /// A record banner for a tab the user is watching is dropped, like any
     /// other raise. `now_ms` is the caller's: [`unix_now_ms`] in
     /// production.
+    ///
+    /// Returns the records' authority at each notification the batch
+    /// placed, for the caller to hand the same chunk's raw OSC 9 / 777
+    /// through [`crate::application::apply_osc`].
     pub fn apply_program_status(
         &self,
         tab_id: i64,
         events: Vec<StatusEvent>,
         now_ms: i64,
-    ) -> Result<(), WorkspaceError> {
+    ) -> Result<RawOscAuthority, WorkspaceError> {
         let mut inner = self.inner.lock().unwrap();
         let watched = inner.tab_is_being_watched(tab_id);
         let row = inner
@@ -2075,7 +2084,7 @@ impl Workspace {
             .get_mut(&tab_id)
             .ok_or(WorkspaceError::TabNotFound(tab_id))?;
         let mut records = row.program_status.clone();
-        let applied = records.apply(&row.agent, events, now_ms);
+        let mut applied = records.apply(&row.agent, events, now_ms);
         let agent = row.agent.clone();
         let mut events = replace_axes(row, agent, records);
         if !watched {
@@ -2097,7 +2106,9 @@ impl Workspace {
             self.commit(inner, events, Persist::Skip);
         }
         applied.emit_logs(tab_id);
-        Ok(())
+        Ok(RawOscAuthority::new(std::mem::take(
+            &mut applied.notifications,
+        )))
     }
 
     /// Apply `first` and then `then` under one lock, emitting the
@@ -2646,11 +2657,16 @@ impl Workspace {
 
 /// Where an attention-raise came from. The only behavioral difference
 /// is the agent gate: raw OSC is dropped while a live agent owns the tab
-/// (plan §3.4), a structured `notification.create` / `roostctl notify`
-/// never is.
+/// (plan §3.4) or program-status records decide it (D5.8), a structured
+/// `notification.create` / `roostctl notify` never is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttentionSource {
-    RawOsc,
+    RawOsc {
+        /// Whether the records were authoritative at the notification's
+        /// own bytes ([`crate::program_status::RawOscAuthority`]); `None`
+        /// reads them as they stand.
+        records_authoritative: Option<bool>,
+    },
     Structured,
 }
 
@@ -4556,7 +4572,14 @@ mod tests {
     fn prompt_mark_reopens_raw_osc_for_a_dead_agent() {
         let (ws, tid) = owned_ws(AgentLifecycle::Working);
         assert!(!ws
-            .raise_attention(tid, "Wrapper", "noise", AttentionSource::RawOsc)
+            .raise_attention(
+                tid,
+                "Wrapper",
+                "noise",
+                AttentionSource::RawOsc {
+                    records_authoritative: None,
+                }
+            )
             .unwrap());
         assert!(!ws.tab(tid).unwrap().has_notification);
 
@@ -4566,7 +4589,14 @@ mod tests {
         assert!(tab.hook_active, "ownership survives as a label");
         assert_eq!(tab.state, TabState::None, "falls through to shell");
         assert!(ws
-            .raise_attention(tid, "Build", "done", AttentionSource::RawOsc)
+            .raise_attention(
+                tid,
+                "Build",
+                "done",
+                AttentionSource::RawOsc {
+                    records_authoritative: None,
+                }
+            )
             .unwrap());
         assert!(ws.tab(tid).unwrap().has_notification);
     }
@@ -5086,13 +5116,27 @@ mod tests {
         let (ws, tid) = owned_ws(AgentLifecycle::Working);
 
         assert!(!ws
-            .raise_attention(tid, "Wrapper", "noise", AttentionSource::RawOsc)
+            .raise_attention(
+                tid,
+                "Wrapper",
+                "noise",
+                AttentionSource::RawOsc {
+                    records_authoritative: None,
+                }
+            )
             .unwrap());
         assert!(!ws.tab(tid).unwrap().has_notification);
 
         ws.apply_shell_mark(tid, "D;0").unwrap();
         assert!(ws
-            .raise_attention(tid, "Build", "done", AttentionSource::RawOsc)
+            .raise_attention(
+                tid,
+                "Build",
+                "done",
+                AttentionSource::RawOsc {
+                    records_authoritative: None,
+                }
+            )
             .unwrap());
         assert!(ws.tab(tid).unwrap().has_notification);
     }
@@ -6659,7 +6703,14 @@ mod tests {
         ws.publish_tab_effect(tab, TabEffectKind::Bell);
         let effects_only = ws.revision();
         assert!(ws
-            .raise_attention(tab, "title", "body", AttentionSource::RawOsc)
+            .raise_attention(
+                tab,
+                "title",
+                "body",
+                AttentionSource::RawOsc {
+                    records_authoritative: None,
+                }
+            )
             .unwrap());
         let fired = ws.revision();
 
@@ -7243,6 +7294,8 @@ mod tests {
 
     /// Plan 082 B4: program status (OSC 7501) wired into the workspace.
     mod program_status {
+        use std::sync::Arc;
+
         use super::*;
         use roost_ipc::program_status::{
             DecidedBy, ProgramStatusKind, ProgramStatusReport, ProgramStatusState as S, PromptMark,
@@ -7266,6 +7319,14 @@ mod tests {
 
         fn claude(state: S, msg: &str) -> StatusEvent {
             status(state, "", "claude-code", msg)
+        }
+
+        /// The place libghostty reports for `OSC 9 ; text`.
+        fn osc9(text: &str) -> StatusEvent {
+            StatusEvent::Notification {
+                title: String::new(),
+                body: text.into(),
+            }
         }
 
         fn banners(events: &[WorkspaceEvent]) -> Vec<(String, String)> {
@@ -7469,7 +7530,14 @@ mod tests {
                 .unwrap();
             assert!(!ws.tab(tid).unwrap().hook_active, "no hook owns the tab");
             assert!(!ws
-                .raise_attention(tid, "codex", "turn done", AttentionSource::RawOsc)
+                .raise_attention(
+                    tid,
+                    "codex",
+                    "turn done",
+                    AttentionSource::RawOsc {
+                        records_authoritative: None,
+                    }
+                )
                 .unwrap());
             assert!(!ws.tab(tid).unwrap().has_notification);
             // Structured attention is never gated this way.
@@ -7482,8 +7550,111 @@ mod tests {
                 .unwrap();
             assert_eq!(ws.tab(tid).unwrap().program_status, None);
             assert!(ws
-                .raise_attention(tid, "Build", "done", AttentionSource::RawOsc)
+                .raise_attention(
+                    tid,
+                    "Build",
+                    "done",
+                    AttentionSource::RawOsc {
+                        records_authoritative: None,
+                    }
+                )
                 .unwrap());
+        }
+
+        /// Plan 082 D5.8's amendment, the branch review's sequence: a raw
+        /// OSC 9 is judged against the records at its own bytes. Here it
+        /// follows `blocked` and precedes the `A` that ends the records'
+        /// authority, so it is suppressed though the chunk ends with no
+        /// record deciding. A raw notification libghostty placed nowhere
+        /// falls back to the records as they stand.
+        #[test]
+        fn raw_osc_is_judged_at_its_place_in_the_chunk() {
+            let (ws, tid) = agent_ws();
+            let mut rx = ws.subscribe();
+            let mut authority = ws
+                .apply_program_status(
+                    tid,
+                    vec![
+                        status(S::Blocked, "", "pi", ""),
+                        osc9("turn over"),
+                        StatusEvent::Prompt(PromptMark::PromptStart),
+                    ],
+                    LATE,
+                )
+                .unwrap();
+            crate::application::apply_osc(&ws, tid, 9, "turn over", &mut authority);
+            assert_eq!(
+                banners(&drain(&mut rx)),
+                vec![("Pi".to_string(), "Needs your input".to_string())],
+                "the record's banner alone"
+            );
+
+            crate::application::apply_osc(&ws, tid, 9, "unplaced", &mut authority);
+            assert_eq!(
+                banners(&drain(&mut rx)),
+                vec![("unplaced".to_string(), String::new())],
+                "no record decides at the chunk's end"
+            );
+            ws.clear_notification(tid, None).unwrap();
+
+            // A notification placed before the record that now decides.
+            let mut authority = ws
+                .apply_program_status(
+                    tid,
+                    vec![osc9("before"), status(S::Working, "", "pi", "")],
+                    LATE,
+                )
+                .unwrap();
+            assert!(ws.tab(tid).unwrap().program_status.is_some());
+            crate::application::apply_osc(&ws, tid, 9, "before", &mut authority);
+            assert_eq!(
+                banners(&drain(&mut rx)),
+                vec![("before".to_string(), String::new())]
+            );
+        }
+
+        /// Plan 082 B-4: the child-record cap's warning reaches the log
+        /// through the workspace, once for a burst.
+        #[test]
+        fn the_child_cap_warns_in_the_log_once() {
+            let (ws, tid) = agent_ws();
+            let children: Vec<StatusEvent> = (0..=crate::program_status::MAX_CHILDREN + 1)
+                .map(|i| status(S::Working, &format!("c{i}"), "", ""))
+                .collect();
+            assert_eq!(children.len(), 257);
+
+            let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let writer = Arc::clone(&captured);
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .with_writer(move || CapturedLog(Arc::clone(&writer)))
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                ws.apply_program_status(tid, children, LATE).unwrap();
+            });
+
+            let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+            assert_eq!(
+                log.matches("the tab is at its child-record cap").count(),
+                1,
+                "{log}"
+            );
+            assert!(log.contains(&format!("tab_id={tid}")), "{log}");
+            assert!(log.contains("id=\"c255\""), "{log}");
+        }
+
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
 
         /// A claim from an agent other than the deciding record's is a

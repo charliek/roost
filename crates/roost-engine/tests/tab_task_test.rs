@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use roost_engine::ipc::{DumpData, ResolvedCellData, ResolvedCellsData};
 use roost_engine::osc::{OscColorSnapshot, OscRgb};
+use roost_engine::program_status::RawOscAuthority;
 use roost_engine::tab_task::{
     ServerVtConfig, ServerVtWorkspace, TabCmd, TabError, SERVER_VT_CONTINUATION_MAX,
 };
@@ -89,7 +90,13 @@ enum Seam {
 }
 
 impl ServerVtWorkspace for TestWorkspace {
-    fn apply_osc(&self, tab_id: i64, command: u32, payload: &str) {
+    fn apply_osc(
+        &self,
+        tab_id: i64,
+        command: u32,
+        payload: &str,
+        _authority: &mut RawOscAuthority,
+    ) {
         if command == 133 {
             self.order
                 .lock()
@@ -114,8 +121,14 @@ impl ServerVtWorkspace for TestWorkspace {
         self.effects.lock().unwrap().push((tab_id, effect));
     }
 
-    fn apply_program_status(&self, _tab_id: i64, events: Vec<StatusEvent>, _now_ms: i64) {
+    fn apply_program_status(
+        &self,
+        _tab_id: i64,
+        events: Vec<StatusEvent>,
+        _now_ms: i64,
+    ) -> RawOscAuthority {
         self.order.lock().unwrap().push(Seam::Status(events));
+        RawOscAuthority::default()
     }
 }
 
@@ -1658,26 +1671,29 @@ struct Outcome {
 }
 
 /// Feed `chunks` to a fresh session tab of a real workspace and read back
-/// its `tab.list` row and the banners it raised.
+/// its `tab.list` row and the banners it raised. With `hook_owner`, a hook
+/// owner still saying Waiting holds the tab first, so the marks move the
+/// hook layer under the records (the B3 review's sequence).
 async fn run_stream(
     sup: &PtySupervisor,
     workspace: &Arc<Workspace>,
     project: i64,
+    hook_owner: bool,
     chunks: &[&[u8]],
 ) -> Outcome {
     let tab_id = workspace.open_tab(project, "/tmp", "t", false).unwrap().id;
-    // A hook owner still saying Waiting, so the marks move the hook layer
-    // under the records (the B3 review's sequence).
-    let claim = TabAgentReportParams {
-        session_id: "s1".into(),
-        ..TabAgentReportParams::sessionless(
-            tab_id,
-            "claude",
-            OwnershipAction::Claim,
-            Some(AgentLifecycle::Waiting),
-        )
-    };
-    assert!(workspace.agent_report(&claim).unwrap().0);
+    if hook_owner {
+        let claim = TabAgentReportParams {
+            session_id: "s1".into(),
+            ..TabAgentReportParams::sessionless(
+                tab_id,
+                "claude",
+                OwnershipAction::Claim,
+                Some(AgentLifecycle::Waiting),
+            )
+        };
+        assert!(workspace.agent_report(&claim).unwrap().0);
+    }
     let mut events = workspace.subscribe();
     let _output = sup
         .spawn(
@@ -1763,9 +1779,16 @@ async fn program_status_does_not_depend_on_read_boundaries() {
         stream.extend_from_slice(&part);
     }
 
-    let whole = run_stream(&sup, &workspace, project, &[&stream]).await;
+    let whole = run_stream(&sup, &workspace, project, true, &[&stream]).await;
     for cut in 1..stream.len() {
-        let split = run_stream(&sup, &workspace, project, &[&stream[..cut], &stream[cut..]]).await;
+        let split = run_stream(
+            &sup,
+            &workspace,
+            project,
+            true,
+            &[&stream[..cut], &stream[cut..]],
+        )
+        .await;
         assert_eq!(split, whole, "split at byte {cut}");
     }
 
@@ -1788,7 +1811,7 @@ async fn program_status_does_not_depend_on_read_boundaries() {
             .chain([stream.len()])
             .collect();
         let chunks: Vec<&[u8]> = bounds.windows(2).map(|w| &stream[w[0]..w[1]]).collect();
-        let random = run_stream(&sup, &workspace, project, &chunks).await;
+        let random = run_stream(&sup, &workspace, project, true, &chunks).await;
         assert_eq!(random, whole, "round {round}, cuts {cuts:?}");
     }
 
@@ -1804,5 +1827,142 @@ async fn program_status_does_not_depend_on_read_boundaries() {
         "the blocked child announced, under the tab's title since the mark \
          dropped the root it would inherit an app from; the done fell in the \
          startup guard"
+    );
+}
+
+/// Plan 082 D5.8's amendment, the branch review's sequence through the
+/// real tab task: on an unwatched tab no hook owns, a `blocked` record, the
+/// program's own OSC 9, then the `A` that ends the record's authority. The
+/// OSC 9 falls inside the authority, so the record's banner is the only
+/// one, whether the three arrive in one read or the read splits anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_raw_notification_is_judged_where_it_falls_whatever_the_reads() {
+    let workspace = Arc::new(Workspace::new());
+    workspace.set_window_focused(false);
+    let project = workspace.create_project("p", "/tmp").unwrap().id;
+    workspace.open_tab(project, "/tmp", "keep", true).unwrap();
+    let sup = PtySupervisor::new();
+    sup.enable_server_vt(ServerVtConfig::new(workspace.clone()))
+        .expect("server-vt enables once");
+
+    let mut stream = osc7501("state=blocked:app=pi");
+    stream.extend_from_slice(b"\x1b]9;turn over\x07");
+    stream.extend_from_slice(b"\x1b]133;A\x07");
+
+    let whole = run_stream(&sup, &workspace, project, false, &[&stream]).await;
+    assert_eq!(
+        whole.banners,
+        vec![("Pi".to_string(), "Needs your input".to_string())],
+        "the record's banner, and not the OSC 9 it covered: {whole:?}"
+    );
+    for cut in 1..stream.len() {
+        let split = run_stream(
+            &sup,
+            &workspace,
+            project,
+            false,
+            &[&stream[..cut], &stream[cut..]],
+        )
+        .await;
+        assert_eq!(split, whole, "split at byte {cut}");
+    }
+}
+
+/// The banners a session tab raises for `lead`, a `blocked` record, an
+/// `OSC 9` both parsers accept, and the `A` ending the record, in one read,
+/// on an unwatched tab no hook owns.
+async fn banners_after(lead: &[u8]) -> Vec<(String, String)> {
+    let workspace = Arc::new(Workspace::new());
+    workspace.set_window_focused(false);
+    let project = workspace.create_project("p", "/tmp").unwrap().id;
+    workspace.open_tab(project, "/tmp", "keep", true).unwrap();
+    let sup = PtySupervisor::new();
+    sup.enable_server_vt(ServerVtConfig::new(workspace.clone()))
+        .expect("server-vt enables once");
+    let mut stream = lead.to_vec();
+    stream.extend_from_slice(&osc7501("state=blocked:app=pi"));
+    stream.extend_from_slice(b"\x1b]9;inside\x07\x1b]133;A\x07");
+    run_stream(&sup, &workspace, project, false, &[&stream])
+        .await
+        .banners
+}
+
+/// Plan 082 D5.8's amendment: OSC 777 with a title alone is a form only
+/// roost-osc raises. It finds no place and is judged at the chunk's end,
+/// where nothing decides, so it fires; the agreeing OSC 9 after it keeps
+/// its own place inside the record's authority, so it doesn't.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_roost_osc_only_form_does_not_take_another_notifications_place() {
+    assert_eq!(
+        banners_after(b"\x1b]777;notify;Roost only\x07").await,
+        vec![
+            ("Pi".to_string(), "Needs your input".to_string()),
+            ("Roost only".to_string(), String::new()),
+        ]
+    );
+}
+
+/// Plan 082 D5.8's amendment: a bare `OSC 9;4` is a form only libghostty
+/// places (roost-osc reads it as ConEmu). Its place, outside the record's
+/// authority, is claimed by nobody, and the agreeing OSC 9 after it still
+/// gets its own, inside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_libghostty_only_place_does_not_shift_another_notifications() {
+    assert_eq!(
+        banners_after(b"\x1b]9;4\x07").await,
+        vec![("Pi".to_string(), "Needs your input".to_string())]
+    );
+}
+
+/// The banners `stream` raises on an unwatched session tab no hook owns,
+/// fed whole and split at every byte: the same each time.
+async fn banners_whatever_the_reads(stream: &[u8]) -> Vec<(String, String)> {
+    let workspace = Arc::new(Workspace::new());
+    workspace.set_window_focused(false);
+    let project = workspace.create_project("p", "/tmp").unwrap().id;
+    workspace.open_tab(project, "/tmp", "keep", true).unwrap();
+    let sup = PtySupervisor::new();
+    sup.enable_server_vt(ServerVtConfig::new(workspace.clone()))
+        .expect("server-vt enables once");
+    let whole = run_stream(&sup, &workspace, project, false, &[stream]).await;
+    for cut in 1..stream.len() {
+        let split = run_stream(
+            &sup,
+            &workspace,
+            project,
+            false,
+            &[&stream[..cut], &stream[cut..]],
+        )
+        .await;
+        assert_eq!(split, whole, "split at byte {cut}");
+    }
+    whole.banners
+}
+
+/// The B7 review's first collision: a bare `OSC 9;4` (a place libghostty
+/// reports with the text `4`, ConEmu to roost-osc) ahead of a real
+/// `OSC 777;notify;4;` inside a `blocked` record's authority. The real one
+/// must not claim the ConEmu one's place, from before the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_conemu_place_is_not_claimed_by_a_notification_with_its_text() {
+    let mut stream = b"\x1b]9;4\x07".to_vec();
+    stream.extend_from_slice(&osc7501("state=blocked:app=pi"));
+    stream.extend_from_slice(b"\x1b]777;notify;4;\x07\x1b]133;A\x07");
+    assert_eq!(
+        banners_whatever_the_reads(&stream).await,
+        vec![("Pi".to_string(), "Needs your input".to_string())]
+    );
+}
+
+/// The B7 review's second collision: a tab inside the two bytes of `¢`.
+/// libghostty drops it before decoding; roost-osc must too, or the texts
+/// differ and the OSC 9 is judged at the chunk's end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_control_inside_a_utf8_sequence_leaves_the_same_text_on_both_sides() {
+    let mut stream = osc7501("state=blocked:app=pi");
+    stream.extend_from_slice(b"\x1b]9;A\xc2\t\xa2\x07\x1b]133;A\x07");
+    assert_eq!(
+        banners_whatever_the_reads(&stream).await,
+        vec![("Pi".to_string(), "Needs your input".to_string())]
     );
 }

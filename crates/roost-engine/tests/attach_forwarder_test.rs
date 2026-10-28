@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use roost_engine::ipc::{IpcHandler, SessionInfo, StopHandle, MAX_DATA_CONNS_PER_SESSION};
+use roost_engine::program_status::RawOscAuthority;
 use roost_engine::tab_task::{AttachPause, AttachReleases, ServerVtConfig, ServerVtWorkspace};
 use roost_engine::{PtySupervisor, Workspace};
 use roost_ipc::dataframe::{
@@ -72,7 +73,14 @@ struct Harness {
 struct NoopWorkspace;
 
 impl ServerVtWorkspace for NoopWorkspace {
-    fn apply_osc(&self, _tab_id: i64, _command: u32, _payload: &str) {}
+    fn apply_osc(
+        &self,
+        _tab_id: i64,
+        _command: u32,
+        _payload: &str,
+        _authority: &mut RawOscAuthority,
+    ) {
+    }
     fn close_row(&self, _tab_id: i64) {}
     fn tab_effect(&self, _tab_id: i64, _effect: roost_engine::TabEffectKind) {}
     fn apply_program_status(
@@ -80,7 +88,8 @@ impl ServerVtWorkspace for NoopWorkspace {
         _tab_id: i64,
         _events: Vec<roost_ipc::program_status::StatusEvent>,
         _now_ms: i64,
-    ) {
+    ) -> RawOscAuthority {
+        RawOscAuthority::default()
     }
 }
 

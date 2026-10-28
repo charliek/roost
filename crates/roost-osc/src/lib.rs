@@ -351,17 +351,19 @@ impl OscScanner {
                 }
             }
             "9" => {
-                if is_conemu_body(body) {
+                let body = notification_text(&self.body);
+                if !is_osc9_notification(&body) {
                     return;
                 }
                 self.pending.push(OscEvent::Notification {
-                    title: body.to_string(),
+                    title: body,
                     body: String::new(),
                 });
             }
             "777" => {
                 // Konsole form: `notify;<title>;<body>`. Some senders
                 // also emit `notify;<title>` (no body).
+                let body = notification_text(&self.body);
                 let parts: Vec<&str> = body.splitn(3, ';').collect();
                 if parts.len() >= 2 && parts[0] == "notify" {
                     let title = parts[1].to_string();
@@ -479,6 +481,21 @@ impl OscScanner {
 /// iTerm2 notification whose text starts with a digit followed by
 /// any non-digit byte (e.g. `"1 file changed"`) still passes
 /// through.
+/// A notification body's text: C0 control bytes dropped **before** the
+/// lossy UTF-8 decode, as libghostty's parser drops them inside any OSC
+/// string. Decoding first would turn the bytes around a control into
+/// replacement characters libghostty never produces.
+fn notification_text(bytes: &[u8]) -> String {
+    let kept: Vec<u8> = bytes.iter().copied().filter(|b| *b >= 0x20).collect();
+    String::from_utf8_lossy(&kept).into_owned()
+}
+
+/// Whether the body of an `OSC 9` is an iTerm2 notification rather than
+/// one of ConEmu's sub-commands: what decides if the scanner raises it.
+pub fn is_osc9_notification(body: &str) -> bool {
+    !is_conemu_body(body)
+}
+
 fn is_conemu_body(body: &str) -> bool {
     let bytes = body.as_bytes();
     if bytes.is_empty() || !bytes[0].is_ascii_digit() {
@@ -784,6 +801,26 @@ mod tests {
             vec![OscEvent::Notification {
                 title: "1 file changed".into(),
                 body: String::new(),
+            }]
+        );
+    }
+
+    /// C0 controls go before the UTF-8 decode, as libghostty drops them:
+    /// a tab between the two bytes of `¢` leaves `¢`, not two U+FFFD.
+    #[test]
+    fn notification_text_drops_c0_before_decoding() {
+        assert_eq!(
+            feed_all(b"\x1b]9;A\xc2\t\xa2\x07"),
+            vec![OscEvent::Notification {
+                title: "A\u{a2}".into(),
+                body: String::new(),
+            }]
+        );
+        assert_eq!(
+            feed_all(b"\x1b]777;notify;T\x01x;B\xc2\t\xa2\x07"),
+            vec![OscEvent::Notification {
+                title: "Tx".into(),
+                body: "B\u{a2}".into(),
             }]
         );
     }

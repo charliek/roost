@@ -14,7 +14,9 @@ use std::panic::AssertUnwindSafe;
 use std::ptr::{self, NonNull};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::program_status::{program_status_trampoline, semantic_prompt_trampoline};
+use crate::program_status::{
+    desktop_notification_trampoline, program_status_trampoline, semantic_prompt_trampoline,
+};
 use crate::sys;
 use crate::{Error, Result, TerminalEvent, TrackedRef};
 
@@ -319,8 +321,8 @@ pub struct Terminal {
 /// * The `write_pty` buffer fills from `vt_write` **and** `resize`
 ///   (mode 2048 in-band size reports fire inside
 ///   `ghostty_terminal_resize`), so drain it after every call of either.
-/// * The status sink fills only from `vt_write` (OSC 7501, OSC 133, and
-///   RIS's `clear`); drain it after every `vt_write`, before acting on
+/// * The status sink fills only from `vt_write` (OSC 7501, OSC 133, OSC
+///   9 / 777, and RIS's `clear`); drain it after every `vt_write`, before acting on
 ///   anything else that write produced, to keep reports and marks in
 ///   byte order.
 #[derive(Default)]
@@ -335,12 +337,17 @@ const PROGRAM_STATUS: sys::GhosttyTerminalOption =
     sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS;
 const SEMANTIC_PROMPT: sys::GhosttyTerminalOption =
     sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT;
+const DESKTOP_NOTIFICATION: sys::GhosttyTerminalOption =
+    sys::GhosttyTerminalOption_GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION;
+const STATUS_CALLBACKS: [sys::GhosttyTerminalOption; 3] =
+    [PROGRAM_STATUS, SEMANTIC_PROMPT, DESKTOP_NOTIFICATION];
 
 // The trampolines are set as `*const c_void`; these pin each one to the
 // callback type bindgen generated for its slot.
 const _: sys::GhosttyTerminalWritePtyFn = Some(write_pty_trampoline);
 const _: sys::GhosttyTerminalProgramStatusFn = Some(program_status_trampoline);
 const _: sys::GhosttyTerminalSemanticPromptFn = Some(semantic_prompt_trampoline);
+const _: sys::GhosttyTerminalDesktopNotificationFn = Some(desktop_notification_trampoline);
 
 /// Lock poison-tolerantly: a panic in another holder must never surface
 /// as an unwind across an `extern "C"` frame.
@@ -671,29 +678,34 @@ impl Terminal {
         Ok(())
     }
 
-    /// Install `sink` as the receiver of OSC 7501 program-status reports
-    /// **and** OSC 133 prompt marks. Both callbacks push into the one
-    /// sink, so it holds them in the order libghostty parsed them; drain
-    /// it per [`CallbackCtx`]'s drain contract.
+    /// Install `sink` as the receiver of OSC 7501 program-status reports,
+    /// OSC 133 prompt marks **and** the places of OSC 9 / 777 desktop
+    /// notifications. All three callbacks push into the one sink, so it
+    /// holds them in the order libghostty parsed them; drain it per
+    /// [`CallbackCtx`]'s drain contract.
     ///
     /// Setting the program-status callback is also what makes libghostty
     /// answer the `OSC 7501 ; ?` support probe (through `write_pty`).
     ///
-    /// Calling again replaces the sink; the old `Arc` is dropped. If
-    /// either callback can't be installed, neither is left installed.
+    /// Calling again replaces the sink; the old `Arc` is dropped. If any
+    /// callback can't be installed, none is left installed.
     pub fn set_status_sink(&mut self, sink: Arc<Mutex<Vec<TerminalEvent>>>) -> Result<()> {
         *lock(&self.ctx().status) = Some(sink);
         self.set_callbacks(&[
             (PROGRAM_STATUS, program_status_trampoline as *const c_void),
             (SEMANTIC_PROMPT, semantic_prompt_trampoline as *const c_void),
+            (
+                DESKTOP_NOTIFICATION,
+                desktop_notification_trampoline as *const c_void,
+            ),
         ])
         .inspect_err(|_| *lock(&self.ctx().status) = None)
     }
 
-    /// Uninstall both status callbacks, then drop the sink. The
+    /// Uninstall the status callbacks, then drop the sink. The
     /// `write_pty` buffer, and `OPT_USERDATA`, are untouched.
     pub fn clear_status_sink(&mut self) -> Result<()> {
-        self.clear_callbacks([PROGRAM_STATUS, SEMANTIC_PROMPT])?;
+        self.clear_callbacks(STATUS_CALLBACKS)?;
         *lock(&self.ctx().status) = None;
         Ok(())
     }
@@ -1326,7 +1338,7 @@ impl Drop for Terminal {
     fn drop(&mut self) {
         // Errors are ignored — there is nothing to recover to in Drop,
         // and the context outlives the handle regardless.
-        let _ = self.clear_callbacks([WRITE_PTY, PROGRAM_STATUS, SEMANTIC_PROMPT]);
+        let _ = self.clear_callbacks(std::iter::once(WRITE_PTY).chain(STATUS_CALLBACKS));
         // SAFETY: handle non-null per constructor; freeing is the
         // documented destructor.
         unsafe { sys::ghostty_terminal_free(self.handle) };

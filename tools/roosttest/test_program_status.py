@@ -374,6 +374,47 @@ def test_program_status_does_not_depend_on_read_boundaries(lane):
     assert results["whole"]["has_notification"] is True, "the blocked child announced"
 
 
+# The branch review's sequence (plan 082 D5.8's amendment): a `blocked`
+# record, the program's own OSC 9, then the `A` that ends the record's
+# authority. The OSC 9 falls inside the authority, so it is suppressed
+# whichever read the `A` arrives in.
+RAW_OSC_INSIDE = (
+    osc7501(state="blocked", app="pi") + b"\x1b]9;turn over\x07" + b"\x1b]133;A\x07"
+)
+SENTINEL = b"\x1b]9;sentinel\x07"
+
+
+def _banners(lane, chunks: list[bytes]) -> list[tuple[str, str]]:
+    """The banners `chunks` raise on an unwatched tab no hook owns, each
+    chunk one feed. A raw OSC 9 fed after them, once no record decides,
+    marks the end of the stream's banners."""
+    tab = lane.quiet_tab()
+    lane.quiet_tab()
+    with EventStream(lane.events_socket) as stream:
+        fence = stream.subscribe()
+        for chunk in chunks:
+            lane.client.tab_feed_pty_bytes(tab, chunk)
+        lane.client.tab_feed_pty_bytes(tab, SENTINEL)
+        banners = []
+        while True:
+            banner, fence, _ = next_for_tab(stream, "notification.fired", tab, fence)
+            if banner["title"] == "sentinel":
+                return banners
+            banners.append((banner["title"], banner["body"]))
+
+
+def test_a_raw_notification_is_judged_where_it_falls(lane):
+    stream = RAW_OSC_INSIDE
+    cut = stream.index(b"\x1b]133;A")
+    partitions = {
+        "whole": [stream],
+        "before the A": [stream[:cut], stream[cut:]],
+        "every byte": [stream[i : i + 1] for i in range(len(stream))],
+    }
+    for name, chunks in partitions.items():
+        assert _banners(lane, chunks) == [("Pi", "Needs your input")], name
+
+
 # ---------------------------------------------------------------------------
 # B-8: the iced Agents panel and banners for a record-only agent
 # ---------------------------------------------------------------------------

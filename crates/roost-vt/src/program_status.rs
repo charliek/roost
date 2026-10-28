@@ -1,10 +1,11 @@
-//! OSC 7501 program-status reports and OSC 133 prompt marks, as
-//! libghostty delivers them through `GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS`
-//! and `GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT`.
+//! OSC 7501 program-status reports, OSC 133 prompt marks and the places of
+//! OSC 9 / 777 desktop notifications, as libghostty delivers them through
+//! `GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS`, `GHOSTTY_TERMINAL_OPT_SEMANTIC_PROMPT`
+//! and `GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION`.
 //!
-//! Both callbacks push into one sink ([`crate::Terminal::set_status_sink`])
-//! so reports and marks keep the byte order libghostty parsed them in,
-//! whatever the PTY read boundaries were.
+//! All three callbacks push into one sink ([`crate::Terminal::set_status_sink`])
+//! so they keep the byte order libghostty parsed them in, whatever the PTY
+//! read boundaries were.
 
 use std::os::raw::c_void;
 use std::ptr;
@@ -63,6 +64,14 @@ pub enum PromptMark {
 pub enum TerminalEvent {
     Status(ProgramStatusReport),
     Prompt(PromptMark),
+    /// An OSC 9 or OSC 777 desktop notification, where it fell in the
+    /// stream. roost-osc's scan of the same bytes is what raises it; the
+    /// text is here so that scan's notification can find its own place.
+    /// OSC 9 has no title, so its text is the body.
+    Notification {
+        title: String,
+        body: String,
+    },
 }
 
 /// Whether a libghostty sized struct, whose leading field is its `size_t`
@@ -167,7 +176,7 @@ fn mark_from_sys(
     }
 }
 
-/// The body both status trampolines share: drop a null pointer or a
+/// The body every status trampoline shares: drop a null pointer or a
 /// struct shorter than v1 before `read` touches it, then push what `read`
 /// makes of it.
 ///
@@ -242,6 +251,21 @@ unsafe fn read_mark(raw: *const sys::GhosttyTerminalSemanticPrompt) -> Option<Te
     mark_from_sys(kind, prompt_kind).map(TerminalEvent::Prompt)
 }
 
+/// # Safety
+///
+/// As for [`read_report`].
+unsafe fn read_notification(
+    raw: *const sys::GhosttyTerminalDesktopNotification,
+) -> Option<TerminalEvent> {
+    // SAFETY: the struct covers v1, whose fields are integers and raw
+    // pointers, valid for any bit pattern.
+    let raw = unsafe { ptr::read_unaligned(raw) };
+    // SAFETY: the strings are valid for the duration of the callback, and
+    // are copied here.
+    let (title, body) = unsafe { (copy_string(raw.title), copy_string(raw.body)) };
+    Some(TerminalEvent::Notification { title, body })
+}
+
 /// Installed as `GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS`, under the
 /// `write_pty` trampoline's hygiene contract.
 pub(crate) unsafe extern "C" fn program_status_trampoline(
@@ -262,6 +286,17 @@ pub(crate) unsafe extern "C" fn semantic_prompt_trampoline(
 ) {
     // SAFETY: libghostty passes this callback's userdata and struct.
     contain(|| unsafe { push_event(userdata, event, read_mark) });
+}
+
+/// Installed as `GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION`, under the
+/// `write_pty` trampoline's hygiene contract.
+pub(crate) unsafe extern "C" fn desktop_notification_trampoline(
+    _terminal: sys::GhosttyTerminal,
+    userdata: *mut c_void,
+    notification: *const sys::GhosttyTerminalDesktopNotification,
+) {
+    // SAFETY: libghostty passes this callback's userdata and struct.
+    contain(|| unsafe { push_event(userdata, notification, read_notification) });
 }
 
 #[cfg(test)]
@@ -425,6 +460,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_notification_shorter_than_v1_or_null_is_dropped() {
+        let (ctx, sink) = ctx_with_sink();
+        let v1 = std::mem::size_of::<sys::GhosttyTerminalDesktopNotification>();
+        let notification = |size| sys::GhosttyTerminalDesktopNotification {
+            size,
+            title: string("Build"),
+            body: string("done"),
+        };
+        let send = |n: *const sys::GhosttyTerminalDesktopNotification| {
+            // SAFETY: as in `call`; a null struct is checked first.
+            unsafe {
+                desktop_notification_trampoline(
+                    ptr::null_mut(),
+                    ptr::from_ref(&ctx).cast_mut().cast(),
+                    n,
+                );
+            }
+        };
+
+        send(&notification(v1 - 1));
+        send(ptr::null());
+        assert!(take(&sink).is_empty(), "a short or null struct is dropped");
+        send(&notification(v1));
+        assert_eq!(
+            take(&sink),
+            vec![TerminalEvent::Notification {
+                title: "Build".into(),
+                body: "done".into(),
+            }]
+        );
+    }
+
     /// A subscriber whose `event` panics, standing in for any subscriber
     /// code that can.
     struct PanickingSubscriber(Arc<std::sync::atomic::AtomicUsize>);
@@ -448,8 +516,33 @@ mod tests {
 
     /// Without containment the panic reaches the `extern "C"` frame and
     /// aborts the test process.
+    ///
+    /// The body runs in a child process of its own. `tracing` caches each
+    /// callsite's interest process-wide, and a parallel test that first
+    /// reaches the same debug callsite with no subscriber can cache it as
+    /// "never" while this one installs its own, which then sees no event.
     #[test]
     fn a_panic_in_a_debug_log_drops_the_event_without_aborting() {
+        const ALONE: &str = "ROOST_VT_PANICKING_SUBSCRIBER_ALONE";
+        if std::env::var_os(ALONE).is_none() {
+            let name = format!(
+                "{}::a_panic_in_a_debug_log_drops_the_event_without_aborting",
+                module_path!().split_once("::").expect("crate::module").1
+            );
+            let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([name.as_str(), "--exact", "--test-threads=1"])
+                .env(ALONE, "1")
+                .output()
+                .expect("run the test alone");
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            assert!(
+                child.status.success() && stdout.contains("1 passed"),
+                "{}\n{stdout}\n{}",
+                child.status,
+                String::from_utf8_lossy(&child.stderr)
+            );
+            return;
+        }
         let (ctx, sink) = ctx_with_sink();
         let events_logged = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let subscriber = PanickingSubscriber(Arc::clone(&events_logged));

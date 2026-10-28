@@ -65,12 +65,20 @@ pub struct ProgramStatusReport {
 }
 
 /// One entry of the ordered stream a tab's authoritative terminal
-/// produces: reports and prompt marks, in the order their bytes arrived.
+/// produces: reports, prompt marks and desktop-notification places, in
+/// the order their bytes arrived.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StatusEvent {
     Report(ProgramStatusReport),
     Prompt(PromptMark),
+    /// An OSC 9 / 777 notification, where it fell. It changes nothing; it
+    /// marks the point the raw notification's suppression is judged at.
+    /// OSC 9 has no title, so its text is the body.
+    Notification {
+        title: String,
+        body: String,
+    },
 }
 
 /// Who decided a tab's composed lifecycle.
