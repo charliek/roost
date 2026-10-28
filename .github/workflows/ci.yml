@@ -104,6 +104,10 @@ jobs:
             tests:
               - 'tools/roosttest/**'
               - 'tools/roosttest_unit/**'
+              # test_release_dry_run.py runs tools/release/dry_run.py on release.yml, so
+              # an edit to either must retrigger harness-unit.
+              - 'tools/release/**'
+              - '.github/workflows/release.yml'
               - 'tools/input/linux/**'
               # The Mac real-input harness: its helper's checks and its suite
               # run in iced-build-e2e's macOS/wgpu cell, its unit tests in

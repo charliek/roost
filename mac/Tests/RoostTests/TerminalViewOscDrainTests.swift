@@ -127,3 +127,47 @@ func appendBytes_routesOsc7CwdEventToOnOsc() {
         "expected decoded path /tmp (got \(String(describing: captured.first?.1)))"
     )
 }
+
+/// Asking is how a program learns the terminal speaks OSC 7501, so a
+/// view without a program-status callback must stay silent: an answer
+/// would advertise support for reports it then drops. Mirrors
+/// `crates/roost-vt/tests/write_pty_test.rs`.
+@Test @MainActor
+func appendBytes_programStatusProbeWithoutTheCallbackGetsNoReply() {
+    #expect(repliesFor(["\u{1B}]7501;?\u{1B}\\"]) == "")
+    #expect(repliesFor(["\u{1B}]7501;?\u{07}"]) == "")
+}
+
+private func ignoreProgramStatus(
+    _ terminal: GhosttyTerminal?,
+    _ userdata: UnsafeMutableRawPointer?,
+    _ report: UnsafePointer<GhosttyTerminalProgramStatus>?
+) {}
+
+/// The other side of the pair above, and its negative control: setting
+/// the callback through `ghostty_terminal_set` is what makes the same
+/// probe answered.
+@Test @MainActor
+func appendBytes_programStatusProbeWithTheCallbackIsAnswered() {
+    let view = TerminalView(cols: 80, rows: 24, theme: testTheme())
+    var captured: [Data] = []
+    view.onKey = { captured.append($0) }
+    guard let handle = view.terminal else {
+        Issue.record("TerminalView has no terminal handle")
+        return
+    }
+    let callback:
+        @convention(c) (
+            GhosttyTerminal?, UnsafeMutableRawPointer?, UnsafePointer<GhosttyTerminalProgramStatus>?
+        ) -> Void = ignoreProgramStatus
+    let rc = ghostty_terminal_set(
+        handle,
+        GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS,
+        unsafeBitCast(callback, to: UnsafeRawPointer.self)
+    )
+    #expect(rc.rawValue == 0)
+
+    view.appendBytes(Data("\u{1B}]7501;?\u{1B}\\".utf8))
+    let reply = captured.map { String(decoding: $0, as: UTF8.self) }.joined()
+    #expect(reply.hasPrefix("\u{1B}]7501;?:states="), "got \(reply)")
+}

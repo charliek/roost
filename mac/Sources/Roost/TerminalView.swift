@@ -91,7 +91,7 @@ final class TerminalView: NSView {
     /// future render-state walks, and freed on the main thread when
     /// the NSView is torn down. Revisit if any background-thread
     /// rendering path lands.
-    nonisolated(unsafe) private var terminal: GhosttyTerminal?
+    nonisolated(unsafe) private(set) var terminal: GhosttyTerminal?
 
     /// libghostty-vt key encoder bridge (goal-mac-polish-cursor-keys
     /// M1). Allocated alongside the terminal handle in `init`, freed
