@@ -53,6 +53,7 @@ jobs:
       linux: ${{ steps.filter.outputs.linux }}
       fixtures: ${{ steps.filter.outputs.fixtures }}
       tests: ${{ steps.filter.outputs.tests }}
+      harness: ${{ steps.filter.outputs.harness }}
       ci: ${{ steps.filter.outputs.ci }}
       deb: ${{ steps.filter.outputs.deb }}
       macbundle: ${{ steps.filter.outputs.macbundle }}
@@ -104,10 +105,6 @@ jobs:
             tests:
               - 'tools/roosttest/**'
               - 'tools/roosttest_unit/**'
-              # test_release_dry_run.py runs tools/release/dry_run.py on release.yml, so
-              # an edit to either must retrigger harness-unit.
-              - 'tools/release/**'
-              - '.github/workflows/release.yml'
               - 'tools/input/linux/**'
               # The Mac real-input harness: its helper's checks and its suite
               # run in iced-build-e2e's macOS/wgpu cell, its unit tests in
@@ -135,6 +132,12 @@ jobs:
               # test_osc7_emitters.py sources all four in real bash and zsh.
               - 'crates/roost-engine/resources/shell-integration/**'
               - 'mac/Sources/Roost/Resources/shell-integration/**'
+            # Inputs of harness-unit's own tests only (test_release_dry_run.py reads
+            # release.yml through tools/release/dry_run.py), kept out of `tests` so
+            # they don't start the E2E lanes that `tests` also gates.
+            harness:
+              - 'tools/release/**'
+              - '.github/workflows/release.yml'
             # roost-cli's `doc_anchors_resolve` test reads the site nav and
             # every page it links, so those files are inputs to a RUST test
             # even though no Rust file changes when they move. Without this,
@@ -274,7 +277,8 @@ jobs:
 
   harness-unit:
     needs: changes
-    if: needs.changes.outputs.tests == 'true' || needs.changes.outputs.ci == 'true'
+    # `rust` too: test_release_dry_run.py reads the workspace version from Cargo.toml.
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.tests == 'true' || needs.changes.outputs.harness == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
