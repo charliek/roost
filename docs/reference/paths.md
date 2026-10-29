@@ -136,12 +136,13 @@ server's own error for that op — `unknown-op` for `host.*` and
 (`app.activate` alone answers `{}` and does nothing) — not a session-specific one. Debug builds substitute `RoostSessionDev`
 / `roost-session-dev` for the directory name in **all** of the paths
 below (socket, state, logs, and the upload store), so a dev session can
-never collide with a real one.
+never collide with a real one — unless [`ROOST_SESSION_SOCKET_DIR`](#session-socket-override)
+names the socket directory, which takes no namespace.
 
 | Platform | Socket | State | Logs | Uploaded files |
 |---|---|---|---|---|
 | macOS | `~/Library/Caches/RoostSession/roost.sock` | `~/Library/Application Support/RoostSession/` | `~/Library/Logs/RoostSession/` | `~/Library/Caches/RoostSession/files/` |
-| Linux | `$XDG_RUNTIME_DIR/roost-session/roost.sock`, falling back to `/tmp/roost-session-<uid>/roost.sock` | `$XDG_DATA_HOME/roost-session/` | `$XDG_STATE_HOME/roost-session/` | `$XDG_CACHE_HOME/roost-session/files/`, defaulting to `~/.cache/roost-session/files/` |
+| Linux | `<passwd home>/.local/state/roost-session/run/roost.sock` (see [below](#session-socket-linux)) | `$XDG_DATA_HOME/roost-session/` | `$XDG_STATE_HOME/roost-session/` | `$XDG_CACHE_HOME/roost-session/files/`, defaulting to `~/.cache/roost-session/files/` |
 
 The **files** column is where [`session.put_file`](ipc.md#sessionput_file)
 lands what a client uploads for a host tab — a pasted image, a dropped
@@ -172,7 +173,10 @@ parses as two arguments. So the store moves instead, to the profile's
 own `/tmp` root, and logs the substitution once:
 `/tmp/RoostSession/files` on macOS, `/tmp/roost-session-<uid>/files` on
 Linux (`RoostSessionDev` / `roost-session-dev` in debug builds, as
-everywhere else here). Per profile, never one shared directory — a debug
+everywhere else here). That Linux fallback
+stays in `/tmp` and does not follow the socket directory: it exists to
+avoid a home whose path cannot be pasted bare, and the socket now lives
+under that home. Per profile, never one shared directory — a debug
 and a release session on the same box would otherwise sweep each other's
 live uploads at start.
 
@@ -200,6 +204,147 @@ itself started has no business leaking into a tab.
 | `ROOST_SESSION_LAUNCH_CWD` | `roostctl session start`, and the UI's own spawn-if-missing connect | The directory the daemon was launched from. The daemon `chdir("/")`s immediately, so this is the only way to log where a session came from — it is logged and then discarded, never used to seed anything (a first-ever session seeds `Untitled 1` at `$HOME` like every UI, regardless of where it was started from — see [`config.md`'s `local-backend`](config.md#local-backend)). |
 | `ROOST_SESSION_NO_SEED` | Only a spawn made *for a [local-backend switch](../guides/host-sessions.md#switching-the-local-backend)'s own destination*: the forward switch you ask for, and the launch-time migration a `session` start performs over an in-process workspace that still has a layout. Both dial that destination the same way, so both withhold. | Tells a first-ever session **not** to seed itself a project. Set because that spawn is immediately followed by the switch's own replay — a session that seeded itself first would hand you a stray empty project sitting beside the layout you just moved over. Every other spawn — `roostctl session start`, an ordinary launch-time connect to the same session, a Connect you press — gets the ordinary seeded behavior. |
 
+### Session socket (Linux)
+
+On Linux the session socket does **not** follow `XDG_RUNTIME_DIR`. That
+variable is a different value in a desktop login, an SSH login and
+`sudo` (and absent in a container), so a daemon started in one was
+invisible from another. It lives under this uid's **passwd** home
+instead:
+
+```text
+<pw_dir>/.local/state/<ns>/run/roost.sock
+<pw_dir>/.local/state/<ns>/run/roost.lock     (the bind lock)
+```
+
+`<ns>` is `roost-session`, or `roost-session-dev` in a debug build.
+`<pw_dir>` comes from `getpwuid_r(getuid())`, looked up once per
+process — never `$HOME`, which `sudo` and `su` can leave pointing
+elsewhere, and never `/tmp`. With the default `XDG_STATE_HOME`, `<ns>`
+is also the session's log directory, so the socket sits beside the
+logs. macOS keeps `~/Library/Caches/RoostSession/`; this section is
+Linux only.
+
+The directories are checked one level at a time, each step tolerant of
+a concurrent creator:
+
+* `~/.local` and `~/.local/state` are made `0700` if missing and
+  otherwise only required to be directories. They are the user's own: a
+  dotfile-manager symlink is followed, and a group-writable `~/.local`
+  (umask `002`) is accepted.
+* `<ns>` must be owned by you, not a symlink, and not group- or
+  world-writable. `0750` is your call — it is also the log directory.
+* `run/` must be owned by you, not a symlink, and exactly `0700`. A
+  `run/` created earlier at `0755` is refused, not repaired.
+
+Every refusal names the offending path and
+[`ROOST_SESSION_SOCKET_DIR`](#session-socket-override). The check holds
+only while the home's own ancestors (`~/.local`, `~/.local/state`) stay
+put; whoever can rename entries there can already replace
+`~/.local/bin/roost-session`, so that is the trust boundary, not a
+hole the check could close.
+
+Three ways resolving the path can fail, each a startup error rather
+than a fallback:
+
+* **No passwd entry, or a relative `pw_dir`** — typical of a minimal
+  container running as an arbitrary uid. Set `ROOST_SESSION_SOCKET_DIR`.
+* **A path that is not UTF-8.** `identify.local_session_socket`
+  advertises the path as a string, and a lossy one would send clients
+  elsewhere, so a non-UTF-8 home (or override) is refused.
+* **A path that does not fit `sun_path`.** The literal socket path is
+  length-checked when it is resolved — 107 bytes on Linux, 103 on macOS —
+  and refused naming the path and the override. A long home directory is
+  the usual cause.
+
+#### Session socket override
+
+`ROOST_SESSION_SOCKET_DIR` names the socket's directory itself, on Linux
+and macOS, for the session profile only (no UI profile reads it):
+
+* An absolute value is the directory: the socket is
+  `<dir>/roost.sock` and the lock `<dir>/roost.lock`. No namespace is
+  appended, so a debug and a release build given one value share one
+  socket.
+* Empty is the same as unset. A relative value is an error naming the
+  variable.
+* The directory is validated at bind time like any runtime directory:
+  owned by you, `0700`, not a symlink.
+* It moves the socket and its lock only. State and logs keep their
+  `XDG_DATA_HOME` / `XDG_STATE_HOME` paths. `roostctl session start`
+  and the UI's spawn-if-missing hand it unchanged to the session they
+  spawn, so `roostctl session status|stop` find that session.
+
+It is the way to run a session somewhere other than the default: a
+container with no passwd entry, a test, a second isolated session. A
+daemon built before this variable existed ignores it; see the upgrade
+note below.
+
+#### Test-only knobs
+
+Two variables exist for the test harness. Both must be absolute, and
+**both are read by debug builds only**; a release build ignores them.
+
+| Variable | Effect |
+|---|---|
+| `ROOST_TEST_PASSWD_HOME` | Replaces the `getpwuid_r` lookup: the session default becomes `<value>/.local/state/<ns>/run/roost.sock`. |
+| `ROOST_TEST_OLD_SESSION_DIR` | Makes `<value>` the one and only old-path candidate (below), so a test can plant a scratch daemon without ever looking at the real runtime directories. |
+
+A test-shaped process fails closed on the session socket. With
+`ROOST_TEST_MODE=1`, resolving the default socket without
+`ROOST_TEST_PASSWD_HOME` is an error naming `ROOST_SESSION_SOCKET_DIR`
+(only the override or the knob satisfies it), and a debug build with
+`ROOST_TEST_SESSION_DIR_NAMES=release` and neither is refused too. That
+keeps a harness that forgot to isolate itself away from the developer's
+real session.
+
+#### Upgrading from an older build
+
+Builds up to 0.0.26 bound the session socket at
+`$XDG_RUNTIME_DIR/<ns>/roost.sock`, else `/tmp/<ns>-<uid>/roost.sock`.
+A daemon one of those started keeps running at its old path after an
+upgrade, and the new build never attaches to it: it is **found,
+reported and restarted**. Discovery looks at the candidates
+`$XDG_RUNTIME_DIR/<ns>`, `/run/user/<uid>/<ns>` and `/tmp/<ns>-<uid>`
+(none on macOS), deduplicated by canonical path and never this build's
+own socket. A candidate must be a socket of this uid in a directory of
+this uid that nobody else can write, and must answer `session.identify`
+within two seconds.
+
+* `roostctl session start` and `roost-session start` refuse, while
+  nothing answers at the new path and an old-path session is found,
+  naming it and the command below. An old daemon with its own state
+  directory would otherwise run beside the new one.
+* `roostctl session status` prints `running at an old path: <socket>
+  (session <id>, protocol <n>)` for each one and still exits 3 when
+  nothing answers at the new path; `--json` adds an `old_paths` array.
+* [`roostctl doctor`](cli.md#doctor) warns on `session.old_path`, and
+  skips the check, saying why, where the probe may not run.
+* The iced UI shows the section as **needs-restart** (`host.status`
+  reason `old socket path`, `detail` the socket) and offers Restart.
+  The restart stops the old daemon where it was found and starts a
+  session at the new path. The layout is kept; running processes are
+  not.
+* `roost-session client-bridge` (what an ssh host runs) reaches an
+  old-path session only as a restricted proxy: it forwards
+  `session.identify` and `session.stop` and answers every other op with
+  an error naming the old path and the fix. Upgrade the laptop together
+  with the remote: an older laptop reaching an older daemon through a
+  newer remote `roost-session` is refused past `session.identify`, while
+  an up-to-date laptop shows the restart prompt.
+* `roostctl session stop` only ever stops this build's own socket.
+  `roostctl session stop --old-path <socket>` stops a session at one of
+  the discovered candidates: it refuses this build's own socket, any
+  path that is not a candidate, and a session that reports no session
+  id. It prints the socket and id first and stops only if that id still
+  answers when the stop is sent.
+
+The probe does not run when `ROOST_SESSION_SOCKET_DIR` is set, when
+`ROOST_TEST_MODE` is set to anything, or in a debug build that resolves
+the shipped names. This compatibility code is temporary:
+[#652](https://github.com/charliek/roost/issues/652) retires it, and
+with it `--old-path` and the doctor check.
+
 ### SSH scratch directories
 
 A saved host reached over SSH (host-sessions HS-3 — see [Host sessions (development) → Transport: SSH hosts](../development/host-sessions.md#transport-ssh-hosts)) does not use the session profile's paths above; the client owns a per-*attempt* scratch directory of its own, one per connect attempt rather than one per host, under whichever of the following candidates leaves room for a 103-byte `AF_UNIX` `sun_path`:
@@ -220,7 +365,8 @@ instance must own move independently:
 
 * `<socket dir>/roost.lock` — the **socket/bind lock**. Guards the
   probe→unlink→bind sequence and the bound socket's lifetime. Follows
-  `XDG_RUNTIME_DIR` (macOS: `~/Library/Caches/<app_label>/`).
+  `XDG_RUNTIME_DIR` for a UI (macOS: `~/Library/Caches/<app_label>/`);
+  the session's follows its [socket directory](#session-socket-linux).
 * `<state dir>/state.lock` — the **state lock**. Guards `state.json`.
   Follows `ROOST_STATE_DIR` / `XDG_DATA_HOME`.
 
@@ -247,7 +393,9 @@ different runtime dir and there is no window to activate.
 
 Cross-version exclusion holds only when the runtime path agrees — a new
 binary cannot contend with an older one whose `XDG_RUNTIME_DIR` differs,
-because it has no way to discover that path.
+because it has no way to discover that path. The session's socket directory
+no longer depends on `XDG_RUNTIME_DIR`; there the gap is closed by
+[old-path discovery](#upgrading-from-an-older-build) instead.
 
 ### No migration from pre-rewrite lowercase paths
 

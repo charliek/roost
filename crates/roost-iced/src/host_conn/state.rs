@@ -7,6 +7,7 @@
 //! is terminal, only localhost auto-retries, the backoff caps — is a
 //! unit test rather than a timing experiment.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use roost_ipc::messages::{AttachPayloadKind, SessionIdentify, SESSION_PROTOCOL_VERSION};
@@ -48,6 +49,11 @@ pub(crate) enum MismatchKind {
     /// — a session older than the fallback, whose only payload is a
     /// snapshot the two builds cannot exchange.
     Build,
+    /// Nothing answers at this machine's session socket, and a session
+    /// does at a path an older build used (plan 083 D-A5,
+    /// [`BuildMismatch::old_socket`]). Never attached, whatever it
+    /// speaks: a restart moves it to the socket this build dials.
+    OldSocketPath,
 }
 
 /// What the gate found when it did not refuse.
@@ -155,9 +161,61 @@ pub(crate) struct BuildMismatch {
     /// D4, D8).
     pub(crate) session_id: String,
     pub(crate) exe_path: Option<String>,
+    /// Where an [`MismatchKind::OldSocketPath`] session was found — the
+    /// socket a restart stops it on, which is never the one it then
+    /// starts and connects at. `None` for every other kind.
+    pub(crate) old_socket: Option<PathBuf>,
 }
 
+/// `host.status`'s `reason` for a session found on an old path; its
+/// `detail` is that path.
+pub(crate) const OLD_SOCKET_PATH_REASON: &str = "old socket path";
+
 impl BuildMismatch {
+    fn new(
+        kind: MismatchKind,
+        identity: &SessionIdentify,
+        client_build: &str,
+        restart: RestartAction,
+    ) -> Self {
+        Self {
+            kind,
+            session_protocol: identity.session_protocol,
+            client_protocol: SESSION_PROTOCOL_VERSION,
+            session_build: identity.libghostty_build.clone(),
+            client_build: client_build.to_string(),
+            session_payload_kinds: identity
+                .payload_kinds
+                .iter()
+                .map(|kind| kind.0.clone())
+                .collect(),
+            restart,
+            running: BuildId::from(identity),
+            session_id: identity.session_id.clone(),
+            exe_path: identity.exe_path.clone(),
+            old_socket: None,
+        }
+    }
+
+    /// The session `identity` answered for at `socket`, a path this
+    /// build no longer uses. Only this machine's own session is ever
+    /// found there, so the offer is always a local restart.
+    pub(crate) fn at_old_socket(
+        identity: &SessionIdentify,
+        client_build: &str,
+        socket: PathBuf,
+    ) -> Self {
+        Self {
+            old_socket: Some(socket),
+            ..Self::new(
+                MismatchKind::OldSocketPath,
+                identity,
+                client_build,
+                RestartAction::RestartLocal,
+            )
+        }
+    }
+
     /// Whether the refused session speaks the newer protocol (plan 076
     /// D3's `Gate::Failed`).
     pub(crate) fn protocol_newer(&self) -> bool {
@@ -174,24 +232,7 @@ pub(crate) fn check_compatibility(
     client_build: &str,
     restart: RestartAction,
 ) -> Result<Compatibility, Box<BuildMismatch>> {
-    let mismatch = |kind| {
-        Box::new(BuildMismatch {
-            kind,
-            session_protocol: identity.session_protocol,
-            client_protocol: SESSION_PROTOCOL_VERSION,
-            session_build: identity.libghostty_build.clone(),
-            client_build: client_build.to_string(),
-            session_payload_kinds: identity
-                .payload_kinds
-                .iter()
-                .map(|kind| kind.0.clone())
-                .collect(),
-            restart,
-            running: BuildId::from(identity),
-            session_id: identity.session_id.clone(),
-            exe_path: identity.exe_path.clone(),
-        })
-    };
+    let mismatch = |kind| Box::new(BuildMismatch::new(kind, identity, client_build, restart));
 
     let serves = |wanted: &str| identity.payload_kinds.iter().any(|kind| kind.0 == wanted);
 
@@ -404,10 +445,27 @@ impl HostConnState {
         }
     }
 
-    /// The long form behind the band line, when this state carries one.
+    /// The band's one-line reason, when this state carries one.
+    pub(crate) fn reason(&self) -> Option<&str> {
+        match self {
+            HostConnState::Disconnected(d) => Some(d.reason.as_str()),
+            HostConnState::NeedsRestart(mismatch) if mismatch.old_socket.is_some() => {
+                Some(OLD_SOCKET_PATH_REASON)
+            }
+            _ => None,
+        }
+    }
+
+    /// The long form behind the band line, when this state carries one:
+    /// a settled launch's whole story, or where a session on an old path
+    /// was found.
     pub(crate) fn detail(&self) -> Option<&str> {
         match self {
             HostConnState::Disconnected(d) => d.detail.as_deref(),
+            HostConnState::NeedsRestart(mismatch) => mismatch
+                .old_socket
+                .as_deref()
+                .and_then(std::path::Path::to_str),
             _ => None,
         }
     }
@@ -632,6 +690,7 @@ mod tests {
             running: BuildId::default(),
             session_id: String::new(),
             exe_path: None,
+            old_socket: None,
         });
         let cases = [
             (HostConnState::Connected, SectionState::Connected),
@@ -665,6 +724,42 @@ mod tests {
             HostConnState::Stopped.section_state().dot(),
             HostDot::Offline
         );
+    }
+
+    /// Plan 083 D-A5: a session found on an old path needs a local
+    /// restart whatever it speaks, and `host.status` names why (`reason`)
+    /// and where (`detail`); every other refusal says neither.
+    #[test]
+    fn a_session_on_an_old_path_is_a_restart_with_its_path_on_record() {
+        let found = identity(SESSION_PROTOCOL_VERSION, &["vt"], "gb-1");
+        let mismatch = BuildMismatch::at_old_socket(
+            &found,
+            "gb-1",
+            PathBuf::from("/run/user/1000/roost-session/roost.sock"),
+        );
+        assert_eq!(mismatch.kind, MismatchKind::OldSocketPath);
+        assert_eq!(mismatch.restart, RestartAction::RestartLocal);
+        assert_eq!(mismatch.session_id, "sess-1");
+        let state = HostConnState::NeedsRestart(mismatch);
+        assert_eq!(
+            state.section_state(),
+            roost_ui_model::host_sidebar::SectionState::NeedsRestart
+        );
+        assert_eq!(state.reason(), Some(OLD_SOCKET_PATH_REASON));
+        assert_eq!(
+            state.detail(),
+            Some("/run/user/1000/roost-session/roost.sock")
+        );
+
+        let refused = *check_compatibility(
+            &identity(SESSION_PROTOCOL_VERSION - 1, &["vt"], "gb-1"),
+            "gb-1",
+            RestartAction::RestartLocal,
+        )
+        .expect_err("an older protocol is refused");
+        assert_eq!(refused.old_socket, None);
+        let state = HostConnState::NeedsRestart(refused);
+        assert_eq!((state.reason(), state.detail()), (None, None));
     }
 
     /// One question: a connection either reached the session and is on

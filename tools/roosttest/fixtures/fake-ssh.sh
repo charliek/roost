@@ -97,7 +97,7 @@
 #
 # Which means the scripts run on **this** machine, and a fixture that
 # leaks this machine's state is not a fixture. So `run-remote` runs the
-# command under `env -i` with exactly the four variables below and
+# command under `env -i` with exactly the variables below and
 # nothing else — sourcing FAKE_SSH_SESSION_ENV only *adds* to what the
 # test runner exported, and a developer's own ROOST_BOOTSTRAP_FS_ROOT
 # reaching the far side would decide which binary the ladder resolves.
@@ -123,6 +123,12 @@
 #                                  `identify` reads its test identity
 #                                  sidecar (plan 076 D2). Empty when the
 #                                  caller set none, which reads as off.
+#   ROOST_SESSION_SOCKET_DIR=<dir> optional: where a remote `start` binds
+#                                  and a remote `client-bridge` dials.
+#                                  Empty when the caller set none, which
+#                                  the resolver reads as unset — and a
+#                                  test-mode remote then refuses to
+#                                  resolve its session socket at all.
 #
 # Without all three the suite would pass or fail according to whether
 # the developer's own box is a Mac and whether it has the deb
@@ -347,6 +353,7 @@ run-remote)
         USER="${USER:-}" \
         ROOST_BOOTSTRAP_FS_ROOT="${ROOST_BOOTSTRAP_FS_ROOT:-}" \
         ROOST_TEST_MODE="${ROOST_TEST_MODE:-}" \
+        ROOST_SESSION_SOCKET_DIR="${ROOST_SESSION_SOCKET_DIR:-}" \
         sh -c "$remote"
     ;;
 drop-after:*)

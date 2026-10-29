@@ -25,13 +25,20 @@ import base64
 import json
 import os
 import pathlib
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 
 SCRATCH_TITLE = "echo-latency-probe"
 ECHO_CHARS = "abcdefghij"
+# `roost_ipc::paths::SESSION_SOCKET_DIR_ENV`. A test-mode UI is refused
+# this user's session socket, so a launched one gets a directory of its
+# own; the two debug-only knobs never reach it.
+SESSION_SOCKET_DIR_ENV = "ROOST_SESSION_SOCKET_DIR"
+SESSION_TEST_KNOBS = ("ROOST_TEST_PASSWD_HOME", "ROOST_TEST_OLD_SESSION_DIR")
 
 
 def default_socket(launching: bool) -> pathlib.Path:
@@ -77,6 +84,22 @@ class Client:
             self.file.close()
         finally:
             self.sock.close()
+
+
+def stop_session_in(directory: pathlib.Path) -> None:
+    """Stop a session the launched UI started in its own socket directory,
+    so it does not outlive the run holding a state lock."""
+    socket_path = directory / "roost.sock"
+    if not socket_path.exists():
+        return
+    try:
+        session = Client(socket_path)
+        try:
+            session.call("session.stop")
+        finally:
+            session.close()
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"warning: could not stop the session at {socket_path}: {exc}", file=sys.stderr)
 
 
 def quit_running_roost_iced():
@@ -219,6 +242,7 @@ def main() -> int:
 
     child = None
     client = None
+    sessions = None
     try:
         if args.launch:
             print("==> quitting any running roost-iced", file=sys.stderr)
@@ -226,6 +250,12 @@ def main() -> int:
             env = dict(os.environ)
             env["ROOST_BUNDLE_PROFILE"] = "iced"
             env["ROOST_TEST_MODE"] = "1"
+            for knob in SESSION_TEST_KNOBS:
+                env.pop(knob, None)
+            # `/tmp` and resolved: short for `sun_path`, and the daemon
+            # refuses a socket directory with a symlinked component.
+            sessions = pathlib.Path(tempfile.mkdtemp(prefix="roost-perf-ss-", dir="/tmp")).resolve()
+            env[SESSION_SOCKET_DIR_ENV] = str(sessions)
             print(f"==> launching {args.launch}", file=sys.stderr)
             child = subprocess.Popen(
                 [args.launch],
@@ -251,6 +281,9 @@ def main() -> int:
                 child.wait(10)
             except subprocess.TimeoutExpired:
                 child.kill()
+        if sessions is not None:
+            stop_session_in(sessions)
+            shutil.rmtree(sessions, ignore_errors=True)
 
 
 if __name__ == "__main__":

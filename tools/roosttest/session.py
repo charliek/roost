@@ -23,11 +23,16 @@ The env differs per OS because the resolver does
   `~/Library/Caches/<label>/roost.sock`,
   `~/Library/Application Support/<label>`, `~/Library/Logs/<label>`.
   So `HOME` alone is the whole isolation knob.
-* **Linux** — XDG: `XDG_RUNTIME_DIR/<ns>/roost.sock`,
-  `XDG_DATA_HOME/<ns>`, `XDG_STATE_HOME/<ns>`. `HOME` is set too, as the
-  fallback the resolver uses when an XDG dir is missing, and
-  `XDG_CACHE_HOME` because `roost-engine`'s shell-integration cache
-  writes there.
+* **Linux** — the socket is not XDG: its default is under the uid's
+  passwd home, which no env var in this process can isolate, so every
+  env carries `ROOST_SESSION_SOCKET_DIR` (`<root>/sock`, see
+  `socket_dir`) and the socket is `<root>/sock/roost.sock`. State and
+  logs stay XDG: `XDG_DATA_HOME/<ns>`, `XDG_STATE_HOME/<ns>`. `HOME` is
+  set too, as the fallback the resolver uses when an XDG dir is missing,
+  and `XDG_CACHE_HOME` because `roost-engine`'s shell-integration cache
+  writes there. `XDG_RUNTIME_DIR` is still pointed at `<root>/run`, so
+  nothing a process launched here reads reaches the developer's, but it
+  no longer moves the session.
 
 The root is **canonicalized** (`Path.resolve()`) before anything is
 derived from it. `validate_runtime_dir` rejects a socket directory with
@@ -42,16 +47,15 @@ inside the profile's root. A test that wants a session to write hook
 entries calls it, and from then on every launch asserts the jail before
 spawning (plan 046 §3.9).
 
-The runtime directory's *parent* is pre-created here rather than left to
+The socket directory's *parent* is pre-created here rather than left to
 the daemon: `validate_runtime_dir` creates only the leaf (non-recursive,
-`0700`), which is right for a real machine where `$XDG_RUNTIME_DIR` and
-`~/Library/Caches` are provided by the OS. The fixture plays the OS.
-On Linux that means `make_env` also chmods `$XDG_RUNTIME_DIR` itself to
-`0700` after creating it, since `Path.mkdir` inherits the process umask
-and a permissive one (e.g. 0002) would otherwise leave it group-writable
-and fail the same validation a real runtime dir would; `data`/`state`/
-`cache` are left as `mkdir` makes them since the daemon never validates
-those.
+`0700`), which is right for a real machine where `~/Library/Caches` is
+provided by the OS, and the override's leaf sits directly under the
+root. The fixture plays the OS. On Linux `make_env` also chmods
+`$XDG_RUNTIME_DIR` to `0700` after creating it, since `Path.mkdir`
+inherits the process umask and a permissive one (e.g. 0002) would
+otherwise leave it group-writable; `data`/`state`/`cache` are left as
+`mkdir` makes them since the daemon never validates those.
 
 # Why `SHELL=/bin/sh`
 
@@ -82,6 +86,13 @@ from pathlib import Path
 
 import agent_jail
 from client import Roost, RoostError, scaled_timeout
+# Re-exported for the lanes, which reach the session knobs through here.
+from ui import (
+    SESSION_ISOLATION_ENV,
+    SESSION_SOCKET_DIR_ENV,
+    TEST_OLD_SESSION_DIR_ENV,
+    TEST_PASSWD_HOME_ENV,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -123,6 +134,10 @@ _SANITIZE = (
     # stray value would move every debug daemon here into the shipped
     # names; the one lane that wants that passes `dir_names=`.
     SESSION_DIR_NAMES_ENV,
+    # Where the session socket lives, and the two debug-only knobs that
+    # widen what a test-mode process may resolve (plan 083 D-A6). Every
+    # env here sets its own socket dir; the knobs no session here needs.
+    *SESSION_ISOLATION_ENV,
     # The test-mode build-string override (plan 037 §3.7). A stray value
     # in a developer's shell would make every session here report a
     # libghostty build no client can match, so the cases that want it
@@ -609,6 +624,7 @@ class SessionEnv:
         for made in (
             self.root / "home",
             self.launch_cwd,
+            socket_dir(self.root),
             self.root / "run" / self.namespace,
             self.root / "data" / self.namespace,
             self.root / "state" / self.namespace,
@@ -809,6 +825,14 @@ def roostctl_binary() -> str:
 # ---------------------------------------------------------------------------
 
 
+def socket_dir(root: Path) -> Path:
+    """The `ROOST_SESSION_SOCKET_DIR` a session env under `root` gets — and
+    so the value a lender of `root` exports for its own processes to agree
+    with it. The directory itself: the daemon creates it (`0700`) when it
+    validates it, exactly as it would `$XDG_RUNTIME_DIR/<ns>`."""
+    return root / "sock"
+
+
 def make_env(
     *,
     launch_cwd_name: str = "launch",
@@ -816,16 +840,18 @@ def make_env(
     state_dir: Path | None = None,
     binary: Path | None = None,
     dir_names: str | None = None,
+    honours_socket_dir: bool = True,
 ) -> SessionEnv:
     """Build an isolated session profile, in a fresh temp root or in one
     the caller lends.
 
-    A lent `root` is one the caller has already pointed
-    `XDG_RUNTIME_DIR` at, so this profile's socket lands exactly where
-    that process resolves it — which is how a lane puts the daemon on
-    the sentinel path a UI dials for `localhost`. This env then owns only
-    the directories it makes under that root, and its teardown removes
-    only those. Lend a **canonical** path: it is resolved here either
+    A lent `root` is one whose `socket_dir` the caller has already
+    exported as `ROOST_SESSION_SOCKET_DIR` (asserted here when it did),
+    with `XDG_RUNTIME_DIR` at its `run`, so this profile's socket lands
+    exactly where that process resolves it — which is how a lane puts the
+    daemon on the sentinel path a UI dials for `localhost`. This env then
+    owns only the directories it makes under that root, and its teardown
+    removes only those. Lend a **canonical** path: it is resolved here either
     way, and a lender that exported an unresolved one would have its
     process resolving a different string than this daemon.
 
@@ -838,6 +864,12 @@ def make_env(
     one, for the old-session lane. `dir_names` is `SESSION_DIR_NAMES_ENV`'s
     value, set on everything this env launches (a debug `roostctl`
     included), so a debug build resolves the directories it names.
+
+    Every env carries its own `ROOST_SESSION_SOCKET_DIR`, `socket_dir`.
+    `honours_socket_dir=False` is for a binary that predates the variable
+    and binds its platform default whatever it is handed: the override then
+    names that very directory, so this tree's clients run under the same
+    env (`roostctl`, a bridge) still reach the daemon.
     """
     binary = binary or session_binary()
     label, namespace = _dir_names(_is_debug_build(binary), dir_names)
@@ -894,6 +926,17 @@ def make_env(
         socket = runtime / namespace / "roost.sock"
         default_state_dir = data / namespace
         log_dir = state / namespace
+
+    if honours_socket_dir:
+        socket = socket_dir(root) / "roost.sock"
+    env[SESSION_SOCKET_DIR_ENV] = str(socket.parent)
+    lenders = os.environ.get(SESSION_SOCKET_DIR_ENV)
+    if not owns_root and lenders is not None:
+        assert lenders == str(socket.parent), (
+            f"the lender of {root} exported {SESSION_SOCKET_DIR_ENV}={lenders}, but a "
+            f"session under it binds {socket.parent}: its processes would dial "
+            "another socket than this daemon's"
+        )
 
     if state_dir is None:
         state_dir = default_state_dir

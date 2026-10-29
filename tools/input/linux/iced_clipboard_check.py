@@ -198,8 +198,14 @@ class Launch:
             "ROOST_CONFIG": str(self.config),
             "ROOST_BUNDLE_PROFILE": "iced",
             "ROOST_TEST_MODE": "1",
+            # Its own session socket directory, so nothing this UI resolves
+            # can be this user's session — and a test-mode UI without one
+            # is refused the session socket outright.
+            "ROOST_SESSION_SOCKET_DIR": str(self.root / "sock"),
             "RUST_LOG": os.environ.get("RUST_LOG", "warn"),
         }
+        for knob in ("ROOST_TEST_PASSWD_HOME", "ROOST_TEST_OLD_SESSION_DIR"):
+            env.pop(knob, None)
         self.log_handle = self.log.open("wb")
         self.process = subprocess.Popen(
             [str(ICED_BIN)],

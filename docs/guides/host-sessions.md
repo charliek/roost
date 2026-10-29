@@ -23,7 +23,7 @@ then use the palette's **Add Host…** (or `roostctl host add`, below) to save i
 
 Once connected, the sidebar gains a **LOCALHOST** section (or whatever label you gave it) alongside your local **LOCAL** projects, and any project you create there survives quitting Roost. With zero hosts saved, the sidebar is exactly what it always was — this is purely additive.
 
-`roost-session`'s own socket, state, and logs live at: on Linux, `$XDG_RUNTIME_DIR/roost-session/roost.sock` (state under `$XDG_DATA_HOME/roost-session/`, logs under `$XDG_STATE_HOME/roost-session/`); on macOS, `~/Library/Caches/RoostSession/roost.sock` (state under `~/Library/Application Support/RoostSession/`, logs under `~/Library/Logs/RoostSession/` — `RoostSessionDev` in place of `RoostSession` for a debug build, so a dev daemon can never collide with a real one). See [Paths and Environment](../reference/paths.md#session-profile) for the full table.
+`roost-session`'s own socket, state, and logs live at: on Linux, `~/.local/state/roost-session/run/roost.sock` under your passwd home — not `XDG_RUNTIME_DIR`, so a desktop login, an SSH login and a `sudo -u` back to your own user all find the same session (the path follows the uid, so a `sudo` to root finds root's) (state under `$XDG_DATA_HOME/roost-session/`, logs under `$XDG_STATE_HOME/roost-session/`); on macOS, `~/Library/Caches/RoostSession/roost.sock` (state under `~/Library/Application Support/RoostSession/`, logs under `~/Library/Logs/RoostSession/` — `RoostSessionDev` in place of `RoostSession` for a debug build, so a dev daemon can never collide with a real one). See [Paths and Environment](../reference/paths.md#session-profile) for the full table.
 
 **Persistence is scoped to host sections, not to Roost as a whole — worth stating plainly.** A project or tab created under *any* host section, including **LOCALHOST**, survives quitting Roost, because its shells live in `roost-session`, not in the app. An ordinary **LOCAL** tab is still hosted in-process and still ends when Roost quits — unless you've switched your *local* tabs onto a session too, which is what the next section covers. A fresh Roost-Iced install starts that way (see [First Run](../getting-started/first-run.md#roost-iced-a-fresh-install-starts-on-a-session)); an install with no `local-backend` key that already has a `state.json` or `config.conf` on disk keeps in-process local tabs until you switch.
 
@@ -109,7 +109,7 @@ On the remote machine, start (or confirm) a session and find its socket:
 ```bash
 ssh workbox
 roostctl session start
-echo "$XDG_RUNTIME_DIR/roost-session/roost.sock"   # e.g. /run/user/1000/roost-session/roost.sock
+roostctl session status   # the first line names the socket, e.g. /home/you/.local/state/roost-session/run/roost.sock
 exit
 ```
 
@@ -117,9 +117,9 @@ Back on your Mac or local Linux box, open a persistent forward — this needs to
 
 ```bash
 mkdir -p ~/.roost-hosts
-# Use the socket path the command above printed — the `1000` in
-# `/run/user/1000` is that machine's UID, not necessarily yours.
-ssh -N -L ~/.roost-hosts/workbox.sock:/run/user/1000/roost-session/roost.sock workbox
+# Use the socket path the command above printed — `/home/you` is the
+# remote machine's home for that account, not necessarily yours.
+ssh -N -L ~/.roost-hosts/workbox.sock:/home/you/.local/state/roost-session/run/roost.sock workbox
 ```
 
 Then add the forwarded socket as a host — a socket-path target, exactly like the native form above but pointed at the local end of the tunnel:

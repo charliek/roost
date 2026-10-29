@@ -14855,6 +14855,7 @@ mod tests {
             running: roost_ipc::session_version::BuildId::default(),
             session_id: String::new(),
             exe_path: None,
+            old_socket: None,
         }
     }
 

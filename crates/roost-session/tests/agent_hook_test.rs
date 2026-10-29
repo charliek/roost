@@ -13,8 +13,11 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-/// Run the verb with a `$HOME` and `$XDG_*` pointing into `home`, and no
-/// `ROOST_SOCKET`, so nothing it could reach exists.
+use roost_ipc::paths::SESSION_SOCKET_DIR_ENV;
+
+/// Run the verb with a `$HOME`, `$XDG_*` and session socket directory
+/// pointing into `home`, and no `ROOST_SOCKET`, so nothing it could reach
+/// exists.
 fn agent_hook(home: &Path, agent: &str, stdin: &[u8]) -> std::process::Output {
     use std::io::Write;
 
@@ -22,6 +25,7 @@ fn agent_hook(home: &Path, agent: &str, stdin: &[u8]) -> std::process::Output {
         .arg("agent-hook")
         .arg(agent)
         .env("HOME", home)
+        .env(SESSION_SOCKET_DIR_ENV, home.join("run"))
         .env("XDG_RUNTIME_DIR", home.join("run"))
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_CACHE_HOME", home.join("cache"))
@@ -157,6 +161,7 @@ fn a_broken_profile_environment_does_not_reach_the_verb() {
         .arg("agent-hook")
         .arg("claude")
         .env_remove("HOME")
+        .env(SESSION_SOCKET_DIR_ENV, "relative-and-invalid")
         .env("XDG_RUNTIME_DIR", "relative-and-invalid")
         .env_remove("ROOST_TAB_ID")
         .env_remove("ROOST_SOCKET")

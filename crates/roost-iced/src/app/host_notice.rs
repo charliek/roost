@@ -125,6 +125,21 @@ pub(super) fn restart_prompt(
     mismatch: &BuildMismatch,
     client: &BuildId,
 ) -> RestartPrompt {
+    // The path is the problem, not the build: which of the two is newer
+    // does not change what a restart fixes.
+    if let Some(old_socket) = &mismatch.old_socket {
+        return RestartPrompt {
+            title: format!("Restart the session on {label}?"),
+            body: format!(
+                "This session is running at an old socket path, {}, which this Roost no longer \
+                 uses. Restarting stops it there and starts it where this Roost looks for it — \
+                 every tab reopens as a fresh shell in its directory, and running programs end.",
+                old_socket.display()
+            ),
+            action: RestartAction::RestartLocal,
+            confirm: Some("Restart session".to_string()),
+        };
+    }
     if session_is_newer(mismatch, client) {
         return blocked_prompt(label, mismatch, client);
     }
@@ -385,6 +400,7 @@ fn vintage(mismatch: &BuildMismatch) -> &'static str {
         }
         MismatchKind::Protocol => "a newer Roost",
         MismatchKind::PayloadKind | MismatchKind::Build => "a different Roost build",
+        MismatchKind::OldSocketPath => "an older Roost",
     }
 }
 
@@ -411,6 +427,13 @@ fn detail(mismatch: &BuildMismatch) -> String {
         MismatchKind::Build => format!(
             "libghostty {} against this client's {}",
             mismatch.session_build, mismatch.client_build
+        ),
+        MismatchKind::OldSocketPath => format!(
+            "its socket is at {}",
+            mismatch.old_socket.as_deref().map_or_else(
+                || "an old path".into(),
+                |socket| socket.display().to_string()
+            )
         ),
     }
 }
@@ -441,7 +464,30 @@ mod tests {
             running: roost_ipc::session_version::BuildId::default(),
             session_id: String::new(),
             exe_path: None,
+            old_socket: None,
         }
+    }
+
+    /// Plan 083 D-A5: the prompt for a session on an old path names the
+    /// path and offers the local restart — even for a session the build
+    /// comparison would call newer, because the path is what is wrong.
+    #[test]
+    fn a_session_on_an_old_path_gets_a_restart_naming_the_path() {
+        let mut old = mismatch(MismatchKind::OldSocketPath, RestartAction::RestartLocal);
+        old.old_socket = Some(std::path::PathBuf::from(
+            "/tmp/roost-session-1000/roost.sock",
+        ));
+        old.session_protocol = old.client_protocol + 1;
+        let prompt = restart_prompt("localhost", &old, &client());
+        assert_eq!(prompt.action, RestartAction::RestartLocal);
+        assert_eq!(prompt.confirm.as_deref(), Some("Restart session"));
+        assert!(
+            prompt
+                .body
+                .contains("old socket path, /tmp/roost-session-1000/roost.sock"),
+            "{}",
+            prompt.body
+        );
     }
 
     /// The terminal area's notice for a tab on a host in `state`,

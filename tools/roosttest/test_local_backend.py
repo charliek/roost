@@ -20,7 +20,8 @@ directly.
 Same arrangement as `test_host_localhost.py`, and for the same reason:
 the switch's destination is *this build's* session socket, one path per
 build per user. This module mints a private root and points
-`XDG_RUNTIME_DIR` (with its `XDG_*` siblings) at it **at import**, before
+`ROOST_SESSION_SOCKET_DIR` and `XDG_RUNTIME_DIR` (with its `XDG_*`
+siblings) into it **at import**, before
 `conftest.py`'s session fixture launches the UI, so the UI's own socket
 and the sentinel it resolves for `localhost` move together. A developer's
 own session is then not merely left alone but unreachable.
@@ -82,6 +83,9 @@ os.environ["XDG_RUNTIME_DIR"] = str(_RUN)
 os.environ["XDG_DATA_HOME"] = str(_ROOT / "data")
 os.environ["XDG_STATE_HOME"] = str(_ROOT / "state")
 os.environ["XDG_CACHE_HOME"] = str(_ROOT / "cache")
+# The session socket the UI's slot dials, `roostctl session` addresses and
+# `make_env(root=_ROOT)` binds.
+os.environ[sessionlib.SESSION_SOCKET_DIR_ENV] = str(sessionlib.socket_dir(_ROOT))
 # The one shell every replayed tab gets, on both sides of the switch. A
 # developer's zsh with Roost's shell integration would rewrite the very
 # titles and cwds this lane matches source against destination on.

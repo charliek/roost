@@ -72,11 +72,13 @@ compiled-in default.
 | `mac` | `Roost.app` (Swift) | `~/Library/Caches/Roost/roost.sock` |
 | `linux` | the packaged `.deb` (`/usr/bin/roost`) | `$XDG_RUNTIME_DIR/roost/roost.sock` |
 | `iced` | every dev iced build, and `Roost-Iced.app` | `$XDG_RUNTIME_DIR/roost-iced/roost.sock`, or `~/Library/Caches/Roost-iced/roost.sock` on macOS |
-| `session` | the headless `roost-session` daemon (opt-in, `roostctl session start`) | `$XDG_RUNTIME_DIR/roost-session/roost.sock`, or `~/Library/Caches/RoostSession/roost.sock` on macOS — debug builds use `roost-session-dev` / `RoostSessionDev` |
+| `session` | the headless `roost-session` daemon (opt-in, `roostctl session start`) | `~/.local/state/roost-session/run/roost.sock` under the uid's passwd home on Linux (not `XDG_RUNTIME_DIR`), or `~/Library/Caches/RoostSession/roost.sock` on macOS — debug builds use `roost-session-dev` / `RoostSessionDev`; `ROOST_SESSION_SOCKET_DIR` replaces the directory |
 
 Without `XDG_RUNTIME_DIR`, Linux falls back to `/tmp/roost-<uid>` and
-`/tmp/roost-iced-<uid>` respectively (and `/tmp/roost-session-<uid>` for
-a session; a debug-build session uses `/tmp/roost-session-dev-<uid>`). Select a live UI with `roostctl --target mac|linux|iced` —
+`/tmp/roost-iced-<uid>` respectively. The session's socket never follows
+`XDG_RUNTIME_DIR` ([why](../reference/paths.md#session-socket-linux)), so
+a test or second dev session isolates itself with
+`ROOST_SESSION_SOCKET_DIR=<short private dir>`. Select a live UI with `roostctl --target mac|linux|iced` —
 auto-detect and `ROOST_BUNDLE_PROFILE` never consider `session`, but
 `--target session` reaches one explicitly (#475). `roostctl session
 start|stop|status` still keep their own pre-connect carve-out, driving

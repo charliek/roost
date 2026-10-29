@@ -118,6 +118,8 @@ def test_a_bind_failure_after_hydrate_exits_and_reaps_the_shell(tmp_path):
     dirs = {name: tmp_path / name for name in ("data", "state", "cache", "state-dir")}
     for path in dirs.values():
         path.mkdir()
+    # Private, though an in-process UI reaches no session through it.
+    dirs["session-socket"] = tmp_path / "session-socket"
 
     marker_value = uuid.uuid4().hex
     marker = f"{MARKER_ENV}={marker_value}".encode()
@@ -133,6 +135,7 @@ def test_a_bind_failure_after_hydrate_exits_and_reaps_the_shell(tmp_path):
             "XDG_DATA_HOME": str(dirs["data"]),
             "XDG_STATE_HOME": str(dirs["state"]),
             "XDG_CACHE_HOME": str(dirs["cache"]),
+            ui.SESSION_SOCKET_DIR_ENV: str(dirs["session-socket"]),
             "SHELL": str(stub),
             "RUST_LOG": "info",
             MARKER_ENV: marker_value,

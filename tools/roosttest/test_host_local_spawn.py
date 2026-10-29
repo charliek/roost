@@ -25,14 +25,20 @@ socket exactly as before.
 
 Not import-time env, which is the missing-daemon twin's reason; this
 module sets none. What is shared here is the **daemon**. The session the
-UI spawns binds the default Session socket for this build — the one
-every other host lane's UI would dial (finding a stranger's session
-instead of spawning or settling one), and the one `roostctl session
-status|stop` address. So the lane demands that socket free before it
-runs, records the `session_id` of the daemon it brings up, and stops
-that id and no other; none of which is sound with another host lane
-driving a UI beside it. Own list, own
+UI spawns binds this run's session socket — the directory
+`ui.claim_session_isolation` handed the whole pytest process, which the
+UI that spawns and the `roostctl session status|stop` that checks both
+inherit, so they agree on it as launcher and client must. Every other
+host lane in the same process would dial that socket too (finding a
+stranger's session instead of spawning or settling one). So the lane
+demands that socket free before it runs, records the `session_id` of the
+daemon it brings up, and stops that id and no other; none of which is
+sound with another host lane driving a UI beside it. Own list, own
 target, own CI steps, ordered after the other host steps.
+
+It deliberately exports no socket directory of its own: the localhost
+and local-backend lanes import this module's helpers after lending their
+own, and an export here would take it back from them.
 
 `pytestmark = pytest.mark.host_client` for the reason the other host
 lanes carry it: a whole-directory run — `make e2e-mac` in particular,
@@ -191,6 +197,13 @@ def spawn_ground(roost: Roost):
         "session it spawned would keep its state",
     )
     status = roostctl_session("status")
+    # A refusal is a fault, not somebody's session: a lane that lost its
+    # session socket dir is refused by the product itself, and that must
+    # fail here rather than read as "already listening" and skip.
+    assert status.returncode in (0, NOT_RUNNING_EXIT), (
+        f"`roostctl session status` failed ({status.returncode}): "
+        f"{status.stdout!r} / {status.stderr!r}"
+    )
     precondition(
         status.returncode == NOT_RUNNING_EXIT,
         "a roost-session is already listening on this build's default session "

@@ -122,6 +122,137 @@ ut_pinned_config() {
   printf '%s\n' "${dst}"
 }
 
+# The iced UI's own session socket directory (`ROOST_SESSION_SOCKET_DIR`),
+# minted per launch. Without one, a UI whose config says `local-backend =
+# session` dials — and can spawn a daemon at — this user's real session
+# socket. Its path is recorded in a directory only this user can write, so
+# `ut_quit` (a separate invocation) can stop what was started there and
+# remove it. Cleanup acts only on a path that is provably one of these
+# directories (`ut_session_dir_valid`); anything else is left alone.
+UT_SESSION_DIR_LEAF_RE='^roost-uitest-ss\.[A-Za-z0-9]{6}$'
+
+# The canonical temp dir: `/private/tmp` on macOS, where `/tmp` is a
+# symlink the daemon would refuse as a socket-dir ancestor.
+ut_tmp_root() { (cd /tmp && pwd -P); }
+
+# ut_owner_mode <path> — "<uid> <octal mode>", GNU or BSD stat.
+ut_owner_mode() {
+  stat -c '%u %a' -- "$1" 2>/dev/null || stat -f '%u %Lp' -- "$1" 2>/dev/null
+}
+
+# ut_private_dir <path> — a real directory (not a symlink), owned by this
+# user, mode 0700.
+ut_private_dir() {
+  [[ -n "$1" && -d "$1" && ! -L "$1" ]] || return 1
+  [[ "$(ut_owner_mode "$1")" == "$(id -u) 700" ]]
+}
+
+# ut_session_dir_valid <path> — exactly one directory directly under the
+# canonical temp dir, named by `ut_session_dir_new`'s own pattern, private
+# to this user, and already canonical (no `..`, no symlinked component).
+ut_session_dir_valid() {
+  local dir="$1" root
+  root="$(ut_tmp_root)" || return 1
+  [[ -n "${dir}" && "${dir%/*}" == "${root}" ]] || return 1
+  [[ "${dir##*/}" =~ ${UT_SESSION_DIR_LEAF_RE} ]] || return 1
+  ut_private_dir "${dir}" || return 1
+  [[ "$(cd "${dir}" && pwd -P)" == "${dir}" ]]
+}
+
+# ut_session_dir_record — where the path is kept: the runtime dir, else
+# ~/.cache/roost-uitest, and only once validated private. Fails (printing
+# why) when neither is.
+ut_session_dir_record() {
+  local base
+  if [[ -n "${XDG_RUNTIME_DIR:-}" && "${XDG_RUNTIME_DIR}" == /* ]] && ut_private_dir "${XDG_RUNTIME_DIR}"; then
+    base="${XDG_RUNTIME_DIR}"
+  else
+    base="${HOME}/.cache/roost-uitest"
+    mkdir -p -m 700 "${base}" 2>/dev/null || true
+    if ! ut_private_dir "${base}"; then
+      echo "warning: neither \$XDG_RUNTIME_DIR nor ${base} is a directory only this user can write; the UI's session socket dir is not recorded and will not be cleaned up" >&2
+      return 1
+    fi
+  fi
+  echo "${base}/roost-uitest-${UT_TARGET}.session-dir"
+}
+
+# ut_session_dir_new — mint, record and print a private session socket
+# dir. Fails closed: a launch with no dir of its own does not happen.
+ut_session_dir_new() {
+  local root dir record
+  root="$(ut_tmp_root)" || { echo "error: cannot resolve /tmp" >&2; return 1; }
+  dir="$(mktemp -d "${root}/roost-uitest-ss.XXXXXX")" || {
+    echo "error: could not create a private session socket dir under ${root}" >&2
+    return 1
+  }
+  if ! ut_session_dir_valid "${dir}"; then
+    echo "error: '${dir}' is not a private session socket dir; refusing to launch on it" >&2
+    return 1
+  fi
+  # A launch nobody recorded is a session no later quit can find and stop.
+  if ! record="$(ut_session_dir_record)" || ! printf '%s\n' "${dir}" > "${record}"; then
+    rmdir -- "${dir}"
+    echo "error: no private place to record '${dir}'; not launching" >&2
+    return 1
+  fi
+  printf '%s\n' "${dir}"
+}
+
+# ut_session_stop <socket> — `session.stop` straight to the socket, as raw
+# NDJSON: no `roostctl` here, whose own resolution (an older build may
+# ignore the override) is beside the point. Exits 0 stopped, 2 nothing
+# listening, 1 anything else.
+ut_session_stop() {
+  python3 - "$1" <<'PY'
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(10)
+try:
+    s.connect(sys.argv[1])
+except (FileNotFoundError, ConnectionRefusedError):
+    sys.exit(2)
+except OSError:
+    sys.exit(1)
+try:
+    s.sendall(b'{"id":"1","op":"session.stop","params":{}}\n')
+    reply = json.loads(s.makefile("rb").readline() or b"null")
+except (OSError, ValueError):
+    sys.exit(1)
+sys.exit(0 if isinstance(reply, dict) and "error" not in reply else 1)
+PY
+}
+
+# ut_session_dir_cleanup — after the UI has stopped: stop any session it
+# started in its recorded dir, then remove the dir and only then the
+# record. Nothing that fails `ut_session_dir_valid` is ever signalled or
+# removed. A stop that does not end in a supported outcome (0 stopped, 2
+# nothing listening) keeps both, so a later quit can retry; it returns 1.
+ut_session_dir_cleanup() {
+  local record dir rc
+  record="$(ut_session_dir_record 2>/dev/null)" || return 0
+  [[ -f "${record}" && ! -L "${record}" ]] || return 0
+  dir="$(head -n1 -- "${record}")"
+  if ! ut_session_dir_valid "${dir}"; then
+    echo "warning: not touching recorded session dir '${dir}': not one of this harness's private dirs" >&2
+    rm -f -- "${record}"
+    return 0
+  fi
+  if [[ -S "${dir}/roost.sock" && ! -L "${dir}/roost.sock" ]]; then
+    rc=0
+    ut_session_stop "${dir}/roost.sock" || rc=$?
+    case "${rc}" in
+      0|2) ;;
+      *)
+        echo "warning: the session at ${dir}/roost.sock did not stop (exit ${rc}); keeping ${dir} and its record for a later quit to retry" >&2
+        return 1
+        ;;
+    esac
+  fi
+  rm -rf -- "${dir}"
+  rm -f -- "${record}"
+}
+
 # ut_launch — start the target UI if it isn't already running.
 ut_launch() {
   if ut_alive; then
@@ -137,11 +268,19 @@ ut_launch() {
       open "${app}"
       ;;
     iced)
+      ut_session_dir_cleanup || {
+        echo "error: an earlier launch's session is still running; not launching over its record" >&2
+        return 1
+      }
       local bin="${UT_REPO_ROOT}/target/debug/roost-iced"
       [[ -x "${bin}" ]] || { echo "==> building roost-iced"; ( cd "${UT_REPO_ROOT}" && cargo build -p roost-iced >/dev/null ); }
       echo "==> launching roost-iced"
       local cfg; cfg="$(ut_pinned_config)"
-      ( cd "${UT_REPO_ROOT}" && ROOST_BUNDLE_PROFILE=iced ROOST_CONFIG="${cfg}" \
+      local sessions
+      sessions="$(ut_session_dir_new)" || return 1
+      [[ -n "${sessions}" ]] || { echo "error: no session socket dir; not launching" >&2; return 1; }
+      ( cd "${UT_REPO_ROOT}" && env -u ROOST_TEST_PASSWD_HOME -u ROOST_TEST_OLD_SESSION_DIR \
+        ROOST_SESSION_SOCKET_DIR="${sessions}" ROOST_BUNDLE_PROFILE=iced ROOST_CONFIG="${cfg}" \
         RUST_LOG="${RUST_LOG:-info}" "${bin}" >/tmp/roost-iced-uitest.log 2>&1 & )
       ;;
   esac
@@ -151,7 +290,11 @@ ut_launch() {
 
 # ut_quit — cleanly stop the target UI (exercises the fsync-on-exit path).
 ut_quit() {
-  ut_alive || { echo "==> ${UT_TARGET} UI not running"; return 0; }
+  if ! ut_alive; then
+    [[ "${UT_TARGET}" != iced ]] || ut_session_dir_cleanup || true
+    echo "==> ${UT_TARGET} UI not running"
+    return 0
+  fi
   case "${UT_TARGET}" in
     mac) osascript -e 'tell application "Roost" to quit' >/dev/null 2>&1 || true ;;
     iced)
@@ -162,8 +305,9 @@ ut_quit() {
   local waited=0
   while ut_alive; do
     sleep 0.5; waited=$((waited + 1))
-    (( waited > 20 )) && { echo "warning: ${UT_TARGET} UI still up after 10s" >&2; break; }
+    (( waited > 20 )) && { echo "warning: ${UT_TARGET} UI still up after 10s" >&2; return 0; }
   done
+  [[ "${UT_TARGET}" != iced ]] || ut_session_dir_cleanup || true
   echo "==> ${UT_TARGET} UI stopped"
 }
 

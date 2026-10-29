@@ -301,7 +301,7 @@ class RealInputUI:
             "--env", f"ROOST_CONFIG={self.state_dir / 'config.conf'}",
             "--env", "ROOST_TEST_MODE=1",
         ]
-        for name in ("ICED_BACKEND", "ROOST_TEST_TIMEOUT_SCALE"):
+        for name in ("ICED_BACKEND", "ROOST_TEST_TIMEOUT_SCALE", ui.SESSION_SOCKET_DIR_ENV):
             ui._forward_env(argv, name)
         if (rust_log := os.environ.get("RUST_LOG")) is not None:
             argv += ["--env", f"RUST_LOG={ui._floor_roost_iced_info(rust_log)}"]

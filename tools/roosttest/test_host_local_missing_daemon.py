@@ -39,6 +39,10 @@ module's header). That is also why this module needs its own pytest
 invocation, separate from the shared-UI directory run: importing it
 would point every other module's UI at a dead `ROOST_SESSION_BIN` too.
 
+The session socket needs no export of its own here: nothing ever binds
+it, and the UI already carries the directory `ui.claim_session_isolation`
+gave the whole pytest process, as the twin's does.
+
 `pytestmark = pytest.mark.host_client` (as `test_host_ssh.py` does) so
 a whole-directory run — `make e2e-mac` in particular, where the Swift
 app answers `unknown-op` to every `host.*` op — deselects it rather

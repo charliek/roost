@@ -425,6 +425,8 @@ def main() -> int:
         "ROOST_CONFIG": str(config),
         "ROOST_BUNDLE_PROFILE": "iced",
         "ROOST_TEST_MODE": "1",
+        # As in the X11 sibling: a session socket directory of its own.
+        "ROOST_SESSION_SOCKET_DIR": str(root / "sock"),
         "ICED_BACKEND": os.environ.get("ICED_BACKEND", "tiny-skia"),
         "WINIT_UNIX_BACKEND": "wayland",
         "WLR_BACKENDS": os.environ.get("WLR_BACKENDS", "headless,libinput"),
@@ -433,6 +435,8 @@ def main() -> int:
     }
     env.pop("DISPLAY", None)
     env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+    for knob in ("ROOST_TEST_PASSWD_HOME", "ROOST_TEST_OLD_SESSION_DIR"):
+        env.pop(knob, None)
 
     process = None
     client = None

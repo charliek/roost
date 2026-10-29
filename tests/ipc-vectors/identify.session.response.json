@@ -11,6 +11,6 @@
     "ui_version": "0.7.0",
     "protocol_version": 1,
     "local_backend": "session",
-    "local_session_socket": "/run/user/1000/roost-session/roost.sock"
+    "local_session_socket": "/home/u/.local/state/roost-session/run/roost.sock"
   }
 }

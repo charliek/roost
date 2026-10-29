@@ -22,15 +22,36 @@
 //! socket EOF ends the process without waiting on stdin — the client
 //! holds its write half open for the whole life of an events
 //! connection, so waiting for it would strand the bridge.
+//!
+//! # A session on an old path
+//!
+//! When nothing listens at this build's socket, a session still on a
+//! path an older build used (`roost_ipc::old_session`) is the likely
+//! reason — this binary was just installed over a running daemon. The
+//! bridge then reaches it as a **restricted proxy**: it forwards a
+//! request line only when its op is `session.identify` or
+//! `session.stop`, and answers any other op itself, naming the old path
+//! and the fix. That is all a client needs to see what is there and
+//! restart it (an older generation's needs-restart flow), and it can
+//! never attach to it — a same-generation daemon on an old path is
+//! refused, not adopted. Whether to fall back is decided by `connect()`
+//! alone, before a byte reaches stdout; nothing answering anywhere keeps
+//! the `client-bridge: no session` stderr prefix the client matches.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context};
+use roost_ipc::codes;
+use roost_ipc::framing::FrameReader;
+use roost_ipc::messages::{ops, RawRequest};
+use roost_ipc::old_session::{self, OldSession};
 use roost_ipc::paths::BundleProfile;
 use roost_ipc::socket_state::{classify_connect_error, SocketState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
+use tokio::sync::Mutex;
 
 /// One read's worth of wire bytes. Large enough that a snapshot stream
 /// is not chopped into a syscall per frame, and a match for the default
@@ -54,12 +75,20 @@ pub fn run() -> i32 {
 fn connect_and_pump() -> anyhow::Result<()> {
     let profile = BundleProfile::session().context("resolve the session bundle profile")?;
     let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
+        .enable_all()
         .build()
         .context("build the bridge runtime")?;
     let outcome = runtime.block_on(async {
-        let socket = connect(&profile.socket_path).await?;
-        pump(socket).await
+        match connect(&profile.socket_path).await {
+            Ok(socket) => pump(socket).await,
+            Err(Unreachable::Nothing(error)) => {
+                match old_path_session(&profile.socket_path).await {
+                    Some((socket, old)) => restricted_pump(socket, &old).await,
+                    None => Err(error),
+                }
+            }
+            Err(Unreachable::Other(error)) => Err(error),
+        }
     });
     // Never dropped: `tokio::io::stdin` reads on a blocking thread that
     // can still be parked in `read(2)` when the socket side finishes,
@@ -68,7 +97,14 @@ fn connect_and_pump() -> anyhow::Result<()> {
     outcome
 }
 
-async fn connect(socket_path: &Path) -> anyhow::Result<UnixStream> {
+/// Why this build's socket did not connect: nothing listening there,
+/// which is when an old path is worth trying, or anything else.
+enum Unreachable {
+    Nothing(anyhow::Error),
+    Other(anyhow::Error),
+}
+
+async fn connect(socket_path: &Path) -> Result<UnixStream, Unreachable> {
     UnixStream::connect(socket_path).await.map_err(|error| {
         // The hint is a contract, not just prose: the client classifies
         // a failed bridge by matching `client-bridge: no session` on
@@ -82,10 +118,128 @@ async fn connect(socket_path: &Path) -> anyhow::Result<UnixStream> {
         // permission problem, a full accept backlog — reads the same to
         // the classifier but not to the human, so it keeps its detail.
         match classify_connect_error(&error) {
-            SocketState::Missing | SocketState::Stale => anyhow!("{hint}"),
-            _ => anyhow!("{hint} ({error})"),
+            SocketState::Missing | SocketState::Stale => Unreachable::Nothing(anyhow!("{hint}")),
+            _ => Unreachable::Other(anyhow!("{hint} ({error})")),
         }
     })
+}
+
+/// The first session found on an old path, connected.
+async fn old_path_session(new_socket: &Path) -> Option<(UnixStream, std::path::PathBuf)> {
+    for old in old_session::discover(new_socket).await {
+        if let OldSession::Found { socket, .. } = old {
+            if let Ok(stream) = UnixStream::connect(&socket).await {
+                return Some((stream, socket));
+            }
+        }
+    }
+    None
+}
+
+/// The ops a bridge to an old path forwards: enough to see what is
+/// there and to stop it, nothing that attaches.
+const OLD_PATH_OPS: [&str; 2] = [ops::SESSION_IDENTIFY, ops::SESSION_STOP];
+
+/// What the restricted proxy does with one request line.
+#[derive(Debug, PartialEq, Eq)]
+enum Admit {
+    Forward,
+    /// Answered here, never forwarded: the reply line, newline excluded.
+    Refuse(Vec<u8>),
+}
+
+/// The restricted proxy's one decision, on the envelope decoded the way
+/// a session decodes it ([`RawRequest`]: an `id`, a string `op`, no
+/// duplicate or unknown keys). A line that does not decode is refused
+/// like an op this does not forward; an admitted one is forwarded as the
+/// bytes that came in.
+fn admit(line: &[u8], old_socket: &Path) -> Admit {
+    let request: Option<RawRequest> = serde_json::from_slice(line).ok();
+    let op = request.as_ref().map(|request| request.op.as_str());
+    if op.is_some_and(|op| OLD_PATH_OPS.contains(&op)) {
+        return Admit::Forward;
+    }
+    let id = request
+        .as_ref()
+        .map_or_else(|| "0".to_string(), |request| request.id.to_string());
+    let (code, message) = match op {
+        Some(op) => (
+            codes::NOT_SUPPORTED,
+            format!(
+                "{op} refused: the only session on this machine is at an old socket path, {}, \
+                 which this roost-session no longer uses; restart it there with 'roostctl \
+                 session stop --old-path {}' and 'roostctl session start'",
+                old_socket.display(),
+                old_socket.display()
+            ),
+        ),
+        None => (
+            codes::PARSE_ERROR,
+            "not a request this bridge can read; nothing was forwarded".to_string(),
+        ),
+    };
+    let reply = serde_json::json!({
+        "id": id,
+        "ok": false,
+        "error": { "code": code, "message": message },
+    });
+    Admit::Refuse(serde_json::to_vec(&reply).expect("a JSON value serializes"))
+}
+
+/// [`pump`] for a session on an old path, line by line: stdin lines go
+/// through [`admit`], socket lines come back whole. Whole lines, because
+/// a refusal written here must never land in the middle of one the
+/// session is sending.
+async fn restricted_pump(socket: UnixStream, old_socket: &Path) -> anyhow::Result<()> {
+    let (socket_read, mut socket_write) = socket.into_split();
+    let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
+    let old_socket = old_socket.to_path_buf();
+    let replies = Arc::clone(&stdout);
+    let mut upstream = tokio::spawn(async move {
+        let mut stdin = FrameReader::new(tokio::io::stdin());
+        while let Some(line) = stdin.read_line().await.context("read stdin")? {
+            match admit(&line, &old_socket) {
+                Admit::Forward => {
+                    socket_write
+                        .write_all(&[line.as_slice(), b"\n"].concat())
+                        .await
+                        .context("write to the session socket")?;
+                }
+                Admit::Refuse(reply) => write_line(&replies, &reply).await?,
+            }
+        }
+        socket_write
+            .shutdown()
+            .await
+            .context("half-close the session socket")
+    });
+    let downstream = async {
+        let mut lines = FrameReader::new(socket_read);
+        while let Some(line) = lines.read_line().await.context("read the session socket")? {
+            write_line(&stdout, &line).await?;
+        }
+        anyhow::Ok(())
+    };
+    tokio::pin!(downstream);
+    tokio::select! {
+        result = &mut downstream => {
+            upstream.abort();
+            result
+        }
+        joined = &mut upstream => {
+            joined.context("the stdin pump panicked")??;
+            downstream.await
+        }
+    }
+}
+
+async fn write_line(stdout: &Mutex<tokio::io::Stdout>, line: &[u8]) -> anyhow::Result<()> {
+    let mut stdout = stdout.lock().await;
+    stdout
+        .write_all(&[line, b"\n"].concat())
+        .await
+        .context("write stdout")?;
+    stdout.flush().await.context("flush stdout")
 }
 
 /// The socket→stdout direction owns the exit; stdin's clean end is only
@@ -149,4 +303,72 @@ async fn socket_to_stdout(mut socket: OwnedReadHalf) -> anyhow::Result<()> {
         stdout.flush().await.context("flush stdout")?;
     }
     stdout.flush().await.context("flush stdout")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refused(line: &[u8]) -> serde_json::Value {
+        match admit(line, Path::new("/tmp/old/roost.sock")) {
+            Admit::Refuse(reply) => serde_json::from_slice(&reply).expect("a JSON reply"),
+            Admit::Forward => panic!("{} was forwarded", String::from_utf8_lossy(line)),
+        }
+    }
+
+    #[test]
+    fn identify_and_stop_are_forwarded() {
+        for op in ["session.identify", "session.stop"] {
+            let line = format!(r#"{{"id":"1","op":"{op}","params":{{}}}}"#);
+            assert_eq!(
+                admit(line.as_bytes(), Path::new("/tmp/old/roost.sock")),
+                Admit::Forward,
+                "{op}"
+            );
+        }
+    }
+
+    /// Plan 083 R6: anything else — an attach, a subscribe, a line that
+    /// is not JSON — is answered here and never reaches the session.
+    #[test]
+    fn every_other_line_is_refused_naming_the_old_path() {
+        for op in [
+            "tab.list",
+            "events.subscribe",
+            "session.set_theme",
+            "tab.attach",
+        ] {
+            let reply = refused(format!(r#"{{"id":"7","op":"{op}","params":{{}}}}"#).as_bytes());
+            assert_eq!(reply["id"], "7", "{op}");
+            assert_eq!(reply["ok"], false, "{op}");
+            assert_eq!(reply["error"]["code"], codes::NOT_SUPPORTED, "{op}");
+            let message = reply["error"]["message"].as_str().unwrap();
+            assert!(message.contains("/tmp/old/roost.sock"), "{message}");
+            assert!(message.contains("--old-path"), "{message}");
+        }
+        for line in [&b"not json"[..], br#"{"id":"3"}"#, br#"["session.stop"]"#] {
+            let reply = refused(line);
+            assert_eq!(reply["ok"], false);
+        }
+        assert_eq!(refused(b"garbage")["error"]["code"], codes::PARSE_ERROR);
+    }
+
+    /// Plan 083 A2 review (R6): an envelope a session would refuse to
+    /// decode is refused here too, even one naming a forwarded op — a
+    /// duplicate `op`, no `id`, an `op` that is not a string, a key the
+    /// envelope does not have.
+    #[test]
+    fn a_malformed_envelope_naming_a_forwarded_op_is_refused() {
+        for line in [
+            &br#"{"id":"1","op":"tab.attach","op":"session.identify"}"#[..],
+            br#"{"id":"1","op":"session.identify","op":"session.identify"}"#,
+            br#"{"op":"session.stop"}"#,
+            br#"{"id":1,"op":"session.stop"}"#,
+            br#"{"id":"1","op":["session.stop"]}"#,
+            br#"{"id":"1","op":"session.stop","attach":true}"#,
+        ] {
+            let reply = refused(line);
+            assert_eq!(reply["ok"], false, "{}", String::from_utf8_lossy(line));
+        }
+    }
 }

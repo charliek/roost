@@ -10,49 +10,34 @@
 //! Nothing here sleeps. Every wait is a read that cannot complete until
 //! the bridge has done the thing being tested.
 
+mod support;
+
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 
+use roost_ipc::paths::{SESSION_SOCKET_DIR_ENV, TEST_OLD_SESSION_DIR_ENV, TEST_PASSWD_HOME_ENV};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-/// The socket `BundleProfile::session()` resolves to when the child's
-/// environment is rooted at `root`. A deliberate mirror of
-/// `roost_ipc::paths` for the one profile this lane drives — the
-/// resolver itself is pinned by that crate's own golden tests, and the
-/// alternative here is mutating process-global env that every other test
-/// in this binary also reads.
+/// The socket `BundleProfile::session()` resolves to when the child is
+/// handed `root` as its `ROOST_SESSION_SOCKET_DIR` — on every platform,
+/// since the override names the socket's directory itself.
 fn session_socket_path(root: &Path) -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        let label = if cfg!(debug_assertions) {
-            "RoostSessionDev"
-        } else {
-            "RoostSession"
-        };
-        root.join("Library/Caches").join(label).join("roost.sock")
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let namespace = if cfg!(debug_assertions) {
-            "roost-session-dev"
-        } else {
-            "roost-session"
-        };
-        root.join(namespace).join("roost.sock")
-    }
+    root.join("roost.sock")
 }
 
-/// Point a child's path resolution at `root`: HOME on macOS,
-/// `XDG_RUNTIME_DIR` on Linux — the inputs each platform's resolver
-/// reads for the socket.
+/// Point a child's session socket at `root`, under `ROOST_TEST_MODE=1`:
+/// a fixture that lost its override then fails closed on the product's
+/// own guard instead of dialing this user's real session socket.
 fn root_env(command: &mut Command, root: &Path) {
-    #[cfg(target_os = "macos")]
-    command.env("HOME", root);
-    #[cfg(not(target_os = "macos"))]
-    command.env("XDG_RUNTIME_DIR", root);
+    command
+        .env(SESSION_SOCKET_DIR_ENV, root)
+        .env("ROOST_TEST_MODE", "1")
+        .env_remove(TEST_PASSWD_HOME_ENV)
+        .env_remove(TEST_OLD_SESSION_DIR_ENV);
 }
 
 /// A root under `/tmp` rather than `$TMPDIR`: macOS hands out deep
@@ -96,8 +81,6 @@ impl Fixture {
     fn start() -> Self {
         let root = root_dir();
         let socket_path = session_socket_path(root.path());
-        std::fs::create_dir_all(socket_path.parent().expect("socket dir"))
-            .expect("create the socket dir");
         let listener = UnixListener::bind(&socket_path).expect("bind the fake session");
         let mut child = spawn_bridge(root.path());
         let stdin = child.stdin.take().expect("child stdin");
@@ -296,4 +279,116 @@ async fn no_session_fails_on_stderr_with_the_hint_and_an_empty_stdout() {
         "{stderr:?}"
     );
     assert!(stderr.contains("roostctl session start"), "{stderr:?}");
+}
+
+/// A bridge whose own socket is empty, and whose one old-path candidate
+/// (`ROOST_TEST_OLD_SESSION_DIR`, a debug build's) is `old`.
+fn spawn_fallback_bridge(root: &Path, old: &Path) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_roost-session"));
+    command.arg("client-bridge");
+    root_env(&mut command, root);
+    command
+        .env(TEST_OLD_SESSION_DIR_ENV, old)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command.spawn().expect("spawn the client bridge")
+}
+
+async fn read_reply(stdout: &mut tokio::io::BufReader<ChildStdout>) -> serde_json::Value {
+    use tokio::io::AsyncBufReadExt;
+    let mut line = String::new();
+    stdout.read_line(&mut line).await.expect("read a reply");
+    serde_json::from_str(&line).unwrap_or_else(|_| panic!("a JSON reply: {line:?}"))
+}
+
+/// Plan 083 A-3: with nothing at this build's socket and a session on an
+/// old path, the bridge reaches it as a restricted proxy — identify and
+/// stop pass, an attach (or anything else) is answered by the bridge and
+/// never reaches that session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_nothing_here_the_bridge_proxies_only_identify_and_stop_to_an_old_path() {
+    if !cfg!(debug_assertions) {
+        eprintln!("skip: the old-session test candidate is honoured by debug builds only");
+        return;
+    }
+    let root = root_dir();
+    let old = root.path().join("old");
+    std::fs::create_dir(&old).unwrap();
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let seen = support::old_path_sentinel(&old.join("roost.sock"));
+    let mut child = spawn_fallback_bridge(&root.path().join("empty"), &old);
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = tokio::io::BufReader::new(child.stdout.take().unwrap());
+
+    stdin
+        .write_all(b"{\"id\":\"1\",\"op\":\"session.identify\",\"params\":{}}\n")
+        .await
+        .unwrap();
+    let identified = read_reply(&mut stdout).await;
+    assert_eq!(identified["result"]["session_id"], "old-1", "{identified}");
+
+    for op in ["tab.attach", "events.subscribe", "tab.list"] {
+        stdin
+            .write_all(format!("{{\"id\":\"2\",\"op\":\"{op}\",\"params\":{{}}}}\n").as_bytes())
+            .await
+            .unwrap();
+        let refused = read_reply(&mut stdout).await;
+        assert_eq!(refused["ok"], false, "{op}: {refused}");
+        let message = refused["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(&old.join("roost.sock").display().to_string()),
+            "{message}"
+        );
+    }
+    stdin.write_all(b"not json\n").await.unwrap();
+    assert_eq!(read_reply(&mut stdout).await["ok"], false);
+
+    stdin
+        .write_all(b"{\"id\":\"3\",\"op\":\"session.stop\",\"params\":{}}\n")
+        .await
+        .unwrap();
+    assert_eq!(read_reply(&mut stdout).await["ok"], true);
+
+    let ops: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["op"].to_string())
+        .collect();
+    // The discovery probe's own identify, on a connection of its own,
+    // is the other line here.
+    assert!(
+        ops.iter()
+            .all(|op| op == "\"session.identify\"" || op == "\"session.stop\""),
+        "only the two forwarded ops reached the old session: {ops:?}"
+    );
+    assert_eq!(
+        ops.last().map(String::as_str),
+        Some("\"session.stop\""),
+        "{ops:?}"
+    );
+    drop(stdin);
+    let _ = child.kill().await;
+}
+
+/// The fallback changes nothing when no old path answers either: the
+/// bridge still fails with the exact prefix the client matches on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_no_session_anywhere_the_bridge_still_says_no_session() {
+    let root = root_dir();
+    let old = root.path().join("old");
+    std::fs::create_dir(&old).unwrap();
+    let output = spawn_fallback_bridge(root.path(), &old)
+        .wait_with_output()
+        .await
+        .expect("reap the failed bridge");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.starts_with("client-bridge: no session is listening at "),
+        "{stderr:?}"
+    );
 }

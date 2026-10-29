@@ -78,6 +78,7 @@ require_tools() {
   fi
   [ -x "$RT/roostctl" ] || fail "no roostctl at $RT/roostctl (set ROOST_RT, or build in the shed)"
   [ -x "$RT/roost-iced" ] || fail "no roost-iced at $RT/roost-iced (set ROOST_RT, or build in the shed)"
+  [ -x "$RT/roost-session" ] || fail "no roost-session at $RT/roost-session (set ROOST_RT, or build in the shed)"
 }
 
 # ── the state surface ────────────────────────────────────────────────
@@ -346,35 +347,37 @@ sshd_start() {
 # `roost-session` is what the app's ssh exec attaches to, and *where* it
 # looks for it is not a choice this harness gets to make. The remote
 # command runs `roost-session client-bridge`, which resolves the socket
-# through `roost-ipc`'s one rule (`paths.rs`, `resolve_paths_linux`):
+# through `roost-ipc`'s one rule (`paths.rs`): `$ROOST_SESSION_SOCKET_DIR/
+# roost.sock` when that variable is set, else this user's default session
+# socket — a real session's. And the environment it reads is the
+# **remote non-interactive login's**: ssh forwards none of this one.
 #
-#     $XDG_RUNTIME_DIR/<namespace>/roost.sock   when that variable is
-#                                               set, non-empty, absolute
-#     /tmp/<namespace>-<uid>/roost.sock         otherwise
-#
-# and the `XDG_RUNTIME_DIR` it reads is the **remote non-interactive
-# login's**, which `pam_systemd` sets to `/run/user/<uid>`.
-#
-# This harness exports its own `XDG_RUNTIME_DIR` (a scratch dir, so a
-# lane's UI socket can never collide with a developer's real one). That
-# override is right for the UI and wrong for the daemon: a `roostctl
-# session start` run under it lands the socket somewhere the bridge
-# never looks. The lanes passed anyway for as long as *some other*
-# daemon happened to be listening at the bridge's path — which is not a
-# thing a harness may depend on, and is false on a fresh shed.
-#
-# So the session verbs, and only they, run under the runtime dir the
-# bridge will resolve. Everything else keeps the scratch dir.
+# So the far side always runs on a private socket directory of the
+# remote's own (never the default), which preflight reads over ssh and
+# refuses to run without; setting it is the remote login's business, not
+# a test run's (README, "The far side"). The session verbs, and only
+# they, run under that directory; the app keeps the harness's own below,
+# for any local session it reaches.
+export ROOST_SESSION_SOCKET_DIR="$XDG_RUNTIME_DIR/session"
+# A debug build reads the old-path test knob before the override and test
+# mode, so an inherited one would aim its probe outside this harness.
+unset ROOST_TEST_PASSWD_HOME ROOST_TEST_OLD_SESSION_DIR
 SESSION_STARTED=0
 SESSION_ID=""
 SESSION_ENV=()
 
 # What the bridge's own shell sees, read over ssh rather than guessed:
 # this single value is what the whole resolution turns on.
-remote_runtime_dir() {
+remote_session_socket_dir() {
   timeout "$PROBE_HARD_TIMEOUT" ssh \
     -o ConnectTimeout="$PROBE_CONNECT_TIMEOUT" "${PROBE_SSH_OPTS[@]}" \
-    "$PROBE_TARGET" 'printf %s "${XDG_RUNTIME_DIR-}"' 2>/dev/null
+    "$PROBE_TARGET" 'printf %s "${ROOST_SESSION_SOCKET_DIR-}"' 2>/dev/null
+}
+
+remote_test_knobs() {
+  timeout "$PROBE_HARD_TIMEOUT" ssh \
+    -o ConnectTimeout="$PROBE_CONNECT_TIMEOUT" "${PROBE_SSH_OPTS[@]}" \
+    "$PROBE_TARGET" 'printf %s "${ROOST_TEST_PASSWD_HOME-}${ROOST_TEST_OLD_SESSION_DIR-}"' 2>/dev/null
 }
 
 # The daemon as the bridge finds it. `roostctl session status` resolves
@@ -393,52 +396,78 @@ remote_session_status() {
     "$PROBE_TARGET" "'$RT/roostctl' session status" 2>&1
 }
 
+# The binary the app's bridge execs: the first rung of the remote
+# exec chain (`roost_ipc::bootstrap::CANDIDATES`, `home-local-bin`), which
+# wins whenever it is executable — so requiring it pins what runs,
+# whatever the rest of the ladder holds. An older build there would ignore
+# ROOST_SESSION_SOCKET_DIR and dial the remote's real default, so it has to
+# be this tree's own `roost-session`, byte for byte.
+BRIDGE_BIN_REMOTE='$HOME/.local/bin/roost-session'
+
+remote_bridge_bin_sha() {
+  timeout "$PROBE_HARD_TIMEOUT" ssh \
+    -o ConnectTimeout="$PROBE_CONNECT_TIMEOUT" "${PROBE_SSH_OPTS[@]}" \
+    "$PROBE_TARGET" "p=\"$BRIDGE_BIN_REMOTE\"; [ -x \"\$p\" ] && sha256sum < \"\$p\"" 2>/dev/null |
+    awk '{ print $1 }'
+}
+
+require_remote_bridge_is_this_build() {
+  local want got
+  want=$(sha256sum <"$RT/roost-session" | awk '{ print $1 }')
+  got=$(remote_bridge_bin_sha) || true
+  [ -n "$got" ] ||
+    fail "the remote has no executable $BRIDGE_BIN_REMOTE, the binary the app's bridge execs first; link it to this build: ln -sf '$RT/roost-session' ~/.local/bin/roost-session"
+  [ "$got" = "$want" ] ||
+    fail "the remote's $BRIDGE_BIN_REMOTE is not $RT/roost-session (sha256 $got, want $want): an older build would ignore ROOST_SESSION_SOCKET_DIR and dial its real default. Link it to this build: ln -sf '$RT/roost-session' ~/.local/bin/roost-session"
+}
+
+# Behavioural proof, for when nothing listens there yet: that binary's
+# own `client-bridge`, run under the remote login's environment, must
+# name `$1/roost.sock` in its no-session refusal.
+require_remote_bridge_resolves() {
+  local out
+  out=$(timeout "$PROBE_HARD_TIMEOUT" ssh -n \
+    -o ConnectTimeout="$PROBE_CONNECT_TIMEOUT" "${PROBE_SSH_OPTS[@]}" \
+    "$PROBE_TARGET" "\"$BRIDGE_BIN_REMOTE\" client-bridge </dev/null" 2>&1) || true
+  case "$out" in
+    *"client-bridge: no session is listening at $1/roost.sock"*) ;;
+    *) fail "the remote's bridge does not resolve $1/roost.sock: $(tail -1 <<<"$out")" ;;
+  esac
+}
+
+# `/tmp/x/` and `/tmp/x` are one directory, and the resolver joins
+# `roost.sock` onto either without a doubled slash.
+strip_trailing_slashes() {
+  local path=$1
+  printf '%s' "${path%"${path##*[!/]}"}"
+}
+
 # Start the daemon where the bridge will look, or confirm the one that
 # is already there — and record which of the two happened, because a
 # daemon this harness did not start is not a daemon it may stop.
 ensure_remote_session() {
-  local rd out user
+  local sd out
+  sd=$(remote_session_socket_dir) || fail "could not read the remote's ROOST_SESSION_SOCKET_DIR over ssh"
+  say "the remote's non-interactive ROOST_SESSION_SOCKET_DIR is '${sd:-<unset>}'"
+  case "$sd" in
+    /*) ;;
+    *) fail "the remote's non-interactive login sets no absolute ROOST_SESSION_SOCKET_DIR, so its client-bridge would dial this user's default session socket — a real session's. Give that login a private one (README, \"The far side\"), then re-run" ;;
+  esac
+  sd=$(strip_trailing_slashes "$sd")
+  [ -n "$sd" ] || fail "the remote's ROOST_SESSION_SOCKET_DIR is '/', not a private directory"
+  [ "$sd" != "$ROOST_SESSION_SOCKET_DIR" ] ||
+    fail "the remote's ROOST_SESSION_SOCKET_DIR is the app's own local one ($sd); the far side needs a directory of its own"
+  [ -z "$(remote_test_knobs)" ] ||
+    fail "the remote's non-interactive login sets ROOST_TEST_PASSWD_HOME or ROOST_TEST_OLD_SESSION_DIR; a debug far side would follow them past its private ROOST_SESSION_SOCKET_DIR. Unset them there, then re-run"
+  SESSION_ENV=(env "ROOST_SESSION_SOCKET_DIR=$sd")
+  require_remote_bridge_is_this_build
   if out=$(remote_session_status); then
     say "a session is already listening where the bridge looks; leaving it alone"
     say "    $(grep '^socket=' <<<"$out" || true)"
     return 0
   fi
-  rd=$(remote_runtime_dir) || fail "could not read the remote's XDG_RUNTIME_DIR over ssh"
-  say "the remote's non-interactive XDG_RUNTIME_DIR is '${rd:-<unset>}'"
-  case "$rd" in
-    /*)
-      user=$(id -un)
-      [ -d "$rd" ] ||
-        fail "the bridge resolves its socket under $rd, but that directory does not exist. It is a per-login runtime dir: run 'sudo loginctl enable-linger $user' once on this box so it persists, then re-run"
-      [ -w "$rd" ] || fail "$rd is not writable by $user, so the daemon cannot bind there"
-      # Existing is not the same as staying. `pam_systemd` creates
-      # `/run/user/<uid>` per login and removes it with the last one, so
-      # a directory that is only there because *this* preflight's own
-      # ssh just logged in would take the daemon's socket with it
-      # moments later — a lane that then failed would be reporting on
-      # the box. Lingering is what makes it permanent, and that is a
-      # decision about the box, so it is named rather than taken.
-      case "$rd" in
-        /run/user/*)
-          if command -v loginctl >/dev/null 2>&1; then
-            case "$(loginctl show-user "$user" -p Linger 2>/dev/null)" in
-              Linger=yes) ;;
-              *) fail "$rd is a per-login runtime dir and lingering is off for $user — it goes away with the last login, and the daemon's socket with it. Run 'sudo loginctl enable-linger $user' once on this box, then re-run" ;;
-            esac
-          fi
-          ;;
-      esac
-      SESSION_ENV=(env "XDG_RUNTIME_DIR=$rd")
-      ;;
-    *)
-      # Unset, empty or relative all mean the same thing to the
-      # resolver, and this side has to mean it too: unset, so the
-      # daemon takes the `/tmp/<namespace>-<uid>` fallback the bridge
-      # will take.
-      SESSION_ENV=(env -u XDG_RUNTIME_DIR)
-      ;;
-  esac
-  say "starting roost-session under the runtime dir the bridge resolves"
+  require_remote_bridge_resolves "$sd"
+  say "starting roost-session on the socket directory the bridge resolves"
   "${SESSION_ENV[@]}" "$RT/roostctl" session start >/dev/null 2>&1 ||
     fail "roostctl session start failed under ${SESSION_ENV[*]}"
   # The claim is not "start exited 0", it is "the bridge can find it".

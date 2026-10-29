@@ -488,6 +488,18 @@ async fn identify_target(path: &str) -> Option<BuildId> {
         .map(|identity| BuildId::from(&identity))
 }
 
+/// Which socket a localhost restart stops its session on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopAt {
+    /// The configured socket, which the relaunch comes back up at.
+    Configured,
+    /// A path an older build used (plan 083 D-A5). Nothing listening
+    /// there any more is the state the restart asked for, not a change:
+    /// the relaunch still has to start the session at the configured
+    /// socket, which is what the person confirmed.
+    OldPath,
+}
+
 /// The stop half of a localhost restart (D8): the session and the
 /// target are re-checked before the stream is let go, so an abort leaves
 /// the connection as it was; after that only the stop, which is itself
@@ -498,19 +510,28 @@ async fn stop_for_restart(
     session_id: String,
     target: RestartTarget,
     release: StreamRelease,
+    at: StopAt,
 ) -> Result<(), LocalFailure> {
-    let serving = identify_running(&socket).await;
-    if serving.map(|serving| serving.session_id).as_deref() != Some(session_id.as_str()) {
-        return Err(LocalFailure::Changed);
+    let gone =
+        || async { at == StopAt::OldPath && roost_ipc::session_launch::probe_gone(&socket).await };
+    let already_gone = gone().await;
+    if !already_gone {
+        let serving = identify_running(&socket).await;
+        if serving.map(|serving| serving.session_id).as_deref() != Some(session_id.as_str()) {
+            return Err(LocalFailure::Changed);
+        }
     }
     if identify_target(&target.path).await.as_ref() != Some(&target.identity) {
         return Err(LocalFailure::Changed);
     }
     release.request().await.map_err(|_| LocalFailure::Changed)?;
+    if already_gone {
+        return Ok(());
+    }
     let stopped = crate::host_conn::restart::stop_and_wait(&socket, Some(&session_id))
         .await
         .map_err(|failure| LocalFailure::Stop(failure.to_string()))?;
-    if !stopped {
+    if !stopped && !gone().await {
         return Err(LocalFailure::Changed);
     }
     Ok(())
@@ -571,6 +592,17 @@ impl App {
                 mismatch.running.clone(),
                 mismatch.exe_path.clone(),
             )),
+            _ => None,
+        }
+    }
+
+    /// The old path `session_id` was found running at, when that is why
+    /// this host needs a restart.
+    fn old_socket_of(&self, saved_id: &str, session_id: &str) -> Option<PathBuf> {
+        match self.hosts.state(saved_id)? {
+            HostConnState::NeedsRestart(mismatch) if mismatch.session_id == session_id => {
+                mismatch.old_socket.clone()
+            }
             _ => None,
         }
     }
@@ -1307,6 +1339,13 @@ impl App {
             );
             return;
         };
+        // Two addresses, kept apart: a session found on an old path is
+        // stopped there, and the relaunch below comes up at `socket`,
+        // the one this build dials (plan 083 D-A5).
+        let (socket, at) = match self.old_socket_of(saved_id, &session_id) {
+            Some(old) => (old, StopAt::OldPath),
+            None => (socket, StopAt::Configured),
+        };
         if let Some(claim) = self.host_actions.claim_mut(saved_id, generation) {
             claim.target = Some(target.clone());
         }
@@ -1321,7 +1360,7 @@ impl App {
         let feed = self.feed_tx.clone();
         let saved_id = saved_id.to_string();
         self.runtime_handle.spawn(async move {
-            let result = stop_for_restart(socket, session_id, target, release).await;
+            let result = stop_for_restart(socket, session_id, target, release, at).await;
             feed.send(crate::engine_feed::EngineFeed::HostAction(Box::new(
                 ActionEvent::Stopped {
                     saved_id,
@@ -1767,6 +1806,147 @@ pub(super) fn action_outcome(
 mod tests {
     use super::*;
     use roost_ui_model::session_update::TargetSource;
+
+    /// A restart target that identifies as itself, and the release a
+    /// restart asks the UI thread for — acked here, as the UI would.
+    async fn restart_parts(
+        dir: &Path,
+    ) -> (
+        RestartTarget,
+        crate::engine_feed::EngineFeedSender,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let line = serde_json::to_string(&roost_ipc::messages::SessionBinaryIdentity {
+            app_version: "0.0.27".into(),
+            session_protocol: roost_ipc::messages::SESSION_PROTOCOL_VERSION,
+            libghostty_build: "g".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let bin = crate::host_conn::fixtures::fake_launcher(
+            dir,
+            "roost-session",
+            &format!("echo '{line}'"),
+        );
+        let identity = roost_ipc::bootstrap::local_identity(&bin)
+            .await
+            .expect("the target identifies");
+        let target = RestartTarget {
+            path: bin.display().to_string(),
+            identity: BuildId::from(&identity),
+            source: TargetSource::Running,
+            session_id: "old-1".into(),
+            generation: 1,
+        };
+        let (feed, mut rx) = crate::engine_feed::channel();
+        let acker = tokio::spawn(async move {
+            loop {
+                let mut batch = crate::engine_feed::EngineBatch::default();
+                while let Some(item) = rx.try_next(&mut batch) {
+                    if let crate::engine_feed::EngineFeed::HostAction(event) = item {
+                        if let ActionEvent::ReleaseStream { ack, .. } = *event {
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+        (target, feed, acker)
+    }
+
+    fn release(feed: &crate::engine_feed::EngineFeedSender) -> StreamRelease {
+        StreamRelease {
+            feed: feed.clone(),
+            saved_id: "h1".into(),
+            generation: 1,
+        }
+    }
+
+    /// A session at `socket` answering `session.identify` as `session_id`.
+    fn answering_as(socket: &Path, session_id: &'static str) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let listener = tokio::net::UnixListener::bind(socket).expect("bind");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = tokio::io::BufReader::new(read).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        let id = request["id"].as_str().unwrap().parse().unwrap();
+                        let identity = SessionIdentify {
+                            session_protocol: 6,
+                            session_id: session_id.into(),
+                            ..Default::default()
+                        };
+                        let mut frame = serde_json::to_vec(&roost_ipc::messages::Response::ok(
+                            id,
+                            serde_json::to_value(identity).unwrap(),
+                        ))
+                        .unwrap();
+                        frame.push(b'\n');
+                        if write.write_all(&frame).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// Plan 083 A2 review: the old-path session a person confirmed a
+    /// restart of may already be gone — then the restart goes on to start
+    /// the session at the configured socket. Another session answering
+    /// the old path is still refused, and the configured socket keeps
+    /// its own rule.
+    #[tokio::test]
+    async fn an_old_path_session_already_gone_does_not_stall_its_restart() {
+        let dir = tempfile::Builder::new()
+            .prefix("r083-sa-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let (target, feed, acker) = restart_parts(dir.path()).await;
+        let gone = dir.path().join("gone.sock");
+
+        assert_eq!(
+            stop_for_restart(
+                gone.clone(),
+                "old-1".into(),
+                target.clone(),
+                release(&feed),
+                StopAt::OldPath
+            )
+            .await,
+            Ok(())
+        );
+        assert_eq!(
+            stop_for_restart(
+                gone,
+                "old-1".into(),
+                target.clone(),
+                release(&feed),
+                StopAt::Configured
+            )
+            .await,
+            Err(LocalFailure::Changed)
+        );
+
+        let replaced = dir.path().join("replaced.sock");
+        answering_as(&replaced, "someone-else");
+        assert_eq!(
+            stop_for_restart(
+                replaced,
+                "old-1".into(),
+                target,
+                release(&feed),
+                StopAt::OldPath
+            )
+            .await,
+            Err(LocalFailure::Changed)
+        );
+        acker.abort();
+    }
 
     /// Review finding: a dev client installs the release asset, so what
     /// the install records and says is the file's answer, not the

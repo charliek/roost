@@ -19,6 +19,18 @@ import ui
 from client import Roost
 from util import is_live_wayland_desktop
 
+# At import, before pytest imports any test module: every module that
+# re-points the session socket does it at its own import, on top of this.
+_SESSION_SOCKET_DIR, _INHERITED_SESSION_SOCKET_DIR = ui.claim_session_isolation()
+
+
+def pytest_report_header(config):
+    replaced = _INHERITED_SESSION_SOCKET_DIR or "nothing"
+    return [
+        f"roosttest session socket dir: {_SESSION_SOCKET_DIR} "
+        f"(this run's own; replaced {replaced})"
+    ]
+
 
 def pytest_addoption(parser):
     parser.addoption(

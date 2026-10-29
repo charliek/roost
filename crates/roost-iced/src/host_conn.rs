@@ -423,14 +423,6 @@ fn gave_up_copy(attempts: u32, family_copy: Option<&str>) -> String {
     }
 }
 
-/// A disconnected state's one-line reason, when it has one.
-fn disconnected_reason(state: &HostConnState) -> Option<&str> {
-    match state {
-        HostConnState::Disconnected(disconnected) => Some(disconnected.reason.as_str()),
-        _ => None,
-    }
-}
-
 /// Open a tunnel to `target` and warm its mux, as one failable step.
 ///
 /// A failed establish is shut down here rather than dropped: `SshTunnel`
@@ -1357,22 +1349,22 @@ impl HostConnSet {
             return Some(note.as_str());
         }
         if let Some(conn) = entry.conn.as_ref() {
-            return disconnected_reason(&conn.state);
+            return conn.state.reason();
         }
         if let Some(failure) = entry.ssh.as_ref().and_then(|ssh| ssh.failure.as_ref()) {
             return Some(failure.message.as_str());
         }
-        disconnected_reason(&entry.retained.as_ref()?.state)
+        entry.retained.as_ref()?.state.reason()
     }
 
     /// The long form behind [`Self::section_reason`], when the reason is
     /// a band line too short to carry what happened.
     ///
     /// Only the connection state has one — a settled localhost launch
-    /// failure writes it (`task::spawn_failure`), and nothing else does
-    /// — so unlike `section_reason` there is no ladder of sources here:
-    /// a bootstrap note and an establish failure are already their own
-    /// full text.
+    /// failure (`task::spawn_failure`), or the path a session on an old
+    /// socket was found at — so unlike `section_reason` there is no
+    /// ladder of sources here: a bootstrap note and an establish failure
+    /// are already their own full text.
     pub(crate) fn section_detail(&self, host: &str) -> Option<&str> {
         self.section(host)?.state.detail()
     }
@@ -5853,6 +5845,7 @@ mod tests {
             running: roost_ipc::session_version::BuildId::default(),
             session_id: String::new(),
             exe_path: None,
+            old_socket: None,
         }
     }
 

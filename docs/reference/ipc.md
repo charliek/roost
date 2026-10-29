@@ -25,7 +25,7 @@ than one is live, it reports the actual candidates and requires selection.
 but nothing ships or launches it there.)
 
 A fifth socket path, `Session` (`~/Library/Caches/RoostSession/roost.sock`
-on macOS, `$XDG_RUNTIME_DIR/roost-session/roost.sock` on Linux), is served
+on macOS, `<passwd home>/.local/state/roost-session/run/roost.sock` on Linux — not under `XDG_RUNTIME_DIR`), is served
 by the headless `roost-session` daemon (HS-1a, plan 035) — see
 [Session sockets](#session-sockets) and [`paths.md`](paths.md#session-profile).
 A session is reachable only **explicitly**: `roostctl --target session` (or
@@ -3072,7 +3072,7 @@ A **live** host additionally carries `connect` and `tabs`:
 - `generation` — which connection attempt this host is on. Bumped once per attempt **started** — an explicit `host.connect`, a launch auto-reconnect, or one rung of the ssh retry ladder — `0` before the first, and **kept across a disconnect**. This is the monotonic edge to wait on: two consecutive attempts can fail with byte-identical reasons, so "state is `disconnected` and `reason` is set" cannot tell attempt N from N−1, but reading `generation` before a connect and waiting for it to advance can. It counts attempts rather than connections on purpose: an ssh host whose handshake never succeeds reaches no connection at all, and a ten-rung ladder that left the number flat would be no edge.
 - `state` — the same spellings `host.connect` answers with, from the same classifier the band's dot reads. A host that has never connected is `disconnected`.
 - `reason` — the connection's own one-line reason, **untruncated**: the band's *input*. Absent when there is none.
-- `detail` — the long form behind `reason`, when there is one the band has no room for. One thing fills it: a **localhost session that could not be started**, where `reason` is the ≤45-character band line (`"cannot find roost-session"`, `"roost-session failed to start"`, `"roost-session exited early (status N)"` or `"(signal N)"`) and `detail` is what actually happened — the launch ladder's three rungs verbatim, the exec error, the daemon's own start verdict, or the exit status of a `roost-session` that exited before it was ready and the last 4 KiB it wrote to stderr. Such a host carries no `retry`: no retry could find a binary, so it settles once and waits for ↻ Reconnect.
+- `detail` — the long form behind `reason`, when there is one the band has no room for. Two things fill it. The first is a **localhost session found at an old socket path** (a pre-083 daemon, see [Paths](paths.md#upgrading-from-an-older-build)): `state` is `needs-restart`, `reason` is `"old socket path"` and `detail` is that socket's path, which a restart stops before starting a session at the configured one. The second is a **localhost session that could not be started**, where `reason` is the ≤45-character band line (`"cannot find roost-session"`, `"roost-session failed to start"`, `"roost-session exited early (status N)"` or `"(signal N)"`) and `detail` is what actually happened — the launch ladder's three rungs verbatim, the exec error, the daemon's own start verdict, or the exit status of a `roost-session` that exited before it was ready and the last 4 KiB it wrote to stderr. Such a host carries no `retry`: no retry could find a binary, so it settles once and waits for ↻ Reconnect.
 - `rollup` — the band's *output*, verbatim from the sidebar's reducer, capped at 60 characters with an ellipsis. For a **connected** host this is the agent count (`"3 agents"`), not state text; absent when the band shows no rollup at all. It is what the next frame draws — nothing here asserts a frame was painted.
 - `retry` — a `RetrySchedule`, absent unless an auto-reconnect is armed. `delay_ms` is the delay the timer was armed with (not what is left) and `armed_at` is when, so a caller can compute the remainder. `attempt` (1-based, the `3` in the band's `(3/10)`) and `budget` come with the **ssh** ladder only: a localhost retry is the connection task's own backoff whose counter never leaves the task, so it reports `delay_ms` alone.
 - `payload_kind` — what the last attach this client accepted on this host is being **decoded as**, one of [`payload_kinds`](#sessionidentify)' spellings. `"vt"` is the fallback a libghostty build skew lands on; such a host connects normally, the dot deliberately stays green, at that payload's [documented fidelity](#payload-kinds). Absent until a tab has actually attached over the *live* connection — it reports what is being decoded, never what could be — and it goes when that connection does, so a reconnect to a matching daemon cannot keep claiming a fallback it is no longer on.
@@ -3414,8 +3414,9 @@ filesystem, so a client queues it rather than waiting on it.
 supervisor exactly like a UI does, but with no window and no renderer
 attached. It resolves the `Session` bundle profile
 ([`paths.md`](paths.md#session-profile)) — same `~/Library/Caches/
-RoostSession/roost.sock` (macOS) / `$XDG_RUNTIME_DIR/roost-session/
-roost.sock` (Linux) socket path `identify.socket_path` names above,
+RoostSession/roost.sock` (macOS) / `<passwd home>/.local/state/
+roost-session/run/roost.sock` (Linux; [`ROOST_SESSION_SOCKET_DIR`](paths.md#session-socket-override)
+replaces the directory) socket path `identify.socket_path` names above,
 `RoostSessionDev` / `roost-session-dev` in debug builds. Startup installs
 `umask 0077` before creating anything, so the state dir, log dir, and
 socket directory it creates itself land at `0700` and `state.json` at
@@ -3433,7 +3434,7 @@ its socket only if the path still resolves to the `(dev, ino)` it bound
 the same path.
 
 **One session per bundle profile per machine.** Precisely: one per
-resolved socket namespace (`XDG_RUNTIME_DIR`, or its fallback) and state
+resolved socket directory (the passwd-home default, or `ROOST_SESSION_SOCKET_DIR`) and state
 namespace (`ROOST_STATE_DIR`) — the two are pointed elsewhere on purpose
 whenever a test, or a second profile, needs an isolated session of its
 own. Uniqueness is enforced by two flocks, taken in a load-bearing

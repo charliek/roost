@@ -8,6 +8,7 @@
 use std::process::Command;
 
 use roost_ipc::messages::SessionBinaryIdentity;
+use roost_ipc::paths::SESSION_SOCKET_DIR_ENV;
 
 #[test]
 fn identify_prints_one_json_line_and_exits_clean() {
@@ -44,11 +45,13 @@ fn identify_prints_one_json_line_and_exits_clean() {
 
 #[test]
 fn identify_needs_no_socket_or_profile_environment() {
-    // Pointing HOME/XDG_RUNTIME_DIR nowhere real would break profile
-    // resolution or socket dialing; identify must not touch either.
+    // A relative session socket directory is a profile that cannot
+    // resolve, and HOME/XDG_RUNTIME_DIR nowhere real would break socket
+    // dialing; identify must not touch either.
     let output = Command::new(env!("CARGO_BIN_EXE_roost-session"))
         .arg("identify")
         .env("HOME", "/nonexistent-for-this-test")
+        .env(SESSION_SOCKET_DIR_ENV, "relative-and-invalid")
         .env("XDG_RUNTIME_DIR", "/nonexistent-for-this-test")
         .env_remove("ROOST_TEST_MODE")
         .env_remove("ROOST_SESSION_FAKE_BUILD")

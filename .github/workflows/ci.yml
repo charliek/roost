@@ -2054,11 +2054,15 @@ jobs:
           XDG_RUNTIME_DIR: ${{ runner.temp }}/iced-release-profile-check/run
           XDG_DATA_HOME: ${{ runner.temp }}/iced-release-profile-check/data
           XDG_STATE_HOME: ${{ runner.temp }}/iced-release-profile-check/state
+          # A fresh install starts its tabs on a session, whose socket is
+          # isolated by ROOST_SESSION_SOCKET_DIR, not by XDG_RUNTIME_DIR:
+          # this keeps the one that spawns inside the check's own tree.
+          ROOST_SESSION_SOCKET_DIR: ${{ runner.temp }}/iced-release-profile-check/session
         run: |
           set -euo pipefail
 
-          mkdir -p "$XDG_RUNTIME_DIR" "$XDG_DATA_HOME" "$XDG_STATE_HOME"
-          chmod 700 "$XDG_RUNTIME_DIR"
+          mkdir -p "$XDG_RUNTIME_DIR" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$ROOST_SESSION_SOCKET_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR" "$ROOST_SESSION_SOCKET_DIR"
 
           UI_BIN="${GITHUB_WORKSPACE}/target/release/roost-iced"
           ROOSTCTL_BIN="${GITHUB_WORKSPACE}/target/release/roostctl"

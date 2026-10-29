@@ -612,8 +612,9 @@ pub async fn read_verdict_line<R: AsyncRead + Unpin>(reader: R, cap: usize) -> V
 /// relative) derive nothing and set nothing, and the daemon's own
 /// reading of the variable is unchanged — a *direct* `roost-session
 /// start` under the seam still uses the value verbatim. Nothing else
-/// moves: the session's socket follows `XDG_RUNTIME_DIR`, so
-/// `roostctl session status|stop` still find it.
+/// moves: the session's socket is its default under the passwd home, or
+/// an inherited [`crate::paths::SESSION_SOCKET_DIR_ENV`] passed through
+/// unchanged, so `roostctl session status|stop` still find it.
 ///
 /// Exercised over a real child in
 /// `tests/session_launch_state_dir_test.rs`, which is a binary of its

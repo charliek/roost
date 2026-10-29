@@ -83,6 +83,7 @@ EXPECTED_CHECK_IDS = {
     "agent.cursor.owning",
     "agent.opencode.wired",
     "agent.opencode.owning",
+    "session.old_path",
 }
 
 # The `tab` section's seven axis checks (everything but `tab.selection`).
@@ -119,6 +120,16 @@ CLAUDE_EVENTS = (
     "StopFailure",
     "SessionEnd",
 )
+
+
+def harness_session_env() -> dict[str, str]:
+    """The harness's own session socket directory (`ui.claim_session_isolation`),
+    for an env this module builds without it. Without it `roostctl`
+    resolves the default session socket — on macOS under a throwaway
+    `HOME`, which overruns `sun_path`'s 103 bytes and puts a warning on
+    stderr; on Linux under this user's real passwd home — and `doctor`
+    looks for old-path sessions on this machine."""
+    return ui.session_isolation_env()
 
 
 def run_doctor(
@@ -341,6 +352,7 @@ def test_socket_env_alone_does_not_claim_a_roost_tab(roost, project, target):
     wait_tab_attached(roost, tab)
 
     base = {k: v for k, v in os.environ.items() if not k.startswith("ROOST_")}
+    base.update(harness_session_env())
     for extra in (
         {"ROOST_SOCKET": str(ui.socket_path(target))},
         {"ROOST_SOCKET": str(ui.socket_path(target)), "ROOST_TAB_ID": str(tab)},
@@ -381,6 +393,7 @@ def test_socket_env_override_is_honored_and_report_is_complete(tmp_path, roost):
 
     nonexistent = tmp_path / "does-not-exist" / "roost.sock"
     base = {k: v for k, v in os.environ.items() if not k.startswith("ROOST_")}
+    base.update(harness_session_env())
 
     control_code, control = run_doctor([], base)
     control_checks = checks_by_id(control)
@@ -430,6 +443,7 @@ def test_claude_section_isolated_by_home(tmp_path, roost, project, target):
         "HOME": str(home),
         "ROOST_SOCKET": str(ui.socket_path(target)),
         "ROOST_TAB_ID": str(tab),
+        **harness_session_env(),
         # An EMPTY directory, not a minimal system PATH: phase 1 asserts
         # the whole claude section is `skipped`, which requires no `claude`
         # binary to be reachable — and `/usr/bin:/bin` cannot promise
@@ -497,6 +511,7 @@ def test_doctor_is_read_only(tmp_path, roost, project, target):
         "HOME": str(home),
         "ROOST_SOCKET": str(ui.socket_path(target)),
         "ROOST_TAB_ID": str(tab),
+        **harness_session_env(),
         # Empty on purpose: doctor executes `claude --version`, and the
         # real binary running under this throwaway $HOME could write its
         # own state into the tree snapshotted below. See `isolated_home`.
@@ -543,6 +558,12 @@ def test_doctor_is_read_only(tmp_path, roost, project, target):
     assert checks["env.tab_id"]["status"] == "ok", checks["env.tab_id"]
     assert checks["tab.selection"]["status"] == "ok", checks["tab.selection"]
     assert axes_are_resolved(checks), [checks[cid] for cid in TAB_AXIS_IDS]
+    # And under the harness's own session isolation: nothing on this
+    # machine was probed for a session on an old path.
+    assert checks["session.old_path"]["status"] == "skipped", checks["session.old_path"]
+    assert ui.SESSION_SOCKET_DIR_ENV in checks["session.old_path"]["detail"], checks[
+        "session.old_path"
+    ]
 
     after_tab = agent_axes()
     after_home = snapshot_home(home)
