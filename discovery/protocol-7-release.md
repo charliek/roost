@@ -528,8 +528,8 @@ for #650, shipped beside it).
 - **A non-UTF-8 socket path is refused**, as is one over 107 bytes on
   Linux or 103 on macOS.
 - **The uploads fallback stays in `/tmp/<ns>-<uid>/files`.**
-- **`e2e-old-session` is local only.** Its pinned releases must predate
-  M2. #652 retires the probe and the bridge fallback one release later.
+- **`e2e-old-session` has no ssh half:** it drives a local session, in
+  Linux CI and by hand. Its pinned releases must predate M2. #652 retires the probe and the bridge fallback one release later.
 
 #### The path
 
