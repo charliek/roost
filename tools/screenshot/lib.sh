@@ -265,14 +265,14 @@ ut_launch() {
       open "${app}"
       ;;
     iced)
-      local bin="${UT_REPO_ROOT}/target/debug/roost-iced"
-      [[ -x "${bin}" ]] || { echo "==> building roost-iced"; ( cd "${UT_REPO_ROOT}" && cargo build -p roost-iced >/dev/null ); }
-      echo "==> launching roost-iced"
-      local cfg; cfg="$(ut_pinned_config)"
       ut_session_dir_cleanup || {
         echo "error: an earlier launch's session is still running; not launching over its record" >&2
         return 1
       }
+      local bin="${UT_REPO_ROOT}/target/debug/roost-iced"
+      [[ -x "${bin}" ]] || { echo "==> building roost-iced"; ( cd "${UT_REPO_ROOT}" && cargo build -p roost-iced >/dev/null ); }
+      echo "==> launching roost-iced"
+      local cfg; cfg="$(ut_pinned_config)"
       local sessions
       sessions="$(ut_session_dir_new)" || return 1
       [[ -n "${sessions}" ]] || { echo "error: no session socket dir; not launching" >&2; return 1; }
